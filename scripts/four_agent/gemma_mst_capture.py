@@ -11,7 +11,7 @@ traces can carry process environments; only scanned GPU-schema exports are retai
 minimal environment. DIR/capture.json records the anchor, the exports' sha256 and the Q5 exit code.
 
 gemma_stage_profile.py mst RUN --exec-xml DIR/metal-gpu-execution-points.xml
-  --mapping-xml DIR/metal-gpu-submission-to-command-buffer-id.xml --process <hf2q|llama-server>
+  --mapping-xml DIR/metal-gpu-submission-to-command-buffer-id.xml --process <server process name>
   --offset-ns <capture.json anchor_monotonic_ns> aligns the GPU timeline to the run's request spans.
 The trace perturbs the run; compare traced against untraced makespans of the same arm.
 """

@@ -15,7 +15,7 @@ D2, because they bind local paths and hashes. Everything they compute comes from
 | Input | Identity |
 |---|---|
 | Target | `gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf`, sha256 `bf65b7e1…8ef53`, from `google/gemma-4-26B-A4B-it@4d7ae498` |
-| Peer | `llama-server` build `b128-e86f5fd` (sha256 `4b604952…a6c`), the Q3 v9 peer binary |
+| Peer | the peer server, build `b128-e86f5fd` (sha256 `4b604952…a6c`), the Q3 v9 peer binary |
 | Base peer arm | `scripts/four_agent/q5_cases/peer-gemma4.json`: 4 × 262144 unified f16 KV, temperature 0, repeat penalty 1.05, thinking off, `--spec-type none` |
 | hf2q | a release build of this branch's commit. Defaults are unchanged; the new diagnostic is off unless set |
 | Workload | the canonical four-agent coding client (`qwen_n4_live_smoke.py --family gemma4`), each run a supervised Q5 calibration |
@@ -34,23 +34,46 @@ hashes.
 | NK | `ngram-map-k` (n 12, m 48, min hits 1) | none | model-free |
 | NV | `ngram-map-k4v` (8/8/2, n-max 64, the peer documentation's repetition setting) | none | model-free, marked experimental by the peer |
 | NC | `ngram-cache` (no lookup files) | none | model-free |
-| MT | `draft-mtp` (n-max 3, greedy, backend sampling: D2's P1 flags) | `google/gemma-4-26B-A4B-it-assistant@6e5aaaf4` (839 MB BF16, `Gemma4AssistantForCausalLM`) | `LLM_ARCH_GEMMA4_ASSISTANT`; the MTP path's `is_mem_shared` Gemma 4 branch shares the target KV (`speculative.cpp:1504-1581`, `llama-context.cpp:239-246`) |
-| E3 | `draft-eagle3` (n-max 3, the speculator's `speculative_tokens`) | `RedHatAI/gemma-4-26B-A4B-it-speculator.eagle3@226b2692` (1.86 GB; aux layers 2/15/27, draft vocabulary 32000) | listed as supported in the peer's `docs/speculative.md:40`; converter `conversion/llama.py` (`Eagle3DraftModel`) |
+| MT | `draft-mtp` (n-max 3, greedy, backend sampling: D2's P1 flags) | `google/gemma-4-26B-A4B-it-assistant@6e5aaaf4` (839 MB BF16, `Gemma4AssistantForCausalLM`) | the peer's Gemma 4 assistant architecture; its MTP path shares the target KV for Gemma 4 (`speculative.cpp:1504-1581` and the context setup for that architecture) |
+| E3 | `draft-eagle3` (n-max 3, the speculator's `speculative_tokens`) | `RedHatAI/gemma-4-26B-A4B-it-speculator.eagle3@226b2692` (1.86 GB; aux layers 2/15/27, draft vocabulary 32000) | listed as supported in the peer's `docs/speculative.md:40`; the peer converter registers `Eagle3DraftModel` |
 | DF | `draft-dflash` (n-max 15; block 16) | `z-lab/gemma-4-26B-A4B-it-DFlash@77d42027` (859 MB; Qwen3 backbone, target layers 1/6/11/17/22/27) | converter `conversion/qwen.py:801` reuses the Gemma 4 tokenizer and embedding scale |
+| DS | `draft-simple` (n-max 8, n-min 0, p-min 0.75, greedy) | `google/gemma-4-E2B-it@4adf1574` (10.2 GB BF16 safetensors with vision/audio towers; converted text-only at Q8_0), operator decision 2026-11-03 | same 262144-token Gemma 4 vocabulary; the peer's `gemma4` architecture loads E2B (per-layer inputs, 20 KV-shared layers) and its converter lists E2B; the vocabulary compatibility check (`speculative.cpp:108-160`) runs at load |
+
+E3, DF and DS place the whole draft model on the GPU (`--spec-draft-ngl all`), so as not to rely on `auto`
+placement next to `--fit off`. MT shares the target context. DS's draft KV takes the target's 1,048,576-token
+pool. E2B has 15 KV-owning layers, 3 of them full attention with one 512-dim KV head, so the draft KV is
+about 6 GiB at f16 [INFERENCE from the config]. Q5 decides the memory tier.
 
 Not candidates:
 - `draft-dspark`. The pinned build supports only Qwen3 DSpark backbones (`docs/speculative.md:106`), and no
   26B-A4B DSpark checkpoint is published (the HF API returns no such repo).
-- `draft-simple` with a small Gemma 4 sibling such as E2B. It is possible in principle, but it would load a
-  second full model, and the 2026-10-31 operator decision covers only reference drafters. It is excluded
-  unless the operator asks for it.
 
-Drafters are reference-only benchmark inputs, never shipped or served by hf2q (the operator decision of
-2026-10-31, as in D2). `$G/00-acquire-drafters.sh` downloads each at its pinned revision, checks the
-safetensors sha256, and converts it with the peer's own `convert_hf_to_gguf.py` (BF16). EAGLE-3 and DFlash
-convert with `--target-model-dir` set to the target's source snapshot. Per-conversion receipts are written
-to `$G/drafters/`. Combined types (for example `ngram-mod,draft-mtp`) enter only through §3's extension
-rule.
+Drafters are reference-only benchmark inputs, never shipped or served by hf2q (operator decisions of
+2026-10-31 and 2026-11-03, as in D2). `$G/00-acquire-drafters.sh` downloads each at its pinned revision,
+checks the safetensors sha256, and converts it with the peer's own `convert_hf_to_gguf.py`. MT, E3 and DF
+convert to BF16; DS converts to Q8_0, text only. EAGLE-3 and DFlash convert with `--target-model-dir` set to
+the target's source snapshot. Every heavy step waits while HOST-LOCK exists and runs at background QoS.
+Per-conversion receipts are copied to `$G/<arm>.receipt.json`. Combined types (for example
+`ngram-mod,draft-mtp`) enter only through §3's extension rule.
+
+### Storage of the drafters (operator, 2026-11-03)
+
+Sources and GGUFs live on the external drive, under `…/hf2q/ext/models/q4-gemma/`. The target GGUF and
+both engines stay on the internal disk. The operator allows a drafter on the external drive in timed runs
+only if loading from it does not affect makespan. The argument and the check:
+
+- **Argument.** The peer arm runs with `--load-mode none`, which means no mmap. The draft model is loaded
+  with the same model parameters (`common_speculative_init_result`, `common.cpp:1708`). Every drafter byte is
+  therefore read into allocated buffers during load, before readiness, and Q5's makespan starts after
+  readiness. After load, the weights are anonymous memory and are never paged back from the file. Load time
+  from the external drive is longer, but it lies outside the makespan.
+- **Check.** Each run with an external drafter records the external drive's cumulative `iostat -I`
+  transfers every second (`$G/ext_io.py`), and the transfer inside the run's makespan bracket is compared
+  with 64 MB. Reads and writes are counted together, so the figure is an upper bound.
+- **Rule.** A qualifying arm that fails or cannot bracket the check is marked
+  `needs-internal-drafter`. It is not timed until its drafter moves to the internal disk, which is the
+  operator's call given the free space.
+- **Pre-run guard.** Every run also checks that the internal disk has at least 20 GB free.
 
 ## 3. Selecting the best valid configuration (the D2 rule)
 
@@ -206,17 +229,29 @@ Leads these numbers give the profile to confirm or refute. None is a measured st
 
 ```sh
 export RUNNER_COMMIT=<feat/q4-gemma-profile commit>
-# build (host lock free): CARGO_TARGET_DIR=.../cargo-targets/GemmaProfile cargo build --release --locked
-# copy target/release/hf2q to $G/bin-$RUNNER_COMMIT/hf2q
-bash $G/00-acquire-drafters.sh       # ~3.6 GB download + 3 BF16 conversions: 10-20 min, no GPU
-bash $G/10-make-cases.sh             # seconds
-bash $G/20-peer-search.sh            # qualify 9 runs + primary up to 27 runs: ~1.5 h
-bash $G/21-tiebreak.sh A B           # only if the top two are within 3%: ~20 min
-bash $G/40-profile.sh BEST           # L1 14 + L2 6 + L3 10 + CF 6 = 36 runs: ~1.5-2 h
+bash $G/05-build.sh                  # waits for HOST-LOCK; focused test + release build to $G/bin-<commit>/
+bash $G/00-acquire-drafters.sh       # CPU/disk/network only, preempted by any HOST-LOCK: ~13.8 GB download,
+                                     # 3 BF16 + 1 Q8_0 conversions onto the external drive
+bash $G/10-make-cases.sh             # seconds; adds MT/E3/DF/DS once $G/drafters.json exists
+bash $G/20-peer-search.sh            # GPU: qualify 10 runs + primary up to 30 runs
+bash $G/21-tiebreak.sh A B           # GPU, only if the top two are within 3%: 8 runs
+bash $G/40-profile.sh BEST           # GPU: L1 14 + L2 6 (traced) + L3 10 + CF 6 = 36 runs
 ```
 
-Each Gemma run is about 13–15 s of makespan plus 1–2 min of load, readiness and teardown, so about
-2–2.5 min per run. The total GPU lane is about 3.5–4.5 h after the drafters are prepared.
+**Expected duration.** Measured from the Q3 v9 receipts, a supervised Gemma N4 run takes 21–31 s from Q5
+start to finish, with the model page-cached. That covers load, readiness, a makespan of about 13–15 s and
+teardown; the peer arm took 21–24 s. Drafter arms add the drafter hash and load. The first load from the
+external drive also adds about 5–15 s at the drive's rate [INFERENCE]. Allowing 30–40 s per untraced run:
+
+| Step | Runs | GPU lane |
+|---|---:|---|
+| Peer search (qualify + primary) | 40 | 20–30 min |
+| Tie-break and extension (if triggered) | ≤ 12 | ≤ 8 min |
+| Profile L1 + L3 + CF | 30 | 15–20 min |
+| Profile L2, traced | 6 | 10–20 min (xctrace start, stop and export add 1–3 min per run [INFERENCE]) |
+| **Total** | ≤ 88 | **about 1–1.5 h**, including halts and inspection between steps |
+
+The earlier estimate of 3.5–4.5 h assumed 2–2.5 min per run and was wrong.
 
 ## 8. Open points before the GPU lane
 
@@ -225,9 +260,10 @@ Each Gemma run is about 13–15 s of makespan plus 1–2 min of load, readiness 
   (±5 s at 1 ms resolution, minimizing GPU-busy time outside request spans) tolerates start latency but
   not a different time base. The first L2 run must check `busy_outside_spans_s ≈ 0` before the rest are
   trusted.
-- **Trace size.** All-process Metal System Trace over a 2–3 minute Q5 run, model load included, is
-  expected to be hundreds of MB before export. The raw bundle is deleted after export.
-- **Drafter memory.** Each drafter's KV is sized to the target's 1,048,576-token pool. EAGLE-3 and DFlash
-  each have one full-attention layer, about 4 GiB at f16 [INFERENCE]. Q5 decides the memory tier.
-- **Downloads.** About 3.6 GB of network and disk work. The scripts wait for the lane grant, so no
-  timing campaign is disturbed.
+- **Trace size.** All-process Metal System Trace over a Q5 run, model load included, is expected to be
+  hundreds of MB before export. The raw bundle is deleted after export.
+- **Drafter memory.** Each separate drafter's KV is sized to the target's 1,048,576-token pool. EAGLE-3 and
+  DFlash each have one full-attention layer, about 4 GiB at f16; E2B needs about 6 GiB [INFERENCE]. Q5
+  decides the memory tier.
+- **External drive.** The drafters are timed from the external drive only while the per-run witness in §2
+  passes.

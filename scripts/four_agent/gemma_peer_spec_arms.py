@@ -14,15 +14,19 @@ is every speculation type the pinned peer build (b128-e86f5fd) can run on a Gemm
   MT  draft-mtp       Google's Gemma 4 assistant drafter (gemma4-assistant, shares the target KV)
   E3  draft-eagle3    Red Hat's EAGLE-3 speculator for this target
   DF  draft-dflash    z-lab's DFlash block drafter for this target (block 16, n-max 15)
+  DS  draft-simple    Google's Gemma 4 E2B instruction model as a plain draft model (same 262144-token
+                      vocabulary; operator decision 2026-11-03), Q8_0, n-max 8, p-min 0.75
 
 Draft-model arms need a reference-only drafter GGUF (converted by the peer's own converter, never shipped
 or served by hf2q); its path and sha256 are case variables DRAFT_MODEL / DRAFT_SHA256, and the runner must
-re-hash before launch. DSpark is absent: the pinned build supports only Qwen3 DSpark backbones and no
-26B-A4B DSpark checkpoint is published. Greedy drafting throughout, as the target samples at temperature 0.
+re-hash before launch. Separate draft models (E3, DF, DS) are placed fully on the GPU (`--spec-draft-ngl
+all`); the MTP assistant shares the target context. DSpark is absent: the pinned build supports only Qwen3
+DSpark backbones and no 26B-A4B DSpark checkpoint is published. Greedy drafting throughout, as the target
+samples at temperature 0.
 
   gemma_peer_spec_arms.py BASE_CASE OUT_DIR [--drafters drafters.json]
 
-drafters.json: {"MT": {"path": ..., "sha256": ..., "source": ...}, "E3": {...}, "DF": {...}}; draft arms
+drafters.json: {"MT": {"path": ..., "sha256": ..., "source": ...}, "E3": {...}, "DF": {...}, "DS": {...}}; draft arms
 without an entry are not written. Refuses to change an existing file whose bytes differ; writes
 OUT_DIR/cases-receipt.json with every case's sha256.
 """
@@ -48,11 +52,14 @@ ARMS = {
                              "--spec-draft-n-max", "3", "--spec-draft-n-min", "0", "--spec-draft-p-min", "0",
                              "--spec-draft-sampling", "greedy", "--spec-draft-backend-sampling"]),
     "E3": ("eagle3", ["--spec-type", "draft-eagle3", "--spec-draft-model", "{DRAFT_MODEL}",
-                      "--spec-draft-n-max", "3", "--spec-draft-sampling", "greedy"]),
+                      "--spec-draft-ngl", "all", "--spec-draft-n-max", "3", "--spec-draft-sampling", "greedy"]),
     "DF": ("dflash", ["--spec-type", "draft-dflash", "--spec-draft-model", "{DRAFT_MODEL}",
-                      "--spec-draft-n-max", "15", "--spec-draft-sampling", "greedy"]),
+                      "--spec-draft-ngl", "all", "--spec-draft-n-max", "15", "--spec-draft-sampling", "greedy"]),
+    "DS": ("draft-e2b", ["--spec-type", "draft-simple", "--spec-draft-model", "{DRAFT_MODEL}",
+                         "--spec-draft-ngl", "all", "--spec-draft-n-max", "8", "--spec-draft-n-min", "0",
+                         "--spec-draft-p-min", "0.75", "--spec-draft-sampling", "greedy"]),
 }
-DRAFT_ARMS = ("MT", "E3", "DF")
+DRAFT_ARMS = ("MT", "E3", "DF", "DS")
 # The `--spec-type` each arm selects: the name the peer prints in its `adding speculative implementation`
 # and `statistics <type>:` lines (visible at --log-verbosity 4) for qualification evidence.
 EXPECTED_TYPE = {arm: (flags[1] if flags else None) for arm, (_, flags) in ARMS.items()}

@@ -63,7 +63,7 @@ class Cli(unittest.TestCase):
             out = Path(tmp) / "cases"
             self.assertEqual(arms.main([str(BASE), str(out), "--drafters", str(drafters)]), 0)
             receipt = json.loads((out / "cases-receipt.json").read_text())
-            self.assertEqual(sorted(receipt["skipped"]), ["DF", "MT"])
+            self.assertEqual(sorted(receipt["skipped"]), ["DF", "DS", "MT"])
             self.assertIn("E3", receipt["cases"])
             self.assertTrue((out / "G-NM-ngram-mod.json").is_file())
             self.assertEqual(receipt["cases"]["E3"]["drafter_sha256"], DRAFTER["sha256"])
