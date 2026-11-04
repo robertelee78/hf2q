@@ -725,6 +725,15 @@ A floor-only family (for example DeepSeek-V4) omits the three `--reference-*` op
 - **Binding.** The coordinator and agent approvals must carry `request_setup: "qwen36-vendor-coding-v1"`. The agent template's preflight replaces `greedy_omissions_rep105_thinking2048_512` with `vendor_coding_t06_p095_k20_rep10_unbudgeted_thinking`. Agent summaries and the coordinator summary record the setup; `aggregate` and the Q2 run audit refuse a run whose agents differ from it, and the audit replays each request against the setup's wire.
 - The setup is Qwen-only, four-slot only, and limited to hf2q or the same-GGUF peer. It cannot be combined with `--phase-plan` or `--benchmark-profile`. It does work with `--instance`, so `quality_campaign.py` can run both vendor cases as a paired campaign.
 
+### Qwen3.6 repair-turn workload (ADR-063 Q4-QWEN36, operator decision 2026-11-03)
+
+`qwen_n4_live_smoke.py --repair-turns 1` gives each agent one repair cycle. The workload is `qwen38_n1_verdict.Workflow`.
+
+- **Rule.** After a failed `run_tests`, the agent's next two calls must be `write_file src/ports.rs` and `run_tests` on the same target. The six steps then resume after the failed `run_tests`, so a repaired agent makes up to 8 tool calls and 9 requests. Unary and streamed requests still alternate by turn. A failed `run_tests` with no cycle left fails the agent at once.
+- **Unchanged.** Prompts, the workflow text, tools, templates, sampling and every other step stay canonical. Without the option, the canonical protocol (`assistant`, `qualify`) is unchanged.
+- **Binding.** The case's `client.approval.set.repair_turns` must equal the client option. `q5_case.repair_turns` refuses a mismatch and any family other than `qwen36`. The coordinator copies the grant into each agent approval, the child checks it, and agent and coordinator summaries record `repair_turns`. `aggregate` and the Q2 run audit replay every request through the same `Workflow`. `quality_campaign.py` and `q3_campaign.py` refuse arms with different grants. The option combines with `--instance`, `--request-setup` and `--phase-plan`, but not with `--benchmark-profile`.
+- **Cases.** `q5_cases/qwen36-repair1.json` and `peer-qwen36-repair1.json` are `qwen36.json` and `peer-qwen36.json` plus the grant. They pin `MODEL_SHA256` to the hf2q-converted GGUF (`815a22ca…`).
+
 ## Three-arm speed campaign (ADR-063 Q3)
 
 `q3_campaign.py` runs the per-family Q3 comparison: stock hf2q (`--stock-bin`, the released binary), experiment hf2q (`--experiment-bin`) and the peer's best valid configuration (`q5_cases/peer-<family>.json`); for Qwen3.8 and Qwen3.6 also Splash's best valid configuration (`--splash-case`, default `q5_cases/splash-<family>.json`; see "Splash peer of record"). A labeled matched-settings peer diagnostic (`--peer-matched-case`) is optional. Every run is one `q5_calibration.py` runtime, run one at a time. The design, estimator, verdict rules and root commands are in [docs/research/adr063-q3-campaign.md](../../docs/research/adr063-q3-campaign.md).

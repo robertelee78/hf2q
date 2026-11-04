@@ -1,7 +1,8 @@
 # ADR-063 Q4-QWEN36: Qwen3.6 harness against Qwen's recommended agentic setup
 
 Status: C3 measured 2026-11-04 (operator decision 2026-11-03: unsloth GGUF only, canonical setup, v0.1.29
-release binary). C0, C1, C2, C4 and C5 have not run. This record holds the setup diff with sources, the
+release binary). The repair-turn workload is prepared, and its campaign has not run. C0, C1, C2, C4 and C5
+have not run. This record holds the setup diff with sources, the
 third-party diagnostic GGUFs, the paired campaigns that separate harness, conversion and model causes
 (story #662), and the C3 result. The starting point is
 [adr063-qwen36-task-failure-diagnosis.md](adr063-qwen36-task-failure-diagnosis.md): canonical workload,
@@ -167,3 +168,72 @@ Campaign `$V/q4-qwen36/campaigns/quality-qwen36-unsloth-udq4km-20261104T001837Z`
   The peer arm uses the same build in both campaigns.
 
 Analysis: `analyze_c3.py` writes `c3-analysis.json` in the evidence directory.
+
+## Repair-turn workload (operator decision 2026-11-03)
+
+Qwen3.6's race workload grants one repair cycle, on the hf2q-converted GGUF (`815a22ca…`), identically on
+hf2q and the peer. The harness option is `--repair-turns 1`. Its cases are `q5_cases/qwen36-repair1.json`
+and `peer-qwen36-repair1.json`; the README section is "Qwen3.6 repair-turn workload".
+
+**Rule.** After a failed `run_tests`, the agent's next two calls must be one `write_file src/ports.rs` and
+one `run_tests` on the same target. The six steps then resume after the failed `run_tests`. A failed
+`run_tests` once the cycle is spent fails the agent at once. The prompt, including the workflow text
+"Complete exactly these six steps", is unchanged, so the model is not told about the cycle. The recorded
+failures show that it writes a fix on its own.
+
+**Prior from the recorded failures (CPU, no new run).** A failed `run_tests ports` is followed by a
+turn-4 `write_file` that the strict workflow refused. In each recorded write, the "same form" is
+`s.parse().map_err(|e| e.to_string())` with no turbofish and no closure type annotation. Source:
+`repair-prior.txt` in the evidence directory.
+
+| Campaign | Engine | Agents with a failed ports test | Turn-4 write recorded | Keeps the same E0282 form |
+|---|---|---:|---:|---:|
+| Canonical (our GGUF) | hf2q | 43 | 20 | 10 |
+| Canonical (our GGUF) | Peer | 48 | 22 | 2 |
+| C3 (unsloth) | hf2q | 62 | 29 | 6 |
+| C3 (unsloth) | Peer | 53 | 26 | 0 |
+
+- Most repair writes add `parse::<T>()` or `|e: ParseIntError|`. The rest were stopped by the coordinator
+  before turn 4.
+- On the repair write, hf2q keeps the failing form more often than the peer: 16/49 vs 2/48 pooled, Fisher
+  two-sided p = 0.0004. Canonical alone gives p = 0.006, C3 alone p = 0.02.
+- Each engine replays its own transcripts, so prefixes differ. This is a pre-registration flag, not an
+  engine verdict. The paired repair campaign decides it. If hf2q shows a `Loss` there, the next step is a
+  same-prefix fork replay of the repair turn (`$E/qwen36-fork-v1/replay.py`).
+
+### Draft ADR-063 amendment (for the operator; the root lands the ADR edit)
+
+Under Q4-QWEN36, after "If Qwen3.6 stays BelowFloor under every setup tested …":
+
+> **Qwen3.6 race workload (operator decision, 2026-11-03).** Qwen3.6 is raced on the canonical four-agent
+> coding task with one repair cycle (`--repair-turns 1`). After a failed `run_tests`, an agent gets exactly
+> one more `write_file` and one more `run_tests` on the same target. A second failure fails the agent;
+> every other step of the six-step workflow, the prompts, tools, template, sampling and thinking budgets
+> are unchanged. The race runs on the hf2q-converted GGUF (`815a22ca…`), identically on hf2q and the peer
+> (`q5_cases/qwen36-repair1.json`, `peer-qwen36-repair1.json`). The approval binds the grant, and the Q2
+> run audit replays it.
+>
+> Rationale:
+> - Under the strict workflow Qwen3.6 is BelowFloor on every engine, precision and conversion tested:
+>   - hf2q 5/24 and peer 4/24 on our GGUF;
+>   - Q8_0 3/24;
+>   - unsloth UD-Q4_K_M 1/24 on both engines (C3, `docs/research/adr063-qwen36-recommended-setup.md`).
+> - The failure is one first-write idiom, `map_err(|e| e.to_string())` (E0282). That idiom becomes more
+>   frequent with precision: Q4 22 → Q8 34 → BF16 41 of 48 replays, and 79–86% of first writes on the
+>   unsloth file.
+> - The conversion audit found no defect in hf2q's artifact against the BF16 source and an independent
+>   converter (`~/.local/state/hf2q/v0130/q4-qwen36/conversion-audit/report.txt`).
+> - The failing agents write a type-correct fix on the next turn in most recorded cases, but the strict
+>   workflow refuses it. A repair cycle measures the engines on a task Qwen3.6 can complete, without
+>   changing the model, artifact or sampling.
+>
+> Scope and comparability:
+> - The repair workload applies to Qwen3.6 only (`q5_case.REPAIR_FAMILIES`).
+> - Qwen3.6 results on it are not comparable to the other families' canonical task: pass rates, request
+>   counts (up to 9 per agent instead of 7) and makespans differ by construction.
+> - Qwen3.8, Gemma 4 and DeepSeek-V4 keep the strict workflow.
+>
+> Gates:
+> - The 24-instance paired task campaign (Q1 §3.5) on this workload decides the floor and the engine verdict.
+> - The Q4 speed race follows only if it clears the floor.
+> - If it stays BelowFloor, Q4-QWEN36 returns to the operator as `needs_decision`.

@@ -179,7 +179,7 @@ def client_args(phase_plan=None):
                               toolchain="stable", sandbox_exec="/usr/bin/sandbox-exec", sandbox_proof="/x/proof.json",
                               sandbox_proof_sha256="b" * 64, server_pid=PID, family="qwen", engine_kind="hf2q",
                               benchmark_profile=None, instance=None, workload=None, phase_plan=phase_plan,
-                              request_setup=None)
+                              request_setup=None, repair_turns=0)
 
 
 class PhasePlans(unittest.TestCase):

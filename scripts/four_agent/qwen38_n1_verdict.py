@@ -117,6 +117,13 @@ def usage(value, turn, engine_kind="hf2q"):
 
 
 def assistant(message, finish, turn, seen_ids):
+    """Canonical six-step protocol: turn N expects EXPECTED[N]; turn 6 is the final summary."""
+    return assistant_step(message, finish, None if turn == 6 else EXPECTED[turn], seen_ids)
+
+
+def assistant_step(message, finish, expected, seen_ids):
+    """One assistant response against its expected step: (name, args), args None for any write,
+    or None for the final summary."""
     require(isinstance(message, dict) and message.get("role") == "assistant", "role")
     for key in ("content", "reasoning_content"):
         require(message.get(key) is None or isinstance(message[key], str), key)
@@ -126,7 +133,7 @@ def assistant(message, finish, turn, seen_ids):
     total += sum(len(c.get("function", {}).get("arguments", "").encode()) for c in calls)
     # Structured tool serialization can expand raw decoded text; separately bounded raw wire.
     require(total <= 6 * DECODE_LIMIT, "decoded/structured output envelope")
-    if turn == 6:
+    if expected is None:
         require(not calls and finish == "stop" and bool((message.get("content") or "").strip()),
                 "final summary missing or extra tool continuation")
         return None
@@ -138,7 +145,7 @@ def assistant(message, finish, turn, seen_ids):
             "missing/duplicate/oversized tool id")
     function = call.get("function", {})
     name = function.get("name")
-    require(name == EXPECTED[turn][0], "initial six-step workflow not followed")
+    require(name == expected[0], "initial six-step workflow not followed")
     try:
         args = loads(function.get("arguments", ""))
     except json.JSONDecodeError as exc:
@@ -149,7 +156,7 @@ def assistant(message, finish, turn, seen_ids):
                 and isinstance(args["content"], str), "write arguments")
         require(len(args["content"].encode()) <= FILE_LIMIT, "source exceeds 64KiB")
     else:
-        require(args == EXPECTED[turn][1], "tool arguments/workflow drift")
+        require(args == expected[1], "tool arguments/workflow drift")
     return cid, name, args
 
 
@@ -272,11 +279,81 @@ def test_harness(stdout, expected=2):
     return expected
 
 
-def qualify(turns, tools, cleanup, source_hash, final_hash):
-    require(len(turns) == 7 and [t["turn"] for t in turns] == list(range(7)), "seven turns")
-    require([t["stream"] for t in turns] == [False, True, False, True, False, True, False],
-            "transport matrix")
-    require(len(tools) == 6 and [t["name"] for t in tools] == [e[0] for e in EXPECTED], "six tools")
+REPAIR_TURNS = (0, 1)
+
+
+def validate_repair_turns(value):
+    require(type(value) is int and value in REPAIR_TURNS, "repair turns must be 0 or 1")
+    return value
+
+
+def max_tools(repair_turns):
+    """Tool calls an agent may make: the six steps plus two per repair cycle."""
+    return len(EXPECTED) + 2 * validate_repair_turns(repair_turns)
+
+
+class Workflow:
+    """The six-step protocol with `repair_turns` repair cycles (ADR-063 Q4-QWEN36, operator decision
+    2026-11-03). After a failed run_tests the agent makes exactly one repair cycle: one write_file
+    src/ports.rs, then run_tests on the same target. The six steps then resume after the failed
+    run_tests. A failed run_tests with no cycle left fails the agent at once. The prompt and every
+    other step are canonical. Clients use this only when repair_turns > 0; repair_turns 0 is the
+    canonical `assistant`/`qualify` path, where a failed test fails the agent later, at the next
+    step or at qualification."""
+
+    def __init__(self, repair_turns):
+        self.repair_turns = validate_repair_turns(repair_turns)
+        self.step = 0
+        self.repairs = 0
+        self.pending = []
+        self.finished = False
+
+    def expected(self):
+        """The next expected call (name, args; args None for a write), or None for the final summary."""
+        if self.pending:
+            return self.pending[0]
+        return None if self.step == len(EXPECTED) else EXPECTED[self.step]
+
+    def policy(self, message, finish, _turn, seen_ids):
+        """The assistant policy of the next response (unary/SSE/replay `assistant_policy`)."""
+        require(not self.finished, "response after the final summary")
+        return assistant_step(message, finish, self.expected(), seen_ids)
+
+    def advance(self, name, passed=None):
+        """Record the executed call; name None is the final summary. `passed` is run_tests' outcome."""
+        expected = self.expected()
+        require(not self.finished, "call after the final summary")
+        if name is None:
+            require(expected is None, "summary before the workflow finished")
+            self.finished = True
+            return
+        require(expected is not None and name == expected[0], "initial six-step workflow not followed")
+        if self.pending:
+            self.pending.pop(0)
+        else:
+            self.step += 1
+        if name == "run_tests":
+            require(type(passed) is bool, "run_tests outcome unknown")
+            if not passed:
+                require(self.repairs < self.repair_turns, "run_tests failed with no repair cycle left")
+                self.repairs += 1
+                self.pending = [("write_file", None), ("run_tests", {"target": expected[1]["target"]})]
+
+
+def qualify(turns, tools, cleanup, source_hash, final_hash, repair_turns=0):
+    if validate_repair_turns(repair_turns) == 0:
+        require(len(turns) == 7 and [t["turn"] for t in turns] == list(range(7)), "seven turns")
+        require([t["stream"] for t in turns] == [False, True, False, True, False, True, False],
+                "transport matrix")
+        require(len(tools) == 6 and [t["name"] for t in tools] == [e[0] for e in EXPECTED], "six tools")
+    else:
+        require(len(tools) <= max_tools(repair_turns) and len(turns) == len(tools) + 1
+                and [t["turn"] for t in turns] == list(range(len(turns))), "workflow turns")
+        require([t["stream"] for t in turns] == [i % 2 == 1 for i in range(len(turns))], "transport matrix")
+        workflow = Workflow(repair_turns)
+        for tool in tools:
+            workflow.advance(tool["name"], tool.get("passed") if tool["name"] == "run_tests" else None)
+        workflow.advance(None)
     require(all(t.get("cleanup") is True for t in tools) and cleanup is True, "cleanup unknown")
     require(source_hash == final_hash and tools[-1].get("passed") is True, "final tests/source")
     require(tools[-1].get("source_sha256") == final_hash, "stale test artifact")

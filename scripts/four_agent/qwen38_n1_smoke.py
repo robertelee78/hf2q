@@ -10,8 +10,8 @@ import signal
 import time
 from urllib.parse import urlsplit
 
-from qwen38_n1_verdict import (FIXTURE_SHA, PROFILE, RAW_LIMIT, WORKFLOW, Invalid, SSE,
-                              loads, qualify, require, unary, wire)
+from qwen38_n1_verdict import (FIXTURE_SHA, PROFILE, RAW_LIMIT, WORKFLOW, Invalid, SSE, Workflow,
+                              loads, max_tools, qualify, require, unary, wire)
 from qwen38_n1_tools import Tools
 import qwen38_n1_process as child
 import coding_family as family_contract
@@ -82,6 +82,12 @@ def approval(args):
         keys = request_setup.preflight(keys, setup)
     else:
         require(packet.get("request_setup") is None, "request-setup approval requires explicit CLI opt-in")
+    repair = getattr(args, "repair_turns", 0)
+    if repair:
+        require(n4 and args.family == "qwen" and args.engine_kind in ("hf2q", "peer")
+                and getattr(args, "benchmark_profile", None) is None,
+                "repair turns are four-agent Qwen hf2q/peer runs without a benchmark profile")
+    require(packet.get("repair_turns") == (repair or None), "repair-turn approval binding")
     require(set(packet.get("preflight", {})) == keys and
             all(v is True for v in packet["preflight"].values()), "preflight unknown")
     require(packet.get("sandbox_proof_sha256") == args.sandbox_proof_sha256,
@@ -176,8 +182,9 @@ def build_request(model, messages, schemas, turn, family="qwen", engine_kind="hf
 
 
 def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q", family="qwen", on_first_token=None,
-             setup=None):
-    """`on_first_token(monotonic_ns)` runs once, at the first streamed reasoning or semantic token."""
+             setup=None, assistant_policy=None):
+    """`on_first_token(monotonic_ns)` runs once, at the first streamed reasoning or semantic token.
+    `assistant_policy` replaces the canonical per-turn protocol (a repair-turn `Workflow.policy`)."""
     if engine_kind != "hf2q":
         if engine_kind == "peer":
             from family_peer import canonical
@@ -233,9 +240,10 @@ def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q"
                     total += len(block)
                     require(total <= RAW_LIMIT, "response wire32MiB envelope")
                     chunks.append(block)
-                message, call, stats = unary(b"".join(chunks), request["model"], turn, seen, engine_kind)
+                message, call, stats = unary(b"".join(chunks), request["model"], turn, seen, engine_kind,
+                                             assistant_policy=assistant_policy)
             else:
-                parser = SSE(request["model"], turn, seen, engine_kind)
+                parser = SSE(request["model"], turn, seen, engine_kind, assistant_policy=assistant_policy)
                 frame, pending = [], bytearray()
                 while True:
                     require(time.monotonic() - started <= deadline and not INTERRUPTED, "request deadline")
@@ -323,6 +331,9 @@ def main():
     parser.add_argument("--phase-cohort", type=int, help="this agent's release cohort under --phase-plan")
     parser.add_argument("--request-setup", choices=("qwen36-vendor-coding-v1",),
                         help="explicit vendor request setup (request_setup.py), bound by the approval")
+    parser.add_argument("--repair-turns", type=int, choices=(0, 1), default=0,
+                        help="repair cycles after a failed run_tests (Workflow; Qwen3.6 operator decision), "
+                             "bound by the approval; 0 is the canonical six-step protocol")
     args = parser.parse_args()
     family_contract.validate_selection(args.family, args.engine_kind, args.diagnostic_slots)
     phase = None
@@ -358,6 +369,8 @@ def main():
             summary["workload_variant"] = variant.record()
         if args.request_setup is not None:
             summary["request_setup"] = args.request_setup
+        if args.repair_turns:
+            summary["repair_turns"] = args.repair_turns
         summary["engine_kind"] = args.engine_kind
         if args.family in ("deepseek4", "gemma4"): summary["family_controls"] = packet["family_controls"]
         save(output / "approval-copy.json", packet)
@@ -388,7 +401,9 @@ def main():
         files = {} if workload is None else {"immutable": workload.immutable, "initial": workload.initial}
         if variant is not None:
             files = {"immutable": variant.immutable, "initial": variant.initial, "read_limit": variant.read_limit}
-        tools = tool_class(output / "tools", args.cargo, args.sandbox_exec, packet["sdk_root"], **files)
+        tools = tool_class(output / "tools", args.cargo, args.sandbox_exec, packet["sdk_root"], **files,
+                           max_calls=max_tools(args.repair_turns))
+        protocol = Workflow(args.repair_turns) if args.repair_turns else None
         seen = set()
         first_decode = []
         if n4:
@@ -402,7 +417,7 @@ def main():
                 first_decode.append(lambda ns: first_decode_marker(args.barrier_dir, args.agent_id, args.run_id,
                                                                    args.barrier_token, ns))
         started = time.monotonic()
-        for turn in range(7):
+        for turn in range(max_tools(args.repair_turns) + 1):
             require(not INTERRUPTED and time.monotonic() - started < 7200, "whole client deadline")
             os.kill(args.server_pid, 0)
             request = build_request(args.model, messages, schemas, turn, args.family, args.engine_kind,
@@ -412,7 +427,8 @@ def main():
             on_first_token = first_decode.pop() if first_decode and request["stream"] else None
             message, call, receipt = exchange(args.base_url, request, turn_output, turn, seen,
                                                deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind, family=args.family,
-                                               on_first_token=on_first_token, setup=args.request_setup)
+                                               on_first_token=on_first_token, setup=args.request_setup,
+                                               assistant_policy=None if protocol is None else protocol.policy)
             summary["turns"].append(receipt)
             messages.append(message)
             if call is not None:
@@ -423,10 +439,15 @@ def main():
                 summary["tools"] = tools.receipts
             save(output / "transcript.json", messages)
             save(output / "summary.json", summary)
+            if protocol is not None:
+                protocol.advance(None if call is None else call[1],
+                                 tools.receipts[-1].get("passed") if call is not None and call[1] == "run_tests" else None)
+            if call is None:
+                break
         tools.invariant()
         final_hash = child.digest(tools.fixture / "src/ports.rs")
         summary["status"] = qualify(summary["turns"], tools.receipts, True,
-                                    tools.source_hash, final_hash)
+                                    tools.source_hash, final_hash, args.repair_turns)
         summary["final_source_sha256"] = final_hash
         summary["f2_clock_id"] = CLOCK_ID
         summary["task_completed_monotonic_ns"] = clock_ns()

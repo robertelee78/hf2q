@@ -111,7 +111,27 @@ def validate(case):
         require(name not in RUNTIME, f'{{{name}}} is known only after launch; use it in the client section')
     for name in referenced(case):
         require(name in BUILTINS + RUNTIME + DERIVED or name in variables, f'undeclared placeholder {{{name}}}')
+    repair_turns(case)
     return case
+
+
+# Families whose four-agent coding cases may grant repair cycles (operator decision 2026-11-03, ADR-063 Q4-QWEN36).
+REPAIR_FAMILIES = ('qwen36',)
+
+
+def repair_turns(case):
+    """The case's repair-cycle budget: client `--repair-turns N` equal to approval.set.repair_turns, else 0."""
+    argv, approval = case['client']['argv'], case['client'].get('approval') or {}
+    granted = (approval.get('set') or {}).get('repair_turns')
+    if '--repair-turns' not in argv:
+        require(granted is None, 'approval repair_turns without client --repair-turns')
+        return 0
+    require(argv.count('--repair-turns') == 1 and argv.index('--repair-turns') + 1 < len(argv),
+            'client --repair-turns needs one value')
+    value = argv[argv.index('--repair-turns') + 1]
+    require(value == '1' and granted == 1, 'client --repair-turns 1 must equal approval.set.repair_turns 1')
+    require(case['family'] in REPAIR_FAMILIES, 'repair turns are granted to ' + ','.join(REPAIR_FAMILIES) + ' only')
+    return 1
 
 
 def _positive(value):

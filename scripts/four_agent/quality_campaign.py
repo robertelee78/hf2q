@@ -177,6 +177,8 @@ def build_plan(args, environ):
                      "engine_kind": engine_kind(cases[arm]),
                      "overrides": overrides(cases[arm], explicit or [], environ)}
     require(arms["subject"]["engine_kind"] == "hf2q", "the subject arm must be an hf2q case")
+    require(len({q5_case.repair_turns(case) for case in cases.values()}) == 1,
+            "both arms must grant the same repair turns (client --repair-turns)")
     if "reference" in arms:
         require(arms["reference"]["family"] == arms["subject"]["family"], "arms must be the same model family")
         require(arms["reference"]["engine_kind"] == REFERENCE_KINDS[args.reference_kind],
