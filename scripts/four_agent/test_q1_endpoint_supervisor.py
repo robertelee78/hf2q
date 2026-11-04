@@ -657,6 +657,50 @@ class QwenT6Continuation(unittest.TestCase):
                 [(T6, f) for f in (proof, proof_bytes, not_closed, three_owners)] + [(T3, f) for f in (cancelled_prefix, prefix_cursor)])
 
 
+class LibtestCompletionLine(unittest.TestCase):
+    """libtest prints `test <filter> ... ` and the runner's first stdout line on ONE line: the fixed and the Σ
+    completion lines are accepted bare or with this case's libtest prefix, exactly once in total."""
+    def cases(self, root):
+        return [QwenT6Continuation.build(root, "CancelledThenRecovered"), QwenT5Phase.build(root, "ForcedProposal")]
+
+    def test_prefixed_stream_and_prefixed_binding_are_one_line(self):
+        for i in range(2):
+            for bind_prefixed, stream_prefixed in ((False, True), (True, True), (True, False)):
+                with self.subTest(case=i, bind=bind_prefixed, stream=stream_prefixed), tempfile.TemporaryDirectory() as root:
+                    c = self.cases(root)[i]; bare = c["case"]["completion_line"]; prefix = "test " + c["case"]["filter"] + " ... "
+                    if bind_prefixed: c["case"]["completion_line"] = prefix + bare
+                    c["stream"] = "running 1 test\n" + (prefix if stream_prefixed else "") + bare + "\nok\n"
+                    run_multistore(root, c)
+
+    def test_both_forms_wrong_filter_or_other_prefix_refuse(self):
+        for i in range(2):
+            for name in ("both", "wrong_filter", "other_prefix"):
+                with self.subTest(case=i, mutation=name), tempfile.TemporaryDirectory() as root:
+                    c = self.cases(root)[i]; bare = c["case"]["completion_line"]; prefix = "test " + c["case"]["filter"] + " ... "
+                    c["stream"] = {"both": prefix + bare + "\n" + bare + "\n", "wrong_filter": "test other::filter ... " + bare + "\n",
+                                   "other_prefix": "noise " + bare + "\n"}[name]
+                    with self.assertRaises(REFUSED):
+                        run_multistore(root, c)
+
+    def test_sigma_line_accepts_the_libtest_prefix_once(self):
+        def build(root):
+            stores = {"s": filler(3)}
+            return dict(case=multistore_case("probe", stores, "Q1_PROBE_COMPLETE"), packet={}, execution={}, stores=stores, family="gemma", lanes=[0, 1, 2, 3])
+        old = dict(s.MULTISTORE_CHECKS); s.MULTISTORE_CHECKS["probe"] = lambda *a: {}
+        try:
+            for stream, ok in (("test fam::probe ... Q1_PROBE_COMPLETE records=3 whole_q1_qualified=false\n", True),
+                               ("Q1_PROBE_COMPLETE records=3 whole_q1_qualified=false\n", True),
+                               ("test fam::probe ... Q1_PROBE_COMPLETE records=3 whole_q1_qualified=false\nQ1_PROBE_COMPLETE records=3 whole_q1_qualified=false\n", False),
+                               ("test fam::probe ... Q1_PROBE_COMPLETE records=2 whole_q1_qualified=false\n", False)):
+                with self.subTest(stream=stream), tempfile.TemporaryDirectory() as root:
+                    c = build(root); c["stream"] = stream
+                    if ok: run_multistore(root, c)
+                    else:
+                        with self.assertRaises(REFUSED): run_multistore(root, c)
+        finally:
+            s.MULTISTORE_CHECKS.clear(); s.MULTISTORE_CHECKS.update(old)
+
+
 class QwenT5Phase(unittest.TestCase):
     @staticmethod
     def build(root, mode):

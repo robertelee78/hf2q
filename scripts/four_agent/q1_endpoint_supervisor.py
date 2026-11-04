@@ -352,6 +352,17 @@ def endpoint_evidence(out, b, trajectory, packet, execution, captured, expected,
     return dict(execution=execution, captured_records=len(captured), logit_records=len(logits), captured_bytes=total, whole_q1_qualified=False)
 
 
+def libtest_prefix(plan):
+    """libtest prints `test <filter> ... ` and the test's first stdout line on ONE line, so a runner's first
+    println arrives prefixed; a later one arrives bare. Both are the same completion line."""
+    return 'test ' + plan['filter'] + ' ... '
+def bare_line(plan):
+    """The bound completion line without the libtest prefix (a binding may carry either form)."""
+    line = plan['completion_line']; prefix = libtest_prefix(plan)
+    return line[len(prefix):] if line.startswith(prefix) else line
+def completion_count(lines, plan, bare):
+    """Occurrences of the completion line in either form (bare, or libtest-prefixed with this case's filter)."""
+    return lines.count(bare) + lines.count(libtest_prefix(plan) + bare)
 def validate_multistore(out, b, case, plan, packet, extent, identity, policy):
     """Every declared store complete and equal to its frozen extent; then the closed registry checks."""
     execution = json.loads((out / 'output/execution.json').read_text())
@@ -366,10 +377,8 @@ def validate_multistore(out, b, case, plan, packet, extent, identity, policy):
     total = sum(s['bytes'] for s in stores.values()); records = sum(len(s['captured']) for s in stores.values())
     require(total <= extent['host_payload_limit'] and total <= policy['phase_payload_upper_bytes'], 'captured bytes <= extent and policy bounds')
     lines = (out / plan['marker_stream']).read_text().splitlines()
-    if plan['completion_line']:
-        require(lines.count(plan['completion_line']) == 1, 'fixed completion line exactly once')
-    else:
-        require(plan['completion_marker'] + ' records=' + str(records) + ' whole_q1_qualified=false' in lines, 'exact multistore completion line')
+    bare = bare_line(plan) if plan['completion_line'] else plan['completion_marker'] + ' records=' + str(records) + ' whole_q1_qualified=false'
+    require(completion_count(lines, plan, bare) == 1, 'fixed completion line exactly once' if plan['completion_line'] else 'exact multistore completion line')
     evidence = dict(execution=execution, stores={n: dict(records=len(s['captured']), bytes=s['bytes']) for n, s in stores.items()}, captured_records=records, captured_bytes=total, whole_q1_qualified=False)
     for check in plan['checks']:
         evidence[check] = MULTISTORE_CHECKS[check](out, b, case, plan, packet, extent, execution, stores, identity, policy)
@@ -431,7 +440,7 @@ def check_qwen_t6_continuation(out, b, case, plan, packet, extent, execution, st
     mode = packet.get('mode'); counts = QWEN_T6_RECORDS.get(b['family']); snapshots = QWEN_T6_SNAPSHOTS.get(mode)
     require(counts is not None and snapshots is not None, 'frozen Qwen continuation mode and family counts')
     same_named(plan, ('continuation',) + snapshots, 'continuation stores by mode')
-    require(plan['completion_line'] == 'Q1_QWEN_RECOVERY_CONTINUATION_COMPLETE mode=%s lanes=4 rows_per_lane=80 first64_logits=false whole_q1=false' % mode and extent['lanes'] == [0, 1, 2, 3], 'verbatim source completion line; four lanes')
+    require(plan['completion_line'] is not None and bare_line(plan) == 'Q1_QWEN_RECOVERY_CONTINUATION_COMPLETE mode=%s lanes=4 rows_per_lane=80 first64_logits=false whole_q1=false' % mode and extent['lanes'] == [0, 1, 2, 3], 'verbatim source completion line; four lanes')
     t6 = mode == 'CancelledThenRecovered'
     require(execution['schema'] == 'hf2q.q1.qwen-recovery-continuation.v1' and execution['mode'] == mode and execution['calls'] == qwen_calls(mode), 'receipt calls = require_calls order')
     require(execution['captured_rows_per_lane'] == 80 and execution['cancelled_unpublished_rows_per_lane'] == (64 if t6 else 0) and execution['first64_logits_captured'] is False and execution['endpoint_scope'] == [64, 144] and execution['active_cache_boundaries'] == [128, 144], 'rows 64..143 per lane, caches at 128 and 144')
@@ -464,7 +473,7 @@ def check_qwen_t5_phase(out, b, case, plan, packet, extent, execution, stores, i
     0 / 4 K3 transitions; the runner's validate_complete input rows and 17 decisions per lane."""
     mode = qwen_t5_receipt(plan, packet, execution, False); counts = QWEN_T5_RECORDS.get(b['family']); forced = mode == 'ForcedProposal'
     require(counts is not None and mode in ('Preparation', 'OrdinaryBaseline', 'ForcedProposal') and extent['lanes'] == [0, 1, 2, 3], 'Qwen T5 family counts and phase')
-    require(plan['completion_line'] == 'Q1_QWEN_T5_PHASE_COMPLETE mode=%s logical_lanes=4 explicit_MTP_selector=true forced_proposal=%s whole_q1=false' % (mode, 'true' if forced else 'false'), 'verbatim source completion line')
+    require(plan['completion_line'] is not None and bare_line(plan) == 'Q1_QWEN_T5_PHASE_COMPLETE mode=%s logical_lanes=4 explicit_MTP_selector=true forced_proposal=%s whole_q1=false' % (mode, 'true' if forced else 'false'), 'verbatim source completion line')
     rows = [128] + list(range(131, 144)) if forced else list(range(128, 144))
     require(execution['ordinary_input_positions'] == [rows] * 4 and type(execution['canonical_decisions']) is list and len(execution['canonical_decisions']) == 4 and all(len(d) == 17 for d in execution['canonical_decisions']), 'ordinary input rows and seed+16 decisions per lane')
     if mode == 'Preparation':
@@ -494,7 +503,7 @@ def check_qwen_t5_first_fork(out, b, case, plan, packet, extent, execution, stor
     require(b['family'] in ('qwen36', 'qwen38') and mode in ('OrdinaryBaseline', 'ForcedProposal'), 'Qwen first-fork arm')
     captures = ('target-before-mtp', 'target-after-mtp') + (('post-draft-discard129',) if forced else ())
     same_named(plan, ('committed',) + (('raw-verifier',) if forced else ()) + captures, 'first-fork stores by arm')
-    require(plan['completion_line'] == 'Q1_QWEN_T5_FIRST_FORK_COMPLETE mode=%s logical_lanes=1 agent=0 cursor=131 float_policy=Unspecified whole_q1=false' % mode, 'verbatim source completion line')
+    require(plan['completion_line'] is not None and bare_line(plan) == 'Q1_QWEN_T5_FIRST_FORK_COMPLETE mode=%s logical_lanes=1 agent=0 cursor=131 float_policy=Unspecified whole_q1=false' % mode, 'verbatim source completion line')
     require(execution['status'] == 'CompleteFirstForkDiagnosticNotQ1Qualified', 'complete first-fork diagnostic')
     ff = execution['first_fork']
     require(ff['logical_lanes_executed'] == 1 and ff['logical_lane'] == 0 and ff['physical_slots'] == 1 and ff['all4lane_execution'] is False and extent['lanes'] == [0] and all(x['at']['agent'] == 'agent-0' for s in stores.values() for x in s['captured']), 'agent 0 only')
@@ -638,7 +647,7 @@ def check_gemma_t5_localizer(out, b, case, plan, packet, extent, execution, stor
 
 
 def all128_precondition(packet, execution, branch):
-    """Branch P only (§2.6, condition 7): the packet binds the PyTools `all128-precondition` record. The b5g All128
+    """Branch P only (§2.6, condition 7): the packet binds the PyTools `all128-precondition` record. The same-build All128
     reference's own row-127 argmax must equal frozen[128] (`holds` true) on this case's greedy workload; the receipt
     echoes {path, sha256, holds}. Branch N carries no precondition (absent or null)."""
     bound_record = packet.get('all128_precondition')

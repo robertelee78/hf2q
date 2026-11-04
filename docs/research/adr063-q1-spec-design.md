@@ -10,6 +10,14 @@ and no model was loaded to write it. Counts marked [INFERENCE] come from source
 manifests and retained stores, not from a run. Each one has a pre-launch check
 that confirms or refutes it before any comparison is made.
 
+Amendment 2026-11-04 (operator): the earlier build split (b4 `d817dffa` plus
+b5/b5g on mlx-native 0.15.16) is replaced by one build of record, **b6**: main on
+mlx-native **0.15.18**, before J1/P4b (§1.2, §2.7). 0.15.18 fixes the
+`rope_multi` partial-rotary pairing that affects every Qwen3.5-family forward.
+The header-only exports on `c043e42d` confirmed the manifest counts (1840 / 20 /
+1440 / 560 / 596, and Gemma 4204 / 4264 / 4). They must be re-exported on b6 before
+binding.
+
 `$E` = `/Users/robert/.local/state/hf2q/campaigns/adr063-preflight-20261023`, `$C` = `$E/q1-closure-v1`.
 New evidence goes to `/Users/robert/.local/state/hf2q/v0130/q1-qwen36-spec/` and `.../q1-gemma-spec/`.
 
@@ -41,28 +49,29 @@ The rule is that the binary comes from main at or after `ea6caf46` and before P4
 - J1 refactors `decode_tick_mtp_k3`, which hosts the Q1 hooks.
 - P4b replaces the DeltaNet rollback.
 
+**Amendment (operator principle, 2026-11-04: do not test what is known to be defective).** mlx-native `rope_multi` mis-pairs partial-rotary dimensions in every Qwen3.5-family forward, which covers Qwen3.6 and Qwen3.8. The fix ships in mlx-native **0.15.18**. The earlier mapping is therefore dropped:
+- no Q1 run on b4 (`d817dffa`, 0.15.16);
+- no Q1 run on `c043e42d` (the PR #684 merge, 0.15.16), which was built and only used for the header-only exports and the hosted controls.
+
+Every Qwen phase and the Gemma series now run on **one** build of record, **b6**.
+
 | Build | Source | Use | Relation, recorded in every receipt |
 |---|---|---|---|
-| **b4** | main `d817dffa7371a2db85a43ed1d6502350906c33f5`; test binary `$C/build-d817dffa…/test-binary`, sha256 `8c0b6a054530beb18bec76d7d43b457095cf53b12011f77c39e8596dae26d823` | T6 block (§1.4), the T0/T3 endpoint gate, and the T5 phases Preparation, OrdinaryBaseline and ForcedProposal (§1.5). None of these needs a D1 runtime change. Shareable with Q1-QWEN38-RERUN (#664) | `git merge-base --is-ancestor ea6caf46 d817dffa` is true (20 commits after it). #527 and #512 were OPEN on 2026-11-03 |
-| **b5** | main after the D1 delta (§1.7) merges, while #512 and #527 are still unmerged. If either merges first, use a pinned topic commit `d817dffa + D1`, whose parent precedes both. **Native must be mlx-native 0.15.16**, the same pin as b4; the fallback commit inherits it from `d817dffa`. A b5 candidate on another native version is refused | `qwen36-t0-b5` (the b5 T0-first gate), then the T5 first fork only. The offline D1 tools (`t5_artifact_compare` Q36, `exact --scope`) run from the b5 helper on the b4 stores, as the Qwen3.8 T5 compare did (separate helper binary) | Record `gh issue view 512/527 --json state,closedAt`, plus `git merge-base --is-ancestor <J1/P4b merge> <b5>` = false for each merge that exists. Record the native version and registry checksum from `Cargo.lock` and the build receipt; both must equal b4's (0.15.16) |
+| **b6** | hf2q main after the `mlx-native = "=0.15.18"` pin lands, and while #512 and #527 are still unmerged. If either merges first, use a pinned topic commit: the 0.15.18 pin plus D1/D2 (#684) plus #685, on a parent that precedes both. **Native must be mlx-native 0.15.18**; a candidate on another native version is refused | All of #653: the T0/T3 endpoint gate, T3cm/T6 (§1.4), T5 Preparation, OrdinaryBaseline and ForcedProposal, and the first fork (§1.5). All of #665 (§2.7). The offline D1/D2 tools (`t5_artifact_compare` Q36, `exact --scope`, `q1_gemma_t5_artifact_compare`) run from the b6 helper on the b6 stores | `git merge-base --is-ancestor ea6caf46 <b6>` is true. Record `gh issue view 512/527 --json state,closedAt`, plus `git merge-base --is-ancestor <J1/P4b merge> <b6>` = false for each merge that exists. Record the native version and registry checksum from `Cargo.lock` and the build receipt (0.15.18) |
 
-Build-log observations for b4 (`build-receipt.json` present):
-- adr063_invariance: 104 passed / 0 failed / 17 ignored;
-- q1_: 61 / 0 / 26;
-- full non-ignored suite: 5743 / 0 / 136.
-
-Each comparison pair stays within one build. The comparable T5 phases and the first-fork arms are each same-build pairs (b4 and b5 respectively). The first fork consumes the reviewed frozen file from the b4 preparation; preparation is non-comparable by construction (`WorkloadPreparationNotComparable`), so the Qwen3.8 precedent of a cross-build preparation applies. Running the comparable phases on b4 leaves only the first fork exposed to the J1/P4b ordering race. Every hardware run records source commit, binary sha256, artifact digest, native version (0.15.16) and case file, and passes Q5 CalibrationPass.
+- **Witness native pin:** the Gemma routing witness admits only `WITNESS_NATIVE_VERSION` (`gemma_routing_witness.rs`, currently 0.15.16). The 0.15.18 pin change must re-review the witness shaders for 0.15.18 and move that constant. It must also update the hardcoded control `gemma_cohort_localizer.rs:371` (`require_published("0.15.16")`). That control otherwise fails, the b6 build receipt then has `controls_exit` ≠ 0, and every b6 case refuses. If only the constant is left unmoved, the witness-ON Gemma cases refuse before load: T0, T5 and the localizer, but not DriftAll128.
+- **Build receipt:** the b6 receipt records the `adr063_invariance`, `q1_`, full non-ignored and four_agent Python control counts, as earlier builds did.
+- **Same build throughout:** every comparison pair, the first fork and the preparation it consumes are all on b6, so the cross-build preparation precedent is no longer needed. Every hardware run records source commit, binary sha256, artifact digest, native version (0.15.18) and case file, and passes Q5 CalibrationPass.
 
 **Compositions and supervisor bindings** (finding 1). `ComparisonKey` includes `config_sha256` (recipe route) and `token_vectors_sha256`, so each row below is a separate composition with its own acquisition review and bindings file. In `q1_endpoint_supervisor.py`, `case_plan` requires `first_case` to be a `T0ColdSerial` endpoint case (failure `'first_case is the family T0 (T0ColdSerial) endpoint case'`). `main` then requires the first case's `receipt.json` `case_complete` before any other case (failure `'<first_case> must complete before another axis'`). Each bindings file therefore re-declares a `t0` case pointing at the completed same-build T0 output, as the `qwen36-loc-b2` bindings do. The supervisor never relaunches it (`main`: `'one fresh case only'`); it only reads the receipt.
 
 | Build | Composition (recipe route; workload) | Cases | `first_case` → out |
 |---|---|---|---|
-| b4 | endpoint (`endpoint`; Suffix144) | `t0`, `t3` | `t0` → `qwen36-t0-b4` (launched here) |
-| b4 | continuation (`qwen-recovery-continuation-v1;targetAll;rows64..143`; Suffix144) | `t3cm`, `t6` | `t0` → `qwen36-t0-b4` |
-| b4 | T5 preparation (`qwen-t5-prefix128-workload-preparation-v1`; Tail128 prefix digest) | `t5prep` | `t0` → `qwen36-t0-b4` |
-| b4 | T5 phases (`qwen-t5-explicit-MTP-K3-forced-proposal-v1`; frozen full-144 digest) | `t5base`, `t5forced` | `t0` → `qwen36-t0-b4` |
-| b5 | endpoint (`endpoint`; Suffix144) | `t0` | `t0` → `qwen36-t0-b5` (launched here) |
-| b5 | T5 first fork (forced-proposal recipe; frozen full-144 digest) | `t5ffbase`, `t5ffforced` | `t0` → `qwen36-t0-b5` |
+| b6 | endpoint (`endpoint`; Suffix144) | `t0`, `t3` | `t0` → `qwen36-t0-b6` (launched here) |
+| b6 | continuation (`qwen-recovery-continuation-v1;targetAll;rows64..143`; Suffix144) | `t3cm`, `t6` | `t0` → `qwen36-t0-b6` |
+| b6 | T5 preparation (`qwen-t5-prefix128-workload-preparation-v1`; Tail128 prefix digest) | `t5prep` | `t0` → `qwen36-t0-b6` |
+| b6 | T5 phases (`qwen-t5-explicit-MTP-K3-forced-proposal-v1`; frozen full-144 digest) | `t5base`, `t5forced` | `t0` → `qwen36-t0-b6` |
+| b6 | T5 first fork (forced-proposal recipe; frozen full-144 digest) | `t5ffbase`, `t5ffforced` | `t0` → `qwen36-t0-b6` |
 
 The T0 gate is a same-binary health gate. It does not bind the T5 workload, which its own composition binds.
 
@@ -78,16 +87,16 @@ The T0 gate is a same-binary health gate. It does not bind the T5 workload, whic
 
 ### 1.4 T6: stores, comparison of record, expected counts
 
-**Cases (b4, one model resident at a time):**
+**Cases (b6, one model resident at a time):**
 
 | Case | Filter / mode | Stores written (`output/…/trace.json`) |
 |---|---|---|
-| `qwen36-t0-b4` | `qwen_actual` endpoint, T0ColdSerial | single store; supervisor T0-first gate (`case_plan` / `main`, see §1.2) for all four b4 compositions |
-| `qwen36-t3-b4` | `qwen_actual` endpoint, T3Chunk64 | single store |
-| `qwen36-t3cm-b4` | continuation `ColdChunkMatched64` | `continuation/` (`T0ChunkMatched64Tail64To143`), `prefix64/` (`T0ChunkMatchedCheckpoint64`) |
-| `qwen36-t6-b4` | continuation `CancelledThenRecovered` | `continuation/` (`T6Tail64To143`), `before/` (`T6Checkpoint64`), `recovered/` (`T6ActualEngineRecovered64`) |
+| `qwen36-t0-b6` | `qwen_actual` endpoint, T0ColdSerial | single store; supervisor T0-first gate (`case_plan` / `main`, see §1.2) for all five b6 compositions |
+| `qwen36-t3-b6` | `qwen_actual` endpoint, T3Chunk64 | single store |
+| `qwen36-t3cm-b6` | continuation `ColdChunkMatched64` | `continuation/` (`T0ChunkMatched64Tail64To143`), `prefix64/` (`T0ChunkMatchedCheckpoint64`) |
+| `qwen36-t6-b6` | continuation `CancelledThenRecovered` | `continuation/` (`T6Tail64To143`), `before/` (`T6Checkpoint64`), `recovered/` (`T6ActualEngineRecovered64`) |
 
-**The store T6 is compared against: `qwen36-t3cm-b4`, the same-build, route-matched chunk-64 never-cancelled continuation.** This deviates from the issue's literal "exact vs T3", and the receipt states the deviation and the reason below (review answer 1).
+**The store T6 is compared against: `qwen36-t3cm-b6`, the same-build, route-matched chunk-64 never-cancelled continuation.** This deviates from the issue's literal "exact vs T3", and the receipt states the deviation and the reason below (review answer 1).
 
 Why this store and not the endpoint T3:
 - T6 builds its 0..64 prefix through the production engine (`advance_qwen35_prefill` via `run_loaded`, `q1_qwen_cancel.rs:178-214`).
@@ -110,8 +119,8 @@ Pre-registered decisions (`q1_decision_policy.py exact`, `:96-113`, keys `:83`):
 | P6-1 (verdict) | `t6/continuation` vs `t3cm/continuation` | ExactEqual | 1440 | 0 | 0 |
 | P6-2 (verdict) | `t6/recovered` vs `t3cm/prefix64` | ExactEqual | 560 | 0 | 0 |
 | P6-3 (verdict) | `t6/before` vs `t6/recovered` (also checked in process: `recovery_proof`, `continuation.rs:447-470`) | ExactEqual | 560 | 0 | 0 |
-| P6-4 (diagnostic) | `t6/continuation` vs `t3-b4` (endpoint) | ExactOnCommon | 1440 | 0 | 816 (256 logit rows 0..63 + 560 active64) |
-| P6-5 (diagnostic) | `t6/recovered` vs `t3-b4` | ExactOnCommon | 560 | 0 | 1696 |
+| P6-4 (diagnostic) | `t6/continuation` vs `t3-b6` (endpoint) | ExactOnCommon | 1440 | 0 | 816 (256 logit rows 0..63 + 560 active64) |
+| P6-5 (diagnostic) | `t6/recovered` vs `t3-b6` | ExactOnCommon | 560 | 0 | 1696 |
 
 The issue's "ExactOnCommon with restored extras only" maps onto this layout as follows. Over all stores, T6 has 2560 records and T3cm has 2000. Common is 2000 with 0 differing. The only extras are T6's 560 `before` records, the pre-cancel twin of `recovered`. Those extras are checked exact by P6-3.
 
@@ -135,13 +144,13 @@ Supervisor check `qwen_t6_continuation` (§3), with per-store count binding, bec
 
 ### 1.5 T5: phases, record sets, classification
 
-**Phases (b4: three model processes; b5: T0 plus two first-fork arms):**
-1. b4 `Preparation` on `Qwen36ToolRoundTail128`. It outputs `frozen-workload.json` and `preparation-only.json` (`runner.rs:404-441`), which get an independent review receipt (finding 4).
-2. b4 `OrdinaryBaseline`, then `ForcedProposal`, on the reviewed frozen file.
+**Phases (all on b6: three T5 model processes, then two first-fork arms):**
+1. `Preparation` on `Qwen36ToolRoundTail128`. It outputs `frozen-workload.json` and `preparation-only.json` (`runner.rs:404-441`), which get an independent review receipt (finding 4).
+2. `OrdinaryBaseline`, then `ForcedProposal`, on the reviewed frozen file.
    - The forced arm injects `[g2, bad, original3]` (`q1_speculation.rs:270-307`).
    - The runner requires matched 1, rejected 1, 2 valid inputs, carry row 1 and cursor 131 (`q1_speculation.rs:448-464`).
    - `bad` is the first non-EOS ID that is not canonical (`qwen_speculation.rs:111-116`).
-3. b5 `qwen36-t0-b5`, then the first-fork baseline and forced arms (agent 0, cursor 131) on the same frozen file. This needs the D1 gate change (§1.7).
+3. The first-fork baseline and forced arms (agent 0, cursor 131) on the same frozen file, behind the same `qwen36-t0-b6` gate. This needs the D1 gate change (§1.7); b6 contains it.
 
 **Record sets** (`qwen_speculation.rs:24-97`):
 - **Committed store**, per comparable phase:
@@ -183,13 +192,13 @@ The v0.1.30 decision is to add no localizer: #653 is Medium successor scope and 
 Each step needs its own composition (§1.2 table), operating review and Q5 CalibrationPass.
 
 1. Offline: derive Tail128 from `db413896…` and check it (§1.3); independent review of the derivation.
-2. b4: endpoint prep and continuation prep, then `qwen36-t0-b4` → `qwen36-t3-b4` → `qwen36-t3cm-b4` → `qwen36-t6-b4`.
-3. Offline: P6-1 to P6-5. Informational: `exact qwen36-t0-b4 qwen36-t0-b2`, a cross-build check.
-4. b4: T5 Preparation → independent review receipt of the frozen file → OrdinaryBaseline → ForcedProposal.
-5. b5: `qwen36-t0-b5` (informational `exact qwen36-t0-b5 qwen36-t0-b4`) → first-fork baseline → first-fork forced.
+2. b6: endpoint prep and continuation prep, then `qwen36-t0-b6` → `qwen36-t3-b6` → `qwen36-t3cm-b6` → `qwen36-t6-b6`.
+3. Offline: P6-1 to P6-5. Informational: `exact qwen36-t0-b6 qwen36-t0-b2`, a cross-build check. It is expected to differ, because 0.15.18 changes `rope_multi`, and it is recorded only.
+4. b6: T5 Preparation → independent review receipt of the frozen file → OrdinaryBaseline → ForcedProposal.
+5. b6: first-fork baseline → first-fork forced.
 6. Offline: `t5_artifact_compare` (Q36), `exact --scope`, `envelope`, then independent review of the receipts.
 
-GPU time [INFERENCE, from the Qwen3.8 precedents of about 1.5 min per process]: 10 processes, about 15–20 minutes.
+GPU time [INFERENCE, from the Qwen3.8 precedents of about 1.5 min per process]: 9 processes (t0, t3, t3cm, t6, t5prep, t5base, t5forced, t5ffbase, t5ffforced), about 14–18 minutes.
 
 ### 1.7 D1 source delta (cfg(test) and tooling only; no serving change)
 
@@ -358,7 +367,7 @@ A RouteSensitive Gemma T5 result must be localized. #665 therefore builds a veri
 **When it runs.** It runs only after the T5 offline decisions, and only in two cases:
 - **Branch N:** G5-B committed rows is `RouteSensitive`. The pair is n-gram arm vs ordinary-global arm.
 - **Branch P:** the n-gram arm refused at row 127 because the global-route initial decision differed from `frozen[128]`. The pair is the ordinary-global arm vs the slot-aware All128 route, which produced the frozen dataset.
-  - **Precondition** (condition 7): the b5g All128 reference's own row-127 `Logits` argmax (its endpoint store) must equal `frozen[128]`.
+  - **Precondition** (condition 7): the b6 All128 reference's own row-127 `Logits` argmax (its endpoint store) must equal `frozen[128]`.
   - If it does not, the frozen decision has drifted across builds, not routes. The record becomes a **build-drift localization**, and branch P is not run. Steps:
     1. **Drift-only localizer mode** (ReviewSpec26 item 7). Add a witness-OFF mode `DriftAll128` to T2Loc's All128 stage localizer.
        - It has its own recipe route `gemma-all128-stage-drift-witness-off-v1`, so it has its own composition key.
@@ -366,18 +375,18 @@ A RouteSensitive Gemma T5 result must be localized. #665 therefore builds a veri
        - **Exceptions, valid in this mode only** (preflight-tested):
          - the packet's `routing_witness` must be null, which waives the cohort localizer's witness-ON requirement;
          - `gemma_routing_witness` is not installed;
-         - the `validate_budget` and `cohort_localizer_export` native-version checks (0.15.16) are skipped.
+         - the `validate_budget` and `cohort_localizer_export` native-version checks (`WITNESS_NATIVE_VERSION`) are skipped.
        - The identity's `native_version` must still equal the build's own `Cargo.toml` pin. Every other mode keeps all existing checks.
        - The mode's code must not depend on the witness module, so the same reviewed patch applies to both builds.
     2. **Both sides run in that mode**, so routing comes from the production dispatch on each side. (With the witness on, its kernel replaces the routing dispatch, which would confound `RouterIds`/`RouterWeights`.)
        - **Diagnostic build:** the greedy144 preparation's source commit `540a470842a73d63675526bc915923491c65f84a` (`Cargo.toml` `mlx-native = "=0.15.9"`; `$E/q1-gemma-greedy144-preparation-actual-v1`), plus a reviewed backport of T2Loc's cfg(test) stage hooks, the All128 localizer and `DriftAll128`. No witness module is added. It is labelled diagnostic and is never a build of record.
-       - **b5g side:** b5g (native 0.15.16), same mode, same plan.
+       - **b6 side:** b6 (native 0.15.18), same mode, same plan.
     3. **Gate (kept):** the diagnostic build's `DriftAll128` endpoint `Logits` row 127 must be byte-equal (`exact`, per lane) to the preparation's retained row-127 logits (`output/trace.json` of that preparation; 68 logit rows, 127..143 per lane).
        - If the gate fails, the backport or the build does not reproduce the preparation. That is a defect of the diagnostic build, and it follows the observer-effect defect path below. It is never localized from an unverified reference.
-    4. **Witness check on b5g:** record the b5g `DriftAll128` row-127 argmax.
-       - If it equals `frozen[128]`, the precondition failure came from the witness-ON routing, not the build. The record then localizes witness-ON vs witness-OFF on b5g: same-manifest `q1_stage_localization.py` on the b5g All128 (witness-ON) stage store vs the b5g `DriftAll128` stage store, both under the same plan.
-    5. Otherwise, run T2Loc's same-manifest `q1_stage_localization.py` on the diagnostic `DriftAll128` stage store vs the b5g `DriftAll128` stage store. The result is the first divergence per lane between the preparation build and b5g on the All128 route.
-    - Tests: `DriftAll128` refuses witness ON; the non-drift modes still refuse witness OFF and a native other than 0.15.16; the drift route label differs from the cohort label; the drift export accepts the build's own native pin.
+    4. **Witness check on b6:** record the b6 `DriftAll128` row-127 argmax.
+       - If it equals `frozen[128]`, the precondition failure came from the witness-ON routing, not the build. The record then localizes witness-ON vs witness-OFF on b6: same-manifest `q1_stage_localization.py` on the b6 All128 (witness-ON) stage store vs the b6 `DriftAll128` stage store, both under the same plan.
+    5. Otherwise, run T2Loc's same-manifest `q1_stage_localization.py` on the diagnostic `DriftAll128` stage store vs the b6 `DriftAll128` stage store. The result is the first divergence per lane between the preparation build and b6 on the All128 route.
+    - Tests: `DriftAll128` refuses witness ON; the non-drift modes still refuse witness OFF and a native other than `WITNESS_NATIVE_VERSION`; the drift route label differs from the cohort label; the drift export accepts the build's own native pin.
 
 It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
 
@@ -402,11 +411,11 @@ It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
 - **Branch P reference:** run T2Loc's `gemma_actual::q1_gemma_actual_all128_stage_localizer` (slot-aware serial All128) with this design's layer and role plan and `decode_stages: []`, on the same build.
   - D2 makes two changes to T2Loc's code, and both go through the same single admission review (condition 9).
   - **Plan-only packet form:** today T2Loc's packet carries `expected_stores["stages"]`, and `cohort_localizer_export` refuses anything over 15 MiB (`gemma_actual` reads at most 16 MiB). Branch P pass 2 would be about 18 MiB. In the new form, the stage list comes from the source `manifest()` and the bound `manifest` file. #652's existing form stays valid. Both forms are tested.
-  - **Observer-effect reference parameter:** the export's hardcoded `observer_effect_reference: "gemma-t0-b3"` becomes a prepare-config parameter. Branch P sets it to `gemma-t0-b5g`.
+  - **Observer-effect reference parameter:** the export's hardcoded `observer_effect_reference: "gemma-t0-b3"` becomes a prepare-config parameter. Branch P sets it to `gemma-t0-b6`.
 - **Observer-effect control:**
   - each localizer arm's `prefork`, `committed` and `raw-verifier` stores must be `ExactEqual` to the same arm's T5 stores;
   - its witness must be `ExactRouting` against the T5 witness;
-  - the branch P reference's endpoint store must be `ExactEqual` to `gemma-t0-b5g`.
+  - the branch P reference's endpoint store must be `ExactEqual` to `gemma-t0-b6`.
   - Any difference is a defect in the localizer adapter, and the record is withheld. Next step (condition 7):
     - the defect gets an issue and a source fix;
     - a new build is made;
@@ -488,9 +497,10 @@ It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
 ### 2.7 Build and order
 
 - Gemma has no ADR-065 ordering constraint.
-- Build **b5g** = main after #652's change and D2 merge, on native 0.15.16. Share it with #652's hooks so that one composition and acquisition review covers both.
-  - Amendment (root decision, 2026-11-03): b5g is **not** shared with #652. #652 ran on its own build of record, the PR #675 merge commit `b0dac052` (native 0.15.16), with its own compositions and reviews (`docs/research/adr063-q1-gemma-t2-localization.md`).
-- Order: `gemma-t0-b5g` (T0-first gate, plus the informational cross-build `exact gemma-t0-b5g gemma-t0-b3`, expected ExactEqual 5616 if the ordinary path is unchanged) → `gemma-t5ord-b5g` → `gemma-t5ngram-b5g` → offline G5-A1, G5-B, `routing-mapped` and the cache@144 compare (`q1_gemma_t5_artifact_compare`).
+- Build **b6** (§1.2): main on mlx-native 0.15.18, shared with every #653 phase so the two stories use one composition family.
+  - Amendment (root decision, 2026-11-03): the Gemma build is **not** shared with #652. #652 ran on its own build of record, the PR #675 merge commit `b0dac052` (native 0.15.16), with its own compositions and reviews (`docs/research/adr063-q1-gemma-t2-localization.md`).
+  - Amendment (operator, 2026-11-04): the earlier b5g (0.15.16) is replaced by b6. `rope_multi` does not affect Gemma, but one build keeps one composition family. b6 requires `WITNESS_NATIVE_VERSION` = 0.15.18 (§1.2).
+- Order: `gemma-t0-b6` (T0-first gate, plus the informational cross-build `exact gemma-t0-b6 gemma-t0-b3`, recorded only; 0.15.18 also changes Gemma kernels) → `gemma-t5ord-b6` → `gemma-t5ngram-b6` → offline G5-A1, G5-B, `routing-mapped` and the cache@144 compare (`q1_gemma_t5_artifact_compare`).
 - Then, only if G5-B is RouteSensitive (branch N) or a row-127 refusal occurred (branch P):
   - **pass 1:** generate and review the pass-1 key map (bound to both T5 receipts, the pass-1 Plan and `a`); run pass 1 for both sides; write `pass-binding.json`; then the pass-1 record;
   - **pass 2:** generate the pass-2 Plan from the pass-1 record by the frozen rule, then generate and review the pass-2 key map, which is a separate map bound to the pass-2 Plan; run pass 2 for both sides; write `pass-binding.json`; then the localization record;
@@ -511,7 +521,7 @@ One change to `scripts/four_agent/q1_endpoint_supervisor.py`, with one admission
 - Every record's agent must be in `lanes`.
 - Σ bytes ≤ `host_payload_limit` and ≤ the policy's phase upper bound.
 - `output/execution.json` must have `packet_sha256` = the packet's sha and `whole_q1_qualified: false`.
-- Completion: without `completion_line`, the line must be exactly `<marker> records=<Σ> whole_q1_qualified=false`.
+- Completion: without `completion_line`, the line must be exactly `<marker> records=<Σ> whole_q1_qualified=false`, and it must occur **exactly once** in `marker_stream`, either bare or with the case's libtest prefix `test <filter> ... ` (libtest prints that prefix and the test's first stdout line on one line).
 - `stores` may be `{}` (then `expected_stores` must be `{}`, records = 0, and the checks own the receipt). This covers the Qwen T5 Preparation, which writes no trace store (`ba6654c4`).
 - `checks` are names from a closed in-file registry.
 - Endpoint and localizer kinds and the T0-first gate are unchanged.
@@ -521,11 +531,11 @@ One change to `scripts/four_agent/q1_endpoint_supervisor.py`, with one admission
     - a manifest-form case whose packet still carries both `lanes` and `host_payload_limit`, equal to the manifest's, is admitted;
     - unequal values refuse;
     - a packet `expected_stores` with a manifest refuses.
-  - The Qwen runners need the `manifest` form because their packets are `deny_unknown_fields` (`runner.rs:27-39`, `continuation.rs:151-164`) and the T6 block must run on b4 unchanged. **Gemma T5 and localizer cases also use the `manifest` form**, because of the packet-size bound (§2.3, ReviewSpec26 condition 1).
+  - The Qwen runners need the `manifest` form because their packets are `deny_unknown_fields` (`runner.rs:27-39`, `continuation.rs:151-164`). **Gemma T5 and localizer cases also use the `manifest` form**, because of the packet-size bound (§2.3, ReviewSpec26 condition 1).
 
 Completion lines:
 - The Qwen runners print fixed lines rather than `records=<Σ>`: `Q1_QWEN_T5_PHASE_COMPLETE …` (`runner.rs:443`) and `Q1_QWEN_RECOVERY_CONTINUATION_COMPLETE …` (`continuation.rs:482`).
-- An optional case key `completion_line` (a non-empty string that contains `completion_marker`). When present, that exact line must occur **exactly once** in `marker_stream` (`ba6654c4`), and it replaces the Σ rule.
+- An optional case key `completion_line` (a non-empty string that contains `completion_marker`). When present, that line must occur **exactly once** in `marker_stream` (`ba6654c4`), counting both the bare form and the libtest-prefixed form `test <filter> ... <line>`, and it replaces the Σ rule. The binding may carry either form; the registry checks compare the bare part with the source line (#685).
 - Conditions from review answer 4: the line is copied verbatim from the source at the bound commit (`runner.rs:443`, `continuation.rs:482`, with the mode filled in). Because these fixed lines carry no record count, the registry checks bind every store's count to `execution.json` and to the source manifest.
 - Qwen T5 and T6 cases declare their exact line, for example `Q1_QWEN_RECOVERY_CONTINUATION_COMPLETE mode=CancelledThenRecovered lanes=4 rows_per_lane=80 first64_logits=false whole_q1=false`.
 - The Gemma T5 adapter prints the Σ form.
@@ -540,21 +550,21 @@ Checks registered for #653/#665:
 | `gemma_t5_ordinary` | t5ord | arm, 4 lanes, initial argmax recorded vs `frozen[128]`, inputs 128..143 = frozen, stores {prefork = 4204, committed = 4264} equal to the execution receipt's counts. **Witness** (condition 5), in `output/routing-witness.jsonl`: header identity = composition comparison key, `qualified` false; only namespace `Canonical`; exact per-lane rows 0..143 × 30 layers; every row native-valid with finite raw values; metadata ≤ quota; `end.records` = rows and `all_scored_rows_captured` true |
 | `gemma_t5_ngram` | t5ngram | arm, 4 transactions with injected origin, initial argmax equal to the ordinary arm (cross-case, from that case's receipt), a and fallback recorded, cursor 129 + a, inputs 129+a..143 = frozen, stores {prefork = 4204, committed = 4264, raw-verifier = 4} equal to the receipt's counts. **Witness:** the same header, validity and quota rules as `gemma_t5_ordinary`, with exactly the namespaces {T5Initial, T5Verify, T5Continuation} and exact per-lane rows `T5Initial` 0..127, `T5Verify` 0..131, `T5Continuation` 129+a..143 × 30 layers |
 | `gemma_t5_localizer` | t5loc-{ord,ngram}-p{1,2} | schema `hf2q.q1.gemma-t5-localizer.v1`, arm, branch, pass, plan extent equal to the bound manifest, stores {prefork, committed, (raw-verifier), stages} with counts equal to the receipt, and the witness rules of the matching T5 check. **Branch N:** frozen `accepted` equal to the T5 n-gram receipt's `a`. **Branch P** (condition 9): only the `OrdinaryGlobal` arm runs; `accepted` is null; the T5 n-gram receipt must show the row-127 initial-decision refusal; the All128 precondition is recorded |
-| branch P reference | t5loc-all128-p{1,2} | T2Loc's `gemma_loc4` check, unchanged, on the plan-only packet form with `observer_effect_reference` = `gemma-t0-b5g` |
+| branch P reference | t5loc-all128-p{1,2} | T2Loc's `gemma_loc4` check, unchanged, on the plan-only packet form with `observer_effect_reference` = `gemma-t0-b6` |
 | drift, diagnostic build | drift-diag-p{1,2} (build `540a4708`, native 0.15.9) | T2Loc's `gemma_loc4` in its `DriftAll128` form: schema as the cohort localizer, route `gemma-all128-stage-drift-witness-off-v1`, 4 lanes, `stages` store equal to the bound manifest (prefill rows 0..127, `decode_stages: []`), endpoint store present, **no routing bank asserted**, `observer_effect_reference` null. The row-127 byte-equality gate against the preparation's retained logits runs offline (`exact`) before pass 1 is used |
-| drift, b5g side | drift-b5g-p{1,2} (b5g, native 0.15.16) | the same `gemma_loc4` `DriftAll128` form, with the same plan and manifest as the diagnostic side for the same pass |
+| drift, b6 side | drift-b6-p{1,2} (b6, native 0.15.18) | the same `gemma_loc4` `DriftAll128` form, with the same plan and manifest as the diagnostic side for the same pass |
 
 The drift composition's bindings carry **no `routing_witness`** (ReviewSpec26 closing note). That is the condition under which `gemma_loc4` skips the routing-bank assertion. It does so only for the `DriftAll128` route label; any other route with no witness refuses. Each build's drift bindings declare that build's own `t0` T0-first gate:
 - at `540a4708`: an ordinary endpoint T0, `gemma_actual::q1_gemma_actual_ordinary_endpoint_trace`, which exists there. It runs without a witness, because that build has none.
-- on b5g: `gemma-t0-b5g`.
+- on b6: `gemma-t0-b6`.
 
 ## 4. Review outcome: author answers as accepted
 
 The independent review accepted the four author answers, with these conditions:
 
-1. **T6 store of record:** accepted. T3cm (`qwen36-t3cm-b4`) is the store of record, as the only same-route never-cancelled baseline (Qwen3.8 precedent: ExactEqual on 3,136 records). P6-4/P6-5 stay pre-registered diagnostics. Condition: the receipt states the deviation from the issue's literal "vs T3" wording (§1.4).
+1. **T6 store of record:** accepted. T3cm (`qwen36-t3cm-b6`) is the store of record, as the only same-route never-cancelled baseline (Qwen3.8 precedent: ExactEqual on 3,136 records). P6-4/P6-5 stay pre-registered diagnostics. Condition: the receipt states the deviation from the issue's literal "vs T3" wording (§1.4).
 2. **Tail128 as the T5 input:** accepted, on condition of finding 5: mechanical derivation from `db413896…` with a sha check, and early EOS goes on record as Missing-with-reason (§1.3). It puts the speculative rows in the assistant-decode region, where serving speculates.
-3. **First fork required for #653 closure:** yes. It is the only capture of the post-draft/discard state and of outputs before and after MTP catch-up, and issue acceptance item 2 requires side effects to be exact. It costs the D1 change, two processes and `qwen36-t0-b5` (§1.2, §1.5).
+3. **First fork required for #653 closure:** yes. It is the only capture of the post-draft/discard state and of outputs before and after MTP catch-up, and issue acceptance item 2 requires side effects to be exact. It costs the D1 change and two processes behind the shared `qwen36-t0-b6` gate (§1.2, §1.5).
 4. **`completion_line` for the fixed Qwen lines:** accepted, on three conditions: the line is copied verbatim from source at the bound commit, it occurs exactly once in `marker_stream`, and record-count binding moves to the per-store and `execution.json` checks (§3).
 
 Operator decision (2026-11-03): the design is approved **without** an unlocalized-RouteSensitive exception for #665. A RouteSensitive Gemma T5 result must be localized, and the verifier-route localizer (§2.6) is in #665's scope.

@@ -81,7 +81,7 @@ separate composition key (`gemma-four-lane-stage-localizer-native-routing1511-v1
 The metadata prepare's optional `cohort_localizer` block (`layers`,
 `prefill_stages`, `decode_stages`, the required `observer_effect_reference`
 and `packed_observer_effect_reference`, e.g. `gemma-t0-b3` / `gemma-t2-b3`, or
-`gemma-t0-b5g` for the #665 branch P reference; optional `mode` and
+`gemma-t0-b6` for the #665 branch P reference; optional `mode` and
 `packet_form`) writes `cohort-localizer-prepared.json` and two disabled
 `multistore` packets (`all128`, `packed`). Each packet echoes its
 `observer_effect_reference`, and the localizer's `execution.json` records it
