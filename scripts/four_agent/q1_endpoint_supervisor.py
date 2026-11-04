@@ -23,6 +23,13 @@ Changes:
      equal the manifest's); every store must be complete and equal its
      frozen extent; closed registry `checks` own the family-specific
      receipt rules.
+  8. the resource policy may select the ADR-063 Q5 runtime pressure rule
+     (`runtime_pressure_rule: "q5-critical-stop"`: warning is recorded, only
+     critical or unknown pressure stops; baseline samples stay normal-only), and
+     a footprint calibration policy (`footprint_calibration: true`, no process
+     cap: Q5 "a calibration run without a prior receipt uses the effective floor
+     as its cap"); every run records its measured memory footprint
+     (`receipt.json` `memory`, per-sample `memory-series.json`).
 The foreign-process denylist and the listener ports are read from the reviewed
 Gemma supervisor source (sha-pinned) so the reviewed list is reused verbatim.
 No physical-admission, performance, float-policy or whole-Q1 qualification.
@@ -55,6 +62,9 @@ LOCALIZER_TOKENS = {'gemma': (144,), 'qwen38': (64, 128), 'qwen36': (64, 128), '
 GEMMA_DEFAULT_WARM_KERNEL = 'VecHybrid'  # shipped since #544; packets must declare any other
 COHORT_SCHEMA = 'hf2q.adr063.q1.cohort-stage-localizer.v1'
 COHORT_ROUTES = {'T0ColdSerial': 'SerialAll128PrefillSingleRowDecode', 'T2ActualCohort': 'PackedPrefill512OwnersBatchedDecodeRows'}
+# Runtime pressure rules (kern.memorystatus_vm_pressure_level: 1 normal, 2 warning, 4 critical). Absent = the
+# reviewed Q1 rule. `q5-critical-stop` is ADR-063 Q5: warning pressure is recorded but is not a stop.
+RUNTIME_PRESSURE = {'normal-every-sample': ('1',), 'q5-critical-stop': ('1', '2')}
 INTERRUPTED = 0
 
 
@@ -80,6 +90,48 @@ def store_dir(rel):
     """A store directory relative to output/: '.' or plain descending names only."""
     require(type(rel) is str and rel and not Path(rel).is_absolute() and (rel == '.' or all(p not in ('', '.', '..') for p in rel.split('/'))), 'store directory inside output/')
     return rel
+def runtime_pressure(policy):
+    """Admitted runtime pressure_raw values; the baseline before launch is always normal-only."""
+    rule = policy.get('runtime_pressure_rule', 'normal-every-sample'); require(rule in RUNTIME_PRESSURE, 'closed runtime pressure rule')
+    return RUNTIME_PRESSURE[rule]
+def process_limits(policy):
+    """(footprint_calibration, rss cap, footprint cap). A calibration has no process cap: its cap is the runtime floor."""
+    calibration = policy.get('footprint_calibration', False); rss, footprint = policy['process_rss_limit_bytes'], policy['process_footprint_limit_bytes']
+    require(type(calibration) is bool, 'footprint_calibration is a boolean')
+    if calibration:
+        require(rss is None and footprint is None and policy.get('runtime_pressure_rule') == 'q5-critical-stop', 'footprint calibration: no process cap, Q5 pressure rule')
+    else:
+        require(type(rss) is int and type(footprint) is int and rss > 0 and footprint > 0, 'process RSS/footprint limits')
+    return calibration, rss, footprint
+
+
+class MemoryRecord:
+    """Measured case footprint. Host metric = Q5 Free+cached (meminfo free + cached_files = vm_stat free +
+    speculative + file-backed); `available` also deducts the owned outputs, as the floors do."""
+    def __init__(self, baseline):
+        free = [x['physical']['free'] + x['physical']['cached_files'] for x in baseline]
+        self.base = dict(min_free_plus_cached_bytes=min(free), max_free_plus_cached_bytes=max(free), samples=len(baseline),
+                         max_wired_bytes=max(x['physical']['wired'] for x in baseline), swap_bytes=baseline[0]['swap_bytes'],
+                         compressor_bytes=baseline[0]['physical']['compressor'], pressure_raw=sorted({x['pressure_raw'] for x in baseline}))
+        self.series = []; self.pressure = {}; self.process = dict(peak_phys_footprint_bytes=None, peak_resident_bytes=None, peak_wired_bytes=None, lifetime_max_phys_footprint_bytes=None)
+    def sample(self, x, available, spawn_ns):
+        p = x['physical']; self.pressure[x['pressure_raw']] = self.pressure.get(x['pressure_raw'], 0) + 1
+        self.series.append(dict(t_ns=x['start_ns'] - spawn_ns, free_plus_cached=p['free'] + p['cached_files'], available=available, wired=p['wired'],
+                                compressor=p['compressor'], swap=x['swap_bytes'], pressure_raw=x['pressure_raw'], footprint=None, resident=None))
+    def ledger(self, value):
+        for key, field in (('peak_phys_footprint_bytes', 'phys_footprint'), ('peak_resident_bytes', 'resident_size'), ('peak_wired_bytes', 'wired_size'), ('lifetime_max_phys_footprint_bytes', 'lifetime_max_phys_footprint')):
+            self.process[key] = max(self.process[key] or 0, value[field])
+        if self.series: self.series[-1].update(footprint=value['phys_footprint'], resident=value['resident_size'])
+    def summary(self):
+        s = self.series; low = min((r['free_plus_cached'] for r in s), default=None)
+        drops = [a['free_plus_cached'] - b['free_plus_cached'] for a, b in zip(s, s[1:])]
+        return dict(metric='free + cached_files (meminfo) = Q5 Free+cached', baseline=self.base, runtime_samples=len(s), pressure_counts=dict(self.pressure),
+                    min_free_plus_cached_bytes=low, min_available_after_owned_outputs_bytes=min((r['available'] for r in s), default=None),
+                    charged_bytes=None if low is None else max(0, self.base['min_free_plus_cached_bytes'] - low),
+                    max_wired_growth_bytes=None if not s else max(r['wired'] for r in s) - self.base['max_wired_bytes'],
+                    max_swap_growth_bytes=None if not s else max(r['swap'] for r in s) - self.base['swap_bytes'],
+                    max_compressor_growth_bytes=None if not s else max(r['compressor'] for r in s) - self.base['compressor_bytes'],
+                    max_sample_drop_bytes=max(drops, default=None), last_sample_t_ns=s[-1]['t_ns'] if s else None, **self.process)
 def case_plan(b, name):
     """Closed launch plan: an endpoint trajectory, a single-lane localizer or a multistore case."""
     first = b['cases'].get(b['first_case'])
@@ -172,7 +224,7 @@ def drain(p):
         except ProcessLookupError: empty = True
         except OSError as e: errors.append('group:' + repr(e))
         if p.poll() is not None and empty: break
-    return dict(reaped=p.poll() is not None, group_empty=empty, errors=errors, exit=p.returncode)
+    return dict(reaped=p.poll() is not None, group_empty=empty, errors=errors, exit=p.returncode, ended_ns=time.monotonic_ns())
 
 
 def terminal_esrch(ledger, value, pid, child_exit, prior_fresh):
@@ -329,6 +381,7 @@ def main():
     require(sha('/usr/bin/meminfo') == obs['meminfo_sha256'] and sha('/usr/bin/osascript') == obs['thermal_sha256'], 'reviewed observation binaries')
     deny = reviewed_denylist(bound(obs['denylist_source'], 'reviewed denylist source'))
     policy = load(b['resource_policy'], 'resource policy binding'); require(policy['family'] == b['family'] and policy['physical_admission'] is False, 'family resource policy')
+    admitted_pressure = runtime_pressure(policy); calibration, rss_limit, footprint_limit = process_limits(policy)
     require('operating_review' not in case and Path(args.operating_review).is_absolute(), 'operating review is a launch argument, not a bindings entry')
     operating_bytes = Path(args.operating_review).read_bytes(); operating = json.loads(operating_bytes); operating_sha = hashlib.sha256(operating_bytes).hexdigest()
     require(operating == dict(schema=REVIEW_SCHEMA, verdict='AcceptedForOneAttempt', family=b['family'], case=args.case, composition_sha256=b['composition']['sha256'], policy_sha256=b['resource_policy']['sha256'], bindings_sha256=BINDINGS_SHA256, supervisor_sha256=sha(__file__), physical_admission=False), 'closed per-case operating review; not physical fit')
@@ -360,7 +413,8 @@ def main():
     require(globals_used <= set(namespace) | set(dir(builtins)), 'missing observer globals:' + repr(globals_used - set(namespace) - set(dir(builtins))))
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(sampler_source), 'exec'), namespace); sample = namespace['sample']
     deadline = policy['deadline_seconds']
-    result = dict(family=b['family'], case=args.case, kind=plan['kind'], operating_review_sha256=operating_sha, case_complete=False, mode=mode, model_launch_attempted=False, physical_admission=False, performance_qualified=False, whole_q1_qualified=False); child = None
+    result = dict(family=b['family'], case=args.case, kind=plan['kind'], operating_review_sha256=operating_sha, case_complete=False, mode=mode, model_launch_attempted=False, physical_admission=False, performance_qualified=False, whole_q1_qualified=False,
+                  footprint_calibration=calibration, endpoint_evidence=not calibration, runtime_pressure_admitted=list(admitted_pressure)); child = None; memory = None
     for sig in HANDLED_SIGNALS: signal.signal(sig, interrupt)
     def available(x, owned): return x['physical']['free'] + x['physical']['cached_files'] - sum(disk_bytes(o) for o in owned)
     try:
@@ -368,24 +422,26 @@ def main():
         for i in range(12):
             target = epoch + i * 500000000; time.sleep(max(0, (target - time.monotonic_ns()) / 1e9)); x = sample('baseline', i, target); baseline.append(x)
             require(x['pressure_raw'] == '1' and available(x, [o for o in outputs if o != out]) >= policy['preload_available_floor_bytes'], 'preload operating headroom/pressure (nothing else resident)')
-        require(not INTERRUPTED, 'interrupted before load'); stat_model(); require(sha(binary) == b['binary_sha256'], 'prelaunch binary')
+        require(not INTERRUPTED, 'interrupted before load'); stat_model(); require(sha(binary) == b['binary_sha256'], 'prelaunch binary'); memory = MemoryRecord(baseline)
         selected_filter = plan['filter']
         command = [str(out / 'test-binary'), selected_filter, '--exact', '--ignored', '--nocapture', '--test-threads=1']; save(out / 'command.json', dict(argv=command, binary_sha256=b['binary_sha256'], source_commit=b['source_commit'], packet_sha256=sha(out / 'packet.json'), packet_env=plan['packet_env'], deadline_seconds=deadline, mode=mode, kind=plan['kind']))
         env = {k: v for k, v in os.environ.items() if not k.startswith(AMBIENT)}; env[plan['packet_env']] = str(out / 'packet.json')
         with (out / 'stdout').open('xb') as so, (out / 'stderr').open('xb') as se:
-            quiet(out, 'immediate-prelaunch', deny); require(not INTERRUPTED, 'interrupted immediately before Popen'); spawn_ns = time.monotonic_ns(); started = time.monotonic(); child = subprocess.Popen(command, cwd=out, env=env, stdout=so, stderr=se, stdin=subprocess.DEVNULL, start_new_session=True); result.update(model_launch_attempted=True, pid=child.pid); i = 0; next_sample = time.monotonic_ns(); proc_identity = None; last_live_ledger = None; previous_sample_ns = None
+            quiet(out, 'immediate-prelaunch', deny); require(not INTERRUPTED, 'interrupted immediately before Popen'); spawn_ns = time.monotonic_ns(); started = time.monotonic(); child = subprocess.Popen(command, cwd=out, env=env, stdout=so, stderr=se, stdin=subprocess.DEVNULL, start_new_session=True); result.update(model_launch_attempted=True, pid=child.pid, spawn_ns=spawn_ns); i = 0; next_sample = time.monotonic_ns(); proc_identity = None; last_live_ledger = None; previous_sample_ns = None
             while child.poll() is None:
                 require(not INTERRUPTED and time.monotonic() - started < deadline, 'interruption/case watchdog')
                 now = time.monotonic_ns()
                 if now >= next_sample:
-                    x = sample('runtime', i, now); require(previous_sample_ns is None or x['start_ns'] - previous_sample_ns <= POLICY['max_sample_gap_ns'], 'stale runtime sample'); previous_sample_ns = x['start_ns']; require(x['pressure_raw'] == '1', 'runtime pressure')
-                    require(available(x, outputs) >= policy['runtime_available_floor_bytes'], 'runtime operating floor'); require(x['swap_bytes'] - baseline[0]['swap_bytes'] <= policy['max_swap_growth_bytes'] and x['physical']['compressor'] - baseline[0]['physical']['compressor'] <= policy['max_compressor_growth_bytes'], 'swap/compressor growth')
+                    x = sample('runtime', i, now); require(previous_sample_ns is None or x['start_ns'] - previous_sample_ns <= POLICY['max_sample_gap_ns'], 'stale runtime sample'); previous_sample_ns = x['start_ns']
+                    avail = available(x, outputs); memory.sample(x, avail, spawn_ns); require(x['pressure_raw'] in admitted_pressure, 'runtime pressure')
+                    require(avail >= policy['runtime_available_floor_bytes'], 'runtime operating floor'); require(x['swap_bytes'] - baseline[0]['swap_bytes'] <= policy['max_swap_growth_bytes'] and x['physical']['compressor'] - baseline[0]['physical']['compressor'] <= policy['max_compressor_growth_bytes'], 'swap/compressor growth')
                     ledger = raw(out, 'process-' + str(i), [str(proc), str(child.pid)], timeout=.5); value = json.loads(ledger['stdout'])
                     if ledger['exit'] == 0 and value.get('available') is True:
                         proc_identity = namespace['proc_fields'](value, child.pid, proc_identity)
                         live = dict(available=True, parent_start_ns=ledger['begin_ns'], parent_end_ns=ledger['end_ns'], parent_duration_ns=ledger['end_ns'] - ledger['begin_ns'], identity_validated=True)
                         require(namespace['ledger_ready'](live, POLICY, time.monotonic_ns(), after_ns=spawn_ns), 'fresh actual owned ledger required'); last_live_ledger = live
-                        require(value['resident_size'] <= policy['process_rss_limit_bytes'] and value['phys_footprint'] <= policy['process_footprint_limit_bytes'], 'RSS/footprint operating limit')
+                        memory.ledger(value)
+                        require(calibration or (value['resident_size'] <= rss_limit and value['phys_footprint'] <= footprint_limit), 'RSS/footprint operating limit')
                     else:
                         terminal_esrch(ledger, value, child.pid, child.poll(), namespace['ledger_ready'](last_live_ledger, POLICY, time.monotonic_ns(), after_ns=spawn_ns)); result['terminal_ledger_race'] = ledger
                     require(sum(disk_bytes(o) for o in outputs) <= policy['paired_disk_working_limit_bytes'], 'owned disk quota; no cold-cache refund'); i += 1; next_sample = now + 500000000  # fixed cadence from the sample start: the 1 s gap bound must not absorb the per-sample ledger/disk work
@@ -407,10 +463,14 @@ def main():
             quiet(out, 'post', deny)
             if result.get('terminal_ledger_race'):
                 post = sample('terminal-exit', 0, time.monotonic_ns())
-                require(post['pressure_raw'] == '1' and available(post, outputs) >= policy['runtime_available_floor_bytes'], 'terminal-race fresh global headroom/pressure')
+                require(post['pressure_raw'] in admitted_pressure and available(post, outputs) >= policy['runtime_available_floor_bytes'], 'terminal-race fresh global headroom/pressure')
                 require(post['swap_bytes'] - baseline[0]['swap_bytes'] <= policy['max_swap_growth_bytes'] and post['physical']['compressor'] - baseline[0]['physical']['compressor'] <= policy['max_compressor_growth_bytes'], 'terminal-race fresh global growth guard')
         except BaseException as e: result['post_failure'] = repr(e)
         result['case_complete'] = not result.get('failure') and not result.get('post_failure') and (child is None or (result.get('cleanup', {}).get('reaped') is True and result['cleanup']['group_empty'] and not result['cleanup']['errors'])) and 'helper_evidence' in result
+        if memory is not None:
+            result['memory'] = memory.summary()
+            try: save(out / 'memory-series.json', dict(schema='hf2q.q1.endpoint-memory-series.v1', series=memory.series))
+            except BaseException as e: result['memory_series_failure'] = repr(e); result['case_complete'] = False
         save(out / 'receipt.json', result)
     print(json.dumps({k: v for k, v in result.items() if k != 'helper_evidence'}, indent=2)); raise SystemExit(0 if result['case_complete'] else 1)
 

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - ADR-063 Q1-GEMMA-T2LOC (test-only): a four-lane Gemma stage localizer for the packed T2 route and its All128 reference. Packed prefill rows map to their agents through `gemma_endpoint::packed_owners`, and new batched-decode stage hooks sit in `batched_body.rs`. Each route also writes the unchanged endpoint store, which serves as the observer-effect control against the b3 stores. The Q1 endpoint supervisor gains a `multistore` case kind with closed registry checks (`gemma_loc4`). `q1_stage_localization.py` reports the per-lane first divergence. No production path changes.
+- ADR-063 Q1 endpoint supervisor (`scripts/four_agent/q1_endpoint_supervisor.py`): a resource policy may select the Q5 runtime pressure rule (`runtime_pressure_rule: "q5-critical-stop"`: warning pressure is recorded, critical or unrecognized pressure stops; the pre-launch baseline stays normal-only) and a footprint-calibration policy (`footprint_calibration: true`, no process cap, the runtime floor is the cap) for the Q1-DS4 measured-footprint run. Every case receipt now records its measured memory footprint (`memory`: baseline and minimum Free+cached, charge, process peaks, pressure counts, swap/compressor/wired growth) with a per-sample `memory-series.json`. Policies without the new keys behave as before.
 
 ### Changed
 
