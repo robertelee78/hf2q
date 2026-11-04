@@ -115,16 +115,22 @@ pub fn looks_like_hf_repo_id(arg: &str) -> bool {
 /// `--quant <name>` argument.
 ///
 /// Returned `&'static str` matches the exact selectors accepted by the
-/// conversion CLI.
-fn map_quant_to_cli(quant: QuantType) -> &'static str {
-    match quant {
+/// conversion CLI. `IQ2_XXS` is an external-file identity with no
+/// conversion path, so it fails closed.
+fn map_quant_to_cli(quant: QuantType) -> Result<&'static str> {
+    Ok(match quant {
         QuantType::Q2_K => "q2_k",
         QuantType::Q8_0 => "q8_0",
         QuantType::Q6_K => "q6_k",
         QuantType::Q5_K_M => "q5_k_m",
         QuantType::Q4_K_M => "q4_k_m",
         QuantType::Q3_K_M => "q3_k_m",
-    }
+        QuantType::IQ2_XXS => {
+            return Err(anyhow!(
+                "hf2q convert has no IQ2_XXS target; IQ2_XXS identifies external GGUF files only"
+            ))
+        }
+    })
 }
 
 /// Returned by [`resolve_or_prepare_model`].  Carries the path the serve
@@ -565,9 +571,9 @@ fn run_convert_subprocess(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "hf2q".to_string())
     });
-    let cli_quant = map_quant_to_cli(quant);
+    let cli_quant = map_quant_to_cli(quant)?;
     let mut cmd = Command::new(&bin);
-    cmd.args(convert_command_args(snapshot_dir, target_gguf, quant));
+    cmd.args(convert_command_args(snapshot_dir, target_gguf, quant)?);
 
     tracing::info!(
         bin = %bin,
@@ -611,15 +617,15 @@ fn convert_command_args(
     snapshot_dir: &Path,
     target_gguf: &Path,
     quant: QuantType,
-) -> Vec<std::ffi::OsString> {
-    vec![
+) -> Result<Vec<std::ffi::OsString>> {
+    Ok(vec![
         "convert".into(),
         snapshot_dir.as_os_str().to_owned(),
         "--quant".into(),
-        map_quant_to_cli(quant).into(),
+        map_quant_to_cli(quant)?.into(),
         "--output".into(),
         target_gguf.as_os_str().to_owned(),
-    ]
+    ])
 }
 
 fn secs_since_epoch() -> u64 {
@@ -743,12 +749,13 @@ mod tests {
 
     #[test]
     fn map_quant_uses_exact_conversion_selectors() {
-        assert_eq!(map_quant_to_cli(QuantType::Q2_K), "q2_k");
-        assert_eq!(map_quant_to_cli(QuantType::Q8_0), "q8_0");
-        assert_eq!(map_quant_to_cli(QuantType::Q6_K), "q6_k");
-        assert_eq!(map_quant_to_cli(QuantType::Q5_K_M), "q5_k_m");
-        assert_eq!(map_quant_to_cli(QuantType::Q4_K_M), "q4_k_m");
-        assert_eq!(map_quant_to_cli(QuantType::Q3_K_M), "q3_k_m");
+        assert_eq!(map_quant_to_cli(QuantType::Q2_K).unwrap(), "q2_k");
+        assert_eq!(map_quant_to_cli(QuantType::Q8_0).unwrap(), "q8_0");
+        assert_eq!(map_quant_to_cli(QuantType::Q6_K).unwrap(), "q6_k");
+        assert_eq!(map_quant_to_cli(QuantType::Q5_K_M).unwrap(), "q5_k_m");
+        assert_eq!(map_quant_to_cli(QuantType::Q4_K_M).unwrap(), "q4_k_m");
+        assert_eq!(map_quant_to_cli(QuantType::Q3_K_M).unwrap(), "q3_k_m");
+        assert!(map_quant_to_cli(QuantType::IQ2_XXS).is_err());
     }
 
     #[test]
@@ -756,11 +763,14 @@ mod tests {
         use clap::Parser;
 
         let mut argv = vec![std::ffi::OsString::from("hf2q")];
-        argv.extend(convert_command_args(
-            Path::new("/tmp/exact-source"),
-            Path::new("/tmp/exact-output.gguf"),
-            QuantType::Q4_K_M,
-        ));
+        argv.extend(
+            convert_command_args(
+                Path::new("/tmp/exact-source"),
+                Path::new("/tmp/exact-output.gguf"),
+                QuantType::Q4_K_M,
+            )
+            .unwrap(),
+        );
         let parsed = crate::cli::Cli::try_parse_from(argv).expect("self-spawn argv must parse");
         let crate::cli::Command::Convert(args) = parsed.command else {
             panic!("expected convert command");

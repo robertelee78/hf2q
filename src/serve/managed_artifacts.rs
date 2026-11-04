@@ -871,6 +871,9 @@ fn quality_descending() -> [QuantType; 6] {
 
 fn quant_quality(quant: QuantType) -> u8 {
     match quant {
+        // External DeepSeek-V4 identity only (no hosted or converted
+        // artifact uses it); 2.06 bpw ranks below Q2_K.
+        QuantType::IQ2_XXS => 0,
         QuantType::Q2_K => 1,
         QuantType::Q3_K_M => 2,
         QuantType::Q4_K_M => 3,

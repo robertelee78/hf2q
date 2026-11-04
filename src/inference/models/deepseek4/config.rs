@@ -130,6 +130,47 @@ fn required_f32_array(gguf: &GgufFile, key: &str) -> Result<Vec<f32>> {
         .collect()
 }
 
+/// `swiglu_clamp_shexp` falls back to `swiglu_clamp_exp` when the key is
+/// absent, as the peer does (ds4's 0731 file omits it; ADR-063
+/// Q4-DS4-RACE L3). A present key is parsed strictly.
+fn shared_swiglu_clamps(gguf: &GgufFile, key: &str, experts: &[f32]) -> Result<Vec<f32>> {
+    if gguf.metadata(key).is_none() {
+        return Ok(experts.to_vec());
+    }
+    required_f32_array(gguf, key)
+}
+
+/// `embedding_length_out` defaults to `embedding_length ×
+/// hyper_connection.count` when absent (L3); `validate` keeps the equality
+/// check for a present key.
+fn hidden_size_out(gguf: &GgufFile, key: &str, hidden: u32, lanes: u32) -> Result<u32> {
+    if gguf.metadata(key).is_none() {
+        return hidden.checked_mul(lanes).ok_or_else(|| {
+            anyhow!("DeepSeek-V4 config: embedding_length * hyper_connection.count overflows u32")
+        });
+    }
+    required_u32(gguf, key)
+}
+
+/// Accept a `compress_ratios` array longer than `block_count` (ds4's file
+/// carries a trailing entry for its unshipped next-token-prediction layer,
+/// L4) only when every entry past `block_count` is 0, and keep the first
+/// `block_count` entries. Shorter arrays reach `validate`'s length check.
+fn layer_compress_ratios(mut ratios: Vec<u32>, block_count: u32) -> Result<Vec<u32>> {
+    let layers = block_count as usize;
+    if ratios.len() > layers {
+        if let Some(index) = ratios[layers..].iter().position(|ratio| *ratio != 0) {
+            bail!(
+                "DeepSeek-V4 config: compress_ratios[{}] past block_count {block_count} must be 0, got {}",
+                layers + index,
+                ratios[layers + index]
+            );
+        }
+        ratios.truncate(layers);
+    }
+    Ok(ratios)
+}
+
 impl Deepseek4Config {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let arch = gguf
@@ -158,10 +199,19 @@ impl Deepseek4Config {
                 "DeepSeek-V4 config: unsupported YaRN ext/attention factors ({yarn_ext_factor}, {yarn_attn_factor})"
             );
         }
+        let hidden_size = required_u32(gguf, &format!("{p}.embedding_length"))?;
+        let hyper_connection_count = required_u32(gguf, &format!("{p}.hyper_connection.count"))?;
+        let num_hidden_layers = required_u32(gguf, &format!("{p}.block_count"))?;
+        let swiglu_clamp_experts = required_f32_array(gguf, &format!("{p}.swiglu_clamp_exp"))?;
         let config = Self {
-            hidden_size: required_u32(gguf, &format!("{p}.embedding_length"))?,
-            hidden_size_out: required_u32(gguf, &format!("{p}.embedding_length_out"))?,
-            num_hidden_layers: required_u32(gguf, &format!("{p}.block_count"))?,
+            hidden_size,
+            hidden_size_out: hidden_size_out(
+                gguf,
+                &format!("{p}.embedding_length_out"),
+                hidden_size,
+                hyper_connection_count,
+            )?,
+            num_hidden_layers,
             max_position_embeddings: required_u32(gguf, &format!("{p}.context_length"))?,
             // Canonical DeepSeek-V4 GGUFs derive vocabulary size from the
             // embedding tensor instead of emitting an architecture KV.
@@ -182,7 +232,10 @@ impl Deepseek4Config {
             o_lora_rank: required_u32(gguf, &format!("{p}.attention.output_lora_rank"))?,
             output_groups: required_u32(gguf, &format!("{p}.attention.output_group_count"))?,
             sliding_window: required_u32(gguf, &format!("{p}.attention.sliding_window"))?,
-            compress_ratios: required_u32_array(gguf, &format!("{p}.attention.compress_ratios"))?,
+            compress_ratios: layer_compress_ratios(
+                required_u32_array(gguf, &format!("{p}.attention.compress_ratios"))?,
+                num_hidden_layers,
+            )?,
             compress_rope_theta: required_f32(
                 gguf,
                 &format!("{p}.attention.compress_rope_freq_base"),
@@ -200,9 +253,13 @@ impl Deepseek4Config {
             )?,
             route_scale: required_f32(gguf, &format!("{p}.expert_weights_scale"))?,
             normalize_topk: required_bool(gguf, &format!("{p}.expert_weights_norm"))?,
-            swiglu_clamp_experts: required_f32_array(gguf, &format!("{p}.swiglu_clamp_exp"))?,
-            swiglu_clamp_shared: required_f32_array(gguf, &format!("{p}.swiglu_clamp_shexp"))?,
-            hyper_connection_count: required_u32(gguf, &format!("{p}.hyper_connection.count"))?,
+            swiglu_clamp_shared: shared_swiglu_clamps(
+                gguf,
+                &format!("{p}.swiglu_clamp_shexp"),
+                &swiglu_clamp_experts,
+            )?,
+            swiglu_clamp_experts,
+            hyper_connection_count,
             hyper_connection_sinkhorn_iterations: required_u32(
                 gguf,
                 &format!("{p}.hyper_connection.sinkhorn_iterations"),
@@ -494,5 +551,99 @@ pub(super) mod tests {
                 .to_string();
             assert!(error.contains("requires exactly 20 Sinkhorn iterations and epsilon 1e-6"));
         }
+    }
+
+    fn set_ratios(kv: &mut [(String, MetaValue)], ratios: Vec<u32>) {
+        kv.iter_mut()
+            .find(|(key, _)| key == "deepseek4.attention.compress_ratios")
+            .unwrap()
+            .1 = MetaValue::ArrayU32(ratios);
+    }
+
+    fn official_ratios() -> Vec<u32> {
+        let kv = official_metadata();
+        let MetaValue::ArrayU32(ratios) = &kv
+            .iter()
+            .find(|(key, _)| key == "deepseek4.attention.compress_ratios")
+            .unwrap()
+            .1
+        else {
+            unreachable!("fixture ratios are u32")
+        };
+        ratios.clone()
+    }
+
+    /// ds4's 0731 file: no `embedding_length_out`, no `swiglu_clamp_shexp`
+    /// and a 44-entry `compress_ratios` with a trailing 0 (Q4-DS4-RACE L3/L4).
+    fn ds4_file_metadata() -> Vec<(String, MetaValue)> {
+        let mut kv = official_metadata();
+        kv.retain(|(key, _)| {
+            key != "deepseek4.embedding_length_out" && key != "deepseek4.swiglu_clamp_shexp"
+        });
+        let mut ratios = official_ratios();
+        ratios.push(0);
+        set_ratios(&mut kv, ratios);
+        kv
+    }
+
+    #[test]
+    fn ds4_file_config_defaults_equal_the_hf2q_artifact_config() {
+        let (_dir, hf2q) = open_fixture(&official_metadata());
+        let (_dir2, ds4) = open_fixture(&ds4_file_metadata());
+        let hf2q = Deepseek4Config::from_gguf(&hf2q).unwrap();
+        let ds4 = Deepseek4Config::from_gguf(&ds4).expect("ds4 file metadata parses");
+        assert_eq!(ds4.hidden_size_out, 16384);
+        assert_eq!(ds4.compress_ratios.len(), 43);
+        assert_eq!(ds4.swiglu_clamp_shared, ds4.swiglu_clamp_experts);
+        assert_eq!(
+            ds4, hf2q,
+            "defaults must reproduce the 0731 artifact config"
+        );
+    }
+
+    #[test]
+    fn present_config_keys_keep_their_strict_checks() {
+        let mut kv = official_metadata();
+        kv.iter_mut()
+            .find(|(key, _)| key == "deepseek4.embedding_length_out")
+            .unwrap()
+            .1 = MetaValue::U32(8192);
+        let (_dir, gguf) = open_fixture(&kv);
+        assert!(Deepseek4Config::from_gguf(&gguf)
+            .unwrap_err()
+            .to_string()
+            .contains("embedding_length_out"));
+
+        let mut kv = official_metadata();
+        kv.iter_mut()
+            .find(|(key, _)| key == "deepseek4.swiglu_clamp_shexp")
+            .unwrap()
+            .1 = MetaValue::ArrayF32(vec![10.0; 42]);
+        let (_dir, gguf) = open_fixture(&kv);
+        assert!(Deepseek4Config::from_gguf(&gguf)
+            .unwrap_err()
+            .to_string()
+            .contains("SwiGLU clamps"));
+    }
+
+    #[test]
+    fn compress_ratios_tail_must_be_zero_and_short_arrays_fail() {
+        let mut kv = ds4_file_metadata();
+        let mut ratios = official_ratios();
+        ratios.push(4);
+        set_ratios(&mut kv, ratios);
+        let (_dir, gguf) = open_fixture(&kv);
+        let error = Deepseek4Config::from_gguf(&gguf).unwrap_err().to_string();
+        assert!(error.contains("compress_ratios[43]"), "{error}");
+
+        let mut kv = ds4_file_metadata();
+        let mut ratios = official_ratios();
+        ratios.pop();
+        set_ratios(&mut kv, ratios);
+        let (_dir, gguf) = open_fixture(&kv);
+        assert!(Deepseek4Config::from_gguf(&gguf)
+            .unwrap_err()
+            .to_string()
+            .contains("compress_ratios must contain one 0/4/128 value per layer"));
     }
 }

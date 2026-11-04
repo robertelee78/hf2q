@@ -59,6 +59,8 @@ mod cache_tests;
 #[cfg(test)]
 mod cooperative_fault;
 #[cfg(test)]
+mod ds4_file_parity_tests;
+#[cfg(test)]
 mod ffn_forward_tests;
 #[cfg(test)]
 mod forward_tests;

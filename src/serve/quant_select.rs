@@ -58,18 +58,24 @@ pub enum QuantType {
     Q4_K_M,
     /// 3.5 bpw K-quant, "M" mix profile (lowest supported in the static table).
     Q3_K_M,
+    /// 2.06 bpw grid codebook (`general.file_type` 19). Pool identity for
+    /// externally produced DeepSeek-V4 files such as ds4's 0731 GGUF
+    /// (ADR-063 Q4-DS4-RACE L1). hf2q never converts to it and the
+    /// hardware table never selects it.
+    IQ2_XXS,
 }
 
 impl QuantType {
     /// Complete runtime pool/cache identity set. Exhaustive operations use
     /// this catalog so a new quant type cannot leave stale cache namespaces.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Q2_K,
         Self::Q8_0,
         Self::Q6_K,
         Self::Q5_K_M,
         Self::Q4_K_M,
         Self::Q3_K_M,
+        Self::IQ2_XXS,
     ];
 
     /// Canonical GGML name (matches `quant_name_to_ggml_type` strings in
@@ -82,6 +88,7 @@ impl QuantType {
             Self::Q5_K_M => "Q5_K_M",
             Self::Q4_K_M => "Q4_K_M",
             Self::Q3_K_M => "Q3_K_M",
+            Self::IQ2_XXS => "IQ2_XXS",
         }
     }
 
@@ -102,8 +109,9 @@ impl QuantType {
             "Q5_K_M" => Ok(Self::Q5_K_M),
             "Q4_K_M" => Ok(Self::Q4_K_M),
             "Q3_K_M" => Ok(Self::Q3_K_M),
+            "IQ2_XXS" => Ok(Self::IQ2_XXS),
             other => Err(format!(
-                "unknown quant type {other:?}: supported = Q2_K, Q8_0, Q6_K, Q5_K_M, Q4_K_M, Q3_K_M"
+                "unknown quant type {other:?}: supported = Q2_K, Q8_0, Q6_K, Q5_K_M, Q4_K_M, Q3_K_M, IQ2_XXS"
             )),
         }
     }
@@ -119,6 +127,7 @@ impl QuantType {
             GgufFtype::MostlyQ5_K_M => Some(Self::Q5_K_M),
             GgufFtype::MostlyQ4_K_M => Some(Self::Q4_K_M),
             GgufFtype::MostlyQ3_K_M => Some(Self::Q3_K_M),
+            GgufFtype::MostlyIQ2_XXS => Some(Self::IQ2_XXS),
             _ => None,
         }
     }
@@ -134,6 +143,7 @@ impl QuantType {
             Self::Q5_K_M => GgufFtype::MostlyQ5_K_M as u32,
             Self::Q4_K_M => GgufFtype::MostlyQ4_K_M as u32,
             Self::Q3_K_M => GgufFtype::MostlyQ3_K_M as u32,
+            Self::IQ2_XXS => GgufFtype::MostlyIQ2_XXS as u32,
         }
     }
 }
@@ -430,7 +440,8 @@ mod tests {
         assert_eq!(QuantType::Q5_K_M.as_str(), "Q5_K_M");
         assert_eq!(QuantType::Q4_K_M.as_str(), "Q4_K_M");
         assert_eq!(QuantType::Q3_K_M.as_str(), "Q3_K_M");
-        assert_eq!(QuantType::ALL.len(), 6);
+        assert_eq!(QuantType::IQ2_XXS.as_str(), "IQ2_XXS");
+        assert_eq!(QuantType::ALL.len(), 7);
         for quant in QuantType::ALL {
             assert_eq!(QuantType::from_canonical_str(quant.as_str()), Ok(quant));
         }
@@ -451,6 +462,21 @@ mod tests {
     fn deepseek_q2_k_file_type_round_trips_exactly() {
         assert_eq!(QuantType::Q2_K.gguf_file_type(), 10);
         assert_eq!(QuantType::from_gguf_file_type(10), Some(QuantType::Q2_K));
+    }
+
+    #[test]
+    fn ds4_iq2_xxs_file_type_round_trips_exactly() {
+        assert_eq!(QuantType::IQ2_XXS.gguf_file_type(), 19);
+        assert_eq!(QuantType::from_gguf_file_type(19), Some(QuantType::IQ2_XXS));
+        assert_eq!(QuantType::IQ2_XXS.as_str(), "IQ2_XXS");
+        assert_eq!(
+            QuantType::from_canonical_str("iq2_xxs"),
+            Ok(QuantType::IQ2_XXS)
+        );
+        // Neighbouring IQ file types stay without a pool identity.
+        for unsupported in [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] {
+            assert_eq!(QuantType::from_gguf_file_type(unsupported), None);
+        }
     }
 
     #[test]

@@ -20,6 +20,12 @@ pub const NUMBER_REGEX: &str = "\\p{N}{1,3}";
 pub const CJK_REGEX: &str = "[一-龥぀-ゟ゠-ヿ]+";
 pub const MAIN_REGEX: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
 
+/// `tokenizer.ggml.pre` names that select the three-regex sequence above.
+/// `joyai-llm` (ds4's 0731 file) is an alias: the peer maps both names to
+/// one case with the same three regexes and `clean_spaces = false`
+/// (ADR-063 Q4-DS4-RACE L2).
+pub const ACCEPTED_PRE_TYPES: [&str; 2] = ["deepseek-v3", "joyai-llm"];
+
 mod token_type {
     pub const CONTROL: i32 = 3;
     pub const USER_DEFINED: i32 = 4;
@@ -37,8 +43,8 @@ pub fn build_tokenizer_from_gguf(gguf: &GgufFile) -> Result<Tokenizer> {
     let pre = gguf
         .metadata_string("tokenizer.ggml.pre")
         .ok_or_else(|| anyhow!("GGUF missing `tokenizer.ggml.pre`"))?;
-    if pre != "deepseek-v3" {
-        bail!("DeepSeek-V4 tokenizer pre-type must be deepseek-v3, got {pre:?}");
+    if !ACCEPTED_PRE_TYPES.iter().any(|name| *name == pre) {
+        bail!("DeepSeek-V4 tokenizer pre-type must be one of {ACCEPTED_PRE_TYPES:?}, got {pre:?}");
     }
 
     let tokens = read_string_array(gguf, "tokenizer.ggml.tokens")?;
@@ -270,6 +276,109 @@ mod tests {
         assert_eq!(CJK_REGEX, "[一-龥぀-ゟ゠-ヿ]+");
         assert!(MAIN_REGEX.contains("[\\p{L}\\p{M}]+"));
         assert!(MAIN_REGEX.contains("\\s+(?!\\S)"));
+    }
+
+    fn synthetic_tokenizer_gguf(pre: &str) -> (tempfile::TempDir, GgufFile) {
+        use crate::backends::gguf::types::MetaValue;
+        use crate::backends::gguf::writer::GgufWriter;
+
+        let mut alphabet = ByteLevel::alphabet().into_iter().collect::<Vec<_>>();
+        alphabet.sort_unstable();
+        let mut tokens = alphabet
+            .into_iter()
+            .map(|ch| ch.to_string())
+            .collect::<Vec<_>>();
+        tokens.extend(["Ġw", "Ġwo", "12", "123", "<｜begin▁of▁sentence｜>"].map(String::from));
+        let mut token_types = vec![1_i32; tokens.len()];
+        *token_types.last_mut().unwrap() = token_type::CONTROL;
+        let kv = vec![
+            ("tokenizer.ggml.model", MetaValue::String("gpt2".into())),
+            ("tokenizer.ggml.pre", MetaValue::String(pre.into())),
+            ("tokenizer.ggml.tokens", MetaValue::ArrayString(tokens)),
+            (
+                "tokenizer.ggml.token_type",
+                MetaValue::ArrayI32(token_types),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                MetaValue::ArrayString(["Ġ w", "Ġw o", "1 2", "12 3"].map(String::from).to_vec()),
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.gguf");
+        let mut writer = GgufWriter::new(std::fs::File::create(&path).unwrap());
+        writer.write_header(0, kv.len() as u64).unwrap();
+        for (key, value) in &kv {
+            writer.write_metadata_kv(key, value).unwrap();
+        }
+        writer.pad_to_alignment().unwrap();
+        writer.finalize().unwrap();
+        let gguf = GgufFile::open(&path).unwrap();
+        (dir, gguf)
+    }
+
+    #[test]
+    fn joyai_llm_pre_type_is_an_exact_alias_of_deepseek_v3() {
+        let (_a, deepseek) = synthetic_tokenizer_gguf("deepseek-v3");
+        let (_b, joyai) = synthetic_tokenizer_gguf("joyai-llm");
+        let deepseek = build_tokenizer_from_gguf(&deepseek).expect("deepseek-v3 pre");
+        let joyai = build_tokenizer_from_gguf(&joyai).expect("joyai-llm pre");
+        for text in [
+            "Hello, world!",
+            "Numbers 1 12 123 1234 12345",
+            "汉字とカタカナ mixed text",
+            "<｜begin▁of▁sentence｜> wow word",
+            "e\u{301}lan\n\n punctuation?!",
+        ] {
+            let expected = deepseek.encode(text, false).unwrap();
+            let actual = joyai.encode(text, false).unwrap();
+            assert!(!expected.get_ids().is_empty());
+            assert_eq!(actual.get_ids(), expected.get_ids(), "{text:?}");
+        }
+        for refused in ["llama-bpe", "deepseek-llm", "JOYAI-LLM", ""] {
+            let (_c, other) = synthetic_tokenizer_gguf(refused);
+            let error = build_tokenizer_from_gguf(&other).unwrap_err().to_string();
+            assert!(
+                error.contains("pre-type must be one of"),
+                "{refused:?}: {error}"
+            );
+        }
+    }
+
+    /// ds4's 0731 file (`joyai-llm`) encodes exactly like hf2q's artifact
+    /// (`deepseek-v3`): same vocabulary, merges and regex sequence.
+    #[test]
+    #[ignore = "opens ds4's DeepSeek-V4 GGUF and hf2q's DeepSeek artifact headers"]
+    fn ds4_file_tokenizer_matches_hf2q_artifact() {
+        let ds4_path = std::env::var("HF2Q_DS4_FILE").expect("set HF2Q_DS4_FILE");
+        let hf2q_path = std::env::var("HF2Q_DEEPSEEK4_GGUF").expect("set HF2Q_DEEPSEEK4_GGUF");
+        let ds4_gguf = GgufFile::open(std::path::Path::new(&ds4_path)).expect("open ds4 file");
+        let hf2q_gguf =
+            GgufFile::open(std::path::Path::new(&hf2q_path)).expect("open hf2q artifact");
+        assert_eq!(
+            ds4_gguf.metadata_string("tokenizer.ggml.pre"),
+            Some("joyai-llm")
+        );
+        let ds4 = build_tokenizer_from_gguf(&ds4_gguf).expect("ds4 tokenizer");
+        let hf2q = build_tokenizer_from_gguf(&hf2q_gguf).expect("hf2q tokenizer");
+        assert_eq!(ds4.get_vocab(true), hf2q.get_vocab(true));
+        let template = crate::core::chat_templates::DEEPSEEK_V4_FLASH_0731;
+        for text in [
+            "Hello, world!",
+            "Numbers 1 12 123 1234 12345",
+            "汉字とカタカナ mixed text",
+            "<｜begin▁of▁sentence｜><｜User｜>Why?<｜Assistant｜></think>",
+            "e\u{301}lan\n\n punctuation?!",
+            template,
+        ] {
+            let expected = hf2q.encode(text, false).unwrap();
+            let actual = ds4.encode(text, false).unwrap();
+            assert_eq!(
+                actual.get_ids(),
+                expected.get_ids(),
+                "token drift for {text:?}"
+            );
+        }
     }
 
     #[test]
