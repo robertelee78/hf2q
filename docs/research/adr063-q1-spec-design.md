@@ -489,6 +489,7 @@ It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
 
 - Gemma has no ADR-065 ordering constraint.
 - Build **b5g** = main after #652's change and D2 merge, on native 0.15.16. Share it with #652's hooks so that one composition and acquisition review covers both.
+  - Amendment (root decision, 2026-11-03): b5g is **not** shared with #652. #652 ran on its own build of record, the PR #675 merge commit `b0dac052` (native 0.15.16), with its own compositions and reviews (`docs/research/adr063-q1-gemma-t2-localization.md`).
 - Order: `gemma-t0-b5g` (T0-first gate, plus the informational cross-build `exact gemma-t0-b5g gemma-t0-b3`, expected ExactEqual 5616 if the ordinary path is unchanged) → `gemma-t5ord-b5g` → `gemma-t5ngram-b5g` → offline G5-A1, G5-B, `routing-mapped` and the cache@144 compare (`q1_gemma_t5_artifact_compare`).
 - Then, only if G5-B is RouteSensitive (branch N) or a row-127 refusal occurred (branch P):
   - **pass 1:** generate and review the pass-1 key map (bound to both T5 receipts, the pass-1 Plan and `a`); run pass 1 for both sides; write `pass-binding.json`; then the pass-1 record;
