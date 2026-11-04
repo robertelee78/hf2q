@@ -360,10 +360,24 @@ A RouteSensitive Gemma T5 result must be localized. #665 therefore builds a veri
 - **Branch P:** the n-gram arm refused at row 127 because the global-route initial decision differed from `frozen[128]`. The pair is the ordinary-global arm vs the slot-aware All128 route, which produced the frozen dataset.
   - **Precondition** (condition 7): the b5g All128 reference's own row-127 `Logits` argmax (its endpoint store) must equal `frozen[128]`.
   - If it does not, the frozen decision has drifted across builds, not routes. The record becomes a **build-drift localization**, and branch P is not run. Steps:
-    1. Build a reviewed **diagnostic build**: the greedy144 preparation's source commit `540a470842a73d63675526bc915923491c65f84a` (native 0.15.9; `$E/q1-gemma-greedy144-preparation-actual-v1`), with only T2Loc's cfg(test) stage hooks and All128 localizer added. It is labelled diagnostic and is never a build of record.
-    2. **Gate:** its All128 localizer endpoint `Logits` row 127 must be byte-equal (`exact`, per lane) to the preparation's retained row-127 logits (`output/trace.json` of that preparation; 68 logit rows, 127..143 per lane).
-       - If the gate fails, the hooks or the build do not reproduce the preparation. That is a defect of the diagnostic build, and it follows the observer-effect defect path below. It is never localized from an unverified reference.
-    3. If the gate passes, run T2Loc's same-manifest `q1_stage_localization.py` on the diagnostic All128 stage store vs the b5g All128 stage store, both under the same plan. The result is the first divergence per lane between the preparation build and b5g on the All128 route.
+    1. **Drift-only localizer mode** (ReviewSpec26 item 7). Add a witness-OFF mode `DriftAll128` to T2Loc's All128 stage localizer.
+       - It has its own recipe route `gemma-all128-stage-drift-witness-off-v1`, so it has its own composition key.
+       - Its prefill-only plan is `decode_stages: []`, rows 0..127, 4 lanes, with the same two-pass rule as the localizer.
+       - **Exceptions, valid in this mode only** (preflight-tested):
+         - the packet's `routing_witness` must be null, which waives the cohort localizer's witness-ON requirement;
+         - `gemma_routing_witness` is not installed;
+         - the `validate_budget` and `cohort_localizer_export` native-version checks (0.15.16) are skipped.
+       - The identity's `native_version` must still equal the build's own `Cargo.toml` pin. Every other mode keeps all existing checks.
+       - The mode's code must not depend on the witness module, so the same reviewed patch applies to both builds.
+    2. **Both sides run in that mode**, so routing comes from the production dispatch on each side. (With the witness on, its kernel replaces the routing dispatch, which would confound `RouterIds`/`RouterWeights`.)
+       - **Diagnostic build:** the greedy144 preparation's source commit `540a470842a73d63675526bc915923491c65f84a` (`Cargo.toml` `mlx-native = "=0.15.9"`; `$E/q1-gemma-greedy144-preparation-actual-v1`), plus a reviewed backport of T2Loc's cfg(test) stage hooks, the All128 localizer and `DriftAll128`. No witness module is added. It is labelled diagnostic and is never a build of record.
+       - **b5g side:** b5g (native 0.15.16), same mode, same plan.
+    3. **Gate (kept):** the diagnostic build's `DriftAll128` endpoint `Logits` row 127 must be byte-equal (`exact`, per lane) to the preparation's retained row-127 logits (`output/trace.json` of that preparation; 68 logit rows, 127..143 per lane).
+       - If the gate fails, the backport or the build does not reproduce the preparation. That is a defect of the diagnostic build, and it follows the observer-effect defect path below. It is never localized from an unverified reference.
+    4. **Witness check on b5g:** record the b5g `DriftAll128` row-127 argmax.
+       - If it equals `frozen[128]`, the precondition failure came from the witness-ON routing, not the build. The record then localizes witness-ON vs witness-OFF on b5g: same-manifest `q1_stage_localization.py` on the b5g All128 (witness-ON) stage store vs the b5g `DriftAll128` stage store, both under the same plan.
+    5. Otherwise, run T2Loc's same-manifest `q1_stage_localization.py` on the diagnostic `DriftAll128` stage store vs the b5g `DriftAll128` stage store. The result is the first divergence per lane between the preparation build and b5g on the All128 route.
+    - Tests: `DriftAll128` refuses witness ON; the non-drift modes still refuse witness OFF and a native other than 0.15.16; the drift route label differs from the cohort label; the drift export accepts the build's own native pin.
 
 It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
 
@@ -477,9 +491,8 @@ It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
 - Build **b5g** = main after #652's change and D2 merge, on native 0.15.16. Share it with #652's hooks so that one composition and acquisition review covers both.
 - Order: `gemma-t0-b5g` (T0-first gate, plus the informational cross-build `exact gemma-t0-b5g gemma-t0-b3`, expected ExactEqual 5616 if the ordinary path is unchanged) → `gemma-t5ord-b5g` → `gemma-t5ngram-b5g` → offline G5-A1, G5-B, `routing-mapped` and the cache@144 compare (`q1_gemma_t5_artifact_compare`).
 - Then, only if G5-B is RouteSensitive (branch N) or a row-127 refusal occurred (branch P):
-  - generate and review the key map;
-  - pass 1 for both sides, then the pass-1 record;
-  - pass 2 for both sides, then the localization record;
+  - **pass 1:** generate and review the pass-1 key map (bound to both T5 receipts, the pass-1 Plan and `a`); run pass 1 for both sides; write `pass-binding.json`; then the pass-1 record;
+  - **pass 2:** generate the pass-2 Plan from the pass-1 record by the frozen rule, then generate and review the pass-2 key map, which is a separate map bound to the pass-2 Plan; run pass 2 for both sides; write `pass-binding.json`; then the localization record;
   - observer-effect `exact` and `routing` decisions.
 - GPU time [INFERENCE]: three T5 processes at about 1–3 min each, plus four localizer processes when a branch runs.
 
@@ -502,7 +515,7 @@ One change to `scripts/four_agent/q1_endpoint_supervisor.py`, with one admission
 - `checks` are names from a closed in-file registry.
 - Endpoint and localizer kinds and the T0-first gate are unchanged.
 - **Extent source:** either the packet carries {lanes, host_payload_limit, expected_stores}, or the case key `manifest` = {path, sha256} binds a JSON with exactly those keys.
-  - **Manifest form** (condition 1): the packet must not carry `expected_stores`. If it carries `lanes` or `host_payload_limit` (the Gemma T5 packet carries `lanes`, and T2Loc's localizer Plan carries `host_payload_limit`), each must equal the manifest's value. The manifest is the extent of record.
+  - **Manifest form** (condition 1): the packet must not carry `expected_stores`. If it carries `lanes` or `host_payload_limit`, each must equal the manifest's value. The Gemma T5 packet carries `lanes`, and `gemma_actual`'s `Packet` has a required top-level `host_payload_limit`; the Plan's own copy under `stage_localizer` is not an extent key. The manifest is the extent of record.
   - This replaces T2Loc's current "extent from exactly one of packet / manifest", which refuses any extent key in the packet when a manifest is bound. The change goes into the same single admission review. Supervisor tests:
     - a manifest-form case whose packet still carries both `lanes` and `host_payload_limit`, equal to the manifest's, is admitted;
     - unequal values refuse;
