@@ -1,8 +1,11 @@
 # ADR-063 Q1 speculative successors: design for Q1-QWEN36-SPEC (#653) and Q1-GEMMA-SPEC (#665)
 
 Status: design reviewed. Independent review `agent://ReviewSpecDesign` returned
-ACCEPT-WITH-CONDITIONS on `d710b029`. This revision applies findings 1–7 and records
-the four author answers as accepted (§4). Nothing in this note has been executed,
+ACCEPT-WITH-CONDITIONS on `d710b029`, and its conditions were closed at `4e5067f1`.
+The operator approved the design on 2026-11-03 **without** the #665
+unlocalized-RouteSensitive exception, so a Gemma verifier-route localizer is now
+in #665's scope (§2.6). This revision applies findings 1–7 and records the four
+author answers as accepted (§4). Nothing in this note has been executed,
 and no model was loaded to write it. Counts marked [INFERENCE] come from source
 manifests and retained stores, not from a run. Each one has a pre-launch check
 that confirms or refutes it before any comparison is made.
@@ -251,7 +254,7 @@ Extend `adr063_invariance::gemma_ngram` rather than add a parallel module. Its h
   - `lanes` [0,1,2,3];
   - `host_payload_limit`;
   - `expected_stores` (the multistore contract, §3).
-- `routing_witness` must be null. Reason in §2.5.
+- `routing_witness` is ON in both arms with the exact admitted budget (`gemma_routing_witness::validate_budget`). The ordinary arm writes `Canonical` rows 0..143. The n-gram arm writes `T5Initial` 0..127, `T5Verify` 0..131 and `T5Continuation` 129+a..143 (`gemma_ngram.rs:74-76`, `before_verify`). Both fit `ROW_CAP = 4 × (128 + 132 + 16)`. §2.5 explains why.
 
 **Workload:** the accepted greedy144 dataset bound by review receipt `9b097208…` (`runner.rs:43-46`), with token digest `84276820…5034`. This is the lineage of `gemma-t0-b3` and of the v3 probe.
 
@@ -313,37 +316,148 @@ How the counts are built:
 |---|---|---|---|
 | G5-A1 pre-fork | A | `prefork`, 4204 records: both arms made the identical call | `exact ord/prefork ngram/prefork` → ExactEqual 4204/0/0/0; anything else = defect |
 | G5-A2 integer decisions (narrowed, finding 2) | A | Same call only: the two arms' initial argmax equal each other; production proposer ran; injected = `[f129, f130, mut131]`; teacher-forced inputs 129+a..143 = frozen | Checked in process and by the supervisor; a difference is a defect |
-| G5-B decisions | B | Initial argmax vs `frozen[128]` (cross-route, see §2.3); a ∈ {0,1,2}, rejected = 3 − a, rollback cursor 129 + a; fallback ID and argmax per continuation row | Recorded, never a defect and never rerun. An initial-decision refusal in the n-gram arm is recorded as "RouteSensitive at row 127"; G5-B committed rows is then not computable |
+| G5-B decisions | B | Initial argmax vs `frozen[128]` (cross-route, see §2.3); a ∈ {0,1,2}, rejected = 3 − a, rollback cursor 129 + a; fallback ID and argmax per continuation row | Recorded, never a defect and never rerun. An initial-decision refusal in the n-gram arm is recorded as "RouteSensitive at row 127". G5-B committed rows is then not computable, and the row-127 result is localized by branch P (§2.6) |
 | **G5-B committed rows** | **B** | **64 Logits rows** = rows 128..143 × lanes 0–3 of `committed` (verifier rows 128..128+a, continuation 129+a..143) | `envelope ord/committed ngram/committed`; **τ = 0.25 nat** (`POLICY.route_decision_error_nats`, unchanged); D as in §3.2; ExactEqual / WithinDecisionEnvelope / RouteSensitive. `Incomplete` with complete supervised stores is an evidence-binding error (§1.4); the model is not rerun |
 | cache@144 | B | 4200 records | Element-wise only, `ExplicitInconclusiveNumericPolicy`, by the new offline D2 test `adr063_invariance::gemma_ngram::compare::q1_gemma_t5_artifact_compare` (env `HF2Q_Q1_GEMMA_T5_COMPARE_PACKET`, no model or device). It binds both arms' traces and execution receipts and calls `compare::compare` (`compare.rs:110-118`) on the two `committed` stores with `NumericPolicy::Unspecified` for every stage, as `t5_artifact_compare.rs:187-188` does for Qwen. `t5_artifact_compare` itself stays Qwen-only |
 
 Reporting rules:
 - The envelope result is split into verifier rows and continuation rows, and each row's D and margin are listed.
-- **Unlocalized RouteSensitive: explicit exception for #665, recorded for design approval** (finding 3). Frozen policy §3.2 and §5.5(c) require a `RouteSensitive` result to carry a localized first divergence. No n-gram verifier-route stage localizer exists, and building one is outside #665's scope. This design therefore asks the design approval to record an explicit exception for #665: a Gemma T5 `RouteSensitive` result closes the comparison as **unlocalized**. The receipt carries `verifier_route_localization: Missing("no n-gram verifier-route localizer")`, and the verdict text says "RouteSensitive, unlocalized". A RouteSensitive result is the likely outcome: the policy's Gemma evidence shows D up to ≈6.7 nat on real-prefix rows across routes. Without the approved exception, a RouteSensitive result leaves #665 open.
+- **A RouteSensitive result must be localized** (operator decision 2026-11-03; there is no unlocalized exception). A `RouteSensitive` G5-B committed-rows result runs localizer branch N (§2.6). A row-127 refusal runs branch P. The #665 verdict cites the localization record, which gives the first divergence per lane in execution order: phase, layer, stage, rows and magnitude. A RouteSensitive result is the likely outcome: the policy's Gemma evidence shows D up to ≈6.7 nat on real-prefix rows across routes.
 - The result has no serving consequence, because Gemma serving does not speculate. A candidate that moves serving onto this route needs the §3.5 paired quality campaign.
 - The ordinary reference is the global route, so no claim about the slot-aware serving body follows.
 - Disclosure (as in #652): the greedy144 prefix has token 496 repeated in rows 29–127. Prefix inputs are identical in both arms, and only rows 128..143 are classified.
 
 ### 2.5 Routing
 
-The witness is off for both T5 arms, and routing margins are **Missing-with-reason**. The reason is a **tooling gap**, not a missing witness: `gemma_routing_witness` can capture these rows, but there is no key-mapping comparator for them.
-- In the n-gram arm, committed rows come from two namespaces: `T5Verify` for rows 128..128+a, from a 132-row re-prefill that also re-routes rows 0..127, and `T5Continuation` (`gemma_routing_witness.rs:64-70`). The ordinary arm would write `Canonical` rows.
-- `routing` joins on (namespace, lane, position, layer) and refuses unpaired keys (`q1_decision_policy.py:261-262`), so it cannot pair the two arms.
-- A key-mapping comparator is out of scope for #665. Receipt text: `routing: Missing("tooling gap: no cross-namespace routing comparator for T5Verify/T5Continuation vs Canonical")`.
-- [INFERENCE] A bitwise-equal `prefork` cache across all 30 layers implies identical prefill routing.
+The witness is **on** in both T5 arms (§2.3), so routing flips and margins (§3.3) are always recorded for the T5 pair, not only when the result is RouteSensitive.
+- In the n-gram arm, committed rows come from two namespaces: `T5Verify` for rows 128..128+a, from a 132-row re-prefill that also re-routes rows 0..127, and `T5Continuation` (`gemma_routing_witness.rs:64-70`). The ordinary arm writes `Canonical` rows.
+- `routing` joins on (namespace, lane, position, layer) and refuses unpaired keys (`q1_decision_policy.py` `routing`, failure `'… unpaired routing keys …'`), so it cannot pair the two arms directly.
+- The new key-mapping comparator `routing-mapped` (§2.6) joins them through the frozen key map. Pairs:
+  - `T5Initial` p < 128 ↔ `Canonical` p: same call, expected ExactRouting;
+  - `T5Verify` p ≤ 128 + a ↔ `Canonical` p;
+  - `T5Continuation` p ↔ `Canonical` p.
+  - `T5Verify` rows 129+a..131 have no counterpart; they are listed as unmapped, with their selections and gaps.
+- `routing-mapped` reports the T5 pair's `changed_rows`, `set_changed_rows`, `order_only_rows` and `changed_gap_max`, split by mapped phase.
 
-### 2.6 Build and order
+### 2.6 Verifier-route localizer (in #665 scope, operator decision 2026-11-03)
+
+A RouteSensitive Gemma T5 result must be localized. #665 therefore builds a verifier-route localizer. It reuses the #652 (T2Loc, `feat/q1-gemma-t2loc`) stage-capture and localization pieces instead of adding a second convention:
+- Coordinates and capture:
+  - `gemma_prefill::after_layer` owned rows and the `serial_lane` lease;
+  - `gemma_stage::capture` (the single-row decode hooks in `gpu_full_attn.rs` `encode_one_layer`);
+  - `family::drained_owned_rows` with `OWNED_AGENT` templates.
+- Roles: `gemma_localizer::PREFILL_STAGES` (14) and `gemma_cohort_localizer::DECODE_STAGES` (12).
+- Manifest shape and admission: `gemma_cohort_localizer::Plan` / `admit`, including the 1 GiB stage cap and the 65,536-record and 4,096-target quotas.
+- Offline record: `scripts/four_agent/q1_stage_localization.py`, reusing `compare_group`, `segment_magnitude`, `repetition` and `routing_changes`.
+- Supervisor: the `multistore` kind.
+- D2 builds on #652's change, so #665's localizer lands after it.
+
+**When it runs.** It runs only after the T5 offline decisions, and only in two cases:
+- **Branch N:** G5-B committed rows is `RouteSensitive`. The pair is n-gram arm vs ordinary-global arm.
+- **Branch P:** the n-gram arm refused at row 127 because the global-route initial decision differed from `frozen[128]`. The pair is the ordinary-global arm vs the slot-aware All128 route, which produced the frozen dataset.
+
+It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
+
+**Rust (cfg(test)), localizer mode of the §2.3 adapter.** Each arm gets a `stage_localizer` packet block with the `Plan` shape {rerun_id, layers, prefill_stages, decode_stages, host_payload_limit}. It writes a nested stage store at `output/stages` beside the T5 stores, with the witness ON.
+- Lane ownership: each lane runs inside `gemma_prefill::serial_lane(lane)`, so every prefill row and every single-row decode row is owned as (lane, absolute position).
+- **Ordinary-global arm:**
+  - initial prefill: prefill roles at rows 0..127, `segment 0`, step key 0;
+  - decode: decode roles at positions 128..143, `segment 0`, step key = position.
+- **N-gram arm:**
+  - A new same-thread, non-nestable `family::pause()` lease (a small addition to `family.rs`) is held from lane start through the `initial` hook. The initial prefill is G5-A1's identical call, so it is not captured again, and step key 0 stays free for the verify re-prefill.
+  - The verify re-prefill (`forward_prefill_batched(prefix, …, 0)`, 132 rows, `gemma_ngram::before_verify` checks start 0 and length 132) captures prefill roles at rows 0..131 with **`segment 1`** (namespace "verify").
+  - The teacher-forced continuation decode captures decode roles at positions 129+a..143, `segment 0`.
+  - `segment 1` keeps verify row 131 (input mut131) distinct from continuation decode row 131 (input f131).
+- **Manifest:** `gemma_ngram_localizer::manifest(cfg, layers, prefill_stages, decode_stages, arm, accepted: [usize; 4])`.
+  - It is built from T2Loc's `row` and `ordered` helpers, which become `pub(super)`.
+  - It runs in per-lane execution order:
+    - the prefill layer, then the stage, then rows 0..R (R = 128 for the ordinary arm, 132 for the verify re-prefill);
+    - then the decode position, layer and stage.
+  - `accepted` is taken from the T5 n-gram receipt (`a` per lane). It is frozen into the localizer packet before launch, and the run refuses if its observed `a` differs.
+  - Admission is like `admit`: the packet's `expected_stores["stages"]` must equal the source manifest.
+- **Preflight:** refuse `HF2Q_PARALLEL_ENCODE` (the `encode_parallel_layers_chunked` path has no stage hooks), xlen (already refused) and witness OFF.
+- **Branch P reference:** run T2Loc's own `gemma_actual::q1_gemma_actual_all128_stage_localizer` (slot-aware serial All128) with this design's layer and role plan and `decode_stages: []`, on the same build.
+- **Observer-effect control:**
+  - each localizer arm's `prefork`, `committed` and `raw-verifier` stores must be `ExactEqual` to the same arm's T5 stores;
+  - its witness must be `ExactRouting` against the T5 witness;
+  - the branch P reference's endpoint store must be `ExactEqual` to `gemma-t0-b5g`.
+  - Any difference is a defect in the localizer, and the record is withheld.
+
+**Two passes, rule frozen now.**
+- **Pass 1 (onset layer):**
+  - Layers: all 30.
+  - Roles: {RouterLogits, RouterIds, LayerOutput} for both prefill and decode.
+  - Size: 132 rows × 4 lanes × 30 layers × 11,808 B ≈ 187 MB of prefill plus about 23 MB of decode per arm. Records: n-gram ≤ 47,520 + 5,760, under the T2Loc quotas.
+  - Output: per lane, the first divergent layer L* in candidate execution order.
+  - **Head rule:** if every mapped `LayerOutput` row at layer 29 is exact but the row's committed `Logits` differ, the onset is the output head, recorded as stage `Head`. The verifier head (`per_position_argmax_from_hidden_batched_impl`) is a different kernel from the decode head. Pass 2 is then skipped for that lane.
+- **Pass 2 (stage within the layer):**
+  - Layers: the union over lanes of {L* − 1, L*}, or {0} when L* = 0; at most 8 layers.
+  - Roles: all 14 prefill and 12 decode roles.
+  - Size: ≤ 8 × 14 × 4 × 132 + 16 × 8 × 12 × 4 = 65,280 records, about 0.6 GB, under the 1 GiB cap.
+  - Output: the first divergent (phase, layer, stage) per lane.
+
+**Key map** (`q1_stage_localization.py ngram-map NGRAM_T5_EXECUTION ORDINARY_T5_EXECUTION PLAN > map.json`).
+- The map is mechanical and sha-pinned, and it is reviewed before any comparison. Schema `hf2q.q1.key-map.v1`.
+- It binds both receipts' sha256, the per-lane `a`, and lists the pairs in candidate execution order. Keys are T2Loc's `key(at)` = (stage, agent, row, layer, segment, step).
+
+| Phase (branch N) | Candidate (n-gram) | Reference (ordinary-global) | Roles |
+|---|---|---|---|
+| `verify-prefix` | segment 1, rows 0..127, prefill role s | segment 0, initial prefill row p, role s | 14 prefill roles |
+| `verify-committed` | segment 1, rows 128..128+a | segment 0, decode position p | the 11 roles in both sets (Query, Key, Value, RopeQuery, RopeKey, Attention, FfnNorm, RouterLogits/Ids/Weights, LayerOutput) |
+| `continuation` | segment 0, decode 129+a..143 | segment 0, decode p | 12 decode roles |
+| unmapped (listed, not compared) | segment 1 rows 129+a..131; prefill-only roles at rows ≥ 128 | decode rows 129..128+a | — |
+
+- Branch P uses an identity map on prefill rows 0..127, plus `Logits` row 127. The candidate is the ordinary-global arm, and the reference is the T2Loc All128 stage store.
+- Each pair must have equal scalar and shape. The map is one-to-one; a duplicate key on either side refuses.
+- The routing pairs of §2.5 are in the same file.
+
+**Offline comparators** (added to T2Loc's existing scripts, not new tools):
+- **`q1_stage_localization.py mapped REFERENCE_STAGES CANDIDATE_STAGES WORKLOAD MAP`**
+  - Inputs: every mapped key must be captured, and payloads are hash-verified (`captured_records`, `verified_payload`).
+  - Grouping: per lane, by candidate execution order into (phase, decode position, layer, stage).
+  - Output: the first group with a differing row: phase, decode position, layer, stage, `rows_in_group`, `differing_rows`, `max_abs` and `relative_rms`.
+  - `verify-prefix` groups also carry `prompt_segments`: rows 0–28, rows 29–127, and rows 128..128+a for `verify-committed`.
+  - Also output: `repeated_prefix`, `router_id_changes` (with the reference raw-logit gap), the unmapped list, `accepted` per lane, the head rule result, `route_class` "ClassB: route-sensitive; a localized stage implies no fix", and `whole_q1_qualified: false`.
+  - Schema: `hf2q.q1.mapped-stage-localization.v1`.
+- **`q1_decision_policy.py routing-mapped LEFT RIGHT MAP`**
+  - Same output as `routing` (`hf2q.q1.routing-comparison.v1`), plus `map_sha256`, per-phase pair counts and the unmapped rows.
+  - Pairs are joined through the map, not by equal keys.
+  - It refuses unpaired keys after mapping, and it refuses any identity field that differs.
+
+**Tests (hosted; no model):**
+- Rust:
+  - n-gram manifest counts for a ∈ {0,1,2}; refusal of a ∉ {0,1,2} and of a mismatch with the frozen `accepted`;
+  - segment-1 verify owners (lane, 0..131), and refusal of rows > 131 or a start ≠ 0;
+  - no capture under `family::pause()`, and a nested pause refuses;
+  - admit refuses a manifest other than the source manifest;
+  - pass-2 layer-union rule and its cap.
+- Python (`test_q1_stage_localization.py`, `test_q1_decision_policy.py`):
+  - the map is one-to-one and complete for each a;
+  - a synthetic difference only in `verify-prefix` layer 3 `Attention` is localized there;
+  - a difference only in an unmapped row is reported but not localized;
+  - a missing mapped key refuses, and a layout mismatch refuses;
+  - the head rule fires when only `Logits` differ;
+  - `routing-mapped` pairs `T5Verify`/`T5Continuation` with `Canonical`, refuses an unpaired key, and reports gaps.
+
+**Receipt and verdict.** The #665 receipt names the branch, the map sha, both passes' records and the observer-effect decisions. The verdict reads, for example: "RouteSensitive; localized: lane l first divergence `verify-prefix` layer L stage S rows … max_abs …". Packed-versus-All128-style Class B wording applies: a localized stage implies no fix.
+
+### 2.7 Build and order
 
 - Gemma has no ADR-065 ordering constraint.
-- Build **b5g** = main after D2 merges, on native 0.15.16. Share it with #652's hooks so that one composition and acquisition review covers both.
-- Order: `gemma-t0-b5g` (T0-first gate, plus the informational cross-build `exact gemma-t0-b5g gemma-t0-b3`, expected ExactEqual 5616 if the ordinary path is unchanged) → `gemma-t5ord-b5g` → `gemma-t5ngram-b5g` → offline G5-A1, G5-B and the cache@144 compare (`q1_gemma_t5_artifact_compare`).
-- GPU time [INFERENCE]: three processes at about 1–3 min each.
+- Build **b5g** = main after #652's change and D2 merge, on native 0.15.16. Share it with #652's hooks so that one composition and acquisition review covers both.
+- Order: `gemma-t0-b5g` (T0-first gate, plus the informational cross-build `exact gemma-t0-b5g gemma-t0-b3`, expected ExactEqual 5616 if the ordinary path is unchanged) → `gemma-t5ord-b5g` → `gemma-t5ngram-b5g` → offline G5-A1, G5-B, `routing-mapped` and the cache@144 compare (`q1_gemma_t5_artifact_compare`).
+- Then, only if G5-B is RouteSensitive (branch N) or a row-127 refusal occurred (branch P):
+  - generate and review the key map;
+  - pass 1 for both sides, then the pass-1 record;
+  - pass 2 for both sides, then the localization record;
+  - observer-effect `exact` and `routing` decisions.
+- GPU time [INFERENCE]: three T5 processes at about 1–3 min each, plus four localizer processes when a branch runs.
 
 ## Part 3: Shared supervisor change (with Q1-GEMMA-T2LOC #652)
 
 One change to `scripts/four_agent/q1_endpoint_supervisor.py`, with one admission review. The #652 owner landed the shared `multistore` kind on `feat/q1-gemma-t2loc` (`362be0cf`, `bf09c013`, and `ba6654c4` for the two deltas below) with only their own check, `gemma_loc4` (`MULTISTORE_CHECKS`). The checks below go into that same registry.
 
-**Sequencing (finding 7):** the checks read the `execution.json` schemas, which exist only once D1 and D2 are written. The order is therefore: **D2 (and D1) `execution.json` schema freeze → the five #653/#665 registry checks → one admission review of the whole supervisor change** (#652's `gemma_loc4` included). #652's runs wait for that one review.
+**Sequencing (finding 7):** the checks read the `execution.json` schemas, which exist only once D1 and D2 are written. The order is therefore: **D2 (and D1) `execution.json` schema freeze → the six #653/#665 registry checks → one admission review of the whole supervisor change** (#652's `gemma_loc4` included). #652's runs wait for that one review.
 
 - `kind: "multistore"` with case keys exactly {kind, out, packet, filter, packet_env, completion_marker, marker_stream, stores, checks}, plus two optional keys: `manifest` (bound, then copied to `out/manifest.json`) and `completion_line`.
 - `stores` maps a name to a directory under `output/` ("." allowed). Each store's `trace.json` must be:
@@ -375,6 +489,7 @@ Checks registered for #653/#665:
 | `qwen_t5_first_fork` | t5ffbase, t5ffforced | status `CompleteFirstForkDiagnosticNotQ1Qualified`, agent 0 only, `logical_lanes_executed` 1, each `first_fork.capture_stores` count equal to its store's records |
 | `gemma_t5_ordinary` | t5ord | arm, 4 lanes, initial argmax recorded vs `frozen[128]`, inputs 128..143 = frozen, stores {prefork = 4204, committed = 4264} equal to the execution receipt's counts |
 | `gemma_t5_ngram` | t5ngram | arm, 4 transactions with injected origin, initial argmax equal to the ordinary arm (cross-case, from that case's receipt), a and fallback recorded, cursor 129 + a, inputs 129+a..143 = frozen, stores {prefork = 4204, committed = 4264, raw-verifier = 4} equal to the receipt's counts |
+| `gemma_t5_localizer` | t5loc-{ord,ngram}-p{1,2} (and branch P's All128 reference uses `gemma_loc4`) | schema `hf2q.q1.gemma-t5-localizer.v1`, arm, branch, pass, frozen `accepted` equal to the T5 receipt's `a`, plan admitted equal to the source manifest, stores {prefork, committed, (raw-verifier), stages} with counts equal to the receipt, witness namespaces as §2.3 |
 
 ## 4. Review outcome: author answers as accepted
 
@@ -385,6 +500,6 @@ The independent review accepted the four author answers, with these conditions:
 3. **First fork required for #653 closure:** yes. It is the only capture of the post-draft/discard state and of outputs before and after MTP catch-up, and issue acceptance item 2 requires side effects to be exact. It costs the D1 change, two processes and `qwen36-t0-b5` (§1.2, §1.5).
 4. **`completion_line` for the fixed Qwen lines:** accepted, on three conditions: the line is copied verbatim from source at the bound commit, it occurs exactly once in `marker_stream`, and record-count binding moves to the per-store and `execution.json` checks (§3).
 
-Remaining approval item: the explicit unlocalized-RouteSensitive exception for #665 (§2.4) must be recorded in the design approval.
+Operator decision (2026-11-03): the design is approved **without** an unlocalized-RouteSensitive exception for #665. A RouteSensitive Gemma T5 result must be localized, and the verifier-route localizer (§2.6) is in #665's scope.
 
 Checks for the main agent after D1/D2: `cargo test --bin hf2q adr063_invariance`, the `q1_` controls, and both four_agent unittest suites (`test_q1_decision_policy.py`, `test_q1_endpoint_supervisor.py`).
