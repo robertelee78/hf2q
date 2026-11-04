@@ -1,8 +1,10 @@
 # ADR-063 Q4-GEMMA-PREFILL-MOE: Gemma 4 warm-prefill MoE and dense cost per row — HLD/LLD
 
-Status: design for approval (2026-11-04). No code, build or hardware run backs
-this document. Every number is quoted from a retained receipt (path given),
-computed from source or file metadata (method given), or marked `[INFERENCE]`.
+Status: design for approval (2026-11-04). Revision 2 applies the
+ACCEPT-WITH-CONDITIONS review (ReviewGemmaPrefillMoe, findings 1–14). No code,
+build or hardware run backs this document. Every number is quoted from a
+retained receipt (path given), computed from source or file metadata (method
+given), or marked `[INFERENCE]`.
 
 Story: **Q4-GEMMA-PREFILL-MOE** (new, v0.1.30, operator decision 2026-11-04).
 It is one of four stories that close the Gemma 4 26B-A4B gap beside
@@ -35,13 +37,16 @@ Sources:
    TFLOP/s, all categories inclusive. The dense GEMM tiles are already 93% full
    at the served row counts. This story changes MoE only. Dense and
    pre-attention get attribution, not kernel changes (§2.6).
-2. **The cause is launch geometry, not arithmetic.** hf2q's `mm_id` launches a
-   uniform grid of 128 experts × ⌈rows/32⌉ tiles × N tiles. The Gemma MoE down
-   call also flattens its rows to `8·n` tokens, which multiplies its grid by 8.
-   Over one four-agent run that is about **225 M threadgroups launched, of which
-   about 3.1 M have work** (§2.4). The peer build's dispatch launches only a
-   compact list of tiles that have work, and it skips the empty half of
-   half-filled tiles (§2.5).
+2. **Hypothesis: much of the MoE excess is launch geometry.** hf2q's `mm_id`
+   launches a uniform grid of 128 experts × ⌈rows/32⌉ tiles × N tiles. The
+   Gemma MoE down call also flattens its rows to `8·n` tokens, which
+   multiplies its grid by 8. Over one four-agent run that is about **225 M
+   threadgroups launched, of which an estimated 3.1 M have work** (routing
+   proxy, §2.4). The peer build's dispatch launches only a compact list of
+   tiles that have work, and it skips the empty half of half-filled tiles
+   (§2.5). This stays a hypothesis until M0b measures it. Part of the category
+   is expert-weight streaming (about 0.15–0.30 s per run `[INFERENCE]`, §2.4),
+   and no change here reduces that part.
 3. **Four changes, all Class A (bitwise against today's route):**
    - **P1 (hf2q only, on the 0.15.16 pin).** The Gemma prefill MoE down call
      moves to the existing slotted `mm_id` entry point. This removes 184.5 M of
@@ -63,11 +68,14 @@ Sources:
    and the expert storage types are unchanged. Quality is inherited from stock
    through `ExactTranscripts` (Q1 §3.6).
 5. **Expected saving: 0.08–0.28 s per run** (estimate, §9.1), within the
-   profile's "≤ 0.3 s after #668" bound. The range depends mostly on one
-   unmeasured constant: the GPU cost of an empty threadgroup. The first GPU step
-   (M0, §8) measures it model-free, on today's kernels, before any
-   implementation. If M0 predicts less than 0.05 s per run, the story stops
-   after recording the result (§7.4).
+   profile's "≤ 0.3 s after #668" bound. The range holds only if an empty
+   threadgroup costs c_e ≥ 0.25 ns of GPU time, and c_e is unmeasured. The
+   first GPU step (M0, §8) measures it model-free, on today's kernels, before
+   any native implementation. §6 freezes the stop rule:
+   - if the predicted saving of P1 + P2 + P2b is below 0.05 s per run, P2,
+     P2b and P2c are not built;
+   - P1 still merges as a bitwise cleanup, with no speed claim;
+   - its switch is removed in the same PR (§7.4).
 6. **This story alone cannot make Gemma Win.** Its gates are a category
    saving with no makespan regression. The family Win is measured on the
    combined candidate in Q4-GEMMA-ATTN's closing campaign.
@@ -185,11 +193,17 @@ tiles use a routing proxy:
 
 The proxy is `[INFERENCE]` until M0b records real agent routing (§8).
 
-**Today's run launches 224.8 M threadgroups, and about 3.1 M of them do
-work.** The empty ones only read one word and exit, but each still costs launch
-and scheduling time. If an empty threadgroup costs c_e of GPU time (amortized
-across cores), the launch waste per run is 0.056 s at c_e = 0.25 ns, 0.11 s at
-0.5 ns, 0.22 s at 1 ns and 0.45 s at 2 ns. c_e is unmeasured. M0a measures it.
+**Hypothesis: today's run launches 224.8 M threadgroups, of which an estimated
+3.1 M do work** (proxy). The empty ones only read one word and exit, but each
+still costs launch and scheduling time. If an empty threadgroup costs c_e of
+GPU time (amortized across cores), the launch waste per run is:
+- 0.056 s at c_e = 0.25 ns;
+- 0.11 s at 0.5 ns;
+- 0.22 s at 1 ns;
+- 0.45 s at 2 ns.
+
+c_e is unmeasured. M0a measures it, and M0b confirms or refutes the
+hypothesis on served shapes.
 
 **Tile fill.** With 32-row tiles, routed rows fill 51% of the computed tile
 rows at n = 232 and 88% at n = 1,420. Weighted by the workload's rows, the fill
@@ -207,10 +221,21 @@ while the rest of the GPU waits at the barrier:
 **Not causes at these shapes:**
 - the `mm_id`/`mv_id` threshold: no warm forward has ≤ 32 rows;
 - the dense route: V2 tiles are 82–99.5% full, 93% weighted;
-- cohort width: already four lanes, except in the 2 of 12 runs above;
-- expert weight bandwidth: `[INFERENCE]` the gate/up and down expert stacks are
-  285 MB and 174–269 MB per layer, read about once per row tile. At ≤ 2 tiles
-  per expert that stays well under the time measured.
+- cohort width: already four lanes, except in the 2 of 12 runs above.
+
+**A real cost this story does not reduce: expert-weight streaming.**
+`[INFERENCE]` from §2.2 sizes:
+- The gate/up stack is 285 MB per layer. The down stack is 174 MB (Q5_0) or
+  269 MB (Q8_0).
+- The proxy gives 2.7–3.2 busy tiles per expert at n = 1,180–1,420, not ≤ 2.
+- Per run, the expert slabs stream about 91 GB if each expert is read once per
+  forward, and about 186 GB if read once per busy tile.
+- At this host's bandwidth that is about 0.15–0.30 s of the 1.1 s category.
+
+P1, P2 and P2c do not change it. Only fewer row tiles per expert would, that
+is, larger or fuller tiles, which §2.6 rejects. So at most about 0.8–0.95 s of
+the category is launch, `map0`, staging, matrix and elementwise work that this
+design can address.
 
 ### 2.5 What the peer build does differently
 
@@ -275,7 +300,7 @@ not depend on the other rows in the batch. Every change here MUST keep:
 | P1 slotted down | **A** | Address identity: slotted `i11 = s`, `i12 = t` reads `(8t+s)·K·4`, the same as flattened `i12 = 8t+s`; output offset `r0 + s·N + 8t·N` = `r0 + (8t+s)·N`; `map0_ne20_8` lists `8t+s` in token order, the same values and order as `map0_ne20_1` over the flattened ids. Gated bitwise (§5.1 N1, §5.3) |
 | P2 compact schedule | **A** | R1 + R2 by construction; gated bitwise on every `mm_id` type, both paths, every entry point (§5.1 N2) |
 | P2b schedule reuse | **A** | the reused schedule equals a fresh one (same ids, `n_tokens`, `top_k`, `n_experts`); misuse fails closed (§5.1 N4) |
-| P2c half-tile skip | **A or not shipped** | bitwise against today's kernel per type and path (§5.1 N5). If the tensor path is not bitwise, P2c ships for the simdgroup path only if that is bitwise, and otherwise not at all. No Class B route enters production through this story |
+| P2c half-tile skip | **A or not shipped** | simdgroup path: skipping simdgroups 2–3's MMA when `nr1 ≤ 16` is bitwise by construction, because they own rows 16–31. Tensor path: full tiles (`nr1 > 16`) keep today's 32-row descriptor, so they are bitwise by construction; only partial tiles use a 16-row descriptor, which §5.1 N5 must show bitwise against the 32-row body per type. If the tensor path is not bitwise, P2c ships for the simdgroup path only. No Class B route enters production through this story |
 
 All changes are Class A, so Q1 §3.6 applies. The task-quality obligation
 against stock is met by `q1_decision_policy.py transcripts` returning
@@ -297,19 +322,39 @@ an extent; retry-until-pass (Q1 §3.7).
 `forward_prefill_batched.rs` (the batched and live-resume prefill body). The
 down call today (`:4959-4978`) passes `n_tokens = seq_len·top_k`, `top_k = 1`.
 
-The new rule follows gate/up's own routing. When gate/up ran `mm_id`
-(`plan_expert_auto_route(seq_len, top_k, hs, false, policy) == Mm`, i.e.
-`seq_len > 32`), the down call uses
-`GraphSession::quantized_matmul_id_ggml_pooled_slotted` with:
+The new rule copies DeepSeek-V4's paired-prefill rule (`deepseek4/ffn_forward.rs:40-51`,
+`use_paired_expert_prefill`), because `plan_expert_auto_route` is `pub(crate)`
+in mlx-native. The down call takes the slotted route when all of these hold:
+- `seq_len > mlx_native::MM_ID_ROUTING_THRESHOLD`;
+- no `HF2Q_MM_ID_ROUTING_THRESHOLD` override is set (the DeepSeek check,
+  `ffn_forward.rs:423`). An override can send gate/up to `mv_id`, where the
+  slotted contract refuses, so with an override present the flattened call
+  stays;
+- the expert stack is not affine (below).
+
+The call has these parameters:
 - `n_tokens = seq_len`, `top_k = top_k`;
 - the same `pf_moe_swiglu` input, `[seq_len, top_k, moe_int]` F32;
 - the same `pf_expert_ids`, output `pf_moe_down` and scratch;
 - `n = hs`, `k = moe_int`, `expert_stride = down_expert_stride`,
   `ggml_type = down_ggml_dtype`.
 
-Otherwise (`seq_len ≤ 32`) the existing flattened call stays, because at 5–32
-rows the flattened down call is `mm_id` while the slotted contract refuses below
-the threshold. Today's routing is kept in both cases, as R3 requires.
+Otherwise the existing flattened call stays. At 5–32 rows the flattened down
+call is `mm_id` while the slotted contract refuses below the threshold, so
+today's routing is kept in every case, as R3 requires.
+
+**Entry point.** The flattened call goes through
+`expert_dispatch::dispatch_expert_matmul_id_pooled`, which also serves scalar
+(F32/F16/BF16) expert stacks via `dense_matmul_id`. P1 therefore adds
+`expert_dispatch::dispatch_expert_matmul_id_pooled_slotted` with the same
+storage split:
+- **scalar stacks:** `dense_matmul_id` with `DenseMatmulIdInputLayout::Slotted`.
+  The input is `[n_tokens, top_k, K]`, the output and IDs are unchanged, and
+  `MayRepeat` / `Direct` are as today. The model-free test must show it is
+  bitwise equal to today's flattened scalar call, and the type ships on the
+  slotted route only if that test passes; otherwise scalar stacks keep the
+  flattened call;
+- **block-quantized stacks:** `GraphSession::quantized_matmul_id_ggml_pooled_slotted`.
 
 Further rules:
 - **Affine stacks.** The `gemma_moe_use_affine` branch (`quantized_matmul_id_into`)
@@ -319,10 +364,13 @@ Further rules:
   (`:1519-1521`) already covers `n_experts × seq_len`.
 - **Switch.** `HF2Q_GEMMA_PREFILL_MOE_DOWN = flat | slotted`, resolved once at
   model load in a small module beside `gemma_live_attention.rs`:
-  - default `slotted` after §7 passes; `flat` is the A/B arm;
+  - default `slotted` after §7's Class A gates pass; `flat` is the A/B arm;
   - an invalid value warns and keeps the default;
   - published in `/hf2q/v1/runtime` active controls;
-  - P2's promotion commit deletes the `flat` arm (§4.5).
+  - it exists only for the same-binary A/B. It is deleted either by P3's
+    promotion commit (§4.5) or, on the stop path (§7.4), by the PR that
+    records the M3 result. Either way, slotted becomes the only route for
+    the cases above.
 - **Joint warm.** `engine_gemma_warm_batch::worker_enabled` does **not** refuse
   either value, because both are Class A. The model-free tests assert this.
 - **Q5 case.** `q5_cases/gemma4.json` and `scripts/serve_gemma4_opencode.sh`
@@ -369,9 +417,20 @@ and simdgroup paths. Out of scope: `fused_gate_up_silu_mm_id_q6_K` and the
 5. If `invalid`, word 0 = `POISON (0x80000000)`.
 
 **`mm_id` v2** (same kernel names plus a `_c` suffix, one per type and path):
-- Grid: `(max_tiles, ⌈N/64⌉, 1)`, with
+- Grid: `max_tiles` tile slots × `⌈N/64⌉` N tiles, with
   `max_tiles = min(rows, ⌈rows/32⌉ + min(n_experts, rows) − 1)` and
-  `rows = n_tokens·top_k`.
+  `rows = n_tokens·top_k`. Word 0 holds `tile_count`.
+- **Grid order.** Two orders are bitwise-neutral, because each output element
+  has one writer:
+  - (a) tile fastest, `(max_tiles, ⌈N/64⌉, 1)`, which is the peer's order;
+  - (b) N tile fastest, `(⌈N/64⌉, max_tiles, 1)`.
+
+  (a) sweeps every expert's tiles for one N block, so the activation re-read
+  distance is the whole input (about 16 MB for gate/up and 32 MB for down at
+  n = 1,420). (b) keeps one expert's rows resident across its N blocks, as
+  today's grid does. M0c measures both, and the faster one at the served
+  shapes becomes the only order shipped. The descriptor format does not
+  depend on the order.
 - Word 0 has POISON: threadgroup (0, 0) writes NaN over the whole logical output
   and every threadgroup returns before forming a weight or activation address.
   This is today's contract (`quantized_matmul_id_ggml.rs:289-296`).
@@ -379,16 +438,41 @@ and simdgroup paths. Out of scope: `fused_gate_up_silu_mm_id_q6_K` and the
 - Otherwise load `(im, idb, nr1)` and run **today's tile body unchanged**, with
   `ids_i32[im·ne21 + r1 + j]` replaced by `ids_i32[idb + j]`.
 
-**Scratch.** `IdMmScratch::alloc(device, n_experts, max_rows)`, where
-`max_rows` bounds `n_tokens·top_k` over the session. The scratch holds:
-- word 0 plus 3·`max_tiles` descriptor words;
-- `max_rows + n_experts` list entries.
+**Scratch** (compatible with every existing caller):
+- **Constructor.** `IdMmScratch::alloc(device, n_experts, max_n_tokens)` keeps
+  its signature and meaning: the largest `n_tokens` per call. A second
+  constructor, `IdMmScratch::alloc_with_top_k(device, n_experts, max_n_tokens,
+  max_top_k)`, sizes the compact areas for `rows = max_n_tokens·max_top_k`.
+  `alloc` stays safe without a top-k bound: it assumes `max_top_k = 8`, the
+  largest `map0` instantiation, and may over-allocate.
+- **Words.** `htpe` holds `max(n_experts, 1 + 3·max_tiles(rows))` u32. The
+  legacy-`map0` consumers (Qwen's fused gate/up-SiLU path, `gpu_ffn.rs:2896`)
+  still find at least `n_experts` words.
+- **List.** `hids` holds `max(n_experts × max_n_tokens, rows + n_experts)` i32
+  while `UniformGrid` exists.
+- **DeepSeek-V4** allocates with token rows and calls with `top_k = 6`
+  (`verifier_forward.rs:646, 919`). Under `alloc` it is covered by the
+  `max_top_k = 8` assumption; it may move to `alloc_with_top_k(…, 6)`.
+- **Encapsulation.** The `htpe`/`hids` fields become private. Read access is
+  through `capacity_n_experts()`, `capacity_n_tokens()`, `capacity_rows()`
+  and buffer accessors, so callers stop deriving capacity from element counts.
+  Qwen's pool check (`qwen35/decode_pool.rs:239-247`), which divides
+  `hids.element_count()` by `htpe.element_count()` and would otherwise
+  reallocate on every call, moves to these accessors.
+- **Key invalidation.** A buffer access through the mutable accessors
+  invalidates the P2b schedule key.
+- **Capacity check.** `check_capacity(n_experts, n_tokens, top_k)` checks the
+  experts, the tokens and `n_tokens·top_k ≤ capacity_rows`.
 
-While `UniformGrid` exists, the list is sized `max(n_experts × max_rows,
-max_rows + n_experts)` so either schedule fits. Every hf2q caller already passes
-`seq_len·top_k` (Gemma) or its row bound (DeepSeek-V4 `verifier_forward.rs:646, 919`,
-`ffn_forward.rs`), and each is re-checked at the pin bump. `check_capacity`
-checks `(n_experts, rows)`.
+**Digests and receipts that change** (to be coordinated with any other native
+release in the same window, decision D7):
+- `GgmlCapabilityRequest::schema_version` and the capability receipts;
+- the serialized `GgmlRoutingPolicy`, which feeds Qwen's
+  `routing_policy_sha256` (`qwen35/execution_config.rs:105`) and the
+  tensor-execution provenance manifests (`core/provenance/tensor_execution`);
+- the native registry-adoption record and the metallib SHA-256.
+
+Regenerate them once per pin.
 
 **Capture mode.** `set_pending_buffer_ranges` declares `ids` as read and the
 scratch as written for `map0`. For `mm_id` it declares `weight, input, scratch`
@@ -406,8 +490,20 @@ encode. The key is:
 
 The new call validates that key against its own `(ids, n_tokens, top_k,
 n_experts)`, the current encoder and "no `map0` since". On any mismatch it
-returns `InvalidArgument` before encoding. hf2q treats that as a bug and
-propagates it.
+returns `InvalidArgument` before encoding.
+
+**hf2q integration.** hf2q does not let a valid mismatch become an error. The
+Gemma body tracks whether it rotated its session between gate/up and down.
+Rotation happens under `profile_buckets_on`:
+- `HF2Q_PROFILE_MOE`;
+- `HF2Q_PROFILE_BUCKETS`;
+- `HF2Q_PROFILE_GPU_TS`, via `bucket_finish!` and the `moe_dn` pre-finish
+  (`forward_prefill_batched.rs:941, 4889`).
+
+When the session was rotated, hf2q calls the plain slotted entry point, which
+builds its own schedule and is bitwise equal. Only when the session was not
+rotated does it call the reusing entry point, and an error there is a bug that
+propagates. A test (§5.2) covers both branches.
 
 The existing `map0` barrier orders schedule construction. The graph's
 `barrier_between` before down already covers `pf_moe_swiglu` and `pf_expert_ids`
@@ -415,30 +511,39 @@ and is unchanged. This generalizes what `pooled_pair` does internally.
 
 ### 4.4 P2c — half-tile skip (conditional)
 
-The `mm_id` v2 body splits its 32-row B tile into two 16-row halves, as the peer
-build does:
-- **Tensor path:** two `matmul2d_descriptor(16, 64, 32)` products, the upper one
-  skipped when `nr1 ≤ 16`.
-- **Simdgroup path:** simdgroups 2–3 skip their MMA and write-back when
-  `nr1 ≤ 16`.
+The `mm_id` v2 body skips work only for partial tiles with `nr1 ≤ 16`:
+- **Simdgroup path.** Simdgroups 2–3 own rows 16–31 (`lsmb = sb + 2·64·(sgitg/2)`).
+  When `nr1 ≤ 16` they skip their MMA and their `simdgroup_store` into shared
+  memory. **The global copy loop (`j = sgitg; j < nr1; j += 4`) keeps all four
+  simdgroups**; otherwise rows j ≡ 2, 3 (mod 4) would never be written. This is
+  bitwise by construction.
+- **Tensor path.** Full tiles (`nr1 > 16`) keep today's
+  `matmul2d_descriptor(32, 64, 32)`, so they are unchanged. Partial tiles use a
+  16-row descriptor over the lower half of the B tile. The peer instead runs two
+  16-row products on every tile; that is not adopted, because it would change
+  full tiles too. N5 must show the 16-row product bitwise against the 32-row
+  body on partial tiles, per type.
 
-It ships under the same `CompactTiles` schedule only if §5.1 N5 is bitwise
-against the 32-row body for that type and path. A failed path keeps the 32-row
-body. The receipt records which paths ship.
+P2c ships under `CompactTiles` only for the paths where N5 passes. A failed
+path keeps the 32-row body. The receipt records which paths ship.
 
 ### 4.5 P3 — hf2q: pin, integrate, promote
 
 1. Pin the mlx-native release that contains P2/P2b(/P2c), with the
-   registry-adoption record and Cargo.lock checksum.
-2. Gemma down (P1's slotted branch) calls the reusing entry point, because
-   gate/up built the schedule in the same session.
+   registry-adoption record, the Cargo.lock checksum and the regenerated
+   digests listed in §4.2.
+2. Gemma down (P1's slotted branch) calls the reusing entry point when the
+   session was not rotated since gate/up (§4.3).
 3. The runtime-controls surface reports `prefill_moe_down` and
    `mm_id_schedule`.
-4. After §7 passes, the promotion commit:
-   - deletes the `flat` arm and `HF2Q_GEMMA_PREFILL_MOE_DOWN`, since slotted
-     is then the only route for `seq_len > 32`;
-   - keeps `HF2Q_MM_ID_SCHEDULE=grid` as the native diagnostic until the next
-     native release removes `UniformGrid` (decision D3);
+4. The Q5 case gains a second pass-through, `HF2Q_Q5_MM_ID_SCHEDULE` →
+   `HF2Q_MM_ID_SCHEDULE` (case variable `MM_ID_SCHEDULE`, forwarded by
+   `serve_gemma4_opencode.sh`). The empty default leaves the native default.
+5. After §7 passes, the promotion commit:
+   - deletes the `flat` arm and `HF2Q_GEMMA_PREFILL_MOE_DOWN`;
+   - keeps `HF2Q_MM_ID_SCHEDULE=grid` and its pass-through as the native
+     diagnostic until the next native release removes `UniformGrid`
+     (decision D3);
    - records the receipts in this document and in the ADR story.
 
 ## 5. Tests
@@ -453,37 +558,62 @@ New `tests/test_mm_id_compact_schedule.rs`, extending `test_quantized_matmul_id_
 | N2 | `CompactTiles` == `UniformGrid`, bitwise | N1's matrix × entry points {auto, pooled shared, pooled pair, pooled slotted} × `top_k` ∈ {1, 6, 8} × Gemma gate/up (2816→1408), down, DeepSeek-V4 shape (k6) |
 | N3 | invalid metadata: id ≥ n_experts, a duplicate within a token, both | whole output NaN on both schedules; no weight read (a guarded weight buffer one byte short of a valid id's slab is never touched); `htpe`/list writes stay inside capacity |
 | N4 | reuse key | a reuse after a different ids buffer, a different `n_tokens`/`top_k`, another `map0`, or another encoder returns `Err` before encoding; a valid reuse equals a fresh schedule bitwise |
-| N5 | half-tile skip vs the 32-row body, bitwise | N2's matrix restricted to tiles with `nr1` ∈ {1, 15, 16, 17, 31, 32} by construction; per type and path, pass/fail recorded |
+| N5 | half-tile skip vs the 32-row body, bitwise | N2's matrix restricted to tiles with `nr1` ∈ {1, 15, 16, 17, 31, 32} by construction; per type and path, pass/fail recorded. Full tiles (`nr1` ≥ 17) must be bitwise on both paths by construction, and any difference there is a defect |
 | N6 | capacity | `max_tiles` bound attained (one row per expert plus full tiles); scratch too small → `Err`; `UniformGrid`-sized scratch fits `CompactTiles` |
 | N7 | row independence | a row's output is bitwise equal whether it is computed alone (n = 33 padding rows with fixed ids) or within any of N1's batches. This is the primitive form of joint == per-slot |
-| N8 | existing suites unchanged | `adr_022_phase2_q5_k_mm_id_parity`, `adr_033_pi_iq4_xs_mm_id_parity`, `moe_pooled_pair_contract`, `test_quantized_matmul_id_mm`, `ggml_capability` receipts regenerated with the new schema version |
+| N8 | existing suites unchanged | `adr_022_phase2_q5_k_mm_id_parity`, `adr_033_pi_iq4_xs_mm_id_parity`, `moe_pooled_pair_contract`, `test_quantized_matmul_id_mm`, `deepseek_q2_k::q2_k_slotted_down_mm_is_byte_identical_to_flattened_rows`, the fused gate/up-SiLU Q6_K parity (legacy `map0` on the new scratch), `ggml_capability` receipts regenerated with the new schema version |
+| N9 | scratch compatibility | `alloc(n_experts, max_n_tokens)` and `alloc_with_top_k` serve every entry point at `top_k` ∈ {1, 6, 8}; `htpe` ≥ `n_experts` words; the capacity accessors report the constructor's bounds; a mutable buffer access invalidates the P2b key |
 
 ### 5.2 hf2q, model-free
 
 - `gemma_prefill_moe_down_switch`: parse table (`flat`/`slotted`/invalid →
   default); runtime-controls publication; `worker_enabled` stays active under
   both values.
-- Route selection: `seq_len ∈ {5, 32}` keeps the flattened call, and
-  `seq_len ∈ {33, 1420}` selects slotted, with a recorded-dispatch fake that
-  captures the params.
+- Route selection, with a recorded-dispatch fake that captures the params:
+  - `seq_len ∈ {5, 32}` keeps the flattened call;
+  - `seq_len ∈ {33, 1420}` selects slotted;
+  - with `HF2Q_MM_ID_ROUTING_THRESHOLD` set, every `seq_len` keeps the
+    flattened call;
+  - affine stacks keep the flattened call.
+- Scalar expert stacks (F32, F16, BF16): `dispatch_expert_matmul_id_pooled_slotted`
+  is bitwise equal to the flattened scalar call at `seq_len` ∈ {33, 232}. The
+  type is routed slotted only if this passes.
+- P2b fallback: with `profile_buckets_on` forced (session rotated between
+  gate/up and down), down takes the self-scheduling slotted call, and without
+  rotation it takes the reusing call. A forced key mismatch without rotation
+  propagates the error.
 
-### 5.3 hf2q, real artifact (Class A; ignored tests; `--exact --ignored --test-threads=1`, one process each)
+### 5.3 hf2q, real artifact (Class A; one process each)
 
-Run each with the switch at its default and again under the A arm
+Invocation rules (frozen):
+- Every test runs alone with `--exact --nocapture --test-threads=1`. The
+  `#[ignore]` tests add `--ignored`; the env-gated `#[test]`s (items 3, 4 and
+  §5.4's Qwen test) must **not** get `--ignored`, which would filter them out.
+- Env-gated tests need `HF2Q_BYTE_EQUIV_E2E=1` and `HF2Q_BYTE_EQUIV_E2E_GGUF`
+  (plus `HF2Q_QWEN35_E2E_GGUF` for Qwen). Without them they print a skip line
+  and pass, so that counts as not run.
+- The `#[ignore]` Gemma tests need `HF2Q_GEMMA4_GGUF`.
+- A receipt counts only if libtest prints `1 passed` with 0 filtered-out
+  ignored for the named test, and the output has no skip line.
+
+Run each test with the switch at its default and again under the A arm
 (`HF2Q_GEMMA_PREFILL_MOE_DOWN=flat`, plus `HF2Q_MM_ID_SCHEDULE=grid` after P2):
 1. `gemma_joint_warm_prefill_matches_per_slot_bitwise` and `…_vec_hybrid`
-   (`engine_gemma_warm_batch_tests.rs`); also on `TiledF32` once #668 lands.
+   (`engine_gemma_warm_batch_tests.rs`, `#[ignore]`); also on `TiledF32` once
+   #668 lands.
 2. `gemma_joint_warm_engine_cohort_matches_serial_tool_turns`,
-   `gemma_joint_warm_forward_fault_retries_each_lane_per_slot`.
+   `gemma_joint_warm_forward_fault_retries_each_lane_per_slot` (`#[ignore]`).
 3. `slot_aware_n4_per_slot_parity_vs_serial`,
    `slot_aware_n4_batched_body_same_prompt_parity_vs_serial`,
-   `iter_g_a_multi_seq_prefill_first_token_isolation`
-   (`HF2Q_BYTE_EQUIV_E2E=1`).
-4. `gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant`.
-5. **New: `gemma_prefill_moe_route_matches_previous_route_bitwise`.** On the
-   official GGUF, with one process and both arms in sequence, a cold prefill
-   (458 rows) and a four-lane joint warm forward (the turn-1 shapes, 4 × 58 rows
-   over 458-row histories) compare, A against B:
+   `iter_g_a_multi_seq_prefill_first_token_isolation` (`engine.rs`,
+   env-gated).
+4. `gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant`
+   (`engine_gemma4_tiny_prefill_tests.rs`, env-gated).
+5. **New: `gemma_prefill_moe_route_matches_previous_route_bitwise`**
+   (`#[ignore]`). On the official GGUF, with one process and both arms in
+   sequence, it runs a cold prefill (458 rows) and a four-lane joint warm
+   forward (the turn-1 shapes, 4 × 58 rows over 458-row histories) and
+   compares, A against B:
    - every layer's `pf_moe_down` and `pf_moe_accum` bytes;
    - the logits rows, KV (K bytes, V codes and scales over valid rows) and the
      next decode token.
@@ -499,7 +629,10 @@ The compact schedule changes every hf2q `mm_id` consumer. Because it is Class
 A, these gates must pass unchanged:
 - `official_artifact_cooperative_warm_prefill_is_exact_and_faster` and
   `official_artifact_b4_decode_body_is_exact_and_measured` (DeepSeek-V4);
-- `slot_aware_qwen35_n8_per_slot_parity_vs_serial` (Qwen MoE);
+- `slot_aware_qwen35_n8_per_slot_parity_vs_serial` (Qwen MoE; env-gated, run
+  under §5.3's invocation rules with `HF2Q_QWEN35_E2E_GGUF`). It also
+  exercises Qwen's decode-pool scratch check (`decode_pool.rs:239-247`)
+  against the new accessors;
 - an A-vs-B `ExactTranscripts` smoke on Qwen3.6 and DeepSeek-V4 (one run per
   arm each) when the root's schedule allows. Otherwise, decision D6.
 
@@ -512,17 +645,24 @@ A, these gates must pass unchanged:
   median and p90.
 - **Receipt fields.** mlx-native commit, metallib SHA-256, device name, thermal
   state, macOS build.
-- **M0a, empty-threadgroup cost** (today's kernels, before P2 is written):
-  - `mm_id` (Q8_0 down shape) with every id = expert 0 and `n_tokens` swept
-    over {33, 256, 1024, 4096, 11360} with `top_k = 1`. Busy work is constant
-    and only the empty grid grows;
-  - the slope of GPU time against launched empty threadgroups is c_e;
-  - a second sweep with all ids on expert 127 checks that empty-threadgroup
-    position does not matter.
+- **M0a, empty-threadgroup cost** (today's kernels, before P2 is written).
+  `dispatch_id_mm_with_prepared_schedule_for_test` encodes `mm_id` against a
+  **synthetic schedule** written into the scratch from the host:
+  - `htpe[0] = 32`, all other experts 0, and `hids[0..32]` = rows 0..31;
+  - Q8_0 down shape (704→2816, E128);
+  - `n_tokens` swept over {33, 256, 1024, 4096, 11360} with `top_k = 1`.
+
+  Busy work stays exactly 1 tile × 44 N tiles, and only the empty grid grows
+  (128 × ⌈n/32⌉ × 44). The slope of GPU time against launched threadgroups is
+  c_e. A second sweep puts the busy expert at 127 to check that position does
+  not matter. (Real routing cannot do this: with every id on expert 0, busy
+  work grows with the grid.)
 - **M0b, served shapes, today's kernels.** For n ∈ {232, 528, 764, 880, 1172,
   1412, 1420} it measures:
-  - gate/up (Q4_K, 2816→1408, k8) and down (Q8_0 and Q5_0, 704→2816), each
-    flattened and slotted;
+  - gate/up (Q4_K, 2816→1408, k8), on its single shared-input route;
+  - down (Q8_0 and Q5_0, 704→2816), flattened and slotted. Both forms have
+    identical busy tiles, so Δt / ΔTG gives a second, served-shape estimate of
+    c_e;
   - `map0_ne20_8` vs `map0_ne20_1` alone;
   - the activation pass and the fused weighted-sum pass at the same n.
 
@@ -534,16 +674,34 @@ A, these gates must pass unchanged:
     routing-witness hook on the canonical prompts. If that hook cannot serve the
     serving path, the witness bootstrap stands in and this is recorded.
 - **M0c, after P2.** The same shapes and tables for `UniformGrid` against
-  `CompactTiles` (± P2b reuse, ± P2c).
-- **Output.** Per shape, the launched and busy threadgroups, ms, and Δ ms. Then
-  `S_pred`: the per-run saving predicted by weighting the shapes with the
-  workload's forward sizes, 30 layers, and the Q5_0/Q8_0 layer split.
+  `CompactTiles`, for both grid orders of §4.2, ± P2b reuse and ± P2c.
+- **Output.** Per shape: the launched and busy threadgroups, ms and Δ ms.
+
+**Prediction formulas (frozen).** The sum Σ runs over the six workload forward
+sizes n ∈ {232, 764, 880, 1180, 528, 1420} with 30 layers per forward. The down
+layers are weighted 16 : 14 for Q5_0 : Q8_0, and the recorded agent table is
+used if present (otherwise the witness bootstrap).
+- `S_pred(P1) = Σ [t_down,flat(n) − t_down,slotted(n)]`, measured in M0b.
+- `S_pred(P2) = c_e · ΔTG_P2 + Δmap0`:
+  - `ΔTG_P2` is the launched-threadgroup reduction from slotted/grid to
+    compact, 36.3 M per run (§2.4), recomputed from the recorded table;
+  - c_e is M0a's slope, cross-checked against M0b's; if they disagree by more
+    than 2×, the larger is used for the stop rule and both are recorded;
+  - `Δmap0` is M0b's per-call `map0_ne20_8` time × 180 calls per run (the
+    `map0` removed by P2b).
+- **P2c is excluded from the stop rule.** M0 cannot predict matrix savings.
+  Its bound, for disclosure only, is ≤ 0.05 s (the §9.1 upper estimate).
+- After P2 exists, M0c's measured per-shape deltas replace both predictions:
+  `S_meas = Σ [t_grid(n) − t_compact(n)]`, summed over gate/up and down plus
+  the `map0` delta.
 
 **Decision rule (frozen here):**
-- If M0a/M0b predict `S_pred(P1) < 0.03 s`, P1 is still implemented, because it
-  is cheap and bitwise, but it gets no speed claim.
-- If `S_pred(P1 + P2 + P2b + P2c) < 0.05 s`, the story stops after P1 and its
-  disposition is recorded: falsified lever, not implemented (§7.4).
+- If `S_pred(P1) < 0.03 s`, P1 is still implemented, because it is cheap and
+  bitwise, but it gets no speed claim.
+- If `S_pred(P1) + S_pred(P2) < 0.05 s`, the story takes the **stop path**
+  (§7.4): P2, P2b and P2c are not built; P1 merges; the switch
+  `HF2Q_GEMMA_PREFILL_MOE_DOWN` is deleted in the PR that records the M3
+  result; the falsified lever is recorded.
 - At no measured shape may `CompactTiles` be slower than `UniformGrid` by more
   than max(2%, 5 µs).
 
@@ -556,14 +714,31 @@ re-baselined on the A arm of the same binary at the candidate commit.
 
 | Gate | Metric | Pass |
 |---|---|---|
-| S1 (primitive) | M0c per-shape GPU time | no regression beyond max(2%, 5 µs); `S_pred ≥ 0.05 s` per run |
-| S2 (warm prefill, primary) | per-run sum of unprofiled joint-warm forward walls; all forwards are matched across arms because the arms are bitwise (verified, §7.2) | paired-block median Δ (B − A) ≤ −0.05 s, 95% bootstrap CI upper bound < 0, over ≥ 6 ABBA pairs. Baseline A ≈ 3.19–3.24 s |
-| S3 (category) | catsplit MoE + layer tail GPU s per run (`HF2Q_GEMMA_PREFILL_CATSPLIT=1`, 3 runs per arm) | median reduction ≥ 50% of `S_pred`; pre-attention, attention and dense change by less than ±3%. Baseline 1.09–1.11 s |
+| S1 (primitive) | M0c per-shape GPU time | no regression beyond max(2%, 5 µs); `S_meas ≥ 0.05 s` per run |
+| S2 (warm prefill, primary) | per-run sum of unprofiled joint-warm forward walls (`Batched prefill complete` lines), over **structure-matched** runs (rule below) | paired-block median Δ (B − A) ≤ −0.05 s, 95% bootstrap CI upper bound < 0, over ≥ 6 structure-matched ABBA pairs. Baseline A (unsplit runs) 3.19–3.21 s |
+| S3 (category) | catsplit MoE + layer tail GPU s per run (`HF2Q_GEMMA_PREFILL_CATSPLIT=1`, 3 runs per arm). Prerequisite met: PR #687 is merged on main (`2dfe71ba`), so the split is available to every candidate built from main | median reduction ≥ 50% of `S_meas` (or of `S_pred(P1)` for M3); pre-attention, attention and dense change by less than ±3%. Baseline 1.09–1.11 s |
 | S4 (makespan) | Q5 four-agent client makespan, same runs as S2 | no regression: median Δ ≤ 0 and 95% CI upper bound ≤ +0.05 s; Δ reported |
 | S5 (n1) | one-agent control, 2 runs per arm | disclosed, not gated (ADR-063 Q4) |
 
+**S2 transaction-structure rule (frozen).**
+- A run's *structure* is the ordered list of its warm transactions, each with
+  its lane count and per-lane advanced rows.
+- The arms are bitwise, so their prompts are identical. Cohort splits, however,
+  depend on request arrival timing, not on outputs. In 2 of 12 profile runs one
+  cohort split (L1 `004-b02`, L3 `030-b05`), and one split adds about 40 ms.
+- S2 pairs an A run with a B run only if their structures are equal.
+- Runs whose structure differs from the modal structure of the campaign are
+  excluded from S2, reported with their transaction lists, and replaced by
+  further ABBA pairs until 6 structure-matched pairs exist. Replacement is
+  capped at 6 extra pairs.
+- If 6 pairs cannot be reached, S2 is instead computed **per transaction**:
+  each modal-structure transaction is paired by turn and row count across arms,
+  the per-run sum is formed over the matched transactions only, and the
+  substitution is recorded.
+- S4 (makespan) uses every run, split or not.
+
 The story's "≤ 0.3 s" is the profile's bound on this whole lever, not a gate.
-A result between 0.05 s and S_pred passes. A result below 0.05 s is §7.4.
+A result between 0.05 s and S_meas passes. A result below 0.05 s is §7.4.
 
 ### 7.2 Quality
 
@@ -583,10 +758,11 @@ A result between 0.05 s and S_pred passes. A result below 0.05 s is §7.4.
   ratios ≤ 1.025 (`NEUTRAL_RATIO`). Against v0.1.28 stock: measured on the
   combined candidate (ADR-063 Q4).
 - Memory: every run passes Q5 `CalibrationPass` with the accepted
-  negative-control receipt. While `UniformGrid` exists, scratch bytes are
-  unchanged or lower. Removing `UniformGrid` later reduces the `mm_id` list for
-  a 4,096-row forward from 16.8 MB to about 131 KB (arithmetic). The closing
-  candidate gets a fresh Q5 calibration in any case.
+  negative-control receipt. While `UniformGrid` exists, the `hids` list is
+  unchanged. `htpe` grows from `n_experts` to `max(n_experts, 1 + 3·max_tiles)`
+  words, about 5.8 KB at 11,360 rows (arithmetic). Removing `UniformGrid`
+  later reduces the `mm_id` list for a 4,096-row forward from 16.8 MB to about
+  131 KB. The closing candidate gets a fresh Q5 calibration in any case.
 
 ### 7.4 Falsification outcomes
 
@@ -594,10 +770,17 @@ A result between 0.05 s and S_pred passes. A result below 0.05 s is §7.4.
   a near-tie. Localize it with the §5.1 matrix. The change does not ship.
 - **S1 fails on a shape:** P2 does not become the default for that type; that
   type keeps `UniformGrid`, and this is recorded per type.
-- **S_pred < 0.05 s or S2 fails:** record "launch geometry is not a material
-  Gemma cost on this host", with the M0 receipts. P1 still merges, because it
-  is bitwise and costs nothing. P2/P2b/P2c are not built, or are reverted
-  before release. The Gemma gap plan in the profile §7 is updated by the root.
+- **Stop path: `S_pred(P1) + S_pred(P2) < 0.05 s` (§6), or S2 fails.**
+  - Record "launch geometry is not a material Gemma cost on this host", with
+    the M0 receipts.
+  - P1 still merges, because it is bitwise and costs nothing. The PR that
+    records the M3 result deletes `HF2Q_GEMMA_PREFILL_MOE_DOWN` and its Q5
+    pass-through, which makes slotted the only route (§4.1).
+  - P2/P2b/P2c are not built, or are reverted before release; no native
+    release or pin is needed.
+  - The root updates the Gemma gap plan in the profile §7.
+  - The story closes through this recorded falsification (§11 delivery
+    boundary).
 
 ## 8. GPU validation plan (root only; GPU lane; one model process at a time)
 
@@ -609,12 +792,12 @@ SHA-256. It passes Q5 `CalibrationPass`. Evidence goes under
 
 | Step | What | Model | Est. time |
 |---|---|---|---|
-| M0a/M0b | §6 on an mlx-native worktree at 0.15.16 (today's kernels) | none | ~15 min |
-| M1 | one four-agent run at hf2q main with `HF2Q_PROFILE_GPU_TS=1` for the per-op split (`moe_gu`, `moe_swiglu`, `moe_dn`, `moe_wsum_add`, `gur`, dense down, O-proj), with the distortion against an unprofiled run stated; plus the read-only capture of the warm forwards' expert-id tables for M0b | Gemma | ~10 min |
-| M2 | P1 Class A gates §5.3 (1–6) | Gemma, 8–10 processes | ~60 min |
-| M3 | P1 A/B: `HF2Q_Q5_GEMMA_PREFILL_MOE_DOWN ∈ {flat, slotted}`, ABBA ≥ 6 pairs, then catsplit 3 + 3 | Gemma | ~45 min |
-| M4 | P2 native qualification: §5.1 on both metallib paths; M0c | none | ~30 min |
-| M5 | P3 pin: §5.3 again (arm A = flat + grid) and §5.4; A/B (A = flat + `HF2Q_MM_ID_SCHEDULE=grid`, B = default), ABBA ≥ 6 pairs; catsplit 3 + 3; n1 2 + 2 | Gemma, DeepSeek-V4, Qwen | ~2.5 h |
+| M0a/M0b | §6 on an mlx-native worktree at 0.15.16 (today's kernels); M0a uses the synthetic schedule | none | ~15 min |
+| M1 | one four-agent run at hf2q main (≥ `2dfe71ba`) with `HF2Q_PROFILE_GPU_TS=1` for the per-op split (`moe_gu`, `moe_swiglu`, `moe_dn`, `moe_wsum_add`, `gur`, dense down, O-proj), with the distortion against an unprofiled run stated; plus the read-only capture of the warm forwards' expert-id tables for M0b | Gemma | ~10 min |
+| M2 | P1 Class A gates §5.3 (1–6), under §5.3's invocation rules | Gemma, 8–10 processes | ~60 min |
+| M3 | P1 A/B: `HF2Q_Q5_GEMMA_PREFILL_MOE_DOWN ∈ {flat, slotted}`, ABBA ≥ 6 structure-matched pairs (§7.1 rule), then catsplit 3 + 3 | Gemma | ~45 min |
+| M4 | P2 native qualification: §5.1 on both metallib paths; M0c (both grid orders) | none | ~30 min |
+| M5 | P3 pin: §5.3 again (arm A = flat + grid) and §5.4; A/B (A = `HF2Q_Q5_GEMMA_PREFILL_MOE_DOWN=flat` + `HF2Q_Q5_MM_ID_SCHEDULE=grid`, B = defaults), ABBA ≥ 6 structure-matched pairs; catsplit 3 + 3; n1 2 + 2 | Gemma, DeepSeek-V4, Qwen | ~2.5 h |
 | M6 | combined candidate (Q4-GEMMA-ATTN §9.3); not this story's gate | — | — |
 
 A/B loop (M3, M5), following the tiled design §9.2:
@@ -631,7 +814,8 @@ python3 scripts/four_agent/q1_decision_policy.py transcripts <A runs> <B runs>  
 ```
 
 From each run, read:
-- the per-forward `Batched prefill complete` lines (S2);
+- the per-forward `Batched prefill complete` lines and the transaction
+  structure (S2);
 - the `joint warm` transaction `elapsed_ms`;
 - the client makespan (S4);
 - TTFT p95 and SSE-gap max (§7.3);
@@ -646,8 +830,8 @@ From each run, read:
 | P1 slotted down | −184.5 M launched threadgroups | 0.05–0.18 (c_e 0.25–1 ns) |
 | P2 compact schedule | −36.3 M more (40.3 M → 4.0 M) | 0.01–0.04 |
 | P2b reuse | −180 `map0` + barrier per run | 0.002–0.01 |
-| P2c half-tile skip | −11% matrix rows (proxy), if MMA + B staging is 25–50% of `mm_id` time | 0.02–0.05 |
-| **Total** | | **0.08–0.28** |
+| P2c half-tile skip | −11% matrix rows (proxy), if MMA + B staging is 25–50% of `mm_id` time; not part of the stop rule | 0.02–0.05 |
+| **Total** | holds only if c_e ≥ 0.25 ns; expert-weight streaming (about 0.15–0.30 s, §2.4) is untouched | **0.08–0.28** |
 
 ### 9.2 Stage ownership and cross-story coupling
 
@@ -668,16 +852,19 @@ savings act on disjoint kernels and add.
 
 | Risk | Mitigation |
 |---|---|
-| c_e is tiny, so the lever is small | M0a measures it first, on today's kernels, before P2 work; the §6 decision rule stops the story |
+| c_e is tiny, so the lever is small | M0a measures it first with a synthetic schedule, on today's kernels, before P2 work, and M0b cross-checks it; the §6 decision rule takes the stop path |
 | The routing proxy misstates real tile fill | M0b uses recorded agent routing tables (M1); S3/S2 measure the real effect |
-| `matmul2d` at M = 16 reduces in a different order from M = 32 | P2c is bitwise-gated per path (N5); otherwise dropped |
+| `matmul2d` at M = 16 reduces in a different order from M = 32 | full tiles keep the 32-row descriptor; partial tiles are bitwise-gated per type (N5); otherwise the tensor path drops P2c |
 | Compact `map0` bug: out-of-bounds list write, wrong descriptor at the tile boundary, poison regression | N3, N6, N7; guard-sized buffers; the descriptor bound is asserted against `max_tiles` |
 | Shared kernel regresses another family | §5.4 gates at the pin bump; the schedule is per policy, so `grid` stays available until the gates pass |
-| Schedule reuse reads a stale schedule | keyed reuse fails closed (N4); only same-encoder, same-ids reuse |
+| Scratch layout breaks other callers (Qwen decode-pool capacity check, Qwen fused legacy `map0`, DeepSeek-V4 `top_k = 6` sizing, direct field writes) | `alloc` signature kept with a `top_k ≤ 8` assumption; `htpe ≥ n_experts` words; capacity accessors and private fields; N8/N9 and §5.4 (§4.2) |
+| Compact grid order loses activation locality | both bitwise-neutral orders measured in M0c; the faster ships (§4.2) |
+| Schedule reuse reads a stale schedule, or a valid profile run aborts | keyed reuse fails closed (N4); hf2q uses the self-scheduling slotted call whenever its session was rotated (§4.3, §5.2) |
 | Thread 0's prefix sum serializes for `n_experts` = 256 | O(n_experts + tiles) per call; included in M0c timings |
-| Capability/receipt schema change breaks consumers | schema version bump and a registry-adoption record at the pin |
+| Capability/receipt schema and routing-policy digests change | regenerate the digests listed in §4.2 once per pin; coordinate with any concurrent native release (D7) |
 | Measurement distortion | primary gate unprofiled (S2); catsplit only for the category share (+13% known distortion) |
-| Cohort splits (2 of 12 runs) add noise to S2 | Class A arms give identical transactions, so pairing is per transaction; split runs are reported, not dropped |
+| Cohort splits (2 of 12 runs; about 40 ms each) add noise to S2 | splits depend on timing, not outputs; the frozen structure rule (§7.1) pairs only structure-matched runs, or falls back to per-transaction pairing; splits are reported |
+| Gates that silently skip | §5.3 invocation rules: env gates set, `--ignored` only for `#[ignore]` tests, receipt must show `1 passed` with no skip line |
 
 ## 11. ADR-063 story section (extraction-ready)
 
@@ -685,29 +872,31 @@ savings act on disjoint kernels and add.
 
 Outcome: Gemma 4 26B-A4B warm prefill spends measurably less GPU time per row in the routed experts, bitwise identical to the previous route, and the saving enters the combined Gemma candidate.
 
-Requirement: The program MUST remove the expert matrix-multiply launch overhead that the Q4-GEMMA profile attributes to warm-prefill MoE, without changing any output byte, and MUST record the measured saving against the profiled MoE share.
+Requirement: The program MUST reduce the GPU time per row of the warm-prefill routed-expert stage (34% of warm-prefill GPU time in the Q4-GEMMA profile) without changing any output byte. It MUST first test, with a model-free microbenchmark, the hypothesis that expert matrix-multiply launch geometry is a material part of that stage. It MUST record the measured saving, or the falsification, against the profiled MoE share.
 
 Acceptance:
 
-- Starting point (Q4-GEMMA #660, hf2q `7f295b38`, native 0.15.16): warm-prefill MoE and layer tail are 34% of warm-prefill GPU time (1.09–1.11 s per run serialized; attention 48%, dense 11%, pre-attention 7.5%). About 225 M expert-matmul threadgroups are launched per four-agent run, of which about 3.1 M have work.
+- Starting point (Q4-GEMMA #660, hf2q `7f295b38`, native 0.15.16): warm-prefill MoE and layer tail are 34% of warm-prefill GPU time (1.09–1.11 s per run serialized; attention 48%, dense 11%, pre-attention 7.5%). About 225 M expert-matmul threadgroups are launched per four-agent run, of which an estimated 3.1 M have work (routing proxy; design §2.4).
 
 - A written design, approved before implementation: `docs/research/adr063-q4-gemma-prefill-moe-design.md`. It covers the Gemma prefill MoE down call on the slotted expert entry point (P1, hf2q); a compact per-expert tile schedule with schedule reuse (P2, P2b, mlx-native); and a half-tile skip only where it is bitwise (P2c). The `mm_id`/`mv_id` threshold (32), dense thresholds, tensor-API selection and storage types are unchanged.
 
 - Every shipped change is Q1 Class A against the previous route. The mlx-native parity matrix (design §5.1) is bitwise on both metallib paths, and so are the hf2q real-artifact gates (joint warm == per-slot on every warm attention route, engine cohort == serial tool turns, per-slot parity, the route A/B layer-byte test, and the greedy144 Q1 endpoint `ExactEqual`). `ExactTranscripts` holds over every A/B run pair. A non-bitwise variant does not ship under this story.
 
-- Speed, with one binary and the previous route as the A arm: at least 6 ABBA pairs. The per-run sum of unprofiled joint-warm forward walls improves by at least 0.05 s (95% CI upper bound < 0). The profiled MoE category falls by at least half the microbenchmark prediction, with the other categories within ±3%. The four-agent makespan does not regress (CI upper bound ≤ +0.05 s). The worst-slot TTFT p95 and SSE-gap max ratios stay within 1.025. If the microbenchmark predicts less than 0.05 s per run, the story closes with the recorded falsification and P1 only.
+- Speed, with one binary and the previous route as the A arm: at least 6 ABBA pairs matched by warm-transaction structure (design §7.1). The per-run sum of unprofiled joint-warm forward walls improves by at least 0.05 s (95% CI upper bound < 0). The profiled MoE category falls by at least half the measured microbenchmark saving, with the other categories within ±3%. The four-agent makespan does not regress (CI upper bound ≤ +0.05 s). The worst-slot TTFT p95 and SSE-gap max ratios stay within 1.025.
 
-- The shared-kernel regression gates for DeepSeek-V4 and Qwen MoE pass at the native pin. Every run passes Q5 `CalibrationPass`.
+- Stop path (design §6, §7.4): if the frozen microbenchmark prediction for P1 + P2 + P2b is below 0.05 s per run, or the warm-prefill gate fails, P1 still merges as a bitwise change with its switch removed, P2/P2b/P2c are not built, and the story closes with the recorded falsification.
+
+- The real-artifact gates run under the design's invocation rules (`--exact`, env gates set, `1 passed` with no skip line). The shared-kernel regression gates for DeepSeek-V4 and Qwen MoE pass at the native pin. Every run passes Q5 `CalibrationPass`.
 
 Repository ownership: mlx-native owns the compact schedule, the schedule-reuse entry point, the half-tile skip, the parity tests, the microbenchmark and the release. hf2q owns the slotted down call, route switches, integration, the real-artifact gates and the A/B campaign, consuming mlx-native at an exact published pin.
 
 Validation: Independent review of the design, the parity and microbenchmark receipts, the Class A real-artifact receipts and the A/B campaign from raw receipts.
 
-Predecessors: Q4-GEMMA (#660, profile result PR #687), Q5 (#371). Consumed by Q4-GEMMA-ATTN's combined candidate, which adds this story to its predecessors.
+Predecessors: Q4-GEMMA (#660, profile result PR #687, merged on main as `2dfe71ba`), Q5 (#371). Consumed by Q4-GEMMA-ATTN's combined candidate, which adds this story to its predecessors.
 
 Priority: High. Core scope (second-tier family).
 
-Delivery boundary: P1 merged to main, and the mlx-native release containing P2 pinned by hf2q, for v0.1.30 (or the first published hf2q release containing the accepted Gemma 4 configuration).
+Delivery boundary: P1 merged to main; and either the mlx-native release containing P2 pinned and integrated by hf2q (P3), or, on the stop path, the recorded falsification. For v0.1.30, or the first published hf2q release containing the accepted Gemma 4 configuration.
 
 ## 12. Decisions for the operator
 
@@ -715,39 +904,54 @@ Delivery boundary: P1 merged to main, and the mlx-native release containing P2 p
   non-bitwise half-tile skip, threshold change or Q5_0 tensor path is out of
   scope. *Recommended: yes.* A Class B MoE route would need its own envelope
   and quality campaign, and Gemma's routing amplifies perturbations.
-- **D2. One story or two.** One story with two PRs (mlx-native, then the hf2q
-  pin), in the Q4-QWEN38 pattern, or split into a native KERNEL story and an
-  hf2q story as #659/#668 did. *Recommended: one story.* The native part is
-  bitwise and has no separate contract issue beyond §4.2.
+- **D2. One story or two.** One story delivered in three PRs: P1 (hf2q, on the
+  current pin), P2 (mlx-native, with a linked mlx-native issue carrying the
+  §4.2–§4.4 contract text), and P3 (hf2q pin and integration). This follows
+  the Q4-QWEN38 pattern. The alternative is to split into a native KERNEL story
+  and an hf2q story, as #659/#668 did. *Recommended: one story.* The native
+  part is bitwise, and its contract is the issue text.
 - **D3. Kill switches.**
-  - `HF2Q_GEMMA_PREFILL_MOE_DOWN` is deleted at promotion.
+  - `HF2Q_GEMMA_PREFILL_MOE_DOWN` is deleted at promotion (P3) or, on the stop
+    path, in the PR that records M3.
   - `HF2Q_MM_ID_SCHEDULE=grid` stays as a native diagnostic for one release;
     the release after Q4 closes removes `UniformGrid`.
   - *Recommended as written.* The alternative is to remove `UniformGrid` in
     the same release and run the A/B across two pins, which is weaker evidence.
-- **D4. Falsification threshold.** Stop after P1 if the microbenchmark
-  predicts < 0.05 s per run. *Recommended: 0.05 s,* about a sixth of the lever's
-  profile bound and about twice the S2 noise floor `[INFERENCE]`.
+- **D4. Falsification threshold.** Take the stop path if `S_pred(P1) +
+  S_pred(P2) < 0.05 s` per run (§6 formulas; P2c excluded). *Recommended:
+  0.05 s,* about a sixth of the lever's profile bound. Without splits, the S2
+  noise is about 5 ms; the main noise source, cohort splits, is handled by the
+  structure rule.
 - **D5. What the story's own acceptance requires.** A category saving with no
   makespan regression; the Win is measured only on the combined candidate.
   *Recommended: yes.* A 0.1–0.3 s saving cannot be resolved as a makespan Win on
   its own.
 - **D6. Cross-family gates at the pin.** DeepSeek-V4 and Qwen MoE bitwise gates
-  plus one `ExactTranscripts` smoke each, against Gemma-only gates.
-  *Recommended: run them,* since every `mm_id` consumer changes.
+  (with §5.3's invocation rules and §4.2's scratch obligations) plus one
+  `ExactTranscripts` smoke each, against Gemma-only gates. *Recommended: run
+  them,* since every `mm_id` consumer changes.
 - **D7. Release coupling.** Ship P2 in the same mlx-native release as
-  Q4-GEMMA-KERNEL (#659) or on its own. *Recommended: whichever is ready first.*
-  The changes touch disjoint kernels and registry entries.
+  Q4-GEMMA-KERNEL (#659) or on its own. *Recommended: whichever is ready first,
+  coordinated.* If both releases bump `GGML_CAPABILITY_SCHEMA_VERSION` or the
+  routing-policy digest, sequence them so the receipts and digests of §4.2 are
+  regenerated once per pin.
 
 ## 13. Source identities read
 
 | Path | Identity |
 |---|---|
-| hf2q `src/serve/forward_prefill_batched.rs` @ `ff4af4bd` | sha256 `3f6541a4…e08e090` |
+| hf2q `src/serve/forward_prefill_batched.rs` @ `ff4af4bd` | sha256 `3f6541a4…e08e090`. Line numbers in this document refer to `ff4af4bd`. On main `2dfe71ba` (`f2072ab3…fe76`, +39 catsplit lines) they shift by +32 around the MoE body: gate/up 4836–4855, down 4991–5010, `moe_dn` pre-finish 4921, scratch 1525–1527; `profile_buckets_on` stays at 941 |
 | hf2q `src/serve/api/engine_gemma_warm_batch.rs` @ `ff4af4bd` | `6ae9d390…b4fa53` |
 | hf2q `src/inference/expert_dispatch.rs` @ `ff4af4bd` | `cd54a844…f9e040e227` |
 | hf2q `src/serve/forward_mlx_shared.rs` @ `ff4af4bd` | `56ffe77c…aa59` |
 | hf2q `docs/research/adr063-q1-numeric-policy.md` @ `ff4af4bd` | `16df680e…fe35` |
+| hf2q `src/inference/models/deepseek4/ffn_forward.rs` @ `2dfe71ba` | `150f70c8…6989` (route rule, §4.1) |
+| hf2q `src/inference/models/qwen35/decode_pool.rs` @ `2dfe71ba` | `7ed8a9be…e6f3` (scratch capacity check, §4.2) |
+| hf2q `src/inference/models/qwen35/gpu_ffn.rs` @ `2dfe71ba` | `f27745a6…80dc` (fused legacy `map0` on the scratch) |
+| hf2q `src/inference/models/qwen35/execution_config.rs` @ `2dfe71ba` | `e776ac97…79a8` (`routing_policy_sha256`) |
+| hf2q `src/serve/api/engine_gemma4_tiny_prefill_tests.rs` @ `2dfe71ba` | `37133bf7…2715` (env-gated test, §5.3) |
+| mlx-native 0.15.16 `src/ops/dense_matmul_id.rs` | `d7950752…ada3` (`DenseMatmulIdInputLayout::Slotted`) |
+| mlx-native 0.15.16 `tests/deepseek_q2_k.rs` | `508f079e…e375` (slotted == flattened precedent) |
 | mlx-native 0.15.16 `src/ops/quantized_matmul_id_ggml.rs` (= 0.15.17) | `9d92db48…dd12` |
 | mlx-native 0.15.16 `src/ggml_capability.rs` | `1d79fdee…0947` |
 | mlx-native 0.15.16 `src/shaders/quantized_matmul_id_mm.metal` | `0a17b978…3890` |
