@@ -58,6 +58,12 @@ Per-conversion receipts are copied to `$G/<arm>.receipt.json`. Combined types (f
 
 ### Storage of the drafters (operator, 2026-11-03)
 
+**Update, 2026-11-04.** With 343 GB free on the internal disk, the four converted drafters were copied to
+the story's evidence directory on the internal disk (`$G/drafters/`, copied with `/bin/cp`, sha256
+re-verified). The timed runs load them from there, under the storage rule that timed models stay
+internal, so the external-drive witness below does not apply to any timed run. The external originals
+remain the conversion record.
+
 Sources and GGUFs live on the external drive, under `…/hf2q/ext/models/q4-gemma/`. The target GGUF and
 both engines stay on the internal disk. The operator allows a drafter on the external drive in timed runs
 only if loading from it does not affect makespan. The argument and the check:
@@ -265,5 +271,5 @@ The earlier estimate of 3.5–4.5 h assumed 2–2.5 min per run and was wrong.
 - **Drafter memory.** Each separate drafter's KV is sized to the target's 1,048,576-token pool. EAGLE-3 and
   DFlash each have one full-attention layer, about 4 GiB at f16; E2B needs about 6 GiB [INFERENCE]. Q5
   decides the memory tier.
-- **External drive.** The drafters are timed from the external drive only while the per-run witness in §2
-  passes.
+- **External drive.** Not used by the timed runs (2026-11-04 update in §2). The witness stays for any later
+  arm that loads from the external drive.
