@@ -1,8 +1,9 @@
 # ADR-063 Q4-QWEN36: Qwen3.6 harness against Qwen's recommended agentic setup
 
-Status: prepared, 2026-11-03. No campaign has run yet. This record holds the setup diff with sources, the
-third-party diagnostic GGUFs, and the paired campaigns that separate harness, conversion and model causes
-(story #662). The starting point is
+Status: C3 measured 2026-11-04 (operator decision 2026-11-03: unsloth GGUF only, canonical setup, v0.1.29
+release binary). C0, C1, C2, C4 and C5 have not run. This record holds the setup diff with sources, the
+third-party diagnostic GGUFs, the paired campaigns that separate harness, conversion and model causes
+(story #662), and the C3 result. The starting point is
 [adr063-qwen36-task-failure-diagnosis.md](adr063-qwen36-task-failure-diagnosis.md): canonical workload,
 hf2q 5/24 against the peer 4/24 (p = 0.77), BelowFloor, attributed to the weights.
 
@@ -127,3 +128,42 @@ The canonical paired campaign took 29.0 min for 48 runs. Median run wall time wa
 
 The core set (C0-C3 plus the smokes) is about 2.5-3 h of GPU lane. C4 and C5 add up to 2 h. Each campaign
 writes about 70 MB of evidence. The two downloads use 42.6 GB.
+
+## C3 result: unsloth UD-Q4_K_M, canonical setup
+
+Campaign `$V/q4-qwen36/campaigns/quality-qwen36-unsloth-udq4km-20261104T001837Z`, where `$V` is
+`~/.local/state/hf2q/v0130`:
+- Manifest sha256 `80cd6bfa…`, plan `5a732c3f…`.
+- 48 runs in 29.8 min. Every run has a task outcome: no Invalid run and no retry.
+- hf2q: v0.1.29 release binary, sha256 `86b64b02…`.
+- Peer: e86f5fd1 build, `4b604952…`.
+- Artifact: `ac0e2c11…`.
+- Client sandbox proof: `owned-cleanup-sandbox-capability-20261031T222313Z` (`8b286684…`). The 2026-10-26
+  proof no longer matches `qwen38_n1_process.py` on main.
+
+| | hf2q | Peer |
+|---|---:|---:|
+| Instances passed (C3) | 1/24 | 1/24 |
+| Instances passed, canonical campaign (our GGUF) | 5/24 | 4/24 |
+| Pass only in C3 / pass only in canonical (same instance ids) | 1 / 5 | 1 / 4 |
+| Two-sided exact sign test, C3 vs canonical | p = 0.22 | p = 0.38 |
+| Agents failing with E0282 on `map_err(\|e\| e.to_string())` | 62 | 53 |
+| First `write_file` containing the idiom | 65/82 (79%) | 64/74 (86%) |
+| Same, canonical campaign | 46/89 (52%) | 49/87 (56%) |
+| Q5 verdicts | 23 ClientFailed, 1 CalibrationPass | 23 ClientFailed, 1 CalibrationPass |
+
+- **Paired verdict:** BelowFloor. hf2q-only failures 1 and peer-only failures 1 give one-sided p = 0.75,
+  so there is no engine difference.
+- **Failure signature:** the same line as the diagnosis. Every failing agent either compiled the E0282
+  idiom, was stopped by the coordinator after a sibling failed, or (1 per engine) was stopped before its
+  first test result arrived.
+- **Smokes:** the two canonical-task smokes, `q5-qwen36-unsloth-20261104T001640Z` and
+  `q5-peer-qwen36-unsloth-20261104T001748Z`, failed the same way.
+- **Conversion:** the third-party GGUF is no better than ours on either engine. Both drops are
+  non-significant. It keeps attention, SSM and shared experts at Q8_0 and uses an imatrix, yet it writes
+  the non-compiling idiom more often. That matches the diagnosis's trend of the idiom rising with precision
+  (Q4 22 → Q8 34 → BF16 41 of 48). The hf2q conversion stays excluded.
+- **Confound:** the hf2q arm's C3-vs-canonical comparison also changes the binary (`0b959107` → v0.1.29).
+  The peer arm uses the same build in both campaigns.
+
+Analysis: `analyze_c3.py` writes `c3-analysis.json` in the evidence directory.
