@@ -90,8 +90,8 @@ Abbreviations: `$G` = `/Users/robert/.local/state/hf2q/v0130/q4-gemma`;
      fairness ≤ 1.025.
 
    Stated plainly (§5): **the lowest adoptable case fails M2.** That case is
-   D1 alone at its adopt threshold, about 0.42–0.48 s and a ratio of about
-   0.97. A 0.96 ratio closes the Gemma Win only if the other three stories
+   D1 alone at its adopt threshold, about 0.36–0.42 s and a ratio of about
+   0.97–0.98. A 0.96 ratio closes the Gemma Win only if the other three stories
    reach their high estimates; otherwise this story needs about 0.93. If M2
    misses, the root's preference is to re-budget the Win across the other
    Gemma stories (§13).
@@ -275,7 +275,7 @@ the workload's context lengths (§7.2, §7.4).
 step and the peer about 1,080 [INFERENCE]. ADR-040 §24 iter-J measured a
 −209 dispatch/step reduction "THROUGHPUT-NEUTRAL (measured ~noise)"
 (BB:2151-2164), and amortizing the F16/F32 weight reads was also neutral
-(BB:477-480).
+(BB:484-487).
 
 ### 2.5 Shapes and types (q4_k_m artifact `bf65b7e1…`)
 
@@ -569,9 +569,36 @@ simd_sum(sumf[j][c]) for each (j, c); lane 0 stores rows < ne01, columns < ne1
 - **A2: mixed-bucket batched flash.** Today any step whose slots straddle an
   (nwg, nsg) bucket falls back to per-slot dispatches (BB:888-901,
   1118-1345).
-  - A2 passes each slot's own (nwg, nsg) in a per-slot parameter array, and
-    each slot's threadgroups run its solo split-K and SIMD-group count. It is
-    exact by construction, and the bucket heuristics are unchanged.
+  - A2 passes each slot's own (nwg, nsg) in a per-slot parameter array, so
+    each slot's threadgroups run its solo split-K and SIMD-group count. The
+    bucket heuristics are unchanged. One dispatch fixes some things for every
+    slot, and A2 handles each so that every slot's arithmetic stays its solo
+    arithmetic:
+    - **Threadgroup size.** Threadgroups are sized for the largest nsg in the
+      step (32·nsg_max). In a slot with a smaller nsg, the extra SIMD groups
+      do no K work: they are excluded from the K stride and from the
+      cross-SG merge. They still reach both main-kernel `threadgroup_barrier`s
+      (`M:src/shaders/flash_attn_vec_hybrid.metal:903`, `:1112`), so barrier
+      participation stays uniform. The active SIMD groups index and merge
+      exactly as a solo dispatch at that slot's nsg would.
+    - **Threadgroup memory** is sized for nsg_max, and each slot uses the
+      prefix its solo layout would use.
+    - **Partials layout.** The split-K partials and the S/M scratch use
+      per-row offsets derived from each slot's own NWG. They replace the
+      uniform `rid·DV·NWG` and `nrows·DV·NWG` offsets. Grid z is sized to the
+      largest NWG, and threadgroups with `z ≥ NWG(slot)` return before their
+      first barrier, uniformly across the whole threadgroup.
+    - **Reduce.** Each slot is reduced at its own NWG. Two variants are both
+      allowed, and M0 picks one:
+      - one reduce dispatch per bucket present in the step (at most 2 today),
+        each at its stock 32·nwg width;
+      - one per-row reduce sized for NWG_max, with each row's lanes beyond
+        its own NWG padded exactly as the stock reduce's `simd_sum` padding
+        does for that NWG.
+
+    T-N8's mixed-bucket cells compare every row bitwise against the slot's
+    solo dispatch, so a mistake here fails the test rather than going
+    unnoticed.
   - It is adopted only if V2 shows mixed-bucket layer-steps at 10% or more
     and M0 shows a gain.
 - **Out of scope:** the KV representation, the NWG/NSG heuristics, KV-encode
@@ -693,18 +720,18 @@ adopt threshold. Below it, the lever is dropped and saves 0.
 
 | Lever (net ms/step now) | Below threshold | At threshold | High | Basis |
 |---|---:|---:|---:|---|
-| D1 q/k/v/o + gate/up (4.89) | 0 | 1.25× → 0.42 s/run | **2× cap** → 1.04 s/run | §2.4: removes shared loads and `sumy`, not FMAs |
+| D1 q/k/v/o + gate/up (4.89) | 0 | 1.25× → 0.36–0.42 s/run | **2× cap** → 1.04 s/run | §2.4: removes shared loads and `sumy`, not FMAs |
 | D1 lm head (unmeasured: 1.3–3.1 ms/step) | 0 | 1.25× → 0.12–0.29 s/run | 2× → 0.30–0.73 s/run | Measured in M0 and M1 before §5 is relied on |
-| D2 dense down (≈ 1.19) | 0 (the 25% case misses ≤ 0.67) | 1.5× → 0.15 s/run | unique bytes at 470 GB/s → 0.37 s/run | System-cache share of re-reads unknown |
-| E1 experts (7.02) | 0 (duplicates already cache-served) | 0.85× → 0.39 s/run | time ∝ distinct pairs, d = 0.35 → 1.04 s/run | No derivation for an in-between share; V2 replaces d |
-| A attention (3.16) | 0 (per-head arithmetic bound) | 0.85× → 0.17 s/run | [INFERENCE] 40% → 0.54 s/run | Sliding 2× and global 8× KV re-read (§2.4) |
+| D2 dense down (≈ 1.19) | 0 (the 25% case misses ≤ 0.67) | 1.5× → 0.15–0.17 s/run | unique bytes at 470 GB/s → 0.37 s/run | System-cache share of re-reads unknown |
+| E1 experts (7.02) | 0 (duplicates already cache-served) | 0.85× → 0.39–0.45 s/run | time ∝ distinct pairs, d = 0.35 → 1.04 s/run | No derivation for an in-between share; V2 replaces d |
+| A attention (3.16) | 0 (per-head arithmetic bound) | 0.85× → 0.17–0.20 s/run | [INFERENCE] 40% → 0.54 s/run | Sliding 2× and global 8× KV re-read (§2.4) |
 
 Totals of decode GPU time per run:
 
 | Case | Saving | Ratio | M2 (≤ 0.96) |
 |---|---:|---:|---|
-| Lowest adoptable (D1 body alone, at threshold) | 0.42–0.48 s | ≈ 0.97 | **Fails** |
-| All levers at threshold | ≈ 1.25–1.6 s | ≈ 0.89–0.92 | Passes |
+| Lowest adoptable (D1 body alone, at threshold) | 0.36–0.42 s | ≈ 0.972–0.976 | **Fails** |
+| All levers at threshold | ≈ 1.19–1.52 s | ≈ 0.90–0.92 | Passes |
 | All levers high | ≈ 3.7 s | — | Passes; exceeds the measured 2.0–2.5 s gap to the peer |
 
 The high case exceeds the gap because the peer's MT figure includes its
@@ -1071,7 +1098,7 @@ Delivery boundary: A published mlx-native release pinned exactly by hf2q, plus t
 
 | Finding | Resolution |
 |---|---|
-| 1. The low savings case fails the design's own gates; E1's 30% share had no derivation | §5.1 now has below-threshold, at-threshold and high columns, and states that the lowest adoptable case (≈ 0.42–0.48 s, ratio ≈ 0.97) fails M2. E1 is bracketed at 0 and at 1 − U/32, and the 30% share is dropped |
+| 1. The low savings case fails the design's own gates; E1's 30% share had no derivation | §5.1 now has below-threshold, at-threshold and high columns, and states that the lowest adoptable case (≈ 0.36–0.42 s, ratio ≈ 0.97–0.98) fails M2. E1 is bracketed at 0 and at 1 − U/32, and the 30% share is dropped |
 | 2. The diagnosis compared unlike units | §2.2 adds element-columns per second; §2.4 restates the diagnosis as per-column work; the D1 high case is capped at 2×; M0 reports both metrics |
 | 3. The fast-math claim was false | §3.2 item 6 now requires the same compile flags as the reference (Metal defaults; fast math is disabled only for `deepseek_tail_rope*`). §3.3 and §10 add the compiler-dependence risk |
 | 4. The policy could not express what M0 adopts, and had no base | §4.7: one `bool` per lever with `serde(default)`, `Copy`-safe, geometry in a static table, `combine_routing_policies` updated. §4.8: base captured at load from `ggml_routing_policy_from_environment()`, refusal on reference-flag mismatch, separate body, lm-head and expert policies |
@@ -1079,6 +1106,7 @@ Delivery boundary: A published mlx-native release pinned exactly by hf2q, plus t
 | 6. The 0.9 factor and the lm-head lever are coupled | §2.1 and §5.1 use f = 0.78–0.90 with the lm head at 1.3–3.1 ms/step; M0 and M1 (§8.2) measure the lm head per step, and §5 is recomputed before M2 |
 | 7. Text corrections | Command-buffer count (≈ 225,000–258,000 per run); stock `mN` tiling (5 → [5], 6 → [3, 3], 7 → [4, 3], 8 → [4, 4]); synthetic row tails; `yl_c` exists only in Q6_K; Q8_0/Q5_0 `mv_id` line ranges; BB:2151-2164 cited for the neutral dispatch reduction; record commits `87d5df5c`/`ddf781b6`; top-16 share 72% (0.49–0.93) for rows 128–143; rows 29–127 mean U 10.5 (p10/p50/p90 8/9/16); 13.1 (not 12.9) ms/step of lever classes in revision 1 |
 | 8. ADR text | §12 states the MT speculation share and the budget condition (0.96 vs ≈ 0.93) |
+| Closing P3s (conditions closed, ACCEPT) | The §5.1 at-threshold figures now span f = 0.78–0.90: lowest adoptable 0.36–0.42 s, all levers at threshold 1.19–1.52 s. §4.5 A2 now states its mechanics: threadgroups sized for the largest nsg, with idle SIMD groups reaching both barriers; per-row NWG offsets; a reduce per bucket or a padded per-row reduce. §2.4 citation corrected to BB:484-487 |
 
 ## Source identities
 
