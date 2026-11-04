@@ -181,11 +181,13 @@ links them, and it reads the GGUF once per new assembly to digest it. Whether a 
 acceptable under the "never link a model file" host rule is decision D8. The hf2q Qwen3.8 case's
 `text_only_locator` already hard-links the same file per run.
 
-Note: creating that hard link changes the GGUF's ctime. `model.json` records each linked file's path, size, mtime,
+Note: every Splash start uses a fresh per-run `models_dir` (`{OUT}/splash/models`), so every start of either family
+reads the whole GGUF once to compute its digest: 16.8 GB for Qwen3.8 and 21.7 GB for Qwen3.6. This happens before
+readiness and outside the makespan (§8 start estimate). `model.json` records each linked file's path, size, mtime,
 ctime and content digest, and the assembly directory is the sha256 of `model.json` (`install/assembly.py:61-78,
-113-129`). After every hf2q Qwen3.8 run, the next Splash start therefore re-hashes 16.8 GB (outside the makespan)
-and gets a new `.resolved/<sha>` path, `model.json` sha256 and argv. The campaign identity freezes none of those
-(§6.2). It freezes an argv template with the assembly as a per-run value, and the content digests and `model.json`
+113-129`). The assembly path, `model.json` sha256 and argv therefore differ from run to run: the run directory
+differs, and an hf2q Qwen3.8 run's hard link changes the GGUF's ctime. The campaign identity freezes none of those
+(§6.2). It freezes an argv template with the assembly as a per-run value, the content digests, and the `model.json`
 fields other than paths and times.
 
 ## 4. Same-artifact check (hf2q's GGUFs)
@@ -273,7 +275,11 @@ usage, readiness, closing audit, identity, process names) and gets a new role:
 1. Verify `SPLASH_DIR`:
    - the clean detached checkout at `SPLASH_COMMIT`;
    - `build-identity.json` `build_id == SPLASH_BUILD_ID`;
-   - `build/splash` sha256 `== SPLASH_BIN_SHA256`, with `host-step.metallib` present;
+   - `build/splash` sha256 `== SPLASH_BIN_SHA256`, `build/splash.metallib` sha256 `== SPLASH_METALLIB_SHA256` and
+     `build/host-step.metallib` sha256 `== SPLASH_HOST_STEP_SHA256` (present: awake host steps);
+   - the toolchain recorded at build time (`build-031a25a6/toolchain.txt`: Xcode 27.2 27B52, Metal 32023.922, Apple
+     clang 21.0.0, SDK 27.2, macOS 27.2 26B5112a) equals the host's current `xcodebuild -version`, `metal
+     --version`, `clang++ --version` and `sw_vers`;
    - every `install/requirements.txt` pin present in `.venv`, and the dist-info freeze sha256
      `== SPLASH_VENV_FREEZE_SHA256`.
 2. Verify the draft: `DRAFT_DIR` is the pinned HF cache snapshot, its `config.json` sha256 equals the pin, and its
@@ -295,7 +301,8 @@ usage, readiness, closing audit, identity, process names) and gets a new role:
    `SPLASH_*`, `PYTHON*`, `HF_HOME`, `HF_HUB_CACHE` or `HF_TOKEN` is inherited.
 
 What the campaign identity freezes (q3_identity, re-checked before every run):
-- the commit, `build_id`, binary sha256 and venv freeze;
+- the commit, `build_id`, the sha256s of `build/splash`, `build/splash.metallib` and `build/host-step.metallib`,
+  the build toolchain versions and the venv freeze;
 - the draft's revision and digests;
 - `MODEL_SHA256`, through the same-model rule;
 - `SPLASH_CONFIG`;
@@ -369,8 +376,8 @@ template, so a byte mismatch means a real rendering difference.
 - workload id `adr063-q5-splash-<family>-n4-coding-ctx262144`;
 - `binary {SPLASH_DIR}/build/splash`;
 - artifact `{MODEL}`/`{MODEL_SHA256}`, the **same** values as `qwen38.json`/`qwen36.json`, required non-empty;
-- variables `SPLASH_DIR`, `SPLASH_COMMIT`, `SPLASH_BUILD_ID`, `SPLASH_BIN_SHA256`, `SPLASH_VENV_FREEZE_SHA256`,
-  `DRAFT_DIR` and `SPLASH_CONFIG` (§7);
+- variables `SPLASH_DIR`, `SPLASH_COMMIT`, `SPLASH_BUILD_ID`, `SPLASH_BIN_SHA256`, `SPLASH_METALLIB_SHA256`,
+  `SPLASH_HOST_STEP_SHA256`, `SPLASH_VENV_FREEZE_SHA256`, `DRAFT_DIR` and `SPLASH_CONFIG` (§7);
 - `client.argv … --engine-kind splash`. The approval carries a `native_splash` block (the launch inputs) and the
   per-run `launch.json` sha256. The source freeze adds `native_peers.py`, `native_peer_splash.py`,
   `native_peer_splash_ready.py` and their test.
@@ -464,9 +471,10 @@ Speculation on/off cannot be swept (§1). Disclose it as "speculation always on 
 
 Basis: Q3 v11 Qwen3.8 (`$E/q3-campaign-v11/qwen38-all`) took 24 n4 runs (4 arms, warmup plus 5 blocks) in 44 min,
 **about 1.85 min per run**, and 60 n1 runs in 49 min, about 0.8 min per run. Qwen3.6 repair1 Q5 runs: peer
-makespan 36 s, hf2q 53 s, readiness 4 s. Splash startup is unmeasured. **[INFERENCE]** 0.5–1.5 min per start (17–22 GB
-read and repacked, a GGUF re-digest after a ctime change, ANE program build), so a Splash run costs
-**about 2.5 min (Qwen3.8) and 1.7 min (Qwen3.6)**.
+makespan 36 s, hf2q 53 s, readiness 4 s. Splash startup is unmeasured. **[INFERENCE]** 0.5–1.5 min per start: the
+per-run GGUF digest (16.8 GB for Qwen3.8 and 21.7 GB for Qwen3.6, every start, at roughly 2–3 GB/s about 6–11 s),
+reading and repacking 17–22 GB of weights, and for Qwen3.8 the Neural Engine program build. A Splash run therefore
+costs **about 2.5 min (Qwen3.8) and 1.7 min (Qwen3.6)**.
 
 | Item | Qwen3.8 | Qwen3.6 |
 |---|---|---|

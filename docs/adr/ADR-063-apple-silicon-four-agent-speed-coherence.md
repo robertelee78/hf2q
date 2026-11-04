@@ -1339,7 +1339,9 @@ amended by its independent review).
   waits. Qwen3.8 keeps the canonical protocol.
 - **Identity.** These are frozen with the campaign identity:
   - the commit and a clean tree;
-  - the binary sha256 and the `build_id`;
+  - the sha256s of `build/splash`, `build/splash.metallib` and
+    `build/host-step.metallib`, the `build_id` and the build toolchain
+    versions (Xcode, Metal, clang, SDK, macOS);
   - the venv freeze;
   - the drafter revision and digests;
   - the GGUF sha256, through the same-model rule;
