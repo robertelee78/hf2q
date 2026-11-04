@@ -5,6 +5,7 @@
   python3 -B q1_stage_localization.py pass-binding MAP CANDIDATE_STAGES REFERENCE_STAGES CANDIDATE_LOGITS \\
       REFERENCE_LOGITS > pass-binding.json
   python3 -B q1_stage_localization.py mapped MAP PASS_BINDING WORKLOAD_JSON > record.json
+  python3 -B q1_stage_localization.py all128-precondition ENDPOINT_TRACE WORKLOAD_JSON > precondition.json
 
 Both traces are complete stage stores written under one frozen manifest (the
 Gemma cohort localizer's All128 reference and packed route share it). For each
@@ -24,8 +25,11 @@ with the ordinary-global arm (reference) per phase (logits, verify-prefix,
 verify-committed, continuation) plus the routing-witness pairs that
 `q1_decision_policy.py routing-mapped` reads; branch P is the identity map of
 the ordinary-global arm (candidate) against the All128 stage localizer
-(reference) on prefill rows 0..127 and Logits row 127. `pass-binding` binds the
-map and the four traces of one completed pass; `mapped` localizes from them.
+(reference) on prefill rows 0..127 and Logits row 127 (the candidate's decode
+rows 128..143 are listed unmapped). `pass-binding` binds the map and the four
+traces of one completed pass; `mapped` localizes from them.
+`all128-precondition` checks branch P's precondition: the All128 endpoint
+store's row-127 Logits argmax equals frozen[128] on every lane.
 """
 import hashlib
 import json
@@ -34,7 +38,7 @@ import struct
 import sys
 from pathlib import Path
 
-from q1_decision_policy import captured_records, require, verified_payload
+from q1_decision_policy import captured_records, logit_records, read_row, require, verified_payload
 
 SCHEMA = "hf2q.q1.stage-localization.v1"
 PROMPT = 128
@@ -166,6 +170,7 @@ BINDING_SCHEMA = "hf2q.q1.localizer-pass-binding.v1"
 MAPPED_SCHEMA = "hf2q.q1.mapped-stage-localization.v1"
 T5_SCHEMA = "hf2q.q1.gemma-t5-phase.v1"
 ROUTE_CLASS = "ClassB: route-sensitive; a localized stage implies no fix"
+CLASS_B_REASON = "RouteSensitive: global-route initial decision differs from frozen at row 127"  # gemma_ngram::t5::CLASS_B
 TOKENS = 144
 VERIFY_ROWS = 132
 LAYERS = 30  # Gemma 4 hidden layers; the routing witness covers all of them
@@ -223,8 +228,8 @@ def t5_receipt(path, arm):
 
 
 def complete_decisions(doc, path):
-    require(doc["status"] == "CompleteScopedAcquisition" and doc["class_b_refusal"] is None,
-            f"{path}: receipt is not complete or carries a Class B refusal")
+    require(doc["status"] == "CompleteScopedAcquisition" and doc["error"] is None and doc["class_b_refusal"] is None,
+            f"{path}: receipt is not complete, carries an error or carries a Class B refusal")
     require([d["lane"] for d in doc["decisions"]] == LANES, f"{path}: one decision per lane 0..3 in order")
     return doc["decisions"]
 
@@ -241,26 +246,20 @@ def accepted_counts(doc, path):
     return accepted
 
 
-def frozen_plan(plan, branch, pass_):
-    """The localizer packet's `stage_localizer` Plan under the frozen two-pass rule."""
+def frozen_plan(plan, pass_):
+    """The localizer packet's `stage_localizer` Plan under the frozen two-pass rule (Rust `require_pass`; both
+    branches: the branch-P candidate is the ordinary-arm localizer, which captures decode rows too)."""
     require(isinstance(plan, dict) and set(plan) == PLAN_KEYS and type(plan["host_payload_limit"]) is int,
             "stage_localizer must carry exactly the Plan keys")
     layers, prefill, decode = plan["layers"], plan["prefill_stages"], plan["decode_stages"]
     require(layers and all(type(l) is int and 0 <= l < LAYERS for l in layers)
             and all(a < b for a, b in zip(layers, layers[1:])), "plan layers must be ascending distinct Gemma layers")
-    require(prefill == [s for s in PREFILL_STAGES if s in prefill] and len(set(prefill)) == len(prefill),
-            "prefill_stages must be distinct roles in source order")
-    require(decode == [s for s in DECODE_STAGES if s in decode] and len(set(decode)) == len(decode),
-            "decode_stages must be distinct roles in source order")
-    decode_rule = [] if branch == "P" else None
     if pass_ == 1:
-        require(layers == list(range(LAYERS)) and prefill == list(PASS1_STAGES)
-                and decode == (decode_rule if decode_rule is not None else list(PASS1_STAGES)),
+        require(layers == list(range(LAYERS)) and prefill == list(PASS1_STAGES) and decode == list(PASS1_STAGES),
                 "pass 1 plan: all 30 layers, roles {RouterLogits, RouterIds, LayerOutput}")
     else:
         require(pass_ == 2, "pass must be 1 or 2")
-        require(len(layers) <= PASS2_MAX_LAYERS and prefill == list(PREFILL_STAGES)
-                and decode == (decode_rule if decode_rule is not None else list(DECODE_STAGES)),
+        require(len(layers) <= PASS2_MAX_LAYERS and prefill == list(PREFILL_STAGES) and decode == list(DECODE_STAGES),
                 "pass 2 plan: at most 8 layers, all 14 prefill and 12 decode roles")
     return plan
 
@@ -273,10 +272,14 @@ def build_map(branch, pass_, plan, receipts, accepted):
     routing = None
     for lane in LANES:
         if branch == "P":
+            # Identity map on the ordinary-global prefill rows 0..127 and Logits row 127; the reference (All128,
+            # decode_stages []) has no decode rows, so the candidate's decode rows 128..143 are listed unmapped.
             phases["logits"].append((k("Logits", lane, PROMPT - 1, LOGIT_LAYER),) * 2)
             for layer in layers:
                 for stage in prefill:
                     phases["prefill"] += [(k(stage, lane, row, layer),) * 2 for row in range(PROMPT)]
+            unmapped["candidate"] += [k(stage, lane, position, layer) for position in range(PROMPT, TOKENS)
+                                      for layer in layers for stage in decode]
             continue
         a = accepted[lane]
         phases["logits"] += [(k("Logits", lane, row, LOGIT_LAYER),) * 2 for row in range(PROMPT, TOKENS)]
@@ -352,7 +355,7 @@ def ngram_map(ngram_path, ordinary_path, plan_path):
     packet = json.loads(Path(plan_path).read_text())
     branch, pass_ = packet["branch"], packet["pass"]
     require(branch in STAGE_PHASES and type(pass_) is int and pass_ in (1, 2), "plan branch must be N or P and pass 1 or 2")
-    plan = frozen_plan(packet["stage_localizer"], branch, pass_)
+    plan = frozen_plan(packet["stage_localizer"], pass_)
     if "t5_receipts" in packet:
         require(packet["t5_receipts"]["ngram"]["sha256"] == ngram_sha
                 and packet["t5_receipts"]["ordinary"]["sha256"] == ordinary_sha,
@@ -362,7 +365,8 @@ def ngram_map(ngram_path, ordinary_path, plan_path):
         require(plan["accepted"] == accepted, f"frozen accepted {plan['accepted']} differs from the receipt's {accepted}")
     else:
         refusal = ngram["class_b_refusal"]
-        require(plan["accepted"] is None and refusal is not None and refusal["row"] == PROMPT - 1,
+        require(plan["accepted"] is None and isinstance(refusal, dict) and refusal.get("row") == PROMPT - 1
+                and refusal.get("reason") == CLASS_B_REASON,
                 "branch P needs accepted null and the n-gram receipt's row-127 Class B refusal")
         accepted = None
     receipts = {"ngram": {"path": str(ngram_path), "sha256": ngram_sha},
@@ -472,9 +476,40 @@ def mapped(map_path, binding_path, workload_path):
     return record
 
 
+PRECONDITION_SCHEMA = "hf2q.q1.gemma-all128-precondition.v1"
+GEMMA_VOCAB = 262144
+
+
+def all128_precondition(endpoint_trace, workload_path):
+    """Branch P precondition (design §2.6, condition 7): the All128 reference endpoint store's own row-127 Logits
+    argmax equals frozen[128] of the greedy144 workload on every lane."""
+    _, trace_sha = sha256_file(endpoint_trace)
+    workload_raw, workload_sha = sha256_file(workload_path)
+    workload = json.loads(workload_raw)
+    require(workload.get("family") == "Gemma4" and workload.get("vocab_size") == GEMMA_VOCAB,
+            f"{workload_path}: not the Gemma4 greedy144 workload")
+    frozen = workload_lanes(workload_path)
+    rows = logit_records(endpoint_trace)
+    lanes = []
+    for lane in LANES:
+        entry = rows.get(("agent-%d" % lane, PROMPT - 1, LOGIT_LAYER, 0, 0))
+        require(entry is not None, f"{endpoint_trace}: no Logits row 127 on agent-{lane}")
+        path, sha256, vocab = entry
+        require(vocab == GEMMA_VOCAB, f"{endpoint_trace}: agent-{lane} row 127 is not a {GEMMA_VOCAB}-wide row")
+        _, row = read_row(path, sha256, vocab)
+        argmax = max(range(len(row)), key=row.__getitem__)  # first maximum
+        lanes.append({"lane": lane, "argmax": argmax, "frozen_128": frozen[lane][PROMPT],
+                      "equal": argmax == frozen[lane][PROMPT]})
+    return {"schema": PRECONDITION_SCHEMA,
+            "endpoint_trace": {"path": str(Path(endpoint_trace).resolve()), "sha256": trace_sha},
+            "workload": {"path": str(Path(workload_path).resolve()), "sha256": workload_sha},
+            "lanes": lanes, "holds": all(l["equal"] for l in lanes), "whole_q1_qualified": False}
+
+
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
-    commands = {"ngram-map": (ngram_map, 3), "pass-binding": (pass_binding, 5), "mapped": (mapped, 3)}
+    commands = {"ngram-map": (ngram_map, 3), "pass-binding": (pass_binding, 5), "mapped": (mapped, 3),
+                "all128-precondition": (all128_precondition, 2)}
     if args and args[0] in commands:
         fn, arity = commands[args[0]]
         require(len(args) == arity + 1, f"usage: see q1_stage_localization.py {args[0]} docstring")

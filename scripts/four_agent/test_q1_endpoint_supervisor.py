@@ -329,7 +329,8 @@ class GemmaLoc4(unittest.TestCase):
             (out / "packet.json").write_text(json.dumps(packet))
             case["execution"]["packet_sha256"] = s.sha(out / "packet.json")
             write_run(out, case["execution"], case["logits"])
-            (out / "output/stages").mkdir()
+            stage_dir = out / "output" / case["plan_case"]["stores"]["stages"]  # the declared directory, so a renamed store refuses on the check
+            stage_dir.mkdir()
             if case["witness_rows"] is not None:
                 rows = [{"kind": "routing_row", "native_boundary_valid": True, "selected_copy_valid": True, "native_decode_error": None,
                          "qualified": False, "scores_f32_bits": [0], "selected_weights_f32_bits": [0x3f800000],
@@ -337,7 +338,7 @@ class GemmaLoc4(unittest.TestCase):
                 (out / "output/routing-witness.jsonl").write_text("\n".join(json.dumps(x) for x in
                     [{"kind": "header", "identity": IDENTITY, "qualified": False}] + rows +
                     [{"kind": "end", "records": len(rows), "all_scored_rows_captured": True, "full_Q1_qualified": False}]) + "\n")
-            (out / "output/stages/trace.json").write_text(json.dumps({"identity": IDENTITY,
+            (stage_dir / "trace.json").write_text(json.dumps({"identity": IDENTITY,
                 "acquisition": {"observed_model_opens": 3, "required_model_opens": 3},
                 "coverage": {"captured": case["stages"], "expected": case["stages"], "errors": []}}))
             (out / "stdout").write_text("test result: ok.\nQ1_GEMMA_COHORT_STAGE_LOCALIZER_COMPLETE records=%d whole_q1_qualified=false\n" % case["records"])
@@ -368,10 +369,10 @@ class GemmaLoc4(unittest.TestCase):
         def named(c):
             c["packet"]["observer_effect_reference"] = "gemma-t0-b5g"; c["execution"]["observer_effect_reference"] = "gemma-t0-b5g"
         self.assertEqual(self.run_case("T0ColdSerial", lambda c: (self.plan_only(c), named(c)))["gemma_loc4"]["observer_effect_reference"], "gemma-t0-b5g")
-        for form in (lambda c: None, self.plan_only):
-            evidence = self.run_case("T0ColdSerial", lambda c: (form(c), self.drift(c)))["gemma_loc4"]
-            self.assertEqual((evidence["route"], evidence["routing_bank_asserted"], evidence["observer_effect_reference"]),
-                             ("gemma-all128-stage-drift-witness-off-v1", False, None))
+        # DriftAll128 runs only in the plan-only form: both drift sides bind the same reviewed stage manifest.
+        evidence = self.run_case("T0ColdSerial", lambda c: (self.plan_only(c), self.drift(c)))["gemma_loc4"]
+        self.assertEqual((evidence["route"], evidence["routing_bank_asserted"], evidence["observer_effect_reference"], evidence["stage_extent_source"]),
+                         ("gemma-all128-stage-drift-witness-off-v1", False, None, "BoundStageManifest"))
 
     def test_new_form_refusals(self):
         def other_manifest(c):
@@ -412,8 +413,9 @@ class GemmaLoc4(unittest.TestCase):
                                    ("T0ColdSerial", drift_route_label), ("T0ColdSerial", drift_packet_witness), ("T0ColdSerial", drift_absent_packet_witness),
                                    ("T0ColdSerial", drift_bindings_witness), ("T0ColdSerial", drift_bank_file), ("T0ColdSerial", drift_reference),
                                    ("T0ColdSerial", drift_decode), ("T0ColdSerial", drift_installed), ("T2ActualCohort", self.drift),
+                                   ("T0ColdSerial", self.drift),  # inline (legacy) stage extent is refused for drift
                                    ("T2ActualCohort", unknown_mode)):
-            with self.subTest(mutate.__name__, trajectory=trajectory), self.assertRaises((ValueError, KeyError, FileNotFoundError)):
+            with self.subTest(mutate.__name__, trajectory=trajectory), self.assertRaises(ValueError):
                 self.run_case(trajectory, mutate)
 
     def test_complete_four_lane_localizer_passes_for_both_routes(self):
@@ -461,7 +463,7 @@ class GemmaLoc4(unittest.TestCase):
             c["witness_rows"] = c["witness_rows"][:-1]
         for mutate in (drop_lane, foreign_lane, drift, route, stage_bytes, two_lane_policy, stage_policy, host,
                        marker, stores, missing_logit, ordinary_axis, no_plan, no_bindings_witness, no_packet_witness, short_bank):
-            with self.subTest(mutate.__name__), self.assertRaises((ValueError, KeyError, FileNotFoundError)):
+            with self.subTest(mutate.__name__), self.assertRaises(ValueError):
                 self.run_case(mutate=mutate)
 class ResourcePolicyRules(unittest.TestCase):
     LIMITS = {"process_rss_limit_bytes": 10, "process_footprint_limit_bytes": 20}
@@ -524,7 +526,7 @@ class MemoryRecordSummary(unittest.TestCase):
 
 
 MANIFEST = {"path": "/x/manifest.json", "sha256": "0" * 64}
-REFUSED = (ValueError, KeyError, FileNotFoundError, TypeError, IndexError)
+REFUSED = ValueError  # every negative must fail a `require`, never an incidental KeyError/TypeError
 
 
 def rec(agent, row=0, stage="CacheKey", layer=0, step=0, segment=0, nbytes=1, shape=None):
@@ -536,8 +538,8 @@ def filler(n, lanes=4, step=128):
     return [rec("agent-%d" % (i % lanes), 0, "CacheKey", i, step) for i in range(n)]
 
 
-def logit_records(rows, lanes=range(4)):
-    return [rec("agent-%d" % l, p, "Logits", s.LOGIT_LAYER) for l in lanes for p in rows]
+def logit_records(rows, lanes=range(4), layer=s.LOGIT_LAYER):
+    return [rec("agent-%d" % l, p, "Logits", layer) for l in lanes for p in rows]
 
 
 def multistore_case(check, stores, marker, line=None, **extra):
@@ -602,7 +604,7 @@ class QwenT6Continuation(unittest.TestCase):
     @staticmethod
     def build(root, mode):
         t6 = mode == "CancelledThenRecovered"; snaps = ("before", "recovered") if t6 else ("prefix64",)
-        stores = {"continuation": logit_records(range(64, 144)) + filler(1120)}
+        stores = {"continuation": logit_records(range(64, 144), layer=40) + filler(1120)}
         for n in snaps:
             stores[n] = filler(560, step=64)
         line = "Q1_QWEN_RECOVERY_CONTINUATION_COMPLETE mode=%s lanes=4 rows_per_lane=80 first64_logits=false whole_q1=false" % mode
@@ -637,6 +639,9 @@ class QwenT6Continuation(unittest.TestCase):
             c["case"]["completion_line"] = c["case"]["completion_line"].replace("rows_per_lane=80", "rows_per_lane=81"); c["stream"] = c["case"]["completion_line"] + "\n"
         def missing_logit_row(c):
             c["stores"]["continuation"][0]["at"]["logical_row_start"] = 63
+        def gemma_logit_layer(c):  # Qwen logits sit at num_hidden_layers (40), never at the Gemma u32::MAX layout
+            for x in c["stores"]["continuation"]:
+                if x["at"]["stage"] == "Logits": x["at"]["layer"] = s.LOGIT_LAYER
         def cancelled_rows(c): c["execution"]["cancelled_unpublished_rows_per_lane"] = 0 if c["packet"]["mode"] == T6[0] else 64
         def family(c): c["family"] = "qwen38"
         def stores_by_mode(c): c["packet"]["mode"] = c["execution"]["mode"] = T3[0] if c["packet"]["mode"] == T6[0] else T6[0]
@@ -647,7 +652,7 @@ class QwenT6Continuation(unittest.TestCase):
         def cancelled_prefix(c): c["execution"]["prefix_preparation"] = [{**c["execution"]["prefix_preparation"][0], "cancellation_performed": True}] * 4
         def prefix_cursor(c): c["execution"]["prefix_preparation"] = [{**c["execution"]["prefix_preparation"][0], "retained_cursor": 63}] * 4
         common = (trace_records, short_continuation, short_snapshot, planned, packet_mode, receipt_mode, schema, calls, line_twice, line_absent,
-                  line_not_verbatim, missing_logit_row, cancelled_rows, family, stores_by_mode)
+                  line_not_verbatim, missing_logit_row, gemma_logit_layer, cancelled_rows, family, stores_by_mode)
         mutated(self, self.build, (T6, T3), [(m, f) for m in (T6, T3) for f in common] +
                 [(T6, f) for f in (proof, proof_bytes, not_closed, three_owners)] + [(T3, f) for f in (cancelled_prefix, prefix_cursor)])
 
@@ -849,6 +854,13 @@ class GemmaT5(unittest.TestCase):
                 path = Path(root) / (name + "-t5.json"); path.write_text(json.dumps(value)); receipts[name] = {"path": str(path), "sha256": s.sha(path)}
             packet.update(stage_localizer=plan, branch=branch, **{"pass": 1}, t5_receipts=receipts, manifest=dict(MANIFEST))
             execution.update(branch=branch, **{"pass": 1}, plan=plan, stage_records=len(stages))
+            if branch == "P":
+                record = {"schema": s.ALL128_PRECONDITION_SCHEMA, "endpoint_trace": {"path": "/x/all128/trace.json", "sha256": "e" * 64},
+                          "workload": dict(workload), "lanes": [{"lane": l, "argmax": lanes[l][128], "frozen_128": lanes[l][128], "equal": True} for l in range(4)],
+                          "holds": True, "whole_q1_qualified": False}
+                path = Path(root) / "all128-precondition.json"; path.write_text(json.dumps(record))
+                binding = {"path": str(path), "sha256": s.sha(path)}
+                packet["all128_precondition"] = binding; execution["all128_precondition"] = dict(binding, holds=True)
         c["case"] = multistore_case(check, stores, "Q1_GEMMA_T5_LOCALIZER_COMPLETE" if check == "gemma_t5_localizer" else "Q1_GEMMA_T5_COMPLETE")
         c["files"] = [lambda out: write_witness(out, c["witness"], c["witness_mode"], c["witness_header"], c["witness_end"], c["witness_bits"])]
         c["marker"] = c["case"]["completion_marker"]
@@ -942,6 +954,26 @@ class GemmaT5(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             evidence = run_multistore(root, self.build(root, *OP))["gemma_t5_localizer"]
             self.assertEqual((evidence["branch"], evidence["ngram_class_b_refusal"]["row"], evidence["stage_records"]), ("P", 127, 576))
+            self.assertTrue(evidence["all128_precondition"]["holds"])
+        with tempfile.TemporaryDirectory() as root:
+            self.assertIsNone(run_multistore(root, self.build(root, *ON))["gemma_t5_localizer"]["all128_precondition"])
+        def rewrite_precondition(c, **change):
+            path = Path(c["packet"]["all128_precondition"]["path"]); v = json.loads(path.read_text()); v.update(change)
+            path.write_text(json.dumps(v)); sha = s.sha(path)
+            c["packet"]["all128_precondition"]["sha256"] = sha; c["execution"]["all128_precondition"]["sha256"] = sha
+            return v
+        def precondition_absent(c): del c["packet"]["all128_precondition"]
+        def precondition_sha(c): c["packet"]["all128_precondition"]["sha256"] = "0" * 64
+        def precondition_schema(c): rewrite_precondition(c, schema="hf2q.q1.other.v1")
+        def precondition_fails(c): rewrite_precondition(c, holds=False)
+        def precondition_lane(c):
+            v = json.loads(Path(c["packet"]["all128_precondition"]["path"]).read_text()); v["lanes"][2].update(argmax=v["lanes"][2]["argmax"] + 1, equal=False)
+            rewrite_precondition(c, lanes=v["lanes"])
+        def precondition_workload(c): rewrite_precondition(c, workload={"path": "/x/other-workload.json", "sha256": "f" * 64})
+        def precondition_unechoed(c): c["execution"]["all128_precondition"] = None
+        def precondition_echo_holds(c): c["execution"]["all128_precondition"]["holds"] = False
+        def precondition_on_branch_n(c): c["packet"]["all128_precondition"] = {"path": "/x/all128-precondition.json", "sha256": "0" * 64}
+        def precondition_echo_on_branch_n(c): c["execution"]["all128_precondition"] = {"path": "/x/p.json", "sha256": "0" * 64, "holds": True}
         def plan_echo(c): c["execution"]["plan"] = {**c["execution"]["plan"], "layers": [1]}
         def branch_echo(c): c["execution"]["branch"] = "P" if c["packet"]["branch"] == "N" else "N"
         def pass_echo(c): c["execution"]["pass"] = 2
@@ -969,8 +1001,10 @@ class GemmaT5(unittest.TestCase):
                                   stage_layer, stage_role, stage_step, stage_segment, missing_stage_row, stage_bytes, phase_schema)
         def ngram_branch_p(c):  # branch P runs the ordinary-global arm only
             c["packet"]["branch"] = c["execution"]["branch"] = "P"
-        negatives = [(m, f) for m in (ON, NN, OP) for f in common] + [(m, f) for m in (ON, NN) for f in (accepted_mismatch, accepted_null, ngram_branch_p)] + \
-                    [(OP, f) for f in (accepted_present, no_row127)]
+        negatives = [(m, f) for m in (ON, NN, OP) for f in common] + \
+                    [(m, f) for m in (ON, NN) for f in (accepted_mismatch, accepted_null, ngram_branch_p, precondition_on_branch_n, precondition_echo_on_branch_n)] + \
+                    [(OP, f) for f in (accepted_present, no_row127, precondition_absent, precondition_sha, precondition_schema, precondition_fails,
+                                       precondition_lane, precondition_workload, precondition_unechoed, precondition_echo_holds)]
         mutated(self, self.build, (ON, NN, OP), negatives)
 
 

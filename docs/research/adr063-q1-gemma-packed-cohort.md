@@ -103,10 +103,17 @@ forms the stage list must equal the source `manifest()`.
 
 `DriftAll128` mode (#665 §2.6, build-drift localization): All128 only,
 witness-OFF (packet `routing_witness` null, witness never installed), prefill
-only (`decode_stages: []`), `observer_effect_reference` null, own route
+only (`decode_stages: []`), plan-only form required (bound `stage_manifest`),
+`observer_effect_reference` null, own route
 `gemma-all128-stage-drift-witness-off-v1` and so its own composition key. Only
 this mode skips the published-witness native check; the identity native must
-still be the build's own `Cargo.toml` pin.
+still be the build's own `Cargo.toml` pin. Every witness reference of
+`gemma_actual`, the cohort localizer and the prepare goes through the
+witness-ON adapter `gemma_actual/routing.rs`, which only endpoint and `Cohort`
+packets reach. The `540a4708` diagnostic backport keeps the other files
+unchanged and replaces that adapter with a witness-free one of the same API
+(non-null budget and published-native checks refuse, charge 0, install
+`None`, hooks no-ops), so only `DriftAll128` runs there.
 
 Observer-effect control: `exact` of each localizer endpoint store against its
 `observer_effect_reference` store must be `ExactEqual` (DriftAll128 instead

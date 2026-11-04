@@ -274,8 +274,7 @@ fn cohort_localizer_prep_emits_two_admissible_multistore_packets() {
         assert_eq!(frozen,stages);
         let endpoint:Vec<ExpectedTensor>=serde_json::from_value(packet["expected_stores"]["endpoint"].clone()).unwrap();
         assert_eq!(endpoint,gemma_actual::endpoint_expected(&cfg(),serde_json::from_value(packet["trajectory"].clone()).unwrap()).unwrap());
-        let charge=super::super::gemma_routing_witness::PAYLOAD_BYTES+super::super::gemma_routing_witness::METADATA_BYTES
-            +super::super::gemma_routing_witness::CPU_LEDGER_BYTES;
+        let charge=gemma_actual::routing::CHARGE;
         assert_eq!(packet["host_payload_limit"],788765696+charge+stage_bytes);
         // Both routes share one separate composition key.
         let key=packet["identity"]["config_sha256"].clone();assert_eq!(*config.get_or_insert(key.clone()),key);
@@ -406,9 +405,53 @@ fn cohort_localizer_drift_export_is_witness_off_all128_with_its_own_key() {
     let (p,path)=plan_only_admitted(&files[1].1,&files[2].1,"drift");
     assert_eq!(gemma_actual::localizer_extent(&p,&endpoint).unwrap(),stages);
     std::fs::remove_file(&path).unwrap();
-    // Prefill-only and reference-free.
+    // Prefill-only, reference-free and plan-only.
     let mut decode=block.clone();decode["decode_stages"]=serde_json::json!(["Norm"]);
     assert!(cohort_export(decode).is_err());
-    let mut named=block;named["observer_effect_reference"]=serde_json::json!("gemma-t0-b5g");
+    let mut named=block.clone();named["observer_effect_reference"]=serde_json::json!("gemma-t0-b5g");
     assert!(cohort_export(named).is_err());
+    for form in [serde_json::json!("Inline"),serde_json::Value::Null] {
+        let mut inline=block.clone();
+        if form.is_null() {inline.as_object_mut().unwrap().remove("packet_form");} else {inline["packet_form"]=form;}
+        assert!(cohort_export(inline).is_err());
+    }
+}
+#[test]
+fn cohort_localizer_plan_only_worst_case_pass2_fits_packet_and_manifest_bounds() {
+    use super::super::{gemma_actual,gemma_cohort_localizer as cohort,gemma_localizer::PREFILL_STAGES,protocol::Trajectory};
+    // Branch-P / drift pass-2 worst case: the union {L*-1, L*} over four lanes,
+    // eight layers of which four are global, every prefill role.
+    let layers=[4u32,5,10,11,16,17,22,23];
+    assert_eq!(layers.iter().filter(|&&l|cfg().is_full_attention(l as usize)).count(),4);
+    let endpoint=gemma_actual::endpoint_expected(&cfg(),Trajectory::T0ColdSerial).unwrap();
+    for (mode,decode,records) in [
+        ("DriftAll128",serde_json::json!([]),8usize*14*4*128),
+        ("Cohort",serde_json::json!(cohort::DECODE_STAGES),8usize*14*4*128+16*8*12*4)] {
+        let mut block=serde_json::json!({"layers":layers,"prefill_stages":PREFILL_STAGES,"decode_stages":decode,
+            "mode":mode,"packet_form":"PlanOnly"});
+        if mode=="Cohort" {
+            block["observer_effect_reference"]=serde_json::json!("gemma-t0-b5g");
+            block["packed_observer_effect_reference"]=serde_json::json!("gemma-t2-b3");
+        }
+        let files=cohort_export(block).unwrap();
+        let prepared:serde_json::Value=serde_json::from_slice(&files[0].1).unwrap();
+        assert_eq!(prepared["stage_records"],records);
+        assert!(records<=65536);
+        for route in prepared["routes"].as_array().unwrap() {
+            assert!(route["host_payload_limit"].as_u64().unwrap()<=2*1024*1024*1024);
+            assert!(route["stage_planned_payload"].as_u64().unwrap()<=cohort::STAGE_PAYLOAD_CAP);
+        }
+        for pair in files[1..].chunks(2) {
+            let ((packet_name,packet),(manifest_name,manifest))=(&pair[0],&pair[1]);
+            assert!(packet_name.starts_with("cohort-localizer-packet-") && manifest_name.starts_with("cohort-localizer-manifest-"));
+            // Packet <= 1 MiB with the supervisor-fill margin; manifest <= 64 MiB.
+            assert!(packet.len()+65536<=1024*1024,"{mode} {packet_name}: {} bytes",packet.len());
+            assert!(manifest.len() as u64<=cohort::MANIFEST_FILE_BYTES,"{mode} {manifest_name}: {} bytes",manifest.len());
+        }
+        // The worst-case All128 plan-only packet is admitted and binds the source extent.
+        let (p,path)=plan_only_admitted(&files[1].1,&files[2].1,&format!("worst-{mode}"));
+        let frozen=gemma_actual::localizer_extent(&p,&endpoint).unwrap();
+        assert_eq!(frozen.len(),records);
+        std::fs::remove_file(&path).unwrap();
+    }
 }

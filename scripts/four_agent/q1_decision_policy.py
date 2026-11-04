@@ -331,6 +331,12 @@ KEY_MAP_SCHEMA = "hf2q.q1.key-map.v1"
 ROUTING_PHASES = {"verify-prefix": "T5Verify", "verify-committed": "T5Verify", "continuation": "T5Continuation"}
 
 
+def routing_span(phase, a):
+    """Absolute positions of one routing phase on a lane with accepted count a (design §2.5)."""
+    return {"verify-prefix": range(128), "verify-committed": range(128, 129 + a),
+            "continuation": range(129 + a, 144)}[phase]
+
+
 def routing_key(item):
     require(isinstance(item, list) and len(item) == 4 and isinstance(item[0], str)
             and all(type(v) is int for v in item[1:]), f"malformed routing key {item!r}")
@@ -342,8 +348,10 @@ def routing_mapped(left_path, right_path, map_path):
     raw = Path(map_path).read_bytes()
     key_map = json.loads(raw)
     require(key_map.get("schema") == KEY_MAP_SCHEMA, f"{map_path}: unexpected key-map schema")
-    section = key_map.get("routing")
+    section, accepted = key_map.get("routing"), key_map.get("accepted")
     require(isinstance(section, dict), f"{map_path}: key map carries no routing pairs")
+    require(isinstance(accepted, list) and len(accepted) == 4 and all(type(a) is int and a in (0, 1, 2) for a in accepted),
+            f"{map_path}: routing pairs need the per-lane accepted counts a in {{0,1,2}}")
     left, right = routing_witnesses(left_path, right_path)
     seen_left, seen_right, phases = set(), set(), {}
     for phase in section["phases"]:
@@ -353,6 +361,9 @@ def routing_mapped(left_path, right_path, map_path):
         for lkey, rkey in pairs:
             require(lkey[0] == ROUTING_PHASES[name] and rkey[0] == "Canonical",
                     f"{name} pair {lkey}->{rkey} outside its namespaces")
+            require(lkey[1:] == rkey[1:], f"{name} pair {lkey}->{rkey} joins a different lane/position/layer")
+            require(0 <= lkey[1] < 4 and lkey[2] in routing_span(name, accepted[lkey[1]]),
+                    f"{name} pair {lkey}->{rkey} outside the phase's position span")
             require(lkey not in seen_left and rkey not in seen_right, f"routing key mapped twice: {lkey}->{rkey}")
             seen_left.add(lkey); seen_right.add(rkey)
             require(lkey in left and rkey in right, f"mapped routing pair {lkey}->{rkey} not captured")

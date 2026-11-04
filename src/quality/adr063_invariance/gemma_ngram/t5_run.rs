@@ -28,6 +28,8 @@ pub(in super::super) struct T5Packet {
     #[serde(default)] pass:Option<u8>,
     #[serde(default)] t5_receipts:Option<Receipts>,
     #[serde(default)] manifest:Option<FileBinding>,
+    /// Branch P only: the reviewed All128 row-127 precondition record.
+    #[serde(default)] all128_precondition:Option<FileBinding>,
 }
 /// The supervisor manifest-form extent (exactly these keys).
 #[derive(Serialize,Deserialize)]#[serde(deny_unknown_fields)]
@@ -39,14 +41,15 @@ pub(in super::super) struct Extra {
     pub(in super::super) arm:Arm,pub(in super::super) lanes:Vec<usize>,pub(in super::super) host_payload_limit:u64,
     pub(in super::super) stage_localizer:Option<localizer::Plan>,pub(in super::super) branch:Option<Branch>,
     pub(in super::super) pass:Option<u8>,pub(in super::super) t5_receipts:Option<Receipts>,pub(in super::super) manifest:Option<FileBinding>,
+    pub(in super::super) all128_precondition:Option<FileBinding>,
 }
 fn split(p:T5Packet)->(Packet,Extra) {
     let T5Packet {execution_approved,identity,acquisition,model,output,greedy_workload,independent_dataset_review,
         configured_context,configured_output_allowance,logical_serial_owners,proposal_origin,ngram_k,ngram_min,ngram_max,
-        payload_limit,metadata_limit,routing_witness,arm,lanes,host_payload_limit,stage_localizer,branch,pass,t5_receipts,manifest}=p;
+        payload_limit,metadata_limit,routing_witness,arm,lanes,host_payload_limit,stage_localizer,branch,pass,t5_receipts,manifest,all128_precondition}=p;
     (Packet {execution_approved,identity,acquisition,model,output,greedy_workload,independent_dataset_review,configured_context,
         configured_output_allowance,logical_serial_owners,proposal_origin,ngram_k,ngram_min,ngram_max,payload_limit,metadata_limit,routing_witness},
-     Extra {arm,lanes,host_payload_limit,stage_localizer,branch,pass,t5_receipts,manifest})
+     Extra {arm,lanes,host_payload_limit,stage_localizer,branch,pass,t5_receipts,manifest,all128_precondition})
 }
 /// The T5 keys of a parsed packet (hosted pairing controls).
 pub(in super::super) fn extra_of(p:T5Packet)->Extra {split(p).1}
@@ -56,6 +59,8 @@ pub(in super::super) fn pairing(x:&Extra,localizer:bool)->Result<()> {
     ensure!(x.stage_localizer.is_some()==localizer && x.branch.is_some()==localizer && x.pass.is_some()==localizer &&
         x.t5_receipts.is_some()==localizer && x.manifest.is_some()==localizer,
         "stage_localizer packets run only under the localizer filter, and only they bind T5 receipts and a manifest");
+    ensure!(x.all128_precondition.is_some()==(x.branch==Some(Branch::P)),
+        "the All128 precondition record is bound exactly by branch P packets");
     let (Some(plan),Some(branch),Some(pass))=(&x.stage_localizer,x.branch,x.pass) else {return Ok(())};
     localizer::require_pass(plan,pass).map_err(anyhow::Error::msg)?;
     plan.accepted().map_err(anyhow::Error::msg)?;
@@ -82,6 +87,19 @@ pub(in super::super) fn check_receipts(ord:&Value,ng:&Value,branch:Branch,accept
         Branch::P=>ensure!(accepted.is_none() && ng["class_b_refusal"]["row"]==127 && ng["class_b_refusal"]["reason"]==t5::CLASS_B,
             "branch P needs the T5 n-gram row-127 initial-decision refusal"),
     }
+    Ok(())
+}
+pub(in super::super) const PRECONDITION_SCHEMA:&str="hf2q.q1.gemma-all128-precondition.v1";
+/// Branch P precondition (design §2.6, condition 7): the All128 reference's
+/// own row-127 argmax equals frozen[128] on the same workload. When it does
+/// not hold, branch P is not run; the record becomes a build-drift localization.
+pub(in super::super) fn check_precondition(v:&Value,greedy_workload_sha256:&str,frozen_128:[u32;4])->Result<()> {
+    ensure!(v["schema"]==PRECONDITION_SCHEMA && v["workload"]["sha256"]==greedy_workload_sha256 && v["whole_q1_qualified"]==false,
+        "bound All128 precondition record of this greedy workload");
+    ensure!(v["holds"]==true,"All128 precondition does not hold: branch P is not run (DriftAll128 build-drift localization instead)");
+    let lanes=v["lanes"].as_array().context("precondition lanes")?;
+    ensure!(lanes.len()==4 && lanes.iter().enumerate().all(|(l,r)|r["lane"]==l && r["frozen_128"]==frozen_128[l] &&
+        r["argmax"]==frozen_128[l] && r["equal"]==true),"All128 row-127 argmax equals frozen[128] on every lane");
     Ok(())
 }
 /// Admission: the packet extent equals the bound manifest, whose T5 stores
@@ -122,6 +140,12 @@ pub(super) fn run(localizer:bool)->Result<()> {
         let ng:Value=serde_json::from_slice(&acquisition::checked_file(&r.ngram,2*1024*1024)?)?;
         check_receipts(&ord,&ng,branch,frozen_accepted)?;
     }
+    let precondition=match &x.all128_precondition {
+        Some(b)=>{let frozen:[u32;4]=std::array::from_fn(|l|workload.lanes[l][128]);
+            check_precondition(&serde_json::from_slice(&acquisition::checked_file(b,1024*1024)?)?,&p.greedy_workload.sha256,frozen)?;
+            Some(json!({"path":b.path,"sha256":b.sha256,"holds":true}))}
+        None=>None,
+    };
     let acquisition=acquisition::Scope::begin(&p.acquisition,&p.identity,&workload,&p.model,&p.output,&raw)?;
     let header=acquisition::open_model(&p.model)?;ensure!(header.metadata_string("general.architecture")==Some("gemma4"),"explicit Gemma");
     let mut cfg=crate::serve::config::Gemma4Config::from_gguf(&header)?;cfg.max_position_embeddings=262144;
@@ -151,31 +175,40 @@ pub(super) fn run(localizer:bool)->Result<()> {
         "greedy_workload":p.greedy_workload.sha256,"dataset_review":p.independent_dataset_review.sha256,
         "configured_context":262144,"configured_output_allowance":8192,"serial_owner_epochs":4,"journal_scope":"events only; tensors in the T5 stores",
         "not_mounted_slots":true,"physical_batch4_claim":false,"host_payload_limit":host}))?;
-    let mut made=Vec::new();
-    for (name,expected) in stores {
-        let (n,bytes,root)=(expected.len(),t5::payload(&expected).map_err(anyhow::Error::msg)?,p.output.join(name));
-        let mut s=Store::new(&root,p.identity.clone(),t5::trajectory(x.arm,name),expected,bytes,n).map_err(anyhow::Error::msg)?;
-        s.bind_acquisition(acquisition::Acquisition {output_root:root,..observed.clone()}).map_err(anyhow::Error::msg)?;made.push(s);
-    }
-    let raw_store=(x.arm==Arm::NgramTransaction).then(||made.pop()).flatten();
-    let committed=made.pop().context("committed store")?;let prefork=made.pop().context("prefork store")?;
-    scope.set_t5(t5::State {arm:x.arm,vocab:cfg.vocab_size,prefork,committed,raw:raw_store,lanes:Vec::new(),verifier:Vec::new(),
-        frozen_accepted,pause:None,class_b:None,localizer})?;
-    let mode=match x.arm {Arm::OrdinaryGlobal=>witness::Mode::Ordinary,Arm::NgramTransaction=>witness::Mode::Transaction};
-    let _routing=witness::install(m.ctx.executor.device(),&p.output,&p.identity,&observed,mode,p.routing_witness.as_ref())?;
-    let _stages=match (&x.stage_localizer,stage) {
-        (Some(plan),Some((targets,_,frozen)))=>{
+    // From the first store on, every error is a failure receipt: each created
+    // store is failed and finished and execution.json is written before the
+    // error returns. Stores live in exactly one of these holders at any time.
+    let mut loose:Vec<(&'static str,Store)>=Vec::new();
+    let mut held:Option<t5::State>=None;
+    let mut stage_loose:Option<Store>=None;
+    let mut stage_scope:Option<family::Scope>=None;
+    let mut routing_scope:Option<witness::Scope>=None;
+    let result=(||->Result<()> {
+        for (name,expected) in stores {
+            let (n,bytes,root)=(expected.len(),t5::payload(&expected).map_err(anyhow::Error::msg)?,p.output.join(name));
+            let mut s=Store::new(&root,p.identity.clone(),t5::trajectory(x.arm,name),expected,bytes,n).map_err(anyhow::Error::msg)?;
+            let bound=s.bind_acquisition(acquisition::Acquisition {output_root:root,..observed.clone()});
+            loose.push((name,s));bound.map_err(anyhow::Error::msg)?;
+        }
+        ensure!(loose.len()==if x.arm==Arm::NgramTransaction {3}else{2},"T5 store set");
+        let mut made=std::mem::take(&mut loose).into_iter().map(|(_,s)|s);
+        let (Some(prefork),Some(committed))=(made.next(),made.next()) else {anyhow::bail!("T5 store set")};
+        if let Err((state,e))=scope.set_t5(t5::State {arm:x.arm,vocab:cfg.vocab_size,prefork,committed,raw:made.next(),lanes:Vec::new(),
+            verifier:Vec::new(),frozen_accepted,pause:None,class_b:None,localizer}) {held=Some(*state);return Err(e);}
+        let mode=match x.arm {Arm::OrdinaryGlobal=>witness::Mode::Ordinary,Arm::NgramTransaction=>witness::Mode::Transaction};
+        routing_scope=witness::install(m.ctx.executor.device(),&p.output,&p.identity,&observed,mode,p.routing_witness.as_ref())?;
+        if let (Some(plan),Some((targets,_,frozen)))=(&x.stage_localizer,stage) {
             let root=p.output.join(t5::STAGES);let n=frozen.len();
             let mut s=Store::new(&root,p.identity.clone(),plan.rerun_id.clone(),frozen,plan.host_payload_limit,n).map_err(anyhow::Error::msg)?;
-            s.bind_acquisition(acquisition::Acquisition {output_root:root,..observed.clone()}).map_err(anyhow::Error::msg)?;
             if plan.prefill_stages.iter().chain(&plan.decode_stages).any(|s|matches!(s,Stage::RouterLogits|Stage::RouterIds|Stage::RouterWeights)) {
                 s.missing_capability("Gemma actual native post-softmax/renormalized selection kth+1 GPU score is not a captured stage output; the routing witness carries the selection-domain margins");
             }
-            Some(family::install(Family::Gemma4,s,targets).map_err(anyhow::Error::msg)?)
+            if let Err(e)=s.bind_acquisition(acquisition::Acquisition {output_root:root,..observed.clone()}) {stage_loose=Some(s);anyhow::bail!(e);}
+            match family::install_or_return(Family::Gemma4,s,targets) {
+                Ok(installed)=>stage_scope=Some(installed),
+                Err((e,s))=>{stage_loose=Some(*s);anyhow::bail!(e);}
+            }
         }
-        _=>None,
-    };
-    let result=(||->Result<()> {
         for lane in 0..4 {
             // Checked prior owner already returned. Clear global active banks, no physical-refund claim.
             m.weights.hybrid_kv=None;m.weights.dense_kvs=None;m.weights.leg_hb_encoded=None;
@@ -211,17 +244,28 @@ pub(super) fn run(localizer:bool)->Result<()> {
             t5_lane_end(&m.weights,lane)?;
         }Ok(())
     })();
+    // Run, acquisition and routing-witness failures all mark every store failed.
     let failure=result.as_ref().err().map(|e|format!("{e:#}"));
     let unchanged=acquisition.check_unchanged();
-    let mut state=scope.take_t5()?;drop(state.pause.take());
-    let stage_trace=if localizer {
-        if let Some(e)=&failure {family::fail(e.clone());}
-        Some(family::finish().map_err(anyhow::Error::msg))
-    } else {None};
+    let witness_end=if failure.is_none() {witness::finish().err().map(|e|format!("routing witness: {e:#}"))} else {None};
+    let abort=failure.clone().or(unchanged.as_ref().err().map(|e|format!("{e:#}"))).or(witness_end);
+    let mut state=scope.take_t5().ok().or(held);
+    if let Some(s)=state.as_mut() {drop(s.pause.take());}
+    let stage_trace=match (stage_scope.is_some(),stage_loose) {
+        (true,_)=>{if let Some(e)=&abort {family::fail(e.clone());}Some(family::finish())}
+        (false,Some(mut s))=>{if let Some(e)=&abort {s.fail(e.clone());}Some(s.finish())}
+        (false,None)=>None,
+    };
+    let (decisions,class_b,made)=match state {
+        Some(t5::State {prefork,committed,raw,lanes,class_b,..})=>{
+            let mut v=vec![(t5::PREFORK,prefork),(t5::COMMITTED,committed)];
+            if let Some(r)=raw {v.push((t5::RAW,r));}(lanes,class_b,v)
+        }
+        None=>(Vec::new(),None,loose),
+    };
     let mut counts=serde_json::Map::new();let mut incomplete=Vec::new();
-    for (name,store) in [(t5::PREFORK,Some(state.prefork)),(t5::COMMITTED,Some(state.committed)),(t5::RAW,state.raw)] {
-        let Some(mut store)=store else {continue};
-        if let Some(e)=&failure {store.fail(e.clone());}
+    for (name,mut store) in made {
+        if let Some(e)=&abort {store.fail(e.clone());}
         match store.finish() {
             Ok(trace)=>{counts.insert(name.into(),json!(trace.coverage.captured.len()));
                 if !trace.coverage.errors.is_empty() {incomplete.push(format!("{name}: {:?}",trace.coverage.errors));}}
@@ -235,17 +279,17 @@ pub(super) fn run(localizer:bool)->Result<()> {
         Some(Err(e))=>incomplete.push(format!("{}: {e}",t5::STAGES)),
         None=>{}
     }
-    let witness_end=if failure.is_none() {witness::finish().map_err(|e|format!("routing witness: {e:#}")).err()} else {None};
-    let error=failure.clone().or(unchanged.as_ref().err().map(|e|format!("{e:#}"))).or(witness_end)
-        .or((!incomplete.is_empty()).then(||format!("incomplete stores: {}",incomplete.join("; "))));
+    drop((stage_scope,routing_scope));
+    let error=abort.or((!incomplete.is_empty()).then(||format!("incomplete stores: {}",incomplete.join("; "))));
     let status=if error.is_none() {"CompleteScopedAcquisition"}else{"FailedOrIncomplete"};
-    let _=with(|a|a.journal.event("execution_result",json!({"failure":error,"class_b_refusal":state.class_b,"whole_q1_qualified":false})));
+    let _=with(|a|a.journal.event("execution_result",json!({"failure":error,"class_b_refusal":class_b,"whole_q1_qualified":false})));
     let records=counts.values().filter_map(Value::as_u64).sum::<u64>()+stage_records as u64;
     let mut report=json!({"schema":if localizer {t5::LOCALIZER_SCHEMA}else{t5::SCHEMA},"packet_sha256":hash(&raw),"arm":x.arm,
-        "status":status,"error":error,"lanes":[0,1,2,3],"decisions":state.lanes,"class_b_refusal":state.class_b,"stores":counts,
+        "status":status,"error":error,"lanes":[0,1,2,3],"decisions":decisions,"class_b_refusal":class_b,"stores":counts,
         "routing_witness":"routing-witness.jsonl","whole_q1_qualified":false});
     if localizer {
-        let extra=json!({"branch":x.branch,"pass":x.pass,"plan":x.stage_localizer,"stage_records":stage_records});
+        let extra=json!({"branch":x.branch,"pass":x.pass,"plan":x.stage_localizer,"stage_records":stage_records,
+            "all128_precondition":precondition});
         report.as_object_mut().context("report object")?.extend(extra.as_object().context("localizer receipt")?.clone());
     }
     OpenOptions::new().create_new(true).write(true).mode(0o600).open(p.output.join("execution.json"))?

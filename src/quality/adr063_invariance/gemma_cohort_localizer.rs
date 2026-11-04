@@ -73,7 +73,9 @@ pub(super) const MANIFEST_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub(super) const DRIFT_ROUTE: &str = "gemma-all128-stage-drift-witness-off-v1";
 /// Localizer mode. `Cohort`: the witness-ON All128/packed pair. `DriftAll128`:
 /// witness-OFF All128 prefill-only build-drift localizer; routing comes from
-/// the production dispatch, and the mode itself needs no witness module.
+/// the production dispatch. This module names no witness item; the Cohort
+/// witness checks live in `gemma_actual::routing` (the adapter the `540a4708`
+/// backport replaces), so drift's code is witness-free.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Mode {
     #[default]
@@ -87,16 +89,14 @@ impl Mode {
             Mode::DriftAll128 => DRIFT_ROUTE,
         }
     }
-    /// Cohort needs the published routing-witness native; DriftAll128 only the
-    /// build's own `Cargo.toml` pin (`build`).
+    /// Every mode: the identity native must be the build's own `Cargo.toml`
+    /// pin (`build`). Cohort additionally requires the published witness
+    /// native (`gemma_actual::routing::require_published`); DriftAll128 does not.
     pub(super) fn admit_native(self, native: &str, build: &str) -> Result<(), String> {
-        match self {
-            Mode::Cohort if native != super::gemma_routing_witness::WITNESS_NATIVE_VERSION || native != build => {
-                Err("cohort localizer requires the exact published routing-witness native build".into())
-            }
-            Mode::DriftAll128 if native != build => Err("DriftAll128 identity native must be the build's own Cargo.toml pin".into()),
-            _ => Ok(()),
+        if native != build {
+            return Err(format!("{self:?} localizer identity native {native} must be the build's own Cargo.toml pin {build}"));
         }
+        Ok(())
     }
 }
 /// The ordinary endpoint recipe under the mode's own route label: both cohort
@@ -363,11 +363,13 @@ mod controls {
         assert!(Mode::DriftAll128.admit_native(build, build).is_ok());
         assert!(Mode::DriftAll128.admit_native("0.15.9", "0.15.9").is_ok());
         assert!(Mode::DriftAll128.admit_native("0.15.9", "0.15.16").is_err());
-        // Cohort keeps the exact published witness native.
-        let witness = super::super::gemma_routing_witness::WITNESS_NATIVE_VERSION;
-        assert!(Mode::Cohort.admit_native(witness, witness).is_ok());
-        assert!(Mode::Cohort.admit_native("0.15.9", "0.15.9").is_err());
-        assert!(Mode::Cohort.admit_native(witness, "0.15.9").is_err());
+        // Cohort also needs the build pin; its published-witness native check
+        // is the witness-ON adapter's, which drift never calls.
+        assert!(Mode::Cohort.admit_native(build, build).is_ok());
+        assert!(Mode::Cohort.admit_native("0.15.9", "0.15.16").is_err());
+        use super::super::gemma_actual::routing::require_published;
+        assert!(require_published("0.15.16").is_ok());
+        assert!(require_published("0.15.9").is_err());
     }
     #[test]
     fn q1_gemma_owned_rows_refuse_fixed_lane_targets_and_relabelling() {

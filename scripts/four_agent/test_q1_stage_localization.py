@@ -1,4 +1,5 @@
 """Host-only controls for the Q1 stage localization record; synthetic stores only."""
+import array
 import hashlib
 import json
 import struct
@@ -133,11 +134,12 @@ def t5_receipt(arm, accepted=None, refusal=None):
             "whole_q1_qualified": False}
 
 
-def plan(pass_, branch="N", accepted=None, layers=None):
+def plan(pass_, accepted=None, layers=None, arm="NgramTransaction"):
+    """The `stage_localizer` block exactly as `gemma_ngram::export::plan` emits it (Rust `require_pass` shape)."""
     full = pass_ == 2
-    return {"rerun_id": "r", "layers": layers or (list(range(30)) if pass_ == 1 else [3, 4]),
+    return {"rerun_id": "loc-%s-p%d" % (arm, pass_), "layers": layers or (list(range(30)) if pass_ == 1 else [3, 4]),
             "prefill_stages": list(loc.PREFILL_STAGES if full else loc.PASS1_STAGES),
-            "decode_stages": [] if branch == "P" else list(loc.DECODE_STAGES if full else loc.PASS1_STAGES),
+            "decode_stages": list(loc.DECODE_STAGES if full else loc.PASS1_STAGES),
             "host_payload_limit": 1 << 30, "accepted": accepted}
 
 
@@ -152,13 +154,14 @@ class KeyMap(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def make(self, pass_, accepted, branch="N", plan_accepted="same", refusal=None):
+    def make(self, pass_, accepted, branch="N", plan_accepted="same", refusal=None, ordinary_error=None):
         ngram, ordinary, packet = self.root / "ngram.json", self.root / "ordinary.json", self.root / "plan.json"
         ngram.write_text(json.dumps(t5_receipt("NgramTransaction", accepted, refusal)))
-        ordinary.write_text(json.dumps(t5_receipt("OrdinaryGlobal")))
+        ordinary.write_text(json.dumps({**t5_receipt("OrdinaryGlobal"), "error": ordinary_error}))
         frozen = accepted if plan_accepted == "same" else plan_accepted
+        arm = "OrdinaryGlobal" if branch == "P" else "NgramTransaction"
         packet.write_text(json.dumps({"branch": branch, "pass": pass_,
-                                      "stage_localizer": plan(pass_, branch, frozen)}))
+                                      "stage_localizer": plan(pass_, frozen, arm=arm)}))
         return loc.ngram_map(ngram, ordinary, packet)
 
     def test_map_is_one_to_one_per_phase_and_complete_for_each_a(self):
@@ -221,16 +224,48 @@ class KeyMap(unittest.TestCase):
             self.make(1, [3] * 4)  # a outside {0,1,2}
         with self.assertRaises(ValueError):
             self.make(1, [1] * 4, branch="P")  # branch P needs accepted null and the row-127 refusal
+        with self.assertRaises(ValueError):
+            self.make(1, [1] * 4, branch="P", plan_accepted=None, refusal={**REFUSAL, "reason": "RouteSensitive"})
+        with self.assertRaises(ValueError):
+            self.make(1, [1] * 4, branch="P", plan_accepted=None, refusal={**REFUSAL, "row": 128})
+        with self.assertRaises(ValueError):
+            self.make(1, [1] * 4, ordinary_error="lane 2: forward_decode failed")  # complete status with an error
+        with self.assertRaises(ValueError):
+            self.make(1, [1] * 4, branch="P", plan_accepted=None, refusal=REFUSAL, ordinary_error="x")
 
-    def test_branch_p_identity_map(self):
-        doc = self.make(1, [1] * 4, branch="P", plan_accepted=None, refusal=REFUSAL)
-        phases, unmapped = loc.validated_map(doc)
-        self.assertEqual(sorted(phases), ["logits", "prefill"])
-        self.assertTrue(all(c == r for pairs in phases.values() for c, r in pairs))
-        self.assertEqual({c[2] for c, _ in phases["logits"]}, {127})
-        self.assertEqual({c[2] for c, _ in phases["prefill"]}, set(range(128)))
-        self.assertEqual(len(phases["prefill"]), 4 * 30 * 3 * 128)
-        self.assertEqual((unmapped, doc["routing"], doc["accepted"]), ({"candidate": [], "reference": []}, None, None))
+    def test_branch_p_identity_map_on_the_rust_pass_shapes(self):
+        for pass_, decode in ((1, loc.PASS1_STAGES), (2, loc.DECODE_STAGES)):
+            doc = self.make(pass_, [1] * 4, branch="P", plan_accepted=None, refusal=REFUSAL)
+            self.assertEqual(doc["plan"]["decode_stages"], list(decode))
+            phases, unmapped = loc.validated_map(doc)
+            self.assertEqual(sorted(phases), ["logits", "prefill"])
+            self.assertTrue(all(c == r for pairs in phases.values() for c, r in pairs))
+            self.assertEqual({c[2] for c, _ in phases["logits"]}, {127})
+            layers = doc["plan"]["layers"]
+            prefill = doc["plan"]["prefill_stages"]
+            self.assertEqual(set(phases["prefill"]), {(loc.k(s, lane, r, l),) * 2 for lane in range(4) for l in layers
+                                                      for s in prefill for r in range(128)})
+            # The ordinary arm's decode rows 128..143 (all decode roles) have no All128 counterpart.
+            self.assertEqual(set(unmapped["candidate"]), {loc.k(s, lane, r, l) for lane in range(4) for l in layers
+                                                          for s in decode for r in range(128, 144)})
+            self.assertEqual((unmapped["reference"], doc["routing"], doc["accepted"]), ([], None, None))
+
+    def test_rust_pass2_plan_with_explicit_layers(self):
+        ngram, ordinary, packet = self.root / "ngram.json", self.root / "ordinary.json", self.root / "plan.json"
+        ngram.write_text(json.dumps(t5_receipt("NgramTransaction", refusal=REFUSAL)))
+        ordinary.write_text(json.dumps(t5_receipt("OrdinaryGlobal")))
+        for layers, ok in (([11, 12], True), (list(range(9)), False), ([12, 11], False)):
+            packet.write_text(json.dumps({"branch": "P", "pass": 2, "stage_localizer": plan(2, None, layers, "OrdinaryGlobal")}))
+            if ok:
+                self.assertEqual(loc.ngram_map(ngram, ordinary, packet)["plan"]["layers"], layers)
+            else:
+                with self.assertRaises(ValueError):
+                    loc.ngram_map(ngram, ordinary, packet)
+        # A prefill-only (decode_stages []) plan is not the Rust shape and refuses.
+        packet.write_text(json.dumps({"branch": "P", "pass": 1,
+                                      "stage_localizer": {**plan(1, None, arm="OrdinaryGlobal"), "decode_stages": []}}))
+        with self.assertRaises(ValueError):
+            loc.ngram_map(ngram, ordinary, packet)
 
 
 SMALL = {"rerun_id": "r", "layers": [2, 3], "prefill_stages": ["Attention", "Residual", "RouterLogits", "RouterIds",
@@ -375,6 +410,84 @@ class Mapped(unittest.TestCase):
         change, = lane["router_id_changes"]
         self.assertFalse(change["set_changed"])
         self.assertEqual(lane["logits"]["differing_rows"], [135])
+
+    def test_branch_p_mapped_accepts_the_rust_shaped_ordinary_store(self):
+        # The candidate (ordinary-global localizer, Rust pass-2 shape) also holds decode rows 128..143; the All128
+        # reference (decode_stages []) does not. Completeness holds because those rows are listed unmapped.
+        rust_plan = plan(2, None, [4], "OrdinaryGlobal")
+        receipts = {"ngram": {"path": "n", "sha256": "1" * 64}, "ordinary": {"path": "o", "sha256": "2" * 64}}
+        self.doc = loc.build_map("P", 2, rust_plan, receipts, None)
+        self.map.write_text(json.dumps(self.doc))
+        phases, self.unmapped = loc.validated_map(self.doc)
+        self.stage, self.logits = phases["prefill"], phases["logits"]
+        _, _, record = self.run_mapped(candidate={loc.k("Attention", 2, 7, 4): 3.0,
+                                                  loc.k("Norm", 0, 130, 4): 3.0})  # the decode change is unmapped
+        self.assertEqual((record["branch"], record["accepted"]), ("P", None))
+        first = record["lanes"][2]["first_divergence"]
+        self.assertEqual((first["phase"], first["layer"], first["stage"], first["differing_rows"]),
+                         ("prefill", 4, "Attention", [7]))
+        self.assertEqual(first["prompt_segments"]["rows_0_28"]["differing_rows"], 1)
+        self.assertIsNone(record["lanes"][0]["first_divergence"])
+        self.assertEqual(len(record["lanes"][0]["unmapped"]), 12 * 16)
+        self.assertEqual(record["lanes"][0]["logits"]["rows"], 1)
+
+
+VOCAB = 262144
+
+
+def endpoint_store(root, argmax_by_lane, rows=(127, 128), corrupt_lane=None):
+    root.mkdir()
+    captured = []
+    for lane, argmax in enumerate(argmax_by_lane):
+        for row in rows:
+            values = array.array("f", bytes(4 * VOCAB))
+            values[argmax] = 5.0
+            values[(argmax + 1) % VOCAB] = 5.0  # a tie: the first maximum wins
+            raw = values.tobytes()
+            name = "logits-%d-%d.bin" % (lane, row)
+            (root / name).write_bytes(raw if lane != corrupt_lane else raw[::-1])
+            captured.append({"at": loc.at_of(loc.k("Logits", lane, row, loc.LOGIT_LAYER)), "scalar": "F32",
+                             "shape": [1, VOCAB], "file": name, "sha256": hashlib.sha256(raw).hexdigest()})
+    expected = [{"at": c["at"], "scalar": c["scalar"], "shape": c["shape"]} for c in captured]
+    (root / "trace.json").write_text(json.dumps({"schema": "hf2q.adr063.invariance.v2",
+                                                 "coverage": {"captured": captured, "expected": expected, "errors": []}}))
+    return root / "trace.json"
+
+
+class All128Precondition(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.frozen = [100, 200, 300, 400]
+        self.workload = self.root / "workload.json"
+        self.workload.write_text(json.dumps({"family": "Gemma4", "vocab_size": VOCAB,
+                                             "lanes": [[1] * 128 + [f] + [2] * 15 for f in self.frozen]}))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_holds_only_when_every_lane_row127_argmax_is_frozen_128(self):
+        trace = endpoint_store(self.root / "ok", self.frozen)
+        record = loc.all128_precondition(trace, self.workload)
+        self.assertEqual(record["schema"], "hf2q.q1.gemma-all128-precondition.v1")
+        self.assertTrue(record["holds"])
+        self.assertFalse(record["whole_q1_qualified"])
+        self.assertEqual(record["workload"]["sha256"], hashlib.sha256(self.workload.read_bytes()).hexdigest())
+        self.assertEqual(record["endpoint_trace"]["sha256"], hashlib.sha256(trace.read_bytes()).hexdigest())
+        self.assertEqual(record["lanes"][3], {"lane": 3, "argmax": 400, "frozen_128": 400, "equal": True})
+        drifted = loc.all128_precondition(endpoint_store(self.root / "drift", [100, 201, 300, 400]), self.workload)
+        self.assertFalse(drifted["holds"])
+        self.assertEqual([l["equal"] for l in drifted["lanes"]], [True, False, True, True])
+
+    def test_refuses_missing_row_corrupt_payload_or_foreign_workload(self):
+        with self.assertRaises(ValueError):
+            loc.all128_precondition(endpoint_store(self.root / "norow", self.frozen, rows=(128,)), self.workload)
+        with self.assertRaises(ValueError):
+            loc.all128_precondition(endpoint_store(self.root / "bad", self.frozen, corrupt_lane=1), self.workload)
+        other = self.root / "qwen.json"
+        other.write_text(json.dumps({**json.loads(self.workload.read_text()), "family": "Qwen38"}))
+        with self.assertRaises(ValueError):
+            loc.all128_precondition(endpoint_store(self.root / "ok", self.frozen), other)
 
 
 if __name__ == "__main__":

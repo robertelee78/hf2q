@@ -60,8 +60,13 @@ impl Scope {
         let mut journal=journal::Journal::new(root)?;journal.event("header",header)?;
         ACTIVE.with(|a|*a.borrow_mut()=Some(Active {journal,owner:None,t5:None}));Ok(Self)
     }
-    fn set_t5(&self,state:t5::State)->Result<()> {
-        with(|a|{ensure!(a.t5.is_none() && a.owner.is_none(),"T5 stores bind before the first owner");a.t5=Some(state);Ok(())})?.context("diagnostic missing")
+    /// Binds the T5 stores; on refusal the state comes back to the caller,
+    /// which still owns (and must fail+finish) every created store.
+    fn set_t5(&self,state:t5::State)->std::result::Result<(),(Box<t5::State>,anyhow::Error)> {
+        ACTIVE.with(|a|match a.borrow_mut().as_mut() {
+            Some(a) if a.t5.is_none() && a.owner.is_none()=>{a.t5=Some(state);Ok(())}
+            _=>Err((Box::new(state),anyhow::anyhow!("T5 stores bind before the first owner of an installed diagnostic"))),
+        })
     }
     fn take_t5(&self)->Result<t5::State> {with(|a|a.t5.take().context("T5 state missing"))?.context("diagnostic missing")}
     fn owner(&self,lane:usize,canonical:&[u32])->Result<()> {
@@ -99,23 +104,36 @@ fn t5_ordinary_initial(m:&MlxModelWeights,lane:usize,id:u32)->Result<()> {with(|
 })?.context("T5 diagnostic missing")}
 /// One teacher-forced `forward_decode(frozen[p], p)` row: committed `Logits`
 /// row p; the input is the frozen ID, the returned argmax only a decision.
-fn t5_decode_row(m:&MlxModelWeights,lane:usize,position:usize,input:u32,next:u32)->Result<()> {with(|a|{
+fn t5_decode_row(m:&MlxModelWeights,lane:usize,position:usize,input:u32,next:u32)->Result<()> {
+    t5_teacher_forced(lane,position,input,next)?;
+    with(|a|{let t=a.t5.as_mut().context("T5 state")?;t5::head_row(&mut t.committed,m,t.vocab,lane,position)})?.context("T5 diagnostic missing")
+}
+/// Model-free half of [`t5_decode_row`]: the input must be frozen[p]; the
+/// returned argmax is recorded as a decision only.
+fn t5_teacher_forced(lane:usize,position:usize,input:u32,next:u32)->Result<()> {with(|a|{
     let o=a.owner.as_ref().context("owner")?;let t=a.t5.as_mut().context("T5 state")?;
     transition(o.phase,if t.arm==t5::Arm::OrdinaryGlobal {Phase::Ready}else{Phase::Committed})?;
-    ensure!(o.lane==lane && o.canonical[position]==input,"teacher-forced decode input must be frozen[p]");
-    t5::head_row(&mut t.committed,m,t.vocab,lane,position)?;
-    let l=t.lane(lane)?;l.decode_inputs.push(t5::Row {position,token:input});l.decode_argmax.push(t5::Row {position,token:next});
+    ensure!(o.lane==lane && o.canonical.get(position)==Some(&input),"teacher-forced decode input must be frozen[p]");
+    let l=t.lane(lane)?;ensure!(l.decode_inputs.last().is_none_or(|r|r.position+1==position),"teacher-forced rows in position order");
+    l.decode_inputs.push(t5::Row {position,token:input});l.decode_argmax.push(t5::Row {position,token:next});
     a.journal.event("teacher_forced_decode",json!({"owner_epoch":lane,"position":position,"frozen_input":input,"actual_gpu_next_id":next}))?;Ok(())
 })?.context("T5 diagnostic missing")}
 /// Cache@144 into `committed`; closes the lane owner.
-fn t5_lane_end(m:&MlxModelWeights,lane:usize)->Result<()> {with(|a|{
-    let o=a.owner.as_mut().context("owner")?;let t=a.t5.as_mut().context("T5 state")?;
+fn t5_lane_end(m:&MlxModelWeights,lane:usize)->Result<()> {
+    t5_lane_inputs_checked(lane)?;
+    with(|a|{let o=a.owner.as_mut().context("owner")?;let t=a.t5.as_mut().context("T5 state")?;
+        ensure!(a.journal.snapshot(m,lane,"teacher_forced_final144",journal::Sink::Store(&mut t.committed,t5::CACHE_RECORDS))?==144,"actual final cursor");
+        o.phase=Phase::Committed;Ok(())
+    })?.context("T5 diagnostic missing")
+}
+/// Model-free half of [`t5_lane_end`]: the lane's decode inputs are exactly
+/// the frozen continuation (ordinary 128..143, n-gram 129+a..143).
+fn t5_lane_inputs_checked(lane:usize)->Result<()> {with(|a|{
+    let o=a.owner.as_ref().context("owner")?;let t=a.t5.as_mut().context("T5 state")?;
     transition(o.phase,if t.arm==t5::Arm::OrdinaryGlobal {Phase::Ready}else{Phase::Committed})?;ensure!(o.lane==lane,"T5 owner lane");
     let inputs=t5::decode_inputs(t.arm,&o.canonical,(t.arm==t5::Arm::NgramTransaction).then_some(o.accepted))?;
-    let l=t.lane(lane)?;
-    ensure!(l.decode_inputs.iter().map(|r|(r.position,r.token)).eq(inputs.iter().copied()),"teacher-forced inputs differ from the frozen continuation");
-    ensure!(a.journal.snapshot(m,lane,"teacher_forced_final144",journal::Sink::Store(&mut t.committed,t5::CACHE_RECORDS))?==144,"actual final cursor");
-    o.phase=Phase::Committed;Ok(())
+    ensure!(t.lane(lane)?.decode_inputs.iter().map(|r|(r.position,r.token)).eq(inputs.iter().copied()),"teacher-forced inputs differ from the frozen continuation");
+    Ok(())
 })?.context("T5 diagnostic missing")}
 /// The n-gram lane's real accepted count after its committed transaction.
 fn t5_accepted(lane:usize)->Result<usize> {with(|a|{
@@ -125,25 +143,35 @@ fn t5_accepted(lane:usize)->Result<usize> {with(|a|{
 pub fn routing_before_initial()->Result<()> {with(|a|{let o=a.owner.as_ref().context("owner")?;
     transition(o.phase,Phase::Ready)?;super::gemma_routing_witness::serial(
         super::gemma_routing_witness::Namespace::T5Initial,o.lane,0,128)})?;Ok(())}
-pub fn initial(m:&MlxModelWeights,prompt:&[u32],id:u32)->Result<()> {let refusal=with(|a|{
-    let o=a.owner.as_mut().context("owner")?;transition(o.phase,Phase::Ready)?;
-    ensure!(prompt==&o.canonical[..128],"same actual first128 required");
-    let (lane,frozen)=(o.lane,o.canonical[128]);let mut refusal=None;
-    match a.t5.as_mut() {
-        None=>{a.journal.tensor(json!({"owner_epoch":lane,"phase":"initial_head","position":127}),&m.activations.logits)?;
-            ensure!(a.journal.snapshot(m,lane,"before_real_verify",journal::Sink::Journal)?==128,"actual128 cursor");}
-        Some(t)=>{
-            // The localizer pause covered exactly G5-A1's identical initial call.
-            ensure!(t.pause.take().is_some()==t.localizer,"localizer pause must cover exactly the initial prefill");
-            t5::head_row(&mut t.prefork,m,t.vocab,lane,127)?;
-            ensure!(a.journal.snapshot(m,lane,"before_real_verify",journal::Sink::Store(&mut t.prefork,t5::CACHE_RECORDS))?==128,"actual128 cursor");
-            let l=t.lane(lane)?;l.initial_argmax=Some(id);l.initial_equals_frozen=Some(id==frozen);
-            refusal=t5::initial_refusal(t.arm,lane,id,frozen);
-            if refusal.is_some() {t.class_b=refusal.clone();}
-        }
+fn initial_owner(a:&Active,prompt:&[u32])->Result<(usize,u32)> {
+    let o=a.owner.as_ref().context("owner")?;transition(o.phase,Phase::Ready)?;
+    ensure!(prompt==&o.canonical[..128],"same actual first128 required");Ok((o.lane,o.canonical[128]))
+}
+pub fn initial(m:&MlxModelWeights,prompt:&[u32],id:u32)->Result<()> {
+    with(|a|{let (lane,_)=initial_owner(a,prompt)?;
+        match a.t5.as_mut() {
+            None=>{a.journal.tensor(json!({"owner_epoch":lane,"phase":"initial_head","position":127}),&m.activations.logits)?;
+                ensure!(a.journal.snapshot(m,lane,"before_real_verify",journal::Sink::Journal)?==128,"actual128 cursor");}
+            Some(t)=>{
+                // The localizer pause covered exactly G5-A1's identical initial call.
+                ensure!(t.pause.take().is_some()==t.localizer,"localizer pause must cover exactly the initial prefill");
+                t5::head_row(&mut t.prefork,m,t.vocab,lane,127)?;
+                ensure!(a.journal.snapshot(m,lane,"before_real_verify",journal::Sink::Store(&mut t.prefork,t5::CACHE_RECORDS))?==128,"actual128 cursor");
+            }
+        }Ok(())})?;
+    initial_decided(prompt,id)
+}
+/// Model-free tail of [`initial`]: the initial decision, its relation to
+/// frozen[128] and, in the n-gram T5 arm, the Class B row-127 refusal.
+fn initial_decided(prompt:&[u32],id:u32)->Result<()> {let refusal=with(|a|{
+    let (lane,frozen)=initial_owner(a,prompt)?;let mut refusal=None;
+    if let Some(t)=a.t5.as_mut() {
+        let l=t.lane(lane)?;l.initial_argmax=Some(id);l.initial_equals_frozen=Some(id==frozen);
+        refusal=t5::initial_refusal(t.arm,lane,id,frozen);
+        if refusal.is_some() {t.class_b=refusal.clone();}
     }
     a.journal.event("initial_gpu_selection",json!({"owner_epoch":lane,"actual_gpu_id":id,"canonical_id":frozen,"source":"actual ordinary returned GPU argmax"}))?;
-    o.phase=Phase::Initial;Ok(refusal)})?.flatten();super::gemma_routing_witness::end_checked()?;
+    a.owner.as_mut().context("owner")?.phase=Phase::Initial;Ok(refusal)})?.flatten();super::gemma_routing_witness::end_checked()?;
     if refusal.is_some() {anyhow::bail!(t5::CLASS_B);}Ok(())}
 pub fn proposal(output:&[u32],original:&[u32],k:u32)->Result<Option<Vec<u32>>> {with(|a|{
     let o=a.owner.as_mut().context("owner")?;transition(o.phase,Phase::Initial)?;
@@ -207,10 +235,18 @@ pub fn decision(drafts:&[u32],argmaxes:&[u32],accepted:usize,fallback:u32)->Resu
         x.verifier_argmax=argmaxes.to_vec();x.accepted=Some(accepted);x.rejected=Some(drafts.len()-accepted);x.fallback=Some(fallback);
     }
     o.phase=Phase::Decided;Ok(())})?;Ok(())}
-pub fn after_rollback(m:&MlxModelWeights,output:&[u32],rejected:usize)->Result<bool> {Ok(with(|a|{
-    let o=a.owner.as_mut().context("owner")?;transition(o.phase,Phase::Decided)?;
-    ensure!(rejected==o.rejected && output.len()==130+o.accepted,"actual acceptance output cardinality");
-    let pos=a.journal.snapshot(m,o.lane,"after_actual_rollback",events_sink(&a.t5))?;require_commit(pos,output.len(),rejected)?;
+fn rollback_owner(a:&Active,output:&[u32],rejected:usize)->Result<usize> {
+    let o=a.owner.as_ref().context("owner")?;transition(o.phase,Phase::Decided)?;
+    ensure!(rejected==o.rejected && output.len()==130+o.accepted,"actual acceptance output cardinality");Ok(o.lane)
+}
+pub fn after_rollback(m:&MlxModelWeights,output:&[u32],rejected:usize)->Result<bool> {
+    let Some(pos)=with(|a|{let lane=rollback_owner(a,output,rejected)?;a.journal.snapshot(m,lane,"after_actual_rollback",events_sink(&a.t5))})? else {return Ok(false)};
+    rollback_committed(output,rejected,pos)
+}
+/// Model-free tail of [`after_rollback`]: the real cursor `pos` must be the
+/// committed one (`132 - rejected`; in T5 mode exactly 129+a).
+fn rollback_committed(output:&[u32],rejected:usize,pos:usize)->Result<bool> {Ok(with(|a|{
+    rollback_owner(a,output,rejected)?;let o=a.owner.as_mut().context("owner")?;require_commit(pos,output.len(),rejected)?;
     if let Some(t)=a.t5.as_mut() {t5::require_cursor(pos,o.accepted)?;
         t.lane(o.lane)?.transaction.as_mut().context("n-gram transaction record")?.rollback_cursor=Some(pos);}
     a.journal.event("commit",json!({"owner_epoch":o.lane,"actual_output":output,"actual_rejected_count":rejected,

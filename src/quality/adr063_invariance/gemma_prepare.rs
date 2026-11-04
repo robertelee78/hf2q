@@ -176,14 +176,17 @@ fn localizer_export(c:&Config,l:&Localizer,cfg:&crate::serve::config::Gemma4Conf
 /// composition key per mode (`gemma_cohort_localizer::recipe`).
 fn cohort_localizer_export(c:&Config,l:&CohortLocalizer,cfg:&crate::serve::config::Gemma4Config,work:&Workload,source:&str,
     binary:&str,raw:&[u8])->Result<Vec<(String,Vec<u8>)>> {
-    use super::gemma_cohort_localizer as cohort;
+    use super::{gemma_actual::routing,gemma_cohort_localizer as cohort};
     let drift=l.mode==cohort::Mode::DriftAll128;
-    l.mode.admit_native(env!("HF2Q_MLX_NATIVE_VERSION"),env!("HF2Q_MLX_NATIVE_VERSION")).map_err(anyhow::Error::msg)?;
+    // Identity native is this build's own pin in both modes; only Cohort (via
+    // the witness-ON adapter) also requires the published witness native.
     if drift {
         ensure!(l.observer_effect_reference.is_none() && l.packed_observer_effect_reference.is_none(),
             "DriftAll128 has no observer-effect reference stores");
         ensure!(l.decode_stages.is_empty(),"DriftAll128 plan is prefill-only (decode_stages: [])");
+        ensure!(l.packet_form==PacketForm::PlanOnly,"DriftAll128 packets use the plan-only form (bound stage manifest)");
     } else {
+        routing::require_published(env!("HF2Q_MLX_NATIVE_VERSION"))?;
         ensure!([&l.observer_effect_reference,&l.packed_observer_effect_reference].iter()
             .all(|r|r.as_deref().is_some_and(super::gemma_actual::file_safe)),"explicit file-safe observer-effect reference stores");
     }
@@ -195,11 +198,7 @@ fn cohort_localizer_export(c:&Config,l:&CohortLocalizer,cfg:&crate::serve::confi
         "tokenizer_sha256":c.tokenizer.sha256,"template_sha256":c.template.sha256,
         "config_sha256":config_sha256,"token_vectors_sha256":token_vectors_sha256});
     // DriftAll128 is witness-OFF: null budget, no charge.
-    let (budget,charge)=if drift {(Value::Null,0)} else {
-        use super::gemma_routing_witness as witness;
-        (serde_json::json!({"payload_bytes":witness::PAYLOAD_BYTES,"metadata_bytes":witness::METADATA_BYTES,
-            "cpu_ledger_bytes":witness::CPU_LEDGER_BYTES}),witness::PAYLOAD_BYTES+witness::METADATA_BYTES+witness::CPU_LEDGER_BYTES)
-    };
+    let (budget,charge)=if drift {(Value::Null,0)} else {(routing::budget_json(),routing::CHARGE)};
     let all128=("all128",super::protocol::Trajectory::T0ColdSerial,"adr063_invariance::gemma_actual::q1_gemma_actual_all128_stage_localizer",&l.observer_effect_reference);
     let plan=if drift {vec![all128]} else {vec![all128,
         ("packed",super::protocol::Trajectory::T2ActualCohort,"adr063_invariance::gemma_actual::q1_gemma_actual_cohort_stage_localizer",&l.packed_observer_effect_reference)]};
@@ -271,7 +270,8 @@ fn run()->Result<()> {
     let mut raw=Vec::new();File::open(path)?.take(1024*1024+1).read_to_end(&mut raw)?;
     ensure!(raw.len()<=1024*1024,"bounded metadata config");let c:Config=serde_json::from_slice(&raw)?;
     output_preflight(&c.output)?;
-    if c.routing_recipes {ensure!(env!("HF2Q_MLX_NATIVE_VERSION")==super::gemma_routing_witness::WITNESS_NATIVE_VERSION,"routing recipe metadata requires the exact published routing-witness native build");}
+    if c.routing_recipes {super::gemma_actual::routing::require_published(env!("HF2Q_MLX_NATIVE_VERSION"))
+        .context("routing recipe metadata requires the exact published routing-witness native build")?;}
     ensure!(exact_hex(&c.expected_exporter_source_commit,40)&&exact_hex(&c.expected_exporter_binary_sha256,64)
         &&c.model.retained_full_sha256==MODEL_SHA,"exact selected source/binary/model bindings");
     let source=option_env!("HF2Q_BUILD_GIT_SHA").context("compiled source stamp")?;

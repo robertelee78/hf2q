@@ -69,7 +69,9 @@ COHORT_ROUTES = {'T0ColdSerial': 'SerialAll128PrefillSingleRowDecode', 'T2Actual
 RUNTIME_PRESSURE = {'normal-every-sample': ('1',), 'q5-critical-stop': ('1', '2')}
 # gemma_actual `localizer_mode` -> recipe route label; only DriftAll128 runs with the routing witness off.
 LOCALIZER_ROUTES = {'Cohort': 'gemma-four-lane-stage-localizer-native-routing1511-v1', 'DriftAll128': 'gemma-all128-stage-drift-witness-off-v1'}
-LOGIT_LAYER = 2**32 - 1  # u32::MAX: logits/verifier rows are not a layer
+LOGIT_LAYER = 2**32 - 1  # u32::MAX: the Gemma logits/verifier layout (gemma_endpoint.rs); rows are not a layer
+# Qwen writes Logits at layer = cfg.num_hidden_layers (qwen_continuation.rs `at`, q1_speculation `plan::at`): 40 on Qwen3.6.
+QWEN_LOGIT_LAYER = {'qwen36': 40}
 # #653 source-manifest counts (design §1.4/§1.5; confirmed pre-launch against the exported manifest).
 QWEN_T6_RECORDS = {'qwen36': dict(continuation=1440, snapshot=560)}
 QWEN_T6_SNAPSHOTS = {'ColdChunkMatched64': ('prefix64',), 'CancelledThenRecovered': ('before', 'recovered')}
@@ -83,6 +85,7 @@ GEMMA_T5_STORES = {'OrdinaryGlobal': ('prefork', 'committed'), 'NgramTransaction
 GEMMA_T5_RECORDS = {'prefork': 4204, 'committed': 4264, 'raw-verifier': 4}
 GEMMA_INJECTED_ORIGIN = 'InjectedDiagnosticFixtureNotProductionProposalQuality'
 GEMMA_ROW127_REFUSAL = 'RouteSensitive: global-route initial decision differs from frozen at row 127'
+ALL128_PRECONDITION_SCHEMA = 'hf2q.q1.gemma-all128-precondition.v1'
 GEMMA_EOS = (1, 106)
 GEMMA_VOCAB = 262144
 GEMMA_ROUTING_LAYERS = 30
@@ -387,6 +390,8 @@ def check_gemma_loc4(out, b, case, plan, packet, extent, execution, stores, iden
     if drift:
         # The only witness-OFF route: no routing bank is asserted, and none may exist.
         require(trajectory == 'T0ColdSerial' and 'routing_witness' in packet and packet['routing_witness'] is None and b.get('routing_witness') is None and reference is None and stage.get('decode_stages') == [] and execution['routing_witness_installed'] is False and not (out / 'output/routing-witness.jsonl').exists(), 'DriftAll128: All128 prefill-only, witness off everywhere, no observer reference')
+        # Both drift sides must run the same reviewed plan: the stage extent is the bound manifest, never an inline list.
+        require('stage_manifest' in packet, 'DriftAll128: plan-only form with the bound stage manifest')
     else:
         # The canonical routing bank is part of this route's evidence: never skipped (spec Part 3; only DriftAll128 may omit it).
         require(type(b.get('routing_witness')) is dict and type(packet.get('routing_witness')) is dict and execution['routing_witness_installed'] is True, 'cohort localizer requires the routing witness in bindings and packet')
@@ -406,10 +411,10 @@ def check_gemma_loc4(out, b, case, plan, packet, extent, execution, stores, iden
 
 def u32(x): return type(x) is int and 0 <= x < 2**32
 def same_named(plan, names, why): require(plan['stores'] == {n: n for n in names}, why)
-def logit_rows(store):
-    """(agent, row) of every Logits record: the endpoint layout layer u32::MAX, segment 0."""
+def logit_rows(store, layer):
+    """(agent, row) of every Logits record at the family's logits layer (u32::MAX for Gemma, num_hidden_layers for Qwen), segment 0."""
     rows = [x['at'] for x in store['captured'] if x['at']['stage'] == 'Logits']
-    require(all(at['layer'] == LOGIT_LAYER and at['segment'] == 0 for at in rows), 'Logits at layer u32::MAX, segment 0')
+    require(all(at['layer'] == layer and at['segment'] == 0 for at in rows), 'Logits at the family logits layer, segment 0')
     keys = {(at['agent'], at['logical_row_start']) for at in rows}; require(len(keys) == len(rows), 'unique logit rows'); return keys
 
 
@@ -432,7 +437,7 @@ def check_qwen_t6_continuation(out, b, case, plan, packet, extent, execution, st
     require(execution['captured_rows_per_lane'] == 80 and execution['cancelled_unpublished_rows_per_lane'] == (64 if t6 else 0) and execution['first64_logits_captured'] is False and execution['endpoint_scope'] == [64, 144] and execution['active_cache_boundaries'] == [128, 144], 'rows 64..143 per lane, caches at 128 and 144')
     tail = stores['continuation']
     require(execution['trace_records'] == len(tail['captured']) == counts['continuation'], 'continuation = trace_records = source count')
-    require(logit_rows(tail) == {('agent-' + str(l), p) for l in range(4) for p in range(64, 144)}, 'continuation logits rows 64..143 x 4 lanes')
+    require(logit_rows(tail, QWEN_LOGIT_LAYER[b['family']]) == {('agent-' + str(l), p) for l in range(4) for p in range(64, 144)}, 'continuation logits rows 64..143 x 4 lanes')
     require(all(len(stores[n]['captured']) == counts['snapshot'] for n in snapshots), 'every active64 snapshot store = source count')
     require(execution['planned_tensor_payload'] == sum(s['bytes'] for s in stores.values()), 'planned payload = captured bytes of every store')
     if t6:
@@ -463,7 +468,9 @@ def check_qwen_t5_phase(out, b, case, plan, packet, extent, execution, stores, i
     rows = [128] + list(range(131, 144)) if forced else list(range(128, 144))
     require(execution['ordinary_input_positions'] == [rows] * 4 and type(execution['canonical_decisions']) is list and len(execution['canonical_decisions']) == 4 and all(len(d) == 17 for d in execution['canonical_decisions']), 'ordinary input rows and seed+16 decisions per lane')
     if mode == 'Preparation':
-        frozen = out / 'output/frozen-workload.json'; prep = json.loads((out / 'output/preparation-only.json').read_text())
+        frozen = out / 'output/frozen-workload.json'; prep_path = out / 'output/preparation-only.json'
+        require(frozen.is_file() and prep_path.is_file(), 'preparation wrote frozen-workload.json and preparation-only.json')
+        prep = json.loads(prep_path.read_text())
         require(execution['status'] == 'CompleteWorkloadPreparationNotComparable' and plan['stores'] == {} and extent['expected_stores'] == {} and execution['committed_records'] is None and execution['raw_records'] is None and execution['actual_transitions'] == [], 'storeless preparation receipt')
         require(prep['frozen_file_sha256'] == sha(frozen) and prep['comparable_acquisition'] is False and prep['requires_independent_review'] is True, 'frozen workload + preparation-only receipt, pending independent review')
         return dict(mode=mode, frozen_file_sha256=prep['frozen_file_sha256'], preparation_sha256=sha(out / 'output/preparation-only.json'))
@@ -541,7 +548,7 @@ def gemma_t5_arm(out, b, plan, packet, extent, execution, stores, identity, sche
     counts = {n: len(stores[n]['captured']) for n in names}
     require(execution['stores'] == counts == {n: GEMMA_T5_RECORDS[n] for n in names}, 'per-store counts = receipt = source manifest')
     lanes = ['agent-' + str(l) for l in range(4)]
-    require(logit_rows(stores['prefork']) == {(l, 127) for l in lanes} and logit_rows(stores['committed']) == {(l, p) for l in lanes for p in range(128, 144)}, 'prefork row 127, committed rows 128..143, four lanes')
+    require(logit_rows(stores['prefork'], LOGIT_LAYER) == {(l, 127) for l in lanes} and logit_rows(stores['committed'], LOGIT_LAYER) == {(l, p) for l in lanes for p in range(128, 144)}, 'prefork row 127, committed rows 128..143, four lanes')
     if 'raw-verifier' in names:
         raw = stores['raw-verifier']['captured']
         require(sorted(x['at']['agent'] for x in raw) == lanes and all(x['at']['stage'] == 'SpecVerifierLogits' and x['at']['logical_step'] == 128 and x['at']['layer'] == LOGIT_LAYER and x['at']['logical_row_start'] == 0 and x['at']['segment'] == 0 and x['shape'] == [4, GEMMA_VOCAB] for x in raw), 'one [4, vocab] verifier record per lane')
@@ -613,6 +620,7 @@ def check_gemma_t5_localizer(out, b, case, plan, packet, extent, execution, stor
     else:
         refusal = ngram['class_b_refusal']
         require(arm == 'OrdinaryGlobal' and stage['accepted'] is None and ngram['status'] == 'FailedOrIncomplete' and type(refusal) is dict and refusal['row'] == 127 and refusal['reason'] == GEMMA_ROW127_REFUSAL, 'branch P: ordinary arm only, no accepted, bound row-127 refusal')
+    precondition = all128_precondition(packet, execution, branch)
     if arm == 'OrdinaryGlobal':
         prefill = {(0, r) for r in range(128)}; decode = {(0, p) for p in range(128, 144)}; per_lane = [(prefill, decode)] * 4
     else:
@@ -626,7 +634,23 @@ def check_gemma_t5_localizer(out, b, case, plan, packet, extent, execution, stor
     want = {(l,) + k for l in range(4) for i in (0, 1) if roles[i] for k in per_lane[l][i]}
     require(seen == want, 'every planned (lane, segment, row) captured')
     refusal = ngram['class_b_refusal']
-    return dict(evidence, branch=branch, plan_pass=passed, stage_records=len(staged['captured']), stage_bytes=staged['bytes'], t5_receipts={k: v['sha256'] for k, v in receipts.items()}, ngram_class_b_refusal=refusal)
+    return dict(evidence, branch=branch, plan_pass=passed, stage_records=len(staged['captured']), stage_bytes=staged['bytes'], t5_receipts={k: v['sha256'] for k, v in receipts.items()}, ngram_class_b_refusal=refusal, all128_precondition=precondition)
+
+
+def all128_precondition(packet, execution, branch):
+    """Branch P only (§2.6, condition 7): the packet binds the PyTools `all128-precondition` record. The b5g All128
+    reference's own row-127 argmax must equal frozen[128] (`holds` true) on this case's greedy workload; the receipt
+    echoes {path, sha256, holds}. Branch N carries no precondition (absent or null)."""
+    bound_record = packet.get('all128_precondition')
+    if branch == 'N':
+        require(bound_record is None and execution.get('all128_precondition') is None, 'branch N: no All128 precondition')
+        return None
+    record = load(bound_record, 'bound All128 precondition record')
+    lanes = record.get('lanes') if type(record) is dict else None
+    require(type(record) is dict and record.get('schema') == ALL128_PRECONDITION_SCHEMA and record.get('holds') is True and type(record.get('workload')) is dict and record['workload'].get('sha256') == packet['greedy_workload']['sha256'], 'All128 precondition holds on this greedy workload')
+    require(type(lanes) is list and [x.get('lane') for x in lanes] == [0, 1, 2, 3] and all(x.get('equal') is True and x.get('argmax') == x.get('frozen_128') for x in lanes), 'All128 row-127 argmax = frozen[128] on every lane')
+    require(execution.get('all128_precondition') == dict(bound_record, holds=True), 'receipt echoes the bound All128 precondition')
+    return dict(bound_record, holds=True)
 
 
 # Closed registry of multistore check functions: (out, b, case, plan, packet, extent, execution, stores, identity, policy) -> evidence dict.

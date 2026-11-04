@@ -26,6 +26,7 @@ fn packet(arm:Arm,plan:Option<&localizer::Plan>,branch:Branch,pass:u8)->serde_js
         o.insert("stage_localizer".into(),json!(plan));o.insert("branch".into(),json!(branch));o.insert("pass".into(),json!(pass));
         o.insert("t5_receipts".into(),json!({"ordinary":binding("t5ord/execution.json"),"ngram":binding("t5ngram/execution.json")}));
         o.insert("manifest".into(),binding("manifest.json"));
+        if branch==Branch::P {o.insert("all128_precondition".into(),binding("all128-precondition.json"));}
     }
     p
 }
@@ -109,6 +110,120 @@ fn q1_gemma_t5_packet_and_arm_are_closed(){
     assert!(super::export::plan(&cfg(),&pass(Branch::N,1,None,None),Arm::NgramTransaction).is_err());
     let mut three=p1.clone();three.accepted=Some([3,0,0,0]);
     assert!(run::pairing(&extra(packet(Arm::NgramTransaction,Some(&three),Branch::N,1)),true).is_err());
+    // The All128 precondition record is bound exactly by branch P.
+    let mut no_pre=packet(Arm::OrdinaryGlobal,Some(&pp),Branch::P,1);no_pre.as_object_mut().unwrap().remove("all128_precondition");
+    assert!(run::pairing(&extra(no_pre),true).is_err());
+    let mut n_pre=good;n_pre["all128_precondition"]=binding("all128-precondition.json");
+    assert!(run::pairing(&extra(n_pre),true).is_err());
+    let mut t5_pre=packet(Arm::OrdinaryGlobal,None,Branch::N,1);t5_pre["all128_precondition"]=binding("all128-precondition.json");
+    assert!(run::pairing(&extra(t5_pre),false).is_err());
+}
+fn precondition(holds:bool)->serde_json::Value {
+    json!({"schema":run::PRECONDITION_SCHEMA,"endpoint_trace":binding("all128/trace.json"),"workload":binding("workload.json"),
+        "lanes":(0..4u32).map(|l|json!({"lane":l,"argmax":1128+l,"frozen_128":1128+l,"equal":holds||l!=2})).collect::<Vec<_>>(),
+        "holds":holds,"whole_q1_qualified":false})
+}
+#[test]
+fn q1_gemma_t5_branch_p_requires_a_holding_all128_precondition(){
+    let (sha,frozen)=("9".repeat(64),[1128,1129,1130,1131]);
+    run::check_precondition(&precondition(true),&sha,frozen).unwrap();
+    // A failed precondition is the build-drift path: branch P is not run.
+    let e=run::check_precondition(&precondition(false),&sha,frozen).unwrap_err();
+    assert!(format!("{e:#}").contains("DriftAll128"),"{e:#}");
+    assert!(run::check_precondition(&precondition(true),&"8".repeat(64),frozen).is_err());
+    assert!(run::check_precondition(&precondition(true),&sha,[1128,1129,1130,1]).is_err());
+    for (key,value) in [("schema",json!("hf2q.q1.other.v1")),("whole_q1_qualified",json!(true)),("lanes",json!([]))] {
+        let mut bad=precondition(true);bad[key]=value;assert!(run::check_precondition(&bad,&sha,frozen).is_err(),"{key}");
+    }
+    let mut bad=precondition(true);bad["lanes"][1]["equal"]=json!(false);
+    assert!(run::check_precondition(&bad,&sha,frozen).is_err());
+    let mut bad=precondition(true);bad["lanes"][3]["argmax"]=json!(7);
+    assert!(run::check_precondition(&bad,&sha,frozen).is_err());
+}
+const HOOK_VOCAB:usize=8;
+/// A real installed T5 diagnostic (journal + Q1 stores of a small synthetic
+/// vocabulary) with lane 0's owner in place; no model or device.
+fn hook_harness(tag:&str,arm:Arm,frozen_accepted:Option<[usize;4]>)->(std::path::PathBuf,Scope,Vec<u32>) {
+    use crate::adr063_invariance::store::Store;
+    let root=std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("hf2q-q1-t5hook-{tag}-{}",std::process::id()));
+    let _=std::fs::remove_dir_all(&root);
+    let scope=Scope::install(&root,json!({"schema":"HOST_ONLY_CONTROL"})).unwrap();
+    let identity:Identity=serde_json::from_value(identity()).unwrap();
+    let logits=|row:usize|ExpectedTensor {at:t5::logits_at(0,row),scalar:Scalar::F32,shape:vec![1,HOOK_VOCAB]};
+    let store=|name:&str,expected:Vec<ExpectedTensor>|{let n=expected.len();
+        Store::new(&root.join(name),identity.clone(),t5::trajectory(arm,name),expected,1<<20,n).unwrap()};
+    let raw=(arm==Arm::NgramTransaction).then(||store(t5::RAW,vec![ExpectedTensor {at:Coordinate {logical_step:128,layer:u32::MAX,
+        stage:Stage::SpecVerifierLogits,agent:"agent-0".into(),logical_row_start:0,segment:0},scalar:Scalar::F32,shape:vec![4,HOOK_VOCAB]}]));
+    let state=t5::State {arm,vocab:HOOK_VOCAB,prefork:store(t5::PREFORK,vec![logits(127)]),committed:store(t5::COMMITTED,(128..144).map(logits).collect()),
+        raw,lanes:Vec::new(),verifier:Vec::new(),frozen_accepted,pause:None,class_b:None,localizer:false};
+    assert!(scope.set_t5(state).is_ok());
+    let frozen:Vec<u32>=(0..144).map(|n|1000+n).collect();
+    scope.owner(0,&frozen).unwrap();
+    (root,scope,frozen)
+}
+/// The owner after a checked verifier: its four argmax rows and post-softcap bytes.
+fn verified(rows:[u32;4]) {
+    with(|a|{let o=a.owner.as_mut().unwrap();o.phase=Phase::Verified;o.rows=rows.to_vec();
+        a.t5.as_mut().unwrap().verifier=(0..4*HOOK_VOCAB).flat_map(|i|(i as f32).to_le_bytes()).collect();Ok(())}).unwrap();
+}
+fn phase()->Phase {ACTIVE.with(|a|a.borrow().as_ref().unwrap().owner.as_ref().unwrap().phase)}
+fn close(root:std::path::PathBuf,scope:Scope) {scope.finish("HOST_ONLY_CONTROL").unwrap();std::fs::remove_dir_all(root).unwrap();}
+#[test]
+fn q1_gemma_t5_decision_hook_refuses_a_frozen_accepted_mismatch(){
+    let (root,scope,frozen)=hook_harness("frozen",Arm::NgramTransaction,Some([1,0,0,0]));
+    let fixture=super::fixture(&frozen,262144).unwrap();let argmax=[fixture[0],fixture[1],7,9];
+    verified(argmax);
+    let e=decision(&fixture,&argmax,2,7).unwrap_err();
+    assert!(format!("{e:#}").contains("frozen localizer plan"),"{e:#}");
+    // Refused before any store write or transaction record; the owner never decided.
+    assert_eq!(phase(),Phase::Verified);
+    let s=scope.take_t5().unwrap();
+    assert!(s.lanes[0].transaction.as_ref().unwrap().accepted.is_none());
+    assert_eq!(s.raw.unwrap().finish().unwrap().coverage.captured.len(),0);
+    assert_eq!(s.committed.finish().unwrap().coverage.captured.len(),0);
+    close(root,scope);
+}
+#[test]
+fn q1_gemma_t5_hooks_commit_verifier_rows_cursor_and_teacher_forced_inputs(){
+    let (root,scope,frozen)=hook_harness("commit",Arm::NgramTransaction,Some([2,0,0,0]));
+    let fixture=super::fixture(&frozen,262144).unwrap();let argmax=[fixture[0],fixture[1],7,9];
+    verified(argmax);decision(&fixture,&argmax,2,7).unwrap();assert_eq!(phase(),Phase::Decided);
+    // Rollback cursor: only the real committed 129+a is admitted.
+    let mut output=frozen[..129].to_vec();output.extend([fixture[0],fixture[1],7]);
+    for wrong in [130,132] {assert!(rollback_committed(&output,1,wrong).is_err());assert_eq!(phase(),Phase::Decided);}
+    assert!(rollback_committed(&output[..131],1,131).is_err());
+    assert!(rollback_committed(&output,1,131).unwrap());assert_eq!(phase(),Phase::Committed);
+    // Teacher forcing: inputs are frozen[p]; the fallback is never an input.
+    t5_teacher_forced(0,131,frozen[131],5).unwrap();
+    assert!(t5_teacher_forced(0,132,7,5).is_err());
+    assert!(t5_teacher_forced(0,133,frozen[133],5).is_err(),"rows in position order");
+    assert!(t5_lane_inputs_checked(0).is_err(),"incomplete continuation");
+    for p in 132..144 {t5_teacher_forced(0,p,frozen[p],5).unwrap();}
+    t5_lane_inputs_checked(0).unwrap();
+    let s=scope.take_t5().unwrap();
+    let x=s.lanes[0].transaction.clone().unwrap();
+    assert_eq!((x.accepted,x.rejected,x.fallback,x.rollback_cursor,x.verifier_argmax),(Some(2),Some(1),Some(7),Some(131),argmax.to_vec()));
+    assert_eq!(s.lanes[0].decode_inputs,(131..144).map(|position|t5::Row {position,token:frozen[position]}).collect::<Vec<_>>());
+    assert_eq!(s.raw.unwrap().finish().unwrap().coverage.captured.len(),1);
+    let committed=s.committed.finish().unwrap();
+    assert_eq!(committed.coverage.captured.iter().map(|t|t.at.logical_row_start).collect::<Vec<_>>(),[128,129,130]);
+    close(root,scope);
+}
+#[test]
+fn q1_gemma_t5_initial_hook_records_the_class_b_refusal(){
+    let (root,scope,frozen)=hook_harness("classb",Arm::NgramTransaction,None);
+    assert!(initial_decided(&frozen[1..129],frozen[128]).is_err(),"another prompt");
+    assert_eq!(phase(),Phase::Ready);
+    let e=initial_decided(&frozen[..128],999).unwrap_err();
+    assert_eq!(format!("{e}"),t5::CLASS_B);assert_eq!(phase(),Phase::Initial);
+    let s=scope.take_t5().unwrap();
+    assert_eq!(s.class_b,Some(json!({"row":127,"reason":t5::CLASS_B,"lane":0})));
+    assert_eq!((s.lanes[0].initial_argmax,s.lanes[0].initial_equals_frozen),(Some(999),Some(false)));
+    close(root,scope);
+    let (root,scope,frozen)=hook_harness("agree",Arm::NgramTransaction,None);
+    initial_decided(&frozen[..128],frozen[128]).unwrap();
+    let s=scope.take_t5().unwrap();assert_eq!(s.class_b,None);assert_eq!(s.lanes[0].initial_equals_frozen,Some(true));
+    close(root,scope);
 }
 fn receipt(arm:Arm,status:&str,class_b:serde_json::Value,accepted:[usize;4])->serde_json::Value {
     json!({"schema":t5::SCHEMA,"arm":arm,"status":status,"error":if status=="CompleteScopedAcquisition" {json!(null)}else{json!("x")},
@@ -304,8 +419,13 @@ fn q1_gemma_t5_largest_packet_and_manifest_fit_their_reads(){
     let cfg=cfg();
     let worst=pass(Branch::N,2,Some([0;4]),Some([Some(5),Some(11),Some(17),Some(23)]));
     let plan=super::export::plan(&cfg,&worst,Arm::NgramTransaction).unwrap();
-    let packet=serde_json::to_vec_pretty(&packet(Arm::NgramTransaction,Some(&plan),Branch::N,2)).unwrap();
-    assert!(packet.len()<=run::PACKET_BYTES,"{}",packet.len());
+    let packet_n=serde_json::to_vec_pretty(&packet(Arm::NgramTransaction,Some(&plan),Branch::N,2)).unwrap();
+    assert!(packet_n.len()<=run::PACKET_BYTES,"{}",packet_n.len());
+    // Branch P pass 2 additionally binds the All128 precondition record.
+    let p_plan=super::export::plan(&cfg,&pass(Branch::P,2,None,Some([Some(5),Some(11),Some(17),Some(23)])),Arm::OrdinaryGlobal).unwrap();
+    let packet_p=serde_json::to_vec_pretty(&packet(Arm::OrdinaryGlobal,Some(&p_plan),Branch::P,2)).unwrap();
+    assert!(packet_p.len()<=run::PACKET_BYTES,"{}",packet_p.len());
+    run::pairing(&extra(serde_json::from_slice(&packet_p).unwrap()),true).unwrap();
     let files=super::export::files(&cfg,Some(&worst)).unwrap();
     assert_eq!(files.iter().map(|f|f.0.as_str()).collect::<Vec<_>>(),["prepared.json","manifest-t5loc-ord-p2.json","manifest-t5loc-ngram-p2.json"]);
     let largest=files.iter().map(|f|f.1.len()).max().unwrap();

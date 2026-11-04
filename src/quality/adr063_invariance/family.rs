@@ -41,21 +41,30 @@ pub fn install(
     store: Store,
     targets: BTreeMap<(u64, u32, Stage), CaptureTarget>,
 ) -> Result<Scope, String> {
+    install_or_return(family, store, targets).map_err(|(e, _)| e)
+}
+/// [`install`] that hands the store back on refusal, so the caller can still
+/// fail and finish it (a failure receipt, never a silently dropped store).
+pub fn install_or_return(
+    family: Family,
+    store: Store,
+    targets: BTreeMap<(u64, u32, Stage), CaptureTarget>,
+) -> Result<Scope, (String, Box<Store>)> {
     if targets.is_empty() || targets.len() > 4096 {
-        return Err("empty family diagnostic packet".into());
+        return Err(("empty family diagnostic packet".into(), Box::new(store)));
     }
     ACTIVE.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {
-            return Err("nested family diagnostic".into());
+            return Err(("nested family diagnostic".into(), Box::new(store)));
         }
-        let id = NEXT_SCOPE
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |v| v.checked_add(1),
-            )
-            .map_err(|_| "capture scope identity overflow")?;
+        let Ok(id) = NEXT_SCOPE.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |v| v.checked_add(1),
+        ) else {
+            return Err(("capture scope identity overflow".into(), Box::new(store)));
+        };
         *slot = Some(Active {
             scope_id: id,
             family,

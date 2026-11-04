@@ -13,7 +13,9 @@ pub(super) struct Packet {
     execution_approved:bool, acquisition:acquisition::Binding,identity:Identity,
     workload:Workload,trajectory:Trajectory,model:PathBuf,output:PathBuf,
     configured_context:u32,configured_output_allowance:usize,host_payload_limit:u64,
-    #[serde(default)] routing_witness:Option<super::gemma_routing_witness::Budget>,
+    /// Witness budget, opaque here: [`routing::budget`] admits it on witness-ON
+    /// packets; DriftAll128 requires it null and never parses it.
+    #[serde(default)] routing_witness:Option<serde_json::Value>,
     /// Warm live-resume kernel the loaded model must resolve; absent = VecHybrid.
     #[serde(default)] warm_live_kernel:WarmLiveKernel,
     /// Cohort stage localizer only: the stage plan, the lanes it covers and
@@ -65,13 +67,14 @@ pub(super) fn preflight(p:&Packet,localizer:bool)->Result<()> {
     ensure!(localizer || (!drift && p.observer_effect_reference.is_none()),
         "localizer mode and observer-effect reference belong to stage-localizer packets only");
     // DriftAll128 only: witness-OFF, so no witness budget/native check.
-    if !drift {super::gemma_routing_witness::validate_budget(p.routing_witness.as_ref())?;}
+    if !drift {routing::budget(p.routing_witness.as_ref())?;}
     ensure!(p.stage_localizer.is_some()==localizer && p.lanes.is_some()==localizer
         && (p.expected_stores.is_some()||p.stage_manifest.is_some())==localizer
         && !(p.expected_stores.is_some() && p.stage_manifest.is_some()),
         "stage-localizer packets run only under their own filters, and only they carry one store extent (inline or bound manifest)");
     if localizer {
         cohort::route(p.trajectory).map_err(anyhow::Error::msg)?;
+        // Both modes: the identity native is the build's own Cargo.toml pin.
         p.localizer_mode.admit_native(&p.identity.native_version,env!("HF2Q_MLX_NATIVE_VERSION")).map_err(anyhow::Error::msg)?;
         if drift {
             ensure!(p.trajectory==Trajectory::T0ColdSerial,"DriftAll128 runs the serial All128 route only");
@@ -79,7 +82,10 @@ pub(super) fn preflight(p:&Packet,localizer:bool)->Result<()> {
             ensure!(p.observer_effect_reference.is_none(),"DriftAll128 has no observer-effect reference store");
             ensure!(p.stage_localizer.as_ref().is_some_and(|plan|plan.decode_stages.is_empty()),
                 "DriftAll128 plan is prefill-only (decode_stages: [])");
+            ensure!(p.stage_manifest.is_some() && p.expected_stores.is_none(),
+                "DriftAll128 requires the plan-only form (bound stage_manifest, no inline expected_stores)");
         } else {
+            routing::require_published(&p.identity.native_version)?;
             ensure!(p.routing_witness.is_some(),"cohort localizer mirrors the witness-ON b3 endpoint stores");
             ensure!(p.observer_effect_reference.as_deref().is_none_or(file_safe),"file-safe observer-effect reference store");
         }
@@ -207,8 +213,7 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
     let bytes=payload(&expected)?;
     ensure!(bytes<=p.host_payload_limit,"Gemma payload exceeds pre-load bound");
     // Zero in DriftAll128, whose packet has no witness budget.
-    let witness=if p.routing_witness.is_some() {super::gemma_routing_witness::PAYLOAD_BYTES
-        +super::gemma_routing_witness::METADATA_BYTES+super::gemma_routing_witness::CPU_LEDGER_BYTES} else {0};
+    let witness=if !drift && p.routing_witness.is_some() {routing::CHARGE} else {0};
     ensure!(bytes+witness<=p.host_payload_limit,"routing+metadata+CPU ledger must join pre-load host bound");
     // Localizer: both frozen store lists (inline or bound manifest) must be the
     // source manifests, and endpoint + routing + stage bytes join the one bound.
@@ -255,8 +260,8 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
         && model.multi_seq_kv_mlx.is_none(),"selected Hybrid only; other actual legs require explicit coverage");
     // DriftAll128 never installs the witness: routing comes from the production dispatch.
     let _routing=if drift {None} else {
-        let routing_mode=if p.trajectory==Trajectory::T6CancelRestore {super::gemma_routing_witness::Mode::Cancelled}else{super::gemma_routing_witness::Mode::Ordinary};
-        super::gemma_routing_witness::install(model.ctx.executor.device(),&p.output,&p.identity,&observed,routing_mode,p.routing_witness.as_ref())?
+        routing::install(model.ctx.executor.device(),&p.output,&p.identity,&observed,
+            p.trajectory==Trajectory::T6CancelRestore,p.routing_witness.as_ref())?
     };
     let _capture=endpoint::install(store).map_err(anyhow::Error::msg)?;
     let _stages=match (stage_store,stage_targets.take()) {
@@ -278,10 +283,10 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
             let slots=[SlotId(0),SlotId(1),SlotId(2),SlotId(3)];
             for position in 128..144 {
                 let tokens=p.workload.lanes.iter().map(|v|v[position]).collect::<Vec<_>>();
-                super::gemma_routing_witness::begin(super::gemma_routing_witness::Namespace::Canonical,
-                    (0..4).map(|lane|super::gemma_routing_witness::Row{lane,position}).collect())?;
+                // Packed T2 is Cohort/endpoint only (preflight refuses it for DriftAll128).
+                routing::begin_canonical(position)?;
                 let logits=q1_gemma_cohort::decode(&mut model,&tokens,&slots,position)?;
-                super::gemma_routing_witness::end_checked()?;
+                routing::end_checked()?;
                 for (lane,row) in logits.chunks_exact(cfg.vocab_size).enumerate() {
                     endpoint::downloaded_logits(lane,position,row).map_err(anyhow::Error::msg)?;
                 }
@@ -331,7 +336,7 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
     let stage_trace=localizer.then(|| super::family::finish().map_err(anyhow::Error::msg));
     let trace=endpoint::finish().map_err(anyhow::Error::msg)?;result?;
     let stage_trace=stage_trace.transpose()?;
-    if !drift {super::gemma_routing_witness::finish()?;}
+    if !drift {routing::finish()?;}
     ensure!(trace.coverage.errors.is_empty(),"Gemma endpoint extent incomplete");
     if let Some(stages)=&stage_trace {
         ensure!(stages.coverage.errors.is_empty(),"Gemma cohort stage coverage incomplete: {:?}",stages.coverage.errors);
@@ -378,6 +383,9 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
     }
     Ok(())
 }
+/// Witness-ON adapter; DriftAll128 never reaches it.
+#[path="gemma_actual/routing.rs"]
+pub(super) mod routing;
 #[cfg(test)]
 #[path="gemma_controls.rs"]
 pub(super) mod controls;

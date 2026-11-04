@@ -64,7 +64,10 @@ pub(super) fn files(cfg:&crate::serve::config::Gemma4Config,l:Option<&Pass>)->Re
         let name=format!("manifest-{case}.json");
         rows.push(json!({"case":case,"manifest":{"file":name,"sha256":hash(&encoded)},
             "packet_extent":{"arm":arm,"lanes":m.lanes,"host_payload_limit":m.host_payload_limit,"stage_localizer":plan,
-                "branch":l.map(|l|l.branch),"pass":l.map(|l|l.pass)},
+                "branch":l.map(|l|l.branch),"pass":l.map(|l|l.pass),
+                // Branch P binds the reviewed All128 row-127 precondition record; the
+                // supervisor fills its {path, sha256} (q1_stage_localization.py all128-precondition).
+                "all128_precondition_required":l.is_some_and(|l|l.branch==Branch::P)},
             "store_records":m.expected_stores.iter().map(|(n,e)|(n.clone(),json!(e.len()))).collect::<serde_json::Map<_,_>>()}));
         files.push((name,encoded));
     }

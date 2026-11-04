@@ -282,11 +282,44 @@ class RoutingMapped(unittest.TestCase):
         with self.assertRaises(Invalid):
             self.run_mapped(key_map=bad)
         doc = json.loads(self.map.read_text())
-        continuation = doc["routing"]["phases"][2]["pairs"]
-        continuation[0][1] = doc["routing"]["phases"][0]["pairs"][0][1]  # Canonical 0..127 row mapped twice
+        prefix = doc["routing"]["phases"][0]["pairs"]
+        prefix.append(prefix[0])  # an aligned, in-span pair repeated: Canonical 0..127 row mapped twice
         bad.write_text(json.dumps(doc))
         with self.assertRaises(Invalid):
             self.run_mapped(key_map=bad)
+
+    def rewrite(self, edit):
+        doc = json.loads(self.map.read_text())
+        edit({p["phase"]: p["pairs"] for p in doc["routing"]["phases"]})
+        path = Path(self.root) / f"map-{len(list(Path(self.root).iterdir()))}.json"
+        path.write_text(json.dumps(doc))
+        return path
+
+    def test_misaligned_pair_or_out_of_span_position_refuses(self):
+        def swap_layers(phases):  # one-to-one and complete, but each pair joins different layers
+            pairs = phases["verify-prefix"]
+            pairs[0][1], pairs[1][1] = pairs[1][1], pairs[0][1]
+        with self.assertRaises(Invalid):
+            self.run_mapped(key_map=self.rewrite(swap_layers))
+
+        def other_lane(phases):
+            phases["continuation"][0][1][1] = (phases["continuation"][0][1][1] + 1) % 4
+        with self.assertRaises(Invalid):
+            self.run_mapped(key_map=self.rewrite(other_lane))
+
+        def committed_row_in_prefix(phases):  # lane 0 (a = 0): Canonical/T5Verify 128 moved to verify-prefix
+            moved = [p for p in phases["verify-committed"] if p[0][1] == 0]
+            phases["verify-committed"][:] = [p for p in phases["verify-committed"] if p[0][1] != 0]
+            phases["verify-prefix"].extend(moved)
+        with self.assertRaises(Invalid):
+            self.run_mapped(key_map=self.rewrite(committed_row_in_prefix))
+
+        def continuation_row_in_committed(phases):  # lane 0 (a = 0): position 129 is continuation, not verify
+            moved = [p for p in phases["continuation"] if p[0][1] == 0 and p[0][2] == 129]
+            phases["continuation"][:] = [p for p in phases["continuation"] if p not in moved]
+            phases["verify-committed"].extend([["T5Verify", *l[1:]], r] for l, r in moved)
+        with self.assertRaises(Invalid):
+            self.run_mapped(key_map=self.rewrite(continuation_row_in_committed))
 
 
 def response(tokens):
