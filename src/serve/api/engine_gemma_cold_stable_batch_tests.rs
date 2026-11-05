@@ -912,6 +912,59 @@ fn gemma_joint_cold_engine_cohort_matches_serial_turn0() {
     );
 }
 
+/// Turn-0 requests that carry a grammar, as tool-calling chat requests do
+/// (the handler compiles the tool grammar into `params.grammar`). The
+/// grammar admits every non-NUL byte, so it constrains nothing the model
+/// emits here, but it moves seeding onto the sampler path and exercises the
+/// cohort's per-lane grammar check.
+fn grammar_turn0_requests(engine: &Engine, lanes: &[Shape]) -> Vec<(Vec<u32>, SamplingParams)> {
+    let grammar = crate::serve::api::grammar::parser::parse("root ::= [^\\x00]*\n")
+        .expect("permissive grammar");
+    let token_bytes = engine.token_bytes_table();
+    turn0_requests(lanes)
+        .into_iter()
+        .map(|(prompt, mut params)| {
+            params.grammar = Some(grammar.clone());
+            params.token_bytes = Some(token_bytes.clone());
+            (prompt, params)
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "official Gemma 4 GGUF: grammar-carrying (tool-calling) turn-0 requests form the cold cohort and equal serial"]
+fn gemma_joint_cold_engine_cohort_with_grammar_matches_serial_turn0() {
+    let rt = runtime();
+    let off = spawn("0");
+    let lanes = engine_turn0(&off);
+    let requests = grammar_turn0_requests(&off, &lanes);
+    assert!(requests.iter().all(|(_, params)| params.grammar.is_some()));
+    let before = cohorts();
+    let expected: Vec<_> = concurrent(&rt, &off, &requests)
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(cohorts(), before, "switch off never forms a cold cohort");
+    shutdown(&rt, off);
+
+    let on = spawn("1");
+    let requests = grammar_turn0_requests(&on, &lanes);
+    let before = cohorts();
+    let actual: Vec<_> = concurrent(&rt, &on, &requests)
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    let after = cohorts();
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (1, 4),
+        "grammar turn 0: one cold stable cohort over 4 lanes"
+    );
+    assert_turns("grammar turn 0", &actual, &expected);
+    shutdown(&rt, on);
+    println!("GEMMA_JOINT_COLD_GRAMMAR_ENGINE_COMPLETE cohort_lanes=4 turn0_bitwise=true");
+}
+
 #[test]
 #[ignore = "official Gemma 4 GGUF: a faulted cold cohort boundary forward retries each lane per slot in FIFO order"]
 fn gemma_joint_cold_forward_fault_retries_each_lane_per_slot() {
@@ -1061,4 +1114,12 @@ fn gemma_joint_cold_cancel_during_transaction() {
     );
     shutdown(&rt, engine);
     println!("GEMMA_JOINT_COLD_CANCEL_COMPLETE others_bitwise=true slot_recovered=true");
+}
+
+#[test]
+fn gemma_cold_permissive_turn0_grammar_parses_and_runs() {
+    let grammar = crate::serve::api::grammar::parser::parse("root ::= [^\\x00]*\n")
+        .expect("permissive grammar");
+    let root = grammar.rule_id("root").expect("root rule");
+    assert!(crate::serve::api::grammar::GrammarRuntime::new(grammar, root).is_some());
 }
