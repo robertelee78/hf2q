@@ -609,9 +609,8 @@ shape) and §7 (gates), with these changes.
 - Group per chunk: `min(flash_attn_vec_hybrid_batched_gqa_pick_group(nh,
   nkv, dk, nsg), 2)`. On Gemma 4 that is G = 2 on both layer kinds and every
   bucket.
-- Stock fallback: a chunk whose (layer kind, stock bucket) is in the §13.0
-  fallback table runs stock `flash_attn_vec_hybrid_batched`. Both kernels
-  are u32-identical, so the fallback is invisible to output.
+- Stock fallback: none. The §13.0 fallback table is empty (every bucket is
+  faster grouped), so the route has no fallback code.
 - Bucket: the chunk's stock bucket for every row,
   `vec![HybridSlotBucket::for_kv_seq_len(kv_seq_len); len]`. This is the
   bucket the stock call derives from the same `kv_seq_len`, so the tmp layout
@@ -658,7 +657,7 @@ shape) and §7 (gates), with these changes.
 | Gate | Test | Required |
 |---|---|---|
 | X1 primitive | `gemma_warm_attn_exact_s0` (in #89) and T-N8, both metallib paths, rerun at every pin bump, macOS update and Metal toolchain change (`xcrun metal --version`, recorded in the receipt) | u32-equal |
-| X2 model route | `gemma_warm_attention_exact_matches_stock_bitwise`: one model load, gate lanes per slot with `VecHybrid` then `VecHybridGqa`, both paths, plus a 31-row suffix (it never reaches the batched prefill, so it is compared as a lane image without dispatch proof) | first token, logits bits, KV bytes, cursors. With `MLX_DISP_BUCKET=1`, counters are reset immediately before the warm prefill forward and read before any decode step, so decode's A1 dispatches cannot count. `flash_attn_vec_hybrid_batched_gqa2_*` warm dispatches must be > 0 in the candidate arm (or every chunk was in a fallback bucket, which is stated) and = 0 in the stock arm |
+| X2 model route | `gemma_warm_attention_exact_matches_stock_bitwise`: one model load, gate lanes per slot with `VecHybrid` then `VecHybridGqa`, both paths, plus a 31-row suffix (it never reaches the batched prefill, so it is compared as a lane image without dispatch proof) | first token, logits bits, KV bytes, cursors. With `MLX_DISP_BUCKET=1`, counters are reset immediately before the warm prefill forward and read before any decode step, so decode's A1 dispatches cannot count. `flash_attn_vec_hybrid_batched_gqa2_*` warm dispatches must be > 0 and stock dispatches = 0 in the candidate arm, and grouped dispatches = 0 in the stock arm |
 | X3 joint == per-slot | `gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid_gqa` | bitwise, with the same dispatch-count proof |
 | X4 envelope harness | `gemma_warm_attention_route_envelope` with `VecHybridGqa` in `ENVELOPE_ROUTES` | every row `d_nat = 0`, 0 flips, dispatch-count proof |
 | X5 Q1 | T1/T3 greedy144, packet `warm_live_kernel: VecHybridGqa` against `VecHybrid` | `q1_decision_policy.py exact` → `ExactEqual` |
