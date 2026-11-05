@@ -1051,6 +1051,35 @@ class GemmaT5(unittest.TestCase):
                                        precondition_lane, precondition_workload, precondition_unechoed, precondition_echo_holds)]
         mutated(self, self.build, (ON, NN, OP), negatives)
 
+class RuntimeSampleWalk(unittest.TestCase):
+    """b6-spec-review-notes 4.4: per runtime sample, `main` walks only the live case out; the other listed outs are walked
+    once before the baseline and once after the child exits (and must be unchanged)."""
+    @staticmethod
+    def main_source():
+        import ast, inspect
+        tree = ast.parse(inspect.getsource(s.main))
+        loop = next(n for n in ast.walk(tree) if isinstance(n, ast.While) and 'child.poll()' in ast.unparse(n.test))
+        return tree, loop
+
+    def test_runtime_loop_walks_only_the_live_out(self):
+        import ast
+        _, loop = self.main_source()
+        calls = [n for n in ast.walk(loop) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+        walks = [ast.unparse(c) for c in calls if c.func.id == 'disk_bytes']
+        self.assertEqual(walks, ['disk_bytes(out)'])
+        self.assertFalse([c for c in calls if c.func.id == 'available'], 'no per-sample walk of every listed out')
+        self.assertIn('available_live', {c.func.id for c in calls})
+
+    def test_other_outs_are_measured_before_baseline_and_rechecked_after_exit(self):
+        import ast
+        tree, _ = self.main_source()
+        text = ast.unparse(tree)
+        measure = text.index("static_other = sum((disk_bytes(o) for o in others))")
+        self.assertLess(measure, text.index("for i in range(12):"))
+        self.assertGreater(text.index("'other listed outs unchanged during the run'"), text.index('while child.poll() is None'))
+        self.assertIn("others = [o for o in outputs if o != out]", text)
+
+
 
 if __name__ == "__main__":
     unittest.main()
