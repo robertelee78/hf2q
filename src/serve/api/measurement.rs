@@ -175,6 +175,10 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
             "grammar": grammar_control(&state.config),
             "dwq_overlay": loaded.config_identity.dwq_overlay,
             "vision_projector": state.mmproj.is_some(),
+            // ADR-063 Q4-GEMMA-PREFILL-MOE A/B arm (`flat` | `slotted`);
+            // null for other families.
+            "gemma_prefill_moe_down": (engine.info().arch_str == "gemma4")
+                .then(crate::serve::gemma_prefill_moe::published_prefill_moe_down),
         },
     }))
 }

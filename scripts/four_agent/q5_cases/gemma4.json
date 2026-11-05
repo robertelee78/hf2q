@@ -7,6 +7,7 @@
     "A/B of the Gemma full-input checkpoint: HF2Q_Q5_GEMMA_FULL_INPUT_CHECKPOINT=0 selects the kill switch (forwarded by the launcher as HF2Q_GEMMA_FULL_INPUT_CHECKPOINT=0); the empty default leaves the hf2q default. Use a distinct --output per arm.",
     "A/B of Gemma joint warm prefill (ADR-063 Stage 1): HF2Q_Q5_GEMMA_JOINT_WARM_PREFILL=0 selects the kill switch (forwarded by the launcher as HF2Q_GEMMA_JOINT_WARM_PREFILL=0, per-slot warm prefill); the empty default leaves the hf2q default (on). Use a distinct --output per arm.",
     "A/B of Gemma tiled F16 warm attention (ADR-063 Stage 2): HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION=0 selects the kill switch (forwarded by the launcher as HF2Q_GEMMA_WARM_TILED_ATTENTION=0, vec-hybrid warm attention); the empty default leaves the hf2q default (on). Use a distinct --output per arm.",
+    "A/B of the Gemma prefill MoE down route (ADR-063 Q4-GEMMA-PREFILL-MOE): HF2Q_Q5_GEMMA_PREFILL_MOE_DOWN=flat|slotted is forwarded by the launcher as HF2Q_GEMMA_PREFILL_MOE_DOWN (flat is the previous flattened route, the A arm); HF2Q_Q5_MM_ID_SCHEDULE=grid|compact is forwarded as HF2Q_MM_ID_SCHEDULE (mlx-native expert-matmul tile schedule; grid is the A arm once the compact schedule ships). The empty defaults leave the hf2q and native defaults. The arm is recorded in /hf2q/v1/runtime active_controls.gemma_prefill_moe_down. Use a distinct --output per arm.",
     "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv.",
     "Text-only: a nonexistent MMPROJ makes the launcher omit --mmproj (it would otherwise default to a repo projector path), and hf2q serve then auto-loads the sibling gemma-4-26B-A4B-it-hf2q-q4_k_m-mmproj.gguf (observed in the 2026-10-30 calibration). artifact.text_only_locator serves a hard link of the same file from a private {OUT}/text-model/ directory, and readiness requires vision_projector == false."
   ],
@@ -29,7 +30,9 @@
     "CLIENT_APPROVAL_TEMPLATE": null,
     "GEMMA_FULL_INPUT_CHECKPOINT": "",
     "GEMMA_JOINT_WARM_PREFILL": "",
-    "GEMMA_WARM_TILED_ATTENTION": ""
+    "GEMMA_WARM_TILED_ATTENTION": "",
+    "GEMMA_PREFILL_MOE_DOWN": "",
+    "MM_ID_SCHEDULE": ""
   },
   "binary": "{HF2Q_BIN}",
   "artifact": {
@@ -55,7 +58,9 @@
       "HF2Q_BIN": "{HF2Q_BIN}",
       "FULL_INPUT_CHECKPOINT": "{GEMMA_FULL_INPUT_CHECKPOINT}",
       "JOINT_WARM_PREFILL": "{GEMMA_JOINT_WARM_PREFILL}",
-      "WARM_TILED_ATTENTION": "{GEMMA_WARM_TILED_ATTENTION}"
+      "WARM_TILED_ATTENTION": "{GEMMA_WARM_TILED_ATTENTION}",
+      "PREFILL_MOE_DOWN": "{GEMMA_PREFILL_MOE_DOWN}",
+      "MM_ID_SCHEDULE": "{MM_ID_SCHEDULE}"
     }
   },
   "readiness": {

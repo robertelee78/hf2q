@@ -93,6 +93,15 @@
 #                                    HF2Q_GEMMA_WARM_TILED_ATTENTION; unset
 #                                    keeps the hf2q default (off, vec-hybrid
 #                                    warm attention). 1 opts in to tiled F16.
+#     PREFILL_MOE_DOWN=flat|slotted  (this script) forwards
+#                                    HF2Q_GEMMA_PREFILL_MOE_DOWN; unset
+#                                    keeps the hf2q default (slotted). flat
+#                                    is the bitwise A/B arm (ADR-063
+#                                    Q4-GEMMA-PREFILL-MOE).
+#     MM_ID_SCHEDULE=grid|compact    (this script) forwards
+#                                    HF2Q_MM_ID_SCHEDULE; unset keeps the
+#                                    mlx-native expert-matmul schedule
+#                                    default. grid is the bitwise A/B arm.
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):
 #   * Disk persistence of the LCP registry for gemma (ADR-017 spiller
@@ -207,6 +216,24 @@ case "${WARM_TILED_ATTENTION:-}" in
         exit 2
         ;;
 esac
+PREFILL_MOE_DOWN_ENV=""
+case "${PREFILL_MOE_DOWN:-}" in
+    "") ;;
+    flat|slotted) PREFILL_MOE_DOWN_ENV="$PREFILL_MOE_DOWN" ;;
+    *)
+        echo "PREFILL_MOE_DOWN must be flat, slotted or unset" >&2
+        exit 2
+        ;;
+esac
+MM_ID_SCHEDULE_ENV=""
+case "${MM_ID_SCHEDULE:-}" in
+    "") ;;
+    grid|compact) MM_ID_SCHEDULE_ENV="$MM_ID_SCHEDULE" ;;
+    *)
+        echo "MM_ID_SCHEDULE must be grid, compact or unset" >&2
+        exit 2
+        ;;
+esac
 
 # macOS bash 3.2 + `set -u`: expanding an EMPTY array via "${MMARGS[@]}"
 # is an unbound-variable error (this killed the no-mmproj boot
@@ -218,6 +245,8 @@ if [[ -f "$MMPROJ" ]]; then
         ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
         ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
+        ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
+        ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
@@ -236,6 +265,8 @@ else
         ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
         ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
+        ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
+        ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \

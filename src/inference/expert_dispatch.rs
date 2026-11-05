@@ -1,8 +1,10 @@
 //! Storage-aware native expert-ID dispatch.
 //!
 //! GGUF scalar stacks use mlx-native's native F32/F16/BF16 primitive while
-//! block-quantized stacks retain the established GGML routes.  Both paths
-//! preserve the existing flattened `(n_tokens, top_k)` contract.
+//! block-quantized stacks retain the established GGML routes.  The plain
+//! entry points keep the flattened `(n_tokens, top_k)` contract (one shared
+//! activation row per token); the `_slotted` entry point reads one
+//! activation row per `(token, slot)` pair.
 
 use anyhow::{Context, Result};
 use mlx_native::{
@@ -20,6 +22,7 @@ fn scalar_dtype(ggml_type: GgmlType) -> Option<DType> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_scalar(
     session: &mut GraphSession<'_>,
     registry: &mut KernelRegistry,
@@ -29,6 +32,7 @@ fn dispatch_scalar(
     expert_ids: &MlxBuffer,
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
+    input_layout: DenseMatmulIdInputLayout,
 ) -> Result<bool> {
     let Some(expected_dtype) = scalar_dtype(params.ggml_type) else {
         return Ok(false);
@@ -46,7 +50,7 @@ fn dispatch_scalar(
         top_k: params.top_k,
         n_experts: params.n_experts,
         expert_stride_bytes: params.expert_stride,
-        input_layout: DenseMatmulIdInputLayout::SharedPerToken,
+        input_layout,
         id_multiplicity: DenseMatmulIdMultiplicity::MayRepeat,
         route: DenseMatmulIdRoute::Direct,
     };
@@ -77,7 +81,15 @@ pub(crate) fn dispatch_expert_matmul_id(
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
     if dispatch_scalar(
-        session, registry, device, input, weight, expert_ids, output, params,
+        session,
+        registry,
+        device,
+        input,
+        weight,
+        expert_ids,
+        output,
+        params,
+        DenseMatmulIdInputLayout::SharedPerToken,
     )? {
         return Ok(());
     }
@@ -98,7 +110,15 @@ pub(crate) fn dispatch_expert_matmul_id_mv(
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
     if dispatch_scalar(
-        session, registry, device, input, weight, expert_ids, output, params,
+        session,
+        registry,
+        device,
+        input,
+        weight,
+        expert_ids,
+        output,
+        params,
+        DenseMatmulIdInputLayout::SharedPerToken,
     )? {
         return Ok(());
     }
@@ -120,7 +140,15 @@ pub(crate) fn dispatch_expert_matmul_id_pooled(
     params: &GgmlQuantizedMatmulIdParams,
 ) -> Result<()> {
     if dispatch_scalar(
-        session, registry, device, input, weight, expert_ids, output, params,
+        session,
+        registry,
+        device,
+        input,
+        weight,
+        expert_ids,
+        output,
+        params,
+        DenseMatmulIdInputLayout::SharedPerToken,
     )? {
         return Ok(());
     }
@@ -129,6 +157,43 @@ pub(crate) fn dispatch_expert_matmul_id_pooled(
             registry, device, input, weight, expert_ids, output, scratch, params,
         )
         .context("pooled block-quantized expert-ID matmul")
+}
+
+/// Slotted expert-ID matmul: `input` is `[n_tokens, top_k, K]`, one row per
+/// `(token, slot)`, and the output is `[n_tokens, top_k, N]`. Bitwise equal
+/// to the flattened call over `n_tokens·top_k` rows with `top_k = 1`
+/// (ADR-063 Q4-GEMMA-PREFILL-MOE §3.2). Block-quantized stacks require the
+/// `mm_id` route (`n_tokens > MM_ID_ROUTING_THRESHOLD`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_expert_matmul_id_pooled_slotted(
+    session: &mut GraphSession<'_>,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    expert_ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut mlx_native::IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    if dispatch_scalar(
+        session,
+        registry,
+        device,
+        input,
+        weight,
+        expert_ids,
+        output,
+        params,
+        DenseMatmulIdInputLayout::Slotted,
+    )? {
+        return Ok(());
+    }
+    session
+        .quantized_matmul_id_ggml_pooled_slotted(
+            registry, device, input, weight, expert_ids, output, scratch, params,
+        )
+        .context("pooled slotted block-quantized expert-ID matmul")
 }
 
 #[cfg(test)]
@@ -311,5 +376,125 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("weight"), "{error:#}");
+    }
+
+    /// ADR-063 Q4-GEMMA-PREFILL-MOE §5.2: for every scalar expert storage
+    /// type, the slotted down call is bitwise equal to the flattened call
+    /// (`n_tokens·top_k` rows, `top_k = 1`) the Gemma prefill used before.
+    #[test]
+    fn scalar_slotted_down_is_bitwise_equal_to_flattened_rows() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            eprintln!("skipping scalar slotted down parity test: no Metal device");
+            return;
+        };
+        const K: usize = 96;
+        const N: usize = 80;
+        const EXPERTS: usize = 16;
+        const TOP_K: usize = 8;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let weights_f32: Vec<f32> = (0..EXPERTS * N * K)
+            .map(|_| ((next() % 2001) as f32 - 1000.0) / 997.0)
+            .collect();
+        let executor = GraphExecutor::new(device.clone());
+        let mut registry = KernelRegistry::new();
+        for (ggml_type, element_bytes) in
+            [(GgmlType::F32, 4usize), (GgmlType::F16, 2), (GgmlType::BF16, 2)]
+        {
+            let weights = match ggml_type {
+                GgmlType::F32 => f32_buffer(&device, &weights_f32),
+                GgmlType::BF16 => bf16_buffer(&device, &weights_f32),
+                _ => {
+                    let mut buffer = device
+                        .alloc_buffer(weights_f32.len() * 2, DType::F16, vec![weights_f32.len()])
+                        .unwrap();
+                    for (destination, value) in buffer
+                        .as_mut_slice::<u16>()
+                        .unwrap()
+                        .iter_mut()
+                        .zip(&weights_f32)
+                    {
+                        *destination = half::f16::from_f32(*value).to_bits();
+                    }
+                    buffer
+                }
+            };
+            for seq_len in [33usize, 232] {
+                let rows = seq_len * TOP_K;
+                let input_values: Vec<f32> = (0..rows * K)
+                    .map(|_| ((next() % 4001) as f32 - 2000.0) / 1999.0)
+                    .collect();
+                let input = f32_buffer(&device, &input_values);
+                // Distinct ids per token, skewed toward low experts.
+                let mut id_values = Vec::with_capacity(rows);
+                for _ in 0..seq_len {
+                    let mut chosen: Vec<u32> = Vec::with_capacity(TOP_K);
+                    while chosen.len() < TOP_K {
+                        let id = ((next() % 64) as u32).min((next() % EXPERTS as u64) as u32);
+                        if !chosen.contains(&id) {
+                            chosen.push(id);
+                        }
+                    }
+                    id_values.extend(chosen);
+                }
+                let mut ids = device
+                    .alloc_buffer(rows * 4, DType::U32, vec![seq_len, TOP_K])
+                    .unwrap();
+                ids.as_mut_slice::<u32>().unwrap().copy_from_slice(&id_values);
+                let mut scratch =
+                    mlx_native::IdMmScratch::alloc(&device, EXPERTS as u32, rows as u32).unwrap();
+                let mut run = |slotted: bool| {
+                    let output = device
+                        .alloc_buffer(rows * N * 4, DType::F32, vec![rows, N])
+                        .unwrap();
+                    let params = GgmlQuantizedMatmulIdParams {
+                        n_tokens: if slotted { seq_len } else { rows } as u32,
+                        top_k: if slotted { TOP_K } else { 1 } as u32,
+                        n: N as u32,
+                        k: K as u32,
+                        n_experts: EXPERTS as u32,
+                        expert_stride: (N * K * element_bytes) as u64,
+                        ggml_type,
+                    };
+                    let mut session = executor.begin().unwrap();
+                    let dispatch = if slotted {
+                        dispatch_expert_matmul_id_pooled_slotted
+                    } else {
+                        dispatch_expert_matmul_id_pooled
+                    };
+                    dispatch(
+                        &mut session,
+                        &mut registry,
+                        &device,
+                        &input,
+                        &weights,
+                        &ids,
+                        &output,
+                        &mut scratch,
+                        &params,
+                    )
+                    .unwrap();
+                    session.finish().unwrap();
+                    output.as_slice::<u32>().unwrap().to_vec()
+                };
+                let flat = run(false);
+                let slotted = run(true);
+                assert!(
+                    flat.iter().all(|bits| f32::from_bits(*bits).is_finite()),
+                    "{ggml_type:?} seq_len {seq_len}: flattened output finite"
+                );
+                let first = flat.iter().zip(&slotted).position(|(a, b)| a != b);
+                assert!(
+                    first.is_none(),
+                    "{ggml_type:?} seq_len {seq_len}: slotted differs from flattened at {first:?}"
+                );
+            }
+        }
     }
 }
