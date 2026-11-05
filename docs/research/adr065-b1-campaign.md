@@ -8,27 +8,31 @@ This document and the campaign file [`scripts/four_agent/adr065/campaign-b1.json
 
 **Operator decision (2026-11-04).** B1 baselines the fixed engine: hf2q main, once mlx-native 0.15.18 is published and pinned on main. 0.15.18 carries the RoPE partial-rotary fix for a bug in `rope_multi.metal`, which affects Qwen3.6 and Qwen3.8. B1 is never run on the v0.1.29 release binary.
 
-The campaign file holds that commit's identity in `baseline`. While a field is `null` (a placeholder), the driver refuses to launch a baseline.
+**Operator decision (2026-11-05).** Rust 1.99.1 from here forward. The host's stable toolchain was updated at 07:14Z, and `38eea839` no longer builds on it. The baseline is therefore rebuilt with stable rustc 1.99.1 (commit `58cf8f9c35b355199727627d07ae34a4e2846d67`) from the newest main, once the Rust 1.99 fix merges. It remains "fixed main".
 
-**Finalized 2026-11-04:**
+The campaign file holds that build's identity in `baseline`. While a field is `null` (a placeholder), the driver refuses to launch a baseline.
 
-- **Source commit:** `38eea8393862b16068bee23789ded41ddf853328`. Its `Cargo.lock` pins mlx-native 0.15.18, checksum `9d10f97e0e25a00c1b4706a0ea9a838b2524b3fc2b999d05f21cd2580c524bee`.
-- **Binary:** `$B1/main-build/hf2q`, sha256 `627d152a122239079a4ee1cef0d6fc6a76877a8fab7d76ec697208761b3a5dff`, 55,518,824 bytes. It reports `hf2q 0.1.29` and embeds only mlx-native 0.15.18.
-- **Build receipt:** sha256 `a7846eb8fe6f9f0b03c900216ac20c134ee3e1b12bbafe42a2ace850a1d7952a`.
-- **Build log:** `$B1/main-build.log`.
+**Superseded build (2026-11-04), kept as evidence only and never the baseline:**
+
+- Source commit `38eea839`.
+- Binary sha256 `627d152a…`, 55,518,824 bytes, built with rustc `4a4ef493…`.
+- Build receipt `a7846eb8…`.
+- Files are in `$B1/main-build-38eea839/`; build log `$B1/main-build.log`.
 
 | Item | Value |
 | --- | --- |
-| Binary | `$B1/main-build/hf2q`. It is built from a clean checkout of `source_commit` with `RUSTC_WRAPPER= CARGO_INCREMENTAL=0 GIT_COMMIT_SHA=<source_commit> CARGO_TARGET_DIR=/Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool cargo build --release --locked`, then copied out of the target directory. The campaign file records its sha256 and bytes. |
-| Source commit | The hf2q main commit that pins mlx-native 0.15.18 (the `source_commit` field). |
-| Build receipt | `$B1/main-build/build-receipt.json` (`hf2q.adr065.build-receipt.v1`, written by `adr065_campaign.py build-receipt`), bound by sha256. It records source commit, binary sha256 and bytes, the mlx-native version and checksum read from `Cargo.lock` at that commit, the native versions embedded in the binary, and the build command. |
-| Native | mlx-native `=0.15.18`, with its crates.io checksum taken from `Cargo.lock` at `source_commit` (the `native.checksum` field). |
+| Binary | `$B1/main-build/hf2q`. It is built from a clean checkout of `source_commit` with `RUSTC_WRAPPER= CARGO_INCREMENTAL=0 GIT_COMMIT_SHA=<source_commit> CARGO_TARGET_DIR=/Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool cargo build --release --locked`, using the stable 1.99.1 toolchain, then copied out of the target directory. The campaign file records its sha256 and bytes. |
+| Source commit | The newest hf2q main commit after the Rust 1.99 fix (the `source_commit` field). |
+| Build receipt | `$B1/main-build/build-receipt.json` (`hf2q.adr065.build-receipt.v1`, written by `adr065_campaign.py build-receipt`), bound by sha256. It records:<br>• source commit, and binary sha256 and bytes;<br>• mlx-native version and checksum, read from `Cargo.lock` at that commit;<br>• `rustc -vV` output (release and commit hash), run in the checkout so a `rust-toolchain` file applies;<br>• the mlx-native versions and rustc commits embedded in the binary;<br>• the build command. |
+| Native | mlx-native `=0.15.18`, with its crates.io checksum from `Cargo.lock` at `source_commit` (`native.checksum`). If main's pin has moved by then, `native.version` moves with it and the change is reviewed. |
+| Toolchain | rustc 1.99.1, commit `58cf8f9c35b355199727627d07ae34a4e2846d67` (`toolchain` in the campaign file). |
 
-Before launch, the driver checks four things against the campaign file:
+Before launch, the driver checks five things against the campaign file:
 - the binary's sha256 and size;
-- the build receipt's sha256 and each of its identity fields;
+- the build receipt's sha256 and each of its identity fields, including `rustc_release` and `rustc_commit_hash`;
 - the mlx-native version and checksum pinned in `Cargo.lock` at `source_commit`, read with `git show` from the harness repository;
-- that the binary embeds exactly one `mlx-native-<version>` path, and that it is 0.15.18.
+- that the binary embeds exactly one `mlx-native-<version>` path, equal to `native.version`;
+- that the binary embeds exactly one `/rustc/<commit>/` path, equal to `toolchain.rustc_commit_hash`.
 
 Everything else in this document is unchanged by the decision: artifacts, cases, design, fairness rule, counts, cooldown and budget.
 
@@ -113,7 +117,8 @@ python3 -B scripts/four_agent/adr065_campaign.py build-receipt --binary $B1/main
   --source-checkout /opt/hf2q-worktrees/b1-main-build --output $B1/main-build/build-receipt.json \
   --command "RUSTC_WRAPPER= CARGO_INCREMENTAL=0 GIT_COMMIT_SHA=$MAIN CARGO_TARGET_DIR=/Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool cargo build --release --locked"
 # 2. Finalize campaign-b1.json: baseline.binary.{source_commit, sha256, bytes}, build_receipt.sha256 and
-#    native.checksum from that output; commit; independent re-check of the identity change before the run.
+#    native.checksum from that output (rustc_release/rustc_commit_hash must already equal toolchain); commit;
+#    independent re-check of the identity change before the run.
 # 3. Dry-run, then the baseline (GPU lane, HOST-LOCK held, nothing else loaded; one family at a time):
 mkdir -p "$B1/baseline"
 for F in qwen38 deepseek4 gemma4; do

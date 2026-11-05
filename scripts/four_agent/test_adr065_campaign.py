@@ -61,6 +61,16 @@ class CampaignFile(unittest.TestCase):
 
 
 SOURCE_COMMIT, NATIVE_SUM, BYTES = "1" * 40, "d" * 64, 4096
+RUSTC = "58cf8f9c35b355199727627d07ae34a4e2846d67"  # the campaign file's toolchain.rustc_commit_hash (1.99.1)
+GOOD = {"native": ["0.15.18"], "rustc": [RUSTC]}
+
+
+def found(native=("0.15.18",), rustc=(RUSTC,)):
+    return {"native": list(native), "rustc": list(rustc)}
+
+
+def fake_rustc(checkout, release="1.99.1", commit=RUSTC):
+    return {"release": release, "commit_hash": commit, "verbose": f"rustc {release}\nrelease: {release}\n"}
 LOCK = ('[[package]]\nname = "mlx-native"\nversion = "{version}"\n'
         'source = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "{checksum}"\n')
 
@@ -127,14 +137,15 @@ class Harness(unittest.TestCase):
         self.campaign["families"]["qwen38"]["artifact"].update(sha256=MODEL_SHA, bytes=10)
         self.receipt = self.root / "build-receipt.json"
         self.receipt.write_text(json.dumps({"schema": ac.BUILD_RECEIPT_SCHEMA, "source": SOURCE_COMMIT, "sha256": BIN_SHA,
-                                            "bytes": BYTES, "native_version": "0.15.18", "native_checksum": NATIVE_SUM}))
+                                            "bytes": BYTES, "native_version": "0.15.18", "native_checksum": NATIVE_SUM,
+                                            "rustc_release": "1.99.1", "rustc_commit_hash": RUSTC}))
         self.campaign["baseline"]["binary"].update(
             source_commit=SOURCE_COMMIT, sha256=BIN_SHA, bytes=BYTES,
             build_receipt={"path": str(self.receipt), "sha256": q5_artifacts.sha256(self.receipt)})
         self.campaign["baseline"]["native"]["checksum"] = NATIVE_SUM
         self.campaign["baseline_campaign"]["runs_per_stage"] = {"n4": 3, "n1": 2, "3+1": 1, "2+2": 1, "1+3": 1}
         self.bin = self.root / "hf2q"
-        self.bin.write_bytes(b"\0mlx-native-0.15.18/src\0")
+        self.bin.write_bytes(b"\0mlx-native-0.15.18/src\0/rustc/" + RUSTC.encode() + b"/library/core/src/lib.rs\0")
         self.case = HERE / "q5_cases" / "qwen38.json"
 
     def tearDown(self):
@@ -155,10 +166,10 @@ class Harness(unittest.TestCase):
             kw.setdefault("b_case", self.b_case())
         return ac.build_plan(Args(mode, **kw), self.campaign, SOURCE)
 
-    def driver(self, plan, cases, out, decide=None, ids=None, versions=lambda path: ["0.15.18"]):
+    def driver(self, plan, cases, out, decide=None, ids=None, scan=lambda path: GOOD):
         runner, clock = FakeRunner(decide), Clock()
         driver = ac.Driver(plan, cases, out, {}, runner, lambda: 0, ids or (lambda: fake_ids(plan)),
-                           clock=clock, sleep=clock.sleep, versions=versions, lock=fake_lock)
+                           clock=clock, sleep=clock.sleep, scan=scan, lock=fake_lock)
         return driver, runner, clock
 
 
@@ -215,20 +226,20 @@ class Plan(Harness):
 
     def test_launch_problems(self):
         plan, _ = self.plan()
-        self.assertEqual(ac.launch_problems(plan, fake_ids(plan), ["0.15.18"], fake_lock), [])
+        self.assertEqual(ac.launch_problems(plan, fake_ids(plan), GOOD, fake_lock), [])
         problems = ac.launch_problems(plan, fake_ids(plan, binary_sha="9" * 64, artifact_sha="8" * 64, dirty=["M x"]),
-                                      ["0.15.15", "0.15.18"], fake_lock)
+                                      found(native=("0.15.15", "0.15.18")), fake_lock)
         self.assertEqual(len(problems), 4, problems)
         self.assertIn("A: artifact /m.gguf is not the official", problems[0])
         self.assertIn(f"the baseline binary must be the main build {BIN_SHA} ({BYTES} bytes)", problems[1])
         self.assertIn("exactly one mlx-native version (0.15.18)", problems[2])
         ab, _ = self.plan("ab", commit="xyz")
         self.assertIn("--commit must be the 40-hex source commit of the binary",
-                      ac.launch_problems(ab, fake_ids(ab), ["0.15.17"], fake_lock))
+                      ac.launch_problems(ab, fake_ids(ab), found(native=("0.15.17",)), fake_lock))
         mixed = fake_ids(ab)
         mixed["arms"]["B"]["binary"]["sha256"] = "9" * 64
         self.assertIn("every arm must run the same binary (arms differ only in a kill switch)",
-                      ac.launch_problems(ab, mixed, ["0.15.18"], fake_lock))
+                      ac.launch_problems(ab, mixed, GOOD, fake_lock))
 
     def test_placeholder_baseline_never_launches(self):
         self.campaign["baseline"]["binary"].update(source_commit=None, sha256=None, bytes=None)
@@ -236,26 +247,31 @@ class Plan(Harness):
         self.campaign["baseline"]["native"]["checksum"] = None
         plan, _ = self.plan()
         self.assertIsNone(plan["declared"]["commit"])
-        problems = ac.launch_problems(plan, fake_ids(plan), ["0.15.18"], fake_lock)
+        problems = ac.launch_problems(plan, fake_ids(plan), GOOD, fake_lock)
         self.assertIn("the campaign file's baseline identity is a placeholder (source_commit, sha256, bytes, "
                       "native_checksum, build_receipt.sha256 unset): build the pinned main commit, write its build "
                       "receipt and finalize campaign-b1.json", problems)
 
-    def test_build_receipt_and_native_pin_bind_the_main_build(self):
+    def test_build_receipt_native_pin_and_rustc_bind_the_main_build(self):
         plan, _ = self.plan()
-        check = lambda **kw: ac.baseline_problems(plan["baseline"], {BIN_SHA}, {BYTES}, ["0.15.18"], **kw)
+        self.assertEqual((plan["baseline"]["rustc_release"], plan["baseline"]["rustc_commit_hash"]), ("1.99.1", RUSTC))
+        check = lambda **kw: ac.baseline_problems(plan["baseline"], {BIN_SHA}, {BYTES}, GOOD, **kw)
         self.assertEqual(check(lock=fake_lock), [])
         self.assertEqual(check(lock=lambda c: fake_lock(c, version="0.15.16")),
                          [f"Cargo.lock at {SOURCE_COMMIT} pins mlx-native 0.15.16 ({NATIVE_SUM}), not 0.15.18 ({NATIVE_SUM})"])
         self.assertIn("no mlx-native pin readable from Cargo.lock", check(lock=lambda c: fake_lock("0" * 40))[0])
         self.assertIn("exactly one mlx-native version (0.15.18); found ['0.15.16']",
-                      ac.baseline_problems(plan["baseline"], {BIN_SHA}, {BYTES}, ["0.15.16"], fake_lock)[0])
-        self.assertIn("must be the main build", ac.baseline_problems(plan["baseline"], {BIN_SHA}, {1}, ["0.15.18"], fake_lock)[0])
+                      ac.baseline_problems(plan["baseline"], {BIN_SHA}, {BYTES}, found(native=("0.15.16",)), fake_lock)[0])
+        old = "4a4ef493e3a1488c6e321570238084b38948f6db"  # the superseded 38eea839 build's rustc
+        self.assertEqual(ac.baseline_problems(plan["baseline"], {BIN_SHA}, {BYTES}, found(rustc=(old,)), fake_lock),
+                         [f"the binary must embed exactly one rustc commit ({RUSTC}, rustc 1.99.1); found ['{old}']"])
+        self.assertIn("must be the main build", ac.baseline_problems(plan["baseline"], {BIN_SHA}, {1}, GOOD, fake_lock)[0])
         document = json.loads(self.receipt.read_text())
-        self.receipt.write_text(json.dumps({**document, "native_checksum": "e" * 64}))
+        self.receipt.write_text(json.dumps({**document, "native_checksum": "e" * 64, "rustc_release": "1.97.0"}))
         self.assertIn("missing or not", check(lock=fake_lock)[0])  # the receipt's bytes changed
         plan["baseline"]["build_receipt"]["sha256"] = q5_artifacts.sha256(self.receipt)
-        self.assertEqual(check(lock=fake_lock), [f"build receipt {self.receipt} differs from the campaign file: native_checksum"])
+        self.assertEqual(check(lock=fake_lock),
+                         [f"build receipt {self.receipt} differs from the campaign file: native_checksum, rustc_release"])
 
     def test_build_receipt_command_reads_a_clean_checkout(self):
         repo = self.root / "src"
@@ -267,19 +283,30 @@ class Plan(Harness):
         git("-c", "user.email=t@t", "-c", "user.name=t", "-c", "core.hooksPath=/dev/null", "commit", "-qm", "c")
         commit = git("rev-parse", "HEAD").strip()
         lock = lambda c: LOCK.format(version="0.15.18", checksum=NATIVE_SUM) if c == commit else None
-        receipt = ac.build_receipt(self.bin, repo, "cargo build --release --locked", lock=lock)
-        self.assertEqual({k: receipt[k] for k in ("schema", "source", "sha256", "bytes", "native_version", "native_checksum")},
+        receipt = ac.build_receipt(self.bin, repo, "cargo build --release --locked", lock=lock, toolchain=fake_rustc)
+        self.assertEqual({k: receipt[k] for k in ("schema", *ac.RECEIPT_KEYS)},
                          {"schema": ac.BUILD_RECEIPT_SCHEMA, "source": commit, "sha256": q5_artifacts.sha256(self.bin),
-                          "bytes": self.bin.stat().st_size, "native_version": "0.15.18", "native_checksum": NATIVE_SUM})
+                          "bytes": self.bin.stat().st_size, "native_version": "0.15.18", "native_checksum": NATIVE_SUM,
+                          "rustc_release": "1.99.1", "rustc_commit_hash": RUSTC})
+        self.assertEqual(receipt["embedded"], GOOD)
         (repo / "Cargo.lock").write_text("dirty\n")
         with self.assertRaisesRegex(q3.qc.CampaignError, "uncommitted changes"):
-            ac.build_receipt(self.bin, repo, "x", lock=lock)
+            ac.build_receipt(self.bin, repo, "x", lock=lock, toolchain=fake_rustc)
         git("checkout", "-q", "Cargo.lock")
         with self.assertRaisesRegex(q3.qc.CampaignError, "embeds mlx-native"):
-            ac.build_receipt(self.bin, repo, "x", lock=lambda c: LOCK.format(version="0.15.16", checksum=NATIVE_SUM))
+            ac.build_receipt(self.bin, repo, "x", lock=lambda c: LOCK.format(version="0.15.16", checksum=NATIVE_SUM),
+                             toolchain=fake_rustc)
+        with self.assertRaisesRegex(q3.qc.CampaignError, "embeds rustc commits"):
+            ac.build_receipt(self.bin, repo, "x", lock=lock, toolchain=lambda c: fake_rustc(c, "1.97.0", "0" * 40))
 
-    def test_native_versions_scan_spans_chunks(self):
-        self.assertEqual(ac.native_versions(self.bin, chunk=4), ["0.15.18"])
+    def test_rustc_identity_parses_verbose_version(self):
+        text = ("rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: " + RUSTC +
+                "\ncommit-date: 2026-10-13\nhost: aarch64-apple-darwin\nrelease: 1.99.1\nLLVM version: 23.1.1\n")
+        run = lambda argv, **kw: ac.subprocess.CompletedProcess(argv, 0, stdout=text)
+        self.assertEqual(ac.rustc_identity(self.root, run=run), {"release": "1.99.1", "commit_hash": RUSTC, "verbose": text})
+
+    def test_embedded_scan_spans_chunks(self):
+        self.assertEqual(ac.embedded(self.bin, chunk=4), GOOD)
 
 
 class Runs(Harness):
@@ -341,7 +368,7 @@ class Runs(Harness):
 
     def test_launch_problems_refuse_to_start(self):
         plan, cases = self.plan()
-        driver, runner, _ = self.driver(plan, cases, self.root / "refused", versions=lambda path: ["0.15.15"])
+        driver, runner, _ = self.driver(plan, cases, self.root / "refused", scan=lambda path: found(native=("0.15.15",)))
         with self.assertRaisesRegex(q3.qc.CampaignError, "mlx-native"):
             driver.run()
         self.assertEqual(runner.calls, [])

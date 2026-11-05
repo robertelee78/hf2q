@@ -45,10 +45,13 @@ CAMPAIGN_FILE = HERE / "adr065" / "campaign-b1.json"
 CAMPAIGN_SCHEMA = "hf2q.adr065.campaign.v1"
 SCHEMA = "hf2q.adr065.campaign-run.v1"
 BUILD_RECEIPT_SCHEMA = "hf2q.adr065.build-receipt.v1"
-NATIVE = re.compile(rb"mlx-native-(\d+\.\d+\.\d+)")
+# Identities a Rust binary embeds in its source paths: the mlx-native crate version and the rustc commit hash.
+EMBEDDED = {"native": re.compile(rb"mlx-native-(\d+\.\d+\.\d+)"), "rustc": re.compile(rb"/rustc/([0-9a-f]{40})/")}
+NOTHING = {"native": [], "rustc": []}
 ROLES = {"A": "previous default", "B": "candidate (one kill switch changed)"}
 # Campaign-file baseline fields that stay null until the pinned main commit is built (a placeholder plan).
 BASELINE_FIELDS = ("source_commit", "sha256", "bytes", "native_checksum", "build_receipt.sha256")
+RECEIPT_KEYS = ("source", "sha256", "bytes", "native_version", "native_checksum", "rustc_release", "rustc_commit_hash")
 
 
 def load_campaign(path=CAMPAIGN_FILE):
@@ -64,15 +67,17 @@ def expand(text, roots):
     return text
 
 
-def native_versions(path, chunk=1 << 22):
-    """mlx-native crate versions named in a binary's embedded source paths (streamed scan)."""
-    found, tail = set(), b""
+def embedded(path, chunk=1 << 22):
+    """{"native": mlx-native versions, "rustc": rustc commit hashes} named in a binary's embedded source paths
+    (streamed scan)."""
+    found, tail = {key: set() for key in EMBEDDED}, b""
     with open(path, "rb") as handle:
         for block in iter(lambda: handle.read(chunk), b""):
             window = tail + block
-            found.update(m.decode() for m in NATIVE.findall(window))
-            tail = window[-32:]
-    return sorted(found)
+            for key, pattern in EMBEDDED.items():
+                found[key].update(m.decode() for m in pattern.findall(window))
+            tail = window[-64:]
+    return {key: sorted(values) for key, values in found.items()}
 
 
 def budget(stage_runs, arms, allowance):
@@ -148,7 +153,9 @@ def build_plan(args, campaign, source):
         plan["baseline"] = {"label": base["label"], "kind": base["kind"],
                             **{k: base["binary"][k] for k in ("source_commit", "sha256", "bytes")},
                             "build_receipt": {"path": expand(receipt["path"], roots), "sha256": receipt["sha256"]},
-                            "native_version": base["native"]["version"], "native_checksum": base["native"]["checksum"]}
+                            "native_version": base["native"]["version"], "native_checksum": base["native"]["checksum"],
+                            "rustc_release": base["toolchain"]["rustc_release"],
+                            "rustc_commit_hash": base["toolchain"]["rustc_commit_hash"]}
         plan["declared"]["commit"] = base["binary"]["source_commit"]
         plan["n1_control"] = None
         fixed = None
@@ -195,10 +202,10 @@ def placeholders(base):
     return [field for field in BASELINE_FIELDS if values[field] is None]
 
 
-def baseline_problems(base, shas, sizes, versions, lock=q2_traced_run.git_lock):
+def baseline_problems(base, shas, sizes, found, lock=q2_traced_run.git_lock):
     """The served binary must be the campaign file's main build: its sha256 and size, its build receipt (bound by
-    sha256: source commit, binary sha256, native pin), the mlx-native pin in Cargo.lock at that commit, and the one
-    mlx-native version embedded in the binary."""
+    sha256: source commit, binary sha256 and size, native pin, rustc release and commit), the mlx-native pin in
+    Cargo.lock at that commit, and the one mlx-native version and one rustc commit embedded in the binary."""
     missing = placeholders(base)
     if missing:
         return [f"the campaign file's baseline identity is a placeholder ({', '.join(missing)} unset): build the "
@@ -211,9 +218,8 @@ def baseline_problems(base, shas, sizes, versions, lock=q2_traced_run.git_lock):
     if document is None or q5_artifacts.sha256(receipt["path"]) != receipt["sha256"]:
         problems.append(f"build receipt {receipt['path']} missing or not {receipt['sha256']}")
     else:
-        expected = {"schema": BUILD_RECEIPT_SCHEMA, "source": base["source_commit"], "sha256": base["sha256"],
-                    "bytes": base["bytes"], "native_version": base["native_version"],
-                    "native_checksum": base["native_checksum"]}
+        expected = {"schema": BUILD_RECEIPT_SCHEMA, "source": base["source_commit"],
+                    **{k: base[k] for k in RECEIPT_KEYS if k != "source"}}
         wrong = [k for k, v in expected.items() if document.get(k) != v]
         if wrong:
             problems.append(f"build receipt {receipt['path']} differs from the campaign file: {', '.join(wrong)}")
@@ -225,13 +231,24 @@ def baseline_problems(base, shas, sizes, versions, lock=q2_traced_run.git_lock):
         if pin != (base["native_version"], base["native_checksum"]):
             problems.append(f"Cargo.lock at {base['source_commit']} pins mlx-native {pin[0]} ({pin[1]}), not "
                             f"{base['native_version']} ({base['native_checksum']})")
-    if versions != [base["native_version"]]:
+    if found["native"] != [base["native_version"]]:
         problems.append(f"the binary must embed exactly one mlx-native version ({base['native_version']}); "
-                        f"found {versions}")
+                        f"found {found['native']}")
+    if found["rustc"] != [base["rustc_commit_hash"]]:
+        problems.append(f"the binary must embed exactly one rustc commit ({base['rustc_commit_hash']}, rustc "
+                        f"{base['rustc_release']}); found {found['rustc']}")
     return problems
 
 
-def build_receipt(binary, source_checkout, command, lock=q2_traced_run.git_lock):
+def rustc_identity(checkout, rustc="rustc", run=subprocess.run):
+    """`rustc -vV` as the build saw it (run in the checkout, so a rust-toolchain file applies)."""
+    text = run([rustc, "-vV"], cwd=checkout, check=True, capture_output=True, text=True, timeout=30).stdout
+    fields = dict(line.split(": ", 1) for line in text.splitlines()[1:] if ": " in line)
+    qc.require({"release", "commit-hash"} <= set(fields), f"unexpected `{rustc} -vV` output")
+    return {"release": fields["release"], "commit_hash": fields["commit-hash"], "verbose": text}
+
+
+def build_receipt(binary, source_checkout, command, lock=q2_traced_run.git_lock, toolchain=rustc_identity):
     """The B1 build receipt of a binary built from a clean checkout of a main commit."""
     checkout = Path(source_checkout).resolve()
     git = lambda *argv: subprocess.run(["git", "-C", str(checkout), *argv], check=True, capture_output=True,
@@ -239,16 +256,19 @@ def build_receipt(binary, source_checkout, command, lock=q2_traced_run.git_lock)
     commit = git("rev-parse", "HEAD").strip()
     qc.require(git("status", "--porcelain", "--untracked-files=no") == "", f"{checkout} has uncommitted changes")
     version, checksum = q2_traced_run.native_pin(lock(commit))
-    embedded = native_versions(binary)
-    qc.require(embedded == [version], f"{binary} embeds mlx-native {embedded}, Cargo.lock pins {version}")
+    found, rustc = embedded(binary), toolchain(checkout)
+    qc.require(found["native"] == [version], f"{binary} embeds mlx-native {found['native']}, Cargo.lock pins {version}")
+    qc.require(found["rustc"] == [rustc["commit_hash"]],
+               f"{binary} embeds rustc commits {found['rustc']}, but rustc {rustc['release']} is {rustc['commit_hash']}")
     stat = os.stat(binary)
     return {"schema": BUILD_RECEIPT_SCHEMA, "source": commit, "sha256": q5_artifacts.sha256(binary),
             "bytes": stat.st_size, "native_version": version, "native_checksum": checksum,
-            "embedded_native_versions": embedded, "binary": str(Path(binary).resolve()),
+            "rustc_release": rustc["release"], "rustc_commit_hash": rustc["commit_hash"], "rustc_verbose": rustc["verbose"],
+            "embedded": found, "binary": str(Path(binary).resolve()),
             "source_checkout": str(checkout), "command": command, "binary_mtime_ns": stat.st_mtime_ns}
 
 
-def launch_problems(plan, ids, versions, lock=q2_traced_run.git_lock):
+def launch_problems(plan, ids, scanned, lock=q2_traced_run.git_lock):
     """Everything that keeps an ADR-065 campaign from starting; empty when launchable."""
     problems = q3_identity.arm_problems(ids)
     artifact = plan["artifact"]
@@ -266,9 +286,9 @@ def launch_problems(plan, ids, versions, lock=q2_traced_run.git_lock):
         problems.append("every arm must run the same binary (arms differ only in a kill switch)")
     if plan["mode"] == "baseline":
         bytes_ = {identity["binary"].get("bytes") for identity in ids["arms"].values()}
-        problems += baseline_problems(plan["baseline"], shas, bytes_, versions, lock)
-    elif len(versions) != 1:
-        problems.append(f"the binary must embed exactly one mlx-native version; found {versions}")
+        problems += baseline_problems(plan["baseline"], shas, bytes_, scanned, lock)
+    elif len(scanned["native"]) != 1:
+        problems.append(f"the binary must embed exactly one mlx-native version; found {scanned['native']}")
     commit = plan["declared"].get("commit")
     if not (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit)):
         problems.append("--commit must be the 40-hex source commit of the binary")
@@ -286,14 +306,14 @@ class Driver(q3.Driver):
     """q3_campaign.Driver with a fixed block count per stage, the campaign cooldown and the run budget."""
     schema = SCHEMA
 
-    def __init__(self, *args, clock=time.monotonic, sleep=time.sleep, versions=native_versions,
+    def __init__(self, *args, clock=time.monotonic, sleep=time.sleep, scan=embedded,
                  lock=q2_traced_run.git_lock, **kwargs):
         super().__init__(*args, **kwargs)
-        self.clock, self.sleep, self.versions, self.lock, self.last_end = clock, sleep, versions, lock, None
+        self.clock, self.sleep, self.scan, self.lock, self.last_end = clock, sleep, scan, lock, None
 
     def launch_problems(self, frozen):
         binary = self.plan["declared"]["binary"]
-        return launch_problems(self.plan, frozen, self.versions(binary) if os.path.isfile(binary) else [], self.lock)
+        return launch_problems(self.plan, frozen, self.scan(binary) if os.path.isfile(binary) else NOTHING, self.lock)
 
     def finished(self, stage):
         fixed = self.plan["design"]["stage_blocks"][stage["workload"]]
@@ -409,7 +429,7 @@ def main(argv=None):
             document = build_receipt(args.binary, args.source_checkout, args.command)
             qc.save(args.output, document)
             print(json.dumps({"receipt": str(args.output.resolve()), "receipt_sha256": q5_artifacts.sha256(args.output),
-                              **{k: document[k] for k in ("source", "sha256", "bytes", "native_version", "native_checksum")}},
+                              **{k: document[k] for k in RECEIPT_KEYS}},
                              indent=2))
             return 0
         campaign, source = load_campaign(args.campaign_file)
@@ -431,10 +451,10 @@ def main(argv=None):
         if args.dry_run:
             ids = identify()
             binary = plan["declared"]["binary"]
-            versions = native_versions(binary) if os.path.isfile(binary) else []
+            found = embedded(binary) if os.path.isfile(binary) else NOTHING
             print(json.dumps({"valid": True, "dry_run": True, "plan_sha256": qc.plan_sha256(plan), "plan": plan,
-                              "identities": ids, "native_versions": versions,
-                              "launch_problems": launch_problems(plan, ids, versions), "schedule": schedule(plan)}, indent=2))
+                              "identities": ids, "embedded": found,
+                              "launch_problems": launch_problems(plan, ids, found), "schedule": schedule(plan)}, indent=2))
             return 0
         out = args.output.absolute()
         driver = Driver(plan, cases, out, environ, qc.subprocess_runner, q5_host.thermal_state, identify)
