@@ -1,10 +1,11 @@
 # ADR-063 Q4-GEMMA-KERNEL (#659) and Q4-GEMMA-ATTN (#668): precise tiled warm attention for Gemma 4
 
-Status: design for approval (2026-11-03). Revision 2 applies the
-ACCEPT-WITH-CONDITIONS review (ReviewGemmaKernelDesign, conditions 1–9; its
-answers are recorded in §11). No code, build or hardware run backs this
-document. Every number below is quoted from a retained receipt, with its path,
-or marked `[INFERENCE]`.
+Status: falsified 2026-11-05 (see §12); historical design. It was approved
+2026-11-03; revision 2 applied the ACCEPT-WITH-CONDITIONS review
+(ReviewGemmaKernelDesign, conditions 1–9; answers in §11). Sections 1–11 are
+kept as written; no code, build or hardware run backed them. Every number
+below is quoted from a retained receipt, with its path, or marked
+`[INFERENCE]`.
 
 Stories:
 - **Q4-GEMMA-KERNEL** (#659, mlx-native) provides the primitive.
@@ -1055,3 +1056,60 @@ It does not change the route design.
    multi-sequence cold path has a larger temperature error (0.9982, from
    bf16(log₂e) = 1.4453125) than the F16 path (1.000216). The precise d256
    entry point would make that fix cheap.
+
+## 12. Outcome (2026-11-05): `TiledF32` falsified
+
+The route was implemented as designed on hf2q PR #698. The design's §8.1 text
+needed one delta: under mlx-native #83 the sliding layers also read the ring
+stage in place. It was gated on the M5 Max at head `bb2e50ea` with mlx-native
+`=0.15.18` (crate sha256 `9d10f97e…c524bee`), test binary sha256
+`822add9a…`, macOS `26B5112a`. Evidence:
+`~/.local/state/hf2q/v0130/q4-gemma-attn/gates-bb2e50ea/`.
+
+| Gate | Result |
+|---|---|
+| G1 Metal fixtures: declared in-place reads, mask fence, A7 (sliding stage `[8, 1023+min(rows,1024), 256]` and global cache, graft 0 and 37) | pass on both metallib paths (`GEMMA_TILED_F32_A7_COMPLETE … bitwise=true`) |
+| A1 joint == per-slot (§8.2 cohorts) | bitwise pass; 18/18 §3.8 scratch lines `within_total=true` |
+| A2 determinism | bitwise pass; precise pipeline origins `PrecompiledMetallib`×16 on the precompiled path, `RuntimeSource`×16 on the runtime path |
+| Localization bound (lane 1) | layer-0 `attn_rel` nmax **4.95e-7** ≤ 2e-5 (rel_rms 3.35e-7); `TiledF16` 3.63e-4 in the same run |
+| E1 (952 rows, `VecHybrid` reference) | **fail**: 72 near-tie-policy failures |
+| A4 vec control | bitwise pass |
+| A3 tiny suffix | not reached: a harness bug stopped the run, fixed in `d1cc5503` |
+
+E1 detail (`E1-summary-from-rows.txt`, from the 952 rows per route logged
+before the stop):
+
+| Route | flips | near-tie failures (vec margin ≥ 0.10) | rows D > 0.25 | median D | max D |
+|---|---|---|---|---|---|
+| `TiledF32` | 121 | 72 | 352 | 0.168 | 4.42 |
+| `TiledF16` | 135 | 86 | 383 | 0.188 | 4.06 |
+
+The `TiledF16` last-row values reproduce §2.2: lane 0 D 0.099, lane 3 D 0.014,
+lanes 1 and 2 flip. This cross-checks the extended harness. On `TiledF32` the
+last row of lane 1 no longer flips (D 0.183), but lane 2 still flips
+(D 0.770 at vec margin 0.392).
+
+Growth through the model (lane 1, `TiledF32` against `VecHybrid`):
+- attention `attn_rel`: 4.95e-7 at layer 0, 6.3e-4 at layer 1, 0.249 at layer 7;
+- residual `hidden_rel` at layer 29: 0.106;
+- final max |Δlogit|: 2.00 (`TiledF16` 4.07).
+
+A 40× margin on the frozen kernel bound does not keep the route inside the
+decision envelope. §2.3.2 and §2.3.4 anticipated this: Gemma's MoE routing
+amplifies any non-bitwise perturbation until it saturates.
+
+Disposition (§8.5, operator ruling 2026-11-05):
+- the route is falsified for default use;
+- hf2q removes `precise`, `TiledF32`, its prewarm, the scratch ledger and the
+  Metal fixtures in a clean cutover on PR #698;
+- the mlx-native precise kernels stay (0.15.18).
+
+Kept from this work:
+- the every-row route envelope with per-row Q1 D and the A3/A4 asserts;
+- the per-row logits probe;
+- the localization relative RMS;
+- `active_controls.gemma_warm_attention_kernel` in `/hf2q/v1/runtime`;
+- the Q5 `skip_if_empty` readiness check.
+
+The warm-attention lever moves to the bitwise-exact successor story
+(`docs/research/adr063-q4-gemma-attn-exact-design.md`, draft on PR #701).

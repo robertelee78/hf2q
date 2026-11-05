@@ -9714,6 +9714,7 @@ mod tests {
             tq_kv_active: false,
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
+            gemma_warm_attention_kernel: None,
         }
     }
 
@@ -9762,6 +9763,7 @@ mod tests {
             tq_kv_active: false,
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
+            gemma_warm_attention_kernel: Some("VecHybrid"),
         }
     }
 

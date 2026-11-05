@@ -611,8 +611,9 @@ Invocation rules (frozen):
 Run each test with the switch at its default and again under the A arm
 (`HF2Q_GEMMA_PREFILL_MOE_DOWN=flat`, plus `HF2Q_MM_ID_SCHEDULE=grid` after P2):
 1. `gemma_joint_warm_prefill_matches_per_slot_bitwise` and `…_vec_hybrid`
-   (`engine_gemma_warm_batch_tests.rs`, `#[ignore]`); also on `TiledF32` once
-   #668 lands.
+   (`engine_gemma_warm_batch_tests.rs`, `#[ignore]`). The precise `TiledF32`
+   route was falsified and removed (#668, 2026-11-05), so no third arm is
+   gated.
 2. `gemma_joint_warm_engine_cohort_matches_serial_tool_turns`,
    `gemma_joint_warm_forward_fault_retries_each_lane_per_slot` (`#[ignore]`).
 3. `slot_aware_n4_per_slot_parity_vs_serial`,
@@ -849,7 +850,7 @@ From each run, read:
 
 | Profiled stage (#660) | Owner |
 |---|---|
-| Warm-prefill attention, 48% | #659 → #668 (TiledF32) |
+| Warm-prefill attention, 48% | #668: TiledF32 falsified 2026-11-05; the bit-exact successor story (Q4-GEMMA-ATTN-EXACT) |
 | Warm-prefill MoE + tail, 34% | **this story** |
 | Warm-prefill dense 11%, pre-attention 7.5% | this story's attribution (M1); no change |
 | Cold-turn admission | Q4-GEMMA cold design. Its joint cold forward (about 4 × 465 rows) takes the same `mm_id` route and gains from P1/P2 by the same mechanism |

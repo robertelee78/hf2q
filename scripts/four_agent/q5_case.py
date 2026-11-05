@@ -88,7 +88,9 @@ def validate(case):
             'readiness.record must be a list of URLs')
     require(isinstance(readiness.get('checks', []), list), 'readiness.checks must be a list')
     for check in readiness.get('checks', []):
-        require(isinstance(check, dict) and set(check) == {'url', 'field', 'equals'}, 'readiness check needs url/field/equals')
+        require(isinstance(check, dict) and {'url', 'field', 'equals'} <= set(check) <= {'url', 'field', 'equals', 'skip_if_empty'},
+                'readiness check needs url/field/equals (and optionally skip_if_empty)')
+        require(type(check.get('skip_if_empty', False)) is bool, 'readiness check skip_if_empty must be a boolean')
     client = case.get('client')
     require(isinstance(client, dict) and set(client) <= {'argv', 'env', 'approval', 'summary', 'success_status', 'timeout_seconds'},
             'client keys')

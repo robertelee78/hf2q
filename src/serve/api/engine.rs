@@ -1955,6 +1955,7 @@ fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
         tq_kv_active: false,
         kv_bytes_per_token_override: None,
         kv_fixed_bytes_per_slot_override: None,
+        gemma_warm_attention_kernel: None,
     })
 }
 
@@ -4022,6 +4023,7 @@ impl LoadInfoBuilder for GemmaLoadedModel {
             kv_fixed_bytes_per_slot_override: Some(load_info::gemma4_fixed_kv_bytes_per_slot(
                 &self.config,
             )),
+            gemma_warm_attention_kernel: Some(self.weights.warm_live_kernel.wire_name()),
         }
     }
 }

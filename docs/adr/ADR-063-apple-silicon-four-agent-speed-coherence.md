@@ -685,6 +685,8 @@ Acceptance:
 
 - #544 set warm tiled attention default-off after `TiledF16` flipped a near-tie decision against `VecHybrid`; tiled-off costs Gemma about 7.8–9.2% (v9 review), and v7 with tiled on was still a Loss (1.058), so the kernel alone cannot be assumed to flip the verdict. Any further change the profile requires is scoped with its own design.
 
+- Outcome 2026-11-05: the Q4-GEMMA-KERNEL route (`TiledF32`) failed E1 and is falsified and removed from hf2q; see "Q4-GEMMA-ATTN outcome: TiledF32 falsified" below. The warm-attention lever moves to the bitwise-exact successor story.
+
 - In hf2q the Q4-GEMMA-KERNEL route stays within the Q1 decision envelope and exactness classes (including the 0.10-nat near-tie policy) at the canonical divergence coordinate and passes the paired task-quality gates before it can become a default.
 
 - The stock SSE-gap max ratio returns within 1.025, and the family verdict against the peer's best valid configuration (from Q4-GEMMA) meets the Q4 win definition and every Q4 gate on the release candidate.
@@ -1965,6 +1967,41 @@ before the change stay as recorded and are not re-scored. A transcript
 comparison across runs (ExactTranscripts, G-S2, T-J1-8, TRACE T/O, the DS4
 non-regression run, B1) is valid only between runs on the same side of the
 change, so those runs use a harness at or after it.
+
+### Q4-GEMMA-ATTN outcome: TiledF32 falsified (operator ruling, 2026-11-05)
+
+The precise tiled warm route (`TiledF32`, `HF2Q_GEMMA_WARM_TILED_ATTENTION=precise`)
+was integrated on PR #698 at mlx-native `=0.15.18` and gated on the M5 Max
+(head `bb2e50ea`, evidence `~/.local/state/hf2q/v0130/q4-gemma-attn/gates-bb2e50ea/`):
+
+- G1 Metal fixtures (declared in-place reads, A7 stage/global layout): pass on
+  both metallib paths.
+- A1 joint == per-slot and A2 determinism (both paths): bitwise pass.
+- Localization: layer-0 `attn_rel` nmax 4.95e-7 against the frozen 2e-5
+  (`TiledF16` 3.63e-4). The kernel met its precision target.
+- E1 (all 952 suffix rows, against `VecHybrid`): 72 near-tie-policy failures
+  (top-1 flips at a vec margin ≥ 0.10 nat), 121 flips, 352 rows with D > 0.25,
+  max D 4.42 nat (`TiledF16`: 86 / 135 / 383 / 4.06). These come from the
+  rows logged before the run stopped on an A3 harness bug, fixed in
+  `d1cc5503`; A4 (the vec-hybrid control) passed. Downstream the
+  layer-0 difference grows to 6.3e-4 at layer 1 and 0.249 at layer 7, and the
+  final logits differ by up to 2.00 (`TiledF16` 4.07).
+
+Ruling: per design §8.5 the route is falsified for default use. hf2q removes
+the `precise` value and the `TiledF32` variant in a clean cutover (PR #698);
+the precise kernels stay in mlx-native 0.15.18. The design records the
+outcome in its §12.
+
+**Revised Gemma lever budget without it (estimate).** Cold turn 0.20–0.35 s,
+prefill MoE 0.08–0.28 s, decode kernels including attention 0.36–1.52 s,
+serving speculation 0 (parked): about 0.64–2.15 s against the 3.0 s a Win
+needs `[INFERENCE]`. A Win is not reachable on these levers alone.
+
+**New story (operator, 2026-11-05).** A warm-prefill attention kernel that is
+u32-bitwise equal to the vec-hybrid warm route (Class A), so it needs no
+envelope or quality campaign. Draft design for review (PR #701):
+`docs/research/adr063-q4-gemma-attn-exact-design.md` (S0 feasibility spike
+first). Q4-GEMMA-ATTN keeps owning the Gemma closing campaign.
 
 ## Consequences
 
