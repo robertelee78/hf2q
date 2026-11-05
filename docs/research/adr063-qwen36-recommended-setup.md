@@ -412,48 +412,9 @@ re-run with a release build of `38eea839`. Peer and BF16 data are reused; eviden
     "initial six-step workflow not followed" right after its repair write; in 5 of these 7 the repair
     re-emits the failing first file byte for byte.
 
-### Draft ADR-063 amendment (ready for the root; the root lands the ADR edit)
+### ADR-063 amendment (landed 2026-11-05)
 
-The first R1 was an hf2q `Loss`. The localization above found the cause in the partial-rotary RoPE pairing
-in mlx-native `rope_multi`; it was fixed in 0.15.18, together with the tool-call newline (#686). The re-run
-on main clears the floor and passes: hf2q 21/24 vs peer 20/24, `Pass`. The root decides whether to land
-this text and schedule the Q4 speed race.
-
-Under Q4-QWEN36, after "If Qwen3.6 stays BelowFloor under every setup tested …":
-
-> **Qwen3.6 race workload (operator decision, 2026-11-03).** Qwen3.6 is raced on the canonical four-agent
-> coding task with one repair cycle (`--repair-turns 1`). After a failed `run_tests`, an agent gets exactly
-> one more `write_file` and one more `run_tests` on the same target. A second failure fails the agent;
-> every other step of the six-step workflow, the prompts, tools, template, sampling and thinking budgets
-> are unchanged. The race runs on the hf2q-converted GGUF (`815a22ca…`), identically on hf2q and the peer
-> (`q5_cases/qwen36-repair1.json`, `peer-qwen36-repair1.json`). The approval binds the grant, and the Q2
-> run audit replays it.
->
-> Rationale:
-> - Under the strict workflow Qwen3.6 is BelowFloor on every engine, precision and conversion tested:
->   - hf2q 5/24 and peer 4/24 on our GGUF;
->   - Q8_0 3/24;
->   - unsloth UD-Q4_K_M 1/24 on both engines (C3, `docs/research/adr063-qwen36-recommended-setup.md`).
-> - The failure is one first-write idiom, `map_err(|e| e.to_string())` (E0282). That idiom becomes more
->   frequent with precision: Q4 22 → Q8 34 → BF16 41 of 48 replays, and 79–86% of first writes on the
->   unsloth file.
-> - The conversion audit found no defect in hf2q's artifact against the BF16 source and an independent
->   converter (`~/.local/state/hf2q/v0130/q4-qwen36/conversion-audit/report.txt`).
-> - The failing agents write a type-correct fix on the next turn in most recorded cases, but the strict
->   workflow refuses it. A repair cycle measures the engines on a task Qwen3.6 can complete, without
->   changing the model, artifact or sampling.
->
-> Scope and comparability:
-> - The repair workload applies to Qwen3.6 only (`q5_case.REPAIR_FAMILIES`).
-> - Qwen3.6 results on it are not comparable to the other families' canonical task: pass rates, request
->   counts (up to 9 per agent instead of 7) and makespans differ by construction.
-> - Qwen3.8, Gemma 4 and DeepSeek-V4 keep the strict workflow.
->
-> Gates:
-> - The 24-instance paired task campaign (Q1 §3.5) on this workload decides the floor and the engine verdict.
-> - The Q4 speed race follows only if it clears the floor. A cleared floor also makes this the declared
->   Qwen3.6 workload of C2's quality rule ("while no workload on which Qwen3.6 passes is declared").
-> - If it stays BelowFloor, Q4-QWEN36 returns to the operator as `needs_decision`.
->
-> Placement: under Q4-QWEN36 Acceptance, after "If Qwen3.6 stays BelowFloor under every setup tested …",
-> with an "Updated" header line in the ADR.
+The race workload is recorded in ADR-063 under Q4-QWEN36 Acceptance ("Qwen3.6 race workload"), with an
+"Updated" header line and the C2 quality-rule clause naming it as Qwen3.6's declared workload. It records the
+operator decision, the rationale and scope, the defect found and fixed on this workload (mlx-native 0.15.18
+`rope_multi`, #686), and the result on fixed main (hf2q 21/24 vs peer 20/24, `Pass`).
