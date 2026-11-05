@@ -1,6 +1,6 @@
 # ADR-063 Q4-GEMMA-ATTN-EXACT: bitwise-exact batched warm-prefill attention for Gemma 4
 
-Status: **accepted (design review), awaiting operator approval** (2026-11-05; revision 3 plus ReviewGemmaExact's three P3 doc fixes).
+Status: **approved (operator 2026-11-05)**: revision 3 with ReviewGemmaExact's three P3 doc fixes, accepted in design review the same day.
 - Revision 1 was reviewed by ReviewGemmaExact (REVISE, 8 findings) and
   revision 2 by the same reviewer (REVISE narrowly, R1–R5). §11 records how
   each finding was answered.
