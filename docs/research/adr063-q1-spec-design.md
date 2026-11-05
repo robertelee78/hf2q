@@ -30,7 +30,7 @@ Binding text:
 
 ### 1.1 Adapters (existing and shared with Qwen3.8)
 
-`matrix.rs:34-39` routes both Qwen families to the same two adapters. For Qwen3.6 only the gap text says "actual execution pending".
+`matrix.rs:34-39` routes both Qwen families to the same two adapters. For Qwen3.6 only the gap text said "actual execution pending"; the #653 evidence PR removed it (§1.7(4); `adr063-q1-qwen36-spec-evidence.md`).
 
 | Trajectory | Adapter | Actual entry point | Qwen3.6 accepted by source |
 |---|---|---|---|
@@ -72,6 +72,8 @@ Every Qwen phase and the Gemma series now run on **one** build of record, **b6**
 | b6 | T5 preparation (`qwen-t5-prefix128-workload-preparation-v1`; Tail128 prefix digest) | `t5prep` | `t0` → `qwen36-t0-b6` |
 | b6 | T5 phases (`qwen-t5-explicit-MTP-K3-forced-proposal-v1`; frozen full-144 digest) | `t5base`, `t5forced` | `t0` → `qwen36-t0-b6` |
 | b6 | T5 first fork (forced-proposal recipe; frozen full-144 digest) | `t5ffbase`, `t5ffforced` | `t0` → `qwen36-t0-b6` |
+
+**t5ff shares the t5phases composition (review finding 5.1, deviation accepted with conditions D1–D4).** `ComparisonKey` has no first-fork field (`acquisition.rs:73-84`; `runner.rs:258-267`, `:297-306`), so the t5ff and t5phases keys are identical. The two rows therefore share one composition and one acquisition review (`qwen36/b6-t5phases/composition-v1.json`, `t5phases-acquisition-review.json`). t5ff keeps its own policy, bindings, instance copy and per-case operating reviews.
 
 The T0 gate is a same-binary health gate. It does not bind the T5 workload, which its own composition binds.
 
@@ -138,8 +140,8 @@ Verdict rules:
 
 Supervisor check `qwen_t6_continuation` (§3), with per-store count binding, because `execution.json` `trace_records` counts only the `continuation` store:
 - `calls` equals the `require_calls` order;
-- `captured_rows_per_lane` 80, `cancelled_unpublished_rows_per_lane` 64, `trace_records` = records of `continuation` = 1440;
-- t6: `before` = `recovered` = 560 records, and `recovery` has 4 entries, with `recovered_cursor` 64, `scheduler_in_flight_after` 0 and `client_closed_after_actual_advance` true; `recovery_proof.disposition` ExactEqual, with its compared record count = 560;
+- `captured_rows_per_lane` 80, `trace_records` = records of `continuation` = 1440; `cancelled_unpublished_rows_per_lane` 64 for t6 and 0 for t3cm (never cancelled; review finding A1);
+- t6: `before` = `recovered` = 560 records, and `recovery` has 4 entries, with `recovered_cursor` 64, `scheduler_in_flight_after` 0 and `client_closed_after_actual_advance` true; `recovery_proof.disposition` ExactEqual. The recovery proof binds `compared_bytes` (266,117,120 in `qwen36-t6-b6`), not a record count (finding A1);
 - t3cm: `prefix64` = 560 records, and `prefix_preparation` has 4 entries with `cancellation_performed` false, `retained_cursor` 64, `scheduler_in_flight_after` 0.
 
 ### 1.5 T5: phases, record sets, classification
@@ -394,7 +396,7 @@ It does not run for ExactEqual, WithinDecisionEnvelope or Incomplete.
 - Lane ownership: each lane runs inside `gemma_prefill::serial_lane(lane)`, so every prefill row and every single-row decode row is owned as (lane, absolute position).
 - **Ordinary-global arm:**
   - initial prefill: prefill roles at rows 0..127, `segment 0`, step key 0;
-  - decode: decode roles at positions 128..143, `segment 0`, step key = position.
+  - decode: decode roles at positions 128..143, `segment 0`. Decode stage records use `logical_step` 0 with `logical_row_start` = position; only the capture-target step key is the position (review finding A2).
 - **N-gram arm:**
   - A new same-thread, non-nestable `family::pause()` lease (a small addition to `family.rs`) is held from lane start through the `initial` hook. The initial prefill is G5-A1's identical call, so it is not captured again, and step key 0 stays free for the verify re-prefill.
   - The verify re-prefill (`forward_prefill_batched(prefix, …, 0)`, 132 rows, `gemma_ngram::before_verify` checks start 0 and length 132) captures prefill roles at rows 0..131 with **`segment 1`** (namespace "verify").
