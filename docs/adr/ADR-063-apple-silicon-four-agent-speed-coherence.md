@@ -1045,9 +1045,9 @@ Acceptance:
   - Rationale: under the strict workflow Qwen3.6 is BelowFloor on every engine, precision and conversion tested (hf2q 5/24 and peer 4/24 on our GGUF, Q8_0 3/24, unsloth UD-Q4_K_M 1/24 on both engines). The failure is one first-write idiom, `map_err(|e| e.to_string())` (E0282), which grows more frequent with precision (Q4 22 → Q8 34 → BF16 41 of 48 replays). Failing agents usually write a type-correct fix on the next turn, which the strict workflow refuses; a repair cycle measures the engines on a task Qwen3.6 can complete without changing the model, artifact or sampling.
   - Scope: Qwen3.6 only (`q5_case.REPAIR_FAMILIES`). Its results are not comparable to the other families' canonical task (pass rates, up to 9 requests per agent instead of 7, makespans). Qwen3.8, Gemma 4 and DeepSeek-V4 keep the strict workflow.
   - Defect found and fixed on this workload: the first repair-turn campaign was an hf2q `Loss` (14/24 vs peer 23/24). The same-prefix fork replay and a layer-by-layer comparison against the peer and the BF16 source localized it to mlx-native `rope_multi`, which paired partial-rotary RoPE dimensions `(p, p + head_dim/2)` instead of `(p, p + rope_dim/2)` on every Qwen3.5-family full-attention layer; fixed in mlx-native 0.15.18. The Qwen tool grammar also dropped the template's newline after `<tool_call>`; fixed in #686. After both fixes hf2q matches the peer within KV-precision noise on the 63 copy/fix decision points (`docs/research/adr063-qwen36-recommended-setup.md`).
-  - Result: the 24-instance paired task campaign on fixed main (`4bfb0436`, rustc 1.99.1) is hf2q 21/24 vs peer 20/24, paired verdict `Pass` (one-sided p 0.81). The floor is cleared, so this is the declared Qwen3.6 workload of C2's quality rule, and the Q4 speed race runs on it. The Splash Qwen3.6 arm (D9) is pending repair-turn harness support: the repair grant covers the hf2q and peer arms only, and the stacked Splash repair-grant PR (#715) extends it to Splash.
+  - Result: the 24-instance paired task campaign on fixed main (`4bfb0436`, rustc 1.99.1) is hf2q 21/24 vs peer 20/24, paired verdict `Pass` (one-sided p 0.81). The floor is cleared, so this is the declared Qwen3.6 workload of C2's quality rule, and the Q4 speed race runs on it. The Splash Qwen3.6 arm (D9) runs it too: #715 extends the repair grant to Splash for Qwen3.6 (`q5_cases/splash-qwen36-repair1.json`).
 
-- Record the workload decision with this evidence; changing the canonical workload is an operator decision recorded in this ADR. On that workload, a per-stage attribution of the hf2q-versus-peer gap on the same run (prefill, decode, MoE/attention, dispatch, scheduling, SSE cadence) is recorded with stated distortion, and the family verdict meets the Q4 win definition (against the peer and against Splash) and every Q4 gate. Splash runs the same declared Qwen3.6 workload (the repair-turn workload once recorded; Splash decision D9).
+- Record the workload decision with this evidence; changing the canonical workload is an operator decision recorded in this ADR. On that workload, a per-stage attribution of the hf2q-versus-peer gap on the same run (prefill, decode, MoE/attention, dispatch, scheduling, SSE cadence) is recorded with stated distortion, and the family verdict meets the Q4 win definition (against the peer and against Splash) and every Q4 gate. Splash runs the same declared Qwen3.6 workload, the repair-turn workload (Splash decision D9; harness support in #715).
 
 Repository ownership: hf2q owns the harness diff, templates/tool format, the checks and the campaign.
 
@@ -1605,10 +1605,11 @@ amended by its independent review).
     default verify rows.
   - Splash's numerics include int8 KV and the Neural Engine split where the
     chosen configuration uses them.
-- **Qwen3.6 workload.** Splash runs the declared Qwen3.6 workload: the
-  repair-turn workload (one repair turn) once it is recorded in this ADR, as
-  for the hf2q and peer Qwen3.6 arms (D9). Until then the Splash Qwen3.6 arm
-  waits. Qwen3.8 keeps the canonical protocol.
+- **Qwen3.6 workload.** Splash runs the declared Qwen3.6 workload, the
+  repair-turn workload (one repair turn, recorded under Q4-QWEN36), as for the
+  hf2q and peer Qwen3.6 arms (D9). Repair-turn support for Splash landed in
+  #715 (`q5_cases/splash-qwen36-repair1.json`). Qwen3.8 keeps the canonical
+  protocol.
 - **Identity.** These are frozen with the campaign identity:
   - the commit and a clean tree;
   - the sha256s of `build/splash`, `build/splash.metallib` and
