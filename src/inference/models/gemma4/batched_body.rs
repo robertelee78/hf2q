@@ -125,6 +125,10 @@ pub struct BatchedDecodeBuffers {
     /// `[layers, N, top_k]` per-step copy of every layer's `moe_expert_ids`
     /// for the V2 diagnostic (`HF2Q_GEMMA_ROUTING_OVERLAP=1`); `None` when off.
     pub routing_overlap_ids: Option<MlxBuffer>,
+    /// Test-only per-step `[layers, N, top_k]` copies of the routed ids and
+    /// routing weights for [`router_capture`]; `None` unless armed.
+    #[cfg(test)]
+    pub router_capture: Option<(MlxBuffer, MlxBuffer)>,
 }
 
 /// Element count of an F32/U32 buffer (4 bytes/element).
@@ -183,6 +187,8 @@ impl BatchedDecodeBuffers {
             moe_accum: f32n(&acts.moe_accum, "moe_accum")?,
             sdpa_tmp: f32n(&acts.sdpa_tmp, "sdpa_tmp")?,
             routing_overlap_ids: None,
+            #[cfg(test)]
+            router_capture: None,
         })
     }
 
@@ -197,6 +203,48 @@ impl BatchedDecodeBuffers {
 #[inline]
 fn row_off(stride: usize, i: usize) -> u64 {
     (i * stride * 4) as u64
+}
+
+/// Test-only capture of every layer's routed expert ids and routing weights
+/// (ADR-063 Q4-GEMMA-DECODE A1 gate). While armed on the calling thread, each
+/// [`MlxModelWeights::forward_decode_body_batched`] step blit-copies them
+/// after the per-slot routing and publishes the copy after the step's final
+/// wait; [`take`] returns the last step.
+#[cfg(test)]
+pub(crate) mod router_capture {
+    use std::cell::{Cell, RefCell};
+
+    /// One step: `ids`/`weights` are `[layers, n, stride]`, `top_k` valid
+    /// entries per row.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(crate) struct Step {
+        pub n: usize,
+        pub stride: usize,
+        pub ids: Vec<u32>,
+        pub weights: Vec<f32>,
+    }
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static LAST: RefCell<Option<Step>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm(on: bool) {
+        ARMED.with(|a| a.set(on));
+        LAST.with(|l| l.borrow_mut().take());
+    }
+
+    pub(crate) fn armed() -> bool {
+        ARMED.with(|a| a.get())
+    }
+
+    pub(crate) fn take() -> Option<Step> {
+        LAST.with(|l| l.borrow_mut().take())
+    }
+
+    pub(super) fn publish(step: Step) {
+        LAST.with(|l| *l.borrow_mut() = Some(step));
+    }
 }
 
 /// ADR-040 iter-G decode-category split (`HF2Q_DECODE_CATSPLIT=1`).
@@ -1993,6 +2041,21 @@ impl MlxModelWeights {
                 .blit_copy_bytes(&bufs.moe_expert_ids, 0, dst, layer_idx as u64 * bytes, bytes)
                 .map_err(|e| anyhow::anyhow!("routing overlap ids copy L{layer_idx}: {e}"))?;
         }
+        #[cfg(test)]
+        if let Some((ids_dst, weights_dst)) = bufs.router_capture.as_ref() {
+            let bytes = (n * ids_stride * 4) as u64;
+            let enc = session.encoder_mut();
+            enc.blit_copy_bytes(&bufs.moe_expert_ids, 0, ids_dst, layer_idx as u64 * bytes, bytes)
+                .map_err(|e| anyhow::anyhow!("router capture ids copy L{layer_idx}: {e}"))?;
+            enc.blit_copy_bytes(
+                &bufs.moe_routing_weights_gpu,
+                0,
+                weights_dst,
+                layer_idx as u64 * bytes,
+                bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("router capture weights copy L{layer_idx}: {e}"))?;
+        }
         // catsplit: fused_gelu_mul (dense SwiGLU) + per-slot MoE routing/top-k.
         cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
         #[cfg(test)]
@@ -2050,10 +2113,14 @@ impl MlxModelWeights {
             .ok_or_else(|| {
                 anyhow::anyhow!("batched body requires fused _id MoE (stacked_down) L{layer_idx}")
             })?;
-        session.barrier_between(
-            &[&bufs.moe_norm_out, &bufs.moe_expert_ids, stacked_gate_up],
-            &[&bufs.moe_gate_up_id_out],
-        );
+        // ADR-063 Q4-GEMMA-DECODE F2 (`HF2Q_GEMMA_DECODE_KERNELS=1`): at
+        // N <= 4 with a Q4_K stack, one expert-grouped gate_up matvec with
+        // the GEGLU epilogue writes the `[N*top_k, moe_int]` activation the
+        // stock mv_id + moe_swiglu_batch pair below writes, bit for bit.
+        let f2 = self
+            .decode_kernels
+            .as_ref()
+            .is_some_and(|k| k.f2_gate_up_geglu(self.layers[layer_idx].moe.gate_up_ggml_dtype, n));
         let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
             n_tokens: nu,
             top_k: top_k as u32,
@@ -2063,43 +2130,67 @@ impl MlxModelWeights {
             expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
             ggml_type: self.layers[layer_idx].moe.gate_up_ggml_dtype,
         };
-        // ADR-040 Phase F `iter-F-moe-mvid`: force the per-token `mv_id` route
-        // (byte-identical to the serial slot-aware ref). At the batched decode
-        // width the down projection's `n_tokens = N*top_k` crosses the `mm_id`
-        // grouped-kernel threshold (>32, i.e. N≥5) whose reduction order is NOT
-        // bit-identical to serial — `slot_aware_n8_per_slot_parity_vs_serial`
-        // diverged on the routed entry point and is byte-identical on this one.
-        // `mm_id` is a prefill optimization + a measured regression at N≤8, so
-        // there is no decode-width cost. gate_up is mv at N≤4 anyway; pinning it
-        // keeps the whole MoE byte-identical for any future N.
-        crate::inference::expert_dispatch::dispatch_expert_matmul_id_mv(
-            session,
-            reg,
-            dev,
-            &bufs.moe_norm_out,
-            stacked_gate_up,
-            &bufs.moe_expert_ids,
-            &bufs.moe_gate_up_id_out,
-            &gu_params,
-        )
-        .map_err(|e| anyhow::anyhow!("batched gate_up _id L{layer_idx}: {e}"))?;
-        // catsplit: MoE gate_up `_id` (per-token mv_id) — the big expert read.
-        cat_boundary(session, exec, catsplit::Cat::MoeGateUp)?;
+        if f2 {
+            session.barrier_between(
+                &[&bufs.moe_norm_out, &bufs.moe_expert_ids, stacked_gate_up],
+                &[&bufs.moe_swiglu_id_out],
+            );
+            mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_mv_grouped_geglu(
+                session.encoder_mut(),
+                reg,
+                dev,
+                &bufs.moe_norm_out,
+                stacked_gate_up,
+                &bufs.moe_expert_ids,
+                &bufs.moe_swiglu_id_out,
+                &gu_params,
+            )
+            .map_err(|e| anyhow::anyhow!("batched F2 gate_up geglu L{layer_idx}: {e}"))?;
+            // catsplit: MoE gate_up `_id` (F2 fuses the activation).
+            cat_boundary(session, exec, catsplit::Cat::MoeGateUp)?;
+        } else {
+            session.barrier_between(
+                &[&bufs.moe_norm_out, &bufs.moe_expert_ids, stacked_gate_up],
+                &[&bufs.moe_gate_up_id_out],
+            );
+            // ADR-040 Phase F `iter-F-moe-mvid`: force the per-token `mv_id` route
+            // (byte-identical to the serial slot-aware ref). At the batched decode
+            // width the down projection's `n_tokens = N*top_k` crosses the `mm_id`
+            // grouped-kernel threshold (>32, i.e. N≥5) whose reduction order is NOT
+            // bit-identical to serial — `slot_aware_n8_per_slot_parity_vs_serial`
+            // diverged on the routed entry point and is byte-identical on this one.
+            // `mm_id` is a prefill optimization + a measured regression at N≤8, so
+            // there is no decode-width cost. gate_up is mv at N≤4 anyway; pinning it
+            // keeps the whole MoE byte-identical for any future N.
+            crate::inference::expert_dispatch::dispatch_expert_matmul_id_mv(
+                session,
+                reg,
+                dev,
+                &bufs.moe_norm_out,
+                stacked_gate_up,
+                &bufs.moe_expert_ids,
+                &bufs.moe_gate_up_id_out,
+                &gu_params,
+            )
+            .map_err(|e| anyhow::anyhow!("batched gate_up _id L{layer_idx}: {e}"))?;
+            // catsplit: MoE gate_up `_id` (per-token mv_id) — the big expert read.
+            cat_boundary(session, exec, catsplit::Cat::MoeGateUp)?;
 
-        // -- swiglu (BATCHED over N*top_k expert rows) --
-        session.barrier_between(&[&bufs.moe_gate_up_id_out], &[&bufs.moe_swiglu_id_out]);
-        mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
-            session.encoder_mut(),
-            reg,
-            metal_dev,
-            &bufs.moe_gate_up_id_out,
-            &bufs.moe_swiglu_id_out,
-            moe_int,
-            top_k * n,
-        )
-        .map_err(|e| anyhow::anyhow!("batched swiglu L{layer_idx}: {e}"))?;
-        // catsplit: MoE expert SwiGLU activation.
-        cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
+            // -- swiglu (BATCHED over N*top_k expert rows) --
+            session.barrier_between(&[&bufs.moe_gate_up_id_out], &[&bufs.moe_swiglu_id_out]);
+            mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
+                session.encoder_mut(),
+                reg,
+                metal_dev,
+                &bufs.moe_gate_up_id_out,
+                &bufs.moe_swiglu_id_out,
+                moe_int,
+                top_k * n,
+            )
+            .map_err(|e| anyhow::anyhow!("batched swiglu L{layer_idx}: {e}"))?;
+            // catsplit: MoE expert SwiGLU activation.
+            cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
+        }
 
         // -- down_id (BATCHED n_tokens=N*top_k) --
         session.barrier_between(
@@ -2413,6 +2504,20 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow::anyhow!("body_batched routing overlap alloc: {e}"))?,
             );
         }
+        #[cfg(test)]
+        if router_capture::armed() {
+            let stride = elems(&bufs.moe_expert_ids) / n;
+            anyhow::ensure!(
+                elems(&bufs.moe_routing_weights_gpu) / n == stride,
+                "router capture: ids and weights strides differ"
+            );
+            let count = self.layers.len() * n * stride;
+            let alloc = |dtype| {
+                dev.alloc_buffer(count * 4, dtype, vec![count])
+                    .map_err(|e| anyhow::anyhow!("router capture alloc: {e}"))
+            };
+            bufs.router_capture = Some((alloc(DType::U32)?, alloc(DType::F32)?));
+        }
 
         // Positions buffer [N] u32 for per-slot RoPE.
         let mut positions_buf = dev
@@ -2705,6 +2810,7 @@ impl MlxModelWeights {
     /// only after the step's final wait; no-op when the buffer was not
     /// allocated. KV lengths mirror each regime's `ksl_of` in
     /// [`Self::encode_one_layer_batched`] (hybrid rings subtract the graft).
+    /// Test builds also publish an armed [`router_capture`] here.
     fn record_routing_overlap(
         &self,
         bufs: &BatchedDecodeBuffers,
@@ -2712,6 +2818,21 @@ impl MlxModelWeights {
         seq_positions: &[usize],
         regime: &BatchedKvRegime<'_>,
     ) -> Result<()> {
+        #[cfg(test)]
+        if let Some((ids, weights)) = bufs.router_capture.as_ref() {
+            router_capture::publish(router_capture::Step {
+                n,
+                stride: elems(&bufs.moe_expert_ids) / n,
+                ids: ids
+                    .as_slice::<u32>()
+                    .map_err(|e| anyhow::anyhow!("router capture read ids: {e}"))?
+                    .to_vec(),
+                weights: weights
+                    .as_slice::<f32>()
+                    .map_err(|e| anyhow::anyhow!("router capture read weights: {e}"))?
+                    .to_vec(),
+            });
+        }
         use super::routing_overlap::{kv_len, record_step, StepLayer};
         let Some(ids_buf) = bufs.routing_overlap_ids.as_ref() else {
             return Ok(());

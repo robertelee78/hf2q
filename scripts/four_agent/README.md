@@ -553,6 +553,13 @@ HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_T
   python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
   --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-gemma4-prefill-moe-A-$(date -u +%Y%m%dT%H%M%SZ)"
+# Gemma4 decode kernels A/B (ADR-063 Q4-GEMMA-DECODE, F2 only: Q4_K expert gate_up GEGLU at widths <= 4): same case, adopted-set arm (ABBA blocks with the default arm, design §12)
+HF2Q_Q5_GEMMA_DECODE_KERNELS=1 \
+HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
+  python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
+  --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/q5-gemma4-decode-kernels-on-$(date -u +%Y%m%dT%H%M%SZ)"
+
 # Gemma4 V2 decode-workload diagnostic (ADR-063 Q4-GEMMA-DECODE §7.4; untimed): prints [ROUTING_OVERLAP] at worker exit
 HF2Q_Q5_GEMMA_ROUTING_OVERLAP=1 \
 HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
