@@ -12,6 +12,19 @@ use support::*;
 /// prefill and the coalesced width-eight decode must match independent N=1
 /// references; staircase decode rows must remain finite before the following
 /// cold prefill checks for persistent corruption.
+///
+/// Retained-suffix resumes are checked against a fresh N=1 model that takes
+/// the same resume path (prefill the 40-token base, then append the suffix
+/// through the one-token primitive). They are not compared bit-for-bit
+/// against a cold full-prompt prefill, because those are different numeric
+/// paths. The cold prefill runs batched flash attention over in-flight F32
+/// K/V. The tiny resume reads the slot cache: F16 K and TQ8 V in Hybrid, TQ
+/// K and V in full-TQ. The base prompt is control and newline-run tokens, so
+/// the next token is a near-tie: on the Gemma 4 26B-A4B q4_k_m GGUF, `"\n\n"`
+/// (108) leads `"\n\n\n"` (109) by 0.115 logits on the cold path and trails
+/// it by 0.033 on the resume path, at N=1 and N=8 alike (#702). The live
+/// resume after width-two decode rows must still equal the same-path
+/// reference exactly, so cross-slot or decode-row corruption fails the test.
 #[test]
 fn gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant() {
     if skip_unless_gated("gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant") {
@@ -105,6 +118,8 @@ fn gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant() {
             prompt
         })
         .collect();
+    // Same-path references (see the doc comment): a fresh N=1 model prefills
+    // the base, then resumes the suffix exactly as the live slot does below.
     let expected_resumes: Vec<u32> = resume_prompts
         .iter()
         .map(|prompt| {
@@ -120,7 +135,7 @@ fn gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant() {
             let mut mlx = g.multi_seq_kv_mlx.take();
             g.weights
                 .forward_prefill_with_soft_tokens_slot_aware(
-                    prompt,
+                    &resume_base,
                     &[],
                     max_decode_tokens,
                     &mut g.ctx,
@@ -130,12 +145,30 @@ fn gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant() {
                     dense.as_mut(),
                     mlx.as_mut(),
                 )
-                .expect("cold full-prompt resume reference")
+                .expect("N=1 resume reference base prefill");
+            clear_gemma4_self_mounts(g);
+            let token = g
+                .weights
+                .forward_prefill_with_soft_tokens_slot_aware_resume(
+                    prompt,
+                    &[],
+                    max_decode_tokens,
+                    &mut g.ctx,
+                    SlotId(0),
+                    &mut kv,
+                    hybrid.as_mut(),
+                    dense.as_mut(),
+                    mlx.as_mut(),
+                    resume_base.len(),
+                )
+                .expect("N=1 resume reference suffix");
+            clear_gemma4_self_mounts(g);
+            token
         })
         .collect();
     assert!(
         expected_resumes.iter().all(|&token| token != 0),
-        "vacuous: a cold resume reference selected token 0: {expected_resumes:?}"
+        "vacuous: an N=1 resume reference selected token 0: {expected_resumes:?}"
     );
     let boundary_prompts: Vec<Vec<u32>> = [31usize, 32usize]
         .into_iter()
