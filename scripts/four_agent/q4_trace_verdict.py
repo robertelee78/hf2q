@@ -10,7 +10,7 @@
                                  policy) must agree exactly for every checked window (design §5.1 P5, §5.2
                                  check 2). Windows: the frozen ones of W (q2_traced_freeze output), or every
                                  composition at those arrivals with --all-compositions.
-  classify --t1-o1 J --g1 pass|fail --t0-o0 J --o1-o1d J [--repeat J]
+  classify --t1-o1 J --g1 pass|fail --t0-o0 J --o1-o1d J [--repeat J --repeat-observer J]
                                  the pre-registered exactness rule (design §5.2) over
                                  `q1_decision_policy.py transcripts` outputs; rows top to bottom, first match
 
@@ -122,7 +122,7 @@ def transcript_verdict(document, name):
     return "Exact" if document["classification"] == "ExactTranscripts" else "Diverged"
 
 
-def classify(t1_o1, g1, t0_o0, o1_o1d, repeat=None):
+def classify(t1_o1, g1, t0_o0, o1_o1d, repeat=None, repeat_observer=None):
     """Design §5.2 pre-registered rule (amended before any run: O1' determinism control). Rows are evaluated
     top to bottom and the first match decides. Qwen3.8 N4 serving switches serial/joint routes with arrival
     timing (a Q1 Class B route), so a cross-run transcript divergence is hook evidence only once the untraced
@@ -131,6 +131,9 @@ def classify(t1_o1, g1, t0_o0, o1_o1d, repeat=None):
     hook, observer = transcript_verdict(t1_o1, "T1 O1"), transcript_verdict(t0_o0, "T0 O0")
     control = transcript_verdict(o1_o1d, "O1 O1'")
     rows = {"T1 O1": hook, "G1": g1, "T0 O0": observer, "O1 O1'": control}
+    require((repeat is None) == (repeat_observer is None), "the repeat needs both T1' O1'' and T0' O0'")
+    require(repeat is None or (hook, g1, control, observer) == ("Diverged", "pass", "Exact", "Exact"),
+            "a repeat is allowed only for the Unresolved row")
     if g1 == "fail":
         verdict, outcome = "HookAttributable", "Story fails: fix the hook (G1 proves output bytes changed)."
     elif hook == "Exact":
@@ -143,17 +146,20 @@ def classify(t1_o1, g1, t0_o0, o1_o1d, repeat=None):
         verdict, outcome = ("ObserverAttributable", "Hook cleared; observer alone diverges. To the operator with "
                             "all comparisons, divergent turns and the recommended ADR re-wording.")
     elif repeat is None:
-        verdict, outcome = "Unresolved", "Run one more pair T1' and O1'' with identical inputs, then re-classify."
+        verdict, outcome = ("Unresolved", "Run the repeat: T1' and O1'' (hook binary) and T0' and O0' (parent), "
+                            "identical inputs, then re-classify.")
     else:
         rows["T1' O1''"] = transcript_verdict(repeat, "T1' O1''")
+        rows["T0' O0'"] = transcript_verdict(repeat_observer, "T0' O0'")
         if rows["T1' O1''"] == "Exact":
             verdict, outcome = ("ScheduleNondeterministic", "To the operator, as ObserverAttributable, with all "
                                 "comparisons and divergent turns.")
+        elif rows["T0' O0'"] == "Diverged":
+            verdict, outcome = ("ObserverAttributable", "The repeat hook pair diverged and so did the repeat "
+                                "observer-only pair. To the operator with all comparisons and divergent turns.")
         else:
-            verdict, outcome = ("HookAttributable", "Story fails: the repeat pair diverged again while the "
-                                "untraced hook binary was run-to-run deterministic.")
-    require(repeat is None or (hook, g1, control, observer) == ("Diverged", "pass", "Exact", "Exact"),
-            "a repeat pair is allowed only for the Unresolved row")
+            verdict, outcome = ("HookAttributable", "Story fails: the repeat hook pair diverged again while the "
+                                "repeat observer-only pair was Exact (O1 vs O1' Exact on one pair).")
     return {"schema": "hf2q.q4-trace.exactness.v2", "inputs": rows, "classification": verdict, "outcome": outcome}
 
 
@@ -184,7 +190,8 @@ def main(argv=None):
     c.add_argument("--g1", required=True, choices=("pass", "fail"))
     c.add_argument("--t0-o0", required=True)
     c.add_argument("--o1-o1d", required=True, help="O1 vs O1' (untraced hook binary run twice): determinism control")
-    c.add_argument("--repeat", help="T1' vs O1'' (only for the Unresolved row)")
+    c.add_argument("--repeat", help="T1' vs O1'' (only for the Unresolved row, with --repeat-observer)")
+    c.add_argument("--repeat-observer", help="T0' vs O0' (only for the Unresolved row, with --repeat)")
     args = parser.parse_args(argv)
     try:
         if args.command == "acceptance":
@@ -193,7 +200,8 @@ def main(argv=None):
             result = isolation(Jsonl(args.trace), frozen_windows(args.windows, args.all_compositions))
         else:
             result = classify(load(args.t1_o1), args.g1, load(args.t0_o0), load(args.o1_o1d),
-                              None if args.repeat is None else load(args.repeat))
+                              None if args.repeat is None else load(args.repeat),
+                              None if args.repeat_observer is None else load(args.repeat_observer))
     except (KeyError, OSError, ValueError) as error:
         print(json.dumps({"error": str(error)}), file=sys.stderr)
         return 2

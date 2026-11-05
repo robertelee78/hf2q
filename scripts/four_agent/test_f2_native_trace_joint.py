@@ -487,19 +487,34 @@ class ExactnessRule(unittest.TestCase):
 
     def test_rows_are_evaluated_top_to_bottom(self):
         x, d = self.transcripts(True), self.transcripts(False)
-        # (T1 O1, G1, T0 O0, O1 O1', repeat T1' O1'')
-        cases = [((x, "fail", x, x, None), "HookAttributable"), ((d, "fail", d, d, None), "HookAttributable"),
-                 ((x, "pass", d, d, None), "Exact"),
-                 ((d, "pass", x, d, None), "ScheduleNondeterministic"),
-                 ((d, "pass", d, d, None), "ScheduleNondeterministic"),
-                 ((d, "pass", d, x, None), "ObserverAttributable"),
-                 ((d, "pass", x, x, None), "Unresolved"), ((d, "pass", x, x, x), "ScheduleNondeterministic"),
-                 ((d, "pass", x, x, d), "HookAttributable")]
+        # (T1 O1, G1, T0 O0, O1 O1', repeat T1' O1'', repeat T0' O0')
+        cases = [((x, "fail", x, x, None, None), "HookAttributable"), ((d, "fail", d, d, None, None), "HookAttributable"),
+                 ((x, "pass", d, d, None, None), "Exact"),
+                 ((d, "pass", x, d, None, None), "ScheduleNondeterministic"),
+                 ((d, "pass", d, d, None, None), "ScheduleNondeterministic"),
+                 ((d, "pass", d, x, None, None), "ObserverAttributable"),
+                 ((d, "pass", x, x, None, None), "Unresolved"),
+                 ((d, "pass", x, x, x, x), "ScheduleNondeterministic"),
+                 ((d, "pass", x, x, x, d), "ScheduleNondeterministic"),
+                 ((d, "pass", x, x, d, d), "ObserverAttributable"),
+                 ((d, "pass", x, x, d, x), "HookAttributable")]
         for args, expected in cases:
             with self.subTest(args=[a if a in ("pass", "fail") else a and a["classification"] for a in args]):
                 result = verdict.classify(*args)
                 self.assertEqual(result["classification"], expected)
                 self.assertEqual(result["inputs"]["O1 O1'"], "Exact" if args[3] is x else "Diverged")
+
+    def test_hook_attribution_needs_g1_fail_or_exact_untraced_and_repeat_observer_controls(self):
+        # Exhaustive: HookAttributable only with G1 fail, or with O1 O1' Exact, T0 O0 Exact and the repeat
+        # observer-only pair Exact while the repeat hook pair diverged.
+        import itertools
+        x, d = self.transcripts(True), self.transcripts(False)
+        for t1, g1, t0, o1d in itertools.product((x, d), ("pass", "fail"), (x, d), (x, d)):
+            unresolved = (t1, g1, t0, o1d) == (d, "pass", x, x)
+            for repeat in (itertools.product((x, d), (x, d)) if unresolved else [(None, None)]):
+                result = verdict.classify(t1, g1, t0, o1d, *repeat)["classification"]
+                expected_hook = g1 == "fail" or (unresolved and repeat == (d, x))
+                self.assertEqual(result == "HookAttributable", expected_hook, (t1, g1, t0, o1d, repeat))
 
     def test_timing_divergence_alone_never_fails_the_hook(self):
         # Serving that diverges run-to-run without hook or observer (O1 vs O1') cannot make a
@@ -511,9 +526,11 @@ class ExactnessRule(unittest.TestCase):
     def test_repeat_only_for_unresolved_and_inputs_are_closed(self):
         x, d = self.transcripts(True), self.transcripts(False)
         with self.assertRaisesRegex(ValueError, "only for the Unresolved row"):
-            verdict.classify(x, "pass", x, x, x)
+            verdict.classify(x, "pass", x, x, x, x)
         with self.assertRaisesRegex(ValueError, "only for the Unresolved row"):
-            verdict.classify(d, "pass", x, d, x)
+            verdict.classify(d, "pass", x, d, x, x)
+        with self.assertRaisesRegex(ValueError, "needs both"):
+            verdict.classify(d, "pass", x, x, x)
         with self.assertRaisesRegex(ValueError, "two-run"):
             verdict.classify(dict(x, runs=3), "pass", x, x)
         with self.assertRaisesRegex(ValueError, "O1 O1'"):
