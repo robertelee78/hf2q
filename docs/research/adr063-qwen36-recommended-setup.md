@@ -391,13 +391,33 @@ re-run with a release build of `38eea839`. Peer and BF16 data are reused; eviden
   - Median +0.01 nat, positive at 32/63 (was +1.55, positive at 52/63).
   - Median absolute difference 0.16 nat, against peer q8_0-vs-f16 noise of 0.17.
   - The copy form is preferred at 26/63 points (peer 28/63, before the fix 43/63).
-- **Not yet re-run.** R1 waits on the tool-grammar newline fix.
 
-### Draft ADR-063 amendment (DRAFT, pending the R1 defect diagnosis; the root lands the ADR edit)
+**R1 re-run on main (2026-11-05): hf2q 21/24 vs peer 20/24, verdict `Pass`.**
+- **Setup.** The frozen R1 design (24 instances, same instance table, case files, GGUF `815a22ca…`, peer arm,
+  sampling). The one change is the hf2q binary: origin/main `4bfb0436`, which includes the RoPE fix (mlx-native
+  0.15.18), the tool-call newline fix (#686) and #704, merged with this branch's harness as `d7efa085`.
+- **Toolchain.** rustc 1.99.1, sha256 `946db5e7…`, cargo 1.99.1 sandbox proof `4b2bea77…`.
+- **Plan.** Plan sha256 `e0936e91…`. It differs from the first R1 plan only in the binary, the proof and two
+  harness source hashes. Campaign directory: `campaigns/quality-qwen36-repair1-ours-20261105T183923Z`, wall
+  time 42 min.
+- **Verdict.** `subject_only_fail` 2, `reference_only_fail` 3, `one_sided_p` 0.81. The first R1 was hf2q
+  14/24 vs peer 23/24, `Loss`.
+- **Against the canonical workload.** On the same instance ids, hf2q passes 16 instances it failed under the
+  canonical workload and fails none it passed (two-sided sign test p = 3e-5).
+- **The remaining failures match across engines.**
+  - Failing-form first writes: hf2q 55/96, peer 58/96.
+  - Repairs used and passed: hf2q 51/54, peer 53/57. No repair compiled and failed its test.
+  - Failing-form repair writes: hf2q 2/54, peer 3/57.
+  - Instances lost: hf2q 3 (i08, i14, i16), peer 4 (i01, i03, i16, i19). In each, one agent ends
+    "initial six-step workflow not followed" right after its repair write; in 5 of these 7 the repair
+    re-emits the failing first file byte for byte.
 
-Do not land this text yet. R1 is an hf2q `Loss` on this workload. The localization above names the cause:
-the partial-rotary RoPE pairing in mlx-native `rope_multi`. The amendment waits until that defect is fixed
-and R1 is re-measured.
+### Draft ADR-063 amendment (ready for the root; the root lands the ADR edit)
+
+The first R1 was an hf2q `Loss`. The localization above found the cause in the partial-rotary RoPE pairing
+in mlx-native `rope_multi`; it was fixed in 0.15.18, together with the tool-call newline (#686). The re-run
+on main clears the floor and passes: hf2q 21/24 vs peer 20/24, `Pass`. The root decides whether to land
+this text and schedule the Q4 speed race.
 
 Under Q4-QWEN36, after "If Qwen3.6 stays BelowFloor under every setup tested …":
 
