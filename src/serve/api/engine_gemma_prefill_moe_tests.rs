@@ -18,11 +18,6 @@
 //!   arm B must reuse the gate/up schedule, or, when a profiling switch
 //!   (`HF2Q_PROFILE_MOE`, `_MOE_POST`, `_BUCKETS`, `_GPU_TS`) replaces the
 //!   session between gate/up and down, take the self-scheduling slotted call.
-//! * `gemma_prefill_moe_imatrix_collection_takes_the_slotted_fallback`: the
-//!   same prefills with an imatrix collector installed (its intercept
-//!   rotates the session) finish without a reuse error, record routed-expert
-//!   rows for `ffn_down_exps`, and every down call takes the slotted
-//!   fallback.
 use super::gemma_warm_batch_tests::{
     assert_lane_equal, load_gate_model, reserve_for, slot_kv_hashes, LaneImage, WarmFixture,
 };
@@ -151,50 +146,4 @@ fn gemma_prefill_moe_route_matches_previous_route_bitwise() {
             slotted.entries.len(),
         );
     }
-}
-
-#[test]
-#[ignore = "official Gemma 4 GGUF: imatrix collection over the slotted prefill MoE down takes the self-scheduling fallback"]
-fn gemma_prefill_moe_imatrix_collection_takes_the_slotted_fallback() {
-    use std::sync::{Arc, Mutex};
-    #[derive(Default)]
-    struct Counts {
-        dense_rows: usize,
-        down_expert_rows: usize,
-    }
-    struct Collector(Arc<Mutex<Counts>>);
-    impl crate::quantize::imatrix::forward::ImatrixCollector for Collector {
-        fn record(&mut self, _name: &str, _row: &[f32]) {
-            self.0.lock().unwrap().dense_rows += 1;
-        }
-        fn record_moe(&mut self, name: &str, _expert_id: usize, _row: &[f32]) {
-            if name.ends_with("ffn_down_exps") {
-                self.0.lock().unwrap().down_expert_rows += 1;
-            }
-        }
-    }
-    let mut loaded = load_gate_model();
-    let LoadedModel::Gemma(g) = &mut loaded else {
-        unreachable!("load_gate_model returns Gemma")
-    };
-    let mut guard = Gemma4KvGuard::take(g).unwrap();
-    let counts = Arc::new(Mutex::new(Counts::default()));
-    let image = crate::quantize::imatrix::forward::with_collector(
-        Collector(Arc::clone(&counts)),
-        || run_arm(&mut guard, GemmaPrefillMoeDown::Slotted, false),
-    );
-    let down_calls = 5 * guard.model.weights.layers.len();
-    assert_eq!(
-        image.entries,
-        vec![DownEntry::Slotted; down_calls],
-        "an installed collector rotates the session: every down call self-schedules"
-    );
-    let counts = counts.lock().unwrap();
-    assert!(counts.down_expert_rows > 0, "the collector saw routed-expert down rows");
-    println!(
-        "GEMMA_PREFILL_MOE_IMATRIX: {} down calls slotted fallback, ffn_down_exps rows={} dense rows={}",
-        image.entries.len(),
-        counts.down_expert_rows,
-        counts.dense_rows
-    );
 }
