@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import stat
 import time
@@ -9,6 +10,27 @@ import tempfile
 
 from qwen38_n1_verdict import FILE_LIMIT, Invalid, loads, require, test_harness
 import qwen38_n1_process as child
+
+# Workload normalization (ADR-063, operator 2026-11-05, effective from B1). The run_tests output reached the
+# model with the fixture's absolute path (run directory, agent id) and cargo/libtest wall-clock durations, so
+# the same four-agent workload sent different prompts in every run (G-S2 run 011: a Gemma lane flipped
+# src/ports.rs to src/ports.py on those digits alone). The model sees the output with each run-specific prefix
+# replaced by a fixed stand-in and every duration replaced by 0.00s; the receipt keeps it verbatim as
+# `raw_output`. read_file returns fixture bytes and write_file a content digest, so neither needs this.
+OWNED_ROOT = "/owned"
+CARGO_CWD = "/cargo-cwd"
+# cargo `Finished ... in 0.15s` / `in 1m 05s`, libtest `; finished in 0.00s`.
+CARGO_ELAPSED = re.compile(r"(?m)^(\s*Finished\b.* in )(?:\d+m \d+s|\d+(?:\.\d+)?s)$")
+TEST_ELAPSED = re.compile(r"(?m)^(test result: .*; finished in )\d+(?:\.\d+)?s$")
+
+
+def model_visible(raw, roots):
+    """Run-invariant model view of a tool output; `roots` are (absolute prefix, stand-in) pairs, longest first."""
+    for prefix, stand_in in roots:
+        raw = raw.replace(prefix, stand_in)
+    raw = CARGO_ELAPSED.sub(r"\g<1>0.00s", raw)
+    return TEST_ELAPSED.sub(r"\g<1>0.00s", raw)
+
 
 MANIFEST = '[package]\nname = "qwen38_n1_fixture"\nversion = "0.0.0"\nedition = "2021"\n'
 LOCK = '# Owned dependency-free fixture\nversion = 4\n\n[[package]]\nname = "qwen38_n1_fixture"\nversion = "0.0.0"\n'
@@ -187,10 +209,16 @@ class Tools:
         require(len(output) <= FILE_LIMIT and used <= FILE_LIMIT, "whole tool output envelope")
         self.invariant()
         require(child.digest(self.fixture / "src/ports.rs") == self.source_hash, "compiler/test altered source")
+        raw = output.decode("utf8", "strict")
         return {"target": target, "passed": passed, "source_sha256": self.source_hash,
                 "fresh_target": str(build), "artifact_sha256": [child.digest(p) for p in artifacts],
                 "processes": observed, "cleanup": all(x["cleanup"] for x in observed),
-                "output": output.decode("utf8", "strict")}
+                "output": model_visible(raw, self.run_roots()), "raw_output": raw}
+
+    def run_roots(self):
+        """Run-specific absolute prefixes of the tool output and their fixed model-visible stand-ins."""
+        roots = {str(self.root): OWNED_ROOT, str(self.root.resolve()): OWNED_ROOT, str(self.cwd): CARGO_CWD}
+        return sorted(roots.items(), key=lambda item: -len(item[0]))
 
     def invoke(self, name, args):
         self.invariant()

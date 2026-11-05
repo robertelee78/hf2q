@@ -620,6 +620,16 @@ The receipt also records `peak_over_cap_bytes`, which is the measured overshoot,
 - A blind sample, meaning failed host observation or a missing real footprint while a cap is enforced, never counts as a quiet host. Three blind samples in a row stop the run.
 - Thermal state is recorded but never stops a run. It is not an out-of-memory risk.
 
+## Tool-result normalization (ADR-063, operator decision 2026-11-05, from B1)
+
+The model sees the same tool results in every run. `Tools.tests` (`qwen38_n1_tools.py`) hands the model a normalized `run_tests` output:
+
+- the owned tool root (`<output>/agent-N/tools`: the run directory and agent id) becomes `/owned`, so the fixture reads as `/owned/fixture`;
+- the cargo working directory (`/private/tmp/hf2q-n1-cargo-*`) becomes `/cargo-cwd`;
+- cargo's `Finished … in <duration>` and libtest's `; finished in <duration>` become `0.00s`.
+
+The tool receipt keeps the verbatim output as `raw_output`. Its `result` is what the model saw, and audits that rebuild transcripts from receipts read that field. Compiler error codes, rendered diagnostics and the libtest `test result:` marker are unchanged. `read_file` returns the fixture bytes and `write_file` a content digest, so neither needs normalizing. Runs recorded before the change keep their raw tool results. Compare transcripts across runs (ExactTranscripts, G-S2, B1) only between runs on the same side of the change. `test_qwen38_n1_tools.py` covers both cases model-free: two run directories with different timings give byte-identical model-visible results, and error codes and test-pass parsing read as before.
+
 ## Long-context workload (ADR-063 D2, #365)
 
 D2's acceptance includes long contexts, and the canonical client tops out near 2.8k prompt tokens per turn. `qwen_n4_live_smoke.py --workload long-context-v1` runs the canonical `parse_port` task with one change: `tests/ports.rs` is the canonical two integration tests followed by [`fixtures/long-context-v1.rs`](fixtures/long-context-v1.rs). That fixture is a 150 KB read-only Rust module, `mod netconf`: the configuration schema of the daemon the port parser feeds. It has 8 sections and 55 settings, each with bounds, a parser, a defaulting reader, a formatter and help text. The module is `#[allow(dead_code)]` and has no `#[test]`. Workflow step (2) reads the file, so every request from turn 2 on carries it.

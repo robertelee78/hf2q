@@ -1894,6 +1894,34 @@ exactness on `d817dffa`/`5504f4ee`, 0.15.16) stands as invariance evidence,
 because state-restore exactness does not depend on the `rope_multi`
 numerics.
 
+### Four-agent workload normalization (operator decision, 2026-11-05)
+
+The canonical four-agent workload did not send the same prompts in every
+run. Its `run_tests` result carried the raw cargo and libtest output: the
+fixture's absolute path (run directory and agent id) and the wall-clock
+durations (`Finished … in 0.15s`, `finished in 0.00s`). These are a few
+digit tokens in an otherwise identical transcript. Q4-GEMMA-COLD G-S2 run 011
+failed on them alone. Its turn-4 prompt matched the other ten runs in length
+(1,247 tokens) but not in content, and all four Gemma lanes read
+`src/ports.py` (one `src/ports.rypts`) instead of `src/ports.rs`. A
+deterministic replay reproduced 011 on its binary and on `main` `0d0179b7`
+for every warm composition (3 joint + 1 per-slot, 4 joint, serial) and for a
+cold full prefill. Per-token logprobs were bitwise equal across the warm
+compositions, and run 010's prompt chose `rs` by 13.8–15.4 nats everywhere.
+The cause was the input, not prefill route numerics or state corruption.
+
+Decision (operator, 2026-11-05): from the ADR-065 B1 (#503) baseline run on,
+the model sees a run-invariant `run_tests` result. `qwen38_n1_tools.py`
+replaces the owned tool root with `/owned` and the cargo working directory
+with `/cargo-cwd`, and sets every cargo and libtest duration to `0.00s`. The
+tool receipt keeps the verbatim output as `raw_output`, and error codes and
+the libtest result marker are unchanged. `read_file` returns fixture bytes
+and `write_file` a content digest, so neither changes. Results recorded
+before the change stay as recorded and are not re-scored. A transcript
+comparison across runs (ExactTranscripts, G-S2, T-J1-8, TRACE T/O, the DS4
+non-regression run, B1) is valid only between runs on the same side of the
+change, so those runs use a harness at or after it.
+
 ## Consequences
 
 ### Positive
