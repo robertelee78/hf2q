@@ -52,16 +52,29 @@ pub(crate) enum AttentionLever {
     VecHybrid,
     /// Lever A (A1 GQA-grouped + A2 mixed-bucket):
     /// `flash_attn_vec_hybrid_batched_gqa` on every step, each slot at its own
-    /// stock `(nwg, nsg)` bucket and the largest legal group size; no
-    /// per-slot fallback for mixed-bucket steps.
-    GqaMixedBucket,
+    /// stock `(nwg, nsg)` bucket; no per-slot fallback for mixed-bucket steps.
+    /// The group size per layer type is the largest legal G not above its cap
+    /// (G = 1 keeps per-head loads but still runs A2). Caps are frozen by M0;
+    /// geometry never changes bits.
+    GqaMixedBucket { sliding_group: u32, global_group: u32 },
 }
 
 impl AttentionLever {
     pub(crate) fn name(self) -> &'static str {
         match self {
             AttentionLever::VecHybrid => "vec_hybrid",
-            AttentionLever::GqaMixedBucket => "gqa_mixed_bucket",
+            AttentionLever::GqaMixedBucket { .. } => "gqa_mixed_bucket",
+        }
+    }
+
+    /// Group-size cap for a layer of head dimension `head_dim` (256 sliding,
+    /// 512 global); `None` for the stock lever.
+    pub(crate) fn group_cap(self, head_dim: u32) -> Option<u32> {
+        match self {
+            AttentionLever::VecHybrid => None,
+            AttentionLever::GqaMixedBucket { sliding_group, global_group } => {
+                Some(if head_dim > 256 { global_group } else { sliding_group })
+            }
         }
     }
 }
@@ -92,7 +105,10 @@ pub(crate) const ADOPTED_LEVERS: Levers = Levers {
     expert_grouped_q4k: true,
     expert_grouped_q5_0: true,
     expert_grouped_q8_0: true,
-    attention: AttentionLever::GqaMixedBucket,
+    // Group caps are provisional until the V1 bench freezes them (design
+    // §7.5): warm S0-b measured G = 8 on global layers at NSG 1 2.3-2.4x
+    // slower than the vec kernel, so the cap starts at 2 for both types.
+    attention: AttentionLever::GqaMixedBucket { sliding_group: 2, global_group: 2 },
 };
 
 impl Levers {
@@ -185,7 +201,7 @@ impl GemmaDecodeKernels {
             format!("{TQ_NSG_ENV} must be unset, got {:?}", env.tq_nsg),
         );
         need(
-            !(env.full_tq && levers.attention == AttentionLever::GqaMixedBucket),
+            !(env.full_tq && matches!(levers.attention, AttentionLever::GqaMixedBucket { .. })),
             format!(
                 "{HYBRID_KV_ENV} must keep the hybrid KV regime on: attention lever {} has no full-TQ route",
                 levers.attention.name()
@@ -292,6 +308,17 @@ fn reference_flags(base: &GgmlRoutingPolicy) -> String {
     )
 }
 
+/// The attention lever with its group caps, for the banner and report.
+pub(crate) fn banner_attention(lever: AttentionLever) -> String {
+    match lever {
+        AttentionLever::VecHybrid => lever.name().to_string(),
+        AttentionLever::GqaMixedBucket { sliding_group, global_group } => format!(
+            "{}(sliding_g<={sliding_group},global_g<={global_group})",
+            lever.name()
+        ),
+    }
+}
+
 /// One-line load banner: switch, adopted lever set and base reference flags.
 pub(crate) fn banner(kernels: Option<&GemmaDecodeKernels>) -> String {
     match kernels {
@@ -299,7 +326,7 @@ pub(crate) fn banner(kernels: Option<&GemmaDecodeKernels>) -> String {
         Some(k) => format!(
             "gemma decode kernels: {ENV}=1 levers=[{}] attention={} base: {}",
             k.levers.names().join(","),
-            k.attention().name(),
+            banner_attention(k.attention()),
             reference_flags(&k.base)
         ),
     }
@@ -312,7 +339,7 @@ pub(crate) fn report(kernels: Option<&GemmaDecodeKernels>) -> serde_json::Value 
         Some(k) => serde_json::json!({
             "switch": "1",
             "levers": k.levers.names(),
-            "attention": k.attention().name(),
+            "attention": banner_attention(k.attention()),
             "base": {
                 "dense_q6k_mv_nr2": k.base.dense_q6k_mv_nr2,
                 "dense_q8_0_mv_nr2": k.base.dense_q8_0_mv_nr2,
@@ -419,7 +446,7 @@ mod tests {
             }
         );
         assert!(!body.dense_row_tiled_m1 && !head.dense_row_tiled_m1);
-        assert_eq!(k.attention(), AttentionLever::GqaMixedBucket);
+        assert!(matches!(k.attention(), AttentionLever::GqaMixedBucket { .. }));
 
         let none = Levers {
             dense_row_tiled_q4k: false,
@@ -461,7 +488,8 @@ mod tests {
             banner(Some(&adopted())),
             "gemma decode kernels: HF2Q_GEMMA_DECODE_KERNELS=1 levers=[dense_row_tiled_q4k,\
              dense_row_tiled_q6k,dense_mn_q5_0,dense_mn_q8_0,lm_head_row_tiled_q6k,\
-             expert_grouped_q4k,expert_grouped_q5_0,expert_grouped_q8_0] attention=gqa_mixed_bucket \
+             expert_grouped_q4k,expert_grouped_q5_0,expert_grouped_q8_0] \
+             attention=gqa_mixed_bucket(sliding_g<=2,global_g<=2) \
              base: dense_q6k_mv_nr2=true dense_q8_0_mv_nr2=true expert_q8_0_mv_nr2=false \
              dense_decode_mv_ext=false"
         );
@@ -469,7 +497,7 @@ mod tests {
         let r = report(Some(&adopted()));
         assert_eq!(r["switch"], "1");
         assert_eq!(r["levers"].as_array().unwrap().len(), 8);
-        assert_eq!(r["attention"], "gqa_mixed_bucket");
+        assert_eq!(r["attention"], "gqa_mixed_bucket(sliding_g<=2,global_g<=2)");
         assert_eq!(r["base"]["dense_q6k_mv_nr2"], true);
         assert_eq!(r["base"]["expert_q8_0_mv_nr2"], false);
         // A set carrying the stock attention lever reports it.
@@ -483,7 +511,22 @@ mod tests {
     #[test]
     fn decode_kernels_attention_lever_names() {
         assert_eq!(AttentionLever::VecHybrid.name(), "vec_hybrid");
-        assert_eq!(AttentionLever::GqaMixedBucket.name(), "gqa_mixed_bucket");
-        assert_eq!(ADOPTED_LEVERS.attention, AttentionLever::GqaMixedBucket);
+        assert_eq!(
+            AttentionLever::GqaMixedBucket { sliding_group: 2, global_group: 2 }.name(),
+            "gqa_mixed_bucket"
+        );
+        assert!(matches!(ADOPTED_LEVERS.attention, AttentionLever::GqaMixedBucket { .. }));
+    }
+
+    #[test]
+    fn decode_kernels_attention_group_caps() {
+        let lever = AttentionLever::GqaMixedBucket { sliding_group: 2, global_group: 4 };
+        assert_eq!(lever.group_cap(256), Some(2));
+        assert_eq!(lever.group_cap(512), Some(4));
+        assert_eq!(AttentionLever::VecHybrid.group_cap(256), None);
+        assert_eq!(
+            banner_attention(lever),
+            "gqa_mixed_bucket(sliding_g<=2,global_g<=4)"
+        );
     }
 }

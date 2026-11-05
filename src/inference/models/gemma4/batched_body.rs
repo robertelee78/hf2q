@@ -1001,8 +1001,8 @@ impl MlxModelWeights {
                 // flash runs each slot at its OWN (nwg, nsg) bucket in-kernel, so
                 // mixed-bucket steps take the batched branch too (batched KV encode,
                 // one flash, batched/per-slot undo as for same-bucket steps).
-                let gqa_flash = self.decode_attention_lever()
-                    == super::decode_kernels::AttentionLever::GqaMixedBucket;
+                let gqa_group_cap = self.decode_attention_lever().group_cap(hd as u32);
+                let gqa_flash = gqa_group_cap.is_some();
                 let use_batched_flash = std::env::var("HF2Q_BATCHED_FLASH").as_deref() != Ok("0")
                     && (same_bucket || gqa_flash);
                 // ROWDIFF probe (HF2Q_DECODE_TRACE): layer 0 only — dump per-slot
@@ -1184,12 +1184,24 @@ impl MlxModelWeights {
                         let buckets: Vec<fav::HybridSlotBucket> =
                             (0..n).map(|i| fav::HybridSlotBucket::for_kv_seq_len(ksl_of(i))).collect();
                         let bucket_nsg_max = buckets.iter().map(|b| b.nsg).max().unwrap_or(1);
-                        let group = fav::flash_attn_vec_hybrid_batched_gqa_pick_group(
-                            nh as u32,
-                            nkv as u32,
-                            hd as u32,
-                            bucket_nsg_max,
-                        );
+                        // Largest legal G not above this layer type's cap
+                        // (frozen by M0); G = 1 is always legal.
+                        let cap = gqa_group_cap.unwrap_or(1);
+                        let group = fav::FLASH_ATTN_VEC_HYBRID_GQA_GROUPS
+                            .iter()
+                            .copied()
+                            .filter(|&g| {
+                                g <= cap
+                                    && fav::flash_attn_vec_hybrid_batched_gqa_group_is_legal(
+                                        nh as u32,
+                                        nkv as u32,
+                                        hd as u32,
+                                        g,
+                                        bucket_nsg_max,
+                                    )
+                            })
+                            .max()
+                            .unwrap_or(1);
                         let tmp_need =
                             fav::flash_attn_vec_hybrid_batched_gqa_tmp_bytes(nh as u32, hd as u32, &buckets)
                                 .map_err(|e| anyhow::anyhow!("gqa flash tmp plan L{layer_idx}: {e}"))?;
