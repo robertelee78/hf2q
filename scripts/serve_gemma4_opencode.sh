@@ -97,6 +97,12 @@
 #                                    HF2Q_GEMMA_WARM_TILED_ATTENTION; unset
 #                                    keeps the hf2q default (off, vec-hybrid
 #                                    warm attention). 1 opts in to tiled F16.
+#     WARM_ATTENTION_EXACT=0|1       (this script) forwards
+#                                    HF2Q_GEMMA_WARM_ATTENTION_EXACT; unset
+#                                    keeps the hf2q default (off). 1 maps
+#                                    vec-hybrid warm attention to the
+#                                    bitwise grouped kernel (ADR-063
+#                                    Q4-GEMMA-ATTN-EXACT-G2).
 #     PREFILL_MOE_DOWN=flat|slotted  (this script) forwards
 #                                    HF2Q_GEMMA_PREFILL_MOE_DOWN; unset
 #                                    keeps the hf2q default (slotted). flat
@@ -229,6 +235,15 @@ case "${WARM_TILED_ATTENTION:-}" in
         exit 2
         ;;
 esac
+WARM_EXACT_ENV=""
+case "${WARM_ATTENTION_EXACT:-}" in
+    "") ;;
+    0|1) WARM_EXACT_ENV="$WARM_ATTENTION_EXACT" ;;
+    *)
+        echo "WARM_ATTENTION_EXACT must be 0, 1 or unset" >&2
+        exit 2
+        ;;
+esac
 PREFILL_MOE_DOWN_ENV=""
 case "${PREFILL_MOE_DOWN:-}" in
     "") ;;
@@ -259,6 +274,7 @@ if [[ -f "$MMPROJ" ]]; then
         ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
         ${JOINT_COLD_ENV:+HF2Q_GEMMA_JOINT_COLD_PREFILL="$JOINT_COLD_ENV"} \
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
+        ${WARM_EXACT_ENV:+HF2Q_GEMMA_WARM_ATTENTION_EXACT="$WARM_EXACT_ENV"} \
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
@@ -280,6 +296,7 @@ else
         ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
         ${JOINT_COLD_ENV:+HF2Q_GEMMA_JOINT_COLD_PREFILL="$JOINT_COLD_ENV"} \
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
+        ${WARM_EXACT_ENV:+HF2Q_GEMMA_WARM_ATTENTION_EXACT="$WARM_EXACT_ENV"} \
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \

@@ -375,6 +375,73 @@ pub(super) fn reserve_for(lanes: &[Lane<'_>]) -> usize {
     )
 }
 
+/// Warm-attention dispatches of one prefill-only forward under
+/// `MLX_DISP_BUCKET=1` (ADR-063 Q4-GEMMA-ATTN-EXACT-G2 dispatch-count proof):
+/// the counters are reset right before the forward and read right after it,
+/// before any decode step, so decode dispatches never count.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct WarmDispatches {
+    /// `flash_attn_vec_hybrid_batched_gqa2_*`.
+    pub(super) gqa2: u64,
+    /// Any other grouped size (must stay 0 under the G <= 2 cap).
+    pub(super) gqa_other: u64,
+    /// Stock `flash_attn_vec_hybrid_batched_dk*`.
+    pub(super) stock: u64,
+}
+
+pub(super) fn disp_bucket_enabled() -> bool {
+    std::env::var("MLX_DISP_BUCKET").as_deref() == Ok("1")
+}
+
+pub(super) fn count_warm_dispatches<T>(forward: impl FnOnce() -> T) -> (T, WarmDispatches) {
+    mlx_native::reset_pipeline_dispatch_buckets();
+    let out = forward();
+    let mut counts = WarmDispatches::default();
+    for (label, count) in mlx_native::pipeline_dispatch_buckets() {
+        let name = label.split('|').next().unwrap_or_default();
+        if name.starts_with("flash_attn_vec_hybrid_batched_gqa2_") {
+            counts.gqa2 += count;
+        } else if name.starts_with("flash_attn_vec_hybrid_batched_gqa") {
+            counts.gqa_other += count;
+        } else if name.starts_with("flash_attn_vec_hybrid_batched_dk") {
+            counts.stock += count;
+        }
+    }
+    (out, counts)
+}
+
+/// The kernel actually ran: `VecHybridGqa` issues only grouped G = 2
+/// dispatches (no bucket falls back, design §13.0), `VecHybrid` only stock
+/// ones, and the tiled route no grouped one.
+pub(super) fn assert_warm_dispatch_proof(label: &str, kernel: GemmaLiveKernel, d: WarmDispatches) {
+    assert_eq!(
+        d.gqa_other, 0,
+        "{label}: grouped size other than 2 dispatched: {d:?}"
+    );
+    match kernel {
+        GemmaLiveKernel::VecHybridGqa => {
+            assert!(d.gqa2 > 0, "{label}: no grouped warm dispatch: {d:?}");
+            assert_eq!(
+                d.stock, 0,
+                "{label}: stock warm dispatch on the grouped route: {d:?}"
+            );
+        }
+        GemmaLiveKernel::VecHybrid => {
+            assert_eq!(
+                d.gqa2, 0,
+                "{label}: grouped dispatch on the stock route: {d:?}"
+            );
+            assert!(d.stock > 0, "{label}: no stock warm dispatch: {d:?}");
+        }
+        GemmaLiveKernel::TiledF16 => {
+            assert_eq!(
+                d.gqa2, 0,
+                "{label}: grouped dispatch on the tiled route: {d:?}"
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore = "official Gemma 4 GGUF: joint warm prefill lanes equal per-slot warm prefill bit for bit (tiled F16 route)"]
 fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
@@ -385,6 +452,17 @@ fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
 #[ignore = "official Gemma 4 GGUF: joint warm prefill lanes equal per-slot warm prefill bit for bit (vec-hybrid route)"]
 fn gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid() {
     joint_warm_prefill_matches_per_slot(GemmaLiveKernel::VecHybrid);
+}
+
+/// ADR-063 Q4-GEMMA-ATTN-EXACT-G2 gate X3 (run with `MLX_DISP_BUCKET=1`).
+#[test]
+#[ignore = "official Gemma 4 GGUF: joint warm prefill on the grouped exact route equals per-slot bit for bit"]
+fn gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid_gqa() {
+    assert!(
+        disp_bucket_enabled(),
+        "gate X3 needs MLX_DISP_BUCKET=1 for its dispatch-count proof"
+    );
+    joint_warm_prefill_matches_per_slot(GemmaLiveKernel::VecHybridGqa);
 }
 
 fn joint_warm_prefill_matches_per_slot(kernel: GemmaLiveKernel) {
@@ -440,9 +518,17 @@ fn joint_warm_prefill_matches_per_slot(kernel: GemmaLiveKernel) {
             .iter()
             .map(|&slot| slot_isolation_image(&guard, slot, longest))
             .collect();
-        let images = fixture
-            .joint(&mut guard, &lanes, reserve_for(&lanes))
-            .unwrap();
+        let (images, dispatches) =
+            count_warm_dispatches(|| fixture.joint(&mut guard, &lanes, reserve_for(&lanes)));
+        let images = images.unwrap();
+        if disp_bucket_enabled() {
+            assert_warm_dispatch_proof(
+                &format!("{kernel:?} case {case} joint"),
+                kernel,
+                dispatches,
+            );
+            println!("GEMMA_WARM_JOINT_DISPATCHES kernel={kernel:?} case={case} lanes={slots:?} {dispatches:?}");
+        }
         for (image, &slot) in images.iter().zip(slots.iter()) {
             assert_lane_equal(
                 &format!(

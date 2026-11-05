@@ -27,6 +27,11 @@
 //! * [`GemmaLiveKernel::VecHybrid`]: `flash_attn_vec_hybrid_batched`, one
 //!   decode-style threadgroup per (query, head), in 256-query chunks split
 //!   at the 512/1024 cache-length buckets.
+//! * [`GemmaLiveKernel::VecHybridGqa`]: `flash_attn_vec_hybrid_batched_gqa`
+//!   with at most [`WARM_GQA_MAX_GROUP`] heads of one KV head per
+//!   threadgroup (shared K/V loads), on exactly the `VecHybrid` chunks,
+//!   stage, positions, bucket and split-K scratch; its output is
+//!   u32-identical to `VecHybrid` (ADR-063 Q4-GEMMA-ATTN-EXACT-G2).
 //!
 //! Everything that reaches a kernel is a function of the sequence alone
 //! (its rows, start, KV view and Q/K/V rows), so a lane of a joint cohort is
@@ -67,30 +72,46 @@ pub(crate) const WARM_TILED_ATTENTION_ENV: &str = "HF2Q_GEMMA_WARM_TILED_ATTENTI
 /// serves unless `1` opts in.
 const WARM_TILED_ATTENTION_DEFAULT: bool = false;
 
-fn parse_warm_tiled_switch(raw: Option<&str>) -> std::result::Result<bool, String> {
+pub(crate) const WARM_ATTENTION_EXACT_ENV: &str = "HF2Q_GEMMA_WARM_ATTENTION_EXACT";
+/// Off until promotion (ADR-063 Q4-GEMMA-ATTN-EXACT-G2 design §13.2): `1`
+/// maps a resolved `VecHybrid` warm kernel to the bitwise `VecHybridGqa`.
+const WARM_ATTENTION_EXACT_DEFAULT: bool = false;
+
+/// Heads per threadgroup of [`GemmaLiveKernel::VecHybridGqa`]: G = 2 is the
+/// fastest exact configuration on both Gemma 4 layer kinds (S0-b sweep,
+/// design §12); G = 8 at NSG 1 runs slower than the stock kernel. Every
+/// stock bucket is faster grouped (design §13.0: 0.73–0.93 of stock), so
+/// no bucket falls back.
+pub(crate) const WARM_GQA_MAX_GROUP: u32 = 2;
+
+fn parse_switch(env: &str, raw: Option<&str>, default: bool) -> std::result::Result<bool, String> {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return Ok(WARM_TILED_ATTENTION_DEFAULT);
+        return Ok(default);
     };
     match raw.to_ascii_lowercase().as_str() {
         "1" | "on" | "true" => Ok(true),
         "0" | "off" | "false" => Ok(false),
         _ => Err(format!(
-            "{WARM_TILED_ATTENTION_ENV} must be 1/on/true or 0/off/false, got {raw:?}"
+            "{env} must be 1/on/true or 0/off/false, got {raw:?}"
         )),
     }
 }
 
-fn warm_kernel_for_switch(raw: Option<&str>) -> GemmaLiveKernel {
-    let tiled = parse_warm_tiled_switch(raw).unwrap_or_else(|error| {
-        tracing::warn!(
-            error,
-            fallback = WARM_TILED_ATTENTION_DEFAULT,
-            "invalid Gemma warm tiled attention switch"
-        );
-        WARM_TILED_ATTENTION_DEFAULT
-    });
-    if tiled {
+fn switch_or_default(env: &str, raw: Option<&str>, default: bool) -> bool {
+    parse_switch(env, raw, default).unwrap_or_else(|error| {
+        tracing::warn!(error, fallback = default, "invalid Gemma warm attention switch");
+        default
+    })
+}
+
+/// `tiled` is `HF2Q_GEMMA_WARM_TILED_ATTENTION`, `exact`
+/// `HF2Q_GEMMA_WARM_ATTENTION_EXACT`; the exact switch only replaces
+/// `VecHybrid`, never `TiledF16`.
+fn warm_kernel_for_switches(tiled: Option<&str>, exact: Option<&str>) -> GemmaLiveKernel {
+    if switch_or_default(WARM_TILED_ATTENTION_ENV, tiled, WARM_TILED_ATTENTION_DEFAULT) {
         GemmaLiveKernel::TiledF16
+    } else if switch_or_default(WARM_ATTENTION_EXACT_ENV, exact, WARM_ATTENTION_EXACT_DEFAULT) {
+        GemmaLiveKernel::VecHybridGqa
     } else {
         GemmaLiveKernel::VecHybrid
     }
@@ -98,19 +119,20 @@ fn warm_kernel_for_switch(raw: Option<&str>) -> GemmaLiveKernel {
 
 /// Kernel for warm live-resume attention (single-slot resumes and joint warm
 /// cohorts), resolved once per model load from
-/// `HF2Q_GEMMA_WARM_TILED_ATTENTION`.
+/// `HF2Q_GEMMA_WARM_TILED_ATTENTION` and `HF2Q_GEMMA_WARM_ATTENTION_EXACT`.
 pub(crate) fn warm_live_kernel_from_env() -> GemmaLiveKernel {
-    let raw = std::env::var(WARM_TILED_ATTENTION_ENV).ok();
-    let kernel = warm_kernel_for_switch(raw.as_deref());
+    let tiled = std::env::var(WARM_TILED_ATTENTION_ENV).ok();
+    let exact = std::env::var(WARM_ATTENTION_EXACT_ENV).ok();
+    let kernel = warm_kernel_for_switches(tiled.as_deref(), exact.as_deref());
     tracing::info!(?kernel, "Gemma warm live attention kernel");
     kernel
 }
 
-/// Warm kernel with `HF2Q_GEMMA_WARM_TILED_ATTENTION` unset (the shipped
-/// default); ADR-063 Q1 harnesses pin their expected route to it.
+/// Warm kernel with both switches unset (the shipped default); ADR-063 Q1
+/// harnesses pin their expected route to it.
 #[cfg(test)]
 pub(crate) fn default_warm_live_kernel() -> GemmaLiveKernel {
-    warm_kernel_for_switch(None)
+    warm_kernel_for_switches(None, None)
 }
 
 /// `HF2Q_GEMMA_TILED_LIVE`: installed long-prompt multi-sequence lanes and
@@ -164,20 +186,23 @@ impl LiveRoute {
     pub(crate) fn seq_kernel(self, rows: usize) -> GemmaLiveKernel {
         match self.kernel {
             GemmaLiveKernel::TiledF16 if rows >= self.min_tiled_rows => GemmaLiveKernel::TiledF16,
-            _ => GemmaLiveKernel::VecHybrid,
+            GemmaLiveKernel::TiledF16 | GemmaLiveKernel::VecHybrid => GemmaLiveKernel::VecHybrid,
+            GemmaLiveKernel::VecHybridGqa => GemmaLiveKernel::VecHybridGqa,
         }
     }
 
     pub(crate) fn uses_vec(self, spans: &[LiveSpan]) -> bool {
-        spans
-            .iter()
-            .any(|span| self.seq_kernel(span.rows) == GemmaLiveKernel::VecHybrid)
+        spans.iter().any(|span| match self.seq_kernel(span.rows) {
+            GemmaLiveKernel::VecHybrid | GemmaLiveKernel::VecHybridGqa => true,
+            GemmaLiveKernel::TiledF16 => false,
+        })
     }
 
     /// Prefill banner fragment.
     pub(crate) fn label(self) -> &'static str {
         match (self.kernel, self.min_tiled_rows) {
             (GemmaLiveKernel::VecHybrid, _) => "vec-hybrid",
+            (GemmaLiveKernel::VecHybridGqa, _) => "vec-hybrid-gqa",
             (GemmaLiveKernel::TiledF16, 0) => "tiled-f16",
             (GemmaLiveKernel::TiledF16, _) => "tiled-f16 (vec-hybrid below 32 rows)",
         }
@@ -213,7 +238,9 @@ fn vec_query_chunk_len(start_pos: usize, remaining: usize) -> usize {
 
 fn chunk_len(kernel: GemmaLiveKernel, is_ring: bool, start_pos: usize, remaining: usize) -> usize {
     match kernel {
-        GemmaLiveKernel::VecHybrid => vec_query_chunk_len(start_pos, remaining),
+        GemmaLiveKernel::VecHybrid | GemmaLiveKernel::VecHybridGqa => {
+            vec_query_chunk_len(start_pos, remaining)
+        }
         GemmaLiveKernel::TiledF16 if is_ring => remaining.min(TILED_SLIDING_QUERY_CHUNK),
         GemmaLiveKernel::TiledF16 => remaining.min(TILED_GLOBAL_QUERY_CHUNK),
     }
@@ -242,7 +269,7 @@ fn chunks(
 /// Query rows a sliding-layer stage holds after its `cap - 1` history rows.
 fn stage_query_rows(kernel: GemmaLiveKernel, rows: usize) -> usize {
     rows.min(match kernel {
-        GemmaLiveKernel::VecHybrid => VEC_QUERY_CHUNK,
+        GemmaLiveKernel::VecHybrid | GemmaLiveKernel::VecHybridGqa => VEC_QUERY_CHUNK,
         GemmaLiveKernel::TiledF16 => TILED_SLIDING_QUERY_CHUNK,
     })
 }
@@ -702,7 +729,7 @@ fn encode_live_seq(
                 &q,
                 &out,
             )?,
-            GemmaLiveKernel::VecHybrid => {
+            GemmaLiveKernel::VecHybrid | GemmaLiveKernel::VecHybridGqa => {
                 let scratch = layer.vec.ok_or_else(|| {
                     anyhow::anyhow!("live vec-hybrid attention L{layer_idx} has no scratch")
                 })?;
@@ -742,22 +769,55 @@ fn encode_live_seq(
                     ],
                     &[&out, &scratch.tmp],
                 );
-                mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
-                    s.encoder_mut(),
-                    reg,
-                    dev,
-                    len as u32,
-                    &q,
-                    attn_k,
-                    attn_v,
-                    attn_norms,
-                    &out,
-                    &scratch.tmp,
-                    &slot_chunk,
-                    &pos_chunk,
-                    &params,
-                )
-                .map_err(|e| anyhow::anyhow!("live hybrid SDPA L{layer_idx}: {e}"))?;
+                use mlx_native::ops::flash_attn_vec_hybrid as hybrid;
+                if kernel == GemmaLiveKernel::VecHybridGqa {
+                    // Every row of the chunk takes the bucket the stock call
+                    // derives from the same `kv_seq_len`, so the split-K tmp
+                    // layout and the reduce are the stock ones.
+                    let bucket = hybrid::HybridSlotBucket::for_kv_seq_len(kv_seq_len);
+                    let group = hybrid::flash_attn_vec_hybrid_batched_gqa_pick_group(
+                        layer.nh as u32,
+                        nkv as u32,
+                        hd as u32,
+                        bucket.nsg,
+                    )
+                    .min(WARM_GQA_MAX_GROUP);
+                    let buckets = [bucket; VEC_QUERY_CHUNK];
+                    hybrid::flash_attn_vec_hybrid_batched_gqa(
+                        s.encoder_mut(),
+                        reg,
+                        dev,
+                        &q,
+                        attn_k,
+                        attn_v,
+                        attn_norms,
+                        &out,
+                        &scratch.tmp,
+                        &slot_chunk,
+                        &pos_chunk,
+                        &params,
+                        group,
+                        &buckets[..len],
+                    )
+                    .map_err(|e| anyhow::anyhow!("live hybrid GQA SDPA L{layer_idx}: {e}"))?;
+                } else {
+                    hybrid::flash_attn_vec_hybrid_batched(
+                        s.encoder_mut(),
+                        reg,
+                        dev,
+                        len as u32,
+                        &q,
+                        attn_k,
+                        attn_v,
+                        attn_norms,
+                        &out,
+                        &scratch.tmp,
+                        &slot_chunk,
+                        &pos_chunk,
+                        &params,
+                    )
+                    .map_err(|e| anyhow::anyhow!("live hybrid SDPA L{layer_idx}: {e}"))?;
+                }
             }
         }
 
@@ -991,7 +1051,7 @@ fn encode_tiled_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::models::gemma4::GemmaLiveKernel::{TiledF16, VecHybrid};
+    use crate::inference::models::gemma4::GemmaLiveKernel::{TiledF16, VecHybrid, VecHybridGqa};
 
     fn chunk_list(kernel: GemmaLiveKernel, is_ring: bool, start: usize, rows: usize) -> Vec<usize> {
         chunks(kernel, is_ring, start, rows)
@@ -1000,21 +1060,50 @@ mod tests {
     }
 
     #[test]
-    fn warm_switch_defaults_off_and_one_selects_the_tiled_route() {
-        for raw in [None, Some(""), Some("  "), Some("0"), Some("off"), Some("False"), Some(" 0 ")] {
-            assert_eq!(warm_kernel_for_switch(raw), VecHybrid, "{raw:?}");
+    fn warm_switches_default_off_and_select_their_routes() {
+        let off = [None, Some(""), Some("  "), Some("0"), Some("off"), Some("False"), Some(" 0 ")];
+        for tiled in off {
+            for exact in off {
+                assert_eq!(warm_kernel_for_switches(tiled, exact), VecHybrid, "{tiled:?} {exact:?}");
+            }
         }
         for raw in ["1", "on", "TRUE"] {
-            assert_eq!(warm_kernel_for_switch(Some(raw)), TiledF16, "{raw:?}");
+            assert_eq!(warm_kernel_for_switches(Some(raw), None), TiledF16, "{raw:?}");
+            assert_eq!(warm_kernel_for_switches(None, Some(raw)), VecHybridGqa, "{raw:?}");
+            // The exact switch replaces only `VecHybrid`, never the tiled route.
+            assert_eq!(warm_kernel_for_switches(Some(raw), Some(raw)), TiledF16, "{raw:?}");
         }
-        assert!(parse_warm_tiled_switch(Some("yes")).is_err());
+        assert!(parse_switch(WARM_TILED_ATTENTION_ENV, Some("yes"), false).is_err());
+        assert!(parse_switch(WARM_ATTENTION_EXACT_ENV, Some("2"), false).is_err());
         // An invalid value keeps the vec-hybrid default rather than opting in.
-        assert_eq!(warm_kernel_for_switch(Some("yes")), VecHybrid);
+        assert_eq!(warm_kernel_for_switches(Some("yes"), None), VecHybrid);
+        assert_eq!(warm_kernel_for_switches(None, Some("yes")), VecHybrid);
+        assert_eq!(default_warm_live_kernel(), VecHybrid);
+    }
+
+    #[test]
+    fn exact_route_keeps_the_vec_hybrid_shape_for_every_length() {
+        for tiled_live in [true, false] {
+            let exact = LiveRoute::select(None, VecHybridGqa, tiled_live);
+            assert_eq!(exact.label(), "vec-hybrid-gqa");
+            for rows in [1, 31, 32, 385, 4096] {
+                assert_eq!(exact.seq_kernel(rows), VecHybridGqa);
+            }
+        }
+        for (is_ring, start, rows) in [(true, 465, 385), (false, 465, 385), (true, 0, 2_500), (false, 900, 5_000)] {
+            assert_eq!(
+                chunk_list(VecHybridGqa, is_ring, start, rows),
+                chunk_list(VecHybrid, is_ring, start, rows)
+            );
+        }
+        for rows in [1, 56, 256, 385, 4096] {
+            assert_eq!(stage_query_rows(VecHybridGqa, rows), stage_query_rows(VecHybrid, rows));
+        }
     }
 
     #[test]
     fn single_slot_and_joint_cohort_always_resolve_the_same_route() {
-        for warm in [TiledF16, VecHybrid] {
+        for warm in [TiledF16, VecHybrid, VecHybridGqa] {
             for tiled_live in [true, false] {
                 let single = LiveRoute::select(None, warm, tiled_live);
                 let joint =
@@ -1044,7 +1133,7 @@ mod tests {
     #[test]
     fn installed_lanes_keep_their_own_switch_and_tile_every_length() {
         // `HF2Q_GEMMA_WARM_TILED_ATTENTION` never moves installed lanes.
-        for warm in [TiledF16, VecHybrid] {
+        for warm in [TiledF16, VecHybrid, VecHybridGqa] {
             let on = LiveRoute::select(Some(GemmaLiveAttention::Tiled), warm, true);
             assert_eq!(on.seq_kernel(1), TiledF16, "a 4096+4096+1 tail stays tiled");
             assert_eq!(on.seq_kernel(4096), TiledF16);
@@ -1064,6 +1153,7 @@ mod tests {
         assert!(!tiled.uses_vec(&[span(56), span(385)]));
         assert!(tiled.uses_vec(&[span(56), span(5)]));
         assert!(LiveRoute::select(None, VecHybrid, true).uses_vec(&[span(56)]));
+        assert!(LiveRoute::select(None, VecHybridGqa, true).uses_vec(&[span(56), span(385)]));
     }
 
     #[test]
@@ -1180,7 +1270,7 @@ mod tests {
     #[test]
     fn gemma_live_kernel_wire_names_are_the_variant_names() {
         // `/hf2q/v1/runtime` and the Q5 readiness check use the variant names.
-        for kernel in [TiledF16, VecHybrid] {
+        for kernel in [TiledF16, VecHybrid, VecHybridGqa] {
             assert_eq!(kernel.wire_name(), format!("{kernel:?}"));
         }
     }

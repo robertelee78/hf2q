@@ -649,7 +649,8 @@ pub struct MlxModelWeights {
     /// cohort lane (installed lanes follow [`GemmaLiveAttention::Tiled`]).
     /// Resolved once at load from `HF2Q_GEMMA_WARM_TILED_ATTENTION` (default
     /// [`GemmaLiveKernel::VecHybrid`]; `1` opts in to
-    /// [`GemmaLiveKernel::TiledF16`]).
+    /// [`GemmaLiveKernel::TiledF16`]) and `HF2Q_GEMMA_WARM_ATTENTION_EXACT`
+    /// (`1` maps `VecHybrid` to the bitwise [`GemmaLiveKernel::VecHybridGqa`]).
     pub warm_live_kernel: GemmaLiveKernel,
 
     /// ADR-063 Q4-GEMMA-PREFILL-MOE — shape of the prefill MoE down call
@@ -730,6 +731,10 @@ pub enum GemmaLiveKernel {
     /// `flash_attn_vec_hybrid_batched`: one decode-style threadgroup per
     /// (query, head) over F16 K and TQ-HB V.
     VecHybrid,
+    /// `flash_attn_vec_hybrid_batched_gqa` with at most 2 heads per
+    /// threadgroup (ADR-063 Q4-GEMMA-ATTN-EXACT-G2): the same chunks, stage,
+    /// tmp layout and reduce as [`Self::VecHybrid`], u32-identical output.
+    VecHybridGqa,
 }
 
 impl GemmaLiveKernel {
@@ -738,6 +743,7 @@ impl GemmaLiveKernel {
         match self {
             Self::TiledF16 => "TiledF16",
             Self::VecHybrid => "VecHybrid",
+            Self::VecHybridGqa => "VecHybridGqa",
         }
     }
 }

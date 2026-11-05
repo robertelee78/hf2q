@@ -558,6 +558,24 @@ class ArgvAndCases(unittest.TestCase):
         self.assertEqual(launcher.count('${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"}'), 2)
         self.assertIn('0|1) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;', launcher)
 
+    def test_gemma_case_forwards_only_an_explicit_warm_attention_exact_arm(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        stock = q5_case.build_plan(case, builtins, self.required())
+        self.assertEqual(stock['serve']['env']['WARM_ATTENTION_EXACT'], '')
+        self.assertNotIn('HF2Q_GEMMA_WARM_ATTENTION_EXACT', stock['serve']['env'])
+        exact = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_WARM_ATTENTION_EXACT': '1',
+                                                    'HF2Q_Q5_GEMMA_WARM_ATTENTION_KERNEL': 'VecHybridGqa'})
+        self.assertEqual(exact['serve']['env']['WARM_ATTENTION_EXACT'], '1')
+        self.assertEqual(exact['serve']['env']['WARM_TILED_ATTENTION'], '', 'arms are independent')
+        field = 'measurement_snapshot.active_controls.gemma_warm_attention_kernel'
+        [check] = [c for c in exact['readiness']['checks'] if c['field'] == field]
+        self.assertTrue(q5_calibration.readiness_check(check, 'VecHybridGqa')['ok'])
+        self.assertFalse(q5_calibration.readiness_check(check, 'VecHybrid')['ok'])
+        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
+        self.assertEqual(launcher.count('${WARM_EXACT_ENV:+HF2Q_GEMMA_WARM_ATTENTION_EXACT="$WARM_EXACT_ENV"}'), 2)
+        self.assertIn('0|1) WARM_EXACT_ENV="$WARM_ATTENTION_EXACT" ;;', launcher)
+
     def test_gemma_case_forwards_only_explicit_prefill_moe_arms(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
         builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
