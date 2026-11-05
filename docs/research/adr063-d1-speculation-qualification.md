@@ -273,7 +273,7 @@ catch-up overhead in §4.
 width-aware in `QwenSpeculationPolicy::resolve_server_policy`. Unset resolves
 to `off` when the worker's `max_slots ≥ 4` and the family is on the measured
 loss list. An explicit `HF2Q_QWEN_SPECULATION=auto` (or `QWEN38_SPECULATION`)
-still opts in. This mirrors `default_joint_decode(moe)`. Update
+still opts in. This mirrored the per-family joint decode default of the time (`default_joint_decode(moe)`, retired on 2026-11-05 when Qwen3.6 joint decode became the default). Update
 `docs/operator-env-vars.md`, the Qwen3.8 launcher comment and the CHANGELOG
 with the receipt path. If only the optional Qwen3.8 diagnostic shows that K3
 wins serially but the joint catch-up loses, the narrower alternative is to

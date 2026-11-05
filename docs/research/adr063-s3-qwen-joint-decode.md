@@ -1,8 +1,8 @@
 # ADR-063 S3 — Qwen joint B-row decode (phase 1)
 
-Status (2026-10-31):
+Status (2026-10-31; Qwen3.6 updated 2026-11-05):
 - **Qwen3.8 (dense): default on.** Official-artifact gates passed and the four-agent ABBA A/B passed; see "Measured result".
-- **Qwen3.6 (MoE): default off, opt-in with `HF2Q_QWEN_JOINT_DECODE=1`.** Its forward is bitwise exact, but the four-agent A/B is incomplete. Both joint runs failed the coding protocol; so do stock hf2q, the peer and the BF16 source, so the failure is model behavior, not joint decode (`docs/research/adr063-qwen36-task-failure-diagnosis.md`). Promotion is deferred to a successor; see "Qwen3.6 verdict".
+- **Qwen3.6 (MoE): default on (2026-11-05).** On the declared repair-turn workload (ADR-063 Q4-QWEN36), the complete A/B against `HF2Q_QWEN_JOINT_DECODE=0` passed task quality and cut makespan by a ratio of 0.800, and a same-prefix fork check found joint decode bitwise identical to serial decode. See "Qwen3.6 verdict".
 - `HF2Q_QWEN_JOINT_DECODE=0` restores the serial path for every family.
 - **Qwen3.8 shared-weight dense FFN (padded mode): default on.** Joint steps no longer re-read the FFN gate/up weights once per packed row; `HF2Q_QWEN_JOINT_FFN_SHARED=0` restores the per-row fused kernel. Hardware gates passed, and the four-agent A/B against the kill switch measured 4.9% less makespan (block-paired 95% CI 2.2–7.6%), well short of the 2.2× bandwidth projection. The real-prompt Q1 envelope is `WithinDecisionEnvelope` for both FFN routes (below). See "Dense FFN weight sharing (padded mode)".
 - **Qwen3.8 task quality against stock: Pass.** On the final binary 38485a23 (joint decode and shared FFN at their defaults) against the same binary with `HF2Q_QWEN_JOINT_DECODE=0`: 22/24 vs 22/24 instances, no discordant pairs (`E/quality-qwen38-exp3848-vs-stock-20261031T061243Z`). The earlier pairing against the peer was 23/24 vs 21/24 at 0b959107.
@@ -327,16 +327,41 @@ HF2Q_QWEN38_GGUF=/Users/robert/.local/share/hf2q/models/qwen38-stock/Qwen3.8-27B
 
 Still missing: the joint width distribution and decode scratch at B=4. Only the first engagement was logged: no retained run has the per-turn `Qwen joint decode turn` debug lines, because the family launcher passes `-v` and hf2q ignores `RUST_LOG` under `-v`.
 
-**Qwen3.6 verdict: inconclusive, unfavourable.** Default off.
+**Qwen3.6 verdict: Pass, default on (2026-11-05).** The 2026-10-31 A/B below was incomplete and ran on the canonical
+workload, where every engine fails the Qwen3.6 task. The complete A/B ran on the declared repair-turn workload
+(ADR-063 Q4-QWEN36) after the mlx-native 0.15.18 RoPE fix and the #686 tool-call newline fix. Its rules were
+pre-registered before any run. Evidence is under `~/.local/state/hf2q/v0130/q4-qwen36/joint-ab/` (`PREREG.md`,
+`RESULT.txt`, `PREREG-fork.md`, `RESULT-fork.txt`).
+
+- **Binary.** One release binary, origin/main `0d79b965` on rustc 1.99.1 (sha256 `d200b032…`), GGUF `815a22ca…`. The arms
+  differ only in `HF2Q_QWEN_JOINT_DECODE` (unset = serial, `1` = joint). Every run's server log shows the mode of its
+  arm (`selected=true mode="exact"` for joint).
+- **Task quality.** A 24-instance paired repair-turn campaign, joint vs serial:
+  - verdict **Pass**: joint 19/24, serial 22/24, 4 joint-only and 1 serial-only failures, one-sided p 0.19;
+  - in both arms the lost instances are the same failure mode as the peer's (the repair re-emits the failing first
+    file, or one agent leaves the workflow after its repair write).
+- **Speed.** The canonical repair-turn task, n4. There is one discarded warmup per arm, then 6 ABBA blocks; all 26 runs
+  are `CalibrationPass`.
+  - Makespan ratio joint/serial **0.800** (95% CI 0.776–0.824).
+  - Joint took 49.7–50.3 s on every run; serial took 58.8–66.5 s.
+- **Same-prefix fork check.** The 32 recorded repair-turn requests, with logprobs (the speculation-ineligible route),
+  were run four ways: serial one at a time; repeated; four at a time on joint rows (2,262 joint turns, all with ≥ 2
+  rows); and four at a time with joint off.
+  - All four give identical outputs: 32/32, with every chosen-token logprob equal over 9,189 tokens.
+  - The copy-vs-fix preference is identical at all 64 same-prefix forks (median Δ 0.000 nat). The pre-registered
+    bound was 0.17 nat.
+  - Joint decode adds no numeric bias.
+  - The quality lean above is consistent with the one route difference that remains with speculation on: serial turns
+    commit MTP K3 verify tokens, joint turns commit M1 tokens ("Phase 1 design", Consequence). That difference was not isolated.
+
+The 2026-10-31 record, kept for history:
 
 - **Forward.** The forward is bitwise exact (gate above).
-- **A/B coverage.** The four-agent A/B (`E/qwen-joint-ab-v1/q36-*`) is incomplete: 2 joint and 2 serial runs.
+- **A/B coverage.** The four-agent A/B (`E/qwen-joint-ab-v1/q36-*`) was incomplete: 2 joint and 2 serial runs, on the canonical workload.
 - **Joint runs.** Both joint runs were `ClientFailed` with the same failure: agent-0 did not follow the initial six-step workflow, and agent-1 also failed.
 - **Serial runs.** One was `CalibrationPass`. In both, agent-0 completed the protocol.
 - **Transcripts.** `q1_decision_policy.py transcripts` gives `DivergedTranscripts` (6 of 49 groups), including agent-0 turn-0. Stock itself was not repeat-deterministic here (its two runs differ in two groups); the two joint runs were identical.
-- **Speed.** Per-request decode rose from about 27.6–28.2 to 35.9–37.4 tok/s; there is no makespan comparison.
-
-Re-enabling by default needs a complete ABBA (≥ 4+4) with protocol parity. The suggested serving-level Class A check is both arms with `HF2Q_QWEN_SPECULATION=off`, where `transcripts` must give `ExactTranscripts`.
+- **Speed.** Per-request decode rose from about 27.6–28.2 to 35.9–37.4 tok/s; there was no makespan comparison.
 
 ## Not in phase 1
 
