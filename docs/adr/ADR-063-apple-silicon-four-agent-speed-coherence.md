@@ -693,7 +693,7 @@ Repository ownership: hf2q owns route selection, integration and the campaign, c
 
 Validation: Independent review of the design, the Q1-envelope receipts, the quality gates and the Q3-design hf2q-versus-peer campaign.
 
-Predecessors: Q4-GEMMA-KERNEL, Q4-GEMMA (#660, profiling result), Q5 (#371). The closing campaign (the combined candidate) also has as predecessors Q4-GEMMA-COLD, Q4-GEMMA-PREFILL-MOE, Q4-GEMMA-DECODE and Q4-GEMMA-SPEC-SERVE (operator decision 2026-11-04): each delivers its qualified change, or its recorded falsification or stop, before that campaign runs.
+Predecessors: Q4-GEMMA-KERNEL, Q4-GEMMA (#660, profiling result), Q5 (#371). The closing campaign (the combined candidate) also has as predecessors Q4-GEMMA-COLD, Q4-GEMMA-PREFILL-MOE, Q4-GEMMA-DECODE, Q4-GEMMA-SPEC-SERVE (operator decision 2026-11-04) and Q4-GEMMA-ATTN-EXACT (operator decision 2026-11-05): each delivers its qualified change, or its recorded falsification or stop, before that campaign runs.
 
 Priority: High. Core scope (second-tier family).
 
@@ -845,6 +845,39 @@ Predecessors: Q4-GEMMA (#660, profiling result), Q5 (#371). Q4-GEMMA-ATTN's clos
 Priority: High. Core scope (second-tier family).
 
 Delivery boundary: The promotion commit merged to main for v0.1.30 and included in the Q4-GEMMA-ATTN combined candidate, or the recorded G0 falsification.
+
+### Q4-GEMMA-ATTN-EXACT. Make Gemma 4 warm-prefill attention faster without changing any output bit
+
+Outcome: Gemma 4 warm-prefill attention runs a batched kernel whose output is u32-identical to the vec-hybrid warm route, so the joint warm prefill is faster with no envelope or quality campaign.
+
+Requirement: mlx-native MUST provide the batched warm-attention kernel under the exactness contract of `docs/research/adr063-q4-gemma-attn-exact-design.md` §3. Its R = 1 case is Q4-GEMMA-DECODE lever A1's `flash_attn_vec_hybrid_batched_gqa`; multi-row blocks are `flash_attn_vec_hybrid_batched_rows`. hf2q MUST route Gemma 4 warm-prefill attention through it only where it is proven u32-equal to `VecHybrid` (Class A, Q1 §3.1).
+
+Acceptance:
+
+- Design approved by the operator, 2026-11-05: `docs/research/adr063-q4-gemma-attn-exact-design.md`, revision 3 with ReviewGemmaExact's three P3 fixes (independent review ACCEPT).
+- The S0 feasibility spike runs first (design §5), measuring R = 1 before any multi-row block.
+  - S0-a: u32 parity of O, the NWG partials and the reduced output on both metallib paths over the full matrix.
+  - S0-b: speed, with a weighted chain ratio ≤ 0.70 against the vec chain.
+  - The kill criteria of design §9 are frozen. A failed S0 ends the story as a recorded falsification, with no Class B fallback.
+- Gates X1–X6 of design §7 pass bitwise, each showing the new kernel ran:
+  - X1 primitive parity;
+  - X2 model route;
+  - X3 joint == per-slot;
+  - X4 envelope harness with `d_nat` = 0 on every row;
+  - X5 Q1 `ExactEqual`;
+  - X6 Q5 `CalibrationPass` with `ExactTranscripts` across arms.
+- M0 (design §9): the median per-run joint-warm saving is ≥ 0.25 s over matched transactions, and makespan does not regress by the paired ABBA rule (≥ 5 runs per arm).
+- The kernel is published in an mlx-native release, verified on crates.io and pinned exactly by hf2q (design §10). The native contract issue is shared with Q4-GEMMA-DECODE lever A1.
+
+Repository ownership: mlx-native owns the kernel, contract, parity tests and release; the shared primitive file is owned by Q4-GEMMA-DECODE's implementer, and this story adds its own warm-prefill tests and bench. hf2q owns the route, the kill switch `HF2Q_GEMMA_WARM_ATTENTION_EXACT`, the gates and the A/B.
+
+Validation: Independent review of the S0 receipt, the native release, the X1–X6 receipts and the M0 A/B.
+
+Predecessors: Q5 (#371). For its R = 1 case it also depends on Q4-GEMMA-DECODE's native lever A1 (shared contract and release).
+
+Priority: High. Core scope (second-tier family).
+
+Delivery boundary: A published mlx-native release pinned exactly by hf2q, plus the promotion commit merged to main for v0.1.30, or the recorded S0/M0 falsification.
 
 ### Q4-DS4. Run the peer on the ds4 DeepSeek-V4 file and determine fit
 
