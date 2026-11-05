@@ -487,22 +487,39 @@ class ExactnessRule(unittest.TestCase):
 
     def test_rows_are_evaluated_top_to_bottom(self):
         x, d = self.transcripts(True), self.transcripts(False)
-        cases = [((x, "fail", x, None), "HookAttributable"), ((d, "fail", d, None), "HookAttributable"),
-                 ((x, "pass", d, None), "Exact"), ((d, "pass", d, None), "ObserverAttributable"),
-                 ((d, "pass", x, None), "Unresolved"), ((d, "pass", x, x), "ScheduleNondeterministic"),
-                 ((d, "pass", x, d), "HookAttributable")]
+        # (T1 O1, G1, T0 O0, O1 O1', repeat T1' O1'')
+        cases = [((x, "fail", x, x, None), "HookAttributable"), ((d, "fail", d, d, None), "HookAttributable"),
+                 ((x, "pass", d, d, None), "Exact"),
+                 ((d, "pass", x, d, None), "ScheduleNondeterministic"),
+                 ((d, "pass", d, d, None), "ScheduleNondeterministic"),
+                 ((d, "pass", d, x, None), "ObserverAttributable"),
+                 ((d, "pass", x, x, None), "Unresolved"), ((d, "pass", x, x, x), "ScheduleNondeterministic"),
+                 ((d, "pass", x, x, d), "HookAttributable")]
         for args, expected in cases:
-            with self.subTest(expected=expected):
-                self.assertEqual(verdict.classify(*args)["classification"], expected)
+            with self.subTest(args=[a if a in ("pass", "fail") else a and a["classification"] for a in args]):
+                result = verdict.classify(*args)
+                self.assertEqual(result["classification"], expected)
+                self.assertEqual(result["inputs"]["O1 O1'"], "Exact" if args[3] is x else "Diverged")
+
+    def test_timing_divergence_alone_never_fails_the_hook(self):
+        # Serving that diverges run-to-run without hook or observer (O1 vs O1') cannot make a
+        # T1/O1 divergence hook-attributable, whatever T0/O0 shows.
+        x, d = self.transcripts(True), self.transcripts(False)
+        for t0_o0 in (x, d):
+            self.assertEqual(verdict.classify(d, "pass", t0_o0, d)["classification"], "ScheduleNondeterministic")
 
     def test_repeat_only_for_unresolved_and_inputs_are_closed(self):
         x, d = self.transcripts(True), self.transcripts(False)
         with self.assertRaisesRegex(ValueError, "only for the Unresolved row"):
-            verdict.classify(x, "pass", x, x)
+            verdict.classify(x, "pass", x, x, x)
+        with self.assertRaisesRegex(ValueError, "only for the Unresolved row"):
+            verdict.classify(d, "pass", x, d, x)
         with self.assertRaisesRegex(ValueError, "two-run"):
-            verdict.classify(dict(x, runs=3), "pass", x)
+            verdict.classify(dict(x, runs=3), "pass", x, x)
+        with self.assertRaisesRegex(ValueError, "O1 O1'"):
+            verdict.classify(x, "pass", x, dict(x, schema="other"))
         with self.assertRaisesRegex(ValueError, "pass or fail"):
-            verdict.classify(x, "skipped", x)
+            verdict.classify(x, "skipped", x, x)
 
 
 class VerdictCli(unittest.TestCase):
@@ -530,7 +547,7 @@ class VerdictCli(unittest.TestCase):
             for name, exact in (("exact", True), ("diverged", False)):
                 (root / f"{name}.json").write_text(json.dumps(ExactnessRule.transcripts(exact)))
             code, out = self.run_cli("classify", "--t1-o1", root / "diverged.json", "--g1", "pass",
-                                     "--t0-o0", root / "diverged.json")
+                                     "--t0-o0", root / "diverged.json", "--o1-o1d", root / "exact.json")
             self.assertEqual((code, json.loads(out)["classification"]), (0, "ObserverAttributable"))
             reduced["unmapped_operator_attempts"] = 1
             (root / "bad.json").write_text(json.dumps(reduced))

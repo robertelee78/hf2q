@@ -375,33 +375,38 @@ Run these with `CARGO_TARGET_DIR` per agent, `RUSTC_WRAPPER=`, `CARGO_INCREMENTA
 | Run | Binary | Trace | Purpose |
 |---|---|---|---|
 | T1 | H | on (`q2_traced_run.py --population n4 --binary H …`) | Acceptance: reducer report |
-| O1 | H | off (same case and population through `q3_campaign.py --family qwen38 --experiment-bin H --workloads n4`, one hf2q arm) | Exactness control vs T1; off-default timing |
+| O1 | H | off (one `q5_calibration.py` run of the same case, `HF2Q_Q5_HF2Q_BIN=H`) | Exactness control vs T1; off-default timing |
 | T0 | P | on (`q2_traced_run.py --population n4 --binary P …`) | Hook overhead under trace (paired with T1) |
-| O0 | P | off (as O1, `--experiment-bin P`) | Off-default control vs O1; observer-only exactness control vs T0 |
+| O0 | P | off (as O1, `HF2Q_Q5_HF2Q_BIN=P`) | Off-default control vs O1; observer-only exactness control vs T0 |
+| O1′ | H | off (as O1, run right after O0) | Determinism control: untraced hook binary run to run (amendment 1) |
 
-The exact `q3_campaign.py` flags for the single off arm are pinned in the implementation PR's runbook from that script's argparse (`q3_campaign.py:462-505`). They are not invented here.
+The untraced runs are single supervised Q5 runs, not a `q3_campaign.py` arm: `q3_campaign.py` always plans the stock and experiment arms in blocks with warmups. They are bound to their T runs afterwards by binary, artifact and case sha256 (operator-accepted runbook on #677). P is H's exact merge-base on main. Each arm runs from its own harness, and both harnesses must contain the #704 tool-result normalization.
 
 Acceptance checks:
 
 1. `q2_traced_freeze.py windows --run T1 --out … --population-policy forward_demand_v2` (the QE §7 command) produces a report with `unmapped_operator_attempts == 0`, `unmapped_by_operation.joint_ordinary_decode == 0`, and `joint_ordinary_decode.unwitnessed == 0` with `witnessed == transactions > 0`. Every joint epoch's commands are checked-drained (the reducer's obligation join passes). `boundary_ambiguous_commands` is reported.
 2. Q2 v2 isolation on hardware: `f2_trace.qualify_window`, called directly, gives identical outputs on T1 and on T1 transformed by P5(b)'s method (joint `forward_input`/`forward_witness`/`forward_input_end` dropped, joint Known scopes relabelled `OpaqueAuxiliary`, joint source removed from the header policy). Read-only CPU.
-3. Exactness, the four transcript comparisons through `python3 scripts/four_agent/q1_decision_policy.py transcripts`, all reported:
+3. Exactness, the transcript comparisons through `python3 scripts/four_agent/q1_decision_policy.py transcripts`, all reported:
    - `T1 O1`: the bound criterion, hook binary trace on vs off;
    - `T0 O0`: observer-only control, parent binary trace on vs off;
+   - `O1 O1′`: determinism control, the hook binary untraced, run to run (amendment 1);
    - `T1 T0`: hook vs no hook, both traced;
    - `O1 O0`: hook binary vs parent, both untraced.
 4. G1 (§5.1) passes on the same binary H.
 
-**Pre-registered exactness rule.** Fixed before any run; one attempt per run, with the single repeat allowed below. Rows are evaluated top to bottom, and the first match decides.
+**Pre-registered exactness rule (amendment 1).** The amendment was fixed before any run and accepted by Main on 2026-11-05. It applies with G1 as the hook test. One attempt per run, with the single repeat allowed below. Rows are evaluated top to bottom, and the first match decides.
 
-| T1 vs O1 | G1 | T0 vs O0 | Classification | Outcome |
-|---|---|---|---|---|
-| any | fail | any | `HookAttributable` | Story fails; fix the hook. G1 proves on a fixed schedule whether the hook changes output bytes, so a G1 failure fails the story even if the four-agent transcripts happen to agree. |
-| Exact | pass | any | `Exact` | Exactness criterion met. |
-| Diverged | pass | Diverged | `ObserverAttributable` | The hook is cleared: it is bitwise-neutral on a fixed schedule, and the observer alone also diverges. The bound criterion is not met as worded, so this goes to the operator with all four comparisons, the `divergent[]` turns and a recommended ADR re-wording ("bitwise neutral on a fixed schedule; observer-induced schedule divergence disclosed"). The operator's decision is recorded in ADR-063 before the story closes. |
-| Diverged | pass | Exact | `Unresolved` | Run one more pair, T1′ and O1′, with identical inputs. If `T1′ O1′` is Exact, classify `ScheduleNondeterministic` and go to the operator as in the previous row. If it diverges again, classify `HookAttributable` and the story fails. |
+| T1 vs O1 | G1 | O1 vs O1′ | T0 vs O0 | Classification | Outcome |
+|---|---|---|---|---|---|
+| any | fail | any | any | `HookAttributable` | Story fails; fix the hook. G1 proves on a fixed schedule whether the hook changes output bytes, so a G1 failure fails the story even if the four-agent transcripts happen to agree. |
+| Exact | pass | any | any | `Exact` | Exactness criterion met. |
+| Diverged | pass | Diverged | any | `ScheduleNondeterministic` | The hook is cleared by G1. Untraced serving of the same binary is not run-to-run transcript-deterministic, so a four-agent transcript divergence cannot be attributed to the hook. This goes to the operator with all comparisons, the `divergent[]` turns, T1's joint/serial transaction mix, and the recommended ADR wording ("bitwise neutral on a fixed schedule (G1); four-agent transcripts not run-to-run deterministic (O1 vs O1′); observer-induced schedule divergence disclosed"). The operator's decision is recorded in ADR-063 before the story closes. |
+| Diverged | pass | Exact | Diverged | `ObserverAttributable` | The hook is cleared: it is bitwise-neutral on a fixed schedule, and the observer alone also diverges. This goes to the operator as in the previous row. |
+| Diverged | pass | Exact | Exact | `Unresolved` | Run one more pair, T1′ and O1″, with identical inputs. If `T1′ O1″` is Exact, classify `ScheduleNondeterministic` and go to the operator. If it diverges again, classify `HookAttributable` and the story fails: the untraced hook binary was shown run-to-run deterministic, so a repeated divergence under the hook is evidence against it. |
 
-The rule exists so the story cannot stall without a decision. Padded joint versus serial is a Q1 Class B route (`joint_decode_routes.rs:14-21`), and whether a turn runs joint or serial depends on timing (n4-fix has 82 serial one-lane decode transactions beside the 896 joint ones), so an observer-induced schedule shift can change transcripts without any fault in the hook. Dropped turns or failed runs are not retried silently; they are handled by Q5's run validity rules.
+The rule exists so the story cannot stall without a decision. Padded joint versus serial is a Q1 Class B route (`joint_decode_routes.rs:14-21`, `docs/research/adr063-s3-qwen-joint-decode.md:87-91`), and whether a turn runs joint or serial depends on arrival timing (n4-fix has 82 serial one-lane decode transactions beside the 896 joint ones). An observer-induced schedule shift can therefore change transcripts without any fault in the hook. Dropped turns or failed runs are not retried silently; they are handled by Q5's run validity rules.
+
+**Why amendment 1.** The Qwen38DetInv investigation (2026-11-05) found that Qwen3.8 N4 serving is not run-to-run transcript-deterministic, because its decode route switches serial↔joint with arrival timing. Under revision 3 the `Unresolved` row would have failed the story on two timing-driven divergences in a row (a chance-Exact `T0 O0` leads straight into that row), even with G1 showing the hook bitwise neutral. The O1′ control measures run-to-run divergence without hook or observer, and a cross-run divergence counts as hook evidence only once that control is Exact. Tooling: `q4_trace_verdict.py classify --o1-o1d` (schema `hf2q.q4-trace.exactness.v2`).
 
 ### 5.3 Overhead measurement (stated in the PR and the evidence README)
 
