@@ -223,6 +223,8 @@ pub(super) fn encode_cold_layer_attention<'e, 'a>(
     let is_sliding = layer.is_sliding;
     let route = layer.route;
     let total = layer.total_rows;
+    let seqs: Vec<ColdSeq<'a>> = seqs.into_iter().collect();
+    let joint_o_proj = stream_o_projection(layer, &seqs);
     for seq in seqs {
         let seq_len = seq.rows;
         let off = seq.offset;
@@ -763,68 +765,149 @@ pub(super) fn encode_cold_layer_attention<'e, 'a>(
             }
         }
 
+        if joint_o_proj {
+            // Stream O-projection below: leave this lane's attention output
+            // seq-major F32 in its rows of `sdpa_out`, exactly the
+            // intermediate `dispatch_qmatmul_head_major_bf16` builds for a
+            // codec without a perm021 kernel (tensor-mm lanes already wrote
+            // it).
+            if !route_through_nofa {
+                s.barrier_between(&[pf_sdpa_out_perm], &[&sdpa_out]);
+                mlx_native::ops::transpose::permute_021_bf16_to_f32(
+                    s.encoder_mut(),
+                    reg,
+                    metal_dev,
+                    pf_sdpa_out_perm,
+                    &sdpa_out,
+                    nh,
+                    seq_len,
+                    hd,
+                )
+                .map_err(|e| anyhow::anyhow!("cold lane attention permute L{layer_idx}: {e}"))?;
+            }
+            continue;
+        }
         // O-projection (m = rows): tensor-mm attention wrote seq-major F32;
         // flash attention wrote head-major BF16, read directly by the
         // perm021 tensor-MM variant (or permuted for other stored codecs).
-        let o_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() || profile_buckets_on {
-            s.finish()
-                .map_err(|e| anyhow::anyhow!("MM-profile pre-finish (O) L{layer_idx}: {e}"))?;
-            let t0 = std::time::Instant::now();
-            s = exec
-                .begin()
-                .map(crate::inference::native_observation::session)
-                .map_err(|e| anyhow::anyhow!("MM-profile begin (O) L{layer_idx}: {e}"))?;
-            Some(t0)
-        } else {
-            None
-        };
-        if route_through_nofa {
-            s.barrier_between(&[&sdpa_out, &layer.o_proj.buffer], &[&attn_out]);
+        s = encode_o_projection(s, exec, reg, layer, |s, reg| {
+            if route_through_nofa {
+                s.barrier_between(&[&sdpa_out, &layer.o_proj.buffer], &[&attn_out]);
+                dispatch_qmatmul(
+                    s,
+                    reg,
+                    dev,
+                    &sdpa_out,
+                    layer.o_proj,
+                    &attn_out,
+                    seq_len as u32,
+                    crate::quantize::imatrix::ImatrixHint::Layered {
+                        tag: "attn_output",
+                        layer: layer_idx,
+                    },
+                )
+            } else {
+                crate::serve::forward_mlx_shared::dispatch_qmatmul_head_major_bf16(
+                    s,
+                    reg,
+                    dev,
+                    pf_sdpa_out_perm,
+                    &sdpa_out,
+                    layer.o_proj,
+                    &attn_out,
+                    seq_len as u32,
+                    nh,
+                    hd,
+                    crate::quantize::imatrix::ImatrixHint::Layered {
+                        tag: "attn_output",
+                        layer: layer_idx,
+                    },
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    anyhow::anyhow!("batched native O-projection L{layer_idx}: {error}")
+                })
+            }
+        })?;
+    }
+    if joint_o_proj {
+        // One O-projection over every stream row (m = total): the ordinary
+        // native route each lane's own projection takes, row-invariant for
+        // m > 8 (the same property the joint Q/K/V projections rely on).
+        s = encode_o_projection(s, exec, reg, layer, |s, reg| {
+            s.barrier_between(&[scratch.sdpa_out, &layer.o_proj.buffer], &[layer.attn_out]);
             dispatch_qmatmul(
-                &mut s,
+                s,
                 reg,
                 dev,
-                &sdpa_out,
+                scratch.sdpa_out,
                 layer.o_proj,
-                &attn_out,
-                seq_len as u32,
-                crate::quantize::imatrix::ImatrixHint::Layered {
-                    tag: "attn_output",
-                    layer: layer_idx,
-                },
-            )?;
-        } else {
-            crate::serve::forward_mlx_shared::dispatch_qmatmul_head_major_bf16(
-                &mut s,
-                reg,
-                dev,
-                pf_sdpa_out_perm,
-                &sdpa_out,
-                layer.o_proj,
-                &attn_out,
-                seq_len as u32,
-                nh,
-                hd,
+                layer.attn_out,
+                total as u32,
                 crate::quantize::imatrix::ImatrixHint::Layered {
                     tag: "attn_output",
                     layer: layer_idx,
                 },
             )
-            .map_err(|error| {
-                anyhow::anyhow!("batched native O-projection L{layer_idx}: {error}")
-            })?;
-        }
-        if let Some(t0) = o_t0 {
-            bucket_finish!(
-                s,
-                exec,
-                t0,
-                &PROFILE_O_MM_NS,
-                &PROFILE_O_MM_COUNT,
-                1,
-                "O_mm"
-            );
-        }
+        })?;
+    }
+    Ok(s)
+}
+
+/// Dense native matmuls take the `mm` kernels for every `m > 8`, whose
+/// per-row result does not depend on `m`.
+const O_PROJ_ROW_INVARIANT_MIN_ROWS: usize = 9;
+
+/// Whether one O-projection over the whole stream equals each lane's own:
+/// two or more lanes, every lane on the ordinary native route (no perm021
+/// kernel for the codec, no affine weight), and every lane and the stream
+/// above 8 rows.
+fn stream_o_projection(layer: &ColdLayer<'_>, seqs: &[ColdSeq<'_>]) -> bool {
+    let ordinary_route = layer.o_proj.affine.is_none()
+        && !crate::serve::native_projection::supports_native_perm021(
+            layer.o_proj,
+            layer.total_rows as u32,
+            layer.hd as u32,
+        );
+    seqs.len() > 1
+        && ordinary_route
+        && seqs
+            .iter()
+            .all(|seq| seq.rows >= O_PROJ_ROW_INVARIANT_MIN_ROWS)
+}
+
+/// Encode one O-projection, bracketed by the `HF2Q_PROFILE_MM` bucket.
+fn encode_o_projection<'e>(
+    mut s: GraphSession<'e>,
+    exec: &'e GraphExecutor,
+    reg: &mut KernelRegistry,
+    layer: &ColdLayer<'_>,
+    encode: impl FnOnce(&mut GraphSession<'e>, &mut KernelRegistry) -> Result<()>,
+) -> Result<GraphSession<'e>> {
+    let layer_idx = layer.layer_idx;
+    let o_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() || layer.profile_buckets {
+        s.finish()
+            .map_err(|e| anyhow::anyhow!("MM-profile pre-finish (O) L{layer_idx}: {e}"))?;
+        let t0 = std::time::Instant::now();
+        s = exec
+            .begin()
+            .map(crate::inference::native_observation::session)
+            .map_err(|e| anyhow::anyhow!("MM-profile begin (O) L{layer_idx}: {e}"))?;
+        Some(t0)
+    } else {
+        None
+    };
+    encode(&mut s, reg)?;
+    if let Some(t0) = o_t0 {
+        bucket_finish!(
+            s,
+            exec,
+            t0,
+            &PROFILE_O_MM_NS,
+            &PROFILE_O_MM_COUNT,
+            1,
+            "O_mm"
+        );
     }
     Ok(s)
 }

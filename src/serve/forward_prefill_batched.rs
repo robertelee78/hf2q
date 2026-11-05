@@ -1655,10 +1655,19 @@ impl MlxModelWeights {
         //   scale=1.0 (Q pre-scaled upstream), do_causal=false (mask carries
         //   causal), q_abs_offset=0. A cold multi-sequence prefill builds
         //   each lane's own square masks (ADR-063 Q4-GEMMA-COLD D2), exactly
-        //   the masks a single-slot prefill of that lane builds.
+        //   the masks a single-slot prefill of that lane builds. A mask is a
+        //   function of the row count alone, so lanes of equal length share
+        //   one set (`cold_mask_rows[i]` is span `i`'s entry).
         let prefill_start = Instant::now();
+        let mut cold_mask_lens: Vec<usize> = cold_spans.iter().map(|&(_, rows)| rows).collect();
+        cold_mask_lens.sort_unstable();
+        cold_mask_lens.dedup();
+        let cold_mask_rows: Vec<usize> = cold_spans
+            .iter()
+            .map(|&(_, rows)| cold_mask_lens.binary_search(&rows).expect("deduplicated lane length"))
+            .collect();
         let mut cold_masks: Vec<gemma_cold_attention::ColdLaneMasks> =
-            Vec::with_capacity(cold_spans.len());
+            Vec::with_capacity(cold_mask_lens.len());
         {
             use crate::serve::gemma_cold_masks::{
                 encode_cold_mask, encode_mask_tiles,
@@ -1667,8 +1676,8 @@ impl MlxModelWeights {
 
             // Pre-allocate every blk byte buffer (Metal alloc, no kernel
             // dispatch) outside the session so &mut borrow stays confined.
-            let mut lane_blks = Vec::with_capacity(cold_spans.len());
-            for &(_, rows) in &cold_spans {
+            let mut lane_blks = Vec::with_capacity(cold_mask_lens.len());
+            for &rows in &cold_mask_lens {
                 let mask_seq_len = gemma_batched_mask_seq_len(rows, live_prefix_resume);
                 let blk_sliding_params = BlkParams {
                     seq_len_q: mask_seq_len as u32,
@@ -3276,7 +3285,8 @@ impl MlxModelWeights {
                         dev,
                         &cold_layer,
                         &cold_scratch,
-                        cold_spans.iter().zip(&cold_masks).map(|(&(offset, rows), masks)| {
+                        cold_spans.iter().zip(&cold_mask_rows).map(|(&(offset, rows), &mask)| {
+                            let masks = &cold_masks[mask];
                             gemma_cold_attention::ColdSeq {
                                 offset,
                                 rows,
