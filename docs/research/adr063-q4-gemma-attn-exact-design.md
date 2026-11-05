@@ -1,6 +1,6 @@
 # ADR-063 Q4-GEMMA-ATTN-EXACT: bitwise-exact batched warm-prefill attention for Gemma 4
 
-Status: **approved (operator 2026-11-05)**: revision 3 with ReviewGemmaExact's three P3 doc fixes, accepted in design review the same day.
+Status: **approved (operator 2026-11-05)**: revision 3 with ReviewGemmaExact's three P3 doc fixes, accepted in design review the same day. **Outcome:** S0 parity passed and the S0-b go bar was missed (§12). The operator adopted the narrowed follow-up Q4-GEMMA-ATTN-EXACT-G2 (§13, draft, needs design review).
 - Revision 1 was reviewed by ReviewGemmaExact (REVISE, 8 findings) and
   revision 2 by the same reviewer (REVISE narrowly, R1–R5). §11 records how
   each finding was answered.
@@ -483,3 +483,147 @@ Open questions from revision 1, as answered by the reviewer and adopted:
 3. `MLX_DISP_BUCKET` stays out of the timed X6 runs. The new-kernel share
    comes from a separate, untimed run; fixed in §7.
 
+
+## 12. Outcome (2026-11-05): S0 parity passed, S0-b go bar missed; narrowed follow-up adopted
+
+S0 ran in two iterations on the M5 Max (macOS `26B5112a`, Metal `32023.922`).
+Evidence lives under `~/.local/state/hf2q/v0130/q4-gemma-attn-exact/`.
+
+**Iteration 1** (`s0-f28f57d/`, `s0-bd62f51/`): R = 1, i.e. Q4-GEMMA-DECODE
+lever A1's `flash_attn_vec_hybrid_batched_gqa`.
+- The first S0-a run found 339 differing NWG partial words. The cause:
+  subnormal `w·2^-4` was flushed under the A1 kernel's compiled association.
+  The final O was still equal.
+- GemmaDecodeImpl fixed it with an operand-form change: the scale-last
+  `ldexp(v_norm·w, -4)` (#89 `c03a61a`), plus T-N8 underflow cells.
+- After the fix, S0-a passed 6/6 and T-N8 16/16 on both metallib paths.
+- S0-b (largest legal G) chain ratio: 0.925 precompiled, 0.920 runtime.
+  - sliding: 0.750 at G = 2;
+  - global: 1.372, because G = 8 at NSG 1 ran 2.3× slower.
+
+**Iteration 2** (`s0-5825877/`): multi-row `flash_attn_vec_hybrid_batched_rows`
+(layout L-A, 26 (G, R) instantiations), reviewed and approved by
+GemmaDecodeImpl before the run.
+- S0-a passed 8/8 on both paths: every legal (G, R) was u32-equal on O and
+  every tmp word. The d512 underflow cell was non-vacuous at sf 22.6 and 3.
+  T-N8 passed 16/16.
+- S0-b sweep (four-lane cells, precompiled, rows ÷ vec per layer kind):
+
+| (G, R) | sliding | global |
+|---|---|---|
+| (1, 1) | 1.008 | 0.990 |
+| (1, 2) | 0.772 | 0.830 |
+| (1, 4) | 0.876 | 1.014 |
+| (1, 8) | 1.092 | 1.460 |
+| **(2, 1)** | **0.731** | **0.804** |
+| (2, 2) | 0.858 | 0.971 |
+| (2, 4) | 1.034 | 1.309 |
+| (2, 8) | 1.780 | 1.311 |
+
+  At every G, R > 1 is slower than R = 1, even though every pipeline keeps
+  1,024 max threads per threadgroup. The extra member loops cost more than the
+  shared loads save. Global G = 4/8 at NSG 1 was not swept for the rows kernel
+  (the bench refused (4, 1) at NSG 4). A1's G = 8 at NSG 1 was 2.3× slower, and
+  global would have needed ≤ 0.61 to reach 0.70 overall.
+- Official S0-b with (G 2, R 1) on both kinds, four-lane + single cells:
+
+| Path | chain ratio | sliding | global | cells > 2% slower |
+|---|---|---|---|---|
+| precompiled | **0.761** (vec 1,471.3 ms, best 1,119.0 ms) | 0.737 | 0.817 | none |
+| runtime | 0.764 | 0.742 | 0.816 | none |
+
+**Verdict.** Parity holds everywhere (Class A). The best passing
+configuration, 0.761, misses the frozen 0.70 go bar. Under §9 the story as
+designed stops, and the multi-row kernel is dropped: it never lands.
+
+**Operator ruling (2026-11-05): adopt the narrowed version.**
+Q4-GEMMA-ATTN-EXACT-G2 wires the bitwise (G = 2, R = 1) kernel into hf2q's
+warm route. Its acceptance is Class A everywhere plus a measured makespan
+saving whose 95% CI excludes 0; there is no fixed size bar. The saving at
+0.761 is about 0.35 s of chain per run `[INFERENCE]`. §13 specifies the
+integration. The warm S0-a cells (`tests/gemma_warm_attn_exact_s0.rs`, X1)
+and the capped `vec_gqa` bench arm ship with #89 (cherry-picked as
+`90a5a22`), so the release that contains #89 (0.15.20) carries X1.
+
+## 13. Q4-GEMMA-ATTN-EXACT-G2: integration (narrowed follow-up)
+
+Status: **draft, needs design review** (2026-11-05). It reuses §3 (the
+exactness contract), §6 (integration shape) and §7 (gates), with these
+changes.
+
+### 13.1 Kernel and dispatch
+
+- Kernel: mlx-native `flash_attn_vec_hybrid_batched_gqa` from #89, pinned
+  exactly at the release that contains it (0.15.20).
+- Group per chunk: `min(flash_attn_vec_hybrid_batched_gqa_pick_group(nh,
+  nkv, dk, nsg), 2)`. On Gemma 4 that is G = 2 on both layer kinds and every
+  bucket.
+- Bucket: the chunk's stock bucket for every row,
+  `vec![HybridSlotBucket::for_kv_seq_len(kv_seq_len); len]`. This is the
+  bucket the stock call derives from the same `kv_seq_len`, so the tmp layout
+  and the reduce are the stock ones. There are no per-slot buckets (decode's
+  A2 is not used).
+- Everything else is identical to today's `VecHybrid` arm of
+  `encode_live_seq`, with the same `params`, slot ids, stage positions and
+  `LiveVecScratch` tmp:
+  - 256-row chunks split at 512/1024;
+  - ring stage `cap − 1 + min(rows, 256)`;
+  - no 32-row threshold.
+
+### 13.2 Selector, kill switch, observability
+
+- Variant: `GemmaLiveKernel::VecHybridGqa`, a bitwise sibling of
+  `VecHybrid`.
+- Kill switch: `HF2Q_GEMMA_WARM_ATTENTION_EXACT`, read once per model load.
+  - Before promotion: unset or `0` keeps `VecHybrid`; `1` maps a resolved
+    `VecHybrid` warm kernel to `VecHybridGqa`.
+  - After promotion: unset → `VecHybridGqa`; `0` stays the kill switch.
+  - `TiledF16` (`HF2Q_GEMMA_WARM_TILED_ATTENTION=1`) is unaffected.
+  - Installed `Tiled` lanes stay on stock, pinned by a unit test.
+  - Invalid values warn and keep the default.
+- Dispatch points: every `match` on `GemmaLiveKernel` in
+  `gemma_live_attention.rs` is exhaustive without a wildcard:
+  - `LiveRoute::select`;
+  - `seq_kernel`;
+  - `uses_vec`;
+  - `chunk_len`;
+  - `stage_query_rows`;
+  - `fill_vec_stage_positions`;
+  - `encode_live_seq`.
+- Observability:
+  - `wire_name()` = `"VecHybridGqa"` in
+    `/hf2q/v1/runtime` `active_controls.gemma_warm_attention_kernel`;
+  - Q5 binds it with `HF2Q_Q5_GEMMA_WARM_ATTENTION_KERNEL` (`skip_if_empty`);
+  - banner `live=vec-hybrid-gqa`;
+  - launcher `WARM_ATTENTION_EXACT=0|1`.
+- Real-artifact tests select the variant in-process through
+  `weights.warm_live_kernel`.
+
+### 13.3 Gates (all Class A; any byte fails)
+
+| Gate | Test | Required |
+|---|---|---|
+| X1 primitive | `gemma_warm_attn_exact_s0` (in #89) and T-N8, both metallib paths, rerun at every pin bump and OS update | u32-equal |
+| X2 model route | `gemma_warm_attention_exact_matches_stock_bitwise`: one model load, gate lanes per slot with `VecHybrid` then `VecHybridGqa`, plus 31-row and 1-row suffixes, both paths | first token, logits bits, KV bytes, cursors; with `MLX_DISP_BUCKET=1`, `flash_attn_vec_hybrid_batched_gqa2_*` dispatches > 0 in the candidate arm and = 0 in the stock arm |
+| X3 joint == per-slot | `gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid_gqa` | bitwise, with the same dispatch-count proof |
+| X4 envelope harness | `gemma_warm_attention_route_envelope` with `VecHybridGqa` in `ENVELOPE_ROUTES` | every row `d_nat = 0`, 0 flips, dispatch-count proof |
+| X5 Q1 | T1/T3 greedy144, packet `warm_live_kernel: VecHybridGqa` against `VecHybrid` | `q1_decision_policy.py exact` → `ExactEqual` |
+| X6 Q5 | A/B of `HF2Q_GEMMA_WARM_ATTENTION_EXACT` 0/1 on `q5_cases/gemma4.json`, ABBA, ≥ 5 runs per arm, readiness bound to the kernel; `MLX_DISP_BUCKET` unset in every timed run, with the new-kernel share from one separate untimed run | `CalibrationPass`; `transcripts` → `ExactTranscripts` across arms; the §13.4 speed rule |
+
+X6 compares transcripts across runs, so it waits for the four-agent harness
+normalisation (root notice, 2026-11-05) and an updated harness pin.
+
+### 13.4 Acceptance and stop rules (frozen)
+
+- **Exactness:** X1–X6 pass. Any non-bitwise result keeps the switch off
+  pending localisation, and the route is never relaxed to an envelope.
+- **Speed:**
+  - Promotion needs the paired makespan difference (arm 1 − arm 0 per ABBA
+    pair, ≥ 5 runs per arm) to have a 95% t-interval lying entirely below 0.
+  - There is no fixed size bar.
+  - The matched-transaction joint-warm `elapsed_ms` saving is reported.
+  - If the interval includes 0, or lies above 0, the change is not promoted:
+    it stays opt-in or is removed in a clean cutover.
+- **Expected:** about 0.35 s of chain per run at the measured ratio 0.761
+  (25 sliding + 5 global, four-lane), a lower bound on the makespan effect
+  `[INFERENCE]`.
