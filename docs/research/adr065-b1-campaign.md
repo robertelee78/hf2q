@@ -42,7 +42,7 @@ Everything else in this document is unchanged by the decision: artifacts, cases,
 | DeepSeek-V4 Flash | `$MODELS/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf` | `50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6` | 107,431,343,264 | `q5_cases/deepseek4.json` (`d362f00e…`) | `…/deepseek4-client-approval.json` (`dfa0bf88…`) |
 | Gemma 4 26B-A4B | `$MODELS/gemma4-google/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf` | `bf65b7e163216885790442d0324839101ba4b5b49f7be4ec0cf3d7c5c538ef53` | 16,796,018,144 | `q5_cases/gemma4.json` (`71c218dd…`) | `…/gemma4-client-approval.json` (`d2e30e96…`) |
 
-**Harness update, 2026-11-05.** The harness now includes main `1fb5e854`. That brings #704, which normalizes run-specific paths, durations and panic thread ids in the model-visible `run_tests` result, so four-agent prompts no longer differ between runs. The baseline binary is unchanged: it is still the build of `38eea839`. Main also changed `q5_cases/gemma4.json` (`c83d4de4…` → `71c218dd…`) and `serve_gemma4_opencode.sh`. They add three forwarded variables: `GEMMA_JOINT_COLD_PREFILL`, `GEMMA_PREFILL_MOE_DOWN` and `MM_ID_SCHEDULE`. All three default to empty, and the launcher forwards nothing when they are empty, so the Gemma server environment for the baseline is unchanged. The Qwen3.8 and DeepSeek-V4 cases are unchanged.
+**Harness update, 2026-11-05.** The harness now includes main `1fb5e854`. That brings #704, which normalizes run-specific paths, durations and panic thread ids in the model-visible `run_tests` result, so four-agent prompts no longer differ between runs. The harness update did not change the baseline binary; the later Rust 1.99.1 decision above did. Main also changed `q5_cases/gemma4.json` (`c83d4de4…` → `71c218dd…`) and `serve_gemma4_opencode.sh`. They add three forwarded variables: `GEMMA_JOINT_COLD_PREFILL`, `GEMMA_PREFILL_MOE_DOWN` and `MM_ID_SCHEDULE`. All three default to empty, and the launcher forwards nothing when they are empty, so the Gemma server environment for the baseline is unchanged. The Qwen3.8 and DeepSeek-V4 cases are unchanged.
 
 `$MODELS` is `/Users/robert/.local/share/hf2q/models`; `$E` is `/Users/robert/.local/state/hf2q/campaigns/adr063-preflight-20261023`; `$B1` is `/Users/robert/.local/state/hf2q/v0130/b1-503`.
 
@@ -109,7 +109,7 @@ Run from a clean checkout of the harness commit; the driver refuses uncommitted 
 B1=/Users/robert/.local/state/hf2q/v0130/b1-503
 MAIN=<40-hex main commit that pins mlx-native 0.15.18>
 # 1. Build (wait while HOST-LOCK exists; kill rust-analyzer first).
-git -C /opt/hf2q fetch origin && git -C /opt/hf2q worktree add --detach /opt/hf2q-worktrees/b1-main-build $MAIN
+git -C /opt/hf2q fetch origin && git -C /opt/hf2q-worktrees/b1-main-build checkout -q --detach $MAIN   # existing clean build worktree
 (cd /opt/hf2q-worktrees/b1-main-build && RUSTC_WRAPPER= CARGO_INCREMENTAL=0 GIT_COMMIT_SHA=$MAIN \
    CARGO_TARGET_DIR=/Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool cargo build --release --locked)
 mkdir -p $B1/main-build && cp /Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool/release/hf2q $B1/main-build/hf2q
