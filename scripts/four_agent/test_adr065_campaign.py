@@ -81,11 +81,13 @@ def fake_lock(commit, version="0.15.18", checksum=NATIVE_SUM):
     return LOCK.format(version=version, checksum=checksum)
 
 
-def fake_ids(plan, binary_sha=BIN_SHA, artifact_sha=MODEL_SHA, dirty=()):
+def fake_ids(plan, binary_sha=BIN_SHA, artifact_sha=MODEL_SHA, dirty=(), inputs=None):
+    bound = {plan[key]["path"]: plan[key]["sha256"] for key in ("client_approval_template", "sandbox_proof", "cargo")}
     return {"arms": {arm: {"binary": {"path": plan["declared"]["binary"], "sha256": binary_sha, "bytes": BYTES,
                                       "exists": True},
                            "artifact": {"path": "/m.gguf", "bytes": 10, "sha256": artifact_sha},
-                           "peer_build_info": None, "missing_variables": [], "file_checks": {}, "inputs": {}}
+                           "peer_build_info": None, "missing_variables": [], "file_checks": {},
+                           "inputs": {**bound, **(inputs or {})}}
                      for arm in plan["arms"]},
             "harness": {"git_commit": "c" * 40, "git_dirty": list(dirty), "sources": {}},
             "python": {"path": "/usr/bin/python3", "sha256": "7" * 64}, "host": {"chip": "test"},
@@ -184,7 +186,10 @@ class Plan(Harness):
         self.assertEqual(overrides["HF2Q_BIN"], str(self.bin))
         self.assertEqual(overrides["MODEL"], "/Users/robert/.local/share/hf2q/models/qwen38-stock/Qwen3.8-27B-vanilla.gguf")
         self.assertEqual(overrides["MODEL_SHA256"], MODEL_SHA)
-        self.assertTrue(overrides["CLIENT_APPROVAL_TEMPLATE"].endswith("approval-templates-proof-8b286684/qwen38-client-approval.json"))
+        self.assertTrue(overrides["CLIENT_APPROVAL_TEMPLATE"].endswith(
+            "approval-templates-proof-4b2bea77-cargo199/qwen38-client-approval.json"))
+        self.assertEqual(overrides["SANDBOX_PROOF_SHA256"], "4b2bea7715c6244e7636d6d07b4e33bd41b7c525313488dcca0f107cc79d486e")
+        self.assertEqual(plan["cargo"]["sha256"], "6d576d8058f8ca643e8fce55b64ee3c614ba64c9da2e536bae843e6a2e1f3951")
         self.assertEqual(plan["declared"]["commit"], SOURCE_COMMIT)
         self.assertEqual((plan["baseline"]["kind"], plan["baseline"]["native_version"], plan["baseline"]["native_checksum"]),
                          ("main-build", "0.15.18", NATIVE_SUM))
@@ -233,6 +238,11 @@ class Plan(Harness):
         self.assertIn("A: artifact /m.gguf is not the official", problems[0])
         self.assertIn(f"the baseline binary must be the main build {BIN_SHA} ({BYTES} bytes)", problems[1])
         self.assertIn("exactly one mlx-native version (0.15.18)", problems[2])
+        old_cargo = "cb7151ab1c5fcd42648336a2c98020b1819b0993955c8ba3ed44494772a82bdf"  # cargo 1.94 (proof 8b286684)
+        stale = fake_ids(plan, inputs={plan["cargo"]["path"]: old_cargo, plan["sandbox_proof"]["path"]: None})
+        self.assertEqual(ac.launch_problems(plan, stale, GOOD, fake_lock), [
+            f"A: {plan['sandbox_proof']['path']} is None, not the campaign file's {plan['sandbox_proof']['sha256']}",
+            f"A: {plan['cargo']['path']} is {old_cargo}, not the campaign file's {plan['cargo']['sha256']}"])
         ab, _ = self.plan("ab", commit="xyz")
         self.assertIn("--commit must be the 40-hex source commit of the binary",
                       ac.launch_problems(ab, fake_ids(ab), found(native=("0.15.17",)), fake_lock))

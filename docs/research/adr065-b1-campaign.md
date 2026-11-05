@@ -38,9 +38,9 @@ Everything else in this document is unchanged by the decision: artifacts, cases,
 
 | Family | Official artifact | sha256 | Bytes | Q5 case (sha256) | Client approval template |
 | --- | --- | --- | --- | --- | --- |
-| Qwen3.8 27B | `$MODELS/qwen38-stock/Qwen3.8-27B-vanilla.gguf` | `cf0eb0103c1ffe7b3702670aa794a669bafbe328b95e892268305dd87c2c30d7` | 16,810,714,976 | `q5_cases/qwen38.json` (`4358e4c3…`) | `$E/approval-templates-proof-8b286684/qwen38-client-approval.json` (`d6c89cee…`) |
-| DeepSeek-V4 Flash | `$MODELS/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf` | `50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6` | 107,431,343,264 | `q5_cases/deepseek4.json` (`d362f00e…`) | `…/deepseek4-client-approval.json` (`dfa0bf88…`) |
-| Gemma 4 26B-A4B | `$MODELS/gemma4-google/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf` | `bf65b7e163216885790442d0324839101ba4b5b49f7be4ec0cf3d7c5c538ef53` | 16,796,018,144 | `q5_cases/gemma4.json` (`71c218dd…`) | `…/gemma4-client-approval.json` (`d2e30e96…`) |
+| Qwen3.8 27B | `$MODELS/qwen38-stock/Qwen3.8-27B-vanilla.gguf` | `cf0eb0103c1ffe7b3702670aa794a669bafbe328b95e892268305dd87c2c30d7` | 16,810,714,976 | `q5_cases/qwen38.json` (`4358e4c3…`) | `$E/approval-templates-proof-4b2bea77-cargo199/qwen38-client-approval.json` (`facc7afa…`) |
+| DeepSeek-V4 Flash | `$MODELS/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf` | `50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6` | 107,431,343,264 | `q5_cases/deepseek4.json` (`d362f00e…`) | `…/deepseek4-client-approval.json` (`b9da8361…`) |
+| Gemma 4 26B-A4B | `$MODELS/gemma4-google/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf` | `bf65b7e163216885790442d0324839101ba4b5b49f7be4ec0cf3d7c5c538ef53` | 16,796,018,144 | `q5_cases/gemma4.json` (`71c218dd…`) | `…/gemma4-client-approval.json` (`89509373…`) |
 
 **Harness update, 2026-11-05.** The harness now includes main `1fb5e854`. That brings #704, which normalizes run-specific paths, durations and panic thread ids in the model-visible `run_tests` result, so four-agent prompts no longer differ between runs. The harness update did not change the baseline binary; the later Rust 1.99.1 decision above did. Main also changed `q5_cases/gemma4.json` (`c83d4de4…` → `71c218dd…`) and `serve_gemma4_opencode.sh`. They add three forwarded variables: `GEMMA_JOINT_COLD_PREFILL`, `GEMMA_PREFILL_MOE_DOWN` and `MM_ID_SCHEDULE`. All three default to empty, and the launcher forwards nothing when they are empty, so the Gemma server environment for the baseline is unchanged. The Qwen3.8 and DeepSeek-V4 cases are unchanged.
 
@@ -48,7 +48,15 @@ Everything else in this document is unchanged by the decision: artifacts, cases,
 
 On 2026-11-03 all three GGUFs were hashed in full, and each sha256 equals its conversion receipt's `output.sha256` (`shasum -a 256`, evidence `/Users/robert/.local/state/hf2q/v0130/b1-503/artifact-sha256.txt`). Gemma 4 is included because Q4-GEMMA and E1 need its baseline. Runs do not re-hash the GGUF. Q5 binds it as Q3 does, through the conversion-receipt digest, checked against the campaign file's `MODEL_SHA256`. The driver also refuses an artifact whose digest or size differs from the campaign file.
 
-Every run also uses the sandbox proof `owned-cleanup-sandbox-capability-20261031T222313Z/proof.json` (`8b286684…`) and the Q5 negative-control receipt `q5-negative-control-20261030T041437Z/receipt.json` (`b3c1db0b…`). At campaign start the driver freezes the binary, model, cases, argv input files, harness sources and commit, Python and host. It re-checks them before every run and against every receipt, as in [Q3](adr063-q3-campaign.md). Any drift is a terminal `IdentityDrift`.
+Every run also uses two fixed files:
+- the sandbox proof `owned-cleanup-sandbox-capability-20261105-cargo199/proof.json` (`4b2bea77…`), which confirms 12 of 12 confinement checks for cargo 1.99.1;
+- the Q5 negative-control receipt `q5-negative-control-20261030T041437Z/receipt.json` (`b3c1db0b…`).
+
+The client's cargo is `stable-aarch64-apple-darwin/bin/cargo` 1.99.1, sha256 `6d576d80…` (`environment.cargo_sha256`). The approval templates in `approval-templates-proof-4b2bea77-cargo199/` differ from the earlier `approval-templates-proof-8b286684/` set only in `cargo_sha256` and `sandbox_proof_sha256`. The earlier set pinned proof `8b286684…` and cargo 1.94 (`cb7151ab…`), and it is kept for historical receipts only.
+
+Before launch, the driver requires every arm's hashed argv inputs to include the approval template, the sandbox proof and cargo, each at its campaign-file sha256.
+
+At campaign start the driver freezes the binary, model, cases, argv input files, harness sources and commit, Python and host. It re-checks them before every run and against every receipt, as in [Q3](adr063-q3-campaign.md). Any drift is a terminal `IdentityDrift`.
 
 ## Design (every later two-arm A/B)
 

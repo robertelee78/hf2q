@@ -143,6 +143,7 @@ def build_plan(args, campaign, source):
             "artifact": fam["artifact"], "client_approval_template": {
                 "path": values["CLIENT_APPROVAL_TEMPLATE"], "sha256": fam["client_approval_template"]["sha256"]},
             "sandbox_proof": {"path": values["SANDBOX_PROOF"], "sha256": env["sandbox_proof"]["sha256"]},
+            "cargo": {"path": env["CARGO"], "sha256": env["cargo_sha256"]},
             "cooldown_seconds": execution["cooldown_seconds"],
             "declared": {"binary": values["HF2Q_BIN"], "qe_identity": args.qe_identity}}
     if args.mode == "baseline":
@@ -278,9 +279,10 @@ def launch_problems(plan, ids, scanned, lock=q2_traced_run.git_lock):
             problems.append(f"{name}: artifact {found.get('path')} is not the official {artifact['sha256']} "
                             f"({artifact['bytes']} bytes)")
         inputs = identity.get("inputs") or {}
-        for key in ("client_approval_template", "sandbox_proof"):
-            if inputs.get(plan[key]["path"]) not in (None, plan[key]["sha256"]):
-                problems.append(f"{name}: {plan[key]['path']} sha256 differs from the campaign file")
+        for key in ("client_approval_template", "sandbox_proof", "cargo"):
+            if inputs.get(plan[key]["path"]) != plan[key]["sha256"]:
+                problems.append(f"{name}: {plan[key]['path']} is {inputs.get(plan[key]['path'])}, not the campaign "
+                                f"file's {plan[key]['sha256']}")
     shas = {identity["binary"]["sha256"] for identity in ids["arms"].values()}
     if len(shas) != 1:
         problems.append("every arm must run the same binary (arms differ only in a kill switch)")

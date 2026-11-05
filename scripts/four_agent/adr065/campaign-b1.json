@@ -36,9 +36,10 @@
   },
   "environment": {
     "CARGO": "/Users/robert/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+    "cargo_sha256": "6d576d8058f8ca643e8fce55b64ee3c614ba64c9da2e536bae843e6a2e1f3951",
     "TOOLCHAIN": "stable-aarch64-apple-darwin",
-    "sandbox_proof": {"path": "{E}/owned-cleanup-sandbox-capability-20261031T222313Z/proof.json",
-                      "sha256": "8b2866842913c206b9b801ced3c86397b5ccde7631b8422fb2166bdbe26ea589"},
+    "sandbox_proof": {"path": "{E}/owned-cleanup-sandbox-capability-20261105-cargo199/proof.json",
+                      "sha256": "4b2bea7715c6244e7636d6d07b4e33bd41b7c525313488dcca0f107cc79d486e"},
     "negative_control_receipt": {"path": "{E}/q5-negative-control-20261030T041437Z/receipt.json",
                                  "sha256": "b3c1db0bbd3df2ff8783ea1df447b2c94799763cf1255fe3623b1155eaea1e3b"}
   },
@@ -52,8 +53,8 @@
                    "conversion_receipt_sha256": "8a370d80c6f06a5f7111abe1dad46ae9cc1dbf66034e6fa2abe90276b0f13b23"},
       "q5_case": {"path": "scripts/four_agent/q5_cases/qwen38.json",
                   "sha256": "4358e4c3c94c55fb737284e33d22a340a3e12edcbfa3abcaf19d98f1aae25633"},
-      "client_approval_template": {"path": "{E}/approval-templates-proof-8b286684/qwen38-client-approval.json",
-                                   "sha256": "d6c89cee2e6b7eb549f3d68ff7c3ab287b3abfc1fae31ffa6115862236b84041"},
+      "client_approval_template": {"path": "{E}/approval-templates-proof-4b2bea77-cargo199/qwen38-client-approval.json",
+                                   "sha256": "facc7afa42cb76330b207292979dcbc846cd2bad0433c81450be0b6cd7d46776"},
       "ab_blocks": 6,
       "run_seconds_estimate": [95, 135]
     },
@@ -65,8 +66,8 @@
                    "conversion_receipt_sha256": "9c5dc7ea21411e44ced343352f510a59039f16c11bdb19e7e4f3a10bfa88e03b"},
       "q5_case": {"path": "scripts/four_agent/q5_cases/deepseek4.json",
                   "sha256": "d362f00ea484facd8e4422affbdefc77364f3aceb89dbc660f0212895d9e1004"},
-      "client_approval_template": {"path": "{E}/approval-templates-proof-8b286684/deepseek4-client-approval.json",
-                                   "sha256": "dfa0bf88fbd640f12bcfd0ce7598511a352a1e6f43a25147dfa6013902c2b6f3"},
+      "client_approval_template": {"path": "{E}/approval-templates-proof-4b2bea77-cargo199/deepseek4-client-approval.json",
+                                   "sha256": "b9da836100f52741cd2d586914701d2d8a5a6aceb0eb4922b6b2fe7d44654393"},
       "ab_blocks": 6,
       "run_seconds_estimate": [111, 160]
     },
@@ -78,8 +79,8 @@
                    "conversion_receipt_sha256": "299aa501a10546a26d85ca1e5600c6d6e5873e2fc2d35a4b0337409771677caf"},
       "q5_case": {"path": "scripts/four_agent/q5_cases/gemma4.json",
                   "sha256": "71c218ddb8ce85c367dd1b48bf397bf8e1b4999fd34ff2eebfa7ca4d8d6d17d6"},
-      "client_approval_template": {"path": "{E}/approval-templates-proof-8b286684/gemma4-client-approval.json",
-                                   "sha256": "d2e30e96f769d5f4892b51949fb9780788acf24df473766947a6775ebd04d8a8"},
+      "client_approval_template": {"path": "{E}/approval-templates-proof-4b2bea77-cargo199/gemma4-client-approval.json",
+                                   "sha256": "895093735222afa592f3444c6feb6e6d3626a0afd237583e9389a68bd8d19490"},
       "ab_blocks": 6,
       "run_seconds_estimate": [29, 35]
     }
