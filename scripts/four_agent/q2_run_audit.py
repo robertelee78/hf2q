@@ -32,7 +32,7 @@ from pathlib import Path
 
 from f2_semantic import semantic_timing_v3
 from q2_certify import checked_cleanup, replay_response, request_wire, require_clock
-from qwen38_n1_verdict import RAW_LIMIT, loads, require
+from qwen38_n1_verdict import RAW_LIMIT, Workflow, loads, max_tools, require
 import qwen_n4_live_smoke as coordinator
 
 SUCCESS = "FourAgentProtocolCompleteAwaitingIndependentReview"
@@ -136,11 +136,14 @@ def ordered_within(stamps, low, high):
 
 
 def audit_agent(directory, name, result, family, engine, response_ids):
-    """Replay one agent's seven archived exchanges; returns its turn receipts."""
+    """Replay one agent's archived exchanges (seven, plus two per repair cycle); returns its turn receipts."""
     turns, tools = result["turns"], result["tools"]
     foreign = [f"coding agent {other}, workload {coordinator.WORKLOAD_ID}"
                for other in coordinator.AGENTS if other != name]
     seen, messages, model, previous_terminal = set(), None, None, None
+    repair = result.get("repair_turns") or 0
+    protocol = Workflow(repair) if repair else None
+    require(len(tools) <= max_tools(repair) and len(turns) == len(tools) + 1, "turn/tool count")
     for turn, receipt in enumerate(turns):
         require_clock(receipt)
         base = Path(directory) / f"turn-{turn}"
@@ -150,7 +153,7 @@ def audit_agent(directory, name, result, family, engine, response_ids):
         request = loads(request_raw)
         require(receipt.get("turn") == turn and receipt.get("stream") is request.get("stream") is (turn % 2 == 1),
                 "turn/transport receipt")
-        request_wire(request, request_raw, family, engine)
+        request_wire(request, request_raw, family, engine, result.get("request_setup"))
         model = request["model"] if model is None else model
         require(request["model"] == model, "model identity changed between turns")
         if turn == 0:
@@ -161,7 +164,8 @@ def audit_agent(directory, name, result, family, engine, response_ids):
             require(request["messages"] == messages, "stale lineage: request history does not extend the validated transcript")
         semantic, progress = [], []
         message, call, stats = replay_response(response_raw, request, turn, seen, engine, semantic,
-                                               progress_frames=progress)
+                                               progress_frames=progress,
+                                               assistant_policy=None if protocol is None else protocol.policy)
         require(receipt.get("usage") == stats, "receipt usage differs from the raw response (usage/cache accounting)")
         rid = response_id(response_raw, request["stream"])
         require(rid not in response_ids, f"stale lineage: response id of {name} turn {turn} repeats {response_ids.get(rid)}")
@@ -186,6 +190,9 @@ def audit_agent(directory, name, result, family, engine, response_ids):
             require(tool.get("name") == function and tool.get("arguments") == args and tool.get("status") == "Complete"
                     and tool.get("cleanup") is True and isinstance(tool.get("result"), str), "tool/argument join")
             messages.append({"role": "tool", "tool_call_id": cid, "name": function, "content": tool["result"]})
+        if protocol is not None:
+            protocol.advance(None if call is None else call[1],
+                             tools[turn].get("passed") if call is not None and call[1] == "run_tests" else None)
     return turns
 
 
@@ -233,7 +240,8 @@ def audit_run(client_dir, summary, phase_plan, engine_kind, require_width):
         checked_cleanup(cleanup[name])
     require(coordinator.aggregate(results, summary["exits"], {n: cleanup[n]["verified"] for n in agents},
                                   summary["server_pid"], summary["run_id"], engine_kind, family,
-                                  summary.get("instance"), phase_plan, summary.get("workload_variant")) == summary["status"],
+                                  summary.get("instance"), phase_plan, summary.get("workload_variant"),
+                                  summary.get("request_setup"), summary.get("repair_turns") or 0) == summary["status"],
             "result scoring disagrees with the claimed status")
     releases = cohort_releases(summary, phase_plan, cohorts, results)
     response_ids, turns = {}, {}

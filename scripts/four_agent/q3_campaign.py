@@ -183,6 +183,12 @@ def build_plan(args, environ, family):
     qc.require(all(flag == approved for flag, approved in selections.values()) and len(set(selections.values())) == 1,
                "every arm must run the same workload variant (client --workload equal to the approval "
                "workload_variant): " + ", ".join(f"{arm}={flag}" for arm, (flag, _) in sorted(selections.items())))
+    repairs = {arm: q5_case.repair_turns(case) for arm, case in cases.items()}
+    qc.require(len(set(repairs.values())) == 1, "every arm must grant the same repair turns (client --repair-turns): "
+               + ", ".join(f"{arm}={value}" for arm, value in sorted(repairs.items())))
+    setups = {arm: q5_case.request_setup(case) for arm, case in cases.items()}
+    qc.require(len(set(setups.values())) == 1, "every arm must use the same request setup (client --request-setup): "
+               + ", ".join(f"{arm}={value}" for arm, value in sorted(setups.items())))
     native = native_peers.peer_kind({"arms": arms})
     evidence, comparison = bool(args.peer_unavailable_evidence), bool(args.native_comparison)
     qc.require((native is None and not comparison and not (args.peer_case and evidence))
