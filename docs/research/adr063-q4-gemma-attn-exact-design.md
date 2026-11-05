@@ -553,7 +553,7 @@ integration, and the expected saving is restated from it.
 
 ## 13. Q4-GEMMA-ATTN-EXACT-G2: integration (narrowed follow-up)
 
-Status: **draft, revision 2, needs design review** (2026-11-05). Revision 2
+Status: **revision 2, design review ACCEPT** (ReviewGemmaExact, 2026-11-05; operator approval pending). Revision 2
 answers ReviewGemmaExact's REVISE (four findings: capped-A1 receipt and
 fallback rule, warm-only dispatch proof, clean-cutover outcome, X1 rerun on
 toolchain change). It reuses §3 (the exactness contract), §6 (integration
@@ -595,12 +595,14 @@ shape) and §7 (gates), with these changes.
   - Bucket ratios on both paths: sliding 0.727–0.786, global 0.856–0.929.
     None exceeds 1.02, so the fallback table is **empty**.
   - Kernel choice: against the rows kernel's 0.761 from another run, 0.791
-    tripped the 0.02 margin. The vec baseline had drifted 2.6% between the
-    two runs, so the operator ordered a same-run head-to-head (`h2h-baae205/`,
+    tripped the 0.02 margin, which returned the decision to the operator as
+    frozen. The vec baseline had drifted 2.6% between the two runs, so the
+    operator ruled that a same-run head-to-head decide (`h2h-baae205/`,
     scratch `5825877` with the arm capped at G = 2). There, rows(2, 1) was
     1,119.4 ms against capped A1's 1,132.9 ms (vec 1,468.5; ratios 0.762 /
     0.771). The rows kernel is only 1.2% faster (runtime path 0.9%), under the
-    2% bar, so **capped A1 is adopted** and the rows kernel is not landed.
+    2% bar, so under the operator's ruling **capped A1 is adopted** and the
+    rows kernel is not landed.
 
 ### 13.1 Kernel and dispatch
 
