@@ -109,9 +109,9 @@
 #     DECODE_KERNELS=0|1             (this script) forwards
 #                                    HF2Q_GEMMA_DECODE_KERNELS; unset keeps
 #                                    the hf2q default (0, stock decode
-#                                    kernels). 1 selects the adopted exact
-#                                    width-4 decode routes (ADR-063
-#                                    Q4-GEMMA-DECODE).
+#                                    kernels). 1 selects the adopted F2
+#                                    expert gate_up GEGLU at widths <= 4
+#                                    (ADR-063 Q4-GEMMA-DECODE).
 #     ROUTING_OVERLAP=0|1            (this script) forwards
 #                                    HF2Q_GEMMA_ROUTING_OVERLAP; unset keeps
 #                                    it off. 1 prints the V2 [ROUTING_OVERLAP]

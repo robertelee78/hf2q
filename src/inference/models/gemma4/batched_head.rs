@@ -170,8 +170,6 @@ impl MlxModelWeights {
             hs,
             vocab,
             ImatrixHint::Global("output.weight"),
-            // Also serves the serial body's head: stock route.
-            None,
         )?;
 
         // ADR-040 §0.21c: the lm_head→softcap (and all other) cross-dispatch
@@ -307,8 +305,6 @@ impl MlxModelWeights {
             hs,
             vocab,
             ImatrixHint::Global("output.weight"),
-            // Fused only into the batched body: adopted head policy, if any.
-            self.lm_head_policy(),
         )?;
 
         if let Some(cap) = self.final_logit_softcapping {

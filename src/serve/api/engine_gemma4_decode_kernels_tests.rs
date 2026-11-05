@@ -2,9 +2,9 @@
 //!
 //! One process, one GGUF: the same four ragged lanes (plus one mid-run
 //! admission) decode in lockstep under the stock route
-//! (`decode_kernels = None`) and under the candidate
-//! (`GemmaDecodeKernels::adopt` over the process policy with
-//! `ADOPTED_LEVERS`), each arm on its own hybrid KV scaffold. Every step must
+//! (`decode_kernels = None`) and under the candidate (the adopted F2 set,
+//! `GemmaDecodeKernels::adopted()`: Q4_K expert gate_up with the GEGLU
+//! epilogue at widths <= 4), each arm on its own hybrid KV scaffold. Every step must
 //! match bitwise: logits (u32 bits), sampled token, the F16 K / TQ-HB V
 //! packed / V norm bytes each layer wrote for each active slot, and every
 //! layer's routed expert ids and routing weights.
@@ -15,9 +15,7 @@
 //!     --ignored --test-threads=1
 use super::*;
 use crate::inference::models::gemma4::batched_body::{router_capture, BatchedKvRegime};
-use crate::inference::models::gemma4::decode_kernels::{
-    AttentionEnv, GemmaDecodeKernels, ADOPTED_LEVERS,
-};
+use crate::inference::models::gemma4::decode_kernels::GemmaDecodeKernels;
 use crate::inference::models::gemma4::kv_cache::{MultiSeqHbKvBuffers, MultiSeqHybridKvBuffers};
 use crate::inference::models::gemma4::routing_overlap::{kv_len, same_bucket};
 use mlx_native::MlxBuffer;
@@ -253,12 +251,14 @@ fn gemma_decode_kernels_match_stock_bitwise() {
     let LoadedModel::Gemma(g) = &mut loaded else {
         panic!("expected a Gemma GGUF")
     };
-    let candidate = GemmaDecodeKernels::adopt(
-        mlx_native::ggml_routing_policy_from_environment(),
-        &AttentionEnv::from_environment(),
-        ADOPTED_LEVERS,
-    )
-    .expect("process policy holds the stock reference");
+    let candidate = GemmaDecodeKernels::adopted();
+    assert!(
+        g.weights
+            .layers
+            .iter()
+            .any(|l| candidate.f2_gate_up_geglu(l.moe.gate_up_ggml_dtype, 1)),
+        "no Q4_K expert gate_up: F2 never engages on this artifact"
+    );
     let mut stock = provision(g, "stock", None);
     let mut cand = provision(g, "candidate", Some(candidate));
     assert!(stock.hybrid.iter().any(|l| l.is_sliding), "no sliding layer");

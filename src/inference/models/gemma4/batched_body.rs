@@ -29,8 +29,7 @@ use crate::debug::INVESTIGATION_ENV;
 use crate::quantize::imatrix::ImatrixHint;
 use crate::serve::config::LayerType;
 use crate::serve::forward_mlx_shared::{
-    dispatch_qmatmul, dispatch_qmatmul_with_policy, dispatch_rms_norm_unit_perhead,
-    RmsNormPerHeadArgs,
+    dispatch_qmatmul, dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
 };
 use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
 
@@ -500,11 +499,6 @@ fn cat_boundary<'a>(
 /// per-row matvec; otherwise loop m=1 per row (correct, weight re-read N times —
 /// these are the minority dense projections; the dominant MoE experts batch
 /// bit-identically via `quantized_matmul_id_ggml`).
-///
-/// `policy` is `None` for the stock route; with `HF2Q_GEMMA_DECODE_KERNELS=1`
-/// the caller passes its adopted body or lm-head policy for §3.1 weight types
-/// and the batched m=N branch dispatches through
-/// [`dispatch_qmatmul_with_policy`]. The per-row m=1 loop stays stock.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_dense_rowident(
     session: &mut GraphSession<'_>,
@@ -517,7 +511,6 @@ pub(super) fn dispatch_dense_rowident(
     in_stride: usize,
     out_stride: usize,
     hint: ImatrixHint<'_>,
-    policy: Option<&mlx_native::GgmlRoutingPolicy>,
 ) -> Result<()> {
     use mlx_native::GgmlType;
     // Measured (ADR-040 M4, 2026-06-24): for F32/F16 weights at decode N≤8 the
@@ -531,12 +524,7 @@ pub(super) fn dispatch_dense_rowident(
     ) && (n as u32)
         <= mlx_native::ops::quantized_matmul_ggml::MM_ROUTING_THRESHOLD;
     if batched_rowident {
-        match policy {
-            None => dispatch_qmatmul(session, reg, dev, input, weight, output, n as u32, hint),
-            Some(policy) => dispatch_qmatmul_with_policy(
-                session, reg, dev, input, weight, output, n as u32, hint, policy,
-            ),
-        }
+        dispatch_qmatmul(session, reg, dev, input, weight, output, n as u32, hint)
     } else {
         // Measured (ADR-040 M4): amortizing the F16/F32 weight read across rows
         // (dispatch row 0 only) was throughput-NEUTRAL (152.3 vs 151.8 @ N=4) —
@@ -552,39 +540,6 @@ pub(super) fn dispatch_dense_rowident(
 }
 
 impl MlxModelWeights {
-    /// Adopted body policy for a dense projection weight; `None` (stock) when
-    /// `HF2Q_GEMMA_DECODE_KERNELS` is off or the type is outside §3.1.
-    pub(super) fn body_policy(
-        &self,
-        weight: &crate::serve::forward_mlx_shared::MlxQWeight,
-    ) -> Option<&mlx_native::GgmlRoutingPolicy> {
-        self.decode_kernels.as_ref()?.body_policy_for(weight.info.ggml_dtype)
-    }
-
-    /// Adopted lm-head policy; `None` (stock) unless adopted for this head.
-    pub(super) fn lm_head_policy(&self) -> Option<&mlx_native::GgmlRoutingPolicy> {
-        self.decode_kernels
-            .as_ref()?
-            .lm_head_policy_for(self.resolved_lm_head().info.ggml_dtype)
-    }
-
-    /// Adopted routed-expert policy; `None` (stock) when off or the stack type
-    /// is outside §3.1.
-    fn expert_policy(&self, ty: mlx_native::GgmlType) -> Option<&mlx_native::GgmlRoutingPolicy> {
-        self.decode_kernels.as_ref()?.expert_policy_for(ty)
-    }
-
-    /// Attention route of the adopted decode set; [`AttentionLever::VecHybrid`]
-    /// (today's route) when `HF2Q_GEMMA_DECODE_KERNELS` is off. Read by the
-    /// hybrid-regime flash gate of [`Self::encode_one_layer_batched`].
-    ///
-    /// [`AttentionLever::VecHybrid`]: super::decode_kernels::AttentionLever::VecHybrid
-    pub(crate) fn decode_attention_lever(&self) -> super::decode_kernels::AttentionLever {
-        self.decode_kernels
-            .as_ref()
-            .map_or(super::decode_kernels::AttentionLever::VecHybrid, |k| k.attention())
-    }
-
     /// ADR-040 S2/S3 — one `[N,hidden]` decode layer (production hybrid-TQ path).
     ///
     /// Position-INDEPENDENT ops (input-norm, post-attn norm, fused MLP, MoE) run
@@ -690,7 +645,6 @@ impl MlxModelWeights {
                 tag: "attn_q",
                 layer: layer_idx,
             },
-            self.body_policy(&self.layers[layer_idx].attn.q_proj),
         )?;
         cat_boundary(session, exec, catsplit::Cat::DenseQ)?;
         dispatch_dense_rowident(
@@ -707,7 +661,6 @@ impl MlxModelWeights {
                 tag: "attn_k",
                 layer: layer_idx,
             },
-            self.body_policy(&self.layers[layer_idx].attn.k_proj),
         )?;
         cat_boundary(session, exec, catsplit::Cat::DenseK)?;
         let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
@@ -726,7 +679,6 @@ impl MlxModelWeights {
                     tag: "attn_v",
                     layer: layer_idx,
                 },
-                self.body_policy(self.layers[layer_idx].attn.v_proj.as_ref().unwrap()),
             )?;
             cat_boundary(session, exec, catsplit::Cat::DenseV)?;
         }
@@ -997,14 +949,8 @@ impl MlxModelWeights {
                 // gated to same-(nwg,nsg)-bucket slots so the per-query math is bit-identical
                 // to the per-slot flash; mixed-bucket (e.g. staggered) slots fall back to the
                 // per-slot loop below.
-                // ADR-063 lever A (`AttentionLever::GqaMixedBucket`): the GQA-grouped
-                // flash runs each slot at its OWN (nwg, nsg) bucket in-kernel, so
-                // mixed-bucket steps take the batched branch too (batched KV encode,
-                // one flash, batched/per-slot undo as for same-bucket steps).
-                let gqa_group_cap = self.decode_attention_lever().group_cap(hd as u32);
-                let gqa_flash = gqa_group_cap.is_some();
-                let use_batched_flash = std::env::var("HF2Q_BATCHED_FLASH").as_deref() != Ok("0")
-                    && (same_bucket || gqa_flash);
+                let use_batched_flash =
+                    std::env::var("HF2Q_BATCHED_FLASH").as_deref() != Ok("0") && same_bucket;
                 // ROWDIFF probe (HF2Q_DECODE_TRACE): layer 0 only — dump per-slot
                 // seq_positions / ksl / cache_pos so we can tell whether staggered slot-0
                 // divergence is BOOKKEEPING (positions differ) or KV-CONTENT (identical).
@@ -1166,87 +1112,30 @@ impl MlxModelWeights {
                         ],
                         &[&bufs.sdpa_out, &bufs.sdpa_tmp],
                     );
-                    // ADR-059 (3c): sliding rings derive their per-query
-                    // read extents prompt-indexed (no graft rows in the
-                    // ring); full layers keep the absolute positions (the
-                    // graft rows participate in their reads).
-                    let flash_positions_buf: &MlxBuffer = if is_ring {
-                        ring_positions_buf.unwrap_or(positions_buf)
-                    } else {
-                        positions_buf
-                    };
-                    if gqa_flash {
-                        // ADR-063 lever A: one GQA-grouped dispatch, slot i at the
-                        // stock bucket of its own KV length (the per-slot fallback's
-                        // `compute_nwg`/`compute_nsg(kv_seq_len)`), reduced per
-                        // maximal same-NWG run with the stock reduce.
-                        use mlx_native::ops::flash_attn_vec_hybrid as fav;
-                        let buckets: Vec<fav::HybridSlotBucket> =
-                            (0..n).map(|i| fav::HybridSlotBucket::for_kv_seq_len(ksl_of(i))).collect();
-                        let bucket_nsg_max = buckets.iter().map(|b| b.nsg).max().unwrap_or(1);
-                        // Largest legal G not above this layer type's cap
-                        // (frozen by M0); G = 1 is always legal.
-                        let cap = gqa_group_cap.unwrap_or(1);
-                        let group = fav::FLASH_ATTN_VEC_HYBRID_GQA_GROUPS
-                            .iter()
-                            .copied()
-                            .filter(|&g| {
-                                g <= cap
-                                    && fav::flash_attn_vec_hybrid_batched_gqa_group_is_legal(
-                                        nh as u32,
-                                        nkv as u32,
-                                        hd as u32,
-                                        g,
-                                        bucket_nsg_max,
-                                    )
-                            })
-                            .max()
-                            .unwrap_or(1);
-                        let tmp_need =
-                            fav::flash_attn_vec_hybrid_batched_gqa_tmp_bytes(nh as u32, hd as u32, &buckets)
-                                .map_err(|e| anyhow::anyhow!("gqa flash tmp plan L{layer_idx}: {e}"))?;
-                        if bufs.sdpa_tmp.byte_len() < tmp_need {
-                            anyhow::bail!(
-                                "gqa flash L{layer_idx}: sdpa_tmp holds {} bytes, the {n}-slot \
-                                 grouped flash needs {tmp_need}",
-                                bufs.sdpa_tmp.byte_len()
-                            );
-                        }
-                        fav::flash_attn_vec_hybrid_batched_gqa(
-                            session.encoder_mut(),
-                            reg,
-                            dev,
-                            &bufs.attn_q_normed,
-                            &buf.k,
-                            &buf.v_packed,
-                            &buf.v_norms,
-                            &bufs.sdpa_out,
-                            &bufs.sdpa_tmp,
-                            slot_id_buf,
-                            flash_positions_buf,
-                            &p_hyb,
-                            group,
-                            &buckets,
-                        )
-                        .map_err(|e| anyhow::anyhow!("gqa batched flash L{layer_idx}: {e}"))?;
-                    } else {
-                        mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
-                            session.encoder_mut(),
-                            reg,
-                            dev,
-                            n as u32,
-                            &bufs.attn_q_normed,
-                            &buf.k,
-                            &buf.v_packed,
-                            &buf.v_norms,
-                            &bufs.sdpa_out,
-                            &bufs.sdpa_tmp,
-                            slot_id_buf,
-                            flash_positions_buf,
-                            &p_hyb,
-                        )
-                        .map_err(|e| anyhow::anyhow!("batched flash L{layer_idx}: {e}"))?;
-                    }
+                    mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
+                        session.encoder_mut(),
+                        reg,
+                        dev,
+                        n as u32,
+                        &bufs.attn_q_normed,
+                        &buf.k,
+                        &buf.v_packed,
+                        &buf.v_norms,
+                        &bufs.sdpa_out,
+                        &bufs.sdpa_tmp,
+                        slot_id_buf,
+                        // ADR-059 (3c): sliding rings derive their per-query
+                        // read extents prompt-indexed (no graft rows in the
+                        // ring); full layers keep the absolute positions (the
+                        // graft rows participate in their reads).
+                        if is_ring {
+                            ring_positions_buf.unwrap_or(positions_buf)
+                        } else {
+                            positions_buf
+                        },
+                        &p_hyb,
+                    )
+                    .map_err(|e| anyhow::anyhow!("batched flash L{layer_idx}: {e}"))?;
                     // PHASE 3 — FWHT-undo. ATTNPRE: ONE batched undo over all N queries
                     // (num_heads=N*nh; kernel base=head_idx*hd over tight [N, nh*hd] ⇒
                     // bit-identical). Else per-slot.
@@ -1955,7 +1844,6 @@ impl MlxModelWeights {
                 tag: "attn_output",
                 layer: layer_idx,
             },
-            self.body_policy(&self.layers[layer_idx].attn.o_proj),
         )?;
         cat_boundary(session, exec, catsplit::Cat::DenseO)?;
 
@@ -2041,7 +1929,6 @@ impl MlxModelWeights {
                 tag: "ffn_gate",
                 layer: layer_idx,
             },
-            self.body_policy(&self.layers[layer_idx].mlp.gate_proj),
         )?;
         dispatch_dense_rowident(
             session,
@@ -2057,7 +1944,6 @@ impl MlxModelWeights {
                 tag: "ffn_up",
                 layer: layer_idx,
             },
-            self.body_policy(&self.layers[layer_idx].mlp.up_proj),
         )?;
         // router_proj is F32 (ffn_gate_inp) → per-row m=1 (tile path not byte-identical).
         dispatch_dense_rowident(
@@ -2074,7 +1960,6 @@ impl MlxModelWeights {
                 tag: "ffn_gate_inp",
                 layer: layer_idx,
             },
-            None,
         )?;
         // catsplit: dense MLP gate + up + router projection.
         cat_boundary(session, exec, catsplit::Cat::DenseFfn)?;
@@ -2183,10 +2068,9 @@ impl MlxModelWeights {
             ],
         )?;
 
-        // -- B11: dense down: mlp_fused -> mlp_down. On the q4_k_m artifact
-        // down_proj is Q5_0/Q8_0 (intermediate=2112 is not 256-aligned) and
-        // takes the batched m=N `Mv` route like the other quantized dense
-        // projections; an F16/F32 down_proj loops per-row m=1. --
+        // -- B11: dense down: mlp_fused -> mlp_down. down_proj is F16
+        // (intermediate=2112 not 256-aligned) → per-row m=1 (tile path not
+        // byte-identical to the m=1 matvec). --
         session.barrier_between(
             &[
                 &bufs.mlp_fused,
@@ -2208,7 +2092,6 @@ impl MlxModelWeights {
                 tag: "ffn_down",
                 layer: layer_idx,
             },
-            self.body_policy(&self.layers[layer_idx].mlp.down_proj),
         )?;
         // catsplit: dense MLP down projection.
         cat_boundary(session, exec, catsplit::Cat::DenseFfn)?;
@@ -2230,10 +2113,14 @@ impl MlxModelWeights {
             .ok_or_else(|| {
                 anyhow::anyhow!("batched body requires fused _id MoE (stacked_down) L{layer_idx}")
             })?;
-        session.barrier_between(
-            &[&bufs.moe_norm_out, &bufs.moe_expert_ids, stacked_gate_up],
-            &[&bufs.moe_gate_up_id_out],
-        );
+        // ADR-063 Q4-GEMMA-DECODE F2 (`HF2Q_GEMMA_DECODE_KERNELS=1`): at
+        // N <= 4 with a Q4_K stack, one expert-grouped gate_up matvec with
+        // the GEGLU epilogue writes the `[N*top_k, moe_int]` activation the
+        // stock mv_id + moe_swiglu_batch pair below writes, bit for bit.
+        let f2 = self
+            .decode_kernels
+            .as_ref()
+            .is_some_and(|k| k.f2_gate_up_geglu(self.layers[layer_idx].moe.gate_up_ggml_dtype, n));
         let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
             n_tokens: nu,
             top_k: top_k as u32,
@@ -2243,44 +2130,68 @@ impl MlxModelWeights {
             expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
             ggml_type: self.layers[layer_idx].moe.gate_up_ggml_dtype,
         };
-        // ADR-040 Phase F `iter-F-moe-mvid`: force the per-token `mv_id` route
-        // (byte-identical to the serial slot-aware ref). At the batched decode
-        // width the down projection's `n_tokens = N*top_k` crosses the `mm_id`
-        // grouped-kernel threshold (>32, i.e. N≥5) whose reduction order is NOT
-        // bit-identical to serial — `slot_aware_n8_per_slot_parity_vs_serial`
-        // diverged on the routed entry point and is byte-identical on this one.
-        // `mm_id` is a prefill optimization + a measured regression at N≤8, so
-        // there is no decode-width cost. gate_up is mv at N≤4 anyway; pinning it
-        // keeps the whole MoE byte-identical for any future N.
-        crate::inference::expert_dispatch::dispatch_expert_matmul_id_mv(
-            session,
-            reg,
-            dev,
-            &bufs.moe_norm_out,
-            stacked_gate_up,
-            &bufs.moe_expert_ids,
-            &bufs.moe_gate_up_id_out,
-            &gu_params,
-            self.expert_policy(gu_params.ggml_type),
-        )
-        .map_err(|e| anyhow::anyhow!("batched gate_up _id L{layer_idx}: {e}"))?;
-        // catsplit: MoE gate_up `_id` (per-token mv_id) — the big expert read.
-        cat_boundary(session, exec, catsplit::Cat::MoeGateUp)?;
+        if f2 {
+            session.barrier_between(
+                &[&bufs.moe_norm_out, &bufs.moe_expert_ids, stacked_gate_up],
+                &[&bufs.moe_swiglu_id_out],
+            );
+            mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_mv_grouped_geglu_with_geometry(
+                session.encoder_mut(),
+                reg,
+                dev,
+                &bufs.moe_norm_out,
+                stacked_gate_up,
+                &bufs.moe_expert_ids,
+                &bufs.moe_swiglu_id_out,
+                &gu_params,
+                super::decode_kernels::F2_ROWS_PER_SIMDGROUP,
+            )
+            .map_err(|e| anyhow::anyhow!("batched F2 gate_up geglu L{layer_idx}: {e}"))?;
+            // catsplit: MoE gate_up `_id` (F2 fuses the activation).
+            cat_boundary(session, exec, catsplit::Cat::MoeGateUp)?;
+        } else {
+            session.barrier_between(
+                &[&bufs.moe_norm_out, &bufs.moe_expert_ids, stacked_gate_up],
+                &[&bufs.moe_gate_up_id_out],
+            );
+            // ADR-040 Phase F `iter-F-moe-mvid`: force the per-token `mv_id` route
+            // (byte-identical to the serial slot-aware ref). At the batched decode
+            // width the down projection's `n_tokens = N*top_k` crosses the `mm_id`
+            // grouped-kernel threshold (>32, i.e. N≥5) whose reduction order is NOT
+            // bit-identical to serial — `slot_aware_n8_per_slot_parity_vs_serial`
+            // diverged on the routed entry point and is byte-identical on this one.
+            // `mm_id` is a prefill optimization + a measured regression at N≤8, so
+            // there is no decode-width cost. gate_up is mv at N≤4 anyway; pinning it
+            // keeps the whole MoE byte-identical for any future N.
+            crate::inference::expert_dispatch::dispatch_expert_matmul_id_mv(
+                session,
+                reg,
+                dev,
+                &bufs.moe_norm_out,
+                stacked_gate_up,
+                &bufs.moe_expert_ids,
+                &bufs.moe_gate_up_id_out,
+                &gu_params,
+            )
+            .map_err(|e| anyhow::anyhow!("batched gate_up _id L{layer_idx}: {e}"))?;
+            // catsplit: MoE gate_up `_id` (per-token mv_id) — the big expert read.
+            cat_boundary(session, exec, catsplit::Cat::MoeGateUp)?;
 
-        // -- swiglu (BATCHED over N*top_k expert rows) --
-        session.barrier_between(&[&bufs.moe_gate_up_id_out], &[&bufs.moe_swiglu_id_out]);
-        mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
-            session.encoder_mut(),
-            reg,
-            metal_dev,
-            &bufs.moe_gate_up_id_out,
-            &bufs.moe_swiglu_id_out,
-            moe_int,
-            top_k * n,
-        )
-        .map_err(|e| anyhow::anyhow!("batched swiglu L{layer_idx}: {e}"))?;
-        // catsplit: MoE expert SwiGLU activation.
-        cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
+            // -- swiglu (BATCHED over N*top_k expert rows) --
+            session.barrier_between(&[&bufs.moe_gate_up_id_out], &[&bufs.moe_swiglu_id_out]);
+            mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
+                session.encoder_mut(),
+                reg,
+                metal_dev,
+                &bufs.moe_gate_up_id_out,
+                &bufs.moe_swiglu_id_out,
+                moe_int,
+                top_k * n,
+            )
+            .map_err(|e| anyhow::anyhow!("batched swiglu L{layer_idx}: {e}"))?;
+            // catsplit: MoE expert SwiGLU activation.
+            cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
+        }
 
         // -- down_id (BATCHED n_tokens=N*top_k) --
         session.barrier_between(
@@ -2307,7 +2218,6 @@ impl MlxModelWeights {
             &bufs.moe_expert_ids,
             &bufs.moe_down_id_out,
             &dn_params,
-            self.expert_policy(dn_params.ggml_type),
         )
         .map_err(|e| anyhow::anyhow!("batched down _id L{layer_idx}: {e}"))?;
         // catsplit: MoE down `_id` (per-token mv_id) — the second big expert read.

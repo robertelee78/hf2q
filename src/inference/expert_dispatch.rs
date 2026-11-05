@@ -9,8 +9,8 @@
 use anyhow::{Context, Result};
 use mlx_native::{
     DType, DenseMatmulIdInputLayout, DenseMatmulIdMultiplicity, DenseMatmulIdParams,
-    DenseMatmulIdRoute, GgmlQuantizedMatmulIdParams, GgmlRoutingPolicy, GgmlType, GraphSession,
-    KernelRegistry, MlxBuffer, MlxDevice,
+    DenseMatmulIdRoute, GgmlQuantizedMatmulIdParams, GgmlType, GraphSession, KernelRegistry,
+    MlxBuffer, MlxDevice,
 };
 
 fn scalar_dtype(ggml_type: GgmlType) -> Option<DType> {
@@ -98,10 +98,6 @@ pub(crate) fn dispatch_expert_matmul_id(
         .context("block-quantized expert-ID matmul")
 }
 
-/// Forced per-token `mv_id` expert dispatch. `policy` is `None` for the
-/// stock route (registry/environment policy); the Gemma batched body passes
-/// its adopted expert policy (ADR-063 Q4-GEMMA-DECODE) for block-quantized
-/// stacks. Scalar stacks ignore it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_expert_matmul_id_mv(
     session: &mut GraphSession<'_>,
@@ -112,7 +108,6 @@ pub(crate) fn dispatch_expert_matmul_id_mv(
     expert_ids: &MlxBuffer,
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
-    policy: Option<&GgmlRoutingPolicy>,
 ) -> Result<()> {
     if dispatch_scalar(
         session,
@@ -127,25 +122,9 @@ pub(crate) fn dispatch_expert_matmul_id_mv(
     )? {
         return Ok(());
     }
-    match policy {
-        None => session
-            .quantized_matmul_id_ggml_mv(registry, device, input, weight, expert_ids, output, params)
-            .context("block-quantized expert-ID matvec"),
-        Some(policy) => {
-            mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_mv_with_policy(
-                session.encoder_mut(),
-                registry,
-                device,
-                input,
-                weight,
-                expert_ids,
-                output,
-                params,
-                policy,
-            )
-            .context("block-quantized expert-ID matvec (explicit policy)")
-        }
-    }
+    session
+        .quantized_matmul_id_ggml_mv(registry, device, input, weight, expert_ids, output, params)
+        .context("block-quantized expert-ID matvec")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -290,7 +269,6 @@ mod tests {
             &ids,
             &output,
             &params,
-            None,
         )
         .unwrap();
         session.finish().unwrap();
