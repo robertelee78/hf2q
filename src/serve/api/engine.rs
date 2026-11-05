@@ -19235,7 +19235,8 @@ fn run_slot_aware_qwen35(
         .collect();
     let mut prompt_caches: Vec<PromptCache> = (0..n_slots).map(|_| PromptCache::new()).collect();
     let mut prompt_anchors: Vec<Option<Qwen35PromptAnchor>> = (0..n_slots).map(|_| None).collect();
-    let qwen_joint_decode = qwen35_joint_decode::qwen35_joint_decode_config(&guard.model.model);
+    let qwen_joint_decode =
+        qwen35_joint_decode::qwen35_joint_decode_config(&guard.model.model, n_slots);
     // ADR-063 D1: resolve the unset speculation default for this worker's
     // width, family and joint-decode selection; every admission, prefill
     // catch-up and history-lookup check reads the resolved policy.

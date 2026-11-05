@@ -72,6 +72,13 @@ impl Qwen35DecodeState {
         }
     }
 
+    /// Whether this slot's serial tick is the ordinary target forward: no
+    /// MTP state and no history lookup, so a one-lane joint step replaces
+    /// exactly that forward and suppresses no speculation (#717).
+    pub(in crate::serve::api) fn ordinary_target_only(&self) -> bool {
+        self.mtp.is_none() && self.history_lookup.is_none()
+    }
+
     /// Prepare the target input this slot's serial tick would feed. Mutates
     /// only what the serial tick mutates before its forward (the thinking
     /// budget's forced cursor on the ordinary path).
