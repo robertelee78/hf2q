@@ -363,10 +363,15 @@ pub(crate) fn invocation(owners: Vec<crate::serve::phase_trace::SlotState>) -> I
 }
 
 fn next_id() -> Option<u64> {
-    NEXT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-        value.checked_add(1)
-    })
-    .ok()
+    // Same loop as the deprecated `fetch_update`; `try_update` is newer than the MSRV.
+    let mut current = NEXT.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1)?;
+        match NEXT.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return Some(previous),
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// Fully observed native work with deliberately opaque logical membership.
