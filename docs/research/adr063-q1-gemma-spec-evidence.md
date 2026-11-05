@@ -46,6 +46,8 @@ Every number below is read from the cited file; sha256 values are of that file.
 
 Reviews are under `$C/gemma/reviews/b6/`, bindings under `$C/sup/`, policies under `$C/inputs/`. Every bindings file above has `final_approval` true and binds the composition and policy shown.
 
+**Reused review path.** The t5ord/t5ngram bindings `gemma-t5-b6-bindings.json` `f82df4fb…` bind `t5-acquisition-review.json` at sha `4f35312766e4b3608c7e42c86cdbf68c087124343e8b1bf00b2e9fdf31f71866`. That path now holds the v3 review `bc3f9292…`. The bound bytes survive unchanged as `t5-acquisition-review-composition-v2.json` (`4f353127…`). The copies in the two outs (`$C/gemma-{t5ord,t5ngram}-b6/acquisition-review.json`) were re-serialized and have sha `b53e66a2bb72643cb8025a53196191a7970af5ef8a9d16a206020b52701b08b7`.
+
 **Recompositions (ctime only).** The compositions went v1 → v2 → v3:
 - t0: v1 `e4bcc3ccd449e28e7bf6a366069685e549d3df88f340fe585ee464a5ad683061` → v2 `f32789c8…3385`;
 - t5: v1 `aa6db81beef1cd18262059a7e7056cc06bba14ad8059db358efed3bb3d6da123` → v2 `e569a44e…c218` → v3 `80289f53…c631`.
@@ -171,6 +173,8 @@ Every control has 0 differing, 0 left-only and 0 right-only. The pass-1 and pass
 | 3 | 1 | verify-committed / L0 / `Query` | 128, 129, 130 | 0.23175048828125 | 0.0010207942724838217 | 7.296700954437256 |
 
 The head rule does not fire on any lane. Each lane lists 26 unmapped records; the map review gives the reason: candidate row 131 and the Residual/DenseOutput/MoeOutput roles at 128..130, and reference Norm at decode 128..130.
+
+Query is the first comparable stage on this pair (the decode-only Norm has no verify twin), so the divergence is already present at layer 0's first mapped tensor; anything before the Q projection is not separately observable.
 
 **`router_id_changes` (layer 0):**
 - lane 0: row 130, order only (set unchanged). Reference `[46, 48, 22, 60, 0, 39, 1, 102]`, candidate `[46, 48, 22, 0, 60, 39, 1, 102]`, reference raw-logit gap 0.00778508186340332.
