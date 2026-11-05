@@ -110,13 +110,18 @@ impl Drop for Scope {
 pub(super) fn install(mut active: Active) -> Result<Scope> {
     ACTIVE.with(|s| {
         anyhow::ensure!(s.borrow().is_none(), "nested T5 scope");
-        let id = NEXT_SCOPE
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |n| n.checked_add(1),
-            )
-            .map_err(|_| anyhow::anyhow!("T5 scope ID overflow"))?;
+        // Same loop as the deprecated `fetch_update`; `try_update` is newer than the MSRV.
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut current = NEXT_SCOPE.load(Relaxed);
+        let id = loop {
+            let next = current
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("T5 scope ID overflow"))?;
+            match NEXT_SCOPE.compare_exchange_weak(current, next, Relaxed, Relaxed) {
+                Ok(previous) => break previous,
+                Err(actual) => current = actual,
+            }
+        };
         active.id = id;
         *s.borrow_mut() = Some(active);
         Ok(Scope {

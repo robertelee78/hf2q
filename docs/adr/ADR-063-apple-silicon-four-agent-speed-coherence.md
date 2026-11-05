@@ -1937,6 +1937,12 @@ exactness on `d817dffa`/`5504f4ee`, 0.15.16) stands as invariance evidence,
 because state-restore exactness does not depend on the `rope_multi`
 numerics.
 
+### Host toolchain (operator decision, 2026-11-05)
+
+rustc 1.99.1 from 2026-11-05 07:14Z for builds and the four-agent fixture
+compile; earlier receipts used 1.94.0; no cross-run transcript comparison
+mixes toolchains.
+
 ### Four-agent workload normalization (operator decision, 2026-11-05)
 
 The canonical four-agent workload did not send the same prompts in every
