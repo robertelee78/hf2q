@@ -380,6 +380,19 @@ This defect is in hf2q's compute path, not the artifact, and it applies to every
 `p + rope_dim/2`) belongs in mlx-native. R1 and the Q3 Qwen3.6 rows need re-measurement after it. The
 grammar newline is still worth a separate fix.
 
+**Fix verified (mlx-native 0.15.18, hf2q main `38eea839`).** The same 63 points and layer-3 dumps were
+re-run with a release build of `38eea839`. Peer and BF16 data are reused; evidence is in `summary.txt`,
+`compare-ropefix.json`, `lens-ropefix.json` and `layer3/stage-ropefix-*.json`.
+- **Layer 3.** Q and K after RoPE differ from the peer by 0.0011 and 0.0010 (were 0.60 and 0.54), the same
+  as before RoPE. The attention block output differs by 0.0038 (was 0.27).
+- **Every layer.** The last-token residual is within 1.0–1.6× of the peer's KV-precision noise: 0.0016 at
+  layer 3 and 0.056 at layer 39, against noise of 0.0012 and 0.054. Before the fix it was 0.082 and 0.32.
+- **Copy-over-fix preference relative to the peer.**
+  - Median +0.01 nat, positive at 32/63 (was +1.55, positive at 52/63).
+  - Median absolute difference 0.16 nat, against peer q8_0-vs-f16 noise of 0.17.
+  - The copy form is preferred at 26/63 points (peer 28/63, before the fix 43/63).
+- **Not yet re-run.** R1 waits on the tool-grammar newline fix.
+
 ### Draft ADR-063 amendment (DRAFT, pending the R1 defect diagnosis; the root lands the ADR edit)
 
 Do not land this text yet. R1 is an hf2q `Loss` on this workload. The localization above names the cause:
