@@ -21,18 +21,28 @@ LIBTEST = ("\nrunning 2 tests\ntest accepts_u16_ports ... ok\ntest rejects_inval
 MISMATCH = ("error[E0308]: mismatched types\n --> src/ports.rs:1:37\n  |\n"
             "1 | pub fn parse_port(s: &str) -> u16 { s.parse::<u32>().unwrap() }\n"
             "  |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u16`, found `u32`\n\n")
+# libtest with one failing test; Rust >= 1.91 prints the panicking thread's OS id.
+FAILING = ("\nrunning 2 tests\ntest accepts_u16_ports ... ok\ntest rejects_invalid_ports ... FAILED\n\n"
+           "failures:\n\n---- rejects_invalid_ports stdout ----\n\n"
+           "thread 'rejects_invalid_ports' ({thread}) panicked at tests/ports.rs:5:9:\nmust reject 0\n"
+           "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\n"
+           "failures:\n    rejects_invalid_ports\n\n"
+           "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in {test}\n\n")
 
 
 class FakeCargo:
     """Scripted `child.run`: one cargo compile, then one run of each test artifact it reported."""
 
-    def __init__(self, tools, finished, test, compile_error=False):
+    def __init__(self, tools, finished, test, compile_error=False, thread=None):
         self.tools, self.finished, self.test, self.compile_error = tools, finished, test, compile_error
+        self.thread = thread
 
     def __call__(self, argv, cwd, env, sandbox, sbpl, output, target, **_):
         receipt = {"exit_code": 0, "cleanup": True}
         fixture = self.tools.fixture
         if argv[0] != str(self.tools.cargo):
+            if self.thread is not None:
+                return dict(receipt, exit_code=101), FAILING.format(thread=self.thread, test=self.test).encode(), b""
             return receipt, LIBTEST.format(test=self.test).encode(), b""
         if self.compile_error:
             stderr = (f"   Compiling qwen38_n1_fixture v0.0.0 ({fixture})\n"
@@ -122,6 +132,24 @@ class RunTestsNormalization(unittest.TestCase):
                 "status": "Failed", "error": "Invalid: tool arguments/workflow drift", "tools": [receipt]}}}))
             self.assertEqual(q3_report.failure_detail({"attempts": [{"output": directory}]}),
                              "agent-3: run_tests ports failed with E0308, then Invalid: tool arguments/workflow drift")
+
+    def test_failing_test_thread_ids_give_byte_identical_model_visible_output(self):
+        a = self.owned("011-b06-on-20261105T033737Z", "agent-1")
+        b = self.owned("012-b06-off-20261105T033800Z", "agent-1")
+        result_a, receipt_a = self.run_tests(a, finished="0.15s", test="0.00s", thread=37675355)
+        result_b, receipt_b = self.run_tests(b, finished="0.18s", test="0.01s", thread=38443326)
+        self.assertEqual(result_a.encode(), result_b.encode())
+        detail = json.loads(result_a)
+        self.assertIs(detail["passed"], False)
+        # Test name, location and assert message reach the model; only the OS thread id is dropped.
+        self.assertIn("thread 'rejects_invalid_ports' panicked at tests/ports.rs:5:9:\nmust reject 0\n", detail["output"])
+        self.assertIn("test rejects_invalid_ports ... FAILED\n", detail["output"])
+        self.assertIn("test result: FAILED. 1 passed; 1 failed;", detail["output"])
+        self.assertIn("thread 'rejects_invalid_ports' (37675355) panicked at", receipt_a["raw_output"])
+        self.assertIn("thread 'rejects_invalid_ports' (38443326) panicked at", receipt_b["raw_output"])
+        self.assertEqual(model_visible("thread 'main' (1234) has overflowed its stack\n", []),
+                         "thread 'main' has overflowed its stack\n")
+        self.assertEqual(model_visible("a thread 'x' (12) panicked at text\n", []), "a thread 'x' (12) panicked at text\n")
 
     def test_longest_prefix_first_and_durations(self):
         roots = [("/private/tmp/run/tools", OWNED_ROOT), ("/tmp/run/tools", OWNED_ROOT)]

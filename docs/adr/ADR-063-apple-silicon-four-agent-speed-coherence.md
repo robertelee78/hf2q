@@ -1913,7 +1913,8 @@ The cause was the input, not prefill route numerics or state corruption.
 Decision (operator, 2026-11-05): from the ADR-065 B1 (#503) baseline run on,
 the model sees a run-invariant `run_tests` result. `qwen38_n1_tools.py`
 replaces the owned tool root with `/owned` and the cargo working directory
-with `/cargo-cwd`, and sets every cargo and libtest duration to `0.00s`. The
+with `/cargo-cwd`, sets every cargo and libtest duration to `0.00s` and drops
+the OS thread id from failing-test panic lines (Rust ≥ 1.91). The
 tool receipt keeps the verbatim output as `raw_output`, and error codes and
 the libtest result marker are unchanged. `read_file` returns fixture bytes
 and `write_file` a content digest, so neither changes. Results recorded

@@ -15,13 +15,16 @@ import qwen38_n1_process as child
 # model with the fixture's absolute path (run directory, agent id) and cargo/libtest wall-clock durations, so
 # the same four-agent workload sent different prompts in every run (G-S2 run 011: a Gemma lane flipped
 # src/ports.rs to src/ports.py on those digits alone). The model sees the output with each run-specific prefix
-# replaced by a fixed stand-in and every duration replaced by 0.00s; the receipt keeps it verbatim as
-# `raw_output`. read_file returns fixture bytes and write_file a content digest, so neither needs this.
+# replaced by a fixed stand-in, every duration replaced by 0.00s and the OS thread id dropped from panic lines;
+# the receipt keeps it verbatim as `raw_output`. read_file returns fixture bytes and write_file a content digest,
+# so neither needs this.
 OWNED_ROOT = "/owned"
 CARGO_CWD = "/cargo-cwd"
 # cargo `Finished ... in 0.15s` / `in 1m 05s`, libtest `; finished in 0.00s`.
 CARGO_ELAPSED = re.compile(r"(?m)^(\s*Finished\b.* in )(?:\d+m \d+s|\d+(?:\.\d+)?s)$")
 TEST_ELAPSED = re.compile(r"(?m)^(test result: .*; finished in )\d+(?:\.\d+)?s$")
+# Rust >= 1.91 panic lines carry the per-run OS thread id: `thread 'name' (37675355) panicked at f:l:c:`.
+THREAD_ID = re.compile(r"(?m)^(thread '[^'\n]*') \(\d+\)(?= panicked at | has overflowed its stack)")
 
 
 def model_visible(raw, roots):
@@ -29,7 +32,8 @@ def model_visible(raw, roots):
     for prefix, stand_in in roots:
         raw = raw.replace(prefix, stand_in)
     raw = CARGO_ELAPSED.sub(r"\g<1>0.00s", raw)
-    return TEST_ELAPSED.sub(r"\g<1>0.00s", raw)
+    raw = TEST_ELAPSED.sub(r"\g<1>0.00s", raw)
+    return THREAD_ID.sub(r"\g<1>", raw)
 
 
 MANIFEST = '[package]\nname = "qwen38_n1_fixture"\nversion = "0.0.0"\nedition = "2021"\n'

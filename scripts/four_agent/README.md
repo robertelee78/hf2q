@@ -626,9 +626,10 @@ The model sees the same tool results in every run. `Tools.tests` (`qwen38_n1_too
 
 - the owned tool root (`<output>/agent-N/tools`: the run directory and agent id) becomes `/owned`, so the fixture reads as `/owned/fixture`;
 - the cargo working directory (`/private/tmp/hf2q-n1-cargo-*`) becomes `/cargo-cwd`;
-- cargo's `Finished … in <duration>` and libtest's `; finished in <duration>` become `0.00s`.
+- cargo's `Finished … in <duration>` and libtest's `; finished in <duration>` become `0.00s`;
+- a panic line's OS thread id (Rust ≥ 1.91: `thread 'name' (37675355) panicked at …`) is dropped, keeping the test name, location and message.
 
-The tool receipt keeps the verbatim output as `raw_output`. Its `result` is what the model saw, and audits that rebuild transcripts from receipts read that field. Compiler error codes, rendered diagnostics and the libtest `test result:` marker are unchanged. `read_file` returns the fixture bytes and `write_file` a content digest, so neither needs normalizing. Runs recorded before the change keep their raw tool results. Compare transcripts across runs (ExactTranscripts, G-S2, B1) only between runs on the same side of the change. `test_qwen38_n1_tools.py` covers both cases model-free: two run directories with different timings give byte-identical model-visible results, and error codes and test-pass parsing read as before.
+The tool receipt keeps the verbatim output as `raw_output`. Its `result` is what the model saw, and audits that rebuild transcripts from receipts read that field. Compiler error codes, rendered diagnostics and the libtest `test result:` marker are unchanged. `read_file` returns the fixture bytes and `write_file` a content digest, so neither needs normalizing. Tool-call ids stay as each engine assigns them. The hf2q and peer GGUF templates (Qwen3.8, Qwen3.6, Gemma 4, DeepSeek-V4), ds4's own renderer and the oMLX Gemma adapter only use the id to match a result to its call; none prints it into the prompt. Runs recorded before the change keep their raw tool results. Compare transcripts across runs (ExactTranscripts, G-S2, B1) only between runs on the same side of the change. `test_qwen38_n1_tools.py` covers this model-free: two run directories with different timings, and failing tests with different panic thread ids, give byte-identical model-visible results, and error codes and test-pass parsing read as before.
 
 ## Long-context workload (ADR-063 D2, #365)
 
