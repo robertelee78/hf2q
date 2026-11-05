@@ -112,6 +112,7 @@ def validate(case):
     for name in referenced(case):
         require(name in BUILTINS + RUNTIME + DERIVED or name in variables, f'undeclared placeholder {{{name}}}')
     repair_turns(case)
+    request_setup(case)
     return case
 
 
@@ -132,6 +133,20 @@ def repair_turns(case):
     require(value == '1' and granted == 1, 'client --repair-turns 1 must equal approval.set.repair_turns 1')
     require(case['family'] in REPAIR_FAMILIES, 'repair turns are granted to ' + ','.join(REPAIR_FAMILIES) + ' only')
     return 1
+
+
+def request_setup(case):
+    """The case's request setup: client `--request-setup NAME` equal to approval.set.request_setup, else None."""
+    argv, approval = case['client']['argv'], case['client'].get('approval') or {}
+    granted = (approval.get('set') or {}).get('request_setup')
+    if '--request-setup' not in argv:
+        require(granted is None, 'approval request_setup without client --request-setup')
+        return None
+    require(argv.count('--request-setup') == 1 and argv.index('--request-setup') + 1 < len(argv),
+            'client --request-setup needs one value')
+    value = argv[argv.index('--request-setup') + 1]
+    require(value == granted, 'client --request-setup must equal approval.set.request_setup')
+    return value
 
 
 def _positive(value):

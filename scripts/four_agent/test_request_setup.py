@@ -130,6 +130,38 @@ class Cases(unittest.TestCase):
     def load(self, name):
         return q5_case.loads((HERE / "q5_cases" / name).read_bytes())
 
+    def test_the_case_setup_is_bound_to_its_approval(self):
+        case = self.load("qwen36-vendor.json")
+        self.assertEqual(q5_case.request_setup(case), SETUP)
+        self.assertIsNone(q5_case.request_setup(self.load("qwen36.json")))
+        mutations = {"argv without approval": lambda c: c["client"]["approval"]["set"].pop("request_setup"),
+                     "approval without argv": lambda c: c["client"]["argv"].__delitem__(slice(-2, None)),
+                     "different name": lambda c: c["client"]["argv"].__setitem__(-1, "other-setup"),
+                     "twice": lambda c: c["client"]["argv"].extend(["--request-setup", SETUP])}
+        for label, mutate in mutations.items():
+            bad = json.loads(json.dumps(case))
+            mutate(bad)
+            with self.subTest(label), self.assertRaises(q5_case.CaseError):
+                q5_case.validate(bad)
+
+    def test_paired_campaign_refuses_arms_with_different_setups(self):
+        def plan(subject, reference):
+            return qc.build_plan(qc.parse_args(["--subject-case", str(HERE / "q5_cases" / subject), "--reference-case",
+                                                str(HERE / "q5_cases" / reference), "--reference-kind", "peer",
+                                                "--dry-run"]), {})
+        for subject, reference in (("qwen36-vendor.json", "peer-qwen36.json"), ("qwen36.json", "peer-qwen36-vendor.json")):
+            with self.subTest(subject=subject), self.assertRaisesRegex(qc.CampaignError, "same request setup"):
+                plan(subject, reference)
+        arms, _ = plan("qwen36-vendor.json", "peer-qwen36-vendor.json")
+        self.assertEqual(arms["arms"]["reference"]["engine_kind"], "peer")
+
+    def test_q3_campaign_refuses_arms_with_different_setups(self):
+        import q3_campaign as q3
+        argv = ["--dry-run", "--family", "qwen36", "--hf2q-case", str(HERE / "q5_cases" / "qwen36-vendor.json"),
+                "--peer-case", str(HERE / "q5_cases" / "peer-qwen36.json")]
+        with self.assertRaisesRegex(q3.qc.CampaignError, "same request setup.*experiment=qwen36-vendor-coding-v1"):
+            q3.build_plan(q3.parse_args(argv), {}, "qwen36")
+
     def test_vendor_cases_differ_from_their_bases_only_in_setup_fields(self):
         for name, base in (("qwen36-vendor.json", "qwen36.json"), ("peer-qwen36-vendor.json", "peer-qwen36.json")):
             case, original = self.load(name), self.load(base)

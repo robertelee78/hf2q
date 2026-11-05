@@ -396,7 +396,7 @@ re-run with a release build of `38eea839`. Peer and BF16 data are reused; eviden
 - **Setup.** The frozen R1 design (24 instances, same instance table, case files, GGUF `815a22ca…`, peer arm,
   sampling). The one change is the hf2q binary: origin/main `4bfb0436`, which includes the RoPE fix (mlx-native
   0.15.18), the tool-call newline fix (#686) and #704, merged with this branch's harness as `d7efa085`.
-- **Toolchain.** rustc 1.99.1, sha256 `946db5e7…`, cargo 1.99.1 sandbox proof `4b2bea77…`.
+- **Toolchain.** hf2q binary sha256 `946db5e7…` (built with rustc 1.99.1 and cargo 1.99.1), sandbox proof `4b2bea77…`.
 - **Plan.** Plan sha256 `e0936e91…`. It differs from the first R1 plan only in the binary, the proof and two
   harness source hashes. Campaign directory: `campaigns/quality-qwen36-repair1-ours-20261105T183923Z`, wall
   time 42 min.
