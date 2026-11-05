@@ -9,6 +9,17 @@ SAME_ARTIFACT_KINDS = ('splash',)
 # Every engine kind whose client protocol is an adapter module (native_peers.adapter).
 ADAPTER_KINDS = NATIVE_KINDS + SAME_ARTIFACT_KINDS
 ENGINE_KINDS = ('hf2q', 'peer') + ADAPTER_KINDS
+# Engine kinds that may run the Qwen3.6 repair-turn workload (ADR-063 Q4-QWEN36; Splash, the same-artifact Qwen peer
+# of record, by design decision D9). Splash also serves Qwen3.8, so its grant needs family_controls.q3_family qwen36.
+REPAIR_KINDS = ('hf2q', 'peer', 'splash')
+
+
+def repair_allowed(family, engine_kind, family_controls):
+    """Whether a client run may carry repair turns (the N4 and benchmark-profile rules stay with the caller)."""
+    if family != 'qwen' or engine_kind not in REPAIR_KINDS:
+        return False
+    return engine_kind != 'splash' or (isinstance(family_controls, dict)
+                                       and family_controls.get('q3_family') == 'qwen36')
 
 
 def validate_selection(family, engine_kind, slots):

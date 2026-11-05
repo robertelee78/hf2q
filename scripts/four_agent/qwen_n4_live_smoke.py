@@ -422,8 +422,9 @@ def main():
         require(packet.get("repair_turns") == (args.repair_turns or None)
                 and "repair_turns" not in packet.get("agent_template", {}), "repair-turn approval binding")
         if args.repair_turns:
-            require(args.family == "qwen" and args.engine_kind in ("hf2q", "peer") and args.benchmark_profile is None,
-                    "repair turns are Qwen hf2q/peer runs without a benchmark profile")
+            require(family_contract.repair_allowed(args.family, args.engine_kind, packet.get("family_controls"))
+                    and args.benchmark_profile is None,
+                    "repair turns are Qwen hf2q/peer/Splash-qwen36 runs without a benchmark profile")
             summary["repair_turns"] = args.repair_turns
         native = None
         if args.engine_kind in family_contract.ADAPTER_KINDS:  # the arm's registry, client modules and test

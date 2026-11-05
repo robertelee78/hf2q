@@ -208,7 +208,8 @@ class Cases(unittest.TestCase):
         return q5_case.loads((CASES / name).read_bytes())
 
     def test_repair_cases_differ_from_their_bases_only_in_the_grant(self):
-        for name, base in (("qwen36-repair1.json", "qwen36.json"), ("peer-qwen36-repair1.json", "peer-qwen36.json")):
+        for name, base in (("qwen36-repair1.json", "qwen36.json"), ("peer-qwen36-repair1.json", "peer-qwen36.json"),
+                           ("splash-qwen36-repair1.json", "splash-qwen36.json")):
             case, original = self.load(name), self.load(base)
             self.assertEqual(q5_case.repair_turns(case), 1)
             self.assertEqual(q5_case.repair_turns(original), 0)
@@ -225,7 +226,11 @@ class Cases(unittest.TestCase):
             self.assertEqual(derived["client"]["approval"]["set"]["repair_turns"], 1)
 
     def test_the_grant_is_qwen36_only_and_bound(self):
-        case = self.load("qwen36-repair1.json")
+        for name in ("qwen36-repair1.json", "splash-qwen36-repair1.json"):
+            with self.subTest(name):
+                self.refuses_mutated_grants(self.load(name))
+
+    def refuses_mutated_grants(self, case):
         mutations = {"other family": lambda c: c.update(family="qwen38"),
                      "argv without approval": lambda c: c["client"]["approval"]["set"].pop("repair_turns"),
                      "approval without argv": lambda c: c["client"]["argv"].__delitem__(slice(-2, None)),
@@ -237,6 +242,32 @@ class Cases(unittest.TestCase):
             mutate(bad)
             with self.subTest(label), self.assertRaises(q5_case.CaseError):
                 q5_case.validate(bad)
+
+    def test_the_client_admits_splash_for_qwen36_only(self):
+        import coding_family
+        import native_peer_splash as splash
+        config = splash.config_text(splash.DEFAULT_KNOBS)
+        qwen36, qwen38 = splash.controls("qwen36", config), splash.controls("qwen38", config)
+        allowed = coding_family.repair_allowed
+        self.assertTrue(allowed("qwen", "hf2q", None) and allowed("qwen", "peer", None))
+        self.assertTrue(allowed("qwen", "splash", qwen36))
+        self.assertFalse(allowed("qwen", "splash", qwen38))
+        self.assertFalse(allowed("qwen", "splash", None))
+        for kind in coding_family.NATIVE_KINDS:  # ds4, tensorfold, omlx
+            self.assertFalse(allowed("qwen", kind, qwen36), kind)
+        for family in ("deepseek4", "gemma4"):
+            for kind in coding_family.ENGINE_KINDS:
+                self.assertFalse(allowed(family, kind, qwen36), (family, kind))
+
+    def test_a_splash_repair_campaign_needs_the_same_grant(self):
+        mixed = qc.parse_args(["--subject-case", str(CASES / "qwen36-repair1.json"), "--reference-case",
+                               str(CASES / "splash-qwen36.json"), "--reference-kind", "splash", "--dry-run"])
+        with self.assertRaisesRegex(qc.CampaignError, "same repair turns"):
+            qc.build_plan(mixed, {})
+        same = qc.parse_args(["--subject-case", str(CASES / "qwen36-repair1.json"), "--reference-case",
+                              str(CASES / "splash-qwen36-repair1.json"), "--reference-kind", "splash", "--dry-run"])
+        plan, _ = qc.build_plan(same, {})
+        self.assertEqual(plan["arms"]["subject"]["family"], "qwen36")
 
     def test_paired_campaign_refuses_arms_with_different_grants(self):
         mixed = qc.parse_args(["--subject-case", str(CASES / "qwen36-repair1.json"), "--reference-case",
@@ -252,47 +283,56 @@ class Cases(unittest.TestCase):
 class RunAudit(unittest.TestCase):
     """Raw-evidence replay over real loopback HTTP: the actual exchange, Workflow, aggregate and Q2 audit."""
 
-    def run_dir(self, **options):
+    def run_dir(self, engine_kind="hf2q", **options):
         import q2_fake_service as fake
         root = Path(tempfile.mkdtemp(prefix="q36-repair-audit-"))
         self.addCleanup(shutil.rmtree, root)
         client = root / "client"
-        return client, fake.honest_run(client, 100.0, "hf2q", **options)
+        return client, fake.honest_run(client, 100.0, engine_kind, **options)
 
     def test_a_repaired_run_re_derives_its_pass(self):
         import q2_run_audit as audit
-        client, summary = self.run_dir(repair_turns=1, instance=3)
-        self.assertEqual(summary["status"], "FourAgentProtocolCompleteAwaitingIndependentReview")
-        self.assertEqual(summary["repair_turns"], 1)
-        for agent in AGENTS:
-            result = summary["agents"][agent]
-            self.assertEqual([t["name"] for t in result["tools"]],
-                             ["read_file", "read_file", "write_file", "run_tests", "write_file", "run_tests",
-                              "read_file", "run_tests"])
-            self.assertEqual(len(result["turns"]), 9)
-        report = audit.audit_run(client, summary, None, "hf2q", True)
-        self.assertEqual(report["expected_width"], 4)
+        for kind in ("hf2q", "splash"):
+            with self.subTest(kind):
+                client, summary = self.run_dir(kind, repair_turns=1, instance=3)
+                self.assertEqual(summary["status"], "FourAgentProtocolCompleteAwaitingIndependentReview")
+                self.assertEqual(summary["repair_turns"], 1)
+                for agent in AGENTS:
+                    result = summary["agents"][agent]
+                    self.assertEqual([t["name"] for t in result["tools"]],
+                                     ["read_file", "read_file", "write_file", "run_tests", "write_file", "run_tests",
+                                      "read_file", "run_tests"])
+                    self.assertEqual(len(result["turns"]), 9)
+                report = audit.audit_run(client, summary, None, kind, True)
+                self.assertEqual(report["expected_width"], 4)
+                if kind == "splash":  # every repaired request bound to a Splash Done line and its render proof
+                    self.assertEqual(report["native_trace"]["requests"], 36)
 
     def test_the_audit_refuses_a_repaired_run_relabelled_canonical(self):
         import q2_run_audit as audit
-        client, summary = self.run_dir(repair_turns=1)
-        stripped = json.loads(json.dumps(summary))
-        stripped.pop("repair_turns")
-        for result in stripped["agents"].values():
-            result.pop("repair_turns")
-        with self.assertRaises(Invalid):
-            audit.audit_run(client, stripped, None, "hf2q", True)
-        relabelled = json.loads(json.dumps(summary))
-        relabelled.pop("repair_turns")
-        with self.assertRaises(Invalid):
-            audit.audit_run(client, relabelled, None, "hf2q", True)
+        for kind in ("hf2q", "splash"):
+            with self.subTest(kind):
+                client, summary = self.run_dir(kind, repair_turns=1)
+                stripped = json.loads(json.dumps(summary))
+                stripped.pop("repair_turns")
+                for result in stripped["agents"].values():
+                    result.pop("repair_turns")
+                with self.assertRaises(Invalid):
+                    audit.audit_run(client, stripped, None, kind, True)
+                relabelled = json.loads(json.dumps(summary))
+                relabelled.pop("repair_turns")
+                with self.assertRaises(Invalid):
+                    audit.audit_run(client, relabelled, None, kind, True)
 
     def test_canonical_runs_are_unchanged(self):
         import q2_run_audit as audit
-        client, summary = self.run_dir()
-        self.assertNotIn("repair_turns", summary)
-        self.assertTrue(all("repair_turns" not in r and len(r["turns"]) == 7 for r in summary["agents"].values()))
-        audit.audit_run(client, summary, None, "hf2q", True)
+        for kind in ("hf2q", "splash"):
+            with self.subTest(kind):
+                client, summary = self.run_dir(kind)
+                self.assertNotIn("repair_turns", summary)
+                self.assertTrue(all("repair_turns" not in r and len(r["turns"]) == 7
+                                    for r in summary["agents"].values()))
+                audit.audit_run(client, summary, None, kind, True)
 
 
 if __name__ == "__main__":
