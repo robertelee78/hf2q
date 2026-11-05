@@ -523,6 +523,115 @@ fn gemma_joint_cold_prefill_deterministic() {
     );
 }
 
+/// G-S1 per-slot arm: the four serial admissions' GPU work (reset, the
+/// `prefill_seed` boundary forward, anchor and cue, cursor commit).
+fn time_per_slot(
+    guard: &mut Gemma4KvGuard<'_>,
+    supervisor: &EngineSupervisor,
+    lanes: &[Shape],
+) -> f64 {
+    let started = Instant::now();
+    for (slot, (prompt, boundary)) in lanes.iter().enumerate() {
+        reset_slot(guard, slot);
+        clear_gemma4_self_mounts(guard.model);
+        let seed = Gemma4DecodeState::prefill_seed(
+            guard.model,
+            prompt,
+            &[],
+            &params(*boundary),
+            None,
+            SlotId(slot as u32),
+            &mut guard.kv,
+            guard.hybrid.as_mut(),
+            guard.dense.as_mut(),
+            guard.mlx.as_mut(),
+            supervisor,
+            0,
+        )
+        .unwrap();
+        clear_gemma4_self_mounts(guard.model);
+        commit_gemma4_slot_cursor(guard, SlotId(slot as u32), 0, prompt.len()).unwrap();
+        drop(seed);
+    }
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
+/// G-S1 cohort arm: reset, Phase B, anchors, Phase C, commit. Returns
+/// `(total, boundary, anchors, cue)` milliseconds.
+fn time_cohort(
+    guard: &mut Gemma4KvGuard<'_>,
+    supervisor: &EngineSupervisor,
+    lanes: &[Shape],
+) -> (f64, f64, f64, f64) {
+    let mut lanes = gate_lanes(lanes);
+    let started = Instant::now();
+    for slot in 0..lanes.len() {
+        reset_slot(guard, slot);
+    }
+    clear_gemma4_self_mounts(guard.model);
+    cohort::boundary_forward(guard, supervisor, &lanes).unwrap();
+    let boundary = started.elapsed();
+    for lane in &mut lanes {
+        lane.anchor = cohort::capture_boundary_anchor(guard, lane).unwrap();
+    }
+    let anchors = started.elapsed();
+    cohort::encode_cues(guard, supervisor, &mut lanes).unwrap();
+    clear_gemma4_self_mounts(guard.model);
+    let commits: Vec<_> = lanes
+        .iter()
+        .map(|lane| (lane.handle.slot_id, 0, lane.shape.prompt_len))
+        .collect();
+    commit_gemma4_slot_cursors(guard, &commits).unwrap();
+    let total = started.elapsed();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    (
+        ms(total),
+        ms(boundary),
+        ms(anchors - boundary),
+        ms(total - anchors),
+    )
+}
+
+/// G-S1 (design §7.1): turn-0 transaction, cohort against the per-slot sum,
+/// 10 + 10 repeats in ABBA order after one untimed warm-up of each arm.
+/// Diagnostic gate: cohort median ≤ 0.80 × per-slot median.
+#[test]
+#[ignore = "official Gemma 4 GGUF: G-S1 cold cohort transaction timing (GPU lane, quiet host)"]
+fn gemma_joint_cold_gs1_transaction_timing() {
+    let mut loaded = load_gate_model();
+    let mut guard = gate_guard(&mut loaded);
+    let supervisor = EngineSupervisor::new();
+    let (lanes, source) = turn0(guard.model.weights.vocab_size);
+    time_per_slot(&mut guard, &supervisor, &lanes);
+    time_cohort(&mut guard, &supervisor, &lanes);
+    let (mut serial, mut joint) = (Vec::new(), Vec::new());
+    for block in 0..5 {
+        for arm in [0, 1, 1, 0] {
+            if arm == 0 {
+                let ms = time_per_slot(&mut guard, &supervisor, &lanes);
+                println!("GEMMA_COLD_GS1_RECORD {{\"block\":{block},\"arm\":\"per_slot\",\"ms\":{ms:.4}}}");
+                serial.push(ms);
+            } else {
+                let (ms, b, a, c) = time_cohort(&mut guard, &supervisor, &lanes);
+                println!(
+                    "GEMMA_COLD_GS1_RECORD {{\"block\":{block},\"arm\":\"cohort\",\"ms\":{ms:.4},\"boundary_ms\":{b:.4},\"anchor_ms\":{a:.4},\"cue_ms\":{c:.4}}}"
+                );
+                joint.push(ms);
+            }
+        }
+    }
+    let median = |values: &mut Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        (values[values.len() / 2 - 1] + values[values.len() / 2]) / 2.0
+    };
+    let (serial_ms, joint_ms) = (median(&mut serial), median(&mut joint));
+    let ratio = joint_ms / serial_ms;
+    println!(
+        "GEMMA_COLD_GS1_SUMMARY turn0_source={source} per_slot_median_ms={serial_ms:.2} cohort_median_ms={joint_ms:.2} ratio={ratio:.4} bound=0.80 verdict={}",
+        if ratio <= 0.80 { "pass" } else { "fail" }
+    );
+}
+
 /// Per-slot cold prefill of whole prompts (no boundary): the
 /// `forward_prefill_with_soft_tokens_slot_aware` reference.
 fn cold_per_slot(guard: &mut Gemma4KvGuard<'_>, prompts: &[Vec<u32>]) -> Vec<LaneImage> {
