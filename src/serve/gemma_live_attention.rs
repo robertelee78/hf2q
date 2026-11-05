@@ -1176,4 +1176,12 @@ mod tests {
         assert_eq!(stage_history_len(2_005, 1_024), 1_023);
         assert_eq!(stage_history_len(0, 0), 0);
     }
+
+    #[test]
+    fn gemma_live_kernel_wire_names_are_the_variant_names() {
+        // `/hf2q/v1/runtime` and the Q5 readiness check use the variant names.
+        for kernel in [TiledF16, VecHybrid] {
+            assert_eq!(kernel.wire_name(), format!("{kernel:?}"));
+        }
+    }
 }
