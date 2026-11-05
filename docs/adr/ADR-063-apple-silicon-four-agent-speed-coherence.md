@@ -924,6 +924,40 @@ Priority: High. Core scope (second-tier family).
 
 Delivery boundary: hf2q pinned to the release containing #89, with the promotion commit merged to main for v0.1.30, or the recorded failure of the exactness or speed rule.
 
+### Q4-GEMMA-LMHEAD-MMA. Run the Gemma 4 lm head through a few-row MMA kernel (Class B)
+
+Outcome: The Gemma 4 lm head (Q6_K, 2816 → 262,144) at decode widths 2..8 costs about weight-streaming time instead of growing per column. Batched decode stays bitwise equal to serial decode at every width.
+
+Requirement: mlx-native MUST provide a few-row MMA Q6_K head kernel whose output for each column is bitwise independent of the other columns and of the width. The program MUST route both the serial and the batched Gemma decode head through it behind a kill switch, and MUST pass the Q1 Class B gates against stock before promotion.
+
+Acceptance:
+
+- Starting point (Q4-GEMMA-DECODE M0, mlx-native `718e811`, cold weights): stock head 1,088 / 2,152 / 4,306 µs at widths 1 / 4 / 8; the peer's MMA `MUL_MAT` 1,062 / 1,181 / 1,208 µs (M0-P, `e86f5fd1`). The exact alternative (Q4-GEMMA-DECODE D1) was 1.6× slower and was dropped. The V2 workload has 403 of 471 decode steps at width 4: about 0.40 s of decode GPU per run [INFERENCE].
+
+- Design approved before implementation: `docs/research/adr063-q4-gemma-lmhead-mma-design.md` (§3 contract, §5 spike rule, §6 gates). The story was opened by the operator on 2026-11-05 under Q4-GEMMA-DECODE design §13 decision 2(b). The MMA reorders each logit's accumulation the way the peer does; its output stays within rounding of today's. The Class B gates are the program's standing nothing-broke checks for a reordered route, not a claim about distance from the peer.
+
+- Class A invariants, bitwise: determinism; column independence and width invariance (m = 1..8, every tiling, NaN/∞ neighbours); views and row tails; batched ≡ serial per slot under the switch (ADR-040 S2/S3 slot-aware tests unchanged, plus a new ≥ 256-step batched-versus-serial MMA test). Both metallib paths, toolchain recorded.
+
+- Spike rule, model-free, before integration: MMA ≤ 0.70 × stock at width 4 and no width 1..8 more than 2% slower. A miss stops the story and the code is removed.
+
+- Class B gates against stock:
+  - Q1 decision envelope on the greedy144 T2 cohort trace, τ = 0.25 nat, every row, element-wise error recorded and not gated.
+  - Paired quality campaign against stock hf2q: 24 instances, `q1_decision_policy.py paired` = `Pass`, no reruns.
+
+- Speed: lm-head GPU per step ≤ 0.70 × the kill switch at N = 4 and ≤ 1.01 at N = 1 (M1, head in its own command buffer). Four-agent Q5 A/B (ABBA, ≥ 4 runs per arm): median makespan ratio ≤ 0.98 with block-paired 95% CI upper below 1.00. Worst-slot TTFT p95 and SSE-gap max ratios ≤ 1.025.
+
+- Switch `HF2Q_GEMMA_LMHEAD_MMA` (`0` default kill switch, `1`, anything else a startup error), independent of `HF2Q_GEMMA_DECODE_KERNELS`. The default flips only after every gate passes; the Gemma verdict is then decided on the combined candidate in the Q4 closing campaign. If not promoted, the code is removed.
+
+Repository ownership: mlx-native owns the kernel, its invariance tests, the error record, the microbenchmark and the release. hf2q owns the switch, the serial and batched head routing, the Class A and Class B gates and the campaigns, consuming an exact published mlx-native pin.
+
+Validation: Independent review of the design, the spike receipts (invariance, error record, M0 cells), the envelope and paired-quality receipts, and the A/B from raw receipts.
+
+Predecessors: Q4-GEMMA-DECODE (M0 and M0-P results), Q1 (numeric policy and paired-quality tooling), Q5 (#371), the four-agent harness normalisation and the cargo-1.99 sandbox proof (2026-11-05).
+
+Priority: High. Core scope (second-tier family).
+
+Delivery boundary: A published mlx-native release pinned exactly by hf2q, plus the integration and promotion merged for v0.1.30, or the recorded failure of the spike rule or a gate.
+
 ### Q4-DS4. Run the peer on the ds4 DeepSeek-V4 file and determine fit
 
 Outcome: Whether the same-GGUF peer can run ds4's DeepSeek-V4 file on the 128 GB host is established, and the peer's per-stage behavior on it is recorded.
