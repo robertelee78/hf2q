@@ -899,6 +899,7 @@ Acceptance:
 
 - Design §13 is design-reviewed and approved by the operator before implementation.
 - Before integration, the capped-A1 S0-b receipt runs on both metallib paths (design §13.0). It reports per-kind ratios and cells more than 2% slower, and it freezes the per-(kind, bucket) stock-fallback table (ratio > 1.02 keeps stock). The expected saving is restated from that receipt. If capped A1's chain ratio is more than 0.02 above the rows kernel's 0.761, the story returns to the operator.
+  - Result (2026-11-05, design §13.0): X1 and T-N8 pass on both paths. Capped A1's chain ratio is 0.791 (saving 299.6 ms of chain per run) with an empty fallback table. In a same-run head-to-head the rows kernel was only 1.2% faster (0.762 against 0.771), so capped A1 is adopted.
 - Gates X1–X6 of design §13.3 pass bitwise, each with dispatch-count proof that the kernel ran:
   - X1: the mlx-native warm suite and T-N8, both metallib paths;
   - X2: model route;

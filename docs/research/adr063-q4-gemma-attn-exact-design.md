@@ -585,6 +585,23 @@ shape) and §7 (gates), with these changes.
     have to be kept and landed instead.
   - Otherwise the story proceeds with capped A1.
 
+- **Result (2026-11-05).** Receipt `s0-g2-20a9e4d/` (mlx-native `20a9e4d`
+  = #89 `a9983e9` plus the `bucket` cells, which #89 carries as `fa54602`;
+  macOS `26B5112a`, Metal `32023.922`).
+  - X1 7/7 and T-N8 16/16 on both paths.
+  - Capped A1, precompiled: chain 0.791 (vec 1,432.8 ms → 1,133.3 ms,
+    saving 299.6 ms), sliding 0.751, global 0.893, no cell more than 2%
+    slower. Runtime path: 0.791 / 0.750 / 0.895.
+  - Bucket ratios on both paths: sliding 0.727–0.786, global 0.856–0.929.
+    None exceeds 1.02, so the fallback table is **empty**.
+  - Kernel choice: against the rows kernel's 0.761 from another run, 0.791
+    tripped the 0.02 margin. The vec baseline had drifted 2.6% between the
+    two runs, so the operator ordered a same-run head-to-head (`h2h-baae205/`,
+    scratch `5825877` with the arm capped at G = 2). There, rows(2, 1) was
+    1,119.4 ms against capped A1's 1,132.9 ms (vec 1,468.5; ratios 0.762 /
+    0.771). The rows kernel is only 1.2% faster (runtime path 0.9%), under the
+    2% bar, so **capped A1 is adopted** and the rows kernel is not landed.
+
 ### 13.1 Kernel and dispatch
 
 - Kernel: mlx-native `flash_attn_vec_hybrid_batched_gqa` from #89, pinned
@@ -662,7 +679,6 @@ normalisation (root notice, 2026-11-05) and an updated harness pin.
   - If the interval includes 0, or lies above 0, the change is not
     promoted. It is then removed in a clean cutover: the variant, the switch
     and its docs, keeping the recorded result.
-- **Expected:** restated from the §13.0 receipt (vec minus capped-A1
-  four-lane projection, 25 sliding + 5 global layers). It is a lower bound on
-  the makespan effect `[INFERENCE]`. The rows kernel's 0.761 (≈ 0.35 s of
-  chain) is not the G2 estimate.
+- **Expected:** about 0.30–0.34 s of chain per run: 299.6 ms in the §13.0
+  receipt and 335.6 ms in the head-to-head (25 sliding + 5 global layers,
+  four-lane). It is a lower bound on the makespan effect `[INFERENCE]`.
