@@ -1,7 +1,7 @@
 # ADR-063 Q4-GEMMA-LMHEAD-MMA: few-row MMA for the Gemma 4 lm head (Class B)
 
-Status: approved (operator 2026-11-05; review ACCEPT), revision 2
-(2026-11-05). The operator opened this story on 2026-11-05 under
+Status: **stopped at the spike (2026-11-05, §14)**; approved (operator
+2026-11-05; review ACCEPT), revision 2 (2026-11-05). The operator opened this story on 2026-11-05 under
 Q4-GEMMA-DECODE design §13 decision 2(b). Revision 2 applies ReviewLmHead's
 REVISE findings 1–12, the root's rulings on decisions 2–4 (§12) and the
 ACCEPT review's required edit and P3s (§13). No code backs this document.
@@ -385,3 +385,39 @@ raises it per step.
 | 12. ADR consistency | ADR-063 header, Q4-GEMMA-ATTN predecessors and the decision log list this story; "within rounding" marked `[INFERENCE]` |
 
 ACCEPT review (ReviewLmHead, revision 2): required edit applied in §4.2 (serving decode heads only; DFlash, n-gram, EAGLE-3 tree-verify and kernel-profile modes refused at startup under `1`; K = 2816 back in the predicate) and §6 gate 1 (widths 9..16 via `lm_head_batched`). P3s applied: M1 uses the §5 projected-saving formula on in-situ numbers (§6 gate 3); the failure path moves the pin forward to the follow-up release that removes the kernel (§11).
+
+## 14. Outcome: spike NO-GO (2026-11-05)
+
+Spike `57dd7c0` (mlx-native branch `feat/gemma-lmhead-mma` on main `f01d0ac`,
+kept unpushed as evidence), measured under the root's GPU lane 20:09–20:18Z.
+Receipts: `~/.local/state/hf2q/v0130/q4-gemma-lmhead-mma/spike-57dd7c0-20261105T195427Z/`
+(`tests-path{1,0}.txt`, `path{1,0}/error_record.json`, `bench/cells.jsonl`,
+`bench/identity.json`, `toolchain.txt`; macOS 26B5112a, metal 32023.922,
+rustc 1.99.1).
+
+| §5 leg | Bar | Result | |
+|---|---|---|---|
+| 1. Exactness and correctness | §4.1 tests 1–2 on both metallib paths | 7/7 on both paths: F64 K-scaled bound at m = 1..16 and tails, determinism, width and tile-position invariance, NaN/∞ neighbours, permutation, refusals | Pass |
+| 2. Projected V2 saving incl. width 1 | ≥ 0.30 s per run | best 0.237 s (`nsg4_nt4`; `nsg8_nt4` 0.234 s) | **Fail** |
+| 3. Width-1 penalty | ≤ 35 µs | best +103 µs (`nsg4_nt2`: 1,187 vs 1,084 µs); others +187 to +350 µs | **Fail** |
+
+Cold-rotation medians (µs) for the stock head and the best MMA cells:
+
+| Width | Stock | `nsg4_nt2` | `nsg4_nt4` | `nsg8_nt4` |
+|---:|---:|---:|---:|---:|
+| 1 | 1,084 | 1,187 | 1,280 | 1,271 |
+| 2 | 1,208 | 1,331 | 1,290 | 1,319 |
+| 4 | 1,980 | 1,432 | 1,378 | 1,380 |
+| 8 | 4,054 | 1,519 | 1,443 | 1,434 |
+| 16 | 4,644 | 2,642 | 2,498 | 2,351 |
+
+- The port is exact in every Class A sense the design required (the
+  hardware tile-position risk did not occur) and about 17% slower than the
+  peer's MMA at width 4 (1,378 against 1,181 µs).
+- Leg 3 is decisive: even at the peer's own MMA times the width-1 penalty is
+  about +96 µs, above the 35 µs bar. Batched ≡ serial requires the MMA at
+  width 1 (§3.2 item 3), so no geometry search can recover it under this
+  contract.
+- Per §5 the story stops. Nothing was merged or released; per §11 the code
+  stays out of both repositories (the spike branch is retained unpushed as
+  evidence). No hf2q integration was started.

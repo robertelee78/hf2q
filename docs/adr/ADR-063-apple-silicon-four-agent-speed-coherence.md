@@ -959,6 +959,8 @@ Priority: High. Core scope (second-tier family).
 
 Delivery boundary: A published mlx-native release pinned exactly by hf2q, plus the integration and promotion merged for v0.1.30, or the recorded failure of the spike rule or a gate.
 
+Outcome (2026-11-05): **stopped at the spike.** Exactness passed on both metallib paths, but both speed legs missed: the projected V2 saving was 0.237 s (bar ≥ 0.30 s) and the width-1 penalty was +103 µs (bar ≤ 35 µs). This is the recorded failure of the spike rule; see design §14.
+
 ### Q4-DS4. Run the peer on the ds4 DeepSeek-V4 file and determine fit
 
 Outcome: Whether the same-GGUF peer can run ds4's DeepSeek-V4 file on the 128 GB host is established, and the peer's per-stage behavior on it is recorded.
@@ -1995,6 +1997,13 @@ away from the peer. Root rulings on review: M2 ≤ 0.98 for this lever alone
 (the 0.96 Win share is judged on the combined candidate), the serial head's
 baked record bypassed at head call sites only, and a width-1 bar of < 0.5% of
 the n1-stage makespan used in both the spike and M1.
+
+**Outcome (2026-11-05): stopped at the spike.** The MMA port passed every
+exactness leg on both metallib paths but missed the §5 speed legs: projected
+V2 saving 0.237 s against ≥ 0.30 s, and a width-1 penalty of +103 µs against
+≤ 35 µs (design §14; receipts
+`~/.local/state/hf2q/v0130/q4-gemma-lmhead-mma/spike-57dd7c0-20261105T195427Z/`).
+Nothing was merged or released; the story closes as Won't do.
 
 ### Host toolchain (operator decision, 2026-11-05)
 
