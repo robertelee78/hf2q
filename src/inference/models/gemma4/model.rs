@@ -631,9 +631,10 @@ pub struct MlxModelWeights {
     /// `prompt_tokens`/`seq_len`) and processed in ONE forward pass with
     /// per-seq isolation. Four deltas gate on `.is_some()`:
     ///   1. positions — per-seq RoPE reset `[0..L0, 0..L1, …]` (not `0..T`),
-    ///   2. mask — host-built block-diagonal causal mask
-    ///      ([`super::super::super::serve::forward_prefill_batched::build_block_diagonal_mask_bf16`])
-    ///      replaces the single-seq GPU `build_sdpa_mask_bf16`,
+    ///   2. attention — each sequence runs its own attention and O-projection
+    ///      (cold: `forward_prefill_batched::gemma_cold_attention` with the
+    ///      sequence's own square masks; live: `gemma_live_attention`),
+    ///      exactly the per-sequence function a single-slot prefill runs,
     ///   3. KV write — each seq's `[O_i, L_i)` slice of the T-stream K/V is
     ///      scattered into its own slot via `slot_views_hybrid[i]`,
     ///   4. head — gather each seq's last row → N first tokens → `out_first_tokens`.

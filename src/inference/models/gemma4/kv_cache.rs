@@ -1605,6 +1605,33 @@ impl GemmaHybridSlotAnchor {
             })
             .sum()
     }
+
+    /// SHA-256 over the boundary and every saved byte, in layer order
+    /// (real-artifact anchor-equality gates).
+    #[cfg(test)]
+    pub fn digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update((self.prompt_len as u64).to_le_bytes());
+        for (index, layer) in self.layers.iter().enumerate() {
+            hash.update((index as u64).to_le_bytes());
+            let Some(layer) = layer else { continue };
+            for bytes in [
+                Some(&layer.k),
+                Some(&layer.v_packed),
+                layer.v_norms.as_ref(),
+                layer.bf16_xlen_k.as_ref(),
+                layer.bf16_xlen_v.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                hash.update((bytes.len() as u64).to_le_bytes());
+                hash.update(bytes);
+            }
+        }
+        hash.finalize().into()
+    }
 }
 
 fn gemma4_copy_slot_region_out(

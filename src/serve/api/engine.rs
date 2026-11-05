@@ -6329,6 +6329,8 @@ fn gemma4_cross_batch_eligible(
 
 #[path = "engine_gemma_cold_batch.rs"]
 mod gemma_cold_batch;
+#[path = "engine_gemma_cold_stable_batch.rs"]
+mod gemma_cold_stable_batch;
 #[path = "engine_gemma_slot_warmup.rs"]
 mod gemma_slot_warmup;
 #[path = "engine_gemma_warm_batch.rs"]
@@ -12044,6 +12046,10 @@ fn run_slot_aware_gemma4(
     // ADR-063: same-step warm tool-turn suffixes share one bitwise-exact
     // transaction; `HF2Q_GEMMA_JOINT_WARM_PREFILL=0` keeps per-slot prefill.
     let joint_warm_prefill = cross_slot_admit && gemma_warm_batch::worker_enabled();
+    // ADR-063 Q4-GEMMA-COLD: simultaneous cold first turns with an exact
+    // boundary share one bitwise-exact transaction;
+    // `HF2Q_GEMMA_JOINT_COLD_PREFILL=0` keeps per-slot admission.
+    let joint_cold_prefill = gemma_cold_batch::worker_enabled(cross_slot_admit);
 
     // ADR-040 production profiling — zero the buckets at worker entry so the
     // worker-exit dump reflects THIS worker's lifetime, not leftover state.
@@ -12648,6 +12654,7 @@ fn run_slot_aware_gemma4(
                         kv_bytes_per_token,
                         &supervisor,
                         stable_batch,
+                        joint_cold_prefill,
                     ) {
                         fail_stop_gemma4_worker(
                             &supervisor,
@@ -13315,6 +13322,85 @@ fn run_slot_aware_gemma4(
     tracing::info!("Gemma4 SlotAware worker thread exited");
 }
 
+/// The scheduler reservation of one per-slot Gemma 4 admission
+/// (`admit_gemma4_slot_routed`); the cold stable cohort issues the same one
+/// per lane, in the same order.
+fn gemma4_slot_admit_request(
+    shape: Gemma4ValidatedRequestShape,
+    prompt_len: usize,
+    graft_len: usize,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+    preferred_slot: Option<SlotId>,
+) -> AdmitRequest {
+    let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
+        0
+    } else {
+        // ADR-059 (3c): the graft adds graft_len physical rows on every
+        // covered full-attention layer — exactly graft_len tokens' worth of
+        // KV bytes (complete site coverage) — so the per-request KV-byte
+        // estimate covers them.
+        u64::from(shape.prompt_tokens)
+            .saturating_add(u64::try_from(graft_len).unwrap_or(u64::MAX))
+            .saturating_add(u64::from(shape.max_tokens))
+            .saturating_mul(kv_bytes_per_token)
+    };
+    AdmitRequest {
+        prompt_tokens: shape.prompt_tokens,
+        max_tokens: shape.max_tokens,
+        kv_bytes_needed: needed_bytes,
+        prompt_kv_bytes: if needed_bytes == 0 {
+            0
+        } else {
+            (prompt_len as u64).saturating_mul(kv_bytes_per_token)
+        },
+        preferred_slot,
+    }
+}
+
+/// The request grammar check per-slot admission runs before reserving a
+/// slot (the cold stable cohort runs it at the same point for each lane).
+fn validate_gemma4_request_grammar(params: &SamplingParams) -> Result<()> {
+    let Some(grammar) = params.grammar.as_ref() else {
+        return Ok(());
+    };
+    let root = grammar
+        .rule_id("root")
+        .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
+    anyhow::ensure!(
+        super::grammar::GrammarRuntime::new(grammar.clone(), root).is_some(),
+        "grammar runtime init failed"
+    );
+    Ok(())
+}
+
+/// The request error of a refused per-slot Gemma 4 reservation.
+fn gemma4_slot_admit_error(error: AdmitError) -> anyhow::Error {
+    match error {
+        AdmitError::SlotBudgetExceeded {
+            needed_bytes,
+            budget_bytes,
+        } => anyhow::anyhow!(
+            "slot_budget_exceeded: ADR-040 full-context slots — shared physical KV \
+             budget exceeded (needed_bytes={needed_bytes}, budget_bytes={budget_bytes}); \
+             logical context was not divided by slot count."
+        ),
+        // Guarantees tune-up item 4 (2026-08-20): never-fits →
+        // `kv_budget_unsatisfiable` prefix so the handler maps to a
+        // non-retryable 400 (no Retry-After) instead of the 429.
+        AdmitError::KvBudgetUnsatisfiable {
+            needed_bytes,
+            budget_bytes,
+        } => anyhow::anyhow!(
+            "kv_budget_unsatisfiable: ADR-040 full-context slots — request can never \
+             fit the shared physical KV budget (needed_bytes={needed_bytes}, \
+             budget_bytes={budget_bytes}); non-retryable — reduce max_tokens, \
+             shorten the prompt, or raise the budget."
+        ),
+        error => anyhow::anyhow!("ADR-040 Phase F M1 admit failed: {error}"),
+    }
+}
+
 /// Admit one Gemma 4 request: reserve a scheduler slot, run prefill now
 /// (`Gemma4DecodeState::prefill_seed`), and either fire immediately (first
 /// token already terminal) or install the slot for decode ticks.
@@ -13440,21 +13526,9 @@ fn admit_gemma4_slot_routed(
             return None;
         }
     };
-    if let Some(grammar) = params.grammar.as_ref() {
-        let grammar_check = (|| -> Result<()> {
-            let root = grammar
-                .rule_id("root")
-                .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
-            anyhow::ensure!(
-                super::grammar::GrammarRuntime::new(grammar.clone(), root).is_some(),
-                "grammar runtime init failed"
-            );
-            Ok(())
-        })();
-        if let Err(error) = grammar_check {
-            slot_fire_done(reply, Err(error), false);
-            return None;
-        }
+    if let Err(error) = validate_gemma4_request_grammar(&params) {
+        slot_fire_done(reply, Err(error), false);
+        return None;
     }
     let bounded_prefill = prompt_tokens.len() > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize;
     // Build borrowed injection slices from the owned data — same shape as
@@ -13474,62 +13548,18 @@ fn admit_gemma4_slot_routed(
         &prompt_tokens,
         params.vision_fingerprint,
     );
-    let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
-        0
-    } else {
-        // ADR-059 (3c): the graft adds graft_len physical rows on every
-        // covered full-attention layer — exactly graft_len tokens' worth of
-        // KV bytes (complete site coverage) — so the per-request KV-byte
-        // estimate covers them.
-        u64::from(shape.prompt_tokens)
-            .saturating_add(u64::try_from(graft_len).unwrap_or(u64::MAX))
-            .saturating_add(u64::from(shape.max_tokens))
-            .saturating_mul(kv_bytes_per_token)
-    };
-    let admit_req = AdmitRequest {
-        prompt_tokens: shape.prompt_tokens,
-        max_tokens: shape.max_tokens,
-        kv_bytes_needed: needed_bytes,
-        prompt_kv_bytes: if needed_bytes == 0 {
-            0
-        } else {
-            (prompt_tokens.len() as u64).saturating_mul(kv_bytes_per_token)
-        },
-        preferred_slot: preferred.map(|preference| preference.slot),
-    };
+    let admit_req = gemma4_slot_admit_request(
+        shape,
+        prompt_tokens.len(),
+        graft_len,
+        per_slot_kv_budget_bytes,
+        kv_bytes_per_token,
+        preferred.map(|preference| preference.slot),
+    );
     let admitted = match scheduler.admit(admit_req) {
         Ok(slot) => slot,
-        Err(AdmitError::SlotBudgetExceeded {
-            needed_bytes,
-            budget_bytes,
-        }) => {
-            let gr = Err(anyhow::anyhow!(
-                "slot_budget_exceeded: ADR-040 full-context slots — shared physical KV \
-                 budget exceeded (needed_bytes={needed_bytes}, budget_bytes={budget_bytes}); \
-                 logical context was not divided by slot count."
-            ));
-            slot_fire_done(reply, gr, false);
-            return None;
-        }
-        // Guarantees tune-up item 4 (2026-08-20): never-fits →
-        // `kv_budget_unsatisfiable` prefix so the handler maps to a
-        // non-retryable 400 (no Retry-After) instead of the 429.
-        Err(AdmitError::KvBudgetUnsatisfiable {
-            needed_bytes,
-            budget_bytes,
-        }) => {
-            let gr = Err(anyhow::anyhow!(
-                "kv_budget_unsatisfiable: ADR-040 full-context slots — request can never \
-                 fit the shared physical KV budget (needed_bytes={needed_bytes}, \
-                 budget_bytes={budget_bytes}); non-retryable — reduce max_tokens, \
-                 shorten the prompt, or raise the budget."
-            ));
-            slot_fire_done(reply, gr, false);
-            return None;
-        }
-        Err(e) => {
-            let gr = Err(anyhow::anyhow!("ADR-040 Phase F M1 admit failed: {e}"));
-            slot_fire_done(reply, gr, false);
+        Err(error) => {
+            slot_fire_done(reply, Err(gemma4_slot_admit_error(error)), false);
             return None;
         }
     };
@@ -14496,7 +14526,11 @@ fn advance_gemma4_prefill_quantum(
                 .saturating_sub(primary.progress.cursor()),
             false,
         )
-        && std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() != Ok("1");
+        && std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() != Ok("1")
+        // ADR-063 Q4-GEMMA-COLD D2: the cursor-0 chunk runs the per-sequence
+        // cold attention; graft-bound workers keep it per slot until a graft
+        // bitwise gate exists.
+        && (!start_at_zero || guard.model.weights.kv_graft_len() == 0);
     if !batch_supported {
         return advance_gemma4_prefill(
             guard,
@@ -15019,17 +15053,22 @@ fn admit_gemma4_slots_batched(
     // Gemma tool-response template can render S == P while this request
     // still extends a retained slot/anchor. Never reset that state in the
     // cold cohort; the existing single-slot path selects/restores it.
-    let plan = gemma_cold_batch::plan(requests.iter().map(|(prompt, params, _)| {
-        let cached = preferred_gemma4_slot_for_request(
-            retained_tokens,
-            prompt_anchors,
-            slots,
-            prompt,
-            params.vision_fingerprint,
-        )
-        .map_or(0, |preference| preference.cached_tokens);
-        (prompt.len(), cached)
-    }));
+    // ADR-063 Q4-GEMMA-COLD D2: graft-bound workers admit cold lanes per slot
+    // until a graft bitwise gate exists for the per-sequence cold attention.
+    let plan = gemma_cold_batch::plan(
+        requests.iter().map(|(prompt, params, _)| {
+            let cached = preferred_gemma4_slot_for_request(
+                retained_tokens,
+                prompt_anchors,
+                slots,
+                prompt,
+                params.vision_fingerprint,
+            )
+            .map_or(0, |preference| preference.cached_tokens);
+            (prompt.len(), cached)
+        }),
+        guard.model.weights.kv_graft_len(),
+    );
     if plan.requires_slot_admission()
         || requests
             .iter()
@@ -15536,7 +15575,62 @@ fn admit_gemma4_slots_stable_batched(
     kv_bytes_per_token: u64,
     supervisor: &EngineSupervisor,
     requests: Vec<(Vec<u32>, SamplingParams, SlotReply)>,
+    joint_cold_prefill: bool,
 ) -> Option<SlotAwareGpuFatal> {
+    // ADR-063 Q4-GEMMA-COLD: a group of cold lanes, each with an exact
+    // pre-generation boundary (the four-agent turn 0), runs as one exact
+    // joint transaction; every other group keeps the route below.
+    let cold_plan = {
+        let ctx = gemma_cold_batch::StableContext {
+            worker_active: joint_cold_prefill && guard.hybrid.is_some(),
+            all_slots_idle: slots.iter().all(Option::is_none),
+            graft_len: guard.model.weights.kv_graft_len(),
+            max_seq_len: guard
+                .model
+                .context_length
+                .unwrap_or(guard.model.config.max_position_embeddings as usize),
+        };
+        gemma_cold_batch::stable_plan(
+            &ctx,
+            requests
+                .iter()
+                .map(|(prompt, params, _)| (prompt.as_slice(), params)),
+            |lane| {
+                preferred_gemma4_slot_for_request(
+                    retained_tokens,
+                    prompt_anchors,
+                    slots,
+                    &requests[lane].0,
+                    None,
+                )
+            },
+            |lanes| {
+                guard.hybrid.as_deref().is_some_and(|scaffold| {
+                    crate::inference::models::gemma4::kv_cache::anchor_budget::boundary_captures_fit(
+                        scaffold,
+                        lanes.iter().map(|lane| lane.boundary),
+                    )
+                    .unwrap_or(false)
+                })
+            },
+        )
+    };
+    if let Some(plan) = cold_plan {
+        return gemma_cold_stable_batch::admit_cohort(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_anchors,
+            registration,
+            scheduler_stats_snapshot,
+            per_slot_kv_budget_bytes,
+            kv_bytes_per_token,
+            supervisor,
+            requests,
+            plan,
+        );
+    }
     let fallback_single = |guard: &mut Gemma4KvGuard<'_>,
                            scheduler: &mut InflightBatchedScheduler,
                            slots: &mut [Option<Gemma4Slot>],
@@ -38722,10 +38816,12 @@ assistant:
     /// `forward_prefill_batched_multi_seq` and asserts each seq's FIRST decode
     /// token equals that prompt prefilled ALONE (single-seq
     /// `forward_prefill_batched`). This validates, on a real model, the
-    /// block-diagonal mask isolation + per-seq RoPE positions + N-row head
-    /// (deltas 1, 2, 4) independently of the admit loop. Delta 3 (KV scatter,
-    /// decode-only) is gated by the E2E full-generation parity test. Same
-    /// HF2Q_BYTE_EQUIV_E2E gate as the serial/parity harness.
+    /// per-sequence cold attention (ADR-063 Q4-GEMMA-COLD D2) + per-seq RoPE
+    /// positions + N-row head independently of the admit loop. Delta 3 (KV
+    /// scatter, decode-only) is gated by the E2E full-generation parity test.
+    /// Same HF2Q_BYTE_EQUIV_E2E gate as the serial/parity harness. The
+    /// official-artifact bitwise gate is
+    /// `gemma_cold_multi_seq_matches_per_slot_bitwise`.
     #[test]
     fn iter_g_a_multi_seq_prefill_first_token_isolation() {
         if byte_equiv_skip_unless_gated("iter_g_a_multi_seq_prefill_first_token_isolation") {
@@ -38748,24 +38844,15 @@ assistant:
         };
 
         // N=1 mechanism gate: a single 70-token prompt exercising the full
-        // multi-seq machinery (GPU block-diagonal mask builder, per-seq RoPE
-        // positions, N-row head, per-slot KV scatter) at offset 0 — which is
-        // offset-invariance-aligned, so it matches the single-seq reference.
+        // multi-seq machinery (per-sequence cold attention, per-seq RoPE
+        // positions, N-row head, per-slot KV scatter) at offset 0.
         //
-        // NOTE: N>1 isolation is NOT yet byte-identical — the orchestration
-        // (GPU mask, positions, KV, head) is CORRECT (N=1 exact; N=8 BF16
-        // tensor-mm = 7/8 byte-exact), but the ATTENTION KERNELS' handling of
-        // block-diagonal masks blocks full byte-identity:
-        //   - F16 FA (D256+D512): sequence-offset-NON-invariant with block-diag
-        //     masks (fork-bisected; same family as task #19);
-        //   - BF16 D512 FA: §0.19 enumeration-coherence bug (worse isolation);
-        //   - tensor-mm globals: closest (7/8), residual = FP-accumulation over
-        //     MASKED columns (matmul sums all T cols → near-tie argmax flips vs
-        //     the per-seq single-seq sum — fundamental to matmul attention).
-        // True byte-identity needs a D512 FA kernel that SKIPS masked tiles AND
-        // is offset-invariant (only FA skips masked tiles; matmul can't) — i.e.
-        // fixing the D512 FA kernel (converges task #19). Set HF2Q_ITERGA_N8=1
-        // for the 8-prompt isolation matrix. See ADR-040 §0.20.
+        // HF2Q_ITERGA_N8=1 runs the 8-prompt isolation matrix. Before the
+        // D2 cutover the block-diagonal BF16 route could not be byte-identical
+        // for N>1 (ADR-040 §0.20); each lane now runs the single-slot cold
+        // attention on its own rows, so lanes above 32 rows equal their
+        // single-seq reference (shorter lanes can differ in the MoE route,
+        // `mv_id` alone versus `mm_id` jointly).
         let prompts: Vec<Vec<u32>> = if std::env::var("HF2Q_ITERGA_N8").as_deref() == Ok("1") {
             // 64-token prompts → each seq starts at a 64-multiple offset =
             // D512 chunk(C=64)-aligned, so post-blk-fix F16 FA isolates byte-exact.
@@ -38846,24 +38933,22 @@ assistant:
         }
         assert_eq!(
             mismatches, 0,
-            "iter-G(a) {mismatches}/{n} seqs diverged (block-diagonal isolation broken)"
+            "iter-G(a) {mismatches}/{n} seqs diverged (per-sequence isolation broken)"
         );
         eprintln!("[iter-G(a)] first-token isolation PASS: {n} seqs, tokens={ms_tokens:?}");
     }
 
-    /// ADR-040 iter-G(a) — BF16 cross-slot prefill DETERMINISM + ISOLATION gate
-    /// (codex's hard gate before committing to the BF16 batched path). Multi-seq
-    /// prefill runs on BF16 FA (the F16 FA prefill kernels are the uncracked
-    /// §0.19 heisenbug on block-diagonal masks). Demands, under the real
+    /// ADR-040 iter-G(a) — cross-slot prefill DETERMINISM + ISOLATION gate.
+    /// Since ADR-063 Q4-GEMMA-COLD D2 every lane runs the per-sequence cold
+    /// attention on the route its single-slot prefill takes (F16 FA by
+    /// default; BF16 under HF2Q_FA_F16=0). Demands, under the real
     /// allocator/buffer-reuse (K repeated in-process runs):
     ///   1. DETERMINISM — K runs of the identical N=8 varied-length batch produce
     ///      BYTE-IDENTICAL first tokens (run-to-run; the user-facing requirement).
-    ///   2. ISOLATION — each seq matches its single-seq BF16 reference.
+    ///   2. ISOLATION — each seq matches its single-seq reference.
     ///   3. NO CONTAMINATION — a sequence held constant while its batch-mates are
     ///      replaced produces the same token (cross-seq independence).
-    /// Run with HF2Q_FA_F16=0 so the single-seq refs are BF16 too (multi-seq
-    /// forces BF16 regardless). FAIL ON ANY FLAKE — one divergence means BF16 is
-    /// only a lower-probability manifestation, not a fix. HF2Q_ITERGA_KRUNS sets K.
+    /// FAIL ON ANY FLAKE. HF2Q_ITERGA_KRUNS sets K.
     #[test]
     fn iter_g_a_bf16_determinism_isolation_gate() {
         if byte_equiv_skip_unless_gated("iter_g_a_bf16_determinism_isolation_gate") {
@@ -58629,6 +58714,14 @@ mod gemma_warm_tiled_tests;
 #[cfg(test)]
 #[path = "engine_gemma_prefill_moe_tests.rs"]
 mod gemma_prefill_moe_tests;
+
+#[cfg(test)]
+#[path = "engine_gemma_cold_stable_batch_tests.rs"]
+mod gemma_cold_stable_batch_tests;
+
+#[cfg(test)]
+#[path = "engine_gemma_cold_gs3_timing.rs"]
+mod gemma_cold_gs3_timing;
 
 #[cfg(test)]
 #[path = "engine_template_json_order_tests.rs"]

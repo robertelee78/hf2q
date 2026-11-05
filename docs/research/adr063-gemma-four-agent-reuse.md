@@ -106,6 +106,51 @@ prefill totals 5.40 s over turns 1–6, serial at 74–406 ms per slot. Turns 1,
 prefill, so slots 1–3 were admitted between decode steps and queued behind
 them (+24 to +92 ms creep per later slot).
 
+### Stage 0: exact cold cohort (ADR-063 Q4-GEMMA-COLD)
+
+Design: `docs/research/adr063-q4-gemma-cold-design.md` (issue #689). Branch
+`feat/q4-gemma-cold`. Source change; the bitwise gates below are the merge
+contract and have not been run by the author.
+
+The four turn-0 requests reach the worker in one coalesce window, but each
+carries an exact pre-generation boundary (S = 458 of P = 465), so the stable
+batch refused them as uncached and the cold batch refused boundaries: the
+cohort was admitted per slot in series (queue staircase 1/285/560/834 ms).
+Now a contiguous group of cold text lanes, each with `33 <= S < P`, at most
+4,096 rows, all slots idle, runs as one transaction
+(`engine_gemma_cold_stable_batch.rs`):
+
+- **Reserve** each lane in FIFO order with the `AdmitRequest` per-slot
+  admission issues, its slot preference computed at its serial planning
+  point (earlier lanes as active owners of their slots); a lane warm at that
+  point sends the whole group per slot.
+- **Reset** every lane, then **Phase B**: one `forward_prefill_batched_multi_seq`
+  over every `prompt[..S]`. Attention and the O-projection run per lane
+  through `gemma_cold_attention`, the function single-slot cold prefill runs
+  (D2 cutover; the block-diagonal BF16 route is removed).
+- **Anchors** (`StableBoundary`) in FIFO order; the planner refuses the
+  cohort unless the serial order's reservations all fit the quota.
+- **Phase C**: cues under 32 rows replay through `forward_decode_body_batched`
+  one step per position (logits from the decode tick's source); cues of 33
+  rows or more on every lane take one `PerSlotExact` live resume; a 32-row
+  cue, or a long cue beside a short one, runs the per-slot resume.
+- **Commit** `(0, P)` all-or-nothing, then **publish** each lane exactly as
+  `admit_gemma4_slot` does.
+- **Kill switch** `HF2Q_GEMMA_JOINT_COLD_PREFILL=0`; trace operation
+  `cold_stable_cohort`; operator kinds `slot-unary-cold-cohort` /
+  `slot-stream-cold-cohort`; log `Gemma4 cold stable cohort prefilled in one
+  joint transaction` with `boundary_ms`, `anchor_ms`, `cue_ms`.
+
+Gates (ignored, official artifact, `engine_gemma_cold_stable_batch_tests.rs`):
+`gemma_joint_cold_prefill_matches_per_slot_bitwise`,
+`gemma_joint_cold_prefill_deterministic`,
+`gemma_cold_multi_seq_matches_per_slot_bitwise`,
+`gemma_joint_cold_engine_cohort_matches_serial_turn0`,
+`gemma_joint_cold_forward_fault_retries_each_lane_per_slot`,
+`gemma_joint_cold_cue_fault_restores_from_boundary_anchors`,
+`gemma_joint_cold_cancel_during_transaction`. G-S3 timing:
+`scripts/q4_gemma_cold_gs3.sh`.
+
 ### Stage 1 (this change): exact joint cohort
 
 - **Attention route parameter.** `forward_prefill_batched_multi_seq_live`

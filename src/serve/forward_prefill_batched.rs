@@ -568,6 +568,11 @@ macro_rules! bucket_finish {
     }};
 }
 
+/// The per-sequence cold attention (declared after `bucket_finish!` so the
+/// moved profiling brackets keep using it).
+#[path = "gemma_cold_attention.rs"]
+pub(crate) mod gemma_cold_attention;
+
 impl MlxModelWeights {
     /// Batched append against Gemma's already-resident SerialFifo prefix.
     ///
@@ -837,21 +842,26 @@ impl MlxModelWeights {
         // (default) scales O(seq) not O(seq²), so long-context workloads
         // benefit from the new default in addition to the algorithmic
         // alignment.
-        let env_no_fa = match std::env::var("HF2Q_NO_FA").as_deref() {
-            Ok("0") | Ok("false") | Ok("off") => Some(false),
-            Ok("1") | Ok("true") | Ok("on") => Some(true),
-            _ => None,
+        let cold_route = gemma_cold_attention::ColdRoute::from_env();
+        // Cold attention routes per sequence (ADR-063 Q4-GEMMA-COLD D2): a
+        // single-slot cold prefill is one sequence over the whole stream; a
+        // cold multi-sequence prefill runs each lane as its own sequence, on
+        // the kernels a single-slot prefill of that lane's length takes.
+        // `(offset, rows)` per sequence. A live resume keeps one whole-stream
+        // span for the setup sizing below; it never runs cold attention.
+        let cold_spans: Vec<(usize, usize)> = match self.multi_seq_prefill.as_ref() {
+            Some(ms) if !live_prefix_resume => ms
+                .seq_offsets
+                .iter()
+                .copied()
+                .zip(ms.seq_lens.iter().copied())
+                .collect(),
+            _ => vec![(0, seq_len)],
         };
-        let use_no_fa = match env_no_fa {
-            // Explicit override always honored.  Operator may force NO_FA
-            // for diagnostic A/B (e.g. validating a future FA kernel
-            // change against the tensor-mm reference).
-            Some(b) => b && seq_len >= 32, // force-FA at seq<32 (kernel guard)
-            // Default (ADR-032): use FA path.  F16-Q-in-shmem matches
-            // peer algorithm; precision is sufficient at both D=256 sliding
-            // and D=512 global layers.
-            None => false,
-        };
+        let max_cold_rows = cold_spans.iter().map(|&(_, rows)| rows).max().unwrap_or(seq_len);
+        // Explicit HF2Q_NO_FA override (diagnostic A/B), honored per
+        // sequence at rows >= 32 only (tensor-mm kernel guard).
+        let use_no_fa = cold_spans.iter().any(|&(_, rows)| cold_route.no_fa(rows));
 
         // ADR-032 (2026-05-17): F16 FA path — peer-aligned default.
         //
@@ -877,21 +887,7 @@ impl MlxModelWeights {
         // comparison only.  BF16-Q is the known-buggy path on enumeration
         // prompts at D=512; the opt-out exists for kernel-bisection work,
         // not production use.
-        // ADR-040 iter-G(a): the MULTI-SEQ (cross-slot) prefill runs on BF16 FA.
-        // The F16 FA prefill kernels are non-deterministic in the live 30-layer
-        // model on block-diagonal (cross-seq) masks at non-chunk-aligned offsets
-        // (the uncracked §0.19 root: deterministic in isolation, flakes under
-        // buffer-reuse/async CBs). BF16 FA isolates byte-exact AND deterministically.
-        // Per codex's gate this is provisional until the N=8 adversarial
-        // determinism matrix passes; single-seq keeps F16 (unchanged). The
-        // batched-vs-serial numeric drift is the already-accepted benign gap
-        // (ADR §B1 / AC4=(b)) — the contract is same-mode determinism + no
-        // cross-sequence contamination, NOT cross-mode byte-identity.
-        let use_fa_f16 = self.multi_seq_prefill.is_none()
-            && !matches!(
-                std::env::var("HF2Q_FA_F16").as_deref(),
-                Ok("0") | Ok("false") | Ok("off")
-            );
+        let use_fa_f16 = cold_route.fa_f16;
 
         // ADR-040 §0.19 (2026-06-25) routed single-seq LONG prompts' global
         // D=512 layers through tensor-mm (NO_FA) because the F16 D512 FA
@@ -920,22 +916,14 @@ impl MlxModelWeights {
         // HF2Q_GLOBAL_FA=1 forces FA for globals at ANY seq > 64;
         // HF2Q_NO_FA=1 forces tensor-mm everywhere it can run (seq >= 32,
         // including > 8192 — O(seq²) memory by explicit operator choice).
-        // ADR-040 iter-G(a): the MULTI-SEQ path always uses FA (BF16 —
-        // `use_fa_f16` above excludes multi-seq, so it takes the BF16 FA
-        // branch) for the global D=512 layers — tensor-mm CANNOT be
-        // byte-identical to per-seq attention (it sums over masked
-        // cross-seq columns → near-tie argmax flips), whereas the
-        // (blk-fixed, §0.19/cb9806c) FA kernels SKIP masked tiles and
-        // isolate byte-exact.
-        /// ADR-040 §7.32K: upper bound of the single-seq global-layer
-        /// tensor-mm (NO_FA) domain; above it globals route through F16
-        /// D512 FA (O(seq) memory). See the routing comment above.
-        const GLOBAL_NOFA_MAX_SEQ: usize = 8192;
+        // Every sequence of a cold multi-sequence prefill evaluates this
+        // predicate with its own row count (`ColdRoute::force_global_nofa`),
+        // so each lane takes exactly its single-slot global route; no
+        // block-diagonal mask or cross-sequence tensor-mm is involved.
         let force_global_nofa = !live_prefix_resume
-            && std::env::var("HF2Q_GLOBAL_FA").as_deref() != Ok("1")
-            && seq_len > 64
-            && seq_len <= GLOBAL_NOFA_MAX_SEQ
-            && self.multi_seq_prefill.is_none();
+            && cold_spans
+                .iter()
+                .any(|&(_, rows)| cold_route.force_global_nofa(rows));
 
         // Wave P4.17 — super-flag: per-op isolation for bucket attribution.
         // When on, every dispatch is bracketed by s.finish()/s = exec.begin()
@@ -1406,7 +1394,7 @@ impl MlxModelWeights {
         let pf_q_perm = alloc_bf16(nh * seq_len * max_hd, "pf_q_perm")?;
         let pf_k_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_k_perm")?;
         let pf_v_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_v_perm")?;
-        let mut pf_sdpa_out_perm = alloc_bf16(nh * seq_len * max_hd, "pf_sdpa_out_perm")?;
+        let pf_sdpa_out_perm = alloc_bf16(nh * seq_len * max_hd, "pf_sdpa_out_perm")?;
 
         // F16 staging buffers for the HF2Q_FA_F16=1 path (kernel migration
         // step 3).  These mirror the BF16 perm buffers but in F16 dtype;
@@ -1433,7 +1421,7 @@ impl MlxModelWeights {
         } else {
             None
         };
-        let mut pf_sdpa_out_perm_f16 = if use_fa_f16 {
+        let pf_sdpa_out_perm_f16 = if use_fa_f16 {
             Some(alloc_f16(nh * seq_len * max_hd, "pf_sdpa_out_perm_f16")?)
         } else {
             None
@@ -1482,8 +1470,10 @@ impl MlxModelWeights {
         } else {
             None
         };
-        let mut pf_kq: Option<MlxBuffer> = if need_nofa_bufs {
-            Some(alloc_f32(nh * seq_len * seq_len, "pf_kq")?)
+        // A cold multi-sequence prefill runs tensor-mm attention per
+        // sequence, so the scores scratch is sized for its longest lane.
+        let pf_kq: Option<MlxBuffer> = if need_nofa_bufs {
+            Some(alloc_f32(nh * max_cold_rows * max_cold_rows, "pf_kq")?)
         } else {
             None
         };
@@ -1492,7 +1482,7 @@ impl MlxModelWeights {
         } else {
             None
         };
-        let mut pf_attn_f32: Option<MlxBuffer> = if need_nofa_bufs {
+        let pf_attn_f32: Option<MlxBuffer> = if need_nofa_bufs {
             Some(alloc_f32(nh * seq_len * max_hd, "pf_attn_f32")?)
         } else {
             None
@@ -1558,9 +1548,9 @@ impl MlxModelWeights {
                 // T-token stream is N concatenated prompts; each seq's RoPE
                 // positions must restart at `start_pos` (= 0 for our caller),
                 // NOT run monotonically 0..T. Token at global index O_i+local
-                // gets position start_pos+local. Combined with the block-
-                // diagonal mask (delta 2), this isolates the N sequences so
-                // each prefills exactly as it would alone.
+                // gets position start_pos+local. Combined with per-sequence
+                // attention (`gemma_cold_attention` / `gemma_live_attention`),
+                // each sequence prefills exactly as it would alone.
                 let mut g = 0usize;
                 for (seq_idx, &l) in ms.seq_lens.iter().enumerate() {
                     for local in 0..l {
@@ -1630,38 +1620,6 @@ impl MlxModelWeights {
             }
             None => None,
         };
-        // ADR-040 iter-G(a) — per-token sequence-id buffer for the GPU
-        // block-diagonal mask kernel. In multi-seq mode, `pf_seq_id[i]` is the
-        // sequence index of token `i`; together with `pf_positions` (= per-seq
-        // local position, set above) it lets the GPU build the block-diagonal
-        // mask. These are kernel ARGUMENTS (host-written, GPU-read — coherent,
-        // like pf_positions for RoPE); the produced mask is GPU-WRITTEN so its
-        // downstream consumers (F16 cast / blk / FA) read a GPU buffer. None in
-        // single-seq mode (the GPU single-seq mask builder runs instead).
-        // Live resume never reads the square masks, so no block-diagonal mask
-        // is built for a resumed multi-sequence cohort either.
-        let pf_seq_id: Option<MlxBuffer> = if let Some(ms) = self
-            .multi_seq_prefill
-            .as_ref()
-            .filter(|_| !live_prefix_resume)
-        {
-            let mut buf = alloc_u32(seq_len, "pf_seq_id")?;
-            {
-                let sid: &mut [u32] = buf
-                    .as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("pf_seq_id write: {e}"))?;
-                let mut g = 0usize;
-                for (s, &l) in ms.seq_lens.iter().enumerate() {
-                    for _ in 0..l {
-                        sid[g] = s as u32;
-                        g += 1;
-                    }
-                }
-            }
-            Some(buf)
-        } else {
-            None
-        };
         let mut pf_token_ids = alloc_u32(seq_len, "pf_token_ids")?;
         {
             let t: &mut [u32] = pf_token_ids
@@ -1688,66 +1646,76 @@ impl MlxModelWeights {
         //
         // ADR-011 Phase 2 Wave 4 mask + blk pre-pass docs (preserved):
         //   Build the two SWA/causal masks (sliding + global) and the two
-        //   tile-skip pre-pass `blk` byte buffers ONCE per prefill, before
-        //   the layer loop. Reused by 25 sliding (D=256) layers + 5 global
-        //   (D=512) layers.  Mask layout: [seq_len, seq_len] bf16, single-
-        //   plane.  blk layout: one byte per (qtile, ktile) at the tile
-        //   shape used by each main kernel — (BQ=32, BK=16) for D=256,
-        //   (BQ=8, BK=64) for D=512.  Constants — scale=1.0 (Q pre-scaled
-        //   upstream), do_causal=false (mask carries causal), q_abs_offset=0.
+        //   tile-skip pre-pass `blk` byte buffers ONCE per prefill and per
+        //   cold sequence, before the layer loop. Reused by 25 sliding
+        //   (D=256) layers + 5 global (D=512) layers.  Mask layout:
+        //   [rows, rows] bf16, single-plane.  blk layout: one byte per
+        //   (qtile, ktile) at the tile shape used by each main kernel —
+        //   (BQ=32, BK=16) for D=256, (BQ=8, BK=64) for D=512.  Constants —
+        //   scale=1.0 (Q pre-scaled upstream), do_causal=false (mask carries
+        //   causal), q_abs_offset=0. A cold multi-sequence prefill builds
+        //   each lane's own square masks (ADR-063 Q4-GEMMA-COLD D2), exactly
+        //   the masks a single-slot prefill of that lane builds. A mask is a
+        //   function of the row count alone, so lanes of equal length share
+        //   one set (`cold_mask_rows[i]` is span `i`'s entry).
         let prefill_start = Instant::now();
-        let sliding_mask: MlxBuffer;
-        let global_mask: MlxBuffer;
-        // F16 sliding mask for HF2Q_FA_F16=1.  Built once via cast_bf16_to_f16
-        // immediately after sliding_mask is constructed, reused across all
-        // 25 sliding-attention layers' F16 FA dispatches.
-        let sliding_mask_f16: Option<MlxBuffer>;
-        // F16 global mask for HF2Q_FA_F16=1.  Same shape and rationale as
-        // sliding_mask_f16; reused across all 5 global D=512 layers' F16
-        // FA dispatches.  Fixes Bug A (Hemoglobin loop) by bringing the
-        // D=512 path to F16's 10-bit mantissa from BF16's 7-bit.
-        let global_mask_f16: Option<MlxBuffer>;
-        let blk_sliding: MlxBuffer;
-        let blk_global: MlxBuffer;
+        let mut cold_mask_lens: Vec<usize> = cold_spans.iter().map(|&(_, rows)| rows).collect();
+        cold_mask_lens.sort_unstable();
+        cold_mask_lens.dedup();
+        let cold_mask_rows: Vec<usize> = cold_spans
+            .iter()
+            .map(|&(_, rows)| cold_mask_lens.binary_search(&rows).expect("deduplicated lane length"))
+            .collect();
+        let mut cold_masks: Vec<gemma_cold_attention::ColdLaneMasks> =
+            Vec::with_capacity(cold_mask_lens.len());
         {
             use crate::serve::gemma_cold_masks::{
-                encode_cold_mask, encode_mask_tiles, ColdMaskLayout,
+                encode_cold_mask, encode_mask_tiles,
             };
             use mlx_native::ops::flash_attn_prefill_blk::{alloc_blk_buffer, BlkParams};
 
-            let mask_seq_len = gemma_batched_mask_seq_len(seq_len, live_prefix_resume);
-
-            // Pre-allocate the two blk byte buffers (Metal alloc, no kernel
+            // Pre-allocate every blk byte buffer (Metal alloc, no kernel
             // dispatch) outside the session so &mut borrow stays confined.
-            let blk_sliding_params = BlkParams {
-                seq_len_q: mask_seq_len as u32,
-                seq_len_k: mask_seq_len as u32,
-                bq: 32,
-                bk: 16,
-            };
-            blk_sliding = alloc_blk_buffer(dev, &blk_sliding_params)
-                .map_err(|e| anyhow::anyhow!("alloc blk_sliding: {e}"))?;
-            let blk_global_params = BlkParams {
-                seq_len_q: mask_seq_len as u32,
-                seq_len_k: mask_seq_len as u32,
-                bq: 8,
-                bk: 64,
-            };
-            blk_global = alloc_blk_buffer(dev, &blk_global_params)
-                .map_err(|e| anyhow::anyhow!("alloc blk_global: {e}"))?;
+            let mut lane_blks = Vec::with_capacity(cold_mask_lens.len());
+            for &rows in &cold_mask_lens {
+                let mask_seq_len = gemma_batched_mask_seq_len(rows, live_prefix_resume);
+                let blk_sliding_params = BlkParams {
+                    seq_len_q: mask_seq_len as u32,
+                    seq_len_k: mask_seq_len as u32,
+                    bq: 32,
+                    bk: 16,
+                };
+                let blk_sliding = alloc_blk_buffer(dev, &blk_sliding_params)
+                    .map_err(|e| anyhow::anyhow!("alloc blk_sliding: {e}"))?;
+                let blk_global_params = BlkParams {
+                    seq_len_q: mask_seq_len as u32,
+                    seq_len_k: mask_seq_len as u32,
+                    bq: 8,
+                    bk: 64,
+                };
+                let blk_global = alloc_blk_buffer(dev, &blk_global_params)
+                    .map_err(|e| anyhow::anyhow!("alloc blk_global: {e}"))?;
+                lane_blks.push((
+                    mask_seq_len,
+                    blk_sliding_params,
+                    blk_sliding,
+                    blk_global_params,
+                    blk_global,
+                ));
+            }
 
             let mut s = exec
                 .begin().map(crate::inference::native_observation::session)
                 .map_err(|e| anyhow::anyhow!("batched setup session: {e}"))?;
 
             // Wave P4.17 — each setup sub-step gets its own bucket timing
-            // when HF2Q_PROFILE_BUCKETS=1.  The five sub-steps (embed,
-            // sliding mask, global mask, sliding blk, global blk) are
-            // independent in the default path (no barrier between embed
+            // when HF2Q_PROFILE_BUCKETS=1.  The sub-steps (embed, then per
+            // sequence sliding mask, global mask, sliding blk, global blk)
+            // are independent in the default path (no barrier between embed
             // and the masks; each mask's cast and blk wait on its declared
-            // fill).  Splitting them adds 4 extra commit+
-            // wait transitions (~50-200 µs each) under the profile flag;
-            // normal runs keep the single session.
+            // fill).  Splitting them adds extra commit+wait transitions
+            // (~50-200 µs each) under the profile flag; normal runs keep the
+            // single session.
 
             // 1. Embedding: native stored rows -> F32 activations.  The gather
             // kernel is type-specific and touches only requested rows; no
@@ -1772,190 +1740,163 @@ impl MlxModelWeights {
                 PROFILE_B_EMBED_COUNT.fetch_add(1, Ordering::Relaxed);
             }
 
-            // 2. Sliding-window causal mask — reused across all 25 sliding layers.
-            let t0_mask_sw = if profile_buckets_on {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            let sliding_layout = match pf_seq_id.as_ref() {
-                // ADR-040 iter-G(a) delta 2 — block-diagonal causal SLIDING
-                // mask, GPU-BUILT from the per-token seq-id + per-seq local
-                // positions (pf_positions). Query qi attends key kj iff same-seq
-                // AND per-seq-causal AND within the sliding window; else -inf
-                // (cross-seq isolation). Sentinels (0xFF80 / 0x0000) match
-                // build_sdpa_mask_bf16 on each seq's diagonal block. The mask is
-                // GPU-PRODUCED (not host-written) so the F16 cast / blk / FA read
-                // a GPU buffer — a CPU-written final mask buffer is NOT reliably
-                // read by those consumers.
-                Some(sid) => ColdMaskLayout::BlockDiagonal {
-                    seq_id: sid,
-                    local_pos: &pf_positions,
-                    len: seq_len,
-                },
-                None => ColdMaskLayout::Square { len: mask_seq_len },
-            };
-            // HF2Q_FA_F16=1: the BF16 sliding mask is also cast to F16 once,
-            // reused across all 25 sliding D=256 layers' F16 FA dispatches.
-            let sliding = encode_cold_mask(
-                &mut s,
-                dev,
-                reg,
-                sliding_layout,
-                Some(self.sliding_window as u32),
-                use_fa_f16,
-                "sliding_mask",
-            )?;
-            sliding_mask = sliding.bf16;
-            sliding_mask_f16 = sliding.f16;
-            if let Some(t0) = t0_mask_sw {
-                bucket_finish!(
-                    s,
-                    exec,
-                    t0,
-                    &PROFILE_B_MASK_SW_NS,
-                    &PROFILE_B_MASK_SW_COUNT,
-                    1,
-                    "mask_sw"
-                );
-            }
+            for (mask_seq_len, blk_sliding_params, blk_sliding, blk_global_params, blk_global) in
+                lane_blks
+            {
+                // 2. Sliding-window causal mask — reused across all 25
+                // sliding layers. HF2Q_FA_F16=1: the BF16 mask is also cast
+                // to F16 once (re-cast per layer by the §0.19 remask rule).
+                let t0_mask_sw = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let sliding = encode_cold_mask(
+                    &mut s,
+                    dev,
+                    reg,
+                    mask_seq_len,
+                    Some(self.sliding_window as u32),
+                    use_fa_f16,
+                    "sliding_mask",
+                )?;
+                if let Some(t0) = t0_mask_sw {
+                    bucket_finish!(
+                        s,
+                        exec,
+                        t0,
+                        &PROFILE_B_MASK_SW_NS,
+                        &PROFILE_B_MASK_SW_COUNT,
+                        1,
+                        "mask_sw"
+                    );
+                }
 
-            // ADR-040 §0.19: checksum the mask RIGHT AFTER build. STABLE here
-            // across repeats but DIVERGED at the FA-read (S019_FAMASK) ⇒ the
-            // mask buffer is corrupted/aliased between build and use (lifetime
-            // bug). DIVERGED here ⇒ the mask BUILD itself races.
-            if std::env::var("HF2Q_S019_CKSUM").is_ok() {
-                if let Ok(s2) = exec.begin().map(crate::inference::native_observation::session) {
-                    let _ = s2.finish();
-                }
-                if let Ok(sl) = sliding_mask.as_slice::<half::bf16>() {
-                    let mut c: u64 = 0xcbf29ce484222325;
-                    for &x in sl.iter() {
-                        c ^= x.to_bits() as u64;
-                        c = c.wrapping_mul(0x100000001b3);
+                // ADR-040 §0.19: checksum the mask RIGHT AFTER build. STABLE
+                // here across repeats but DIVERGED at the FA-read
+                // (S019_FAMASK) ⇒ the mask buffer is corrupted/aliased
+                // between build and use (lifetime bug). DIVERGED here ⇒ the
+                // mask BUILD itself races.
+                if std::env::var("HF2Q_S019_CKSUM").is_ok() {
+                    if let Ok(s2) = exec.begin().map(crate::inference::native_observation::session) {
+                        let _ = s2.finish();
                     }
-                    eprintln!("S019_MASKBUILD_BF16 cks={c:016x} n={}", sl.len());
-                }
-                if let Some(ref mf) = sliding_mask_f16 {
-                    if let Ok(sl) = mf.as_slice::<half::f16>() {
+                    if let Ok(sl) = sliding.bf16.as_slice::<half::bf16>() {
                         let mut c: u64 = 0xcbf29ce484222325;
                         for &x in sl.iter() {
                             c ^= x.to_bits() as u64;
                             c = c.wrapping_mul(0x100000001b3);
                         }
-                        eprintln!("S019_MASKBUILD_F16 cks={c:016x} n={}", sl.len());
+                        eprintln!("S019_MASKBUILD_BF16 cks={c:016x} n={}", sl.len());
+                    }
+                    if let Some(mf) = &sliding.f16 {
+                        if let Ok(sl) = mf.as_slice::<half::f16>() {
+                            let mut c: u64 = 0xcbf29ce484222325;
+                            for &x in sl.iter() {
+                                c ^= x.to_bits() as u64;
+                                c = c.wrapping_mul(0x100000001b3);
+                            }
+                            eprintln!("S019_MASKBUILD_F16 cks={c:016x} n={}", sl.len());
+                        }
                     }
                 }
-            }
 
-            // 3. Global causal mask — reused across all 5 global layers.
-            let t0_mask_gl = if profile_buckets_on {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            let global_layout = match pf_seq_id.as_ref() {
-                // ADR-040 iter-G(a) delta 2 — block-diagonal causal GLOBAL mask
-                // (no sliding window), GPU-built. Full per-seq causal; off-
-                // diagonal blocks -inf isolate the N sequences across the 5
-                // global D=512 layers (F16 FA for T<=64, tensor-mm for T>64 per
-                // §0.19 — both consume this GPU-produced buffer).
-                Some(sid) => ColdMaskLayout::BlockDiagonal {
-                    seq_id: sid,
-                    local_pos: &pf_positions,
-                    len: seq_len,
-                },
-                None => ColdMaskLayout::Square { len: mask_seq_len },
-            };
-            // HF2Q_FA_F16=1: F16 copy reused across all 5 global D=512
-            // layers' F16 FA dispatches.
-            let global = encode_cold_mask(
-                &mut s,
-                dev,
-                reg,
-                global_layout,
-                None,
-                use_fa_f16,
-                "global_mask",
-            )?;
-            global_mask = global.bf16;
-            global_mask_f16 = global.f16;
-            if let Some(t0) = t0_mask_gl {
-                bucket_finish!(
-                    s,
-                    exec,
-                    t0,
-                    &PROFILE_B_MASK_GL_NS,
-                    &PROFILE_B_MASK_GL_COUNT,
-                    1,
-                    "mask_gl"
-                );
-            }
+                // 3. Global causal mask — reused across all 5 global layers.
+                let t0_mask_gl = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let global = encode_cold_mask(
+                    &mut s,
+                    dev,
+                    reg,
+                    mask_seq_len,
+                    None,
+                    use_fa_f16,
+                    "global_mask",
+                )?;
+                if let Some(t0) = t0_mask_gl {
+                    bucket_finish!(
+                        s,
+                        exec,
+                        t0,
+                        &PROFILE_B_MASK_GL_NS,
+                        &PROFILE_B_MASK_GL_COUNT,
+                        1,
+                        "mask_gl"
+                    );
+                }
 
-            // 4. Tile-skip classifiers — read mask, write blk bytes.
-            let t0_blk_sw = if profile_buckets_on {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            encode_mask_tiles(
-                &mut s,
-                dev,
-                reg,
-                &sliding_mask,
-                &blk_sliding,
-                &blk_sliding_params,
-                "blk_sliding",
-            )?;
-            if let Some(t0) = t0_blk_sw {
-                bucket_finish!(
-                    s,
-                    exec,
-                    t0,
-                    &PROFILE_B_BLK_SW_NS,
-                    &PROFILE_B_BLK_SW_COUNT,
-                    1,
-                    "blk_sw"
-                );
-            }
+                // 4. Tile-skip classifiers — read mask, write blk bytes.
+                let t0_blk_sw = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                encode_mask_tiles(
+                    &mut s,
+                    dev,
+                    reg,
+                    &sliding.bf16,
+                    &blk_sliding,
+                    &blk_sliding_params,
+                    "blk_sliding",
+                )?;
+                if let Some(t0) = t0_blk_sw {
+                    bucket_finish!(
+                        s,
+                        exec,
+                        t0,
+                        &PROFILE_B_BLK_SW_NS,
+                        &PROFILE_B_BLK_SW_COUNT,
+                        1,
+                        "blk_sw"
+                    );
+                }
 
-            let t0_blk_gl = if profile_buckets_on {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            encode_mask_tiles(
-                &mut s,
-                dev,
-                reg,
-                &global_mask,
-                &blk_global,
-                &blk_global_params,
-                "blk_global",
-            )?;
-            if let Some(t0) = t0_blk_gl {
-                bucket_finish!(
-                    s,
-                    exec,
-                    t0,
-                    &PROFILE_B_BLK_GL_NS,
-                    &PROFILE_B_BLK_GL_COUNT,
-                    1,
-                    "blk_gl"
-                );
+                let t0_blk_gl = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                encode_mask_tiles(
+                    &mut s,
+                    dev,
+                    reg,
+                    &global.bf16,
+                    &blk_global,
+                    &blk_global_params,
+                    "blk_global",
+                )?;
+                if let Some(t0) = t0_blk_gl {
+                    bucket_finish!(
+                        s,
+                        exec,
+                        t0,
+                        &PROFILE_B_BLK_GL_NS,
+                        &PROFILE_B_BLK_GL_COUNT,
+                        1,
+                        "blk_gl"
+                    );
+                }
+                cold_masks.push(gemma_cold_attention::ColdLaneMasks {
+                    sliding: sliding.bf16,
+                    sliding_f16: sliding.f16,
+                    global: global.bf16,
+                    global_f16: global.f16,
+                    blk_sliding,
+                    blk_global,
+                });
             }
 
             // Wave P4.18 — setup-session async commit.  Matches the
             // layer-boundary async-commit pattern (commit 9091b8c): the
-            // setup outputs (sliding_mask, global_mask, blk_sliding,
-            // blk_global, pf_hidden, pf_positions, pf_token_ids) are
-            // written to shared buffers and read by layer 0's first
-            // dispatches.  Metal guarantees in-order execution of CBs
-            // submitted to the same queue, so those reads see the setup
-            // writes without requiring a CPU-side wait.  The ~30-45 ms
-            // of GPU idle at the setup→layer0 boundary (from the 2026-
-            // 04-20 bucket profile) collapses: layer 0's CPU-encode
-            // phase runs concurrently with the tail of setup's GPU work.
+            // setup outputs (masks, blk bytes, pf_hidden, pf_positions,
+            // pf_token_ids) are written to shared buffers and read by layer
+            // 0's first dispatches.  Metal guarantees in-order execution of
+            // CBs submitted to the same queue, so those reads see the setup
+            // writes without requiring a CPU-side wait.
             //
             // Same fallback escape hatches as the layer boundary:
             //   * HF2Q_BATCHED_DUMP set — dump path CPU-reads setup
@@ -1971,26 +1912,6 @@ impl MlxModelWeights {
             if sync_setup {
                 s.finish()
                     .map_err(|e| anyhow::anyhow!("batched setup finish: {e}"))?;
-                if std::env::var("HF2Q_DUMP_SLIDING_MASK").as_deref() == Ok("1") {
-                    if let (Some(ms), Some(_)) = (self.multi_seq_prefill.as_ref(), &pf_seq_id) {
-                        let t = seq_len;
-                        if let Ok(sm) = sliding_mask.as_slice::<half::bf16>() {
-                            // A-query rows are seq0 [0,L0); B-key cols are seq1.
-                            let l0 = ms.seq_lens[0];
-                            let o1 = ms.seq_offsets[1];
-                            let qa = 5.min(l0.saturating_sub(1));
-                            let kb = o1 + 1; // a seq1 (B) key column
-                            let ka = 3.min(l0.saturating_sub(1)); // a seq0 (A) key (causal)
-                            eprintln!(
-                                "[SMDUMP] T={t} L0={l0} o1={o1} | mask[A_q{qa},B_k{kb}]=0x{:04x} (want FF80) | mask[A_q{qa},A_k{ka}]=0x{:04x} (want 0000) | mask[A_q{qa},A_k{}]=0x{:04x}",
-                                sm[qa * t + kb].to_bits(),
-                                sm[qa * t + ka].to_bits(),
-                                qa + 1,
-                                sm[qa * t + qa + 1].to_bits(), // future A key → want FF80
-                            );
-                        }
-                    }
-                }
             } else {
                 let _committed = s.commit();
                 drop(_committed);
@@ -2550,8 +2471,21 @@ impl MlxModelWeights {
                 // (iter-81 measurement).  Keeping FA_SW for sliding +
                 // routing global through NO_FA saves ~52 ms wall at pp8333
                 // per model.
+                // Cold layers route per sequence (`gemma_cold_attention`);
+                // this whole-stream predicate only selects the DFlash xlen
+                // verify branch below, which never runs multi-sequence (the
+                // multi-sequence wrappers refuse HF2Q_DFLASH_XLEN_SDPA).
                 let route_through_nofa =
-                    !live_prefix_resume && (use_no_fa || force_global_nofa) && !is_sliding;
+                    !live_prefix_resume && !is_sliding && cold_route.global_tensor_mm(seq_len);
+                // ADR-030 iter-82 — HF2Q_DFLASH_XLEN_D512_OFF=1 routes the
+                // full-attn (D=512) layers through the standard cold path while
+                // keeping sliding (D=256) layers on the xlen path.
+                let xlen_d512_disabled =
+                    std::env::var("HF2Q_DFLASH_XLEN_D512_OFF").as_deref() == Ok("1");
+                let xlen_layer = xlen_sdpa_mode
+                    && !live_prefix_resume
+                    && !route_through_nofa
+                    && (is_sliding || !xlen_d512_disabled);
                 if live_prefix_resume {
                     if warm_split {
                         crate::serve::gemma_prefill_catsplit::boundary(
@@ -2615,265 +2549,8 @@ impl MlxModelWeights {
                             crate::serve::gemma_prefill_catsplit::Cat::Attention,
                         )?;
                     }
-                } else if route_through_nofa {
-                    // ---- HF2Q_NO_FA path: tensor-mm attention ----
-                    //
-                    // Mirrors the peer's `-fa 0` fast path (which on M5
-                    // today measures 3410 vs 3217 for `-fa 1` at pp2455):
-                    //
-                    //   1. Q bf16 -> f32 (src1 dtype for our bf16 tensor-mm)
-                    //   2. Q @ K^T -> kq f32  [nh, seq, seq]
-                    //   3. scale-mask-softmax -> kq in-place
-                    //   4. transpose_last2 V bf16 -> V_t bf16 [nkv, hd, seq]
-                    //   5. scores @ V_t -> attn f32 [nh, seq, hd]
-                    //   6. permute_021 attn -> pf_sdpa_out f32 [seq, nh, hd]
-                    //
-                    // Gemma 4 on this GGUF has no Q·K softcap (only the
-                    // lm_head softcap), so step 3 skips the tanh-based
-                    // logit cap that llama's graph inserts for Gemma 2/3.
-                    // The mask buffer is the same bf16 sliding / global
-                    // mask the FA path uses (reused verbatim).
-                    let pf_q_perm_f32_ref = pf_q_perm_f32
-                        .as_ref()
-                        .expect("pf_q_perm_f32 must be allocated in HF2Q_NO_FA mode");
-                    let pf_kq_ref = pf_kq
-                        .as_mut()
-                        .expect("pf_kq must be allocated in HF2Q_NO_FA mode");
-                    let pf_v_perm_t_ref = pf_v_perm_t
-                        .as_ref()
-                        .expect("pf_v_perm_t must be allocated in HF2Q_NO_FA mode");
-                    let pf_attn_f32_ref = pf_attn_f32
-                        .as_mut()
-                        .expect("pf_attn_f32 must be allocated in HF2Q_NO_FA mode");
-
-                    // Step 1 removed (D.1): the Q bf16→f32 cast is fused
-                    // into the head-norm+RoPE kernel via the optional
-                    // output_f32_perm buffer.  pf_q_perm_f32 is already
-                    // populated at permuted [nh, seq, hd] layout.
-
-                    // Step 2: Q @ K^T via dense bf16×f32→f32 tensor-mm.
-                    // src0 = K [nkv, seq, hd] bf16, src1 = Q [nh, seq, hd] f32.
-                    // Output kq[h, q, k] = sum_d K[h/r2, k, d] * Q[h, q, d].
-                    // r2 = nh / nkv for GQA head broadcast.
-                    // ADR-029 iter-81 H61: bracket with finish/begin under
-                    // profile_buckets_on to measure per-dispatch GPU+CPU wall.
-                    let nofa_qk_t0 = if profile_buckets_on {
-                        s.finish()
-                            .map_err(|e| anyhow::anyhow!("noFA QK pre-finish L{layer_idx}: {e}"))?;
-                        let t0 = std::time::Instant::now();
-                        s = exec
-                            .begin().map(crate::inference::native_observation::session)
-                            .map_err(|e| anyhow::anyhow!("noFA QK begin L{layer_idx}: {e}"))?;
-                        Some(t0)
-                    } else {
-                        None
-                    };
-                    s.barrier_between(&[&pf_k_perm, pf_q_perm_f32_ref], &[pf_kq_ref]);
-                    mlx_native::ops::dense_mm_bf16::dense_matmul_bf16_f32_tensor(
-                        s.encoder_mut(),
-                        reg,
-                        dev,
-                        &pf_k_perm,
-                        pf_q_perm_f32_ref,
-                        pf_kq_ref,
-                        &mlx_native::ops::dense_mm_bf16::DenseMmBf16F32Params {
-                            m: seq_len as u32,
-                            n: seq_len as u32,
-                            k: hd as u32,
-                            src0_batch: nkv as u32,
-                            src1_batch: nh as u32,
-                        },
-                    )
-                    .map_err(|e| anyhow::anyhow!("non-FA Q@K^T L{layer_idx}: {e}"))?;
-                    if let Some(t0) = nofa_qk_t0 {
-                        s.finish().map_err(|e| {
-                            anyhow::anyhow!("noFA QK post-finish L{layer_idx}: {e}")
-                        })?;
-                        let dt_ns = t0.elapsed().as_nanos() as u64;
-                        PROFILE_B_NOFA_QK_NS.fetch_add(dt_ns, Ordering::Relaxed);
-                        PROFILE_B_NOFA_QK_COUNT.fetch_add(1, Ordering::Relaxed);
-                        s = exec
-                            .begin().map(crate::inference::native_observation::session)
-                            .map_err(|e| anyhow::anyhow!("noFA QK reopen L{layer_idx}: {e}"))?;
-                    }
-
-                    // Step 3: scale + mask + softmax fused.  scale = 1.0
-                    // because Q's norm-weight pre-scales by 1/sqrt(hd)
-                    // (matches FA path's scale=1.0).
-                    let nofa_sms_t0 = if profile_buckets_on {
-                        s.finish().map_err(|e| {
-                            anyhow::anyhow!("noFA SMS pre-finish L{layer_idx}: {e}")
-                        })?;
-                        let t0 = std::time::Instant::now();
-                        s = exec
-                            .begin().map(crate::inference::native_observation::session)
-                            .map_err(|e| anyhow::anyhow!("noFA SMS begin L{layer_idx}: {e}"))?;
-                        Some(t0)
-                    } else {
-                        None
-                    };
-                    let mask_ref = if is_sliding {
-                        &sliding_mask
-                    } else {
-                        &global_mask
-                    };
-                    s.barrier_between(&[pf_kq_ref, mask_ref], &[pf_kq_ref]);
-                    mlx_native::ops::scale_mask_softmax::dispatch_scale_mask_softmax_f32(
-                        s.encoder_mut(),
-                        reg,
-                        dev,
-                        pf_kq_ref,
-                        pf_kq_ref,
-                        mask_ref,
-                        &mlx_native::ops::scale_mask_softmax::ScaleMaskSoftmaxParams {
-                            rows: (nh * seq_len) as u32,
-                            cols: seq_len as u32,
-                            seq_q: seq_len as u32,
-                            scale: 1.0,
-                        },
-                    )
-                    .map_err(|e| anyhow::anyhow!("non-FA scale_mask_softmax L{layer_idx}: {e}"))?;
-                    if let Some(t0) = nofa_sms_t0 {
-                        s.finish().map_err(|e| {
-                            anyhow::anyhow!("noFA SMS post-finish L{layer_idx}: {e}")
-                        })?;
-                        let dt_ns = t0.elapsed().as_nanos() as u64;
-                        PROFILE_B_NOFA_SMS_NS.fetch_add(dt_ns, Ordering::Relaxed);
-                        PROFILE_B_NOFA_SMS_COUNT.fetch_add(1, Ordering::Relaxed);
-                        s = exec
-                            .begin().map(crate::inference::native_observation::session)
-                            .map_err(|e| anyhow::anyhow!("noFA SMS reopen L{layer_idx}: {e}"))?;
-                    }
-
-                    // Step 4: transpose V [nkv, seq, hd] -> [nkv, hd, seq]
-                    // so the scores@V matmul contracts on seq_kv (K-dim
-                    // = inner-most dim of src0 per our kernel contract).
-                    let nofa_vtrans_t0 = if profile_buckets_on {
-                        s.finish().map_err(|e| {
-                            anyhow::anyhow!("noFA Vtrans pre-finish L{layer_idx}: {e}")
-                        })?;
-                        let t0 = std::time::Instant::now();
-                        s = exec
-                            .begin().map(crate::inference::native_observation::session)
-                            .map_err(|e| anyhow::anyhow!("noFA Vtrans begin L{layer_idx}: {e}"))?;
-                        Some(t0)
-                    } else {
-                        None
-                    };
-                    s.barrier_between(&[&pf_v_perm], &[pf_v_perm_t_ref]);
-                    mlx_native::ops::transpose::transpose_last2_bf16(
-                        s.encoder_mut(),
-                        reg,
-                        metal_dev,
-                        &pf_v_perm,
-                        pf_v_perm_t_ref,
-                        nkv,
-                        seq_len,
-                        hd,
-                    )
-                    .map_err(|e| anyhow::anyhow!("non-FA V transpose L{layer_idx}: {e}"))?;
-                    if let Some(t0) = nofa_vtrans_t0 {
-                        s.finish().map_err(|e| {
-                            anyhow::anyhow!("noFA Vtrans post-finish L{layer_idx}: {e}")
-                        })?;
-                        let dt_ns = t0.elapsed().as_nanos() as u64;
-                        PROFILE_B_NOFA_VTRANS_NS.fetch_add(dt_ns, Ordering::Relaxed);
-                        PROFILE_B_NOFA_VTRANS_COUNT.fetch_add(1, Ordering::Relaxed);
-                        s = exec
-                            .begin().map(crate::inference::native_observation::session)
-                            .map_err(|e| anyhow::anyhow!("noFA Vtrans reopen L{layer_idx}: {e}"))?;
-                    }
-
-                    // Step 5: scores @ V_t via dense bf16×f32→f32 tensor-mm.
-                    // src0 = V_t [nkv, hd, seq_kv] bf16, src1 = kq [nh, seq_q, seq_kv] f32.
-                    // Output attn[h, q, d] = sum_k V_t[h/r2, d, k] * kq[h, q, k]
-                    //                       = sum_k V[h/r2, k, d] * probs[h, q, k].
-                    let nofa_sv_t0 = if profile_buckets_on {
-                        s.finish()
-                            .map_err(|e| anyhow::anyhow!("noFA SV pre-finish L{layer_idx}: {e}"))?;
-                        let t0 = std::time::Instant::now();
-                        s = exec
-                            .begin().map(crate::inference::native_observation::session)
-                            .map_err(|e| anyhow::anyhow!("noFA SV begin L{layer_idx}: {e}"))?;
-                        Some(t0)
-                    } else {
-                        None
-                    };
-                    s.barrier_between(&[pf_v_perm_t_ref, pf_kq_ref], &[pf_attn_f32_ref]);
-                    mlx_native::ops::dense_mm_bf16::dense_matmul_bf16_f32_tensor(
-                        s.encoder_mut(),
-                        reg,
-                        dev,
-                        pf_v_perm_t_ref,
-                        pf_kq_ref,
-                        pf_attn_f32_ref,
-                        &mlx_native::ops::dense_mm_bf16::DenseMmBf16F32Params {
-                            m: seq_len as u32,
-                            n: hd as u32,
-                            k: seq_len as u32,
-                            src0_batch: nkv as u32,
-                            src1_batch: nh as u32,
-                        },
-                    )
-                    .map_err(|e| anyhow::anyhow!("non-FA scores@V L{layer_idx}: {e}"))?;
-                    if let Some(t0) = nofa_sv_t0 {
-                        s.finish().map_err(|e| {
-                            anyhow::anyhow!("noFA SV post-finish L{layer_idx}: {e}")
-                        })?;
-                        let dt_ns = t0.elapsed().as_nanos() as u64;
-                        PROFILE_B_NOFA_SV_NS.fetch_add(dt_ns, Ordering::Relaxed);
-                        PROFILE_B_NOFA_SV_COUNT.fetch_add(1, Ordering::Relaxed);
-                        s = exec
-                            .begin().map(crate::inference::native_observation::session)
-                            .map_err(|e| anyhow::anyhow!("noFA SV reopen L{layer_idx}: {e}"))?;
-                    }
-
-                    // Step 6: permute attn [nh, seq, hd] f32 -> pf_sdpa_out
-                    // [seq, nh, hd] f32 to match the O-proj input layout.
-                    let nofa_perm_t0 = if profile_buckets_on {
-                        s.finish().map_err(|e| {
-                            anyhow::anyhow!("noFA perm pre-finish L{layer_idx}: {e}")
-                        })?;
-                        let t0 = std::time::Instant::now();
-                        s = exec
-                            .begin().map(crate::inference::native_observation::session)
-                            .map_err(|e| anyhow::anyhow!("noFA perm begin L{layer_idx}: {e}"))?;
-                        Some(t0)
-                    } else {
-                        None
-                    };
-                    s.barrier_between(&[pf_attn_f32_ref], &[&pf_sdpa_out]);
-                    mlx_native::ops::transpose::permute_021_f32(
-                        s.encoder_mut(),
-                        reg,
-                        metal_dev,
-                        pf_attn_f32_ref,
-                        &pf_sdpa_out,
-                        nh,
-                        seq_len,
-                        hd,
-                    )
-                    .map_err(|e| anyhow::anyhow!("non-FA attn permute L{layer_idx}: {e}"))?;
-                    if let Some(t0) = nofa_perm_t0 {
-                        s.finish().map_err(|e| {
-                            anyhow::anyhow!("noFA perm post-finish L{layer_idx}: {e}")
-                        })?;
-                        let dt_ns = t0.elapsed().as_nanos() as u64;
-                        PROFILE_B_NOFA_PERM_NS.fetch_add(dt_ns, Ordering::Relaxed);
-                        PROFILE_B_NOFA_PERM_COUNT.fetch_add(1, Ordering::Relaxed);
-                        s = exec
-                            .begin().map(crate::inference::native_observation::session)
-                            .map_err(|e| anyhow::anyhow!("noFA perm reopen L{layer_idx}: {e}"))?;
-                    }
-                } else {
+                } else if xlen_layer {
                     s.barrier_between(&[&pf_q_perm, &pf_k_perm, &pf_v_perm], &[&pf_sdpa_out_perm]);
-                    // Wave P4.0 — env-gated FA isolation for per-kernel timing.
-                    // When HF2Q_PROFILE_FA=1: commit-and-wait the QKV+permute
-                    // work, restart with a session that holds ONLY the FA
-                    // dispatch, then commit-and-wait again to capture true
-                    // FA-only wall-clock GPU time.  The 2 extra syncs/layer
-                    // make the overall prefill slower but isolate FA's cost
-                    // from QKV mm and the post-FA permute/cast.
                     let profile_fa = std::env::var("HF2Q_PROFILE_FA").is_ok() || profile_buckets_on;
                     let fa_start = if profile_fa {
                         s.finish().map_err(|e| {
@@ -2888,7 +2565,7 @@ impl MlxModelWeights {
                         None
                     };
                     if is_sliding {
-                        if xlen_sdpa_mode {
+                        {
                             // ADR-030 iter-78 — pre-SDPA hybrid_kv write.
                             // The standard K/V copy to hybrid_kv (line 1572+) happens
                             // AFTER SDPA, but xlen SDPA needs hybrid_kv to be
@@ -3300,269 +2977,13 @@ impl MlxModelWeights {
                                     anyhow::anyhow!("xlen O F32->BF16 L{layer_idx}: {e}")
                                 })?;
                             }
-                        } else {
-                            // ADR-011 Phase 2 Wave 4 Stage 2: flash_attn_prefill D=256
-                            // replaces sdpa_sliding. Inputs:
-                            //   - Q/K/V/O: bf16 [n_heads/n_kv_heads, seq_len, hd=256],
-                            //     contiguous inner dim (already ensured by the
-                            //     permute_021_bf16 pre-SDPA step above).
-                            //   - mask: &sliding_mask, rank-2 [seq_len, seq_len] bf16
-                            //     built once per prefill with window_size=sliding_window
-                            //     and causal=true (Wave 2D). Post-Wave-4.1 dispatcher
-                            //     detects rank-2 and emits strides [0,0,kL] so the
-                            //     single plane broadcasts across all 16 heads.
-                            //   - blk: &blk_sliding, (BQ=32, BK=16) tile-skip bytes
-                            //     from Wave 2E classifier. Per-tile content matches
-                            //     (sliding_mask tile); main kernel skips fully-masked
-                            //     tiles entirely, saving work on rows where the
-                            //     sliding window excludes most of the prefix.
-                            //   - scale=1.0 (Gemma 4: Q is pre-scaled upstream in
-                            //     qmatmul), do_causal=false (mask carries causal).
-                            if use_fa_f16 {
-                                // HF2Q_FA_F16=1: F16 FA path (kernel migration step 4).
-                                //
-                                // Source F16 Q/K/V from the F32 *_normed buffers
-                                // directly via permute_021_f32_to_f16 (mlx-native
-                                // step 4 kernel) — bypassing the BF16 pf_*_perm
-                                // round-trip that left the step-3 wiring with
-                                // BF16 precision.  F16 is sourced from F32 with
-                                // a single rounding step at the F16 store, giving
-                                // F16's full 10-bit-mantissa precision (~8× the
-                                // BF16 7-bit mantissa).
-                                let q_f16 = pf_q_perm_f16.as_ref().ok_or_else(|| {
-                                    anyhow::anyhow!("FA_F16: pf_q_perm_f16 not allocated")
-                                })?;
-                                let k_f16 = pf_k_perm_f16.as_ref().ok_or_else(|| {
-                                    anyhow::anyhow!("FA_F16: pf_k_perm_f16 not allocated")
-                                })?;
-                                let v_f16 = pf_v_perm_f16.as_ref().ok_or_else(|| {
-                                    anyhow::anyhow!("FA_F16: pf_v_perm_f16 not allocated")
-                                })?;
-                                let out_f16 = pf_sdpa_out_perm_f16.as_mut().ok_or_else(|| {
-                                    anyhow::anyhow!("FA_F16: pf_sdpa_out_perm_f16 not allocated")
-                                })?;
-                                let mask_f16 = sliding_mask_f16.as_ref().ok_or_else(|| {
-                                    anyhow::anyhow!("FA_F16: sliding_mask_f16 not allocated")
-                                })?;
-
-                                let q_elems = (nh * seq_len * hd) as usize;
-
-                                // pf_q_normed / pf_k_normed / pf_v_normed are F32 in
-                                // natural [seq_len, n_heads, head_dim] layout.
-                                // permute_021_f32_to_f16 writes F16 in permuted
-                                // [n_heads, seq_len, head_dim] layout which is what
-                                // dispatch_flash_attn_prefill_f16_d256_with_blk expects.
-                                s.barrier_between(&[&pf_q_normed], &[q_f16]);
-                                mlx_native::ops::transpose::permute_021_f32_to_f16(
-                                    s.encoder_mut(),
-                                    reg,
-                                    metal_dev,
-                                    &pf_q_normed,
-                                    q_f16,
-                                    seq_len,
-                                    nh,
-                                    hd,
-                                )
-                                .map_err(|e| {
-                                    anyhow::anyhow!("FA_F16 Q permute+cast L{layer_idx}: {e}")
-                                })?;
-                                s.barrier_between(&[&pf_k_normed], &[k_f16]);
-                                mlx_native::ops::transpose::permute_021_f32_to_f16(
-                                    s.encoder_mut(),
-                                    reg,
-                                    metal_dev,
-                                    &pf_k_normed,
-                                    k_f16,
-                                    seq_len,
-                                    nkv,
-                                    hd,
-                                )
-                                .map_err(|e| {
-                                    anyhow::anyhow!("FA_F16 K permute+cast L{layer_idx}: {e}")
-                                })?;
-                                s.barrier_between(&[&pf_v_normed], &[v_f16]);
-                                mlx_native::ops::transpose::permute_021_f32_to_f16(
-                                    s.encoder_mut(),
-                                    reg,
-                                    metal_dev,
-                                    &pf_v_normed,
-                                    v_f16,
-                                    seq_len,
-                                    nkv,
-                                    hd,
-                                )
-                                .map_err(|e| {
-                                    anyhow::anyhow!("FA_F16 V permute+cast L{layer_idx}: {e}")
-                                })?;
-
-                                // ADR-040 §0.19: checksum the ACTUAL FA inputs (F16
-                                // casts + mask + blk tile-classification). Any DIVERGED
-                                // ⇒ upstream cast/blk-build races; all STABLE while
-                                // out_f16 diverges ⇒ FA D256 kernel COMPUTE is the root.
-                                if std::env::var("HF2Q_S019_CKSUM").is_ok() {
-                                    if let Ok(s2) = exec.begin().map(crate::inference::native_observation::session) {
-                                        let _ = s2.finish();
-                                    }
-                                    macro_rules! ck16 {
-                                        ($b:expr,$n:expr) => {
-                                            if let Ok(s) = $b.as_slice::<half::f16>() {
-                                                let mut c: u64 = 0xcbf29ce484222325;
-                                                for &x in s.iter() {
-                                                    c ^= x.to_bits() as u64;
-                                                    c = c.wrapping_mul(0x100000001b3);
-                                                }
-                                                eprintln!(
-                                                    "S019_{} L{layer_idx:02} cks={c:016x}",
-                                                    $n
-                                                );
-                                            }
-                                        };
-                                    }
-                                    ck16!(q_f16, "FAQ16");
-                                    ck16!(k_f16, "FAK16");
-                                    ck16!(v_f16, "FAV16");
-                                    ck16!(mask_f16, "FAMASK");
-                                    if let Ok(s) = blk_sliding.as_slice::<u8>() {
-                                        let mut c: u64 = 0xcbf29ce484222325;
-                                        for &x in s.iter() {
-                                            c ^= x as u64;
-                                            c = c.wrapping_mul(0x100000001b3);
-                                        }
-                                        eprintln!("S019_FABLK L{layer_idx:02} cks={c:016x}");
-                                    }
-                                }
-                                // ADR-040 §0.19 FIX (default-on; opt-out HF2Q_S019_NO_REMASK):
-                                // rebuild the F16 sliding mask IN THIS LAYER'S SESSION right
-                                // before the FA reads it, from the intact bf16 source. Root
-                                // cause (per-op checksum bisection + tracker analysis):
-                                // sliding_mask_f16 is built ONCE in the SETUP session and
-                                // reused cross-session by every sliding layer's FA; under
-                                // GPU contention an untracked aliasing writer corrupts its
-                                // full 131072-byte memory (mask byte-stable AT BUILD, DIVERGES
-                                // AT FA-read; sync/ordering can't fix it — verified). The
-                                // per-session range tracker cannot bridge the setup→layer
-                                // cross-session hazard, so the architecturally-correct fix is
-                                // to recompute the mask in the consuming session (cast is
-                                // ~one [seq,seq] f16 op/sliding-layer, <1% of prefill). This
-                                // re-cast + the FA barrier_between below are in ONE session,
-                                // so the range tracker DOES order them. Restores per-op SDPA
-                                // determinism (12/12). NOTE: closes the PREFILL §0.19; the
-                                // N=8 decode-side residual (batched_body reused buffers) is
-                                // the same class, fixed separately.
-                                if std::env::var("HF2Q_S019_NO_REMASK").is_err() {
-                                    s.barrier_between(&[&sliding_mask], &[mask_f16]);
-                                    mlx_native::ops::elementwise::cast(
-                                        s.encoder_mut(),
-                                        reg,
-                                        metal_dev,
-                                        &sliding_mask,
-                                        mask_f16,
-                                        (seq_len * seq_len) as usize,
-                                        mlx_native::ops::elementwise::CastDirection::BF16ToF16,
-                                    )
-                                    .map_err(|e| {
-                                        anyhow::anyhow!("§0.19 remask L{layer_idx}: {e}")
-                                    })?;
-                                }
-                                s.barrier_between(
-                                    &[q_f16, k_f16, v_f16, mask_f16, &blk_sliding],
-                                    &[out_f16],
-                                );
-                                mlx_native::ops::flash_attn_prefill::
-                            dispatch_flash_attn_prefill_f16_d256_with_blk(
-                            s.encoder_mut(), dev, reg,
-                            q_f16, k_f16, v_f16,
-                            Some(mask_f16),
-                            Some(&blk_sliding),
-                            out_f16,
-                            &mlx_native::ops::flash_attn_prefill::FlashAttnPrefillParams {
-                                n_heads: nh as u32,
-                                n_kv_heads: nkv as u32,
-                                head_dim: hd as u32,
-                                seq_len_q: seq_len as u32,
-                                seq_len_k: seq_len as u32,
-                                batch: 1,
-                                scale: 1.0,
-                                do_causal: false,
-                            },
-                        ).map_err(|e| anyhow::anyhow!("FA_F16 sliding L{layer_idx}: {e}"))?;
-
-                                // Cast F16 output back to BF16 for o_proj input compat.
-                                s.barrier_between(&[out_f16], &[&pf_sdpa_out_perm]);
-                                mlx_native::ops::elementwise::cast(
-                                    s.encoder_mut(),
-                                    reg,
-                                    metal_dev,
-                                    out_f16,
-                                    &pf_sdpa_out_perm,
-                                    q_elems,
-                                    mlx_native::ops::elementwise::CastDirection::F16ToBF16,
-                                )
-                                .map_err(|e| anyhow::anyhow!("FA_F16 O cast L{layer_idx}: {e}"))?;
-                            } else {
-                                mlx_native::ops::flash_attn_prefill::
-                        dispatch_flash_attn_prefill_bf16_d256_with_blk(
-                        s.encoder_mut(), dev, reg,
-                        &pf_q_perm, &pf_k_perm, &pf_v_perm,
-                        Some(&sliding_mask),
-                        Some(&blk_sliding),
-                        &mut pf_sdpa_out_perm,
-                        &mlx_native::ops::flash_attn_prefill::FlashAttnPrefillParams {
-                            n_heads: nh as u32,
-                            n_kv_heads: nkv as u32,
-                            head_dim: hd as u32,
-                            seq_len_q: seq_len as u32,
-                            seq_len_k: seq_len as u32,
-                            batch: 1,
-                            scale: 1.0,
-                            do_causal: false,
-                        },
-                    ).map_err(|e| anyhow::anyhow!("batched sliding flash_attn_prefill L{layer_idx}: {e}"))?;
-                            } // end FA_F16 vs BF16 branch
-                        } // end sliding else (existing non-xlen path)
+                        }
                     } else {
-                        // ADR-011 Phase 2 Wave 4 Stage 3: flash_attn_prefill D=512
-                        // (NSG=8 peer-derived kernel) replaces s.sdpa for
-                        // Gemma 4's 5 global layers (head_dim=512).
-                        //   - Q/K/V/O: bf16 [n_heads/n_kv_heads, seq_len, 512],
-                        //     contiguous inner dim.
-                        //   - mask: &global_mask, rank-2 [seq_len, seq_len] bf16
-                        //     with window_size=None, causal=true (Wave 2D).
-                        //   - blk: &blk_global, (BQ=8, BK=64) tile-skip bytes —
-                        //     BK=64 matches the D=512 main kernel's ic0 loop
-                        //     step (NCPSG=64). For fully-causal masks most
-                        //     tiles are type-1 (mixed), so blk offers modest
-                        //     savings mostly at (qtile, ktile) pairs beyond
-                        //     the causal diagonal.
-                        //   - scale=1.0, do_causal=false (same contract as D=256).
-                        //
-                        // History: an interim revert (commit 787f2fe) routed this
-                        // branch back to s.sdpa after a kernel-level softmax bug
-                        // in flash_attn_prefill_d512.metal flipped sourdough_gate
-                        // argmaxes. The bug was a double application of log2(e)
-                        // inside the online softmax (mlx-native commit f3abe0d);
-                        // it is now fixed and this revert restores the original
-                        // Wave 4 Stage 3 wiring. See
-                        //   /opt/hf2q/docs/ADR-011-phase2-wave2c-d512-bug-fix.md
-                        // for the per-line trace, the math, and the per-test
-                        // tolerance numbers.
-                        // ADR-030 iter-82 — env-gated D=512 xlen bypass for bisection.
-                        // HF2Q_DFLASH_XLEN_D512_OFF=1 routes the full-attn (D=512)
-                        // layers through the STANDARD non-xlen path while keeping
-                        // sliding (D=256) layers on the xlen path.  Used for
-                        // root-causing iter-82's L29 NaN; left in for safety
-                        // valve.
-                        let xlen_d512_disabled =
-                            std::env::var("HF2Q_DFLASH_XLEN_D512_OFF").as_deref() == Ok("1");
                         // ADR-030 iter-84 — F16 D=512 attention OVERFLOWS at the
-                        // final gemma-4 layer (L29) because Q magnitudes are
-                        // ~16× larger there and the F16 exponent caps at 2^15.
-                        // BF16 has the same exponent range as F32 so it's safe.
-                        // Cast hybrid_kv K, V from F16 to BF16 via F32, then
-                        // dispatch the new bf16 D=512 resume kernel.  pf_q_perm
-                        // is already BF16, so Q needs no cast.  Output goes
-                        // directly to pf_sdpa_out_perm (BF16).
-                        if xlen_sdpa_mode && !xlen_d512_disabled {
+                        // final gemma-4 layer (L29); cast hybrid_kv K, V from F16
+                        // to BF16 via F32 and dispatch the bf16 D=512 resume
+                        // kernel. Output goes directly to pf_sdpa_out_perm (BF16).
+                        {
                             // ADR-030 iter-78 — pre-SDPA hybrid_kv write (D=512).
                             let hybrid_kv_vec = self.hybrid_kv.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("xlen SDPA L{layer_idx}: hybrid_kv not allocated — HF2Q_FULL_F16_KV=1 required"))?;
@@ -3785,160 +3206,8 @@ impl MlxModelWeights {
                                 &pf_out_f16_xlen,
                                 &pf_out_f32_xlen,
                             );
-                        } else if use_fa_f16 {
-                            // Bug A fix (2026-05-17): F16 D=512 FA path — keeps Q
-                            // in F16 (10-bit mantissa) instead of BF16 (7-bit) for
-                            // the global D=512 attention layers.  Worst-case
-                            // accumulated relative error over the 512-element dot
-                            // product drops from ~18% (BF16) to ~2.2% (F16) —
-                            // below the empirical argmax-flip threshold that
-                            // produced the `Format: Hemoglobin` greedy loop at
-                            // decode-pos ~70 on 300-item enumeration probes.
-                            //
-                            // Source F16 Q/K/V from F32 *_normed buffers via
-                            // permute_021_f32_to_f16 (single rounding step;
-                            // bypasses the BF16 round-trip through pf_*_perm).
-                            let q_f16 = pf_q_perm_f16.as_ref().ok_or_else(|| {
-                                anyhow::anyhow!("FA_F16: pf_q_perm_f16 not allocated")
-                            })?;
-                            let k_f16 = pf_k_perm_f16.as_ref().ok_or_else(|| {
-                                anyhow::anyhow!("FA_F16: pf_k_perm_f16 not allocated")
-                            })?;
-                            let v_f16 = pf_v_perm_f16.as_ref().ok_or_else(|| {
-                                anyhow::anyhow!("FA_F16: pf_v_perm_f16 not allocated")
-                            })?;
-                            let out_f16 = pf_sdpa_out_perm_f16.as_mut().ok_or_else(|| {
-                                anyhow::anyhow!("FA_F16: pf_sdpa_out_perm_f16 not allocated")
-                            })?;
-                            let mask_f16 = global_mask_f16.as_ref().ok_or_else(|| {
-                                anyhow::anyhow!("FA_F16: global_mask_f16 not allocated")
-                            })?;
-
-                            let q_elems = (nh * seq_len * hd) as usize;
-
-                            s.barrier_between(&[&pf_q_normed], &[q_f16]);
-                            mlx_native::ops::transpose::permute_021_f32_to_f16(
-                                s.encoder_mut(),
-                                reg,
-                                metal_dev,
-                                &pf_q_normed,
-                                q_f16,
-                                seq_len,
-                                nh,
-                                hd,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!("FA_F16 global Q permute+cast L{layer_idx}: {e}")
-                            })?;
-                            s.barrier_between(&[&pf_k_normed], &[k_f16]);
-                            mlx_native::ops::transpose::permute_021_f32_to_f16(
-                                s.encoder_mut(),
-                                reg,
-                                metal_dev,
-                                &pf_k_normed,
-                                k_f16,
-                                seq_len,
-                                nkv,
-                                hd,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!("FA_F16 global K permute+cast L{layer_idx}: {e}")
-                            })?;
-                            s.barrier_between(&[&pf_v_normed], &[v_f16]);
-                            mlx_native::ops::transpose::permute_021_f32_to_f16(
-                                s.encoder_mut(),
-                                reg,
-                                metal_dev,
-                                &pf_v_normed,
-                                v_f16,
-                                seq_len,
-                                nkv,
-                                hd,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!("FA_F16 global V permute+cast L{layer_idx}: {e}")
-                            })?;
-
-                            // ADR-040 §0.19 FIX (default-on; opt-out HF2Q_S019_NO_REMASK):
-                            // global_mask_f16 is the same cross-session-reused-mask hazard
-                            // as the sliding mask — rebuild it in-session from the bf16
-                            // source before the D512 FA reads it.
-                            if std::env::var("HF2Q_S019_NO_REMASK").is_err() {
-                                s.barrier_between(&[&global_mask], &[mask_f16]);
-                                mlx_native::ops::elementwise::cast(
-                                    s.encoder_mut(),
-                                    reg,
-                                    metal_dev,
-                                    &global_mask,
-                                    mask_f16,
-                                    (seq_len * seq_len) as usize,
-                                    mlx_native::ops::elementwise::CastDirection::BF16ToF16,
-                                )
-                                .map_err(|e| {
-                                    anyhow::anyhow!("§0.19 remask global L{layer_idx}: {e}")
-                                })?;
-                            }
-                            s.barrier_between(
-                                &[q_f16, k_f16, v_f16, mask_f16, &blk_global],
-                                &[out_f16],
-                            );
-                            mlx_native::ops::flash_attn_prefill_d512::
-                            dispatch_flash_attn_prefill_f16_d512_with_blk(
-                            s.encoder_mut(), dev, reg,
-                            q_f16, k_f16, v_f16,
-                            Some(mask_f16),
-                            Some(&blk_global),
-                            out_f16,
-                            &mlx_native::ops::flash_attn_prefill_d512::FlashAttnPrefillParams {
-                                n_heads: nh as u32,
-                                n_kv_heads: nkv as u32,
-                                head_dim: hd as u32,
-                                seq_len_q: seq_len as u32,
-                                seq_len_k: seq_len as u32,
-                                batch: 1,
-                                scale: 1.0,
-                                do_causal: false,
-                            },
-                        ).map_err(|e| anyhow::anyhow!("FA_F16 global D=512 L{layer_idx}: {e}"))?;
-
-                            // Cast F16 output back to BF16 for o_proj input compat.
-                            s.barrier_between(&[out_f16], &[&pf_sdpa_out_perm]);
-                            mlx_native::ops::elementwise::cast(
-                                s.encoder_mut(),
-                                reg,
-                                metal_dev,
-                                out_f16,
-                                &pf_sdpa_out_perm,
-                                q_elems,
-                                mlx_native::ops::elementwise::CastDirection::F16ToBF16,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!("FA_F16 global O cast L{layer_idx}: {e}")
-                            })?;
-                        } else {
-                            mlx_native::ops::flash_attn_prefill_d512::
-                        dispatch_flash_attn_prefill_bf16_d512_with_blk(
-                        s.encoder_mut(), dev, reg,
-                        &pf_q_perm, &pf_k_perm, &pf_v_perm,
-                        Some(&global_mask),
-                        Some(&blk_global),
-                        &mut pf_sdpa_out_perm,
-                        &mlx_native::ops::flash_attn_prefill_d512::FlashAttnPrefillParams {
-                            n_heads: nh as u32,
-                            n_kv_heads: nkv as u32,
-                            head_dim: hd as u32,
-                            seq_len_q: seq_len as u32,
-                            seq_len_k: seq_len as u32,
-                            batch: 1,
-                            scale: 1.0,
-                            do_causal: false,
-                        },
-                    ).map_err(|e| anyhow::anyhow!("batched global flash_attn_prefill L{layer_idx}: {e}"))?;
                         }
                     }
-                    // Wave P4.0 — close the FA-only session and accumulate
-                    // wall-clock time (commit_and_wait blocks until the GPU
-                    // finishes, so the measurement bounds true GPU work).
                     if let Some(t0) = fa_start {
                         if is_sliding {
                             bucket_finish!(
@@ -3962,117 +3231,141 @@ impl MlxModelWeights {
                             );
                         }
                     }
-
-                    // Wave P4.19 — POST_FA_PERMUTE elimination.
-                    //
-                    // Pre-P4.19 we ran a dedicated `permute_021_bf16_to_f32`
-                    // dispatch here that transposed `pf_sdpa_out_perm`
-                    // ([n_heads, seq_len, head_dim] bf16, natively written by
-                    // flash-attention) into `pf_sdpa_out`
-                    // ([seq_len, n_heads*head_dim] f32) for the O-proj
-                    // matmul's f32 input contract.  The dispatch cost ~11 ms
-                    // in the bucket profile at pp2455 and ~30 MB of write+
-                    // read traffic per layer (~900 MB across the prefill).
-                    //
-                    // Wave P4.19 teaches supported O-proj matmul kernels to read
-                    // `pf_sdpa_out_perm` DIRECTLY via a bf16-input perm021
-                    // variant (`kernel_mul_mm_q{4_0,6_K}_tensor_bf16_perm021`
-                    // in quantized_matmul_mm_tensor.metal).  The B-stage of
-                    // the kernel maps logical (m, k) to physical
-                    // (h = k/hd, t = m, f = k%hd) and converts bf16→half at
-                    // staging time.
-                    //
-                    // Byte-exact equivalence:
-                    //   old path: bf16 -> (cast dispatch) f32 -> (mm B-stage) half
-                    //   new path: bf16 -> (mm B-stage) half
-                    // Both produce identical half bits because bfloat->float
-                    // is pure bit-expansion and the float->half RNE round
-                    // drops the zero-pad low 16 bits without changing the
-                    // result. Unsupported stored O-projection codecs keep the
-                    // activation-only permute and execute their ordinary native
-                    // weight route; no weight shadow is synthesized.
-                } // end of !use_no_fa branch
-
-                // 8. O-proj (m = seq_len): [seq_len, nh*hd] -> [seq_len, hs]
-                //
-                // Branches on use_no_fa:
-                //   * !use_no_fa (default FA path): admitted Q4_0/Q8_0/Q6_K
-                //       O-projections read pf_sdpa_out_perm directly through
-                //       the perm021 tensor-MM variant. Other admitted stored
-                //       codecs permute only the activation into seq-major F32,
-                //       then use the ordinary native projection route.
-                //   * use_no_fa (experimental tensor-mm attention path):
-                //       the NO_FA attention steps already permute the
-                //       attention output into [seq_len, n_heads, head_dim]
-                //       f32 at pf_sdpa_out, so O-proj reads pf_sdpa_out as
-                //       before via the standard f32 tensor-mm path.
-                let o_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() || profile_buckets_on {
-                    s.finish().map_err(|e| {
-                        anyhow::anyhow!("MM-profile pre-finish (O) L{layer_idx}: {e}")
-                    })?;
-                    let t0 = std::time::Instant::now();
-                    s = exec
-                        .begin().map(crate::inference::native_observation::session)
-                        .map_err(|e| anyhow::anyhow!("MM-profile begin (O) L{layer_idx}: {e}"))?;
-                    Some(t0)
                 } else {
-                    None
-                };
-                // ADR-029 iter-82 H62: O-proj reads pf_sdpa_out (NO_FA layout
-                // f32) only when this layer actually routed through NO_FA
-                // (i.e. !is_sliding AND (use_no_fa || force_global_nofa) —
-                // the §7.32K seq-bounded global routing). Sliding layers
-                // under FA_SW populated pf_sdpa_out_perm (FA layout bf16)
-                // and need the FA-style O-proj branch.
-                if live_prefix_resume || route_through_nofa {
-                    s.barrier_between(
-                        &[&pf_sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
-                        &[&pf_attn_out],
-                    );
-                    dispatch_qmatmul(
-                        &mut s,
-                        reg,
-                        dev,
-                        &pf_sdpa_out,
-                        &self.layers[layer_idx].attn.o_proj,
-                        &mut pf_attn_out,
-                        seq_len as u32,
-                        crate::quantize::imatrix::ImatrixHint::Layered {
-                            tag: "attn_output",
-                            layer: layer_idx,
-                        },
-                    )?;
-                } else {
-                    crate::serve::forward_mlx_shared::dispatch_qmatmul_head_major_bf16(
-                        &mut s,
-                        reg,
-                        dev,
-                        &pf_sdpa_out_perm,
-                        &pf_sdpa_out,
-                        &self.layers[layer_idx].attn.o_proj,
-                        &pf_attn_out,
-                        seq_len as u32,
+                    // Cold attention + O-projection: the one per-sequence
+                    // function a single-slot cold prefill (one sequence over
+                    // the whole stream) and every lane of a cold
+                    // multi-sequence prefill share (ADR-063 Q4-GEMMA-COLD D2).
+                    let cold_layer = gemma_cold_attention::ColdLayer {
+                        layer_idx,
                         nh,
+                        nkv,
                         hd,
-                        crate::quantize::imatrix::ImatrixHint::Layered {
-                            tag: "attn_output",
-                            layer: layer_idx,
-                        },
-                    )
-                    .map_err(|error| {
-                        anyhow::anyhow!("batched native O-projection L{layer_idx}: {error}")
-                    })?;
-                }
-                if let Some(t0) = o_t0 {
-                    bucket_finish!(
+                        is_sliding,
+                        route: cold_route,
+                        profile_buckets: profile_buckets_on,
+                        total_rows: seq_len,
+                        q: &pf_q,
+                        k: &pf_k,
+                        v_input: if v_is_k { &pf_k } else { &pf_v },
+                        q_normed: &pf_q_normed,
+                        k_normed: &pf_k_normed,
+                        v_normed: &pf_v_normed,
+                        positions: &pf_positions,
+                        q_norm_weight: &self.layers[layer_idx].attn.q_norm_weight,
+                        k_norm_weight: &self.layers[layer_idx].attn.k_norm_weight,
+                        freq_factors: ff_gpu,
+                        hd_norm_params,
+                        half_rope,
+                        eps,
+                        theta,
+                        o_proj: &self.layers[layer_idx].attn.o_proj,
+                        attn_out: &pf_attn_out,
+                        hidden_size: hs,
+                    };
+                    let cold_scratch = gemma_cold_attention::ColdScratch {
+                        q_perm: &pf_q_perm,
+                        k_perm: &pf_k_perm,
+                        v_perm: &pf_v_perm,
+                        sdpa_out_perm: &pf_sdpa_out_perm,
+                        q_perm_f16: pf_q_perm_f16.as_ref(),
+                        k_perm_f16: pf_k_perm_f16.as_ref(),
+                        v_perm_f16: pf_v_perm_f16.as_ref(),
+                        sdpa_out_perm_f16: pf_sdpa_out_perm_f16.as_ref(),
+                        q_perm_f32: pf_q_perm_f32.as_ref(),
+                        kq: pf_kq.as_ref(),
+                        v_perm_t: pf_v_perm_t.as_ref(),
+                        attn_f32: pf_attn_f32.as_ref(),
+                        sdpa_out: &pf_sdpa_out,
+                    };
+                    s = gemma_cold_attention::encode_cold_layer_attention(
                         s,
                         exec,
-                        t0,
-                        &PROFILE_O_MM_NS,
-                        &PROFILE_O_MM_COUNT,
-                        1,
-                        "O_mm"
-                    );
+                        reg,
+                        dev,
+                        &cold_layer,
+                        &cold_scratch,
+                        cold_spans.iter().zip(&cold_mask_rows).map(|(&(offset, rows), &mask)| {
+                            let masks = &cold_masks[mask];
+                            gemma_cold_attention::ColdSeq {
+                                offset,
+                                rows,
+                                masks,
+                            }
+                        }),
+                    )?;
+                }
+
+                // 8. O-proj for live-resume and DFlash xlen layers (cold
+                //    layers project per sequence in `gemma_cold_attention`).
+                //    Live resume wrote seq-major F32 `pf_sdpa_out`; xlen wrote
+                //    head-major BF16 `pf_sdpa_out_perm`, which admitted
+                //    Q4_0/Q8_0/Q6_K O-projections read directly through the
+                //    perm021 tensor-MM variant (Wave P4.19; other stored
+                //    codecs permute only the activation into seq-major F32).
+                if live_prefix_resume || xlen_layer {
+                    let o_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() || profile_buckets_on {
+                        s.finish().map_err(|e| {
+                            anyhow::anyhow!("MM-profile pre-finish (O) L{layer_idx}: {e}")
+                        })?;
+                        let t0 = std::time::Instant::now();
+                        s = exec
+                            .begin().map(crate::inference::native_observation::session)
+                            .map_err(|e| anyhow::anyhow!("MM-profile begin (O) L{layer_idx}: {e}"))?;
+                        Some(t0)
+                    } else {
+                        None
+                    };
+                    if live_prefix_resume {
+                        s.barrier_between(
+                            &[&pf_sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
+                            &[&pf_attn_out],
+                        );
+                        dispatch_qmatmul(
+                            &mut s,
+                            reg,
+                            dev,
+                            &pf_sdpa_out,
+                            &self.layers[layer_idx].attn.o_proj,
+                            &mut pf_attn_out,
+                            seq_len as u32,
+                            crate::quantize::imatrix::ImatrixHint::Layered {
+                                tag: "attn_output",
+                                layer: layer_idx,
+                            },
+                        )?;
+                    } else {
+                        crate::serve::forward_mlx_shared::dispatch_qmatmul_head_major_bf16(
+                            &mut s,
+                            reg,
+                            dev,
+                            &pf_sdpa_out_perm,
+                            &pf_sdpa_out,
+                            &self.layers[layer_idx].attn.o_proj,
+                            &pf_attn_out,
+                            seq_len as u32,
+                            nh,
+                            hd,
+                            crate::quantize::imatrix::ImatrixHint::Layered {
+                                tag: "attn_output",
+                                layer: layer_idx,
+                            },
+                        )
+                        .map_err(|error| {
+                            anyhow::anyhow!("batched native O-projection L{layer_idx}: {error}")
+                        })?;
+                    }
+                    if let Some(t0) = o_t0 {
+                        bucket_finish!(
+                            s,
+                            exec,
+                            t0,
+                            &PROFILE_O_MM_NS,
+                            &PROFILE_O_MM_COUNT,
+                            1,
+                            "O_mm"
+                        );
+                    }
                 }
 
                 // ADR-040 §0.19 sub-localization: checksum the ATTENTION block
@@ -6780,10 +6073,15 @@ impl MlxModelWeights {
     /// ADR-040 iter-G(a) — cross-slot batched prefill ENTRY POINT.
     ///
     /// Prefills N prompts in ONE forward pass (paying the per-layer dispatch
-    /// launch overhead ONCE — the short-prompt N=8 TTFT lever, §0.17) with
-    /// per-seq isolation enforced entirely by the block-diagonal mask. Each
-    /// seq's KV is scattered into its own slot region; returns each seq's first
-    /// decoded (greedy) token in input order.
+    /// launch overhead ONCE — the short-prompt N=8 TTFT lever, §0.17). The
+    /// row-wise work runs once over the concatenated stream; attention and
+    /// the O-projection run per sequence through `gemma_cold_attention`, the
+    /// function a single-slot cold prefill of that sequence runs (ADR-063
+    /// Q4-GEMMA-COLD D2). Each seq's KV is scattered into its own slot region;
+    /// returns each seq's first decoded (greedy) token and logits row in input
+    /// order. A lane is bitwise equal to its own single-slot cold prefill when
+    /// it has more than 32 rows (`gemma_warm_batch::MIN_SUFFIX_TOKENS`: a
+    /// shorter lane's MoE would take `mv_id` alone but `mm_id` jointly).
     ///
     /// Hybrid-KV regime only (the production default). Caller must ensure: the
     /// hybrid scaffold is provisioned with `n_seqs >= seqs.len()`, every
@@ -6995,146 +6293,6 @@ impl MlxModelWeights {
             first_tokens: state.out_first_tokens,
             logits: state.out_logits,
         })
-    }
-}
-
-/// ADR-040 iter-G(a): build a BLOCK-DIAGONAL causal additive mask for N
-/// concatenated sequences — the cross-slot batched-prefill isolation mechanism.
-/// The mlx-native spike `iter_g_a_block_diagonal_mask_isolates_sequences` proves
-/// this mask isolates concatenated sequences BYTE-EXACTLY in one FA pass.
-///
-/// Returns a flat `[T, T]` row-major `bf16` buffer (`T = sum(seq_lens)`), using
-/// the EXACT sentinels `build_sdpa_mask_bf16` / `flash_attn_prefill_mask.metal`
-/// emit (so the host-built mask is byte-identical to the single-seq kernel mask
-/// on the diagonal blocks): masked = `bf16::NEG_INFINITY` (0xFF80), attended =
-/// `bf16(0.0)`. For query token `qi` (global) and key token `kj` (global), with
-/// per-sequence LOCAL positions `qp`/`kp`: attended iff same sequence AND
-/// `kp <= qp` (causal) AND (sliding: `qp - kp < window`); else masked.
-///
-/// The caller MUST pair this with per-sequence RoPE position reset
-/// (`pf_positions = [0..L0, 0..L1, ...]`) and `do_causal=false` at the kernel
-/// (the additive mask owns causality).
-///
-/// HOST reference only: the production multi-seq path builds this mask ON THE
-/// GPU via `mlx_native::ops::flash_attn_prefill_mask::build_block_diagonal_sdpa_mask_bf16`
-/// (the CPU-written final mask buffer is not reliably read by the FA/cast/blk
-/// consumers — the producing kernel must be on the GPU). This fn retains its
-/// unit tests as the byte-level reference for the kernel's predicate.
-#[cfg(test)]
-pub(crate) fn build_block_diagonal_mask_bf16(
-    seq_lens: &[usize],
-    sliding_window: Option<usize>,
-) -> Vec<half::bf16> {
-    use half::bf16;
-    let masked = bf16::NEG_INFINITY; // 0xFF80 — matches flash_attn_prefill_mask.metal:120
-    let attended = bf16::from_f32(0.0); // 0x0000
-    let t: usize = seq_lens.iter().sum();
-
-    // Per global token index → (sequence index, local position).
-    let mut owner: Vec<(usize, usize)> = Vec::with_capacity(t);
-    for (s, &l) in seq_lens.iter().enumerate() {
-        for p in 0..l {
-            owner.push((s, p));
-        }
-    }
-
-    let mut mask = vec![masked; t * t];
-    for qi in 0..t {
-        let (qs, qp) = owner[qi];
-        let row = qi * t;
-        for kj in 0..t {
-            let (ks, kp) = owner[kj];
-            let attended_here = qs == ks
-                && kp <= qp
-                && match sliding_window {
-                    Some(w) => qp - kp < w,
-                    None => true,
-                };
-            if attended_here {
-                mask[row + kj] = attended;
-            }
-        }
-    }
-    mask
-}
-
-#[cfg(test)]
-mod block_diagonal_mask_tests {
-    use super::build_block_diagonal_mask_bf16;
-    use half::bf16;
-
-    fn bits(x: bf16) -> u16 {
-        x.to_bits()
-    }
-
-    /// Global (full-causal) block-diagonal mask for two sequences L=[3,2]:
-    /// diagonal blocks are single-seq causal; off-diagonal is all -inf.
-    #[test]
-    fn block_diagonal_global_two_seqs() {
-        let m = build_block_diagonal_mask_bf16(&[3, 2], None);
-        let t = 5;
-        let neg = bits(bf16::NEG_INFINITY);
-        let zero = bits(bf16::from_f32(0.0));
-        // seq0 = tokens 0..3, seq1 = tokens 3..5
-        // exact sentinel bit-patterns (byte-identical to the kernel mask)
-        for qi in 0..t {
-            for kj in 0..t {
-                let v = bits(m[qi * t + kj]);
-                let same_seq = (qi < 3) == (kj < 3);
-                let (qp, kp) = (
-                    if qi < 3 { qi } else { qi - 3 },
-                    if kj < 3 { kj } else { kj - 3 },
-                );
-                let attended = same_seq && kp <= qp;
-                let expect = if attended { zero } else { neg };
-                assert_eq!(
-                    v, expect,
-                    "mask[{qi},{kj}] same_seq={same_seq} qp={qp} kp={kp}: got 0x{v:04x} want 0x{expect:04x}"
-                );
-            }
-        }
-    }
-
-    /// Sliding-window variant: a key outside the per-seq window is masked even
-    /// when same-seq and causal.
-    #[test]
-    fn block_diagonal_sliding_window() {
-        // one sequence of length 5, window=2 → token q attends only kp in (q-2, q].
-        let m = build_block_diagonal_mask_bf16(&[5], Some(2));
-        let t = 5;
-        let neg = bits(bf16::NEG_INFINITY);
-        let zero = bits(bf16::from_f32(0.0));
-        for q in 0..t {
-            for k in 0..t {
-                let v = bits(m[q * t + k]);
-                let attended = k <= q && (q - k) < 2;
-                assert_eq!(
-                    v,
-                    if attended { zero } else { neg },
-                    "sliding mask[{q},{k}]"
-                );
-            }
-        }
-    }
-
-    /// Cross-sequence isolation: no query attends a key in a different sequence,
-    /// even when the cross-seq key is at a lower GLOBAL position (the adversarial
-    /// case the mlx-native isolation spike covers).
-    #[test]
-    fn block_diagonal_cross_seq_isolation() {
-        let m = build_block_diagonal_mask_bf16(&[4, 4], None);
-        let t = 8;
-        let neg = bits(bf16::NEG_INFINITY);
-        // seq1 query (global 4..8) vs seq0 key (global 0..4): all masked.
-        for q in 4..8 {
-            for k in 0..4 {
-                assert_eq!(
-                    bits(m[q * t + k]),
-                    neg,
-                    "cross-seq mask[{q},{k}] must be -inf"
-                );
-            }
-        }
     }
 }
 

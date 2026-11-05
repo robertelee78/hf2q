@@ -89,6 +89,10 @@
 #                                    HF2Q_GEMMA_JOINT_WARM_PREFILL; unset
 #                                    keeps the hf2q default (on). 0 is the
 #                                    A/B kill switch (per-slot warm prefill).
+#     JOINT_COLD_PREFILL=0|1         (this script) forwards
+#                                    HF2Q_GEMMA_JOINT_COLD_PREFILL; unset
+#                                    keeps the hf2q default (on). 0 is the
+#                                    A/B kill switch (per-slot cold turn 0).
 #     WARM_TILED_ATTENTION=0|1       (this script) forwards
 #                                    HF2Q_GEMMA_WARM_TILED_ATTENTION; unset
 #                                    keeps the hf2q default (off, vec-hybrid
@@ -207,6 +211,15 @@ case "${JOINT_WARM_PREFILL:-}" in
         exit 2
         ;;
 esac
+JOINT_COLD_ENV=""
+case "${JOINT_COLD_PREFILL:-}" in
+    "") ;;
+    0|1) JOINT_COLD_ENV="$JOINT_COLD_PREFILL" ;;
+    *)
+        echo "JOINT_COLD_PREFILL must be 0, 1 or unset" >&2
+        exit 2
+        ;;
+esac
 WARM_TILED_ENV=""
 case "${WARM_TILED_ATTENTION:-}" in
     "") ;;
@@ -244,6 +257,7 @@ if [[ -f "$MMPROJ" ]]; then
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
         ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
+        ${JOINT_COLD_ENV:+HF2Q_GEMMA_JOINT_COLD_PREFILL="$JOINT_COLD_ENV"} \
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
@@ -264,6 +278,7 @@ else
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
         ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
+        ${JOINT_COLD_ENV:+HF2Q_GEMMA_JOINT_COLD_PREFILL="$JOINT_COLD_ENV"} \
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
