@@ -1,6 +1,6 @@
 # ADR-063 Q4-GEMMA-ATTN-EXACT: bitwise-exact batched warm-prefill attention for Gemma 4
 
-Status: **approved (operator 2026-11-05)**: revision 3 with ReviewGemmaExact's three P3 doc fixes, accepted in design review the same day. **Outcome:** S0 parity passed and the S0-b go bar was missed (§12). The operator adopted the narrowed follow-up Q4-GEMMA-ATTN-EXACT-G2 (§13, draft, needs design review).
+Status: **approved (operator 2026-11-05)**: revision 3 with ReviewGemmaExact's three P3 doc fixes, accepted in design review the same day. **Outcome:** S0 parity passed and the S0-b go bar was missed (§12). The operator adopted the narrowed follow-up Q4-GEMMA-ATTN-EXACT-G2 (§13, approved).
 - Revision 1 was reviewed by ReviewGemmaExact (REVISE, 8 findings) and
   revision 2 by the same reviewer (REVISE narrowly, R1–R5). §11 records how
   each finding was answered.
@@ -553,7 +553,7 @@ integration, and the expected saving is restated from it.
 
 ## 13. Q4-GEMMA-ATTN-EXACT-G2: integration (narrowed follow-up)
 
-Status: **revision 2, design review ACCEPT** (ReviewGemmaExact, 2026-11-05; operator approval pending). Revision 2
+Status: **approved (operator 2026-11-05; review ACCEPT)**: revision 2, accepted by ReviewGemmaExact. Revision 2
 answers ReviewGemmaExact's REVISE (four findings: capped-A1 receipt and
 fallback rule, warm-only dispatch proof, clean-cutover outcome, X1 rerun on
 toolchain change). It reuses §3 (the exactness contract), §6 (integration
