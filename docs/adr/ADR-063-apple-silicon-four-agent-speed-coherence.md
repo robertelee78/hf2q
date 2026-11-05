@@ -898,6 +898,7 @@ Requirement: hf2q MUST add the bitwise warm kernel `VecHybridGqa`, specified in 
 Acceptance:
 
 - Design §13 is design-reviewed and approved by the operator before implementation.
+- Before integration, the capped-A1 S0-b receipt runs on both metallib paths (design §13.0). It reports per-kind ratios and cells more than 2% slower, and it freezes the per-(kind, bucket) stock-fallback table (ratio > 1.02 keeps stock). The expected saving is restated from that receipt. If capped A1's chain ratio is more than 0.02 above the rows kernel's 0.761, the story returns to the operator.
 - Gates X1–X6 of design §13.3 pass bitwise, each with dispatch-count proof that the kernel ran:
   - X1: the mlx-native warm suite and T-N8, both metallib paths;
   - X2: model route;
@@ -907,7 +908,7 @@ Acceptance:
   - X6: Q5 `CalibrationPass` with `ExactTranscripts` across arms.
 - No timed run sets `MLX_DISP_BUCKET`.
 - Class A holds everywhere. Any non-bitwise result keeps the switch off; the route is never relaxed to an envelope.
-- Speed: in a paired ABBA A/B of the switch (≥ 5 runs per arm), the per-pair makespan difference has a 95% CI that excludes 0 in the saving direction. There is no fixed size bar. The matched-transaction joint-warm saving is reported.
+- Speed: in a paired ABBA A/B of the switch (≥ 5 runs per arm), the per-pair makespan difference has a 95% CI that excludes 0 in the saving direction. There is no fixed size bar. The matched-transaction joint-warm saving is reported. Dispatch-count proofs count warm-prefill dispatches only (counters reset before the warm forward and read before decode). Not promoted means clean-cutover removal of the variant and its switch.
 - The pinned mlx-native release contains #89 (0.15.20), verified on crates.io and pinned exactly by hf2q.
 
 Repository ownership: mlx-native owns the kernel, its contract, the warm parity suite `tests/gemma_warm_attn_exact_s0.rs` (X1, landed with #89) and the release. The primitive file is owned by Q4-GEMMA-DECODE's implementer. hf2q owns the route, the selector and kill switch, the gates and the A/B.

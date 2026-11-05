@@ -537,19 +537,53 @@ configuration, 0.761, misses the frozen 0.70 go bar. Under §9 the story as
 designed stops, and the multi-row kernel is dropped: it never lands.
 
 **Operator ruling (2026-11-05): adopt the narrowed version.**
-Q4-GEMMA-ATTN-EXACT-G2 wires the bitwise (G = 2, R = 1) kernel into hf2q's
-warm route. Its acceptance is Class A everywhere plus a measured makespan
-saving whose 95% CI excludes 0; there is no fixed size bar. The saving at
-0.761 is about 0.35 s of chain per run `[INFERENCE]`. §13 specifies the
+Q4-GEMMA-ATTN-EXACT-G2 wires a bitwise G = 2, R = 1 kernel into hf2q's warm
+route. Its acceptance is Class A everywhere plus a measured makespan saving
+whose 95% CI excludes 0; there is no fixed size bar. §13 specifies the
 integration. The warm S0-a cells (`tests/gemma_warm_attn_exact_s0.rs`, X1)
 and the capped `vec_gqa` bench arm ship with #89 (cherry-picked as
 `90a5a22`), so the release that contains #89 (0.15.20) carries X1.
 
+**What 0.761 measured.** The 0.761 is the multi-row kernel at (2, 1), not
+the A1 kernel G2 ships. The capped A1 kernel (G = 2) has been measured only
+on sliding layers: the iteration-1 receipt's largest legal G there was 2,
+giving 0.750 against the rows kernel's 0.737. Global layers ran at G = 8.
+The S0-b receipt of capped A1 on both paths (§13.0) therefore comes before
+integration, and the expected saving is restated from it.
+
 ## 13. Q4-GEMMA-ATTN-EXACT-G2: integration (narrowed follow-up)
 
-Status: **draft, needs design review** (2026-11-05). It reuses §3 (the
-exactness contract), §6 (integration shape) and §7 (gates), with these
-changes.
+Status: **draft, revision 2, needs design review** (2026-11-05). Revision 2
+answers ReviewGemmaExact's REVISE (four findings: capped-A1 receipt and
+fallback rule, warm-only dispatch proof, clean-cutover outcome, X1 rerun on
+toolchain change). It reuses §3 (the exactness contract), §6 (integration
+shape) and §7 (gates), with these changes.
+
+### 13.0 Capped-A1 S0-b receipt (before integration)
+
+- **Run.** `bench_flash_attn_warm_precise` at the #89 head carrying the
+  capped `vec_gqa` arm and the `bucket` cell group. It uses
+  `BENCH_CELLS=four_lane,single,bucket` and
+  `BENCH_ARMS=vec,vec_gqa,tiled_f16`, once per metallib path. X1 runs on the
+  same build first.
+- **Report.**
+  - `s0b.vec_gqa`: chain ratio, sliding and global ratios, cells more than
+    2% slower;
+  - `bucket_ratios` per (kind, bucket);
+  - the restated saving: vec minus capped-A1 four-lane projection, in ms of
+    chain per run.
+- **Stock-fallback rule (frozen).** Each (layer kind, stock bucket) is one
+  of: kv_seq_len ≤ 512 (16, 1), ≤ 1024 (32, 1), else (32, 4). Its ratio is
+  capped A1 over stock, summed over that bucket's 256-row and 64-row cells.
+  If the ratio exceeds 1.02 on either path, that (kind, bucket) keeps stock
+  `flash_attn_vec_hybrid_batched`. The resulting table is a constant in hf2q
+  that cites the receipt.
+- **Kernel choice (frozen).**
+  - If capped A1's precompiled chain ratio (with the fallback applied) is
+    more than 0.02 above the rows kernel's 0.761, the story stops and returns
+    to the operator with both receipts. The (2, 1) rows kernel would then
+    have to be kept and landed instead.
+  - Otherwise the story proceeds with capped A1.
 
 ### 13.1 Kernel and dispatch
 
@@ -558,6 +592,9 @@ changes.
 - Group per chunk: `min(flash_attn_vec_hybrid_batched_gqa_pick_group(nh,
   nkv, dk, nsg), 2)`. On Gemma 4 that is G = 2 on both layer kinds and every
   bucket.
+- Stock fallback: a chunk whose (layer kind, stock bucket) is in the §13.0
+  fallback table runs stock `flash_attn_vec_hybrid_batched`. Both kernels
+  are u32-identical, so the fallback is invisible to output.
 - Bucket: the chunk's stock bucket for every row,
   `vec![HybridSlotBucket::for_kv_seq_len(kv_seq_len); len]`. This is the
   bucket the stock call derives from the same `kv_seq_len`, so the tmp layout
@@ -603,8 +640,8 @@ changes.
 
 | Gate | Test | Required |
 |---|---|---|
-| X1 primitive | `gemma_warm_attn_exact_s0` (in #89) and T-N8, both metallib paths, rerun at every pin bump and OS update | u32-equal |
-| X2 model route | `gemma_warm_attention_exact_matches_stock_bitwise`: one model load, gate lanes per slot with `VecHybrid` then `VecHybridGqa`, plus 31-row and 1-row suffixes, both paths | first token, logits bits, KV bytes, cursors; with `MLX_DISP_BUCKET=1`, `flash_attn_vec_hybrid_batched_gqa2_*` dispatches > 0 in the candidate arm and = 0 in the stock arm |
+| X1 primitive | `gemma_warm_attn_exact_s0` (in #89) and T-N8, both metallib paths, rerun at every pin bump, macOS update and Metal toolchain change (`xcrun metal --version`, recorded in the receipt) | u32-equal |
+| X2 model route | `gemma_warm_attention_exact_matches_stock_bitwise`: one model load, gate lanes per slot with `VecHybrid` then `VecHybridGqa`, both paths, plus a 31-row suffix (it never reaches the batched prefill, so it is compared as a lane image without dispatch proof) | first token, logits bits, KV bytes, cursors. With `MLX_DISP_BUCKET=1`, counters are reset immediately before the warm prefill forward and read before any decode step, so decode's A1 dispatches cannot count. `flash_attn_vec_hybrid_batched_gqa2_*` warm dispatches must be > 0 in the candidate arm (or every chunk was in a fallback bucket, which is stated) and = 0 in the stock arm |
 | X3 joint == per-slot | `gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid_gqa` | bitwise, with the same dispatch-count proof |
 | X4 envelope harness | `gemma_warm_attention_route_envelope` with `VecHybridGqa` in `ENVELOPE_ROUTES` | every row `d_nat = 0`, 0 flips, dispatch-count proof |
 | X5 Q1 | T1/T3 greedy144, packet `warm_live_kernel: VecHybridGqa` against `VecHybrid` | `q1_decision_policy.py exact` → `ExactEqual` |
@@ -622,8 +659,10 @@ normalisation (root notice, 2026-11-05) and an updated harness pin.
     pair, ≥ 5 runs per arm) to have a 95% t-interval lying entirely below 0.
   - There is no fixed size bar.
   - The matched-transaction joint-warm `elapsed_ms` saving is reported.
-  - If the interval includes 0, or lies above 0, the change is not promoted:
-    it stays opt-in or is removed in a clean cutover.
-- **Expected:** about 0.35 s of chain per run at the measured ratio 0.761
-  (25 sliding + 5 global, four-lane), a lower bound on the makespan effect
-  `[INFERENCE]`.
+  - If the interval includes 0, or lies above 0, the change is not
+    promoted. It is then removed in a clean cutover: the variant, the switch
+    and its docs, keeping the recorded result.
+- **Expected:** restated from the §13.0 receipt (vec minus capped-A1
+  four-lane projection, 25 sliding + 5 global layers). It is a lower bound on
+  the makespan effect `[INFERENCE]`. The rows kernel's 0.761 (≈ 0.35 s of
+  chain) is not the G2 estimate.
