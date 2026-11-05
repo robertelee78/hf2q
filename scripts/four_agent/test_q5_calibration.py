@@ -487,6 +487,19 @@ class ArgvAndCases(unittest.TestCase):
         self.assertEqual(launcher.count('${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"}'), 2)
         self.assertIn('0|1) JOINT_WARM_ENV="$JOINT_WARM_PREFILL" ;;', launcher)
 
+    def test_gemma_case_forwards_only_an_explicit_joint_cold_prefill_arm(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        stock = q5_case.build_plan(case, builtins, self.required())
+        self.assertEqual(stock['serve']['env']['JOINT_COLD_PREFILL'], '')
+        self.assertNotIn('HF2Q_GEMMA_JOINT_COLD_PREFILL', stock['serve']['env'])
+        off = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_JOINT_COLD_PREFILL': '0'})
+        self.assertEqual(off['serve']['env']['JOINT_COLD_PREFILL'], '0')
+        self.assertEqual(off['serve']['env']['JOINT_WARM_PREFILL'], '', 'arms are independent')
+        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
+        self.assertEqual(launcher.count('${JOINT_COLD_ENV:+HF2Q_GEMMA_JOINT_COLD_PREFILL="$JOINT_COLD_ENV"}'), 2)
+        self.assertIn('0|1) JOINT_COLD_ENV="$JOINT_COLD_PREFILL" ;;', launcher)
+
     def test_gemma_case_forwards_only_an_explicit_warm_tiled_attention_arm(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
         builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}

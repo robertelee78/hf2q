@@ -531,6 +531,13 @@ HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_T
   --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-gemma4-joint-warm-off-$(date -u +%Y%m%dT%H%M%SZ)"
 
+# Gemma4 joint cold prefill A/B (ADR-063 Q4-GEMMA-COLD): same case, kill-switch arm (alternate ABAB with the default arm)
+HF2Q_Q5_GEMMA_JOINT_COLD_PREFILL=0 \
+HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
+  python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
+  --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/q5-gemma4-joint-cold-off-$(date -u +%Y%m%dT%H%M%SZ)"
+
 # Gemma4 tiled F16 warm attention A/B (ADR-063 Stage 2): same case, tiled opt-in arm (alternate ABAB with the default vec-hybrid arm)
 HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION=1 \
 HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
