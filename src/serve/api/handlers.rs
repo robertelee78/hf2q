@@ -5097,8 +5097,8 @@ fn compile_tool_grammar_with_registration(
     //     between-call sequence is just whitespace (or empty).
     //   * Auto multi-fn parallel: separator =
     //     `auto_lazy_multi_fn_inter_call()` (`"<|tool_call>"` Gemma,
-    //     `"\n<tool_call>\n"` Qwen).  Each per-fn alt is body-only
-    //     (`body close`), so the inter-call separator must include
+    //     `"\n<tool_call>"` Qwen).  Each per-fn alt is body-only
+    //     (`body close`; Qwen's starts with the template `\n`), so the inter-call separator must include
     //     the open marker to reconstruct the chat-template emission
     //     shape — except for the FIRST call, where the splitter has
     //     already consumed the open marker (awaiting_trigger gate).
@@ -6051,27 +6051,22 @@ mod compile_tool_grammar_precondition_tests {
 
         // Step 4 — body bytes flow through accept_bytes with runtime eager.
         // Qwen35 body-only shape (OneOrMoreCallsBodyOnly, single call):
-        //   `body \n </tool_call> space`
-        // where body = `<function=NAME>\n<parameter=KEY>\nVAL\n</parameter>\n</function>`
-        // NO leading `<tool_call>` and NO leading `\n` — the splitter consumed
-        // `<tool_call>` in step 2, and `single_body` starts at `<function=`.
-        // The `\n` between `<tool_call>` and `<function=` appears ONLY in
-        // the outer OneOrMoreCalls wrapper; OneOrMoreCallsBodyOnly omits it.
+        //   `\n body \n </tool_call>`
+        // where body = `<function=NAME>\n<parameter=KEY>\nVAL\n</parameter>\n</function>`.
+        // NO leading `<tool_call>` — the splitter consumed it in step 2 — but
+        // the template's `\n` after `<tool_call>` is grammar-owned (#662: the
+        // native `<tool_call>\n<function=` encoding must not be masked).
         //
         // Pre-Wave-3.5 (OneOrMoreCalls grammar): root starts with the
         // encoded `<tool_call>` marker and these body bytes would drive
         // the runtime dead immediately.
-        // Post-Wave-3.5 (OneOrMoreCallsBodyOnly grammar): root starts with
-        // `<function=get_weather>` and accepts this byte stream.
-        let body: &[u8] = b"<function=get_weather>\n<parameter=q>\nSF\n</parameter>\n</function>";
+        let body: &[u8] = b"\n<function=get_weather>\n<parameter=q>\nSF\n</parameter>\n</function>";
         let body_alive = rt.accept_bytes(body);
         assert!(
             body_alive,
             "qwen35 production-order regression: body-only grammar MUST accept \
-             body bytes (starting with `<function=`) after trigger with no \
-             leading `<tool_call>` marker.  A regression to OneOrMoreCalls would \
-             mark the runtime dead because root would still expect the already- \
-             consumed open marker `<tool_call>`."
+             the template-native `\\n<function=` body after trigger with no \
+             leading `<tool_call>` marker."
         );
         assert!(
             !rt.is_dead(),
@@ -6278,11 +6273,9 @@ mod compile_tool_grammar_precondition_tests {
             rt.trigger();
             assert!(!rt.is_awaiting_trigger());
 
-            // Post-trigger body 1 — no leading `<tool_call>` and no leading `\n`.
-            // Qwen35 single_body starts at `<function=NAME>` directly.
-            // The outer `\n` between `<tool_call>` and `<function=` is part of
-            // the OneOrMoreCalls wrapper only; absent in OneOrMoreCallsBodyOnly.
-            let body1 = b"<function=get_weather>\n<parameter=q>\nSF\n</parameter>\n</function>";
+            // Post-trigger body 1 — no leading `<tool_call>`, but the
+            // template's `\n` after it precedes `<function=NAME>`.
+            let body1 = b"\n<function=get_weather>\n<parameter=q>\nSF\n</parameter>\n</function>";
             let alive1 = rt.accept_bytes(body1);
             assert!(
                 alive1,
@@ -6334,6 +6327,60 @@ mod compile_tool_grammar_precondition_tests {
                  `body \\n close (\\n open \\n body \\n close)* space`)"
             );
             assert!(!rt.is_dead());
+        }
+    }
+
+    /// #662: Auto-lazy multi-function Qwen grammars admit the template's
+    /// `<tool_call>\n<function=` encoding for the first and every later call,
+    /// and reject a doubled newline (the pre-fix separator `\n<tool_call>\n`
+    /// plus the alt's own `\n` would have demanded it).
+    #[test]
+    fn auto_lazy_multi_function_qwen_grammar_matches_template_bytes() {
+        let tools: Vec<Tool> = one_scalar_tool("read_file")
+            .into_iter()
+            .chain(one_scalar_tool("grep"))
+            .collect();
+        let call = |name: &str, q: &str| {
+            format!("\n<function={name}>\n<parameter=q>\n{q}\n</parameter>\n</function>\n</tool_call>")
+        };
+        for model in ["qwen3.6-35b-a3b", "Qwen3.8-27B"] {
+            for parallel in [false, true] {
+                let req = req_with_parallel(model, Some(tools.clone()), parallel);
+                let g = compile_tool_grammar(&req, &ToolChoiceValue::Auto)
+                    .expect("compile")
+                    .expect("Auto grammar");
+                let root = g.rule_id("root").expect("root");
+                let fresh = || {
+                    let mut rt = grammar::sampler::GrammarRuntime::new(g.clone(), root)
+                        .expect("runtime");
+                    rt.set_lazy_trigger(b"<tool_call>");
+                    rt
+                };
+
+                let mut rt = fresh();
+                let first = format!("Looking.\n\n<tool_call>{}", call("grep", "fn main"));
+                assert!(rt.accept_bytes(first.as_bytes()), "{model} parallel={parallel}");
+                assert!(rt.is_accepted(), "{model} parallel={parallel}: first call");
+                if parallel {
+                    let second = format!("\n<tool_call>{}", call("read_file", "src/main.rs"));
+                    assert!(rt.accept_bytes(second.as_bytes()), "{model}: second call");
+                    assert!(rt.is_accepted(), "{model}: second call accepted");
+
+                    let mut doubled = fresh();
+                    let bytes = format!(
+                        "<tool_call>{}\n<tool_call>\n{}",
+                        call("grep", "x"),
+                        call("read_file", "y")
+                    );
+                    assert!(!doubled.accept_bytes(bytes.as_bytes()), "{model}: doubled newline");
+                }
+
+                let mut compact = fresh();
+                assert!(
+                    !compact.accept_bytes(b"<tool_call><function=grep>"),
+                    "{model} parallel={parallel}: compact non-native form accepted"
+                );
+            }
         }
     }
 
@@ -13410,3 +13457,7 @@ mod tool_result_capacity_tokens_tests;
 #[cfg(test)]
 #[path="handlers_q1_deepseek_prepare.rs"]
 pub(crate) mod q1_deepseek_prepare;
+
+#[cfg(test)]
+#[path = "handlers_splash_prompt_parity_post_oracle_tests.rs"]
+mod splash_prompt_parity_post_oracle_tests;

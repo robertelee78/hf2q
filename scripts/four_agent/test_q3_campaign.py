@@ -218,6 +218,11 @@ def noisy(base, call, spread):
 
 class Harness(unittest.TestCase):
     def setUp(self):
+        # The generic driver, verdict and rows controls run qwen38 without the Splash arm (its fake service speaks the
+        # hf2q and peer protocols only); test_native_peer_splash covers the Splash requirement and wiring.
+        patcher = mock.patch.object(q3_report, "SPLASH_FAMILIES", ())
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve()
         self.nc = self.root / "nc-receipt.json"

@@ -1,7 +1,7 @@
 //! Actual endpoint plan/refusal controls. No model/device/Metal construction.
 use super::*;
 use crate::serve::config::{Gemma4Config,LayerType};
-fn cfg() -> Gemma4Config {
+pub(crate) fn cfg() -> Gemma4Config {
     // Exact scalar mapping from frozen GGUF bf65b7e1...: block_count30,
     // head_count_kv[8,8,8,8,8,2] repeated; swa/global key_length256/512,
     // window1024/context262144. No tensor/tokenizer payload fixture.
@@ -44,6 +44,137 @@ fn ordinary_axis_refusal_is_before_model_acquisition() {
         let admitted=matches!(t,Trajectory::T0ColdSerial|Trajectory::T1Resume64|
             Trajectory::T3Chunk64|Trajectory::T4ReverseOrder|Trajectory::T7RepeatCold|Trajectory::T8RepeatCold);
         assert_eq!(require_ordinary(t).is_ok(),admitted);
+    }
+}
+/// A complete approved packet as JSON (identity/workload valid), optionally a
+/// cohort localizer packet with stores over layer 1 keys only.
+fn packet(trajectory:&str,localizer:bool)->serde_json::Value {
+    let hex=|c:char,n:usize|c.to_string().repeat(n);
+    let lanes=(0..4u32).map(|lane|(0..144).map(|i|lane*1000+i).collect::<Vec<_>>()).collect::<Vec<_>>();
+    let mut v=serde_json::json!({"execution_approved":true,
+        "acquisition":{"composition":{"path":"/x/c.json","sha256":hex('a',64)},"independent_review":{"path":"/x/r.json","sha256":hex('b',64)}},
+        "identity":{"family":"Gemma4","source_commit":hex('0',40),"binary_sha256":hex('1',64),"native_version":env!("HF2Q_MLX_NATIVE_VERSION"),
+            "native_checksum":hex('2',64),"model_sha256":hex('3',64),"tokenizer_sha256":hex('4',64),"template_sha256":hex('5',64),
+            "config_sha256":hex('6',64),"token_vectors_sha256":hex('7',64)},
+        "workload":{"family":"Gemma4","vocab_size":262144,"lanes":lanes},"trajectory":trajectory,
+        "model":"/x/model.gguf","output":"/x/out","configured_context":262144,"configured_output_allowance":8192,
+        "host_payload_limit":2u64*1024*1024*1024,"routing_witness":routing::budget_json()});
+    if localizer {
+        v["stage_localizer"]=serde_json::json!({"rerun_id":"cohort-x","layers":[1],"prefill_stages":["Key"],
+            "decode_stages":[],"host_payload_limit":4194304});
+        v["lanes"]=serde_json::json!([0,1,2,3]);
+        v["expected_stores"]=serde_json::json!({"endpoint":[],"stages":[]});
+    }
+    v
+}
+#[test]
+fn q1_gemma_cohort_localizer_packets_run_only_under_their_own_filters() {
+    let parse=|v:serde_json::Value|serde_json::from_value::<Packet>(v).unwrap();
+    for t in ["T0ColdSerial","T2ActualCohort"] {
+        assert!(preflight(&parse(packet(t,false)),false).is_ok());
+        assert!(preflight(&parse(packet(t,true)),true).is_ok());
+        // An endpoint filter refuses a localizer packet and vice versa.
+        assert!(preflight(&parse(packet(t,true)),false).is_err());
+        assert!(preflight(&parse(packet(t,false)),true).is_err());
+    }
+    // Only the All128 reference and the packed route are localizer routes.
+    for t in ["T1Resume64","T3Chunk64","T4ReverseOrder"] {
+        assert!(preflight(&parse(packet(t,true)),true).is_err());
+    }
+    let mut v=packet("T2ActualCohort",true);v["lanes"]=serde_json::json!([0,1,2]);
+    assert!(preflight(&parse(v),true).is_err());
+    let mut v=packet("T2ActualCohort",true);v["expected_stores"]["extra"]=serde_json::json!([]);
+    assert!(preflight(&parse(v),true).is_err());
+    let mut v=packet("T2ActualCohort",true);v["routing_witness"]=serde_json::Value::Null;
+    assert!(preflight(&parse(v),true).is_err(),"observer control mirrors the witness-ON b3 stores");
+    let mut v=packet("T0ColdSerial",true);v.as_object_mut().unwrap().remove("lanes");
+    assert!(preflight(&parse(v),true).is_err());
+}
+/// The localizer packet in its DriftAll128 form: witness-OFF, All128 only,
+/// plan-only (bound stage manifest).
+fn drift_packet()->serde_json::Value {
+    let mut v=packet("T0ColdSerial",true);
+    v["localizer_mode"]=serde_json::json!("DriftAll128");v["routing_witness"]=serde_json::Value::Null;
+    v.as_object_mut().unwrap().remove("expected_stores");
+    v["stage_manifest"]=serde_json::json!({"path":"/x/manifest.json","sha256":"a".repeat(64)});v
+}
+#[test]
+fn q1_gemma_drift_all128_is_witness_off_all128_prefill_only() {
+    let parse=|v:serde_json::Value|serde_json::from_value::<Packet>(v).unwrap();
+    preflight(&parse(drift_packet()),true).unwrap();
+    // Absent `routing_witness` is the same null.
+    let mut v=drift_packet();v.as_object_mut().unwrap().remove("routing_witness");
+    preflight(&parse(v),true).unwrap();
+    // DriftAll128 refuses witness ON, and any non-null budget without parsing it.
+    let mut v=drift_packet();v["routing_witness"]=packet("T0ColdSerial",false)["routing_witness"].clone();
+    assert!(preflight(&parse(v),true).is_err());
+    let mut v=drift_packet();v["routing_witness"]=serde_json::json!({"opaque":1});
+    assert!(preflight(&parse(v),true).is_err());
+    // DriftAll128 requires the plan-only form: inline stores refuse, with or without a manifest.
+    let mut v=drift_packet();v.as_object_mut().unwrap().remove("stage_manifest");
+    v["expected_stores"]=serde_json::json!({"endpoint":[],"stages":[]});
+    assert!(preflight(&parse(v.clone()),true).is_err());
+    v["stage_manifest"]=drift_packet()["stage_manifest"].clone();
+    assert!(preflight(&parse(v),true).is_err());
+    // All128 only, prefill-only plan, no observer reference, never an endpoint filter.
+    let mut v=drift_packet();v["trajectory"]=serde_json::json!("T2ActualCohort");
+    assert!(preflight(&parse(v),true).is_err());
+    let mut v=drift_packet();v["stage_localizer"]["decode_stages"]=serde_json::json!(["Norm"]);
+    assert!(preflight(&parse(v),true).is_err());
+    let mut v=drift_packet();v["observer_effect_reference"]=serde_json::json!("gemma-t0-b5g");
+    assert!(preflight(&parse(v),true).is_err());
+    let mut v=packet("T0ColdSerial",false);v["localizer_mode"]=serde_json::json!("DriftAll128");
+    v["routing_witness"]=serde_json::Value::Null;
+    assert!(preflight(&parse(v),false).is_err());
+    let mut v=drift_packet();v["localizer_mode"]=serde_json::json!("Drift");
+    assert!(serde_json::from_value::<Packet>(v).is_err());
+    // The non-drift mode still refuses witness OFF (explicit Cohort or absent mode).
+    for mode in [Some("Cohort"),None] {
+        let mut v=packet("T0ColdSerial",true);v["routing_witness"]=serde_json::Value::Null;
+        if let Some(m)=mode {v["localizer_mode"]=serde_json::json!(m);}
+        assert!(preflight(&parse(v),true).is_err());
+    }
+    // Witness-ON packets still parse and admit their budget exactly.
+    let mut v=packet("T0ColdSerial",true);v["routing_witness"]=serde_json::json!({"opaque":1});
+    assert!(preflight(&parse(v),true).is_err());
+    let mut v=packet("T0ColdSerial",false);v["routing_witness"]["payload_bytes"]=serde_json::json!(1);
+    assert!(preflight(&parse(v),false).is_err());
+    // Identity native must be the build's own pin in both modes.
+    for mut v in [drift_packet(),packet("T0ColdSerial",true)] {
+        v["identity"]["native_version"]=serde_json::json!("0.15.9");
+        assert!(preflight(&parse(v),true).is_err());
+    }
+}
+#[test]
+fn q1_gemma_localizer_observer_reference_and_extent_form_are_closed() {
+    let parse=|v:serde_json::Value|serde_json::from_value::<Packet>(v).unwrap();
+    let mut v=packet("T0ColdSerial",true);v["observer_effect_reference"]=serde_json::json!("gemma-t0-b5g");
+    let p=parse(v);preflight(&p,true).unwrap();
+    assert_eq!(p.observer_effect_reference.as_deref(),Some("gemma-t0-b5g"));
+    let mut v=packet("T0ColdSerial",true);v["observer_effect_reference"]=serde_json::json!("../gemma-t0-b3");
+    assert!(preflight(&parse(v),true).is_err());
+    // Endpoint packets carry no observer reference.
+    let mut v=packet("T0ColdSerial",false);v["observer_effect_reference"]=serde_json::json!("gemma-t0-b5g");
+    assert!(preflight(&parse(v),false).is_err());
+    // Plan-only form: a bound manifest instead of inline stores, never both, never on an endpoint packet.
+    let binding=serde_json::json!({"path":"/x/manifest.json","sha256":"a".repeat(64)});
+    let mut v=packet("T2ActualCohort",true);v.as_object_mut().unwrap().remove("expected_stores");
+    v["stage_manifest"]=binding.clone();preflight(&parse(v.clone()),true).unwrap();
+    v.as_object_mut().unwrap().remove("stage_manifest");
+    assert!(preflight(&parse(v),true).is_err());
+    let mut v=packet("T2ActualCohort",true);v["stage_manifest"]=binding.clone();
+    assert!(preflight(&parse(v),true).is_err());
+    let mut v=packet("T0ColdSerial",false);v["stage_manifest"]=binding;
+    assert!(preflight(&parse(v),false).is_err());
+}
+#[test]
+fn q1_gemma_endpoint_expected_is_the_reviewed_t0_t2_extent() {
+    let cfg=cfg();
+    for t in [Trajectory::T0ColdSerial,Trajectory::T2ActualCohort] {
+        let e=endpoint_expected(&cfg,t).unwrap();
+        // The b3 T0/T2 endpoint stores: 5616 records, 788765696 planned bytes.
+        assert_eq!(e.len(),5616);
+        assert_eq!(payload(&e).unwrap(),788765696);
     }
 }
 #[test]

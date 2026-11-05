@@ -57,7 +57,7 @@ def arm(name, case, overrides, environ):
                 "missing_variables": plan["missing_variables"],
                 "file_checks": q5_artifacts.file_checks(plan) if plan["complete"] else {},
                 "inputs": q5_artifacts.input_hashes(plan)}
-    if native_peers.is_native(qc.engine_kind(case)):  # the arm's build identity and frozen native runtime
+    if native_peers.has_adapter(qc.engine_kind(case)):  # the arm's build identity and frozen native runtime
         identity.update(native_peers.adapter(qc.engine_kind(case)).campaign_identity(plan))
     return identity
 
@@ -145,8 +145,9 @@ def harness_clean(ids):
     return ids["harness"]["git_commit"] is not None and not ids["harness"]["git_dirty"]
 
 
-def launch_problems(plan, ids):
-    """Everything that keeps a campaign from starting; empty when launchable."""
+def launch_problems(plan, ids, output=None):
+    """Everything that keeps a campaign from starting; empty when launchable. output: the campaign directory, which
+    same-artifact arms check (Splash run directories must be on APFS)."""
     problems = [f"--{name}-bin is required" for name in ("stock", "experiment") if not plan["declared"][name]["binary"]]
     problems += arm_problems(ids)
     native = native_arms(plan)
@@ -155,9 +156,16 @@ def launch_problems(plan, ids):
     problems += [f"{name}: native artifact with its sha256 is required" for name in native
                  if not (ids["arms"][name]["artifact"] or {}).get("sha256")]
     hf2q_sha = (ids["arms"]["experiment"]["artifact"] or {}).get("sha256")
-    for name in native:  # an ambient hf2q artifact must never stand in for the native artifact
+    same_artifact = [name for name, spec in plan["arms"].items() if native_peers.is_same_artifact(spec["engine_kind"])]
+    # Native arms: an ambient hf2q artifact must never stand in for the native artifact. Same-artifact arms
+    # (Splash): the artifact must be the experiment's GGUF itself, the build found must be the declared one, and the
+    # output volume must suit its run directories.
+    for name in native:
         problems += native_peers.adapter(plan["arms"][name]["engine_kind"]).launch_problems(
             name, ids["arms"][name]["artifact"] or {}, hf2q_sha)
+    for name in same_artifact:
+        problems += native_peers.adapter(plan["arms"][name]["engine_kind"]).launch_problems(
+            name, ids["arms"][name]["artifact"] or {}, hf2q_sha, ids["arms"][name], output)
     stock, experiment = ids["arms"]["stock"]["binary"]["sha256"], ids["arms"]["experiment"]["binary"]["sha256"]
     if stock is not None and stock == experiment:
         problems.append("stock and experiment binaries are identical")

@@ -1,0 +1,223 @@
+{
+  "schema": "hf2q.q5.calibration-case.v1",
+  "family": "qwen38",
+  "notes": [
+    "Splash peer of record (ADR-063 'Splash peer of record for the Qwen families'; operator decisions 2026-11-03/11-04; design docs/research/adr063-splash-peer-design.md): incoai/splash 031a25a6 (git describe 1.5.0-29-g031a25a6), built from a clean detached clone at SPLASH_DIR with `make -j4` and `make install-environment` (build_id src-f7663ee7...). It serves the SAME hf2q GGUF as the hf2q qwen38 arm (MODEL and MODEL_SHA256 must equal that arm's; q3_identity same_model and native_peer_splash_ready.launch_problems refuse anything else) with its family's pinned DFlash2 draft. In Q3 it is the measured arm 'splash' (--splash-case), never --peer-case and never a native comparison. Adapter: scripts/four_agent/native_peer_splash.py; launch, identity, readiness and closing: native_peer_splash_ready.py; post-run audit: native_peer_splash_audit.py.",
+    "Launch (serve.argv runs native_peer_splash_launch.py, which execs in the same process, so SERVER_PID is the server): it verifies SPLASH_DIR is a clean detached 031a25a6 checkout whose build/engine/build-identity.json build_id is SPLASH_BUILD_ID, build/splash, build/splash.metallib and build/host-step.metallib have SPLASH_BIN_SHA256, SPLASH_METALLIB_SHA256 and SPLASH_HOST_STEP_SHA256 (the host-step library present: awake host steps), the host toolchain (xcodebuild -version, metal and clang++ --version, the SDK version, sw_vers) hashes to SPLASH_TOOLCHAIN_SHA256 (`splash_sweep.py identity` prints every value) and .venv carries every install/requirements.txt pin (freeze sha256 SPLASH_VENV_FREEZE_SHA256); DRAFT_DIR is the pinned HF cache snapshot; then prepares {OUT}/splash/models with Splash's install.local.prepare_local_model (no network), requires its model.json to record the GGUF content digest equal to MODEL_SHA256 and the pinned draft blob, writes {OUT}/splash/launch.json and execs `.venv/bin/python -P -u -m server.server <assembly> --model MODEL_ID --binary build/splash --host 127.0.0.1 --port PORT --max-context 256K --idle-release off --no-webui --thinking-end-text '\\nI need to answer now.</think>' <SPLASH_CONFIG flags>` with PYTHONPATH=SPLASH_DIR.",
+    "SPLASH_CONFIG is the configuration (knob=value for kv, state, ane, verify, decode_share, cache_disk, max_memory, in that order; native_peer_splash.KNOBS). The default is the one-factor sweep's S0, Splash's documented defaults with decode share 0.5 explicit. The best valid configuration is chosen by scripts/four_agent/splash_sweep.py (design section 7) and recorded before the campaign of record; --max-memory stays auto unless the Q5 floor trips (decision D6). Speculation is always on (DFlash2; no off switch). Lossy defaults (int8 KV, bf16 state, the Neural Engine W8A8 FFN split) are valid unless Splash's quality gate fails (D10).",
+    "Requests (closed envelope; Splash ignores unknown fields): greedy (temperature 0, top_p 1, top_k 0, min_p 0, zero presence/frequency), thinking on with preserve_thinking, no reasoning_effort, hf2q's 2048/512 thinking ceilings as thinking_token_budget, parallel_tool_calls false (Splash's tool grammar, decision D5) and NO repetition penalty (decision D3; hf2q's 1.05 over a 64-token window has no Splash equivalent, recorded in every readiness record). Every turn's prompt is re-rendered at closing by /apply-template and counted by /tokenize (outside the makespan).",
+    "Qwen3.8 27B dense: verify rows are every row (no knob); the default prefill splits the FFN between GPU and Neural Engine (ane=auto, calibrated once per Mac, model, macOS and build; the calibration file under $(getconf DARWIN_USER_CACHE_DIR)/splash-ane is recorded before and after each run). Draft z-lab/Qwen3.8-27B-DFlash2@50307d4c, byte-identical to incoai/Qwen3.8-27B-DFlash2@015e7956 (config sha256 873e3556..., weights LFS sha256 67fc76d6...). Workload: the canonical six-step protocol, as qwen38.json.",
+    "Prefix cache: Splash's exact-prefix KV/state cache is always on (RAM, plus the SSD tier unless cache_disk=0, whose files are unlinked temporaries under TMPDIR); --persistent-cache stays off. Run as a calibration (no --admission-receipt): different binary from every hf2q calibration."
+  ],
+  "workload": {
+    "id": "adr063-q5-splash-qwen38-n4-coding-ctx262144",
+    "slots": 4,
+    "context_per_slot": 262144,
+    "client": "scripts/four_agent/qwen_n4_live_smoke.py --family qwen --engine-kind splash"
+  },
+  "variables": {
+    "SPLASH_DIR": "/Users/robert/.local/share/hf2q/peers/splash-031a25a6",
+    "SPLASH_PY": "{SPLASH_DIR}/.venv/bin/python",
+    "SPLASH_BIN": "{SPLASH_DIR}/build/splash",
+    "SPLASH_COMMIT": "031a25a6125af2d7acf7096580afe56eb33d65bc",
+    "SPLASH_BUILD_ID": "src-f7663ee765e357e6ecff82e45483f19866d459f0204afaf94f71737b0584f919",
+    "SPLASH_BIN_SHA256": null,
+    "SPLASH_METALLIB_SHA256": null,
+    "SPLASH_HOST_STEP_SHA256": null,
+    "SPLASH_TOOLCHAIN_SHA256": null,
+    "SPLASH_VENV_FREEZE_SHA256": null,
+    "HF_HUB_CACHE": "/Users/robert/.cache/huggingface/hub",
+    "DRAFT_DIR": "{HF_HUB_CACHE}/models--z-lab--Qwen3.8-27B-DFlash2/snapshots/50307d4c4cde6860d4eee73e2547cd786fe8e8a4",
+    "SPLASH_CONFIG": "kv=int8,state=fp32,ane=auto,verify=auto,decode_share=0.5,cache_disk=auto,max_memory=auto",
+    "MODEL": "{REPO}/models/qwen38-stock/Qwen3.8-27B-vanilla.gguf",
+    "MODEL_SHA256": null,
+    "MODEL_ID": "hf2q/Qwen3.8-27B",
+    "PORT": "18257",
+    "CARGO": null,
+    "TOOLCHAIN": null,
+    "SANDBOX_PROOF": null,
+    "SANDBOX_PROOF_SHA256": null,
+    "CLIENT_APPROVAL_TEMPLATE": null
+  },
+  "binary": "{SPLASH_BIN}",
+  "artifact": {
+    "path": "{MODEL}",
+    "sha256": "{MODEL_SHA256}"
+  },
+  "port": "{PORT}",
+  "serve": {
+    "argv": [
+      "{PYTHON}",
+      "-E",
+      "-s",
+      "-B",
+      "{REPO}/scripts/four_agent/native_peer_splash_launch.py",
+      "--q3-family",
+      "qwen38",
+      "--splash-dir",
+      "{SPLASH_DIR}",
+      "--commit",
+      "{SPLASH_COMMIT}",
+      "--build-id",
+      "{SPLASH_BUILD_ID}",
+      "--binary-sha256",
+      "{SPLASH_BIN_SHA256}",
+      "--metallib-sha256",
+      "{SPLASH_METALLIB_SHA256}",
+      "--host-step-sha256",
+      "{SPLASH_HOST_STEP_SHA256}",
+      "--toolchain-sha256",
+      "{SPLASH_TOOLCHAIN_SHA256}",
+      "--venv-freeze-sha256",
+      "{SPLASH_VENV_FREEZE_SHA256}",
+      "--model",
+      "{MODEL}",
+      "--model-sha256",
+      "{MODEL_SHA256}",
+      "--draft-dir",
+      "{DRAFT_DIR}",
+      "--config",
+      "{SPLASH_CONFIG}",
+      "--run-dir",
+      "{OUT}/splash",
+      "--port",
+      "{PORT}"
+    ],
+    "env": {
+      "HF_HUB_OFFLINE": "1",
+      "HF_HUB_DISABLE_TELEMETRY": "1"
+    }
+  },
+  "readiness": {
+    "url": "http://127.0.0.1:{PORT}/ready",
+    "field": "status",
+    "equals": "ready",
+    "timeout_seconds": 1800,
+    "record": [
+      "http://127.0.0.1:{PORT}/status",
+      "http://127.0.0.1:{PORT}/v1/models"
+    ],
+    "checks": [
+      {
+        "url": "http://127.0.0.1:{PORT}/status",
+        "field": "instance.model",
+        "equals": "{MODEL_ID}"
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/status",
+        "field": "maximum_context_tokens",
+        "equals": 262144
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/status",
+        "field": "vision",
+        "equals": false
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/status",
+        "field": "identity.cache.build_id",
+        "equals": "{SPLASH_BUILD_ID}"
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/status",
+        "field": "requests.submitted",
+        "equals": 0
+      }
+    ]
+  },
+  "client": {
+    "argv": [
+      "{PYTHON}",
+      "-E",
+      "-s",
+      "-B",
+      "{REPO}/scripts/four_agent/qwen_n4_live_smoke.py",
+      "--base-url",
+      "http://127.0.0.1:{PORT}/v1",
+      "--model",
+      "{MODEL_ID}",
+      "--output",
+      "{OUT}/client",
+      "--cargo",
+      "{CARGO}",
+      "--toolchain",
+      "{TOOLCHAIN}",
+      "--sandbox-exec",
+      "/usr/bin/sandbox-exec",
+      "--sandbox-proof",
+      "{SANDBOX_PROOF}",
+      "--sandbox-proof-sha256",
+      "{SANDBOX_PROOF_SHA256}",
+      "--server-pid",
+      "{SERVER_PID}",
+      "--approval",
+      "{CLIENT_APPROVAL}",
+      "--approval-sha256",
+      "{CLIENT_APPROVAL_SHA256}",
+      "--family",
+      "qwen",
+      "--engine-kind",
+      "splash"
+    ],
+    "env": {},
+    "approval": {
+      "template": "{CLIENT_APPROVAL_TEMPLATE}",
+      "set": {
+        "server_pid": "{SERVER_PID}",
+        "base_url": "http://127.0.0.1:{PORT}/v1",
+        "model": "{MODEL_ID}",
+        "run_id": "{RUN_ID}",
+        "barrier_token": "{NONCE32}",
+        "python_sha256": "{PYTHON_SHA256}",
+        "sources": {
+          "sha256_of": [
+            "{REPO}/scripts/four_agent/qwen38_n1_smoke.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_tools.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_verdict.py",
+            "{REPO}/scripts/four_agent/qwen38_n1_process.py",
+            "{REPO}/scripts/four_agent/test_qwen38_n1_verdict.py",
+            "{REPO}/scripts/four_agent/qwen_n4_live_smoke.py",
+            "{REPO}/scripts/four_agent/test_qwen_n4_live_smoke.py",
+            "{REPO}/scripts/four_agent/coding_family.py",
+            "{REPO}/scripts/four_agent/test_coding_family.py",
+            "{REPO}/scripts/four_agent/qwen_n4_peer.py",
+            "{REPO}/scripts/four_agent/test_qwen_n4_peer.py",
+            "{REPO}/scripts/four_agent/family_peer.py",
+            "{REPO}/scripts/four_agent/test_family_peer.py",
+            "{REPO}/scripts/four_agent/f2_semantic.py",
+            "{REPO}/scripts/four_agent/native_peers.py",
+            "{REPO}/scripts/four_agent/native_peer_splash.py",
+            "{REPO}/scripts/four_agent/native_peer_splash_ready.py",
+            "{REPO}/scripts/four_agent/test_native_peer_splash.py"
+          ]
+        },
+        "native_splash": {
+          "q3_family": "qwen38",
+          "splash_dir": "{SPLASH_DIR}",
+          "commit": "{SPLASH_COMMIT}",
+          "build_id": "{SPLASH_BUILD_ID}",
+          "binary_sha256": "{SPLASH_BIN_SHA256}",
+          "metallib_sha256": "{SPLASH_METALLIB_SHA256}",
+          "host_step_sha256": "{SPLASH_HOST_STEP_SHA256}",
+          "toolchain_sha256": "{SPLASH_TOOLCHAIN_SHA256}",
+          "venv_freeze_sha256": "{SPLASH_VENV_FREEZE_SHA256}",
+          "model": "{MODEL}",
+          "model_sha256": "{MODEL_SHA256}",
+          "draft_dir": "{DRAFT_DIR}",
+          "config": "{SPLASH_CONFIG}",
+          "run_dir": "{OUT}/splash",
+          "port": "{PORT}",
+          "server_stdout": "{OUT}/server.stdout",
+          "server_stderr": "{OUT}/server.stderr"
+        },
+        "native_splash_launch_sha256": {
+          "sha256_of": "{OUT}/splash/launch.json"
+        }
+      }
+    },
+    "summary": "{OUT}/client/summary.json",
+    "success_status": "FourAgentProtocolCompleteAwaitingIndependentReview",
+    "timeout_seconds": 7200
+  },
+  "policy": {}
+}

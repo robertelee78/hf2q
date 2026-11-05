@@ -223,13 +223,13 @@ impl Eagle3DrafterConfig {
             "head_dim ({}) must be even (NeoX RoPE pairing requires head_dim/2)",
             self.head_dim
         );
-        // Codex /cfa E4b.5b Major (2026-05-22): kernel pairs NeoX dims
-        // as (p, p + head_dim/2) — partial rotation `rope_dim < head_dim`
-        // would rotate the wrong second-half coordinates. Require full
-        // rotation until a partial-NeoX kernel ships.
+        // `apply_imrope` pairs (p, p + rope_dim/2) with the tail passed
+        // through (mlx-native 0.15.18), so partial rotation is correct at
+        // the kernel. The EAGLE-3 drafter path has parity coverage only for
+        // full rotation (`cpu_neox_rope` tests), so it still requires it.
         ensure!(
             self.rope_dim == self.head_dim,
-            "rope_dim ({}) must equal head_dim ({}) — partial rotation not supported by apply_imrope NeoX pairing",
+            "rope_dim ({}) must equal head_dim ({}) — the EAGLE-3 drafter is validated only for full rotation",
             self.rope_dim,
             self.head_dim
         );

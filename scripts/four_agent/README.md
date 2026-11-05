@@ -217,6 +217,18 @@ HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/peer-deepseek4-client-approval.json \
   --output "$Q5_ROOT/q5-peer-deepseek4-$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
+`q5_cases/peer-deepseek4-ds4file.json` (ADR-063 Q4-DS4, #661) is the DeepSeek-V4 peer arm on ds4's Flash 0731 file (`DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`, sha256 `ca22ae2f…`) instead of the hf2q artifact, which runs the peer out of device memory. Everything else equals `peer-deepseek4.json`, including the reviewed hf2q template (the file's embedded template has no `reasoning_effort` tiers and the client refuses it), except the port (18242) and three variables for the best-valid-configuration sweep: `LOAD_MODE` (`auto`, i.e. mmap, or `none`), `UBATCH` (512, 1024, 2048) and `PEER_LOG_VERBOSITY` (4, which adds load-time buffer sizes and per-task prompt-cache/checkpoint lines; never per token). Override them with `HF2Q_Q5_<NAME>`. The file is a benchmark comparison artifact, not an hf2q conversion; any comparison against hf2q on its own artifact discloses the artifact difference.
+
+### Gemma 4 peer configuration search and stage profile (ADR-063 Q4-GEMMA)
+
+The method, arm set and commands are in `docs/research/adr063-q4-gemma-profile-method.md`.
+- `gemma_peer_spec_arms.py BASE OUT [--drafters drafters.json]` writes one case per speculation type the pinned peer can run on Gemma 4 26B-A4B. Each is `peer-gemma4.json` with only `--spec-type none` replaced. Draft arms bind `DRAFT_MODEL`/`DRAFT_SHA256`, and the runner re-hashes the drafter before launch.
+- `gemma_stage_profile.py` reads settled run directories only.
+  - `profile` and `compare ROOT --arm NAME=GLOB --base NAME=GLOB` give per-turn and per-run prefill, decode, residual, client and tail times, from the engines' own per-request timing and the client's monotonic clock. `compare` adds deltas with block-paired bootstrap CIs, a warm-prefill cost fit and SSE-gap attribution.
+  - `mst` aligns a Metal System Trace export to the request spans.
+  - `catsplit` parses hf2q's `[CATSPLIT]` / `[PREFILL_CATSPLIT_JSON]` worker-exit dumps.
+- `gemma_mst_capture.py --output DIR -- <q5 command>` runs one calibration under an all-process Metal System Trace. It keeps only credential-scanned GPU-schema XML exports.
+
 ### Native-engine registry
 
 `native_peers.py` maps each native-engine kind (`coding_family.NATIVE_KINDS`: `ds4`, `tensorfold`, `omlx`) to its arm module `native_peer_<kind>.py`; no consumer branches on a kind's name. `native_peers.INTERFACE` lists what an arm declares: family and slot scope (`FAMILIES`, the harness families its client runs use, and `Q3_FAMILIES`, its case families; an arm may serve several), request translation and its inverse (`request_controls`, `canonical`), closed reply envelopes (`check_unary`, `check_frame`, `usage`), `readiness`, the optional coordinator `closing` hook (run once every agent finished, outside the makespan), `campaign_identity`, `launch_problems`, `label`/`q3_role`, F2 `BASELINES`, the post-run `AUDIT` module, `PROCESSES` for the competing-runtime inventories (`q5_preflight.py`, `q2_capture_preflight.py`), the verdict reasons `SAME_GGUF_UNAVAILABLE`/`NATIVE_COMPARISON` (`None` where the arm cannot run that way) and the Q3 `PEER_CASE_REFUSAL` text. `quality_campaign.py` accepts `--reference-kind <kind>-native`. A native client run freezes the fourteen client sources plus the arm's `CLIENT_MODULES` (the registry, the arm's client modules and its test); hf2q and same-GGUF peer runs never import the registry.
@@ -424,6 +436,64 @@ HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/native-omlx-qwen36-client-approval.json \
 # Qwen3.8 and Gemma 4: the same with native-omlx-qwen38.json / native-omlx-gemma4.json and their snapshot.
 ```
 
+### Splash peer of record (Qwen3.8, Qwen3.6; operator decisions 2026-11-03/11-04)
+
+Splash (`incoai/splash`, source build `031a25a6`, engine kind `splash`) is a second **same-artifact** peer of record
+for the Qwen families. It serves the hf2q GGUF itself: the same path and sha256 as the family's hf2q case. It
+decodes with its family's pinned DFlash2 draft. Q3 runs it as its own measured arm `splash` beside `peer`, and for
+`qwen38`/`qwen36` a Win needs ≥5% sooner than both. Design: [docs/research/adr063-splash-peer-design.md](../../docs/research/adr063-splash-peer-design.md).
+
+| File | Role |
+| --- | --- |
+| `native_peer_splash.py` | Adapter: pinned build, families and drafts, configuration knobs and sweep presets, `family_controls`, closed request/response/usage envelopes |
+| `native_peer_splash_ready.py` | Launch inputs, build/venv/toolchain/draft identity, per-run model assembly (`model.json` digests), argv template, readiness, closing render proof (`/apply-template` + `/tokenize`), campaign identity |
+| `native_peer_splash_launch.py` | q5 serve entry: verifies, prepares `{OUT}/splash/models`, writes `launch.json`, execs the Splash server in the same process |
+| `native_peer_splash_audit.py` | Post-run audit (Done/Started lines bound to client turns, render archive, no cancel/error/restart) and `run_record` |
+| `splash_sweep.py` | `identity` (the build variables), `derive-case` (one sweep point, optional D6 `--max-memory` cap), `select` (validity from Splash's own runs and the best configuration), `parity-config` (the input of hf2q's `splash_prompt_parity_post_oracle`) |
+| `q5_cases/splash-qwen38.json`, `splash-qwen36.json` | Q5 cases; `SPLASH_CONFIG` is the configuration (default: sweep point `s0`) |
+
+- **Build.** Build a clean detached clone of `031a25a6` with `make -j4 && make install-environment`, only while
+  `HOST-LOCK` is absent, and record the toolchain the build used (`xcodebuild -version`, `xcrun metal --version`,
+  `clang --version`, `xcrun --show-sdk-version`, `sw_vers`) in `toolchain.txt`. Then
+  `python3 scripts/four_agent/splash_sweep.py identity --splash-dir DIR --build-toolchain toolchain.txt` prints
+  `SPLASH_BIN_SHA256`, `SPLASH_METALLIB_SHA256`, `SPLASH_HOST_STEP_SHA256`, `SPLASH_TOOLCHAIN_SHA256` and
+  `SPLASH_VENV_FREEZE_SHA256`, refusing a host toolchain the build did not record. The case requires all five; it
+  also requires `MODEL_SHA256`, the hf2q GGUF's.
+- **Drafts.** Qwen3.8 uses `z-lab/Qwen3.8-27B-DFlash2@50307d4c`, which is byte-identical to
+  `incoai/Qwen3.8-27B-DFlash2@015e7956`. Qwen3.6 uses `incoai/Qwen3.6-35B-A3B-DFlash2@51ef7b69`. Each is an HF
+  cache snapshot on the internal disk.
+- **Approval template.** `CLIENT_APPROVAL_TEMPLATE` must carry:
+  - `engine_kind: "splash"`, family `qwen`;
+  - `family_controls` equal to `native_peer_splash.controls("<q3 family>", SPLASH_CONFIG)`;
+  - the preflight keys from `native_peer_splash.preflight`.
+
+  The supervisor adds `native_splash` (the launch inputs) and the per-run `native_splash_launch_sha256`.
+- **Per run.** Every start digests the GGUF again into a fresh `{OUT}/splash/models`, outside the makespan. The
+  campaign identity freezes the build, toolchain, venv, draft, configuration and argv template, never the assembly
+  path.
+  - Splash's `model.json` must record the hf2q GGUF with `MODEL_SHA256`, the pinned draft weights, and the reviewed
+    template as `tokenizer/chat_template.jinja`.
+  - `{OUT}` must be on APFS (the internal disk). On the exFAT external drive, Splash's model-directory cleanup stops
+    on the `._*` files macOS writes there.
+  - The run must add no draft pin to the shared HF cache (`refs/splash`); local sources carry none.
+  - `/status` must report the configured KV format and cache dtype and no engine restart, at readiness and closing.
+- **Sweep.** After each settled sweep run, write `parity-config RUN --template FILE` (default output
+  `RUN/splash-prompt-parity`) and run hf2q's `splash_prompt_parity_post_oracle` on it. `select` counts a
+  configuration valid only when every run has a `PassedByteIdentical` result there. A run that stopped before the
+  client is an invalid row of its own.
+- **Q3.** `--splash-case` defaults to `q5_cases/splash-<family>.json` for qwen38/qwen36. The arm runs only in the
+  `n4` and `n1` stages (D7). `--splash-unavailable-evidence` declares Splash unavailable; the family verdict is
+  then `Unavailable`, never a Win against the peer alone. A peer-unavailable campaign requires no Splash arm (its
+  verdict is Unavailable already).
+  - Launch refuses a campaign whose Splash build, toolchain or venv differs from the case's declared hashes, or
+    whose output is not on APFS, before any run.
+  - A Splash Q5 memory stop halts the campaign, also before the client starts (load and readiness window): record
+    a `--max-memory` cap (D6), re-confirm the configuration and start a new campaign.
+- **Quality gate.** Run `quality_campaign.py --reference-kind splash` with a Splash reference case. The F2 tier
+  requires a `splash` gate for records that require Splash.
+- **Qwen3.6 workload.** The arm runs the declared Qwen3.6 workload. The repair-turn workload applies once it is
+  recorded on main: add `--repair-turns 1` to the hf2q, peer and Splash Qwen3.6 cases together.
+
 ### Root commands
 
 Run the commands from the repository root, one family at a time, with no other runtime loaded. `Q5_ROOT` is a campaign evidence directory outside Git. The supervisor refuses an output directory inside a Git tree or one that already exists.
@@ -461,12 +531,27 @@ HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_T
   --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-gemma4-joint-warm-off-$(date -u +%Y%m%dT%H%M%SZ)"
 
+# Gemma4 joint cold prefill A/B (ADR-063 Q4-GEMMA-COLD): same case, kill-switch arm (alternate ABAB with the default arm)
+HF2Q_Q5_GEMMA_JOINT_COLD_PREFILL=0 \
+HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
+  python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
+  --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/q5-gemma4-joint-cold-off-$(date -u +%Y%m%dT%H%M%SZ)"
+
 # Gemma4 tiled F16 warm attention A/B (ADR-063 Stage 2): same case, tiled opt-in arm (alternate ABAB with the default vec-hybrid arm)
 HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION=1 \
 HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
   python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
   --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-gemma4-warm-tiled-on-$(date -u +%Y%m%dT%H%M%SZ)"
+
+# Gemma4 prefill MoE route A/B (ADR-063 Q4-GEMMA-PREFILL-MOE): A arm = previous flattened down call
+# (plus HF2Q_Q5_MM_ID_SCHEDULE=grid once the compact native schedule is pinned); B arm = defaults. ABBA order.
+HF2Q_Q5_GEMMA_PREFILL_MOE_DOWN=flat \
+HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
+  python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
+  --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/q5-gemma4-prefill-moe-A-$(date -u +%Y%m%dT%H%M%SZ)"
 
 # Qwen3.6 35B-A3B
 HF2Q_Q5_MODEL=/abs/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/qwen36-client-approval.json \
@@ -542,6 +627,17 @@ The receipt also records `peak_over_cap_bytes`, which is the measured overshoot,
 - A blind sample, meaning failed host observation or a missing real footprint while a cap is enforced, never counts as a quiet host. Three blind samples in a row stop the run.
 - Thermal state is recorded but never stops a run. It is not an out-of-memory risk.
 
+## Tool-result normalization (ADR-063, operator decision 2026-11-05, from B1)
+
+The model sees the same tool results in every run. `Tools.tests` (`qwen38_n1_tools.py`) hands the model a normalized `run_tests` output:
+
+- the owned tool root (`<output>/agent-N/tools`: the run directory and agent id) becomes `/owned`, so the fixture reads as `/owned/fixture`;
+- the cargo working directory (`/private/tmp/hf2q-n1-cargo-*`) becomes `/cargo-cwd`;
+- cargo's `Finished … in <duration>` and libtest's `; finished in <duration>` become `0.00s`;
+- a panic line's OS thread id (Rust ≥ 1.91: `thread 'name' (37675355) panicked at …`) is dropped, keeping the test name, location and message.
+
+The tool receipt keeps the verbatim output as `raw_output`. Its `result` is what the model saw, and audits that rebuild transcripts from receipts read that field. Compiler error codes, rendered diagnostics and the libtest `test result:` marker are unchanged. `read_file` returns the fixture bytes and `write_file` a content digest, so neither needs normalizing. Tool-call ids stay as each engine assigns them. The hf2q and peer GGUF templates (Qwen3.8, Qwen3.6, Gemma 4, DeepSeek-V4), ds4's own renderer and the oMLX Gemma adapter only use the id to match a result to its call; none prints it into the prompt. Runs recorded before the change keep their raw tool results. Compare transcripts across runs (ExactTranscripts, G-S2, B1) only between runs on the same side of the change. `test_qwen38_n1_tools.py` covers this model-free: two run directories with different timings, and failing tests with different panic thread ids, give byte-identical model-visible results, and error codes and test-pass parsing read as before.
+
 ## Long-context workload (ADR-063 D2, #365)
 
 D2's acceptance includes long contexts, and the canonical client tops out near 2.8k prompt tokens per turn. `qwen_n4_live_smoke.py --workload long-context-v1` runs the canonical `parse_port` task with one change: `tests/ports.rs` is the canonical two integration tests followed by [`fixtures/long-context-v1.rs`](fixtures/long-context-v1.rs). That fixture is a 150 KB read-only Rust module, `mod netconf`: the configuration schema of the daemon the port parser feeds. It has 8 sections and 55 settings, each with bounds, a parser, a defaulting reader, a formatter and help text. The module is `#[allow(dead_code)]` and has no `#[test]`. Workflow step (2) reads the file, so every request from turn 2 on carries it.
@@ -614,7 +710,7 @@ A floor-only family (for example DeepSeek-V4) omits the three `--reference-*` op
 
 ## Three-arm speed campaign (ADR-063 Q3)
 
-`q3_campaign.py` runs the per-family Q3 comparison: stock hf2q (`--stock-bin`, the released binary), experiment hf2q (`--experiment-bin`) and the peer's best valid configuration (`q5_cases/peer-<family>.json`). A labeled matched-settings peer diagnostic (`--peer-matched-case`) is optional. Every run is one `q5_calibration.py` runtime, run one at a time. The design, estimator, verdict rules and root commands are in [docs/research/adr063-q3-campaign.md](../../docs/research/adr063-q3-campaign.md).
+`q3_campaign.py` runs the per-family Q3 comparison: stock hf2q (`--stock-bin`, the released binary), experiment hf2q (`--experiment-bin`) and the peer's best valid configuration (`q5_cases/peer-<family>.json`); for Qwen3.8 and Qwen3.6 also Splash's best valid configuration (`--splash-case`, default `q5_cases/splash-<family>.json`; see "Splash peer of record"). A labeled matched-settings peer diagnostic (`--peer-matched-case`) is optional. Every run is one `q5_calibration.py` runtime, run one at a time. The design, estimator, verdict rules and root commands are in [docs/research/adr063-q3-campaign.md](../../docs/research/adr063-q3-campaign.md).
 
 - **Identities.** Binaries (with the peer's sibling dylibs), model, peer `build_info`, argv input files, harness sources and commit, Python and host are frozen at start and re-checked before every run and against every receipt. Any change is a terminal `IdentityDrift`.
 - **Stages.** `n4` (primary, all four agents together), then the controls `n1`, `3+1`, `2+2` and `1+3`. Each stage runs one discarded warmup per arm per driver session, then Williams-ordered blocks: 5 to 20 blocks, stopping when every required makespan contrast has a 95% half-width ≤ 2.5 points.

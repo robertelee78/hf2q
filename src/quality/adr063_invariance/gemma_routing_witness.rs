@@ -46,7 +46,13 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// shaders gain the threadgroup barrier after the softmax-max broadcast read
 /// (the same WAR race fix as the production decode routing kernels), with no
 /// arithmetic change; `src/ops/routing_selection_witness.rs` is unchanged.
-pub const WITNESS_NATIVE_VERSION: &str = "0.15.16";
+/// Re-reviewed 0.15.16 -> 0.15.18 (0.15.17 was never pinned): the changes are
+/// the registry's runtime-source fallbacks and IQ4_XS sources, the precise
+/// flash-attention prefill variants, IQ2_XXS matmuls and the partial-rotary
+/// `rope_multi` pairing fix. `src/ops/routing_selection_witness.rs`, the
+/// routing and routing-witness shaders are unchanged, and the witness kernels
+/// are not registration fallbacks, so their pipeline resolution is unchanged.
+pub const WITNESS_NATIVE_VERSION: &str = "0.15.18";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {

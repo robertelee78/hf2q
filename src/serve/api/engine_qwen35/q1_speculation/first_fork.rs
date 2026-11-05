@@ -159,20 +159,27 @@ pub(super) fn finish(mut c: Captures, failure: Option<&str>) -> Result<serde_jso
 fn q1_qwen_t5_first_fork_actual() {super::runner::run_first_fork().unwrap();}
 #[test]
 fn first_fork_scope_and_disk_bound_do_not_relabel_four_lanes_or_sixteen_rows() {
-    let cfg=qwen_cache::selected_header_fixture(true);
-    let c=committed(&cfg).unwrap();
-    assert!(c.iter().all(|e|e.at.agent=="agent-0"));
-    assert_eq!(c.iter().filter(|e|e.at.stage==Stage::Logits).count(),3);
-    assert!(c.iter().all(|e| if e.at.stage==Stage::Logits {(128..131).contains(&e.at.logical_row_start)}
-        else {[129,131].contains(&e.at.logical_step)}));
-    assert_eq!(output_plan(&cfg).len(),4);
-    assert_eq!(raw(&cfg).len(),5);
-    assert!(raw(&cfg).iter().filter(|e|matches!(e.at.stage,Stage::SpecVerifierLogits|Stage::SpecVerifierHidden))
-        .all(|e|e.shape[0]==2));
-    assert_eq!(payload_plan(&cfg,false).unwrap(),330_014_848);
-    assert_eq!(payload_plan(&cfg,true).unwrap(),493_497_024);
-    assert_eq!(payload_plan(&cfg,false).unwrap()+payload_plan(&cfg,true).unwrap(),823_511_872);
-    assert!(payload_plan(&cfg,false).unwrap()+payload_plan(&cfg,true).unwrap()<1024*1024*1024);
+    // (q38, committed records, baseline, forced): per lane-boundary 140 target
+    // + 8 MTP records on Q36 (Q38: 352 + 16), so 3 logits + 2 checkpoints.
+    for (q38,records,base,forced) in [(true,3+2*368,330_014_848u64,493_497_024u64),
+        (false,3+2*148,141_687_488,211_029_904)] {
+        let cfg=qwen_cache::selected_header_fixture(q38);
+        let c=committed(&cfg).unwrap();
+        assert_eq!(c.len(),records);
+        assert!(c.iter().all(|e|e.at.agent=="agent-0"));
+        assert_eq!(c.iter().filter(|e|e.at.stage==Stage::Logits).count(),3);
+        assert!(c.iter().all(|e| if e.at.stage==Stage::Logits {(128..131).contains(&e.at.logical_row_start)}
+            else {[129,131].contains(&e.at.logical_step)}));
+        assert_eq!(output_plan(&cfg).len(),4);
+        assert_eq!(raw(&cfg).len(),5);
+        assert_eq!(draft_plan(&cfg).unwrap().len(),(records-3)/2);
+        assert!(raw(&cfg).iter().filter(|e|matches!(e.at.stage,Stage::SpecVerifierLogits|Stage::SpecVerifierHidden))
+            .all(|e|e.shape[0]==2));
+        assert_eq!(payload_plan(&cfg,false).unwrap(),base);
+        assert_eq!(payload_plan(&cfg,true).unwrap(),forced);
+        assert!(base+forced<1024*1024*1024);
+    }
+    assert_eq!(330_014_848u64+493_497_024,823_511_872);
 }
 
 #[test]

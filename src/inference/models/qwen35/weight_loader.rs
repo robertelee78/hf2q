@@ -42,7 +42,10 @@ use super::in_memory_loader::{
     bf16_bytes_to_f32, f16_bytes_to_f32, f32_bytes_to_f32, quantize_f32_to_q8_0_buffer,
 };
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
-use super::{default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35MoeConfig, Qwen35Variant};
+use super::{
+    default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35MoeConfig, Qwen35Variant,
+    QWEN35_DEFAULT_MROPE_SECTION, QWEN35_DEFAULT_PARTIAL_ROTARY_FACTOR,
+};
 
 // ============================================================================
 // Quantized MoE weight container
@@ -691,7 +694,10 @@ fn infer_lazy_qwen35_config(lookup: &LazyQwen35Lookup<'_>) -> Result<Qwen35Confi
         }
     };
 
-    let rotary_dim = head_dim / 2;
+    // A lazy tensor map carries no rope metadata; use the family's published
+    // rope config (as the source-config loader does for omitted fields):
+    // rotary_dim = head_dim * 0.25 (64 of 256), IMROPE sections [11,11,10,0].
+    let rotary_dim = (f64::from(head_dim) * f64::from(QWEN35_DEFAULT_PARTIAL_ROTARY_FACTOR)) as u32;
     Ok(Qwen35Config {
         variant,
         hidden_size,
@@ -706,14 +712,10 @@ fn infer_lazy_qwen35_config(lookup: &LazyQwen35Lookup<'_>) -> Result<Qwen35Confi
         linear_conv_kernel_dim,
         full_attention_interval,
         layer_types,
-        partial_rotary_factor: if head_dim == 0 {
-            0.0
-        } else {
-            rotary_dim as f32 / head_dim as f32
-        },
+        partial_rotary_factor: QWEN35_DEFAULT_PARTIAL_ROTARY_FACTOR,
         rope_theta: 10_000_000.0,
         rotary_dim,
-        mrope_section: [rotary_dim / 4, rotary_dim / 4, rotary_dim / 4, 0],
+        mrope_section: QWEN35_DEFAULT_MROPE_SECTION,
         mrope_interleaved: true,
         rms_norm_eps: 1e-6,
         max_position_embeddings: 131_072,
@@ -1855,6 +1857,21 @@ mod tests {
         assert_eq!(model.token_embd[0], 100.0);
         assert_eq!(model.output_weight[0], 200.0);
         assert_eq!(model.output_norm[0], 300.0);
+    }
+
+    /// The lazy loader must use the family's published rope config:
+    /// rotary_dim = head_dim / 4 (it used to be head_dim / 2) and IMROPE
+    /// sections [11, 11, 10, 0].
+    #[test]
+    fn infer_lazy_config_uses_published_partial_rotary() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let map = synthetic_four_layer_dense_map();
+        let cfg = infer_lazy_qwen35_config(&LazyQwen35Lookup::new(&map)).expect("infer");
+        assert_eq!(cfg.head_dim, 8);
+        assert_eq!(cfg.rotary_dim, 2);
+        assert_eq!(cfg.partial_rotary_factor, 0.25);
+        assert_eq!(cfg.mrope_section, [11, 11, 10, 0]);
+        assert!(cfg.mrope_interleaved);
     }
 
     #[test]

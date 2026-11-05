@@ -18,7 +18,7 @@ fn q1_qwen_endpoint_prepare_matches_actual_recipe_and_cache() {
     for (q38, family) in [(true, Family::Qwen38), (false, Family::Qwen36)] {
         let cfg = selected_header_fixture(q38);
         let work = work(family, cfg.vocab_size);
-        let plan = plan(&cfg, &work, 262144, 2 * 1024 * 1024 * 1024, [0, 0]).unwrap();
+        let plan = plan(&cfg, &work, 262144, qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX, [0, 0]).unwrap();
         // The literal recipe `qwen_actual` checked before this cutover.
         let literal = acquisition::ConfigRecipe {
             family,
@@ -40,7 +40,7 @@ fn q1_qwen_endpoint_prepare_matches_actual_recipe_and_cache() {
             assert_eq!(cache, &actual);
             assert_eq!(
                 *planned,
-                qwen_checkpoint::planned_payload(&actual, cfg.vocab_size as usize, 2 * 1024 * 1024 * 1024)
+                qwen_checkpoint::planned_payload(&actual, cfg.vocab_size as usize, qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX)
                     .unwrap()
             );
         }
@@ -63,6 +63,10 @@ fn q1_qwen_endpoint_prepare_negative_controls() {
     assert!(plan(&cfg, &work(Family::Qwen36, cfg.vocab_size), 143, 2 << 30, [0, 0]).is_err());
     assert!(plan(&cfg, &work(Family::Qwen36, cfg.vocab_size), 262144, 2 << 30, [64, 64]).is_err());
     assert!(plan(&cfg, &work(Family::Qwen36, cfg.vocab_size), 262144, 1, [0, 0]).is_err());
+    assert!(plan(&cfg, &work(Family::Qwen36, cfg.vocab_size), 262144,
+        qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX + 1, [0, 0]).is_err());
+    let q38 = selected_header_fixture(true);
+    assert!(plan(&q38, &work(Family::Qwen38, q38.vocab_size), 262144, qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX, [64, 64]).is_err());
 }
 
 #[test]

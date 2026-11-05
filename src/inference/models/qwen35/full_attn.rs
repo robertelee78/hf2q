@@ -145,8 +145,12 @@ fn sigmoid(x: f32) -> f32 {
 /// position axes equal the token position, so IMROPE degenerates to plain
 /// NeoX RoPE — we implement the full spec anyway for future multimodal.
 ///
-/// Spec matches mlx-native's rope_multi kernel exactly.
-fn imrope_inplace(
+/// NeoX pairing inside the rotated block: pair `p < rotary_dim/2` is
+/// `(x[p], x[p + rotary_dim/2])`; dims `[rotary_dim, head_dim)` pass
+/// through unchanged. For Qwen3.5/3.6 (256/64) that is `(p, p + 32)`,
+/// matching the reference implementation and mlx-native's `rope_multi`
+/// from 0.15.18 on.
+pub(super) fn imrope_inplace(
     data: &mut [f32],
     n_head: u32,
     head_dim: u32,
@@ -156,7 +160,6 @@ fn imrope_inplace(
     sections: [u32; 4],
 ) {
     let head_dim = head_dim as usize;
-    let half_dim = head_dim / 2;
     let rotary_dim = rotary_dim as usize;
     let half_rope = rotary_dim / 2;
     let sect_dims = sections.iter().sum::<u32>().max(1);
@@ -187,9 +190,9 @@ fn imrope_inplace(
             let (ca, sa) = (angle.cos(), angle.sin());
 
             let x0 = data[base + pair];
-            let x1 = data[base + pair + half_dim];
+            let x1 = data[base + pair + half_rope];
             data[base + pair] = x0 * ca - x1 * sa;
-            data[base + pair + half_dim] = x0 * sa + x1 * ca;
+            data[base + pair + half_rope] = x0 * sa + x1 * ca;
         }
     }
 }
@@ -698,5 +701,32 @@ mod tests {
         let out = gated_full_attention_cpu_ref(&x, &positions, &weights, shape);
         assert_eq!(out.len(), h);
         assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// Partial rotary pairs `(p, p + rotary_dim/2)` and leaves
+    /// `[rotary_dim, head_dim)` untouched; the pre-0.15.18 pairing
+    /// `(p, p + head_dim/2)` would rotate dims 4 and 5 here.
+    #[test]
+    fn imrope_partial_rotary_pairs_within_rotated_block() {
+        // head_dim 8, rotary_dim 4: pairs (0, 2) and (1, 3); dims 4..8 tail.
+        let theta = 100.0f32;
+        let pos = 3i32;
+        let input: Vec<f32> = (0..8).map(|i| 0.25 + i as f32).collect();
+        let mut got = input.clone();
+        imrope_inplace(&mut got, 1, 8, 4, theta, [pos; 4], [1, 1, 0, 0]);
+
+        for (pair, freq) in [(0usize, 1.0f32), (1, 1.0 / theta.powf(0.5))] {
+            let (s, c) = (pos as f32 * freq).sin_cos();
+            let (x0, x1) = (input[pair], input[pair + 2]);
+            assert!(
+                (got[pair] - (x0 * c - x1 * s)).abs() < 1e-6,
+                "pair {pair} x0"
+            );
+            assert!(
+                (got[pair + 2] - (x0 * s + x1 * c)).abs() < 1e-6,
+                "pair {pair} x1"
+            );
+        }
+        assert_eq!(&got[4..], &input[4..], "tail must pass through");
     }
 }

@@ -421,6 +421,31 @@ class ArgvAndCases(unittest.TestCase):
         self.assertEqual(len(ports), 4)
         self.assertFalse(ports & hf_ports)
 
+    def test_ds4_file_peer_case_differs_from_the_matched_peer_arm_only_in_artifact_and_tuning(self):
+        # Q4-DS4 (#661): ds4's DeepSeek-V4 file under the matched peer arm. Only the artifact, the port and the
+        # declared best-valid-configuration knobs (load mode, ubatch, log verbosity) may differ.
+        base = q5_case.loads((HERE / 'q5_cases' / 'peer-deepseek4.json').read_bytes())
+        case = q5_case.loads((HERE / 'q5_cases' / 'peer-deepseek4-ds4file.json').read_bytes())
+        self.assertEqual(case['family'], 'deepseek4')
+        variables = case['variables']
+        self.assertTrue(variables['MODEL'].endswith(
+            '/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf'))
+        self.assertEqual(variables['MODEL_SHA256'], 'ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0')
+        self.assertEqual((variables['LOAD_MODE'], variables['UBATCH'], variables['PEER_LOG_VERBOSITY']),
+                         ('auto', '512', '4'))
+        tuning = {'MODEL', 'MODEL_SHA256', 'PORT', 'LOAD_MODE', 'UBATCH', 'PEER_LOG_VERBOSITY'}
+        self.assertEqual({k: v for k, v in variables.items() if k not in tuning},
+                         {k: v for k, v in base['variables'].items() if k not in tuning})
+        self.assertNotEqual(variables['PORT'], base['variables']['PORT'])
+        expected = list(base['serve']['argv'])
+        expected[expected.index('--load-mode') + 1] = '{LOAD_MODE}'
+        expected[expected.index('--ubatch-size') + 1] = '{UBATCH}'
+        self.assertEqual(case['serve'], {'argv': expected + ['--log-verbosity', '{PEER_LOG_VERBOSITY}'], 'env': {}})
+        for section in ('readiness', 'client', 'binary', 'artifact', 'port', 'policy'):
+            self.assertEqual(case[section], base[section], section)
+        self.assertEqual({k: v for k, v in case['workload'].items() if k != 'id'},
+                         {k: v for k, v in base['workload'].items() if k != 'id'})
+
     def test_hf2q_case_sources_match_the_client_source_freeze(self):
         from qwen_n4_live_smoke import MODULES
         for family in ('qwen38', 'qwen36', 'gemma4', 'deepseek4'):
@@ -462,6 +487,19 @@ class ArgvAndCases(unittest.TestCase):
         self.assertEqual(launcher.count('${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"}'), 2)
         self.assertIn('0|1) JOINT_WARM_ENV="$JOINT_WARM_PREFILL" ;;', launcher)
 
+    def test_gemma_case_forwards_only_an_explicit_joint_cold_prefill_arm(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        stock = q5_case.build_plan(case, builtins, self.required())
+        self.assertEqual(stock['serve']['env']['JOINT_COLD_PREFILL'], '')
+        self.assertNotIn('HF2Q_GEMMA_JOINT_COLD_PREFILL', stock['serve']['env'])
+        off = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_JOINT_COLD_PREFILL': '0'})
+        self.assertEqual(off['serve']['env']['JOINT_COLD_PREFILL'], '0')
+        self.assertEqual(off['serve']['env']['JOINT_WARM_PREFILL'], '', 'arms are independent')
+        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
+        self.assertEqual(launcher.count('${JOINT_COLD_ENV:+HF2Q_GEMMA_JOINT_COLD_PREFILL="$JOINT_COLD_ENV"}'), 2)
+        self.assertIn('0|1) JOINT_COLD_ENV="$JOINT_COLD_PREFILL" ;;', launcher)
+
     def test_gemma_case_forwards_only_an_explicit_warm_tiled_attention_arm(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
         builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
@@ -475,6 +513,27 @@ class ArgvAndCases(unittest.TestCase):
         launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
         self.assertEqual(launcher.count('${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"}'), 2)
         self.assertIn('0|1) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;', launcher)
+
+    def test_gemma_case_forwards_only_explicit_prefill_moe_arms(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        stock = q5_case.build_plan(case, builtins, self.required())
+        self.assertEqual(stock['serve']['env']['PREFILL_MOE_DOWN'], '')
+        self.assertEqual(stock['serve']['env']['MM_ID_SCHEDULE'], '')
+        self.assertNotIn('HF2Q_GEMMA_PREFILL_MOE_DOWN', stock['serve']['env'])
+        self.assertNotIn('HF2Q_MM_ID_SCHEDULE', stock['serve']['env'])
+        arm_a = q5_case.build_plan(case, builtins, {
+            **self.required(), 'HF2Q_Q5_GEMMA_PREFILL_MOE_DOWN': 'flat', 'HF2Q_Q5_MM_ID_SCHEDULE': 'grid'})
+        self.assertEqual(arm_a['serve']['env']['PREFILL_MOE_DOWN'], 'flat')
+        self.assertEqual(arm_a['serve']['env']['MM_ID_SCHEDULE'], 'grid')
+        self.assertEqual(arm_a['serve']['env']['WARM_TILED_ATTENTION'], '', 'arms are independent')
+        self.assertEqual(arm_a['serve']['env']['JOINT_WARM_PREFILL'], '', 'arms are independent')
+        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
+        self.assertEqual(launcher.count(
+            '${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"}'), 2)
+        self.assertEqual(launcher.count('${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"}'), 2)
+        self.assertIn('flat|slotted) PREFILL_MOE_DOWN_ENV="$PREFILL_MOE_DOWN" ;;', launcher)
+        self.assertIn('grid|compact) MM_ID_SCHEDULE_ENV="$MM_ID_SCHEDULE" ;;', launcher)
 
     def test_run_id_matches_client_identity_rule(self):
         for name in ('x', 'q5-qwen38-20261030T120000Z', 'a.b c' * 30):

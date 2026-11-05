@@ -9,6 +9,7 @@ const DECLARATIONS: &[&str] = &[
     "\n#[cfg(test)]\n#[path = \"handlers_gemma_largest_prompt_tests.rs\"]\nmod gemma_largest_prompt_tests;\n",
     "\n#[cfg(test)]\n#[path = \"handlers_gemma_full_input_post_oracle_tests.rs\"]\nmod gemma_full_input_post_oracle_tests;\n",
     "\n#[cfg(test)]\n#[path = \"handlers_gemma_matched_tokens_tests.rs\"]\nmod gemma_matched_tokens_tests;\n",
+    "\n#[cfg(test)]\n#[path = \"handlers_splash_prompt_parity_post_oracle_tests.rs\"]\nmod splash_prompt_parity_post_oracle_tests;\n",
 ];
 
 /// Remove only these exact appended test declarations, stopping at the frozen

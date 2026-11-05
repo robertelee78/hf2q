@@ -119,3 +119,46 @@ fn q1_t5_hook_scope_is_panic_safe_and_inactive_proposals_unchanged() {
     drop(current);
     assert!(ACTIVE.with(|s| s.borrow().is_none()));
 }
+#[test]
+fn q1_t5_first_fork_inputs_bind_reviewed_frozen_preparation() {
+    use crate::adr063_invariance::store::hash;
+    let (frozen, digest) = (runner::Q38_RETAINED_FROZEN_SHA256, runner::Q38_RETAINED_FULL144_DIGEST);
+    let preparation = |frozen: &str, digest: &str, comparable: bool| serde_json::to_vec(&serde_json::json!({
+        "frozen_file_sha256":frozen,"full144_digest_computed_after_generation":digest,
+        "comparable_acquisition":comparable,"requires_independent_review":true})).unwrap();
+    let review = |verdict: &str, frozen: &str, prep: &[u8]| serde_json::to_vec(&serde_json::json!({
+        "schema":runner::FROZEN_REVIEW_SCHEMA,"verdict":verdict,"frozen_file_sha256":frozen,
+        "preparation_sha256":hash(prep),"reviewer":"fixture-reviewer","notes":"hosted fixture"})).unwrap();
+    let ok = |first_fork: bool, p: &[u8], r: &[u8]|
+        runner::check_first_fork_inputs(first_fork, Some((p, r)), frozen, digest).is_ok();
+    // Control: the retained Q38 literals are accepted through the rule.
+    let p = preparation(frozen, digest, false);
+    let r = review("Accepted", frozen, &p);
+    assert!(ok(true, &p, &r));
+    assert!(runner::check_first_fork_inputs(false, None, frozen, digest).is_ok());
+    // Missing with first_fork; present without it.
+    assert!(runner::check_first_fork_inputs(true, None, frozen, digest).is_err());
+    assert!(!ok(false, &p, &r));
+    // Review verdict other than Accepted.
+    assert!(!ok(true, &p, &review("Rejected", frozen, &p)));
+    // Frozen-sha mismatch: in the review, in the preparation, or in the input.
+    let other = "1".repeat(64);
+    assert!(!ok(true, &p, &review("Accepted", &other, &p)));
+    let q = preparation(&other, digest, false);
+    assert!(!ok(true, &q, &review("Accepted", frozen, &q)));
+    assert!(runner::check_first_fork_inputs(true, Some((p.as_slice(), r.as_slice())), &other, digest).is_err());
+    // Preparation digest, comparability, review/preparation binding, closed review.
+    let q = preparation(frozen, &other, false);
+    assert!(!ok(true, &q, &review("Accepted", frozen, &q)));
+    let q = preparation(frozen, digest, true);
+    assert!(!ok(true, &q, &review("Accepted", frozen, &q)));
+    let mut q = p.clone();
+    q.push(b'\n');
+    assert!(!ok(true, &q, &r), "review binds the exact preparation bytes");
+    let mut open: serde_json::Value = serde_json::from_slice(&r).unwrap();
+    open["extra"] = serde_json::json!(true);
+    assert!(!ok(true, &p, &serde_json::to_vec(&open).unwrap()));
+    let mut schema: serde_json::Value = serde_json::from_slice(&r).unwrap();
+    schema["schema"] = serde_json::json!("hf2q.q1.other.v1");
+    assert!(!ok(true, &p, &serde_json::to_vec(&schema).unwrap()));
+}

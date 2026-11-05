@@ -203,24 +203,38 @@ pub(super) fn load_gate_model() -> LoadedModel {
     loaded
 }
 
-/// Four slots holding `HISTORIES`, each from one cold prefill checkpointed on
-/// the CPU, so every reference and joint arm resumes from identical bytes.
+/// Four slots holding their histories (`HISTORIES` by default), each from one
+/// cold prefill checkpointed on the CPU, so every reference and joint arm
+/// resumes from identical bytes.
 pub(super) struct WarmFixture {
     pub(super) prompts: Vec<Vec<u32>>,
+    histories: Vec<usize>,
+    /// Each slot's cold prefill: first token and final logits as bits.
+    pub(super) cold: Vec<(u32, Vec<u32>)>,
     anchors: Vec<GemmaHybridSlotAnchor>,
 }
 
 impl WarmFixture {
     pub(super) fn build(guard: &mut Gemma4KvGuard<'_>) -> Self {
+        Self::build_shape(guard, &HISTORIES, &SUFFIXES)
+    }
+
+    /// Four slots with the given history and suffix lengths.
+    pub(super) fn build_shape(
+        guard: &mut Gemma4KvGuard<'_>,
+        histories: &[usize; 4],
+        suffixes: &[usize; 4],
+    ) -> Self {
         assert_eq!(guard.model.weights.kv_graft_len(), 0, "no graft bound");
         let vocab = guard.model.weights.vocab_size;
         let prompts: Vec<Vec<u32>> = (0..4)
-            .map(|slot| synthetic_prompt(slot, HISTORIES[slot] + SUFFIXES[slot], vocab))
+            .map(|slot| synthetic_prompt(slot, histories[slot] + suffixes[slot], vocab))
             .collect();
         let mut anchors = Vec::new();
+        let mut cold = Vec::new();
         for slot in 0..4 {
-            let history = HISTORIES[slot];
-            guard
+            let history = histories[slot];
+            let first = guard
                 .model
                 .weights
                 .forward_prefill_with_soft_tokens_slot_aware(
@@ -235,6 +249,8 @@ impl WarmFixture {
                     guard.mlx.as_mut(),
                 )
                 .unwrap();
+            let logits = guard.model.weights.logits_view().unwrap();
+            cold.push((first, logits.iter().map(|value| value.to_bits()).collect()));
             clear_gemma4_self_mounts(guard.model);
             install_gemma4_slot_cursor(guard, SlotId(slot as u32), history).unwrap();
             anchors.push(
@@ -246,7 +262,12 @@ impl WarmFixture {
                 .unwrap(),
             );
         }
-        Self { prompts, anchors }
+        Self {
+            prompts,
+            histories: histories.to_vec(),
+            cold,
+            anchors,
+        }
     }
 
     pub(super) fn restore(&self, guard: &mut Gemma4KvGuard<'_>, slot: usize, history: usize) {
@@ -264,7 +285,7 @@ impl WarmFixture {
         (
             slot,
             self.prompts[slot].as_slice(),
-            HISTORIES[slot],
+            self.histories[slot],
             MAX_DECODE,
         )
     }

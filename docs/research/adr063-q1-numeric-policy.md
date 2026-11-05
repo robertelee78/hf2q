@@ -70,7 +70,8 @@ records that this tail is not a greedy continuation.
 | T1 resume at 64 vs T3 cold 64+64 | A | `ExactOnCommon`: 8,136 common records equal; T1's 2,520 extra restore records were exact-checked inside T1 (43,479,040 B) |
 | T0 OFF vs T0 ON routing witness, two processes, accepted greedy144 dataset `842768` (source `9df42ba0`, native 0.15.11) | A | `ExactEqual`, 5,616 records (788,765,696 B); instrumentation does not interfere |
 | T0 All128 vs T1/T3 64+64 | B | `RouteSensitive`: top-1 391/576; D p50 0.83, p95 20.0, max 36.8 nat; KL p95 8.7 nat. Rows 0–28 (real template prefix): 6/116 flips, D up to ≈6.7 nat |
-| T0 serial vs T2 packed four-sequence prefill and batched decode | B | `RouteSensitive`: top-1 362/576; D p95 20.2 nat; KL p95 8.2 nat. Rows 0–28: 17/116 flips |
+| T0 serial vs T2 packed four-sequence prefill and batched decode | B | Workload `922bec…` (this table's scope): `RouteSensitive`: top-1 362/576; D p95 20.2 nat; KL p95 8.2 nat. Rows 0–28: 17/116 flips |
+| T0 serial vs T2 packed, greedy144 workload842 (b3 `91b0c382`, native 0.15.16) | B | `RouteSensitive`: top-1 391/576, 63 rows with left margin below τ (`~/.local/state/hf2q/campaigns/adr063-preflight-20261023/q1-closure-v1/decisions/gemma-b3-envelope-t0-t2.json`, `f5dbfa5f…e1e2`); routing `RoutingChanged` 8,914/17,280 rows, set changed 4,587, gap max 0.0243 (`gemma-b3-routing-t0-t2.json`, `15f78365…cdad`). **Localized (#652):** first divergence at layer 0 prefill `Attention` (SDPA output), all four lanes, all 128 prompt rows; prefill Q/K/V and RoPE outputs exact; at the observed sliding layers 0–1, batched decode is bit-exact given equal inputs (layer 0); full-attention layers not observed in decode (`docs/research/adr063-q1-gemma-t2-localization.md`) |
 | T0 vs T1 CacheKey by layer, agent-0 | B | Rows < 64 are bitwise through layer 5, then diverge (relative RMS 0.0046 at layer 6 → 0.048 at layer 29). Rows ≥ 64 diverge from layer 1 (0.0021) up to 0.43 at layer 29 |
 | Routing witness on the greedy144 T0 (17,280 rows, top-8 of 128 experts) | — | Gap between 8th and 9th softmax probability: median 7.5e-4, p5 5.1e-5, p1 1.0e-5. 171 rows (1.0%) below 1e-5, 15 below 1e-6. Relative gap p1 6.2e-4 |
 | T5 n-gram transaction probe v3 | — | Accepted and rejected transitions observed on all four lanes. No ordinary-vs-speculative numeric comparison yet |
@@ -361,6 +362,7 @@ and runs each case under the existing Q5 supervisor, one model at a time:
    - Packets come from the Gemma metadata prepare with an optional `localizer` block (`agent`, `layers`, `stages`, `normalize_rows`, `routes` of `rerun_id` + `prefill_chunks`, e.g. `[128]` and `[64,64]`). It writes `localizer-prepared.json` (stage-localizer `config_sha256`, recipe, identity with `native_checksum: null`, `planned_payload` per route) and one disabled `localizer-packet-<rerun_id>.json` per route, and prints `Q1_GEMMA_LOCALIZER_METADATA_PREPARED`. Every route freezes the same `expected` list, so `exact` can compare them.
    - The stage-localizer `config_sha256` differs from the endpoint one, so the localizer needs its own composition, acquisition review and bindings file.
    - The Qwen endpoint prepare takes the same block, with `operations` (`embed`, `attn_out`, `ffn_out`, `layer_out`) instead of `stages`. Its routes are 128 tokens as `[128]` or `[64,64]` on one cache, and it prints `Q1_QWEN_LOCALIZER_METADATA_PREPARED`.
+   - The packed T2 route is localized against an All128 reference for all four lanes with `…::gemma_actual::q1_gemma_actual_cohort_stage_localizer` and `…::q1_gemma_actual_all128_stage_localizer` (`HF2Q_Q1_GEMMA_ENDPOINT_PACKET`, supervisor kind `multistore`, check `gemma_loc4`). Packets come from the prepare's optional `cohort_localizer` block. Each run also writes the unchanged endpoint store; `exact` against `gemma-t2-b3` / `gemma-t0-b3` is the observer-effect control. `scripts/four_agent/q1_stage_localization.py` writes the per-lane first-divergence record (`docs/research/adr063-q1-gemma-packed-cohort.md`).
 4. **Quality:** floor-only (no peer) on 24 instances; any candidate that changes chunk or batch routing needs the paired A/B against stock.
 
 ### 5.5 Per-family closure checklist
@@ -369,7 +371,7 @@ A family's Q1 closes when an independent reviewer accepts all of:
 
 - (a) oracle controls pass;
 - (b) every applicable Class A entry is `ExactEqual` or `ExactOnCommon` with explained extra records;
-- (c) every Class B entry is classified, and each `RouteSensitive` one carries a localized first divergence;
+- (c) every Class B entry is classified, and each `RouteSensitive` one carries a localized first divergence (Gemma T0 vs T2: `docs/research/adr063-q1-gemma-t2-localization.md`);
 - (d) routing margins are recorded where a witness exists, or explicitly N/A or Missing;
 - (e) a task-quality verdict exists: `paired` `Pass`, `transcripts` `ExactTranscripts` for Class A candidates, or a recorded `Loss`/`BelowFloor`/`Inconclusive`. A failure verdict is a valid closing record for Q1; it is not a pass for Q3/Q4.
 

@@ -3,6 +3,8 @@
 - **Status:** Proposed
 - **Date:** 2026-11-02
 - **Updated:** 2026-11-02 — amended by the owner after a field report: UD-IQ1_S runs on a 128 GiB M5 Max (the peer, about 360 tok/s prefill and 35 tok/s decode). hf2q supports UD-IQ1_S on the M5 Max as its first V4.1 target, starting now; the M5 Ultra remains the target for the higher-quality versions.
+- **Updated:** 2026-11-03 — operator decision (ADR-063 v0.1.30 speed program): the IQ2_XXS subset of N1, N3 and N4 is pulled ahead of B2 as its own story, N-IQ2XXS, for ADR-063 Q4-DS4-RACE (#667), which serves ds4's DeepSeek-V4-Flash-0731 IQ2_XXS file. N1, N3 and N4 are narrowed to build on it, with no duplicate kernels. Design: `docs/research/adr066-iq2xxs-subset-design.md`.
+- **Updated:** 2026-11-03 (later) — operator approval of the N-IQ2XXS design (`docs/research/adr066-iq2xxs-subset-design.md` §3), jointly with ADR-063 Q4-DS4-RACE (#667); see N-IQ2XXS.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** deepseek, deepseek41, gguf, split-gguf, mxfp4, iq-quants, engram, dspark, vision, m5-max, m5-ultra, agentic-serving
 - **Depends on:** ADR-042, ADR-063, ADR-065
@@ -111,7 +113,7 @@ The program MUST deliver, on the M5 Max: supported UD-IQ1_S serving with the omp
 
 The program MUST preserve every product boundary in AGENTS.md: Rust-owned conversion, quantization and inference; no Python, peer engine or vendor converter at runtime; hosted GGUF bytes never satisfy `convert`; downloads only through `hf-hub` or operator scripts. Python and peer engines appear only in developer parity harnesses. The program MUST NOT regress DeepSeek-V4-Flash-0731 serving (the 0731 invariance gate).
 
-Out of scope: UD-IQ1_M and any IQ1 output from `hf2q convert`; ds4-format GGUFs; GPU-resident Engram tables; SSD expert streaming for 128 GiB hosts (successor watchlist); tool namespaces; executing a GGUF's embedded Jinja template; a hosted admission contract for `deepseek4` (0731); new drafter architectures beyond DeepSeek's DSpark.
+Out of scope: UD-IQ1_M and any IQ1 output from `hf2q convert`; ds4's private tensor and row layouts and any ds4-produced V4.1 file (the standard-ggml ds4 DeepSeek-V4-Flash-0731 GGUF, IQ2_XXS/Q2_K/Q8_0/F16, is served under ADR-063 Q4-DS4-RACE using N-IQ2XXS, not by this ADR's V4.1 work); GPU-resident Engram tables; SSD expert streaming for 128 GiB hosts (successor watchlist); tool namespaces; executing a GGUF's embedded Jinja template; a hosted admission contract for `deepseek4` (0731); new drafter architectures beyond DeepSeek's DSpark.
 
 ### Numerical contract
 
@@ -140,7 +142,7 @@ A story closes by type:
 
 ## Repository ownership
 
-mlx-native owns every Metal kernel, GGUF type, shard-set reader, residency filter, CPU decode helper, parity test and release. hf2q owns the variant, plan, graph, cache, Engram reader orchestration, conversion, quantizers, serving, launcher, gates, receipts and documentation. The integration owner owns release-gate infrastructure, Actions variables and the peer pin. A native change is evidence only after it is merged, released, verified on crates.io and pinned exactly in hf2q (AGENTS.md). Native releases are batched: (1) N1, N2, S1; (2) N3–N6, S2, S3, L1; (3) N8 and any G3 kernel change; (4) N7.
+mlx-native owns every Metal kernel, GGUF type, shard-set reader, residency filter, CPU decode helper, parity test and release. hf2q owns the variant, plan, graph, cache, Engram reader orchestration, conversion, quantizers, serving, launcher, gates, receipts and documentation. The integration owner owns release-gate infrastructure, Actions variables and the peer pin. A native change is evidence only after it is merged, released, verified on crates.io and pinned exactly in hf2q (AGENTS.md). Native releases are batched: (0) N-IQ2XXS, ahead of the others, for v0.1.30 — no other ADR-066 story ships in that release, which may also carry ADR-063's v0.1.30 mlx-native work (for example Q4-GEMMA-KERNEL); (1) N1, N2, S1; (2) N3–N6, S2, S3, L1; (3) N8 and any G3 kernel change; (4) N7.
 
 ## B. Baselines, references, oracles and thresholds
 
@@ -279,15 +281,43 @@ Delivery boundary: Merged to main.
 
 ## N. Native quantized types (mlx-native)
 
+### N-IQ2XXS. Provide the IQ2_XXS storage type and DeepSeek-V4-Flash expert kernels
+
+Outcome: mlx-native opens, decodes and multiplies IQ2_XXS routed experts at DeepSeek-V4-Flash shapes, so hf2q can serve ds4's DeepSeek-V4-Flash-0731 IQ2_XXS file (ADR-063 Q4-DS4-RACE). N1, N3 and N4 later extend the same type, tables and kernels to V4.1.
+
+Requirement: mlx-native MUST parse GGML type 16 with ggml's block geometry and a CPU dequantization bit-exact against ggml, MUST hold the `iq2xxs` grid, sign and mask tables in one checked Rust source from which every Metal copy is generated, MUST provide IQ2_XXS `mv_id`, `mm_id` and tensor `mm_id` kernels with registered sources and CPU-oracle parity at DeepSeek-V4-Flash expert shapes, and MUST prove the existing Q2_K expert kernels at the DeepSeek-V4-Flash down shape.
+
+Acceptance:
+
+- Design approved by the operator, 2026-11-03: `docs/research/adr066-iq2xxs-subset-design.md` §3 (one type registration, one checked table source, IQ2_XXS `mv_id`/`mm_id`/tensor `mm_id` kernels; Q2_K reuses existing kernels with new down-shape parity and row-bitwise tests; Q8_0 and F16 reuse existing kernels unchanged; release and pin per §3.8).
+- `GgmlType` gains IQ2_XXS (256 values, 66 bytes per block) with the frozen serde name `iq2_xxs`. Dense IQ2_XXS mv/mm report "no kernel" and return a typed error, never a panic.
+- CPU dequantization matches ggml's `dequantize_row_iq2_xxs` bit for bit on seeded random blocks and on edge blocks (every scale nibble, grid index and sign index; ±0, subnormal, largest finite and ±inf scales), through a checked-in fixture whose generator records the ggml source revision and hashes. NaN scales are compared by class (NaN where ggml gives NaN), not by bit pattern.
+- The `iq2xxs_grid`, `ksigns_iq2xs` and `kmask_iq2xs` tables live in one Rust module that later IQ grids join (N3). Every shader copy is generated from it and checked byte for byte, and the bytes of all three tables match pinned sha256 values of ggml's tables.
+- IQ2_XXS `mv_id`, simdgroup `mm_id` and tensor `mm_id` match the CPU oracle at 256 experts, top-6, K = 4096 and N = 2048, from 1 routed row to 4,096 tokens, within bounds frozen before the first Metal run. The paired gate/up entry point works with IQ2_XXS over one shared expert map.
+- `mv_id` output at m = 1..8 rows is bitwise equal to m one-row calls, through the forced `mv_id` entry at the shapes hf2q's joint decode issues: IQ2_XXS gate/up with m tokens and top-6 at K = 4096/N = 2048, and Q2_K down with 6·m routed rows and top-1 at K = 2048/N = 4096 (48 rows at m = 8, above the automatic `mm_id` threshold). This is the proof hf2q's joint decode requires.
+- Q2_K `mv_id`, `mm_id`, tensor `mm_id` and the slotted down path match the CPU oracle at 256 experts, top-6, K = 2048 and N = 4096. No new Q2_K kernel is added.
+- Every IQ2_XXS kernel name resolves with `MLX_PRECOMPILED_METALLIB=0`, and the capability row reports the expert routes as native.
+- Microbenchmarks at those shapes recorded, including Q2_K at the same gate/up shape as the baseline.
+
+Repository ownership: mlx-native.
+
+Validation: Native primitive closure.
+
+Predecessors: none. Pulled ahead of B2 by operator decision (2026-11-03). Its ggml reference is the pinned peer checkout ADR-063 uses; B2's later pin re-verifies the table hashes.
+
+Priority: High.
+
+Delivery boundary: A published mlx-native release pinned by hf2q for v0.1.30.
+
 ### N1. Register and parse every V4.1 storage type
 
 Outcome: mlx-native can open every admissible unsloth shard and every hf2q V4.1 profile, and every kernel resolves without the precompiled metallib.
 
-Requirement: mlx-native MUST parse GGML types 16, 17, 18, 19, 21, 22, 39 and 43 with correct block geometry and CPU dequantization, MUST classify type 43 by byte extent as defined under Defaults, and MUST register kernel sources for every kernel name.
+Requirement: mlx-native MUST parse GGML types 17, 18, 19, 21, 22, 39 and 43 with correct block geometry and CPU dequantization, MUST classify type 43 by byte extent as defined under Defaults, and MUST register kernel sources for every kernel name. Type 16 (IQ2_XXS) is delivered by N-IQ2XXS, and N1 does not change its parse, dequantization or serde name.
 
 Acceptance:
 
-- `GgmlType` gains IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, MXFP4, MXFP8 and F8_E4M3 with frozen serde names; block sizes match ggml and, for MXFP8, the fork.
+- `GgmlType` gains IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, MXFP4, MXFP8 and F8_E4M3 with frozen serde names, beside N-IQ2XXS's IQ2_XXS; block sizes match ggml and, for MXFP8, the fork.
 - A type-43 tensor whose extent matches neither layout, or matches both without an agreeing encoding marker, fails with a typed error.
 - CPU dequantization for every new type matches ggml's `dequantize_row_*` bit for bit on random blocks.
 - Every existing kernel name, including IQ4_XS, has a registered source; a test resolves every `GgmlType` kernel name with `MLX_PRECOMPILED_METALLIB=0`.
@@ -297,7 +327,7 @@ Repository ownership: mlx-native.
 
 Validation: Native primitive closure.
 
-Predecessors: B2.
+Predecessors: B2, N-IQ2XXS.
 
 Priority: High.
 
@@ -329,32 +359,32 @@ Delivery boundary: Released and pinned in hf2q.
 
 Outcome: The two IQ types present in every admissible IQ/Q2/Q3 quant run on Metal.
 
-Requirement: mlx-native MUST provide the IQ grid and sign tables in Rust and Metal and IQ3_XXS and IQ2_S `mv_id`, `mm_id` and tensor `mm_id` kernels with CPU-oracle parity.
+Requirement: mlx-native MUST extend N-IQ2XXS's checked table source with the remaining IQ grid and sign tables in Rust and Metal, and MUST provide IQ3_XXS and IQ2_S `mv_id`, `mm_id` and tensor `mm_id` kernels with CPU-oracle parity.
 
 Acceptance:
 
-- Grids (`iq2xxs`, `iq2xs`, `iq2s`, `iq3xxs`, `iq3s`, `iq1s`, signs and masks) generated from one checked source and verified against ggml.
+- Grids (`iq2xs`, `iq2s`, `iq3xxs`, `iq3s`, `iq1s`) are added to N-IQ2XXS's single checked source (which already holds `iq2xxs`, signs and masks), generated into the shaders and verified against ggml.
 - Parity and microbenchmarks at V4.1 expert shapes.
 
 Repository ownership: mlx-native.
 
 Validation: Native primitive closure.
 
-Predecessors: N1.
+Predecessors: N1, N-IQ2XXS.
 
 Priority: High.
 
 Delivery boundary: Released and pinned in hf2q.
 
-### N4. Provide IQ3_S, IQ2_XXS and IQ2_XS expert kernels
+### N4. Provide IQ3_S and IQ2_XS expert kernels and V4.1-shape IQ2_XXS parity
 
 Outcome: Every IQ2/IQ3 expert type used by the admissible quants runs on Metal.
 
-Requirement: mlx-native MUST provide `mv_id`, `mm_id` and tensor `mm_id` kernels for IQ3_S, IQ2_XXS and IQ2_XS with CPU-oracle parity.
+Requirement: mlx-native MUST provide `mv_id`, `mm_id` and tensor `mm_id` kernels for IQ3_S and IQ2_XS with CPU-oracle parity, and MUST prove N-IQ2XXS's IQ2_XXS kernels at V4.1 expert shapes. It MUST NOT add a second IQ2_XXS kernel; any geometry change a V4.1 shape needs is made in N-IQ2XXS's kernels.
 
 Acceptance:
 
-- Parity and microbenchmarks at V4.1 expert shapes for each type.
+- Parity and microbenchmarks at V4.1 expert shapes for IQ3_S, IQ2_XS and IQ2_XXS.
 - Together with N2, admission of UD-Q2_K_XL, UD-IQ3_XXS, UD-IQ3_S and UD-Q3_K_XL needs no further weight kernel.
 
 Repository ownership: mlx-native.
@@ -376,7 +406,7 @@ Requirement: mlx-native MUST provide IQ1_S `mv_id`, `mm_id` and tensor `mm_id` k
 Acceptance:
 
 - Parity and microbenchmarks at V4.1 expert shapes.
-- Together with N4 (IQ2_XXS) and N6 (IQ4_NL Engram rows), admission of UD-IQ1_S needs no further weight kernel.
+- Together with N-IQ2XXS and N4 (IQ2_XXS at V4.1 shapes) and N6 (IQ4_NL Engram rows), admission of UD-IQ1_S needs no further weight kernel.
 
 Repository ownership: mlx-native.
 
@@ -1782,10 +1812,11 @@ Delivery boundary: Included in a published hf2q release.
 
 ## Coverage and sequencing
 
-Execution starts now on the M5 Max. B4 precedes B1, and B1 precedes every hf2q change to shared DeepSeek code (G1, G2) and S4. B2 precedes everything that cites a reference. The plan runs in four phases. **Phase 0, M5 Max with UD-IQ1_S (starts now):** B1–B6, N1–N6, N8, S1–S4, L1–L6, G1–G5, E1–E7a, E8, C1–C5, D1a–D3, V1a–V3 and M1–M6. **Phase 1, M5 Ultra MXFP4 bootstrap:** Q1, C8a, C9a, Q2a and G6. **Phase 2, IQ and remaining quants:** N7, C6, C7a, C7b, C8b, C9b, C10, Q2b, Q2c and D4. **Phase 3, M5 Ultra qualification and release:** Q3–Q6 and E7b. E6 rehearses on 0731 once B6 exists; its V4.1 mode needs E7a (dotted). Open DeepSeek-V4 pull requests (#420, #421, #439, #453) and ADR-065 F1 change files that G2, G3 and G5 rewrite; whichever lands first, the pre-change binary for the 0731 invariance gate is taken from the resulting main.
+Execution starts now on the M5 Max. B4 precedes B1, and B1 precedes every hf2q change to shared DeepSeek code (G1, G2) and S4. B2 precedes everything that cites a reference, except N-IQ2XXS, which the operator pulled ahead on 2026-11-03 (its ggml reference is the ADR-063 peer checkout; B2 re-verifies its table hashes). The plan runs in four phases. **Phase 0, M5 Max with UD-IQ1_S (starts now):** N-IQ2XXS, B1–B6, N1–N6, N8, S1–S4, L1–L6, G1–G5, E1–E7a, E8, C1–C5, D1a–D3, V1a–V3 and M1–M6. **Phase 1, M5 Ultra MXFP4 bootstrap:** Q1, C8a, C9a, Q2a and G6. **Phase 2, IQ and remaining quants:** N7, C6, C7a, C7b, C8b, C9b, C10, Q2b, Q2c and D4. **Phase 3, M5 Ultra qualification and release:** Q3–Q6 and E7b. E6 rehearses on 0731 once B6 exists; its V4.1 mode needs E7a (dotted). Open DeepSeek-V4 pull requests (#420, #421, #439, #453) and ADR-065 F1 change files that G2, G3 and G5 rewrite; whichever lands first, the pre-change binary for the 0731 invariance gate is taken from the resulting main.
 
 ```mermaid
 flowchart LR
+  NIQ2XXS["N-IQ2XXS"] --> N1 & N3
   B2 --> B3 & N1 & E1 & C1 & B5 & L5 & C7a
   B3 --> B6
   B4 --> B1

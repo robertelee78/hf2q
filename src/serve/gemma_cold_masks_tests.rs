@@ -116,7 +116,7 @@ fn cold_square_masks_fence_cast_and_tile_classifier() {
         &mut s,
         &device,
         &mut reg,
-        ColdMaskLayout::Square { len: LEN },
+        LEN,
         Some(16),
         true,
         "sliding_mask",
@@ -126,7 +126,7 @@ fn cold_square_masks_fence_cast_and_tile_classifier() {
         &mut s,
         &device,
         &mut reg,
-        ColdMaskLayout::Square { len: LEN },
+        LEN,
         None,
         true,
         "global_mask",
@@ -161,88 +161,6 @@ fn cold_square_masks_fence_cast_and_tile_classifier() {
     // Each BF16 mask is read by its F16 cast and its blk classifier.
     assert_fenced(&nodes, &sliding.bf16, &[], 2, "sliding");
     assert_fenced(&nodes, &global.bf16, &[], 2, "global");
-    drop(nodes);
-    assert_eq!(mlx_native::commit_count(), commits_before);
-}
-
-#[test]
-fn cold_block_diagonal_masks_fence_tile_classifier() {
-    let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let Some(device) = device() else { return };
-    let mut reg = registry();
-    // Two sequences of 40 and 24 tokens: the classifier must see the -inf
-    // off-diagonal blocks, or the tile-skip path attends across sequences.
-    let mut seq_id = device.alloc_buffer(LEN * 4, DType::U32, vec![LEN]).unwrap();
-    let mut local_pos = device.alloc_buffer(LEN * 4, DType::U32, vec![LEN]).unwrap();
-    for (token, (sid, pos)) in seq_id
-        .as_mut_slice::<u32>()
-        .unwrap()
-        .iter_mut()
-        .zip(local_pos.as_mut_slice::<u32>().unwrap().iter_mut())
-        .enumerate()
-    {
-        (*sid, *pos) = if token < 40 {
-            (0, token as u32)
-        } else {
-            (1, token as u32 - 40)
-        };
-    }
-    let (sw_params, blk_sw) = blk(&device, 32, 16);
-    let (gl_params, blk_gl) = blk(&device, 8, 64);
-    let commits_before = mlx_native::commit_count();
-    let executor = GraphExecutor::new(device.clone());
-    let mut s = executor.begin_recorded().unwrap();
-    let layout = || ColdMaskLayout::BlockDiagonal {
-        seq_id: &seq_id,
-        local_pos: &local_pos,
-        len: LEN,
-    };
-    let sliding = encode_cold_mask(
-        &mut s,
-        &device,
-        &mut reg,
-        layout(),
-        Some(16),
-        false,
-        "sliding_mask",
-    )
-    .unwrap();
-    let global = encode_cold_mask(
-        &mut s,
-        &device,
-        &mut reg,
-        layout(),
-        None,
-        false,
-        "global_mask",
-    )
-    .unwrap();
-    assert!(sliding.f16.is_none() && global.f16.is_none());
-    encode_mask_tiles(
-        &mut s,
-        &device,
-        &mut reg,
-        &sliding.bf16,
-        &blk_sw,
-        &sw_params,
-        "blk_sliding",
-    )
-    .unwrap();
-    encode_mask_tiles(
-        &mut s,
-        &device,
-        &mut reg,
-        &global.bf16,
-        &blk_gl,
-        &gl_params,
-        "blk_global",
-    )
-    .unwrap();
-    let nodes = s.encoder_mut().take_capture().unwrap();
-    drop(s);
-    let fill_reads = [&seq_id, &local_pos];
-    assert_fenced(&nodes, &sliding.bf16, &fill_reads, 1, "multi-seq sliding");
-    assert_fenced(&nodes, &global.bf16, &fill_reads, 1, "multi-seq global");
     drop(nodes);
     assert_eq!(mlx_native::commit_count(), commits_before);
 }

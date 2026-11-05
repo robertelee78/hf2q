@@ -92,29 +92,44 @@ def family_verdict(state):
     `state` keys: experiment_failures, peer_unavailable (dict or None), peer_failures, quality
     ({"status": "pass"|"loss"|"unresolved"|"none", ...}), complete (bool), vs_stock, vs_peer,
     fairness ({name: effect} of lower-is-better experiment-vs-stock effects), thermal_valid
-    (False only when a serious/critical state was observed), memory_valid (bool).
+    (False only when a serious/critical state was observed), memory_valid (bool). Optional (ADR-063 "Splash
+    peer of record for the Qwen families"): splash_required (bool), splash_unavailable (dict or None),
+    splash_failures (list), vs_splash (effect). Where Splash is required, a missing, unavailable or failed Splash
+    arm never yields a Win and the vs-Splash ratio must meet the same PEER_MARGIN as the peer's.
     """
+    splash = bool(state.get("splash_required"))
     if state["experiment_failures"]:
         return "Failed", ["experiment arm failed its task: " + "; ".join(state["experiment_failures"])]
     if state["quality"]["status"] == "loss":
         return "Failed", ["experiment task quality loss: " + state["quality"]["reason"]]
     if state["peer_unavailable"] is not None:
         return "Unavailable", ["no runnable peer arm: " + state["peer_unavailable"]["reason"]]
+    if splash and state.get("splash_unavailable") is not None:
+        return "Unavailable", ["no runnable Splash arm: " + state["splash_unavailable"]["reason"]]
     if state["peer_failures"]:
         return "Failed", ["peer arm failed its task (a failed peer cannot yield a win): "
                           + "; ".join(state["peer_failures"])]
+    if splash and state.get("splash_failures"):
+        return "Failed", ["Splash arm failed its task (a failed Splash arm cannot yield a win): "
+                          + "; ".join(state["splash_failures"])]
     if not state["complete"]:
         return "Pending", ["primary workload has not reached its stopping rule"]
     vs_stock, vs_peer = state["vs_stock"], state["vs_peer"]
+    vs_splash = state["vs_splash"] if splash else None
     if vs_peer["ratio_ci95"] is not None and vs_peer["ratio_ci95"][0] > 1:
         return "Loss", ["experiment makespan is longer than the peer's (95% CI of the ratio above 1)"]
+    if splash and vs_splash["ratio_ci95"] is not None and vs_splash["ratio_ci95"][0] > 1:
+        return "Loss", ["experiment makespan is longer than Splash's (95% CI of the ratio above 1)"]
     reasons = []
-    if not (precise(vs_stock) and precise(vs_peer)):
-        reasons.append(f"precision not reached: 95% half-width must be <= {HALF_WIDTH_PP} points for both contrasts")
+    if not (precise(vs_stock) and precise(vs_peer) and (not splash or precise(vs_splash))):
+        reasons.append(f"precision not reached: 95% half-width must be <= {HALF_WIDTH_PP} points for "
+                       + ("every contrast (stock, peer, Splash)" if splash else "both contrasts"))
     if vs_stock["ratio_ci95"] is None or vs_stock["ratio_ci95"][1] >= 1:
         reasons.append("no demonstrated makespan gain over stock (95% CI of the ratio reaches 1)")
     if vs_peer["ratio_ci95"] is None or vs_peer["ratio_ci95"][1] > PEER_MARGIN:
         reasons.append("peer margin not demonstrated (95% CI upper bound of the ratio above 0.95)")
+    if splash and (vs_splash["ratio_ci95"] is None or vs_splash["ratio_ci95"][1] > PEER_MARGIN):
+        reasons.append("Splash margin not demonstrated (95% CI upper bound of the ratio above 0.95)")
     for name, effect in sorted(state["fairness"].items()):
         if regression(effect):
             reasons.append(f"fairness regression vs stock: {name}")

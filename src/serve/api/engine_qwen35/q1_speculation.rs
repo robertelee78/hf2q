@@ -465,3 +465,5 @@ fn accepted_rejected_transition(
 
 #[path = "q1_speculation/first_fork.rs"]
 pub(super) mod first_fork;
+#[path = "q1_speculation/extent_export.rs"]
+mod extent_export;

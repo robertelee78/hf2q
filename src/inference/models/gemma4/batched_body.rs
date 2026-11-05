@@ -564,6 +564,15 @@ impl MlxModelWeights {
             .map_err(|e| anyhow::anyhow!("batched pre-attn norm L{layer_idx}: {e}"))
         })?;
         cat_boundary(session, exec, catsplit::Cat::RmsNorm)?;
+        // ADR-063 Q1 batched-decode stage hooks (T2 localizer): the same roles
+        // as the single-row `gpu_full_attn` hooks, per actual `[N, stride]`
+        // row, each owned by its slot/position. No-op unless a stage is selected.
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_stage::capture_batched(
+            session, exec, layer_idx, slot_ids, seq_positions, &[
+                (crate::adr063_invariance::receipt::Stage::Norm, &bufs.norm_out, hs, vec![hs]),
+            ],
+        )?;
 
         // -- QKV projections (BATCHED m=N): all read norm_out, write disjoint --
         session.barrier_between(
@@ -621,6 +630,13 @@ impl MlxModelWeights {
             )?;
             cat_boundary(session, exec, catsplit::Cat::DenseV)?;
         }
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_stage::capture_batched(
+            session, exec, layer_idx, slot_ids, seq_positions, &[
+                (crate::adr063_invariance::receipt::Stage::Query, &bufs.attn_q, q_stride, vec![nh, hd]),
+                (crate::adr063_invariance::receipt::Stage::Key, &bufs.attn_k, k_stride, vec![nkv, hd]),
+            ],
+        )?;
 
         // -- Per-head RMS norm + RoPE on Q and K (PER-SLOT row-views) --
         // Position-dependent: each slot's row uses its own position. Mirrors the
@@ -804,6 +820,15 @@ impl MlxModelWeights {
         }
         // catsplit: Q/K head-norm+RoPE + V-norm (the pre-attention head ops).
         cat_boundary(session, exec, catsplit::Cat::AttnPre)?;
+        // Value = the NORMED V source of the KV encode (scalar `v_src`).
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_stage::capture_batched(
+            session, exec, layer_idx, slot_ids, seq_positions, &[
+                (crate::adr063_invariance::receipt::Stage::RopeQuery, &bufs.attn_q_normed, q_stride, vec![nh, hd]),
+                (crate::adr063_invariance::receipt::Stage::RopeKey, &bufs.attn_k_normed, k_stride, vec![nkv, hd]),
+                (crate::adr063_invariance::receipt::Stage::Value, v_out_buf, v_normed_stride, vec![nkv, hd]),
+            ],
+        )?;
 
         // -- ATTENTION (PER-SLOT): hybrid KV-encode (F16-K copy + FWHT-V quant)
         // -> flash_attn_vec_hybrid -> fwht_sign_undo, each against this slot's
@@ -1736,6 +1761,12 @@ impl MlxModelWeights {
         // catsplit: KV-encode + flash attention + FWHT-undo (the whole
         // per-slot/batched attention block above, either regime).
         cat_boundary(session, exec, catsplit::Cat::AttnFlash)?;
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_stage::capture_batched(
+            session, exec, layer_idx, slot_ids, seq_positions, &[
+                (crate::adr063_invariance::receipt::Stage::Attention, &bufs.sdpa_out, sdpa_stride, vec![nh, hd]),
+            ],
+        )?;
 
         let num_experts = self.num_experts;
         let top_k = self.layers[layer_idx].moe.top_k;
@@ -1951,6 +1982,15 @@ impl MlxModelWeights {
         }
         // catsplit: fused_gelu_mul (dense SwiGLU) + per-slot MoE routing/top-k.
         cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_stage::capture_batched(
+            session, exec, layer_idx, slot_ids, seq_positions, &[
+                (crate::adr063_invariance::receipt::Stage::FfnNorm, &bufs.moe_norm_out, hs, vec![hs]),
+                (crate::adr063_invariance::receipt::Stage::RouterLogits, &bufs.moe_router_logits, rl_stride, vec![num_experts]),
+                (crate::adr063_invariance::receipt::Stage::RouterIds, &bufs.moe_expert_ids, ids_stride, vec![top_k]),
+                (crate::adr063_invariance::receipt::Stage::RouterWeights, &bufs.moe_routing_weights_gpu, ids_stride, vec![top_k]),
+            ],
+        )?;
 
         // -- B11: dense down: mlp_fused -> mlp_down. down_proj is F16
         // (intermediate=2112 not 256-aligned) → per-row m=1 (tile path not
@@ -2290,6 +2330,13 @@ impl MlxModelWeights {
                 }
             }
         }
+
+        #[cfg(test)]
+        crate::adr063_invariance::gemma_stage::capture_batched(
+            session, exec, layer_idx, slot_ids, seq_positions, &[
+                (crate::adr063_invariance::receipt::Stage::LayerOutput, &bufs.hidden, hs, vec![hs]),
+            ],
+        )?;
 
         // catsplit: post-FF norm2 + end-of-layer norm+scale (fused or unfused).
         cat_boundary(session, exec, catsplit::Cat::RmsNorm)?;
