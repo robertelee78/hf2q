@@ -42,12 +42,12 @@ No Class A defect. `whole_q1_qualified` is false in every receipt and in the T5 
 | continuation (t3cm, t6) | `4a00663291cabc8f215048e40b8eace7106199f5b3c21c656aa03d96ece9cdd6` | `0165d872dbaf11a53409be5cfb9cca7e78846605f2b4dd53c1546c31742524fe` | `180ca1065fe934efa2e1bb71a9200470d3970b102ba37d1101a79bd7b95be57e` |
 | t5prep | `120fffd38f29b1055c568fa12f8430b91f9789f959392819b6f1990ffaaa9daa` | `1bd0e61ceaa62108aaeca8f7cf7cb77eeb0a9aa8afdd19732681212c68bef733` | `0e953bb28643e513819213d20af00ac040e1e0b1a91d4e08bef0a1ea3afedda6` |
 | t5phases (t5base, t5forced) | `b563baa7d896b0699caa58eb72d57332bad700e13d9bff586a8d2a6e01b7a243` | `2b5096b6becae4f11c55e87608dac5f921e146a167745b45577392c14d66d62b` | `f015901c7f6d9a10af26299460ada17c57d8675f0e97c98ae511b3b2edc378c2` |
-| t5ff (t5ffbase, t5ffforced) | same as t5phases (deviation D4 below) | same as t5phases | `fb6b37a60e71697b9e5b5c648e5fc74416cd795cefb3ae3bd2dff46f1259a955` |
+| t5ff (t5ffbase, t5ffforced) | same as t5phases (deviation 5.1 below) | same as t5phases | `fb6b37a60e71697b9e5b5c648e5fc74416cd795cefb3ae3bd2dff46f1259a955` |
 
 Compositions under `$C/qwen36/b6*/composition-v1.json`, reviews under `$C/qwen36/reviews/b6/`, bindings under `$C/sup/qwen36-*-b6-bindings.json`. Tail128 derivation review `e61b85ef51a8cd47e9fc003cc943463118f3e84cdf8b420ca0f861581e23189e`; T5 frozen-file review `t5-frozen-review.json` `822b6ea9044472c493d362cb5e49220eec4e6820141a5bc705b8fb9dbdbd96f8` (frozen workload `492e917c9761c02a7bbbd8141fdf2f87a5f00160fb08347aebe6c3e0af4ca52d`).
 Quiet bind readings: `$L/bind-reading-qwen-20261105T051628Z.json` `9d32eaa48a33b0fdc5e1be12af5cf834f53fc9672424876e6b11adf3e545ee4e` (endpoint, continuation, t5prep) and `$L/bind-reading-qwen-t5-20261105T052939Z.json` `f81c88c6ee5a87e71e9364854f661b52cfc80256f4f7f7ed29e41561235f35ec` (t5phases, t5ff).
 
-### Deviation D4: t5ff shares the t5phases composition (review §5, finding 5.1)
+### Deviation 5.1 (shared t5ff composition; disclosure condition D4)
 
 The design §1.2 table lists the T5 first fork as its own composition row. `ComparisonKey` has no first-fork field (`acquisition.rs:73-84`; `runner.rs:258-267`, `:297-306`), so the t5ff key equals the t5phases key and two composition files would be byte-equal. The review (`b6-spec-review-notes.md` §5) ACCEPTED one shared composition and one acquisition review, under conditions D1–D4. D1–D3 are recorded there (both bindings bind the same composition and review; the review attests the t5ff packets; separate policies, bindings, copies and operating reviews). **D4 is this statement.** The design §1.2 table is amended by this PR.
 
@@ -101,9 +101,9 @@ Checked inside the Rust `t5_artifact_compare` (`t5_artifact_compare.rs:68-98`, `
 | catch-up, base arm | `t5ffbase/target-before-mtp` vs `target-after-mtp` | ExactEqual | 4 | 0 | 0 | 0 | `40ac4f9c08f72c20b1c91ef1b9cfc14c41dad60973044a8b25ab63e155322056` |
 | catch-up, forced arm | `t5ffforced/target-before-mtp` vs `target-after-mtp` | ExactEqual | 4 | 0 | 0 | 0 | `40ac4f9c08f72c20b1c91ef1b9cfc14c41dad60973044a8b25ab63e155322056` |
 
-All 148 post-draft-discard records (cache@129 after draft+discard) equal the committed state; the 151 left-only records are the rest of the committed store, which has no post-discard twin. Both catch-up files have the same bytes.
+All 148 post-draft-discard records (cache@129 after draft+discard) equal the committed state; the 151 left-only records are the rest of the committed store, which has no post-discard twin. This ExactOnCommon equals ExactEqual on the 148-record cache@129 scope that design §1.5 names: 148 common, 0 differing, and the 151 left-only records lie outside the scope. Both catch-up files have the same bytes.
 
-**Fork-arm diagnostic** (`T5-FF-fork129.json` `7c0bd82e2cffb0cb691789547a7d5efff21577cb1ae136125a5d7db1d632db8f`; t5ffbase vs t5ffforced `committed`): DivergedExactInvariant, common 299, differing 148, so 151 common records are equal and the 148 post-fork cache@131 records differ. First differing key `[CacheConv, agent-0, 0, 1, 0, 131]`. This is the expected route split after the fork, recorded, not gated.
+**Fork-arm diagnostic** (`T5-FF-fork129.json` `7c0bd82e2cffb0cb691789547a7d5efff21577cb1ae136125a5d7db1d632db8f`; t5ffbase vs t5ffforced `committed`): DivergedExactInvariant, common 299, differing 148: Logits rows 129 and 130 and 146 of the 148 cache@131 records (equal: Logits row 128, all 148 cache@129 records, and the layer-0 CacheConv/CacheRecurrent records at 131). First differing key `[CacheConv, agent-0, 0, 1, 0, 131]`. Expected post-fork route split; recorded, not gated.
 
 ### T5-B: committed rows — WithinDecisionEnvelope
 
@@ -112,7 +112,7 @@ All 148 post-draft-discard records (cache@129 after draft+discard) equal the com
 - decision error D: max 0.21340179443359375, p95 0.13153076171875, p50 0.007526397705078125;
 - KL (nats): max 0.001882108948175161, p95 0.0002380261191757894, p50 1.1502984424842552e-06.
 
-**Split into verifier rows (129, 130) vs post-rollback rows (131..143):** flips and rows over τ are 0 in both groups, since both lists are empty. A per-group D distribution (max, p50, p95) or per-group top1/exact counts are **not computable from the record**: `T5-B.json` keeps only whole-set aggregates and lists per-row data only for flips and rows over τ.
+**Split into verifier rows (129, 130) vs post-rollback rows (131..143):** Not required (WithinDecisionEnvelope); flips and rows over τ are 0 in both groups; per-group D not computed.
 
 ### Caches at 131/144 — ExplicitInconclusiveNumericPolicy
 
@@ -128,7 +128,7 @@ Missing("no Qwen3.6 verifier-route localizer"). T5-B is WithinDecisionEnvelope, 
 
 ## Decision provenance
 
-`$L/sup/record_decisions.py` `9cea5f429669a44654c45e86426eeee65cb296879f5026c538d7c5a7e37c23e6` (from the #652 precedent) re-ran every Python decision with `python3 -B` and decision tool `/opt/hf2q-worktrees/build-q1-b6/scripts/four_agent/q1_decision_policy.py` `01dd7fdf8d4d4374cb41a42405d6e575bc1ac368e2abe1c9eaaf7916083ce72f`. It required each output to be byte-identical to the existing file and wrote `hf2q.q1.closure-decision-record.v1` records (argv, tool sha, input shas, output sha, expectation, check rule, bindings). The Rust compare record binds the packet, log, build receipt and report shas and the test-binary sha, without re-running.
+`$L/sup/record_decisions.py` (from the #652 precedent) re-ran every Python decision with `python3 -B` and decision tool `/opt/hf2q-worktrees/build-q1-b6/scripts/four_agent/q1_decision_policy.py` `01dd7fdf8d4d4374cb41a42405d6e575bc1ac368e2abe1c9eaaf7916083ce72f`. It required each output to be byte-identical to the existing file and wrote `hf2q.q1.closure-decision-record.v1` records (argv, tool sha, input shas, output sha, expectation, check rule, bindings). The Rust compare record binds the packet, log, build receipt and report shas and the test-binary sha, without re-running. The first twelve records were written by script version `9cea5f429669a44654c45e86426eeee65cb296879f5026c538d7c5a7e37c23e6`. The current version `4bad3f2b463475a74799d9a38ea75f2041d3d17701f3a7c1996ee0098f25b9f7` adds the `info-t0b6-t0b2` entry and skips (never overwrites) existing records; it wrote only `info-t0b6-t0b2.record.json`.
 
 | Record (`$L/decisions/`) | sha256 |
 |---|---|
@@ -144,6 +144,11 @@ Missing("no Qwen3.6 verifier-route localizer"). T5-B is WithinDecisionEnvelope, 
 | `T5-A3-catchup-forced.record.json` | `aae547412914dd389e2409a297337a6632004bf60152fbea6313bec4fb9501c9` |
 | `T5-FF-fork129.record.json` | `a7a88cfbb57b1cc4995b10857655eb885468dbb09cd1a4753ebef4335fced159` |
 | `T5-artifact-compare-q36.record.json` | `21227d4edf725935da708431a72d9ff6e29147f4d7a6b5fb80fc842664abe731` |
+| `info-t0b6-t0b2.record.json` | `7959a9ed3eb87f57356dcc2bbd9247661d2b8a5d128a8e3531f87cfd87909c37` |
+
+### Informational cross-build check (design §1.6 step 3; not gated)
+
+`exact qwen36-t0-b6 qwen36-t0-b2` (`$L/decisions/info-t0b6-t0b2.json` `8418835a37920c8eba9a57d8310b450b25e4658293b1ae83497db30e34e628d6`): DivergedExactInvariant, common 1696, differing 1612, left_only 0, right_only 0, first differing key `[CacheConv, agent-0, 0, 4, 0, 128]`. It is expected to differ, because mlx-native 0.15.18 changes `rope_multi`. It is recorded only, it does not gate any #653 verdict, and every #653 comparison pair is same-build b6.
 
 ## Design text and matrix changes in this PR
 
