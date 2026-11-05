@@ -84,9 +84,9 @@ def approval(args):
         require(packet.get("request_setup") is None, "request-setup approval requires explicit CLI opt-in")
     repair = getattr(args, "repair_turns", 0)
     if repair:
-        require(n4 and args.family == "qwen" and args.engine_kind in ("hf2q", "peer")
+        require(n4 and family_contract.repair_allowed(args.family, args.engine_kind, packet.get("family_controls"))
                 and getattr(args, "benchmark_profile", None) is None,
-                "repair turns are four-agent Qwen hf2q/peer runs without a benchmark profile")
+                "repair turns are four-agent Qwen hf2q/peer/Splash-qwen36 runs without a benchmark profile")
     require(packet.get("repair_turns") == (repair or None), "repair-turn approval binding")
     require(set(packet.get("preflight", {})) == keys and
             all(v is True for v in packet["preflight"].values()), "preflight unknown")

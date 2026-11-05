@@ -491,8 +491,8 @@ decodes with its family's pinned DFlash2 draft. Q3 runs it as its own measured a
     a `--max-memory` cap (D6), re-confirm the configuration and start a new campaign.
 - **Quality gate.** Run `quality_campaign.py --reference-kind splash` with a Splash reference case. The F2 tier
   requires a `splash` gate for records that require Splash.
-- **Qwen3.6 workload.** The arm runs the declared Qwen3.6 workload. The repair-turn workload applies once it is
-  recorded on main: add `--repair-turns 1` to the hf2q, peer and Splash Qwen3.6 cases together.
+- **Qwen3.6 workload.** The arm runs the declared Qwen3.6 workload (D9): `q5_cases/splash-qwen36-repair1.json` is
+  the repair-turn arm (see "Qwen3.6 repair-turn workload"), run beside the hf2q and peer repair cases.
 
 ### Root commands
 
@@ -731,8 +731,8 @@ A floor-only family (for example DeepSeek-V4) omits the three `--reference-*` op
 
 - **Rule.** After a failed `run_tests`, the agent's next two calls must be `write_file src/ports.rs` and `run_tests` on the same target. The six steps then resume after the failed `run_tests`, so a repaired agent makes up to 8 tool calls and 9 requests. Unary and streamed requests still alternate by turn. A failed `run_tests` with no cycle left fails the agent at once.
 - **Unchanged.** Prompts, the workflow text, tools, templates, sampling and every other step stay canonical. Without the option, the canonical protocol (`assistant`, `qualify`) is unchanged.
-- **Binding.** The case's `client.approval.set.repair_turns` must equal the client option. `q5_case.repair_turns` refuses a mismatch and any family other than `qwen36`. The coordinator copies the grant into each agent approval, the child checks it, and agent and coordinator summaries record `repair_turns`. `aggregate` and the Q2 run audit replay every request through the same `Workflow`. `quality_campaign.py` and `q3_campaign.py` refuse arms with different grants. The option combines with `--instance`, `--request-setup` and `--phase-plan`, but not with `--benchmark-profile`.
-- **Cases.** `q5_cases/qwen36-repair1.json` and `peer-qwen36-repair1.json` are `qwen36.json` and `peer-qwen36.json` plus the grant. They pin `MODEL_SHA256` to the hf2q-converted GGUF (`815a22ca…`).
+- **Binding.** The case's `client.approval.set.repair_turns` must equal the client option. `q5_case.repair_turns` refuses a mismatch and any family other than `qwen36`. The client admits the grant for engine kinds hf2q, peer and Splash (design decision D9), Splash only with `family_controls.q3_family` `qwen36` (`coding_family.repair_allowed`); ds4, TensorFold and oMLX are refused. The coordinator copies the grant into each agent approval, the child checks it, and agent and coordinator summaries record `repair_turns`. `aggregate` and the Q2 run audit replay every request through the same `Workflow`; on Splash the arm's audit module binds every repaired request to a Done line and its render proof. `quality_campaign.py` and `q3_campaign.py` refuse arms with different grants. The option combines with `--instance`, `--request-setup` and `--phase-plan`, but not with `--benchmark-profile`.
+- **Cases.** `q5_cases/qwen36-repair1.json`, `peer-qwen36-repair1.json` and `splash-qwen36-repair1.json` are `qwen36.json`, `peer-qwen36.json` and `splash-qwen36.json` plus the grant. They pin `MODEL_SHA256` to the hf2q-converted GGUF (`815a22ca…`).
 
 ## Three-arm speed campaign (ADR-063 Q3)
 

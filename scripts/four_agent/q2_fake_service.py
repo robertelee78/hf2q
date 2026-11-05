@@ -32,9 +32,12 @@ import qwen38_n1_process as child
 from qwen38_n1_smoke import build_request, exchange, initial_messages
 from qwen38_n1_verdict import EXPECTED, Workflow, loads, max_tools, qualify
 import qwen_n4_live_smoke as coordinator
+from native_peer_splash import MODEL_IDS as splash_ids
+from native_peer_splash_ready import TEMPLATE_FIELDS as SPLASH_TEMPLATE_FIELDS
 
 HERE = Path(__file__).resolve().parent
 MODEL = "fake-q2-model"
+SPLASH_MODEL = splash_ids["qwen36"]   # the pinned served id of the Qwen3.6 Splash arm
 RUN = "q2-fake-run-0000000001"
 TOKEN = "0123456789abcdef0123456789abcdef"
 SERVER_PID = 4242
@@ -156,11 +159,16 @@ class FakeService:
     A rendezvous, admission or close wait that fails is recorded and fails `__exit__` loudly.
     `bursty=True` streams the low-frame shape of hf2q Gemma: one reasoning frame, a pause of
     `timing.gap`, then the tool name and two argument frames back to back (four progress frames).
-    `repair=True` answers every agent with REPAIR_SCRIPT (one repair cycle; summary at turn 8)."""
+    `repair=True` answers every agent with REPAIR_SCRIPT (one repair cycle; summary at turn 8).
+    `splash=True` speaks the closed Splash wire (native_peer_splash.check_unary/check_frame: ids, metrics,
+    timings, reasoning usage), serves the closing /apply-template and /tokenize render endpoints (the prompt is
+    the request's template fields, its token count the turn's usage.prompt_tokens) and logs Splash's Started/Done
+    status lines in `self.log` (native_peer_splash_audit)."""
 
     def __init__(self, timing=None, faults=None, model=MODEL, slots=None, bursty=False, rendezvous=(),
-                 admit_together=None, repair=False):
+                 admit_together=None, repair=False, splash=False):
         self.timing, self.model, self.bursty, self.repair = timing or Timing(), model, bursty, repair
+        self.splash, self.prompts, self.log = splash, {}, []
         assert not (slots and rendezvous), "a slot-capped service cannot hold a rendezvous group open"
         self.slots = None if slots is None else threading.BoundedSemaphore(slots)
         self.acks = Path(tempfile.mkdtemp(prefix="q2-rendezvous-")) if rendezvous else None
@@ -182,6 +190,9 @@ class FakeService:
             def do_POST(self):
                 accepted = clock_ns()
                 body = self.rfile.read(int(self.headers["Content-Length"]))
+                if service.splash and self.path in ("/apply-template", "/tokenize"):
+                    service.render(self, json.loads(body))
+                    return
                 if service.admission is not None:
                     service.admit()
                 if service.slots is not None:
@@ -254,7 +265,7 @@ class FakeService:
             if fault == "reused_response_id":
                 rid = self.response_ids[(agent, 0)]
             self.response_ids.setdefault((agent, turn), rid)
-            cid = f"call_{agent}_{turn}_{self.counter:06d}"
+            cid = f"call_{uuid.uuid4().hex}_0" if self.splash else f"call_{agent}_{turn}_{self.counter:06d}"
             if fault == "reused_call_id":
                 cid = self.call_ids[(agent, 0)]
             self.call_ids.setdefault((agent, turn), cid)
@@ -274,6 +285,10 @@ class FakeService:
             usage["prompt_tokens_details"]["cached_tokens"] = 64
         elif fault == "no_reuse":
             usage["prompt_tokens_details"]["cached_tokens"] = 0
+        native = {}
+        if self.splash:
+            usage["completion_tokens_details"] = {"reasoning_tokens": 8}
+            native = self.splash_record(request, usage)
         reasoning = f"Step {turn + 1}: following the six-step workflow."
         if fault == "foreign_identity":
             other = coordinator.AGENTS[(coordinator.AGENTS.index(agent) + 1) % len(coordinator.AGENTS)]
@@ -293,7 +308,7 @@ class FakeService:
         if fault == "length_finish":
             finish = "length"
         if request.get("stream"):
-            frames = self.stream_frames(rid, model, reasoning, call, content, finish, usage, fault)
+            frames = self.stream_frames(rid, model, reasoning, call, content, finish, usage, fault, native)
             handler.send_response(200)
             handler.send_header("Content-Type", "text/event-stream")
             handler.send_header("Connection", "close")
@@ -317,7 +332,7 @@ class FakeService:
                 message["tool_calls"] = [call]
             payload = json.dumps({"id": rid, "object": "chat.completion", "model": model,
                                   "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-                                  "usage": usage}).encode()
+                                  "usage": usage, **native}).encode()
             handler.send_response(200)
             handler.send_header("Content-Type", "application/json")
             handler.send_header("Content-Length", str(len(payload)))
@@ -329,16 +344,48 @@ class FakeService:
             self.requests.append({"agent": agent, "turn": turn, "accepted_ns": accepted, "started_ns": started,
                                   "finished_ns": clock_ns(), "stream": bool(request.get("stream"))})
 
-    def stream_frames(self, rid, model, reasoning, call, content, finish, usage, fault):
+    def splash_record(self, request, usage):
+        """Splash's Started/Done lines and the turn's render key; returns the reply's created/metrics/timings."""
+        cached, prompt = usage["prompt_tokens_details"]["cached_tokens"], usage["prompt_tokens"]
+        key = json.dumps({k: request.get(k) for k in SPLASH_TEMPLATE_FIELDS}, sort_keys=True, ensure_ascii=False)
+        with self.state:
+            self.prompts[key] = prompt
+            self.log += [f"00:00:00 Started · input {prompt:,} · cached {cached:,} · high · thinking on",
+                         f"00:00:01 Done · input {prompt:,} · cached {cached:,} · output {usage['completion_tokens']:,}"
+                         " · TTFT 0.1s · 50.0 tok/s · 5.0 tok/cycle"]
+        return {"created": 1, "metrics": {"prefill": {}, "decode": {}, "request_latency": {}, "cache": {}},
+                "timings": {"prompt_n": prompt, "prompt_ms": 1.0, "prompt_per_second": 1.0,
+                            "predicted_n": usage["completion_tokens"], "predicted_ms": 1.0,
+                            "predicted_per_second": 1.0, "cache_n": cached}}
+
+    def render(self, handler, body):
+        """Splash /apply-template (the prompt is the request's template fields) and /tokenize (prompt_tokens ids)."""
+        if handler.path == "/apply-template":
+            doc = {"prompt": json.dumps(body, sort_keys=True, ensure_ascii=False)}
+        else:
+            doc = {"tokens": list(range(self.prompts[body["content"]]))}
+        payload = json.dumps(doc).encode()
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.write(payload)
+        handler.close_connection = True
+
+    def stream_frames(self, rid, model, reasoning, call, content, finish, usage, fault, native=None):
+        splash = bool(native)
+
         def frame(choices, extra=None):
-            obj = {"id": rid, "object": "chat.completion.chunk", "model": model, "choices": choices, **(extra or {})}
+            obj = {"id": rid, "object": "chat.completion.chunk", **({"created": native["created"]} if splash else {}),
+                   "model": model, "choices": choices, **(extra or {})}
             return ("data: " + json.dumps(obj) + "\n\n").encode()
 
         def delta(value):
-            return frame([{"index": 0, "delta": value}])
+            return frame([{"index": 0, "delta": value, **({"finish_reason": None} if splash else {})}])
 
         gap = self.timing.gap
-        frames = [(0, delta({"role": "assistant"}))]
+        frames = [(0, delta({"role": "assistant", "content": ""} if splash else {"role": "assistant"}))]
         if fault != "role_only":
             pieces = 1 if self.bursty else REASONING_FRAMES
             size = -(-len(reasoning) // pieces)
@@ -355,8 +402,9 @@ class FakeService:
                                        delta({"tool_calls": [{"index": 0, "function": {"arguments": part}}]})))
                 else:
                     frames.append((gap, delta({"content": content})))
-        frames.append((0, frame([{"index": 0, "delta": {}, "finish_reason": finish}])))
-        frames.append((0, frame([], {"usage": usage})))
+        frames.append((0, frame([{"index": 0, "delta": {}, "finish_reason": finish}],
+                                {"timings": native["timings"]} if splash else None)))
+        frames.append((0, frame([], {"usage": usage, **({"metrics": native["metrics"]} if splash else {})})))
         frames.append((0, b"data: [DONE]\n\n"))
         return frames
 
@@ -560,12 +608,14 @@ def retime(results, phase_plan, makespan_s, slots=None, origin=10 ** 12):
 
 
 _TEMPLATES = {}
+_SPLASH_EVIDENCE = {}   # template key -> (per-agent render proofs, Splash status log lines)
 _TEMPLATE_ROOT = None
 
 
 def template(engine_kind="hf2q", phase_plan=None, instance=None, family="qwen", variant=None, repair_turns=0):
     """Raw evidence of one honest run (cached per process): directory and per-agent results.
-    `repair_turns=1`: every agent fails its first run_tests and repairs it (REPAIR_SCRIPT)."""
+    `repair_turns=1`: every agent fails its first run_tests and repairs it (REPAIR_SCRIPT).
+    `engine_kind="splash"`: the Splash wire with the pinned Qwen3.6 served id, and the closing render proofs."""
     global _TEMPLATE_ROOT
     key = (engine_kind, phase_plan, instance, family, variant, repair_turns)
     if key not in _TEMPLATES:
@@ -574,11 +624,17 @@ def template(engine_kind="hf2q", phase_plan=None, instance=None, family="qwen", 
             atexit.register(_TEMPLATE_ROOT.cleanup)
         root = Path(_TEMPLATE_ROOT.name) / f"t{len(_TEMPLATES)}"
         results = {}
-        with FakeService(repair=bool(repair_turns)) as service:
+        splash = engine_kind == "splash"
+        with FakeService(repair=bool(repair_turns), splash=splash) as service:
             for agent in coordinator.active_agents(phase_plan):
                 results[agent] = drive_agent(service.url, root / agent, agent, engine_kind=engine_kind, family=family,
                                              instance=instance, phase=coordinator.agent_phase(phase_plan, agent),
-                                             variant=variant, repair_turns=repair_turns)
+                                             variant=variant, repair_turns=repair_turns,
+                                             **({"model": SPLASH_MODEL} if splash else {}))
+            if splash:
+                from native_peer_splash_ready import render_proof
+                _SPLASH_EVIDENCE[key] = ({agent: render_proof(service.url, root / agent, result["turns"])
+                                          for agent, result in results.items()}, list(service.log))
         _TEMPLATES[key] = (root, results)
     return _TEMPLATES[key]
 
@@ -593,8 +649,17 @@ def honest_run(client_dir, makespan_s=100.0, engine_kind="hf2q", phase_plan=None
         shutil.copytree(root / agent, client_dir / agent)
     results = copy.deepcopy(results)
     releases, triggers = retime(results, phase_plan, makespan_s, slots)
-    return assemble(client_dir, results, releases, triggers, phase_plan, engine_kind, family, instance, variant=variant,
-                    repair_turns=repair_turns)
+    summary = assemble(client_dir, results, releases, triggers, phase_plan, engine_kind, family, instance,
+                       variant=variant, repair_turns=repair_turns)
+    if engine_kind == "splash":  # the coordinator's readiness and closing records and the server's status log
+        from native_peer_splash import SPLASH_COMMIT
+        render, log = _SPLASH_EVIDENCE[(engine_kind, phase_plan, instance, family, variant, repair_turns)]
+        summary.update(native_readiness={"engine_kind": "splash", "source_revision": SPLASH_COMMIT,
+                                         "q3_family": "qwen36"}, native_closing={"render": copy.deepcopy(render)})
+        (client_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        (client_dir.parent / "server.stdout").write_text("\n".join(log) + "\n")
+        (client_dir.parent / "server.stderr").write_text("")
+    return summary
 
 
 def write_json(path, value):

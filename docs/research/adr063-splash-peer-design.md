@@ -540,11 +540,10 @@ are kept for the record.
 - **D8 — Symlinks: acceptable.** Splash's assembly symlinks to the GGUF and the draft (no hard link, no write).
 - **D9 — Qwen3.6 workload: the declared Qwen3.6 workload.** The Splash Qwen3.6 case runs whatever workload
   Q4-QWEN36 declares for the hf2q and peer Qwen3.6 arms. The operator's direction is the repair-turn workload,
-  one repair turn after a failed `run_tests` (`qwen_n4_live_smoke.py --repair-turns 1`, Qwen3.6 only), once it is
-  recorded in ADR-063. That workload and its decision are still unmerged (#662), and the draft makes it
-  conditional on clearing the quality floor. Until it is recorded, the Splash Qwen3.6 arm waits. Qwen3.8 keeps the
-  canonical six-step protocol. When the workload lands, the client's repair-turn gate ("repair turns are Qwen
-  hf2q/peer runs") is widened to `splash`.
+  one repair turn after a failed `run_tests` (`qwen_n4_live_smoke.py --repair-turns 1`, Qwen3.6 only). It is
+  recorded in ADR-063 under Q4-QWEN36 (#681, after the floor was cleared: hf2q 21/24 vs peer 20/24, `Pass`).
+  The client's repair-turn gate admits `splash` for Qwen3.6 since #715, whose case is
+  `q5_cases/splash-qwen36-repair1.json`. Qwen3.8 keeps the canonical six-step protocol.
 - **D10 — Lossy engine settings are valid when Splash's own task outcomes pass.** These are int8 KV (the default),
   bf16 state (only if a sweep point selects it; fp32 is the default) and the Neural Engine W8A8 FFN split (the
   Qwen3.8 default). A configuration is valid or invalid on Splash's own runs (§7.1): Q5, the run audits, the Q1
