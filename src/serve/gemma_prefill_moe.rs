@@ -128,6 +128,47 @@ pub(crate) fn mm_id_threshold_override_present() -> bool {
     std::env::var_os("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some()
 }
 
+/// Expert entry point of one down call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DownEntry {
+    /// `dispatch_expert_matmul_id_pooled` (flattened rows).
+    Flat,
+    /// `dispatch_expert_matmul_id_pooled_slotted`: builds its own schedule.
+    Slotted,
+    /// `dispatch_expert_matmul_id_pooled_slotted_reusing_schedule`: reuses
+    /// the schedule the gate/up `map0` left in the scratch (design §4.3).
+    SlottedReusingSchedule,
+}
+
+/// Entry point of a down call (design §4.3, P2b). The gate/up call built a
+/// reusable schedule only when both expert stacks are block-quantized (a
+/// scalar stack never writes the scratch) and the call is slotted (the same
+/// `mm_id` rows, ids, `n_tokens` and `top_k` as gate/up). A session the
+/// body rotated between gate/up and down (profiling pre-finishes, the
+/// imatrix intercept) takes the self-scheduling slotted call, so a valid
+/// run never meets a key mismatch; without rotation a reuse error is a bug
+/// and propagates.
+pub(crate) fn down_entry(
+    call: DownCall,
+    both_stacks_block_quantized: bool,
+    session_rotated: bool,
+) -> DownEntry {
+    if !call.slotted {
+        DownEntry::Flat
+    } else if both_stacks_block_quantized && !session_rotated {
+        DownEntry::SlottedReusingSchedule
+    } else {
+        DownEntry::Slotted
+    }
+}
+
+/// The native expert-matmul tile schedule the process resolves
+/// (`HF2Q_MM_ID_SCHEDULE`), for the runtime-controls surface.
+pub(crate) fn published_mm_id_schedule() -> serde_json::Value {
+    serde_json::to_value(mlx_native::ggml_routing_policy_from_environment().expert_mm_schedule)
+        .unwrap_or(serde_json::Value::Null)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +235,27 @@ mod tests {
                 "top_k {top_k} has no mm_id route: flattened call"
             );
         }
+    }
+
+    #[test]
+    fn gemma_prefill_moe_down_schedule_reuse_falls_back_on_rotation() {
+        let slotted = down_call(Slotted, 232, 8, false, false);
+        let flat = down_call(Flat, 232, 8, false, false);
+        // Not rotated, block-quantized stacks: reuse the gate/up schedule.
+        assert_eq!(
+            down_entry(slotted, true, false),
+            DownEntry::SlottedReusingSchedule
+        );
+        // Rotated (profile buckets, imatrix): self-scheduling slotted call.
+        assert_eq!(down_entry(slotted, true, true), DownEntry::Slotted);
+        // A scalar stack wrote no schedule.
+        assert_eq!(down_entry(slotted, false, false), DownEntry::Slotted);
+        for rotated in [false, true] {
+            assert_eq!(down_entry(flat, true, rotated), DownEntry::Flat);
+        }
+        assert!(matches!(
+            published_mm_id_schedule().as_str(),
+            Some("uniform_grid" | "compact_tiles")
+        ));
     }
 }

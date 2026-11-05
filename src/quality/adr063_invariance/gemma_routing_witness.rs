@@ -52,7 +52,12 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// `rope_multi` pairing fix. `src/ops/routing_selection_witness.rs`, the
 /// routing and routing-witness shaders are unchanged, and the witness kernels
 /// are not registration fallbacks, so their pipeline resolution is unchanged.
-pub const WITNESS_NATIVE_VERSION: &str = "0.15.18";
+/// Re-reviewed 0.15.18 -> 0.16.0 (`dc236dc` -> `1a5fc09`, tag `v0.16.0`): the changes are the
+/// compact expert-matmul tile schedule (`map0c`, `mm_id` `_c` kernels,
+/// `IdMmScratch` accessors, routing-policy field `expert_mm_schedule`) and the
+/// ring-bytes KV restore. `src/ops/routing_selection_witness.rs` and the
+/// routing and routing-witness shaders are unchanged.
+pub const WITNESS_NATIVE_VERSION: &str = "0.16.0";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
