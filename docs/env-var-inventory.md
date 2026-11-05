@@ -66,6 +66,7 @@ These rows were added by hand. The rest of this snapshot was not regenerated.
 ## Added in ADR-063 Q4-GEMMA (2026-11-03)
 
 - `HF2Q_GEMMA_PREFILL_CATSPLIT` (`development-only`) is the Gemma 4 warm-prefill category split for the Q4-GEMMA profile. Only the exact value `1` enables it; it is off by default. In each layer of a warm live-prefix-resume batched prefill it closes GPU-timed command buffers before and after live attention, before the routed MoE and at the layer end (categories `pre_attn`, `attention`, `dense`, `moe`), and the Gemma 4 worker prints one `[PREFILL_CATSPLIT_JSON]` line of lifetime totals at graceful exit. It adds CPU waits but changes no dispatch; `HF2Q_GRAPH_OPT_PREFILL=1` skips it.
+- `HF2Q_GEMMA_ROUTING_OVERLAP` (`development-only`) is the ADR-063 Q4-GEMMA-DECODE V2 decode-workload diagnostic. Only the exact value `1` enables it; it is off by default and read once per process. Each `[N,hidden]` batched decode step blit-copies every layer's routed expert ids into a per-step buffer, read after the step's existing final wait, and records each slot's KV length per layer type and whether the step was mixed-bucket. The Gemma 4 worker prints one `[ROUTING_OVERLAP]` JSON line at graceful exit: distinct experts per (layer, width), KV-length histograms (power-of-two and `(nwg, nsg)` bucket) per layer type, and the mixed-bucket share. It adds one blit per layer; untimed runs only.
 
 This row was added by hand.
 
@@ -277,6 +278,7 @@ this release:
 | `HF2Q_GEMMA_N8_PREFILL_REPEATS` | `development-only` | 1 |
 | `HF2Q_GEMMA_N8_RESUME_REPEATS` | `development-only` | 1 |
 | `HF2Q_GEMMA_PREFILL_CATSPLIT` | `development-only` | 3 |
+| `HF2Q_GEMMA_ROUTING_OVERLAP` | `development-only` | 5 |
 | `HF2Q_GEMMA_TILED_LIVE` | `development-only` | 4 |
 | `HF2Q_GEMMA_WARM_TILED_ATTENTION` | `documented-escape` | 7 |
 | `HF2Q_GLOBAL_FA` | `development-only` | 7 |

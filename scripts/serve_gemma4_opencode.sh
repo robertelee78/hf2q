@@ -106,6 +106,11 @@
 #                                    HF2Q_MM_ID_SCHEDULE; unset keeps the
 #                                    mlx-native expert-matmul schedule
 #                                    default. grid is the bitwise A/B arm.
+#     ROUTING_OVERLAP=0|1            (this script) forwards
+#                                    HF2Q_GEMMA_ROUTING_OVERLAP; unset keeps
+#                                    it off. 1 prints the V2 [ROUTING_OVERLAP]
+#                                    decode-workload histograms at worker exit
+#                                    (diagnostic, untimed runs only).
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):
 #   * Disk persistence of the LCP registry for gemma (ADR-017 spiller
@@ -247,6 +252,15 @@ case "${MM_ID_SCHEDULE:-}" in
         exit 2
         ;;
 esac
+ROUTING_OVERLAP_ENV=""
+case "${ROUTING_OVERLAP:-}" in
+    "") ;;
+    0|1) ROUTING_OVERLAP_ENV="$ROUTING_OVERLAP" ;;
+    *)
+        echo "ROUTING_OVERLAP must be 0, 1 or unset" >&2
+        exit 2
+        ;;
+esac
 
 # macOS bash 3.2 + `set -u`: expanding an EMPTY array via "${MMARGS[@]}"
 # is an unbound-variable error (this killed the no-mmproj boot
@@ -261,6 +275,7 @@ if [[ -f "$MMPROJ" ]]; then
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
+        ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
@@ -282,6 +297,7 @@ else
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
+        ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \

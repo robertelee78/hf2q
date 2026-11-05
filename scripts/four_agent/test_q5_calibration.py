@@ -579,6 +579,19 @@ class ArgvAndCases(unittest.TestCase):
         self.assertIn('flat|slotted) PREFILL_MOE_DOWN_ENV="$PREFILL_MOE_DOWN" ;;', launcher)
         self.assertIn('grid|compact) MM_ID_SCHEDULE_ENV="$MM_ID_SCHEDULE" ;;', launcher)
 
+    def test_gemma_case_forwards_only_an_explicit_routing_overlap_arm(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        stock = q5_case.build_plan(case, builtins, self.required())
+        self.assertEqual(stock['serve']['env']['ROUTING_OVERLAP'], '')
+        self.assertNotIn('HF2Q_GEMMA_ROUTING_OVERLAP', stock['serve']['env'])
+        on = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_ROUTING_OVERLAP': '1'})
+        self.assertEqual(on['serve']['env']['ROUTING_OVERLAP'], '1')
+        self.assertEqual(on['serve']['env']['WARM_TILED_ATTENTION'], '', 'arms are independent')
+        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
+        self.assertEqual(launcher.count('${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"}'), 2)
+        self.assertIn('0|1) ROUTING_OVERLAP_ENV="$ROUTING_OVERLAP" ;;', launcher)
+
     def test_run_id_matches_client_identity_rule(self):
         for name in ('x', 'q5-qwen38-20261030T120000Z', 'a.b c' * 30):
             self.assertRegex(q5_calibration.run_id(name, 'f' * 32), r'^[A-Za-z0-9_-]{16,64}$')
