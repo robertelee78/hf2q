@@ -1,8 +1,9 @@
 # ADR-063 Q4-GEMMA-ATTN-EXACT: bitwise-exact batched warm-prefill attention for Gemma 4
 
-Status: **draft revision 2, needs design review** (2026-11-05).
-- Revision 1 was reviewed by ReviewGemmaExact (REVISE, 8 findings); §11
-  records how each was answered.
+Status: **draft revision 3, needs design review** (2026-11-05).
+- Revision 1 was reviewed by ReviewGemmaExact (REVISE, 8 findings) and
+  revision 2 by the same reviewer (REVISE narrowly, R1–R5). §11 records how
+  each finding was answered.
 - No code, build or hardware run backs this document. Numbers are quoted from
   the receipts named, or marked `[INFERENCE]`.
 
@@ -134,6 +135,15 @@ Invariants (bitwise on the raw u32 of every F32 output and partial):
     - Reading K or codes from threadgroup memory instead of device memory is
       exactly the kind of change that flipped Apple's FMA contraction before
       (ADR-040 §0.21c). Only S0-a's tests decide.
+    - **Running output in registers is an operand-form change.** In the
+      reference the running output `so4` lives in threadgroup memory: in the
+      softmax block `so4[ii*NL] *= ms`, then after the V loop
+      `so4[ii*NL] += lo[ii]`, separated by stores and barriers (`lo` is a
+      per-chunk local). Holding `so` in registers lets the compiler fuse
+      `so·ms + lo` into one `fma`, which is one rounding instead of two.
+      S0-a must prove register `so` bitwise. If it does not hold, the layout
+      keeps `so` in threadgroup memory (L-A-tg, where it fits) or falls back
+      to L-B (§4.2).
 11. **Compiler dependence.** Decode design §3.3 applies:
     - parity is per metallib path and per compiler;
     - every receipt records the macOS build, `xcrun metal --version` and the
@@ -145,7 +155,7 @@ Invariants (bitwise on the raw u32 of every F32 output and partial):
 `flash_attn_vec_hybrid_batched_rows<DK, DV>` with function-constant P, R and
 KS.
 
-### 4.1 Layout L-A (primary): pair-major simdgroups, per-slice staging, register accumulators
+### 4.1 Layout L-A (primary): pair-major simdgroups, two-phase per-chunk staging
 
 - **Grid:** (row block, KV head, iwg). A block holds R consecutive query rows
   of one sequence chunk × the G query heads sharing the KV head, so P = R·G
@@ -155,43 +165,70 @@ KS.
     (iwg, sgitg = s) chunk sequence.
   - Allowed P: NSG = 1 → P ≤ 32; NSG = 4 → P ≤ 8. Global at NSG = 4 and
     G = 8 is therefore R = 1, P = 8.
-- **Lockstep:** all simdgroups advance the chunk index k together. For each
-  k and each key sub-tile of KS keys (KS ∈ {4, 8, 16, 32}), they:
-  1. barrier;
-  2. let a designated set of threads load, for every slice s, sub-tile K
-     rows (F16), V code bytes and V norms of chunk `iwg·NSG + s + k·NWG·NSG`
-     into bank s;
-  3. barrier;
-  4. let each simdgroup (p, s) run the reference per-key code on bank s for
-     its pair.
-- **Accumulators:** (M, S, lo) stay in registers, as in the reference. This
-  needs no bit change; it is the reference's own storage.
-- **Merge:** after the loop, pairs merge one at a time through one reused
-  bank of NSG·(SH + 2·PV) halves, in the reference's order, and write O and
-  the partials.
-- **Threadgroup memory**, ≤ 32 KiB (B = bytes):
+- **Two-phase lockstep per chunk.** All simdgroups advance the chunk index k
+  together. A pair whose row skips the chunk (§3 item 5), or has no chunk at
+  k, still takes part in every barrier and changes no state. For chunk
+  `ic0 = iwg·NSG + s + k·NWG·NSG` of each slice s:
+  1. **Scores.** For each K sub-tile of KS keys (KS ∈ {2, 4, 8, 16, 32}):
+     barrier; load the KS F16 K rows of every slice into bank s; barrier;
+     each simdgroup (p, s) runs the reference Q·K code for those keys of its
+     pair, writing its scores into its own `ss`.
+  2. **Softmax.** After all 32 scores of the chunk, each simdgroup runs the
+     reference per-chunk softmax on its `ss`:
+     - the mask/skip;
+     - `M = simd_max(max(M, s_new))`;
+     - `ms`, the weights `ss[cc]`;
+     - `S = S·ms + simd_sum(vs)`;
+     - `so *= ms`.
+  3. **V.** For each V sub-tile of KS keys: barrier; load the KS rows of V
+     code bytes and V norms of every slice into bank s; barrier; each
+     simdgroup accumulates `lo += dequant_hb_float4(…, v_sw or sn0, …)` in
+     `cc` order (§3 item 7). Then `so += lo` as in the reference.
+- **Storage.**
+  - `ss` is per simdgroup in threadgroup memory, as in the reference
+    (SH = 128 halves = 256 B).
+  - `lo` is a per-chunk local, as in the reference.
+  - The running `so` stays in registers, an operand-form change S0-a must
+    prove (§3 item 10). L-A-tg keeps `so` in threadgroup memory where the
+    budget allows: rows 1, 2 and 5 of the table below.
+- **Merge.** After the loop, pairs merge one at a time in the reference's
+  order. Each pair writes its slices' `so` into a merge area of NSG·2·PV
+  halves, then runs the reference `j = 0..NSG` arithmetic with its `ss`
+  values (already resident). The merge area **reuses the staging banks**,
+  which are idle after the loop.
+- **Threadgroup memory**, ≤ 32,768 B. PK = PV = DK halves and SH = 128 halves
+  (`flash_attn_vec_hybrid.rs`: `pad2(head_dim, 128)`, `sh = 4·32`). Columns:
+  - Q: P·DK·2 B;
+  - `ss`: P·NSG·256 B;
+  - bank: NSG·max(K tile KS·DK·2, V tile KS·(DK + 4·norms_per_pos)), and the
+    K tile always dominates;
+  - merge area: NSG·DK·4 B, which must fit inside the bank.
 
-| Shape | Q (P·PK·2 B) | staged banks NSG·KS·(DK·2 + DK + norms) | merge bank | total |
-|---|---|---|---|---|
-| d256, NSG 1, P 2 (R 1), KS 32 | 1 KiB | 1·32·(512+256+4) = 24.1 KiB | 1.75 KiB | ≈ 26.9 KiB |
-| d256, NSG 1, P 16 (R 8), KS 16 | 8 KiB | 12.1 KiB | 1.75 KiB | ≈ 21.9 KiB |
-| d256, NSG 4, P 2 (R 1), KS 8 | 1 KiB | 4·8·772 = 24.1 KiB | 5.5 KiB | ≈ 30.6 KiB |
-| d256, NSG 4, P 8 (R 4), KS 4 | 4 KiB | 12.1 KiB | 5.5 KiB | ≈ 21.6 KiB |
-| d512, NSG 1, P 8 (R 1), KS 16 | 8 KiB | 1·16·(1024+512+8) = 24.1 KiB | 3.25 KiB | ≈ 35.4 KiB → KS 8: ≈ 23.3 KiB |
-| d512, NSG 4, P 8 (R 1), KS 4 | 8 KiB | 4·4·1544 = 24.1 KiB | 10 KiB | ≈ 42 KiB → KS 2: ≈ 30 KiB |
+| Shape | Q | `ss` | bank | merge (in bank) | total |
+|---|---|---|---|---|---|
+| 1. d256, NSG 1, P 2 (R 1), KS 32 | 1 KiB | 0.5 KiB | 16 KiB | 1 KiB | 17.5 KiB |
+| 2. d256, NSG 1, P 16 (R 8), KS 16 | 8 KiB | 4 KiB | 8 KiB | 1 KiB | 20 KiB |
+| 3. d256, NSG 4, P 2 (R 1), KS 8 | 1 KiB | 2 KiB | 16 KiB | 4 KiB | 19 KiB |
+| 4. d256, NSG 4, P 8 (R 4), KS 4 | 4 KiB | 8 KiB | 8 KiB | 4 KiB | 20 KiB |
+| 5. d512, NSG 1, P 8 (R 1), KS 16 | 8 KiB | 2 KiB | 16 KiB | 2 KiB | 26 KiB |
+| 6. d512, NSG 4, P 8 (R 1), KS 2 | 8 KiB | 8 KiB | 8 KiB | 8 KiB | 24 KiB |
 
-  Values are per the reference's PK/SH/PV padding `[INFERENCE: from the
-  kernel's shmem formula, (PK + NSG·(SH + 2PV))·2 B]`. S0 replaces them with
-  measured `threadgroupMemoryLength`.
+  - L-A-tg adds P·NSG·2·PV·2 B for `so`: +2 KiB for row 1, +16 KiB for row 2
+    (36 KiB, so not at R = 8, KS = 16; KS 8 gives 32 KiB), +4 KiB for row 5.
+  - At d512, NSG 4, P 8, `so` alone is 64 KiB, so L-A-tg is impossible there;
+    if register `so` fails, that shape uses L-B or the stock fallback.
+  - S0 replaces every figure with the measured `threadgroupMemoryLength`.
 - **Reuse at NSG = 4.** Each slice owns at most one of the ≤ 54 chunks, so
   there is no chunk loop to amortise. All reuse is across the P pairs inside
   one sub-tile.
 
 ### 4.2 Layout L-B (fallback only if L-A fails parity or budget)
 
-sgitg becomes a grid axis: each slice writes its (M, S, lo) partials to
-device memory, and a separate merge pass runs the reference's `j = 0..NSG`
-merge arithmetic in the reference order before the NWG partial write.
+sgitg becomes a grid axis, with `so` and `ss` in threadgroup memory per
+(pair, slice) exactly as in the reference. Each slice writes its (M, S, so)
+partials to device memory. A separate merge pass then runs the reference's
+`j = 0..NSG` merge arithmetic in the reference order, before the NWG partial
+write.
 - This changes how §3 item 8 is executed: a separate pass instead of
   threadgroup banks. The arithmetic stays the same.
 - It needs its own S0-a pass, and the doc is amended before any use.
@@ -224,7 +261,15 @@ output, must equal the reference. Both metallib paths; pipeline origin
 asserted. Inputs: real TQ-HB-encoded V (`dispatch_hadamard_quantize_kv_hb_seq`)
 and RMS-normed Q/K. Matrix:
 - **Buckets:** kL at 1, 31, 32, 33, 511, 512, 513, 1023, 1024, 1025, 2047,
-  4096; every (NWG, NSG) ∈ {16, 32} × {1, 4} reached.
+  4096. This reaches the three (NWG, NSG) pairs the policy can produce:
+  - (16, 1) at kL ≤ 512;
+  - (32, 1) at 513–1024;
+  - (32, 4) above 1024.
+
+  (16, 4) needs the `HF2Q_HYBRID_NWG`/`HF2Q_TQ_NSG` overrides, which hf2q
+  does not set; it is out of scope.
+- **Storage form:** register `so` (L-A), and L-A-tg and L-B where they are
+  candidates, each checked on the full matrix.
 - **Sliding d256 (G = 2):**
   - ring stage with history 0, 1, 465, 714, 943, 1022, 1023;
   - `q_offset > 0`;
@@ -288,6 +333,28 @@ precompiled path for the decision, runtime path recorded.
   - no 32-row threshold, so all rows take it.
   - `encode_live_seq` calls the new dispatcher with `rows_share_slot = true`
     (one sequence per dispatch).
+- **Dispatch points that must name the new variant.** Each of these, in
+  `src/serve/gemma_live_attention.rs` today, otherwise silently routes
+  `VecHybridBatched` to the stock kernel:
+  - `LiveRoute::select`: `PerSlotExact`/single-slot returns the warm kernel
+    as resolved;
+  - `LiveRoute::seq_kernel`: its catch-all `_ => VecHybrid` must return
+    `VecHybridBatched` for that route;
+  - `LiveRoute::uses_vec` (scratch allocation): true for both vec variants;
+  - `chunk_len` and `stage_query_rows`: the vec arms;
+  - `fill_vec_stage_positions`: the vec chunking, shared by both variants;
+  - the `encode_live_seq` kernel match.
+
+  Every `match` on `GemmaLiveKernel` is made exhaustive without a wildcard,
+  so a new variant fails to compile until each point decides.
+- **`Tiled` descriptor.** Installed long-prompt lanes
+  (`GemmaLiveAttention::Tiled`) with `HF2Q_GEMMA_TILED_LIVE=0` resolve to
+  `VecHybrid`, and they **stay on the stock kernel** in this story. Those
+  lanes are not bitwise-coupled to per-slot prefill and are outside the warm
+  route; moving them is a separate change. A unit test pins this.
+- **Out-of-table shapes.** The native dispatcher's stock fallback (§4.4) is
+  allowed; X2–X4 measure how often it runs and require it not to take every
+  dispatch.
 - **Runtime:** `wire_name()` = `"VecHybridBatched"`, published as
   `active_controls.gemma_warm_attention_kernel`; Q5 binds it with
   `HF2Q_Q5_GEMMA_WARM_ATTENTION_KERNEL` (`skip_if_empty`).
@@ -301,11 +368,11 @@ precompiled path for the decision, runtime path recorded.
 | Gate | Test | Required |
 |---|---|---|
 | X1 primitive parity | the S0-a matrix as mlx-native ignored tests, both metallib paths, origin asserted; rerun at every pin bump and OS update | u32-equal |
-| X2 model route | `gemma_warm_attention_exact_matches_stock_bitwise`: one model load; the four gate lanes per slot with `warm_live_kernel` = `VecHybrid` then `VecHybridBatched`; plus a 31-row and a 1-row suffix; run on both metallib paths | first token, logits bits, KV bytes, cursors |
-| X3 joint == per-slot | `gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid_batched` (Stage 1 cohorts) | bitwise |
-| X4 envelope harness | `gemma_warm_attention_route_envelope` with `VecHybridBatched` in `ENVELOPE_ROUTES` | every row `d_nat = 0`, `q1_class_b = ExactEqualDecision`, 0 flips |
+| X2 model route | `gemma_warm_attention_exact_matches_stock_bitwise`: one model load; the four gate lanes per slot with `warm_live_kernel` = `VecHybrid` then `VecHybridBatched`; plus a 31-row and a 1-row suffix; run on both metallib paths | first token, logits bits, KV bytes, cursors; **and the new kernel ran**: with `MLX_DISP_BUCKET=1`, `pipeline_dispatch_buckets()` reset per arm shows `flash_attn_vec_hybrid_batched_rows_*` count > 0 in the batched arm and = 0 in the stock arm |
+| X3 joint == per-slot | `gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid_batched` (Stage 1 cohorts) | bitwise; the same dispatch-count assertion per case |
+| X4 envelope harness | `gemma_warm_attention_route_envelope` with `VecHybridBatched` in `ENVELOPE_ROUTES` | every row `d_nat = 0`, `q1_class_b = ExactEqualDecision`, 0 flips; the same dispatch-count assertion |
 | X5 Q1 | T1/T3 greedy144 endpoints, packet `warm_live_kernel: VecHybridBatched` against `VecHybrid` | `q1_decision_policy.py exact` → `ExactEqual` |
-| X6 Q5 | A/B of `HF2Q_GEMMA_WARM_ATTENTION_EXACT` 0/1 on `q5_cases/gemma4.json`, ABBA, ≥ 3 runs per arm, readiness bound to the kernel | `CalibrationPass`; `transcripts` → `ExactTranscripts` across arms; the §9 speed rules |
+| X6 Q5 | A/B of `HF2Q_GEMMA_WARM_ATTENTION_EXACT` 0/1 on `q5_cases/gemma4.json`, ABBA, ≥ 5 runs per arm, readiness bound to the kernel | `CalibrationPass`; `transcripts` → `ExactTranscripts` across arms; the receipt records the share of warm vec dispatches that took the new kernel (`MLX_DISP_BUCKET=1` dump at shutdown) against the stock fallback; the §9 speed rules |
 
 ## 8. Expected saving `[INFERENCE]`
 
@@ -343,8 +410,11 @@ precompiled path for the decision, runtime path recorded.
   - the median over matched transactions (identical per-lane cached/advanced
     counts across arms) of per-run joint-warm `elapsed_ms` saving is below
     0.25 s;
-  - the median client makespan of arm 1 is more than 1.0% above arm 0's
-    (≥ 3 runs per arm, ABBA).
+  - the makespan regresses: ≥ 5 runs per arm in ABBA pairs; promotion stops
+    if the 95% t-interval of the paired difference (arm 1 − arm 0, per ABBA
+    pair) lies entirely above 0. A 1-run-per-arm noise band (about ±4% in
+    #660's MT vs P0) makes a fixed-percentage median rule unreliable at these
+    counts.
 - **X1–X6.** Any non-bitwise result blocks promotion. The route stays off
   pending localization and is never relaxed to an envelope.
 
@@ -362,7 +432,9 @@ precompiled path for the decision, runtime path recorded.
 3. hf2q integration PR (§6) → X2–X5 on the GPU lane → X6 → promotion
    commit.
 
-## 11. Review record (ReviewGemmaExact, revision 1: REVISE)
+## 11. Review record
+
+### 11.1 ReviewGemmaExact on revision 1: REVISE
 
 | # | Finding | Answer in revision 2 |
 |---|---|---|
@@ -381,3 +453,14 @@ Open questions from revision 1, as answered by the reviewer and adopted:
 2. Dequantized V cannot be staged bit-equal (finding 1, §3 item 7).
 3. Shared native contract issue and PR with decode lever A1; separate hf2q
    stories and thresholds (§1 item 4, §10).
+
+### 11.2 ReviewGemmaExact on revision 2: REVISE narrowly
+
+| # | Finding | Answer in revision 3 |
+|---|---|---|
+| R1 (P2) | Running output in registers is not the reference's storage; `so·ms + lo` may contract | §3 item 10 lists register `so` as an operand-form change S0-a must prove; L-A-tg keeps `so` in threadgroup memory where it fits; otherwise L-B (§4.2) or the stock fallback |
+| R2 (P2) | Softmax runs per chunk; sub-tile V cannot be consumed before it | §4.1 is now two-phase per chunk: K sub-tiles → Q·K into `ss` → per-chunk softmax and `so *= ms` → V code/norm sub-tiles in `cc` order → `so += lo`. Bank = max(K tile, V tile); table recomputed |
+| R3 (P2) | Per-simdgroup `ss` scratch missing; merge figures wrong | §4.1: `ss` column (P·NSG·256 B); merge area NSG·DK·4 B reuses the staging banks after the loop; all six rows ≤ 26 KiB in L-A, with L-A-tg figures |
+| R4 (P2) | Silent fallbacks can pass X2–X4 vacuously | §6 names `select`, `seq_kernel`, `uses_vec`, `chunk_len`/`stage_query_rows`, `fill_vec_stage_positions` and the `encode_live_seq` match, all exhaustive; the `Tiled` descriptor stays on stock; X2–X4 assert the new pipeline's dispatch count > 0 / = 0; X6 records the share |
+| R5 (P3) | M0 at 3 runs is weak; (16, 4) unreachable | §9: ≥ 5 runs per arm, paired 95% t-interval rule; §5 lists the three reachable (NWG, NSG) pairs |
+
