@@ -216,8 +216,37 @@ fn planned(lanes: &[Shape]) -> Vec<StableLane> {
     .lanes
 }
 
+thread_local! {
+    /// Each slot's sliding-ring bytes as loaded, captured at its first reset
+    /// (before any gate writes it).
+    static PRISTINE: std::cell::RefCell<
+        Vec<Option<crate::inference::models::gemma4::kv_cache::GemmaHybridSlotAnchor>>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Reset `slot` and return its sliding rings to their as-loaded bytes, so
+/// both arms start from identical slot memory. The anchor gate compares the
+/// whole saved ring (rows past the boundary included); without this, the
+/// rows past S would carry whichever arm last wrote the slot.
 fn reset_slot(guard: &mut Gemma4KvGuard<'_>, slot: usize) {
+    use crate::inference::models::gemma4::kv_cache::{
+        restore_gemma_hybrid_slot_anchor, snapshot_gemma_hybrid_slot_anchor,
+    };
     let slot_id = SlotId(slot as u32);
+    PRISTINE.with(|pristine| {
+        let mut pristine = pristine.borrow_mut();
+        if pristine.len() <= slot {
+            pristine.resize_with(slot + 1, || None);
+        }
+        let hybrid = guard.hybrid.as_mut().unwrap();
+        match &pristine[slot] {
+            None => {
+                pristine[slot] =
+                    Some(snapshot_gemma_hybrid_slot_anchor(hybrid, slot_id, 1).unwrap())
+            }
+            Some(anchor) => restore_gemma_hybrid_slot_anchor(hybrid, slot_id, anchor, 0).unwrap(),
+        }
+    });
     for buf in guard.kv.iter_mut() {
         buf.reset_for_slot(slot_id).unwrap();
     }
