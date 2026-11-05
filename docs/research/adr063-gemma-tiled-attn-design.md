@@ -1074,7 +1074,7 @@ stage in place. It was gated on the M5 Max at head `bb2e50ea` with mlx-native
 | Localization bound (lane 1) | layer-0 `attn_rel` nmax **4.95e-7** ≤ 2e-5 (rel_rms 3.35e-7); `TiledF16` 3.63e-4 in the same run |
 | E1 (952 rows, `VecHybrid` reference) | **fail**: 72 near-tie-policy failures |
 | A4 vec control | bitwise pass |
-| A3 tiny suffix | not reached: a harness bug stopped the run, fixed in `d1cc5503` |
+| A3 tiny suffix | not reached: a harness bug stopped the run, fixed on PR #698 |
 
 E1 detail (`E1-summary-from-rows.txt`, from the 952 rows per route logged
 before the stop):
@@ -1112,4 +1112,5 @@ Kept from this work:
 - the Q5 `skip_if_empty` readiness check.
 
 The warm-attention lever moves to the bitwise-exact successor story
-(`docs/research/adr063-q4-gemma-attn-exact-design.md`, draft on PR #701).
+(Q4-GEMMA-ATTN-EXACT, `docs/research/adr063-q4-gemma-attn-exact-design.md`,
+approved 2026-11-05).

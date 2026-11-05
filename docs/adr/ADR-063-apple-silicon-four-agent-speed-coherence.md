@@ -1983,7 +1983,7 @@ was integrated on PR #698 at mlx-native `=0.15.18` and gated on the M5 Max
   (top-1 flips at a vec margin ≥ 0.10 nat), 121 flips, 352 rows with D > 0.25,
   max D 4.42 nat (`TiledF16`: 86 / 135 / 383 / 4.06). These come from the
   rows logged before the run stopped on an A3 harness bug, fixed in
-  `d1cc5503`; A4 (the vec-hybrid control) passed. Downstream the
+  PR #698; A4 (the vec-hybrid control) passed. Downstream the
   layer-0 difference grows to 6.3e-4 at layer 1 and 0.249 at layer 7, and the
   final logits differ by up to 2.00 (`TiledF16` 4.07).
 
@@ -1999,9 +1999,10 @@ needs `[INFERENCE]`. A Win is not reachable on these levers alone.
 
 **New story (operator, 2026-11-05).** A warm-prefill attention kernel that is
 u32-bitwise equal to the vec-hybrid warm route (Class A), so it needs no
-envelope or quality campaign. Draft design for review (PR #701):
-`docs/research/adr063-q4-gemma-attn-exact-design.md` (S0 feasibility spike
-first). Q4-GEMMA-ATTN keeps owning the Gemma closing campaign.
+envelope or quality campaign: Q4-GEMMA-ATTN-EXACT (story section above;
+design `docs/research/adr063-q4-gemma-attn-exact-design.md`, approved
+2026-11-05, S0 feasibility spike first). Q4-GEMMA-ATTN keeps owning the
+Gemma closing campaign.
 
 ## Consequences
 
