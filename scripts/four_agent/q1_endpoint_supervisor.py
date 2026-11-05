@@ -722,12 +722,19 @@ def main():
     result = dict(family=b['family'], case=args.case, kind=plan['kind'], operating_review_sha256=operating_sha, case_complete=False, mode=mode, model_launch_attempted=False, physical_admission=False, performance_qualified=False, whole_q1_qualified=False,
                   footprint_calibration=calibration, endpoint_evidence=not calibration, runtime_pressure_admitted=list(admitted_pressure)); child = None; memory = None
     for sig in HANDLED_SIGNALS: signal.signal(sig, interrupt)
+    # Every OTHER listed out is a finished (or absent) case: one model process at a time under HOST-LOCK, and `main` launches
+    # only `out`. Walk them once before the baseline, deduct that fixed total on every sample, walk only the live `out` per
+    # runtime sample, and re-walk them at the end to prove they did not change. Walking every listed out twice per sample
+    # (~132k store files for a four-lane localizer bindings) exceeded the 1 s sample-gap bound (b6-spec-review-notes 4.4).
+    others = [o for o in outputs if o != out]; static_other = None
     def available(x, owned): return x['physical']['free'] + x['physical']['cached_files'] - sum(disk_bytes(o) for o in owned)
+    def available_live(x, live): return x['physical']['free'] + x['physical']['cached_files'] - static_other - live
     try:
-        quiet(out, 'pre', deny); chip = raw(out, 'host-chip', ['sysctl', '-n', 'machdep.cpu.brand_string']); require(chip['exit'] == 0 and chip['stdout'].strip() == host['chip'] and not chip['stderr'], 'mandatory host chip'); epoch = time.monotonic_ns(); baseline = []
+        quiet(out, 'pre', deny); chip = raw(out, 'host-chip', ['sysctl', '-n', 'machdep.cpu.brand_string']); require(chip['exit'] == 0 and chip['stdout'].strip() == host['chip'] and not chip['stderr'], 'mandatory host chip')
+        static_other = sum(disk_bytes(o) for o in others); result['other_listed_out_bytes'] = static_other; epoch = time.monotonic_ns(); baseline = []
         for i in range(12):
             target = epoch + i * 500000000; time.sleep(max(0, (target - time.monotonic_ns()) / 1e9)); x = sample('baseline', i, target); baseline.append(x)
-            require(x['pressure_raw'] == '1' and available(x, [o for o in outputs if o != out]) >= policy['preload_available_floor_bytes'], 'preload operating headroom/pressure (nothing else resident)')
+            require(x['pressure_raw'] == '1' and available_live(x, 0) >= policy['preload_available_floor_bytes'], 'preload operating headroom/pressure (nothing else resident)')
         require(not INTERRUPTED, 'interrupted before load'); stat_model(); require(sha(binary) == b['binary_sha256'], 'prelaunch binary'); memory = MemoryRecord(baseline)
         selected_filter = plan['filter']
         command = [str(out / 'test-binary'), selected_filter, '--exact', '--ignored', '--nocapture', '--test-threads=1']; save(out / 'command.json', dict(argv=command, binary_sha256=b['binary_sha256'], source_commit=b['source_commit'], packet_sha256=sha(out / 'packet.json'), packet_env=plan['packet_env'], deadline_seconds=deadline, mode=mode, kind=plan['kind']))
@@ -739,7 +746,7 @@ def main():
                 now = time.monotonic_ns()
                 if now >= next_sample:
                     x = sample('runtime', i, now); require(previous_sample_ns is None or x['start_ns'] - previous_sample_ns <= POLICY['max_sample_gap_ns'], 'stale runtime sample'); previous_sample_ns = x['start_ns']
-                    avail = available(x, outputs); memory.sample(x, avail, spawn_ns); require(x['pressure_raw'] in admitted_pressure, 'runtime pressure')
+                    live_bytes = disk_bytes(out); avail = available_live(x, live_bytes); memory.sample(x, avail, spawn_ns); require(x['pressure_raw'] in admitted_pressure, 'runtime pressure')
                     require(avail >= policy['runtime_available_floor_bytes'], 'runtime operating floor'); require(x['swap_bytes'] - baseline[0]['swap_bytes'] <= policy['max_swap_growth_bytes'] and x['physical']['compressor'] - baseline[0]['physical']['compressor'] <= policy['max_compressor_growth_bytes'], 'swap/compressor growth')
                     ledger = raw(out, 'process-' + str(i), [str(proc), str(child.pid)], timeout=.5); value = json.loads(ledger['stdout'])
                     if ledger['exit'] == 0 and value.get('available') is True:
@@ -750,9 +757,10 @@ def main():
                         require(calibration or (value['resident_size'] <= rss_limit and value['phys_footprint'] <= footprint_limit), 'RSS/footprint operating limit')
                     else:
                         terminal_esrch(ledger, value, child.pid, child.poll(), namespace['ledger_ready'](last_live_ledger, POLICY, time.monotonic_ns(), after_ns=spawn_ns)); result['terminal_ledger_race'] = ledger
-                    require(sum(disk_bytes(o) for o in outputs) <= policy['paired_disk_working_limit_bytes'], 'owned disk quota; no cold-cache refund'); i += 1; next_sample = now + 500000000  # fixed cadence from the sample start: the 1 s gap bound must not absorb the per-sample ledger/disk work
+                    require(static_other + live_bytes <= policy['paired_disk_working_limit_bytes'], 'owned disk quota; no cold-cache refund'); i += 1; next_sample = now + 500000000  # fixed cadence from the sample start: the 1 s gap bound must not absorb the per-sample ledger/disk work
                 time.sleep(.02)
-        result.update(exit=child.returncode, elapsed_seconds=time.monotonic() - started, runtime_samples=i); require(proc_identity is not None, 'no validated live owned process ledger'); require(sum(disk_bytes(o) for o in outputs) <= policy['paired_disk_working_limit_bytes'], 'final owned disk quota'); require(child.returncode == 0 and result['elapsed_seconds'] <= deadline, 'actual helper failed/deadline')
+        result.update(exit=child.returncode, elapsed_seconds=time.monotonic() - started, runtime_samples=i); require(proc_identity is not None, 'no validated live owned process ledger')
+        require(sum(disk_bytes(o) for o in others) == static_other, 'other listed outs unchanged during the run'); require(sum(disk_bytes(o) for o in outputs) <= policy['paired_disk_working_limit_bytes'], 'final owned disk quota'); require(child.returncode == 0 and result['elapsed_seconds'] <= deadline, 'actual helper failed/deadline')
         stdout = (out / 'stdout').read_text(); marked = (out / plan['marker_stream']).read_text()
         require('test result: ok. 1 passed; 0 failed; 0 ignored;' in stdout and plan['completion_marker'] in marked, 'exact helper pass and family completion marker')
         validate = dict(endpoint=lambda: validate_endpoint(out, b, args.case, packet, identity, policy),
