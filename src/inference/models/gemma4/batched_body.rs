@@ -2135,7 +2135,7 @@ impl MlxModelWeights {
                 &[&bufs.moe_norm_out, &bufs.moe_expert_ids, stacked_gate_up],
                 &[&bufs.moe_swiglu_id_out],
             );
-            mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_mv_grouped_geglu_with_geometry(
+            mlx_native::ops::quantized_matmul_id_ggml::quantized_matmul_id_ggml_mv_grouped_geglu(
                 session.encoder_mut(),
                 reg,
                 dev,
@@ -2144,7 +2144,6 @@ impl MlxModelWeights {
                 &bufs.moe_expert_ids,
                 &bufs.moe_swiglu_id_out,
                 &gu_params,
-                super::decode_kernels::F2_ROWS_PER_SIMDGROUP,
             )
             .map_err(|e| anyhow::anyhow!("batched F2 gate_up geglu L{layer_idx}: {e}"))?;
             // catsplit: MoE gate_up `_id` (F2 fuses the activation).

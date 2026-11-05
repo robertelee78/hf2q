@@ -26,8 +26,6 @@ pub(crate) const ENV: &str = "HF2Q_GEMMA_DECODE_KERNELS";
 
 /// Largest batched decode width that takes F2.
 pub(crate) const F2_MAX_WIDTH: usize = 4;
-/// F2 rows per SIMD group, frozen by M0.
-pub(crate) const F2_ROWS_PER_SIMDGROUP: u32 = 4;
 /// Names of the adopted levers, for the banner and report.
 pub(crate) const ADOPTED_LEVERS: &[&str] = &["f2_gate_up_geglu"];
 
@@ -97,7 +95,7 @@ pub(crate) fn banner(kernels: Option<&GemmaDecodeKernels>) -> String {
         None => format!("gemma decode kernels: {ENV}=0 (stock decode kernels)"),
         Some(_) => format!(
             "gemma decode kernels: {ENV}=1 levers=[{}] max_width={F2_MAX_WIDTH} \
-             r0={F2_ROWS_PER_SIMDGROUP} reference=mv_id+moe_swiglu_batch (no refused flags)",
+             reference=mv_id+moe_swiglu_batch (no refused flags)",
             ADOPTED_LEVERS.join(",")
         ),
     }
@@ -111,7 +109,6 @@ pub(crate) fn report(kernels: Option<&GemmaDecodeKernels>) -> serde_json::Value 
             "switch": "1",
             "levers": ADOPTED_LEVERS,
             "max_width": F2_MAX_WIDTH,
-            "rows_per_simdgroup": F2_ROWS_PER_SIMDGROUP,
             "reference": "mv_id+moe_swiglu_batch",
         }),
     }
@@ -173,7 +170,7 @@ mod tests {
         assert_eq!(
             banner(Some(&k)),
             "gemma decode kernels: HF2Q_GEMMA_DECODE_KERNELS=1 levers=[f2_gate_up_geglu] max_width=4 \
-             r0=4 reference=mv_id+moe_swiglu_batch (no refused flags)"
+             reference=mv_id+moe_swiglu_batch (no refused flags)"
         );
         assert_eq!(report(None), serde_json::json!({"switch": "0"}));
         assert_eq!(
@@ -182,7 +179,6 @@ mod tests {
                 "switch": "1",
                 "levers": ["f2_gate_up_geglu"],
                 "max_width": 4,
-                "rows_per_simdgroup": 4,
                 "reference": "mv_id+moe_swiglu_batch",
             })
         );
