@@ -186,6 +186,9 @@ fn q1_gemma_warm_kernel_defaults_to_shipped_vec_hybrid_and_refuses_undeclared_ti
     assert!(require_warm_kernel(WarmLiveKernel::VecHybrid,K::TiledF16).is_err());
     assert!(require_warm_kernel(WarmLiveKernel::TiledF16,K::VecHybrid).is_err());
     assert_eq!(require_warm_kernel(WarmLiveKernel::TiledF16,K::TiledF16).unwrap(),WarmLiveKernel::TiledF16);
+    assert!(require_warm_kernel(WarmLiveKernel::VecHybrid,K::VecHybridGqa).is_err());
+    assert_eq!(require_warm_kernel(WarmLiveKernel::VecHybridGqa,K::VecHybridGqa).unwrap(),WarmLiveKernel::VecHybridGqa);
+    assert_eq!(serde_json::to_value(WarmLiveKernel::VecHybridGqa).unwrap(),serde_json::json!("VecHybridGqa"));
     assert_eq!(serde_json::to_value(WarmLiveKernel::VecHybrid).unwrap(),serde_json::json!("VecHybrid"));
     assert!(serde_json::from_value::<WarmLiveKernel>(serde_json::json!("Tiled")).is_err());
 }

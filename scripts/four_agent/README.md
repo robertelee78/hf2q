@@ -546,6 +546,15 @@ HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_T
   --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-gemma4-warm-tiled-on-$(date -u +%Y%m%dT%H%M%SZ)"
 
+# Gemma4 grouped exact warm attention A/B (ADR-063 Q4-GEMMA-ATTN-EXACT-G2): ABBA, >= 5 runs per arm,
+# arm 1 = VecHybridGqa, arm 0 = VecHybrid (kill switch). Transcripts must be ExactTranscripts across arms.
+# Never export MLX_DISP_BUCKET in a timed run.
+HF2Q_Q5_GEMMA_WARM_ATTENTION_EXACT=1 HF2Q_Q5_GEMMA_WARM_ATTENTION_KERNEL=VecHybridGqa \
+HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
+  python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
+  --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/q5-gemma4-warm-exact-1-$(date -u +%Y%m%dT%H%M%SZ)"
+
 # Gemma4 prefill MoE route A/B (ADR-063 Q4-GEMMA-PREFILL-MOE): A arm = previous flattened down call
 # (plus HF2Q_Q5_MM_ID_SCHEDULE=grid once the compact native schedule is pinned); B arm = defaults. ABBA order.
 HF2Q_Q5_GEMMA_PREFILL_MOE_DOWN=flat \

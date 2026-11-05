@@ -4,6 +4,9 @@
 //!
 //! Ignored; `HF2Q_GEMMA4_GGUF` names the official Gemma 4 26B-A4B GGUF. Run
 //! each test alone with `--exact --ignored --nocapture --test-threads=1`.
+//! * `gemma_warm_attention_exact_matches_stock_bitwise` (gate X2): per lane,
+//!   `VecHybridGqa` equals `VecHybrid` bit for bit, with a warm-only
+//!   dispatch-count proof (`MLX_DISP_BUCKET=1`).
 //! * `gemma_warm_tiled_attention_is_deterministic`: on the tiled route, each
 //!   gate lane's per-slot warm prefill and the four-lane joint cohort repeat
 //!   bit for bit (first token, logits bits, KV bytes, cursors).
@@ -12,7 +15,9 @@
 //!   identical histories, with the Q1 §3.2 statistic D and the 0.10-nat
 //!   near-tie policy per row (recorded, not asserted). Asserted: the
 //!   `VecHybrid` rerun equals the reference bit for bit, and a 31-row suffix
-//!   is the vec-hybrid graph under every tiled route. The precise F32 route
+//!   is the vec-hybrid graph under every tiled route. `VecHybridGqa` (ADR-063
+//!   Q4-GEMMA-ATTN-EXACT-G2 gate X4, `MLX_DISP_BUCKET=1`) must equal
+//!   `VecHybrid` bit for bit on every row. The precise F32 route
 //!   failed this envelope (ADR-063 Q4-GEMMA-ATTN, 72 near-tie failures over
 //!   952 rows) and was removed; a future warm route plugs in here.
 //! * `gemma_warm_tiled_attention_layer_localization` (diagnostic): one lane
@@ -20,8 +25,8 @@
 //!   prints, per layer, the attention and residual differences against
 //!   vec-hybrid (max-relative and relative RMS).
 use super::gemma_warm_batch_tests::{
-    assert_lane_equal, load_gate_model, reserve_for, LaneImage, WarmFixture, HISTORIES, MAX_DECODE,
-    SUFFIXES,
+    assert_lane_equal, assert_warm_dispatch_proof, count_warm_dispatches, disp_bucket_enabled,
+    load_gate_model, reserve_for, LaneImage, WarmFixture, HISTORIES, MAX_DECODE, SUFFIXES,
 };
 use super::*;
 use crate::inference::models::gemma4::GemmaLiveKernel;
@@ -34,7 +39,48 @@ const NEAR_TIE_NAT: f64 = 0.10;
 /// Q1 §3.2 τ_route.
 const TAU_ROUTE_NAT: f64 = 0.25;
 /// Warm routes measured against `VecHybrid` by the envelope and localization diagnostics.
-const ENVELOPE_ROUTES: [GemmaLiveKernel; 1] = [GemmaLiveKernel::TiledF16];
+/// `VecHybridGqa` (ADR-063 Q4-GEMMA-ATTN-EXACT-G2 gate X4) must be exact on every row.
+const ENVELOPE_ROUTES: [GemmaLiveKernel; 2] = [GemmaLiveKernel::TiledF16, GemmaLiveKernel::VecHybridGqa];
+
+/// ADR-063 Q4-GEMMA-ATTN-EXACT-G2 gate X2: per gate lane, the grouped exact
+/// route equals the stock vec-hybrid route bit for bit (first token, logits
+/// bits, KV bytes, cursors), and each arm's warm forward dispatched its own
+/// kernel. Run with `MLX_DISP_BUCKET=1`, once per metallib path.
+#[test]
+#[ignore = "official Gemma 4 GGUF: grouped exact warm attention equals vec-hybrid bit for bit (gate X2)"]
+fn gemma_warm_attention_exact_matches_stock_bitwise() {
+    assert!(disp_bucket_enabled(), "gate X2 needs MLX_DISP_BUCKET=1 for its dispatch-count proof");
+    let mut loaded = load_gate_model();
+    let LoadedModel::Gemma(g) = &mut loaded else {
+        unreachable!("load_gate_model returns Gemma")
+    };
+    let mut guard = Gemma4KvGuard::take(g).unwrap();
+    let fixture = WarmFixture::build(&mut guard);
+    let prompts = fixture.prompts.clone();
+    let run = |guard: &mut Gemma4KvGuard<'_>, kernel: GemmaLiveKernel, slot: usize, prompt: &[u32]| {
+        guard.model.weights.warm_live_kernel = kernel;
+        count_warm_dispatches(|| fixture.per_slot(guard, slot, prompt, HISTORIES[slot], MAX_DECODE))
+    };
+    for slot in 0..4 {
+        let (stock, stock_d) = run(&mut guard, GemmaLiveKernel::VecHybrid, slot, &prompts[slot]);
+        let (exact, exact_d) = run(&mut guard, GemmaLiveKernel::VecHybridGqa, slot, &prompts[slot]);
+        assert_warm_dispatch_proof(&format!("X2 stock slot {slot}"), GemmaLiveKernel::VecHybrid, stock_d);
+        assert_warm_dispatch_proof(&format!("X2 exact slot {slot}"), GemmaLiveKernel::VecHybridGqa, exact_d);
+        assert_lane_equal(&format!("X2 VecHybridGqa == VecHybrid slot {slot}"), &exact, &stock);
+        println!(
+            "GEMMA_WARM_EXACT_X2_LANE slot={slot} history={} suffix={} stock={stock_d:?} exact={exact_d:?} equal=true",
+            HISTORIES[slot], SUFFIXES[slot]
+        );
+    }
+    // A 31-row suffix never reaches the batched prefill: lane images only.
+    let tiny: Vec<u32> = prompts[0][..HISTORIES[0] + 31].to_vec();
+    let (tiny_stock, _) = run(&mut guard, GemmaLiveKernel::VecHybrid, 0, &tiny);
+    let (tiny_exact, _) = run(&mut guard, GemmaLiveKernel::VecHybridGqa, 0, &tiny);
+    assert_lane_equal("X2 31-row suffix", &tiny_exact, &tiny_stock);
+    println!(
+        "GEMMA_WARM_EXACT_X2_COMPLETE lanes=4 tiny_suffix_rows=31 logits_bits=true kv_bytes=true cursors=true histories={HISTORIES:?} suffixes={SUFFIXES:?}"
+    );
+}
 
 #[test]
 #[ignore = "official Gemma 4 GGUF: tiled F16 warm attention repeats bit for bit"]
@@ -231,7 +277,14 @@ fn gemma_warm_attention_route_envelope() {
         assert_lane_equal(&format!("vec-hybrid control slot {slot}"), &control_image, &reference_image);
         assert!(bits(&control) == bits(&reference), "vec-hybrid control slot {slot}: row logits bits");
         for (route, rows) in ENVELOPE_ROUTES.into_iter().zip(&mut per_route) {
-            let (_, route_rows) = run_rows(&fixture, &mut guard, route, slot, &prompts[slot]);
+            let ((_, route_rows), dispatches) =
+                count_warm_dispatches(|| run_rows(&fixture, &mut guard, route, slot, &prompts[slot]));
+            if route == GemmaLiveKernel::VecHybridGqa {
+                // Gate X4: the grouped exact route is the vec-hybrid graph bit for bit.
+                assert!(disp_bucket_enabled(), "gate X4 needs MLX_DISP_BUCKET=1 for its dispatch-count proof");
+                assert_warm_dispatch_proof(&format!("X4 slot {slot}"), route, dispatches);
+                assert!(bits(&route_rows) == bits(&reference), "X4 {route:?} slot {slot}: row logits bits");
+            }
             for (row, (l, r)) in reference.iter().zip(&route_rows).enumerate() {
                 let envelope = RowEnvelope::measure(row, l, r);
                 println!(
@@ -285,6 +338,12 @@ fn gemma_warm_attention_route_envelope() {
             }));
         }
         let max_d = rows.iter().map(|(_, e)| e.d).fold(0.0, f64::max);
+        if route == GemmaLiveKernel::VecHybridGqa {
+            assert!(
+                rows.iter().all(|(_, e)| e.d == 0.0 && !e.flipped()),
+                "X4 {route:?}: every row d_nat = 0 with no flip"
+            );
+        }
         let verdict = if rows.iter().all(|(_, e)| e.d == 0.0) {
             "ExactEqualDecision"
         } else if max_d <= TAU_ROUTE_NAT {

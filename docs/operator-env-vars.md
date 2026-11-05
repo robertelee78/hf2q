@@ -278,6 +278,23 @@ the model loads.
   quality gate (2026-11-01).
 - **Any other value:** logs a warning and keeps the default.
 
+### Gemma grouped exact warm attention (default off)
+
+`HF2Q_GEMMA_WARM_ATTENTION_EXACT` selects a faster kernel for the vec-hybrid
+warm-prefill attention above (ADR-063 Q4-GEMMA-ATTN-EXACT-G2). It is read
+once when the model loads.
+- **Unset, `0`, `off` or `false` (default):** stock vec-hybrid attention.
+- **`1`, `on` or `true`:** the grouped vec-hybrid kernel, which serves two
+  query heads of one KV head per threadgroup. Its output is bit-for-bit
+  identical to the stock kernel (same chunks, buckets, split-K partials and
+  reduce), so tokens, logits and KV bytes do not change. It has no effect
+  when `HF2Q_GEMMA_WARM_TILED_ATTENTION=1` selects the tiled route.
+- **Any other value:** logs a warning and keeps the default.
+
+`/hf2q/v1/runtime` reports the resolved kernel as
+`active_controls.gemma_warm_attention_kernel` (`VecHybrid` or
+`VecHybridGqa`).
+
 Installed long-prompt lanes (prompts over 4,096 tokens) keep their own
 switch, `HF2Q_GEMMA_TILED_LIVE`. The model load logs `Gemma warm live
 attention kernel`, each live prefill banner prints `live=`, and
