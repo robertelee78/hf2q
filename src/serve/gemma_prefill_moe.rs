@@ -169,6 +169,28 @@ pub(crate) fn published_mm_id_schedule() -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
+/// Test-only record of every down entry point the prefill body chose on the
+/// calling thread, in dispatch order (real-artifact gates assert reuse vs
+/// fallback with it).
+#[cfg(test)]
+pub(crate) mod entry_probe {
+    use super::DownEntry;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ENTRIES: RefCell<Vec<DownEntry>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record(entry: DownEntry) {
+        ENTRIES.with(|entries| entries.borrow_mut().push(entry));
+    }
+
+    /// Every entry since the previous `take`.
+    pub(crate) fn take() -> Vec<DownEntry> {
+        ENTRIES.with(|entries| std::mem::take(&mut *entries.borrow_mut()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

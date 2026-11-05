@@ -14,12 +14,21 @@
 //!   residual, each cold prefill's first token and logits, the cold KV of
 //!   every slot, and each joint lane's first token, logits, KV and cursors.
 //!   Both arms run with the per-layer probe armed and again without it.
+//!   Every down call's entry point is recorded: arm A must be flattened,
+//!   arm B must reuse the gate/up schedule, or, when a profiling switch
+//!   (`HF2Q_PROFILE_MOE`, `_MOE_POST`, `_BUCKETS`, `_GPU_TS`) replaces the
+//!   session between gate/up and down, take the self-scheduling slotted call.
+//! * `gemma_prefill_moe_imatrix_collection_takes_the_slotted_fallback`: the
+//!   same prefills with an imatrix collector installed (its intercept
+//!   rotates the session) finish without a reuse error, record routed-expert
+//!   rows for `ffn_down_exps`, and every down call takes the slotted
+//!   fallback.
 use super::gemma_warm_batch_tests::{
     assert_lane_equal, load_gate_model, reserve_for, slot_kv_hashes, LaneImage, WarmFixture,
 };
 use super::*;
 use crate::serve::forward_prefill_batched::live_layer_probe::{self, LayerCapture};
-use crate::serve::gemma_prefill_moe::GemmaPrefillMoeDown;
+use crate::serve::gemma_prefill_moe::{entry_probe, DownEntry, GemmaPrefillMoeDown};
 
 const COLD_ROWS: usize = 458;
 const WARM_ROWS: usize = 58;
@@ -29,10 +38,12 @@ struct ArmImage {
     cold_kv: Vec<Vec<[u8; 32]>>,
     warm: Vec<LaneImage>,
     layers: Vec<LayerCapture>,
+    entries: Vec<DownEntry>,
 }
 
 fn run_arm(guard: &mut Gemma4KvGuard<'_>, down: GemmaPrefillMoeDown, probe: bool) -> ArmImage {
     guard.model.weights.prefill_moe_down = down;
+    entry_probe::take();
     if probe {
         live_layer_probe::arm();
     }
@@ -58,6 +69,7 @@ fn run_arm(guard: &mut Gemma4KvGuard<'_>, down: GemmaPrefillMoeDown, probe: bool
         cold_kv,
         warm,
         layers,
+        entries: entry_probe::take(),
     }
 }
 
@@ -105,21 +117,84 @@ fn gemma_prefill_moe_route_matches_previous_route_bitwise() {
         unreachable!("load_gate_model returns Gemma")
     };
     let mut guard = Gemma4KvGuard::take(g).unwrap();
+    let rotated = [
+        "HF2Q_PROFILE_MOE",
+        "HF2Q_PROFILE_MOE_POST",
+        "HF2Q_PROFILE_BUCKETS",
+        "HF2Q_PROFILE_GPU_TS",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some());
+    let reused_entry = if rotated {
+        DownEntry::Slotted
+    } else {
+        DownEntry::SlottedReusingSchedule
+    };
+    // 4 cold prefills + 1 joint forward, every layer.
+    let down_calls = 5 * guard.model.weights.layers.len();
     for probe in [true, false] {
         let flat = run_arm(&mut guard, GemmaPrefillMoeDown::Flat, probe);
         let slotted = run_arm(&mut guard, GemmaPrefillMoeDown::Slotted, probe);
         if probe {
-            // 4 cold prefills + 1 joint forward, 30 layers each.
-            let per_forward = guard.model.weights.layers.len();
-            assert_eq!(flat.layers.len(), 5 * per_forward, "probe captured every layer");
+            assert_eq!(flat.layers.len(), down_calls, "probe captured every layer");
         }
+        assert_eq!(flat.entries, vec![DownEntry::Flat; down_calls], "arm A entry points");
+        assert_eq!(slotted.entries, vec![reused_entry; down_calls], "arm B entry points");
         let label = if probe { "probed" } else { "unprobed" };
         assert_arms_equal(label, &flat, &slotted);
         println!(
-            "GEMMA_PREFILL_MOE_ROUTE_AB {label}: flat == slotted over {} cold slots, {} warm lanes, {} layer captures",
+            "GEMMA_PREFILL_MOE_ROUTE_AB {label}: flat == slotted over {} cold slots, {} warm lanes, {} layer captures; down entries flat={} slotted={}x{reused_entry:?}",
             flat.cold.len(),
             flat.warm.len(),
-            flat.layers.len()
+            flat.layers.len(),
+            flat.entries.len(),
+            slotted.entries.len(),
         );
     }
+}
+
+#[test]
+#[ignore = "official Gemma 4 GGUF: imatrix collection over the slotted prefill MoE down takes the self-scheduling fallback"]
+fn gemma_prefill_moe_imatrix_collection_takes_the_slotted_fallback() {
+    use std::sync::{Arc, Mutex};
+    #[derive(Default)]
+    struct Counts {
+        dense_rows: usize,
+        down_expert_rows: usize,
+    }
+    struct Collector(Arc<Mutex<Counts>>);
+    impl crate::quantize::imatrix::forward::ImatrixCollector for Collector {
+        fn record(&mut self, _name: &str, _row: &[f32]) {
+            self.0.lock().unwrap().dense_rows += 1;
+        }
+        fn record_moe(&mut self, name: &str, _expert_id: usize, _row: &[f32]) {
+            if name.ends_with("ffn_down_exps") {
+                self.0.lock().unwrap().down_expert_rows += 1;
+            }
+        }
+    }
+    let mut loaded = load_gate_model();
+    let LoadedModel::Gemma(g) = &mut loaded else {
+        unreachable!("load_gate_model returns Gemma")
+    };
+    let mut guard = Gemma4KvGuard::take(g).unwrap();
+    let counts = Arc::new(Mutex::new(Counts::default()));
+    let image = crate::quantize::imatrix::forward::with_collector(
+        Collector(Arc::clone(&counts)),
+        || run_arm(&mut guard, GemmaPrefillMoeDown::Slotted, false),
+    );
+    let down_calls = 5 * guard.model.weights.layers.len();
+    assert_eq!(
+        image.entries,
+        vec![DownEntry::Slotted; down_calls],
+        "an installed collector rotates the session: every down call self-schedules"
+    );
+    let counts = counts.lock().unwrap();
+    assert!(counts.down_expert_rows > 0, "the collector saw routed-expert down rows");
+    println!(
+        "GEMMA_PREFILL_MOE_IMATRIX: {} down calls slotted fallback, ffn_down_exps rows={} dense rows={}",
+        image.entries.len(),
+        counts.down_expert_rows,
+        counts.dense_rows
+    );
 }

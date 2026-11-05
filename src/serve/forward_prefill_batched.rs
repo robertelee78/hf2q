@@ -4349,12 +4349,15 @@ impl MlxModelWeights {
                         || std::env::var("HF2Q_PROFILE_MOE_POST").is_ok()
                         || crate::quantize::imatrix::is_active();
                     use crate::inference::expert_dispatch as experts;
-                    let dispatch_down = match crate::serve::gemma_prefill_moe::down_entry(
+                    let entry = crate::serve::gemma_prefill_moe::down_entry(
                         down,
                         experts::writes_pooled_schedule(ggml_type_gu)
                             && experts::writes_pooled_schedule(ggml_type_dn),
                         session_rotated,
-                    ) {
+                    );
+                    #[cfg(test)]
+                    crate::serve::gemma_prefill_moe::entry_probe::record(entry);
+                    let dispatch_down = match entry {
                         crate::serve::gemma_prefill_moe::DownEntry::Flat => {
                             experts::dispatch_expert_matmul_id_pooled
                         }
