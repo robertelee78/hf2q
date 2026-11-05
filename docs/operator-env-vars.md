@@ -244,8 +244,8 @@ starts.
   generation cues. Attention runs per request with the single-slot route.
   Each request's tokens, logprobs, checkpoint and cache bytes are bitwise
   equal to the per-slot admission, and no request waits for the others'
-  serial prefills. Groups with a cached lane, a grammar, a vision input or
-  more than 4,096 rows keep the per-slot route.
+  serial prefills. Groups with a cached lane, a vision input or more than
+  4,096 rows keep the per-slot route.
 - **`0`, `off` or `false`:** kill switch; every cold request is admitted per
   slot.
 - **Any other value:** logs a warning and keeps the default.
