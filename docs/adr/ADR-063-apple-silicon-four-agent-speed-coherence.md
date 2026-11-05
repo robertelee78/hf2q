@@ -928,7 +928,7 @@ Delivery boundary: hf2q pinned to the release containing #89, with the promotion
 
 Outcome: The Gemma 4 lm head (Q6_K, 2816 → 262,144) at decode widths 2..16 costs about weight-streaming time instead of growing per column. Batched decode stays bitwise equal to serial decode at every width, and the kill-switch arm is bitwise today's serving.
 
-Requirement: mlx-native MUST provide a few-row MMA Q6_K head kernel whose output for each column is bitwise independent of the other columns and of the width. The program MUST route every decode-time Gemma head site (serial, batched and verify) through it behind a kill switch, at the head call sites only, and MUST pass the Q1 Class B gates against stock before promotion.
+Requirement: mlx-native MUST provide a few-row MMA Q6_K head kernel whose output for each column is bitwise independent of the other columns and of the width. The program MUST route the serving decode heads (serial and batched) through it behind a kill switch, at the head call sites only, refusing speculative-verify and kernel-profile modes under the switch, and MUST pass the Q1 Class B gates against stock before promotion.
 
 Acceptance:
 
@@ -941,9 +941,9 @@ Acceptance:
 - Spike rule, model-free, before integration: the V2-weighted projected saving including width 1 is ≥ 0.30 s per run, and the width-1 penalty is ≤ 35 µs (the width-1 head penalty must cost under 0.5% of the n1-stage makespan; at M1 the bar is min(35 µs, 0.005 × measured n1 time per decode step)). The width-1 leg is predicted to fail at the peer's MMA efficiency. A miss stops the story and the code is removed.
 
 - Gates in order, any failure stops:
-  - Class A at serving level: slot-aware n1/n4/n8/eviction parity under `0` and `1`, a ≥ 256-step batched-versus-serial MMA test including widths 9..16, both `HF2Q_FUSE_LMHEAD` settings, `ExactTranscripts` of `0` against the pre-integration pin, and Q4-GEMMA-SPEC-SERVE A1 on the combined candidate.
+  - Class A at serving level: slot-aware n1/n4/n8/eviction parity under `0` and `1`, a ≥ 256-step batched-versus-serial MMA test including widths 9..16, both `HF2Q_FUSE_LMHEAD` settings, and `ExactTranscripts` of `0` against the pre-integration pin.
   - Q1 decision envelope on the greedy144 T2 cohort trace (τ = 0.25 nat, every row; 64 of its 576 rows exercise the head). `RouteSensitive` stops the story as a kernel defect.
-  - M1: lm-head GPU per step ≤ 0.65 × the kill switch at N = 4; width-1 penalty within the spike bar at N = 1.
+  - M1: the spike's projected-saving formula on in-situ lm-head GPU per step is ≥ 0.30 s per run; width-1 penalty within the spike bar at N = 1.
   - M2: four-agent Q5 A/B, ABBA, 4 runs per arm (extended once to 8 if the CI half-width exceeds 2.5 points): median makespan ratio ≤ 0.98 against the 13.9 s baseline with block-paired 95% CI upper below 1.00; `ExactTranscripts` of arm `1` run to run; worst-slot TTFT p95 and SSE-gap max ratios ≤ 1.025.
   - Paired quality against the same binary at `0` (equal `HF2Q_GEMMA_DECODE_KERNELS`): 24 instances, `q1_decision_policy.py paired` = `Pass`, no reruns.
 

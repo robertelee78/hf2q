@@ -1,10 +1,11 @@
 # ADR-063 Q4-GEMMA-LMHEAD-MMA: few-row MMA for the Gemma 4 lm head (Class B)
 
-Status: design for review, revision 2 (2026-11-05). Revision 2 applies
-ReviewLmHead's REVISE findings 1–12 and the root's rulings on decisions 2–4
-(§12). The operator opened this story on 2026-11-05 under Q4-GEMMA-DECODE
-design §13 decision 2(b). No code backs this document. Numbers come from
-retained receipts (paths given) or are marked `[INFERENCE]`.
+Status: approved (operator 2026-11-05; review ACCEPT), revision 2
+(2026-11-05). The operator opened this story on 2026-11-05 under
+Q4-GEMMA-DECODE design §13 decision 2(b). Revision 2 applies ReviewLmHead's
+REVISE findings 1–12, the root's rulings on decisions 2–4 (§12) and the
+ACCEPT review's required edit and P3s (§13). No code backs this document.
+Numbers come from retained receipts (paths given) or are marked `[INFERENCE]`.
 
 Abbreviations:
 - `$D` = `~/.local/state/hf2q/v0130/q4-gemma-decode`;
@@ -16,7 +17,7 @@ Abbreviations:
 ## 1. Summary
 
 - **What.** The Gemma 4 lm head is Q6_K, 2816 → 262,144, tied to the token
-  embedding, 605.6 MB. At every decode-time head site it is replaced by a
+  embedding, 605.6 MB. At the serving decode heads it is replaced by a
   few-row matrix-multiply kernel:
   - the weight is dequantized once per lane for all columns;
   - 8×8 simdgroup tiles accumulate in F32;
@@ -125,7 +126,8 @@ Notes:
      (`rt`) may vary with width only if they leave that order unchanged.
    - Widths above 8 run in column groups of at most 8 (§4.1).
 3. **Batched ≡ serial per slot** under `HF2Q_GEMMA_LMHEAD_MMA=1`, at every
-   width. All decode-time head sites use the MMA (§4.2), so ADR-040 S2/S3 and
+   width. The serial and batched decode heads both use the MMA (§4.2), and modes
+   that would compare any other head with them are refused, so ADR-040 S2/S3 and
    the slot-aware parity tests keep passing.
 4. **Views and bounds.** Non-zero-offset views, row tails (synthetic N, for
    example 7 and 262,151), and no writes outside the output view.
@@ -187,18 +189,17 @@ Notes:
 - **Routing at the head call sites only.** The shared dispatchers stay
   byte-unchanged; with `0` every site below is exactly today's code.
   - **Predicate:** the weight is `resolved_lm_head()` (identity, not shape),
-    with N = vocab and type Q6_K.
-  - **Under `1`, MMA at every decode-time head:**
+    with type Q6_K, K = 2816 and N = vocab.
+  - **Under `1`, MMA at the serving decode heads only:**
     - the serial decode head (`forward_gpu.rs:994`);
-    - the batched heads (`lm_head_batched`, `encode_lm_head_into`);
-    - the verify-path heads (`forward_gpu.rs:2216`, `:2700`, and
-      `io_heads.rs:141`, `:319`, the DFlash and n-gram verify paths). Their
-      rows are compared with serial rows, so they must use the same route.
+    - the batched heads (`lm_head_batched`, `encode_lm_head_into`).
+  - **Refused at startup under `1`:** every mode that would compare another
+    head with these rows. That covers the DFlash, n-gram and EAGLE-3 tree-verify
+    modes (`forward_gpu.rs:2216`, `:2700`, `io_heads.rs:141`, `:319`) and the
+    kernel-profile modes. Extending the route to them needs a later revision.
   - **Prefill heads keep stock in both arms** (`forward_prefill.rs:3029`,
     `forward_prefill_batched.rs:5688`): the first token comes from the
     prefill head either way.
-  - Any head site the integration cannot route is refused at startup under
-    `1`. A stock verify head must never be compared with MMA serial rows.
 - **Independence.** `HF2Q_GEMMA_LMHEAD_MMA` is independent of
   `HF2Q_GEMMA_DECODE_KERNELS` (F2). Every A/B in §6 holds the other switch
   fixed and equal in both arms.
@@ -247,20 +248,24 @@ the post-#704 harness, and records rustc in run-meta.
    - Slot-aware n1/n4/n4-batched-body/n8/eviction parity tests under `0` and
      under `1`.
    - A new `gemma_lmhead_mma_batched_equals_serial`: four ragged lanes,
-     ≥ 256 steps, widths 4 → 3 → 1, plus widths 9..16 through the verify
-     path. Logits are compared u32 per slot against the serial MMA head.
+     ≥ 256 steps, widths 4 → 3 → 1, plus widths 9..16 through the batched-head
+     path (`lm_head_batched` at N = 9..16). Logits are compared u32 per slot
+     against the serial MMA head.
    - Both `HF2Q_FUSE_LMHEAD` settings: production fuses the head, M1 runs
      with `=0`.
    - `0` against the pre-integration pin: `ExactTranscripts` over one
      four-agent run each.
-   - Q4-GEMMA-SPEC-SERVE gate A1 is re-run on the combined candidate.
+   - Speculative verify modes are refused under `1` (§4.2). Combining this
+     lever with Q4-GEMMA-SPEC-SERVE needs a later revision that routes the
+     verify heads, and SPEC-SERVE gate A1 would then be re-run.
 2. **Q1 envelope:** the T2 cohort trace under `0` and `1`, then `envelope`.
    It must be `WithinDecisionEnvelope`; `RouteSensitive` stops (§3.1).
 3. **M1** (`slot_aware_n4_batched_body_throughput_probe`, `HF2Q_GPU_BUSY=1`,
    head in its own command buffer with `HF2Q_FUSE_LMHEAD=0`):
-   - lm-head GPU per step ≤ 0.65 × the kill switch at N = 4, consistent with
-     §5 leg 2;
-   - at N = 1 the width-1 penalty is within the §5 leg-3 bar.
+   - The §5 leg-2 projected-saving formula, Σ_w steps_w · (stock_w − mma_w)
+     over the V2 step mix, evaluated on the in-situ lm-head GPU per step at
+     N = 1, 2, 3, 4, must be ≥ 0.30 s per run.
+   - At N = 1 the width-1 penalty is within the §5 leg-3 bar.
 4. **M2:** four-agent Q5 A/B, ABBA, 4 runs per arm.
    - Extend once to 8 per arm if the CI half-width exceeds 2.5 points; no
      other extension.
@@ -306,7 +311,7 @@ applies.
 | Width-invariant tiling costs part of the peer's gain | §5 leg 2 misses | Geometry search; stop on a miss |
 | A head defect shows up as D > τ | `RouteSensitive` | Stop and localize (§3.1) |
 | Quality campaign underpowered (n = 24) | `Inconclusive` | Stated power (Q1 §3.5 table); no reruns |
-| Verify widths 9..16 (Q4-GEMMA-SPEC-SERVE) | Batched ≡ serial at R = 12/16 | Column groups of at most 8 (§4.1); gate 1 widths 9..16; SPEC-SERVE A1 re-run |
+| Verify widths 9..16 (Q4-GEMMA-SPEC-SERVE) | Batched ≡ serial at R = 12/16 | Column groups of at most 8 (§4.1); gate 1 widths 9..16 on the batched-head path; verify modes refused under `1` until a revision routes them |
 
 ## 9. Repository ownership
 
@@ -340,9 +345,10 @@ raises it per step.
      kernel file and its registration, `tests/gemma_lmhead_mma.rs`, and the
      `lmhead_mma` bench family. If the release already shipped, a follow-up
      minor release.
-   - **hf2q:** the switch, head-site routing, the batched-versus-serial MMA
-     test, the case variable and launcher forwarding, the env-inventory
-     entry, and the pin bump back to a release without the kernel.
+   - **hf2q:** the switch, head-site routing, the startup refusals, the
+     batched-versus-serial MMA test, the case variable and launcher
+     forwarding, the env-inventory entry, and the exact pin moved forward to
+     the follow-up mlx-native release that removes the kernel.
    - Then the slot-aware suite and `ExactTranscripts` against the
      pre-integration pin run again under the restored code. Receipts are
      recorded.
@@ -377,3 +383,5 @@ raises it per step.
 | 10. Wrong parameter named as setting the order | §3.2 item 2: NSG and K-chunk assignment fixed; tile-position risk added (§8) |
 | 11. Envelope coverage overstated | §3.1: 64 of 576 rows exercise the MMA |
 | 12. ADR consistency | ADR-063 header, Q4-GEMMA-ATTN predecessors and the decision log list this story; "within rounding" marked `[INFERENCE]` |
+
+ACCEPT review (ReviewLmHead, revision 2): required edit applied in §4.2 (serving decode heads only; DFlash, n-gram, EAGLE-3 tree-verify and kernel-profile modes refused at startup under `1`; K = 2816 back in the predicate) and §6 gate 1 (widths 9..16 via `lm_head_batched`). P3s applied: M1 uses the §5 projected-saving formula on in-situ numbers (§6 gate 3); the failure path moves the pin forward to the follow-up release that removes the kernel (§11).
