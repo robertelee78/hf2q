@@ -1,6 +1,6 @@
 # ADR-063 Q4-GEMMA-ATTN-EXACT: bitwise-exact batched warm-prefill attention for Gemma 4
 
-Status: **draft revision 3, needs design review** (2026-11-05).
+Status: **accepted (design review), awaiting operator approval** (2026-11-05; revision 3 plus ReviewGemmaExact's three P3 doc fixes).
 - Revision 1 was reviewed by ReviewGemmaExact (REVISE, 8 findings) and
   revision 2 by the same reviewer (REVISE narrowly, R1–R5). §11 records how
   each finding was answered.
@@ -169,13 +169,19 @@ KS.
   together. A pair whose row skips the chunk (§3 item 5), or has no chunk at
   k, still takes part in every barrier and changes no state. For chunk
   `ic0 = iwg·NSG + s + k·NWG·NSG` of each slice s:
+  0. **Mask and skip.** As in the reference, each simdgroup first writes its
+     pair's mask values for the chunk's 32 keys into its own `ss`, then
+     evaluates the chunk skip `simd_max(ss) <= -65504.0f`, before any score
+     is formed. A skipping pair runs no phase-1 to phase-3 arithmetic but
+     keeps joining the barriers.
   1. **Scores.** For each K sub-tile of KS keys (KS ∈ {2, 4, 8, 16, 32}):
      barrier; load the KS F16 K rows of every slice into bank s; barrier;
      each simdgroup (p, s) runs the reference Q·K code for those keys of its
-     pair, writing its scores into its own `ss`.
+     pair (`mqk = simd_sum(partial)`) and writes each score into `ss` with
+     the reference's expression over the mask already there:
+     `ss[cc] = fma(mqk, scale, ss[cc])`.
   2. **Softmax.** After all 32 scores of the chunk, each simdgroup runs the
      reference per-chunk softmax on its `ss`:
-     - the mask/skip;
      - `M = simd_max(max(M, s_new))`;
      - `ms`, the weights `ss[cc]`;
      - `S = S·ms + simd_sum(vs)`;
@@ -190,7 +196,8 @@ KS.
   - `lo` is a per-chunk local, as in the reference.
   - The running `so` stays in registers, an operand-form change S0-a must
     prove (§3 item 10). L-A-tg keeps `so` in threadgroup memory where the
-    budget allows: rows 1, 2 and 5 of the table below.
+    budget allows: rows 1 and 2, and row 5 only at KS 4 (see the notes below
+    the table).
 - **Merge.** After the loop, pairs merge one at a time in the reference's
   order. Each pair writes its slices' `so` into a merge area of NSG·2·PV
   halves, then runs the reference `j = 0..NSG` arithmetic with its `ss`
@@ -214,7 +221,9 @@ KS.
 | 6. d512, NSG 4, P 8 (R 1), KS 2 | 8 KiB | 8 KiB | 8 KiB | 8 KiB | 24 KiB |
 
   - L-A-tg adds P·NSG·2·PV·2 B for `so`: +2 KiB for row 1, +16 KiB for row 2
-    (36 KiB, so not at R = 8, KS = 16; KS 8 gives 32 KiB), +4 KiB for row 5.
+    (36 KiB, so not at R = 8, KS = 16; KS 8 gives 32 KiB), and +16 KiB for
+    row 5 (8 pairs × 2 KiB: 42 KiB at KS 16, so it fits only at KS 4:
+    8 + 2 + 4 + 16 ≈ 30 KiB).
   - At d512, NSG 4, P 8, `so` alone is 64 KiB, so L-A-tg is impossible there;
     if register `so` fails, that shape uses L-B or the stock fallback.
   - S0 replaces every figure with the measured `threadgroupMemoryLength`.
@@ -372,7 +381,7 @@ precompiled path for the decision, runtime path recorded.
 | X3 joint == per-slot | `gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid_batched` (Stage 1 cohorts) | bitwise; the same dispatch-count assertion per case |
 | X4 envelope harness | `gemma_warm_attention_route_envelope` with `VecHybridBatched` in `ENVELOPE_ROUTES` | every row `d_nat = 0`, `q1_class_b = ExactEqualDecision`, 0 flips; the same dispatch-count assertion |
 | X5 Q1 | T1/T3 greedy144 endpoints, packet `warm_live_kernel: VecHybridBatched` against `VecHybrid` | `q1_decision_policy.py exact` → `ExactEqual` |
-| X6 Q5 | A/B of `HF2Q_GEMMA_WARM_ATTENTION_EXACT` 0/1 on `q5_cases/gemma4.json`, ABBA, ≥ 5 runs per arm, readiness bound to the kernel | `CalibrationPass`; `transcripts` → `ExactTranscripts` across arms; the receipt records the share of warm vec dispatches that took the new kernel (`MLX_DISP_BUCKET=1` dump at shutdown) against the stock fallback; the §9 speed rules |
+| X6 Q5 | A/B of `HF2Q_GEMMA_WARM_ATTENTION_EXACT` 0/1 on `q5_cases/gemma4.json`, ABBA, ≥ 5 runs per arm, readiness bound to the kernel | `CalibrationPass`; `transcripts` → `ExactTranscripts` across arms; the §9 speed rules. `MLX_DISP_BUCKET` stays **unset** in every timed run (it adds per-dispatch host work). The new-kernel share (warm vec dispatches that took `flash_attn_vec_hybrid_batched_rows_*` against the stock fallback) is recorded in one separate, untimed arm-1 run with `MLX_DISP_BUCKET=1` on the same binary and workload |
 
 ## 8. Expected saving `[INFERENCE]`
 
@@ -463,4 +472,14 @@ Open questions from revision 1, as answered by the reviewer and adopted:
 | R3 (P2) | Per-simdgroup `ss` scratch missing; merge figures wrong | §4.1: `ss` column (P·NSG·256 B); merge area NSG·DK·4 B reuses the staging banks after the loop; all six rows ≤ 26 KiB in L-A, with L-A-tg figures |
 | R4 (P2) | Silent fallbacks can pass X2–X4 vacuously | §6 names `select`, `seq_kernel`, `uses_vec`, `chunk_len`/`stage_query_rows`, `fill_vec_stage_positions` and the `encode_live_seq` match, all exhaustive; the `Tiled` descriptor stays on stock; X2–X4 assert the new pipeline's dispatch count > 0 / = 0; X6 records the share |
 | R5 (P3) | M0 at 3 runs is weak; (16, 4) unreachable | §9: ≥ 5 runs per arm, paired 95% t-interval rule; §5 lists the three reachable (NWG, NSG) pairs |
+
+### 11.3 ReviewGemmaExact on revision 3: ACCEPT, three P3 doc fixes (applied)
+
+1. The L-A-tg figure for row 5 is +16 KiB, so it fits only at KS 4
+   (≈ 30 KiB); fixed in §4.1.
+2. The mask is written into `ss` and the chunk skip is evaluated before
+   phase 1. Each score is `fma(mqk, scale, ss[cc])` over the mask; fixed in
+   §4.1, phases 0–1.
+3. `MLX_DISP_BUCKET` stays out of the timed X6 runs. The new-kernel share
+   comes from a separate, untimed run; fixed in §7.
 
