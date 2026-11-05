@@ -1966,6 +1966,7 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
                 &self.model.cfg,
                 6_880,
             )),
+            gemma_warm_attention_kernel: None,
         }
     }
 }

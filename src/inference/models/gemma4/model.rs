@@ -732,6 +732,16 @@ pub enum GemmaLiveKernel {
     VecHybrid,
 }
 
+impl GemmaLiveKernel {
+    /// Stable wire name (`/hf2q/v1/runtime` active controls).
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::TiledF16 => "TiledF16",
+            Self::VecHybrid => "VecHybrid",
+        }
+    }
+}
+
 /// Per-request head output from one shared multi-sequence Gemma prefill.
 /// `first_tokens[i]` is the exact GPU argmax of `logits[i]`; callers may use
 /// the logits instead when request-local sampling or grammar constraints are

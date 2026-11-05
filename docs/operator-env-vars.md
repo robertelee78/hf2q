@@ -280,5 +280,9 @@ the model loads.
 
 Installed long-prompt lanes (prompts over 4,096 tokens) keep their own
 switch, `HF2Q_GEMMA_TILED_LIVE`. The model load logs `Gemma warm live
-attention kernel`, and each live prefill banner prints `live=`. Evidence:
-`docs/research/adr063-gemma-four-agent-reuse.md`.
+attention kernel`, each live prefill banner prints `live=`, and
+`/hf2q/v1/runtime` publishes the resolved kernel (`VecHybrid` or `TiledF16`)
+as `measurement_snapshot.active_controls.gemma_warm_attention_kernel`.
+Evidence: `docs/research/adr063-gemma-four-agent-reuse.md`. A precise F32
+tiled route was evaluated and falsified (ADR-063 Q4-GEMMA-ATTN,
+`docs/research/adr063-gemma-tiled-attn-design.md` §12).

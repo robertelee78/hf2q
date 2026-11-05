@@ -1096,6 +1096,7 @@ impl LoadInfoBuilder for Qwen35LoadedModel {
                 self.tq_kv_active,
             )),
             kv_fixed_bytes_per_slot_override: Some(load_info::qwen35_fixed_kv_bytes_per_slot(cfg)),
+            gemma_warm_attention_kernel: None,
         }
     }
 }

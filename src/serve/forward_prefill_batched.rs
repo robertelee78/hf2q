@@ -104,6 +104,41 @@ pub(crate) mod live_layer_probe {
     }
 }
 
+/// Test-only capture of every suffix row's final logits on the calling
+/// thread (ADR-063 warm-route envelope: it covers every row,
+/// never only the last). While armed, a single-slot batched prefill runs the
+/// m=1 head once per row in order; the last row runs last, so the published
+/// first token and the logits buffer are those of an ordinary prefill.
+#[cfg(test)]
+pub(crate) mod live_row_logits_probe {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ROWS: RefCell<Option<Vec<(usize, Vec<f32>)>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm() {
+        ROWS.with(|rows| *rows.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub(crate) fn armed() -> bool {
+        ROWS.with(|rows| rows.borrow().is_some())
+    }
+
+    pub(crate) fn push(row: usize, logits: Vec<f32>) {
+        ROWS.with(|rows| {
+            if let Some(list) = rows.borrow_mut().as_mut() {
+                list.push((row, logits));
+            }
+        });
+    }
+
+    /// Disarm and return `(stream row, logits)` of every row since `arm`.
+    pub(crate) fn take() -> Vec<(usize, Vec<f32>)> {
+        ROWS.with(|rows| rows.borrow_mut().take().unwrap_or_default())
+    }
+}
+
 #[cfg(test)]
 fn live_layer_probe_armed() -> bool {
     live_layer_probe::armed()
@@ -4947,7 +4982,20 @@ impl MlxModelWeights {
         #[cfg(test)]
         let original_head_rows = head_rows.clone();
         #[cfg(test)]
-        let head_rows = q1_endpoint_rows.unwrap_or(head_rows);
+        let row_probe = live_row_logits_probe::armed();
+        #[cfg(test)]
+        anyhow::ensure!(
+            !row_probe || (self.multi_seq_prefill.is_none() && !q1_endpoint_all_rows),
+            "the live row-logits probe covers a single-slot prefill without a Q1 endpoint"
+        );
+        #[cfg(test)]
+        let q1_endpoint_all_rows = q1_endpoint_all_rows || row_probe;
+        #[cfg(test)]
+        let head_rows = if row_probe {
+            (0..seq_len).collect()
+        } else {
+            q1_endpoint_rows.unwrap_or(head_rows)
+        };
         let mut ms_tokens: Vec<u32> = Vec::with_capacity(head_rows.len());
         let mut ms_logits: Vec<Vec<f32>> = Vec::with_capacity(head_rows.len());
         let capture_multi_seq_logits = self.multi_seq_prefill.is_some();
@@ -5109,6 +5157,15 @@ impl MlxModelWeights {
             #[cfg(test)]
             crate::adr063_invariance::gemma_endpoint::logits(
                 head_row, &self.activations.logits, vocab_size).map_err(anyhow::Error::msg)?;
+            #[cfg(test)]
+            if row_probe {
+                let logits: &[f32] = self
+                    .activations
+                    .logits
+                    .as_slice()
+                    .map_err(|e| anyhow::anyhow!("live row-logits probe read: {e}"))?;
+                live_row_logits_probe::push(head_row, logits[..vocab_size].to_vec());
+            }
 
             #[cfg(test)]
             let publish_selected_head = !q1_endpoint_all_rows || original_head_rows.contains(&head_row);

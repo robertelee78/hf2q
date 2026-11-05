@@ -340,6 +340,12 @@ pub struct LoadInfo {
     /// provisioned, independent of logical context length. This includes
     /// Gemma sliding rings and Qwen DeltaNet recurrent/conv state.
     pub kv_fixed_bytes_per_slot_override: Option<u64>,
+
+    /// Gemma 4 warm live-resume attention kernel resolved at model load
+    /// (`HF2Q_GEMMA_WARM_TILED_ATTENTION`, ADR-063): `VecHybrid` or `TiledF16`.
+    /// `None` for every other family. Published as
+    /// `active_controls.gemma_warm_attention_kernel` in `/hf2q/v1/runtime`.
+    pub gemma_warm_attention_kernel: Option<&'static str>,
 }
 
 impl LoadInfo {
@@ -1613,6 +1619,7 @@ mod tests {
             tq_kv_active: false,
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
+            gemma_warm_attention_kernel: None,
         };
 
         let cloned = info.clone();
@@ -1664,6 +1671,7 @@ mod tests {
             tq_kv_active: false,
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
+            gemma_warm_attention_kernel: None,
         }
     }
 
@@ -1909,6 +1917,7 @@ mod tests {
             tq_kv_active: false,
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
+            gemma_warm_attention_kernel: None,
         };
         assert_eq!(info.arch_family, ArchFamily::Gemma4);
         assert_eq!(info.quant_label, Some("Q6_K".to_string()));
@@ -2317,6 +2326,7 @@ mod tests {
             tq_kv_active: false,
             kv_bytes_per_token_override: Some(exact),
             kv_fixed_bytes_per_slot_override: Some(super::gemma4_fixed_kv_bytes_per_slot(&cfg)),
+            gemma_warm_attention_kernel: Some("VecHybrid"),
         };
         // Override wins over the flattened formula.
         assert_eq!(

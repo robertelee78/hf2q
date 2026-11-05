@@ -510,6 +510,50 @@ class ArgvAndCases(unittest.TestCase):
         self.assertEqual(off['serve']['env']['WARM_TILED_ATTENTION'], '0')
         self.assertEqual(off['serve']['env']['JOINT_WARM_PREFILL'], '', 'arms are independent')
         self.assertEqual(off['serve']['env']['FULL_INPUT_CHECKPOINT'], '', 'arms are independent')
+        tiled = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION': '1',
+                                                    'HF2Q_Q5_GEMMA_WARM_ATTENTION_KERNEL': 'TiledF16'})
+        self.assertEqual(tiled['serve']['env']['WARM_TILED_ATTENTION'], '1')
+        # Readiness binds each experiment arm's resolved kernel (/hf2q/v1/runtime); the stock
+        # default leaves the check empty, so binaries without the field (v0.1.28) still pass.
+        field = 'measurement_snapshot.active_controls.gemma_warm_attention_kernel'
+        kernel = lambda plan: [c for c in plan['readiness']['checks'] if c['field'] == field]
+        self.assertEqual([c['equals'] for c in kernel(stock)], [''])
+        self.assertEqual([c['equals'] for c in kernel(off)], [''])
+        self.assertEqual([c['equals'] for c in kernel(tiled)], ['TiledF16'])
+        [stock_check], [tiled_check] = kernel(stock), kernel(tiled)
+        for actual in (None, 'unavailable: KeyError()', 'VecHybrid', 'TiledF16'):
+            row = q5_calibration.readiness_check(stock_check, actual)
+            self.assertEqual((row['ok'], row['skipped'], row['actual']), (True, 'empty expected value', actual))
+        self.assertTrue(q5_calibration.readiness_check(tiled_check, 'TiledF16')['ok'])
+        for actual in (None, 'VecHybrid', 'tiled-f16', 'unavailable: KeyError()'):
+            row = q5_calibration.readiness_check(tiled_check, actual)
+            self.assertFalse(row['ok'], actual)
+            self.assertNotIn('skipped', row)
+        # The skip is opt-in per check: only the Gemma kernel check carries skip_if_empty, so an empty
+        # override of any identity check (model id, max_slots, vision) still fails readiness.
+        opted = [c['field'] for c in stock['readiness']['checks'] if c.get('skip_if_empty')]
+        self.assertEqual(opted, [field])
+        self.assertIs(stock_check['skip_if_empty'], True)
+        vision = next(c for c in stock['readiness']['checks'] if c['field'].endswith('vision_projector'))
+        self.assertFalse(q5_calibration.readiness_check(vision, True)['ok'])
+        # The model-id check expands {MODEL_ID}; with it empty (the client argv refuses an empty
+        # MODEL_ID at plan time, so build the row directly) the check still compares and fails.
+        model_check = {**next(c for c in stock['readiness']['checks'] if c['field'] == 'model'), 'equals': ''}
+        self.assertNotIn('skip_if_empty', model_check)
+        row = q5_calibration.readiness_check(model_check, 'Gemma 4 26B A4B It')
+        self.assertFalse(row['ok'])
+        self.assertNotIn('skipped', row)
+        self.assertFalse(q5_calibration.readiness_check({**stock_check, 'skip_if_empty': False}, 'VecHybrid')['ok'])
+        # Case validation: the flag is optional, boolean only, and no other keys are accepted.
+        for bad in ('yes', 1, None):
+            broken = json.loads(json.dumps(case))
+            next(c for c in broken['readiness']['checks'] if c['field'] == field)['skip_if_empty'] = bad
+            with self.assertRaises(q5_case.CaseError):
+                q5_case.validate(broken)
+        broken = json.loads(json.dumps(case))
+        broken['readiness']['checks'][0]['optional'] = True
+        with self.assertRaises(q5_case.CaseError):
+            q5_case.validate(broken)
         launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
         self.assertEqual(launcher.count('${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"}'), 2)
         self.assertIn('0|1) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;', launcher)

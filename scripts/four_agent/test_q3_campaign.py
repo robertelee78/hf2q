@@ -24,6 +24,7 @@ import q3_metrics
 import q3_report
 import q3_stats
 import q5_case
+import q5_calibration
 from test_native_peer_ds4_campaign import manifest as native_manifest
 
 HERE = Path(__file__).resolve().parent
@@ -825,6 +826,31 @@ class Plan(Harness):
         plan, _ = q3.build_plan(q3.parse_args(["--dry-run", "--family", "qwen38"]), {}, "qwen38")
         self.assertIsNone(plan["arms"]["stock"]["overrides"]["HF2Q_BIN"])  # no silent case default
         self.assertIn("--stock-bin is required", q3_identity.launch_problems(plan, fake_identities(plan)))
+
+    def test_experiment_vars_select_the_gemma_warm_attention_arm_only_on_the_experiment(self):
+        # A non-default Gemma warm-attention experiment arm binds its resolved kernel at readiness; the
+        # stock arm keeps the hf2q default and an empty (skipped) kernel check.
+        argv = ["--family", "gemma4", "--stock-bin", "/bin/stock", "--stock-commit", "1" * 40,
+                "--experiment-bin", "/bin/experiment", "--experiment-commit", "2" * 40,
+                "--qe-identity", "qe-test", "--negative-control-receipt", str(self.nc),
+                "--workloads", "n4", "--output", str(self.out),
+                "--experiment-var", "GEMMA_WARM_TILED_ATTENTION=1",
+                "--experiment-var", "GEMMA_WARM_ATTENTION_KERNEL=TiledF16"]
+        plan, cases = q3.build_plan(q3.parse_args(argv), {}, "gemma4")
+        experiment, stock = plan["arms"]["experiment"]["overrides"], plan["arms"]["stock"]["overrides"]
+        self.assertEqual((experiment["GEMMA_WARM_TILED_ATTENTION"], experiment["GEMMA_WARM_ATTENTION_KERNEL"]),
+                         ("1", "TiledF16"))
+        self.assertNotIn("GEMMA_WARM_TILED_ATTENTION", stock)
+        self.assertNotIn("GEMMA_WARM_ATTENTION_KERNEL", stock)
+        field = "measurement_snapshot.active_controls.gemma_warm_attention_kernel"
+        for arm, expected in (("experiment", "TiledF16"), ("stock", "")):
+            values = q5_case.build_plan(cases[arm], {**q5_calibration.builtins(Path("/private/tmp/q3-dry") / arm),
+                                                     "REPO": str(HERE.parent.parent)},
+                                        q3.qc.arm_environ({}, plan["arms"][arm]["overrides"]))
+            self.assertEqual([c["equals"] for c in values["readiness"]["checks"] if c["field"] == field],
+                             [expected], arm)
+        with self.assertRaises(q3.qc.CampaignError):
+            q3.build_plan(q3.parse_args(argv + ["--experiment-var", "NOT_A_CASE_VARIABLE=1"]), {}, "gemma4")
 
     def test_arm_cases_must_match_role_and_family(self):
         with self.assertRaises(q3.qc.CampaignError):
