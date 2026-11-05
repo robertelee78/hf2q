@@ -13358,6 +13358,22 @@ fn gemma4_slot_admit_request(
     }
 }
 
+/// The request grammar check per-slot admission runs before reserving a
+/// slot (the cold stable cohort runs it at the same point for each lane).
+fn validate_gemma4_request_grammar(params: &SamplingParams) -> Result<()> {
+    let Some(grammar) = params.grammar.as_ref() else {
+        return Ok(());
+    };
+    let root = grammar
+        .rule_id("root")
+        .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
+    anyhow::ensure!(
+        super::grammar::GrammarRuntime::new(grammar.clone(), root).is_some(),
+        "grammar runtime init failed"
+    );
+    Ok(())
+}
+
 /// The request error of a refused per-slot Gemma 4 reservation.
 fn gemma4_slot_admit_error(error: AdmitError) -> anyhow::Error {
     match error {
@@ -13510,21 +13526,9 @@ fn admit_gemma4_slot_routed(
             return None;
         }
     };
-    if let Some(grammar) = params.grammar.as_ref() {
-        let grammar_check = (|| -> Result<()> {
-            let root = grammar
-                .rule_id("root")
-                .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
-            anyhow::ensure!(
-                super::grammar::GrammarRuntime::new(grammar.clone(), root).is_some(),
-                "grammar runtime init failed"
-            );
-            Ok(())
-        })();
-        if let Err(error) = grammar_check {
-            slot_fire_done(reply, Err(error), false);
-            return None;
-        }
+    if let Err(error) = validate_gemma4_request_grammar(&params) {
+        slot_fire_done(reply, Err(error), false);
+        return None;
     }
     let bounded_prefill = prompt_tokens.len() > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize;
     // Build borrowed injection slices from the owned data — same shape as

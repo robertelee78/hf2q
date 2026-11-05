@@ -235,9 +235,8 @@ pub(super) fn stable_plan<'a>(
         let boundary = params.stable_prompt_prefix_tokens?;
         let text = params.vision_fingerprint.is_none()
             && gemma_full_input::effective(params).is_none()
-            // A grammar is validated before reservation on the per-slot path;
-            // keep such requests there.
-            && params.grammar.is_none()
+            // A tool or response grammar is validated per lane at its
+            // reservation point, as per-slot admission does.
             // `max_tokens == 1` finishes at the seed and releases its slot
             // before the next serial lane is planned; keep it per slot.
             && params.max_tokens > 1;
@@ -529,7 +528,8 @@ mod tests {
         assert!(refused(&|p| p.vision_fingerprint = Some([7; 32])));
         assert!(refused(&|p| p.max_tokens = 1));
         assert!(refused(&|p| p.max_tokens = 0));
-        assert!(refused(&|p| {
+        // Tool-calling turns carry a grammar (the four-agent turn 0 does).
+        assert!(!refused(&|p| {
             p.grammar = Some(crate::serve::api::grammar::parser::parse("root ::= \"a\"").unwrap())
         }));
         assert!(!refused(&|p| p.max_tokens = 2));

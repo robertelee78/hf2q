@@ -332,6 +332,11 @@ pub(super) fn admit_cohort(
             );
             continue;
         }
+        // Per-slot admission fails an unusable grammar before reserving.
+        if let Err(error) = validate_gemma4_request_grammar(&params) {
+            slot_fire_done(reply, Err(error), false);
+            continue;
+        }
         let earlier: Vec<(usize, &[u32], usize)> = lanes
             .iter()
             .map(|lane| {
