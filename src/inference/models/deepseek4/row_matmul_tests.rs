@@ -12,7 +12,7 @@ use mlx_native::{DType, MlxBuffer, MlxDevice};
 use super::forward_support::{
     alloc, grouped_output_a, grouped_output_a_batched, raw_matmul, BatchedGroupedOutputArena,
 };
-use super::residency::RawMatrixRef;
+use super::residency::{MatvecKernels, RawMatrixRef};
 use super::row_matmul::{row_matmul, row_view, splits_independent_rows, RowMatmul};
 use crate::serve::gpu::GpuContext;
 
@@ -98,6 +98,7 @@ fn q8_0_independent_rows_match_one_row_matvec_bitwise() {
         buffer: &weight,
         ggml_type: GgmlType::Q8_0,
         shape: &shape,
+        matvec: MatvecKernels::Stock,
     };
     let input = f32_input(&device, vec![ROWS, K], 3);
     let joint = alloc(&device, DType::F32, vec![ROWS, N], "joint output").unwrap();
@@ -156,6 +157,7 @@ fn dense_f32_independent_rows_match_one_row_matvec_bitwise() {
         buffer: &weight,
         ggml_type: GgmlType::F32,
         shape: &shape,
+        matvec: MatvecKernels::Stock,
     };
     let input = f32_input(&device, vec![ROWS, K], 5);
     let joint = alloc(&device, DType::F32, vec![ROWS, N], "joint output").unwrap();
@@ -212,6 +214,7 @@ fn q8_0_grouped_output_rows_match_one_row_groups_bitwise() {
         buffer: &weight,
         ggml_type: GgmlType::Q8_0,
         shape: &shape,
+        matvec: MatvecKernels::Stock,
     };
     let input = f32_input(&device, vec![ROWS, HEADS, HEAD_DIM], 7);
     let joint = alloc(
@@ -329,6 +332,7 @@ fn dense_f16_one_row_matvec_matches_f64_dot() {
             buffer: &weight,
             ggml_type: GgmlType::F16,
             shape: &shape,
+            matvec: MatvecKernels::Stock,
         };
         let input = f32_input(&device, vec![1, K], 7);
         let output = alloc(&device, DType::F32, vec![1, n], "F16 matvec output").unwrap();
@@ -373,6 +377,7 @@ fn dense_f16_one_row_matvec_does_not_round_the_input_to_half() {
         buffer: &weight,
         ggml_type: GgmlType::F16,
         shape: &shape,
+        matvec: MatvecKernels::Stock,
     };
     let value = 1.0_f32 + 2.0_f32.powi(-12);
     assert_eq!(half::f16::from_f32(value).to_f32(), 1.0);
@@ -401,6 +406,7 @@ fn dense_f16_independent_rows_match_one_row_matvec_bitwise() {
         buffer: &weight,
         ggml_type: GgmlType::F16,
         shape: &shape,
+        matvec: MatvecKernels::Stock,
     };
     let input = f32_input(&device, vec![ROWS, K], 9);
     let joint = alloc(&device, DType::F32, vec![ROWS, N], "joint output").unwrap();

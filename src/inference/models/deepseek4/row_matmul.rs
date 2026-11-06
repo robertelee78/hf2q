@@ -8,14 +8,16 @@
 //! route is the matvec family whose per-row arithmetic does not depend on `m`
 //! (one input row per threadgroup row, unchanged accumulation order). Dense
 //! float weights switch from a matvec at `m = 1` to tiled tensor kernels at
-//! `m > 1`, so independent rows apply them one row at a time.
+//! `m > 1`, so independent rows apply them one row at a time. A model that
+//! selected `MatvecKernels::RowExact` issues F16 and Q8_0 independent rows
+//! as row-exact dispatches of at most 8 rows instead.
 
 use anyhow::{ensure, Context, Result};
 use mlx_native::graph::GraphSession;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlType, MM_ROUTING_THRESHOLD};
 use mlx_native::{KernelRegistry, MlxBuffer, MlxDevice};
 
-use super::forward_support::raw_matmul;
+use super::forward_support::{raw_matmul, row_exact_storage, ROW_EXACT_MAX_ROWS};
 use super::residency::RawMatrixRef;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +58,31 @@ pub(super) fn row_view(buffer: &MlxBuffer, row: usize, shape: Vec<usize>) -> Res
         .context("reshape DeepSeek-V4 row view")
 }
 
+/// Zero-copy view of rows `first..first + rows` of a row-major `[_, cols]`
+/// buffer, shaped `[rows, cols]`.
+fn rows_view(buffer: &MlxBuffer, first: usize, rows: usize, cols: usize) -> Result<MlxBuffer> {
+    let start = first
+        .checked_mul(cols)
+        .context("DeepSeek-V4 rows view start overflow")?;
+    let elements = rows
+        .checked_mul(cols)
+        .context("DeepSeek-V4 rows view length overflow")?;
+    ensure!(
+        start + elements <= buffer.element_count(),
+        "DeepSeek-V4 rows {first}..{} of {cols} columns exceed buffer {:?}",
+        first + rows,
+        buffer.shape()
+    );
+    let byte_offset = start
+        .checked_mul(buffer.dtype().size_of())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .context("DeepSeek-V4 rows view byte offset overflow")?;
+    buffer
+        .slice_view(byte_offset, elements)
+        .with_shape(vec![rows, cols])
+        .context("reshape DeepSeek-V4 rows view")
+}
+
 /// `raw_matmul` with explicit row semantics.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn row_matmul(
@@ -75,6 +102,31 @@ pub(super) fn row_matmul(
         return raw_matmul(
             session, registry, device, input, weight, output, m, n, k, label,
         );
+    }
+    if row_exact_storage(weight).is_some() {
+        if m <= ROW_EXACT_MAX_ROWS {
+            return raw_matmul(
+                session, registry, device, input, weight, output, m, n, k, label,
+            );
+        }
+        for first in (0..m).step_by(ROW_EXACT_MAX_ROWS) {
+            let rows = ROW_EXACT_MAX_ROWS.min(m - first);
+            let input_rows = rows_view(input, first, rows, k)?;
+            let output_rows = rows_view(output, first, rows, n)?;
+            raw_matmul(
+                session,
+                registry,
+                device,
+                &input_rows,
+                weight,
+                &output_rows,
+                rows,
+                n,
+                k,
+                label,
+            )?;
+        }
+        return Ok(());
     }
     if !splits_independent_rows(weight.ggml_type, m) {
         ensure!(
