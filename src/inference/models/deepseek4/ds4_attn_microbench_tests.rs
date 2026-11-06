@@ -65,8 +65,8 @@ use super::compressed_attention_weights::{
 };
 use super::compressor_tail::{encode_indexer_tail, encode_main_tail, CompressorTail};
 use super::ds4_bench_support::{
-    copies_for, f16_matrix, f32_buf, floor_cells, gpu_warmup, median, run_once, time_op, Out, Rng,
-    COLD_BYTES, TRIALS,
+    bench_matvec, copies_for, f16_matrix, f32_buf, floor_cells, gpu_warmup, median, run_once,
+    time_op, Out, Rng, COLD_BYTES, TRIALS,
 };
 use super::forward_support::{
     alloc, alloc_host_input, begin_decode_pool_token, end_decode_pool_token, rms_params,
@@ -164,11 +164,13 @@ impl CompressorWeights {
                 buffer: &self.kv,
                 ggml_type: GgmlType::F16,
                 shape: &self.shape,
+                matvec: bench_matvec(),
             },
             gate: RawMatrixRef {
                 buffer: &self.gate,
                 ggml_type: GgmlType::F16,
                 shape: &self.shape,
+                matvec: bench_matvec(),
             },
             ape: &self.ape,
             norm: &self.norm,
@@ -236,6 +238,7 @@ impl LayerWeights {
             buffer: &unused.buffer,
             ggml_type: GgmlType::F16,
             shape: &unused.shape,
+            matvec: bench_matvec(),
         };
         let u = &unused.buffer;
         CompressedAttentionWeightsRef {
@@ -260,11 +263,13 @@ impl LayerWeights {
                     buffer: &i.q_b,
                     ggml_type: GgmlType::F16,
                     shape: &i.q_b_shape,
+                    matvec: bench_matvec(),
                 },
                 projection: RawMatrixRef {
                     buffer: &i.projection,
                     ggml_type: GgmlType::F16,
                     shape: &i.projection_shape,
+                    matvec: bench_matvec(),
                 },
                 compressor: i.compressor.get(),
             }),
@@ -1087,6 +1092,7 @@ impl HcRows<'_> {
             buffer: &self.hc_fn[rep % self.hc_fn.len()],
             ggml_type: GgmlType::F16,
             shape: self.fn_shape,
+            matvec: bench_matvec(),
         };
         row_matmul(
             RowMatmul::IndependentRows,

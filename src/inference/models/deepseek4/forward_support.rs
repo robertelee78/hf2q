@@ -14,10 +14,14 @@ use mlx_native::ops::quantized_matmul_ggml::{
     GgmlBatchedQuantizedMatmulParams, GgmlQuantizedMatmulParams, GgmlType, MM_ROUTING_THRESHOLD,
 };
 use mlx_native::ops::quantized_matmul_id_ggml::{GgmlQuantizedMatmulIdParams, IdMmScratch};
+use mlx_native::ops::row_exact_matvec::{
+    dispatch_row_exact_matvec, dispatch_row_exact_matvec_scheduled, RowExactMatvecSchedule,
+    RowExactMatvecShape, RowExactWeight, ROW_EXACT_MATVEC_MAX_ROWS,
+};
 use mlx_native::ops::transpose::permute_021_f32;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxBufferPool, MlxDevice};
 
-use super::residency::RawMatrixRef;
+use super::residency::{MatvecKernels, RawMatrixRef};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransientPoolPhase {
@@ -283,6 +287,22 @@ pub(super) fn rms_params(
     Ok(params)
 }
 
+/// Largest row count one row-exact dispatch takes.
+pub(super) const ROW_EXACT_MAX_ROWS: usize = ROW_EXACT_MATVEC_MAX_ROWS as usize;
+
+/// The row-exact storage of `weight` when its model selected
+/// [`MatvecKernels::RowExact`] and the storage has a row-exact kernel.
+pub(super) fn row_exact_storage(weight: &RawMatrixRef<'_>) -> Option<RowExactWeight> {
+    if weight.matvec != MatvecKernels::RowExact {
+        return None;
+    }
+    match weight.ggml_type {
+        GgmlType::F16 => Some(RowExactWeight::F16),
+        GgmlType::Q8_0 => Some(RowExactWeight::Q8_0),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn raw_matmul(
     session: &mut GraphSession<'_>,
@@ -303,6 +323,26 @@ pub(super) fn raw_matmul(
         );
     }
     session.barrier_between(&[input, weight.buffer], &[output]);
+    // Row-exact family: one m <= 8 dispatch whose rows equal their m = 1
+    // results bitwise. Larger m keep the matrix routes below.
+    if let Some(storage) = row_exact_storage(weight).filter(|_| m <= ROW_EXACT_MAX_ROWS) {
+        let shape = RowExactMatvecShape::contiguous(
+            u32::try_from(m).context("DeepSeek-V4 matvec rows exceed u32")?,
+            u32::try_from(n).context("DeepSeek-V4 matvec outputs exceed u32")?,
+            u32::try_from(k).context("DeepSeek-V4 matvec input exceeds u32")?,
+        );
+        return dispatch_row_exact_matvec(
+            session.encoder_mut(),
+            registry,
+            device.metal_device(),
+            storage,
+            weight.buffer,
+            input,
+            output,
+            &shape,
+        )
+        .with_context(|| format!("encode DeepSeek-V4 row-exact {label}"));
+    }
     match weight.ggml_type {
         GgmlType::F32 if m == 1 => dispatch_dense_matvec_f32(
             session.encoder_mut(),
@@ -384,6 +424,58 @@ pub(super) fn raw_matmul(
     .with_context(|| format!("encode DeepSeek-V4 {label}"))
 }
 
+/// Grouped output-A through one row-exact dispatch on token-major input
+/// `[rows, groups * group_width]` and output `[rows, groups * rank]`.
+///
+/// The schedule is pinned from the weight shape alone (`m = 1`), so the
+/// serial `rows = 1` and joint `rows = B` products are bitwise equal per row.
+#[allow(clippy::too_many_arguments)]
+fn grouped_output_a_row_exact(
+    session: &mut GraphSession<'_>,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &RawMatrixRef<'_>,
+    output: &MlxBuffer,
+    storage: RowExactWeight,
+    rows: usize,
+    groups: usize,
+    rank: usize,
+    group_width: usize,
+) -> Result<()> {
+    let shape = |m: usize| -> Result<RowExactMatvecShape> {
+        Ok(RowExactMatvecShape::grouped_token_major(
+            u32::try_from(m).context("DeepSeek-V4 output-A rows exceed u32")?,
+            u32::try_from(groups).context("DeepSeek-V4 output-A groups exceed u32")?,
+            u32::try_from(rank).context("DeepSeek-V4 output-A rank exceeds u32")?,
+            u32::try_from(group_width).context("DeepSeek-V4 output-A group width exceeds u32")?,
+        ))
+    };
+    let schedule = RowExactMatvecSchedule::auto(storage, &shape(1)?);
+    session.barrier_between(&[input, weight.buffer], &[output]);
+    dispatch_row_exact_matvec_scheduled(
+        session.encoder_mut(),
+        registry,
+        device.metal_device(),
+        storage,
+        weight.buffer,
+        input,
+        output,
+        &shape(rows)?,
+        &schedule,
+    )
+    .context("encode row-exact DeepSeek-V4 grouped output-A")
+}
+
+/// Row-exact storage for grouped output-A (Q8_0 only) at `rows`.
+fn grouped_output_a_row_exact_storage(
+    weight: &RawMatrixRef<'_>,
+    rows: usize,
+) -> Option<RowExactWeight> {
+    row_exact_storage(weight)
+        .filter(|&storage| storage == RowExactWeight::Q8_0 && rows <= ROW_EXACT_MAX_ROWS)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn grouped_output_a(
     session: &mut GraphSession<'_>,
@@ -421,6 +513,21 @@ pub(super) fn grouped_output_a(
         .checked_div(block)
         .and_then(|blocks| blocks.checked_mul(weight.ggml_type.block_bytes() as usize))
         .context("DeepSeek-V4 output-A row-byte overflow")?;
+    if let Some(storage) = grouped_output_a_row_exact_storage(weight, 1) {
+        return grouped_output_a_row_exact(
+            session,
+            registry,
+            device,
+            input,
+            weight,
+            output,
+            storage,
+            1,
+            groups,
+            rank,
+            group_width,
+        );
+    }
     if matches!(weight.ggml_type, GgmlType::Q2_K | GgmlType::Q8_0) {
         session.barrier_between(&[input, weight.buffer], &[output]);
         return quantized_matmul_ggml_batched_mv(
@@ -552,6 +659,21 @@ pub(super) fn grouped_output_a_batched(
         .checked_div(block)
         .and_then(|blocks| blocks.checked_mul(weight.ggml_type.block_bytes() as usize))
         .context("DeepSeek-V4 output-A row-byte overflow")?;
+    if let Some(storage) = grouped_output_a_row_exact_storage(weight, rows) {
+        return grouped_output_a_row_exact(
+            session,
+            registry,
+            device,
+            input,
+            weight,
+            output,
+            storage,
+            rows,
+            groups,
+            rank,
+            group_width,
+        );
+    }
 
     if weight.ggml_type == GgmlType::Q8_0 && rows > MM_ROUTING_THRESHOLD as usize {
         let input_row_bytes = groups
@@ -858,6 +980,7 @@ mod tests {
             buffer: &weight,
             ggml_type: GgmlType::F32,
             shape: &shape,
+            matvec: MatvecKernels::Stock,
         };
         let (executor, registry) = ctx.split();
         let mut session = executor.begin().unwrap();

@@ -22,8 +22,8 @@ use mlx_native::{DType, MlxBuffer, MlxDevice};
 use serde_json::json;
 
 use super::ds4_bench_support::{
-    copies_for, f16_matrix, f32_buf, floor_cells, gpu_warmup, time_op, Out, Rng, COLD_BYTES,
-    MIN_REPS,
+    bench_matvec, copies_for, f16_matrix, f32_buf, floor_cells, gpu_warmup, time_op, Out, Rng,
+    COLD_BYTES, MIN_REPS,
 };
 use super::forward_support::{
     alloc, expert_matmul, grouped_output_a_batched, raw_matmul, BatchedGroupedOutputArena,
@@ -125,6 +125,7 @@ fn ds4_op_microbench() {
                             buffer: &weights[rep % weights.len()],
                             ggml_type: GgmlType::Q8_0,
                             shape: &shape,
+                            matvec: bench_matvec(),
                         };
                         if mode == "batched" {
                             raw_matmul(s, r, d, &x, &w, &y, b, n, k, name)
@@ -163,6 +164,7 @@ fn ds4_op_microbench() {
                         buffer: &w,
                         ggml_type: GgmlType::Q8_0,
                         shape: &shape,
+                        matvec: bench_matvec(),
                     };
                     raw_matmul(s, r, d, &x, &wr, &y, b, n, k, "output head")
                 });
@@ -204,6 +206,7 @@ fn ds4_op_microbench() {
                         buffer: &weights[rep % weights.len()],
                         ggml_type: GgmlType::Q8_0,
                         shape: &shape,
+                        matvec: bench_matvec(),
                     };
                     grouped_output_a_batched(
                         s, r, d, &x, &w, &y, &arena, b, groups, rank, heads, head_dim,
@@ -246,6 +249,7 @@ fn ds4_op_microbench() {
                         buffer: &weights[rep % weights.len()],
                         ggml_type: GgmlType::F16,
                         shape: &shape,
+                        matvec: bench_matvec(),
                     };
                     row_matmul(
                         RowMatmul::IndependentRows,
@@ -307,6 +311,7 @@ fn ds4_op_microbench() {
                         buffer: &w,
                         ggml_type: ty,
                         shape: &shape,
+                        matvec: bench_matvec(),
                     };
                     expert_matmul(
                         s,

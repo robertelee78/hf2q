@@ -66,10 +66,46 @@ struct ResidentTensor {
     buffer: MlxBuffer,
 }
 
+/// Kernel family of every few-row (`m <= 8`) F16 and Q8_0 product one model
+/// issues. Chosen once at model load, so the serial, joint-decode, prefill
+/// and verifier graphs of a process share one family.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MatvecKernels {
+    /// Existing routes: the F16 `m = 1` matvec (L9) with tiled kernels above
+    /// it, the canonical GGUF matvec family (Q8_0 NR2) for block storage.
+    #[default]
+    Stock,
+    /// mlx-native `row_exact_matvec` for F16 and Q8_0 at `m <= 8`: one
+    /// dispatch whose every row equals its `m = 1` result bitwise.
+    RowExact,
+}
+
+impl MatvecKernels {
+    /// Process switch read by [`Self::from_env`].
+    pub const ENV: &'static str = "HF2Q_DEEPSEEK_ROW_EXACT_MATVEC";
+
+    /// `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC`: `1` selects [`Self::RowExact`];
+    /// unset or `0` keeps [`Self::Stock`]; anything else is an error.
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::parse(std::env::var_os(Self::ENV).as_deref())
+    }
+
+    /// [`Self::from_env`] on an explicit switch value.
+    pub fn parse(value: Option<&std::ffi::OsStr>) -> anyhow::Result<Self> {
+        match value.map(|value| value.to_str()) {
+            None | Some(Some("0")) => Ok(Self::Stock),
+            Some(Some("1")) => Ok(Self::RowExact),
+            Some(_) => anyhow::bail!("{} must be 0 or 1 (got {value:?})", Self::ENV),
+        }
+    }
+}
+
 pub struct RawMatrixRef<'a> {
     pub buffer: &'a MlxBuffer,
     pub ggml_type: GgmlType,
     pub shape: &'a [usize],
+    /// The owning model's few-row kernel family.
+    pub matvec: MatvecKernels,
 }
 
 pub struct Deepseek4Weights {
@@ -78,6 +114,7 @@ pub struct Deepseek4Weights {
     file_backed_bytes: u64,
     anonymous_bytes: u64,
     mapped_segment_count: usize,
+    matvec: MatvecKernels,
     _device: MlxDevice,
 }
 
@@ -188,6 +225,7 @@ impl Deepseek4Weights {
             file_backed_bytes,
             anonymous_bytes,
             mapped_segment_count,
+            matvec: MatvecKernels::Stock,
             _device: device,
         })
     }
@@ -219,6 +257,17 @@ impl Deepseek4Weights {
     /// Number of shared Metal resources spanning the file-backed tensors.
     pub fn mapped_segment_count(&self) -> usize {
         self.mapped_segment_count
+    }
+
+    /// Few-row kernel family handed to every [`RawMatrixRef`].
+    pub fn matvec_kernels(&self) -> MatvecKernels {
+        self.matvec
+    }
+
+    /// Select the few-row kernel family; the model loader calls this once,
+    /// before any graph is built.
+    pub fn set_matvec_kernels(&mut self, matvec: MatvecKernels) {
+        self.matvec = matvec;
     }
 
     pub fn tensor(
@@ -264,6 +313,7 @@ impl Deepseek4Weights {
             buffer: &entry.buffer,
             ggml_type: entry.ggml_type,
             shape: &entry.shape,
+            matvec: self.matvec,
         })
     }
 
@@ -349,6 +399,6 @@ fn validate_loaded_buffer(
 }
 
 #[cfg(test)]
-pub(super) fn metadata_storage_valid(spec:&super::weights::TensorSpec,actual:GgmlType)->bool {
-    validate_storage_type(&spec.name,spec.role,actual).is_ok()
+pub(super) fn metadata_storage_valid(spec: &super::weights::TensorSpec, actual: GgmlType) -> bool {
+    validate_storage_type(&spec.name, spec.role, actual).is_ok()
 }

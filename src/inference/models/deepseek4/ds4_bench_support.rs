@@ -22,7 +22,7 @@ use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 use serde_json::{json, Value};
 
 use super::forward_support::{alloc, raw_matmul};
-use super::residency::RawMatrixRef;
+use super::residency::{MatvecKernels, RawMatrixRef};
 use crate::serve::gpu::GpuContext;
 
 pub(super) const TRIALS: usize = 9;
@@ -47,6 +47,13 @@ impl Rng {
     pub(super) fn unit(&mut self) -> f32 {
         ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     }
+}
+
+/// Few-row kernel family for every bench weight: `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC`, read the way
+/// the model loader reads it, so one run times one family (each cell records it).
+pub(super) fn bench_matvec() -> MatvecKernels {
+    static MATVEC: std::sync::OnceLock<MatvecKernels> = std::sync::OnceLock::new();
+    *MATVEC.get_or_init(|| MatvecKernels::from_env().expect("HF2Q_DEEPSEEK_ROW_EXACT_MATVEC"))
 }
 
 /// Copies needed for `bytes` per copy to exceed `COLD_BYTES` (1 when warm), capped at `MIN_REPS`.
@@ -185,6 +192,7 @@ pub(super) fn gpu_warmup(ctx: &mut GpuContext) {
                 buffer: &weights[rep % weights.len()],
                 ggml_type: GgmlType::F16,
                 shape: &shape,
+                matvec: bench_matvec(),
             };
             raw_matmul(s, r, d, &x, &w, &y, 1, n, k, "warmup")
         });
@@ -225,6 +233,7 @@ impl Out {
                 target.insert(key.clone(), value.clone());
             }
         }
+        target.insert("matvec".into(), json!(format!("{:?}", bench_matvec())));
         eprintln!("{cell}");
         writeln!(self.0, "{cell}").unwrap();
     }

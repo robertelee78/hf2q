@@ -62,6 +62,7 @@ with the audit script for this change (the lexical count of
 
 - `HF2Q_DEEPSEEK_JOINT_DECODE` (`documented-escape`) is the DeepSeek-V4 joint decode kill switch. It is on by default; `0`/`off`/`false` restores serial per-slot decode.
 - `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` (`development-only`) sets the joint width, 2..8 with a default of 4. Widths 5–8 have no serving measurement.
+- `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC` (`development-only`, ADR-063 gap program, 2026-11-06) selects the DeepSeek-V4 few-row kernel family. Unset or `0`: the existing routes. `1`: every F16 and Q8_0 product at `m <= 8` (and Q8_0 grouped output-A) runs mlx-native's `row_exact_matvec`, one dispatch whose every row equals its `m = 1` result bitwise, so joint decode issues F16 independent rows as one dispatch instead of one per row. Any other value refuses model load. Read once at model load; the serial, joint, prefill and verifier graphs of the process share the choice. Off by default until the real-artifact joint ≡ serial and Q1 envelope gates pass.
 - `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` (`documented-escape`) is the Gemma 4 full-input checkpoint switch. Unset means on where the worker's substrate and quota plan allow it; `0` is the kill switch (also skips the slot-route warmup); `1` forces it and refuses startup otherwise. It no longer needs `HF2Q_UNSAFE_EXPERIMENTS`.
 - `HF2Q_GEMMA_JOINT_WARM_PREFILL` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the Gemma 4 joint warm prefill kill switch (ADR-063 Stage 1). Unset or `1`/`on`/`true`: same-step warm tool-turn suffixes share one bitwise-exact transaction; `0`/`off`/`false` restores per-slot warm prefill. Invalid values warn and keep the default. Read once per SlotAware worker; also off when `HF2Q_CROSS_SLOT_ADMIT` is off, `HF2Q_PREFILL_SLOT_BATCHED=0` or `HF2Q_MM_ID_ROUTING_THRESHOLD` is set.
 - `HF2Q_GEMMA_WARM_TILED_ATTENTION` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects the Gemma 4 warm-prefill attention kernel (ADR-063 Stage 2). Unset or `0`/`off`/`false` (default since the 2026-11-01 quality gate): vec-hybrid warm attention. `1`/`on`/`true`: single-slot warm prefills, joint warm cohorts and installed long-prompt lanes attend with tiled F16 flash attention (suffixes under 32 rows keep vec-hybrid); this route changed agent decisions on the canonical four-agent task. Invalid values warn and keep the default. Read once per model load.
@@ -204,6 +205,7 @@ this release:
 | `HF2Q_DEEPSEEK_MMAP_WEIGHTS` | `development-only` | 3 |
 | `HF2Q_DEEPSEEK_PREFILL_TIMING` | `development-only` | 3 |
 | `HF2Q_DEEPSEEK_PREFILL_WINDOWS` | `development-only` | 6 |
+| `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC` | `development-only` | 5 |
 | `HF2Q_DEEPSEEK_SEQUENTIAL_PREFILL` | `development-only` | 1 |
 | `HF2Q_DEEPSEEK_SKIP_WARMUP` | `development-only` | 1 |
 | `HF2Q_DEEPSEEK_SLOT_DECODE_QUANTUM` | `development-only` | 1 |
