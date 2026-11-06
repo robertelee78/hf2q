@@ -84,6 +84,21 @@ These are documented only.
    - Families b (Qwen3.8 `auto`) and c (Qwen3.6 repair1): not run. Both use speculation `auto`, which this change does not make repeatable (out-of-scope section); T-J1-8 already records their behaviour.
 5. **Cost: not run per operator directive 2026-11-06 (no speed tests).** The lone-lane decode-rate rule (on/off median ≥ 0.95) and the N4 makespan ABBA (≥ 8 blocks, CI upper bound ≤ 1.02) were pre-registered and are dropped. Option 2 (exact mode at N4: `HF2Q_DECODE_MVN=1 HF2Q_DECODE_MV_EXT=0` for Qwen3.8 workers with `max_slots >= 4`, where joint equals serial bitwise) stays the documented alternative if a cost problem is found later.
 
+## Results (branch 616dd750 on main dc72f452, mlx-native 0.16.0)
+
+Evidence: `~/.local/state/hf2q/v0130/q38-det-inv/fix717/` (`release-616dd750…/build-receipt.json`; server sha256 in the receipt; `p1-20261106T165219Z/report.json`; `p2-repeat/report.json`).
+
+1. **Host tests:** 13 passed (`serve::api::engine::qwen35_joint_decode::`); replay tool 14 passed.
+2. **Official-artifact gates:** `qwen38_joint_decode_padded_mv_ext_rows_are_cohort_invariant_bitwise` and `qwen38_joint_decode_padded_mv_ext_keeps_decision_parity` both passed.
+3. **Serving k-sweep: pass.** All nine arms have equal per-request `cached_tokens`.
+   - Switch on: solo ×2, k = 13, k = 17 and all-joint (k = 67) give one byte-identical agent-1 turn-4 output, the a-base " to" transcript. The debug lines show the one-lane joint steps (`lanes=1`).
+   - Switch off (control): solo and k = 13 give " and", while k = 17 and all-joint give " to". This is the defect reproduced.
+4. **Four-agent repeat: pass.** All six Q5 runs were `CalibrationPass` with cleanup proven and the protocol complete.
+   - The four switch-on runs give `ExactTranscripts`: 28/28 turn positions, 0 same-request/different-output.
+   - The two switch-off runs also agree with each other (`ExactTranscripts`), so the control showed no run-to-run divergence in this sample (two runs). That weakens the gate-4 evidence as pre-registered; the deterministic reproduction is gate 3.
+   - Across all six runs, the on and off arms differ at agent-1 turn-4, the same near-tie: the route change itself, not run-to-run noise.
+5. **Cost:** not run (operator directive 2026-11-06).
+
 ## Docs and consumers
 
 - S3 doc (`adr063-s3-qwen-joint-decode.md`): the phase-1 width rule (padded mode groups every eligible lane; lone ordinary lanes run joint) and the numeric contract (gap closed), with the gates' results.

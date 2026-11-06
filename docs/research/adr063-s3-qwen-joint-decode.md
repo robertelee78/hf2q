@@ -97,6 +97,7 @@ The Q1 numeric policy is `docs/research/adr063-q1-numeric-policy.md` (branch `do
   - The replay (`~/.local/state/hf2q/v0130/q38-det-inv/campaign-20261105T214953Z/`, fresh text-only servers, recorded bodies, a companion leaving the cohort after k measured joint steps) reproduces case (a) deterministically. Solo and k ≤ 13 give the " and" transcript; k = 17 and all-joint give the " to" transcript. Repeated arms are byte-identical.
   - Token 16 logprobs: solo " and" −0.797 / " to" −0.804; all-joint " to" −0.790 / " and" −0.808. This is a near-tie, well inside the envelope.
   - With speculation off the replay's turn-6 outputs did not depend on arrival order. With speculation auto, agent-0's output depended on whether it arrived first (2/2 each way).
+  - Gates on the fix (616dd750; `docs/research/adr063-qwen-n4-solo-joint-717.md`, "Results"): the padded invariance and parity gates pass. The replay's agent-1 turn-4 is byte-identical across solo, k = 13, k = 17 and all-joint with the solo route on, and splits by k with `HF2Q_QWEN_JOINT_SOLO=0`. Four Q5 four-agent runs with speculation off give `ExactTranscripts`.
 - MoE artifacts under `HF2Q_DECODE_MV_EXT=1` stay serial.
 - **Dense FFN.** The default shared-weight gate/up route (next section) is part of this Class B route. It is not bitwise equal to the per-row fused kernel, so no bitwise gate applies to it; exact mode refuses it before any cache write.
 
