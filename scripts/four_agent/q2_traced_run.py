@@ -55,7 +55,8 @@ SERVER_BUDGET, CLIENT_BUDGET = 6 * GIB, 128 * MIB
 EVENT_LIMIT, METADATA_LIMIT = 8_000_000, 16 * MIB
 PROFILE = "native_command_capture_v3"
 WITNESS = {"schema": "hf2q.f2.forward-witness-policy.v1", "operator": "target_input_rms_norm",
-           "input_sources": ["qwen35.greedy.actual_tokens", "qwen35.forward.actual_tokens"],
+           "input_sources": ["qwen35.greedy.actual_tokens", "qwen35.forward.actual_tokens",
+                             "qwen35.joint_decode.actual_slot_rows"],
            "coverage": "each_admitted_lane_in_first_fixed_window",
            "batching_scope": "operator_only_full_body_unknown"}
 ARM_READBACK_LIMIT = 8 * MIB  # the pre-client trace holds only header, baseline and arm ACK

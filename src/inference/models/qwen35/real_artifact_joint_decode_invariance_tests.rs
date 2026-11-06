@@ -65,13 +65,13 @@ fn slot_region(buffer: &MlxBuffer, slot: u32) -> Vec<u8> {
 
 /// Every observable byte of one slot's target cache state.
 #[derive(Debug, PartialEq, Eq)]
-struct SlotState {
+pub(super) struct SlotState {
     cursor: Option<u32>,
     full_attn: Vec<(u32, Vec<Vec<u8>>)>,
     linear_attn: Vec<(bool, Vec<Vec<u8>>)>,
 }
 
-fn slot_state(cache: &HybridKvCache, slot: u32) -> SlotState {
+pub(super) fn slot_state(cache: &HybridKvCache, slot: u32) -> SlotState {
     let index = slot as usize;
     SlotState {
         cursor: cache.sequence_len_for_slot(SlotId(slot)).ok(),

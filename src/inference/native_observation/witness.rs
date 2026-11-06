@@ -3,6 +3,10 @@
 use super::*;
 use std::sync::Arc;
 
+/// Qwen joint ordinary decode: one actual one-token span per packed matrix
+/// row. The only source whose physical matrix may carry owner-less padding.
+pub(super) const JOINT_SOURCE: &str = "qwen35.joint_decode.actual_slot_rows";
+
 struct Descriptor {
     id: u64,
     source: &'static str,
@@ -14,9 +18,16 @@ struct Descriptor {
 thread_local! {
     static INPUT: RefCell<Option<Arc<Descriptor>>> = const { RefCell::new(None) };
 }
+/// Closes a joint forward's own encoding: forward id and invocation epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EndMarker {
+    forward_id: u64,
+    epoch: u64,
+}
 pub(crate) struct Input {
     previous: Option<Arc<Descriptor>>,
     active: bool,
+    end: Option<EndMarker>,
     _thread_bound: PhantomData<Rc<()>>,
 }
 fn source_layout(source: &str, spans: &[InputSpan]) -> bool {
@@ -34,64 +45,167 @@ fn source_layout(source: &str, spans: &[InputSpan]) -> bool {
         | "deepseek4.prefill.actual_cooperative_lane" => spans.len() == 1,
         "gemma4.decode.actual_token_slot_position_arrays"
         | "gemma4.prefill.actual_concat_descriptor"
-        | "deepseek4.prefill.actual_cooperative_pack" => {
+        | "deepseek4.prefill.actual_cooperative_pack"
+        | JOINT_SOURCE => {
             (source != "deepseek4.prefill.actual_cooperative_pack"
                 || (2..=4).contains(&spans.len()))
+                && (source != JOINT_SOURCE || spans.len() <= MAX_JOINT_DECODE_ROWS)
                 && spans.iter().enumerate().all(|(index, span)| {
                     spans[..index].iter().all(|old| old.slot != span.slot)
-                        && (source != "gemma4.decode.actual_token_slot_position_arrays"
-                            || span.count == 1)
+                        && (!matches!(
+                            source,
+                            "gemma4.decode.actual_token_slot_position_arrays" | JOINT_SOURCE
+                        ) || span.count == 1)
                 })
         }
         _ => false,
     }
 }
+impl Input {
+    /// The end-marker decision: only an active guard that published a joint
+    /// input closes it, exactly once (drop, early return or unwinding alike).
+    fn take_end(&mut self) -> Option<EndMarker> {
+        if self.active {
+            self.end.take()
+        } else {
+            None
+        }
+    }
+}
 impl Drop for Input {
     fn drop(&mut self) {
+        if let Some(marker) = self.take_end() {
+            publish_end(marker);
+        }
         if self.active {
             INPUT.with(|value| *value.borrow_mut() = self.previous.take());
         }
     }
 }
 
+/// `scope_watermark` is the highest id handed out so far: every scope created
+/// inside this forward lies in `(forward_id, scope_watermark]`.
+fn publish_end(marker: EndMarker) {
+    note(Hook::Marker);
+    let watermark = NEXT.load(Ordering::Acquire).saturating_sub(1);
+    match crate::serve::phase_trace::monotonic_ns() {
+        Ok(end) => crate::serve::phase_trace::publish(
+            "forward_input_end",
+            serde_json::json!({
+            "forward_id":marker.forward_id,"epoch":marker.epoch,
+            "scope_watermark":watermark,"end_monotonic_ns":end}),
+        ),
+        Err(_) => crate::serve::phase_trace::invalidate("forward input end clock unavailable"),
+    }
+}
+
+/// Hook decisions, counted per thread in tests only (publish is a no-op there).
+#[derive(Clone, Copy)]
+enum Hook {
+    Input,
+    Witness,
+    Unmapped,
+    Marker,
+}
+#[cfg(test)]
+thread_local! {
+    static HOOKS: Cell<[u32; 4]> = const { Cell::new([0; 4]) };
+}
+#[cfg(test)]
+fn note(hook: Hook) {
+    HOOKS.with(|value| {
+        let mut counts = value.get();
+        counts[hook as usize] += 1;
+        value.set(counts);
+    });
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn note(_: Hook) {}
+/// This thread's `[inputs, witnesses, unmapped, end markers]` since the last call.
+#[cfg(test)]
+pub(crate) fn take_hook_counts() -> [u32; 4] {
+    HOOKS.with(|value| value.replace([0; 4]))
+}
+
 /// Call only where the actual ordered token tensor is constructed. Spans are
 /// packed in this order; a scheduler's desired width is not an input manifest.
 pub(crate) fn input(source: &'static str, spans: &[InputSpan]) -> Input {
+    input_rows(source, spans, 0)
+}
+
+/// Logical rows plus the physical matrix row count. Padding rows are
+/// owner-less physical rows and exist only for the joint source; that source
+/// is ordinary target decode only (a joint verify is refused, not relabelled).
+fn manifest(
+    source: &str,
+    spans: &[InputSpan],
+    padding_rows: u32,
+    role: &'static str,
+    selected: &[crate::serve::phase_trace::SlotState],
+    owners: &[crate::serve::phase_trace::SlotState],
+) -> Option<(Vec<crate::serve::phase_trace::PhysicalRow>, u64)> {
+    let joint = source == JOINT_SOURCE;
+    if (padding_rows != 0 && !joint) || (joint && role != "target") || !source_layout(source, spans)
+    {
+        return None;
+    }
+    let mut rows = resolve_selected(spans, selected, owners)?;
+    if role == "target_verify" {
+        for row in &mut rows {
+            row.phase = "verify";
+        }
+    }
+    if joint && rows.iter().any(|row| row.phase != "ordinary") {
+        return None;
+    }
+    let total = rows.iter().try_fold(u64::from(padding_rows), |sum, row| {
+        sum.checked_add(u64::from(row.token_count))
+    })?;
+    Some((rows, total))
+}
+
+pub(super) fn input_rows(source: &'static str, spans: &[InputSpan], padding_rows: u32) -> Input {
     let mut descriptor = None;
+    let mut end = None;
     let active = ARMED.load(Ordering::Acquire);
     if active {
-        let rows = if source_layout(source, spans) {
-            SELECTED.with(|selected| {
-                OWNERS.with(|owners| resolve_selected(spans, &selected.borrow(), &owners.borrow()))
+        let role = ROLE.with(Cell::get);
+        let rows = SELECTED.with(|selected| {
+            OWNERS.with(|owners| {
+                manifest(
+                    source,
+                    spans,
+                    padding_rows,
+                    role,
+                    &selected.borrow(),
+                    &owners.borrow(),
+                )
             })
-        } else {
-            None
-        };
-        if let (Some(mut rows), Some(id)) = (rows, next_id()) {
-            let role = ROLE.with(Cell::get);
-            if role == "target_verify" {
-                for row in &mut rows {
-                    row.phase = "verify";
-                }
-            }
-            let total = rows
-                .iter()
-                .try_fold(0u64, |sum, row| sum.checked_add(u64::from(row.token_count)));
-            if let Some(total) = total.filter(|_| EPOCH.with(Cell::get) != 0) {
+        });
+        if let (Some((rows, total)), Some(id)) = (rows, next_id()) {
+            let epoch = EPOCH.with(Cell::get);
+            if epoch != 0 {
                 let mut offset = 0u64;
                 let packed: Vec<_> = rows.iter().map(|row| {
                     let begin = offset; offset += u64::from(row.token_count);
                     serde_json::json!({"matrix_row_start":begin,"matrix_row_end":offset,"logical":row})
                 }).collect();
-                crate::serve::phase_trace::publish(
-                    "forward_input",
-                    serde_json::json!({
-                    "forward_id":id,"epoch":EPOCH.with(Cell::get),"source":source,
-                    "role":role,"matrix_rows":total,"packed_rows":packed,
-                    "operator_site":if source == "deepseek4.prefill.actual_cooperative_pack" {
-                        "ffn_hc_input" } else { "pre_attention_input" },
-                    "execution_proven":false}),
-                );
+                let mut payload = serde_json::json!({
+                "forward_id":id,"epoch":epoch,"source":source,
+                "role":role,"matrix_rows":total,"packed_rows":packed,
+                "operator_site":if source == "deepseek4.prefill.actual_cooperative_pack" {
+                    "ffn_hc_input" } else { "pre_attention_input" },
+                "execution_proven":false});
+                if source == JOINT_SOURCE {
+                    payload["padding_rows"] = serde_json::json!(padding_rows);
+                    end = Some(EndMarker {
+                        forward_id: id,
+                        epoch,
+                    });
+                }
+                crate::serve::phase_trace::publish("forward_input", payload);
+                note(Hook::Input);
                 descriptor = Some(Arc::new(Descriptor {
                     id,
                     source,
@@ -116,6 +230,7 @@ pub(crate) fn input(source: &'static str, spans: &[InputSpan]) -> Input {
     Input {
         previous,
         active,
+        end,
         _thread_bound: PhantomData,
     }
 }
@@ -125,6 +240,7 @@ pub(crate) fn single_input(source: &'static str, start: usize, count: usize) -> 
         return Input {
             previous: None,
             active: false,
+            end: None,
             _thread_bound: PhantomData,
         };
     }
@@ -165,6 +281,24 @@ fn footprint(
     Some(read_bytes)
 }
 
+/// What one witnessed RMS call does with the current input descriptor.
+enum Claim {
+    /// No manifest is in place: publish `forward_witness_unmapped`.
+    Unmapped,
+    /// This forward's one witness was already claimed: publish nothing.
+    Silent,
+    Witness(Arc<Descriptor>),
+}
+fn claim(descriptor: Option<Arc<Descriptor>>) -> Claim {
+    match descriptor {
+        None => Claim::Unmapped,
+        Some(descriptor) if descriptor.witness_claimed.swap(true, Ordering::AcqRel) => {
+            Claim::Silent
+        }
+        Some(descriptor) => Claim::Witness(descriptor),
+    }
+}
+
 /// The caller wraps ONLY the existing RMS-norm encode (one native arithmetic
 /// dispatch), not its surrounding body, QKV wrapper or per-slot kernels.
 /// A malformed observer descriptor invalidates metadata, never the real result.
@@ -177,19 +311,20 @@ fn prepare(
     if !ARMED.load(Ordering::Acquire) {
         return None;
     }
-    let descriptor = INPUT.with(|value| value.borrow().clone());
-    let Some(descriptor) = descriptor else {
-        crate::serve::phase_trace::publish(
-            "forward_witness_unmapped",
-            serde_json::json!({
-            "operator":"target_input_rms_norm","reason":"NoActualInputManifest",
-            "progress_eligible":false}),
-        );
-        return None;
+    let descriptor = match claim(INPUT.with(|value| value.borrow().clone())) {
+        Claim::Unmapped => {
+            note(Hook::Unmapped);
+            crate::serve::phase_trace::publish(
+                "forward_witness_unmapped",
+                serde_json::json!({
+                "operator":"target_input_rms_norm","reason":"NoActualInputManifest",
+                "progress_eligible":false}),
+            );
+            return None;
+        }
+        Claim::Silent => return None,
+        Claim::Witness(descriptor) => descriptor,
     };
-    if descriptor.witness_claimed.swap(true, Ordering::AcqRel) {
-        return None;
-    }
     let bytes = footprint(
         descriptor.total,
         rows,
@@ -230,6 +365,7 @@ fn prepare(
         "input_data_bytes":matrix.data_byte_len(),"input_parent_bytes":matrix.byte_len(),
         "dispatches_expected":1,"execution_proven":false,"full_body_batching_proven":false}),
     );
+    note(Hook::Witness);
     Some((scope_guard, scope))
 }
 
@@ -280,50 +416,5 @@ pub(crate) fn witness_command_rms_norm<R>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn actual_witness_footprint_requires_all_rows_and_checked_view_extent() {
-        assert_eq!(footprint(4, 4, 8, 32, 128, 64, 192, 4), Some(128));
-        assert_eq!(footprint(4, 1, 8, 8, 32, 0, 32, 4), None);
-        assert_eq!(footprint(4, 4, 8, 32, 127, 64, 192, 4), None);
-        assert_eq!(footprint(4, 4, 8, 32, 128, 65, 192, 4), None);
-        assert_eq!(footprint(4, 4, 8, 31, 128, 64, 192, 4), None);
-        assert_eq!(footprint(4, 4, usize::MAX, 0, 0, 0, 0, 4), None);
-        assert_eq!(footprint(4, 4, 8, 32, 128, u64::MAX, 192, 4), None);
-    }
-    #[test]
-    fn actual_source_layout_does_not_relabel_scalar_or_temporal_as_independent_quad() {
-        let scalar = [InputSpan {
-            slot: 0,
-            start: 3,
-            count: 1,
-        }];
-        assert!(source_layout("qwen35.greedy.actual_tokens", &scalar));
-        let temporal = [InputSpan {
-            slot: 0,
-            start: 3,
-            count: 4,
-        }];
-        assert!(!source_layout("qwen35.greedy.actual_tokens", &temporal));
-        assert!(source_layout("qwen35.forward.actual_tokens", &temporal));
-        assert!(!source_layout(
-            "gemma4.decode.actual_token_slot_position_arrays",
-            &temporal
-        ));
-        let independent = std::array::from_fn::<_, 4, _>(|slot| InputSpan {
-            slot: slot as u32,
-            start: 3,
-            count: 1,
-        });
-        assert!(source_layout(
-            "gemma4.decode.actual_token_slot_position_arrays",
-            &independent
-        ));
-        assert!(!source_layout("qwen35.forward.actual_tokens", &independent));
-        assert!(!source_layout(
-            "gemma4.decode.actual_token_slot_position_arrays",
-            &[scalar[0], scalar[0]]
-        ));
-    }
-}
+#[path = "witness_tests.rs"]
+mod tests;

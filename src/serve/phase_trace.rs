@@ -286,7 +286,7 @@ fn validate_config(c: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn monotonic_ns() -> Result<u64, String> {
+pub(crate) fn monotonic_ns() -> Result<u64, String> {
     let mut t = std::mem::MaybeUninit::<libc::timespec>::uninit();
     // SAFETY: valid writable timespec; no payload or device access.
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) } != 0 {

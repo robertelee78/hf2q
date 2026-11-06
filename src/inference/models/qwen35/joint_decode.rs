@@ -331,6 +331,13 @@ impl Qwen35Model {
             }
         }
         let positions = host_buffer(device, DType::I32, positions.as_slice(), "positions")?;
+        // The forward's actual input manifest (trace on only): one row per
+        // packed slot in matrix order, padding rows owner-less. Its drop at
+        // return closes the forward before the caller's per-lane settle work.
+        let _native_input = crate::inference::native_observation::joint_decode_input(
+            rows.iter().map(|row| (row.slot_id.0, row.position)),
+            width,
+        );
         let mut embedded = device
             .alloc_buffer(width * h * 4, DType::F32, vec![width, h])
             .map_err(|e| anyhow!("allocate Qwen joint embeddings: {e}"))?;
