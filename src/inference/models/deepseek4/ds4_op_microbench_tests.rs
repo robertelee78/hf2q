@@ -2,45 +2,36 @@
 //!
 //! Model-free: synthetic weights with in-range scales, no model runtime. Each cell times hf2q's own dispatch
 //! wrappers (`raw_matmul`, `row_matmul(IndependentRows)`, `grouped_output_a_batched`, `expert_matmul` forced
-//! `mv_id`) exactly as joint decode issues them. One trial encodes `REPS` back-to-back copies of the op in one
-//! session and times `finish()` (commit + wait); the cell is the median of `TRIALS` trials divided by `REPS`.
-//! Weights rotate over enough copies to exceed 256 MiB, so each repetition reads cold weights from DRAM,
-//! as one layer of a decode step does; `warm` cells reuse one copy.
+//! `mv_id`) exactly as joint decode issues them. Timing is `ds4_bench_support` (shared with M2b): GPU
+//! command-buffer timestamps, copies per session calibrated for >= 2 ms of GPU work, median of 9 trials per
+//! copy, `wall_us` and `encode_us` per copy alongside, a 2 s warm-up first and >= 50 ms of untimed sessions
+//! before every cell; the `floor` cells record the method's floor in every run.
+//!
+//! Every family is timed warm (one weight copy, or for routed experts one fixed expert set) and cold:
+//! dense weights rotate as `copies[rep % copies]` over enough copies to exceed 256 MiB (at most 64, so every
+//! copy is read in every session); routed experts rotate over as many distinct expert-id sets. Tensors
+//! larger than 256 MiB (output head) have one copy, so their warm and cold cells read the same bytes.
 //!
 //! Run (standing grant, model-free, <= 15 min):
 //! ```text
 //! HF2Q_DS4_MICROBENCH_OUT=<cells.jsonl> cargo test --release --bin hf2q ds4_op_microbench -- --ignored --nocapture
 //! ```
 
-use std::io::Write;
-use std::time::Instant;
-
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 use serde_json::json;
 
+use super::ds4_bench_support::{
+    copies_for, f16_matrix, f32_buf, floor_cells, gpu_warmup, time_op, Out, Rng, COLD_BYTES,
+    MIN_REPS,
+};
 use super::forward_support::{
     alloc, expert_matmul, grouped_output_a_batched, raw_matmul, BatchedGroupedOutputArena,
     ExpertMatmulRoute,
 };
 use super::residency::RawMatrixRef;
-use super::row_matmul::{row_matmul, RowMatmul};
+use super::row_matmul::{row_matmul, row_view, RowMatmul};
 use crate::serve::gpu::GpuContext;
-
-const TRIALS: usize = 9;
-const REPS: usize = 16;
-const COLD_BYTES: usize = 256 << 20;
-
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-}
 
 /// Random block bytes with every block's f16 scale fields set to small normal values.
 fn block_weight(
@@ -74,70 +65,26 @@ fn block_weight(
     buf
 }
 
-fn f16_weight(device: &MlxDevice, n: usize, k: usize, seed: u64) -> MlxBuffer {
-    let mut buf = device
-        .alloc_buffer(n * k * 2, DType::F16, vec![n, k])
-        .unwrap();
-    let mut rng = Rng(seed);
-    for v in buf.as_mut_slice::<u16>().unwrap() {
-        *v = half::f16::from_f32(((rng.next() >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.05)
-            .to_bits();
-    }
-    buf
-}
-
 fn input(device: &MlxDevice, shape: Vec<usize>, seed: u64) -> MlxBuffer {
-    let mut buf = alloc(device, DType::F32, shape, "bench input").unwrap();
+    f32_buf(device, shape, seed, 1.0)
+}
+
+/// `top_k` distinct expert ids per token for `tokens` tokens.
+fn expert_ids(device: &MlxDevice, tokens: usize, top_k: usize, seed: u64) -> MlxBuffer {
+    let mut ids = alloc(device, DType::U32, vec![tokens * top_k], "bench ids").unwrap();
     let mut rng = Rng(seed);
-    for v in buf.as_mut_slice::<f32>().unwrap() {
-        *v = ((rng.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0;
-    }
-    buf
-}
-
-fn copies_for(bytes: usize, warm: bool) -> usize {
-    if warm {
-        1
-    } else {
-        COLD_BYTES.div_ceil(bytes).clamp(1, 64)
-    }
-}
-
-/// Median seconds per op over TRIALS trials of REPS encodes each.
-fn time_op(
-    ctx: &mut GpuContext,
-    mut encode: impl FnMut(
-        &mut mlx_native::graph::GraphSession<'_>,
-        &mut mlx_native::KernelRegistry,
-        &MlxDevice,
-        usize,
-    ),
-) -> f64 {
-    let device = ctx.device().clone();
-    let mut samples = Vec::with_capacity(TRIALS + 1);
-    for trial in 0..=TRIALS {
-        let (executor, registry) = ctx.split();
-        let mut session = executor.begin().unwrap();
-        for rep in 0..REPS {
-            encode(&mut session, registry, &device, rep);
+    let idv = ids.as_mut_slice::<u32>().unwrap();
+    for t in 0..tokens {
+        let mut chosen = Vec::with_capacity(top_k);
+        while chosen.len() < top_k {
+            let e = (rng.next() % 256) as u32;
+            if !chosen.contains(&e) {
+                chosen.push(e);
+            }
         }
-        let t0 = Instant::now();
-        session.finish().unwrap();
-        let dt = t0.elapsed().as_secs_f64();
-        if trial > 0 {
-            samples.push(dt / REPS as f64); // trial 0 warms pipelines
-        }
+        idv[t * top_k..(t + 1) * top_k].copy_from_slice(&chosen);
     }
-    samples.sort_by(f64::total_cmp);
-    samples[samples.len() / 2]
-}
-
-struct Out(std::fs::File);
-impl Out {
-    fn cell(&mut self, cell: serde_json::Value) {
-        eprintln!("{cell}");
-        writeln!(self.0, "{cell}").unwrap();
-    }
+    ids
 }
 
 #[test]
@@ -149,6 +96,9 @@ fn ds4_op_microbench() {
     let mut ctx = GpuContext::new().unwrap();
     let device = ctx.device().clone();
 
+    gpu_warmup(&mut ctx);
+    floor_cells(&mut ctx, &mut out);
+
     // ── dense Q8_0 projections: batched raw_matmul at m = B, vs B one-row calls ─────────────
     let dense_q8: [(&str, usize, usize); 6] = [
         ("attn_q_a", 1024, 4096),
@@ -159,59 +109,71 @@ fn ds4_op_microbench() {
         ("shexp_down", 4096, 2048),
     ];
     for (name, n, k) in dense_q8 {
+        let bytes = n * k / 32 * 34;
+        let all: Vec<MlxBuffer> = (0..copies_for(bytes, false))
+            .map(|c| block_weight(&device, GgmlType::Q8_0, vec![n, k], c as u64))
+            .collect();
+        let shape = [n, k];
         for warm in [false, true] {
-            let bytes = n * k / 32 * 34;
-            let copies = copies_for(bytes, warm);
-            let weights: Vec<MlxBuffer> = (0..copies)
-                .map(|c| block_weight(&device, GgmlType::Q8_0, vec![n, k], c as u64))
-                .collect();
-            let shape = [n, k];
+            let weights = &all[..copies_for(bytes, warm)];
             for b in 1..=4usize {
                 let x = input(&device, vec![b, k], 7);
                 let y = alloc(&device, DType::F32, vec![b, n], "bench out").unwrap();
                 for mode in ["batched", "per_row"] {
-                    let secs = time_op(&mut ctx, |s, r, d, rep| {
+                    let t = time_op(&mut ctx, |s, r, d, rep| {
                         let w = RawMatrixRef {
-                            buffer: &weights[rep % copies],
+                            buffer: &weights[rep % weights.len()],
                             ggml_type: GgmlType::Q8_0,
                             shape: &shape,
                         };
                         if mode == "batched" {
-                            raw_matmul(s, r, d, &x, &w, &y, b, n, k, name).unwrap();
+                            raw_matmul(s, r, d, &x, &w, &y, b, n, k, name)
                         } else {
                             for row in 0..b {
-                                let xr = super::row_matmul::row_view(&x, row, vec![1, k]).unwrap();
-                                let yr = super::row_matmul::row_view(&y, row, vec![1, n]).unwrap();
-                                raw_matmul(s, r, d, &xr, &w, &yr, 1, n, k, name).unwrap();
+                                let xr = row_view(&x, row, vec![1, k])?;
+                                let yr = row_view(&y, row, vec![1, n])?;
+                                raw_matmul(s, r, d, &xr, &w, &yr, 1, n, k, name)?;
                             }
+                            Ok(())
                         }
                     });
-                    out.cell(json!({"family": "dense_q8_0", "op": name, "n": n, "k": k, "b": b, "mode": mode,
-                                    "warm": warm, "us": secs * 1e6, "weight_bytes": bytes,
-                                    "gbps": bytes as f64 / secs / 1e9}));
+                    out.cell(
+                        &json!({"family": "dense_q8_0", "op": name, "n": n, "k": k, "b": b, "mode": mode,
+                                "warm": warm, "copies": weights.len(), "weight_bytes": bytes}),
+                        json!({"gbps": bytes as f64 / t.us / 1e3}),
+                        &t,
+                    );
                 }
             }
         }
     }
 
-    // ── output head Q8_0 [129280, 4096] (forward_logits raw_matmul at m = B) ─────────────────────────
+    // ── output head Q8_0 [129280, 4096] (forward_logits raw_matmul at m = B); one copy > COLD_BYTES ──
     {
         let (n, k) = (129_280usize, 4096usize);
+        let bytes = n * k / 32 * 34;
         let w = block_weight(&device, GgmlType::Q8_0, vec![n, k], 99);
         let shape = [n, k];
-        for b in 1..=4usize {
-            let x = input(&device, vec![b, k], 3);
-            let y = alloc(&device, DType::F32, vec![b, n], "bench out").unwrap();
-            let secs = time_op(&mut ctx, |s, r, d, _| {
-                let wr = RawMatrixRef {
-                    buffer: &w,
-                    ggml_type: GgmlType::Q8_0,
-                    shape: &shape,
-                };
-                raw_matmul(s, r, d, &x, &wr, &y, b, n, k, "output head").unwrap();
-            });
-            out.cell(json!({"family": "dense_q8_0", "op": "output_head", "n": n, "k": k, "b": b, "mode": "batched",
-                            "warm": false, "us": secs * 1e6, "weight_bytes": n * k / 32 * 34}));
+        for warm in [false, true] {
+            for b in 1..=4usize {
+                let x = input(&device, vec![b, k], 3);
+                let y = alloc(&device, DType::F32, vec![b, n], "bench out").unwrap();
+                let t = time_op(&mut ctx, |s, r, d, _| {
+                    let wr = RawMatrixRef {
+                        buffer: &w,
+                        ggml_type: GgmlType::Q8_0,
+                        shape: &shape,
+                    };
+                    raw_matmul(s, r, d, &x, &wr, &y, b, n, k, "output head")
+                });
+                out.cell(
+                    &json!({"family": "dense_q8_0", "op": "output_head", "n": n, "k": k, "b": b,
+                            "mode": "batched", "warm": warm, "copies": 1, "weight_bytes": bytes,
+                            "note": "one copy exceeds COLD_BYTES; warm and cold read the same bytes"}),
+                    json!({"gbps": bytes as f64 / t.us / 1e3}),
+                    &t,
+                );
+            }
         }
     }
 
@@ -220,8 +182,7 @@ fn ds4_op_microbench() {
         let (groups, rank, heads, head_dim) = (8usize, 1024usize, 64usize, 512usize);
         let gw = heads * head_dim / groups;
         let bytes = groups * rank * gw / 32 * 34;
-        let copies = copies_for(bytes, false);
-        let weights: Vec<MlxBuffer> = (0..copies)
+        let all: Vec<MlxBuffer> = (0..copies_for(bytes, false))
             .map(|c| {
                 block_weight(
                     &device,
@@ -232,24 +193,30 @@ fn ds4_op_microbench() {
             })
             .collect();
         let shape = [groups * rank, gw];
-        for b in 1..=4usize {
-            let x = input(&device, vec![b, heads * head_dim], 5);
-            let y = alloc(&device, DType::F32, vec![b, groups * rank], "bench out").unwrap();
-            let arena = BatchedGroupedOutputArena::new(&device, b, groups, gw, rank).unwrap();
-            let secs = time_op(&mut ctx, |s, r, d, rep| {
-                let w = RawMatrixRef {
-                    buffer: &weights[rep % copies],
-                    ggml_type: GgmlType::Q8_0,
-                    shape: &shape,
-                };
-                grouped_output_a_batched(
-                    s, r, d, &x, &w, &y, &arena, b, groups, rank, heads, head_dim,
-                )
-                .unwrap();
-            });
-            out.cell(json!({"family": "dense_q8_0", "op": "attn_output_a_grouped", "n": groups * rank, "k": gw,
-                            "b": b, "mode": "batched", "warm": false, "us": secs * 1e6, "weight_bytes": bytes,
-                            "gbps": bytes as f64 / secs / 1e9}));
+        for warm in [false, true] {
+            let weights = &all[..copies_for(bytes, warm)];
+            for b in 1..=4usize {
+                let x = input(&device, vec![b, heads * head_dim], 5);
+                let y = alloc(&device, DType::F32, vec![b, groups * rank], "bench out").unwrap();
+                let arena = BatchedGroupedOutputArena::new(&device, b, groups, gw, rank).unwrap();
+                let t = time_op(&mut ctx, |s, r, d, rep| {
+                    let w = RawMatrixRef {
+                        buffer: &weights[rep % weights.len()],
+                        ggml_type: GgmlType::Q8_0,
+                        shape: &shape,
+                    };
+                    grouped_output_a_batched(
+                        s, r, d, &x, &w, &y, &arena, b, groups, rank, heads, head_dim,
+                    )
+                });
+                out.cell(
+                    &json!({"family": "dense_q8_0", "op": "attn_output_a_grouped", "n": groups * rank,
+                            "k": gw, "b": b, "mode": "batched", "warm": warm, "copies": weights.len(),
+                            "weight_bytes": bytes}),
+                    json!({"gbps": bytes as f64 / t.us / 1e3}),
+                    &t,
+                );
+            }
         }
     }
 
@@ -265,42 +232,49 @@ fn ds4_op_microbench() {
     ];
     for (name, n, k) in f16_rows {
         let bytes = n * k * 2;
-        let copies = copies_for(bytes, false);
-        let weights: Vec<MlxBuffer> = (0..copies)
-            .map(|c| f16_weight(&device, n, k, 200 + c as u64))
+        let all: Vec<MlxBuffer> = (0..copies_for(bytes, false))
+            .map(|c| f16_matrix(&device, n, k, 200 + c as u64))
             .collect();
         let shape = [n, k];
-        for b in 1..=4usize {
-            let x = input(&device, vec![b, k], 11);
-            let y = alloc(&device, DType::F32, vec![b, n], "bench out").unwrap();
-            let secs = time_op(&mut ctx, |s, r, d, rep| {
-                let w = RawMatrixRef {
-                    buffer: &weights[rep % copies],
-                    ggml_type: GgmlType::F16,
-                    shape: &shape,
-                };
-                row_matmul(
-                    RowMatmul::IndependentRows,
-                    s,
-                    r,
-                    d,
-                    &x,
-                    &w,
-                    &y,
-                    b,
-                    n,
-                    k,
-                    name,
-                )
-                .unwrap();
-            });
-            out.cell(json!({"family": "f16_row", "op": name, "n": n, "k": k, "b": b, "mode": "independent_rows",
-                            "warm": false, "us": secs * 1e6, "weight_bytes": bytes,
-                            "gbps": (bytes * b) as f64 / secs / 1e9}));
+        for warm in [false, true] {
+            let weights = &all[..copies_for(bytes, warm)];
+            for b in 1..=4usize {
+                let x = input(&device, vec![b, k], 11);
+                let y = alloc(&device, DType::F32, vec![b, n], "bench out").unwrap();
+                let t = time_op(&mut ctx, |s, r, d, rep| {
+                    let w = RawMatrixRef {
+                        buffer: &weights[rep % weights.len()],
+                        ggml_type: GgmlType::F16,
+                        shape: &shape,
+                    };
+                    row_matmul(
+                        RowMatmul::IndependentRows,
+                        s,
+                        r,
+                        d,
+                        &x,
+                        &w,
+                        &y,
+                        b,
+                        n,
+                        k,
+                        name,
+                    )
+                });
+                out.cell(
+                    &json!({"family": "f16_row", "op": name, "n": n, "k": k, "b": b,
+                            "mode": "independent_rows", "warm": warm, "copies": weights.len(),
+                            "weight_bytes": bytes}),
+                    json!({"gbps": (bytes * b) as f64 / t.us / 1e3}),
+                    &t,
+                );
+            }
         }
     }
 
     // ── routed experts, forced mv_id as joint decode issues them (gate/up: n_tokens = B, top-6; down: 6B rows) ──
+    // Warm: one fixed expert set per token (re-read every copy). Cold: rotate over distinct random expert sets
+    // until the experts read per session exceed COLD_BYTES.
     let experts: [(&str, GgmlType, usize, usize, bool); 2] = [
         (
             "expert_gate_or_up_iq2_xxs",
@@ -314,57 +288,52 @@ fn ds4_op_microbench() {
     for (name, ty, n, k, broadcast) in experts {
         let w = block_weight(&device, ty, vec![256, n, k], 300);
         let shape = [256usize, n, k];
+        let expert_bytes = n * k / ty.block_values() as usize * ty.block_bytes() as usize;
         for b in 1..=4usize {
-            let mut ids = alloc(&device, DType::U32, vec![b * 6], "bench ids").unwrap();
-            let mut rng = Rng(b as u64);
-            let idv = ids.as_mut_slice::<u32>().unwrap();
-            for t in 0..b {
-                let mut chosen = Vec::new();
-                while chosen.len() < 6 {
-                    let e = (rng.next() % 256) as u32;
-                    if !chosen.contains(&e) {
-                        chosen.push(e);
-                    }
-                }
-                idv[t * 6..t * 6 + 6].copy_from_slice(&chosen);
-            }
+            let per_copy = expert_bytes * b * 6;
+            let all: Vec<MlxBuffer> = (0..copies_for(per_copy, false))
+                .map(|c| expert_ids(&device, b, 6, (b * MIN_REPS + c) as u64))
+                .collect();
             let (n_tokens, top_k, x) = if broadcast {
                 (b, 6usize, input(&device, vec![b, k], 13))
             } else {
                 (b * 6, 1usize, input(&device, vec![b * 6, k], 13))
             };
             let y = alloc(&device, DType::F32, vec![b * 6, n], "bench out").unwrap();
-            let secs = time_op(&mut ctx, |s, r, d, _| {
-                let wr = RawMatrixRef {
-                    buffer: &w,
-                    ggml_type: ty,
-                    shape: &shape,
-                };
-                expert_matmul(
-                    s,
-                    r,
-                    d,
-                    &x,
-                    &wr,
-                    &ids,
-                    &y,
-                    n_tokens,
-                    top_k,
-                    256,
-                    n,
-                    k,
-                    ExpertMatmulRoute::ForceMv,
-                    None,
-                    name,
-                )
-                .unwrap();
-            });
-            let expert_bytes = n * k / 256 * ty.block_bytes() as usize;
-            out.cell(
-                json!({"family": "expert_mv_id", "op": name, "n": n, "k": k, "b": b, "rows": b * 6,
-                            "mode": "force_mv", "warm": false, "us": secs * 1e6,
-                            "weight_bytes_read_max": expert_bytes * b * 6}),
-            );
+            for warm in [false, true] {
+                let ids = &all[..copies_for(per_copy, warm)];
+                let t = time_op(&mut ctx, |s, r, d, rep| {
+                    let wr = RawMatrixRef {
+                        buffer: &w,
+                        ggml_type: ty,
+                        shape: &shape,
+                    };
+                    expert_matmul(
+                        s,
+                        r,
+                        d,
+                        &x,
+                        &wr,
+                        &ids[rep % ids.len()],
+                        &y,
+                        n_tokens,
+                        top_k,
+                        256,
+                        n,
+                        k,
+                        ExpertMatmulRoute::ForceMv,
+                        None,
+                        name,
+                    )
+                });
+                out.cell(
+                    &json!({"family": "expert_mv_id", "op": name, "n": n, "k": k, "b": b, "rows": b * 6,
+                            "mode": "force_mv", "warm": warm, "copies": ids.len(),
+                            "weight_bytes_read_max": per_copy, "cold_bytes": COLD_BYTES}),
+                    json!({}),
+                    &t,
+                );
+            }
         }
     }
     eprintln!("cells: {out_path}");
