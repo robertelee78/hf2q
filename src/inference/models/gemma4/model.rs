@@ -653,7 +653,7 @@ pub struct MlxModelWeights {
     /// stable cue and installed long-prompt lanes).
     /// Resolved once at load from `HF2Q_GEMMA_WARM_TILED_ATTENTION` (default
     /// [`GemmaLiveKernel::VecHybrid`]; `1` opts in to
-    /// [`GemmaLiveKernel::TiledF16`]).
+    /// [`GemmaLiveKernel::TiledF16`], `tensor` to [`GemmaLiveKernel::TensorF16`]).
     pub warm_live_kernel: GemmaLiveKernel,
 
     /// ADR-063 Q4-GEMMA-PREFILL-MOE — shape of the prefill MoE down call
@@ -718,6 +718,9 @@ pub enum GemmaLiveKernel {
     /// `flash_attn_vec_hybrid_batched`: one decode-style threadgroup per
     /// (query, head) over F16 K and TQ-HB V.
     VecHybrid,
+    /// ADR-063 gap program F1: mlx-native's tensor-API flash attention over
+    /// compacted K and dequantized V (`HF2Q_GEMMA_WARM_TILED_ATTENTION=tensor`).
+    TensorF16,
 }
 
 impl GemmaLiveKernel {
@@ -726,6 +729,7 @@ impl GemmaLiveKernel {
         match self {
             Self::TiledF16 => "TiledF16",
             Self::VecHybrid => "VecHybrid",
+            Self::TensorF16 => "TensorF16",
         }
     }
 }

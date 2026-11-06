@@ -96,10 +96,11 @@
 #                                    HF2Q_GEMMA_JOINT_COLD_PREFILL; unset
 #                                    keeps the hf2q default (on). 0 is the
 #                                    A/B kill switch (per-slot cold turn 0).
-#     WARM_TILED_ATTENTION=0|1       (this script) forwards
+#     WARM_TILED_ATTENTION=0|1|tensor (this script) forwards
 #                                    HF2Q_GEMMA_WARM_TILED_ATTENTION; unset
 #                                    keeps the hf2q default (off, vec-hybrid
-#                                    warm attention). 1 opts in to tiled F16.
+#                                    warm attention). 1 opts in to tiled F16,
+#                                    tensor to the tensor-API route (gap F1).
 #     PREFILL_MOE_DOWN=flat|slotted  (this script) forwards
 #                                    HF2Q_GEMMA_PREFILL_MOE_DOWN; unset
 #                                    keeps the hf2q default (slotted). flat
@@ -240,9 +241,9 @@ esac
 WARM_TILED_ENV=""
 case "${WARM_TILED_ATTENTION:-}" in
     "") ;;
-    0|1) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;
+    0|1|tensor) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;
     *)
-        echo "WARM_TILED_ATTENTION must be 0, 1 or unset" >&2
+        echo "WARM_TILED_ATTENTION must be 0, 1, tensor or unset" >&2
         exit 2
         ;;
 esac
