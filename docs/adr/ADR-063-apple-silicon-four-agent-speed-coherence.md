@@ -1096,6 +1096,32 @@ Result (2026-11-06, M5 Max 128 GB, PR #677; evidence `~/.local/state/hf2q/v0130/
 - **Validation.** The traced run was reviewed independently (Review677, ACCEPT on acceptance item 5).
 - **Attribution.** The per-phase and per-pipeline attribution of T1 for Q4-QWEN38 and the gap program is recorded as `analysis/attribution-T1.json` (`q4_trace_attribution.py`). The phase trace carries no per-kernel or per-command GPU time.
 
+### Q4-TRACE-GPU-TIMING. Per-command GPU timestamps in the diagnostic phase trace
+
+Outcome: A traced four-agent run attributes GPU time to each native command, so each joint-decode layer chain, each prefill command and the bubbles between them have a measured GPU duration. The Q4-TRACE attribution could only split a joint step into host encode (about 7 ms) and an unattributed completion tail (about 79 ms).
+
+Requirement: The program MUST record mlx-native's per-command GPU timing stream in the diagnostic phase trace behind an explicit opt-in. It MUST validate the stream fail closed, and MUST attribute GPU time per joint chain and per phase without assuming a clock mapping or a command layout.
+
+Acceptance:
+
+- With `native_observer.gpu_timestamps` absent, configs, headers, traces and reports are byte-identical to today. The flag is accepted only for a diagnostic case, and an explicit `false` is refused.
+- Timing events travel in the same ordered queue as native events. The reducer checks their streaming order: after a status-4 drain and before `Dropped`, exactly one per command. It also checks a closed schema with reason-to-cause rules, and clock-free duration bounds (per command against its host submit-to-drain bracket, per epoch against the host span).
+- Chains are mapped to layers from a published `joint_chain_plan` derived from the code's chain plan. An epoch whose command count or dispatch signature does not match is refused for per-chain attribution, never mapped silently.
+- G2 passes: on a fixed schedule, with the stream installed, joint forwards are bitwise equal armed vs unarmed. On one new binary, a traced n4 run with the flag on is `ExactTranscripts` against the same binary with it off. The timing-event and trace-byte deltas are stated.
+- `q4_trace_attribution.py` reports per-chain GPU time by logical width, GPU bubbles, and prefill GPU time. It is handed to the Qwen op-parity lead. Per-kernel time stays out of scope.
+
+Design: `docs/research/adr063-q4-trace-gpu-timing-design.md` (revision 3). Main records the design approval on the story issue on Review677's ACCEPT, per Main's instruction of 2026-11-06. If operator approval is required, the approval event names the operator.
+
+Repository ownership: mlx-native already owns the timing stream (0.16.0, no change). hf2q owns the opt-in, sink, records, reducer and attribution.
+
+Validation: Independent review of the traced run (T1g) and of the G2 result. Correctness runs only, per the operator's 2026-11-06 no-speed-test directive.
+
+Predecessors: Q4-TRACE.
+
+Priority: High. It serves the gap program's attribution (Q4-QWEN38 and the Qwen op-parity work).
+
+Delivery boundary: Qualified implementation merged to main for v0.1.30.
+
 ### Q1-DS4. Capture DeepSeek-V4 Q1 endpoints on this 128 GB Mac (#549)
 
 Outcome: The deferred DeepSeek-V4 Q1 numerical endpoints run on the M5 Max 128 GB under a measured, reviewed resource policy.
