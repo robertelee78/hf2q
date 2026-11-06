@@ -33,7 +33,7 @@ One scheduler turn advances every eligible decoding slot (2–4 rows by default)
   - Each lane commits through its serial tick's own commit code (`finish_joint_tick`).
   - Settlement (emit, progress, retained prefix, finish, cancel recovery, error reset) is `settle_qwen35_decode_lane`, extracted from `decode_batch_qwen35` and shared by both paths.
 - **Configuration.**
-  - The switch and width are read once at worker start. Unset means the per-family default: dense on, MoE off.
+  - The switch and width are read once at worker start. Unset means on for every Qwen artifact that has a joint route (dense and MoE).
   - The worker logs `requested`, `explicit`, `moe`, `max_rows`, `selected`, `mode` and the `unavailable` reason.
   - Every turn re-checks the process routing policy. A turn whose policy no longer satisfies the worker's mode runs serially (logged once); a later turn that satisfies it again runs jointly.
 
@@ -334,7 +334,7 @@ pre-registered before any run. Evidence is under `~/.local/state/hf2q/v0130/q4-q
 `RESULT.txt`, `PREREG-fork.md`, `RESULT-fork.txt`).
 
 - **Binary.** One release binary, origin/main `0d79b965` on rustc 1.99.1 (sha256 `d200b032…`), GGUF `815a22ca…`. The arms
-  differ only in `HF2Q_QWEN_JOINT_DECODE` (unset = serial, `1` = joint). Every run's server log shows the mode of its
+  differ only in `HF2Q_QWEN_JOINT_DECODE` (unset = serial at `0d79b965`, `1` = joint). Every run's server log shows the mode of its
   arm (`selected=true mode="exact"` for joint).
 - **Task quality.** A 24-instance paired repair-turn campaign, joint vs serial:
   - verdict **Pass**: joint 19/24, serial 22/24, 4 joint-only and 1 serial-only failures, one-sided p 0.19;

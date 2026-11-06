@@ -55,7 +55,7 @@ pub(super) struct Qwen35JointDecodeConfig {
     pub dense_ffn: JointDenseFfnRoute,
 }
 
-/// `Ok(None)` when unset, so the caller applies the per-family default.
+/// `Ok(None)` when unset, so the caller applies the default (on).
 fn parse_qwen_joint_decode(raw: Option<&str>) -> Result<Option<bool>, String> {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
         return Ok(None);
