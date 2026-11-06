@@ -64,6 +64,8 @@ mod cooperative_fault;
 #[cfg(test)]
 mod ds4_attn_microbench_tests;
 #[cfg(test)]
+mod ds4_batch_probe_tests;
+#[cfg(test)]
 mod ds4_bench_support;
 #[cfg(test)]
 mod ds4_file_kernel_parity_tests;
