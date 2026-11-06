@@ -20881,6 +20881,7 @@ fn decode_batch_qwen35(
         },
         None => None,
     };
+    let turn_lanes = handles.len();
     let handles = serial_handles.as_deref().unwrap_or(handles);
     for &handle in handles {
         let slot_idx = handle.slot_id.0 as usize;
@@ -20952,6 +20953,18 @@ fn decode_batch_qwen35(
             continue;
         }
 
+        // The tick's single route decision (planned before the joint partition
+        // under the repeatable route, here otherwise), witnessed for the
+        // repeatability gates.
+        let kind = state.plan_tick().map_or("unplanned", |kind| kind.label());
+        tracing::debug!(
+            target: "hf2q::serve::api::engine_qwen35::progress",
+            slot = handle.slot_id.0,
+            kind,
+            path = "serial",
+            turn_lanes,
+            "Qwen decode tick route"
+        );
         let _native_invocation =
             scheduler.trace_transaction("qwen35", "ordinary_or_temporal_mtp_decode", &[handle]);
         let tick = state.decode_tick(

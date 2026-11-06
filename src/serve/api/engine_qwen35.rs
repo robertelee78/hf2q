@@ -4472,6 +4472,37 @@ pub(crate) struct Qwen35DecodeState {
     /// History lookup has negligible proposal cost, but its block target
     /// verifier can still lose on a particular model/device.
     history_cost: SpeculationCostController,
+    /// Routing and cost-gate mode captured at admission.
+    route: super::qwen35_speculation::QwenSpeculationRoute,
+    /// This turn's decision, planned before the joint partition and executed
+    /// by the joint step (Ordinary) or the serial loop (every kind).
+    planned_tick: Option<Qwen35TickKind>,
+}
+
+/// Route of one decode tick, decided from the request's own state by
+/// [`Qwen35DecodeState::next_tick_kind`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Qwen35TickKind {
+    /// Drain one already verified output token; no forward.
+    Commit,
+    /// A history-lookup verify round over these drafts.
+    History(Vec<u32>),
+    /// A fixed-depth-three MTP round.
+    K3,
+    /// One ordinary target decision (plus MTP catch-up when MTP state is
+    /// held): the only kind a joint step serves under the repeatable route.
+    Ordinary,
+}
+
+impl Qwen35TickKind {
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::History(_) => "history",
+            Self::K3 => "k3",
+            Self::Ordinary => "ordinary",
+        }
+    }
 }
 
 struct Qwen35SlotMtpState {
@@ -4503,8 +4534,14 @@ mod speculation_qualification_tests;
 #[path = "engine_qwen35/speculation_real_artifact_tests.rs"]
 mod speculation_real_artifact_tests;
 #[cfg(test)]
+#[path = "engine_qwen35/round_slot_independence_tests.rs"]
+mod round_slot_independence_tests;
+#[cfg(test)]
 #[path = "engine_qwen35/text_decode_tests.rs"]
 mod text_decode_tests;
+#[cfg(test)]
+#[path = "engine_qwen35/tick_route_tests.rs"]
+mod tick_route_tests;
 
 const QWEN35_REPETITION_WINDOW: usize = 64;
 
@@ -5098,6 +5135,8 @@ impl Qwen35DecodeState {
         } else {
             None
         };
+        // Repeatable route: fixed-cost proposer gates; adaptive: wall time.
+        let cost_model = qwen.speculation.cost_model();
 
         Ok(Self {
             slot_id,
@@ -5128,8 +5167,14 @@ impl Qwen35DecodeState {
             history_lookup,
             pending_speculation_output: VecDeque::new(),
             terminal_after_pending: false,
-            mtp_cost: SpeculationCostController::new(),
-            history_cost: SpeculationCostController::new(),
+            mtp_cost: cost_model.map_or_else(SpeculationCostController::new, |model| {
+                SpeculationCostController::modelled(model.mtp_round)
+            }),
+            history_cost: cost_model.map_or_else(SpeculationCostController::new, |model| {
+                SpeculationCostController::modelled(model.history_round)
+            }),
+            route: qwen.speculation.route(),
+            planned_tick: None,
         })
     }
 
@@ -5260,15 +5305,107 @@ impl Qwen35DecodeState {
                 finished: true,
             });
         }
-        if let Some(token) = take_pending_speculation_output(&mut self.pending_speculation_output) {
-            return self.commit_speculation_output(qwen, token);
+        let kind = match self.planned_tick.take() {
+            Some(kind) => kind,
+            None => self.next_tick_kind()?,
+        };
+        match kind {
+            Qwen35TickKind::Commit => {
+                let token = take_pending_speculation_output(&mut self.pending_speculation_output)
+                    .context("Qwen commit tick without pending verified output")?;
+                self.commit_speculation_output(qwen, token)
+            }
+            Qwen35TickKind::History(drafts) => {
+                self.history_round(qwen, kv_cache, supervisor, drafts)
+            }
+            Qwen35TickKind::K3 => self.mtp_k3_round(qwen, kv_cache, supervisor),
+            Qwen35TickKind::Ordinary if self.mtp.is_some() => {
+                self.decode_tick_mtp_warmup(qwen, kv_cache, supervisor)
+            }
+            Qwen35TickKind::Ordinary => self.ordinary_target_tick(qwen, kv_cache, supervisor),
         }
-        if self.history_lookup.is_some() {
-            return self.decode_tick_history_lookup(qwen, kv_cache, supervisor);
+    }
+
+    /// The single decision point for a tick's route (the repeatable route's
+    /// contract): it reads only this request's own state (pending verified
+    /// output, proposer ledgers, step bound and proposer cost gates) and never
+    /// the cohort or wall time, apart from the gates' measured inputs under
+    /// `HF2Q_QWEN_SPECULATION_ROUTE=adaptive`. Mutates only what the former
+    /// tick did before choosing: the history ledger sync, the no-match
+    /// counter and the permanent MTP drop after a cost-disabled history miss.
+    pub(in crate::serve::api) fn next_tick_kind(&mut self) -> Result<Qwen35TickKind> {
+        if !self.pending_speculation_output.is_empty() {
+            return Ok(Qwen35TickKind::Commit);
         }
-        if self.mtp.is_some() {
-            return self.decode_tick_mtp_k3(qwen, kv_cache, supervisor);
+        let remaining = self.max_tokens.saturating_sub(self.generated_tokens.len());
+        if let Some(lookup) = self.history_lookup.as_mut() {
+            if self.history_cost.may_speculate() {
+                let expected_len = self.prompt_tokens.len() + self.generated_tokens.len();
+                if lookup.verified_len() < expected_len {
+                    let generated_cursor = lookup
+                        .verified_len()
+                        .checked_sub(self.prompt_tokens.len())
+                        .context("Qwen history lookup precedes prompt boundary")?;
+                    lookup.extend_verified(&self.generated_tokens[generated_cursor..]);
+                }
+                anyhow::ensure!(
+                    lookup.verified_len() == expected_len,
+                    "Qwen history lookup ledger cursor mismatch"
+                );
+                let mut drafts = lookup.propose();
+                drafts.truncate(remaining.saturating_sub(1).min(3));
+                if !drafts.is_empty() {
+                    return Ok(Qwen35TickKind::History(drafts));
+                }
+                super::qwen35_speculation::record_history_lookup_no_match();
+                if self.mtp.is_some() && !may_route_history_miss_to_mtp(true, &self.mtp_cost) {
+                    // Once MTP is cost-disabled, ordinary target decode may
+                    // advance without reconciling its cache. Drop the semantic
+                    // state permanently rather than restore a lagging proposer.
+                    self.mtp = None;
+                }
+            }
         }
+        if self.mtp.is_some() && remaining >= K3_VERIFY_ROWS && self.mtp_cost.may_speculate() {
+            return Ok(Qwen35TickKind::K3);
+        }
+        Ok(Qwen35TickKind::Ordinary)
+    }
+
+    /// Plan this tick before a decode turn partitions its lanes, so the joint
+    /// partition and the serial loop execute the same decision. Returns the
+    /// planned kind for the partition's eligibility.
+    pub(in crate::serve::api) fn plan_tick(&mut self) -> Result<&Qwen35TickKind> {
+        if self.planned_tick.is_none() {
+            self.planned_tick = Some(self.next_tick_kind()?);
+        }
+        Ok(self.planned_tick.as_ref().expect("planned tick set above"))
+    }
+
+    /// The planned kind, if this turn planned one.
+    pub(in crate::serve::api) fn planned_tick(&self) -> Option<&Qwen35TickKind> {
+        self.planned_tick.as_ref()
+    }
+
+    /// Discard a plan that a joint step consumed (its ordinary row ran there).
+    pub(in crate::serve::api) fn consume_planned_tick(&mut self) {
+        self.planned_tick = None;
+    }
+
+    /// The speculation route this request was admitted with.
+    pub(in crate::serve::api) fn speculation_route(
+        &self,
+    ) -> super::qwen35_speculation::QwenSpeculationRoute {
+        self.route
+    }
+
+    /// One ordinary target decision without MTP state.
+    fn ordinary_target_tick(
+        &mut self,
+        qwen: &mut Qwen35LoadedModel,
+        kv_cache: &mut HybridKvCache,
+        supervisor: &EngineSupervisor,
+    ) -> Result<Qwen35TickOutcome> {
         let ordinary_target_started = Instant::now();
         let pos = self.decode_position_base + self.step - 1;
         let pos_i32 = pos as i32;
@@ -5439,69 +5576,18 @@ impl Qwen35DecodeState {
         })
     }
 
-    /// Target-verified request-history speculation. The lookup may return up
-    /// to three continuation tokens; one target batch verifies the block and,
-    /// when MTP is available, reconciles that same batch into its K/V cache so
-    /// proposer selection can change on the next round without state drift.
-    fn decode_tick_history_lookup(
+    /// Target-verified request-history speculation over `drafts` (one to
+    /// three continuation tokens chosen by [`Self::next_tick_kind`]); one
+    /// target batch verifies the block and, when MTP is available, reconciles
+    /// that same batch into its K/V cache so proposer selection can change on
+    /// the next round without state drift.
+    fn history_round(
         &mut self,
         qwen: &mut Qwen35LoadedModel,
         kv_cache: &mut HybridKvCache,
         supervisor: &EngineSupervisor,
+        drafts: Vec<u32>,
     ) -> Result<Qwen35TickOutcome> {
-        if let Some(token) = take_pending_speculation_output(&mut self.pending_speculation_output) {
-            return self.commit_speculation_output(qwen, token);
-        }
-        if !self.history_cost.may_speculate() {
-            let lookup = self
-                .history_lookup
-                .take()
-                .expect("history lookup checked above");
-            let outcome = self.decode_tick(qwen, kv_cache, supervisor);
-            self.history_lookup = Some(lookup);
-            return outcome;
-        }
-
-        let expected_len = self.prompt_tokens.len() + self.generated_tokens.len();
-        let lookup = self
-            .history_lookup
-            .as_mut()
-            .expect("history lookup checked above");
-        if lookup.verified_len() < expected_len {
-            let generated_cursor = lookup
-                .verified_len()
-                .checked_sub(self.prompt_tokens.len())
-                .context("Qwen history lookup precedes prompt boundary")?;
-            lookup.extend_verified(&self.generated_tokens[generated_cursor..]);
-        }
-        anyhow::ensure!(
-            lookup.verified_len() == expected_len,
-            "Qwen history lookup ledger cursor mismatch"
-        );
-        let remaining = self.max_tokens.saturating_sub(self.generated_tokens.len());
-        let mut drafts = lookup.propose();
-        drafts.truncate(remaining.saturating_sub(1).min(3));
-        if drafts.is_empty() {
-            super::qwen35_speculation::record_history_lookup_no_match();
-            let mut lookup = self
-                .history_lookup
-                .take()
-                .expect("history lookup checked above");
-            if self.mtp.is_some() && !may_route_history_miss_to_mtp(true, &self.mtp_cost) {
-                // Once MTP is cost-disabled, ordinary target decode may
-                // advance without reconciling its cache. Drop the semantic
-                // state permanently rather than restore a lagging proposer.
-                self.mtp = None;
-            }
-            let committed_before = self.generated_tokens.len();
-            let outcome = self.decode_tick(qwen, kv_cache, supervisor);
-            if self.generated_tokens.len() > committed_before {
-                lookup.extend_verified(&self.generated_tokens[committed_before..]);
-            }
-            self.history_lookup = Some(lookup);
-            return outcome;
-        }
-
         let round_started = Instant::now();
         let next_token = *self
             .generated_tokens
@@ -5762,22 +5848,15 @@ impl Qwen35DecodeState {
     /// Partial rejection commits the valid prefix directly from captured
     /// target state; no ordinary replay is required.
     /// The transaction units live in `k3_transaction` (ADR-065 J1); this
-    /// wrapper keeps the solo-only policy: warm-up fallback, phase profile,
-    /// proposer timing and the cost controller.
-    fn decode_tick_mtp_k3(
+    /// wrapper keeps the solo-only policy: phase profile, proposer timing and
+    /// the cost controller. [`Self::next_tick_kind`] admits it (MTP state, at
+    /// least four output tokens remaining, the MTP gate open).
+    pub(in crate::serve::api) fn mtp_k3_round(
         &mut self,
         qwen: &mut Qwen35LoadedModel,
         kv_cache: &mut HybridKvCache,
         supervisor: &EngineSupervisor,
     ) -> Result<Qwen35TickOutcome> {
-        if let Some(token) = take_pending_speculation_output(&mut self.pending_speculation_output) {
-            return self.commit_speculation_output(qwen, token);
-        }
-        let remaining = self.max_tokens.saturating_sub(self.generated_tokens.len());
-        if remaining < K3_VERIFY_ROWS || !self.mtp_cost.may_speculate() {
-            return self.decode_tick_mtp_warmup(qwen, kv_cache, supervisor);
-        }
-
         let round_started = Instant::now();
         let phase_profile = std::env::var("HF2Q_MTP_PHASE_PROFILE").as_deref() == Ok("1");
         let entry = self.k3_entry(kv_cache)?;

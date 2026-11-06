@@ -11,10 +11,9 @@ use std::time::Duration;
 /// Server policy selected with `HF2Q_QWEN_SPECULATION`.
 ///
 /// An explicit `off`/`auto` always wins. When the variable is unset the
-/// default depends on the worker ([`default_server_policy`]): `off` for a
-/// dense artifact on a SlotAware worker that selected joint decode and has
-/// at least [`UNSET_OFF_MIN_SLOTS`] slots, where ADR-063 D1 measured a
-/// four-agent makespan loss for `auto` (Qwen3.8); `auto` everywhere else
+/// default depends on the worker ([`default_server_policy`]): `off` on a
+/// SlotAware worker that selected joint decode and has at least
+/// [`UNSET_OFF_MIN_SLOTS`] slots (dense and MoE), `auto` everywhere else
 /// (ADR-044, updated 2026-08-21: every admission path fails closed, so the
 /// worst case is ordinary decode plus telemetry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,35 +23,111 @@ pub enum QwenSpeculationPolicy {
 }
 
 /// Narrowest SlotAware width at which an unset policy resolves to `off` for
-/// dense joint-decode workers. ADR-063 D1 (#364): at four slots, Qwen3.8
-/// `auto` vs `off` own-output makespan ratio 1.020 (95% CI 1.0095-1.0308,
-/// 8 adjacent ABBA pairs, every pair slower under `auto`; receipts
-/// `adr063-preflight-20261023/d1-speculation-ext-v2`).
+/// joint-decode workers. Dense (Qwen3.8): ADR-063 D1 (#364) measured `auto`
+/// vs `off` own-output makespan 1.020 at four slots (95% CI 1.0095-1.0308,
+/// 8 ABBA pairs; `adr063-preflight-20261023/d1-speculation-ext-v2`). MoE
+/// (Qwen3.6): operator ruling 2026-11-06 for repeatable four-agent serving,
+/// supported by #719 (joint vs serial makespan 0.800 with speculation at its
+/// default in both arms, i.e. per-slot serial K3 at N4 cost about 25% against
+/// mostly-joint M1 rows). D1's Qwen3.6 result is Inconclusive and was
+/// measured with joint decode off, so it is not the evidence for MoE.
 pub const UNSET_OFF_MIN_SLOTS: usize = 4;
 
-/// Unset default for a worker serving `max_slots` slots. Only the measured
-/// configuration defaults `off`: a dense artifact whose worker selected joint
-/// decode (where each MTP-holding lane pays its catch-up inside joint steps)
-/// at [`UNSET_OFF_MIN_SLOTS`] or more slots. SerialFifo, narrower workers,
-/// workers whose joint decode is off or unavailable, and MoE artifacts
-/// (Qwen3.6, not measured as a loss) keep `auto`.
-pub fn default_server_policy(
-    max_slots: usize,
-    moe: bool,
-    joint_decode: bool,
-) -> QwenSpeculationPolicy {
-    if !moe && joint_decode && max_slots >= UNSET_OFF_MIN_SLOTS {
+/// Unset default for a worker serving `max_slots` slots: `off` for a worker
+/// whose joint decode is selected at [`UNSET_OFF_MIN_SLOTS`] or more slots,
+/// `auto` otherwise (SerialFifo, narrower workers, workers whose joint
+/// decode is off or unavailable).
+pub fn default_server_policy(max_slots: usize, joint_decode: bool) -> QwenSpeculationPolicy {
+    if joint_decode && max_slots >= UNSET_OFF_MIN_SLOTS {
         QwenSpeculationPolicy::Off
     } else {
         QwenSpeculationPolicy::Auto
     }
 }
 
-const DENSE_WIDE_DEFAULT_OFF_REASON: &str = "unset: ADR-063 D1 measured a dense four-slot \
-     joint-decode makespan loss for auto (ratio 1.020); set HF2Q_QWEN_SPECULATION=auto to opt in";
-const DEFAULT_AUTO_REASON: &str = "unset: auto default (ADR-044); ADR-063 D1 disables it only \
-     for dense joint-decode workers with max_slots >= 4";
+const JOINT_WIDE_DEFAULT_OFF_REASON: &str = "unset: joint-decode workers with max_slots >= 4 \
+     default off (dense: ADR-063 D1 makespan 1.020; MoE: repeatable four-agent serving, #719); \
+     set HF2Q_QWEN_SPECULATION=auto to opt in";
+const DEFAULT_AUTO_REASON: &str = "unset: auto default (ADR-044); joint-decode workers with \
+     max_slots >= 4 default off";
 const EXPLICIT_REASON: &str = "explicit HF2Q_QWEN_SPECULATION";
+
+/// How a speculating SlotAware lane is routed and gated, selected with
+/// `HF2Q_QWEN_SPECULATION_ROUTE`.
+///
+/// - `Repeatable` (default): each tick's route is decided from the lane's
+///   own state only. A lane whose tick speculates never joins a joint step,
+///   and the proposer cost gates read a fixed cost model
+///   ([`MTP_ROUND_COST_UNITS`], [`HISTORY_ROUND_COST_UNITS`]) instead of
+///   wall time, so identical requests take identical routes in every run.
+/// - `Adaptive`: the phase-1 behaviour. A speculation-capable lane joins any
+///   joint group as an M1 row, and the gates compare measured wall time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QwenSpeculationRoute {
+    Repeatable,
+    Adaptive,
+}
+
+impl QwenSpeculationRoute {
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None => Ok(Self::Repeatable),
+            Some(value) if value.eq_ignore_ascii_case("repeatable") => Ok(Self::Repeatable),
+            Some(value) if value.eq_ignore_ascii_case("adaptive") => Ok(Self::Adaptive),
+            Some(value) => Err(format!(
+                "HF2Q_QWEN_SPECULATION_ROUTE must be repeatable or adaptive (got {value:?})"
+            )),
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Repeatable => "repeatable",
+            Self::Adaptive => "adaptive",
+        }
+    }
+
+    fn from_environment() -> Self {
+        Self::parse(std::env::var("HF2Q_QWEN_SPECULATION_ROUTE").ok().as_deref()).unwrap_or_else(
+            |message| {
+                tracing::warn!(%message, fallback = "repeatable", "invalid Qwen speculation route");
+                Self::Repeatable
+            },
+        )
+    }
+}
+
+/// Modelled cost of one MTP K3 round (draft + four-row verify + catch-up +
+/// commit) in ordinary target decisions. From the cost controllers' own
+/// counters in the ADR-063 D2 H1 receipts (Qwen3.8 27B, binary 38485a23;
+/// `adr063-preflight-20261023/d2-v1/extra-runs/{A/01,A/10,N/01,N/14}-*-H1-*
+/// .metrics/last.prom`): 102 rounds, 8.077 s of round time = 79.2 ms per
+/// round; 21.355 s of equivalent ordinary time over about 339 decisions
+/// (accepted + rounds) = 63.0 ms per ordinary decision; 79.2 / 63.0 = 1.26.
+/// No Qwen3.6 receipt carries these counters; Qwen3.6 uses the same value.
+pub const MTP_ROUND_COST_UNITS: f64 = 1.26;
+
+/// Modelled cost of one history-lookup verify round, one constant for every
+/// row count (aggregate counters cannot split it by rows). Same receipts:
+/// 17 rounds, 1.640 s = 96.5 ms per round; 3.171 s over about 49 decisions
+/// = 64.7 ms per ordinary decision; 96.5 / 64.7 = 1.49.
+pub const HISTORY_ROUND_COST_UNITS: f64 = 1.49;
+
+/// Development-only overrides of the modelled round costs, used by the
+/// repeatability gate to force a cost-disabled proposer. Invalid or
+/// non-positive values warn and keep the default.
+fn modelled_round_cost(env: &str, default: f64) -> f64 {
+    match std::env::var(env) {
+        Ok(raw) => match raw.trim().parse::<f64>() {
+            Ok(value) if value.is_finite() && value > 0.0 => value,
+            _ => {
+                tracing::warn!(variable = env, value = %raw, fallback = default, "invalid Qwen speculation cost override");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
 
 impl QwenSpeculationPolicy {
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
@@ -91,26 +166,23 @@ impl QwenSpeculationPolicy {
 
     /// Server-side resolution for the qwen35 engine: an explicit request
     /// wins; an unset one takes [`default_server_policy`] for a worker of
-    /// `max_slots` slots serving a dense (`!moe`) or MoE artifact, with or
-    /// without joint decode selected. Pure.
+    /// `max_slots` slots, with or without joint decode selected. Pure.
     pub fn resolve_server_policy(
         requested: Option<Self>,
         max_slots: usize,
-        moe: bool,
         joint_decode: bool,
     ) -> Self {
-        requested.unwrap_or_else(|| default_server_policy(max_slots, moe, joint_decode))
+        requested.unwrap_or_else(|| default_server_policy(max_slots, joint_decode))
     }
 
     fn resolution_reason(
         requested: Option<Self>,
         max_slots: usize,
-        moe: bool,
         joint_decode: bool,
     ) -> &'static str {
-        match (requested, default_server_policy(max_slots, moe, joint_decode)) {
+        match (requested, default_server_policy(max_slots, joint_decode)) {
             (Some(_), _) => EXPLICIT_REASON,
-            (None, Self::Off) => DENSE_WIDE_DEFAULT_OFF_REASON,
+            (None, Self::Off) => JOINT_WIDE_DEFAULT_OFF_REASON,
             (None, Self::Auto) => DEFAULT_AUTO_REASON,
         }
     }
@@ -197,6 +269,14 @@ pub fn prefill_mtp_catchup_allowed(
         && !graft_bound
 }
 
+/// Fixed round costs the repeatable route's proposer gates read, in ordinary
+/// target decisions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QwenSpeculationCostModel {
+    pub mtp_round: f64,
+    pub history_round: f64,
+}
+
 /// One-worker controller. It holds no KV tensors and only carries the
 /// current conversation identity plus the previous speculative result.
 #[derive(Debug, Clone)]
@@ -205,44 +285,65 @@ pub struct QwenSpeculationController {
     requested: Option<QwenSpeculationPolicy>,
     /// Policy every admission/prefill/decode consumer reads.
     policy: QwenSpeculationPolicy,
+    /// Routing and cost-gate mode for speculating lanes.
+    route: QwenSpeculationRoute,
+    /// Round costs of the repeatable gates.
+    cost_model: QwenSpeculationCostModel,
     conversation_prompt: Option<Vec<u32>>,
 }
 
 impl QwenSpeculationController {
-    /// Controller with an explicit policy; worker resolution keeps it.
+    /// Controller with an explicit policy and the default (repeatable)
+    /// route; worker resolution keeps both.
     pub fn new(policy: QwenSpeculationPolicy) -> Self {
         Self {
             requested: Some(policy),
             policy,
+            route: QwenSpeculationRoute::Repeatable,
+            cost_model: QwenSpeculationCostModel {
+                mtp_round: MTP_ROUND_COST_UNITS,
+                history_round: HISTORY_ROUND_COST_UNITS,
+            },
             conversation_prompt: None,
         }
     }
 
-    /// Reads `HF2Q_QWEN_SPECULATION` once at engine load. Until a SlotAware
-    /// worker calls [`Self::resolve_for_worker`], the policy is the
-    /// one-slot (SerialFifo) resolution, which is `auto` when unset.
+    /// Reads `HF2Q_QWEN_SPECULATION`, `HF2Q_QWEN_SPECULATION_ROUTE` and the
+    /// development-only cost overrides once at engine load. Until a SlotAware
+    /// worker calls [`Self::resolve_for_worker`], the policy is the one-slot
+    /// (SerialFifo) resolution, which is `auto` when unset.
     pub fn from_environment() -> Self {
         let requested = QwenSpeculationPolicy::requested_from_environment();
         Self {
             requested,
             policy: requested.unwrap_or(QwenSpeculationPolicy::Auto),
+            route: QwenSpeculationRoute::from_environment(),
+            cost_model: QwenSpeculationCostModel {
+                mtp_round: modelled_round_cost("HF2Q_QWEN_SPEC_COST_MTP", MTP_ROUND_COST_UNITS),
+                history_round: modelled_round_cost(
+                    "HF2Q_QWEN_SPEC_COST_HISTORY",
+                    HISTORY_ROUND_COST_UNITS,
+                ),
+            },
             conversation_prompt: None,
         }
     }
 
     /// Resolve the unset default for a SlotAware worker of `max_slots`
-    /// slots once at worker start (ADR-063 D1) and log the decision.
-    /// `joint_decode` is whether the worker selected Qwen joint decode.
+    /// slots once at worker start and log the decision. `joint_decode` is
+    /// whether the worker selected Qwen joint decode; `moe` is logged only.
     pub fn resolve_for_worker(&mut self, max_slots: usize, moe: bool, joint_decode: bool) {
         let requested = self.requested;
         self.policy =
-            QwenSpeculationPolicy::resolve_server_policy(requested, max_slots, moe, joint_decode);
-        let reason =
-            QwenSpeculationPolicy::resolution_reason(requested, max_slots, moe, joint_decode);
+            QwenSpeculationPolicy::resolve_server_policy(requested, max_slots, joint_decode);
+        let reason = QwenSpeculationPolicy::resolution_reason(requested, max_slots, joint_decode);
         tracing::info!(
             target: "hf2q::serve::api::engine_qwen35::progress",
             requested = requested.map_or("unset", QwenSpeculationPolicy::label),
             policy = self.policy.label(),
+            route = self.route.label(),
+            mtp_round_cost = self.cost_model.mtp_round,
+            history_round_cost = self.cost_model.history_round,
             max_slots,
             moe,
             joint_decode,
@@ -253,6 +354,16 @@ impl QwenSpeculationController {
 
     pub fn policy(&self) -> QwenSpeculationPolicy {
         self.policy
+    }
+
+    pub fn route(&self) -> QwenSpeculationRoute {
+        self.route
+    }
+
+    /// The fixed round costs when the route is repeatable; `None` keeps the
+    /// measured (wall-time) gates of the adaptive route.
+    pub fn cost_model(&self) -> Option<QwenSpeculationCostModel> {
+        (self.route == QwenSpeculationRoute::Repeatable).then_some(self.cost_model)
     }
 
     /// Decide the transaction path. A non-extension resets the state before
@@ -515,39 +626,36 @@ mod tests {
         }
     }
 
-    /// ADR-063 D1: unset resolves to `off` only for dense joint-decode
-    /// workers with at least four slots; explicit values always win.
+    /// Unset resolves to `off` for every joint-decode worker with at least
+    /// four slots (dense: ADR-063 D1; MoE: operator ruling 2026-11-06);
+    /// explicit values always win.
     #[test]
     fn server_policy_resolution_table() {
         use QwenSpeculationPolicy::{Auto, Off};
         let invalid = QwenSpeculationPolicy::requested(Some("always"));
-        // (requested, max_slots, moe, joint_decode, expected)
+        // (requested, max_slots, joint_decode, expected)
         let table = [
-            (None, 4, false, true, Off),
-            (None, 8, false, true, Off),
-            (None, 3, false, true, Auto),
-            (None, 1, false, true, Auto),
-            (None, 4, false, false, Auto),
-            (None, 8, false, false, Auto),
-            (None, 4, true, false, Auto),
-            (None, 4, true, true, Auto),
-            (None, 8, true, true, Auto),
-            (None, 1, true, false, Auto),
-            (Some(Auto), 4, false, true, Auto),
-            (Some(Auto), 8, false, true, Auto),
-            (Some(Off), 1, false, false, Off),
-            (Some(Off), 3, false, true, Off),
-            (Some(Off), 4, false, true, Off),
-            (Some(Off), 1, true, false, Off),
-            (Some(Off), 4, true, true, Off),
-            (invalid, 1, true, false, Off),
-            (invalid, 4, false, true, Off),
+            (None, 4, true, Off),
+            (None, 8, true, Off),
+            (None, 3, true, Auto),
+            (None, 2, true, Auto),
+            (None, 1, true, Auto),
+            (None, 4, false, Auto),
+            (None, 8, false, Auto),
+            (None, 1, false, Auto),
+            (Some(Auto), 4, true, Auto),
+            (Some(Auto), 8, true, Auto),
+            (Some(Off), 1, false, Off),
+            (Some(Off), 3, true, Off),
+            (Some(Off), 4, true, Off),
+            (invalid, 1, false, Off),
+            (invalid, 4, true, Off),
         ];
-        for (requested, max_slots, moe, joint, expected) in table {
+        for (requested, max_slots, joint, expected) in table {
             assert_eq!(
-                QwenSpeculationPolicy::resolve_server_policy(requested, max_slots, moe, joint),
+                QwenSpeculationPolicy::resolve_server_policy(requested, max_slots, joint),
                 expected,
-                "requested={requested:?} max_slots={max_slots} moe={moe} joint={joint}"
+                "requested={requested:?} max_slots={max_slots} joint={joint}"
             );
         }
     }
@@ -556,28 +664,60 @@ mod tests {
     fn worker_resolution_replaces_only_the_unset_default() {
         let unset = || QwenSpeculationController {
             requested: None,
-            policy: QwenSpeculationPolicy::Auto,
-            conversation_prompt: None,
+            ..QwenSpeculationController::new(QwenSpeculationPolicy::Auto)
         };
-        let mut dense_joint_four = unset();
-        dense_joint_four.resolve_for_worker(4, false, true);
-        assert_eq!(dense_joint_four.policy(), QwenSpeculationPolicy::Off);
-        let mut dense_serial_four = unset();
-        dense_serial_four.resolve_for_worker(4, false, false);
-        assert_eq!(dense_serial_four.policy(), QwenSpeculationPolicy::Auto);
-        let mut moe_four = unset();
-        moe_four.resolve_for_worker(4, true, false);
-        assert_eq!(moe_four.policy(), QwenSpeculationPolicy::Auto);
-        let mut dense_joint_three = unset();
-        dense_joint_three.resolve_for_worker(3, false, true);
-        assert_eq!(dense_joint_three.policy(), QwenSpeculationPolicy::Auto);
+        for moe in [false, true] {
+            let mut joint_four = unset();
+            joint_four.resolve_for_worker(4, moe, true);
+            assert_eq!(joint_four.policy(), QwenSpeculationPolicy::Off, "moe={moe}");
+            let mut serial_four = unset();
+            serial_four.resolve_for_worker(4, moe, false);
+            assert_eq!(
+                serial_four.policy(),
+                QwenSpeculationPolicy::Auto,
+                "moe={moe}"
+            );
+            let mut joint_three = unset();
+            joint_three.resolve_for_worker(3, moe, true);
+            assert_eq!(
+                joint_three.policy(),
+                QwenSpeculationPolicy::Auto,
+                "moe={moe}"
+            );
+        }
 
         let mut explicit_auto = QwenSpeculationController::new(QwenSpeculationPolicy::Auto);
-        explicit_auto.resolve_for_worker(4, false, true);
+        explicit_auto.resolve_for_worker(4, true, true);
         assert_eq!(explicit_auto.policy(), QwenSpeculationPolicy::Auto);
         let mut explicit_off = QwenSpeculationController::new(QwenSpeculationPolicy::Off);
         explicit_off.resolve_for_worker(1, true, false);
         assert_eq!(explicit_off.policy(), QwenSpeculationPolicy::Off);
+    }
+
+    #[test]
+    fn speculation_route_defaults_repeatable_and_parses_both_arms() {
+        use QwenSpeculationRoute::{Adaptive, Repeatable};
+        assert_eq!(QwenSpeculationRoute::parse(None), Ok(Repeatable));
+        assert_eq!(QwenSpeculationRoute::parse(Some(" ")), Ok(Repeatable));
+        assert_eq!(
+            QwenSpeculationRoute::parse(Some("Repeatable")),
+            Ok(Repeatable)
+        );
+        assert_eq!(QwenSpeculationRoute::parse(Some("adaptive")), Ok(Adaptive));
+        assert!(QwenSpeculationRoute::parse(Some("measured")).is_err());
+        let repeatable = QwenSpeculationController::new(QwenSpeculationPolicy::Auto);
+        assert_eq!(
+            repeatable.cost_model(),
+            Some(QwenSpeculationCostModel {
+                mtp_round: MTP_ROUND_COST_UNITS,
+                history_round: HISTORY_ROUND_COST_UNITS,
+            })
+        );
+        let adaptive = QwenSpeculationController {
+            route: Adaptive,
+            ..QwenSpeculationController::new(QwenSpeculationPolicy::Auto)
+        };
+        assert_eq!(adaptive.cost_model(), None);
     }
 
     #[test]

@@ -131,7 +131,7 @@ pub(super) fn run_lane_until(
                 "real ordinary baseline not measured; no cost override"
             );
             let before = state.generated_tokens.len();
-            let outcome = state.decode_tick_mtp_k3(
+            let outcome = state.mtp_k3_round(
                 lease.model,
                 lease.cache.as_mut().unwrap(),
                 &supervisor,
