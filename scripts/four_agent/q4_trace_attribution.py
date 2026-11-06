@@ -15,10 +15,15 @@ tail (last `Submitted` end -> last `CheckedDrain` end) and epoch span. Per nativ
 shapes it ran, and its first site in a joint forward (command index, dispatch ordinal), which maps it to the
 encode order in `encode_joint_decode` (without the hook, the whole joint epoch's order).
 
-Not observable from this trace: GPU time per kernel or per command. The phase trace records host encode
-instants and each command's commit and checked return; joint layer chains are committed back to back and
-checked together at the end of the forward, so command GPU durations are not separable (the completion
-tail is the GPU work left after encoding). Pipeline names are not recorded either. Read-only, CPU-only.
+Without GPU timing records, GPU time per command is not observable: joint layer chains are committed back
+to back and checked together at the end of the forward (the completion tail is the GPU work left after
+encoding). With the Q4-TRACE-GPU-TIMING opt-in (`native_gpu_timing` records), each epoch also gets its GPU
+busy time (union of command GPU intervals), GPU bubbles (gaps inside its GPU envelope) and per-command GPU
+time, and joint epochs that match the trace's `joint_chain_plan` (command count and per-index dispatch
+signature) get per-chain GPU time with each chain's layer range; any other epoch is counted as
+`chain_map_refused`, never mapped. A commit-to-GPU-start launch time is reported only with both paired host
+clock samples, with its measured bound and its stated assumption. Per-kernel time and pipeline names are
+never in the trace. Read-only, CPU-only.
 """
 import argparse
 import json
@@ -26,6 +31,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from f2_gpu_timing import union_ns
 from q1_decision_policy import nearest_rank
 from q4_trace_verdict import Jsonl, require
 
@@ -52,6 +58,7 @@ class Attribution:
         self.kernels = defaultdict(lambda: {"dispatches": Counter(), "grids": Counter(), "first_joint_site": None})
         self.kinds = Counter()
         self.first_at = self.last_at = None
+        self.plan, self.pairs, self.gpu_seen = None, [], False
 
     def consume(self, record):
         kind, p = record["kind"], record["payload"]
@@ -70,12 +77,23 @@ class Attribution:
             self.ends[p["epoch"]] = (p["scope_watermark"], p["end_monotonic_ns"])
         elif kind == "native_event":
             self.event(p)
+        elif kind == "joint_chain_plan":
+            self.plan = p
+        elif kind == "native_gpu_timing":
+            c = self.commands.get(p["command_id"])
+            available = p["timestamps"].get("Available")
+            if c is not None and available is not None:
+                c["gpu"] = (available["start_seconds"], available["end_seconds"])
+                self.gpu_seen = True
+        elif kind in ("native_arm_ack", "native_final") and "clock_pair" in p:
+            self.pairs.append(p["clock_pair"])
 
     def event(self, p):
         identity, kind = p["command_id"], p["kind"]
         if kind == "Created":
             self.commands[identity] = {"epoch": p["invocation_epoch"], "created": p["begin_monotonic_ns"],
-                                       "dispatches": [], "first_scope": None, "submit_end": None, "drain_end": None}
+                                       "dispatches": [], "first_scope": None, "submit_end": None, "drain_end": None,
+                                       "gpu": None}
             return
         c = self.commands.get(identity)
         if c is None:
@@ -138,6 +156,7 @@ class Attribution:
                     by_part[self.part(epoch, c)].append(c)
                 for part, members in by_part.items():
                     self.span(parts[name][part], members)
+        chains, refused = self.chains()
         total = sum(sum(c["dispatches"].values()) for c in self.kernels.values())
         kernels = []
         for pipeline, k in sorted(self.kernels.items(), key=lambda item: -sum(item[1]["dispatches"].values())):
@@ -148,7 +167,7 @@ class Attribution:
                             "grids": [{"grid": list(g), "threads_per_threadgroup": list(t), "dispatches": n}
                                       for (g, t), n in k["grids"].most_common(3)],
                             "distinct_grids": len(k["grids"]), "first_joint_site": k["first_joint_site"]})
-        return {"schema": "hf2q.q4-trace.attribution.v1",
+        result = {"schema": "hf2q.q4-trace.attribution.v1",
                 "phases": {name: self.render(metrics) for name, metrics in sorted(phases.items())},
                 "joint_forward_settle": {name: {part: self.render(m) for part, m in sorted(by.items())}
                                          for name, by in sorted(parts.items())},
@@ -157,6 +176,62 @@ class Attribution:
                 "records_by_kind": dict(sorted(self.kinds.items())),
                 "not_observed": ["GPU time per kernel or per command (joint layer chains are committed back to "
                                  "back and checked together at the forward's end)", "pipeline names"]}
+        if self.gpu_seen:
+            result["not_observed"] = ["GPU time per kernel (a command buffer is the smallest timed unit)",
+                                      "pipeline names"]
+            result["joint_chains"] = chains
+            result["chain_map_refused"] = refused
+            result["chain_plan"] = self.plan
+            result["launch"] = self.launch()
+        return result
+
+    def chains(self):
+        """Per-chain GPU time of joint epochs that match the published plan; others are refused."""
+        if self.plan is None or not self.gpu_seen:
+            return {}, 0
+        commands, kinds = self.plan["commands"], self.plan["layer_kinds"]
+        signature, refused = {}, 0
+        chains = defaultdict(lambda: defaultdict(list))
+        for epoch, members in self.done.items():
+            info = self.epochs.get(epoch)
+            if info is None or info["operation"] != JOINT:
+                continue
+            ordered = sorted(members, key=lambda c: c["created"])
+            counts = [len(c["dispatches"]) for c in ordered]
+            expected = signature.setdefault(info["width"], counts) if len(ordered) == len(commands) else None
+            if expected != counts or any(c["gpu"] is None for c in ordered):
+                refused += 1
+                continue
+            for label, c in zip(commands, ordered):
+                chains[phase_name(JOINT, info["width"])][label].append(round((c["gpu"][1] - c["gpu"][0]) * 1e9))
+        def layers(label):
+            if not label.startswith("layers"):
+                return None
+            a, b = (int(x) for x in label[label.index("[") + 1:-1].split(","))
+            return {"range": [a, b], "kinds": kinds[a:b]}
+        return ({name: [{"command": label, "layers": layers(label), "gpu_ns": summary(by[label])}
+                        for label in commands if label in by] for name, by in sorted(chains.items())}, refused)
+
+    def launch(self):
+        """Commit end -> GPU start per command, only with both paired host clock samples."""
+        if len(self.pairs) < 2:
+            return {"reported": False, "reason": "needs the arm and final paired host clock samples"}
+        def offset(pair):
+            numer, denom = pair["mach_timebase"]
+            return pair["monotonic_ns"] - pair["mach_absolute_ticks"] * numer // denom
+        first, last = offset(self.pairs[0]), offset(self.pairs[-1])
+        bound = max(pair["read_span_ns"] for pair in self.pairs) + abs(last - first)
+        phases = defaultdict(list)
+        for epoch, members in self.done.items():
+            info = self.epochs.get(epoch)
+            for c in members:
+                if info is not None and c["gpu"] is not None and c["submit_end"] is not None:
+                    gpu_start = round(c["gpu"][0] * 1e9) + first
+                    phases[phase_name(info["operation"], info["width"])].append(gpu_start - c["submit_end"])
+        return {"reported": True, "bound_ns": bound,
+                "assumption": "Metal host seconds are mach_absolute_time x timebase; the bound covers the "
+                              "sample read spans and the monotonic-mach offset drift only",
+                "by_phase": {name: summary(values) for name, values in sorted(phases.items())}}
 
     @staticmethod
     def span(metrics, commands):
@@ -164,6 +239,12 @@ class Attribution:
         submits = [c["submit_end"] for c in commands if c["submit_end"] is not None]
         drains = [c["drain_end"] for c in commands if c["drain_end"] is not None]
         metrics["commands"].append(len(commands))
+        gpu = [(round(c["gpu"][0] * 1e9), round(c["gpu"][1] * 1e9)) for c in commands if c["gpu"] is not None]
+        if gpu:
+            busy = union_ns(gpu)
+            metrics["gpu_busy_ns"].append(busy)
+            metrics["gpu_bubble_ns"].append(max(b for _, b in gpu) - min(a for a, _ in gpu) - busy)
+            metrics["command_gpu_ns"].extend(b - a for a, b in gpu)
         metrics["dispatches"].append(sum(len(c["dispatches"]) for c in commands))
         if submits:
             metrics["encode_span_ns"].append(max(submits) - min(created))

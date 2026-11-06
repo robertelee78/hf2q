@@ -3,6 +3,7 @@
 Opaque auxiliary work is retained in lifecycle/counts, never promoted into
 logical rows. This validates a diagnostic, not an observer-OFF primary cohort.
 """
+import f2_gpu_timing
 
 ROW = {"request_id", "slot_id", "generation", "token_position", "token_count", "phase"}
 EVENT = {"clock_id", "command_id", "invocation_epoch", "queue_identity", "device_registry_id",
@@ -49,8 +50,10 @@ class NativeTrace:
     def __init__(self, header, scenario):
         self.header = header
         config = header["native_observer"]
+        self.gpu = type(config) is dict and config.get("gpu_timestamps") is True
         need(type(config) is dict and set(config) == {"event_limit", "metadata_limit_bytes",
-             "diagnostic_case", "control_nonce", "witness_manifest"} and config["diagnostic_case"] is True,
+             "diagnostic_case", "control_nonce", "witness_manifest"} | ({"gpu_timestamps"} if self.gpu else set())
+             and config["diagnostic_case"] is True,
              "closed separate native diagnostic configuration")
         profile = header.get("metadata_budget_profile")
         need("metadata_budget_profile" not in header or
@@ -86,6 +89,8 @@ class NativeTrace:
         self.joint_transactions = self.joint_witnessed = self.joint_unwitnessed = 0
         self.input_epochs, self.joint_epoch, self.joint_forwards, self.witness_scope = set(), 0, {}, {}
         self.unmapped_by_operation = {JOINT_OPERATION: 0}
+        # Q4-TRACE-GPU-TIMING: per-command GPU timing, only under the explicit opt-in.
+        self.gpu_timing = f2_gpu_timing.GpuTiming() if self.gpu else None
 
     def transaction(self, p):
         """A validated scheduler `transaction` (f2_trace checks its schema and owners)."""
@@ -172,12 +177,15 @@ class NativeTrace:
             self.baseline = p
         elif kind == "native_arm_ack":
             need(self.baseline is not None and self.ack is None and set(p) == {
-                 "nonce", "clock_id", "worker_queue_checked", "quiescent", "baseline", "scope"} and
+                 "nonce", "clock_id", "worker_queue_checked", "quiescent", "baseline", "scope"} |
+                 ({"clock_pair"} if self.gpu else set()) and
                  p["nonce"] == self.header["native_observer"]["control_nonce"] and
                  p["clock_id"] == "CLOCK_MONOTONIC" and p["worker_queue_checked"] is True and
                  p["quiescent"] is True and p["baseline"] == self.baseline and
                  p["scope"] == "one_fresh_phase_diagnostic", "actual owning-worker arm acknowledgement")
             self.status(p["baseline"])
+            if self.gpu:
+                self.gpu_timing.clock_pair(p["clock_pair"])
             self.ack = record
         elif kind == "scope_definition":
             need(self.ack is not None and set(p) == {"scope", "operation", "membership", "rows"},
@@ -260,7 +268,20 @@ class NativeTrace:
             self.end(record)
         elif kind == "native_event":
             self.event(record)
+        elif kind in ("native_gpu_timing", "joint_chain_plan"):
+            need(self.gpu and self.ack is not None, f"{kind} requires the gpu_timestamps diagnostic")
+            if kind == "joint_chain_plan":
+                self.gpu_timing.joint_chain_plan(p)
+            else:
+                c = self.commands.get(p.get("command_id")) if type(p) is dict else None
+                need(c is not None and not c["dropped"], "GPU timing for an unknown or retired command")
+                self.gpu_timing.timing(p, c)
+                self.events += 1  # mlx-native counts timing events in the same native event total
         elif kind == "native_final":
+            if self.gpu:
+                need(type(p) is dict and "clock_pair" in p, "GPU timing final status needs its clock pair")
+                self.gpu_timing.clock_pair(p["clock_pair"])
+                p = {k: v for k, v in p.items() if k != "clock_pair"}
             self.status(p)
             need(self.baseline is not None and self.ack is not None and
                  p["events"] - self.baseline["events"] == self.events and
@@ -325,6 +346,8 @@ class NativeTrace:
                  "duplicate/late command creation")
             self.commands[identity] = {"created": p, "dispatches": 0, "submit": None, "drain": None,
                                        "dropped": False, "noncompute": 0, "end": p["end_monotonic_ns"]}
+            if self.gpu:
+                self.commands[identity].update(timing=None, queue=p["queue_identity"])
             return
         c = self.commands.get(identity)
         need(c and not c["dropped"] and all(p[name] == c["created"][name] for name in
@@ -391,10 +414,12 @@ class NativeTrace:
                  "observed submitted work dropped without checked completion")
             need(p["submitted"] == bool(c["submit"]) and
                  p["checked_status"] == (4 if c["drain"] else None), "drop status mismatch")
+            if self.gpu:
+                self.gpu_timing.dropped(c)
             c["dropped"] = True
             # Retired: keep only what finish() joins (epoch, work, commit/check instants).
             created = {"invocation_epoch": p["invocation_epoch"]}
-            if self.joint:  # joint forward/settle split: creation instant (first scope kept above)
+            if self.joint or self.gpu:  # joint split / GPU epoch bound: creation instant
                 created["begin_monotonic_ns"] = c["created"]["begin_monotonic_ns"]
             c["created"] = created
             for name in ("submit", "drain"):
@@ -465,6 +490,8 @@ class NativeTrace:
                  "joint forward input without forward_input_end at the end of the trace")
             report[JOINT_OPERATION] = self.joint_report(epochs)
             report["unmapped_by_operation"] = dict(self.unmapped_by_operation)
+        if self.gpu:
+            report["gpu_timing"] = self.gpu_timing.finish(self.commands.values())
         return report
 
     def joint_report(self, epochs):

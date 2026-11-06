@@ -18,7 +18,7 @@ SLOT_KEYS = {"request_id", "slot_id", "generation", "phase", "active",
 ROW_KEYS = {"request_id", "slot_id", "generation", "token_position", "token_count", "phase"}
 NATIVE_KINDS = {"native_baseline", "native_arm_ack", "scope_definition", "forward_input",
                 "forward_witness", "forward_witness_unmapped", "native_event", "native_final",
-                "forward_input_end"}
+                "forward_input_end", "native_gpu_timing", "joint_chain_plan"}
 
 
 def require(ok, why):

@@ -149,6 +149,30 @@ fn joint_chain_n(cfg: &Qwen35Config, layer_weights: &[LayerWeightsGpu]) -> usize
         .unwrap_or_else(|| default_chain_n(cfg, layer_weights))
 }
 
+/// Whether the joint layer chain closes (commits) after `layer_idx`.
+fn closes_chain(layer_idx: usize, chain_n: usize, n_layers: usize) -> bool {
+    (layer_idx + 1) % chain_n == 0 || layer_idx + 1 == n_layers
+}
+
+/// The observed native commands of one joint forward, in commit order: the
+/// embedding gather, one command per closed layer chain, an open-chain flush
+/// (never, while every chain closes at `n_layers`) and the output head.
+fn joint_command_plan(n_layers: usize, chain_n: usize) -> Vec<String> {
+    let mut commands = vec!["embed".to_string()];
+    let mut start = 0;
+    for layer in 0..n_layers {
+        if closes_chain(layer, chain_n, n_layers) {
+            commands.push(format!("layers[{start},{})", layer + 1));
+            start = layer + 1;
+        }
+    }
+    if start < n_layers {
+        commands.push(format!("layers.flush[{start},{n_layers})"));
+    }
+    commands.push("output_head".into());
+    commands
+}
+
 fn host_buffer<T: bytemuck::Pod>(
     device: &MlxDevice,
     dtype: DType,
@@ -362,6 +386,17 @@ impl Qwen35Model {
             "Qwen joint plan covers {} of {n_layers} layers",
             plan.layers.len()
         );
+        crate::inference::native_observation::joint_chain_plan(|| {
+            let kinds: Vec<_> = layer_weights
+                .iter()
+                .map(|weights| match weights {
+                    LayerWeightsGpu::FullAttn { .. } => "full",
+                    LayerWeightsGpu::LinearAttn { .. } => "linear",
+                })
+                .collect();
+            serde_json::json!({"model":"qwen35","n_layers":n_layers,"chain_n":chain_n,
+                "layer_kinds":kinds,"commands":joint_command_plan(n_layers, chain_n)})
+        });
         let mut hidden = embedded;
         let mut retained = Vec::with_capacity(n_layers);
         let mut chain: Option<CommandEncoder> = None;
@@ -509,8 +544,7 @@ impl Qwen35Model {
                     bail!("Qwen joint layer {layer_idx} has no admitted FFN arm")
                 }
             };
-            let last_in_group = (layer_idx + 1) % chain_n == 0 || layer_idx + 1 == n_layers;
-            if last_in_group {
+            if closes_chain(layer_idx, chain_n, n_layers) {
                 chain
                     .take()
                     .expect("joint layer encoder opened above")
@@ -802,5 +836,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn joint_command_plan_follows_the_commit_points() {
+        let plan = joint_command_plan(64, 4);
+        assert_eq!(plan.len(), 18);
+        assert_eq!(plan[0], "embed");
+        assert_eq!(plan[1], "layers[0,4)");
+        assert_eq!(plan[16], "layers[60,64)");
+        assert_eq!(plan[17], "output_head");
+        // A remainder group closes at the last layer; no open-chain flush.
+        assert_eq!(
+            joint_command_plan(10, 4),
+            [
+                "embed",
+                "layers[0,4)",
+                "layers[4,8)",
+                "layers[8,10)",
+                "output_head"
+            ]
+        );
+        assert_eq!(joint_command_plan(3, 1).len(), 5);
+        let closes = (0..10).filter(|&layer| closes_chain(layer, 4, 10)).count();
+        assert_eq!(closes, 3);
     }
 }

@@ -133,7 +133,7 @@ def check_identity(identity, *, binary_sha256, build, template_sha256, model_sha
     return identity
 
 
-def trace_config(out, run_id, identity, nonce):
+def trace_config(out, run_id, identity, nonce, gpu_timestamps=False):
     require(RUN_ID.fullmatch(run_id) is not None, "invalid run id")
     require(32 <= len(nonce) <= 128 and re.fullmatch(r"[A-Za-z0-9_-]+", nonce) is not None, "invalid control nonce")
     return {"schema": "hf2q.f2.phase-trace.v1", "output": str(out / TRACE_NAME), "run_id": run_id,
@@ -141,7 +141,10 @@ def trace_config(out, run_id, identity, nonce):
             "metadata_budget_profile": PROFILE,
             "native_observer": {"event_limit": EVENT_LIMIT, "metadata_limit_bytes": METADATA_LIMIT,
                                 "diagnostic_case": True, "control_nonce": nonce,
-                                "witness_manifest": json.loads(json.dumps(WITNESS))},
+                                "witness_manifest": json.loads(json.dumps(WITNESS)),
+                                # ADR-063 Q4-TRACE-GPU-TIMING: present only when on, so default
+                                # configs (and config_sha256) are unchanged.
+                                **({"gpu_timestamps": True} if gpu_timestamps else {})},
             "identity": dict(identity)}
 
 
@@ -190,6 +193,8 @@ def arm_readback(path, config):
     require(len(acks) == 1 and ack.get("nonce") == config["native_observer"]["control_nonce"]
             and ack.get("worker_queue_checked") is True and ack.get("quiescent") is True,
             "native arm ACK nonce/worker check failed")
+    gpu = config["native_observer"].get("gpu_timestamps") is True
+    require(("clock_pair" in ack) == gpu, "arm ACK clock pair must match the gpu_timestamps opt-in")
     baseline = ack.get("baseline") or {}
     require(baseline.get("pending_commands") == 0 and baseline.get("invalid") is False
             and baseline.get("dropped_events") == 0, "native arm baseline is not clean")
@@ -267,6 +272,8 @@ def parse_args(argv):
     parser.add_argument("--output", required=True, type=Path, help="new run directory outside any Git tree")
     parser.add_argument("--case", type=Path, default=HERE / "q5_cases" / "qwen38.json")
     parser.add_argument("--dry-run", action="store_true", help="check identities and print the plan; launch nothing")
+    parser.add_argument("--gpu-timestamps", action="store_true",
+                        help="record per-command GPU timing (ADR-063 Q4-TRACE-GPU-TIMING); default off")
     args = parser.parse_args(argv)
     for name in ("binary", "build_receipt", "identity", "negative_control_receipt", "output", "case"):
         if not getattr(args, name).is_absolute():
@@ -298,7 +305,7 @@ def prepare(args, environ):
     check_identity(identity, binary_sha256=binary_sha, build=q5.load_json(args.build_receipt),
                    template_sha256=sha256(template), model_sha256=artifact["sha256"],
                    native=native_pin(git_lock(identity["server_source"])))
-    config = trace_config(out, base["RUN_ID"], identity, "q2t_" + secrets.token_hex(24))
+    config = trace_config(out, base["RUN_ID"], identity, "q2t_" + secrets.token_hex(24), args.gpu_timestamps)
     latency = q5_admission.negative_control_latency(q5.load_json(args.negative_control_receipt))
     return {"plan": plan, "values": {**base, **plan["variables"]}, "config": config, "identity": identity,
             "artifact": artifact, "latency_ns": latency, "binary_sha256": binary_sha, "template": template}
