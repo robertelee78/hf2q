@@ -417,7 +417,7 @@ Review677 (2026-11-05) required the repeat to include the observer-only pair T0�
   - T0 has no joint `forward_input`, so its joint epochs are identified by order: the first `scope_definition` after a `joint_ordinary_decode` transaction carries the epoch, as seen for epoch 561 in n4-fix.
   - A small streaming extractor, `scripts/four_agent/q4_trace_overhead.py` with tests, computes both arms with one rule.
 - **Trace-on record delta:** record counts by kind and trace bytes, T1 vs T0. Expected: about −43 records per joint forward (§3.7).
-- **Off-default (O1 vs O0):** makespan and per-token rate from the client receipts, descriptive. The cost is bounded by construction at two atomic loads per joint forward. The claim is "within run-to-run noise", never "zero" unless measured as such.
+- **Off-default (O1 vs O0), waived by the operator on 2026-11-06 (no speed tests; not reported):** makespan and per-token rate from the client receipts, descriptive. The cost is bounded by construction at two atomic loads per joint forward. The claim is "within run-to-run noise", never "zero" unless measured as such.
 - **Total observer cost (T1 vs O1):** reported for E4's distortion statement. It is not part of this story's acceptance.
 
 ## 6. Files touched (hf2q only)

@@ -1087,6 +1087,15 @@ Priority: High. Core scope.
 
 Delivery boundary: Qualified implementation merged to main for v0.1.30.
 
+Result (2026-11-06, M5 Max 128 GB, PR #677; evidence `~/.local/state/hf2q/v0130/q4-trace/`): **Exact; acceptance met.** Binary H `f33f9fa1` (sha256 `ecff6960…`) against its merge-base P `1336f7e0` (`f546d149…`), both built with rustc 1.99.1, on the official Qwen3.8-27B artifact and the n4 case `q5_cases/qwen38.json`.
+- **Witness coverage.** In the traced n4 run T1, every one of the 1,671 joint ordinary decode forwards is witnessed and none is unwitnessed. `unmapped_operator_attempts` is 0. The width mix is 1,472 four-lane, 74 three-lane, 75 two-lane and 50 one-lane steps; the one-lane steps come from the #717 solo route. The parent's traced run T0 recorded 80,352 unmapped attempts.
+- **Exactness.** G1 passes: on a fixed schedule, every width's output is bitwise the same with the hook armed as unarmed. Transcripts are `ExactTranscripts` (28 turn positions) in all five pairs: T1 O1, T0 O0, the determinism control O1 O1′, T1 T0 and O1 O0. The classification under the design's pre-registered rule, as amended before any run with the O1′ determinism control, is `Exact`.
+- **Q2 isolation.** Q2 v2 window outputs on T1 are identical with and without the joint records. All four frozen windows are `Unqualified` in both shapes, so the synthetic isolation control P5 is the test that would catch a leak.
+- **Overhead (trace on).** Per joint epoch the hook adds a median +0.64 ms at four lanes (bootstrap 95% CI 0.34–0.86 ms) on an epoch of about 86 ms, and +1.2 to +2.1 ms at one to three lanes. It cuts about 45 trace records per joint epoch.
+- **Operator waiver (2026-11-06): no speed tests.** The off-default O1 vs O0 makespan comparison of design §5.3 is dropped. The untraced runs serve only the exactness classification.
+- **Validation.** The traced run was reviewed independently (Review677, ACCEPT on acceptance item 5).
+- **Attribution.** The per-phase and per-pipeline attribution of T1 for Q4-QWEN38 and the gap program is recorded as `analysis/attribution-T1.json` (`q4_trace_attribution.py`). The phase trace carries no per-kernel or per-command GPU time.
+
 ### Q1-DS4. Capture DeepSeek-V4 Q1 endpoints on this 128 GB Mac (#549)
 
 Outcome: The deferred DeepSeek-V4 Q1 numerical endpoints run on the M5 Max 128 GB under a measured, reviewed resource policy.
