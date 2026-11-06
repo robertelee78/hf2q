@@ -682,22 +682,41 @@ fn stock_matvec_kernels_keep_the_main_routes_bitwise() {
     assert_eq!(row_exact_pipelines_built(registry), Vec::<&str>::new());
 }
 
+/// Resolution order: the runtime switch when set (`0`/`1` only), else the
+/// build-time default, which itself is Stock unless the build set it.
 #[test]
-fn matvec_switch_parses_zero_one_and_unset_only() {
+fn matvec_switch_resolves_env_then_build_default_then_stock() {
     use std::ffi::OsStr;
-    assert_eq!(MatvecKernels::parse(None).unwrap(), MatvecKernels::Stock);
-    assert_eq!(
-        MatvecKernels::parse(Some(OsStr::new("0"))).unwrap(),
-        MatvecKernels::Stock
-    );
-    assert_eq!(
-        MatvecKernels::parse(Some(OsStr::new("1"))).unwrap(),
-        MatvecKernels::RowExact
-    );
-    for bad in ["", "true", "2", "on"] {
-        assert!(
-            MatvecKernels::parse(Some(OsStr::new(bad))).is_err(),
-            "{bad}"
+    use MatvecKernels::{RowExact, Stock};
+    for build_default in [Stock, RowExact] {
+        // Unset: the build default.
+        assert_eq!(
+            MatvecKernels::resolve(None, build_default).unwrap(),
+            build_default
         );
+        // Set: the runtime value wins over either build default.
+        assert_eq!(
+            MatvecKernels::resolve(Some(OsStr::new("0")), build_default).unwrap(),
+            Stock
+        );
+        assert_eq!(
+            MatvecKernels::resolve(Some(OsStr::new("1")), build_default).unwrap(),
+            RowExact
+        );
+        for bad in ["", "true", "2", "on"] {
+            assert!(
+                MatvecKernels::resolve(Some(OsStr::new(bad)), build_default).is_err(),
+                "{bad}"
+            );
+        }
     }
+    // The build default follows HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT of this
+    // build, and is Stock when the build did not set it.
+    let expected = match option_env!("HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT") {
+        Some("1") => RowExact,
+        _ => Stock,
+    };
+    assert_eq!(MatvecKernels::BUILD_DEFAULT, expected);
+    // One line per binary for build receipts (two Q1 arms of one commit).
+    eprintln!("MATVEC_BUILD_DEFAULT {:?}", MatvecKernels::BUILD_DEFAULT);
 }
