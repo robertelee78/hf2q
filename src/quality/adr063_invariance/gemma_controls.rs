@@ -186,6 +186,15 @@ fn q1_gemma_warm_kernel_defaults_to_shipped_vec_hybrid_and_refuses_undeclared_ti
     assert!(require_warm_kernel(WarmLiveKernel::VecHybrid,K::TiledF16).is_err());
     assert!(require_warm_kernel(WarmLiveKernel::TiledF16,K::VecHybrid).is_err());
     assert_eq!(require_warm_kernel(WarmLiveKernel::TiledF16,K::TiledF16).unwrap(),WarmLiveKernel::TiledF16);
+    {
+        use crate::serve::gemma_decode_attention::GemmaDecodeAttnNe as N;
+        assert_eq!(DecodeAttnNe::default(),DecodeAttnNe::Stock);
+        assert_eq!(require_decode_attn_ne(DecodeAttnNe::Stock,N::Stock).unwrap(),DecodeAttnNe::Stock);
+        assert!(require_decode_attn_ne(DecodeAttnNe::Stock,N::Ne(4)).is_err());
+        assert!(require_decode_attn_ne(DecodeAttnNe::Ne4,N::Stock).is_err());
+        assert_eq!(require_decode_attn_ne(DecodeAttnNe::Ne4,N::Ne(4)).unwrap(),DecodeAttnNe::Ne4);
+        assert_eq!(serde_json::to_value(DecodeAttnNe::Ne4).unwrap(),serde_json::json!("Ne4"));
+    }
     assert_eq!(serde_json::to_value(WarmLiveKernel::VecHybrid).unwrap(),serde_json::json!("VecHybrid"));
     assert!(serde_json::from_value::<WarmLiveKernel>(serde_json::json!("Tiled")).is_err());
 }
