@@ -8,10 +8,12 @@
 //! head. Work that touches a slot's cache (DeltaNet conv + recurrence, KV
 //! write + SDPA) runs per row against that slot's cursor and ping-pong
 //! parity; see
-//! [`super::super::joint_decode_core`]. MoE FFNs run per row through the
-//! serial helper: the router and shared expert are float projections whose
-//! packed route differs from `m = 1`, and routed experts are mostly distinct
-//! per row, so packing them would trade exactness for little weight reuse.
+//! [`super::super::joint_decode_core`]. MoE FFNs with native router and
+//! shared-expert storage (`HF2Q_QWEN_MOE_BATCHED=1`) run one batched layer
+//! over the packed rows ([`super::super::moe_batched`]), whose kernels are
+//! row-exact, so serial decode runs the same route at one row. Otherwise
+//! they run per row through the serial helper: the BF16 router and shared
+//! expert are float projections whose packed route differs from `m = 1`.
 //!
 //! Admission ([`super::super::joint_decode_routes`]) runs before the first
 //! write. Cursors and parities advance at encode time exactly as in the
@@ -52,7 +54,8 @@ use crate::inference::models::qwen35::joint_decode_routes::{
 };
 use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
-use crate::inference::models::qwen35::model::Qwen35Model;
+use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35Model};
+use crate::inference::models::qwen35::moe_batched::build_moe_ffn_layer_gpu_batched_into;
 use crate::inference::models::qwen35::spec_decode::nth_hidden_row;
 use crate::inference::models::qwen35::Qwen35Config;
 use crate::serve::multi_seq_kv::SlotId;
@@ -195,6 +198,30 @@ fn host_buffer<T: bytemuck::Pod>(
 }
 
 impl Qwen35Model {
+    /// Decode route of this model's MoE FFN layers, from the loaded weights:
+    /// `batched_native` (every MoE layer has native router/shared storage,
+    /// `HF2Q_QWEN_MOE_BATCHED=1`), `per_row_bf16`, `mixed`, or `none` for a
+    /// dense artifact.
+    pub(crate) fn moe_ffn_decode_route(&self) -> &'static str {
+        let (mut moe, mut native) = (0_usize, 0_usize);
+        for layer in &self.layers {
+            match layer.ffn() {
+                Qwen35FfnWeights::MoeQ(weights) => {
+                    moe += 1;
+                    native += usize::from(weights.native_dense.is_some());
+                }
+                Qwen35FfnWeights::Moe(_) => moe += 1,
+                Qwen35FfnWeights::Dense(_) | Qwen35FfnWeights::DenseQ(_) => {}
+            }
+        }
+        match (moe, native) {
+            (0, _) => "none",
+            (moe, native) if native == moe => "batched_native",
+            (_, 0) => "per_row_bf16",
+            _ => "mixed",
+        }
+    }
+
     /// Joint route mode for this artifact and its routing policy, or why decode must
     /// stay serial. Primes the GPU weight cache so storage types are known.
     pub(crate) fn joint_decode_mode(&self) -> Result<JointRouteMode, String> {
@@ -528,46 +555,70 @@ impl Qwen35Model {
                         moe_intermediate_size: moe.moe_intermediate_size,
                         shared_intermediate_size: moe.shared_expert_intermediate_size,
                     };
-                    let mut per_row = Vec::with_capacity(rows.len());
-                    for row in 0..rows.len() {
-                        if row > 0 {
-                            enc.memory_barrier();
-                        }
-                        per_row.push(
-                            build_moe_ffn_layer_gpu_q_into(
-                                enc,
-                                device,
-                                registry,
-                                &row_view(&ffn_input, row, vec![1, h])?,
-                                weights,
-                                shape,
-                                Some(&row_view(&ffn_residual, row, vec![1, h])?),
-                                layer_idx,
-                            )
-                            .with_context(|| {
-                                format!("Qwen joint MoE FFN layer {layer_idx} row {row}")
-                            })?,
-                        );
-                    }
-                    enc.memory_barrier();
-                    let packed_output = device
-                        .alloc_buffer(width * h * 4, DType::F32, vec![width, h])
-                        .map_err(|e| anyhow!("allocate Qwen joint MoE output: {e}"))?;
-                    for index in 0..width {
-                        let source = &per_row[if index < rows.len() { index } else { 0 }];
-                        dispatch_copy_f32(
-                            enc,
-                            registry,
-                            device.metal_device(),
-                            source,
-                            &packed_output,
-                            0,
-                            index * h,
-                            h,
+                    if weights.dense_storage.is_native() {
+                        let mut output = decode_pool::pooled_alloc_buffer(
+                            device,
+                            width * h * 4,
+                            DType::F32,
+                            vec![width, h],
                         )
-                        .map_err(|e| anyhow!("gather Qwen joint MoE row {index}: {e}"))?;
+                        .map_err(|e| anyhow!("allocate Qwen joint MoE output: {e}"))?;
+                        build_moe_ffn_layer_gpu_batched_into(
+                            enc,
+                            device,
+                            registry,
+                            &ffn_input,
+                            weights,
+                            shape,
+                            Some(&ffn_residual),
+                            &mut output,
+                            width_u32,
+                            layer_idx,
+                        )
+                        .with_context(|| format!("Qwen joint batched MoE FFN layer {layer_idx}"))?;
+                        output
+                    } else {
+                        let mut per_row = Vec::with_capacity(rows.len());
+                        for row in 0..rows.len() {
+                            if row > 0 {
+                                enc.memory_barrier();
+                            }
+                            per_row.push(
+                                build_moe_ffn_layer_gpu_q_into(
+                                    enc,
+                                    device,
+                                    registry,
+                                    &row_view(&ffn_input, row, vec![1, h])?,
+                                    weights,
+                                    shape,
+                                    Some(&row_view(&ffn_residual, row, vec![1, h])?),
+                                    layer_idx,
+                                )
+                                .with_context(|| {
+                                    format!("Qwen joint MoE FFN layer {layer_idx} row {row}")
+                                })?,
+                            );
+                        }
+                        enc.memory_barrier();
+                        let packed_output = device
+                            .alloc_buffer(width * h * 4, DType::F32, vec![width, h])
+                            .map_err(|e| anyhow!("allocate Qwen joint MoE output: {e}"))?;
+                        for index in 0..width {
+                            let source = &per_row[if index < rows.len() { index } else { 0 }];
+                            dispatch_copy_f32(
+                                enc,
+                                registry,
+                                device.metal_device(),
+                                source,
+                                &packed_output,
+                                0,
+                                index * h,
+                                h,
+                            )
+                            .map_err(|e| anyhow!("gather Qwen joint MoE row {index}: {e}"))?;
+                        }
+                        packed_output
                     }
-                    packed_output
                 }
                 FfnWeightsGpu::Dense(_) | FfnWeightsGpu::Moe(_) => {
                     bail!("Qwen joint layer {layer_idx} has no admitted FFN arm")
