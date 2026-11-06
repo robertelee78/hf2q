@@ -13,7 +13,8 @@
 //! ```text
 //! HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 HF2Q_QWEN38_GGUF=/path/qwen38.gguf \
 //!   cargo test --release --bin hf2q \
-//!   qwen38_joint_decode_witness_armed_rows_are_bitwise_unarmed -- --ignored --exact
+//!   inference::models::qwen35::real_artifact_joint_decode_witness_tests::qwen38_joint_decode_witness_armed_rows_are_bitwise_unarmed \
+//!   -- --ignored --exact
 //! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};

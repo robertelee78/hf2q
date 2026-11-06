@@ -356,7 +356,8 @@ cargo test --lib native_observation
 cargo test --lib qwen35::joint_decode
 # GPU lane only:
 HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 HF2Q_QWEN38_GGUF=<official artifact> cargo test --release --bin hf2q \
-  qwen38_joint_decode_witness_armed_rows_are_bitwise_unarmed -- --ignored --exact
+  inference::models::qwen35::real_artifact_joint_decode_witness_tests::qwen38_joint_decode_witness_armed_rows_are_bitwise_unarmed \
+  -- --ignored --exact
 cd scripts/four_agent && python3 -m unittest test_f2_native_trace test_f2_trace test_f2_demand \
   test_q2_traced_run test_q2_certify test_f2_metadata_budget
 ```

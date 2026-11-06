@@ -822,7 +822,9 @@ The traced-run witness manifest lists `qwen35.joint_decode.actual_slot_rows` bes
 - `q4_trace_verdict.py classify --t1-o1 J --g1 pass|fail --t0-o0 J --o1-o1d J [--repeat J --repeat-observer J]` applies the pre-registered exactness rule of the design (§5.2, amendment 1) to `q1_decision_policy.py transcripts` outputs. Rows, in order: `HookAttributable` (G1 fail), `Exact`, `ScheduleNondeterministic` (the untraced hook binary diverges run to run, O1 vs O1′), `ObserverAttributable`, then `Unresolved`. After `Unresolved`, the repeat (T1′ O1″ with T0′ O0′) gives `ScheduleNondeterministic`, `ObserverAttributable` or `HookAttributable`.
 - `q4_trace_overhead.py T1_TRACE T0_TRACE [--left-windows W] [--left-summary S --right-summary S]` identifies joint epochs in both arms by the first scope after each joint transaction and reports, per logical width, the epoch span (first `Created` to last `CheckedDrain`) median and p95 with bootstrap 95% CIs of the deltas, record counts by kind and trace bytes. Optional: T1's forward/settle split and the descriptive makespan delta.
 
-Design: [docs/research/adr063-q4-trace-design.md](../../docs/research/adr063-q4-trace-design.md). Tests: `test_f2_native_trace_joint.py`, `test_q4_trace_overhead.py`.
+- `q4_trace_attribution.py TRACE [--windows W]` attributes one traced run by phase and by native pipeline. Each transaction's epoch is the epoch of the first scope after it. For joint decode, by logical width, it reports the forward/settle split at the end marker. Per epoch it reports host encode span, completion tail and epoch span. Per pipeline it reports dispatch counts by phase, grid shapes and the first site in a joint forward. GPU time per kernel or per command, and pipeline names, are not in the phase trace; the output says so.
+
+Design: [docs/research/adr063-q4-trace-design.md](../../docs/research/adr063-q4-trace-design.md). Tests: `test_f2_native_trace_joint.py`, `test_q4_trace_overhead.py`, `test_q4_trace_attribution.py`.
 
 ## F2 scoreboard rendering
 
