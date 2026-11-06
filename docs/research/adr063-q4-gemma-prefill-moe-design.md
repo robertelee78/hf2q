@@ -1,8 +1,11 @@
 # ADR-063 Q4-GEMMA-PREFILL-MOE: Gemma 4 warm-prefill MoE and dense cost per row — HLD/LLD
 
-Status: design for approval (2026-11-04). Revision 2 applies the
-ACCEPT-WITH-CONDITIONS review (ReviewGemmaPrefillMoe, findings 1–14). No code,
-build or hardware run backs this document. Every number is quoted from a
+Status: implemented (2026-11-06). Approved design 2026-11-04 (revision 2
+applies the ACCEPT-WITH-CONDITIONS review, ReviewGemmaPrefillMoe, findings
+1–14). P1 merged as #693, P2/P2b/P2c as mlx-native #88 (0.16.0) with the
+grid-order decision in #95, P3 as #697. The results are recorded in §14; the
+speed gates of §7.1 were not run per operator directive 2026-11-06. Sections
+1–13 are the design as approved; every number there is quoted from a
 retained receipt (path given), computed from source or file metadata (method
 given), or marked `[INFERENCE]`.
 
@@ -977,3 +980,52 @@ Delivery boundary: P1 merged to main; and either the mlx-native release containi
 | Target GGUF header | `bf65b7e1…8ef53` (tensor types and shapes, §2.2) |
 | Profile evidence | `$G/profile/l1/*/server.stderr`, `$G/profile/l3/*/server.stderr`, `$G/profile/l3/*.catsplit.json` |
 | Routing proxy | `$E/q1-gemma-routing1511-t0-on-actual-v1/output/routing-witness.jsonl` |
+
+## 14. Results (2026-11-04 to 2026-11-06)
+
+Receipts are under `/Users/robert/.local/state/hf2q/v0130/q4-gemma-prefill-moe/`.
+
+### 14.1 Delivered
+
+| Change | Where | Class A evidence |
+|---|---|---|
+| P1 slotted down call, `HF2Q_GEMMA_PREFILL_MOE_DOWN` | hf2q #693 | M2 (`m2/`): §5.3 items 1–3 and 5 bitwise on both metallib paths and both arms; item 6 `ExactEqual` (5616 records). Item 4 fails identically on main (pre-existing, #702) |
+| P2 compact tile schedule, P2b schedule reuse, P2c half-tile skip | mlx-native #88 (0.16.0) | §5.1 N1–N9 bitwise on both paths; N5 bitwise on every type × path, so P2c ships on the simdgroup path and on the tensor path of the validated GPU family ("Apple M5") |
+| Grid order: tile fastest only | mlx-native #95 | test_mm_id_compact_schedule 9/9, lib and N8 suites on both paths (`native95/`) |
+| P3 pin 0.16.0, down-call schedule reuse, Qwen/DeepSeek migrations | hf2q #697 | Review697 items 1–8 (`r697/`): Gemma gates under defaults and arm A (flat + grid); route A/B asserts 150/150 down calls reuse the schedule, and 150/150 take the slotted fallback under each rotating profiler; T0 greedy144 `ExactEqual` against the #693 store, grid, runtime metallib and arm A; Qwen3.6 logits and DeepSeek-V4 prefill state/logits compact == grid bytes |
+
+### 14.2 Microbenchmark (§6), Apple M5 Max, witness bootstrap routing
+
+Record: `m0/M0-RECORD.md`. The recorded agent routing tables were not captured (M1 cancelled), so
+every routing-dependent figure uses the witness bootstrap (§6 fallback). M0c ran on a pre-registered
+6-layer subset (layers 0, 8, 20 with Q8_0 down and 3, 13, 25 with Q5_0 down), scaled to 30 layers as
+recorded before the run; a run perturbed by another agent's build was discarded and repeated.
+
+- c_e = 0.61–0.64 ns per launched threadgroup (M0a), 0.60–0.64 ns (M0b cross-check).
+- S_pred(P1) = 0.018 s per run: below 0.03 s, so P1 carries no speed claim. The slotted call removes
+  184 M threadgroups but pays `map0_ne20_8` (265–1,588 µs per call) where the flattened call paid
+  `map0_ne20_1` (112–681 µs). The single-threadgroup `map0` is the dominant cost, not empty threadgroups.
+- S_pred(P2) = 0.191 s (0.023 s launch geometry + 0.168 s `map0` removed by P2b); S_pred total 0.209 s.
+- **M0c measured S_meas = 0.195 s per run**: compact schedule (tile fastest) 0.115 s + schedule reuse
+  0.080 s; S1 passes with 0 per-shape regressions beyond max(2%, 5 µs). Tile fastest beats N tile fastest
+  by 0.012 s per run, so it is the only order shipped (#95). P2c adds 0.040 s (disclosed, outside the stop
+  rule). `map0c_ne20_8` is 43% faster than `map0_ne20_8`.
+
+### 14.3 Not run
+
+- §7.1 S2, S3, S4 (warm-prefill A/B, catsplit, makespan), §7.3 fairness, the S5 n1 control and M1:
+  **not run per operator directive 2026-11-06** (no further speed campaigns).
+- §5.4 four-agent `ExactTranscripts` smoke for Qwen3.6 and DeepSeek-V4: replaced by the Review697
+  byte-level checks above (same native change, same build).
+
+### 14.4 Pre-existing defects found (not caused by this story)
+
+- Gemma n8 tiny-prefill repeat invariance fails on main (#702).
+- The imatrix intercept cannot collect over the batched Gemma prefill: the dense O-projection
+  intercept materializes the whole pooled buffer (3,751,936 f32 against 458 × 4,096 expected) and
+  returns a shape mismatch before any MoE call. The down-call fallback under an installed collector
+  is covered model-free.
+- `HF2Q_GRAPH_OPT_PREFILL=1` cannot record the Q1 T0 endpoint trace: the routing-witness blits are
+  refused under graph capture. The production prefill gates pass under graph capture.
+- `qwen35::gpu_delta_net::tests::chunk_arena_byte_exact_parity_at_seq128` is intermittent (1/8 on main):
+  a missing barrier in mlx-native `gated_delta_net_chunk`, present in 0.15.18 and 0.16.0.
