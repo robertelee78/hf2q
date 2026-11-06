@@ -2885,6 +2885,9 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                     ne32,
                     seq_len * shape.num_experts_per_tok,
                     |scratch| {
+                        // The legacy map0 inside the fused kernel writes the
+                        // scratch: take it through the key-invalidating accessor.
+                        let (htpe, hids) = scratch.buffers_mut();
                         mlx_native::ops::quantized_matmul_id_ggml::dispatch_id_mm_fused_gate_up_silu_for_test(
                             enc,
                             registry,
@@ -2893,8 +2896,8 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                             &weights.expert_gate_q,
                             &weights.expert_up_q,
                             &ids_buf,
-                            &scratch.htpe,
-                            &scratch.hids,
+                            htpe,
+                            hids,
                             &h_all_buf, // direct fused output — skip up_all
                             &fused_dispatch_params,
                         )
@@ -3353,6 +3356,9 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                     ne32,
                     seq_len * shape.num_experts_per_tok,
                     |scratch| {
+                        // The legacy map0 inside the fused kernel writes the
+                        // scratch: take it through the key-invalidating accessor.
+                        let (htpe, hids) = scratch.buffers_mut();
                         mlx_native::ops::quantized_matmul_id_ggml::dispatch_id_mm_fused_gate_up_silu_for_test(
                             enc,
                             registry,
@@ -3361,8 +3367,8 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                             &weights.expert_gate_q,
                             &weights.expert_up_q,
                             &arena.ids_buf,
-                            &scratch.htpe,
-                            &scratch.hids,
+                            htpe,
+                            hids,
                             &arena.h_all_buf, // direct fused output
                             &fused_dispatch_params,
                         )

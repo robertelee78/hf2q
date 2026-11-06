@@ -4341,10 +4341,32 @@ impl MlxModelWeights {
                         gemma_moe_use_affine,
                         crate::serve::gemma_prefill_moe::mm_id_threshold_override_present(),
                     );
-                    let dispatch_down = if down.slotted {
-                        crate::inference::expert_dispatch::dispatch_expert_matmul_id_pooled_slotted
-                    } else {
-                        crate::inference::expert_dispatch::dispatch_expert_matmul_id_pooled
+                    // P2b: the slotted call has gate/up's ids, n_tokens and
+                    // top_k, so it reuses gate/up's schedule unless the body
+                    // replaced the session in between (profiling pre-finishes,
+                    // the imatrix intercept's rotate) — design §4.3.
+                    let session_rotated = profile_moe
+                        || std::env::var("HF2Q_PROFILE_MOE_POST").is_ok()
+                        || crate::quantize::imatrix::is_active();
+                    use crate::inference::expert_dispatch as experts;
+                    let entry = crate::serve::gemma_prefill_moe::down_entry(
+                        down,
+                        experts::writes_pooled_schedule(ggml_type_gu)
+                            && experts::writes_pooled_schedule(ggml_type_dn),
+                        session_rotated,
+                    );
+                    #[cfg(test)]
+                    crate::serve::gemma_prefill_moe::entry_probe::record(entry);
+                    let dispatch_down = match entry {
+                        crate::serve::gemma_prefill_moe::DownEntry::Flat => {
+                            experts::dispatch_expert_matmul_id_pooled
+                        }
+                        crate::serve::gemma_prefill_moe::DownEntry::Slotted => {
+                            experts::dispatch_expert_matmul_id_pooled_slotted
+                        }
+                        crate::serve::gemma_prefill_moe::DownEntry::SlottedReusingSchedule => {
+                            experts::dispatch_expert_matmul_id_pooled_slotted_reusing_schedule
+                        }
                     };
                     dispatch_down(
                         &mut s,

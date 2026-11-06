@@ -196,6 +196,41 @@ pub(crate) fn dispatch_expert_matmul_id_pooled_slotted(
         .context("pooled slotted block-quantized expert-ID matmul")
 }
 
+/// Slotted expert-ID matmul that reuses the routing schedule the previous
+/// pooled `mm_id` call (same ids, `n_tokens`, `top_k`, `n_experts`, encoder)
+/// left in `scratch` (ADR-063 Q4-GEMMA-PREFILL-MOE P2b). Block-quantized
+/// stacks only: a scalar stack never builds a schedule. mlx-native refuses a
+/// mismatched key before encoding; the error propagates.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_expert_matmul_id_pooled_slotted_reusing_schedule(
+    session: &mut GraphSession<'_>,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    expert_ids: &MlxBuffer,
+    output: &MlxBuffer,
+    scratch: &mut mlx_native::IdMmScratch,
+    params: &GgmlQuantizedMatmulIdParams,
+) -> Result<()> {
+    anyhow::ensure!(
+        scalar_dtype(params.ggml_type).is_none(),
+        "scalar {:?} expert stacks build no reusable mm_id schedule",
+        params.ggml_type
+    );
+    session
+        .quantized_matmul_id_ggml_pooled_slotted_reusing_schedule(
+            registry, device, input, weight, expert_ids, output, scratch, params,
+        )
+        .context("pooled slotted block-quantized expert-ID matmul (reused schedule)")
+}
+
+/// True for block-quantized expert stacks (the GGML `mm_id` route, which
+/// writes the pooled schedule), false for scalar GGUF stacks.
+pub(crate) fn writes_pooled_schedule(ggml_type: GgmlType) -> bool {
+    scalar_dtype(ggml_type).is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +531,184 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ADR-063 Q4-GEMMA-PREFILL-MOE §5.2 P2b: the down call reusing the
+    /// gate/up schedule equals the self-scheduling slotted call bitwise, and
+    /// a reuse without a matching schedule (fresh scratch, other ids, another
+    /// session) is refused instead of reading a stale schedule.
+    #[test]
+    fn q8_0_slotted_down_reusing_gate_up_schedule_is_bitwise_and_keyed() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            eprintln!("skipping schedule reuse test: no Metal device");
+            return;
+        };
+        const K: usize = 64;
+        const N: usize = 128;
+        const EXPERTS: usize = 16;
+        const TOP_K: usize = 8;
+        const SEQ: usize = 40;
+        const BLOCK_BYTES: usize = 34;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let q8_0 = |rows: usize, next: &mut dyn FnMut() -> u64| {
+            let mut bytes = Vec::with_capacity(rows * K / 32 * BLOCK_BYTES);
+            for _ in 0..rows * K / 32 {
+                let scale = half::f16::from_f32(((next() % 64) as f32 + 1.0) / 4096.0);
+                bytes.extend_from_slice(&scale.to_bits().to_le_bytes());
+                bytes.extend((0..32).map(|_| (next() % 255) as u8));
+            }
+            let mut buffer = device.alloc_buffer(bytes.len(), DType::U8, vec![bytes.len()]).unwrap();
+            buffer.as_mut_slice::<u8>().unwrap().copy_from_slice(&bytes);
+            buffer
+        };
+        let gate_up_weight = q8_0(EXPERTS * N, &mut next);
+        let down_weight = q8_0(EXPERTS * N, &mut next);
+        let stride = (N * K / 32 * BLOCK_BYTES) as u64;
+        let values = |len: usize, next: &mut dyn FnMut() -> u64| -> Vec<f32> {
+            (0..len)
+                .map(|_| ((next() % 2001) as f32 - 1000.0) / 1000.0)
+                .collect()
+        };
+        let shared_input = f32_buffer(&device, &values(SEQ * K, &mut next));
+        let slotted_input = f32_buffer(&device, &values(SEQ * TOP_K * K, &mut next));
+        let ids_buffer = |next: &mut dyn FnMut() -> u64| {
+            let mut ids = Vec::with_capacity(SEQ * TOP_K);
+            for _ in 0..SEQ {
+                let mut chosen: Vec<u32> = Vec::new();
+                while chosen.len() < TOP_K {
+                    let id = (next() % EXPERTS as u64) as u32;
+                    if !chosen.contains(&id) {
+                        chosen.push(id);
+                    }
+                }
+                ids.extend(chosen);
+            }
+            let mut buffer = device
+                .alloc_buffer(ids.len() * 4, DType::U32, vec![SEQ, TOP_K])
+                .unwrap();
+            buffer.as_mut_slice::<u32>().unwrap().copy_from_slice(&ids);
+            buffer
+        };
+        let ids = ids_buffer(&mut next);
+        let other_ids = ids_buffer(&mut next);
+        let params = GgmlQuantizedMatmulIdParams {
+            n_tokens: SEQ as u32,
+            top_k: TOP_K as u32,
+            n: N as u32,
+            k: K as u32,
+            n_experts: EXPERTS as u32,
+            expert_stride: stride,
+            ggml_type: GgmlType::Q8_0,
+        };
+        let output = || {
+            device
+                .alloc_buffer(SEQ * TOP_K * N * 4, DType::F32, vec![SEQ * TOP_K, N])
+                .unwrap()
+        };
+        let executor = GraphExecutor::new(device.clone());
+        let mut registry = KernelRegistry::new();
+        let mut scratch =
+            mlx_native::IdMmScratch::alloc(&device, EXPERTS as u32, (SEQ * TOP_K) as u32).unwrap();
+        let gate_up = |session: &mut GraphSession<'_>,
+                       registry: &mut KernelRegistry,
+                       scratch: &mut mlx_native::IdMmScratch,
+                       ids: &MlxBuffer| {
+            dispatch_expert_matmul_id_pooled(
+                session,
+                registry,
+                &device,
+                &shared_input,
+                &gate_up_weight,
+                ids,
+                &output(),
+                scratch,
+                &params,
+            )
+            .unwrap();
+        };
+
+        // Reference: the self-scheduling slotted call.
+        let fresh = output();
+        let mut session = executor.begin().unwrap();
+        dispatch_expert_matmul_id_pooled_slotted(
+            &mut session,
+            &mut registry,
+            &device,
+            &slotted_input,
+            &down_weight,
+            &ids,
+            &fresh,
+            &mut scratch,
+            &params,
+        )
+        .unwrap();
+        session.finish().unwrap();
+
+        // gate/up then the reusing down call, as in the Gemma body.
+        let reused = output();
+        let mut session = executor.begin().unwrap();
+        gate_up(&mut session, &mut registry, &mut scratch, &ids);
+        dispatch_expert_matmul_id_pooled_slotted_reusing_schedule(
+            &mut session,
+            &mut registry,
+            &device,
+            &slotted_input,
+            &down_weight,
+            &ids,
+            &reused,
+            &mut scratch,
+            &params,
+        )
+        .unwrap();
+        session.finish().unwrap();
+        let fresh_bits = fresh.as_slice::<u32>().unwrap();
+        assert!(fresh_bits.iter().all(|bits| f32::from_bits(*bits).is_finite()));
+        assert!(
+            fresh_bits == reused.as_slice::<u32>().unwrap(),
+            "reused schedule differs from a fresh schedule"
+        );
+
+        let refused = |session: &mut GraphSession<'_>,
+                       registry: &mut KernelRegistry,
+                       scratch: &mut mlx_native::IdMmScratch,
+                       ids: &MlxBuffer| {
+            dispatch_expert_matmul_id_pooled_slotted_reusing_schedule(
+                session,
+                registry,
+                &device,
+                &slotted_input,
+                &down_weight,
+                ids,
+                &output(),
+                scratch,
+                &params,
+            )
+            .is_err()
+        };
+        // A schedule built for other ids.
+        let mut session = executor.begin().unwrap();
+        gate_up(&mut session, &mut registry, &mut scratch, &other_ids);
+        assert!(refused(&mut session, &mut registry, &mut scratch, &ids));
+        session.finish().unwrap();
+        // A schedule built in another session (encoder).
+        let mut session = executor.begin().unwrap();
+        gate_up(&mut session, &mut registry, &mut scratch, &ids);
+        session.finish().unwrap();
+        let mut session = executor.begin().unwrap();
+        assert!(refused(&mut session, &mut registry, &mut scratch, &ids));
+        session.finish().unwrap();
+        // A fresh scratch holds no schedule.
+        let mut empty =
+            mlx_native::IdMmScratch::alloc(&device, EXPERTS as u32, (SEQ * TOP_K) as u32).unwrap();
+        let mut session = executor.begin().unwrap();
+        assert!(refused(&mut session, &mut registry, &mut empty, &ids));
+        session.finish().unwrap();
     }
 }

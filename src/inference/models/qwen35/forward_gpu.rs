@@ -3703,6 +3703,20 @@ impl Qwen35Model {
                         // for MoE (top_k=8 routed) + (top_k=1 down).
                         "kernel_mul_mm_id_map0_ne20_1",
                         "kernel_mul_mm_id_map0_ne20_8",
+                        // Compact-schedule (default) variants of the same
+                        // mm_id kernels and map0 (ADR-063 Q4-GEMMA-PREFILL-MOE).
+                        "kernel_mul_mm_id_q4_0_f32_c",
+                        "kernel_mul_mm_id_q4_0_tensor_f32_c",
+                        "kernel_mul_mm_id_q8_0_f32_c",
+                        "kernel_mul_mm_id_q8_0_tensor_f32_c",
+                        "kernel_mul_mm_id_q4_K_f32_c",
+                        "kernel_mul_mm_id_q4_K_tensor_f32_c",
+                        "kernel_mul_mm_id_q5_K_f32_c",
+                        "kernel_mul_mm_id_q5_K_tensor_f32_c",
+                        "kernel_mul_mm_id_q6_K_f32_c",
+                        "kernel_mul_mm_id_q6_K_tensor_f32_c",
+                        "kernel_mul_mm_id_map0c_ne20_1",
+                        "kernel_mul_mm_id_map0c_ne20_8",
                     ];
                     let warmed = registry.prewarm_pipelines(device.metal_device(), hot_kernels);
 

@@ -222,30 +222,13 @@ where
     };
     cell.with(|cell| {
         let mut guard = cell.borrow_mut();
-        // Capacity check: the inner scratch's caps are private, so we
-        // proxy via `IdMmScratch::alloc`'s error-returning check_capacity
-        // path indirectly — easier to just track the caps we requested
-        // and grow when we exceed them.  Using the option's None state
-        // for first-time allocation, plus a stored cap pair on Some.
-        //
-        // We tag the cap pair onto a side-table of static AtomicU32s
-        // keyed off slot — but a simpler approach: stash the caps in
-        // adjacent thread_local cells.  Inline that via the helper
-        // closure here: any check_capacity error reallocates.
+        // Reallocate when the cached scratch's constructor bounds (its
+        // capacity accessors) do not cover this call.
         let needs_realloc = match guard.as_ref() {
             None => true,
             Some(scratch) => {
-                // Probe the public api: scratch.htpe.element_count is
-                // the n_experts cap; scratch.hids.element_count() ==
-                // n_experts_cap × n_tokens_cap.  Both fields pub.
-                let cap_n_experts = scratch.htpe.element_count() as u32;
-                let cap_total = scratch.hids.element_count() as u64;
-                let cap_n_tokens = if cap_n_experts == 0 {
-                    0
-                } else {
-                    (cap_total / cap_n_experts as u64) as u32
-                };
-                n_experts > cap_n_experts || max_n_tokens > cap_n_tokens
+                n_experts > scratch.capacity_n_experts()
+                    || max_n_tokens > scratch.capacity_n_tokens()
             }
         };
         if needs_realloc {
