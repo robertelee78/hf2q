@@ -13742,6 +13742,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
         };
 
         let cpu_weights = super::super::ffn::MoeFfnWeights {
@@ -14159,6 +14160,7 @@ mod tests {
                 expert_gate_affine: None,
                 expert_up_affine: None,
                 expert_down_affine: None,
+                dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
             }
         };
 
@@ -14908,6 +14910,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
         };
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
@@ -15012,6 +15015,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
         };
         let hidden_in_a = upload_f32(&hidden_data, &device).unwrap();
         let mask =
@@ -15055,6 +15059,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
         };
         let hidden_in_b = upload_f32(&hidden_data, &device).unwrap();
         let mut k_b = alloc_kv_cache(nkv, cap, d, &device);

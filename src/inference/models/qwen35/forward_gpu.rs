@@ -7962,38 +7962,31 @@ impl Qwen35Model {
                         .with_context(|| format!("upload moe_ffn layer {i}"))?,
                 ),
                 Qwen35FfnWeights::MoeQ(w) => {
-                    // Expert buffers already on Metal device; only router and
-                    // shared-expert F32 vecs need uploading.
+                    // Expert buffers already on Metal device; router and
+                    // shared-expert weights are uploaded as BF16 or, on the
+                    // batched route, retained in GGUF storage.
                     let moe_cfg = cfg
                         .moe
                         .as_ref()
                         .ok_or_else(|| anyhow!("layer {i}: MoeQ but no moe config"))?;
                     let mut moe_gpu = MoeFfnWeightsGpuQ::from_quantized(
-                        // Clone the Metal buffer handle (ARC retain — no data copy).
-                        w.expert_gate_q.clone(),
-                        w.expert_up_q.clone(),
-                        w.expert_down_q.clone(),
-                        w.ggml_type_gate_up,
-                        w.ggml_type_down,
+                        w,
                         moe_cfg.num_experts,
                         moe_cfg.moe_intermediate_size,
                         cfg.hidden_size,
-                        &w.router,
-                        &w.shared_gate_logit,
-                        &w.shared_gate,
-                        &w.shared_up,
-                        &w.shared_down,
                         device,
                     )
                     .with_context(|| format!("upload moe_ffn_q layer {i}"))?;
                     // ADR-020 AC#5 Iter C2.4 #4 — propagate DWQ overlay
                     // affine stacks from MoeFfnWeightsQ into the GPU
                     // bundle.  Cheap clone (Arc-wrapped MlxBuffer).
-                    moe_gpu.attach_affine_overlay(
-                        w.expert_gate_affine.as_ref(),
-                        w.expert_up_affine.as_ref(),
-                        w.expert_down_affine.as_ref(),
-                    );
+                    moe_gpu
+                        .attach_affine_overlay(
+                            w.expert_gate_affine.as_ref(),
+                            w.expert_up_affine.as_ref(),
+                            w.expert_down_affine.as_ref(),
+                        )
+                        .with_context(|| format!("moe_ffn_q layer {i} affine overlay"))?;
                     FfnWeightsGpu::MoeQ(moe_gpu)
                 }
             };

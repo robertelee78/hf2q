@@ -61,6 +61,7 @@ width). No `src/` occurrence of the three names remains.
 - `HF2Q_QWEN_JOINT_SOLO` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the kill switch for the padded-mode solo route (#717). Unset or `1`/`on`/`true`: on workers with two or more slots, every eligible lane joins a joint group, and a lone ordinary lane runs a one-lane padded joint step. `0`/`off`/`false` restores the serial forward for a lone lane and for lanes beyond the joint width. Exact mode and one-slot workers ignore it. Read once at worker start; invalid values warn and keep the default.
 - `HF2Q_QWEN_SPECULATION_ROUTE` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects how speculating Qwen SlotAware lanes are routed and gated. Unset or `repeatable`: each tick's route is decided from the request's own state, a speculating lane never joins a joint step, and the proposer gates use fixed round costs instead of wall time. `adaptive`: the phase-1 cohort-dependent route and measured gates. Read once at engine load; invalid values warn and keep the default (`docs/research/adr063-qwen-spec-repeatable.md`).
 - `HF2Q_QWEN_SPEC_COST_MTP` and `HF2Q_QWEN_SPEC_COST_HISTORY` (`development-only`) override the repeatable route's modelled round costs, in ordinary decisions (defaults 1.26 and 1.49). The repeatability gate uses them to force a cost-disabled proposer. Non-positive or invalid values warn and keep the default.
+- `HF2Q_QWEN_MOE_BATCHED` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects the batched Qwen3.6 MoE decode route. Unset or `0`/`off`/`false` (default): router and shared expert are uploaded as BF16 and every MoE layer runs once per row. `1`/`on`/`true`: they load in GGUF storage (F32 router and gate logit, Q4_K/Q6_K shared expert, no BF16 copies) and serial and joint decode both run one batched layer over the step's rows, row-exact (a row's output is the same solo or in a joint step). Read once at model load; invalid values warn and keep the default.
 - `HF2Q_QWEN_JOINT_Q1_PROMPTS`, `HF2Q_QWEN_JOINT_Q1_OUT` and `HF2Q_QWEN_JOINT_Q1_STEPS` (`development-only`) drive the ignored Q1 Class B trace test.
 - `HF2Q_QWEN36_GGUF` and `HF2Q_QWEN38_GGUF` (`development-only`) select the official artifacts for the ignored Qwen joint decode hardware gates.
 
@@ -394,6 +395,7 @@ this release:
 | `HF2Q_QWEN_JOINT_Q1_OUT` | `development-only` | 1 |
 | `HF2Q_QWEN_JOINT_Q1_PROMPTS` | `development-only` | 1 |
 | `HF2Q_QWEN_JOINT_Q1_STEPS` | `development-only` | 1 |
+| `HF2Q_QWEN_MOE_BATCHED` | `documented-escape` | 9 |
 | `HF2Q_QWEN_SPECULATION` | `promote-or-internalize` | 6 |
 | `HF2Q_QWEN_VISION_MMPROJ` | `development-only` | 3 |
 | `HF2Q_RERANK_PROFILE` | `development-only` | 5 |

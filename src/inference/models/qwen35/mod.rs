@@ -84,6 +84,9 @@ pub mod kernels;
 pub mod kv_cache;
 pub mod model;
 pub mod moe;
+pub(crate) mod moe_batched;
+#[cfg(test)]
+mod moe_batched_tests;
 pub mod mtp;
 pub mod mtp_weights_load;
 mod source_config;

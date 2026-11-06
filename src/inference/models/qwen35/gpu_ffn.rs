@@ -220,7 +220,11 @@ fn dispatch_moe_id_routed(
 
 use super::ffn::{DenseFfnShape, DenseFfnWeights, MoeFfnShape, MoeFfnWeights};
 use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32, upload_f32_weight};
-use super::weight_loader::DenseFfnWeightsQ;
+use super::moe_batched::{
+    build_moe_ffn_layer_gpu_batched_into, encode_native_dense_proj, MoeDenseRole,
+};
+pub use super::moe_batched::MoeDenseStorage;
+use super::weight_loader::{DenseFfnWeightsQ, MoeFfnWeightsQ};
 
 // ================================================================
 // GPU weight containers
@@ -367,10 +371,13 @@ impl MoeFfnWeightsGpu {
 ///   Q5_K+Q6_K path: ~0.78 GB per layer
 ///   Savings per layer: ~2.4 GB; across 40 MoE layers: ~96 GB
 ///
-/// Router (`[num_experts, hidden]`) and shared-expert weights are kept
-/// as F32 because they are small: router ≈ 2 MB, shared ≈ 8 MB.
+/// Router (`[num_experts, hidden]`) and shared-expert weights are small. With
+/// [`MoeDenseStorage::Bf16`] they are dequantized at load and uploaded as
+/// BF16; with [`MoeDenseStorage::Native`] (`HF2Q_QWEN_MOE_BATCHED=1`) they
+/// keep their GGUF storage (router and shared gate logit F32, shared
+/// gate/up/down raw GGML blocks) and decode runs the batched route.
 pub struct MoeFfnWeightsGpuQ {
-    /// Router F32 projection: `[num_experts, hidden_size]`.
+    /// Router projection: `[num_experts, hidden_size]` (BF16 or native F32).
     pub router: MlxBuffer,
     /// Stacked expert gate projections, raw GGML blocks.
     pub expert_gate_q: MlxBuffer,
@@ -388,14 +395,16 @@ pub struct MoeFfnWeightsGpuQ {
     pub expert_down_stride: u64,
     /// Number of experts.
     pub num_experts: u32,
-    /// Shared-expert sigmoid gate: `[1, hidden_size]` F32.
+    /// Shared-expert sigmoid gate: `[1, hidden_size]` (BF16 or native F32).
     pub shared_gate_inp: MlxBuffer,
-    /// Shared-expert gate_proj: `[shared_intermediate, hidden_size]` F32.
+    /// Shared-expert gate_proj: `[shared_intermediate, hidden_size]`.
     pub shared_gate: MlxBuffer,
-    /// Shared-expert up_proj: `[shared_intermediate, hidden_size]` F32.
+    /// Shared-expert up_proj: `[shared_intermediate, hidden_size]`.
     pub shared_up: MlxBuffer,
-    /// Shared-expert down_proj: `[hidden_size, shared_intermediate]` F32.
+    /// Shared-expert down_proj: `[hidden_size, shared_intermediate]`.
     pub shared_down: MlxBuffer,
+    /// Storage of the five router / shared-expert buffers above.
+    pub dense_storage: MoeDenseStorage,
     /// ADR-020 AC#5 Iter C2.4 #4 — DWQ-overlay mlx-affine expert
     /// stacks (cloned from the originating `MoeFfnWeightsQ` after the
     /// overlay was applied at load time).  When `Some`, the matching
@@ -422,28 +431,21 @@ fn ggml_type_stride(t: GgmlType, rows: usize, cols: usize) -> Result<u64> {
 }
 
 impl MoeFfnWeightsGpuQ {
-    /// Construct from pre-loaded quantized Metal buffers.
+    /// Construct from a loaded [`MoeFfnWeightsQ`].
     ///
-    /// `expert_{gate,up,down}_q` are already on the Metal device (loaded via
-    /// `GgufFile::load_tensor`).  Router and shared-expert weights are f32
-    /// vecs that need uploading.
-    #[allow(clippy::too_many_arguments)]
+    /// Expert buffers are already on the Metal device (ARC retain, no copy).
+    /// With `w.native_dense` the router / shared-expert buffers are retained
+    /// in their GGUF storage ([`MoeDenseStorage::Native`]); otherwise the F32
+    /// vecs are uploaded as BF16 ([`MoeDenseStorage::Bf16`]).
     pub fn from_quantized(
-        expert_gate_q: MlxBuffer,
-        expert_up_q: MlxBuffer,
-        expert_down_q: MlxBuffer,
-        ggml_type_gate_up: GgmlType,
-        ggml_type_down: GgmlType,
+        w: &MoeFfnWeightsQ,
         num_experts: u32,
         moe_intermediate_size: u32,
         hidden_size: u32,
-        router_f32: &[f32],
-        shared_gate_inp_f32: &[f32],
-        shared_gate_f32: &[f32],
-        shared_up_f32: &[f32],
-        shared_down_f32: &[f32],
         device: &MlxDevice,
     ) -> Result<Self> {
+        let ggml_type_gate_up = w.ggml_type_gate_up;
+        let ggml_type_down = w.ggml_type_down;
         // Gate/up: [num_experts, moe_intermediate_size, hidden_size]
         // Each expert slice: moe_intermediate_size rows × hidden_size cols.
         let gate_stride = ggml_type_stride(
@@ -462,29 +464,51 @@ impl MoeFfnWeightsGpuQ {
         )
         .context("down stride")?;
 
+        let (router, shared_gate_inp, shared_gate, shared_up, shared_down, dense_storage) =
+            match &w.native_dense {
+                Some(native) => (
+                    native.router.clone(),
+                    native.shared_gate_inp.clone(),
+                    native.shared_gate.clone(),
+                    native.shared_up.clone(),
+                    native.shared_down.clone(),
+                    MoeDenseStorage::Native {
+                        shared_gate_up: native.ggml_type_shared_gate_up,
+                        shared_down: native.ggml_type_shared_down,
+                    },
+                ),
+                // Pre-cast router and shared expert weights to BF16 so the
+                // projections never cast per inference.
+                None => (
+                    upload_bf16_from_f32(&w.router, device).context("upload router bf16")?,
+                    upload_bf16_from_f32(&w.shared_gate_logit, device)
+                        .context("upload shared_gate_inp bf16")?,
+                    upload_bf16_from_f32(&w.shared_gate, device)
+                        .context("upload shared_gate bf16")?,
+                    upload_bf16_from_f32(&w.shared_up, device)
+                        .context("upload shared_up bf16")?,
+                    upload_bf16_from_f32(&w.shared_down, device)
+                        .context("upload shared_down bf16")?,
+                    MoeDenseStorage::Bf16,
+                ),
+            };
+
         Ok(Self {
-            // Router is small (~2MB) but also benefits from pre-cast since
-            // `proj()` now checks dtype — keep BF16 for consistency.
-            router: upload_bf16_from_f32(router_f32, device).context("upload router bf16")?,
-            expert_gate_q,
-            expert_up_q,
-            expert_down_q,
+            router,
+            expert_gate_q: w.expert_gate_q.clone(),
+            expert_up_q: w.expert_up_q.clone(),
+            expert_down_q: w.expert_down_q.clone(),
             ggml_type_gate_up,
             ggml_type_down,
             expert_gate_stride: gate_stride,
             expert_up_stride: gate_stride, // gate and up have the same dimensions
             expert_down_stride: down_stride,
             num_experts,
-            // Pre-cast shared expert weights to BF16 to avoid per-inference
-            // F32→BF16 cast in proj() (~46MB each × 40 layers).
-            shared_gate_inp: upload_bf16_from_f32(shared_gate_inp_f32, device)
-                .context("upload shared_gate_inp bf16")?,
-            shared_gate: upload_bf16_from_f32(shared_gate_f32, device)
-                .context("upload shared_gate bf16")?,
-            shared_up: upload_bf16_from_f32(shared_up_f32, device)
-                .context("upload shared_up bf16")?,
-            shared_down: upload_bf16_from_f32(shared_down_f32, device)
-                .context("upload shared_down bf16")?,
+            shared_gate_inp,
+            shared_gate,
+            shared_up,
+            shared_down,
+            dense_storage,
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
@@ -497,15 +521,24 @@ impl MoeFfnWeightsGpuQ {
     /// has populated `expert_*_affine` slots (from
     /// `Qwen35Model::apply_dwq_overlay`).  Cheap clone — `MlxBuffer`
     /// is internally Arc-wrapped (no GPU copy).
+    ///
+    /// Native router/shared-expert storage (the batched decode route) has no
+    /// affine expert path; attaching an overlay to it is an error.
     pub fn attach_affine_overlay(
         &mut self,
         gate: Option<&crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
         up: Option<&crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
         down: Option<&crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
-    ) {
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.dense_storage.is_native() || (gate.is_none() && up.is_none() && down.is_none()),
+            "{} does not support DWQ affine expert overlays; unset it to load this artifact",
+            super::moe_batched::QWEN_MOE_BATCHED_ENV
+        );
         self.expert_gate_affine = gate.cloned();
         self.expert_up_affine = up.cloned();
         self.expert_down_affine = down.cloned();
+        Ok(())
     }
 }
 
@@ -834,6 +867,97 @@ fn proj_into(
             .context("dense_matmul_bf16_f32_tensor proj_into")?;
     }
     Ok(())
+}
+
+/// [`proj_pooled`] for a MoE router / shared-expert projection under the
+/// layer's [`MoeDenseStorage`]: BF16 storage keeps [`proj_pooled`]; native
+/// storage reads the GGUF-typed weight ([`encode_native_dense_proj`]).
+#[allow(clippy::too_many_arguments)]
+fn moe_dense_proj_pooled(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weights: &MoeFfnWeightsGpuQ,
+    role: MoeDenseRole,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<MlxBuffer> {
+    if !weights.dense_storage.is_native() {
+        return proj_pooled(
+            encoder,
+            registry,
+            device,
+            input,
+            role.weight(weights),
+            seq_len,
+            in_features,
+            out_features,
+        );
+    }
+    let dst = super::decode_pool::pooled_alloc_buffer(
+        device,
+        (seq_len * out_features) as usize * 4,
+        DType::F32,
+        vec![seq_len as usize, out_features as usize],
+    )
+    .map_err(|e| anyhow!("alloc native MoE proj dst (pooled): {e}"))?;
+    encode_native_dense_proj(
+        encoder,
+        registry,
+        device,
+        input,
+        weights,
+        role,
+        &dst,
+        seq_len,
+        in_features,
+        out_features,
+    )?;
+    Ok(dst)
+}
+
+/// [`proj_into`] for a MoE router / shared-expert projection under the
+/// layer's [`MoeDenseStorage`] (see [`moe_dense_proj_pooled`]).
+#[allow(clippy::too_many_arguments)]
+fn moe_dense_proj_into(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weights: &MoeFfnWeightsGpuQ,
+    role: MoeDenseRole,
+    dst: &mut MlxBuffer,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<()> {
+    if !weights.dense_storage.is_native() {
+        return proj_into(
+            encoder,
+            registry,
+            device,
+            input,
+            role.weight(weights),
+            dst,
+            seq_len,
+            in_features,
+            out_features,
+        );
+    }
+    encode_native_dense_proj(
+        encoder,
+        registry,
+        device,
+        input,
+        weights,
+        role,
+        dst,
+        seq_len,
+        in_features,
+        out_features,
+    )
 }
 
 // ================================================================
@@ -2551,6 +2675,27 @@ pub fn build_moe_ffn_layer_gpu_q_into(
     let m_moe32 = shape.moe_intermediate_size;
     let m_sh32 = shape.shared_intermediate_size;
 
+    // HF2Q_QWEN_MOE_BATCHED: one-row decode on native router/shared storage
+    // runs the batched route at one row, the same kernels a joint step runs
+    // over its rows, so a row's output does not depend on the joint width.
+    if seq_len == 1 && weights.dense_storage.is_native() {
+        let mut out = super::decode_pool::pooled_alloc_buffer(device, h * 4, DType::F32, vec![1, h])
+            .map_err(|e| anyhow!("alloc batched moe output (pooled, decode): {e}"))?;
+        build_moe_ffn_layer_gpu_batched_into(
+            enc,
+            device,
+            registry,
+            x,
+            weights,
+            shape,
+            add_residual,
+            &mut out,
+            1,
+            layer_idx,
+        )?;
+        return Ok(out);
+    }
+
     // ADR-013 P13.3 perf: entire MoE FFN in ONE command buffer.
     // By fusing all projections + routing + expert matmuls + weighted combine into a
     // single encoder (single commit_and_wait per MoE layer), we eliminate the second
@@ -2706,42 +2851,46 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseAProj,
             );
-            let logits_buf = proj_pooled(
+            let logits_buf = moe_dense_proj_pooled(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.router,
+                weights,
+                MoeDenseRole::Router,
                 seq_len,
                 h32,
                 ne32,
             )?;
-            let sh_logit_buf = proj_pooled(
+            let sh_logit_buf = moe_dense_proj_pooled(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.shared_gate_inp,
+                weights,
+                MoeDenseRole::SharedGateLogit,
                 seq_len,
                 h32,
                 1,
             )?;
-            let a_s_buf = proj_pooled(
+            let a_s_buf = moe_dense_proj_pooled(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.shared_gate,
+                weights,
+                MoeDenseRole::SharedGate,
                 seq_len,
                 h32,
                 m_sh32,
             )?;
-            let b_s_buf = proj_pooled(
+            let b_s_buf = moe_dense_proj_pooled(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.shared_up,
+                weights,
+                MoeDenseRole::SharedUp,
                 seq_len,
                 h32,
                 m_sh32,
@@ -2946,12 +3095,13 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             }
             // ADR-015 iter7b — pooled (q_into path; y_s_buf flows into
             // dispatch_moe_weighted_reduce, no CPU download).
-            proj_pooled(
+            moe_dense_proj_pooled(
                 enc,
                 registry,
                 device,
                 &h_s_buf,
-                &weights.shared_down,
+                weights,
+                MoeDenseRole::SharedDown,
                 seq_len,
                 m_sh32,
                 h32,
@@ -3214,45 +3364,49 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseAProj,
             );
-            proj_into(
+            moe_dense_proj_into(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.router,
+                weights,
+                MoeDenseRole::Router,
                 &mut arena.logits_buf,
                 seq_len,
                 h32,
                 ne32,
             )?;
-            proj_into(
+            moe_dense_proj_into(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.shared_gate_inp,
+                weights,
+                MoeDenseRole::SharedGateLogit,
                 &mut arena.sh_logit_buf,
                 seq_len,
                 h32,
                 1,
             )?;
-            proj_into(
+            moe_dense_proj_into(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.shared_gate,
+                weights,
+                MoeDenseRole::SharedGate,
                 &mut arena.a_s_buf,
                 seq_len,
                 h32,
                 m_sh32,
             )?;
-            proj_into(
+            moe_dense_proj_into(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.shared_up,
+                weights,
+                MoeDenseRole::SharedUp,
                 &mut arena.b_s_buf,
                 seq_len,
                 h32,
@@ -3415,12 +3569,13 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                     },
                 )?;
             }
-            proj_pooled(
+            moe_dense_proj_pooled(
                 enc,
                 registry,
                 device,
                 &arena.h_s_buf,
-                &weights.shared_down,
+                weights,
+                MoeDenseRole::SharedDown,
                 seq_len,
                 m_sh32,
                 h32,
@@ -4446,6 +4601,7 @@ mod tests {
             shared_gate: upload_f32(&shared_gate_f32, &device).expect("sh_gate"),
             shared_up: upload_f32(&shared_up_f32, &device).expect("sh_up"),
             shared_down: upload_f32(&shared_down_f32, &device).expect("sh_down"),
+            dense_storage: MoeDenseStorage::Bf16,
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,

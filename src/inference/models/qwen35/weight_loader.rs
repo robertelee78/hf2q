@@ -24,7 +24,7 @@
 //! the `[out_dim, in_dim]` convention our CPU refs expect. Single-vector
 //! tensors (norms, biases) are 1-D and drop in directly.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use mlx_native::gguf::{GgufFile, TensorInfo};
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType as MlxDType, MlxBuffer, MlxDevice};
@@ -52,13 +52,14 @@ use super::{
 // ============================================================================
 
 /// Per-layer MoE FFN weights with expert tensors kept in their native GGML
-/// quantization.  Small tensors (router, shared-expert) are still f32.
+/// quantization. Small tensors (router, shared-expert) are f32 vecs, unless
+/// `native_dense` holds them in GGUF storage (`HF2Q_QWEN_MOE_BATCHED=1`).
 ///
 /// This struct is the bridge between GGUF disk bytes and
 /// `MoeFfnWeightsGpuQ`: it holds the raw Metal buffers that `GgufFile::load_tensor`
 /// produced, plus the f32 scalars needed for routing and shared-expert computation.
 pub struct MoeFfnWeightsQ {
-    /// Router: `[num_experts, hidden_size]` F32.
+    /// Router: `[num_experts, hidden_size]` F32. Empty when `native_dense` is set.
     pub router: Vec<f32>,
     /// Stacked expert gate_proj: raw GGML blocks, dtype U8 on Metal.
     pub expert_gate_q: MlxBuffer,
@@ -72,12 +73,17 @@ pub struct MoeFfnWeightsQ {
     /// GGML quantization type for the down expert buffer (may differ from gate/up).
     /// In the apex GGUF this is Q6_K.
     pub ggml_type_down: GgmlType,
-    /// Shared-expert sigmoid gate: `[hidden_size]` F32.
+    /// Shared-expert sigmoid gate: `[hidden_size]` F32. Empty when
+    /// `native_dense` is set.
     pub shared_gate_logit: Vec<f32>,
-    /// Shared-expert SwiGLU weights (F32).
+    /// Shared-expert SwiGLU weights (F32, dequantized). Empty when
+    /// `native_dense` is set.
     pub shared_gate: Vec<f32>,
     pub shared_up: Vec<f32>,
     pub shared_down: Vec<f32>,
+    /// Router and shared-expert weights in their GGUF storage, for the
+    /// batched MoE decode route. `None` keeps the f32 vecs above.
+    pub native_dense: Option<MoeNativeDenseQ>,
     /// ADR-020 AC#5 Iter C2.4 — DWQ-overlay mlx-affine expert stacks
     /// (packed-U32 weight + BF16 scales + BF16 biases).  When `Some`,
     /// the corresponding `expert_*_q` buffer above stays
@@ -87,6 +93,22 @@ pub struct MoeFfnWeightsQ {
     pub expert_gate_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
     pub expert_up_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
     pub expert_down_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
+}
+
+/// A MoE layer's router, shared-expert gate logit and shared-expert SwiGLU
+/// weights exactly as the GGUF stores them (Metal buffers, no conversion).
+pub struct MoeNativeDenseQ {
+    /// `ffn_gate_inp`: `[num_experts, hidden_size]` F32.
+    pub router: MlxBuffer,
+    /// `ffn_gate_inp_shexp`: `[hidden_size]` F32.
+    pub shared_gate_inp: MlxBuffer,
+    /// `ffn_gate_shexp` / `ffn_up_shexp`: `[shared_i, hidden_size]` GGML blocks.
+    pub shared_gate: MlxBuffer,
+    pub shared_up: MlxBuffer,
+    /// `ffn_down_shexp`: `[hidden_size, shared_i]` GGML blocks.
+    pub shared_down: MlxBuffer,
+    pub ggml_type_shared_gate_up: GgmlType,
+    pub ggml_type_shared_down: GgmlType,
 }
 
 // ============================================================================
@@ -943,6 +965,7 @@ fn load_lazy_moe_ffn_quantized(
         shared_gate: load_lazy_f32(lookup, &format!("{p}.ffn_gate_shexp.weight"))?,
         shared_up: load_lazy_f32(lookup, &format!("{p}.ffn_up_shexp.weight"))?,
         shared_down: load_lazy_f32(lookup, &format!("{p}.ffn_down_shexp.weight"))?,
+        native_dense: None,
         expert_gate_affine: None,
         expert_up_affine: None,
         expert_down_affine: None,
@@ -1298,8 +1321,10 @@ pub fn load_moe_ffn(gguf: &GgufFile, layer_idx: u32, device: &MlxDevice) -> Resu
 /// `load_tensor_f32`.  This avoids the ~3.2 GB per-layer F32 expansion that
 /// causes the OOM on the 35B apex model.
 ///
-/// Small tensors (router, shared-expert) are still dequantized to f32 because
-/// they are projected with the existing F32 dense kernel.
+/// Small tensors (router, shared-expert) are dequantized to f32 vecs, unless
+/// `HF2Q_QWEN_MOE_BATCHED=1` and their GGUF storage is admitted by the
+/// batched decode route ([`load_moe_native_dense`]); then they stay in GGUF
+/// storage and the f32 vecs are empty.
 pub fn load_moe_ffn_quantized(
     gguf: &GgufFile,
     layer_idx: u32,
@@ -1307,13 +1332,24 @@ pub fn load_moe_ffn_quantized(
 ) -> Result<MoeFfnWeightsQ> {
     let p = format!("blk.{}", layer_idx);
 
-    // Router and shared-expert weights are small — dequantize to f32.
-    let router = load_f32_tensor(gguf, &format!("{p}.ffn_gate_inp.weight"), device)?;
-    let shared_gate_logit =
-        load_f32_tensor(gguf, &format!("{p}.ffn_gate_inp_shexp.weight"), device)?;
-    let shared_gate = load_f32_tensor(gguf, &format!("{p}.ffn_gate_shexp.weight"), device)?;
-    let shared_up = load_f32_tensor(gguf, &format!("{p}.ffn_up_shexp.weight"), device)?;
-    let shared_down = load_f32_tensor(gguf, &format!("{p}.ffn_down_shexp.weight"), device)?;
+    let native_dense = if super::moe_batched::qwen_moe_batched_requested() {
+        load_moe_native_dense(gguf, &p, device)
+            .with_context(|| format!("layer {layer_idx} native router/shared expert"))?
+    } else {
+        None
+    };
+    let (router, shared_gate_logit, shared_gate, shared_up, shared_down) =
+        if native_dense.is_some() {
+            Default::default()
+        } else {
+            (
+                load_f32_tensor(gguf, &format!("{p}.ffn_gate_inp.weight"), device)?,
+                load_f32_tensor(gguf, &format!("{p}.ffn_gate_inp_shexp.weight"), device)?,
+                load_f32_tensor(gguf, &format!("{p}.ffn_gate_shexp.weight"), device)?,
+                load_f32_tensor(gguf, &format!("{p}.ffn_up_shexp.weight"), device)?,
+                load_f32_tensor(gguf, &format!("{p}.ffn_down_shexp.weight"), device)?,
+            )
+        };
 
     // Expert weights: load raw GGML blocks, preserving quantization.
     // W-5b.7 iter 2: residency-aware via `load_tensor_with_residency`.
@@ -1385,10 +1421,97 @@ pub fn load_moe_ffn_quantized(
         shared_gate,
         shared_up,
         shared_down,
+        native_dense,
         expert_gate_affine: None,
         expert_up_affine: None,
         expert_down_affine: None,
     })
+}
+
+/// Router, shared-expert gate logit and shared-expert SwiGLU weights of
+/// layer `p` in GGUF storage, or `None` when their storage types are not
+/// admitted by the batched MoE decode route (F32 router and gate logit,
+/// shared gate/up/down in [`super::moe_batched::native_shared_types_supported`]).
+fn load_moe_native_dense(
+    gguf: &GgufFile,
+    p: &str,
+    device: &MlxDevice,
+) -> Result<Option<MoeNativeDenseQ>> {
+    let names = [
+        format!("{p}.ffn_gate_inp.weight"),
+        format!("{p}.ffn_gate_inp_shexp.weight"),
+        format!("{p}.ffn_gate_shexp.weight"),
+        format!("{p}.ffn_up_shexp.weight"),
+        format!("{p}.ffn_down_shexp.weight"),
+    ];
+    let mut infos = Vec::with_capacity(names.len());
+    for name in &names {
+        infos.push(
+            gguf.tensor_info(name)
+                .ok_or_else(|| anyhow!("'{name}' not found in GGUF"))?,
+        );
+    }
+    let [router_i, gate_inp_i, gate_i, up_i, down_i] = infos.as_slice() else {
+        unreachable!("five tensor infos");
+    };
+    if router_i.ggml_type != GgmlType::F32
+        || gate_inp_i.ggml_type != GgmlType::F32
+        || gate_i.ggml_type != up_i.ggml_type
+        || !super::moe_batched::native_shared_types_supported(gate_i.ggml_type, down_i.ggml_type)
+    {
+        tracing::warn!(
+            layer = p,
+            router = ?router_i.ggml_type,
+            shared_gate_logit = ?gate_inp_i.ggml_type,
+            shared_gate = ?gate_i.ggml_type,
+            shared_up = ?up_i.ggml_type,
+            shared_down = ?down_i.ggml_type,
+            "Qwen MoE batched route does not admit these storage types; layer keeps the per-row route"
+        );
+        return Ok(None);
+    }
+    let &[n_experts, hidden] = router_i.shape.as_slice() else {
+        bail!("'{}' shape {:?} is not 2-D", names[0], router_i.shape);
+    };
+    let &[shared_i, gate_cols] = gate_i.shape.as_slice() else {
+        bail!("'{}' shape {:?} is not 2-D", names[2], gate_i.shape);
+    };
+    anyhow::ensure!(
+        gate_cols == hidden,
+        "'{}' shape {:?} does not match hidden {hidden}",
+        names[2],
+        gate_i.shape
+    );
+    let (router, _) = load_native_projection(gguf, &names[0], n_experts, hidden, device)?;
+    let gate_inp_values: usize = gate_inp_i.shape.iter().product();
+    anyhow::ensure!(
+        gate_inp_values == hidden,
+        "'{}' shape {:?} does not hold {hidden} values",
+        names[1],
+        gate_inp_i.shape
+    );
+    let shared_gate_inp = load_tensor_with_residency(gguf, &names[1], device)?;
+    anyhow::ensure!(
+        shared_gate_inp.dtype() == MlxDType::F32 && shared_gate_inp.element_count() == hidden,
+        "'{}' loaded as {:?} with {} values",
+        names[1],
+        shared_gate_inp.dtype(),
+        shared_gate_inp.element_count()
+    );
+    let (shared_gate, ggml_type_shared_gate_up) =
+        load_native_projection(gguf, &names[2], shared_i, hidden, device)?;
+    let (shared_up, _) = load_native_projection(gguf, &names[3], shared_i, hidden, device)?;
+    let (shared_down, ggml_type_shared_down) =
+        load_native_projection(gguf, &names[4], hidden, shared_i, device)?;
+    Ok(Some(MoeNativeDenseQ {
+        router,
+        shared_gate_inp,
+        shared_gate,
+        shared_up,
+        shared_down,
+        ggml_type_shared_gate_up,
+        ggml_type_shared_down,
+    }))
 }
 
 pub(crate) fn qwen35_moe_expert_type_supported(t: GgmlType) -> bool {
