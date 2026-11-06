@@ -14,13 +14,12 @@
 //! - HC ops: `rms_norm_no_scale_f32` over 4x4096, F16 `hc_fn` per row, `dispatch_hc_split_sinkhorn`,
 //!   `dispatch_hc_pre`, `dispatch_hc_post`, and the whole pre site.
 //!
-//! Timing as in M2a (`ds4_op_microbench_tests.rs`): one trial encodes `REPS` back-to-back copies
-//! in one session and times `finish()` (commit + wait); the cell is the median of `TRIALS` trials
-//! divided by `REPS`. `encode_us` is the host encode time per copy (not included in `us`);
-//! `plan_us` is the host time of `plan_*_row` for one layer's B rows inside a decode pool cycle.
-//! The `floor` cells (1 or 16 dependent 1-element dispatches per copy) give the method's floor. A 2 s
-//! F16 matvec warm-up runs first, and every cell runs >= 50 ms of untimed trials before its
-//! timed ones, so cells see the sustained GPU clock after host-side setup.
+//! Timing: `ds4_bench_support` (shared with M2a): GPU command-buffer timestamps, `reps` per
+//! session calibrated for >= 2 ms of GPU work, median of 9 trials per copy; `wall_us` (commit + wait)
+//! and `encode_us` (host) per copy are recorded too. `plan_us` is the host time of `plan_*_row` for
+//! one layer's B rows inside a decode pool cycle. The `floor` cells (1 or 16 dependent 1-element
+//! dispatches per copy) record the method's floor in every run. A 2 s F16 matvec warm-up runs
+//! first, and every cell runs >= 50 ms of untimed sessions before its timed ones.
 //! Cold cells rotate over distinct layers (own weights and own cache rows) until the weights
 //! exceed 256 MiB; `warm` cells reuse one layer. Compressed layers are timed at a step that emits a
 //! compressed row (`emit`) and one that does not; amortize as `(ratio-1)/ratio * steady + emit/ratio`.
@@ -35,7 +34,6 @@
 //! HF2Q_DS4_ATTN_BENCH_OUT=<cells.jsonl> cargo test --release --bin hf2q ds4_attn_microbench -- --ignored --nocapture
 //! ```
 
-use std::io::Write;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -47,7 +45,6 @@ use mlx_native::ops::deepseek_sparse_attention::{
     dispatch_deepseek_sparse_attention, dispatch_deepseek_sparse_attention_flash_decode,
     dispatch_deepseek_sparse_attention_with_scratch, DeepSeekSparseAttentionParams,
 };
-use mlx_native::ops::elementwise::scalar_mul_f32;
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 use serde_json::{json, Value};
@@ -67,8 +64,12 @@ use super::compressed_attention_weights::{
     CompressedAttentionWeightsRef, CompressorWeightsRef, IndexerWeightsRef,
 };
 use super::compressor_tail::{encode_indexer_tail, encode_main_tail, CompressorTail};
+use super::ds4_bench_support::{
+    copies_for, f16_matrix, f32_buf, floor_cells, gpu_warmup, median, run_once, time_op, Out, Rng,
+    COLD_BYTES, TRIALS,
+};
 use super::forward_support::{
-    alloc, alloc_host_input, begin_decode_pool_token, end_decode_pool_token, raw_matmul, rms_params,
+    alloc, alloc_host_input, begin_decode_pool_token, end_decode_pool_token, rms_params,
 };
 use super::joint_decode_core::{
     encode_compressed_row, encode_window_row, plan_compressed_row, plan_window_row, JointRowInputs,
@@ -80,28 +81,9 @@ use super::row_matmul::{row_matmul, row_view, RowMatmul};
 use super::Deepseek4Config;
 use crate::serve::gpu::GpuContext;
 
-const TRIALS: usize = 9;
-const REPS: usize = 16;
-const WARM_SECS: f64 = 0.05;
-const COLD_BYTES: usize = 256 << 20;
 const CONTEXT: usize = 8192;
 const MAX_ROWS: usize = 4;
 const LAYERS: usize = 43;
-
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-    /// Uniform in [-1, 1).
-    fn unit(&mut self) -> f32 {
-        ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-}
 
 fn ds4_ratios() -> Vec<u32> {
     (0..LAYERS)
@@ -111,26 +93,6 @@ fn ds4_ratios() -> Vec<u32> {
             _ => 128,
         })
         .collect()
-}
-
-fn f16_matrix(device: &MlxDevice, n: usize, k: usize, seed: u64) -> MlxBuffer {
-    let mut buf = device
-        .alloc_buffer(n * k * 2, DType::F16, vec![n, k])
-        .unwrap();
-    let mut rng = Rng(seed);
-    for v in buf.as_mut_slice::<u16>().unwrap() {
-        *v = half::f16::from_f32(rng.unit() * 0.025).to_bits();
-    }
-    buf
-}
-
-fn f32_buf(device: &MlxDevice, shape: Vec<usize>, seed: u64, scale: f32) -> MlxBuffer {
-    let mut buf = alloc(device, DType::F32, shape, "bench f32").unwrap();
-    let mut rng = Rng(seed);
-    for v in buf.as_mut_slice::<f32>().unwrap() {
-        *v = rng.unit() * scale;
-    }
-    buf
 }
 
 fn fill_bf16(buf: &mut MlxBuffer, seed: u64, scale: f32) {
@@ -154,65 +116,6 @@ fn host_table(device: &MlxDevice, values: Vec<f32>) -> MlxBuffer {
     buf
 }
 
-fn median(mut samples: Vec<f64>) -> f64 {
-    samples.sort_by(f64::total_cmp);
-    samples[samples.len() / 2]
-}
-
-struct Timing {
-    us: f64,
-    encode_us: f64,
-}
-
-/// Median GPU seconds (as µs) per copy over TRIALS trials of REPS encodes each. Untimed trials run
-/// first for >= WARM_SECS (pipelines, GPU clock after host-side setup). The encode closure gets a
-/// running copy index, so cold cells rotate over all their layers across trials.
-fn time_op(
-    ctx: &mut GpuContext,
-    mut encode: impl FnMut(&mut GraphSession<'_>, &mut KernelRegistry, &MlxDevice, usize) -> Result<()>,
-) -> Timing {
-    let device = ctx.device().clone();
-    let mut gpu = Vec::with_capacity(TRIALS);
-    let mut host = Vec::with_capacity(TRIALS);
-    let warm_start = Instant::now();
-    let mut copy = 0usize;
-    let mut warming = true;
-    while gpu.len() < TRIALS {
-        let (executor, registry) = ctx.split();
-        let mut session = executor.begin().unwrap();
-        let t0 = Instant::now();
-        for _ in 0..REPS {
-            encode(&mut session, registry, &device, copy).unwrap();
-            copy += 1;
-        }
-        let t1 = Instant::now();
-        session.finish().unwrap();
-        let dt = t1.elapsed().as_secs_f64();
-        if warming {
-            warming = warm_start.elapsed().as_secs_f64() < WARM_SECS;
-            continue;
-        }
-        gpu.push(dt / REPS as f64);
-        host.push((t1 - t0).as_secs_f64() / REPS as f64);
-    }
-    Timing {
-        us: median(gpu) * 1e6,
-        encode_us: median(host) * 1e6,
-    }
-}
-
-/// Encode once and wait (untimed setup, e.g. populating top-k indices).
-fn run_once(
-    ctx: &mut GpuContext,
-    encode: impl FnOnce(&mut GraphSession<'_>, &mut KernelRegistry, &MlxDevice) -> Result<()>,
-) {
-    let device = ctx.device().clone();
-    let (executor, registry) = ctx.split();
-    let mut session = executor.begin().unwrap();
-    encode(&mut session, registry, &device).unwrap();
-    session.finish().unwrap();
-}
-
 /// Host µs to plan one layer's B rows, median of TRIALS decode-pool cycles (joint decode plans inside
 /// `begin_decode_pool_token`), plus one plan made outside the pool for the GPU cells.
 fn plan_rows<T>(layers: usize, mut plan: impl FnMut() -> Vec<T>) -> (Vec<T>, f64) {
@@ -227,63 +130,6 @@ fn plan_rows<T>(layers: usize, mut plan: impl FnMut() -> Vec<T>) -> (Vec<T>, f64
     }
     samples.remove(0); // cycle 0 fills the pool
     (plan(), median(samples) * 1e6)
-}
-
-/// Bring the GPU to its sustained clock before the first cell: cold F16 matvecs for >= 2 s.
-fn gpu_warmup(ctx: &mut GpuContext) {
-    let device = ctx.device().clone();
-    let (n, k) = (8192usize, 4096usize);
-    let weights: Vec<MlxBuffer> = (0..4).map(|c| f16_matrix(&device, n, k, 900 + c)).collect();
-    let shape = [n, k];
-    let x = f32_buf(&device, vec![1, k], 901, 1.0);
-    let y = alloc(&device, DType::F32, vec![1, n], "warmup out").unwrap();
-    let t0 = Instant::now();
-    while t0.elapsed().as_secs_f64() < 2.0 {
-        time_op(ctx, |s, r, d, rep| {
-            let w = RawMatrixRef {
-                buffer: &weights[rep % weights.len()],
-                ggml_type: GgmlType::F16,
-                shape: &shape,
-            };
-            raw_matmul(s, r, d, &x, &w, &y, 1, n, k, "warmup")
-        });
-    }
-}
-
-/// Floor of the timing method: `dispatches` dependent 1-element dispatches (barrier between each)
-/// per copy. With 1 and 16 per copy, `(us16 - us1) / 15` is the cost of one dependent dispatch and
-/// `us1` minus that is the session commit + wait share of one copy.
-fn floor_cells(ctx: &mut GpuContext, out: &mut Out) {
-    let device = ctx.device().clone();
-    let x = f32_buf(&device, vec![1], 902, 1.0);
-    let y = alloc(&device, DType::F32, vec![1], "floor out").unwrap();
-    for dispatches in [1usize, 16] {
-        let t = time_op(ctx, |s, r, d, _| {
-            for _ in 0..dispatches {
-                s.barrier_between(&[&x], &[&y]);
-                scalar_mul_f32(s.encoder_mut(), r, d.metal_device(), &x, &y, 1, 2.0)?;
-            }
-            Ok(())
-        });
-        out.cell(
-            &json!({"family": "floor", "b": 1}),
-            json!({"op": format!("scalar_mul_x{dispatches}"), "dispatches_per_copy": dispatches,
-                   "us": t.us, "encode_us": t.encode_us, "reps": REPS, "trials": TRIALS}),
-        );
-    }
-}
-
-struct Out(std::fs::File);
-impl Out {
-    fn cell(&mut self, base: &Value, fields: Value) {
-        let mut cell = base.clone();
-        let target = cell.as_object_mut().unwrap();
-        for (key, value) in fields.as_object().unwrap() {
-            target.insert(key.clone(), value.clone());
-        }
-        eprintln!("{cell}");
-        writeln!(self.0, "{cell}").unwrap();
-    }
 }
 
 struct CompressorWeights {
@@ -830,10 +676,7 @@ fn window_cells(
         }
         Ok(())
     });
-    out.cell(
-        base,
-        json!({"op": "core", "us": t.us, "encode_us": t.encode_us, "plan_us": plan_us}),
-    );
+    out.cell(base, json!({"op": "core", "plan_us": plan_us}), &t);
 
     let t = time_op(ctx, |s, r, d, rep| {
         let layer = layers[rep % n];
@@ -856,10 +699,7 @@ fn window_cells(
         }
         Ok(())
     });
-    out.cell(
-        base,
-        json!({"op": "window_write", "us": t.us, "encode_us": t.encode_us}),
-    );
+    out.cell(base, json!({"op": "window_write"}), &t);
 
     let window_capacity = case.lc(0, layers[0]).window_kv.shape()[0];
     let index_row = window_indices(window_capacity, 1, case.position)
@@ -901,8 +741,8 @@ fn window_cells(
     });
     out.cell(
         base,
-        json!({"op": "attention", "kernel": "sparse_score_reduce", "us": t.us, "encode_us": t.encode_us,
-               "attention_width": width}),
+        json!({"op": "attention", "kernel": "sparse_score_reduce", "attention_width": width}),
+        &t,
     );
 }
 
@@ -968,10 +808,7 @@ fn compressed_cells(
         }
         Ok(())
     });
-    out.cell(
-        base,
-        json!({"op": "core", "us": t.us, "encode_us": t.encode_us, "plan_us": plan_us}),
-    );
+    out.cell(base, json!({"op": "core", "plan_us": plan_us}), &t);
     drop(cores);
 
     // (b) sub-ops through the entry points `encode_compressed_row` calls.
@@ -1013,10 +850,7 @@ fn compressed_cells(
         }
         Ok(())
     });
-    out.cell(
-        base,
-        json!({"op": "window_write", "us": t.us, "encode_us": t.encode_us}),
-    );
+    out.cell(base, json!({"op": "window_write"}), &t);
 
     let t = time_op(ctx, |s, r, d, rep| {
         let layer = layers[rep % n];
@@ -1042,10 +876,7 @@ fn compressed_cells(
         }
         Ok(())
     });
-    out.cell(
-        base,
-        json!({"op": "main_compressor", "us": t.us, "encode_us": t.encode_us}),
-    );
+    out.cell(base, json!({"op": "main_compressor"}), &t);
 
     let t = time_op(ctx, |s, r, d, rep| {
         let layer = layers[rep % n];
@@ -1082,10 +913,7 @@ fn compressed_cells(
         }
         Ok(())
     });
-    out.cell(
-        base,
-        json!({"op": "main_compressor_tail", "us": t.us, "encode_us": t.encode_us}),
-    );
+    out.cell(base, json!({"op": "main_compressor_tail"}), &t);
 
     if ratio == 4 {
         let t = time_op(ctx, |s, r, d, rep| {
@@ -1117,10 +945,7 @@ fn compressed_cells(
             }
             Ok(())
         });
-        out.cell(
-            base,
-            json!({"op": "indexer", "us": t.us, "encode_us": t.encode_us}),
-        );
+        out.cell(base, json!({"op": "indexer"}), &t);
 
         let t = time_op(ctx, |s, r, d, rep| {
             let layer = layers[rep % n];
@@ -1158,10 +983,7 @@ fn compressed_cells(
             }
             Ok(())
         });
-        out.cell(
-            base,
-            json!({"op": "indexer_compressor_tail", "us": t.us, "encode_us": t.encode_us}),
-        );
+        out.cell(base, json!({"op": "indexer_compressor_tail"}), &t);
 
         let t = time_op(ctx, |s, r, d, rep| {
             let layer = layers[rep % n];
@@ -1172,8 +994,9 @@ fn compressed_cells(
         });
         out.cell(
             base,
-            json!({"op": "indexer_select", "kernel": "indexer_into_mma_tiled", "us": t.us,
-                   "encode_us": t.encode_us, "index_keys": valid, "top_k": cfg.index_top_k}),
+            json!({"op": "indexer_select", "kernel": "indexer_into_mma_tiled", "index_keys": valid,
+                   "top_k": cfg.index_top_k}),
+            &t,
         );
 
         // The attention-only cell must read real top-k indices, not the -1 placeholders.
@@ -1207,8 +1030,9 @@ fn compressed_cells(
     };
     out.cell(
         base,
-        json!({"op": "attention", "kernel": kernel, "us": t.us, "encode_us": t.encode_us,
-               "attention_width": width, "physical_kv_len": subs[0].physical_kv_len}),
+        json!({"op": "attention", "kernel": kernel, "attention_width": width,
+               "physical_kv_len": subs[0].physical_kv_len}),
+        &t,
     );
 }
 
@@ -1259,6 +1083,7 @@ impl HcRows<'_> {
         rep: usize,
     ) -> Result<()> {
         let w = RawMatrixRef {
+            // `rep % copies` with copies = len (cold) or 1 (warm), set by the caller's slice.
             buffer: &self.hc_fn[rep % self.hc_fn.len()],
             ggml_type: GgmlType::F16,
             shape: self.fn_shape,
@@ -1347,7 +1172,7 @@ fn hc_cells(ctx: &mut GpuContext, out: &mut Out, cfg: &Deepseek4Config) {
     let mix = (2 + hc) * hc;
     let fn_shape = [mix, hc_hidden];
     let fn_bytes = mix * hc_hidden * 2;
-    let copies = COLD_BYTES.div_ceil(fn_bytes).clamp(1, 64);
+    let copies = copies_for(fn_bytes, false);
     let hc_fn: Vec<MlxBuffer> = (0..copies)
         .map(|c| f16_matrix(&device, mix, hc_hidden, 500 + c as u64))
         .collect();
@@ -1356,7 +1181,7 @@ fn hc_cells(ctx: &mut GpuContext, out: &mut Out, cfg: &Deepseek4Config) {
     let params = rms_params(&device, cfg.rms_norm_eps, hc_hidden, "bench hc params").unwrap();
     for b in 1..=MAX_ROWS {
         let state = f32_buf(&device, vec![b, hc, hidden], 63, 1.0);
-        let h = HcRows {
+        let mut h = HcRows {
             rows: b,
             hidden,
             hc_hidden,
@@ -1381,43 +1206,37 @@ fn hc_cells(ctx: &mut GpuContext, out: &mut Out, cfg: &Deepseek4Config) {
         run_once(ctx, |s, r, d| h.sinkhorn(s, r, d));
         let base = json!({"family": "hc", "b": b, "hc": hc, "hidden": hidden,
                           "sinkhorn_iterations": cfg.hyper_connection_sinkhorn_iterations});
+        // Weightless ops: one set of activations, warm by construction.
         let t = time_op(ctx, |s, r, d, _| h.norm(s, r, d));
-        out.cell(
-            &base,
-            json!({"op": "hc_norm", "us": t.us, "encode_us": t.encode_us, "warm": true}),
-        );
-        let t = time_op(ctx, |s, r, d, rep| h.mixes(s, r, d, rep));
-        out.cell(
-            &base,
-            json!({"op": "hc_fn", "us": t.us, "encode_us": t.encode_us, "warm": false,
-                   "weight_bytes": fn_bytes, "copies": copies}),
-        );
+        out.cell(&base, json!({"op": "hc_norm", "warm": true}), &t);
         let t = time_op(ctx, |s, r, d, _| h.sinkhorn(s, r, d));
-        out.cell(
-            &base,
-            json!({"op": "hc_split_sinkhorn", "us": t.us, "encode_us": t.encode_us, "warm": true}),
-        );
+        out.cell(&base, json!({"op": "hc_split_sinkhorn", "warm": true}), &t);
         let t = time_op(ctx, |s, r, d, _| h.pre(s, r, d));
-        out.cell(
-            &base,
-            json!({"op": "hc_pre", "us": t.us, "encode_us": t.encode_us, "warm": true}),
-        );
+        out.cell(&base, json!({"op": "hc_pre", "warm": true}), &t);
         let t = time_op(ctx, |s, r, d, _| h.post(s, r, d));
-        out.cell(
-            &base,
-            json!({"op": "hc_post", "us": t.us, "encode_us": t.encode_us, "warm": true}),
-        );
-        let t = time_op(ctx, |s, r, d, rep| {
-            h.norm(s, r, d)?;
-            h.mixes(s, r, d, rep)?;
-            h.sinkhorn(s, r, d)?;
-            h.pre(s, r, d)
-        });
-        out.cell(
-            &base,
-            json!({"op": "hc_pre_site", "parts": "norm+hc_fn+split_sinkhorn+pre", "us": t.us,
-                   "encode_us": t.encode_us, "warm": false}),
-        );
+        out.cell(&base, json!({"op": "hc_post", "warm": true}), &t);
+        for warm in [false, true] {
+            let n = if warm { 1 } else { copies };
+            h.hc_fn = &hc_fn[..n];
+            let t = time_op(ctx, |s, r, d, rep| h.mixes(s, r, d, rep));
+            out.cell(
+                &base,
+                json!({"op": "hc_fn", "warm": warm, "weight_bytes": fn_bytes, "copies": n}),
+                &t,
+            );
+            let t = time_op(ctx, |s, r, d, rep| {
+                h.norm(s, r, d)?;
+                h.mixes(s, r, d, rep)?;
+                h.sinkhorn(s, r, d)?;
+                h.pre(s, r, d)
+            });
+            out.cell(
+                &base,
+                json!({"op": "hc_pre_site", "parts": "norm+hc_fn+split_sinkhorn+pre", "warm": warm,
+                       "copies": n}),
+                &t,
+            );
+        }
     }
 }
 
