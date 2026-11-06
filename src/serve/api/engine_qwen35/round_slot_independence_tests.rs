@@ -2,27 +2,28 @@
 //! independent of the other slots (Q1 §3.1 Class A).
 //!
 //! Each gate loads the official artifact once with speculation `auto` (the
-//! default repeatable route) and serves the same target request in slot 2 of
-//! a fresh four-slot cache, once per peer state of slots 0, 1 and 3:
+//! default repeatable route) and serves the same target request in a fresh
+//! four-slot cache. The reference runs it in slot 2 with the other slots
+//! untouched; each variant changes one thing:
 //!
-//! 1. **Empty.** The peers are never touched (the reference).
-//! 2. **Prefilled.** After the target's prefill, each peer is prefilled with
-//!    its own prompt.
-//! 3. **Mid-decode.** As 2, then each peer runs a few decode ticks (its
+//! 1. **Prefilled.** After the target's prefill, each peer slot is prefilled
+//!    with its own prompt.
+//! 2. **Mid-decode.** As 1, then each peer runs a few decode ticks (its
 //!    ordinary warm-up decision and its own speculative rounds).
-//! 4. **Interleaved.** As 3, and every live peer also ticks once in each
+//! 3. **Interleaved.** As 2, and every live peer also ticks once in each
 //!    scheduler turn, in slot order around the target.
+//! 4. **Target slot.** Empty peers, the target in slot 0, 1 or 3: a server
+//!    may place the same request in any slot.
 //!
 //! The target is driven like a server lane: bounded prefill through
-//! `Qwen35PrefillState`, then `Qwen35DecodeState::decode_tick` until it has
-//! run at least one K3 MTP round and one history-lookup round, then until its
-//! verified queue drains. Its prompt asks for a verbatim copy of a code
-//! block: the first speculative tick (assistant-header suffix) finds no
+//! `Qwen35PrefillState`, then `Qwen35DecodeState::decode_tick` until it
+//! finishes (`TARGET_MAX_TOKENS`). Its prompt asks for a verbatim copy of a
+//! code block: the first speculative tick (assistant-header suffix) finds no
 //! history match and runs K3, and once the copy starts history lookup finds
-//! drafts. Each tick's route is read from the process-global speculation
-//! counters around the target's own tick (run with `--test-threads=1`).
-//! Every proposer stays below eight rounds, so neither cost gate can complete
-//! the two evaluation windows a disable needs.
+//! drafts; the reference must run both. Each tick's route is read from the
+//! process-global speculation counters around the target's own tick (run
+//! with `--test-threads=1`). The repeatable route's cost gates are modelled,
+//! so a gate disable is part of the compared route sequence.
 //!
 //! Compared bitwise against the reference:
 //! - the target's prefill logits;
@@ -40,10 +41,10 @@
 //! ```text
 //! HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 \
 //! HF2Q_QWEN38_GGUF=/abs/Qwen3.8-27B-vanilla.gguf \
-//!   cargo test --release --lib qwen38_k3_and_history_rounds_are_slot_independent_bitwise \
+//!   cargo test --release --bin hf2q qwen38_k3_and_history_rounds_are_slot_independent_bitwise \
 //!   -- --ignored --exact --nocapture --test-threads=1
 //! HF2Q_QWEN36_GGUF=/abs/qwen36.gguf \
-//!   cargo test --release --lib qwen36_k3_and_history_rounds_are_slot_independent_bitwise \
+//!   cargo test --release --bin hf2q qwen36_k3_and_history_rounds_are_slot_independent_bitwise \
 //!   -- --ignored --exact --nocapture --test-threads=1
 //! ```
 
@@ -63,18 +64,16 @@ use crate::serve::api::qwen35_speculation::{
 use crate::serve::multi_seq_kv::SlotId;
 
 const SLOTS: u32 = 4;
-const TARGET: SlotId = SlotId(2);
-const PEERS: [SlotId; 3] = [SlotId(0), SlotId(1), SlotId(3)];
+/// The reference target slot; variants also place the target in the others.
+const REFERENCE_SLOT: SlotId = SlotId(2);
 const CAPACITY: u32 = 1024;
 const PREFILL_CHUNK: usize = 512;
-const TARGET_MAX_TOKENS: usize = 96;
+const TARGET_MAX_TOKENS: usize = 192;
 const PEER_MAX_TOKENS: usize = 48;
 const PEER_DECODE_STEPS: usize = 4;
-const MAX_TARGET_TICKS: usize = 64;
-/// A cost gate evaluates every four rounds and disables a proposer only
-/// after two unprofitable windows, so at most seven rounds per proposer keep
-/// the route sequence independent of the gate.
-const MAX_ROUNDS_PER_PROPOSER: usize = 7;
+/// Every tick commits one token, so a target that runs to its bound takes at
+/// most this many ticks.
+const MAX_TARGET_TICKS: usize = TARGET_MAX_TOKENS + 1;
 
 const TARGET_TEXT: &str =
     "Copy this Python function exactly, as one code block with no other text.\n\n\
@@ -359,17 +358,18 @@ fn tick_peer(
 fn tick_target(
     qwen: &mut Qwen35LoadedModel,
     kv: &mut HybridKvCache,
+    slot: SlotId,
     state: &mut Qwen35DecodeState,
     supervisor: &EngineSupervisor,
 ) -> Tick {
     let (mtp_before, history_before) = rounds_recorded();
-    let (cursor_before, _) = cursors(kv, TARGET);
+    let (cursor_before, _) = cursors(kv, slot);
     let outcome = state
         .decode_tick(qwen, kv, supervisor)
         .unwrap_or_else(|error| panic!("target tick: {error:#}"));
     let finished = state.complete_tick(outcome).finished;
     let (mtp_after, history_after) = rounds_recorded();
-    let (target_cursor, mtp_cursor) = cursors(kv, TARGET);
+    let (target_cursor, mtp_cursor) = cursors(kv, slot);
     let route = match (mtp_after - mtp_before, history_after - history_before) {
         (0, 0) if target_cursor == cursor_before => Route::Commit,
         (0, 0) => Route::Ordinary,
@@ -394,21 +394,22 @@ fn tick_target(
     }
 }
 
-/// Serve the target request in a fresh cache with `peers` in the other
-/// slots, until one K3 round and one history round ran and the verified
-/// queue drained.
+/// Serve the target request in `target_slot` of a fresh cache with `peers`
+/// in the other slots, until it finishes.
 fn run_variant(
     qwen: &mut Qwen35LoadedModel,
     target_prompt: &[u32],
     peer_prompts: &[Vec<u32>; 3],
+    target_slot: SlotId,
     peers: Peers,
 ) -> TargetTrace {
+    let label = format!("{peers:?} target slot {}", target_slot.0);
     let supervisor = EngineSupervisor::new();
     let mut kv = new_cache(qwen);
     let (mut target, prefill_logits) = prefill(
         qwen,
         &mut kv,
-        TARGET,
+        target_slot,
         target_prompt,
         TARGET_MAX_TOKENS,
         &supervisor,
@@ -418,12 +419,13 @@ fn run_variant(
         target.history_lookup.is_some(),
         "target must be eligible for history lookup"
     );
-    kv.validate_speculative_cursors_for_slot(TARGET, target_prompt.len())
+    kv.validate_speculative_cursors_for_slot(target_slot, target_prompt.len())
         .expect("target and MTP cursors at the prompt boundary");
 
     let mut lanes: Vec<Peer> = Vec::new();
     if peers != Peers::Empty {
-        for (&slot, prompt) in PEERS.iter().zip(peer_prompts) {
+        let peer_slots = (0..SLOTS).map(SlotId).filter(|&slot| slot != target_slot);
+        for (slot, prompt) in peer_slots.zip(peer_prompts) {
             let (state, _) = prefill(qwen, &mut kv, slot, prompt, PEER_MAX_TOKENS, &supervisor);
             lanes.push(Peer {
                 slot,
@@ -441,44 +443,22 @@ fn run_variant(
         for lane in &lanes {
             assert!(
                 lane.state.generated_tokens.len() > 1,
-                "{peers:?}: peer slot {} did not advance",
+                "{label}: peer slot {} did not advance",
                 lane.slot.0
             );
         }
     }
 
     let mut ticks: Vec<Tick> = Vec::new();
-    let (mut k3_rounds, mut history_rounds) = (0usize, 0usize);
-    loop {
-        let rounds_ran = k3_rounds > 0 && history_rounds > 0;
-        if ticks.last().is_some_and(|tick| tick.finished) {
-            assert!(
-                rounds_ran,
-                "{peers:?}: target finished before a K3 and a history round ran: {:?}",
-                ticks.iter().map(|tick| tick.route).collect::<Vec<_>>()
-            );
-            break;
-        }
-        if rounds_ran && target.pending_speculation_output.is_empty() {
-            break;
-        }
+    while !ticks.last().is_some_and(|tick: &Tick| tick.finished) {
         assert!(
-            ticks.len() < MAX_TARGET_TICKS
-                && k3_rounds <= MAX_ROUNDS_PER_PROPOSER
-                && history_rounds <= MAX_ROUNDS_PER_PROPOSER,
-            "{peers:?}: no K3 and history round within the bounds: {:?}",
-            ticks.iter().map(|tick| tick.route).collect::<Vec<_>>()
+            ticks.len() < MAX_TARGET_TICKS,
+            "{label}: target did not finish within {MAX_TARGET_TICKS} ticks"
         );
         // One scheduler turn, lanes in slot order.
         for slot in (0..SLOTS).map(SlotId) {
-            if slot == TARGET {
-                let tick = tick_target(qwen, &mut kv, &mut target, &supervisor);
-                match tick.route {
-                    Route::K3 => k3_rounds += 1,
-                    Route::History => history_rounds += 1,
-                    Route::Ordinary | Route::Commit => {}
-                }
-                ticks.push(tick);
+            if slot == target_slot {
+                ticks.push(tick_target(qwen, &mut kv, slot, &mut target, &supervisor));
             } else if peers == Peers::Interleaved {
                 if let Some(lane) = lanes.iter_mut().find(|lane| lane.slot == slot) {
                     tick_peer(qwen, &mut kv, lane, &supervisor);
@@ -486,23 +466,25 @@ fn run_variant(
             }
         }
     }
-    assert!(supervisor.is_healthy(), "{peers:?}: GPU supervision failed");
+    assert!(supervisor.is_healthy(), "{label}: GPU supervision failed");
 
-    let state = slot_state(&kv, TARGET);
+    let state = slot_state(&kv, target_slot);
     let next = *target
         .generated_tokens
         .last()
         .expect("target committed tokens");
     let position = target_prompt.len() + target.generated_tokens.len() - 1;
-    assert_eq!(
-        cursors(&kv, TARGET).0 as usize,
-        position,
-        "{peers:?}: the newest committed token must be the next target input"
-    );
-    let probe = qwen
-        .model
-        .forward_gpu_last_logits(&[next], &[position as i32; 4], &mut kv, TARGET)
-        .unwrap_or_else(|error| panic!("{peers:?}: probe forward: {error:#}"));
+    // A request that finishes inside a verify round leaves its cursor past
+    // the newest committed token (the slot is released, never rolled back);
+    // the probe then has no defined input and is skipped. The per-tick
+    // cursors already compare that end state.
+    let probe = if cursors(&kv, target_slot).0 as usize == position {
+        qwen.model
+            .forward_gpu_last_logits(&[next], &[position as i32; 4], &mut kv, target_slot)
+            .unwrap_or_else(|error| panic!("{label}: probe forward: {error:#}"))
+    } else {
+        Vec::new()
+    };
     TargetTrace {
         prefill_logits: bits(&prefill_logits),
         ticks,
@@ -511,7 +493,7 @@ fn run_variant(
     }
 }
 
-fn assert_same(reference: &TargetTrace, variant: &TargetTrace, peers: Peers) {
+fn assert_same(reference: &TargetTrace, variant: &TargetTrace, peers: &str) {
     assert!(
         variant.prefill_logits == reference.prefill_logits,
         "{peers:?}: target prefill logits differ"
@@ -628,25 +610,41 @@ fn run_gate(env: &str) {
     let target_prompt = encode(TARGET_TEXT);
     let peer_prompts = PEER_TEXTS.map(encode);
 
-    let reference = run_variant(qwen, &target_prompt, &peer_prompts, Peers::Empty);
+    let reference = run_variant(
+        qwen,
+        &target_prompt,
+        &peer_prompts,
+        REFERENCE_SLOT,
+        Peers::Empty,
+    );
     let routes = reference.routes();
-    eprintln!("[slot-independence] {env}: target routes {routes:?}");
+    eprintln!(
+        "[slot-independence] {env}: {} target ticks, routes {routes:?}",
+        routes.len()
+    );
     assert!(routes.contains(&Route::K3), "no K3 round ran: {routes:?}");
     assert!(
         routes.contains(&Route::History),
         "no history round ran: {routes:?}"
     );
-    for peers in [Peers::Prefilled, Peers::MidDecode, Peers::Interleaved] {
-        let variant = run_variant(qwen, &target_prompt, &peer_prompts, peers);
-        assert_same(&reference, &variant, peers);
+    let variants = [Peers::Prefilled, Peers::MidDecode, Peers::Interleaved]
+        .map(|peers| (REFERENCE_SLOT, peers))
+        .into_iter()
+        .chain([0, 1, 3].map(|slot| (SlotId(slot), Peers::Empty)));
+    for (slot, peers) in variants {
+        let variant = run_variant(qwen, &target_prompt, &peer_prompts, slot, peers);
+        let label = format!("{peers:?} target slot {}", slot.0);
+        assert_same(&reference, &variant, &label);
+        eprintln!("[slot-independence] {env}: {label} bitwise equal");
     }
 }
 
 /// Class A (Q1 §3.1) on the official Qwen3.8 artifact, padded `mul_mv_ext`
-/// decode route: a K3 MTP round and a history-lookup round on slot 2 leave
+/// decode route: a request's K3 MTP and history-lookup rounds leave
 /// bitwise-identical logits, hidden rows, committed tokens, cursors, KV
-/// codes/scales, conv/recurrent state and MTP cache whether the other three
-/// slots are empty, prefilled, mid-decode, or decoding in the same turns.
+/// codes/scales, conv/recurrent state and MTP cache whatever slot it runs in
+/// and whether the other slots are empty, prefilled, mid-decode, or decoding
+/// in the same turns.
 #[test]
 #[ignore = "requires HF2Q_QWEN38_GGUF (official Qwen3.8 artifact with its MTP head), HF2Q_DECODE_MVN=0, HF2Q_DECODE_MV_EXT=1 and Apple Metal"]
 fn qwen38_k3_and_history_rounds_are_slot_independent_bitwise() {
@@ -660,11 +658,11 @@ fn qwen38_k3_and_history_rounds_are_slot_independent_bitwise() {
     run_gate("HF2Q_QWEN38_GGUF");
 }
 
-/// Class A (Q1 §3.1) on the official Qwen3.6 artifact: a K3 MTP round and a
-/// history-lookup round on slot 2 leave bitwise-identical logits, hidden
-/// rows, committed tokens, cursors, KV codes/scales, conv/recurrent state and
-/// MTP cache whether the other three slots are empty, prefilled, mid-decode,
-/// or decoding in the same turns.
+/// Class A (Q1 §3.1) on the official Qwen3.6 artifact: a request's K3 MTP and
+/// history-lookup rounds leave bitwise-identical logits, hidden rows,
+/// committed tokens, cursors, KV codes/scales, conv/recurrent state and MTP
+/// cache whatever slot it runs in and whether the other slots are empty,
+/// prefilled, mid-decode, or decoding in the same turns.
 #[test]
 #[ignore = "requires HF2Q_QWEN36_GGUF (official Qwen3.6 artifact with its MTP head) and Apple Metal"]
 fn qwen36_k3_and_history_rounds_are_slot_independent_bitwise() {
