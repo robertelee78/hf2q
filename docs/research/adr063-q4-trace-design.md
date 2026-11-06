@@ -280,7 +280,7 @@ The values above are illustrative except the histogram buckets, which use the n4
 
 Since #717 (padded-mode solo route, `HF2Q_QWEN_JOINT_SOLO`, default on), a lone ordinary lane runs a one-lane padded joint step instead of a serial forward. Lanes beyond the joint width run further joint steps. `logical1_pad3` is therefore a normal bucket in Qwen3.8 N4 runs, and the n4-fix value of 0 no longer describes the expected shape.
 
-Those steps are now `joint_ordinary_decode` transactions rather than `ordinary_or_temporal_mtp_decode`. Until the joint input manifest above lands, each one publishes unmapped witness records instead of a witnessed `forward_input`, so the Q2 `witness_progress` check in `scripts/four_agent/f2_trace.py` no longer gets witnesses from them. A window in which a slot advanced only through lone steps can then report it under `slots_without_required_forward_witness`. `HF2Q_QWEN_JOINT_SOLO=0` restores the old transaction mix for trace runs that need it.
+Those steps are now `joint_ordinary_decode` transactions rather than `ordinary_or_temporal_mtp_decode`. With the joint input manifest, each one publishes a witnessed `forward_input` and one joint witness, and no unmapped records. Joint witnesses stay out of `submissions` (§3.4), so the Q2 `witness_progress` check in `scripts/four_agent/f2_trace.py` gets no witness from these steps either. A window in which a slot advanced only through lone steps can then report it under `slots_without_required_forward_witness`. Letting Q2 count joint witnesses is the Q2 v3 rule (successor scope). `HF2Q_QWEN_JOINT_SOLO=0` restores the old transaction mix for trace runs that need it.
 
 Field meaning:
 
