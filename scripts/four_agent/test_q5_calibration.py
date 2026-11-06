@@ -431,8 +431,9 @@ class ArgvAndCases(unittest.TestCase):
         self.assertTrue(variables['MODEL'].endswith(
             '/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf'))
         self.assertEqual(variables['MODEL_SHA256'], 'ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0')
+        # Q4-DS4-RACE: the provisional best valid configuration (none/1024) until the section 7.1 re-sweep
         self.assertEqual((variables['LOAD_MODE'], variables['UBATCH'], variables['PEER_LOG_VERBOSITY']),
-                         ('auto', '512', '4'))
+                         ('none', '1024', '4'))
         tuning = {'MODEL', 'MODEL_SHA256', 'PORT', 'LOAD_MODE', 'UBATCH', 'PEER_LOG_VERBOSITY'}
         self.assertEqual({k: v for k, v in variables.items() if k not in tuning},
                          {k: v for k, v in base['variables'].items() if k not in tuning})

@@ -120,7 +120,13 @@ CLIENT_MODULES = ('native_peers.py', 'native_peer_splash.py', 'native_peer_splas
 PROCESSES = ('splash',)                  # build/splash serve-native (the engine child of the Python server)
 PYTHON_MODULES = ('server.server',)     # the Python server under the pinned .venv (server/server.py), engine or not
 BASELINES = {}
+SAME_FILE_BASELINES = ()
 AUDIT = 'native_peer_splash_audit'
+
+
+def mode_problems(case, evidence, comparison):
+    """Splash is never a --peer-case (PEER_CASE_REFUSAL), so no campaign mode depends on its case."""
+    return []
 
 
 def _family(family):

@@ -17,14 +17,14 @@ Every arm runs the same GGUF, the canonical four-agent coding client (`qwen_n4_l
 
 The checked-in peer cases match hf2q's model-facing settings (template, thinking, sampling, context, slots; see their notes and `family_peer.py`). No better valid peer configuration has been identified for these workloads, so they are the declared best valid configuration. The DeepSeek-V4 `--load-mode` mmap, `--ubatch-size 256` variant (`$E/peer-arms-v1/peer-deepseek4-mmap.json`) was the best-valid-configuration attempt for that family. Declaring a different best configuration is an operator decision made before a campaign starts: pass it as `--peer-case` and keep the matched one as `--peer-matched-case`.
 
-**Native ds4 arm (DeepSeek-V4 only, operator decision 2026-10-31).** `--peer-case q5_cases/native-ds4-deepseek4.json` with the same-GGUF `--peer-unavailable-evidence` runs antirez ds4 c97964b in the `peer` slot, on its own ds4f-q2 Flash 0731 artifact. The plan labels the arm `ds4 c97964b (native Flash-0731 q2 artifact)`. Its artifact is exempt from the same-model rule but must carry a sha256. Its build identity is the ds4 commit plus the `ds4-server` sha256, and its 26 runtime Metal sources are frozen too. The family verdict stays `Unavailable`, because there is no same-GGUF peer. `verdict.json` `native_peer` reports the task-makespan comparison separately, and F2 rows use baseline `ds4_native`. Like every campaign with a native peer arm, it emits only those native rows (plus control failure rows), never an experiment-vs-stock row: that effect is of record only in the same-GGUF campaign. Adapter and controls: `scripts/four_agent/README.md` "Native ds4 arm".
+**Native ds4 arm (DeepSeek-V4 only, operator decision 2026-10-31).** `--peer-case q5_cases/native-ds4-deepseek4.json` with the same-GGUF `--peer-unavailable-evidence` runs antirez ds4 c97964b in the `peer` slot, on its own ds4f-q2 Flash 0731 artifact. The plan labels the arm `ds4 c97964b (native Flash-0731 q2 artifact)`. Its artifact is exempt from the same-model rule but must carry a sha256. Its build identity is the ds4 commit plus the `ds4-server` sha256, and its 26 runtime Metal sources are frozen too. The family verdict stays `Unavailable`, because there is no same-GGUF peer. `verdict.json` `native_peer` reports the task-makespan comparison separately, and F2 rows use baseline `ds4_native`. Like every campaign with a native peer arm, it emits only those native rows (plus control failure rows), never an experiment-vs-stock row: that effect is of record only in the same-GGUF campaign. The same-file case `native-ds4-deepseek4-samefile.json` (ds4 on the ds4 file the hf2q arm loads, `artifact_relation: same_as_hf2q`) runs only under `--native-comparison` instead: see "No-stock-arm campaigns". Adapter and controls: `scripts/four_agent/README.md` "Native ds4 arm".
 
 **Native TensorFold arm (Qwen3.8 only, operator decision 2026-10-31).** Qwen3.8's same-GGUF peer is runnable, so TensorFold never replaces it in the campaign of record. A separate campaign passes `--peer-case q5_cases/native-tensorfold-qwen38.json` (no drafter) or `native-tensorfold-qwen38-dflash2.json` (DFlash2) together with `--native-comparison`. TensorFold 1157ea5b then runs in the `peer` slot on its own MLX 4-bit checkpoint, and the plan records `native_comparison`.
 - `--peer-unavailable-evidence` and `--peer-matched-case` both refuse with this flag. Without the flag, a TensorFold `--peer-case` refuses.
 - The artifact is the pinned target snapshot's `config.json` (TensorFold's `config_sha256`), with `TARGET_CONFIG_SHA256` required. Build identity is `tensorfold <version> <commit> binary-sha256 <TF_BIN_SHA256>`, and the target and drafter snapshot file listings are frozen with the campaign identity.
 - `verdict.json` sets `verdict_of_record: false` and `campaign_label: "native-comparison campaign; not the verdict of record"`, and the family verdict is `Unavailable` with that reason. `native_peer` carries the task-makespan statement, with the same withholding rules as ds4.
 - F2 rows go to group `qwen38-q3-tensorfold-native` or `qwen38-q3-tensorfold-dflash2-native` (`-controls-` groups under `--controls-of`), and every row carries the not-of-record label. No experiment-vs-stock row is emitted: that effect belongs to the campaign of record. The TensorFold row renders only under "Native-engine comparisons".
-- The stock arm stays in the design. Dropping it would need new plan and verdict code, so an experiment-plus-TensorFold-only campaign is not offered.
+- A TensorFold or oMLX comparison keeps the stock arm by default. `--no-stock-arm --native-comparison` drops it (no vs-stock row exists in a native comparison anyway): see "No-stock-arm campaigns" below.
 - Adapter and controls: `scripts/four_agent/README.md`, section "Native TensorFold arm".
 
 **Native oMLX arm (Qwen3.8, Qwen3.6, Gemma 4; operator decision 2026-10-31).** Every one of these families has a runnable same-GGUF peer, so oMLX runs only in a separate `--native-comparison` campaign, with TensorFold's rules: `--peer-case q5_cases/native-omlx-<family>.json --native-comparison`. oMLX 6b413c90 then runs in the `peer` slot on the pinned mlx-community 4-bit snapshot.
@@ -200,6 +200,76 @@ python3 -B scripts/four_agent/q3_campaign.py --family qwen38 "${STOCK[@]}" "${EX
   --peer-var CLIENT_APPROVAL_TEMPLATE=$T/peer-qwen38-client-approval.json \
   --controls-of "$Q3/<v7 campaign>/qwen38/verdict.json" --workloads 3+1,2+2,1+3 \
   --output "$Q3/<controls campaign>/qwen38"
+```
+
+## No-stock-arm campaigns (ADR-063 Q4-DS4-RACE, decisions D1 and D2)
+
+Design: `docs/research/adr066-iq2xxs-subset-design.md` §7.4 and §8. v0.1.28 and v0.1.29 cannot open ds4's DeepSeek-V4 Flash 0731 file (IQ2_XXS), so a campaign on that file has no stock arm. Its vs-stock terms come from a same-artifact record on hf2q's own artifact, measured with the same candidate binary.
+
+- **Arguments.** `--no-stock-arm` needs exactly one of `--stock-record VERDICT_JSON` (the verdict-of-record mode) or `--native-comparison` (no vs-stock row exists). `--stock-record` without `--no-stock-arm` refuses, and so does `--stock-record` with `--peer-unavailable-evidence` (the campaign is judged against the peer, so it would have no contrast). With `--no-stock-arm`, `--stock-bin`, `--stock-commit`, `--stock-label` and `--stock-var` refuse, and so does `--controls-of` (the controls run in the same campaign). `--stock-record` needs exactly one `--family` and applies to `deepseek4` only.
+- **Plan.** The measured arms omit `stock`, `declared.stock` is `null`, and only the experiment needs a binary and a 40-hex commit. `plan.stock_record` binds the record, following the `--controls-of` pattern: the paths and sha256 of its `verdict.json` and `campaign.json`, the family, the primary status, the recorded verdict, the stock and experiment declarations, the stock and experiment binary sha256 and the hf2q artifact sha256. The binding refuses a record that:
+  - is not a `verdict.json` beside the `campaign.json` it binds (`campaign_sha256`, `identities_sha256`);
+  - is not a complete `deepseek4` primary (a `Complete` primary stage of a default campaign, not controls-only);
+  - is itself a no-stock campaign, or has a native peer arm or a native comparison;
+  - has no vs-stock effect or no hf2q artifact sha256.
+- **Launch and every run.** `launch_problems` refuses when the record's experiment binary sha256 differs from this campaign's `--experiment-bin`, or when either bound file changed since binding. The frozen identities carry the experiment binary sha256 and the bound files' current sha256 (`identities.stock_record`), which are re-checked before every run, so a rebuilt binary or a changed record halts the campaign with `IdentityDrift`. `plan.stock_record` is part of the plan a `--resume` must reproduce. **Operating rule:** freeze the record read-only (`chmod a-w`) before binding, as for `--controls-of`.
+- **Stopping rule.** It waits on `vs_stock` only when the plan has a stock arm. A stock-record or no-stock native-comparison campaign waits on `vs_peer`. When the peer becomes unavailable or fails, such a stage has no contrast left: it stops at once with reason `no_contrast` (`q3_stats.NO_CONTRAST`), and so does every later stage, instead of running experiment-only blocks to the maximum.
+- **Verdict.** `verdict.json` `stock_record` re-binds the record by sha256 and carries its primary `vs_stock` makespan effect and the `vs_stock` fairness secondaries, its stock and experiment failures, and its thermal and memory validity. The family verdict uses them as its `vs_stock` and `fairness`. `stock_failures` and `experiment_failures` are the union of both campaigns, each record entry tagged `(stock record <path>)`. `thermal_valid` and `memory_valid` are the conjunction of both. `q3_stats.family_verdict` takes `stock_source` (the record's path, sha256 and status): every vs-stock reason names it, and a record that is missing, changed since binding or not `Complete` gives `Pending` with that reason, never a silent skip. The decision rules are unchanged, so a Win still needs the 95% CI of the vs-stock ratio below 1, precision and the fairness band, all from the record.
+- **No-stock native comparison.** Without a record (`--no-stock-arm --native-comparison`), `vs_stock` is the empty effect and `fairness` is `{}`. The native branch makes the verdict `Unavailable` with the comparison reason, as for any native comparison.
+- **Rows.** The workload text reads "stock `<label>` on hf2q's artifact, from record `<$E ref>`" (or "no stock arm" without a record). The vs-stock rows read `verdict.json` `stock_record.effects.vs_stock` (and `stock_record.secondary.<metric>.vs_stock` under `--of-record`), carry the record's hf2q artifact sha256, and note "baseline stock `<label>`, from the same-artifact record `<$E ref>` on hf2q's artifact". `--of-record` accepts a stock-record campaign. Its `q3_record` carries `stock_record` (the record's `$E/` verdict ref, hf2q artifact sha256 and stock label), and the tier labels the stock cell and the fairness cell "vs stock (hf2q artifact record)". The quality-gate references stay `stock-hf2q` and `peer`: the `stock-hf2q` gate must run the record's stock binary with the record's (equal) experiment binary as subject, every run on the record's hf2q artifact, and the `peer` gate must run this campaign's peer binary on the peer arm's artifact (ds4's file).
+- **Same-file ds4 arm (D2).** `q5_cases/native-ds4-deepseek4-samefile.json` declares `artifact_relation: same_as_hf2q` in its approval `native_ds4` block, a closed field (`different` by default; not a case variable, bound by `case_sha256` and the ds4 `campaign_identity`). The plan labels the arm `ds4 c97964b (same ds4 file)` and its F2 baseline is `ds4_samefile`. It runs only with `--native-comparison` (`--peer-unavailable-evidence` refuses: the same-file peer runs), and the different-artifact case only with `--peer-unavailable-evidence`. Launch needs the native and the hf2q artifact sha256 both present and equal; the `MODEL_FILE` name check stays. TensorFold and oMLX refuse a `same_as_hf2q` case. `native_peer`, row notes and the scoreboard say "same file", task makespan only, and the scoreboard renders same-file rows in their own "Native-engine comparisons (same file as the hf2q arm, task makespan only)" section. The weights are the same bytes, but prompts are not byte-identical (ds4 renders tool schemas first, and its Think Max prefix differs).
+- **Artifact verification.** No sidecar receipt accompanies the model file. Each case's `MODEL_SHA256` is verified by the §6.1 T2 full-file digest, `scripts/four_agent/ds4_file_digest.py` (per-tensor and full-file sha256 in one streaming pass), whose receipt is `/Users/robert/.local/state/hf2q/v0130/q4-ds4-race/t2-digest.json`.
+
+Root commands, in order (§7.4; variables as in "Root commands" below; `$CAND`/`$CAND_COMMIT` are the candidate binary and its 40-hex commit, one candidate for all three campaigns):
+
+```sh
+R=/Users/robert/.local/state/hf2q/v0130/q4-ds4-race
+DS4FILE=/Users/robert/.local/share/hf2q/peers/ds4-c97964b/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
+# §6.1 T2: the file digest that verifies MODEL_SHA256 (heavy disk; reads the whole 87 GB file once)
+python3 -B scripts/four_agent/ds4_file_digest.py "$DS4FILE" --output "$R/t2-digest.json" \
+  --expect-sha256 ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0
+
+# 1. Stock record on hf2q's own artifact (existing harness). Its own family_verdict is Unavailable (no peer) and is
+#    not the verdict of record. Freeze verdict.json and campaign.json read-only before step 2 binds them.
+HF2Q_Q5_MODEL=$MODELS/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf \
+HF2Q_Q5_MODEL_SHA256=50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6 \
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/current-port-balanced-c1-normal-n4-v1/client-approval.json \
+  python3 -B scripts/four_agent/q3_campaign.py --family deepseek4 "${STOCK[@]}" \
+  --experiment-bin "$CAND" --experiment-commit "$CAND_COMMIT" "${COMMON[@]}" \
+  --peer-unavailable-evidence $E/peer-arms-v1/peer-deepseek4-20261030T165847Z/receipt.json \
+  --peer-unavailable-evidence $E/peer-arms-v1/peer-deepseek4-20261030T165847Z/server.stderr \
+  --peer-unavailable-evidence $E/peer-arms-v1/peer-deepseek4-mmap-20261030T165948Z/receipt.json \
+  --peer-unavailable-evidence $E/peer-arms-v1/peer-deepseek4-mmap-20261030T165948Z/server.stderr \
+  --output "$R/q3-stock-record/deepseek4"
+chmod a-w "$R/q3-stock-record/deepseek4/verdict.json" "$R/q3-stock-record/deepseek4/campaign.json"
+
+# 2. ds4-file campaign of record: experiment and peer on ds4's file, n4 primary then the controls. The hf2q approval
+#    template is step 1's: the case's approval `set` writes `model` from MODEL_ID ("DeepSeek V4 Flash", the file's
+#    general.name that hf2q serves) at run time.
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/current-port-balanced-c1-normal-n4-v1/client-approval.json \
+  python3 -B scripts/four_agent/q3_campaign.py --family deepseek4 \
+  --hf2q-case scripts/four_agent/q5_cases/deepseek4-ds4file.json \
+  --peer-case scripts/four_agent/q5_cases/peer-deepseek4-ds4file.json \
+  --peer-var CLIENT_APPROVAL_TEMPLATE=$T/peer-deepseek4-client-approval.json \
+  --no-stock-arm --stock-record "$R/q3-stock-record/deepseek4/verdict.json" \
+  --experiment-bin "$CAND" --experiment-commit "$CAND_COMMIT" "${COMMON[@]}" \
+  --output "$R/q3-ds4file/deepseek4"
+
+# 3. Same-file native comparison: the experiment and ds4 (--ctx 393216) on the same file; native_peer, task makespan only.
+HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=$E/current-port-balanced-c1-normal-n4-v1/client-approval.json \
+  python3 -B scripts/four_agent/q3_campaign.py --family deepseek4 \
+  --hf2q-case scripts/four_agent/q5_cases/deepseek4-ds4file.json \
+  --peer-case scripts/four_agent/q5_cases/native-ds4-deepseek4-samefile.json \
+  --peer-var CLIENT_APPROVAL_TEMPLATE=$T/native-ds4-deepseek4-client-approval.json \
+  --native-comparison --no-stock-arm \
+  --experiment-bin "$CAND" --experiment-commit "$CAND_COMMIT" "${COMMON[@]}" \
+  --output "$R/q3-ds4file-native-ds4/deepseek4"
+
+# The verdict of record's rows (q3_report through --rows), with both quality gates:
+python3 -B scripts/four_agent/q3_campaign.py --rows "$R/q3-ds4file/deepseek4" --evidence-root "$R" --of-record \
+  --quality-gate stock-hf2q="$R/qg-stock/<QG-stock campaign>/manifest.json" \
+  --quality-gate peer="$R/qg-peer/<QG-peer campaign>/manifest.json" \
+  --review "$R/reviews/<independent verdict review>.md"
 ```
 
 ## Existing evidence (not rerun)

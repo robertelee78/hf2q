@@ -286,5 +286,33 @@ class Determinism(unittest.TestCase):
         self.assertEqual((r.REPO / "docs/research/adr063-f2-scoreboard.md").read_text(), expected)
 
 
+class NativeComparisons(unittest.TestCase):
+    """ADR-063 Q4-DS4-RACE decision D2: same-file native rows (ds4 on hf2q's own ds4 file) render in their own
+    native-engine section, never among wins or non-wins and never mixed with the different-artifact rows."""
+    DIFFERENT = "## Native-engine comparisons (different artifact, task makespan only)"
+    SAME = "## Native-engine comparisons (same file as the hf2q arm, task makespan only)"
+
+    def native(self, rid, baseline):
+        return effect(rid, 20.0, [10.0, 30.0], metric="makespan_s", baseline_arm=baseline,
+                      note=f"statement {rid}; task makespan only")
+
+    def test_same_file_rows_render_separately(self):
+        self.assertEqual(r.native_peers.same_file_baselines(), {"ds4_samefile"})
+        text = r.render(manifest([self.native("ds4-diff", "ds4_native"), self.native("ds4-same", "ds4_samefile")]), [],
+                        "0" * 64)
+        different, same = section(text, self.DIFFERENT), section(text, self.SAME)
+        self.assertIn("`ds4-diff`", different)
+        self.assertNotIn("`ds4-same`", different)
+        self.assertIn("`ds4-same`", same)
+        self.assertIn("vs ds4 c97964b (same ds4 file)", same)
+        self.assertNotIn("`ds4-diff`", same)
+        for title in ("### Descriptive wins", "## Negative results", "## Open gaps"):
+            self.assertNotIn("`ds4-same`", section(text, title))
+        self.assertFalse(r.effect_is_win(self.native("ds4-same", "ds4_samefile")))
+        only_same = r.render(manifest([self.native("ds4-same", "ds4_samefile")]), [], "0" * 64)
+        self.assertNotIn(self.DIFFERENT, only_same)
+        self.assertIn("`ds4-same`", section(only_same, self.SAME))
+
+
 if __name__ == "__main__":
     unittest.main()

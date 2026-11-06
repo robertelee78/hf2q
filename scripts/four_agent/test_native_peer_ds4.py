@@ -398,5 +398,70 @@ class ExistingKindsUnchanged(unittest.TestCase):
             validate_selection(family, 'peer', 4)
 
 
+def related(relation=None):
+    """A minimal q5 case whose approval native_ds4 block declares (or omits) artifact_relation."""
+    block = {} if relation is None else {'artifact_relation': relation}
+    return {'client': {'approval': {'set': {'native_ds4': block}}}}
+
+
+class SameFile(unittest.TestCase):
+    """ADR-063 Q4-DS4-RACE decision D2: ds4 on the ds4 file the hf2q arm loads (artifact_relation same_as_hf2q)."""
+    SHA = 'c' * 64
+
+    def test_the_declaration_is_closed_and_defaults_to_different(self):
+        spec = {'binary': '/x/ds4/ds4-server', 'binary_sha256': 'a' * 64, 'commit': nd.DS4_COMMIT, 'chdir': '/x/ds4',
+                'model': f'/x/ds4/gguf/{nd.MODEL_FILE}', 'model_sha256': 'b' * 64, 'ctx': '393216', 'port': '18251',
+                'server_log': '/x/run/server.stderr', 'trace': f'/x/run/{nd.TRACE_NAME}'}
+        self.assertEqual(nd.native_spec(spec)['artifact_relation'], 'different')
+        for relation in ('different', 'same_as_hf2q'):
+            self.assertEqual(nd.native_spec({**spec, 'artifact_relation': relation})['artifact_relation'], relation)
+        for bad in ('same', '', 'SAME_AS_HF2Q'):
+            with self.subTest(bad=bad), self.assertRaises(Invalid):
+                nd.native_spec({**spec, 'artifact_relation': bad})
+        with self.assertRaises(Invalid):
+            nd.relation(related('mixed'))
+        self.assertEqual((nd.relation(related()), nd.relation({})), ('different', 'different'))
+
+    def test_labels_roles_and_baselines_follow_the_relation(self):
+        self.assertEqual((nd.label(related()), nd.q3_role(related())), (nd.LABEL, nd.Q3_ROLE))
+        same = related('same_as_hf2q')
+        self.assertEqual(nd.label(same), 'ds4 c97964b (same ds4 file)')
+        self.assertIn('same-file native comparison', nd.q3_role(same))
+        self.assertIn('task makespan only', nd.q3_role(same))
+        self.assertEqual(nd.BASELINES['ds4_samefile'], nd.label(same))
+        self.assertEqual(f2.BASELINE_ARMS['ds4_samefile'], nd.SAMEFILE_LABEL)
+        record = nd.validate_readiness(models(), log(), M, 393216, 18251, '/run/ds4-trace.txt', 'same_as_hf2q')
+        self.assertEqual(record['label'], nd.SAMEFILE_LABEL)
+
+    def test_campaign_modes_follow_the_relation(self):
+        same, different = related('same_as_hf2q'), related()
+        self.assertEqual(nd.mode_problems(same, False, True), [])
+        self.assertEqual(nd.mode_problems(different, True, False), [])
+        self.assertIn('--peer-unavailable-evidence is refused', nd.mode_problems(same, True, False)[0])
+        self.assertIn('--native-comparison needs artifact_relation same_as_hf2q', nd.mode_problems(different, False, True)[0])
+        self.assertIn('--native-comparison when it is same_as_hf2q', nd.PEER_CASE_REFUSAL)
+
+    def test_same_file_launch_needs_both_sha256_present_and_equal(self):
+        same = related('same_as_hf2q')
+        artifact = {'path': f'/m/gguf/{nd.MODEL_FILE}', 'sha256': self.SHA}
+        self.assertEqual(nd.launch_problems('peer', artifact, self.SHA, same), [])
+        for native, hf2q in ((self.SHA, 'd' * 64), (None, self.SHA), (self.SHA, None), (None, None)):
+            with self.subTest(native=native, hf2q=hf2q):
+                self.assertEqual(nd.launch_problems('peer', {**artifact, 'sha256': native}, hf2q, same),
+                                 ['peer: a same_as_hf2q ds4 case needs the native and the hf2q artifact sha256 both '
+                                  'present and equal (set MODEL_SHA256 in both cases)'])
+        self.assertIn(f'peer: native artifact must be {nd.MODEL_FILE} (set --peer-var MODEL)',
+                      nd.launch_problems('peer', {**artifact, 'path': '/m/other.gguf'}, self.SHA, same))
+        # the different-artifact case keeps today's refusal, with or without the case argument
+        for case in (related(), None):
+            self.assertEqual(nd.launch_problems('peer', artifact, self.SHA, case),
+                             ["peer: native artifact sha256 equals the hf2q artifact's (set --peer-var MODEL_SHA256)"])
+
+    def test_campaign_identity_binds_a_same_file_declaration_only(self):
+        variables = {'variables': {'DS4_COMMIT': nd.DS4_COMMIT, 'DS4_BIN_SHA256': 'a' * 64, 'DS4_DIR': '/nowhere'}}
+        self.assertNotIn('artifact_relation', nd.campaign_identity(variables))  # existing campaigns keep their identity
+        self.assertEqual(nd.campaign_identity({**variables, **related('same_as_hf2q')})['artifact_relation'], 'same_as_hf2q')
+
+
 if __name__ == '__main__':
     unittest.main()

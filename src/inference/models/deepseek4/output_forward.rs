@@ -6,6 +6,8 @@ use mlx_native::ops::deepseek_hyper_connection::{dispatch_hc_head_weights, dispa
 use mlx_native::{DType, MlxBuffer};
 
 use super::forward_support::{alloc, raw_matmul, rms_params};
+use super::joint_decode_routes::{output_hc_fn_product, JointProduct};
+use super::row_matmul::{row_matmul, RowMatmul};
 use super::Deepseek4Model;
 
 impl Deepseek4Model {
@@ -128,7 +130,15 @@ impl Deepseek4Model {
             tokens_u32,
             hc_hidden_u32,
         )?;
-        raw_matmul(
+        // A float `output_hc_fn` (ds4's 0731 file) is applied one row at a
+        // time so joint decode rows equal serial `m = 1` rows (ADR-063
+        // Q4-DS4-RACE L6); block storage keeps one `m = tokens` product.
+        let hc_fn_mode = match output_hc_fn_product(hc_fn.ggml_type) {
+            JointProduct::RowMatmul => RowMatmul::IndependentRows,
+            _ => RowMatmul::Matrix,
+        };
+        row_matmul(
+            hc_fn_mode,
             &mut session,
             registry,
             &device,

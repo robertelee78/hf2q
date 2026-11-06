@@ -4,7 +4,9 @@ use std::cell::{Cell, RefCell};
 
 use anyhow::{bail, Context, Result};
 use mlx_native::graph::GraphSession;
-use mlx_native::ops::dense_gemm::{dispatch_dense_matvec_f32, DenseGemmF16Params};
+use mlx_native::ops::dense_gemm::{
+    dispatch_dense_matvec_f16w_f32io, dispatch_dense_matvec_f32, DenseGemmF16Params,
+};
 use mlx_native::ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::quantized_matmul_ggml::{
@@ -328,6 +330,22 @@ pub(super) fn raw_matmul(
                 k: u32::try_from(k).context("DeepSeek-V4 matmul input exceeds u32")?,
                 src0_batch: 1,
                 src1_batch: 1,
+            },
+        ),
+        // One-row F16 products (ds4's router, HC and compressor projections)
+        // keep the F32 input and accumulate in F32; the tiled tensor kernel
+        // would round the input to half (ADR-063 Q4-DS4-RACE L9).
+        GgmlType::F16 if m == 1 => dispatch_dense_matvec_f16w_f32io(
+            session.encoder_mut(),
+            registry,
+            device.metal_device(),
+            input,
+            weight.buffer,
+            output,
+            &DenseGemmF16Params {
+                m: 1,
+                n: u32::try_from(n).context("DeepSeek-V4 matvec outputs exceed u32")?,
+                k: u32::try_from(k).context("DeepSeek-V4 matvec input exceeds u32")?,
             },
         ),
         GgmlType::F16 => dense_matmul_f16_f32_tensor(

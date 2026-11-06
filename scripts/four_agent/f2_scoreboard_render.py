@@ -240,7 +240,7 @@ def comparisons(manifest):
                                          c["arm"][1] or "", c["baseline"][0]))
 
 
-def effect_is_win(row):  # a native-engine (different artifact) or peer comparison is never a win
+def effect_is_win(row):  # a native-engine (different artifact or same file) or peer comparison is never a win
     return (row["kind"] == "effect" and row["verification"]["state"] == "Verified"
             and row.get("baseline_arm") not in (*NATIVE_BASELINES, *PEER_BASELINES)
             and row["status"] in ("Qualified", "Descriptive") and row.get("ci95") is not None and row["ci95"][0] > 0)
@@ -363,12 +363,16 @@ def render(manifest, scoreboards, manifest_sha256):
     out += [f"| {fams[r['family']]['title']} | {groups[r['group']]['title']}: {METRICS[r['metric']][0]} | "
             f"{arm_label((r['arm'], r['variant']))} | — | {row_value(r)} {tag(r)}: {r['note']} | `{r['id']}` |"
             for r in rows if r["status"] == "Failure"]
-    if native:
-        out += ["", "## Native-engine comparisons (different artifact, task makespan only)", "",
-                "| Family | Comparison | Makespan effect | Statement, token volume, output rate, TTFT ratio | Evidence |",
-                "|---|---|---|---|---|"] + [
-            f"| {fams[x['family']]['title']} | {arm_label((x['arm'], x['variant']))} vs {BASELINE_ARMS[x['baseline_arm']]} | "
-            f"{row_value(x)} {tag(x)} | {x['note']} | `{x['id']}` |" for x in native]
+    same_file = native_peers.same_file_baselines()  # the native engine on hf2q's own artifact (ds4 same file)
+    native_sections = (("different artifact", [x for x in native if x["baseline_arm"] not in same_file]),
+                       ("same file as the hf2q arm", [x for x in native if x["baseline_arm"] in same_file]))
+    for relation, section in native_sections:
+        if section:
+            out += ["", f"## Native-engine comparisons ({relation}, task makespan only)", "",
+                    "| Family | Comparison | Makespan effect | Statement, token volume, output rate, TTFT ratio | Evidence |",
+                    "|---|---|---|---|---|"] + [
+                f"| {fams[x['family']]['title']} | {arm_label((x['arm'], x['variant']))} vs {BASELINE_ARMS[x['baseline_arm']]} | "
+                f"{row_value(x)} {tag(x)} | {x['note']} | `{x['id']}` |" for x in section]
     if controls:
         out += ["", "## Q3 controls of a primary verdict of record (never a win or loss)", "",
                 "| Family | Comparison | Result | Note | Primary of record | Evidence |",
