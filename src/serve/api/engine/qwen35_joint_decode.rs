@@ -29,24 +29,16 @@ use super::{
 };
 
 /// Kill switch for A/B measurement: `1`/`on`/`true` selects joint decode,
-/// `0`/`off`/`false` keeps the serial per-slot turn. Unset selects the
-/// per-family default ([`default_joint_decode`]).
+/// `0`/`off`/`false` keeps the serial per-slot turn. Unset selects joint
+/// decode on every Qwen artifact that has a proven joint route:
+/// - dense (Qwen3.8): the official-artifact gates passed and the four-agent
+///   ABBA A/B cut median makespan 116.4 → 90.1 s with 8/8 `CalibrationPass`;
+/// - MoE (Qwen3.6): on the declared repair-turn workload (ADR-063
+///   Q4-QWEN36) the paired 24-instance task campaign is `Pass` against serial
+///   decode, and the six-block canonical n4 ABBA cut makespan by a ratio of
+///   0.800 (95% CI 0.776–0.824) with 26/26 `CalibrationPass`.
 const QWEN_JOINT_DECODE_ENV: &str = "HF2Q_QWEN_JOINT_DECODE";
 
-/// Per-family default when the switch is unset. Dense artifacts (Qwen3.8)
-/// are on: the official-artifact gates passed and the four-agent ABBA A/B
-/// cut median makespan 116.4 → 90.1 s with 8/8 `CalibrationPass`. MoE
-/// artifacts (Qwen3.6) are off: their forward is bitwise exact, but joint
-/// rows commit M1 tokens where stock commits K3 verify tokens, and the
-/// incomplete A/B (2 runs per arm) failed the coding protocol on both joint
-/// runs. They need `HF2Q_QWEN_JOINT_DECODE=1` until a complete ABBA shows
-/// protocol parity.
-fn default_joint_decode(moe: bool) -> bool {
-    !moe
-}
-
-const MOE_DEFAULT_OFF_REASON: &str = "MoE artifacts default off pending a complete Qwen3.6 \
-     four-agent A/B; set HF2Q_QWEN_JOINT_DECODE=1 to opt in";
 /// Widest joint step selected by default. Exact mode accepts 5..=8 when
 /// raised explicitly (no serving measurement); the padded `mul_mv_ext` mode
 /// caps at 4 so its packed width stays fixed.
@@ -63,7 +55,7 @@ pub(super) struct Qwen35JointDecodeConfig {
     pub dense_ffn: JointDenseFfnRoute,
 }
 
-/// `Ok(None)` when unset, so the caller applies the per-family default.
+/// `Ok(None)` when unset, so the caller applies the default (on).
 fn parse_qwen_joint_decode(raw: Option<&str>) -> Result<Option<bool>, String> {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
         return Ok(None);
@@ -111,7 +103,7 @@ fn select_qwen_joint_decode(
 /// decision, including why an artifact or configuration keeps serial decode.
 pub(super) fn qwen35_joint_decode_config(model: &Qwen35Model) -> Option<Qwen35JointDecodeConfig> {
     let moe = model.cfg.moe.is_some();
-    let default = default_joint_decode(moe);
+    let default = true;
     let raw = std::env::var(QWEN_JOINT_DECODE_ENV).ok();
     let explicit = parse_qwen_joint_decode(raw.as_deref()).unwrap_or_else(|error| {
         tracing::warn!(
@@ -131,10 +123,10 @@ pub(super) fn qwen35_joint_decode_config(model: &Qwen35Model) -> Option<Qwen35Jo
         );
         DEFAULT_QWEN_JOINT_DECODE_ROWS
     });
-    let mode = match (requested, explicit) {
-        (true, _) => model.joint_decode_mode(),
-        (false, None) => Err(MOE_DEFAULT_OFF_REASON.into()),
-        (false, Some(_)) => Err("disabled by HF2Q_QWEN_JOINT_DECODE".into()),
+    let mode = if requested {
+        model.joint_decode_mode()
+    } else {
+        Err("disabled by HF2Q_QWEN_JOINT_DECODE".into())
     };
     let unavailable = mode.as_ref().err().cloned();
     let ffn_shared = joint_ffn_shared_from_process().unwrap_or_else(|error| {
@@ -446,12 +438,9 @@ mod tests {
     }
 
     #[test]
-    fn joint_decode_switch_defaults_per_family_and_parses_explicit_arms() {
+    fn joint_decode_switch_parses_explicit_arms() {
         assert_eq!(parse_qwen_joint_decode(None), Ok(None));
         assert_eq!(parse_qwen_joint_decode(Some("  ")), Ok(None));
-        // Dense (Qwen3.8) on, MoE (Qwen3.6) off unless explicitly enabled.
-        assert!(default_joint_decode(false));
-        assert!(!default_joint_decode(true));
         for raw in ["1", "on", "TRUE"] {
             assert_eq!(parse_qwen_joint_decode(Some(raw)), Ok(Some(true)));
         }

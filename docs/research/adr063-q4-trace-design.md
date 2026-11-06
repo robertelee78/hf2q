@@ -217,7 +217,7 @@ The guard is placed here, not in `run_qwen35_joint_decode`, for four reasons:
 - The guard drops when `encode_joint_decode` returns, and its `forward_input_end` marker closes the forward there. That is before `finish_joint_tick` (`qwen35_joint_decode.rs:372-380`), whose MTP catch-up and sampling run under the same invocation epoch: `_native_invocation` lives until the end of the `if !prepared.is_empty()` block, and the encoder adapter tags their commands with the joint `EPOCH`. Those commands are reported as the epoch's settle part, never as forward time. MTP uses `rms_norm_with_weight` (`mtp.rs:603-612`), not the witnessed wrapper, so it emits no unmapped records.
 - The joint path runs synchronously on the owning worker thread (`forward_joint_decode` → `forward_gpu_decode_joint` inside `GPU_CACHE.with`, `engine_qwen35/joint_decode.rs:170-198`, `joint_decode.rs:260-291`), so the thread-local `SELECTED`/`EPOCH` from `trace_transaction` are visible. A unit test pins this (§5, R4).
 
-The same call covers Qwen3.6 MoE joint decode, which is opt-in. It uses the same `encode_joint_decode` and the same DeltaNet pre-norm.
+The same call covers Qwen3.6 MoE joint decode, which is on by default since 2026-11-05 (#719). It uses the same `encode_joint_decode` and the same DeltaNet pre-norm.
 
 **(d) Why layer 0 is the witness.** With `full_attention_interval = 4`, layer 0 is DeltaNet, and its input `x` is exactly the `[width, h]` F32 embedding buffer the manifest describes. If a future artifact had no DeltaNet layer, the input would have no witness, and the reducer rejects that (`f2_native_trace.py:334-336`, "required forward input replaced by auxiliary/missing/duplicate witness"), which is fail closed.
 
