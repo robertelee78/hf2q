@@ -10,10 +10,10 @@
 //! | A | shared gate, shared up `[rows, shared_i]` | `quantized_matmul_ggml` m = rows (`kernel_mul_mv_<q>_f32` at 1 row, `_mN_r1_<rows>` at 2..5) |
 //! | B | softmax + top-k + renorm over all rows | `moe_softmax_topk_simd_f32` |
 //! | B | shared SwiGLU | `silu_mul_f32` |
-//! | C | expert gate, expert up over `rows * top_k` pairs | `kernel_mul_mv_id_<q>_f32` (forced matvec route) |
+//! | C | expert gate, expert up over `rows * top_k` pairs | `kernel_mul_mv_id_q4_K_f32_nr2` (Q4_K) or `kernel_mul_mv_id_<q>_f32` (forced matvec route) |
 //! | C | shared down `[rows, hidden]` | `quantized_matmul_ggml` m = rows |
 //! | D | expert SwiGLU | `silu_mul_f32` |
-//! | E | expert down over `rows * top_k` pairs | `kernel_mul_mv_id_<q>_f32[_nr2]` (forced matvec route) |
+//! | E | expert down over `rows * top_k` pairs | `kernel_mul_mv_id_q4_K_f32_nr2` (Q4_K) or `kernel_mul_mv_id_<q>_f32[_nr2]` (forced matvec route) |
 //! | F | weighted reduce + sigmoid(shared gate) * shared + residual | `moe_weighted_reduce_f32` |
 //!
 //! Every kernel computes a row (or a `(row, expert)` pair) with arithmetic
@@ -35,7 +35,8 @@ use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk_simd;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    quantized_matmul_id_ggml_mv, GgmlQuantizedMatmulIdParams,
+    quantized_matmul_id_ggml_mv, quantized_matmul_id_ggml_mv_q4_k_nr2,
+    GgmlQuantizedMatmulIdParams,
 };
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -219,7 +220,9 @@ pub(crate) fn encode_native_dense_proj(
 
 /// Expert matvec over `params.n_tokens * params.top_k` pairs on the forced
 /// `mv_id` route (never the grouped `mm_id` route, whose reduction differs),
-/// behind the same imatrix intercept as the serial builder.
+/// behind the same imatrix intercept as the serial builder. Q4_K experts take
+/// the peer-layout kernel (`kernel_mul_mv_id_q4_K_f32_nr2`) at every width,
+/// including one row, so a pair's result never depends on the width.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_expert_mv(
     enc: &mut CommandEncoder,
@@ -248,8 +251,12 @@ fn dispatch_expert_mv(
         || ids.as_slice::<u32>().ok().map(|sl| sl.to_vec()),
     )
     .map_err(|e| anyhow!("imatrix moe intercept ({tag}): {e}"))?;
-    quantized_matmul_id_ggml_mv(enc, registry, device, input, weight, ids, output, params)
-        .map_err(|e| anyhow!("{tag} mul_mv_id: {e}"))
+    let dispatched = if params.ggml_type == GgmlType::Q4_K {
+        quantized_matmul_id_ggml_mv_q4_k_nr2(enc, registry, device, input, weight, ids, output, params)
+    } else {
+        quantized_matmul_id_ggml_mv(enc, registry, device, input, weight, ids, output, params)
+    };
+    dispatched.map_err(|e| anyhow!("{tag} mul_mv_id: {e}"))
 }
 
 /// Routing produced by one batched layer: `[rows * top_k]` expert ids and
