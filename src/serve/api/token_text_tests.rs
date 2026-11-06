@@ -5,7 +5,7 @@ use tokenizers::decoders::byte_level::ByteLevel;
 use tokenizers::models::bpe::BPE;
 use tokenizers::Tokenizer;
 
-use super::{byte_level_byte, token_raw_bytes, TokenTextDecoder};
+use super::{byte_level_byte, token_bytes_table, token_raw_bytes, TokenTextDecoder};
 use crate::serve::api::grammar::mask::{mask_invalid_tokens_with_eog, sample_greedy_valid_token};
 use crate::serve::api::grammar::parser::parse;
 use crate::serve::api::grammar::sampler::GrammarRuntime;
@@ -397,4 +397,21 @@ fn partial_utf8_survives_only_where_its_character_can_match() {
     let mut done = runtime("root ::= \"a\"\n");
     assert!(done.accept_bytes(b"a"));
     assert!(!done.clone().accept_token(lead_ce, &table[lead_ce as usize]));
+}
+
+#[test]
+fn engine_token_bytes_table_matches_per_id_raw_bytes() {
+    let tokenizer = gemma_like_tokenizer();
+    let vocab = tokenizer.get_vocab_size(true);
+    // The table Engine builds at construction is entry-for-entry what the
+    // former first-request build produced: `token_raw_bytes` per id.
+    let table = token_bytes_table(&tokenizer, vocab);
+    assert_eq!(table, raw_table(&tokenizer));
+    assert_eq!(table[byte_id(&tokenizer, 0x82) as usize], vec![0x82]);
+
+    // Ids past the tokenizer vocabulary (padded model vocab) stay empty.
+    let padded = token_bytes_table(&tokenizer, vocab + 3);
+    assert_eq!(padded[..vocab], table[..]);
+    assert!(padded[vocab..].iter().all(Vec::is_empty));
+    assert!(token_bytes_table(&tokenizer, 0).is_empty());
 }

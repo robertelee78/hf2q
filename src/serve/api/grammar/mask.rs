@@ -983,16 +983,11 @@ mod tests {
         }
     }
 
-    /// Build the per-vocab byte table for a small id range using the
-    /// SAME mechanism as `Engine::token_bytes_table`
-    /// (`token_raw_bytes(tok, id)`). Returns `Vec<Vec<u8>>` indexed by
-    /// id from 0 to `up_to` exclusive.
+    /// Build the per-vocab byte table for a small id range with the
+    /// builder `Engine` uses (`token_text::token_bytes_table`). Returns
+    /// `Vec<Vec<u8>>` indexed by id from 0 to `up_to` exclusive.
     fn token_bytes_table_for_range(tok: &tokenizers::Tokenizer, up_to: u32) -> Vec<Vec<u8>> {
-        let mut out: Vec<Vec<u8>> = Vec::with_capacity(up_to as usize);
-        for id in 0..up_to {
-            out.push(crate::serve::api::token_text::token_raw_bytes(tok, id));
-        }
-        out
+        crate::serve::api::token_text::token_bytes_table(tok, up_to as usize)
     }
 
     /// Real-tokenizer test: Gemma 4 id 48 (the `<|tool_call>` special

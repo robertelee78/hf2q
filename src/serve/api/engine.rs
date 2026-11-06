@@ -356,7 +356,7 @@ pub struct SamplingParams {
     /// when `grammar` is also `None` (no grammar, no need for the
     /// table).  When `grammar` is `Some`, this MUST be `Some(table)`
     /// — the chat handler obtains it via `Engine::token_bytes_table()`
-    /// (lazily built + cached on the Engine).  Cheap to attach: an
+    /// (built once when the Engine is constructed).  Cheap to attach: an
     /// Arc clone (no copy of the underlying vector).
     pub token_bytes: Option<Arc<Vec<Vec<u8>>>>,
     /// Kind discriminant for the grammar attached above.
@@ -1381,7 +1381,7 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
             chat_template: Arc::new(String::new()),
             registration: None,
             vision_consumer_contract: None,
-            token_bytes: std::sync::OnceLock::new(),
+            token_bytes: Arc::default(),
             kv_spill_descriptor: Some(descriptor_for_engine),
             tq_packed_descriptor: None,
             mode: EngineMode::SerialFifo,
@@ -1440,7 +1440,7 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
             chat_template: Arc::new(String::new()),
             registration: None,
             vision_consumer_contract: None,
-            token_bytes: std::sync::OnceLock::new(),
+            token_bytes: Arc::default(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
             mode: EngineMode::SerialFifo,
@@ -1516,7 +1516,7 @@ pub(crate) fn make_synthetic_engine_over_budget(
             chat_template: Arc::new(String::new()),
             registration: None,
             vision_consumer_contract: None,
-            token_bytes: std::sync::OnceLock::new(),
+            token_bytes: Arc::default(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
             mode: EngineMode::SerialFifo,
@@ -1582,7 +1582,7 @@ pub(crate) fn make_synthetic_engine_aggregate_stream_pressure(arch: LoadedArch) 
             chat_template: Arc::new(String::new()),
             registration: None,
             vision_consumer_contract: None,
-            token_bytes: std::sync::OnceLock::new(),
+            token_bytes: Arc::default(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
             mode: EngineMode::SlotAware { max_slots: 4 },
@@ -1668,7 +1668,7 @@ pub(crate) fn make_synthetic_engine_that_panics(
             chat_template: Arc::new(String::new()),
             registration: None,
             vision_consumer_contract: None,
-            token_bytes: std::sync::OnceLock::new(),
+            token_bytes: Arc::default(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
             mode: EngineMode::SlotAware { max_slots: 4 },
@@ -1757,7 +1757,7 @@ pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
             chat_template: Arc::new(String::new()),
             registration: None,
             vision_consumer_contract: None,
-            token_bytes: std::sync::OnceLock::new(),
+            token_bytes: Arc::default(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
             mode: EngineMode::SerialFifo,
@@ -1812,8 +1812,7 @@ struct EngineInner {
     /// embedder (Phase 2a Task #8) — used to validate the OpenAI
     /// `dimensions` parameter and to size the response payload.
     hidden_size: usize,
-    /// Vocabulary size — needed to size the per-vocab token_bytes table
-    /// (built lazily on first grammar request).
+    /// Vocabulary size — sizes the per-vocab token_bytes table.
     vocab_size: usize,
     eos_token_ids: Vec<u32>,
     /// Tokenizer cloned per-request so handlers can tokenize without a lock.
@@ -1826,13 +1825,12 @@ struct EngineInner {
     registration: Option<super::registry::ModelRegistration>,
     vision_consumer_contract: Option<VisionConsumerContract>,
     /// Per-vocab raw token byte table — `token_bytes[id]` is the bytes
-    /// token `id` contributes to the output when sampled.  Built on
-    /// first grammar request via `Engine::token_bytes_table()` and
-    /// cached for the engine's lifetime (vocab × ~3-5 bytes ≈ 1 MB at
-    /// 256K vocab — trivial vs the model weights).  `OnceLock` so
-    /// concurrent first-callers race only on the build, not on reads.
-    /// Phase 2a Task #5 / iter-95.
-    token_bytes: std::sync::OnceLock<Arc<Vec<Vec<u8>>>>,
+    /// token `id` contributes to the output when sampled.  Built once
+    /// while the Engine is constructed, concurrently with the worker's
+    /// warmup, so no request waits for it (vocab × ~3-5 bytes ≈ 1 MB at
+    /// 256K vocab — trivial vs the model weights).  Phase 2a Task #5 /
+    /// iter-95; ADR-063 Q4-GEMMA host P2.
+    token_bytes: Arc<Vec<Vec<u8>>>,
     /// Phase B-dense.2 follow-up: cached KV-spill shape descriptor for
     /// the Gemma 4 dense F32/F16 K/V cache. Populated at `Engine::spawn`
     /// time from the `GemmaLoadedModel`'s `MlxModelWeights` BEFORE the
@@ -1918,6 +1916,18 @@ struct EngineInner {
     /// a brief `Mutex` acquisition (no cross-thread scheduler access).
     /// Phase C3 wires this into the Prometheus exposition.
     scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
+}
+
+/// Build [`EngineInner::token_bytes`]: one tokenizer decode per vocabulary
+/// id (~50-200 ms of CPU at Gemma 4's 262,144 ids).
+fn build_token_bytes_table(tokenizer: &Tokenizer, vocab_size: usize) -> Arc<Vec<Vec<u8>>> {
+    let table = super::token_text::token_bytes_table(tokenizer, vocab_size);
+    tracing::info!(
+        "Engine: built per-vocab token_bytes table ({} ids, ~{:.1} MB)",
+        vocab_size,
+        table.iter().map(Vec::len).sum::<usize>() as f64 / 1e6
+    );
+    Arc::new(table)
 }
 
 #[cfg(test)]
@@ -4320,6 +4330,9 @@ impl Engine {
         )
         .expect("spawn hf2q-engine thread");
 
+        // The worker thread (and its warmup) runs from here on; build the
+        // grammar byte table on this thread meanwhile.
+        let token_bytes = build_token_bytes_table(&tokenizer, vocab_size);
         Engine {
             inner: Arc::new(EngineInner {
                 tx,
@@ -4337,7 +4350,7 @@ impl Engine {
                 chat_template,
                 registration,
                 vision_consumer_contract,
-                token_bytes: std::sync::OnceLock::new(),
+                token_bytes,
                 kv_spill_descriptor,
                 tq_packed_descriptor,
                 mode: initial_mode,
@@ -4921,6 +4934,9 @@ impl Engine {
         )
         .expect("spawn hf2q-engine-slotaware thread");
 
+        // The worker thread (and its warmup) runs from here on; build the
+        // grammar byte table on this thread meanwhile.
+        let token_bytes = build_token_bytes_table(&tokenizer, vocab_size);
         Engine {
             inner: Arc::new(EngineInner {
                 tx,
@@ -4938,7 +4954,7 @@ impl Engine {
                 chat_template,
                 registration,
                 vision_consumer_contract,
-                token_bytes: std::sync::OnceLock::new(),
+                token_bytes,
                 kv_spill_descriptor,
                 tq_packed_descriptor,
                 mode: initial_mode,
@@ -5198,8 +5214,8 @@ impl Engine {
         self.inner.vision_consumer_contract.clone()
     }
 
-    /// Lazily build + cache the per-vocab raw byte table used by the
-    /// grammar mask (Phase 2a Task #5 / iter-95).
+    /// The per-vocab raw byte table used by the grammar mask (Phase 2a
+    /// Task #5 / iter-95), built when the Engine was constructed.
     ///
     /// `token_bytes[id]` is the bytes token `id` contributes to the output
     /// (`token_text::token_raw_bytes`): `tokenizer.decode(&[id], false)`
@@ -5209,36 +5225,11 @@ impl Engine {
     /// grammar mask. Model EOG ids are handled separately and survive only
     /// once the grammar is accepting.
     ///
-    /// Cost: vocab × one tokenizer.decode call.  At Gemma-4's vocab=256K
-    /// this is ~50-200 ms on first call (CPU work; not on hot path),
-    /// then ~free for every subsequent grammar request through this
-    /// Engine.  The build runs on the calling thread so the worker
-    /// thread is unaffected.
-    ///
     /// Returned as `Arc<Vec<Vec<u8>>>` — the chat handler attaches it
     /// to `SamplingParams.token_bytes` (cheap Arc clone) so the worker
     /// thread can consume it without re-resolving on every request.
     pub fn token_bytes_table(&self) -> Arc<Vec<Vec<u8>>> {
-        self.inner
-            .token_bytes
-            .get_or_init(|| {
-                let v = self.inner.vocab_size;
-                let tok = &self.inner.tokenizer;
-                let mut out: Vec<Vec<u8>> = Vec::with_capacity(v);
-                for id in 0..v as u32 {
-                    // Failure (out-of-range id, unsupported token) yields
-                    // empty bytes so the mask treats it as a "special" /
-                    // unprintable token.
-                    out.push(super::token_text::token_raw_bytes(tok, id));
-                }
-                tracing::info!(
-                    "Engine: built per-vocab token_bytes table ({} ids, ~{:.1} MB)",
-                    v,
-                    out.iter().map(|v| v.len()).sum::<usize>() as f64 / 1e6
-                );
-                Arc::new(out)
-            })
-            .clone()
+        Arc::clone(&self.inner.token_bytes)
     }
 
     pub fn model_id(&self) -> &str {
@@ -34300,7 +34291,7 @@ assistant:
                 chat_template: Arc::new(String::new()),
                 registration: None,
                 vision_consumer_contract: None,
-                token_bytes: std::sync::OnceLock::new(),
+                token_bytes: Arc::default(),
                 kv_spill_descriptor: None,
                 tq_packed_descriptor: None,
                 mode: EngineMode::SerialFifo,
@@ -36183,7 +36174,7 @@ assistant:
                 chat_template: Arc::new(String::new()),
                 registration: None,
                 vision_consumer_contract: None,
-                token_bytes: std::sync::OnceLock::new(),
+                token_bytes: Arc::default(),
                 kv_spill_descriptor: descriptor,
                 tq_packed_descriptor: None,
                 mode: EngineMode::SerialFifo,
