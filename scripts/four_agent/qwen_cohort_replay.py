@@ -35,7 +35,7 @@ Manifest (JSON, schema `hf2q.qwen-cohort-replay.manifest.v1`):
                   (see below); a missing server.stderr or zero counter invalidates the report
 
 Route witness: `analyze` parses server.stderr lines (ANSI codes stripped)
-  Qwen decode tick route slot=<u32> kind="<commit|history|k3|ordinary>" path="<serial|joint>" turn_lanes=<n>
+  Qwen decode tick route slot=<u32> kind="<commit|history|k3|ordinary|bound|unplanned>" path="<serial|joint>" turn_lanes=<n>
 emitted once per lane per decode turn, into per-arm `route_witness` counters:
   spec_in_busy_turn     kind k3|history with turn_lanes >= 2
   ordinary_alone_joint  kind ordinary, path joint, turn_lanes == 1

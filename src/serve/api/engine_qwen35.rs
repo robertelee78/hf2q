@@ -693,8 +693,8 @@ impl Qwen35LoadedModel {
             persistent_kv_cache: None,
             // ADR-044 (2026-08-21) / ADR-063 D1: an unset
             // HF2Q_QWEN_SPECULATION is `auto` here (one slot); a SlotAware
-            // worker re-resolves it at start, to `off` for dense artifacts
-            // with max_slots >= 4. Explicit values always win.
+            // worker re-resolves it at start, to `off` when it selected joint
+            // decode with max_slots >= 4. Explicit values always win.
             speculation: super::qwen35_speculation::QwenSpeculationController::from_environment(),
         };
 
@@ -5374,12 +5374,16 @@ impl Qwen35DecodeState {
 
     /// Plan this tick before a decode turn partitions its lanes, so the joint
     /// partition and the serial loop execute the same decision. Returns the
-    /// planned kind for the partition's eligibility.
-    pub(in crate::serve::api) fn plan_tick(&mut self) -> Result<&Qwen35TickKind> {
+    /// planned kind for the partition's eligibility, or `None` for a lane at
+    /// its step bound: `decode_tick` finishes it without a route decision.
+    pub(in crate::serve::api) fn plan_tick(&mut self) -> Result<Option<&Qwen35TickKind>> {
+        if self.step >= self.max_tokens {
+            return Ok(None);
+        }
         if self.planned_tick.is_none() {
             self.planned_tick = Some(self.next_tick_kind()?);
         }
-        Ok(self.planned_tick.as_ref().expect("planned tick set above"))
+        Ok(self.planned_tick.as_ref())
     }
 
     /// The planned kind, if this turn planned one.

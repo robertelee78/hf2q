@@ -111,6 +111,14 @@ pub const MTP_ROUND_COST_UNITS: f64 = 1.26;
 /// row count (aggregate counters cannot split it by rows). Same receipts:
 /// 17 rounds, 1.640 s = 96.5 ms per round; 3.171 s over about 49 decisions
 /// = 64.7 ms per ordinary decision; 96.5 / 64.7 = 1.49.
+///
+/// Caveat for both constants: those runs were four-slot `adaptive` with joint
+/// decode, so the ordinary-decision time comes from joint rows (prepare to
+/// the lane's own finish). Speculation now runs by default only at one to
+/// three slots, where a serial ordinary decision is cheaper. ADR-044's
+/// one-slot profile suggests about 2.1 for MTP (68–75 ms per round against
+/// about 34 ms per token) [INFERENCE], so these constants may undercharge a
+/// round there. This is a speed effect only; the route stays request-local.
 pub const HISTORY_ROUND_COST_UNITS: f64 = 1.49;
 
 /// Development-only overrides of the modelled round costs, used by the

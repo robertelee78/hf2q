@@ -29,23 +29,23 @@ The ruling is for repeatability, and the evidence for the default is #719, not D
 - B at N4 sends warmed MTP lanes to serial K3 on almost every tick, so it would move toward #719's slower arm [INFERENCE].
 - D1 does not show that speculation gains nothing for MoE at N4. D1 §7 for Qwen3.6 is Inconclusive: decode throughput auto/off 1.014 (CI 0.978–1.051), measured with joint decode off, on the canonical workload where Qwen3.6 mostly fails the task. Makespan was excluded (1.076, CI 1.004–1.154) because per-agent completion differed. D2 covers Qwen3.8 only.
 
-Follow-on edits: the off-reason string (`DENSE_WIDE_DEFAULT_OFF_REASON` becomes a joint-wide reason), the `default_server_policy` doc and tests, the launcher comments (`serve_qwen38_opencode.sh`, `serve_qwen36_opencode.sh`), `docs/operator-env-vars.md` and the CHANGELOG.
+Follow-on edits: the off-reason string (`DENSE_WIDE_DEFAULT_OFF_REASON` becomes `JOINT_WIDE_DEFAULT_OFF_REASON`), the `default_server_policy` doc and tests, the `serve_qwen38_opencode.sh` launcher comments (`serve_qwen36_opencode.sh` carries no speculation comment), `docs/operator-env-vars.md` and the CHANGELOG.
 
 ### B: request-local route per tick, used wherever speculation is on
 
 B covers N1 (only the cost change matters there), 2–3 slots, workers with joint decode off, and explicit `auto` at N4. It has three parts.
 
 1. **One decision point per tick.**
-   - `Qwen35DecodeState::next_tick(&mut self, kv) -> Qwen35TickKind` is the only place that chooses a tick's route. `decode_tick` matches on its result; no second decision exists to disagree with it (no debug assertion). Its body is today's chain of decisions, moved into one function:
+   - `Qwen35DecodeState::next_tick_kind(&mut self) -> Result<Qwen35TickKind>` is the only place that chooses a tick's route. `decode_tick` matches on its result (or on the turn's plan); no second decision exists to disagree with it (no debug assertion). Its body is today's chain of decisions, moved into one function:
      - pending output → `Commit`;
      - history lookup with drafts and an admitting controller → `History(drafts)`. The history miss path, the MTP drop on a cost-disabled miss and the ledger sync move here unchanged.
      - MTP state, at least 4 output tokens remaining and an admitting controller → `K3`;
      - otherwise → `Ordinary`: a plain target step, or the coherent target plus MTP catch-up step.
-   - The kind is computed in the joint partition's pre-pass and stored on the lane for the tick, so the serial loop executes the same decision.
+   - `plan_tick` computes the kind in the joint partition's pre-pass and stores it on the lane for the tick, so the serial loop executes the same decision. A lane at its step bound gets no plan; `decode_tick` finishes it without consulting a proposer.
 2. **Joint eligibility by kind.**
    - In repeatable mode the partition's classify returns `None` for `Commit`, `K3` and `History` lanes. They never join a joint group, so a speculating lane runs its round whatever the cohort.
    - `Ordinary` lanes join as today. In padded mode they always run the joint row, alone included (#717). In exact mode they run serial alone and joint in company, which are bitwise equal (`qwen36_joint_decode_matches_serial_decode_bitwise` covers both the plain and the `LogitsAndHidden` catch-up row).
-   - Partition tests cover speculating lanes in 2–4-lane turns in both modes.
+   - Eligibility is decided per lane by `Qwen35DecodeState::joint_lane_class` and tested there for every kind; the partition itself is unchanged and admits exactly the lanes classified `Some` (its existing ragged-eligibility tests).
 3. **Deterministic cost controllers.**
    - The controllers keep their algorithm: 4-round windows, disable after two unprofitable windows, at least one ordinary observation before any speculation.
    - In repeatable mode they are fed modelled costs in ordinary-decision units: an ordinary decision is 1 unit, and a round is a fixed per-proposer constant. A window is then unprofitable exactly when its mean target-equivalent decisions per round are ≤ C, which is a pure function of the transcript.
@@ -58,6 +58,7 @@ B covers N1 (only the cost change matters there), 2–3 slots, workers with join
 
    - `C_hist` is one constant for every row count, because aggregate counters cannot split it by rows.
    - There are no Qwen3.6 receipts with these counters, so Qwen3.6 uses the Qwen3.8 constants [INFERENCE: its MoE M1/K3 cost ratio may differ]. The constants are recorded in code with this source.
+   - The source runs were four-slot `adaptive` with joint decode, so their ordinary-decision time is a joint row's (prepare to the lane's own finish). Speculation now runs by default only at one to three slots, where a serial ordinary decision is cheaper. ADR-044's one-slot profile suggests about 2.1 for MTP (68–75 ms per round against about 34 ms per token) [INFERENCE], so 1.26 probably undercharges a round there.
    - With no speed runs allowed, the accuracy of these constants is the only protection for speed; if one is wrong, the cost is speed, not correctness.
    - **Telemetry stays measured.** `/metrics` `*_round_seconds_total` and `*_equivalent_ordinary_seconds_total` keep wall-clock values from a separate measured accumulator. The modelled units only drive the gate.
    - The `cost_controller.rs` module comment changes: the repeatable gate is an acceptance threshold against a fixed cost model; the measured gate remains under `adaptive`.
@@ -92,8 +93,8 @@ A2 can therefore ship only under `adaptive`, or redesigned with per-lane depth f
 ## Gates (correctness only)
 
 1. **Model-free.**
-   - `next_tick` kind tests: pending output; drafts and no drafts; history miss with the MTP drop; fewer than 4 remaining; cost-disabled; no MTP.
-   - Partition tests: speculating lanes in 2–4-lane turns, padded and exact.
+   - `next_tick_kind` tests: pending output; drafts and no drafts; history miss with the MTP drop; fewer than 4 remaining; cost-disabled; no MTP.
+   - Lane-class tests (`joint_lane_class`): planned `Ordinary` joins (a coherent MTP catch-up lane included); planned `K3`, `History`, unplanned and step-bound lanes stay serial; `adaptive` keeps the phase-1 class.
    - Modelled-controller tests: window arithmetic; a disable at mean ≤ C; identical decisions for an identical transcript; telemetry still measured.
    - Policy tests: Qwen3.6/MoE `off` at four slots and `auto` below.
    - The existing speculation-equals-greedy model-free tests.

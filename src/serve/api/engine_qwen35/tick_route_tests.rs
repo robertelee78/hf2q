@@ -217,13 +217,16 @@ fn joint_partition_admits_only_planned_ordinary_ticks_under_the_repeatable_route
 
     let mut ordinary = state(&qwen, 64);
     assert_eq!(ordinary.joint_lane_class(), None, "unplanned");
-    assert_eq!(ordinary.plan_tick().unwrap(), &Qwen35TickKind::Ordinary);
+    assert_eq!(
+        ordinary.plan_tick().unwrap(),
+        Some(&Qwen35TickKind::Ordinary)
+    );
     assert_eq!(ordinary.joint_lane_class(), Some(true));
 
     let mut k3 = state(&qwen, 64);
     with_mtp(&mut k3, &device);
     warm(&mut k3, Duration::from_millis(30));
-    assert_eq!(k3.plan_tick().unwrap(), &Qwen35TickKind::K3);
+    assert_eq!(k3.plan_tick().unwrap(), Some(&Qwen35TickKind::K3));
     assert_eq!(k3.joint_lane_class(), None);
 
     let mut history = state(&qwen, 64);
@@ -231,7 +234,7 @@ fn joint_partition_admits_only_planned_ordinary_ticks_under_the_repeatable_route
     warm(&mut history, Duration::from_millis(30));
     assert!(matches!(
         history.plan_tick().unwrap(),
-        Qwen35TickKind::History(_)
+        Some(Qwen35TickKind::History(_))
     ));
     assert_eq!(history.joint_lane_class(), None);
 
@@ -240,8 +243,20 @@ fn joint_partition_admits_only_planned_ordinary_ticks_under_the_repeatable_route
     let mut coherent = state(&qwen, 3);
     with_mtp(&mut coherent, &device);
     warm(&mut coherent, Duration::from_millis(30));
-    assert_eq!(coherent.plan_tick().unwrap(), &Qwen35TickKind::Ordinary);
+    assert_eq!(
+        coherent.plan_tick().unwrap(),
+        Some(&Qwen35TickKind::Ordinary)
+    );
     assert_eq!(coherent.joint_lane_class(), Some(true));
+
+    // A lane at its step bound gets no plan, so it stays serial and
+    // `decode_tick` finishes it without consulting a proposer.
+    let mut bound = state(&qwen, 64);
+    with_history(&mut bound);
+    warm(&mut bound, Duration::from_millis(30));
+    bound.step = bound.max_tokens;
+    assert_eq!(bound.plan_tick().unwrap(), None);
+    assert_eq!(bound.joint_lane_class(), None);
 
     let mut adaptive = state(&qwen, 64);
     with_mtp(&mut adaptive, &device);
