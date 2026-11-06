@@ -82,6 +82,12 @@ This row was added by hand.
 
 These rows were added by hand.
 
+## Added in ADR-063 Q4-GEMMA-DECODE op parity (2026-11-06)
+
+- `HF2Q_GEMMA_DECODE_MMA` (`development-only`) routes every Gemma 4 decode-width (1..=8 rows) dense GGUF matmul — attention q/k/v/o, dense FFN gate/up/down and the lm head, in the solo decode, the `[N,hidden]` batched body, the batched/fused lm head and the speculative verify heads and tree-verify layers — through mlx-native's column-invariant few-row MMA mat-vec. Only the exact value `1` enables it; it is off by default and read once per process. Admission depends only on (type, N, K): Q4_K, Q6_K and Q5_0 with `K % 64 == 0` (and the type's block size), Q8_0 with `K % 32 == 0`; other weights (F32 router, F16/BF16, affine, other block types) and prefill widths keep their routes. Numerics class B against the stock routes; each row is bitwise equal at every width. Published as `measurement_snapshot.active_controls.gemma_decode_dense_kernel` (`Stock` / `ColumnInvariantMma`) and declared as `decode_dense_kernel` in Gemma Q1 endpoint and localizer packets.
+
+This row was added by hand.
+
 ## Remaining promotion queue
 
 The inventory deliberately identifies follow-up work without smuggling it into
@@ -272,6 +278,7 @@ this release:
 | `HF2Q_GEMMA_COLD_GS3_REPEATS` | `development-only` | 2 |
 | `HF2Q_GEMMA_COLD_TURN0_PROMPTS` | `development-only` | 5 |
 | `HF2Q_GEMMA_COLD_TURN0_RUN` | `development-only` | 1 |
+| `HF2Q_GEMMA_DECODE_MMA` | `development-only` | 7 |
 | `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` | `documented-escape` | 4 |
 | `HF2Q_GEMMA_JOINT_COLD_PREFILL` | `documented-escape` | 4 |
 | `HF2Q_GEMMA_JOINT_WARM_PREFILL` | `documented-escape` | 3 |

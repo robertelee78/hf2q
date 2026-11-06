@@ -18,6 +18,8 @@ pub(super) struct Packet {
     #[serde(default)] routing_witness:Option<serde_json::Value>,
     /// Warm live-resume kernel the loaded model must resolve; absent = VecHybrid.
     #[serde(default)] warm_live_kernel:WarmLiveKernel,
+    /// Decode dense/lm-head kernel the process must resolve; absent = Stock.
+    #[serde(default)] decode_dense_kernel:DecodeDenseKernel,
     /// Cohort stage localizer only: the stage plan, the lanes it covers and
     /// every store's frozen record list (`endpoint`, `stages`), either inline
     /// (`expected_stores`) or in the bound plan-only `stage_manifest` file.
@@ -42,6 +44,19 @@ pub(super) fn require_warm_kernel(declared:WarmLiveKernel,resolved:crate::infere
     use crate::inference::models::gemma4::GemmaLiveKernel as K;
     let resolved=match resolved {K::VecHybrid=>WarmLiveKernel::VecHybrid,K::TiledF16=>WarmLiveKernel::TiledF16};
     ensure!(resolved==declared,"resolved Gemma warm live kernel {resolved:?} differs from the packet's {declared:?} (absent = shipped VecHybrid)");
+    Ok(resolved)
+}
+/// Gemma decode dense/lm-head kernel (`HF2Q_GEMMA_DECODE_MMA`, read once per
+/// process, not in `config_sha256`). `Stock` is the shipped default and the
+/// kernel of every retained Gemma Q1 run; `ColumnInvariantMma` must be declared.
+#[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
+pub(super) enum DecodeDenseKernel {#[default] Stock,ColumnInvariantMma}
+/// Refuses a process whose decode dense kernel is not the packet's declared one.
+pub(super) fn require_decode_dense_kernel(declared:DecodeDenseKernel,
+    resolved:crate::inference::models::gemma4::decode_mma::DecodeDenseKernel)->Result<DecodeDenseKernel> {
+    use crate::inference::models::gemma4::decode_mma::DecodeDenseKernel as K;
+    let resolved=match resolved {K::Stock=>DecodeDenseKernel::Stock,K::ColumnInvariantMma=>DecodeDenseKernel::ColumnInvariantMma};
+    ensure!(resolved==declared,"resolved Gemma decode dense kernel {resolved:?} differs from the packet's {declared:?} (absent = shipped Stock)");
     Ok(resolved)
 }
 const ENDPOINT_PACKET_BYTES:usize=1024*1024;
@@ -243,6 +258,7 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
         else {anyhow::bail!("explicit Gemma model required")};
     scope.check_config(&p.identity,&recipe_for(&model.config))?;
     let warm_live_kernel=require_warm_kernel(p.warm_live_kernel,model.weights.warm_live_kernel)?;
+    let decode_dense_kernel=require_decode_dense_kernel(p.decode_dense_kernel,crate::inference::models::gemma4::decode_mma::kernel())?;
     let observed=scope.observed(model.ctx.executor.device(),&model as *const _ as usize as u64,3)?;
     store.bind_acquisition(observed.clone()).map_err(anyhow::Error::msg)?;
     if let Some(stages)=stage_store.as_mut() {
@@ -348,7 +364,7 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
         "trajectory":p.trajectory,"actual_cancellation":cancellation,"active64_exact_copy":exact64,"logical_lanes":4,"physical_graph_membership":if p.trajectory==Trajectory::T2ActualCohort {
             "actual packed prefill512 rows with four128-owner spans; actual decode input4rows; operator-specific source geometry, not whole-kernel/F2 membership"
         } else {"per-request ordinary; not T2"},
-        "logit_rows_per_lane":144,"cache_boundaries":positions(p.trajectory),"capture_records":records,"warm_live_kernel":warm_live_kernel,
+        "logit_rows_per_lane":144,"cache_boundaries":positions(p.trajectory),"capture_records":records,"warm_live_kernel":warm_live_kernel,"decode_dense_kernel":decode_dense_kernel,
         "planned_tensor_payload":bytes,"oracle_quality_qualified":false,"whole_q1_qualified":false,
         "float_policy":"Unspecified","diagnostic_head_scope":"same production scalar head applied to every actual prefill hidden row"});
     let mut stage_records=0;
