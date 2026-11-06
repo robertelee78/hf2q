@@ -15,7 +15,7 @@ UNKNOWN = {"reason", "checked_status", "raw_bits"}
 REASONS = {"NotHealthyCompleted", "EmptyCommand", "NonFinite", "NonPositive", "NotStrictlyOrdered",
            "DroppedWithoutCheckedTiming", "TaintedObservation"}
 PAIR = {"monotonic_ns", "uptime_raw_ns", "mach_absolute_ticks", "mach_timebase", "read_span_ns"}
-PLAN = {"model", "n_layers", "chain_n", "layer_kinds", "commands"}
+PLAN = {"model", "n_layers", "chain_n", "native_embedding", "layer_kinds", "commands"}
 MIN_TOLERANCE_NS = 1_000
 
 
@@ -37,9 +37,10 @@ def clock_pair(value):
     return value
 
 
-def plan_commands(n_layers, chain_n):
-    """The joint forward's commands in commit order, by the server's closes_chain rule."""
-    commands, start = ["embed"], 0
+def plan_commands(n_layers, chain_n, native_embedding=True):
+    """The joint forward's commands in commit order, by the server's closes_chain rule. The embedding
+    gather is an observed command only on the native embedding route."""
+    commands, start = (["embed"] if native_embedding else []), 0
     for layer in range(n_layers):
         if (layer + 1) % chain_n == 0 or layer + 1 == n_layers:
             commands.append(f"layers[{start},{layer + 1})")
@@ -78,7 +79,8 @@ class GpuTiming:
              number(p["n_layers"]) and 0 < p["n_layers"] <= 1024 and number(p["chain_n"]) and p["chain_n"] > 0 and
              type(p["layer_kinds"]) is list and len(p["layer_kinds"]) == p["n_layers"] and
              all(kind in ("linear", "full") for kind in p["layer_kinds"]) and
-             p["commands"] == plan_commands(p["n_layers"], p["chain_n"]),
+             type(p["native_embedding"]) is bool and
+             p["commands"] == plan_commands(p["n_layers"], p["chain_n"], p["native_embedding"]),
              "one closed joint chain plan matching the commit rule")
         self.plan = p
 
@@ -109,7 +111,9 @@ class GpuTiming:
                                                 all(number(x) for x in value["raw_bits"]))),
                  "closed Unknown GPU timing")
             reason, drained = value["reason"], c["drain"] is not None
-            cause = {"EmptyCommand": not (c["dispatches"] or c["noncompute"]),
+            # EmptyCommand is classified at the checked drain (an unchecked empty command is
+            # DroppedWithoutCheckedTiming instead).
+            cause = {"EmptyCommand": drained and not (c["dispatches"] or c["noncompute"]),
                      "DroppedWithoutCheckedTiming": not drained,
                      "NonFinite": drained and value["raw_bits"] is not None,
                      "NonPositive": drained and value["raw_bits"] is not None,

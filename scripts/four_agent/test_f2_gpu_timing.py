@@ -82,14 +82,16 @@ class GpuTiming(unittest.TestCase):
 
     def test_joint_trace_with_its_chain_plan(self):
         records, identity, scenario = gpu_trace(widths)
-        plan = {"model": "qwen35", "n_layers": 8, "chain_n": 4, "layer_kinds": ["linear"] * 3 + ["full"] +
-                ["linear"] * 3 + ["full"], "commands": ["embed", "layers[0,4)", "layers[4,8)", "output_head"]}
+        plan = {"model": "qwen35", "n_layers": 8, "chain_n": 4, "native_embedding": True,
+                "layer_kinds": ["linear"] * 3 + ["full"] + ["linear"] * 3 + ["full"],
+                "commands": ["embed", "layers[0,4)", "layers[4,8)", "output_head"]}
         at = record(records, "transaction")
         records.insert(records.index(at) + 1, dict(copy.deepcopy(at), kind="joint_chain_plan", payload=plan))
         report = trace.validate_trace(renumber(records), identity, scenario)
         self.assertEqual(report["gpu_timing"]["joint_chain_plan"], plan)
         self.assertEqual(report["joint_ordinary_decode"]["witnessed"], 4)
-        for commands in (["embed", "layers[0,8)", "output_head"], ["layers[0,4)", "layers[4,8)", "output_head"]):
+        for commands in (["embed", "layers[0,8)", "output_head"], ["layers[0,4)", "layers[4,8)", "output_head"],
+                         ["embed", "layers[0,4)", "layers[4,8)"]):
             with self.subTest(commands=commands):
                 bad = copy.deepcopy(records)
                 record(bad, "joint_chain_plan")["payload"]["commands"] = commands
@@ -100,6 +102,8 @@ class GpuTiming(unittest.TestCase):
         self.assertEqual(len(timing.plan_commands(64, 4)), 18)
         self.assertEqual(timing.plan_commands(10, 4),
                          ["embed", "layers[0,4)", "layers[4,8)", "layers[8,10)", "output_head"])
+        self.assertEqual(timing.plan_commands(8, 4, native_embedding=False),
+                         ["layers[0,4)", "layers[4,8)", "output_head"])
 
     def test_records_need_the_opt_in_and_its_clock_pairs(self):
         records, identity, scenario = gpu_trace()
@@ -172,6 +176,18 @@ class GpuTiming(unittest.TestCase):
             with self.subTest(reason=reason):
                 with self.assertRaisesRegex(ValueError, reason):
                     trace.validate_trace(*gpu_trace(available=available))
+        # An empty command that was never checked is DroppedWithoutCheckedTiming, not EmptyCommand.
+        def empty_unchecked(records):
+            for item in records:
+                stamps = item["payload"].get("timestamps") if item["kind"] == "native_gpu_timing" else None
+                if stamps and "Unknown" in stamps:
+                    stamps["Unknown"].update(reason="EmptyCommand")
+                    return
+            raise AssertionError("fixture has no unchecked command")
+        records, identity, scenario = gpu_trace(widths)
+        empty_unchecked(records)
+        with self.assertRaisesRegex(ValueError, "EmptyCommand without its cause"):
+            trace.validate_trace(records, identity, scenario)
         ok = stamps({"Unknown": {"reason": "NonFinite", "checked_status": 4, "raw_bits": [1, 2]}})
         report = trace.validate_trace(*gpu_trace(available=ok))
         self.assertEqual(report["gpu_timing"]["unknown_by_reason"], {"NonFinite": 1})

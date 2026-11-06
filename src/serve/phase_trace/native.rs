@@ -102,6 +102,12 @@ const QUEUED_EVENTS: usize = 2048;
 /// without holding the trace lock long against the worker's own records.
 const WRITE_BATCH: usize = 64;
 static STOP: AtomicBool = AtomicBool::new(false);
+/// The installed diagnostic's GPU-timestamp opt-in, cached at install so hot
+/// paths never take the trace lock to read it.
+static GPU_TIMESTAMPS: AtomicBool = AtomicBool::new(false);
+pub(super) fn gpu_timestamps_installed() -> bool {
+    GPU_TIMESTAMPS.load(Ordering::Acquire)
+}
 static WRITER: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 /// One ordered queue for both native streams: mlx-native emits a command's
 /// timing right after its checked drain and before its drop, and a single
@@ -239,6 +245,7 @@ pub(super) fn install(config: &Config) -> Result<(), String> {
                 STOP.store(true, Ordering::Release);
                 error.to_owned()
             })?;
+            GPU_TIMESTAMPS.store(config.gpu_timestamps(), Ordering::Release);
             crate::inference::native_observation::installed();
             Ok(())
         })

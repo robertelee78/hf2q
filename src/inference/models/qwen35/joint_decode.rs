@@ -155,10 +155,14 @@ fn closes_chain(layer_idx: usize, chain_n: usize, n_layers: usize) -> bool {
 }
 
 /// The observed native commands of one joint forward, in commit order: the
-/// embedding gather, one command per closed layer chain, an open-chain flush
-/// (never, while every chain closes at `n_layers`) and the output head.
-fn joint_command_plan(n_layers: usize, chain_n: usize) -> Vec<String> {
-    let mut commands = vec!["embed".to_string()];
+/// embedding gather (an observed command only on the native embedding route),
+/// one command per closed layer chain, an open-chain flush (never, while every
+/// chain closes at `n_layers`) and the output head.
+fn joint_command_plan(n_layers: usize, chain_n: usize, native_embedding: bool) -> Vec<String> {
+    let mut commands = Vec::new();
+    if native_embedding {
+        commands.push("embed".to_string());
+    }
     let mut start = 0;
     for layer in 0..n_layers {
         if closes_chain(layer, chain_n, n_layers) {
@@ -394,8 +398,10 @@ impl Qwen35Model {
                     LayerWeightsGpu::LinearAttn { .. } => "linear",
                 })
                 .collect();
+            let native_embedding = self.token_embd_native.is_some();
             serde_json::json!({"model":"qwen35","n_layers":n_layers,"chain_n":chain_n,
-                "layer_kinds":kinds,"commands":joint_command_plan(n_layers, chain_n)})
+                "native_embedding":native_embedding,"layer_kinds":kinds,
+                "commands":joint_command_plan(n_layers, chain_n, native_embedding)})
         });
         let mut hidden = embedded;
         let mut retained = Vec::with_capacity(n_layers);
@@ -840,7 +846,7 @@ mod tests {
 
     #[test]
     fn joint_command_plan_follows_the_commit_points() {
-        let plan = joint_command_plan(64, 4);
+        let plan = joint_command_plan(64, 4, true);
         assert_eq!(plan.len(), 18);
         assert_eq!(plan[0], "embed");
         assert_eq!(plan[1], "layers[0,4)");
@@ -848,7 +854,7 @@ mod tests {
         assert_eq!(plan[17], "output_head");
         // A remainder group closes at the last layer; no open-chain flush.
         assert_eq!(
-            joint_command_plan(10, 4),
+            joint_command_plan(10, 4, true),
             [
                 "embed",
                 "layers[0,4)",
@@ -857,7 +863,12 @@ mod tests {
                 "output_head"
             ]
         );
-        assert_eq!(joint_command_plan(3, 1).len(), 5);
+        assert_eq!(joint_command_plan(3, 1, true).len(), 5);
+        // Host embedding (no native table): no observed embed command.
+        assert_eq!(
+            joint_command_plan(8, 4, false),
+            ["layers[0,4)", "layers[4,8)", "output_head"]
+        );
         let closes = (0..10).filter(|&layer| closes_chain(layer, 4, 10)).count();
         assert_eq!(closes, 3);
     }

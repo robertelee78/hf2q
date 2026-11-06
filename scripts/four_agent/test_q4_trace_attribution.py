@@ -59,7 +59,8 @@ class GpuAttribution(unittest.TestCase):
     def test_gpu_busy_chains_refusal_and_bounded_launch(self):
         from test_f2_gpu_timing import gpu_trace
         records, _, _ = gpu_trace(widths)
-        plan = {"model": "qwen35", "n_layers": 2, "chain_n": 2, "layer_kinds": ["linear", "full"],
+        plan = {"model": "qwen35", "n_layers": 2, "chain_n": 2, "native_embedding": False,
+                "layer_kinds": ["linear", "full"],
                 "commands": ["layers[0,2)", "output_head"]}
         records.insert(5, dict(records[5], kind="joint_chain_plan", payload=plan))
         result = attribution.attribute(records)

@@ -411,14 +411,7 @@ pub(crate) fn native_control_nonce() -> Option<String> {
 
 /// Q4-TRACE-GPU-TIMING opt-in of the active native diagnostic (false otherwise).
 pub(crate) fn native_gpu_timestamps() -> bool {
-    match TRACE.get() {
-        Some(Trace::Active(lock)) => lock.lock().ok().is_some_and(|r| {
-            r.native_config
-                .as_ref()
-                .is_some_and(|config| config.gpu_timestamps())
-        }),
-        _ => false,
-    }
+    native::gpu_timestamps_installed()
 }
 
 /// A paired host-clock sample for the arm ACK and final status when GPU timestamps
