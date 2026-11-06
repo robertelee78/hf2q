@@ -100,6 +100,12 @@ This row was added by hand.
 - `HF2Q_GEMMA_COLD_GS3_REPEATS` (`development-only`) sets the timed repeats of the ignored G-S3 harness (`scripts/q4_gemma_cold_gs3.sh`).
 - `HF2Q_DUMP_SLIDING_MASK` is removed with the block-diagonal cold multi-sequence mask it dumped (D2 cutover).
 
+## Added in the ADR-063 gap program (2026-11-07)
+
+- `HF2Q_GEMMA_DECODE_ATTN_NE` (`development-only`) selects the Gemma 4 decode attention head split of d256 (sliding) layers. Unset or `0`/`1`/`off`/`false`/`stock`: stock vec-hybrid decode attention. `4` or `2`: the NE head-split kernels on every decode path (batched cohort dispatch, mixed-bucket per-slot fallback and single-slot decode), which share their per-row math, so a slot's decode stays bitwise the same on each path; d512 layers keep stock. Class B against stock. Read once at model load; invalid values warn and keep stock; published as `active_controls.gemma_decode_attn_ne` and bound by the Gemma Q1 packet field `decode_attn_ne`. `serve_gemma4_opencode.sh` forwards `DECODE_ATTN_NE`, and the Gemma Q5 case forwards `HF2Q_Q5_GEMMA_DECODE_ATTN_NE`.
+
+This row was added by hand.
+
 These rows were added by hand.
 
 ## Removed after ADR-063 #725 (2026-11-07)
@@ -307,6 +313,7 @@ this release:
 | `HF2Q_GEMMA_COLD_TURN0_PROMPTS` | `development-only` | 5 |
 | `HF2Q_GEMMA_COLD_TURN0_RUN` | `development-only` | 1 |
 | `HF2Q_GEMMA_DECODE_DENSE` | `development-only` | 11 |
+| `HF2Q_GEMMA_DECODE_ATTN_NE` | `development-only` | 5 |
 | `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` | `documented-escape` | 4 |
 | `HF2Q_GEMMA_JOINT_COLD_PREFILL` | `documented-escape` | 4 |
 | `HF2Q_GEMMA_JOINT_WARM_PREFILL` | `documented-escape` | 3 |

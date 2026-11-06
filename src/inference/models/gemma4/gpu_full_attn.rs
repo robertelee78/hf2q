@@ -1614,18 +1614,35 @@ impl MlxModelWeights {
                     })?;
                     *total_dispatches += 1; // NWG=1: no reduce kernel
                 } else {
-                    mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
-                        session.encoder_mut(),
-                        reg,
-                        dev,
-                        &self.activations.attn_q_normed,
-                        &hybrid_kv[layer_idx].k,
-                        &hybrid_kv[layer_idx].v_packed,
-                        &hybrid_kv[layer_idx].v_norms,
-                        &self.activations.sdpa_out,
-                        &self.activations.sdpa_tmp,
-                        &p_hyb,
-                    )
+                    // Gap program: the NE head split on d256 layers, the same
+                    // per-row math as the batched decode (`gemma_decode_attention`).
+                    match self.decode_attn_ne.for_head_dim(hd) {
+                        Some(ne) => mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_ne(
+                            session.encoder_mut(),
+                            reg,
+                            dev,
+                            &self.activations.attn_q_normed,
+                            &hybrid_kv[layer_idx].k,
+                            &hybrid_kv[layer_idx].v_packed,
+                            &hybrid_kv[layer_idx].v_norms,
+                            &self.activations.sdpa_out,
+                            &self.activations.sdpa_tmp,
+                            &p_hyb,
+                            ne,
+                        ),
+                        None => mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
+                            session.encoder_mut(),
+                            reg,
+                            dev,
+                            &self.activations.attn_q_normed,
+                            &hybrid_kv[layer_idx].k,
+                            &hybrid_kv[layer_idx].v_packed,
+                            &hybrid_kv[layer_idx].v_norms,
+                            &self.activations.sdpa_out,
+                            &self.activations.sdpa_tmp,
+                            &p_hyb,
+                        ),
+                    }
                     .map_err(|e| anyhow::anyhow!("flash_attn_vec_hybrid L{layer_idx}: {e}"))?;
                     *total_dispatches += 2; // main + reduce (conservative)
                 }

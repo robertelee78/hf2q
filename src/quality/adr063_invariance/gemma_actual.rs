@@ -20,6 +20,8 @@ pub(super) struct Packet {
     #[serde(default)] warm_live_kernel:WarmLiveKernel,
     /// Decode dense/lm-head kernel the process must resolve; absent = Stock.
     #[serde(default)] decode_dense_kernel:DecodeDenseKernel,
+    /// Decode attention head split the loaded model must resolve (gap program); absent = Stock.
+    #[serde(default)] decode_attn_ne:DecodeAttnNe,
     /// Cohort stage localizer only: the stage plan, the lanes it covers and
     /// every store's frozen record list (`endpoint`, `stages`), either inline
     /// (`expected_stores`) or in the bound plan-only `stage_manifest` file.
@@ -39,6 +41,18 @@ pub(super) struct Packet {
 /// kernel of every retained Gemma Q1 run; `TiledF16` must be declared.
 #[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
 pub(super) enum WarmLiveKernel {#[default] VecHybrid,TiledF16}
+/// Gemma decode attention head split of d256 layers (gap program,
+/// `HF2Q_GEMMA_DECODE_ATTN_NE`). Resolved once at model load and not in
+/// `config_sha256`; `Stock` is the shipped default, `Ne2`/`Ne4` must be declared.
+#[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
+pub(super) enum DecodeAttnNe {#[default] Stock,Ne2,Ne4}
+/// Refuses a loaded model whose decode head split is not the packet's declared one.
+pub(super) fn require_decode_attn_ne(declared:DecodeAttnNe,resolved:crate::serve::gemma_decode_attention::GemmaDecodeAttnNe)->Result<DecodeAttnNe> {
+    use crate::serve::gemma_decode_attention::GemmaDecodeAttnNe as N;
+    let resolved=match resolved {N::Stock=>DecodeAttnNe::Stock,N::Ne(2)=>DecodeAttnNe::Ne2,N::Ne(4)=>DecodeAttnNe::Ne4,N::Ne(n)=>anyhow::bail!("unsupported decode head split NE {n}")};
+    ensure!(resolved==declared,"resolved Gemma decode attention head split {resolved:?} differs from the packet's {declared:?} (absent = shipped Stock)");
+    Ok(resolved)
+}
 /// Refuses a loaded model whose warm kernel is not the packet's declared one.
 pub(super) fn require_warm_kernel(declared:WarmLiveKernel,resolved:crate::inference::models::gemma4::GemmaLiveKernel)->Result<WarmLiveKernel> {
     use crate::inference::models::gemma4::GemmaLiveKernel as K;
@@ -261,6 +275,7 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
     scope.check_config(&p.identity,&recipe_for(&model.config))?;
     let warm_live_kernel=require_warm_kernel(p.warm_live_kernel,model.weights.warm_live_kernel)?;
     let decode_dense_kernel=require_decode_dense_kernel(p.decode_dense_kernel,crate::inference::models::gemma4::decode_dense::resolve()?)?;
+    let decode_attn_ne=require_decode_attn_ne(p.decode_attn_ne,model.weights.decode_attn_ne)?;
     let observed=scope.observed(model.ctx.executor.device(),&model as *const _ as usize as u64,3)?;
     store.bind_acquisition(observed.clone()).map_err(anyhow::Error::msg)?;
     if let Some(stages)=stage_store.as_mut() {
@@ -367,6 +382,7 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
             "actual packed prefill512 rows with four128-owner spans; actual decode input4rows; operator-specific source geometry, not whole-kernel/F2 membership"
         } else {"per-request ordinary; not T2"},
         "logit_rows_per_lane":144,"cache_boundaries":positions(p.trajectory),"capture_records":records,"warm_live_kernel":warm_live_kernel,"decode_dense_kernel":decode_dense_kernel,
+        "logit_rows_per_lane":144,"cache_boundaries":positions(p.trajectory),"capture_records":records,"warm_live_kernel":warm_live_kernel,"decode_attn_ne":decode_attn_ne,
         "planned_tensor_payload":bytes,"oracle_quality_qualified":false,"whole_q1_qualified":false,
         "float_policy":"Unspecified","diagnostic_head_scope":"same production scalar head applied to every actual prefill hidden row"});
     let mut stage_records=0;
