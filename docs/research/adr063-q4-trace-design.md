@@ -276,7 +276,11 @@ Letting Q2 consume joint witnesses is exactly the v0.1.31 Q2 v3 decision (ADR-06
 "unmapped_by_operation": {"joint_ordinary_decode": 0}
 ```
 
-The values above are illustrative except the histogram buckets, which use the n4-fix counts as the expected shape. Histogram keys are `logical<N>_pad<M>`, so they cannot be confused with the Q3 population names (`3+1` = 3 prefill + 1 decode in `q3_campaign.WORKLOADS`). `logical1_pad3` exists because a joint forward can carry one logical row: the guard is `!prepared.is_empty()` (`qwen35_joint_decode.rs:350`), and one lane's `prepare_joint_tick` can fail. In `Exact` mode the keys are `logical<N>_pad0`.
+The values above are illustrative except the histogram buckets, which use the n4-fix counts as the expected shape. Histogram keys are `logical<N>_pad<M>`, so they cannot be confused with the Q3 population names (`3+1` = 3 prefill + 1 decode in `q3_campaign.WORKLOADS`). `logical1_pad3` exists because a joint forward can carry one logical row: the guard is `!prepared.is_empty()` (`run_qwen35_joint_group` in `qwen35_joint_decode.rs`), and one lane's `prepare_joint_tick` can fail. In `Exact` mode the keys are `logical<N>_pad0`.
+
+Since #717 (padded-mode solo route, `HF2Q_QWEN_JOINT_SOLO`, default on), a lone ordinary lane runs a one-lane padded joint step instead of a serial forward. Lanes beyond the joint width run further joint steps. `logical1_pad3` is therefore a normal bucket in Qwen3.8 N4 runs, and the n4-fix value of 0 no longer describes the expected shape.
+
+Those steps are now `joint_ordinary_decode` transactions rather than `ordinary_or_temporal_mtp_decode`. Until the joint input manifest above lands, each one publishes unmapped witness records instead of a witnessed `forward_input`, so the Q2 `witness_progress` check in `scripts/four_agent/f2_trace.py` no longer gets witnesses from them. A window in which a slot advanced only through lone steps can then report it under `slots_without_required_forward_witness`. `HF2Q_QWEN_JOINT_SOLO=0` restores the old transaction mix for trace runs that need it.
 
 Field meaning:
 

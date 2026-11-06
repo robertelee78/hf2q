@@ -26,7 +26,9 @@ One scheduler turn advances every eligible decoding slot (2–4 rows by default)
   - its cache cursor equals the committed ledger (prompt + generated − 1), with an equal MTP cursor when it holds MTP state.
 
   A turn with an active DeltaNet capture is serial.
-- **Width.** Lanes are sorted by slot and capped at `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` (2..8, default 4). The padded `mul_mv_ext` mode caps at 4 whatever the setting, so its packed width is always 4. Fewer than two eligible lanes keep the whole turn serial, including MTP K3 and history speculation.
+- **Width.** Lanes are sorted by slot and capped at `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` (2..8, default 4). The padded `mul_mv_ext` mode caps at 4 whatever the setting, so its packed width is always 4.
+  - Exact mode: fewer than two eligible lanes keep the whole turn serial, including MTP K3 and history speculation, and eligible lanes beyond the cap stay serial. Both are bitwise equal to the joint row.
+  - Padded mode on workers with two or more slots (#717, `HF2Q_QWEN_JOINT_SOLO`, default on): every eligible lane runs, in scheduler order, in consecutive joint steps of at most the cap. A lone lane runs a one-lane padded step when its serial tick would be the ordinary target forward (no MTP or history state). A lone speculating lane keeps its serial K3 or history round. Design: `docs/research/adr063-qwen-n4-solo-joint-717.md`.
 - **Per-lane execution.**
   - Each lane prepares exactly the inputs its serial tick would feed the target (`Qwen35DecodeState::prepare_joint_tick`).
   - The step runs under one supervisor lease.
@@ -89,12 +91,13 @@ The Q1 numeric policy is `docs/research/adr063-q1-numeric-policy.md` (branch `do
 - **Arithmetic class.** The route is the same arithmetic class as stock Qwen3.8 serving: stock commits most tokens through width-4 `mul_mv_ext` R4 verify rows (ADR-044). Q1 §2.1 measured M1 vs R4 as `WithinDecisionEnvelope` (D max 0.093 nat). [INFERENCE: same kernel family and width; the recurrent scan length differs.]
 - **Padding.** Every step packs exactly 4 rows (joint width is capped at 4) so the packed width never depends on how many tenants share the step. Padding rows replay row 0's token, carry row 0's core outputs, never touch a cache, and are discarded. The cohort-invariance gate checks the bytes.
 - **No decision-parity guarantee.** In the A/B, serving transcripts differ from stock in 2 of 114 same-request groups (`q1_decision_policy.py transcripts`: `DivergedTranscripts`; agent-1 turn-2 and agent-3 turn-2). The four joint runs agree with each other and the four serial runs agree with each other. The forks are not yet classified (near-tie or not).
-- **No run-to-run determinism at N4.** Joint width never changes a row's bytes, but leaving or joining the cohort does. A step with fewer than two eligible lanes runs the serial one-row forward, which is not bitwise equal to the padded joint forward. Which steps run serially depends on when the other agents' requests arrive and finish, so near-tie tokens flip between runs on identical requests (#717).
+- **Run-to-run determinism at N4 (#717).** Joint width never changes a row's bytes, but leaving or joining the cohort did. Before #717, a step with fewer than two eligible lanes ran the serial one-row forward, which is not bitwise equal to the padded joint forward. Which steps ran serially depended on when the other agents' requests arrived and finished, so near-tie tokens flipped between runs on identical requests. With the solo route, every ordinary decode step runs the padded joint row whatever the cohort; `HF2Q_QWEN_JOINT_SOLO=0` restores the old partition. Lanes with MTP or history state still alternate between joint M1 rows and serial speculative rounds, so speculation `auto` stays timing-dependent. The evidence that established the defect:
   - T-J1-8 (binary 627d152a, `~/.local/state/hf2q/v0130/j1-512/t8/`), policy off: agent-1 turn-4 token 16 was " to" after about 18 joint steps and " and" after about 14.
   - T-J1-8, speculation auto: in every run the diverging turn-6 agent was the first to arrive. Its early steps can run serially or speculate while the speculating turn-4 lane is not joint-eligible.
   - The replay (`~/.local/state/hf2q/v0130/q38-det-inv/campaign-20261105T214953Z/`, fresh text-only servers, recorded bodies, a companion leaving the cohort after k measured joint steps) reproduces case (a) deterministically. Solo and k ≤ 13 give the " and" transcript; k = 17 and all-joint give the " to" transcript. Repeated arms are byte-identical.
   - Token 16 logprobs: solo " and" −0.797 / " to" −0.804; all-joint " to" −0.790 / " and" −0.808. This is a near-tie, well inside the envelope.
   - With speculation off the replay's turn-6 outputs did not depend on arrival order. With speculation auto, agent-0's output depended on whether it arrived first (2/2 each way).
+  - Gates on the fix (616dd750; `docs/research/adr063-qwen-n4-solo-joint-717.md`, "Results"): the padded invariance and parity gates pass. The replay's agent-1 turn-4 is byte-identical across solo, k = 13, k = 17 and all-joint with the solo route on, and splits by k with `HF2Q_QWEN_JOINT_SOLO=0`. Four Q5 four-agent runs with speculation off give `ExactTranscripts`.
 - MoE artifacts under `HF2Q_DECODE_MV_EXT=1` stay serial.
 - **Dense FFN.** The default shared-weight gate/up route (next section) is part of this Class B route. It is not bitwise equal to the per-row fused kernel, so no bitwise gate applies to it; exact mode refuses it before any cache write.
 
@@ -195,7 +198,7 @@ Run every command from the worktree root with the exports above. In its `Qwen jo
 
 | When | What happens |
 |---|---|
-| Refusal before lanes are taken: switch off, policy revoked at the turn check, fewer than two eligible lanes, active DeltaNet capture | the turn is serial; nothing fails |
+| Refusal before lanes are taken: switch off, policy revoked at the turn check, no joint group (exact mode or `HF2Q_QWEN_JOINT_SOLO=0`: fewer than two eligible lanes; padded mode: only a lone speculating lane), active DeltaNet capture | the turn is serial; nothing fails |
 | A lane's prepare error | that lane fails (slot reset, request error), as its serial tick would |
 | Refusal inside the joint transaction: admission plan, routing policy changed between the turn check and the forward, duplicate or out-of-range slot | refused before any cache write, but the step returns an error, so every prepared row fails and its slot is reset |
 | A submitted failure | fails exactly the step's rows: each gets the serial error path (slot reset, request error); rows outside the step are untouched |
@@ -226,7 +229,7 @@ Results for the shared-FFN change (branch `c25d7ef2`) are in `E/qwen-ffn-gates-v
 - `qwen38_joint_decode_mvn_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MV_EXT` unset). **Passed** at 0b959107 (`E/qwen-joint-invariance-v1/qwen38-mvn.log`).
 - `qwen38_joint_decode_padded_mv_ext_rows_are_cohort_invariant_bitwise` (`HF2Q_QWEN38_GGUF`, `HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1`): both dense FFN routes, shared weights first. **Passed** for both routes (`padded-invariance.log`).
 
-Gap: the "alone" variant runs `forward_gpu_decode_joint` with one row. Serving never does this. With fewer than two eligible lanes it runs the serial `decode_tick` (one-row forward, or a K3 round under speculation). The gate therefore says nothing about a slot moving between serial and joint steps, which is what breaks run-to-run determinism at N4 in the padded mode (#717). In exact mode that switch is covered by `qwen38_joint_decode_mvn_matches_serial_decode_bitwise`.
+Serving path: the "alone" variant runs `forward_gpu_decode_joint` with one row. Before #717, serving never did this. With fewer than two eligible lanes it ran the serial `decode_tick` (one-row forward, or a K3 round under speculation), so the gate said nothing about a slot moving between serial and joint steps. With the padded-mode solo route, a lone ordinary lane runs exactly this one-row joint forward, so the gate now covers every ordinary serving step. In exact mode the switch is covered by `qwen38_joint_decode_mvn_matches_serial_decode_bitwise`.
 
 **Q1 Class B envelope on real prompts** (Qwen3.8 padded mode; `qwen35::real_artifact_joint_decode_q1_tests`).
 

@@ -90,7 +90,7 @@ architecture.
 
 ## Qwen joint decode
 
-With two or more Qwen agents decoding at once, eligible slots can advance through one shared target forward per scheduler turn instead of one forward per slot. Joint rows run ordinary target decode: MTP drafting and history proposals are suppressed for them (slots with MTP state still run their MTP catch-up, so a later solo turn resumes K3). With fewer than two eligible slots the turn is serial, including MTP K3 and history speculation.
+With two or more Qwen agents decoding at once, eligible slots can advance through one shared target forward per scheduler turn instead of one forward per slot. Joint rows run ordinary target decode: MTP drafting and history proposals are suppressed for them (slots with MTP state still run their MTP catch-up, so a later solo turn resumes K3). In exact mode, a turn with fewer than two eligible slots is serial, including MTP K3 and history speculation, and slots beyond the joint width stay serial that turn. In the padded mode (below), every eligible slot runs in consecutive joint steps of at most the joint width. That includes a lone slot whose next tick is ordinary target decode, so an ordinary request's arithmetic does not depend on which tenants share its turns (#717). A lone slot with MTP or history speculation state keeps its serial speculative round.
 
 Under the default exact routing policy each joint row is bitwise identical to its serial target forward and independent of which slots share its step; per-request output can still differ from stock because joint rows do not speculate. Under the Qwen3.8 production policy (`HF2Q_DECODE_MV_EXT=1`) dense artifacts use the padded `mul_mv_ext` mode: every step packs exactly 4 rows (joint width is capped at 4), so a row's packed width never depends on how many tenants share the step. In that mode the dense FFN gate and up products are also shared across the packed rows (each weight read once per step) unless `HF2Q_QWEN_JOINT_FFN_SHARED=0`. That mode is an ADR-063 Q1 Class B route against stock (decision envelope, not bitwise; `docs/research/adr063-q1-numeric-policy.md`).
 
@@ -99,8 +99,9 @@ Joint decode is on by default for dense (Qwen3.8) and MoE (Qwen3.6) artifacts. M
 | Var | Default | Values | Effect |
 |---|---|---|---|
 | `HF2Q_QWEN_JOINT_DECODE` | on (Qwen3.8 and Qwen3.6) | `0`/`off`/`false`, `1`/`on`/`true` | Escape hatch and A/B switch. `0` restores serial per-slot decode. Read once at worker start. Invalid values warn and use the default (on). |
-| `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` | `4` | `2`–`8` | Widest joint step; further eligible slots stay serial that turn. The padded `mul_mv_ext` mode caps at 4 regardless. Widths above 4 have no serving measurement. Invalid values warn and use 4. |
+| `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` | `4` | `2`–`8` | Widest joint step. In exact mode, or with `HF2Q_QWEN_JOINT_SOLO=0`, further eligible slots stay serial that turn. In the padded mode they run in further joint steps. The padded `mul_mv_ext` mode caps at 4 regardless. Widths above 4 have no serving measurement. Invalid values warn and use 4. |
 | `HF2Q_QWEN_JOINT_FFN_SHARED` | on | `0`/`off`/`false`, `1`/`on`/`true` | Padded mode only. `0` restores the serial builder's per-row fused gate/up/SiLU kernel, which reads the gate and up weights once per packed row (four times per step). Read once at worker start. Invalid values warn and use on. |
+| `HF2Q_QWEN_JOINT_SOLO` | on | `0`/`off`/`false`, `1`/`on`/`true` | Padded mode on workers with two or more slots only. On: every eligible slot joins a joint step, and a lone ordinary slot runs a one-lane padded step instead of the serial forward, so N4 output with speculation off no longer depends on request timing. `0` restores the serial forward for a lone slot and for slots beyond the joint width (A/B and escape hatch). Read once at worker start. Invalid values warn and use on. |
 
 ## DeepSeek-V4 decode
 
