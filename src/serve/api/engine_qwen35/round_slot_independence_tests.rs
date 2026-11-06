@@ -6,24 +6,32 @@
 //! four-slot cache. The reference runs it in slot 2 with the other slots
 //! untouched; each variant changes one thing:
 //!
-//! 1. **Prefilled.** After the target's prefill, each peer slot is prefilled
+//! 1. **Repeat.** The reference again: same slot, empty peers. This catches
+//!    run-to-run nondeterminism, e.g. the missing MTP gate-multiply barrier
+//!    that changed K3 drafts between identical rounds.
+//! 2. **Prefilled.** After the target's prefill, each peer slot is prefilled
 //!    with its own prompt.
-//! 2. **Mid-decode.** As 1, then each peer runs a few decode ticks (its
+//! 3. **Mid-decode.** As 2, then each peer runs a few decode ticks (its
 //!    ordinary warm-up decision and its own speculative rounds).
-//! 3. **Interleaved.** As 2, and every live peer also ticks once in each
+//! 4. **Interleaved.** As 3, and every live peer also ticks once in each
 //!    scheduler turn, in slot order around the target.
-//! 4. **Target slot.** Empty peers, the target in slot 0, 1 or 3: a server
+//! 5. **Target slot.** Empty peers, the target in slot 0, 1 or 3: a server
 //!    may place the same request in any slot.
 //!
 //! The target is driven like a server lane: bounded prefill through
 //! `Qwen35PrefillState`, then `Qwen35DecodeState::decode_tick` until it
-//! finishes (`TARGET_MAX_TOKENS`). Its prompt asks for a verbatim copy of a
-//! code block: the first speculative tick (assistant-header suffix) finds no
-//! history match and runs K3, and once the copy starts history lookup finds
-//! drafts; the reference must run both. Each tick's route is read from the
-//! process-global speculation counters around the target's own tick (run
-//! with `--test-threads=1`). The repeatable route's cost gates are modelled,
-//! so a gate disable is part of the compared route sequence.
+//! finishes (`TARGET_MAX_TOKENS`). Two targets run:
+//! - **copy:** a verbatim copy of a code block. The first speculative tick
+//!   (assistant-header suffix) finds no history match and runs K3; once the
+//!   copy starts, history lookup finds drafts. The reference must run both.
+//! - **k3:** free generation, where history rarely matches and K3 chains run
+//!   for dozens of rounds.
+//!
+//! Each tick's route is read from the process-global speculation counters
+//! around the target's own tick (run with `--test-threads=1`). The repeatable
+//! route's cost gates are modelled, so a gate disable is part of the compared
+//! route sequence; the reference route is printed one letter per tick for
+//! comparison across processes.
 //!
 //! Compared bitwise against the reference:
 //! - the target's prefill logits;
@@ -88,6 +96,10 @@ else:\n            \
 merged.append([start, end])\n    \
 return merged\n\
 ```";
+/// Free generation: history lookup rarely matches, so K3 rounds dominate.
+const K3_TARGET_TEXT: &str =
+    "Explain step by step how inserting a key into a binary search tree works, \
+then show a short Rust implementation of the insert function.";
 const PEER_TEXTS: [&str; 3] = [
     "List the first ten prime numbers, one per line.",
     "Explain in two sentences why the sky looks blue during the day.",
@@ -498,13 +510,11 @@ fn assert_same(reference: &TargetTrace, variant: &TargetTrace, peers: &str) {
         variant.prefill_logits == reference.prefill_logits,
         "{peers:?}: target prefill logits differ"
     );
-    assert_eq!(
-        variant.routes(),
-        reference.routes(),
-        "{peers:?}: target route sequence differs"
-    );
+    // Per tick, inputs of the next decision first (hidden row, cursors),
+    // then the route, so the first report names the earliest difference.
     for (index, (got, want)) in variant.ticks.iter().zip(&reference.ticks).enumerate() {
         let at = format!("{peers:?} tick {index} ({:?})", want.route);
+        assert_eq!(got.route, want.route, "{at}: route differs");
         assert_eq!(
             got.generated, want.generated,
             "{at}: committed tokens differ"
@@ -516,11 +526,29 @@ fn assert_same(reference: &TargetTrace, variant: &TargetTrace, peers: &str) {
             (want.target_cursor, want.mtp_cursor),
             "{at}: (target, MTP) cursors differ"
         );
-        assert!(
-            got.verifier_hidden == want.verifier_hidden,
-            "{at}: MTP verifier hidden row differs"
-        );
+        if got.verifier_hidden != want.verifier_hidden {
+            let max_abs = got
+                .verifier_hidden
+                .iter()
+                .zip(&want.verifier_hidden)
+                .map(|(&a, &b)| (f32::from_bits(a) - f32::from_bits(b)).abs())
+                .fold(0.0f32, f32::max);
+            let count = got
+                .verifier_hidden
+                .iter()
+                .zip(&want.verifier_hidden)
+                .filter(|(a, b)| a != b)
+                .count();
+            panic!(
+                "{at}: MTP verifier hidden row differs in {count} elements, max |diff| {max_abs:e}"
+            );
+        }
     }
+    assert_eq!(
+        variant.routes(),
+        reference.routes(),
+        "{peers:?}: target route sequence length differs"
+    );
 
     let (state, expected) = (&variant.state, &reference.state);
     assert_eq!(state.full_attn.len(), expected.full_attn.len());
@@ -607,35 +635,58 @@ fn run_gate(env: &str) {
             .get_ids()
             .to_vec()
     };
-    let target_prompt = encode(TARGET_TEXT);
     let peer_prompts = PEER_TEXTS.map(encode);
 
-    let reference = run_variant(
-        qwen,
-        &target_prompt,
-        &peer_prompts,
-        REFERENCE_SLOT,
-        Peers::Empty,
-    );
-    let routes = reference.routes();
-    eprintln!(
-        "[slot-independence] {env}: {} target ticks, routes {routes:?}",
-        routes.len()
-    );
-    assert!(routes.contains(&Route::K3), "no K3 round ran: {routes:?}");
-    assert!(
-        routes.contains(&Route::History),
-        "no history round ran: {routes:?}"
-    );
-    let variants = [Peers::Prefilled, Peers::MidDecode, Peers::Interleaved]
+    // The copy target exercises history rounds, the free-generation target
+    // long K3 chains (dozens of rounds, where serving first showed MTP
+    // acceptance changing between processes).
+    for (name, text, needs_history) in [("copy", TARGET_TEXT, true), ("k3", K3_TARGET_TEXT, false)]
+    {
+        let target_prompt = encode(text);
+        let reference = run_variant(
+            qwen,
+            &target_prompt,
+            &peer_prompts,
+            REFERENCE_SLOT,
+            Peers::Empty,
+        );
+        let routes = reference.routes();
+        let k3_rounds = routes.iter().filter(|&&route| route == Route::K3).count();
+        // One letter per tick, comparable across processes.
+        let code: String = routes
+            .iter()
+            .map(|route| match route {
+                Route::Ordinary => 'O',
+                Route::Commit => 'c',
+                Route::K3 => 'K',
+                Route::History => 'H',
+            })
+            .collect();
+        eprintln!(
+            "[slot-independence] {env} {name}: {} target ticks, {k3_rounds} K3 rounds, routes {code}",
+            routes.len()
+        );
+        assert!(k3_rounds > 0, "{name}: no K3 round ran: {routes:?}");
+        assert!(
+            !needs_history || routes.contains(&Route::History),
+            "{name}: no history round ran: {routes:?}"
+        );
+        // `Empty` in the reference slot again is the in-process repeat.
+        let variants = [
+            Peers::Empty,
+            Peers::Prefilled,
+            Peers::MidDecode,
+            Peers::Interleaved,
+        ]
         .map(|peers| (REFERENCE_SLOT, peers))
         .into_iter()
         .chain([0, 1, 3].map(|slot| (SlotId(slot), Peers::Empty)));
-    for (slot, peers) in variants {
-        let variant = run_variant(qwen, &target_prompt, &peer_prompts, slot, peers);
-        let label = format!("{peers:?} target slot {}", slot.0);
-        assert_same(&reference, &variant, &label);
-        eprintln!("[slot-independence] {env}: {label} bitwise equal");
+        for (slot, peers) in variants {
+            let variant = run_variant(qwen, &target_prompt, &peer_prompts, slot, peers);
+            let label = format!("{name}: {peers:?} target slot {}", slot.0);
+            assert_same(&reference, &variant, &label);
+            eprintln!("[slot-independence] {env}: {label} bitwise equal");
+        }
     }
 }
 

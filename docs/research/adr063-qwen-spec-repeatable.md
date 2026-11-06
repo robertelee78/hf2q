@@ -100,7 +100,16 @@ A2 can therefore ship only under `adaptive`, or redesigned with per-lane depth f
    - The existing speculation-equals-greedy model-free tests.
 2. **Official-artifact.**
    - `qwen38_slot_aware_speculation_auto_matches_off` (T-J1-7) and the padded and exact joint gates still pass.
-   - **New:** `qwen38_k3_and_history_rounds_are_slot_independent_bitwise` and the Qwen3.6 twin. A K3 round and a history round run on a target slot while peers are empty, prefilled, or mid-decode in other slots. Logits, hidden, committed tokens, cursors, KV codes and scales, conv/recurrent state and MTP cache must be bitwise equal across peer states.
+   - **New:** `qwen38_k3_and_history_rounds_are_slot_independent_bitwise` and its Qwen3.6 twin. Two targets run to their bound: a copy prompt that exercises history rounds, and a free-generation prompt with about 50 K3 rounds. Each target is compared against the same request in slot 2 with empty peers, in these variants:
+     - a repeat of that reference;
+     - peers prefilled, mid-decode, or decoding in the same turns;
+     - the target in slots 0, 1 and 3.
+
+     Logits, hidden rows, committed tokens, routes, cursors, KV codes and scales, conv/recurrent state and the MTP cache must be bitwise equal. The reference route is also printed for comparison across processes.
+   - **Finding (2026-11-06).** In serving replay, the K3 accept pattern changed from run to run even for a solo, fully sequential request; committed tokens did not change. The repeat variant reproduced it in one process on both families: on identical inputs, a round's MTP drafts differed (for example `[198, 727, 10562]` vs `[1944, 261, 310]`).
+     - **Cause:** the MTP attention-output encoder dispatched the sigmoid gate multiply and the `wo` projection concurrently, with no RAW barrier (`mtp.rs` `forward_full_attention`). The target path had the same race and fixed it in ADR-015 iter21.
+     - **Fix:** a `memory_barrier` between the two dispatches.
+     - **Result:** with the barrier, all 14 variants per family are bitwise equal, and the reference routes are identical across four processes.
 3. **Serving replay** (model load, grant). The cohort replay tool gains an arrival-order arm (T-J1-8 (b): agent-1 turn-4 running, then turn-6 of agents 0/3/2 in orders 0,3,2 and 3,0,2) and a route witness.
    - **Route witness:** per-tick debug lines with kind and cohort size. Each arm must show K3 or history rounds in busy turns, and catch-up rows both alone and in company. An arm without the routes it exercises is invalid.
    - **Arms:** Qwen3.8 with explicit `auto` on 4, 3 and 2 slots, `repeatable` vs `adaptive`.
