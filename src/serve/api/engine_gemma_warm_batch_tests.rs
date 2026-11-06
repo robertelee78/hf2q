@@ -14,6 +14,9 @@
 //!   concurrent tagged tool turns through the real admission path form one
 //!   cohort and answer byte-identically to the same turns sent one at a time;
 //!   a lane whose suffix is 32 rows falls back to per-slot prefill.
+//! * `gemma_prefill_pool_hostile_fill_matches_zero_fill_bitwise`: the
+//!   prefill arena's `Overwritten` activations handed out `0xFF`-filled give
+//!   the same cold, per-slot warm and joint warm bytes as zero-filled ones.
 use super::*;
 use crate::inference::models::gemma4::kv_cache::{
     restore_gemma_hybrid_slot_anchor, snapshot_gemma_hybrid_slot_anchor, GemmaHybridSlotAnchor,
@@ -385,6 +388,44 @@ fn gemma_joint_warm_prefill_matches_per_slot_bitwise() {
 #[ignore = "official Gemma 4 GGUF: joint warm prefill lanes equal per-slot warm prefill bit for bit (vec-hybrid route)"]
 fn gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid() {
     joint_warm_prefill_matches_per_slot(GemmaLiveKernel::VecHybrid);
+}
+
+/// ADR-063 Q4-GEMMA host P1: every `Init::Overwritten` prefill activation is
+/// fully written before any read. Fill each such hand-out with `0xFF` (NaN in
+/// F32, BF16 and F16) and compare against zero-filled hand-outs (the
+/// pre-arena allocation state): the cold per-slot prefills, a per-slot warm
+/// resume and a four-lane joint warm prefill must be bit for bit equal.
+#[test]
+#[ignore = "official Gemma 4 GGUF: 0xFF-filled pooled prefill activations give the zero-filled bytes"]
+fn gemma_prefill_pool_hostile_fill_matches_zero_fill_bitwise() {
+    use crate::serve::forward_prefill_batched::gemma_prefill_pool::set_overwritten_fill_for_test;
+    let mut loaded = load_gate_model();
+    let LoadedModel::Gemma(g) = &mut loaded else {
+        unreachable!("load_gate_model returns Gemma")
+    };
+    let mut guard = Gemma4KvGuard::take(g).unwrap();
+    for kernel in [GemmaLiveKernel::VecHybrid, GemmaLiveKernel::TiledF16] {
+        guard.model.weights.warm_live_kernel = kernel;
+        let mut arms = Vec::new();
+        for fill in [0x00, 0xFF] {
+            set_overwritten_fill_for_test(Some(fill));
+            let fixture = WarmFixture::build(&mut guard);
+            let per_slot =
+                fixture.per_slot(&mut guard, 1, &fixture.prompts[1], HISTORIES[1], MAX_DECODE);
+            let lanes: Vec<_> = (0..4).map(|slot| fixture.lane(slot)).collect();
+            let joint = fixture
+                .joint(&mut guard, &lanes, reserve_for(&lanes))
+                .unwrap();
+            arms.push((fixture.cold.clone(), per_slot, joint));
+        }
+        set_overwritten_fill_for_test(None);
+        let (zero, hostile) = (&arms[0], &arms[1]);
+        assert_eq!(hostile.0, zero.0, "{kernel:?}: cold per-slot prefills");
+        assert_lane_equal(&format!("{kernel:?} per-slot warm"), &hostile.1, &zero.1);
+        for (slot, (h, z)) in hostile.2.iter().zip(&zero.2).enumerate() {
+            assert_lane_equal(&format!("{kernel:?} joint lane {slot}"), h, z);
+        }
+    }
 }
 
 fn joint_warm_prefill_matches_per_slot(kernel: GemmaLiveKernel) {
