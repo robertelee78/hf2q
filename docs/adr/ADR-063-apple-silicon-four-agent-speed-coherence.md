@@ -1110,7 +1110,7 @@ Acceptance:
 - G2 passes: on a fixed schedule, with the stream installed, joint forwards are bitwise equal armed vs unarmed. On one new binary, a traced n4 run with the flag on is `ExactTranscripts` against the same binary with it off. The timing-event and trace-byte deltas are stated.
 - `q4_trace_attribution.py` reports per-chain GPU time by logical width, GPU bubbles, and prefill GPU time. It is handed to the Qwen op-parity lead. Per-kernel time stays out of scope.
 
-Design: `docs/research/adr063-q4-trace-gpu-timing-design.md`. Approval is recorded on Review677's ACCEPT (Main, 2026-11-06).
+Design: `docs/research/adr063-q4-trace-gpu-timing-design.md` (revision 3). Main records the design approval on the story issue on Review677's ACCEPT, per Main's instruction of 2026-11-06. If operator approval is required, the approval event names the operator.
 
 Repository ownership: mlx-native already owns the timing stream (0.16.0, no change). hf2q owns the opt-in, sink, records, reducer and attribution.
 

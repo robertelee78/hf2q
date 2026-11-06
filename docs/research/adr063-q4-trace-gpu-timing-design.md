@@ -1,6 +1,6 @@
 # ADR-063 Q4-TRACE-GPU-TIMING: per-command GPU timestamps in the phase trace
 
-- **Status:** Design revision 2, awaiting independent re-review (Review677). Main approves on the reviewer's ACCEPT. Revision 2 resolves Review677's REVISE of revision 1 (`647104db`); see §6. No code yet.
+- **Status:** Design revision 3. Review677 accepted it conditional on its rev-2 finding 1, which §2.6 applies; Main approves on the reviewer's ACCEPT. Revisions 2 and 3 resolve Review677's reviews of revisions 1 (`647104db`) and 2 (`5ae19c2a`); see §6. No code yet.
 - **Story:** ADR-063 §Q4-TRACE-GPU-TIMING, a follow-up to Q4-TRACE (#663, merged in `dafb63ab`).
 - **Motivation:** the Q4-TRACE T1 attribution (2026-11-06, `~/.local/state/hf2q/v0130/q4-trace/attribution-handoff.md`) splits a Qwen3.8 joint step into host encode (median about 7 ms) and a completion tail (about 79 ms). It cannot say which layer chains spend that time.
   - Joint decode commits its layer chains back to back and checks them together at the end of the forward. The trace's `CheckedDrain` instants are therefore the final waits, not per-command completions.
@@ -83,6 +83,13 @@ enum Item { Event(SubmissionEvent), Timing(CompletedGpuTimingEvent) }
 - **Live observer metadata:** unchanged. Timing events are not pending-command metadata.
 - **GPU work:** none. The timestamps are read after the existing checked wait or retirement.
 
+### 2.6 Traced-run harness (`q2_traced_run.py`)
+
+- `--gpu-timestamps` (default off) writes `native_observer.gpu_timestamps: true` into `native-config.json` only when it is set. `config_sha256` therefore changes only for flagged runs. Default runs and old configs reproduce byte-identically.
+- `arm_readback` requires `clock_pair` in the worker-checked arm ACK exactly when the flag is on, and refuses it otherwise.
+- `q2_traced_freeze.py` and `q2_certify.py` pass the config and header through unchanged. Scenario `forward_witness_manifest` and `trace_scenario` are not affected.
+- `test_q2_traced_run` asserts that the key is absent by default and present when set, and that `clock_pair` readback is gated by the flag.
+
 ## 3. Reducer and tools
 
 ### 3.1 Closed schema and streaming order (`f2_native_trace.py`, `f2_trace.py`)
@@ -110,10 +117,10 @@ enum Item { Event(SubmissionEvent), Timing(CompletedGpuTimingEvent) }
 
 ### 3.2 Clock-free bounds (reducer)
 
-All comparisons below are durations; no offset between clocks is assumed.
+All comparisons below are durations; no offset between clocks is assumed. Metal's host seconds are `f64` and the host instants are integer nanoseconds. Each bound therefore carries an explicit tolerance `ε = max(1 µs, read_span_ns of the larger clock_pair sample)`, so float rounding cannot fail a correct trace.
 
-- **Per command, violation raises:** `gpu_end − gpu_start ≤ CheckedDrain.end_monotonic_ns − Submitted.begin_monotonic_ns`, converted to ns.
-- **Per epoch, violation raises:** the union of the epoch's `Available` GPU intervals must be ≤ the host epoch span (first `Created` to last `CheckedDrain`).
+- **Per command, violation raises:** `gpu_end − gpu_start ≤ CheckedDrain.end_monotonic_ns − Submitted.begin_monotonic_ns + ε`, converted to ns.
+- **Per epoch, violation raises:** the union of the epoch's `Available` GPU intervals must be ≤ the host epoch span (first `Created` to last `CheckedDrain`) `+ ε`.
 - **Per queue, reported, not raised:** GPU start times should be non-decreasing in commit (`Submitted`) order. The count of inversions is reported.
 
 ### 3.3 Cross-clock figures (attribution only, optional)
@@ -163,7 +170,7 @@ All comparisons below are durations; no offset between clocks is assumed.
 - **G2 (model-level, bitwise; does not depend on run-to-run determinism):** a sibling of Q4-TRACE's G1.
   - The process installs the observer with the timestamp stream and a counting sink.
   - The same joint forwards (logical4..1 padded, identical caches) run unarmed and armed. Logits, hidden, cursors, KV and recurrent bytes must be bitwise equal.
-  - Each armed forward must produce exactly one timing event per observed command, all `Available`, with `EmptyCommand` the only allowed `Unknown`.
+  - Each armed forward must produce exactly one timing event per observed command. Every armed joint command is submitted (embed, the layer chains and the output head; 18 for Qwen3.8), so all must be `Available`. `EmptyCommand` and `DroppedWithoutCheckedTiming` are allowed only under the §3.1 reason-to-cause rule, and G2 asserts their count is 0 for joint forwards.
   - Run alone with the full test path and `--exact`.
 - **T1n / T1g (same binary, back to back):** the new binary's traced n4 run with the flag off (T1n), then with it on (T1g).
   - `q1_decision_policy.py transcripts T1n T1g` must be `ExactTranscripts`.
@@ -187,3 +194,12 @@ All comparisons below are durations; no offset between clocks is assumed.
 | 4 [P2] Same-binary baseline; model-level bitwise test | T1n/T1g back to back on one binary, plus G2 bitwise armed vs unarmed with the stream installed (§4.2). Budget deltas reported. |
 | 5 [P3] Closed reducer schema; explicit `false` | Clock string, closed `Unknown` keys, reason-to-cause rules; `false` refused; `skip_serializing_if` keeps headers byte-identical (§2.1, §3.1). |
 | 6 [P3] Code basis 0.16.0; budget arithmetic | Basis `dafb63ab` / mlx-native 0.16.0, line references corrected (§1). `size_of::<Item>()` bound and event/byte arithmetic (§2.2, §2.5). |
+
+Re-review of revision 2 (Review677, `5ae19c2a`): one P2 and three P3s. Revision 3 applies all four.
+
+| Finding | Resolution |
+|---|---|
+| 1 [P2] The `q2_traced_run.py` flag was dropped | §2.6 adds `--gpu-timestamps` (default off, `config_sha256` changes only when set), `clock_pair`-gated arm readback, pass-through in freeze/certify, and tests. |
+| 2 [P3] Bounds tolerance | §3.2 tolerance `ε = max(1 µs, read_span_ns)`. |
+| 3 [P3] G2 `Unknown` rule | §4.2: every armed joint command is submitted, so all are `Available`. `EmptyCommand`/`DroppedWithoutCheckedTiming` fall under the §3.1 rule, with an asserted count of 0. |
+| 4 [P3] Who records approval | The ADR story names who records it (Main on Review677's ACCEPT, per Main's instruction), and the operator if the story issue requires operator approval. |
