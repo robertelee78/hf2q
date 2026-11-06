@@ -84,16 +84,38 @@ impl MatvecKernels {
     /// Process switch read by [`Self::from_env`].
     pub const ENV: &'static str = "HF2Q_DEEPSEEK_ROW_EXACT_MATVEC";
 
-    /// `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC`: `1` selects [`Self::RowExact`];
-    /// unset or `0` keeps [`Self::Stock`]; anything else is an error.
-    pub fn from_env() -> anyhow::Result<Self> {
-        Self::parse(std::env::var_os(Self::ENV).as_deref())
+    /// Family used when [`Self::ENV`] is unset: the build-time
+    /// `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT` (`1` = [`Self::RowExact`],
+    /// `0` or unset = [`Self::Stock`]; any other value fails the build).
+    /// Lets a harness that strips `HF2Q_*` from the runtime environment run
+    /// the row-exact family from a separately built binary.
+    pub const BUILD_DEFAULT: Self =
+        Self::build_default(option_env!("HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT"));
+
+    const fn build_default(value: Option<&str>) -> Self {
+        match value {
+            None => Self::Stock,
+            Some(value) => match value.as_bytes() {
+                b"0" => Self::Stock,
+                b"1" => Self::RowExact,
+                _ => panic!("HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT must be 0 or 1"),
+            },
+        }
     }
 
-    /// [`Self::from_env`] on an explicit switch value.
-    pub fn parse(value: Option<&std::ffi::OsStr>) -> anyhow::Result<Self> {
+    /// `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC`: `1` selects [`Self::RowExact`], `0`
+    /// [`Self::Stock`]; unset falls back to [`Self::BUILD_DEFAULT`]; anything
+    /// else is an error.
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::resolve(std::env::var_os(Self::ENV).as_deref(), Self::BUILD_DEFAULT)
+    }
+
+    /// Resolution order of [`Self::from_env`]: the runtime value when set,
+    /// else `build_default`.
+    pub fn resolve(value: Option<&std::ffi::OsStr>, build_default: Self) -> anyhow::Result<Self> {
         match value.map(|value| value.to_str()) {
-            None | Some(Some("0")) => Ok(Self::Stock),
+            None => Ok(build_default),
+            Some(Some("0")) => Ok(Self::Stock),
             Some(Some("1")) => Ok(Self::RowExact),
             Some(_) => anyhow::bail!("{} must be 0 or 1 (got {value:?})", Self::ENV),
         }
