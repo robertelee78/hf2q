@@ -85,7 +85,7 @@ const CONTEXT: usize = 8192;
 const MAX_ROWS: usize = 4;
 const LAYERS: usize = 43;
 
-fn ds4_ratios() -> Vec<u32> {
+pub(super) fn ds4_ratios() -> Vec<u32> {
     (0..LAYERS)
         .map(|layer| match layer {
             0 | 1 => 0,
@@ -95,20 +95,20 @@ fn ds4_ratios() -> Vec<u32> {
         .collect()
 }
 
-fn fill_bf16(buf: &mut MlxBuffer, seed: u64, scale: f32) {
+pub(super) fn fill_bf16(buf: &mut MlxBuffer, seed: u64, scale: f32) {
     let mut rng = Rng(seed);
     for v in buf.as_mut_slice::<u16>().unwrap() {
         *v = half::bf16::from_f32(rng.unit() * scale).to_bits();
     }
 }
 
-fn bf16_buf(device: &MlxDevice, shape: Vec<usize>, seed: u64, scale: f32) -> MlxBuffer {
+pub(super) fn bf16_buf(device: &MlxDevice, shape: Vec<usize>, seed: u64, scale: f32) -> MlxBuffer {
     let mut buf = alloc(device, DType::BF16, shape, "bench bf16").unwrap();
     fill_bf16(&mut buf, seed, scale);
     buf
 }
 
-fn host_table(device: &MlxDevice, values: Vec<f32>) -> MlxBuffer {
+pub(super) fn host_table(device: &MlxDevice, values: Vec<f32>) -> MlxBuffer {
     let mut buf = alloc_host_input(device, DType::F32, vec![values.len()], "bench table").unwrap();
     buf.as_logical_mut_slice::<f32>()
         .unwrap()
@@ -187,14 +187,14 @@ struct IndexerWeights {
 }
 
 /// Synthetic F16 weights of one layer as stored in the ds4 file; only what the per-row core reads.
-struct LayerWeights {
-    sinks: MlxBuffer,
+pub(super) struct LayerWeights {
+    pub(super) sinks: MlxBuffer,
     compressor: Option<CompressorWeights>,
     indexer: Option<IndexerWeights>,
 }
 
 impl LayerWeights {
-    fn new(device: &MlxDevice, cfg: &Deepseek4Config, ratio: u32, seed: u64) -> Self {
+    pub(super) fn new(device: &MlxDevice, cfg: &Deepseek4Config, ratio: u32, seed: u64) -> Self {
         let hidden = cfg.hidden_size as usize;
         let seed = seed * 64;
         let compressor = (ratio != 0).then(|| {
@@ -233,7 +233,7 @@ impl LayerWeights {
             })
     }
 
-    fn compressed<'a>(&'a self, unused: &'a Unused) -> CompressedAttentionWeightsRef<'a> {
+    pub(super) fn compressed<'a>(&'a self, unused: &'a Unused) -> CompressedAttentionWeightsRef<'a> {
         let m = || RawMatrixRef {
             buffer: &unused.buffer,
             ggml_type: GgmlType::F16,
@@ -278,9 +278,9 @@ impl LayerWeights {
 }
 
 /// Stand-in for the projection tensors that the per-row core never reads.
-struct Unused {
-    buffer: MlxBuffer,
-    shape: [usize; 2],
+pub(super) struct Unused {
+    pub(super) buffer: MlxBuffer,
+    pub(super) shape: [usize; 2],
 }
 
 /// Batched projection outputs of one joint step and their per-row views (as joint decode builds them).
@@ -329,7 +329,7 @@ impl RowBatch {
     }
 }
 
-fn synthetic_cache(device: &MlxDevice, plan: &Deepseek4CachePlan, seed: u64) -> Deepseek4Cache {
+pub(super) fn synthetic_cache(device: &MlxDevice, plan: &Deepseek4CachePlan, seed: u64) -> Deepseek4Cache {
     let mut cache = Deepseek4Cache::allocate(plan, device.clone()).unwrap();
     for (layer, lc) in cache.layers_mut().iter_mut().enumerate() {
         let seed = seed * 1000 + layer as u64 * 2;
@@ -1170,7 +1170,7 @@ impl HcRows<'_> {
     }
 }
 
-fn hc_cells(ctx: &mut GpuContext, out: &mut Out, cfg: &Deepseek4Config) {
+pub(super) fn hc_cells(ctx: &mut GpuContext, out: &mut Out, cfg: &Deepseek4Config, rows: &[usize]) {
     let device = ctx.device().clone();
     let hidden = cfg.hidden_size as usize;
     let hc = cfg.hyper_connection_count as usize;
@@ -1185,7 +1185,7 @@ fn hc_cells(ctx: &mut GpuContext, out: &mut Out, cfg: &Deepseek4Config) {
     let hc_scale = f32_buf(&device, vec![3], 61, 0.5);
     let hc_base = f32_buf(&device, vec![mix], 62, 0.5);
     let params = rms_params(&device, cfg.rms_norm_eps, hc_hidden, "bench hc params").unwrap();
-    for b in 1..=MAX_ROWS {
+    for &b in rows {
         let state = f32_buf(&device, vec![b, hc, hidden], 63, 1.0);
         let mut h = HcRows {
             rows: b,
@@ -1258,7 +1258,7 @@ fn ds4_attn_microbench() {
 
     gpu_warmup(&mut ctx);
     floor_cells(&mut ctx, &mut out);
-    hc_cells(&mut ctx, &mut out, &cfg);
+    hc_cells(&mut ctx, &mut out, &cfg, &(1..=MAX_ROWS).collect::<Vec<_>>());
 
     let plan = Deepseek4CachePlan::for_context(&cfg, CONTEXT).unwrap();
     let mut caches: Vec<Deepseek4Cache> = (0..MAX_ROWS)

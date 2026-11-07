@@ -589,8 +589,12 @@ impl Deepseek4Model {
                 );
             }
         }
-        for &token in &token_ids[offset..] {
-            state = Some(self.forward_verifier_one(token, cache)?);
+        let step_rows = self.token_wise_step_rows();
+        for tokens in token_ids[offset..].chunks(step_rows) {
+            state = Some(match tokens {
+                [token] => self.forward_verifier_one(*token, cache)?,
+                _ => self.forward_verifier_rows_step_with_commit_gate(tokens, cache, || Ok(()))?,
+            });
         }
         state.context("DeepSeek-V4 prompt encoded zero chunks")
     }
