@@ -27,6 +27,9 @@
 //! * `gemma_joint_cold_forward_fault_retries_each_lane_per_slot`,
 //!   `gemma_joint_cold_cue_fault_restores_from_boundary_anchors`,
 //!   `gemma_joint_cold_cancel_during_transaction`: failure semantics.
+//! * `gemma_stable_warm_group_is_independent_of_the_admission_window` (#728):
+//!   a cached stable-boundary group is admitted per slot, bitwise equal at
+//!   coalesce windows 0 (serial) and 100 ms (concurrent), anchors included.
 use super::gemma_cold_batch::{self, CueRoute, StableContext, StableLane};
 use super::gemma_cold_stable_batch::{self as cohort, Lane};
 use super::gemma_warm_batch_tests::{
@@ -1122,4 +1125,90 @@ fn gemma_cold_permissive_turn0_grammar_parses_and_runs() {
         .expect("permissive grammar");
     let root = grammar.rule_id("root").expect("root rule");
     assert!(crate::serve::api::grammar::GrammarRuntime::new(grammar, root).is_some());
+}
+
+/// #728: a group of cached stable-boundary requests whose boundary and cue
+/// phases both reach 32 rows (the shape that used to form the tiled stable
+/// batch) is admitted per slot, so the admission coalesce window cannot
+/// change a request's numerics. Reference: window 0 and every request alone.
+/// Arm: the 100 ms window with the requests concurrent. Turn 2 resumes each
+/// turn-1 boundary anchor, so it also compares the anchors' KV.
+#[test]
+#[ignore = "official Gemma 4 GGUF: a cached stable-boundary group is bitwise independent of the admission window"]
+fn gemma_stable_warm_group_is_independent_of_the_admission_window() {
+    const COALESCE_ENV: &str = "HF2Q_ADMIT_COALESCE_US";
+    // Turn 1 boundary phase and cue phase, both above the 32-row floor.
+    const HISTORY: usize = 48;
+    const CUE: usize = 40;
+    let rt = runtime();
+    let serve = |engine: &Engine, requests: &[(Vec<u32>, SamplingParams)], together: bool| {
+        if together {
+            concurrent(&rt, engine, requests)
+                .into_iter()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        } else {
+            requests
+                .iter()
+                .map(|(prompt, params)| {
+                    rt.block_on(engine.generate(prompt.clone(), params.clone()))
+                        .unwrap()
+                })
+                .collect()
+        }
+    };
+    let run = |coalesce_us: &str, together: bool| {
+        std::env::set_var(COALESCE_ENV, coalesce_us);
+        let engine = spawn("1");
+        let lanes = engine_turn0(&engine);
+        // Turn 0 alone per lane: every slot then holds its boundary anchor.
+        let turn0: Vec<_> = lanes
+            .iter()
+            .map(|(prompt, boundary)| (prompt.clone(), greedy(4, Some(*boundary))))
+            .collect();
+        let t0 = serve(&engine, &turn0, false);
+        let turn1: Vec<_> = lanes
+            .iter()
+            .enumerate()
+            .map(|(agent, (prompt, boundary))| {
+                let mut next = prompt[..*boundary].to_vec();
+                next.extend((0..HISTORY + CUE).map(|i| 3_000 + ((agent * 97 + i) % 500) as u32));
+                (next, greedy(16, Some(boundary + HISTORY)))
+            })
+            .collect();
+        let t1 = serve(&engine, &turn1, together);
+        let turn2: Vec<_> = turn1
+            .iter()
+            .enumerate()
+            .map(|(agent, (prompt, params))| {
+                let mut next = prompt[..params.stable_prompt_prefix_tokens.unwrap()].to_vec();
+                next.extend((0..64).map(|i| 3_600 + ((agent * 61 + i) % 300) as u32));
+                (next, greedy(16, None))
+            })
+            .collect();
+        let t2 = serve(&engine, &turn2, together);
+        shutdown(&rt, engine);
+        std::env::remove_var(COALESCE_ENV);
+        (lanes, [t0, t1, t2])
+    };
+    let (lanes, expected) = run("0", false);
+    for (agent, (_, boundary)) in lanes.iter().enumerate() {
+        assert_eq!(
+            expected[1][agent].cached_tokens, *boundary,
+            "reference turn 1 agent {agent} resumed its turn-0 boundary anchor"
+        );
+        assert_eq!(
+            expected[2][agent].cached_tokens,
+            boundary + HISTORY,
+            "reference turn 2 agent {agent} resumed its turn-1 boundary anchor"
+        );
+    }
+    let (_, actual) = run("100000", true);
+    for (turn, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+        assert_turns(&format!("window 100 ms turn {turn}"), actual, expected);
+    }
+    println!(
+        "GEMMA_STABLE_WARM_WINDOW_INDEPENDENT_COMPLETE lanes={} boundary_rows={HISTORY} cue_rows={CUE} outputs_bitwise=true anchors_bitwise=true",
+        lanes.len()
+    );
 }

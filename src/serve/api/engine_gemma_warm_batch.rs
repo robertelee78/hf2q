@@ -777,7 +777,7 @@ mod tests {
         assert_eq!(
             plan(&stable_second, &anchors()),
             0,
-            "a stable cue split stays in the stable batch class"
+            "a stable cue split stays out of the joint warm cohort (admitted per slot)"
         );
     }
 

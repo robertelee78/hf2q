@@ -113,8 +113,8 @@ pub(crate) fn default_warm_live_kernel() -> GemmaLiveKernel {
     warm_kernel_for_switch(None)
 }
 
-/// `HF2Q_GEMMA_TILED_LIVE`: installed long-prompt multi-sequence lanes and
-/// the stable cue batch ([`GemmaLiveAttention::Tiled`]) only.
+/// `HF2Q_GEMMA_TILED_LIVE`: installed long-prompt multi-sequence lanes
+/// ([`GemmaLiveAttention::Tiled`]) only.
 fn tiled_live_enabled() -> bool {
     !matches!(
         std::env::var("HF2Q_GEMMA_TILED_LIVE").as_deref(),
