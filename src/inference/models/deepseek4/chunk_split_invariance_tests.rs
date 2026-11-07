@@ -851,6 +851,70 @@ fn ds4_cohort_microbench() {
     }
 }
 
+/// S3 unequal-plan cohorts (the planner admits lanes at any cursor with any
+/// chunk of at least 33 rows): every lane of every arm equals its own solo
+/// route bitwise. Arms cover both ends of the aggregate range a cohort can
+/// pack (66 = 2 x 33 rows; 2048 = the cooperative maximum, the only
+/// row-count selections in the packed FFN being m > 8 and rows > 32, both
+/// below it), the Mixed slice (two lanes, one window each), a cold lane
+/// packed with lanes mid-prompt, and the 33-row floor at both members. A
+/// sub-33 cold lane packed with a large companion must differ (negative
+/// control: its experts leave mv_id), and the 2048-row arm repeats bitwise.
+#[test]
+#[ignore = "model-free but GPU-heavy: writes a ~12 GB synthetic GGUF and runs real-shape prefill; run under the lane hold"]
+fn ds4_unequal_plan_cohorts_equal_each_lane_solo() {
+    const REPEATS: usize = 5;
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let cfg = config();
+    let (_directory, gguf) = write_fixture(&cfg);
+    let mut model = Deepseek4Model::load_from_gguf(&gguf).unwrap();
+    let row_bytes = (cfg.hyper_connection_count * cfg.hidden_size) as usize * 4;
+    let lane = |seed, prefix, chunk| Lane { seed, prefix, chunk };
+    let arms: Vec<(&str, Vec<Lane>, bool)> = vec![
+        ("aggregate_66", vec![lane(0x7101, 500, 33), lane(0x7102, 1300, 33)], true),
+        (
+            "aggregate_2048",
+            vec![lane(0x7111, 0, 1024), lane(0x7112, 700, 512), lane(0x7113, 2111, 512)],
+            true,
+        ),
+        ("mixed_2x128", vec![lane(0x7121, 1000, 128), lane(0x7122, 1500, 128)], true),
+        ("mixed_128_33", vec![lane(0x7131, 2200, 128), lane(0x7132, 400, 33)], true),
+        (
+            "cold_with_mid_prompt",
+            vec![lane(0x7141, 0, 749), lane(0x7142, 300, 333), lane(0x7143, 2111, 512)],
+            true,
+        ),
+        ("sub33_cold_packed", vec![lane(0x7151, 0, 20), lane(0x7152, 900, 512)], false),
+    ];
+    let mut failures = Vec::new();
+    for (arm, lanes, expect_equal) in &arms {
+        let solo: Vec<Capture> = lanes.iter().map(|&lane| solo_lane(&mut model, lane)).collect();
+        let packed = cohort_lanes(&mut model, lanes);
+        for (index, (lane, (reference, capture))) in lanes.iter().zip(solo.iter().zip(&packed)).enumerate() {
+            let equal = compare(arm, &[lane.chunk], reference, capture, row_bytes);
+            println!("DS4_COHORT_UNEQUAL arm={arm} lane={index} {lane:?} bitwise_equal={equal}");
+            if lane.chunk >= MIN_MATRIX_APPEND_TOKENS && !equal {
+                failures.push(format!("{arm} lane {index} differs from solo"));
+            }
+            if !expect_equal && lane.chunk < MIN_MATRIX_APPEND_TOKENS && equal {
+                failures.push(format!("{arm} lane {index}: sub-33 control did not differ"));
+            }
+        }
+        if *arm == "aggregate_2048" {
+            let digests: Vec<String> = packed.iter().map(digest).collect();
+            for repeat in 0..REPEATS {
+                let again: Vec<String> = cohort_lanes(&mut model, lanes).iter().map(digest).collect();
+                println!("DS4_COHORT_UNEQUAL arm={arm} repeat={repeat} digests={again:?}");
+                if again != digests {
+                    failures.push(format!("{arm} repeat {repeat} differs"));
+                }
+            }
+        }
+    }
+    println!("DS4_COHORT_UNEQUAL failures={failures:?}");
+    assert!(failures.is_empty(), "unequal-plan cohort arms: {failures:?}");
+}
+
 /// Transient prefill scratch (`MlxBufferPool` holdings: every buffer the
 /// transaction's pool generations allocated, kept for reuse until released)
 /// of one transaction over `lanes`, run as a cohort or, with `solo`, as one

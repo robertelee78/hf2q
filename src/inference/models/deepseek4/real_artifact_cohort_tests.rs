@@ -535,6 +535,22 @@ fn diagnostic_common_prefix_cache_copy_is_exact_and_faster() {
     );
 }
 
+/// How a cohort route's companion lanes relate to the lane under test.
+#[derive(Clone, Copy, Debug)]
+enum Companions {
+    /// Same warm prefix length and chunk lengths as the lane under test,
+    /// which packs first (the pre-S3 equal-plan cohort).
+    Equal,
+    /// S3 unequal-plan cohorts: companions sit at other cursors (warm
+    /// prefixes of `PREFIX_ROWS + UNEQUAL_PREFIX_OFFSETS[lane]`) and ingest
+    /// their own planner chunks under the same window cap, so starts and
+    /// lengths differ; the lane under test packs at `target_offset`.
+    Unequal { target_offset: usize },
+}
+
+/// Extra warm-prefix rows of each unequal companion.
+const UNEQUAL_PREFIX_OFFSETS: [usize; 3] = [211, 523, 1_337];
+
 /// One route's observable result for the #726 route-boundary gate.
 struct RouteReceipt {
     chunks: Vec<String>,
@@ -559,16 +575,28 @@ fn route_receipt(
     windows: usize,
     width: usize,
     decoding_peers: usize,
+    relation: Companions,
 ) -> RouteReceipt {
     use crate::serve::api::engine_deepseek4::{
         plan_resumable_prefill_chunk, ResumablePrefillChunk, RECOVERY_TAIL_TOKENS,
     };
-    let capacity = prompt.len() + 1;
     let recovery = prompt.len() - RECOVERY_TAIL_TOKENS;
+    let extra = |lane: usize| match relation {
+        Companions::Equal => 0,
+        Companions::Unequal { .. } => UNEQUAL_PREFIX_OFFSETS[lane - 1],
+    };
+    // Unequal companions get prompts long enough to always plan a full
+    // matrix chunk of their own; the anchor of each stays far ahead.
+    let companion_len = |lane: usize| match relation {
+        Companions::Equal => prompt.len(),
+        Companions::Unequal { .. } => prompt.len() + extra(lane) + 4_096,
+    };
+    let capacity = (1..width).map(companion_len).fold(prompt.len(), usize::max) + 1;
     let companion_prompts: Vec<Vec<u32>> = (1..width)
         .map(|lane| {
-            let mut tokens = token_batch(lane, 0, PREFIX_ROWS);
-            tokens.extend(token_batch(lane, 2, prompt.len() - PREFIX_ROWS));
+            let prefix = PREFIX_ROWS + extra(lane);
+            let mut tokens = token_batch(lane, 0, prefix);
+            tokens.extend(token_batch(lane, 2, companion_len(lane) - prefix));
             tokens
         })
         .collect();
@@ -579,10 +607,13 @@ fn route_receipt(
     model
         .forward_verifier_prefill(&prompt[..PREFIX_ROWS], &mut cache)
         .expect("install warm prefix");
-    for (companion, tokens) in companions.iter_mut().zip(&companion_prompts) {
+    let mut companion_cursors = Vec::with_capacity(width.saturating_sub(1));
+    for (lane, (companion, tokens)) in companions.iter_mut().zip(&companion_prompts).enumerate() {
+        let prefix = PREFIX_ROWS + extra(lane + 1);
         model
-            .forward_verifier_prefill(&tokens[..PREFIX_ROWS], companion)
+            .forward_verifier_prefill(&tokens[..prefix], companion)
             .expect("install companion prefix");
+        companion_cursors.push(prefix);
     }
     let mut peers: Vec<Deepseek4Cache> = (0..decoding_peers)
         .map(|peer| {
@@ -616,17 +647,48 @@ fn route_receipt(
             ResumablePrefillChunk::Matrix(rows) => {
                 let tokens = &prompt[cursor..cursor + rows];
                 let state = if width > 1 && cursor + rows <= recovery {
-                    chunks.push(format!("cohort{width}x{rows}"));
-                    let batches: Vec<&[u32]> = std::iter::once(tokens)
-                        .chain(companion_prompts.iter().map(|lane| &lane[cursor..cursor + rows]))
+                    // Each companion's chunk: the target's span (equal) or its
+                    // own planner chunk at its own cursor (unequal).
+                    let spans: Vec<(usize, usize)> = companion_cursors
+                        .iter()
+                        .zip(&companion_prompts)
+                        .map(|(&at, tokens)| match relation {
+                            Companions::Equal => (cursor, rows),
+                            Companions::Unequal { .. } => {
+                                let anchor = tokens.len() - RECOVERY_TAIL_TOKENS;
+                                let slice = plan_resumable_prefill_chunk(at, anchor - at, 128, windows, anchor)
+                                    .expect("plan companion chunk");
+                                let ResumablePrefillChunk::Matrix(own) = slice.chunk else {
+                                    panic!("unequal companion planned token-wise work at {at}");
+                                };
+                                (at, own)
+                            }
+                        })
                         .collect();
-                    let mut caches: Vec<&mut Deepseek4Cache> = std::iter::once(&mut cache)
-                        .chain(companions.iter_mut())
+                    chunks.push(format!(
+                        "cohort{width}x{rows}+{:?}",
+                        spans.iter().map(|(_, own)| *own).collect::<Vec<_>>()
+                    ));
+                    let target_offset = match relation {
+                        Companions::Equal => 0,
+                        Companions::Unequal { target_offset } => target_offset,
+                    };
+                    let mut batches: Vec<&[u32]> = companion_prompts
+                        .iter()
+                        .zip(&spans)
+                        .map(|(lane, &(at, own))| &lane[at..at + own])
                         .collect();
-                    model
+                    batches.insert(target_offset, tokens);
+                    let mut caches: Vec<&mut Deepseek4Cache> = companions.iter_mut().collect();
+                    caches.insert(target_offset, &mut cache);
+                    let state = model
                         .forward_verifier_prefill_cohort(&batches, &mut caches)
                         .expect("cohort route chunk")
-                        .swap_remove(0)
+                        .swap_remove(target_offset);
+                    for (at, (_, own)) in companion_cursors.iter_mut().zip(&spans) {
+                        *at += own;
+                    }
+                    state
                 } else {
                     chunks.push(format!("matrix{rows}"));
                     model
@@ -681,7 +743,10 @@ fn route_receipt(
 /// physical cache byte, the prompt logits and the first decode step must be
 /// bitwise equal to solo. The 2,312-row pre-anchor segment is nine 256-row
 /// Mixed windows plus 8 rows: before #726 Mixed replayed those 8 rows
-/// token-wise.
+/// token-wise. S3 unequal-plan cohorts add routes whose companions sit at
+/// other cursors with other chunk lengths (target first, middle or last in
+/// the pack, with and without decoding peers, and the two-lane Mixed slice):
+/// they must equal solo too.
 #[test]
 #[ignore = "loads the release checkpoint; #726 route-boundary model gate"]
 fn official_artifact_prefill_route_boundary_is_route_independent() {
@@ -694,22 +759,34 @@ fn official_artifact_prefill_route_boundary_is_route_independent() {
     let mut prompt = token_batch(0, 0, PREFIX_ROWS);
     prompt.extend(token_batch(0, 2, PRE_ANCHOR_ROWS + RECOVERY_TAIL_TOKENS));
 
-    // (route, window cap, cohort width, decoding peers)
-    let routes: [(&str, usize, usize, usize); 8] = [
-        ("solo", 16, 1, 0),
-        ("mixed", 2, 1, 0),
-        ("mixed+2-decoding-peers", 2, 1, 2),
-        ("mixed+3-decoding-peers", 2, 1, 3),
-        ("cohort-2", 8, 2, 0),
-        ("cohort-2+2-decoding-peers", 8, 2, 2),
-        ("cohort-3", 5, 3, 0),
-        ("cohort-4", 4, 4, 0),
+    // (route, window cap, cohort width, decoding peers, companions). The
+    // S3 unequal-plan routes pack the lane under test with companions at
+    // other cursors and chunk lengths, first and last in the pack, with and
+    // without decoding peers, and as the Mixed cohort slice (two lanes, one
+    // window each).
+    use Companions::{Equal, Unequal};
+    let routes: [(&str, usize, usize, usize, Companions); 14] = [
+        ("solo", 16, 1, 0, Equal),
+        ("mixed", 2, 1, 0, Equal),
+        ("mixed+2-decoding-peers", 2, 1, 2, Equal),
+        ("mixed+3-decoding-peers", 2, 1, 3, Equal),
+        ("cohort-2", 8, 2, 0, Equal),
+        ("cohort-2+2-decoding-peers", 8, 2, 2, Equal),
+        ("cohort-3", 5, 3, 0, Equal),
+        ("cohort-4", 4, 4, 0, Equal),
+        ("unequal-cohort-2-first", 8, 2, 0, Unequal { target_offset: 0 }),
+        ("unequal-cohort-4-last", 4, 4, 0, Unequal { target_offset: 3 }),
+        ("unequal-cohort-3-middle+2-decoding-peers", 5, 3, 2, Unequal { target_offset: 1 }),
+        ("unequal-cohort-4-first+3-decoding-peers", 4, 4, 3, Unequal { target_offset: 0 }),
+        ("mixed-cohort-2-first+2-decoding-peers", 1, 2, 2, Unequal { target_offset: 0 }),
+        ("mixed-cohort-2-last+3-decoding-peers", 1, 2, 3, Unequal { target_offset: 1 }),
     ];
-    let (_, solo_windows, solo_width, solo_peers) = routes[0];
-    let reference = route_receipt(&mut model, &prompt, solo_windows, solo_width, solo_peers);
+    let (_, solo_windows, solo_width, solo_peers, solo_relation) = routes[0];
+    let reference =
+        route_receipt(&mut model, &prompt, solo_windows, solo_width, solo_peers, solo_relation);
     eprintln!("DS4_ROUTE_BOUNDARY solo chunks={:?}", reference.chunks);
-    for &(route, windows, width, decoding_peers) in &routes[1..] {
-        let receipt = route_receipt(&mut model, &prompt, windows, width, decoding_peers);
+    for &(route, windows, width, decoding_peers, relation) in &routes[1..] {
+        let receipt = route_receipt(&mut model, &prompt, windows, width, decoding_peers, relation);
         eprintln!("DS4_ROUTE_BOUNDARY {route} chunks={:?}", receipt.chunks);
         assert_exact_f32(
             &format!("{route} suffix final states"),

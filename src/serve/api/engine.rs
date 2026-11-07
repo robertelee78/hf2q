@@ -5021,6 +5021,14 @@ impl Engine {
         self.inner.supervisor.is_healthy() && !self.inner.tx.is_closed()
     }
 
+    /// Count a request as in flight to this engine's worker while the
+    /// handler renders and tokenizes it; drop the guard right before the
+    /// request is enqueued. The DeepSeek-V4 worker waits a bounded time for
+    /// such requests before it starts a prefill transaction.
+    pub(super) fn begin_admission(&self) -> super::engine_supervisor::AdmissionGuard {
+        self.inner.supervisor.begin_admission()
+    }
+
     /// Short cause of a dead engine for readiness reporting, or `None`
     /// while the worker is healthy. A worker that exited without a recorded
     /// cause still reports a failure rather than looking like warmup.
@@ -8812,69 +8820,78 @@ fn deepseek4_should_redrain_admission(
     admission_open && has_free_slot && receiver_has_pending
 }
 
+/// Longest the worker holds a pure-prefill transaction for requests an HTTP
+/// handler is still rendering and tokenizing, so near-simultaneous agents
+/// start in one cohort (S3 cohort design §3.2). A fixed constant, not
+/// adaptive: it decides cohort membership only, never numerics, and a lone
+/// request (nothing else in flight) never waits.
+const DEEPSEEK4_ADMISSION_BARRIER: Duration = Duration::from_millis(25);
+
+/// Admission barrier state between two prefill transactions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Deepseek4PrefillAlignmentCatchup {
-    handle: SlotHandle,
-    cursor: usize,
-    target_cursor: usize,
-    window_cap: usize,
+enum Deepseek4AdmissionBarrier {
+    /// Not armed since the last prefill transaction.
+    Idle,
+    /// Armed at this instant; the worker redrains admission until it ends.
+    Armed(Instant),
+    /// Already used before the next prefill transaction; never re-arms.
+    Spent,
 }
 
-/// Select one lagging warm matrix lane and advance it only as far as the
-/// current leading cursor. A request that arrives just after a cooperative
-/// transaction can then join the widest cohort on the next scheduler step,
-/// without an admission timer or sleep.
-fn deepseek4_prefill_alignment_catchup(
-    lanes: impl IntoIterator<Item = (SlotHandle, Option<(usize, usize, usize)>)>,
-    sliding_window: usize,
-) -> Option<Deepseek4PrefillAlignmentCatchup> {
-    if sliding_window == 0 {
-        return None;
+/// Whether the worker should wait (park briefly and redrain admission)
+/// before its next step. Arms only when the next step is a pure prefill (no
+/// runnable decoder), a slot is free, admission is open and another request
+/// is in flight; ends at the bound, or as soon as nothing is in flight or a
+/// condition fails; at most once per prefill transaction.
+fn deepseek4_admission_barrier_wait(
+    barrier: &mut Deepseek4AdmissionBarrier,
+    now: Instant,
+    admission_open: bool,
+    has_free_slot: bool,
+    pure_prefill_next: bool,
+    admissions_in_flight: usize,
+) -> bool {
+    let wanted = admission_open && has_free_slot && pure_prefill_next && admissions_in_flight > 0;
+    match *barrier {
+        Deepseek4AdmissionBarrier::Idle if wanted => {
+            *barrier = Deepseek4AdmissionBarrier::Armed(now);
+            true
+        }
+        Deepseek4AdmissionBarrier::Idle | Deepseek4AdmissionBarrier::Spent => false,
+        Deepseek4AdmissionBarrier::Armed(armed_at)
+            if wanted && now.saturating_duration_since(armed_at) < DEEPSEEK4_ADMISSION_BARRIER =>
+        {
+            true
+        }
+        Deepseek4AdmissionBarrier::Armed(_) => {
+            *barrier = Deepseek4AdmissionBarrier::Spent;
+            false
+        }
     }
-    let lanes = lanes
-        .into_iter()
-        .map(|(handle, state)| state.map(|state| (handle, state)))
-        .collect::<Option<Vec<_>>>()?;
-    if lanes.len() < 2 {
-        return None;
-    }
-    let (_, (_, recovery_position, _)) = lanes.first()?;
-    let recovery_position = *recovery_position;
-    if lanes
-        .iter()
-        .any(|(_, (_, recovery, _))| *recovery != recovery_position)
-    {
-        return None;
-    }
-    let target_cursor = lanes.iter().map(|(_, (cursor, _, _))| *cursor).max()?;
-    let (handle, (cursor, _, window_multiplier)) = lanes
-        .iter()
-        .filter(|(_, (cursor, _, _))| *cursor < target_cursor)
-        .min_by_key(|(_, (cursor, _, _))| *cursor)
-        .copied()?;
-    let delta = target_cursor.checked_sub(cursor)?;
-    if delta == 0 || delta % sliding_window != 0 {
-        return None;
-    }
-    let window_cap = (delta / sliding_window).min(window_multiplier);
-    (window_cap > 0).then_some(Deepseek4PrefillAlignmentCatchup {
-        handle,
-        cursor,
-        target_cursor,
-        window_cap,
-    })
 }
 
+/// The next scheduler step is pure prefill: some slot prefills and none
+/// decodes (a parked completion is not runnable decode).
+fn deepseek4_pure_prefill_next(slots: &[Option<Deepseek4Slot>]) -> bool {
+    let mut prefill = false;
+    for (work, _, _) in slots.iter().flatten() {
+        match work {
+            Deepseek4SlotWork::Prefill(_) => prefill = true,
+            Deepseek4SlotWork::Decode { .. } => return false,
+            Deepseek4SlotWork::ParkedCompletion { .. } => {}
+        }
+    }
+    prefill
+}
+
+/// Cohort widths a prefill quantum may try, widest first: 2 up to the
+/// candidate count. Unequal-plan cohorts let a lane join at its own cursor,
+/// so a cold wave needs no full four-lane minimum (and no alignment
+/// catch-up) to share work.
 fn deepseek4_cooperative_prefill_widths(
     maximum_width: usize,
-    cold_wave: bool,
 ) -> Option<std::ops::RangeInclusive<usize>> {
-    let minimum_width = if cold_wave {
-        DEEPSEEK4_COLD_PREFILL_WAVE_SLOTS
-    } else {
-        2
-    };
-    (maximum_width >= minimum_width).then_some(minimum_width..=maximum_width)
+    (maximum_width >= 2).then_some(2..=maximum_width)
 }
 
 fn choose_full_context_slot(
@@ -8916,10 +8933,12 @@ fn choose_full_context_slot(
 /// prefills. Lopsided `Mixed` work advances a visible decoder between
 /// two-window prefill slices. Terminal cold lanes retain one scheduler tick
 /// until their unfinished cold peers drain, publishing the cohort together.
-/// Recovery tails align before decode; complete four-request cold matrix waves
-/// and compatible warm waves may share cooperative prefill. Larger lopsided
-/// tool-result prefills remain interleavable. No more than one prefill
-/// transaction owns the shared scratch arena at any instant.
+/// Recovery tails align before decode. Prefilling lanes whose next work is a
+/// matrix chunk of at least 33 rows share cooperative prefill at their own
+/// cursors and chunk lengths (up to four lanes; two lanes within the Mixed
+/// slice budget while decoders run), after a bounded admission barrier for
+/// requests still being tokenized. No more than one prefill transaction owns
+/// the shared scratch arena at any instant.
 #[allow(clippy::too_many_arguments)]
 fn run_slot_aware_deepseek4(
     mut model: super::engine_deepseek4::Deepseek4LoadedModel,
@@ -8956,6 +8975,7 @@ fn run_slot_aware_deepseek4(
     let mut cold_cohort_phase = Deepseek4ColdCohortPhase::Idle;
     let mut pending_affinity_wait: Option<(SlotId, usize)> = None;
     let mut shutdown_requested = false;
+    let mut admission_barrier = Deepseek4AdmissionBarrier::Idle;
     tracing::info!(
         slots = sessions.len(),
         decode_quantum,
@@ -9292,9 +9312,21 @@ fn run_slot_aware_deepseek4(
             !rx.is_empty(),
         ) {
             // Seeding can take long enough for another member of the same
-            // cold wave to reach the receiver. Re-enter admission before an
-            // expensive matrix transaction so a complete four-lane wave can
-            // start aligned without a timer or batching delay.
+            // wave to reach the receiver. Re-enter admission before an
+            // expensive matrix transaction so the wave starts as one cohort.
+            continue 'worker;
+        }
+        if deepseek4_admission_barrier_wait(
+            &mut admission_barrier,
+            Instant::now(),
+            admission_open,
+            slots.iter().any(Option::is_none),
+            deepseek4_pure_prefill_next(&slots),
+            supervisor.admissions_in_flight(),
+        ) {
+            // Another request is still being rendered and tokenized by its
+            // handler: hold the prefill (bounded) and redrain admission.
+            std::thread::sleep(Duration::from_millis(1));
             continue 'worker;
         }
         let slots_empty = slots.iter().all(Option::is_none);
@@ -9394,93 +9426,24 @@ fn run_slot_aware_deepseek4(
             }
             Ok(SchedulerStep::Prefill { handle, .. }) => {
                 // A pure-prefill step exposes the scheduler's oldest FIFO
-                // handle. Compatible aligned peers may share row-local
-                // FFN/MoE work without waiting; recovery checkpoints, tails,
-                // and mixed work retain the proven serial transaction path.
+                // handle. Prefilling peers with compatible matrix chunks (any
+                // cursor and length) share the row-local FFN/MoE work;
+                // recovery tails and sub-33-row chunks keep the serial path.
+                admission_barrier = Deepseek4AdmissionBarrier::Idle;
                 let serial_fallback =
                     next_deepseek4_prefill_handle(&slots, last_prefill_slot).unwrap_or(handle);
-                let sliding_window = model.model.cfg.sliding_window as usize;
-                let alignment = deepseek4_prefill_alignment_catchup(
-                    scheduler
-                        .prefill_handles_fifo()
-                        .into_iter()
-                        .map(|candidate| {
-                            let state = slots
-                                .get(candidate.slot_id.0 as usize)
-                                .and_then(Option::as_ref)
-                                .and_then(|(work, _, installed)| {
-                                    if *installed != candidate {
-                                        return None;
-                                    }
-                                    match work {
-                                        Deepseek4SlotWork::Prefill(state) => {
-                                            state.warm_matrix_alignment_state()
-                                        }
-                                        _ => None,
-                                    }
-                                });
-                            (candidate, state)
-                        }),
-                    sliding_window,
-                )
-                .and_then(|mut alignment| {
-                    let state = slots
-                        .get(alignment.handle.slot_id.0 as usize)
-                        .and_then(Option::as_ref)
-                        .and_then(|(work, _, installed)| {
-                            if *installed != alignment.handle {
-                                return None;
-                            }
-                            match work {
-                                Deepseek4SlotWork::Prefill(state) => Some(state),
-                                _ => None,
-                            }
-                        })?;
-                    alignment.window_cap = state.exact_warm_matrix_alignment_window_cap(
-                        alignment.target_cursor,
-                        sliding_window,
-                    )?;
-                    Some(alignment)
-                });
-                let (fatal, used_serial_fallback, serial_fallback) =
-                    if let Some(alignment) = alignment {
-                        tracing::info!(
-                            slot = alignment.handle.slot_id.0,
-                            cursor = alignment.cursor,
-                            target_cursor = alignment.target_cursor,
-                            window_cap = alignment.window_cap,
-                            "DeepSeek-V4 staggered warm prefill alignment catch-up"
-                        );
-                        (
-                            advance_deepseek4_prefill(
-                                &mut model,
-                                &mut sessions,
-                                &mut slots,
-                                &mut scheduler,
-                                registration.as_ref(),
-                                alignment.handle,
-                                kv_bytes_per_token,
-                                Some(alignment.window_cap),
-                                &supervisor,
-                            ),
-                            true,
-                            alignment.handle,
-                        )
-                    } else {
-                        let (fatal, used_serial_fallback) = advance_deepseek4_prefill_quantum(
-                            &mut model,
-                            &mut sessions,
-                            &mut slots,
-                            &mut scheduler,
-                            registration.as_ref(),
-                            handle,
-                            serial_fallback,
-                            kv_bytes_per_token,
-                            None,
-                            &supervisor,
-                        );
-                        (fatal, used_serial_fallback, serial_fallback)
-                    };
+                let (fatal, used_serial_fallback) = advance_deepseek4_prefill_quantum(
+                    &mut model,
+                    &mut sessions,
+                    &mut slots,
+                    &mut scheduler,
+                    registration.as_ref(),
+                    handle,
+                    serial_fallback,
+                    kv_bytes_per_token,
+                    None,
+                    &supervisor,
+                );
                 record_deepseek4_serial_prefill_fallback(
                     &mut last_prefill_slot,
                     serial_fallback,
@@ -9561,17 +9524,23 @@ fn run_slot_aware_deepseek4(
                     break 'worker;
                 }
                 last_prefill_slot = Some(prefill.slot_id);
-                if let Some(fatal) = advance_deepseek4_prefill(
+                admission_barrier = Deepseek4AdmissionBarrier::Idle;
+                // With decoders runnable the slice keeps the Mixed row budget:
+                // the selected lane alone, or a cohort of at most two lanes
+                // at one window each (`plan_deepseek4_prefill_cohort`).
+                let (fatal, _used_serial_fallback) = advance_deepseek4_prefill_quantum(
                     &mut model,
                     &mut sessions,
                     &mut slots,
                     &mut scheduler,
                     registration.as_ref(),
                     prefill,
+                    prefill,
                     kv_bytes_per_token,
                     mixed_budget.max_prefill_windows,
                     &supervisor,
-                ) {
+                );
+                if let Some(fatal) = fatal {
                     fail_stop_deepseek4_worker(
                         &supervisor,
                         &mut rx,
@@ -10030,92 +9999,183 @@ fn reinstall_deepseek4_decode_cohort_lanes(
     }
 }
 
+/// Widest Mixed cohort: with decoders runnable a cohort slice keeps the
+/// single-lane Mixed row budget, split across at most two lanes.
+const DEEPSEEK4_MIXED_COHORT_WIDTH: usize = 2;
+
+/// One prefilling lane as the cohort selector sees it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Deepseek4CohortLane {
+    handle: SlotHandle,
+    cold_wave: bool,
+    reply_class: Deepseek4ReplyClass,
+}
+
+/// Choose the members of one cooperative prefill. `lanes[0]` is the primary,
+/// the rest are candidates in scheduler FIFO order. For each width, widest
+/// first, every member's chunk is its own plan at `lane_rows(width)`
+/// (`plan(lane, rows)` returns the plan and its row count): lanes may sit at
+/// different cursors and ingest different row counts, because a lane's
+/// attention runs on its own cache and span and the packed FFN is row-local.
+/// A member's chunk must be a matrix chunk of at least
+/// `MIN_MATRIX_APPEND_TOKENS` rows, so its dense (`m > 8`) and expert
+/// (`rows > 32`) routes are the same alone and packed. Companions must share
+/// the primary's cold-wave flag and reply class. An ineligible candidate is
+/// skipped; the primary must be a member, so the oldest request is never
+/// starved by later arrivals.
+fn select_deepseek4_prefill_cohort<P>(
+    lanes: &[Deepseek4CohortLane],
+    widths: std::ops::RangeInclusive<usize>,
+    lane_rows: impl Fn(usize) -> usize,
+    mut plan: impl FnMut(usize, usize) -> Result<Option<(P, usize)>>,
+) -> Result<Option<Vec<(usize, P)>>> {
+    let Some(primary) = lanes.first().copied() else {
+        return Ok(None);
+    };
+    'width: for width in widths.rev() {
+        let rows = lane_rows(width);
+        if rows == 0 {
+            continue;
+        }
+        let mut members = Vec::with_capacity(width);
+        for (index, lane) in lanes.iter().enumerate() {
+            if members.len() == width {
+                break;
+            }
+            let compatible = index == 0
+                || (lane.cold_wave == primary.cold_wave && lane.reply_class == primary.reply_class);
+            let member = if compatible {
+                plan(index, rows)?.filter(|(_, tokens)| {
+                    *tokens >= crate::inference::models::deepseek4::MIN_MATRIX_APPEND_TOKENS
+                })
+            } else {
+                None
+            };
+            match member {
+                Some((lane_plan, _)) => members.push((index, lane_plan)),
+                None if index == 0 => continue 'width,
+                None => {}
+            }
+        }
+        if members.len() == width {
+            return Ok(Some(members));
+        }
+    }
+    Ok(None)
+}
+
+/// Per-lane row cap of a cohort of `width` lanes: the aggregate budget (the
+/// cooperative maximum, or the Mixed slice's `windows`) split evenly, in
+/// whole sliding windows.
+fn deepseek4_cohort_lane_rows(
+    width: usize,
+    sliding_window: usize,
+    mixed_windows: Option<usize>,
+) -> usize {
+    let aggregate = mixed_windows.map_or(
+        crate::inference::models::deepseek4::MAX_COOPERATIVE_PREFILL_ROWS,
+        |windows| windows.saturating_mul(sliding_window),
+    );
+    aggregate
+        .checked_div(width)
+        .and_then(|rows| rows.checked_div(sliding_window))
+        .unwrap_or(0)
+        .saturating_mul(sliding_window)
+}
+
+/// Plan a cooperative prefill led by `primary`. Pure-prefill steps
+/// (`mixed_windows == None`) lead with the scheduler's oldest prefill and
+/// take up to four lanes over at most `MAX_COOPERATIVE_PREFILL_ROWS`; Mixed
+/// steps lead with the selected Mixed lane and take at most two lanes over
+/// the Mixed row budget, one window per lane.
 fn plan_deepseek4_prefill_cohort(
     model: &super::engine_deepseek4::Deepseek4LoadedModel,
     sessions: &[super::engine_deepseek4::Deepseek4Session],
     slots: &[Option<Deepseek4Slot>],
     scheduler: &InflightBatchedScheduler,
     primary: SlotHandle,
+    mixed_windows: Option<usize>,
 ) -> Result<Option<Vec<Deepseek4CooperativeCandidate>>> {
     let handles = scheduler.prefill_handles_fifo();
-    anyhow::ensure!(
-        handles.first().copied() == Some(primary),
-        "DeepSeek-V4 cooperative primary is not the oldest scheduler prefill"
-    );
+    if mixed_windows.is_none() {
+        anyhow::ensure!(
+            handles.first().copied() == Some(primary),
+            "DeepSeek-V4 cooperative primary is not the oldest scheduler prefill"
+        );
+    }
     let sliding_window = model.model.cfg.sliding_window as usize;
     anyhow::ensure!(sliding_window > 0, "DeepSeek-V4 sliding window is zero");
-    let maximum_width = handles.len().min(4);
-    let primary_index = primary.slot_id.0 as usize;
-    let primary_cold_wave = matches!(
-        slots.get(primary_index).and_then(Option::as_ref),
-        Some((Deepseek4SlotWork::Prefill(state), _, installed))
-            if *installed == primary && state.is_cold_wave()
-    );
-    let Some(widths) = deepseek4_cooperative_prefill_widths(maximum_width, primary_cold_wave)
-    else {
+    let prefilling = |handle: SlotHandle| match slots
+        .get(handle.slot_id.0 as usize)
+        .and_then(Option::as_ref)
+    {
+        Some((Deepseek4SlotWork::Prefill(state), reply, installed))
+            if *installed == handle && !reply.client_closed() =>
+        {
+            Some((state, reply))
+        }
+        _ => None,
+    };
+    let lanes: Vec<(Deepseek4CohortLane, &super::engine_deepseek4::Deepseek4PrefillState)> =
+        std::iter::once(primary)
+            .chain(handles.iter().copied().filter(|handle| *handle != primary))
+            .filter_map(|handle| {
+                prefilling(handle).map(|(state, reply)| {
+                    (
+                        Deepseek4CohortLane {
+                            handle,
+                            cold_wave: state.is_cold_wave(),
+                            reply_class: deepseek4_reply_class(reply),
+                        },
+                        state,
+                    )
+                })
+            })
+            .collect();
+    if lanes.first().map(|(lane, _)| lane.handle) != Some(primary) {
+        return Ok(None);
+    }
+    let maximum_width = lanes.len().min(if mixed_windows.is_some() {
+        DEEPSEEK4_MIXED_COHORT_WIDTH
+    } else {
+        4
+    });
+    let Some(widths) = deepseek4_cooperative_prefill_widths(maximum_width) else {
         return Ok(None);
     };
-    for width in widths.rev() {
-        let lane_rows = crate::inference::models::deepseek4::MAX_COOPERATIVE_PREFILL_ROWS
-            .checked_div(width)
-            .unwrap_or(0)
-            / sliding_window
-            * sliding_window;
-        if lane_rows == 0 {
-            continue;
-        }
-        let mut candidates = Vec::with_capacity(width);
-        let mut expected_plan = None;
-        let mut expected_reply_class = None;
-        let mut compatible = true;
-        for handle in handles.iter().copied().take(width) {
-            let index = handle.slot_id.0 as usize;
-            let Some((Deepseek4SlotWork::Prefill(state), reply, installed)) =
-                slots.get(index).and_then(Option::as_ref)
-            else {
-                compatible = false;
-                break;
-            };
-            if *installed != handle || reply.client_closed() {
-                compatible = false;
-                break;
-            }
-            if state.is_cold_wave() != primary_cold_wave {
-                compatible = false;
-                break;
-            }
-            let reply_class = deepseek4_reply_class(reply);
-            if expected_reply_class.is_some_and(|expected| expected != reply_class) {
-                compatible = false;
-                break;
-            }
-            expected_reply_class = Some(reply_class);
-            let Some(plan) = state.plan_cooperative_prefill(
-                sessions[index].cache_position(),
-                sessions[index].committed_tokens().len(),
-                sliding_window,
-                lane_rows,
-            )?
-            else {
-                compatible = false;
-                break;
-            };
-            if expected_plan.is_some_and(|expected| expected != plan) {
-                compatible = false;
-                break;
-            }
-            expected_plan = Some(plan);
-            candidates.push(Deepseek4CooperativeCandidate {
-                handle,
-                plan,
-                tokens: state.cooperative_tokens(plan)?.to_vec(),
-            });
-        }
-        if compatible && candidates.len() == width {
-            return Ok(Some(candidates));
-        }
-    }
-    Ok(None)
+    let views: Vec<Deepseek4CohortLane> = lanes.iter().map(|(lane, _)| *lane).collect();
+    let members = select_deepseek4_prefill_cohort(
+        &views,
+        widths,
+        |width| deepseek4_cohort_lane_rows(width, sliding_window, mixed_windows),
+        |index, rows| {
+            let (lane, state) = lanes[index];
+            let session = &sessions[lane.handle.slot_id.0 as usize];
+            Ok(state
+                .plan_cooperative_prefill(
+                    session.cache_position(),
+                    session.committed_tokens().len(),
+                    sliding_window,
+                    rows,
+                )?
+                .map(|plan| (plan, plan.token_count())))
+        },
+    )?;
+    members
+        .map(|members| {
+            members
+                .into_iter()
+                .map(|(index, plan)| {
+                    let (lane, state) = lanes[index];
+                    Ok(Deepseek4CooperativeCandidate {
+                        handle: lane.handle,
+                        plan,
+                        tokens: state.cooperative_tokens(plan)?.to_vec(),
+                    })
+                })
+                .collect()
+        })
+        .transpose()
 }
 
 fn reinstall_deepseek4_cooperative_lanes(
@@ -10145,24 +10205,14 @@ fn advance_deepseek4_prefill_quantum(
     max_matrix_prefill_windows: Option<usize>,
     supervisor: &EngineSupervisor,
 ) -> (Option<SlotAwareGpuFatal>, bool) {
-    if max_matrix_prefill_windows.is_some() {
-        return (
-            advance_deepseek4_prefill(
-                model,
-                sessions,
-                slots,
-                scheduler,
-                registration,
-                serial_fallback,
-                kv_bytes_per_token,
-                max_matrix_prefill_windows,
-                supervisor,
-            ),
-            true,
-        );
-    }
-    let candidates = match plan_deepseek4_prefill_cohort(model, sessions, slots, scheduler, primary)
-    {
+    let candidates = match plan_deepseek4_prefill_cohort(
+        model,
+        sessions,
+        slots,
+        scheduler,
+        primary,
+        max_matrix_prefill_windows,
+    ) {
         Ok(Some(candidates)) => candidates,
         Ok(None) => {
             return (
@@ -10174,7 +10224,7 @@ fn advance_deepseek4_prefill_quantum(
                     registration,
                     serial_fallback,
                     kv_bytes_per_token,
-                    None,
+                    max_matrix_prefill_windows,
                     supervisor,
                 ),
                 true,
@@ -10259,7 +10309,7 @@ fn advance_deepseek4_prefill_quantum(
                 registration,
                 serial_fallback,
                 kv_bytes_per_token,
-                None,
+                max_matrix_prefill_windows,
                 supervisor,
             ),
             true,
@@ -10307,7 +10357,6 @@ fn advance_deepseek4_prefill_quantum(
             return (Some(fatal), false);
         }
     };
-    let completed_plan = lanes[0].plan;
     drop(outputs);
 
     for lane in &lanes {
@@ -10344,12 +10393,17 @@ fn advance_deepseek4_prefill_quantum(
     for lane in &lanes {
         scheduler.advance_after_prefill(lane.handle, lane.plan.token_count() as u32);
     }
+    // Members may sit at different cursors and ingest different row counts:
+    // report every lane's own span, never one lane's plan for the cohort.
     tracing::info!(
         lanes = lanes.len(),
-        start = completed_plan.start(),
-        rows_per_lane = completed_plan.token_count(),
-        aggregate_rows = lanes.len().saturating_mul(completed_plan.token_count()),
-        recovery_anchor = completed_plan.captures_anchor(),
+        mixed = max_matrix_prefill_windows.is_some(),
+        spans = ?lanes
+            .iter()
+            .map(|lane| (lane.handle.slot_id.0, lane.plan.start(), lane.plan.token_count()))
+            .collect::<Vec<_>>(),
+        aggregate_rows = lanes.iter().map(|lane| lane.plan.token_count()).sum::<usize>(),
+        recovery_anchors = lanes.iter().filter(|lane| lane.plan.captures_anchor()).count(),
         "DeepSeek-V4 cooperative prefill complete"
     );
 
@@ -31549,90 +31603,275 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_cold_cooperative_prefill_requires_full_four_lane_wave() {
-        assert_eq!(deepseek4_cooperative_prefill_widths(1, false), None);
-        assert_eq!(deepseek4_cooperative_prefill_widths(2, false), Some(2..=2));
-        assert_eq!(deepseek4_cooperative_prefill_widths(4, false), Some(2..=4));
-        assert_eq!(deepseek4_cooperative_prefill_widths(3, true), None);
-        assert_eq!(deepseek4_cooperative_prefill_widths(4, true), Some(4..=4));
+    fn deepseek_cooperative_prefill_widths_start_at_two_for_every_wave() {
+        assert_eq!(deepseek4_cooperative_prefill_widths(0), None);
+        assert_eq!(deepseek4_cooperative_prefill_widths(1), None);
+        assert_eq!(deepseek4_cooperative_prefill_widths(2), Some(2..=2));
+        assert_eq!(deepseek4_cooperative_prefill_widths(3), Some(2..=3));
+        assert_eq!(deepseek4_cooperative_prefill_widths(4), Some(2..=4));
     }
 
     #[test]
-    fn deepseek_staggered_warm_prefill_catches_lagging_lane_to_aligned_cursor() {
-        let handles = (0..4)
-            .map(|slot| SlotHandle {
+    fn deepseek_cohort_lane_rows_split_the_aggregate_budget_in_windows() {
+        assert_eq!(deepseek4_cohort_lane_rows(2, 128, None), 1_024);
+        assert_eq!(deepseek4_cohort_lane_rows(3, 128, None), 640);
+        assert_eq!(deepseek4_cohort_lane_rows(4, 128, None), 512);
+        // Mixed: the two-window slice budget over two lanes, one window each.
+        assert_eq!(
+            deepseek4_cohort_lane_rows(
+                DEEPSEEK4_MIXED_COHORT_WIDTH,
+                128,
+                Some(DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS)
+            ),
+            128
+        );
+        assert_eq!(deepseek4_cohort_lane_rows(4, 0, None), 0);
+    }
+
+    fn cohort_lane(slot: u32, cold_wave: bool, reply_class: Deepseek4ReplyClass) -> Deepseek4CohortLane {
+        Deepseek4CohortLane {
+            handle: SlotHandle {
                 slot_id: SlotId(slot),
                 generation: 1,
-            })
-            .collect::<Vec<_>>();
-        let plan = deepseek4_prefill_alignment_catchup(
-            [
-                (handles[0], Some((7_316, 9_466, 8))),
-                (handles[1], Some((7_316, 9_466, 8))),
-                (handles[2], Some((7_316, 9_466, 8))),
-                (handles[3], Some((6_676, 9_466, 8))),
-            ],
-            128,
-        )
-        .expect("the fourth lane is five native windows behind");
-        assert_eq!(plan.handle, handles[3]);
-        assert_eq!(plan.cursor, 6_676);
-        assert_eq!(plan.target_cursor, 7_316);
-        assert_eq!(plan.window_cap, 5);
+            },
+            cold_wave,
+            reply_class,
+        }
+    }
 
-        assert!(deepseek4_prefill_alignment_catchup(
-            handles
-                .iter()
-                .copied()
-                .map(|handle| (handle, Some((7_316, 9_466, 8)))),
-            128,
-        )
-        .is_none());
-
-        let multi_laggard = deepseek4_prefill_alignment_catchup(
-            [
-                (handles[0], Some((6_676, 12_000, 2))),
-                (handles[1], Some((6_932, 12_000, 8))),
-                (handles[2], Some((7_316, 12_000, 8))),
-            ],
-            128,
-        )
-        .expect("the lowest cursor advances first");
-        assert_eq!(multi_laggard.handle, handles[0]);
-        assert_eq!(multi_laggard.target_cursor, 7_316);
-        assert_eq!(
-            multi_laggard.window_cap, 2,
-            "the catch-up remains bounded by the lagging lane's native window multiplier"
-        );
+    /// `(start, rows)` of a lane's own plan under a per-lane cap: each lane
+    /// has its own cursor and remaining rows; `None` is token-wise work.
+    fn lane_plan(cursor: usize, remaining: Option<usize>, cap: usize) -> Option<((usize, usize), usize)> {
+        remaining.map(|remaining| {
+            let rows = remaining.min(cap);
+            ((cursor, rows), rows)
+        })
     }
 
     #[test]
-    fn deepseek_prefill_alignment_rejects_incompatible_or_non_matrix_lanes() {
-        let handle = |slot| SlotHandle {
-            slot_id: SlotId(slot),
-            generation: 1,
+    fn deepseek_cohort_accepts_unequal_plans_each_at_its_own_cursor() {
+        use Deepseek4ReplyClass::Unary;
+        let lanes = [
+            cohort_lane(0, false, Unary),
+            cohort_lane(1, false, Unary),
+            cohort_lane(2, false, Unary),
+            cohort_lane(3, false, Unary),
+        ];
+        let cursors = [0, 300, 1_111, 2_111];
+        let remaining = [Some(749), Some(333), Some(129), Some(2_000)];
+        let mut caps = Vec::new();
+        let members = select_deepseek4_prefill_cohort(
+            &lanes,
+            deepseek4_cooperative_prefill_widths(4).unwrap(),
+            |width| deepseek4_cohort_lane_rows(width, 128, None),
+            |lane, cap| {
+                caps.push((lane, cap));
+                Ok(lane_plan(cursors[lane], remaining[lane], cap))
+            },
+        )
+        .unwrap()
+        .expect("four unequal matrix plans form one cohort");
+        assert_eq!(
+            members,
+            vec![(0, (0, 512)), (1, (300, 333)), (2, (1_111, 129)), (3, (2_111, 512))]
+        );
+        assert!(caps.iter().all(|&(_, cap)| cap == 512), "every lane planned at the width-4 cap");
+        let aggregate: usize = members.iter().map(|(_, (_, rows))| rows).sum();
+        assert!(aggregate <= crate::inference::models::deepseek4::MAX_COOPERATIVE_PREFILL_ROWS);
+    }
+
+    #[test]
+    fn deepseek_cohort_skips_sub_matrix_and_incompatible_lanes_but_never_the_primary() {
+        use Deepseek4ReplyClass::{Stream, Unary};
+        let plans = |remaining: [Option<usize>; 5]| {
+            move |lane: usize, cap: usize| -> Result<Option<((usize, usize), usize)>> {
+                Ok(lane_plan(lane * 1_000, remaining[lane], cap))
+            }
         };
-        assert!(deepseek4_prefill_alignment_catchup(
-            [
-                (handle(0), Some((6_676, 9_466, 8))),
-                (handle(1), Some((7_316, 9_594, 8))),
-            ],
-            128,
+        let lanes = [
+            cohort_lane(0, false, Unary),
+            cohort_lane(1, false, Unary),
+            cohort_lane(2, false, Stream),
+            cohort_lane(3, true, Unary),
+            cohort_lane(4, false, Unary),
+        ];
+        let rows = |width| deepseek4_cohort_lane_rows(width, 128, None);
+        // Lane 1's chunk is 20 rows (a cold sub-33 prompt): packing it would
+        // move its experts from mv_id to mm_id. Lanes 2 and 3 differ in reply
+        // class and cold flag. The cohort is the primary plus lane 4.
+        let members = select_deepseek4_prefill_cohort(
+            &lanes,
+            2..=4,
+            rows,
+            plans([Some(600), Some(20), Some(600), Some(600), Some(600)]),
         )
-        .is_none());
-        assert!(deepseek4_prefill_alignment_catchup(
-            [
-                (handle(0), Some((6_700, 9_466, 8))),
-                (handle(1), Some((7_316, 9_466, 8))),
-            ],
-            128,
+        .unwrap()
+        .expect("primary and lane 4 are compatible matrix lanes");
+        assert_eq!(members.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(), vec![0, 4]);
+        // A token-wise companion (its recovery tail) is never a member.
+        let members = select_deepseek4_prefill_cohort(
+            &lanes,
+            2..=4,
+            rows,
+            plans([Some(600), None, None, None, Some(33)]),
         )
-        .is_none());
-        assert!(deepseek4_prefill_alignment_catchup(
-            [(handle(0), Some((6_676, 9_466, 8))), (handle(1), None)],
-            128,
+        .unwrap()
+        .unwrap();
+        assert_eq!(members.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(), vec![0, 4]);
+        // An ineligible primary (sub-33 or token-wise) runs serially.
+        for primary in [Some(32), None] {
+            assert!(select_deepseek4_prefill_cohort(
+                &lanes,
+                2..=4,
+                rows,
+                plans([primary, Some(600), Some(600), Some(600), Some(600)]),
+            )
+            .unwrap()
+            .is_none());
+        }
+        // No compatible companion: serial.
+        assert!(select_deepseek4_prefill_cohort(
+            &lanes,
+            2..=4,
+            rows,
+            plans([Some(600), None, Some(600), Some(600), None]),
         )
+        .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn deepseek_mixed_cohort_keeps_the_slice_budget_and_excludes_tails() {
+        use Deepseek4ReplyClass::Unary;
+        let lanes = [
+            cohort_lane(2, false, Unary),
+            cohort_lane(0, false, Unary),
+            cohort_lane(1, false, Unary),
+            cohort_lane(3, false, Unary),
+        ];
+        let budget = DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS * 128;
+        let widths =
+            deepseek4_cooperative_prefill_widths(lanes.len().min(DEEPSEEK4_MIXED_COHORT_WIDTH))
+                .unwrap();
+        // Lane 0 is in its token-wise recovery tail (no matrix plan): the
+        // Mixed cohort pairs the selected lane with the next matrix lane.
+        let remaining = [Some(5_000), None, Some(96), Some(5_000)];
+        let members = select_deepseek4_prefill_cohort(
+            &lanes,
+            widths,
+            |width| deepseek4_cohort_lane_rows(width, 128, Some(DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS)),
+            |lane, cap| Ok(lane_plan(lane, remaining[lane], cap)),
+        )
+        .unwrap()
+        .expect("two matrix lanes form a Mixed cohort");
+        assert_eq!(members.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(), vec![0, 2]);
+        assert!(members.len() <= DEEPSEEK4_MIXED_COHORT_WIDTH);
+        assert!(members.iter().map(|(_, (_, rows))| rows).sum::<usize>() <= budget);
+        // A selected lane in its tail is never cohorted: the Mixed slice
+        // drains the tail serially first.
+        let tail_first = [None, Some(5_000), Some(5_000), Some(5_000)];
+        assert!(select_deepseek4_prefill_cohort(
+            &lanes,
+            2..=2,
+            |width| deepseek4_cohort_lane_rows(width, 128, Some(DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS)),
+            |lane, cap| Ok(lane_plan(lane, tail_first[lane], cap)),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn deepseek_admission_barrier_is_bounded_and_free_for_a_lone_request() {
+        use Deepseek4AdmissionBarrier::{Armed, Idle, Spent};
+        let start = Instant::now();
+        let mut barrier = Idle;
+        // A lone request: nothing else in flight, no wait.
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, true, true, 0));
+        assert_eq!(barrier, Idle);
+        // Decoders runnable, no free slot or admission closed: never armed.
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, true, false, 3));
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, false, true, 3));
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, false, true, true, 3));
+        assert_eq!(barrier, Idle);
+        // Another request in flight: wait, bounded by the constant.
+        assert!(deepseek4_admission_barrier_wait(&mut barrier, start, true, true, true, 2));
+        assert_eq!(barrier, Armed(start));
+        let almost = start + DEEPSEEK4_ADMISSION_BARRIER - Duration::from_micros(1);
+        assert!(deepseek4_admission_barrier_wait(&mut barrier, almost, true, true, true, 1));
+        assert!(!deepseek4_admission_barrier_wait(
+            &mut barrier,
+            start + DEEPSEEK4_ADMISSION_BARRIER,
+            true,
+            true,
+            true,
+            1
+        ));
+        assert_eq!(barrier, Spent);
+        // At most once per prefill transaction.
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, almost, true, true, true, 1));
+        // Ends as soon as nothing is in flight (or the slots fill).
+        let mut barrier = Idle;
+        assert!(deepseek4_admission_barrier_wait(&mut barrier, start, true, true, true, 1));
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, true, true, 0));
+        assert_eq!(barrier, Spent);
+        let mut barrier = Armed(start);
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, false, true, 1));
+        assert_eq!(barrier, Spent);
+    }
+
+    #[test]
+    fn deepseek_partial_cold_wave_admits_stragglers_and_releases_every_parked_completion() {
+        use Deepseek4ColdCohortPhase::{Draining, Filling};
+        // The barrier expired with two cold lanes seeded; two more cold
+        // requests arrive while they prefill. Admission stays open for them
+        // and they join the same wave.
+        let filling = deepseek4_reconcile_cold_cohort(Filling, false, false, true, 2, 2, true, true);
+        assert_eq!((filling.phase, filling.admission_open), (Filling, true));
+        assert!(filling.rerun_admission);
+        let full = deepseek4_reconcile_cold_cohort(Filling, true, false, false, 4, 4, false, false);
+        assert_eq!((full.phase, full.admission_open), (Draining, false));
+        // Release depends on remaining cold work only, never on which lanes
+        // shared a cohort transaction: an early finisher parks while the
+        // stragglers still prefill or decode, then finalizes.
+        let request = AdmitRequest {
+            prompt_tokens: 757,
+            max_tokens: 1,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        };
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(4, 4, 0);
+        scheduler.set_prefill_chunk_tokens(u32::MAX);
+        let early = scheduler.admit(request).unwrap().handle.unwrap();
+        scheduler.advance_after_prefill(early, 757);
+        let mut disposition = account_deepseek4_decode_turn(
+            &mut scheduler,
+            early,
+            Deepseek4DecodeAccounting::Fresh {
+                completed_ticks: 1,
+                finished: true,
+            },
+            true,
+            3,
+            757,
+            0,
+        );
+        for pending in [3, 2, 1] {
+            let Deepseek4DecodeDisposition::Park { deferred_ticks } = disposition else {
+                panic!("parked while {pending} cold peers remain, got {disposition:?}");
+            };
+            disposition = account_deepseek4_decode_turn(
+                &mut scheduler,
+                early,
+                Deepseek4DecodeAccounting::Parked { deferred_ticks },
+                true,
+                pending - 1,
+                757,
+                0,
+            );
+        }
+        assert_eq!(disposition, Deepseek4DecodeDisposition::Finalize);
+        assert_eq!(scheduler.stats().completed_total, 1);
     }
 
     #[test]

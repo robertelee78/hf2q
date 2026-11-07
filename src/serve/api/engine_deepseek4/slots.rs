@@ -183,47 +183,6 @@ impl Deepseek4PrefillState {
             && self.plan.cursor < self.prompt_tokens.len()
     }
 
-    /// Cursor metadata for timer-free alignment of staggered warm matrix
-    /// prefills. Cold waves retain their four-lane admission barrier, and a
-    /// recovery tail is incremental work rather than an alignable segment.
-    pub(crate) fn warm_matrix_alignment_state(&self) -> Option<(usize, usize, usize)> {
-        (!self.plan.is_cold_wave() && self.plan.cursor < self.plan.recovery_position).then_some((
-            self.plan.cursor,
-            self.plan.recovery_position,
-            self.plan.window_multiplier,
-        ))
-    }
-
-    /// Validate that the existing serial prefill planner will land exactly on
-    /// `target_cursor`. Near a recovery boundary it may intentionally shorten
-    /// a nominal window-aligned chunk so the remainder stays a legal matrix
-    /// chunk; such a chunk is not an alignment catch-up.
-    pub(crate) fn exact_warm_matrix_alignment_window_cap(
-        &self,
-        target_cursor: usize,
-        sliding_window: usize,
-    ) -> Option<usize> {
-        let (cursor, recovery_position, window_multiplier) = self.warm_matrix_alignment_state()?;
-        let delta = target_cursor.checked_sub(cursor)?;
-        if delta == 0 || sliding_window == 0 || delta % sliding_window != 0 {
-            return None;
-        }
-        let window_cap = (delta / sliding_window).min(window_multiplier);
-        if window_cap == 0 {
-            return None;
-        }
-        let slice = plan_resumable_prefill_chunk(
-            cursor,
-            recovery_position.checked_sub(cursor)?,
-            sliding_window,
-            window_cap,
-            recovery_position,
-        )
-        .ok()?;
-        matches!(slice.chunk, ResumablePrefillChunk::Matrix(tokens) if tokens == delta)
-            .then_some(window_cap)
-    }
-
     /// Plan a cooperative FFN chunk without changing request, cache, or
     /// scheduler state. Aligned matrix work through the recovery anchor is
     /// eligible; incremental replay and final head publication stay on the
@@ -844,26 +803,6 @@ mod tests {
     }
 
     #[test]
-    fn warm_matrix_alignment_cap_lands_exactly_or_falls_back() {
-        let state = cached_prefill_state(6_676, 9_466);
-        assert_eq!(
-            state.warm_matrix_alignment_state(),
-            Some((6_676, 9_466, 16))
-        );
-        assert_eq!(
-            state.exact_warm_matrix_alignment_window_cap(7_316, 128),
-            Some(5)
-        );
-
-        let shrink_band = cached_prefill_state(852, 1_000);
-        assert_eq!(
-            shrink_band.exact_warm_matrix_alignment_window_cap(980, 128),
-            None,
-            "the prefill planner shortens this nominal 128-token catch-up to keep a legal matrix remainder"
-        );
-    }
-
-    #[test]
     fn uncached_tokens_reports_the_exact_recovery_suffix() {
         let mut state = cached_prefill_state(6_676, 6_676);
         state.prompt_tokens.truncate(6_684);
@@ -874,10 +813,8 @@ mod tests {
         cold.plan.origin = super::super::Deepseek4PrefillOrigin::Cold;
         cold.prompt_tokens.truncate(6_684);
         assert!(!cold.is_recovery_tail());
-        assert_eq!(cold.warm_matrix_alignment_state(), None);
         cold.plan.cursor = cold.plan.recovery_position;
         assert!(cold.is_recovery_tail());
-        assert_eq!(cold.warm_matrix_alignment_state(), None);
         cold.plan.cursor = cold.prompt_tokens.len();
         assert!(!cold.is_recovery_tail());
     }

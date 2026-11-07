@@ -619,6 +619,7 @@ async fn chat_completions_with_prepared(
 ) -> Response {
     let PreparedChatContext {
         loaded_engine,
+        admission,
         model_lease: _model_lease,
         prompt_tokens,
         params,
@@ -650,6 +651,9 @@ async fn chat_completions_with_prepared(
     // the worker plugs the projected ViT embeddings into the prefill
     // at every placeholder position. Empty `soft_tokens` ⇒ pure-text
     // path (unchanged `Engine::generate`).
+    // The request reaches the worker queue inside the call below, before
+    // its first await.
+    drop(admission);
     let gen_outcome = if soft_tokens.is_empty() {
         engine.generate(prompt_tokens, params).await
     } else if deepstack_data.is_some() || positions_flat.is_some() {
@@ -1253,6 +1257,10 @@ struct PreparedChatContext {
     /// keep the engine alive through the handler's lifetime even if
     /// the pool evicts it concurrently.
     loaded_engine: Arc<LoadedEngine<Engine>>,
+    /// Counts this request as in flight to the engine's worker from engine
+    /// resolution until it is enqueued (dropped right before the generate
+    /// call, or with the context on any early return or disconnect).
+    admission: Option<super::engine_supervisor::AdmissionGuard>,
     /// Held through unary execution or transferred into the SSE body stream.
     model_lease: Option<ModelLease>,
     prompt_tokens: Vec<u32>,
@@ -1869,6 +1877,7 @@ where
     let loaded_engine = resolved_engine.loaded_engine;
     let model_lease = resolved_engine.model_lease;
     let engine: &Engine = &loaded_engine.engine;
+    let admission = Some(engine.begin_admission());
     frontend_timing.set_family(|| format!("{:?}", engine.info().arch_family));
     if let Some(cause) = engine.failure_detail() {
         return Err(ApiError::engine_failed(engine::engine_failed_message(&cause)).into_response());
@@ -2521,6 +2530,7 @@ where
 
     Ok(PreparedChatContext {
         loaded_engine,
+        admission,
         model_lease,
         prompt_tokens: final_prompt_tokens,
         params,
@@ -2919,6 +2929,9 @@ async fn chat_completions_stream(
             }
         }
     }
+    // The request reaches the worker queue inside the call below, before
+    // its first await.
+    drop(prepared.admission);
     if let Err(e) = engine
         .generate_stream_with_deepstack(
             prepared.prompt_tokens,
@@ -12479,6 +12492,7 @@ mod a5d_handler_429_tests {
         params.max_tokens = max_tokens;
         PreparedChatContext {
             loaded_engine,
+            admission: None,
             model_lease: None,
             prompt_tokens,
             params,
