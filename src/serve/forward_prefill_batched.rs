@@ -608,6 +608,10 @@ macro_rules! bucket_finish {
 #[path = "gemma_cold_attention.rs"]
 pub(crate) mod gemma_cold_attention;
 
+/// Cross-forward arena for the batched activations below.
+#[path = "gemma_prefill_pool.rs"]
+pub(crate) mod gemma_prefill_pool;
+
 impl MlxModelWeights {
     /// Batched append against Gemma's already-resident SerialFifo prefix.
     ///
@@ -832,14 +836,6 @@ impl MlxModelWeights {
         let nh = self.num_attention_heads;
         let intermediate = self.intermediate_size;
         let num_experts = self.num_experts;
-
-        let f32_sz = std::mem::size_of::<f32>();
-        let u32_sz = std::mem::size_of::<u32>();
-        // bf16 = 2 bytes/element (ADR-011 Phase 2 Wave 3 bf16 conversion).
-        // Intermediate sublayer activations (Q/K/V, SDPA out, MLP/MoE expert
-        // outputs) move to bf16 per the MLX-LM dtype convention; residual
-        // stream stays f32. See docs/ADR-011-phase2-bf16-conversion-map.md.
-        let bf16_sz: usize = 2;
 
         let (exec, reg) = gpu.split();
         let dev = exec.device();
@@ -1357,29 +1353,49 @@ impl MlxModelWeights {
 
         // -------------------------------------------------------------------
         // Batched activation buffers (seq_len × ...)
+        //
+        // ADR-063 Q4-GEMMA host P1: drawn from a cross-forward arena
+        // (`gemma_prefill_pool`). `Overwritten` buffers are fully written by
+        // their producer in every layer (or by the CPU below) before any
+        // read inside that layer's extent, so they skip the per-forward
+        // memset; `Zeroed` buffers can be read before or without a write and
+        // keep `alloc_buffer`'s zero state. Diagnostics that CPU-read whole
+        // buffers (including the tail past a narrower layer's extent) keep
+        // every buffer zeroed.
         // -------------------------------------------------------------------
-        let alloc_f32 = |n: usize, name: &str| -> Result<MlxBuffer> {
-            dev.alloc_buffer(n * f32_sz, DType::F32, vec![n])
-                .map_err(|e| anyhow::anyhow!("batched alloc {name}: {e}"))
+        use gemma_prefill_pool::Init;
+        let zero_all_activations = INVESTIGATION_ENV.batched_dump.is_some()
+            || std::env::var("HF2Q_S019_CKSUM").is_ok()
+            || crate::quantize::imatrix::is_active();
+        // Declared before every activation so it drops after them.
+        let prefill_pool =
+            gemma_prefill_pool::PrefillPoolCycle::begin(zero_all_activations, || {
+                // An empty commit-and-wait drains the in-order queue.
+                exec.begin()
+                    .map(crate::inference::native_observation::session)
+                    .map_err(|e| anyhow::anyhow!("batched prefill pool drain session: {e}"))?
+                    .finish()
+                    .map_err(|e| anyhow::anyhow!("batched prefill pool drain: {e}"))?;
+                Ok(())
+            })?;
+        let alloc_f32 = |n: usize, init: Init, name: &str| -> Result<MlxBuffer> {
+            prefill_pool.alloc(dev, DType::F32, n, init, name)
         };
         // bf16 allocation helper — used for intermediate sublayer activations
         // (Q/K/V post-qmatmul casts, head-normed + RoPE'd Q/K/V, permuted
         // Q/K/V for SDPA, SDPA output, MLP/MoE expert intermediates). The
         // residual stream (pf_hidden, pf_residual) stays f32.
-        let alloc_bf16 = |n: usize, name: &str| -> Result<MlxBuffer> {
-            dev.alloc_buffer(n * bf16_sz, DType::BF16, vec![n])
-                .map_err(|e| anyhow::anyhow!("batched alloc {name}: {e}"))
+        let alloc_bf16 = |n: usize, init: Init, name: &str| -> Result<MlxBuffer> {
+            prefill_pool.alloc(dev, DType::BF16, n, init, name)
         };
         // ADR-030 iter-77: F16 alloc helper for the cross-length verify
         // SDPA path (Q/output cast targets).  F16 width is 2 bytes
         // (matches BF16 in size; only mantissa/exponent split differs).
-        let alloc_f16 = |n: usize, name: &str| -> Result<MlxBuffer> {
-            dev.alloc_buffer(n * 2, DType::F16, vec![n])
-                .map_err(|e| anyhow::anyhow!("batched alloc {name}: {e}"))
+        let alloc_f16 = |n: usize, init: Init, name: &str| -> Result<MlxBuffer> {
+            prefill_pool.alloc(dev, DType::F16, n, init, name)
         };
-        let alloc_u32 = |n: usize, name: &str| -> Result<MlxBuffer> {
-            dev.alloc_buffer(n * u32_sz, DType::U32, vec![n])
-                .map_err(|e| anyhow::anyhow!("batched alloc {name}: {e}"))
+        let alloc_u32 = |n: usize, init: Init, name: &str| -> Result<MlxBuffer> {
+            prefill_pool.alloc(dev, DType::U32, n, init, name)
         };
 
         let max_nkv = self
@@ -1388,23 +1404,30 @@ impl MlxModelWeights {
             .map(|l| l.num_kv_heads)
             .max()
             .unwrap_or(8);
-        let pf_hidden = alloc_f32(seq_len * hs, "pf_hidden")?;
-        let pf_residual = alloc_f32(seq_len * hs, "pf_residual")?;
-        let pf_norm_out = alloc_f32(seq_len * hs, "pf_norm_out")?;
-        let pf_moe_norm_out = alloc_f32(seq_len * hs, "pf_moe_norm_out")?;
-        let pf_router_norm_out = alloc_f32(seq_len * hs, "pf_router_norm_out")?;
-        let mut pf_attn_out = alloc_f32(seq_len * hs, "pf_attn_out")?;
+        // Residual stream: embedding (setup) and the end-of-layer norm+add
+        // write `pf_hidden`; the per-layer norms, O-projection and fused
+        // norm+add write the rest over all `seq_len × hs` before their reads.
+        let pf_hidden = alloc_f32(seq_len * hs, Init::Overwritten, "pf_hidden")?;
+        let pf_residual = alloc_f32(seq_len * hs, Init::Overwritten, "pf_residual")?;
+        let pf_norm_out = alloc_f32(seq_len * hs, Init::Overwritten, "pf_norm_out")?;
+        let pf_moe_norm_out = alloc_f32(seq_len * hs, Init::Overwritten, "pf_moe_norm_out")?;
+        let pf_router_norm_out = alloc_f32(seq_len * hs, Init::Overwritten, "pf_router_norm_out")?;
+        let mut pf_attn_out = alloc_f32(seq_len * hs, Init::Overwritten, "pf_attn_out")?;
         // Wave P4.14 — pf_mlp_down_out (the intermediate normed MLP-down
         // buffer between post-FF norm 1 and the MoE wsum+add) is no longer
         // needed: the fused fused_moe_wsum_dnorm_add_f32 dispatch absorbs
         // both norms and the add into one pass.
 
-        let mut pf_q = alloc_f32(seq_len * nh * max_hd, "pf_q")?;
-        let mut pf_k = alloc_f32(seq_len * max_nkv * max_hd, "pf_k")?;
-        let mut pf_v = alloc_f32(seq_len * max_nkv * max_hd, "pf_v")?;
-        let pf_q_normed = alloc_f32(seq_len * nh * max_hd, "pf_q_normed")?;
-        let pf_k_normed = alloc_f32(seq_len * max_nkv * max_hd, "pf_k_normed")?;
-        let pf_v_normed = alloc_f32(seq_len * max_nkv * max_hd, "pf_v_normed")?;
+        // Sized for the widest layer; every layer's projection / head norm
+        // writes `[seq_len, heads, hd]` of its own `hd`, and every reader of
+        // that layer stays inside it. `pf_v` is read only on layers that
+        // project V (`v_input` falls back to `pf_k` otherwise).
+        let mut pf_q = alloc_f32(seq_len * nh * max_hd, Init::Overwritten, "pf_q")?;
+        let mut pf_k = alloc_f32(seq_len * max_nkv * max_hd, Init::Overwritten, "pf_k")?;
+        let mut pf_v = alloc_f32(seq_len * max_nkv * max_hd, Init::Overwritten, "pf_v")?;
+        let pf_q_normed = alloc_f32(seq_len * nh * max_hd, Init::Overwritten, "pf_q_normed")?;
+        let pf_k_normed = alloc_f32(seq_len * max_nkv * max_hd, Init::Overwritten, "pf_k_normed")?;
+        let pf_v_normed = alloc_f32(seq_len * max_nkv * max_hd, Init::Overwritten, "pf_v_normed")?;
 
         // ADR-011 Phase 2 Wave 3 (bf16 SDPA island):
         //
@@ -1426,10 +1449,11 @@ impl MlxModelWeights {
         // pre-FA dispatch.
         // Wave P4.16 — pf_v_normed_bf16 removed.  V's dual-norm now writes
         // bf16 directly at permuted [nkv, seq_len, hd] layout into pf_v_perm.
-        let pf_q_perm = alloc_bf16(nh * seq_len * max_hd, "pf_q_perm")?;
-        let pf_k_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_k_perm")?;
-        let pf_v_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_v_perm")?;
-        let pf_sdpa_out_perm = alloc_bf16(nh * seq_len * max_hd, "pf_sdpa_out_perm")?;
+        let pf_q_perm = alloc_bf16(nh * seq_len * max_hd, Init::Overwritten, "pf_q_perm")?;
+        let pf_k_perm = alloc_bf16(max_nkv * seq_len * max_hd, Init::Overwritten, "pf_k_perm")?;
+        let pf_v_perm = alloc_bf16(max_nkv * seq_len * max_hd, Init::Overwritten, "pf_v_perm")?;
+        let pf_sdpa_out_perm =
+            alloc_bf16(nh * seq_len * max_hd, Init::Overwritten, "pf_sdpa_out_perm")?;
 
         // F16 staging buffers for the HF2Q_FA_F16=1 path (kernel migration
         // step 3).  These mirror the BF16 perm buffers but in F16 dtype;
@@ -1441,23 +1465,41 @@ impl MlxModelWeights {
         // the additional memory budget is 4× per-head F16 perm =
         // `(nh + max_nkv*2 + nh) * seq_len * max_hd * 2` bytes.  At
         // seq=246, max_hd=512 (D=512 layers): ~24 MB.  At seq=1359: ~134 MB.
+        // Cold flash attention casts each lane's Q/K/V into these and its
+        // output back out of them over the lane's `[heads, rows, hd]`.
         let pf_q_perm_f16 = if use_fa_f16 {
-            Some(alloc_f16(nh * seq_len * max_hd, "pf_q_perm_f16")?)
+            Some(alloc_f16(
+                nh * seq_len * max_hd,
+                Init::Overwritten,
+                "pf_q_perm_f16",
+            )?)
         } else {
             None
         };
         let pf_k_perm_f16 = if use_fa_f16 {
-            Some(alloc_f16(max_nkv * seq_len * max_hd, "pf_k_perm_f16")?)
+            Some(alloc_f16(
+                max_nkv * seq_len * max_hd,
+                Init::Overwritten,
+                "pf_k_perm_f16",
+            )?)
         } else {
             None
         };
         let pf_v_perm_f16 = if use_fa_f16 {
-            Some(alloc_f16(max_nkv * seq_len * max_hd, "pf_v_perm_f16")?)
+            Some(alloc_f16(
+                max_nkv * seq_len * max_hd,
+                Init::Overwritten,
+                "pf_v_perm_f16",
+            )?)
         } else {
             None
         };
         let pf_sdpa_out_perm_f16 = if use_fa_f16 {
-            Some(alloc_f16(nh * seq_len * max_hd, "pf_sdpa_out_perm_f16")?)
+            Some(alloc_f16(
+                nh * seq_len * max_hd,
+                Init::Overwritten,
+                "pf_sdpa_out_perm_f16",
+            )?)
         } else {
             None
         };
@@ -1472,22 +1514,38 @@ impl MlxModelWeights {
             && start_pos > 0
             && self.dflash_capture.is_some();
         let pf_q_f32_xlen: Option<MlxBuffer> = if xlen_sdpa_mode {
-            Some(alloc_f32(nh * seq_len * max_hd, "pf_q_f32_xlen")?)
+            Some(alloc_f32(
+                nh * seq_len * max_hd,
+                Init::Zeroed,
+                "pf_q_f32_xlen",
+            )?)
         } else {
             None
         };
         let pf_q_f16_xlen: Option<MlxBuffer> = if xlen_sdpa_mode {
-            Some(alloc_f16(nh * seq_len * max_hd, "pf_q_f16_xlen")?)
+            Some(alloc_f16(
+                nh * seq_len * max_hd,
+                Init::Zeroed,
+                "pf_q_f16_xlen",
+            )?)
         } else {
             None
         };
         let pf_out_f16_xlen: Option<MlxBuffer> = if xlen_sdpa_mode {
-            Some(alloc_f16(nh * seq_len * max_hd, "pf_out_f16_xlen")?)
+            Some(alloc_f16(
+                nh * seq_len * max_hd,
+                Init::Zeroed,
+                "pf_out_f16_xlen",
+            )?)
         } else {
             None
         };
         let pf_out_f32_xlen: Option<MlxBuffer> = if xlen_sdpa_mode {
-            Some(alloc_f32(nh * seq_len * max_hd, "pf_out_f32_xlen")?)
+            Some(alloc_f32(
+                nh * seq_len * max_hd,
+                Init::Zeroed,
+                "pf_out_f32_xlen",
+            )?)
         } else {
             None
         };
@@ -1501,24 +1559,40 @@ impl MlxModelWeights {
         // (default, to dodge the broken D=512 FA kernels).
         let need_nofa_bufs = use_no_fa || force_global_nofa;
         let pf_q_perm_f32: Option<MlxBuffer> = if need_nofa_bufs {
-            Some(alloc_f32(nh * seq_len * max_hd, "pf_q_perm_f32")?)
+            Some(alloc_f32(
+                nh * seq_len * max_hd,
+                Init::Zeroed,
+                "pf_q_perm_f32",
+            )?)
         } else {
             None
         };
         // A cold multi-sequence prefill runs tensor-mm attention per
         // sequence, so the scores scratch is sized for its longest lane.
         let pf_kq: Option<MlxBuffer> = if need_nofa_bufs {
-            Some(alloc_f32(nh * max_cold_rows * max_cold_rows, "pf_kq")?)
+            Some(alloc_f32(
+                nh * max_cold_rows * max_cold_rows,
+                Init::Zeroed,
+                "pf_kq",
+            )?)
         } else {
             None
         };
         let pf_v_perm_t: Option<MlxBuffer> = if need_nofa_bufs {
-            Some(alloc_bf16(max_nkv * max_hd * seq_len, "pf_v_perm_t")?)
+            Some(alloc_bf16(
+                max_nkv * max_hd * seq_len,
+                Init::Zeroed,
+                "pf_v_perm_t",
+            )?)
         } else {
             None
         };
         let pf_attn_f32: Option<MlxBuffer> = if need_nofa_bufs {
-            Some(alloc_f32(nh * seq_len * max_hd, "pf_attn_f32")?)
+            Some(alloc_f32(
+                nh * seq_len * max_hd,
+                Init::Zeroed,
+                "pf_attn_f32",
+            )?)
         } else {
             None
         };
@@ -1526,12 +1600,25 @@ impl MlxModelWeights {
         // between permute and cast) is no longer needed: the fused
         // permute_021_bf16_to_f32 dispatch writes f32 directly into
         // pf_sdpa_out from the bf16 source.
-        let pf_sdpa_out = alloc_f32(seq_len * nh * max_hd, "pf_sdpa_out")?;
+        //
+        // Live attention writes every stream row before the O-projection
+        // reads it. A cold flash-attention lane whose O-projection reads the
+        // head-major BF16 output directly never writes it, while the Q1
+        // stage and probe captures still read it.
+        let pf_sdpa_out = alloc_f32(
+            seq_len * nh * max_hd,
+            if live_prefix_resume {
+                Init::Overwritten
+            } else {
+                Init::Zeroed
+            },
+            "pf_sdpa_out",
+        )?;
 
-        let mut pf_mlp_gate = alloc_f32(seq_len * intermediate, "pf_mlp_gate")?;
-        let mut pf_mlp_up = alloc_f32(seq_len * intermediate, "pf_mlp_up")?;
-        let pf_mlp_fused = alloc_f32(seq_len * intermediate, "pf_mlp_fused")?;
-        let mut pf_mlp_down = alloc_f32(seq_len * hs, "pf_mlp_down")?;
+        let mut pf_mlp_gate = alloc_f32(seq_len * intermediate, Init::Overwritten, "pf_mlp_gate")?;
+        let mut pf_mlp_up = alloc_f32(seq_len * intermediate, Init::Overwritten, "pf_mlp_up")?;
+        let pf_mlp_fused = alloc_f32(seq_len * intermediate, Init::Overwritten, "pf_mlp_fused")?;
+        let mut pf_mlp_down = alloc_f32(seq_len * hs, Init::Overwritten, "pf_mlp_down")?;
 
         let top_k_max = self.layers.iter().map(|l| l.moe.top_k).max().unwrap_or(2);
         let moe_int_max = self
@@ -1540,14 +1627,28 @@ impl MlxModelWeights {
             .map(|l| l.moe.moe_intermediate_size)
             .max()
             .unwrap_or(0);
-        let mut pf_router_logits = alloc_f32(seq_len * num_experts, "pf_router_logits")?;
-        let pf_expert_ids = alloc_u32(seq_len * top_k_max, "pf_expert_ids")?;
-        let pf_routing_weights = alloc_f32(seq_len * top_k_max, "pf_routing_weights")?;
-        let mut pf_moe_gate_up =
-            alloc_f32(seq_len * top_k_max * 2 * moe_int_max, "pf_moe_gate_up")?;
-        let pf_moe_swiglu = alloc_f32(seq_len * top_k_max * moe_int_max, "pf_moe_swiglu")?;
-        let mut pf_moe_down = alloc_f32(seq_len * top_k_max * hs, "pf_moe_down")?;
-        let pf_moe_accum = alloc_f32(seq_len * hs, "pf_moe_accum")?;
+        // Routing writes `top_k` ids/weights for every row, and the expert
+        // matmuls write one output row per routed (row, slot) pair.
+        let mut pf_router_logits =
+            alloc_f32(seq_len * num_experts, Init::Overwritten, "pf_router_logits")?;
+        let pf_expert_ids = alloc_u32(seq_len * top_k_max, Init::Overwritten, "pf_expert_ids")?;
+        let pf_routing_weights =
+            alloc_f32(seq_len * top_k_max, Init::Overwritten, "pf_routing_weights")?;
+        let mut pf_moe_gate_up = alloc_f32(
+            seq_len * top_k_max * 2 * moe_int_max,
+            Init::Overwritten,
+            "pf_moe_gate_up",
+        )?;
+        let pf_moe_swiglu = alloc_f32(
+            seq_len * top_k_max * moe_int_max,
+            Init::Overwritten,
+            "pf_moe_swiglu",
+        )?;
+        let mut pf_moe_down =
+            alloc_f32(seq_len * top_k_max * hs, Init::Overwritten, "pf_moe_down")?;
+        // Never written: the fused weighted sum lands in `pf_mlp_down`. The
+        // Q1 stage capture and the sub-stage dump still read it.
+        let pf_moe_accum = alloc_f32(seq_len * hs, Init::Zeroed, "pf_moe_accum")?;
 
         // ADR-011 Phase 3 Wave P3b — scratch pooling for MoE mm_id path.
         //
@@ -1565,7 +1666,8 @@ impl MlxModelWeights {
             mlx_native::IdMmScratch::alloc(dev, num_experts as u32, max_id_n_tokens)
                 .map_err(|e| anyhow::anyhow!("batched alloc IdMmScratch: {e}"))?;
 
-        let mut pf_positions = alloc_u32(seq_len, "pf_positions")?;
+        // The CPU writes all `seq_len` positions and token ids right below.
+        let mut pf_positions = alloc_u32(seq_len, Init::Overwritten, "pf_positions")?;
         {
             let p: &mut [u32] = pf_positions
                 .as_mut_slice()
@@ -1655,7 +1757,7 @@ impl MlxModelWeights {
             }
             None => None,
         };
-        let mut pf_token_ids = alloc_u32(seq_len, "pf_token_ids")?;
+        let mut pf_token_ids = alloc_u32(seq_len, Init::Overwritten, "pf_token_ids")?;
         {
             let t: &mut [u32] = pf_token_ids
                 .as_mut_slice()
@@ -3066,10 +3168,20 @@ impl MlxModelWeights {
                             // proven iter-84 path.  D=256 uses BF16-cache.
                             let _q_n_elems = nh * seq_len * hd;
                             let kv_full_elems = nkv * (layer_kv.capacity) * hd;
+                            // Per-layer scratch, dropped with this layer: kept
+                            // out of the prefill arena (zero-filled anyway).
+                            let alloc_layer_scratch = |dtype: DType, name: &str| {
+                                dev.alloc_buffer(
+                                    kv_full_elems * dtype.size_of(),
+                                    dtype,
+                                    vec![kv_full_elems],
+                                )
+                                .map_err(|e| anyhow::anyhow!("batched alloc {name}: {e}"))
+                            };
                             let f32_kv_scratch =
-                                alloc_f32(kv_full_elems, "xlen_d512_kv_f32_scratch")?;
-                            let bf16_k = alloc_bf16(kv_full_elems, "xlen_d512_bf16_k")?;
-                            let bf16_v = alloc_bf16(kv_full_elems, "xlen_d512_bf16_v")?;
+                                alloc_layer_scratch(DType::F32, "xlen_d512_kv_f32_scratch")?;
+                            let bf16_k = alloc_layer_scratch(DType::BF16, "xlen_d512_bf16_k")?;
+                            let bf16_v = alloc_layer_scratch(DType::BF16, "xlen_d512_bf16_v")?;
                             s.barrier_between(&[&layer_kv.k], &[&f32_kv_scratch]);
                             mlx_native::ops::elementwise::cast(
                                 s.encoder_mut(),
@@ -5235,6 +5347,10 @@ impl MlxModelWeights {
             if q1_endpoint_all_rows && !capture_multi_seq_logits { first_token = tok; }
             if publish_selected_head { ms_tokens.push(tok); }
         }
+        // Every setup, layer and head command buffer went to the same
+        // in-order queue and the last head's `finish()` waited for it, so no
+        // GPU work still uses the pooled activations.
+        prefill_pool.gpu_quiescent();
         // iter-G(a): hand the per-seq first tokens back to the wrapper. No-op
         // in single-seq mode (multi_seq_prefill is None).
         if let Some(ms) = self.multi_seq_prefill.as_mut() {

@@ -770,6 +770,47 @@ fn gemma_cold_multi_seq_matches_per_slot_bitwise() {
     );
 }
 
+/// ADR-063 Q4-GEMMA host P1 on the cold routes: per-slot cold prefills and
+/// the per-sequence cold multi-sequence prefill give the same bytes when
+/// every `Init::Overwritten` activation is handed out `0xFF`-filled (NaN in
+/// every float dtype) as when it is zero-filled (the pre-arena state).
+#[test]
+#[ignore = "official Gemma 4 GGUF: 0xFF-filled pooled cold prefill activations give the zero-filled bytes"]
+fn gemma_cold_prefill_pool_hostile_fill_matches_zero_fill_bitwise() {
+    use crate::serve::forward_prefill_batched::gemma_prefill_pool::set_overwritten_fill_for_test;
+    let mut loaded = load_gate_model();
+    let mut guard = gate_guard(&mut loaded);
+    let vocab = guard.model.weights.vocab_size;
+    // FA lanes (33, 64 rows) and tensor-mm-global lanes (458, 900 rows).
+    let prompts: Vec<Vec<u32>> = [33usize, 64, 458, 900]
+        .iter()
+        .enumerate()
+        .map(|(lane, &len)| synthetic_prompt(lane + 5, len, vocab))
+        .collect();
+    let mut arms = Vec::new();
+    for fill in [0x00, 0xFF] {
+        set_overwritten_fill_for_test(Some(fill));
+        let per_slot = cold_per_slot(&mut guard, &prompts);
+        let joint = cold_multi_seq(&mut guard, &prompts);
+        arms.push((per_slot, joint));
+    }
+    set_overwritten_fill_for_test(None);
+    let (zero, hostile) = (&arms[0], &arms[1]);
+    for (lane, prompt) in prompts.iter().enumerate() {
+        let rows = prompt.len();
+        super::gemma_warm_batch_tests::assert_lane_equal(
+            &format!("per-slot cold lane {lane} rows {rows}"),
+            &hostile.0[lane],
+            &zero.0[lane],
+        );
+        super::gemma_warm_batch_tests::assert_lane_equal(
+            &format!("multi-seq cold lane {lane} rows {rows}"),
+            &hostile.1[lane],
+            &zero.1[lane],
+        );
+    }
+}
+
 /// An engine whose worker resolves `HF2Q_GEMMA_JOINT_COLD_PREFILL=switch`.
 /// The variable stays set until the caller has served and shut the engine
 /// down (`shutdown`), so the worker can never start without it.
