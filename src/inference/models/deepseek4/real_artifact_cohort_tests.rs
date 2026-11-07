@@ -4,6 +4,7 @@ use std::time::Instant;
 use mlx_native::MlxBuffer;
 
 use super::cache::Deepseek4Cache;
+use super::chunk_split_invariance_tests::{cache_bytes, CacheBytes};
 use super::model::Deepseek4Model;
 use super::real_artifact_tests::official_artifact;
 use super::verifier_forward::MAX_COOPERATIVE_PREFILL_ROWS;
@@ -532,4 +533,174 @@ fn diagnostic_common_prefix_cache_copy_is_exact_and_faster() {
         baseline_median_ms - copied_median_ms,
         process_peak_rss_bytes(),
     );
+}
+
+/// One route's observable result for the #726 route-boundary gate.
+struct RouteReceipt {
+    chunks: Vec<String>,
+    suffix_rows: Vec<f32>,
+    cache: Vec<CacheBytes>,
+    logits: Vec<f32>,
+    greedy_token: u32,
+    decode_state: Vec<f32>,
+}
+
+/// Ingest `prompt` from a warm `PREFIX_ROWS` cache with the serving planner's
+/// chunk sequence under one route: `windows` is the route's window cap
+/// (solo 16, Mixed 2, cohort lanes 8/5/4) and `width > 1` runs every
+/// pre-anchor matrix chunk as a cooperative cohort with `width - 1` real
+/// companion lanes. Token-wise chunks replay one row at a time, as the engine
+/// does.
+fn route_receipt(
+    model: &mut Deepseek4Model,
+    prompt: &[u32],
+    windows: usize,
+    width: usize,
+) -> RouteReceipt {
+    use crate::serve::api::engine_deepseek4::{
+        plan_resumable_prefill_chunk, ResumablePrefillChunk, RECOVERY_TAIL_TOKENS,
+    };
+    let capacity = prompt.len() + 1;
+    let recovery = prompt.len() - RECOVERY_TAIL_TOKENS;
+    let companion_prompts: Vec<Vec<u32>> = (1..width)
+        .map(|lane| {
+            let mut tokens = token_batch(lane, 0, PREFIX_ROWS);
+            tokens.extend(token_batch(lane, 2, prompt.len() - PREFIX_ROWS));
+            tokens
+        })
+        .collect();
+    let mut cache = model.allocate_cache(capacity).expect("allocate route cache");
+    let mut companions: Vec<Deepseek4Cache> = (1..width)
+        .map(|_| model.allocate_cache(capacity).expect("allocate companion cache"))
+        .collect();
+    model
+        .forward_verifier_prefill(&prompt[..PREFIX_ROWS], &mut cache)
+        .expect("install warm prefix");
+    for (companion, tokens) in companions.iter_mut().zip(&companion_prompts) {
+        model
+            .forward_verifier_prefill(&tokens[..PREFIX_ROWS], companion)
+            .expect("install companion prefix");
+    }
+    let mut cursor = PREFIX_ROWS;
+    let mut chunks = Vec::new();
+    let mut suffix_rows = Vec::new();
+    let mut last = None;
+    while cursor < prompt.len() {
+        let segment_end = if cursor < recovery { recovery } else { prompt.len() };
+        let slice = plan_resumable_prefill_chunk(cursor, segment_end - cursor, 128, windows, recovery)
+            .expect("plan route chunk");
+        match slice.chunk {
+            ResumablePrefillChunk::Matrix(rows) => {
+                let tokens = &prompt[cursor..cursor + rows];
+                let state = if width > 1 && cursor + rows <= recovery {
+                    chunks.push(format!("cohort{width}x{rows}"));
+                    let batches: Vec<&[u32]> = std::iter::once(tokens)
+                        .chain(companion_prompts.iter().map(|lane| &lane[cursor..cursor + rows]))
+                        .collect();
+                    let mut caches: Vec<&mut Deepseek4Cache> = std::iter::once(&mut cache)
+                        .chain(companions.iter_mut())
+                        .collect();
+                    model
+                        .forward_verifier_prefill_cohort(&batches, &mut caches)
+                        .expect("cohort route chunk")
+                        .swap_remove(0)
+                } else {
+                    chunks.push(format!("matrix{rows}"));
+                    model
+                        .forward_verifier_prefill(tokens, &mut cache)
+                        .expect("matrix route chunk")
+                };
+                suffix_rows.extend(read_f32(&state, "route chunk state"));
+                cursor += rows;
+                last = Some(state);
+            }
+            ResumablePrefillChunk::Incremental(rows) => {
+                chunks.push(format!("token-wise{rows}"));
+                for &token in &prompt[cursor..cursor + rows] {
+                    let state = model
+                        .forward_verifier_one(token, &mut cache)
+                        .expect("token-wise route row");
+                    suffix_rows.extend(read_f32(&state, "token-wise state"));
+                    last = Some(state);
+                }
+                cursor += rows;
+            }
+        }
+    }
+    let last = model
+        .last_token_state(&last.expect("route ingested rows"))
+        .expect("view last prompt row");
+    let logits_buffer = model.forward_logits(&last).expect("route prompt logits");
+    let logits = read_f32(&logits_buffer, "route logits");
+    let greedy_token = model.greedy_token(&logits_buffer).expect("route greedy token");
+    let cache_snapshot = cache_bytes(&cache);
+    let decode = model
+        .forward_verifier_one(greedy_token, &mut cache)
+        .expect("route first decode step");
+    RouteReceipt {
+        chunks,
+        suffix_rows,
+        cache: cache_snapshot,
+        logits,
+        greedy_token,
+        decode_state: read_f32(&decode, "route decode state"),
+    }
+}
+
+/// #726 model gate: the same warm long suffix ingested under solo
+/// (2,048-row chunks), Mixed (256-row chunks) and cohort widths 2/3/4
+/// (1,024/640/512-row lanes with real companions). The serving planner keeps
+/// every pre-anchor row on the matrix route and the anchor's last eight rows
+/// token-wise under every route, so every suffix row's final state, every
+/// physical cache byte, the prompt logits and the first decode step must be
+/// bitwise equal. The 2,312-row pre-anchor segment is nine 256-row Mixed
+/// windows plus 8 rows: before #726 Mixed replayed those 8 rows token-wise.
+#[test]
+#[ignore = "loads the release checkpoint; #726 route-boundary model gate"]
+fn official_artifact_prefill_route_boundary_is_route_independent() {
+    use crate::serve::api::engine_deepseek4::RECOVERY_TAIL_TOKENS;
+    const PRE_ANCHOR_ROWS: usize = 9 * 256 + 8;
+    let (path, gguf) = official_artifact();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut model = Deepseek4Model::load_from_gguf(&gguf)
+        .unwrap_or_else(|error| panic!("load official artifact {}: {error:#}", path.display()));
+    let mut prompt = token_batch(0, 0, PREFIX_ROWS);
+    prompt.extend(token_batch(0, 2, PRE_ANCHOR_ROWS + RECOVERY_TAIL_TOKENS));
+
+    let routes: [(&str, usize, usize); 5] = [
+        ("solo", 16, 1),
+        ("mixed", 2, 1),
+        ("cohort-2", 8, 2),
+        ("cohort-3", 5, 3),
+        ("cohort-4", 4, 4),
+    ];
+    let reference = route_receipt(&mut model, &prompt, routes[0].1, routes[0].2);
+    eprintln!("DS4_ROUTE_BOUNDARY solo chunks={:?}", reference.chunks);
+    for &(route, windows, width) in &routes[1..] {
+        let receipt = route_receipt(&mut model, &prompt, windows, width);
+        eprintln!("DS4_ROUTE_BOUNDARY {route} chunks={:?}", receipt.chunks);
+        assert_exact_f32(
+            &format!("{route} suffix final states"),
+            &reference.suffix_rows,
+            &receipt.suffix_rows,
+        );
+        for (expected, actual) in reference.cache.iter().zip(&receipt.cache) {
+            assert_eq!(expected.label, actual.label);
+            let row = expected
+                .bytes
+                .iter()
+                .zip(&actual.bytes)
+                .position(|(a, b)| a != b)
+                .map(|byte| byte / expected.row_bytes);
+            assert!(row.is_none(), "{route} {} differs from row {row:?}", expected.label);
+        }
+        assert_exact_f32(&format!("{route} prompt logits"), &reference.logits, &receipt.logits);
+        assert_eq!(reference.greedy_token, receipt.greedy_token, "{route} greedy token");
+        assert_exact_f32(
+            &format!("{route} first decode state"),
+            &reference.decode_state,
+            &receipt.decode_state,
+        );
+        eprintln!("DS4_ROUTE_BOUNDARY {route} bitwise_equal=true");
+    }
 }

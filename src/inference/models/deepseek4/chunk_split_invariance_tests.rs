@@ -287,13 +287,13 @@ fn write_fixture(cfg: &Deepseek4Config) -> (tempfile::TempDir, GgufFile) {
 }
 
 /// Every physical byte of one cache buffer, with its row width.
-struct CacheBytes {
-    label: String,
-    row_bytes: usize,
-    bytes: Vec<u8>,
+pub(super) struct CacheBytes {
+    pub(super) label: String,
+    pub(super) row_bytes: usize,
+    pub(super) bytes: Vec<u8>,
 }
 
-fn cache_bytes(cache: &Deepseek4Cache) -> Vec<CacheBytes> {
+pub(super) fn cache_bytes(cache: &Deepseek4Cache) -> Vec<CacheBytes> {
     let mut out = Vec::new();
     for (layer, buffers) in cache.layers().iter().enumerate() {
         for (name, buffer) in [
