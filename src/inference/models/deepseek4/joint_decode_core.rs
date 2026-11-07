@@ -69,6 +69,14 @@ pub(super) struct CompressedRowCore {
     sparse: SparseDecodeWorkspace,
 }
 
+#[cfg(test)]
+impl CompressedRowCore {
+    /// The row's attention index storage (window, graft and indexer slots).
+    pub(super) fn index_storage(&self) -> &MlxBuffer {
+        &self.indices
+    }
+}
+
 fn layer_cache<'a>(cache: &'a Deepseek4Cache, layer: usize) -> Result<&'a LayerCache> {
     cache
         .layers()
