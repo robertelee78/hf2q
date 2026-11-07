@@ -289,20 +289,29 @@ Evidence: `docs/research/adr063-gemma-four-agent-reuse.md`. A precise F32
 tiled route was evaluated and falsified (ADR-063 Q4-GEMMA-ATTN,
 `docs/research/adr063-gemma-tiled-attn-design.md` §12).
 
-### Gemma decode column-invariant MMA (default off)
+### Gemma decode dense kernel (default `stock`)
 
-`HF2Q_GEMMA_DECODE_MMA=1` routes the dense GGUF matmuls of Gemma 4 decode
-(attention q/k/v/o, dense FFN gate/up/down and the lm head) at widths 1..=8
-through the column-invariant few-row MMA mat-vec (the peer's `mul_mv_mma`
-technique, ADR-063 Q4-GEMMA-DECODE op parity). It covers the solo decode, the
-`[N,hidden]` batched body, the batched and fused lm head, and the speculative
-verify heads and tree-verify layers, so a slot's logits do not depend on the
-decode width or path. Only the exact value `1` enables it; it is read once per
-process. A weight takes the kernel only for Q4_K, Q6_K or Q5_0 with
-`K % 64 == 0` (and the type's block size) or Q8_0 with `K % 32 == 0`; the
-decision depends on (type, N, K) and never on the width. Every other weight
-(F32 router, F16/BF16, other types) and prefill keep their routes. Numerics
-class B against the default routes. `/hf2q/v1/runtime` publishes the resolved
-kernel (`Stock` or `ColumnInvariantMma`) as
+`HF2Q_GEMMA_DECODE_DENSE` selects the kernel of the dense GGUF matmuls of
+Gemma 4 decode (attention q/k/v/o, dense FFN gate/up/down and the lm head) in
+the solo decode, the `[N,hidden]` batched body, the batched and fused lm head,
+and the speculative verify heads and tree-verify layers (ADR-063
+Q4-GEMMA-DECODE op parity). It is read once per process, at model load.
+- **Unset or `stock` (default):** the existing routes.
+- **`row_exact`:** the row-exact few-row mat-vec (`row_exact_matvec`) for
+  Q4_K or Q6_K weights with `K % 256 == 0` (Q4_K also needs a 16-byte-aligned
+  weight start) and Q5_0 or Q8_0 weights with `K % 32 == 0`.
+- **`mma`:** the column-invariant few-row MMA mat-vec (the peer's
+  `mul_mv_mma` technique) for Q4_K, Q6_K or Q5_0 weights with `K % 64 == 0`
+  (and the type's block size) and Q8_0 weights with `K % 32 == 0`. Numerics
+  class B against the default routes.
+- **Any other value:** the model load fails.
+
+Under `row_exact` and `mma` each row's result is bitwise the same however many
+rows share the dispatch, so a slot's logits do not depend on the decode width
+or path; products wider than 8 rows run in chunks of at most 8 rows. Whether a
+weight takes the kernel depends on the weight alone, never on the width; every
+other weight (F32 router, F16/BF16, other types) and prefill keep their
+routes. `/hf2q/v1/runtime` publishes the resolved kernel (`Stock`,
+`RowExact` or `ColumnInvariantMma`) as
 `measurement_snapshot.active_controls.gemma_decode_dense_kernel`; Gemma Q1
 endpoint and localizer packets declare it as `decode_dense_kernel`.

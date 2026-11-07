@@ -46,16 +46,18 @@ pub(super) fn require_warm_kernel(declared:WarmLiveKernel,resolved:crate::infere
     ensure!(resolved==declared,"resolved Gemma warm live kernel {resolved:?} differs from the packet's {declared:?} (absent = shipped VecHybrid)");
     Ok(resolved)
 }
-/// Gemma decode dense/lm-head kernel (`HF2Q_GEMMA_DECODE_MMA`, read once per
+/// Gemma decode dense/lm-head kernel (`HF2Q_GEMMA_DECODE_DENSE`, read once per
 /// process, not in `config_sha256`). `Stock` is the shipped default and the
-/// kernel of every retained Gemma Q1 run; `ColumnInvariantMma` must be declared.
+/// kernel of every retained Gemma Q1 run; `RowExact` and `ColumnInvariantMma`
+/// must be declared.
 #[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
-pub(super) enum DecodeDenseKernel {#[default] Stock,ColumnInvariantMma}
+pub(super) enum DecodeDenseKernel {#[default] Stock,RowExact,ColumnInvariantMma}
 /// Refuses a process whose decode dense kernel is not the packet's declared one.
 pub(super) fn require_decode_dense_kernel(declared:DecodeDenseKernel,
-    resolved:crate::inference::models::gemma4::decode_mma::DecodeDenseKernel)->Result<DecodeDenseKernel> {
-    use crate::inference::models::gemma4::decode_mma::DecodeDenseKernel as K;
-    let resolved=match resolved {K::Stock=>DecodeDenseKernel::Stock,K::ColumnInvariantMma=>DecodeDenseKernel::ColumnInvariantMma};
+    resolved:crate::inference::models::gemma4::decode_dense::DecodeDenseKernel)->Result<DecodeDenseKernel> {
+    use crate::inference::models::gemma4::decode_dense::DecodeDenseKernel as K;
+    let resolved=match resolved {K::Stock=>DecodeDenseKernel::Stock,K::RowExact=>DecodeDenseKernel::RowExact,
+        K::ColumnInvariantMma=>DecodeDenseKernel::ColumnInvariantMma};
     ensure!(resolved==declared,"resolved Gemma decode dense kernel {resolved:?} differs from the packet's {declared:?} (absent = shipped Stock)");
     Ok(resolved)
 }
@@ -258,7 +260,7 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
         else {anyhow::bail!("explicit Gemma model required")};
     scope.check_config(&p.identity,&recipe_for(&model.config))?;
     let warm_live_kernel=require_warm_kernel(p.warm_live_kernel,model.weights.warm_live_kernel)?;
-    let decode_dense_kernel=require_decode_dense_kernel(p.decode_dense_kernel,crate::inference::models::gemma4::decode_mma::kernel())?;
+    let decode_dense_kernel=require_decode_dense_kernel(p.decode_dense_kernel,crate::inference::models::gemma4::decode_dense::resolve()?)?;
     let observed=scope.observed(model.ctx.executor.device(),&model as *const _ as usize as u64,3)?;
     store.bind_acquisition(observed.clone()).map_err(anyhow::Error::msg)?;
     if let Some(stages)=stage_store.as_mut() {

@@ -190,19 +190,24 @@ fn q1_gemma_warm_kernel_defaults_to_shipped_vec_hybrid_and_refuses_undeclared_ti
     assert!(serde_json::from_value::<WarmLiveKernel>(serde_json::json!("Tiled")).is_err());
 }
 #[test]
-fn q1_gemma_decode_dense_kernel_defaults_to_shipped_stock_and_refuses_undeclared_mma() {
-    use crate::inference::models::gemma4::decode_mma::DecodeDenseKernel as K;
+fn q1_gemma_decode_dense_kernel_defaults_to_shipped_stock_and_refuses_undeclared_kernels() {
+    use crate::inference::models::gemma4::decode_dense::DecodeDenseKernel as K;
     assert_eq!(DecodeDenseKernel::default(),DecodeDenseKernel::Stock);
-    assert_eq!(require_decode_dense_kernel(DecodeDenseKernel::Stock,K::Stock).unwrap(),DecodeDenseKernel::Stock);
-    assert!(require_decode_dense_kernel(DecodeDenseKernel::Stock,K::ColumnInvariantMma).is_err());
-    assert!(require_decode_dense_kernel(DecodeDenseKernel::ColumnInvariantMma,K::Stock).is_err());
-    assert_eq!(require_decode_dense_kernel(DecodeDenseKernel::ColumnInvariantMma,K::ColumnInvariantMma).unwrap(),
-        DecodeDenseKernel::ColumnInvariantMma);
+    let pairs=[(DecodeDenseKernel::Stock,K::Stock),(DecodeDenseKernel::RowExact,K::RowExact),
+        (DecodeDenseKernel::ColumnInvariantMma,K::ColumnInvariantMma)];
+    for (declared,_) in pairs {
+        for (expected,resolved) in pairs {
+            let got=require_decode_dense_kernel(declared,resolved);
+            if declared==expected {assert_eq!(got.unwrap(),declared);} else {assert!(got.is_err(),"{declared:?} vs {resolved:?}");}
+        }
+    }
     // Receipt wire names equal the runtime-controls wire names.
-    for (receipt,runtime) in [(DecodeDenseKernel::Stock,K::Stock),(DecodeDenseKernel::ColumnInvariantMma,K::ColumnInvariantMma)] {
+    for (receipt,runtime) in pairs {
         assert_eq!(serde_json::to_value(receipt).unwrap(),serde_json::json!(runtime.wire_name()));
     }
-    assert!(serde_json::from_value::<DecodeDenseKernel>(serde_json::json!("Mma")).is_err());
+    for bad in ["Mma","row_exact","mma","stock"] {
+        assert!(serde_json::from_value::<DecodeDenseKernel>(serde_json::json!(bad)).is_err(),"{bad}");
+    }
 }
 #[test]
 fn complete_active_cache_plan_has_every_head_and_distinct_actual_restore64() {

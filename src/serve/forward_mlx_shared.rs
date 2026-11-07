@@ -560,44 +560,10 @@ pub fn dispatch_qmatmul(
         .map_err(|e| anyhow::anyhow!("quantized_matmul_ggml failed: {e}"))
 }
 
-/// Column-invariant few-row MMA mat-vec for a GGUF block weight at decode
-/// width `m ∈ 1..=8` (`mlx_native::quantized_matmul_ggml_column_invariant_mma`).
-/// Same imatrix intercept and capture-mode range annotation as
-/// [`dispatch_qmatmul`]; the caller owns the routing decision (Gemma 4:
-/// `gemma4::decode_mma`). Numerics class B against `dispatch_qmatmul`; each
-/// output row is bitwise independent of `m` and of the other rows.
-#[allow(clippy::too_many_arguments)]
-pub fn dispatch_qmatmul_column_invariant_mma(
-    session: &mut GraphSession<'_>,
-    registry: &mut mlx_native::KernelRegistry,
-    device: &MlxDevice,
-    input: &MlxBuffer,
-    weight: &MlxQWeight,
-    output: &MlxBuffer,
-    m: u32,
-    imatrix_hint: ImatrixHint<'_>,
-) -> Result<()> {
-    anyhow::ensure!(
-        weight.affine.is_none(),
-        "dispatch_qmatmul_column_invariant_mma: affine weights are not GGUF block weights"
-    );
-    qmatmul_preamble(session, input, weight, output, m, imatrix_hint)?;
-    let params = weight.matmul_params(m)?;
-    mlx_native::quantized_matmul_ggml_column_invariant_mma(
-        session.encoder_mut(),
-        registry,
-        device,
-        input,
-        &weight.buffer,
-        output,
-        &params,
-    )
-    .map_err(|e| anyhow::anyhow!("quantized_matmul_ggml_column_invariant_mma failed: {e}"))
-}
-
-/// Imatrix intercept and capture-mode range annotation shared by
-/// [`dispatch_qmatmul`] and [`dispatch_qmatmul_column_invariant_mma`].
-fn qmatmul_preamble(
+/// Imatrix intercept and capture-mode range annotation of a dense matmul
+/// dispatch, shared by [`dispatch_qmatmul`] and the Gemma 4 decode dense
+/// selector (`gemma4::decode_dense`).
+pub(crate) fn qmatmul_preamble(
     session: &mut GraphSession<'_>,
     input: &MlxBuffer,
     weight: &MlxQWeight,

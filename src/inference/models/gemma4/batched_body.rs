@@ -450,10 +450,10 @@ fn cat_boundary<'a>(
 /// these are the minority dense projections; the dominant MoE experts batch
 /// bit-identically via `quantized_matmul_id_ggml`).
 ///
-/// Both arms go through [`super::decode_mma::dispatch_decode_dense`]: with
-/// `HF2Q_GEMMA_DECODE_MMA=1`, an admitted weight takes the column-invariant
-/// MMA at m=N (and at m=1 in the per-row loop for N > 8), the same per-row
-/// result as the solo m=1 decode.
+/// Both arms go through [`super::decode_dense::dispatch_decode_dense`]: under
+/// `HF2Q_GEMMA_DECODE_DENSE=row_exact|mma` an admitted weight takes the
+/// row-invariant kernel at m=N (and at m=1 in the per-row loop for N > 8),
+/// the same per-row result as the solo m=1 decode.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_dense_rowident(
     session: &mut GraphSession<'_>,
@@ -479,7 +479,7 @@ pub(super) fn dispatch_dense_rowident(
     ) && (n as u32)
         <= mlx_native::ops::quantized_matmul_ggml::MM_ROUTING_THRESHOLD;
     if batched_rowident {
-        super::decode_mma::dispatch_decode_dense(
+        super::decode_dense::dispatch_decode_dense(
             session, reg, dev, input, weight, output, n as u32, hint,
         )
     } else {
@@ -490,7 +490,7 @@ pub(super) fn dispatch_dense_rowident(
         for i in 0..n {
             let in_i = input.slice_view(row_off(in_stride, i), in_stride);
             let out_i = output.slice_view(row_off(out_stride, i), out_stride);
-            super::decode_mma::dispatch_decode_dense(
+            super::decode_dense::dispatch_decode_dense(
                 session, reg, dev, &in_i, weight, &out_i, 1, hint,
             )?;
         }
