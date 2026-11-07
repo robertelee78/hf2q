@@ -6,6 +6,8 @@
 //! takes the options explicitly, so one process can run several (the Q1
 //! trace).
 
+use super::joint_projection::JointProjectionKernel;
+
 /// Switch for [`JointStepOptions::pooled_outputs`]: `1`/`on`/`true` takes the
 /// joint layer chain's multi-row outputs from the decode pool
 /// ([`super::decode_pool::StepPooledOutputs`]); unset, blank or
@@ -16,6 +18,7 @@ pub(crate) const QWEN_JOINT_POOLED_OUTPUTS_ENV: &str = "HF2Q_QWEN_JOINT_POOLED_O
 /// fix. The default turns every choice off.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct JointStepOptions {
+    pub projection: JointProjectionKernel,
     /// Multi-row layer outputs from the decode pool (Class A).
     pub pooled_outputs: bool,
 }
