@@ -28,7 +28,6 @@ mod joint_decode;
 mod joint_decode_core;
 mod joint_decode_routes;
 mod joint_decode_rows;
-mod moe_schedule;
 pub mod model;
 mod output_forward;
 mod prefill_annotations;

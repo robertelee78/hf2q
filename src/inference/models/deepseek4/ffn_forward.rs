@@ -280,11 +280,13 @@ impl Deepseek4Model {
         } else {
             ExpertMatmulRoute::Auto
         };
-        // Fix 2 (gap program): the slotted down call reuses the paired
-        // gate/up schedule (same ids and encoder) instead of a second map0c,
-        // unless stage profiling may split the encoder in between.
-        let reuse_down_schedule = self.moe_down_schedule_reuse.enabled()
-            && std::env::var("HF2Q_DEEPSEEK_ENCODER_STAGES").as_deref() != Ok("1");
+        // The slotted down call reuses the paired gate/up `mm_id` schedule
+        // (same ids, rows, top-k, experts, scratch and encoder) instead of a
+        // second map0c; the schedule depends only on the ids, so the output
+        // is byte-identical. Stage profiling may split the encoder in
+        // between, so it keeps the self-scheduling call.
+        let reuse_down_schedule =
+            std::env::var("HF2Q_DEEPSEEK_ENCODER_STAGES").as_deref() != Ok("1");
 
         let registry = &mut self.ctx.registry;
         let mut encode = |session: &mut GraphSession<'_>| -> Result<()> {

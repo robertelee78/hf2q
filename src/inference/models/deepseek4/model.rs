@@ -37,9 +37,6 @@ pub struct Deepseek4Model {
     /// How joint decode encodes the cache-dependent attention cores
     /// (`HF2Q_DEEPSEEK_BATCHED_ATTN_CORES`, read once at load).
     pub(super) attn_cores: super::joint_decode_rows::AttnCores,
-    /// `HF2Q_DEEPSEEK_MOE_DOWN_REUSE`, read once at load: the prefill down
-    /// projection reuses the paired gate/up `mm_id` schedule.
-    pub(super) moe_down_schedule_reuse: super::moe_schedule::MoeDownScheduleReuse,
 }
 
 impl Deepseek4Model {
@@ -82,7 +79,6 @@ impl Deepseek4Model {
         let matvec = super::residency::MatvecKernels::from_env()?;
         let tail_rows_step = super::rows_step::TailRowsStep::from_env()?;
         let attn_cores = super::joint_decode_rows::AttnCores::from_env()?;
-        let moe_down_schedule_reuse = super::moe_schedule::MoeDownScheduleReuse::from_env()?;
         let ctx = GpuContext::new()
             .map_err(|source| anyhow::anyhow!("DeepSeek-V4 Metal initialization: {source}"))?;
         let mut weights = Deepseek4Weights::load_from_gguf(gguf, &cfg, ctx.device().clone())
@@ -98,7 +94,6 @@ impl Deepseek4Model {
             joint_route_unproven,
             tail_rows_step,
             attn_cores,
-            moe_down_schedule_reuse,
         })
     }
 
