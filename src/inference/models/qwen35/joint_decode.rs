@@ -41,8 +41,8 @@ use crate::inference::models::qwen35::gpu_ffn::{
 };
 use crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_into_with_ggml_type;
 use crate::inference::models::qwen35::joint_decode_core::{
-    encode_joint_delta_net_layer, encode_joint_full_attn_layer, row_view, DeltaNetRoutes,
-    FullAttnRoutes, JointRows,
+    encode_joint_delta_net_layer, encode_joint_full_attn_layer, row_view, DeltaNetReplay,
+    DeltaNetRoutes, FullAttnRoutes, JointRows, JointWindow,
 };
 use crate::inference::models::qwen35::joint_decode_routes::{
     check_dense_ffn_route, check_mode_policy, dense_ffn_route,
@@ -94,9 +94,20 @@ enum LayerRoutes {
     Linear(DeltaNetRoutes),
 }
 
-struct JointPlan {
+/// Admitted product routes of every layer and the output head.
+pub(super) struct JointPlan {
     layers: Vec<LayerRoutes>,
     head: JointProductRoute,
+}
+
+/// The packed rows of one joint forward.
+pub(super) struct JointPacking<'a> {
+    /// Real rows in packed order.
+    pub rows: &'a [Qwen35JointRow],
+    /// Lane windows over `rows` (single rows for a decode step).
+    pub windows: &'a [JointWindow],
+    /// Packed width, at least `rows.len()`; padding rows copy row 0.
+    pub width: usize,
 }
 
 fn plan_joint_routes(
@@ -285,6 +296,41 @@ impl Qwen35Model {
                 "Qwen joint position must be non-negative"
             );
         }
+        self.check_joint_step_admission(kv_cache, mode, dense_ffn, options)?;
+        let slots = rows.iter().map(|row| row.slot_id).collect::<Vec<_>>();
+        let windows = JointWindow::per_row(&slots);
+        let packing = JointPacking {
+            rows,
+            windows: &windows,
+            width: joint_padded_width(mode, rows.len()),
+        };
+        self.with_joint_forward(mode, |device, registry, layer_weights, output_head, plan| {
+            self.encode_joint_decode(
+                device,
+                registry,
+                layer_weights,
+                output_head,
+                plan,
+                &packing,
+                kv_cache,
+                dense_ffn,
+                options,
+                None,
+            )
+        })
+    }
+
+    /// Admission shared by every joint forward, before any cache write: no
+    /// DeltaNet capture, no serial-only diagnostics or steering, the mode
+    /// and dense FFN route admitted by the model's routing policy, and the
+    /// MMA projections only in the padded mode.
+    pub(super) fn check_joint_step_admission(
+        &self,
+        kv_cache: &HybridKvCache,
+        mode: JointRouteMode,
+        dense_ffn: JointDenseFfnRoute,
+        options: JointStepOptions,
+    ) -> Result<()> {
         ensure!(
             !kv_cache.la_capture_active(),
             "Qwen joint decode cannot run while a DeltaNet capture is active"
@@ -310,10 +356,25 @@ impl Qwen35Model {
             "Qwen joint decode unavailable: the column-invariant MMA projections are \
              admitted only in the padded mode"
         );
-        self.ensure_gpu_cache_primed()?;
+        Ok(())
+    }
 
+    /// Run `encode` inside one joint forward: the primed GPU cache of this
+    /// model, its admitted route plan and a freshly reset decode pool.
+    pub(super) fn with_joint_forward<R>(
+        &self,
+        mode: JointRouteMode,
+        encode: impl FnOnce(
+            &MlxDevice,
+            &mut KernelRegistry,
+            &[LayerWeightsGpu],
+            &OutputHeadGpu,
+            &JointPlan,
+        ) -> Result<R>,
+    ) -> Result<R> {
+        self.ensure_gpu_cache_primed()?;
         let pool_operation = decode_pool::profile::Operation::enter(self as *const _ as usize)?;
-        let result = GPU_CACHE.with(|cell| -> Result<Vec<Qwen35JointRowOutput>> {
+        let result = GPU_CACHE.with(|cell| -> Result<R> {
             let mut guard = cell.borrow_mut();
             let cache = guard
                 .as_mut()
@@ -333,47 +394,45 @@ impl Qwen35Model {
                 .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
             decode_pool::checked_reset_decode_pool()
                 .map_err(|e| anyhow!("Qwen joint decode pool reset: {e}"))?;
-            self.encode_joint_decode(
-                device,
-                registry,
-                layer_weights,
-                output_head,
-                &plan,
-                rows,
-                kv_cache,
-                mode,
-                dense_ffn,
-                options,
-            )
+            encode(device, registry, layer_weights, output_head, &plan)
         });
         pool_operation.complete()?;
         result
     }
 
+    /// Encode and run one joint forward over `packing`. `replay` (MTP
+    /// verify only) retains the multi-row windows' DeltaNet inputs.
     #[allow(clippy::too_many_arguments)]
-    fn encode_joint_decode(
+    pub(super) fn encode_joint_decode(
         &self,
         device: &MlxDevice,
         registry: &mut KernelRegistry,
         layer_weights: &[LayerWeightsGpu],
         output_head: &OutputHeadGpu,
         plan: &JointPlan,
-        rows: &[Qwen35JointRow],
+        packing: &JointPacking<'_>,
         kv_cache: &mut HybridKvCache,
-        mode: JointRouteMode,
         dense_ffn: JointDenseFfnRoute,
         options: JointStepOptions,
+        mut replay: Option<&mut DeltaNetReplay>,
     ) -> Result<Vec<Qwen35JointRowOutput>> {
         let cfg = &self.cfg;
         let hidden_size = cfg.hidden_size;
         let h = hidden_size as usize;
         let eps = cfg.rms_norm_eps;
         let vocab = cfg.vocab_size as usize;
-        let width = joint_padded_width(mode, rows.len());
+        let rows = packing.rows;
+        let width = packing.width;
+        ensure!(
+            (1..=width).contains(&rows.len()) && width <= MAX_JOINT_DECODE_ROWS,
+            "Qwen joint forward packs {} rows at width {width}",
+            rows.len()
+        );
         let width_u32 = width as u32;
         let slots = rows.iter().map(|row| row.slot_id).collect::<Vec<_>>();
         let joint_rows = JointRows {
             slots: &slots,
+            windows: packing.windows,
             width,
         };
         // Padding rows replay row 0's token and position; their outputs are
@@ -389,13 +448,16 @@ impl Qwen35Model {
             }
         }
         let positions = host_buffer(device, DType::I32, positions.as_slice(), "positions")?;
-        // The forward's actual input manifest (trace on only): one row per
-        // packed slot in matrix order, padding rows owner-less. Its drop at
-        // return closes the forward before the caller's per-lane settle work.
-        let _native_input = crate::inference::native_observation::joint_decode_input(
-            rows.iter().map(|row| (row.slot_id.0, row.position)),
-            width,
-        );
+        // The decode forward's actual input manifest (trace on only): one
+        // row per packed slot in matrix order, padding rows owner-less. Its
+        // drop at return closes the forward before the caller's per-lane
+        // settle work. A verify window has no joint trace role yet.
+        let _native_input = replay.is_none().then(|| {
+            crate::inference::native_observation::joint_decode_input(
+                rows.iter().map(|row| (row.slot_id.0, row.position)),
+                width,
+            )
+        });
         let mut embedded = device
             .alloc_buffer(width * h * 4, DType::F32, vec![width, h])
             .map_err(|e| anyhow!("allocate Qwen joint embeddings: {e}"))?;
@@ -484,6 +546,7 @@ impl Qwen35Model {
                         layer_idx,
                         &joint_rows,
                         cfg,
+                        replay.as_deref_mut(),
                     )
                     .with_context(|| format!("Qwen joint DeltaNet layer {layer_idx}"))?,
                     &attn.post_attn_norm,
