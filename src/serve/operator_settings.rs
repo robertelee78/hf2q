@@ -76,13 +76,17 @@ pub(crate) struct ResolvedKvBudget {
     pub(crate) origin: Option<SettingOrigin>,
 }
 
-/// #727: built-in host byte budget of the Qwen SlotAware reclaimed-slot spill
-/// store when neither `--slot-spill-budget` nor `[serve] slot_spill_budget`
-/// sets one. A fixed constant, never derived from available memory, so the
-/// spill/evict sequence depends only on the request sequence. One 32K-token
-/// spill (cache rows, both DeltaNet ping-pong buffers, and the prompt
-/// anchor) is about 1.6 GB on Qwen3.8 27B and 0.57 GB on Qwen3.6 35B-A3B,
-/// so 16 GiB holds about ten or thirty such conversations.
+/// #727: built-in host byte budget of the Qwen and Gemma SlotAware
+/// reclaimed-slot spill store when neither `--slot-spill-budget` nor
+/// `[serve] slot_spill_budget` sets one. A fixed constant, never derived
+/// from available memory, so the spill/evict sequence depends only on the
+/// request sequence. One 32K-token Qwen spill (cache rows, both DeltaNet
+/// ping-pong buffers, and the prompt anchor) is about 1.6 GB on Qwen3.8 27B
+/// and 0.57 GB on Qwen3.6 35B-A3B, so 16 GiB holds about ten or thirty such
+/// conversations. A Gemma 4 spill holds the global rows below the cursor
+/// plus two copies of the sliding rings (the live slot's and the prompt
+/// anchor's); one ring copy is the ~150 MiB per-slot anchor plan on Gemma 4
+/// 26B-A4B.
 pub(crate) const DEFAULT_SLOT_SPILL_BUDGET_BYTES: u64 = 16 << 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

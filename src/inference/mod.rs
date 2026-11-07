@@ -69,6 +69,9 @@ pub(crate) fn hf2q_gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 pub(crate) mod expert_dispatch;
 pub(crate) mod gguf_contract;
+/// Issue #727 — slot-major KV row copies shared by every family's
+/// reclaimed-slot spill.
+pub(crate) mod kv_slot_rows;
 
 // Pending native0.15.13 publication/pin. Diagnostic only; no serving activation.
 #[cfg(test)]

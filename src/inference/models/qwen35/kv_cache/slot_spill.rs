@@ -27,10 +27,11 @@
 //! Metal buffers: the same access the slot-anchor checkpoint uses at the same
 //! admission point. The caller must not have GPU work in flight on the slot.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use mlx_native::MlxBuffer;
 
 use super::{copy_slot_region_in, copy_slot_region_out, FullAttnKvSlot, HybridKvCache};
+use crate::inference::kv_slot_rows::{read_rows, write_rows, SlotRows};
 use crate::serve::multi_seq_kv::SlotId;
 
 /// Cursor-visible state of one full-attention block (a layer or the MTP
@@ -130,109 +131,6 @@ fn linear_buffers_mut(layer: &mut super::LinearAttnStateSlot) -> [&mut MlxBuffer
     ]
 }
 
-/// Byte geometry of one `[n_seqs, heads, capacity, inner]` K/V buffer.
-struct RowLayout {
-    heads: usize,
-    capacity: usize,
-    row_bytes: usize,
-    head_stride: usize,
-    slot_stride: usize,
-}
-
-impl RowLayout {
-    fn of(buffer: &MlxBuffer, n_seqs: usize, name: &str) -> Result<Self> {
-        let shape = buffer.shape();
-        anyhow::ensure!(
-            shape.len() == 4 && shape[0] == n_seqs,
-            "slot spill ({name}): expected [n_seqs={n_seqs}, heads, capacity, inner], got {shape:?}"
-        );
-        let (heads, capacity, inner) = (shape[1], shape[2], shape[3]);
-        let row_bytes = inner
-            .checked_mul(buffer.dtype().size_of())
-            .ok_or_else(|| anyhow!("slot spill ({name}): row extent overflow"))?;
-        let head_stride = capacity
-            .checked_mul(row_bytes)
-            .ok_or_else(|| anyhow!("slot spill ({name}): head stride overflow"))?;
-        let slot_stride = heads
-            .checked_mul(head_stride)
-            .ok_or_else(|| anyhow!("slot spill ({name}): slot stride overflow"))?;
-        let extent = slot_stride
-            .checked_mul(n_seqs)
-            .ok_or_else(|| anyhow!("slot spill ({name}): buffer extent overflow"))?;
-        anyhow::ensure!(
-            extent <= buffer.byte_len(),
-            "slot spill ({name}): shape covers {extent} bytes but the buffer holds {}",
-            buffer.byte_len()
-        );
-        Ok(Self {
-            heads,
-            capacity,
-            row_bytes,
-            head_stride,
-            slot_stride,
-        })
-    }
-
-    /// Bytes of rows `0..rows` over every head of one slot.
-    fn spilled_len(&self, rows: usize, name: &str) -> Result<usize> {
-        anyhow::ensure!(
-            rows <= self.capacity,
-            "slot spill ({name}): cursor {rows} exceeds capacity {}",
-            self.capacity
-        );
-        Ok(self.heads * rows * self.row_bytes)
-    }
-}
-
-fn read_rows(
-    buffer: &MlxBuffer,
-    slot_idx: usize,
-    n_seqs: usize,
-    rows: usize,
-    name: &str,
-) -> Result<Vec<u8>> {
-    let layout = RowLayout::of(buffer, n_seqs, name)?;
-    let mut out = Vec::with_capacity(layout.spilled_len(rows, name)?);
-    let bytes = buffer
-        .as_slice::<u8>()
-        .with_context(|| format!("slot spill ({name}) as_slice"))?;
-    let copy = rows * layout.row_bytes;
-    for head in 0..layout.heads {
-        let start = slot_idx * layout.slot_stride + head * layout.head_stride;
-        out.extend_from_slice(&bytes[start..start + copy]);
-    }
-    Ok(out)
-}
-
-fn write_rows(
-    src: &[u8],
-    buffer: &mut MlxBuffer,
-    slot_idx: usize,
-    n_seqs: usize,
-    rows: usize,
-    name: &str,
-) -> Result<()> {
-    let layout = RowLayout::of(buffer, n_seqs, name)?;
-    anyhow::ensure!(
-        src.len() == layout.spilled_len(rows, name)?,
-        "slot spill ({name}): spilled {} bytes for {rows} rows, expected {}",
-        src.len(),
-        layout.heads * rows * layout.row_bytes
-    );
-    let copy = rows * layout.row_bytes;
-    if copy == 0 {
-        return Ok(());
-    }
-    let bytes = buffer
-        .as_mut_slice::<u8>()
-        .with_context(|| format!("slot spill ({name}) as_mut_slice"))?;
-    for (head, chunk) in src.chunks_exact(copy).enumerate() {
-        let start = slot_idx * layout.slot_stride + head * layout.head_stride;
-        bytes[start..start + copy].copy_from_slice(chunk);
-    }
-    Ok(())
-}
-
 fn block_cursor(block: &FullAttnKvSlot, slot_idx: usize, name: &str) -> Result<u32> {
     block
         .current_len
@@ -273,7 +171,7 @@ fn attention_spill_bytes(
     let cursor = block_cursor(block, slot_idx, name)? as usize;
     attention_buffers(block)
         .into_iter()
-        .map(|buffer| RowLayout::of(buffer, n_seqs, name)?.spilled_len(cursor, name))
+        .map(|buffer| SlotRows::of(buffer, n_seqs, name)?.spilled_len(cursor, name))
         .sum()
 }
 
@@ -293,7 +191,7 @@ fn validate_attention(
         buffers.len()
     );
     for (index, (buffer, rows)) in buffers.into_iter().zip(&spilled.rows).enumerate() {
-        let expected = RowLayout::of(buffer, n_seqs, name)?
+        let expected = SlotRows::of(buffer, n_seqs, name)?
             .spilled_len(spilled.cursor as usize, name)?;
         anyhow::ensure!(
             rows.len() == expected,
