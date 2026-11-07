@@ -808,7 +808,12 @@ The co-progress width is the largest set of agents whose streamed requests stay 
 
 ### Q2 traced cohort (`q2_traced_run.py`, `q2_traced_freeze.py`)
 
-`q2_traced_run.py` runs one supervised attempt of the Qwen3.8 four-slot case (`q5_cases/qwen38.json`) on a given hf2q binary with `HF2Q_PHASE_TRACE_CONFIG` set. `--population` is `n4` (the canonical release of all four agents) or a Q3 control (`n1`, `3+1`, `2+2`, `1+3`, passed to the client as `--phase-plan`). It reuses the Q5 preflight, memory sampler, stop latch and owned-group cleanup. It never retries.
+`q2_traced_run.py` runs one supervised attempt of a four-slot case on a given hf2q binary with `HF2Q_PHASE_TRACE_CONFIG` set. The default case is `q5_cases/qwen38.json`; `--case q5_cases/deepseek4-ds4file.json` and the other DeepSeek-V4 cases also work. The case's family selects the predeclared witness manifest, i.e. the actual-input sources that family's engine publishes:
+
+- `qwen38`: `qwen35.greedy.actual_tokens`, `qwen35.forward.actual_tokens`, `qwen35.joint_decode.actual_slot_rows`.
+- `deepseek4`: `deepseek4.sorted_cache_lane`, `deepseek4.prefill.actual_cooperative_lane`, `deepseek4.prefill.actual_cooperative_pack`, `deepseek4.prefill.actual_cache_span`, `deepseek4.scalar_verifier`.
+
+The readiness check that no vision projector is loaded applies only to the text-only Qwen3.8 case. `q2_traced_freeze.py plan` and q2_certify stay Qwen3.8-only (they build the Qwen turn-0 requests); DeepSeek-V4 traces are read with `q4_trace_attribution.py` and `f2_trace.validate_trace`. `--population` is `n4` (the canonical release of all four agents) or a Q3 control (`n1`, `3+1`, `2+2`, `1+3`, passed to the client as `--phase-plan`). It reuses the Q5 preflight, memory sampler, stop latch and owned-group cleanup. It never retries.
 
 - **One identity.** `--identity` is the eight-key q2_certify identity. Before launch it must match the binary sha256, the build receipt (`source`, `sha256`), the client approval template sha256 (`profile_sha256`), the model's conversion-receipt sha256 and the mlx-native pin in `<server_source>:Cargo.lock`. At readiness, the served tokenizer and template sha256 and the server pid must match too.
 - **One run id.** The run id is `q2t-<output directory name>`. The client approval and `native-config.json` both carry it, and the trace header must repeat it.

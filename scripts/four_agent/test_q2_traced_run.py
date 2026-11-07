@@ -34,7 +34,7 @@ def facts(**change):
 
 
 def config(out=Path("/runs/x")):
-    return traced.trace_config(out, RUN, IDENTITY, NONCE)
+    return traced.trace_config(out, RUN, IDENTITY, NONCE, "qwen38")
 
 
 def record(seq, kind, payload, at=1000):
@@ -115,9 +115,16 @@ class RunIdentityTest(unittest.TestCase):
                           "qwen35.joint_decode.actual_slot_rows"])
         self.assertNotIn("forward_demand_policy", cfg)
         with self.assertRaisesRegex(ValueError, "invalid control nonce"):
-            traced.trace_config(Path("/r"), RUN, IDENTITY, "short")
+            traced.trace_config(Path("/r"), RUN, IDENTITY, "short", "qwen38")
         with self.assertRaisesRegex(ValueError, "invalid run id"):
-            traced.trace_config(Path("/r"), "bad id", IDENTITY, NONCE)
+            traced.trace_config(Path("/r"), "bad id", IDENTITY, NONCE, "qwen38")
+        with self.assertRaisesRegex(ValueError, "traced families"):
+            traced.trace_config(Path("/r"), RUN, IDENTITY, NONCE, "gemma4")
+        ds4 = traced.trace_config(Path("/r"), RUN, IDENTITY, NONCE, "deepseek4")["native_observer"]["witness_manifest"]
+        self.assertEqual(ds4, {**cfg["native_observer"]["witness_manifest"], "input_sources": [
+            "deepseek4.sorted_cache_lane", "deepseek4.prefill.actual_cooperative_lane",
+            "deepseek4.prefill.actual_cooperative_pack", "deepseek4.prefill.actual_cache_span",
+            "deepseek4.scalar_verifier"]})
 
     def test_identity_binds_binary_build_template_model_and_native_pin(self):
         self.assertEqual(traced.check_identity(dict(IDENTITY), **facts()), IDENTITY)
@@ -159,17 +166,22 @@ class CaseAndReadinessTest(unittest.TestCase):
         twice = traced.traced_case(self.case, "n4")
         with self.assertRaisesRegex(ValueError, "case already sets HF2Q_PHASE_TRACE_CONFIG"):
             traced.traced_case(twice, "n4")
-        with self.assertRaisesRegex(ValueError, "Qwen3.8 four-slot case"):
+        with self.assertRaisesRegex(ValueError, "four-slot case of a traced family"):
             traced.traced_case({**self.case, "family": "gemma4"}, "n4")
+        ds4 = case_loads((HERE / "q5_cases" / "deepseek4-ds4file.json").read_bytes())
+        traced_ds4 = traced.traced_case(ds4, "n4")
+        self.assertEqual(traced_ds4["serve"]["env"], {**ds4["serve"]["env"],
+                                                      "HF2Q_PHASE_TRACE_CONFIG": "{OUT}/native-config.json"})
+        self.assertEqual(traced.traced_case(ds4, "n1")["client"]["argv"], ds4["client"]["argv"] + ["--phase-plan", "1"])
 
-    def ready(self, **change):
+    def ready(self, family="qwen38", **change):
         runtime = {"serve": {"max_slots": 4}, "measurement_snapshot": {
             "process_pid": 41, "active_controls": {"vision_projector": False},
             "tokenizer_sha256": SHA["tokenizer"], "template_sha256": SHA["template"]}}
         values = dict(health={"model": "Qwen3.8 27B", "context_length": 262144}, runtime=runtime, readyz={"ready": True})
         values.update(change)
         return traced.readiness_envelope(values["health"], values["runtime"], values["readyz"],
-                                         model_id="Qwen3.8 27B", server_pid=41, identity=IDENTITY)
+                                         model_id="Qwen3.8 27B", server_pid=41, identity=IDENTITY, family=family)
 
     def test_readiness_envelope_is_checked_against_the_launched_process(self):
         self.assertEqual(set(self.ready()), {"health", "runtime", "readyz"})
@@ -185,6 +197,13 @@ class CaseAndReadinessTest(unittest.TestCase):
         for change, reason in refusals:
             with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
                 self.ready(**change)
+        # The vision check binds the text-only (qwen38) family only; every other check binds every family.
+        loaded = snap(active_controls={"vision_projector": True})
+        self.assertEqual(set(self.ready("deepseek4", runtime=loaded)), {"health", "runtime", "readyz"})
+        for change, reason in refusals:
+            if reason != "vision projector loaded":
+                with self.subTest(family="deepseek4", reason=reason), self.assertRaisesRegex(ValueError, reason):
+                    self.ready("deepseek4", **change)
 
 
 class TraceReadbackTest(unittest.TestCase):
@@ -216,7 +235,7 @@ class TraceReadbackTest(unittest.TestCase):
                     traced.arm_readback(self.path, self.cfg)
 
     def test_gpu_timestamps_opt_in_adds_one_key_and_gates_the_ack_clock_pair(self):
-        off, on = config(), traced.trace_config(Path("/runs/x"), RUN, IDENTITY, NONCE, gpu_timestamps=True)
+        off, on = config(), traced.trace_config(Path("/runs/x"), RUN, IDENTITY, NONCE, "qwen38", gpu_timestamps=True)
         self.assertNotIn("gpu_timestamps", off["native_observer"])
         self.assertEqual(on["native_observer"], {**off["native_observer"], "gpu_timestamps": True})
         self.assertEqual({k: v for k, v in on.items() if k != "native_observer"},

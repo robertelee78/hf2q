@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""ADR-063 Q2 items 4 and 6: one-attempt traced Qwen3.8 cohort for q2_certify.
+"""ADR-063 Q2 items 4 and 6: one-attempt traced four-agent cohort (Qwen3.8 or DeepSeek-V4).
 
-Runs ONE canonical four-agent coding cohort (`--population n4`) or one Q3 population
+The family comes from the --case (`qwen38` or `deepseek4`) and selects the predeclared witness manifest:
+the input sources that family's engine actually publishes. Runs ONE canonical four-agent coding cohort (`--population n4`) or one Q3 population
 control (`n1`, `3+1`, `2+2`, `1+3`: the client's --phase-plan) on the given hf2q binary
 with HF2Q_PHASE_TRACE_CONFIG set, under the Q5 supervision (q5_calibration preflight,
 500 ms memory sampler, stop latch and owned process-group cleanup). Client and trace share
@@ -54,9 +55,17 @@ CONFIG_NAME, TRACE_NAME = "native-config.json", "native-phase-trace.jsonl"
 SERVER_BUDGET, CLIENT_BUDGET = 6 * GIB, 128 * MIB
 EVENT_LIMIT, METADATA_LIMIT = 8_000_000, 16 * MIB
 PROFILE = "native_command_capture_v3"
+# Per family: the actual-input witness sources its engine publishes (native_observation adapters).
+WITNESS_SOURCES = {
+    "qwen38": ["qwen35.greedy.actual_tokens", "qwen35.forward.actual_tokens",
+               "qwen35.joint_decode.actual_slot_rows"],
+    "deepseek4": ["deepseek4.sorted_cache_lane", "deepseek4.prefill.actual_cooperative_lane",
+                  "deepseek4.prefill.actual_cooperative_pack", "deepseek4.prefill.actual_cache_span",
+                  "deepseek4.scalar_verifier"],
+}
+# Families whose traced case serves a text-only locator: readiness must show no vision projector.
+TEXT_ONLY = {"qwen38"}
 WITNESS = {"schema": "hf2q.f2.forward-witness-policy.v1", "operator": "target_input_rms_norm",
-           "input_sources": ["qwen35.greedy.actual_tokens", "qwen35.forward.actual_tokens",
-                             "qwen35.joint_decode.actual_slot_rows"],
            "coverage": "each_admitted_lane_in_first_fixed_window",
            "batching_scope": "operator_only_full_body_unknown"}
 ARM_READBACK_LIMIT = 8 * MIB  # the pre-client trace holds only header, baseline and arm ACK
@@ -84,10 +93,15 @@ def phase_plan(population):
     return q3_campaign.WORKLOADS[population]
 
 
+def witness(family):
+    require(family in WITNESS_SOURCES, "traced families: " + ", ".join(sorted(WITNESS_SOURCES)))
+    return {**json.loads(json.dumps(WITNESS)), "input_sources": list(WITNESS_SOURCES[family])}
+
+
 def traced_case(case, population):
-    """The Qwen3.8 four-slot case for one population, with the server phase trace config added."""
-    require(case.get("family") == "qwen38" and case.get("workload", {}).get("slots") == 4,
-            "the traced cohort runs the Qwen3.8 four-slot case")
+    """A traced family's four-slot case for one population, with the server phase trace config added."""
+    require(case.get("family") in WITNESS_SOURCES and case.get("workload", {}).get("slots") == 4,
+            "the traced cohort runs a four-slot case of a traced family (" + ", ".join(sorted(WITNESS_SOURCES)) + ")")
     derived = q3_campaign.derive_case(case, population)
     env = derived["serve"].setdefault("env", {})
     require("HF2Q_PHASE_TRACE_CONFIG" not in env, "case already sets HF2Q_PHASE_TRACE_CONFIG")
@@ -133,7 +147,7 @@ def check_identity(identity, *, binary_sha256, build, template_sha256, model_sha
     return identity
 
 
-def trace_config(out, run_id, identity, nonce, gpu_timestamps=False):
+def trace_config(out, run_id, identity, nonce, family, gpu_timestamps=False):
     require(RUN_ID.fullmatch(run_id) is not None, "invalid run id")
     require(32 <= len(nonce) <= 128 and re.fullmatch(r"[A-Za-z0-9_-]+", nonce) is not None, "invalid control nonce")
     return {"schema": "hf2q.f2.phase-trace.v1", "output": str(out / TRACE_NAME), "run_id": run_id,
@@ -141,14 +155,14 @@ def trace_config(out, run_id, identity, nonce, gpu_timestamps=False):
             "metadata_budget_profile": PROFILE,
             "native_observer": {"event_limit": EVENT_LIMIT, "metadata_limit_bytes": METADATA_LIMIT,
                                 "diagnostic_case": True, "control_nonce": nonce,
-                                "witness_manifest": json.loads(json.dumps(WITNESS)),
+                                "witness_manifest": witness(family),
                                 # ADR-063 Q4-TRACE-GPU-TIMING: present only when on, so default
                                 # configs (and config_sha256) are unchanged.
                                 **({"gpu_timestamps": True} if gpu_timestamps else {})},
             "identity": dict(identity)}
 
 
-def readiness_envelope(health, runtime, readyz, *, model_id, server_pid, identity):
+def readiness_envelope(health, runtime, readyz, *, model_id, server_pid, identity, family):
     """The single readiness file q2_certify reads, checked against the launched process."""
     require(isinstance(readyz, dict) and readyz.get("ready") is True, "readyz is not ready")
     require(isinstance(health, dict) and health.get("model") == model_id and health.get("context_length") == 262144,
@@ -157,8 +171,9 @@ def readiness_envelope(health, runtime, readyz, *, model_id, server_pid, identit
     snapshot = runtime.get("measurement_snapshot") or {} if isinstance(runtime, dict) else {}
     require(serve.get("max_slots") == 4, "runtime serve.max_slots is not 4")
     require(snapshot.get("process_pid") == server_pid, "measurement_snapshot.process_pid is not the launched server pid")
-    require((snapshot.get("active_controls") or {}).get("vision_projector") is False,
-            "vision projector loaded: the traced cohort is text-only")
+    if family in TEXT_ONLY:
+        require((snapshot.get("active_controls") or {}).get("vision_projector") is False,
+                "vision projector loaded: the traced cohort is text-only")
     require(snapshot.get("tokenizer_sha256") == identity["tokenizer_sha256"]
             and snapshot.get("template_sha256") == identity["template_sha256"],
             "served tokenizer/template sha256 differ from the frozen identity")
@@ -305,13 +320,14 @@ def prepare(args, environ):
     check_identity(identity, binary_sha256=binary_sha, build=q5.load_json(args.build_receipt),
                    template_sha256=sha256(template), model_sha256=artifact["sha256"],
                    native=native_pin(git_lock(identity["server_source"])))
-    config = trace_config(out, base["RUN_ID"], identity, "q2t_" + secrets.token_hex(24), args.gpu_timestamps)
+    config = trace_config(out, base["RUN_ID"], identity, "q2t_" + secrets.token_hex(24), case["family"],
+                          args.gpu_timestamps)
     latency = q5_admission.negative_control_latency(q5.load_json(args.negative_control_receipt))
     return {"plan": plan, "values": {**base, **plan["variables"]}, "config": config, "identity": identity,
             "artifact": artifact, "latency_ns": latency, "binary_sha256": binary_sha, "template": template}
 
 
-def wait_ready(plan, server, latch, stop, identity):
+def wait_ready(plan, server, latch, stop, identity, family):
     spec, start = plan["readiness"], time.monotonic()
     while not latch.event.is_set():
         if INTERRUPTED:
@@ -332,7 +348,7 @@ def wait_ready(plan, server, latch, stop, identity):
     try:
         return readiness_envelope(q5.get_json(base + "/health"), q5.get_json(base + "/hf2q/v1/runtime"),
                                   q5.get_json(base + "/readyz"), model_id=plan["variables"]["MODEL_ID"],
-                                  server_pid=server.pid, identity=identity)
+                                  server_pid=server.pid, identity=identity, family=family)
     except (OSError, ValueError) as error:
         return stop("readiness_mismatch", str(error))
 
@@ -384,7 +400,7 @@ def supervise(prepared, out, receipt, state):
         latch.groups.append(server.pid)
         sampler.pgid, sampler.roots = server.pid, {server.pid}
         values["SERVER_PID"] = receipt["server_pid"] = server.pid
-        envelope = wait_ready(plan, server, latch, stop, prepared["identity"])
+        envelope = wait_ready(plan, server, latch, stop, prepared["identity"], plan["family"])
         if envelope is None:
             return
         q5.save(out / "readiness.json", envelope)
