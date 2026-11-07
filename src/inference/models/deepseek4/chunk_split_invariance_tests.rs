@@ -15,8 +15,9 @@
 //! compressed rows, indexer rows, the four compressor states) and the
 //! last-row logits must equal the reference split bitwise:
 //! - group A, 2048 rows from position 0: one 2048-row chunk;
-//! - group B, 4609 rows: the solo plan 2048 + 2049, then 512 rows from the
-//!   unaligned start 4097.
+//! - group B, 4609 rows: a reference split of 2048 + 2049 (one oversized
+//!   chunk; the serving planner balance-splits a cold prompt instead), then
+//!   512 rows from the unaligned start 4097.
 //!
 //! Cooperative cohort arms (widths 2/3/4 at the engine's 1024/640/512-row
 //! sizing, companion lanes ingesting other tokens) must match too.

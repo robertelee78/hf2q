@@ -859,7 +859,7 @@ mod tests {
         assert_eq!(
             shrink_band.exact_warm_matrix_alignment_window_cap(980, 128),
             None,
-            "the prefill planner shortens this nominal 128-token catch-up to preserve a legal tail"
+            "the prefill planner shortens this nominal 128-token catch-up to keep a legal matrix remainder"
         );
     }
 
