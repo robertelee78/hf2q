@@ -592,6 +592,12 @@ selected by `--kv-persist PATH`; it is also available as
 `[serve] kv_persist_budget` and through `hf2q setup`.
 `--lcp-resume-budget <SIZE>` (or `[serve] lcp_resume_budget`) sizes the
 in-memory LCP resume registry; it defaults to a host-independent 8GiB.
+`--slot-spill-budget <SIZE>` (`[serve] slot_spill_budget`, default `16GiB`,
+`0` disables) caps host memory for Qwen conversations whose idle slot another
+request reclaims: their cache state is spilled and restored into whatever slot
+they are granted when they return, instead of recomputing the prefix. The
+oldest spill is evicted first. A conversation's own next turn or retry in its
+own slot resumes in place and copies nothing.
 Requests that cannot safely fit wait or fail explicitly instead of silently
 receiving a shorter context. A live `/v1/models` entry reports the effective
 limit as `context_length` and the GGUF capability as `max_context_length`.

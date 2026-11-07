@@ -53,6 +53,8 @@ mod source_teacher;
 mod allocation_plan;
 #[cfg(test)]
 pub(crate) mod q1_capture_layout;
+mod slot_spill;
+pub use slot_spill::HybridKvSlotSpill;
 use allocation_plan::{
     ensure_capture_with, CaptureAllocationPlan, CaptureRole, ExistingCapture, HybridCacheAllocationPlan,
 };
@@ -1014,6 +1016,7 @@ pub struct HybridKvCacheSnapshot {
 /// its per-layer cursors plus the fixed-size DeltaNet state. Keeping the
 /// sequence K/V in place avoids a prompt-length-sized duplicate allocation
 /// for every agent slot.
+#[derive(Clone)]
 pub struct HybridKvSlotAnchor {
     prompt_len: usize,
     full_attn_current_len: Vec<u32>,

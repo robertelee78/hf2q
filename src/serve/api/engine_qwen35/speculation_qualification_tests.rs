@@ -108,6 +108,7 @@ pub(super) fn loaded_model(policy: QwenSpeculationPolicy) -> Qwen35LoadedModel {
         tq_kv_active: false,
         persistent_kv_cache: None,
         speculation: QwenSpeculationController::new(policy),
+        slot_spill_budget_bytes: 0,
     }
 }
 

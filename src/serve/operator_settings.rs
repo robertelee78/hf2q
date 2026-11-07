@@ -76,6 +76,22 @@ pub(crate) struct ResolvedKvBudget {
     pub(crate) origin: Option<SettingOrigin>,
 }
 
+/// #727: built-in host byte budget of the Qwen SlotAware reclaimed-slot spill
+/// store when neither `--slot-spill-budget` nor `[serve] slot_spill_budget`
+/// sets one. A fixed constant, never derived from available memory, so the
+/// spill/evict sequence depends only on the request sequence. One 32K-token
+/// spill (cache rows, both DeltaNet ping-pong buffers, and the prompt
+/// anchor) is about 1.6 GB on Qwen3.8 27B and 0.57 GB on Qwen3.6 35B-A3B,
+/// so 16 GiB holds about ten or thirty such conversations.
+pub(crate) const DEFAULT_SLOT_SPILL_BUDGET_BYTES: u64 = 16 << 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedSlotSpillBudget {
+    /// Host bytes the spill store may hold; `0` disables spilling.
+    pub(crate) bytes: u64,
+    pub(crate) origin: SettingOrigin,
+}
+
 /// ADR-062 D1 — provenance of the effective scheduler and slot count,
 /// reported by `hf2q info` and `/hf2q/v1/runtime` (CLI flag, `[serve]`
 /// config key, or the built-in default from one shared constant).
@@ -449,6 +465,38 @@ pub(crate) fn resolve_lcp_resume_budget(
         budget: LcpResumeBudget::from_bytes(bytes),
         origin,
     })
+}
+
+/// #727: resolve the reclaimed-slot spill budget, CLI > `[serve]` config >
+/// [`DEFAULT_SLOT_SPILL_BUDGET_BYTES`]. An explicit `0` disables spilling.
+pub(crate) fn resolve_slot_spill_budget(
+    cli_value: Option<&str>,
+    defaults: Option<&ServeDefaultsV2>,
+) -> Result<ResolvedSlotSpillBudget, String> {
+    let selected = cli_value
+        .map(|value| (value, SettingOrigin::Cli))
+        .or_else(|| {
+            defaults
+                .and_then(|defaults| defaults.slot_spill_budget.as_deref())
+                .map(|value| (value, SettingOrigin::Config))
+        });
+    let Some((value, origin)) = selected else {
+        return Ok(ResolvedSlotSpillBudget {
+            bytes: DEFAULT_SLOT_SPILL_BUDGET_BYTES,
+            origin: SettingOrigin::BuiltIn,
+        });
+    };
+    let bytes = parse_byte_size(value).map_err(|error| {
+        let setting = match origin {
+            SettingOrigin::Cli => "--slot-spill-budget",
+            SettingOrigin::Config => "serve.slot_spill_budget",
+            SettingOrigin::Gguf | SettingOrigin::BuiltIn => {
+                unreachable!("only the CLI and config.toml supply a spill budget string")
+            }
+        };
+        format!("{setting}: {error}")
+    })?;
+    Ok(ResolvedSlotSpillBudget { bytes, origin })
 }
 
 /// Reject a command-line disk budget that cannot affect the requested
@@ -861,6 +909,7 @@ mod tests {
             kv_cache_budget: Some("2GiB".to_owned()),
             kv_persist_path: Some("/tmp/hf2q-kv".into()),
             kv_persist_budget: Some("32GiB".to_owned()),
+            slot_spill_budget: None,
         };
         let requested = requested_context(planning.ctx, Some(&config.serve))
             .unwrap()
@@ -892,9 +941,37 @@ mod tests {
             kv_cache_budget: None,
             kv_persist_path: None,
             kv_persist_budget: None,
+            slot_spill_budget: None,
         };
         let error = resolve_scheduler(&planning, None).unwrap_err();
         assert!(error.contains("inflight-batched"), "{error}");
+    }
+
+    #[test]
+    fn slot_spill_budget_is_cli_then_config_then_a_fixed_default() {
+        let builtin = resolve_slot_spill_budget(None, None).unwrap();
+        assert_eq!(builtin.bytes, DEFAULT_SLOT_SPILL_BUDGET_BYTES);
+        assert_eq!(builtin.bytes, 16 * (1u64 << 30));
+        assert_eq!(builtin.origin, SettingOrigin::BuiltIn);
+
+        let mut config = crate::setup::OperatorConfigV2::guide_defaults().unwrap();
+        let unset = resolve_slot_spill_budget(None, Some(&config.serve)).unwrap();
+        assert_eq!(unset, builtin);
+
+        config.serve.slot_spill_budget = Some("6GiB".to_owned());
+        let configured = resolve_slot_spill_budget(None, Some(&config.serve)).unwrap();
+        assert_eq!(configured.bytes, 6 * (1u64 << 30));
+        assert_eq!(configured.origin, SettingOrigin::Config);
+
+        let cli = resolve_slot_spill_budget(Some("0"), Some(&config.serve)).unwrap();
+        assert_eq!(cli.bytes, 0, "an explicit zero disables spilling");
+        assert_eq!(cli.origin, SettingOrigin::Cli);
+
+        let error = resolve_slot_spill_budget(Some("lots"), None).unwrap_err();
+        assert!(error.starts_with("--slot-spill-budget:"), "{error}");
+        config.serve.slot_spill_budget = Some("lots".to_owned());
+        let error = resolve_slot_spill_budget(None, Some(&config.serve)).unwrap_err();
+        assert!(error.starts_with("serve.slot_spill_budget:"), "{error}");
     }
 
     #[test]
