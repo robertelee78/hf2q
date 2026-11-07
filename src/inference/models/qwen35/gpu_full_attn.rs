@@ -7703,6 +7703,207 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
     Ok(out_buf)
 }
 
+/// Whether [`apply_tq_sdpa_rows_gated_into`] serves this joint step of a
+/// full-attention slot: TQ-only cache (no F32 shadow), `head_dim == 256`,
+/// distinct slots, and room for one more token in every slot. Otherwise the
+/// caller runs the per-row chain.
+pub(crate) fn tq_sdpa_rows_route(
+    slot: &FullAttnKvSlot,
+    slots: &[SlotId],
+    head_dim: u32,
+    max_seq_len: u32,
+) -> bool {
+    slot.tq.is_some()
+        && slot.k.is_none()
+        && head_dim == 256
+        && slots.iter().enumerate().all(|(index, slot_id)| {
+            slot.current_len
+                .get(slot_id.0 as usize)
+                .is_some_and(|&len| len < max_seq_len)
+                && !slots[..index].contains(slot_id)
+        })
+}
+
+/// Row-batched TQ decode attention and output gate of one joint
+/// full-attention layer (ADR-063 Q4-QWEN36, per-row small ops).
+///
+/// The rows are packed: `q_rows` `[width, n_heads, head_dim]` (after IMROPE),
+/// `k_rows` / `v_rows` `[width, n_kv_heads * head_dim]`, `gate_rows`
+/// `[width, n_heads * head_dim]`; the first `slots.len()` rows are real and
+/// row `r` belongs to `slots[r]`. Encodes, with no per-row barrier:
+/// 1. one batched TQ encode each for K and V at every row's cursor, and the
+///    Q sign premultiply over all real rows' heads (in place);
+/// 2. every row's TQ-HB attention (`flash_attn_vec_tq_hb_rows`: all split-K
+///    mains, one barrier, all reduces) straight into packed rotated rows;
+/// 3. for padding rows (`width > slots.len()`), copies of row 0;
+/// 4. one fused FWHT undo + sigmoid gate over all `width` rows,
+///
+/// then advances every slot's cursor. Returns the gated `[width, n_heads *
+/// head_dim]` rows; the caller orders their reader with a barrier.
+///
+/// Row `r`'s cache bytes and gated output are bitwise those of the per-row
+/// chain ([`apply_sdpa_with_kv_cache_decode_into`], row copy,
+/// [`apply_sigmoid_gate_multiply`]) and so of the serial single-token layer,
+/// at any width and row order: each kernel computes row `r` from row `r`'s
+/// inputs and slot alone, with the per-row kernels' arithmetic (mlx-native
+/// `test_qwen36_attn_rows`). Requires [`tq_sdpa_rows_route`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_tq_sdpa_rows_gated_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_rows: &MlxBuffer,
+    k_rows: &MlxBuffer,
+    v_rows: &MlxBuffer,
+    gate_rows: &MlxBuffer,
+    slot: &mut FullAttnKvSlot,
+    slots: &[SlotId],
+    width: usize,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_seq_len: u32,
+) -> Result<MlxBuffer> {
+    ensure!(
+        tq_sdpa_rows_route(slot, slots, head_dim, max_seq_len),
+        "row-batched TQ attention needs a TQ-only slot, head_dim 256, distinct slots with room"
+    );
+    let real = slots.len();
+    ensure!(real > 0 && real <= width, "row-batched TQ attention: {real} real rows of {width}");
+    let q_total = (n_heads * head_dim) as usize;
+    ensure!(
+        q_rows.element_count() >= width * q_total && gate_rows.element_count() >= width * q_total,
+        "row-batched TQ attention: Q/gate rows hold fewer than {width} rows of {q_total}"
+    );
+    let codebook_bits = match crate::debug::INVESTIGATION_ENV.tq_codebook_bits {
+        bits @ (5 | 6 | 8) => bits,
+        _ => 8,
+    };
+    let cursors: Vec<u32> = slots
+        .iter()
+        .map(|slot_id| slot.current_len[slot_id.0 as usize])
+        .collect();
+
+    // (1) K/V of every row at its cursor; Q pre-rotation of every real row.
+    let writes: Vec<(SlotId, u32)> = slots.iter().copied().zip(cursors.iter().copied()).collect();
+    slot.encode_rows_to_tq(
+        k_rows,
+        v_rows,
+        &writes,
+        n_kv_heads,
+        head_dim,
+        max_seq_len,
+        codebook_bits,
+        enc,
+        registry,
+        device,
+    )
+    .context("row-batched TQ K/V encode")?;
+    mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
+        enc,
+        registry,
+        device.metal_device(),
+        q_rows,
+        real as u32 * n_heads,
+        head_dim,
+    )
+    .context("row-batched TQ Q pre-rotation")?;
+    enc.memory_barrier();
+
+    // (2) Every row's attention over its slot, written into its packed row.
+    let attention = super::decode_pool::pooled_alloc_buffer(
+        device,
+        width * q_total * 4,
+        DType::F32,
+        vec![width, q_total],
+    )
+    .map_err(|e| anyhow!("alloc row-batched attention: {e}"))?;
+    let tmp_bytes = flash_attn_vec_tmp_bytes(n_heads, head_dim);
+    let mut decode_rows = Vec::with_capacity(real);
+    let mut row_buffers = Vec::with_capacity(real);
+    for (row, (&slot_id, &cursor)) in slots.iter().zip(&cursors).enumerate() {
+        let params = super::kv_cache::Qwen35TqSdpaParams {
+            num_heads: n_heads,
+            num_kv_heads: n_kv_heads,
+            head_dim,
+            kv_seq_len: cursor + 1,
+            kv_capacity: max_seq_len,
+            scale: 1.0_f32 / (head_dim as f32).sqrt(),
+            mask_type: 0,
+            sliding_window: 0,
+            softcap: 0.0,
+            ring_start: 0,
+            scale_factor_d512: 1.0,
+            codebook_bits,
+        };
+        decode_rows.push(slot.tq_decode_row_for_slot(&params, slot_id, real)?);
+        let byte_offset = (row * q_total * 4) as u64;
+        let tmp = super::decode_pool::pooled_alloc_buffer(
+            device,
+            tmp_bytes,
+            DType::F32,
+            vec![tmp_bytes / 4],
+        )
+        .map_err(|e| anyhow!("alloc row-batched attention tmp: {e}"))?;
+        row_buffers.push((
+            q_rows.slice_view(byte_offset, q_total),
+            attention.slice_view(byte_offset, q_total),
+            tmp,
+        ));
+    }
+    let bound: Vec<_> = decode_rows
+        .iter()
+        .zip(&row_buffers)
+        .map(|(row, (q, output, tmp))| row.bind(q, output, tmp))
+        .collect();
+    mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_rows(enc, registry, device, &bound)
+        .context("row-batched TQ attention")?;
+    enc.memory_barrier();
+
+    // (3) Padding rows read row 0's (still rotated) attention.
+    if width > real {
+        for row in real..width {
+            mlx_native::ops::copy::dispatch_copy_f32(
+                enc,
+                registry,
+                device.metal_device(),
+                &attention,
+                &attention,
+                0,
+                row * q_total,
+                q_total,
+            )
+            .map_err(|e| anyhow!("copy row-batched attention padding row {row}: {e}"))?;
+        }
+        enc.memory_barrier();
+    }
+
+    // (4) Un-rotate and gate every packed row in one dispatch.
+    let gated = super::decode_pool::pooled_alloc_buffer(
+        device,
+        width * q_total * 4,
+        DType::F32,
+        vec![width * q_total],
+    )
+    .map_err(|e| anyhow!("alloc row-batched gated attention: {e}"))?;
+    mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_sigmoid_mul_f32(
+        enc,
+        registry,
+        device.metal_device(),
+        &attention,
+        gate_rows,
+        &gated,
+        width as u32 * n_heads,
+        head_dim,
+    )
+    .context("row-batched TQ un-rotation + sigmoid gate")?;
+
+    for (&slot_id, &cursor) in slots.iter().zip(&cursors) {
+        slot.current_len[slot_id.0 as usize] = cursor + 1;
+    }
+    Ok(gated)
+}
+
 /// Decode-only Qwen3.5/3.6 gated full-attention layer encoded into the
 /// caller's command buffer.
 ///
@@ -7885,31 +8086,51 @@ pub fn apply_gated_attn_layer_decode_into(
     // Suppress unused warnings — same pattern as legacy build_gated_attn_layer.
     let _ = (x_norm, q_flat, k_flat, q_normed, k_normed);
 
-    // ---- Op 5: SDPA decode-fast-path (kv-cache write + sdpa_decode) ----
-    let attn_out = apply_sdpa_with_kv_cache_decode_into(
-        enc,
-        device,
-        registry,
-        &q_rope,
-        &k_rope,
-        &v_flat,
-        slot,
-        seq_len,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        max_seq_len,
-        slot_id,
-    )?;
-
-    // INTER-STAGE BARRIER (NEW): sdpa_kv → ops6-7 (replaces the former
-    // CB boundary at legacy :1245 / :1211).  sigmoid_gate_multiply reads
-    // attn_out written above.
-    enc.memory_barrier();
-
-    // ---- Ops 6-7: sigmoid-gate multiply + output projection ----
+    // ---- Ops 5-6: kv-cache write + SDPA decode, then the sigmoid gate ----
+    // On the production TQ cache this is the joint step's row-batched pass at
+    // one row (encode + Q rotation, attention, fused un-rotation + gate), so
+    // a row's serial and joint results are the same kernels' bits.
     let n_elem = seq_len * q_total;
-    let gated = apply_sigmoid_gate_multiply(enc, registry, device, &attn_out, &gate_flat, n_elem)?;
+    let gated = if seq_len == 1 && tq_sdpa_rows_route(slot, &[slot_id], head_dim, max_seq_len) {
+        apply_tq_sdpa_rows_gated_into(
+            enc,
+            device,
+            registry,
+            &q_rope,
+            &k_rope,
+            &v_flat,
+            &gate_flat,
+            slot,
+            &[slot_id],
+            1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+        )?
+    } else {
+        let attn_out = apply_sdpa_with_kv_cache_decode_into(
+            enc,
+            device,
+            registry,
+            &q_rope,
+            &k_rope,
+            &v_flat,
+            slot,
+            seq_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            slot_id,
+        )?;
+
+        // INTER-STAGE BARRIER (NEW): sdpa_kv → ops6-7 (replaces the former
+        // CB boundary at legacy :1245 / :1211).  sigmoid_gate_multiply reads
+        // attn_out written above.
+        enc.memory_barrier();
+        apply_sigmoid_gate_multiply(enc, registry, device, &attn_out, &gate_flat, n_elem)?
+    };
     // ADR-015 iter21: memory_barrier between Op 6 (sigmoid_gate_multiply
     // writes `gated`) and Op 7 (linear_projection reads `gated`).
     //

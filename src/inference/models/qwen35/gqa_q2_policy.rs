@@ -10,6 +10,29 @@
 /// lower crossover. The specialized PSO is compiled during model warmup.
 const GQA_Q2_MIN_KV_SEQ_LEN: u32 = 8_192;
 
+/// Qwen3.6-35B-A3B attention geometry (16 query heads over 2 KV heads), the
+/// one with a measured short-context gate: the M5 Max KV sweep of ADR-063
+/// Q4-QWEN36 (`q4-qwen36/attn-smallops/native-kvsweep-gqa-*`, model-free
+/// cold-rotated cells) puts the crossover at KV 4,096 for one row (2,048:
+/// 32.9 vs 32.3 µs; 4,096: 36.0 vs 60.2 µs) and at 1,024 when several rows
+/// share the attention pass (four rows at 1,024: 39.5 vs 62.8 µs; 2,048:
+/// 74.0 vs 118.1 µs). Both kernels give the same bits, so this is speed only.
+const QWEN36_GQA_GEOMETRY: (u32, u32) = (16, 2);
+const QWEN36_GQA_Q2_MIN_KV_ONE_ROW: u32 = 4_096;
+const QWEN36_GQA_Q2_MIN_KV_ROWS: u32 = 1_024;
+
+/// Shortest KV length at which `auto` selects the cooperative kernel for an
+/// attention pass over `rows` decode rows.
+fn gqa_q2_min_kv_seq_len(params: &Qwen35TqSdpaParams, rows: usize) -> u32 {
+    if (params.num_heads, params.num_kv_heads) != QWEN36_GQA_GEOMETRY {
+        GQA_Q2_MIN_KV_SEQ_LEN
+    } else if rows > 1 {
+        QWEN36_GQA_Q2_MIN_KV_ROWS
+    } else {
+        QWEN36_GQA_Q2_MIN_KV_ONE_ROW
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum GqaQ2Mode {
     Off,
@@ -37,13 +60,17 @@ pub(super) fn gqa_q2_mode() -> GqaQ2Mode {
     *MODE.get_or_init(|| parse_gqa_q2_mode(std::env::var("HF2Q_QWEN_GQA_Q2").ok().as_deref()))
 }
 
-pub(super) fn use_gqa_q2_tq_sdpa(params: &Qwen35TqSdpaParams) -> bool {
-    use_gqa_q2_tq_sdpa_for_mode(params, gqa_q2_mode())
+/// Whether a decode row under `params` runs the cooperative GQA-Q2 kernel
+/// when `rows` rows share its attention pass. The two kernels are bitwise
+/// equal per row (mlx-native GQA parity gate), so a row's result does not
+/// depend on `rows`.
+pub(super) fn use_gqa_q2_tq_sdpa(params: &Qwen35TqSdpaParams, rows: usize) -> bool {
+    use_gqa_q2_tq_sdpa_for_mode(params, rows, gqa_q2_mode())
 }
 
-fn use_gqa_q2_tq_sdpa_for_mode(params: &Qwen35TqSdpaParams, mode: GqaQ2Mode) -> bool {
+fn use_gqa_q2_tq_sdpa_for_mode(params: &Qwen35TqSdpaParams, rows: usize, mode: GqaQ2Mode) -> bool {
     mode != GqaQ2Mode::Off
-        && (mode == GqaQ2Mode::On || params.kv_seq_len >= GQA_Q2_MIN_KV_SEQ_LEN)
+        && (mode == GqaQ2Mode::On || params.kv_seq_len >= gqa_q2_min_kv_seq_len(params, rows))
         && params.head_dim == 256
         && params.num_kv_heads > 0
         && params
@@ -120,31 +147,47 @@ mod tests {
     #[test]
     fn qwen38_geometry_selects_q2_at_measured_crossover() {
         let mut p = params();
-        p.kv_seq_len = GQA_Q2_MIN_KV_SEQ_LEN - 1;
-        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::Auto));
-        p.kv_seq_len = GQA_Q2_MIN_KV_SEQ_LEN;
-        assert!(use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::Auto));
-        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::Off));
+        for rows in [1, 4] {
+            p.kv_seq_len = GQA_Q2_MIN_KV_SEQ_LEN - 1;
+            assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, rows, GqaQ2Mode::Auto));
+            p.kv_seq_len = GQA_Q2_MIN_KV_SEQ_LEN;
+            assert!(use_gqa_q2_tq_sdpa_for_mode(&p, rows, GqaQ2Mode::Auto));
+            assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, rows, GqaQ2Mode::Off));
+        }
         p.kv_seq_len = 1;
-        assert!(use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::On));
+        assert!(use_gqa_q2_tq_sdpa_for_mode(&p, 1, GqaQ2Mode::On));
+    }
+
+    #[test]
+    fn qwen36_geometry_selects_q2_at_its_measured_crossovers() {
+        let mut p = params();
+        (p.num_heads, p.num_kv_heads) = QWEN36_GQA_GEOMETRY;
+        for (rows, min) in [(1, QWEN36_GQA_Q2_MIN_KV_ONE_ROW), (2, QWEN36_GQA_Q2_MIN_KV_ROWS), (4, 1_024)] {
+            p.kv_seq_len = min - 1;
+            assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, rows, GqaQ2Mode::Auto), "rows {rows}");
+            p.kv_seq_len = min;
+            assert!(use_gqa_q2_tq_sdpa_for_mode(&p, rows, GqaQ2Mode::Auto), "rows {rows}");
+            assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, rows, GqaQ2Mode::Off), "rows {rows}");
+        }
+        assert_eq!(QWEN36_GQA_Q2_MIN_KV_ONE_ROW, 4_096);
     }
 
     #[test]
     fn unsupported_geometry_and_attention_modes_fall_back() {
         let mut p = params();
         p.head_dim = 512;
-        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::On));
+        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, 1, GqaQ2Mode::On));
         p = params();
         p.num_heads = 20;
         p.num_kv_heads = 4;
-        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::On));
+        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, 1, GqaQ2Mode::On));
         p = params();
         p.mask_type = 2;
         p.sliding_window = 4_096;
-        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::On));
+        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, 1, GqaQ2Mode::On));
         p = params();
         p.codebook_bits = 4;
-        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, GqaQ2Mode::On));
+        assert!(!use_gqa_q2_tq_sdpa_for_mode(&p, 1, GqaQ2Mode::On));
     }
 
     #[test]
