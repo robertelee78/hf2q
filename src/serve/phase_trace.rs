@@ -13,6 +13,7 @@ use std::sync::{Mutex, OnceLock};
 mod metadata_budget;
 mod demand;
 mod native;
+mod clock_pair;
 
 pub(crate) const SCHEMA: &str = "hf2q.f2.phase-trace.v1";
 const EVENT_LIMIT: usize = 64 * 1024;
@@ -405,6 +406,26 @@ pub(crate) fn native_control_nonce() -> Option<String> {
             .as_ref()
             .map(|c| c.control_nonce.clone()),
         _ => None,
+    }
+}
+
+/// Q4-TRACE-GPU-TIMING opt-in of the active native diagnostic (false otherwise).
+pub(crate) fn native_gpu_timestamps() -> bool {
+    native::gpu_timestamps_installed()
+}
+
+/// A paired host-clock sample for the arm ACK and final status when GPU timestamps
+/// are on; `None` otherwise. A failed sample invalidates the trace (fail closed).
+pub(crate) fn native_clock_pair() -> Option<Value> {
+    if !native_gpu_timestamps() {
+        return None;
+    }
+    match clock_pair::sample() {
+        Ok(pair) => serde_json::to_value(pair).ok(),
+        Err(reason) => {
+            invalidate(reason);
+            None
+        }
     }
 }
 

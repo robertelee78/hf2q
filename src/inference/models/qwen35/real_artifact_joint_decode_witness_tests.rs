@@ -35,9 +35,9 @@ use super::{Qwen35JointOutput, Qwen35JointRow};
 use crate::inference::native_observation::{armed_transaction_for_test, take_hook_counts};
 use crate::serve::multi_seq_kv::SlotId;
 
-const STEPS: usize = 3;
+pub(super) const STEPS: usize = 3;
 const CAPACITY: u32 = 160;
-const COHORTS: [(&str, &[u32]); 4] = [
+pub(super) const COHORTS: [(&str, &[u32]); 4] = [
     ("logical4_pad0", &[0, 1, 2, 3]),
     ("logical3_pad1", &[0, 1, 3]),
     ("logical2_pad2", &[1, 2]),
@@ -62,7 +62,7 @@ impl SubmissionObserver for CountingSink {
 
 /// Every row's per-step logits and hidden bits, then every slot's state.
 #[derive(Debug, PartialEq, Eq)]
-struct ArmTrace {
+pub(super) struct ArmTrace {
     logits: Vec<Vec<Vec<u32>>>,
     hidden: Vec<Vec<Vec<u32>>>,
     states: Vec<SlotState>,
@@ -86,7 +86,7 @@ fn owners(cohort: &[u32]) -> Vec<crate::serve::phase_trace::SlotState> {
         .collect()
 }
 
-fn run_arm(model: &Qwen35Model, label: &str, cohort: &[u32], armed: bool) -> ArmTrace {
+pub(super) fn run_arm(model: &Qwen35Model, label: &str, cohort: &[u32], armed: bool) -> ArmTrace {
     let hidden_size = model.cfg.hidden_size as usize;
     let mut cache = cache_with_capacity(model, CAPACITY);
     let mut next = Vec::with_capacity(SLOTS as usize);

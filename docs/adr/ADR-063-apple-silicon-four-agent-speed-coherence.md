@@ -1122,6 +1122,18 @@ Priority: High. It serves the gap program's attribution (Q4-QWEN38 and the Qwen 
 
 Delivery boundary: Qualified implementation merged to main for v0.1.30.
 
+Result (2026-11-06, M5 Max 128 GB, PR #732; evidence `~/.local/state/hf2q/v0130/q4-trace-gpu-timing/`): **acceptance met.** Binary `433e2ca9` (sha256 `7173b547…`), built with rustc 1.99.1, on the official Qwen3.8-27B artifact and the n4 case. Later commits on the PR change only docs.
+- **Neutrality.** G2 passes: with the stream installed, joint forwards at all four widths are bitwise equal armed vs unarmed, with 18 `Available` timings per armed forward. G1 also passes on this binary. T1n (flag off) and T1g (flag on), run back to back on the same binary, are `ExactTranscripts` (28 turn positions).
+- **Coverage and checks.** T1g reduces: 41,052 commands are all `Available` (0 `Unknown`). Every epoch passes the clock-free bounds (1,726 epochs), with 0 commit-order inversions. The Q4-TRACE witness acceptance holds in both runs (1670/1670).
+- **Cost.** +41,052 native events (8 M limit) and +15.6 MB of trace (6 GiB server budget). The design estimated about 10.7 MB; the records are larger than estimated.
+- **Attribution.** Every joint epoch matched the published plan (64 layers, `chain_n` 4, native embedding: 18 commands), so `chain_map_refused` is 0.
+  - At 4 lanes, a step's GPU is busy 87.9 ms of an 89.1 ms median epoch, with bubbles of about 0.5 ms.
+  - Each of the 16 four-layer chains (3 DeltaNet + 1 full attention) takes 5.14–5.29 ms, and the output head 3.6 ms.
+  - Width costs little: chains take 4.7–5.1 ms at 1 lane.
+  - Per-kernel time remains unobservable.
+  - Handed to the Qwen op-parity lead (`attribution-handoff.md`).
+- **Validation.** Review677 approved #732; there were no speed tests, per the operator's 2026-11-06 directive.
+
 ### Q1-DS4. Capture DeepSeek-V4 Q1 endpoints on this 128 GB Mac (#549)
 
 Outcome: The deferred DeepSeek-V4 Q1 numerical endpoints run on the M5 Max 128 GB under a measured, reviewed resource policy.

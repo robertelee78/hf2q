@@ -215,6 +215,25 @@ class TraceReadbackTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, reason):
                     traced.arm_readback(self.path, self.cfg)
 
+    def test_gpu_timestamps_opt_in_adds_one_key_and_gates_the_ack_clock_pair(self):
+        off, on = config(), traced.trace_config(Path("/runs/x"), RUN, IDENTITY, NONCE, gpu_timestamps=True)
+        self.assertNotIn("gpu_timestamps", off["native_observer"])
+        self.assertEqual(on["native_observer"], {**off["native_observer"], "gpu_timestamps": True})
+        self.assertEqual({k: v for k, v in on.items() if k != "native_observer"},
+                         {k: v for k, v in off.items() if k != "native_observer"})
+        pair = {"monotonic_ns": 1, "uptime_raw_ns": 2, "mach_absolute_ticks": 3, "mach_timebase": [1, 1],
+                "read_span_ns": 4}
+        write_lines(self.path, [header(on), ack(on, clock_pair=pair)])
+        self.assertEqual(traced.arm_readback(self.path, on)["ack"]["payload"]["clock_pair"], pair)
+        for cfg, records in ((on, [header(on), ack(on)]), (off, [header(off), ack(off, clock_pair=pair)])):
+            with self.subTest(gpu="gpu_timestamps" in cfg["native_observer"]):
+                write_lines(self.path, records)
+                with self.assertRaisesRegex(ValueError, "clock pair must match"):
+                    traced.arm_readback(self.path, cfg)
+        args = traced.parse_args(["--population", "n4", "--binary", "/b", "--build-receipt", "/r", "--identity", "/i",
+                                  "--negative-control-receipt", "/n", "--output", "/o"])
+        self.assertFalse(args.gpu_timestamps)
+
     def test_trace_final_needs_the_bound_header_and_a_clean_end(self):
         end = record(9, "end", {"error": None, "dropped_events": 0})
         write_lines(self.path, [header(self.cfg), ack(self.cfg), end])

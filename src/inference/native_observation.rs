@@ -68,12 +68,13 @@ pub(crate) fn arm_on_worker(
     );
     device.command_encoder()?.commit_and_wait()?;
     let baseline = arm().map_err(anyhow::Error::msg)?;
-    crate::serve::phase_trace::publish(
-        "native_arm_ack",
-        serde_json::json!({
-        "nonce":nonce,"clock_id":"CLOCK_MONOTONIC","worker_queue_checked":true,
-        "quiescent":true,"baseline":baseline,"scope":"one_fresh_phase_diagnostic"}),
-    );
+    let mut ack = serde_json::json!({
+    "nonce":nonce,"clock_id":"CLOCK_MONOTONIC","worker_queue_checked":true,
+    "quiescent":true,"baseline":baseline,"scope":"one_fresh_phase_diagnostic"});
+    if let Some(pair) = crate::serve::phase_trace::native_clock_pair() {
+        ack["clock_pair"] = pair;
+    }
+    crate::serve::phase_trace::publish("native_arm_ack", ack);
     Ok(())
 }
 
@@ -102,7 +103,11 @@ pub(crate) fn arm() -> Result<ObservationStatus, &'static str> {
 pub(crate) fn finish() -> ObservationStatus {
     ARMED.store(false, Ordering::Release);
     let status = mlx_native::submission_observer::submission_observation_status();
-    crate::serve::phase_trace::publish("native_final", serde_json::json!(status));
+    let mut payload = serde_json::json!(status);
+    if let Some(pair) = crate::serve::phase_trace::native_clock_pair() {
+        payload["clock_pair"] = pair;
+    }
+    crate::serve::phase_trace::publish("native_final", payload);
     if status.pending_commands != 0 || status.pending_command_limit != 1024 {
         crate::serve::phase_trace::invalidate("native submitted command ownership not retired");
     }
@@ -135,6 +140,20 @@ pub(crate) fn update_owners(owners: &[crate::serve::phase_trace::SlotState]) {
         return;
     }
     OWNERS.with(|value| *value.borrow_mut() = owners.to_vec());
+}
+
+static CHAIN_PLAN: AtomicBool = AtomicBool::new(false);
+/// Q4-TRACE-GPU-TIMING: publish the joint forward's command plan once per
+/// process, only in an armed trace with GPU timestamps on. Off path: one load.
+pub(crate) fn joint_chain_plan(payload: impl FnOnce() -> serde_json::Value) {
+    if !ARMED.load(Ordering::Acquire)
+        || CHAIN_PLAN.load(Ordering::Acquire)
+        || !crate::serve::phase_trace::native_gpu_timestamps()
+        || CHAIN_PLAN.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    crate::serve::phase_trace::publish("joint_chain_plan", payload());
 }
 
 /// Constructed from the actual selected input, never from a scheduler width.
