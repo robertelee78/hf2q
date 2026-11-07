@@ -9,8 +9,8 @@
 //! byte on the CPU and registers each buffer with the residency set, and the
 //! route ends in a host wait, so all of that is serial with the GPU.
 //!
-//! With `HF2Q_QWEN_RESUME_ATTN_FAST` on, the route runs the same dispatches
-//! in the same order on the same input bytes:
+//! With `HF2Q_QWEN_RESUME_ATTN_FAST` on (the default), the route runs the
+//! same dispatches in the same order on the same input bytes:
 //! - the BF16 Q and output buffers come from the prefill's
 //!   [`FaPrefillArena`], which resumed chunks allocate but did not use;
 //! - the K/V temps, their BF16 casts and the F32 result are allocated once
@@ -27,7 +27,8 @@
 //! residency-rescission contract of [`FaPrefillArena`]).
 //!
 //! Outside `forward_gpu_impl` (no arena: MTP drafts, decode, the source
-//! teacher, direct helpers) route (c) is unchanged.
+//! teacher, direct helpers) route (c) is unchanged, as it is everywhere with
+//! the switch off.
 
 use std::sync::LazyLock;
 
@@ -43,20 +44,24 @@ use super::kv_cache::FullAttnKvSlot;
 use super::FaPrefillArena;
 use crate::serve::multi_seq_kv::SlotId;
 
-/// Opt-in switch: `1`/`on`/`true` takes the fast route; unset, blank or
-/// `0`/`off`/`false` keeps route (c) as it was.
+/// Kill switch, default on: unset, blank or `1`/`on`/`true` takes the fast
+/// route; `0`/`off`/`false` keeps route (c) as it was.
 pub(crate) const QWEN_RESUME_ATTN_FAST_ENV: &str = "HF2Q_QWEN_RESUME_ATTN_FAST";
 
-/// Parse the switch; an invalid value warns and keeps it off.
+/// Parse the switch; unset or blank is on, and an invalid value warns and
+/// keeps the default (on).
 pub(crate) fn parse_resume_attn_fast(raw: Option<&str>) -> bool {
-    parse_switch(QWEN_RESUME_ATTN_FAST_ENV, raw).unwrap_or_else(|error| {
-        tracing::warn!(
-            error,
-            fallback = false,
-            "invalid Qwen resumed-prefill attention switch"
-        );
-        false
-    })
+    match raw.map(str::trim) {
+        None | Some("") => true,
+        Some(_) => parse_switch(QWEN_RESUME_ATTN_FAST_ENV, raw).unwrap_or_else(|error| {
+            tracing::warn!(
+                error,
+                fallback = true,
+                "invalid Qwen resumed-prefill attention switch"
+            );
+            true
+        }),
+    }
 }
 
 static RESUME_ATTN_FAST: LazyLock<bool> = LazyLock::new(|| {
@@ -593,17 +598,17 @@ mod tests {
     }
 
     #[test]
-    fn resume_attn_fast_switch_parses_and_defaults_off() {
-        assert!(!parse_resume_attn_fast(None));
-        assert!(!parse_resume_attn_fast(Some("  ")));
+    fn resume_attn_fast_switch_parses_and_defaults_on() {
+        assert!(parse_resume_attn_fast(None));
+        assert!(parse_resume_attn_fast(Some("  ")));
         for on in ["1", "on", "TRUE"] {
             assert!(parse_resume_attn_fast(Some(on)), "{on}");
         }
-        for off in ["0", "off", "False"] {
+        for off in ["0", "off", "False", " 0 "] {
             assert!(!parse_resume_attn_fast(Some(off)), "{off}");
         }
-        // Invalid: warns and keeps the switch off.
-        assert!(!parse_resume_attn_fast(Some("fast")));
+        // Invalid: warns and keeps the default (on).
+        assert!(parse_resume_attn_fast(Some("fast")));
     }
 
     /// Bitwise against route (c) at Qwen3.8 shapes, including attended
