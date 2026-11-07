@@ -32,10 +32,7 @@ use super::decode_cohort::publish_verifier_cohort_after_gate;
 use super::forward_support::{
     alloc, alloc_host_input, begin_decode_pool_token, end_decode_pool_token,
 };
-use super::joint_decode_core::{
-    encode_compressed_row, encode_window_row, plan_compressed_row, plan_window_row,
-    CompressedRowCore, JointRowInputs, WindowRowCore,
-};
+use super::joint_decode_core::{encode_row_cores, plan_row_cores, JointRowInputs, RowCaches};
 use super::rope::yarn_frequencies;
 use super::row_matmul::{row_view, RowMatmul};
 use super::submission::{drain, retained_reference_pipeline_enabled, SubmissionChain};
@@ -121,11 +118,6 @@ impl JointRopeFrequencies {
     }
 }
 
-enum JointRowCore {
-    Window(WindowRowCore),
-    Compressed(CompressedRowCore),
-}
-
 impl Deepseek4Model {
     /// Advance `token_ids.len()` independent caches by one token each in one
     /// layer-major transaction and return their `[B, hc, hidden]` final
@@ -156,9 +148,14 @@ impl Deepseek4Model {
             .collect::<Result<Vec<_>>>()?;
         let positions = steps.iter().map(|step| step.position).collect::<Vec<_>>();
 
+        let views = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
         begin_decode_pool_token();
-        let (result, submitted_any) =
-            self.forward_verifier_decode_joint_uncommitted(token_ids, caches, &steps);
+        let (result, submitted_any) = self.forward_verifier_rows_uncommitted(
+            token_ids,
+            &views,
+            &steps,
+            RowCaches::Independent,
+        );
         end_decode_pool_token();
         match result {
             Ok(state) => {
@@ -176,11 +173,15 @@ impl Deepseek4Model {
         }
     }
 
-    fn forward_verifier_decode_joint_uncommitted(
+    /// Encode and drain one layer-major transaction over `token_ids.len()`
+    /// rows (joint decode: independent caches; rows step: one cache at
+    /// consecutive positions) without publishing any cache.
+    pub(super) fn forward_verifier_rows_uncommitted(
         &mut self,
         token_ids: &[u32],
-        caches: &[&mut Deepseek4Cache],
+        caches: &[&Deepseek4Cache],
         steps: &[CacheStep],
+        order: RowCaches,
     ) -> (Result<MlxBuffer>, bool) {
         let mut submitted_any = false;
         let result = (|| -> Result<MlxBuffer> {
@@ -227,6 +228,7 @@ impl Deepseek4Model {
                                 steps,
                                 &positions,
                                 &frequencies,
+                                order,
                             )
                             .with_context(|| {
                                 format!("encode DeepSeek-V4 joint layer-{layer} attention")
@@ -279,10 +281,11 @@ impl Deepseek4Model {
         layer: usize,
         state: Option<&MlxBuffer>,
         token_ids: &[u32],
-        caches: &[&mut Deepseek4Cache],
+        caches: &[&Deepseek4Cache],
         steps: &[CacheStep],
         positions: &MlxBuffer,
         frequencies: &JointRopeFrequencies,
+        order: RowCaches,
     ) -> Result<MlxBuffer> {
         let rows = token_ids.len();
         let ratio = self
@@ -363,31 +366,7 @@ impl Deepseek4Model {
             vec![1, rows, heads, head_dim],
             "joint sparse attention",
         )?;
-        let row_cores = (0..rows)
-            .map(|row| {
-                let step = &steps[row];
-                let planned = if ratio == 0 {
-                    plan_window_row(&device, caches[row], layer, step.position, head_dim)
-                        .map(JointRowCore::Window)
-                } else {
-                    let layer_step = step
-                        .layers
-                        .get(layer)
-                        .with_context(|| format!("missing layer-{layer} joint cache step"))?;
-                    plan_compressed_row(
-                        &device,
-                        &self.cfg,
-                        caches[row],
-                        layer,
-                        ratio,
-                        step.position,
-                        layer_step,
-                    )
-                    .map(JointRowCore::Compressed)
-                };
-                planned.with_context(|| format!("plan DeepSeek-V4 joint layer-{layer} row {row}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let row_cores = plan_row_cores(&device, &self.cfg, caches, steps, layer, ratio)?;
         let row_inputs = (0..rows)
             .map(|row| {
                 Ok(JointRowInputs {
@@ -473,46 +452,21 @@ impl Deepseek4Model {
             },
         )?;
 
-        for (row, (row_core, inputs)) in row_cores.iter().zip(&row_inputs).enumerate() {
-            let layer_cache = caches[row]
-                .layers()
-                .get(layer)
-                .with_context(|| format!("missing layer-{layer} joint row-{row} cache"))?;
-            let layer_step = steps[row]
-                .layers
-                .get(layer)
-                .with_context(|| format!("missing layer-{layer} joint row-{row} cache step"))?;
-            let encoded = match row_core {
-                JointRowCore::Window(window) => encode_window_row(
-                    session,
-                    registry,
-                    &device,
-                    cfg,
-                    layer_cache,
-                    layer_step,
-                    window,
-                    attention_weights.sinks,
-                    inputs,
-                ),
-                JointRowCore::Compressed(compressed) => encode_compressed_row(
-                    session,
-                    registry,
-                    &device,
-                    cfg,
-                    layer_cache,
-                    layer_step,
-                    compressed,
-                    compressed_weights
-                        .as_ref()
-                        .context("DeepSeek-V4 compressed joint weights missing")?,
-                    frequency_buffer,
-                    inputs,
-                ),
-            };
-            encoded.with_context(|| {
-                format!("encode DeepSeek-V4 joint layer-{layer} row {row} core")
-            })?;
-        }
+        encode_row_cores(
+            session,
+            registry,
+            &device,
+            cfg,
+            caches,
+            steps,
+            layer,
+            &row_cores,
+            &row_inputs,
+            attention_weights.sinks,
+            compressed_weights.as_ref(),
+            frequency_buffer,
+            order,
+        )?;
 
         encode_compressed_attention_epilogue(
             session,

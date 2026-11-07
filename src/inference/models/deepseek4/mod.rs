@@ -35,6 +35,7 @@ pub mod residency;
 pub mod rope;
 pub mod routing;
 mod row_matmul;
+mod rows_step;
 mod submission;
 pub mod tokenizer;
 mod verifier_forward;
@@ -87,11 +88,17 @@ mod real_artifact_mixed_step_tests;
 #[cfg(test)]
 mod real_artifact_tests;
 #[cfg(test)]
+mod real_artifact_rows_step_tests;
+#[cfg(test)]
 mod residency_tests;
 #[cfg(test)]
 mod row_matmul_tests;
 #[cfg(test)]
 mod row_exact_matvec_tests;
+#[cfg(test)]
+mod rows_step_tests;
+#[cfg(test)]
+mod ds4_tail_rows_microbench_tests;
 
 pub const ARCH_DEEPSEEK4: &str = "deepseek4";
 
