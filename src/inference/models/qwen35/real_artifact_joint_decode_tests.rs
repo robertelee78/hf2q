@@ -362,6 +362,9 @@ fn run_bitwise_gate(env: &str) {
             let slot = row.slot_id.0;
             let positions = [row.position; 4];
             let next = match row.output {
+                Qwen35JointOutput::GreedyTokenAndHidden => {
+                    unreachable!("the gate's rows never ask for an argmax with hidden")
+                }
                 Qwen35JointOutput::GreedyToken => {
                     let token = model
                         .forward_gpu_greedy(&[row.token], &positions, &mut serial, row.slot_id)

@@ -34,10 +34,11 @@
 //! [`JointRouteMode`], [`JointDenseFfnRoute`] and [`JointStepOptions`].
 
 use anyhow::{anyhow, ensure, Context, Result};
+use mlx_native::MlxBuffer;
 
 use super::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput};
 use crate::inference::models::qwen35::joint_decode_core::{
-    encode_delta_net_replay, DeltaNetReplay, JointWindow,
+    encode_delta_net_replay, rows_view, DeltaNetReplay, JointWindow,
 };
 use crate::inference::models::qwen35::joint_decode_routes::{
     joint_verify_padded_width, JointDenseFfnRoute, JointRouteMode, MAX_JOINT_DECODE_ROWS,
@@ -63,6 +64,9 @@ pub(crate) struct Qwen35JointVerifyLane<'a> {
 pub(crate) struct Qwen35JointVerify {
     /// Per lane in input order, one output per window row.
     pub rows: Vec<Vec<Qwen35JointRowOutput>>,
+    /// Per lane, its window's `[rows, hidden]` post-output-norm rows (a
+    /// view of one durable buffer): the MTP catch-up's target hidden.
+    pub hidden: Vec<MlxBuffer>,
     /// The state the commit settles.
     pub pending: Qwen35JointVerifyPending,
 }
@@ -84,6 +88,7 @@ struct PendingLane {
     rows: usize,
 }
 
+#[cfg(test)]
 impl Qwen35JointVerifyPending {
     /// `(slot, window rows)` per lane, in the verify step's lane order.
     pub(crate) fn lanes(&self) -> impl Iterator<Item = (SlotId, usize)> + '_ {
@@ -178,7 +183,7 @@ impl Qwen35Model {
             width: joint_verify_padded_width(mode, total),
         };
         let linear_layers = kv_cache.linear_attn.len();
-        let (outputs, replay) = self.with_joint_forward(
+        let (outputs, normed, replay) = self.with_joint_forward(
             mode,
             |device, registry, layer_weights, output_head, plan| {
                 let mut replay = DeltaNetReplay::new(
@@ -188,7 +193,7 @@ impl Qwen35Model {
                     packing.width,
                     linear_layers,
                 )?;
-                let outputs = self.encode_joint_decode(
+                let (outputs, normed) = self.encode_joint_decode(
                     device,
                     registry,
                     layer_weights,
@@ -200,7 +205,7 @@ impl Qwen35Model {
                     options,
                     replay.as_mut(),
                 )?;
-                Ok((outputs, replay))
+                Ok((outputs, normed, replay))
             },
         )?;
         let mut outputs = outputs.into_iter();
@@ -214,8 +219,14 @@ impl Qwen35Model {
                 .all(|(lane, window)| lane.len() == window.rows),
             "Qwen joint verify returned fewer rows than it packed"
         );
+        let hidden_size = self.cfg.hidden_size as usize;
+        let hidden = windows
+            .iter()
+            .map(|window| rows_view(&normed, window.start, window.rows, hidden_size))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Qwen35JointVerify {
             rows,
+            hidden,
             pending: Qwen35JointVerifyPending {
                 lanes: pending,
                 replay,

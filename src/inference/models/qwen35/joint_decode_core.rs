@@ -397,30 +397,18 @@ fn replay_elements(elements: usize) -> usize {
 /// multi-row window, the scaled Q, L2-normed K, V and raw conv input rows
 /// plus a replay output scratch. Single-row windows retain nothing: their
 /// commit is a fast path (keep, or discard by a parity flip).
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "read by the joint MTP verify commit; its production caller is H4")
-)]
 pub(crate) struct DeltaNetReplay {
     arena: MlxBuffer,
     used: usize,
     layers: Vec<DeltaNetReplayLayer>,
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "read by the joint MTP verify commit; its production caller is H4")
-)]
 struct DeltaNetReplayLayer {
     rank: usize,
     lanes: Vec<DeltaNetReplayLane>,
 }
 
 /// One multi-row window's replay inputs in one DeltaNet layer.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "read by the joint MTP verify commit; its production caller is H4")
-)]
 struct DeltaNetReplayLane {
     slot: SlotId,
     rows: usize,
@@ -452,10 +440,6 @@ struct WindowStage {
 impl DeltaNetReplay {
     /// Storage for `linear_layers` DeltaNet layers of a step with `windows`
     /// at packed `width`; `None` when no window has more than one row.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "the joint MTP verify window's production caller is H4")
-    )]
     pub(crate) fn new(
         device: &MlxDevice,
         cfg: &Qwen35Config,
@@ -596,10 +580,6 @@ fn gdn_params(shape: &DeltaNetLayerShape, rows: usize) -> GatedDeltaNetParams {
 ///   `accepted` is copied back in the state layout.
 ///
 /// No parity changes. The caller commits `enc`.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the joint MTP verify commit's production caller is H4")
-)]
 pub(crate) fn encode_delta_net_replay(
     enc: &mut CommandEncoder,
     device: &MlxDevice,
