@@ -1545,10 +1545,15 @@ impl Deepseek4LoadedModel {
             progress.mixed_prefill_slice(batch, window_cap);
         }
         if incremental {
-            let start = plan.cursor;
-            let step_rows = self.model.token_wise_step_rows();
             let mut state = None;
-            for tokens in prompt_tokens[start..segment_end].chunks(step_rows) {
+            while plan.cursor < segment_end {
+                // Width per chunk: an in-process Qwen3.8 load can revoke rows
+                // steps mid-prompt; the rest then runs as one-token steps.
+                let rows = self
+                    .model
+                    .token_wise_step_rows()
+                    .min(segment_end - plan.cursor);
+                let tokens = &prompt_tokens[plan.cursor..plan.cursor + rows];
                 anyhow::ensure!(
                     !cancelled(),
                     "DeepSeek-V4 generation cancelled during incremental prefill"
@@ -1663,8 +1668,10 @@ impl Deepseek4LoadedModel {
             offset += batch;
             progress.advance_prefill(batch);
         }
-        let step_rows = self.model.token_wise_step_rows();
-        for chunk in tokens[offset..].chunks(step_rows) {
+        while offset < tokens.len() {
+            // Width per chunk, as in the resumable path.
+            let rows = self.model.token_wise_step_rows().min(tokens.len() - offset);
+            let chunk = &tokens[offset..offset + rows];
             anyhow::ensure!(
                 !cancelled(),
                 "DeepSeek-V4 generation cancelled during prefill"
@@ -1674,7 +1681,8 @@ impl Deepseek4LoadedModel {
                     .context("execute DeepSeek-V4 cached-prefix append tokens")?,
             );
             self.committed_tokens.extend_from_slice(chunk);
-            progress.advance_prefill(chunk.len());
+            offset += rows;
+            progress.advance_prefill(rows);
         }
         Ok(state)
     }

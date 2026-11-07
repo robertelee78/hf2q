@@ -29,6 +29,9 @@ use super::Deepseek4Config;
 use crate::serve::gpu::GpuContext;
 
 const CONTEXT: usize = 1024;
+/// Context of the indexer top-k case: positions past 2048, where a ratio-4
+/// layer holds more than `index_top_k` (512) compressed rows.
+const TOP_K_CONTEXT: usize = 4096;
 const RATIOS: [u32; 3] = [0, 4, 128];
 
 fn fill_f32(buffer: &mut MlxBuffer, seed: u64) {
@@ -155,11 +158,11 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(device: &MlxDevice) -> Self {
+    fn new(device: &MlxDevice, context: usize) -> Self {
         let cfg = config(RATIOS.to_vec());
         let rope = cfg.rope_head_dim as usize;
         Self {
-            plan: Deepseek4CachePlan::for_context(&cfg, CONTEXT).unwrap(),
+            plan: Deepseek4CachePlan::for_context(&cfg, context).unwrap(),
             weights: RATIOS
                 .iter()
                 .enumerate()
@@ -241,10 +244,14 @@ impl Fixture {
 /// buffer, or `None` when every cache byte and attention output is equal. `stale_plans` plans every
 /// row of the rows step at `start` (negative control: the comparison must see it).
 fn rows_step_mismatch(start: usize, stale_plans: bool) -> Option<String> {
+    rows_step_mismatch_in(CONTEXT, start, stale_plans)
+}
+
+fn rows_step_mismatch_in(context: usize, start: usize, stale_plans: bool) -> Option<String> {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let mut ctx = GpuContext::new().unwrap();
     let device = ctx.device().clone();
-    let fixture = Fixture::new(&device);
+    let fixture = Fixture::new(&device, context);
     let rows = MAX_JOINT_DECODE_ROWS;
 
     // Reference: one-token steps, each in its own command buffer, committed.
@@ -320,6 +327,27 @@ fn rows_step_cores_match_one_token_steps_across_window_wrap_and_csa_emits() {
 fn rows_step_cores_match_one_token_steps_across_an_hca_block() {
     // Positions 251..=258: the ratio-128 block completes at position 255.
     assert_eq!(rows_step_mismatch(251, false), None);
+}
+
+#[test]
+fn rows_step_cores_match_one_token_steps_while_the_indexer_drops_rows() {
+    // Positions 2045..=2052: the ratio-4 layer holds 511 compressed rows at
+    // 2045 and emits at 2047 and 2051, so rows 2051 and 2052 select 512 of
+    // 513 rows (the indexer's top-k drops one) under the sequential order.
+    {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let cfg = config(RATIOS.to_vec());
+        let plan = Deepseek4CachePlan::for_context(&cfg, TOP_K_CONTEXT).unwrap();
+        let mut cache = Deepseek4Cache::allocate(&plan, MlxDevice::new().unwrap()).unwrap();
+        for position in 0..2045 {
+            cache.commit_step(position).unwrap();
+        }
+        let valid =
+            |position| cache.plan_step_at(position).unwrap().layers[1].compressed_valid_after;
+        assert_eq!(valid(2045), 511);
+        assert!(valid(2051) > cfg.index_top_k as usize);
+    }
+    assert_eq!(rows_step_mismatch_in(TOP_K_CONTEXT, 2045, false), None);
 }
 
 #[test]
