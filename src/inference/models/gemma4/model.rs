@@ -709,9 +709,11 @@ pub struct MultiSeqPrefillState {
 /// (`serve::gemma_live_attention`). Only the kernel policy differs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GemmaLiveAttention {
-    /// Installed long-prompt lanes and the stable cue batch: tiled F16 flash
-    /// attention for every suffix length, or the vec-hybrid kernel when
-    /// `HF2Q_GEMMA_TILED_LIVE=0`. Not bitwise equal to a per-slot resume.
+    /// Installed long-prompt lanes: tiled F16 flash attention for every
+    /// suffix length, or the vec-hybrid kernel when `HF2Q_GEMMA_TILED_LIVE=0`.
+    /// Not bitwise equal to a per-slot resume. (Stable-boundary groups of at
+    /// most 4,096 rows are admitted per slot since #728; longer prompts become
+    /// installed lanes and can still take this route, #725.)
     Tiled,
     /// Joint warm tool-turn cohort: exactly the single-slot live-resume
     /// route ([`MlxModelWeights::warm_live_kernel`], with suffixes under 32

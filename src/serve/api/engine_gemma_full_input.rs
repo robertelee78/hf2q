@@ -148,7 +148,6 @@ pub(super) enum AnchorRole {
     FullInput,
     ExactImage,
     StableBoundary,
-    StableBatchBoundary,
     RequestStartRollback,
 }
 
@@ -289,7 +288,6 @@ mod tests {
             AnchorRole::FullInput,
             AnchorRole::ExactImage,
             AnchorRole::StableBoundary,
-            AnchorRole::StableBatchBoundary,
             AnchorRole::RequestStartRollback,
         ] {
             assert_eq!(capture_or_skip(SlotId(1), role, Ok(7)).unwrap(), Some(7));

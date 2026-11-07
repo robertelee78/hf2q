@@ -159,7 +159,7 @@ Neither Gemma nor DeepSeek serving has a wall-time speculation gate.
 | 1 (#725) | Gemma | Long prompts (> 4,096 tokens) installed together: later chunks use `Tiled` F16 attention instead of vec-hybrid alone. The chunk is `budget / lanes_left`, and a 32-row lane takes `mm_id` jointly but `mv_id` alone (`engine.rs` ~14555–14735, ~6613–6637) | how many long prompts overlap | Tiled is documented as not bitwise per-slot; chunk size is Class B |
 | 2 (#726) | DeepSeek-V4 | Prefill chunk size: cooperative chunk = 2048 ÷ width; Mixed-step serial cap when any peer decodes; alignment catch-up sized by the leader's cursor (`engine.rs` ~8185–8197, ~8747–8798, ~9325–9460) | cohort width, arrival | Bitwise equality is proven only at equal chunks; chunk vs chunk is unmeasured [INFERENCE] |
 | 3 (#727) | Shared scheduler (Qwen and Gemma) | A preferred (anchored) slot is lost when it is not free or fails the shared KV budget counting others' reservations; the request is cold-prefilled (`src/serve/scheduler.rs:1189-1225`; Gemma `engine.rs:13413`) | other requests' timing and reservations | Cold vs resume is Class B |
-| 4 (#728) | Gemma | Stable warm batch on `Tiled` vs per-slot admission, decided by the 25 ms wall-clock admission window (`engine.rs:6307`; `HF2Q_ADMIT_COALESCE_US` up to 100 ms, `:12043-12047`, loop `:12137-12162`; also gates `admit_gemma4_slots_batched`, `:12576`) | arrival within the window | Tiled is not bitwise per-slot; low reach (canonical cue under 32 rows) [INFERENCE] |
+| 4 (#728) | Gemma | Stable warm batch on `Tiled` vs per-slot admission, decided by the 25 ms wall-clock admission window (`engine.rs:6307`; `HF2Q_ADMIT_COALESCE_US` up to 100 ms, `:12043-12047`, loop `:12137-12162`; also gates `admit_gemma4_slots_batched`, `:12576`) | arrival within the window | Tiled is not bitwise per-slot; low reach (canonical cue under 32 rows) [INFERENCE]. **Fixed by #739:** stable-boundary groups that are not a joint cold cohort are admitted per slot, so for prompts up to 4,096 tokens the window only affects throughput (gate `gemma_stable_warm_group_is_independent_of_the_admission_window`; it fails on the pre-fix main) |
 | 5 (#729) | Multi-model process | Kernel routing policy is process-global and cached on first use (`engine_qwen35.rs:277-292`). If Qwen3.8 loads first, every family inherits `MVN=0`/`MV_EXT=1`; if it loads second, Qwen3.8 runs padded mode on kernels fixed earlier. The per-turn joint re-check itself changes no numbers (exact joint and serial are bitwise equal) | model-load order | Different kernel routes |
 | 6 (#730) | Qwen (prefix resume) | The prefix-resume budget is 5% of memory available at startup, with eviction by bytes (`lcp_registry.rs:130-227`), so resume vs cold prefill depends on host state and other requests (#717 residual risk) | host memory, other requests | Cold vs resume is Class B |
 
@@ -167,7 +167,7 @@ Proposed directions:
 1. A per-lane chunk plan and attention kernel that do not depend on co-installation.
 2. Fixed chunk sizes independent of width and peer state.
 3. Reserve or wait for the anchored slot rather than cold-prefill, or document it as budget-bound behaviour.
-4. Make the stable-batch kernel match the per-slot route.
+4. Make the stable-batch kernel match the per-slot route. (Done by routing the group per slot, #739.)
 5. Make routing per worker rather than process-global.
 6. Document it, or pin resume to deterministic capacity.
 
