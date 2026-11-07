@@ -108,7 +108,8 @@ fn qwen36_moe_route_q1_envelope_trace() {
     let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     let route = model.moe_ffn_decode_route();
-    let expected = if std::env::var("HF2Q_QWEN_MOE_BATCHED").as_deref() == Ok("1") { "batched_native" } else { "per_row_bf16" };
+    let batched = super::moe_batched::parse_qwen_moe_batched(std::env::var("HF2Q_QWEN_MOE_BATCHED").ok().as_deref());
+    let expected = if batched == Ok(true) { "batched_native" } else { "per_row_bf16" };
     assert_eq!(route, expected, "MoE decode route does not follow HF2Q_QWEN_MOE_BATCHED");
     let layers = model.cfg.num_hidden_layers as usize;
     let longest = prompts.iter().map(Vec::len).max().expect("prompts");
