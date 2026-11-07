@@ -54,7 +54,7 @@ width). No `src/` occurrence of the three names remains.
 - `HF2Q_GEMMA_JOINT_WARM_PREFILL` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the Gemma 4 joint warm prefill kill switch (ADR-063 Stage 1). Unset or `1`/`on`/`true`: same-step warm tool-turn suffixes share one bitwise-exact transaction; `0`/`off`/`false` restores per-slot warm prefill. Invalid values warn and keep the default. Read once per SlotAware worker; also off when `HF2Q_CROSS_SLOT_ADMIT` is off, `HF2Q_PREFILL_SLOT_BATCHED=0` or `HF2Q_MM_ID_ROUTING_THRESHOLD` is set.
 - `HF2Q_GEMMA_WARM_TILED_ATTENTION` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects the Gemma 4 warm-prefill attention kernel (ADR-063 Stage 2). Unset or `0`/`off`/`false` (default since the 2026-11-01 quality gate): vec-hybrid warm attention. `1`/`on`/`true`: single-slot warm prefills, joint warm cohorts and installed long-prompt lanes attend with tiled F16 flash attention (suffixes under 32 rows keep vec-hybrid); this route changed agent decisions on the canonical four-agent task. Invalid values warn and keep the default. Read once per model load.
 - `HF2Q_GEMMA4_GGUF` (`development-only`) names the official Gemma 4 GGUF for the ignored real-artifact checkpoint/warmup/joint-warm-prefill/warm-tiled-attention tests.
-- `HF2Q_GEMMA_TILED_LIVE` (`development-only`) governs only the `Tiled` live route, which no serving path selects any more: stable-boundary groups are admitted per slot since #728, and installed long-prompt lanes follow `HF2Q_GEMMA_WARM_TILED_ATTENTION` since #725, as warm prefills do.
+- `HF2Q_GEMMA_TILED_LIVE` is removed with the `Tiled` live attention route it switched, which no serving path selected after #725 and #728; every live resume follows `HF2Q_GEMMA_WARM_TILED_ATTENTION`.
 - `HF2Q_QWEN_JOINT_DECODE` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the Qwen joint decode switch. Unset, it is on for dense (Qwen3.8) and MoE (Qwen3.6) artifacts; `0`/`off`/`false` restores serial per-slot decode, including MTP K3 and history speculation.
 - `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` (`development-only`) sets the Qwen joint width, 2..8 with a default of 4; the padded `mul_mv_ext` mode caps at 4.
 - `HF2Q_QWEN_JOINT_FFN_SHARED` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the kill switch for the weight-shared dense FFN of the padded Qwen joint mode. Unset or `1`/`on`/`true`: gate and up run as separate width-4 products (weights read once per step) followed by `silu_mul`; `0`/`off`/`false` restores the serial builder's per-row fused gate/up kernel. Exact mode ignores it. Read once at worker start; invalid values warn and keep the default.
@@ -282,7 +282,6 @@ this release:
 | `HF2Q_GEMMA_N8_RESUME_REPEATS` | `development-only` | 1 |
 | `HF2Q_GEMMA_PREFILL_CATSPLIT` | `development-only` | 3 |
 | `HF2Q_GEMMA_ROUTING_OVERLAP` | `development-only` | 5 |
-| `HF2Q_GEMMA_TILED_LIVE` | `development-only` | 4 |
 | `HF2Q_GEMMA_WARM_TILED_ATTENTION` | `documented-escape` | 7 |
 | `HF2Q_GLOBAL_FA` | `development-only` | 7 |
 | `HF2Q_GPU_BUSY` | `development-only` | 5 |

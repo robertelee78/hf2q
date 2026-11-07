@@ -23,7 +23,7 @@
 //!   body (byte-identical to N serial `forward_decode_slot_aware` calls),
 //!   one step per cue position, logits read from the decode tick's own
 //!   source; cues of 33 rows or more (all lanes) take one joint live resume
-//!   with `GemmaLiveAttention::PerSlotExact`; a 32-row cue, or a long cue
+//!   (the single-slot warm route); a 32-row cue, or a long cue
 //!   beside a short one, runs the per-slot resume inside the transaction.
 //!
 //! Failure semantics (design §4.5):
@@ -819,7 +819,6 @@ pub(super) fn encode_cues(
                     &seqs,
                     scaffold,
                     reserve,
-                    GemmaLiveAttention::PerSlotExact,
                     &mut guard.model.ctx,
                 )
             })?

@@ -645,8 +645,8 @@ pub struct MlxModelWeights {
     pub multi_seq_prefill: Option<MultiSeqPrefillState>,
 
     /// ADR-063 Stage 2 — kernel of warm live-resume attention: every
-    /// single-slot resume and every [`GemmaLiveAttention::PerSlotExact`]
-    /// cohort lane (joint warm, stable cue and installed long-prompt lanes).
+    /// single-slot resume and every resumed multi-sequence lane (joint warm,
+    /// stable cue and installed long-prompt lanes).
     /// Resolved once at load from `HF2Q_GEMMA_WARM_TILED_ATTENTION` (default
     /// [`GemmaLiveKernel::VecHybrid`]; `1` opts in to
     /// [`GemmaLiveKernel::TiledF16`]).
@@ -688,9 +688,6 @@ pub struct MultiSeqPrefillState {
     /// multi-sequence attention reads layer geometry (capacity, ring, V
     /// dtype) from them and mounts them as the model's hybrid KV for the call.
     pub full_views_hybrid: Vec<HybridKvBuffers>,
-    /// Attention route of a resumed (live) multi-sequence prefill. Ignored by
-    /// cold multi-sequence prefill, which never reads a slot's history.
-    pub live_attention: GemmaLiveAttention,
     /// Filled by the head delta: each seq's first decoded (greedy argmax)
     /// token. Length `== seq_lens.len()` on return. Empty until the head runs.
     pub out_first_tokens: Vec<u32>,
@@ -700,28 +697,6 @@ pub struct MultiSeqPrefillState {
     /// transformer-body pass. Returning only argmax tokens would silently
     /// weaken native tool semantics for batched agent requests.
     pub out_logits: Vec<Vec<f32>>,
-}
-
-/// Attention route for resumed multi-sequence Gemma prefill. Row-parallel work
-/// (projections, norms, FFN/MoE, per-row head) runs once over every suffix row
-/// in both routes; per-sequence attention against each slot's own KV runs
-/// through the one shared live-attention function
-/// (`serve::gemma_live_attention`). Only the kernel policy differs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GemmaLiveAttention {
-    /// Tiled F16 flash attention for every suffix length, or the vec-hybrid
-    /// kernel when `HF2Q_GEMMA_TILED_LIVE=0`. Not bitwise equal to a per-slot
-    /// resume. No serving path selects it any more: stable-boundary groups of
-    /// at most 4,096 rows are admitted per slot since #728, and installed
-    /// long-prompt lanes take `PerSlotExact` since #725. Cold multi-sequence
-    /// prefill carries it as an unused placeholder.
-    Tiled,
-    /// Joint warm tool-turn cohort and installed long-prompt lanes: exactly
-    /// the single-slot live-resume route
-    /// ([`MlxModelWeights::warm_live_kernel`], with suffixes under 32 rows on
-    /// vec-hybrid), the slot view addressed as slot 0, so every lane is
-    /// bitwise equal to its per-slot resume.
-    PerSlotExact,
 }
 
 /// Kernel of the per-sequence live (warm-resume) attention.

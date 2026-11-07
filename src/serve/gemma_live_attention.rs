@@ -31,12 +31,12 @@
 //! Everything that reaches a kernel is a function of the sequence alone
 //! (its rows, start, KV view and Q/K/V rows), so a lane of a joint cohort is
 //! bitwise equal to the same sequence prefilled alone whenever both resolve
-//! the same kernel. [`LiveRoute`] guarantees that: a single-slot resume and a
-//! [`GemmaLiveAttention::PerSlotExact`] cohort resolve the identical route.
+//! the same kernel. [`LiveRoute`] guarantees that: a single-slot resume and
+//! every multi-sequence lane resolve the one warm route.
 use anyhow::Result;
 use mlx_native::{DType, GraphSession, KernelRegistry, MlxBuffer, MlxDevice};
 
-use crate::inference::models::gemma4::{GemmaLiveAttention, GemmaLiveKernel, HybridKvBuffers};
+use crate::inference::models::gemma4::{GemmaLiveKernel, HybridKvBuffers};
 use crate::serve::forward_prefill::GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS;
 
 /// Vec-hybrid query chunk: bounds the attention scratch while keeping every
@@ -113,58 +113,24 @@ pub(crate) fn default_warm_live_kernel() -> GemmaLiveKernel {
     warm_kernel_for_switch(None)
 }
 
-/// `HF2Q_GEMMA_TILED_LIVE`: the `Tiled` route
-/// ([`GemmaLiveAttention::Tiled`]), which no serving path selects since #725
-/// and #728.
-fn tiled_live_enabled() -> bool {
-    !matches!(
-        std::env::var("HF2Q_GEMMA_TILED_LIVE").as_deref(),
-        Ok("0") | Ok("false") | Ok("off")
-    )
-}
-
-/// Attention route of one live-resume forward.
+/// Attention route of one live-resume forward: the model's warm kernel, with
+/// suffixes under [`WARM_TILED_MIN_ROWS`] on `VecHybrid`. Single-slot
+/// resumes and every multi-sequence lane take this one route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LiveRoute {
     kernel: GemmaLiveKernel,
-    /// Under `TiledF16`, sequences with fewer rows keep `VecHybrid`.
-    min_tiled_rows: usize,
 }
 
 impl LiveRoute {
-    /// `attention` is the multi-sequence descriptor's route, `None` for a
-    /// single-slot resume.
-    pub(crate) fn resolve(
-        attention: Option<GemmaLiveAttention>,
-        warm_kernel: GemmaLiveKernel,
-    ) -> Self {
-        Self::select(attention, warm_kernel, tiled_live_enabled())
-    }
-
-    fn select(
-        attention: Option<GemmaLiveAttention>,
-        warm_kernel: GemmaLiveKernel,
-        tiled_live: bool,
-    ) -> Self {
-        match attention {
-            Some(GemmaLiveAttention::Tiled) => Self {
-                kernel: if tiled_live {
-                    GemmaLiveKernel::TiledF16
-                } else {
-                    GemmaLiveKernel::VecHybrid
-                },
-                min_tiled_rows: 0,
-            },
-            None | Some(GemmaLiveAttention::PerSlotExact) => Self {
-                kernel: warm_kernel,
-                min_tiled_rows: WARM_TILED_MIN_ROWS,
-            },
+    pub(crate) fn resolve(warm_kernel: GemmaLiveKernel) -> Self {
+        Self {
+            kernel: warm_kernel,
         }
     }
 
     pub(crate) fn seq_kernel(self, rows: usize) -> GemmaLiveKernel {
         match self.kernel {
-            GemmaLiveKernel::TiledF16 if rows >= self.min_tiled_rows => GemmaLiveKernel::TiledF16,
+            GemmaLiveKernel::TiledF16 if rows >= WARM_TILED_MIN_ROWS => GemmaLiveKernel::TiledF16,
             _ => GemmaLiveKernel::VecHybrid,
         }
     }
@@ -177,10 +143,9 @@ impl LiveRoute {
 
     /// Prefill banner fragment.
     pub(crate) fn label(self) -> &'static str {
-        match (self.kernel, self.min_tiled_rows) {
-            (GemmaLiveKernel::VecHybrid, _) => "vec-hybrid",
-            (GemmaLiveKernel::TiledF16, 0) => "tiled-f16",
-            (GemmaLiveKernel::TiledF16, _) => "tiled-f16 (vec-hybrid below 32 rows)",
+        match self.kernel {
+            GemmaLiveKernel::VecHybrid => "vec-hybrid",
+            GemmaLiveKernel::TiledF16 => "tiled-f16 (vec-hybrid below 32 rows)",
         }
     }
 }
@@ -1014,44 +979,14 @@ mod tests {
     }
 
     #[test]
-    fn single_slot_and_joint_cohort_always_resolve_the_same_route() {
-        for warm in [TiledF16, VecHybrid] {
-            for tiled_live in [true, false] {
-                let single = LiveRoute::select(None, warm, tiled_live);
-                let joint =
-                    LiveRoute::select(Some(GemmaLiveAttention::PerSlotExact), warm, tiled_live);
-                assert_eq!(single, joint, "warm={warm:?} tiled_live={tiled_live}");
-                for rows in [1, 31, 32, 33, 56, 385, 4096] {
-                    assert_eq!(single.seq_kernel(rows), joint.seq_kernel(rows));
-                }
-            }
-        }
-    }
-
-    #[test]
     fn warm_route_follows_its_switch_and_keeps_tiny_suffixes_on_vec_hybrid() {
-        // `HF2Q_GEMMA_TILED_LIVE` never moves the warm route.
-        for tiled_live in [true, false] {
-            let tiled = LiveRoute::select(None, TiledF16, tiled_live);
-            assert_eq!(tiled.seq_kernel(1), VecHybrid);
-            assert_eq!(tiled.seq_kernel(31), VecHybrid);
-            assert_eq!(tiled.seq_kernel(32), TiledF16);
-            assert_eq!(tiled.seq_kernel(385), TiledF16);
-            let vec = LiveRoute::select(None, VecHybrid, tiled_live);
-            assert_eq!(vec.seq_kernel(385), VecHybrid);
-        }
-    }
-
-    #[test]
-    fn tiled_route_keeps_its_own_switch_and_tiles_every_length() {
-        // `HF2Q_GEMMA_WARM_TILED_ATTENTION` never moves the `Tiled` route.
-        for warm in [TiledF16, VecHybrid] {
-            let on = LiveRoute::select(Some(GemmaLiveAttention::Tiled), warm, true);
-            assert_eq!(on.seq_kernel(1), TiledF16, "a 1-row sequence stays tiled");
-            assert_eq!(on.seq_kernel(4096), TiledF16);
-            let off = LiveRoute::select(Some(GemmaLiveAttention::Tiled), warm, false);
-            assert_eq!(off.seq_kernel(4096), VecHybrid);
-        }
+        let tiled = LiveRoute::resolve(TiledF16);
+        assert_eq!(tiled.seq_kernel(1), VecHybrid);
+        assert_eq!(tiled.seq_kernel(31), VecHybrid);
+        assert_eq!(tiled.seq_kernel(32), TiledF16);
+        assert_eq!(tiled.seq_kernel(385), TiledF16);
+        let vec = LiveRoute::resolve(VecHybrid);
+        assert_eq!(vec.seq_kernel(385), VecHybrid);
     }
 
     #[test]
@@ -1061,10 +996,10 @@ mod tests {
             rows,
             start: 465,
         };
-        let tiled = LiveRoute::select(None, TiledF16, true);
+        let tiled = LiveRoute::resolve(TiledF16);
         assert!(!tiled.uses_vec(&[span(56), span(385)]));
         assert!(tiled.uses_vec(&[span(56), span(5)]));
-        assert!(LiveRoute::select(None, VecHybrid, true).uses_vec(&[span(56)]));
+        assert!(LiveRoute::resolve(VecHybrid).uses_vec(&[span(56)]));
     }
 
     #[test]
