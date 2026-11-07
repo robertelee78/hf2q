@@ -24,7 +24,8 @@ use std::path::PathBuf;
 use sha2::{Digest, Sha256};
 
 use super::real_artifact_joint_decode_invariance_tests::cache_with_capacity;
-use super::real_artifact_joint_decode_tests::{argmax, load, SLOTS};
+use super::model::Qwen35Model;
+use super::real_artifact_joint_decode_tests::{argmax, SLOTS};
 use super::spec_decode::positions_for_range;
 use crate::serve::multi_seq_kv::SlotId;
 
@@ -99,15 +100,27 @@ fn qwen36_moe_route_q1_envelope_trace() {
         assert!(forced.iter().all(|t| t.len() >= steps), "forced lists cover every step");
     }
     let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let model = load("HF2Q_QWEN36_GGUF");
+    // Load and prime in place: the thread-local GPU cache is keyed by the model's address, so the
+    // model must not move after `ensure_gpu_cache_primed`.
+    let gguf_path = std::env::var_os("HF2Q_QWEN36_GGUF").map(PathBuf::from).expect("HF2Q_QWEN36_GGUF");
+    let gguf = mlx_native::gguf::GgufFile::open(&gguf_path).expect("open GGUF");
+    let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
+    let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
+    model.ensure_gpu_cache_primed().expect("prime GPU cache");
+    let route = model.moe_ffn_decode_route();
+    let expected = if std::env::var("HF2Q_QWEN_MOE_BATCHED").as_deref() == Ok("1") { "batched_native" } else { "per_row_bf16" };
+    assert_eq!(route, expected, "MoE decode route does not follow HF2Q_QWEN_MOE_BATCHED");
     let layers = model.cfg.num_hidden_layers as usize;
     let longest = prompts.iter().map(Vec::len).max().expect("prompts");
     let capacity = u32::try_from((longest + steps + 16).next_multiple_of(256)).expect("capacity");
 
     let mut rows = Vec::with_capacity(prompts.len() * steps);
     let mut consumed = vec![Vec::with_capacity(steps); prompts.len()];
-    for (group, chunk) in prompts.chunks(SLOTS as usize).enumerate() {
-        let mut cache = cache_with_capacity(&model, capacity);
+    let mut caches = prompts
+        .chunks(SLOTS as usize)
+        .map(|_| cache_with_capacity(&model, capacity))
+        .collect::<Vec<_>>();
+    for ((group, chunk), cache) in prompts.chunks(SLOTS as usize).enumerate().zip(caches.iter_mut()) {
         for (offset, tokens) in chunk.iter().enumerate() {
             let agent = group * SLOTS as usize + offset;
             let slot = SlotId(offset as u32);
@@ -115,7 +128,7 @@ fn qwen36_moe_route_q1_envelope_trace() {
             for start in (0..tokens.len()).step_by(PREFILL_CHUNK) {
                 let piece = &tokens[start..(start + PREFILL_CHUNK).min(tokens.len())];
                 logits = model
-                    .forward_gpu_last_logits(piece, &positions_for_range(start as i32, piece.len()), &mut cache, slot)
+                    .forward_gpu_last_logits(piece, &positions_for_range(start as i32, piece.len()), cache, slot)
                     .expect("chunked prefill");
             }
             for step in 0..steps {
@@ -125,7 +138,7 @@ fn qwen36_moe_route_q1_envelope_trace() {
                 let token = forced.as_ref().map_or_else(|| argmax(&logits), |f| f[agent][step]);
                 consumed[agent].push(token);
                 logits = model
-                    .forward_gpu_last_logits(&[token], &[position as i32; 4], &mut cache, slot)
+                    .forward_gpu_last_logits(&[token], &[position as i32; 4], cache, slot)
                     .expect("decode step");
             }
         }
@@ -137,6 +150,7 @@ fn qwen36_moe_route_q1_envelope_trace() {
         "prompt_tokens": prompts.iter().map(Vec::len).collect::<Vec<_>>(),
         "steps": steps,
         "moe_batched": std::env::var("HF2Q_QWEN_MOE_BATCHED").ok(),
+        "moe_ffn_decode_route": route,
         "teacher_forcing": if forced.is_some() { "forced tokens file" } else { "own greedy top-1" },
         "forced": std::env::var(FORCED_ENV).ok(),
     });
