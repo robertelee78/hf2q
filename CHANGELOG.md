@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Qwen resumed prefill (ADR-063 gap program F3): `HF2Q_QWEN_PREFILL_TENSOR_ATTN=1` routes resumed chunks with more than 32 queries on TQ-only KV through mlx-native's tensor-API flash attention, over an F16 prefix dequantized in the FWHT-rotated domain. Default off, with a fallback to the BF16 bridge when the device lacks the tensor API. The route numerics are Q1 Class B against the bridge. The resolved route appears on the load banner and in `active_controls.qwen_prefill_attention` (`docs/research/adr063-qwen38-prefill-tensor-attn.md`).
 - Diagnostics: `scripts/four_agent/q2_traced_run.py` now traces DeepSeek-V4 four-slot cases as well as Qwen3.8 (gap program S3). The case's family selects the witness manifest of sources its engine publishes, and only a case that declares a text-only locator gets one. Q2 window freezing still takes Qwen3.8 runs only. With `--gpu-timestamps`, a traced DeepSeek-V4 run records per-command GPU time.
 - Diagnostics (ADR-063 Q4-TRACE-GPU-TIMING): traced runs can opt in to per-command GPU timestamps (`native_observer.gpu_timestamps: true`; `q2_traced_run.py --gpu-timestamps`).
   - The phase trace records mlx-native's existing per-command GPU timing stream (Metal command-buffer start and end) in the same ordered queue as the native events, plus the joint forward's command plan and paired host clock samples.

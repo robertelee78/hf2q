@@ -91,8 +91,13 @@ fn q1_qwen_actual_endpoint_trace() {
     let planned_payload = super::qwen_checkpoint::planned_payload(&preplanned_cache,
         header_cfg.vocab_size as usize,packet.requested_payload_limit).unwrap();
     let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
-    let model =
+    let mut model =
         crate::inference::models::qwen35::model::Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .unwrap();
+    // ADR-063 F3: the T1/T3 resumed chunk takes the route this process's
+    // HF2Q_QWEN_PREFILL_TENSOR_ATTN resolves to, recorded in `actual_route`.
+    model.prefill_attention =
+        crate::inference::models::qwen35::prefill_tensor_attn::resolve_prefill_attention_from_process()
             .unwrap();
     assert_eq!(model.cfg.vocab_size, packet.workload.vocab_size);
     acquisition_scope

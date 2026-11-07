@@ -171,6 +171,11 @@ pub struct Qwen35Model {
     /// positions `0..n_slots`; the request path applies the resulting
     /// position offset. Off unless `--kv-graft` bound one at serve time.
     pub kv_graft: Option<crate::inference::graft::BoundGraft>,
+    /// ADR-063 F3: attention route for resumed-prefill chunks with a cached
+    /// prefix and more than 32 queries on a TQ-only slot. Default
+    /// `Bridge`; the serving load resolves `HF2Q_QWEN_PREFILL_TENSOR_ATTN`
+    /// once ([`super::prefill_tensor_attn::resolve_prefill_attention_from_process`]).
+    pub prefill_attention: super::prefill_tensor_attn::QwenPrefillAttention,
     /// Present only on the evidence-bearing copied-load path. Ordinary Qwen
     /// loading remains behaviorally unchanged until it opts into that path.
     #[cfg(test)]
@@ -227,6 +232,7 @@ impl Qwen35Model {
             mtp: None,
             glp: None,
             kv_graft: None,
+            prefill_attention: Default::default(),
             #[cfg(test)]
             loaded_candidate_identity: None,
             cfg,
@@ -474,6 +480,7 @@ impl Qwen35Model {
             mtp,
             glp: None,
             kv_graft: None,
+            prefill_attention: Default::default(),
             #[cfg(test)]
             loaded_candidate_identity: None,
         })

@@ -1966,6 +1966,7 @@ fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
         kv_bytes_per_token_override: None,
         kv_fixed_bytes_per_slot_override: None,
         gemma_warm_attention_kernel: None,
+        qwen_prefill_attention: None,
     })
 }
 
@@ -4067,6 +4068,7 @@ impl LoadInfoBuilder for GemmaLoadedModel {
                 &self.config,
             )),
             gemma_warm_attention_kernel: Some(self.weights.warm_live_kernel.wire_name()),
+            qwen_prefill_attention: None,
         }
     }
 }

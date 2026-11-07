@@ -1021,6 +1021,7 @@ impl Qwen35Model {
             mtp: None,
             glp: None,
             kv_graft: None,
+            prefill_attention: Default::default(),
             #[cfg(test)]
             loaded_candidate_identity: None,
         })

@@ -6,7 +6,8 @@ use super::{
     receipt::Family,
 };
 use crate::inference::models::qwen35::{
-    kv_cache::HybridKvCache, model::Qwen35Model, spec_decode::positions_for_range, Qwen35Variant,
+    kv_cache::HybridKvCache, model::Qwen35Model, prefill_tensor_attn::QwenPrefillAttention,
+    spec_decode::positions_for_range, Qwen35Variant,
 };
 use crate::serve::multi_seq_kv::SlotId;
 use anyhow::{ensure, Result};
@@ -36,7 +37,7 @@ pub fn run(
     model.ensure_gpu_cache_primed()?;
     let mut evidence = ExecutionEvidence {
         trajectory,
-        actual_route: "Qwen actual forward_gpu All + TQ8 independent serial slot0 caches".into(),
+        actual_route: actual_route(model.prefill_attention),
         positions_per_lane: vec![0; 4],
         checked_terminal_calls: 0,
         observed_calls: vec![],
@@ -118,6 +119,17 @@ pub fn run(
     evidence.validate().map_err(anyhow::Error::msg)?;
     Ok(evidence)
 }
+
+/// The shipped route string, extended with the resumed-prefill attention
+/// route (ADR-063 F3) whenever the switch was requested.
+fn actual_route(prefill_attention: QwenPrefillAttention) -> String {
+    let base = "Qwen actual forward_gpu All + TQ8 independent serial slot0 caches";
+    match prefill_attention {
+        QwenPrefillAttention::Bridge => base.into(),
+        route => format!("{base}; resumed prefill attention {}", route.label()),
+    }
+}
+
 fn forward(
     model: &Qwen35Model,
     lane: usize,

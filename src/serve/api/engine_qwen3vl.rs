@@ -482,6 +482,7 @@ impl LoadInfoBuilder for Qwen3VlTextLoadedModel {
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
             gemma_warm_attention_kernel: None,
+            qwen_prefill_attention: None,
         }
     }
 }

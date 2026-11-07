@@ -5999,6 +5999,28 @@ pub fn apply_sdpa_with_kv_cache(
                         head_dim,
                         slot_id,
                     )?
+                } else if let Some(out) = super::prefill_tensor_attn::with_active_chunk(|chunk| {
+                    // ADR-063 F3 route (c′): a tensor scope is open only
+                    // when HF2Q_QWEN_PREFILL_TENSOR_ATTN resolved to the
+                    // tensor route; `q_rope` has no reader after attention,
+                    // so the route rotates it in place.
+                    super::prefill_tensor_attn::apply_tq_prefill_seq_major_resume_tensor_for_slot(
+                        device,
+                        registry,
+                        slot,
+                        q_seq_major,
+                        seq_len,
+                        cur_len as u32,
+                        kv_seq_len,
+                        max_seq_len,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        slot_id,
+                        chunk,
+                    )
+                }) {
+                    out?
                 } else {
                     apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
                         device,

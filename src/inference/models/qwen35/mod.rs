@@ -86,6 +86,7 @@ pub mod model;
 pub mod moe;
 pub mod mtp;
 pub mod mtp_weights_load;
+pub mod prefill_tensor_attn;
 mod source_config;
 pub(crate) mod source_precision;
 pub mod spec_decode;

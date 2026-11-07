@@ -693,6 +693,58 @@ impl FullAttnKvSlot {
         )
     }
 
+    /// Dequantize positions `[0, n_tokens)` of this slot's TQ K or V into the
+    /// caller's F16 `dst` as `[n_kv_heads, n_tokens, head_dim]`, in the
+    /// FWHT-rotated domain (no undo), equal to `half(F32 dequant)` bitwise.
+    /// Staging for the tensor resumed-prefill route (ADR-063 F3): only the
+    /// first `n_kv_heads · n_tokens · head_dim` elements of `dst` are written.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dequant_seq_to_f16_rotated_into_for_slot(
+        &self,
+        is_k: bool,
+        n_tokens: u32,
+        cache_capacity: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        slot_id: crate::serve::multi_seq_kv::SlotId,
+        dst: &MlxBuffer,
+        encoder: &mut mlx_native::CommandEncoder,
+        registry: &mut mlx_native::KernelRegistry,
+        device: &MlxDevice,
+    ) -> Result<()> {
+        let tq = self.tq.as_ref().ok_or_else(|| {
+            anyhow!("FullAttnKvSlot::dequant_seq_to_f16_rotated_into: slot.tq is None")
+        })?;
+        let cb_env = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
+        let codebook_bits: u32 = if matches!(cb_env, 5 | 6 | 8) {
+            cb_env
+        } else {
+            8
+        };
+        let views = tq.slot_views(slot_id, n_kv_heads, cache_capacity, head_dim)?;
+        let (packed, norms) = if is_k {
+            (&views.k_packed, &views.k_norms)
+        } else {
+            (&views.v_packed, &views.v_norms)
+        };
+        mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_hb_kv_seq_f16(
+            encoder,
+            registry,
+            device.metal_device(),
+            packed,
+            norms,
+            dst,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            /*start_pos=*/ 0,
+            n_tokens,
+            /*scale_factor_d512=*/ 1.0,
+            codebook_bits,
+        )
+        .map_err(|e| anyhow!("dequant_seq_to_f16_rotated_into: {e}"))
+    }
+
     /// ADR-027 Phase B iter-32 (sub-sub-iter 23c-β.3) — dequant + un-rotate
     /// chain: dequant TQ to temp F32 (rotated domain), then apply
     /// `FWHT × sign-undo` per-(head, position) chunk so the output is in the

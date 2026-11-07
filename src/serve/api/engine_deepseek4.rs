@@ -1967,6 +1967,7 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
                 6_880,
             )),
             gemma_warm_attention_kernel: None,
+            qwen_prefill_attention: None,
         }
     }
 }

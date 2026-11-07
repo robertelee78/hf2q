@@ -4084,6 +4084,11 @@ impl Qwen35Model {
         // accesses; durable nextn parents/rings are direct, not pool-issued.
         super::decode_pool::checked_reset_decode_pool()?;
         let seq_len = tokens.len() as u32;
+        // ADR-063 F3: with the tensor resumed-prefill route resolved, every
+        // FA layer of this chunk shares one staging/mask/blk set held here
+        // until after the forward's terminal wait. Inert on the bridge.
+        let _prefill_tensor_scope =
+            super::prefill_tensor_attn::TensorResumeScope::enter(self.prefill_attention);
         // ---- ADR-019 Phase 2 iter91 Worker B (H2 production CB-count probe) ----
         //
         // When `HF2Q_DUMP_CB_COUNT=1` is set, capture the process-global

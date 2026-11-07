@@ -346,6 +346,13 @@ pub struct LoadInfo {
     /// `None` for every other family. Published as
     /// `active_controls.gemma_warm_attention_kernel` in `/hf2q/v1/runtime`.
     pub gemma_warm_attention_kernel: Option<&'static str>,
+
+    /// Qwen resumed-prefill attention route resolved at model load
+    /// (`HF2Q_QWEN_PREFILL_TENSOR_ATTN`, ADR-063 F3): `bridge`, `tensor` or
+    /// `bridge (tensor unavailable)`. `None` for every other family.
+    /// Published as `active_controls.qwen_prefill_attention` in
+    /// `/hf2q/v1/runtime` and printed on the load banner.
+    pub qwen_prefill_attention: Option<&'static str>,
 }
 
 impl LoadInfo {
@@ -890,6 +897,9 @@ pub fn print_banner<W: std::io::Write>(
         "inactive"
     };
     writeln!(w, "{d}hf2q load: tq_kv = {}{r}", tq_kv_text)?;
+    if let Some(route) = info.qwen_prefill_attention {
+        writeln!(w, "{d}hf2q load: qwen_prefill_attention = {route}{r}")?;
+    }
     writeln!(
         w,
         "{d}hf2q load: ready in {:.2} s{r}",
@@ -1620,6 +1630,7 @@ mod tests {
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
             gemma_warm_attention_kernel: None,
+            qwen_prefill_attention: None,
         };
 
         let cloned = info.clone();
@@ -1672,6 +1683,7 @@ mod tests {
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
             gemma_warm_attention_kernel: None,
+            qwen_prefill_attention: None,
         }
     }
 
@@ -1918,6 +1930,7 @@ mod tests {
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
             gemma_warm_attention_kernel: None,
+            qwen_prefill_attention: None,
         };
         assert_eq!(info.arch_family, ArchFamily::Gemma4);
         assert_eq!(info.quant_label, Some("Q6_K".to_string()));
@@ -2327,6 +2340,7 @@ mod tests {
             kv_bytes_per_token_override: Some(exact),
             kv_fixed_bytes_per_slot_override: Some(super::gemma4_fixed_kv_bytes_per_slot(&cfg)),
             gemma_warm_attention_kernel: Some("VecHybrid"),
+            qwen_prefill_attention: None,
         };
         // Override wins over the flattened formula.
         assert_eq!(

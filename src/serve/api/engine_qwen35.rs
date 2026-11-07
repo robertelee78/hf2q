@@ -363,6 +363,10 @@ impl Qwen35LoadedModel {
         );
         let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
             .context("Qwen35Model::load_from_gguf")?;
+        // ADR-063 F3: resolve HF2Q_QWEN_PREFILL_TENSOR_ATTN once per load
+        // (default bridge; falls back to the bridge without the tensor API).
+        model.prefill_attention =
+            crate::inference::models::qwen35::prefill_tensor_attn::resolve_prefill_attention_from_process()?;
 
         // ADR-053: bind a GLP steering vector when the operator supplied one.
         // Fail-closed: any loader/conformance error aborts the serve load
@@ -1097,6 +1101,7 @@ impl LoadInfoBuilder for Qwen35LoadedModel {
             )),
             kv_fixed_bytes_per_slot_override: Some(load_info::qwen35_fixed_kv_bytes_per_slot(cfg)),
             gemma_warm_attention_kernel: None,
+            qwen_prefill_attention: Some(self.model.prefill_attention.label()),
         }
     }
 }
