@@ -63,9 +63,50 @@ static RESUME_ATTN_FAST: LazyLock<bool> = LazyLock::new(|| {
     parse_resume_attn_fast(std::env::var(QWEN_RESUME_ATTN_FAST_ENV).ok().as_deref())
 });
 
-/// Whether `HF2Q_QWEN_RESUME_ATTN_FAST` is on (read once per process).
+/// Whether `HF2Q_QWEN_RESUME_ATTN_FAST` is on (read once per process). Test
+/// builds honour a [`ForceResumeAttnRoute`] scope on the calling thread first.
 pub(crate) fn resume_attn_fast_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(fast) = FORCED_ROUTE.with(std::cell::Cell::get) {
+        return fast;
+    }
     *RESUME_ATTN_FAST
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCED_ROUTE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static FAST_ROUTE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: while alive, route (c) on this thread takes the fast path
+/// (`fast`) or the shipped bridge (`!fast`) regardless of the switch, which
+/// is read once per process.
+#[cfg(test)]
+pub(crate) struct ForceResumeAttnRoute {
+    previous: Option<bool>,
+}
+
+#[cfg(test)]
+impl ForceResumeAttnRoute {
+    pub(crate) fn new(fast: bool) -> Self {
+        Self {
+            previous: FORCED_ROUTE.with(|cell| cell.replace(Some(fast))),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceResumeAttnRoute {
+    fn drop(&mut self) {
+        FORCED_ROUTE.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Test-only: fast-route layer calls committed on this thread so far.
+#[cfg(test)]
+pub(crate) fn fast_route_calls() -> u64 {
+    FAST_ROUTE_CALLS.with(std::cell::Cell::get)
 }
 
 /// Route (c) buffers that depend on the attended length, plus the F32
@@ -281,6 +322,8 @@ pub(crate) fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_fast(
         slot_id,
         arena,
     )?;
+    #[cfg(test)]
+    FAST_ROUTE_CALLS.with(|calls| calls.set(calls.get() + 1));
     enc.commit_labeled("layer.full_attn.tq_bridge_resume");
     // Release the submitted encoder so the native observer retains this
     // command before the layer's next wait checks the queue.
