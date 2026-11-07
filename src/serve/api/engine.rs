@@ -15562,6 +15562,10 @@ fn admit_gemma4_slots_batched(
 /// transaction (ADR-063 Q4-GEMMA-COLD); every other group is admitted per
 /// slot through the single-request resume, so a request's numerics never
 /// depend on which requests shared its admission window (#728).
+#[cfg(test)]
+pub(crate) static GEMMA4_STABLE_GROUP_LANES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[allow(clippy::too_many_arguments)]
 fn admit_gemma4_slots_stable_batched(
     guard: &mut Gemma4KvGuard<'_>,
@@ -15636,6 +15640,10 @@ fn admit_gemma4_slots_stable_batched(
     // suffix body would be a different attention route (not bitwise equal to
     // the per-slot resume), and whether a group forms depends on the
     // admission coalesce window, so the window may only change throughput.
+    #[cfg(test)]
+    if requests.len() >= 2 {
+        GEMMA4_STABLE_GROUP_LANES.fetch_add(requests.len(), std::sync::atomic::Ordering::Relaxed);
+    }
     let mut requests = requests.into_iter();
     while let Some((prompt_tokens, params, reply)) = requests.next() {
         if let Some(mut fatal) = admit_gemma4_slot(

@@ -1167,6 +1167,7 @@ fn gemma_stable_warm_group_is_independent_of_the_admission_window() {
             .map(|(prompt, boundary)| (prompt.clone(), greedy(4, Some(*boundary))))
             .collect();
         let t0 = serve(&engine, &turn0, false);
+        let grouped_before = GEMMA4_STABLE_GROUP_LANES.load(Ordering::Relaxed);
         let turn1: Vec<_> = lanes
             .iter()
             .enumerate()
@@ -1177,6 +1178,7 @@ fn gemma_stable_warm_group_is_independent_of_the_admission_window() {
             })
             .collect();
         let t1 = serve(&engine, &turn1, together);
+        let grouped = GEMMA4_STABLE_GROUP_LANES.load(Ordering::Relaxed) - grouped_before;
         let turn2: Vec<_> = turn1
             .iter()
             .enumerate()
@@ -1189,9 +1191,13 @@ fn gemma_stable_warm_group_is_independent_of_the_admission_window() {
         let t2 = serve(&engine, &turn2, together);
         shutdown(&rt, engine);
         std::env::remove_var(COALESCE_ENV);
-        (lanes, [t0, t1, t2])
+        (lanes, grouped, [t0, t1, t2])
     };
-    let (lanes, expected) = run("0", false);
+    let (lanes, serial_grouped, expected) = run("0", false);
+    assert_eq!(
+        serial_grouped, 0,
+        "serial turn-1 requests never share a window"
+    );
     for (agent, (_, boundary)) in lanes.iter().enumerate() {
         assert_eq!(
             expected[1][agent].cached_tokens, *boundary,
@@ -1203,12 +1209,16 @@ fn gemma_stable_warm_group_is_independent_of_the_admission_window() {
             "reference turn 2 agent {agent} resumed its turn-1 boundary anchor"
         );
     }
-    let (_, actual) = run("100000", true);
+    let (_, grouped, actual) = run("100000", true);
+    assert!(
+        grouped >= 2,
+        "the 100 ms window must group turn-1 lanes into one stable-boundary group (got {grouped})"
+    );
     for (turn, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
         assert_turns(&format!("window 100 ms turn {turn}"), actual, expected);
     }
     println!(
-        "GEMMA_STABLE_WARM_WINDOW_INDEPENDENT_COMPLETE lanes={} boundary_rows={HISTORY} cue_rows={CUE} outputs_bitwise=true anchors_bitwise=true",
+        "GEMMA_STABLE_WARM_WINDOW_INDEPENDENT_COMPLETE lanes={} grouped_lanes={grouped} boundary_rows={HISTORY} cue_rows={CUE} outputs_bitwise=true anchors_bitwise=true",
         lanes.len()
     );
 }

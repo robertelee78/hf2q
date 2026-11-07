@@ -1479,15 +1479,15 @@ write_gemma_transaction_receipt() {
   local out="$OUT_ROOT/gemma/transactions-$phase.json"
   local rows="$OUT_ROOT/gemma/transactions-$phase.rows"
   local max_rows multi_slot nonaligned
-  rg 'Gemma4 (bounded prefill transaction complete|installed prefills advanced in one aggregate-bounded transaction|stable agent suffixes prefilled in one multi-slot body)' \
+  rg 'Gemma4 (bounded prefill transaction complete|installed prefills advanced in one aggregate-bounded transaction)' \
     "$log" >"$rows"
   [[ -s "$rows" ]] || return 1
-  max_rows=$(sed -n -E 's/.*(advanced_tokens|suffix_tokens)=([0-9]+).*/\2/p' "$rows" |
+  max_rows=$(sed -n -E 's/.*advanced_tokens=([0-9]+).*/\1/p' "$rows" |
     sort -n | tail -1)
   [[ "$max_rows" =~ ^[0-9]+$ ]] && ((max_rows <= 4096)) || return 1
   multi_slot=$(rg -c 'requests=([2-9]|[1-9][0-9]+)( |$)' "$rows" || true)
   ((multi_slot > 0)) || return 1
-  nonaligned=$(sed -n -E 's/.*(advanced_tokens|suffix_tokens)=([0-9]+).*/\2/p' "$rows" |
+  nonaligned=$(sed -n -E 's/.*advanced_tokens=([0-9]+).*/\1/p' "$rows" |
     awk '$1 > 0 && $1 < 4096 {count++} END {print count + 0}')
   ((nonaligned > 0)) || return 1
   jq -n --arg status pass --arg phase "$phase" --arg rows_sha256 "$(sha256_file "$rows")" \
