@@ -295,10 +295,47 @@ define_fused_gate_up_wrapper!(
 /// Dense GGML dispatch used by every admitted Qwen text projection.
 ///
 /// Under an evidence configuration this consumes the exact policy resolved at
-/// load time.  Outside that scope it delegates to the legacy entrypoint and
-/// therefore preserves existing serving behavior.
+/// load time.  Outside that scope the `HF2Q_QWEN_ROWEXACT_PROJ` selector
+/// picks the row-exact kernel for admitted weights at decode widths, and
+/// everything else delegates to the legacy entrypoint, preserving existing
+/// serving behavior.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn quantized_matmul_ggml(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> mlx_native::Result<()> {
+    let configured = ACTIVE_CONFIGURATION.with(|slot| {
+        matches!(
+            slot.borrow().as_ref(),
+            Some(ActiveExecutionState::CopiedGgml { .. })
+        )
+    });
+    if !configured {
+        let enabled = super::rowexact_proj::qwen_rowexact_proj_requested();
+        if let Some(kernel) = super::rowexact_proj::select(enabled, weight, params) {
+            ACTIVE_CONFIGURATION.with(|slot| {
+                reject_source_teacher_quantized_dispatch(
+                    slot.borrow().as_ref(),
+                    "GGML projection dispatch",
+                )
+            })?;
+            return super::rowexact_proj::dispatch(
+                encoder, registry, device, kernel, input, weight, output, params,
+            );
+        }
+    }
+    quantized_matmul_ggml_stock(encoder, registry, device, input, weight, output, params)
+}
+
+/// Stock dense GGML dispatch (evidence policy or legacy entrypoint), never
+/// the Qwen row-exact selector (the shared helper other model families call).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn quantized_matmul_ggml_stock(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,

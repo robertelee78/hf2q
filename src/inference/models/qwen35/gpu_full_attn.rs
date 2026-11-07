@@ -68,7 +68,9 @@ use mlx_native::ops::tree_attention::{self as tree_attn_ops, TreeAttentionParams
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::encoder_stage::LayerEncoder;
-use super::execution_dispatch::{fused_qkvg_enabled, quantized_matmul_ggml};
+use super::execution_dispatch::{
+    fused_qkvg_enabled, quantized_matmul_ggml, quantized_matmul_ggml_stock,
+};
 use super::full_attn::FullAttnLayerWeights;
 use super::kv_cache::FullAttnKvSlot;
 // ADR-040 Phase B4a-cont (2026-05-23) — multi-seq slot identity routed
@@ -1213,6 +1215,9 @@ pub fn apply_linear_projection_f32_with_ggml_type(
 /// `qweight.affine` and `qweight.f16_shadow` are NOT consulted; the encoder
 /// path does not currently have F16-shadow integration. Future cleanup can
 /// converge with `dispatch_qmatmul` once tree-verify migrates to sessions.
+///
+/// Its only callers are Gemma 4 tree-verify blocks, so the U8 arm takes the
+/// stock GGML dispatch and never the Qwen `HF2Q_QWEN_ROWEXACT_PROJ` selector.
 pub fn apply_linear_projection_f32_qweight(
     encoder: &mut mlx_native::CommandEncoder,
     registry: &mut KernelRegistry,
@@ -1250,7 +1255,7 @@ pub fn apply_linear_projection_f32_qweight(
                 k: in_features,
                 ggml_type: qweight.info.ggml_dtype,
             };
-            quantized_matmul_ggml(
+            quantized_matmul_ggml_stock(
                 encoder,
                 registry,
                 device,

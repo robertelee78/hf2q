@@ -35,13 +35,15 @@ use super::{
     ForwardGpuCache, LayerWeightsGpu, OutputHeadGpu, GPU_CACHE,
 };
 use crate::inference::models::qwen35::decode_pool;
+use crate::inference::models::qwen35::delta_net::DeltaNetLayerShape;
 use crate::inference::models::qwen35::dump_bisect;
 use crate::inference::models::qwen35::ffn::MoeFfnShape;
 use crate::inference::models::qwen35::gpu_ffn::{
     build_dense_ffn_layer_gpu_q_into_with_gate_up, build_moe_ffn_layer_gpu_q_into,
-    DenseGateUpDispatch,
+    DenseFfnWeightsGpuQ, DenseGateUpDispatch, MoeDenseStorage, MoeFfnWeightsGpuQ,
 };
 use crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_into_with_ggml_type;
+use crate::inference::models::qwen35::gpu_full_attn::FullAttnQGateWeightsGpu;
 use crate::inference::models::qwen35::joint_decode_core::{
     encode_joint_delta_net_layer, encode_joint_full_attn_layer, row_view, DeltaNetRoutes,
     FullAttnRoutes, JointRows,
@@ -55,9 +57,14 @@ use crate::inference::models::qwen35::joint_decode_routes::{
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
 use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35Model};
 use crate::inference::models::qwen35::moe_batched::build_moe_ffn_layer_gpu_batched_into;
+use crate::inference::models::qwen35::mtp::{MtpFfnWeightsGpu, MtpQGateWeightsGpu, MtpWeights};
+use crate::inference::models::qwen35::rowexact_proj::{
+    qwen_rowexact_proj_requested, ProjRoute, ProjRouteCount,
+};
 use crate::inference::models::qwen35::spec_decode::nth_hidden_row;
 use crate::inference::models::qwen35::Qwen35Config;
 use crate::serve::multi_seq_kv::SlotId;
+use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 
 /// What the caller needs back for one joint row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,6 +203,208 @@ fn host_buffer<T: bytemuck::Pod>(
     Ok(buffer)
 }
 
+/// Count the gated-attention projections `[q(+gate)], k, v, o`.
+#[allow(clippy::too_many_arguments)]
+fn count_attention_projections(
+    count: &mut ProjRouteCount,
+    enabled: bool,
+    cfg: &Qwen35Config,
+    q_gate: &FullAttnQGateWeightsGpu,
+    k: (&MlxBuffer, GgmlType),
+    v: (&MlxBuffer, GgmlType),
+    o: (&MlxBuffer, GgmlType),
+) {
+    let hidden = cfg.hidden_size;
+    let q_total = cfg.num_attention_heads * cfg.head_dim;
+    let kv_total = cfg.num_key_value_heads * cfg.head_dim;
+    match q_gate {
+        FullAttnQGateWeightsGpu::Fused { weight, ggml_type } => {
+            count.add(enabled, *ggml_type, 2 * q_total, hidden, weight)
+        }
+        FullAttnQGateWeightsGpu::Split {
+            wq,
+            wq_ggml_type,
+            w_gate,
+            w_gate_ggml_type,
+        } => {
+            count.add(enabled, *wq_ggml_type, q_total, hidden, wq);
+            count.add(enabled, *w_gate_ggml_type, q_total, hidden, w_gate);
+        }
+    }
+    count.add(enabled, k.1, kv_total, hidden, k.0);
+    count.add(enabled, v.1, kv_total, hidden, v.0);
+    count.add(enabled, o.1, hidden, q_total, o.0);
+}
+
+/// Count the GGML projections of a quantized FFN that go through the
+/// projection selector: the dense down projection, and the native-storage
+/// shared expert of a MoE layer (BF16 shared experts are not GGML).
+fn count_ffn_projections(
+    count: &mut ProjRouteCount,
+    enabled: bool,
+    cfg: &Qwen35Config,
+    dense: Option<&DenseFfnWeightsGpuQ>,
+    moe: Option<(&MoeFfnWeightsGpuQ, u32)>,
+) {
+    let hidden = cfg.hidden_size;
+    if let Some(weights) = dense {
+        count.add(
+            enabled,
+            weights.ggml_type_down,
+            hidden,
+            weights.intermediate_size,
+            &weights.down_q,
+        );
+    }
+    if let Some((weights, shared_i)) = moe {
+        if let MoeDenseStorage::Native {
+            shared_gate_up,
+            shared_down,
+        } = weights.dense_storage
+        {
+            count.add(
+                enabled,
+                shared_gate_up,
+                shared_i,
+                hidden,
+                &weights.shared_gate,
+            );
+            count.add(
+                enabled,
+                shared_gate_up,
+                shared_i,
+                hidden,
+                &weights.shared_up,
+            );
+            count.add(enabled, shared_down, hidden, shared_i, &weights.shared_down);
+        }
+    }
+}
+
+fn count_layer_projections(
+    count: &mut ProjRouteCount,
+    enabled: bool,
+    cfg: &Qwen35Config,
+    layer: &LayerWeightsGpu,
+) {
+    let hidden = cfg.hidden_size;
+    let ffn = match layer {
+        LayerWeightsGpu::FullAttn { attn, ffn } => {
+            count_attention_projections(
+                count,
+                enabled,
+                cfg,
+                &attn.q_gate,
+                (&attn.wk, attn.wk_ggml_type),
+                (&attn.wv, attn.wv_ggml_type),
+                (&attn.wo, attn.wo_ggml_type),
+            );
+            ffn
+        }
+        LayerWeightsGpu::LinearAttn { attn, ffn } => {
+            let shape = DeltaNetLayerShape::from_config(cfg);
+            let z_channels = shape.n_v_heads * shape.d_v;
+            let qkv_channels = 2 * shape.n_k_heads * shape.d_k + z_channels;
+            for (weight, ggml_type, n, k) in [
+                (
+                    &attn.attn_qkv,
+                    attn.attn_qkv_ggml_type,
+                    qkv_channels,
+                    hidden,
+                ),
+                (
+                    &attn.attn_gate,
+                    attn.attn_gate_ggml_type,
+                    z_channels,
+                    hidden,
+                ),
+                (
+                    &attn.ssm_alpha,
+                    attn.ssm_alpha_ggml_type,
+                    shape.n_v_heads,
+                    hidden,
+                ),
+                (
+                    &attn.ssm_beta,
+                    attn.ssm_beta_ggml_type,
+                    shape.n_v_heads,
+                    hidden,
+                ),
+                (&attn.ssm_out, attn.ssm_out_ggml_type, hidden, z_channels),
+            ] {
+                count.add(enabled, ggml_type, n, k, weight);
+            }
+            ffn
+        }
+    };
+    let shared_i = cfg
+        .moe
+        .as_ref()
+        .map_or(0, |moe| moe.shared_expert_intermediate_size);
+    match ffn {
+        FfnWeightsGpu::DenseQ(weights) => {
+            count_ffn_projections(count, enabled, cfg, Some(weights), None)
+        }
+        FfnWeightsGpu::MoeQ(weights) => {
+            count_ffn_projections(count, enabled, cfg, None, Some((weights, shared_i)))
+        }
+        FfnWeightsGpu::Dense(_) | FfnWeightsGpu::Moe(_) => {}
+    }
+}
+
+fn count_mtp_projections(
+    count: &mut ProjRouteCount,
+    enabled: bool,
+    cfg: &Qwen35Config,
+    mtp: &MtpWeights,
+) {
+    let hidden = mtp.hidden_size;
+    count.add(
+        enabled,
+        mtp.eh_proj_ggml_type,
+        hidden,
+        2 * hidden,
+        &mtp.eh_proj,
+    );
+    let attn = &mtp.attn;
+    let k = (&attn.wk, attn.wk_ggml_type);
+    let v = (&attn.wv, attn.wv_ggml_type);
+    let o = (&attn.wo, attn.wo_ggml_type);
+    match &attn.q_gate {
+        MtpQGateWeightsGpu::Gated(q_gate) => {
+            count_attention_projections(count, enabled, cfg, q_gate, k, v, o)
+        }
+        MtpQGateWeightsGpu::Ungated { wq, wq_ggml_type } => {
+            let q_total = cfg.num_attention_heads * cfg.head_dim;
+            let kv_total = cfg.num_key_value_heads * cfg.head_dim;
+            count.add(enabled, *wq_ggml_type, q_total, hidden, wq);
+            count.add(enabled, k.1, kv_total, hidden, k.0);
+            count.add(enabled, v.1, kv_total, hidden, v.0);
+            count.add(enabled, o.1, hidden, q_total, o.0);
+        }
+    }
+    match &mtp.ffn {
+        MtpFfnWeightsGpu::DenseQ { weights } => {
+            count_ffn_projections(count, enabled, cfg, Some(weights), None)
+        }
+        MtpFfnWeightsGpu::Moe { weights, shape } => count_ffn_projections(
+            count,
+            enabled,
+            cfg,
+            None,
+            Some((weights, shape.shared_intermediate_size)),
+        ),
+        MtpFfnWeightsGpu::Dense { .. } => {}
+    }
+    count.add(
+        enabled,
+        mtp.shared_head_head_ggml_type,
+        mtp.vocab_size,
+        hidden,
+        &mtp.shared_head_head,
+    );
+}
+
 impl Qwen35Model {
     /// Decode route of this model's MoE FFN layers, from the loaded weights:
     /// `batched_native` (every MoE layer has native router/shared storage,
@@ -219,6 +428,50 @@ impl Qwen35Model {
             (_, 0) => "per_row_bf16",
             _ => "mixed",
         }
+    }
+
+    /// Resolved `HF2Q_QWEN_ROWEXACT_PROJ` route of this model, counted from
+    /// the GPU buffers the decode kernels read (primes the GPU weight cache):
+    /// every layer's attention / DeltaNet projections, the dense FFN down
+    /// and native shared-expert projections, the lm head, and the MTP block
+    /// when one is loaded. Dense FFN gate/up are not counted: on the default
+    /// fused route they run the fused gate/up kernels, not the projection
+    /// selector. They do reach the selector with `HF2Q_FUSED_GATE_UP_SILU=0`,
+    /// for types without a fused kernel, and on the padded shared-weight route;
+    /// Qwen3.6 has no dense FFN and Qwen3.8's gate/up shapes are not in the
+    /// row-exact shape set, so no current artifact is miscounted.
+    pub(crate) fn rowexact_proj_route(&self) -> Result<ProjRoute, String> {
+        let enabled = qwen_rowexact_proj_requested();
+        self.ensure_gpu_cache_primed()
+            .map_err(|error| format!("GPU cache priming failed: {error:#}"))?;
+        let main = GPU_CACHE.with(|cell| -> Result<ProjRouteCount, String> {
+            let cache = cell.borrow();
+            let cache = cache
+                .as_ref()
+                .ok_or_else(|| "GPU cache is not primed".to_string())?;
+            if !gpu_cache_matches_model(cache, self) {
+                return Err("GPU cache belongs to a different Qwen model".to_string());
+            }
+            let mut count = ProjRouteCount::default();
+            for layer in &cache.layer_weights {
+                count_layer_projections(&mut count, enabled, &self.cfg, layer);
+            }
+            let head = &cache.output_head;
+            count.add(
+                enabled,
+                head.lm_head_ggml_type,
+                self.cfg.vocab_size,
+                self.cfg.hidden_size,
+                &head.lm_head,
+            );
+            Ok(count)
+        })?;
+        let mtp = self.mtp.as_ref().map(|mtp| {
+            let mut count = ProjRouteCount::default();
+            count_mtp_projections(&mut count, enabled, &self.cfg, mtp);
+            count
+        });
+        Ok(ProjRoute { main, mtp })
     }
 
     /// Joint route mode for this artifact and process, or why decode must

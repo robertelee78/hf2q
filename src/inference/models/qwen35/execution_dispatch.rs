@@ -115,8 +115,33 @@ mod production {
         mlx_native::ops::fused_gate_up_silu_iq4_nl::FusedGateUpSiluIq4NlArgs
     );
 
+    /// Dense GGML projection: the row-exact kernel where the
+    /// `HF2Q_QWEN_ROWEXACT_PROJ` selector admits the weight at this width,
+    /// else the stock `quantized_matmul_ggml`.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::inference::models::qwen35) fn quantized_matmul_ggml(
+        encoder: &mut CommandEncoder,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        output: &MlxBuffer,
+        params: &GgmlQuantizedMatmulParams,
+    ) -> mlx_native::Result<()> {
+        reject_source_teacher_quantized_dispatch("GGML projection dispatch")?;
+        let enabled = super::super::rowexact_proj::qwen_rowexact_proj_requested();
+        if let Some(kernel) = super::super::rowexact_proj::select(enabled, weight, params) {
+            return super::super::rowexact_proj::dispatch(
+                encoder, registry, device, kernel, input, weight, output, params,
+            );
+        }
+        legacy_quantized_matmul_ggml(encoder, registry, device, input, weight, output, params)
+    }
+
+    /// Stock `quantized_matmul_ggml`, never the Qwen row-exact selector (the
+    /// shared helper other model families call).
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::inference::models::qwen35) fn quantized_matmul_ggml_stock(
         encoder: &mut CommandEncoder,
         registry: &mut KernelRegistry,
         device: &MlxDevice,
@@ -180,6 +205,7 @@ mod production_boundary_tests {
         let _ = production::dispatch_fused_gate_up_silu_q8_0;
         let _ = production::dispatch_fused_gate_up_silu_iq4_nl;
         let _ = production::quantized_matmul_ggml;
+        let _ = production::quantized_matmul_ggml_stock;
         let _ = production::dense_gate_up_fusion_enabled;
         let _ = production::fused_qkvg_enabled;
         let _ = production::dense_q_arena_reset_enabled;
