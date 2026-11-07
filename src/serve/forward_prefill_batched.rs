@@ -35,9 +35,7 @@ use crate::inference::models::gemma4::model::{MultiSeqPrefillOutput, MultiSeqPre
 use crate::inference::models::gemma4::{
     DenseKvBuffers, HbKvBuffers, HybridKvBuffers, MlxModelWeights,
 };
-use crate::serve::forward_mlx_shared::{
-    dispatch_qmatmul, dispatch_rms_norm_unit_perhead_dual_perm,
-};
+use crate::serve::forward_mlx_shared::dispatch_qmatmul;
 use crate::serve::gemma_live_attention::{
     encode_live_layer_attention, LiveLayer, LiveRoute, LiveSeq, LiveSpan, LiveVecScratch,
 };
@@ -2555,7 +2553,7 @@ impl MlxModelWeights {
                 //     traffic eliminated).
                 let v_input = if v_is_k { &pf_k } else { &pf_v };
                 s.barrier_between(&[v_input], &[&pf_v_normed, &pf_v_perm]);
-                dispatch_rms_norm_unit_perhead_dual_perm(
+                mlx_native::ops::rms_norm::dispatch_rms_norm_no_scale_f32_dual_perm(
                     s.encoder_mut(),
                     reg,
                     metal_dev,
@@ -2566,7 +2564,8 @@ impl MlxModelWeights {
                     nkv as u32,
                     seq_len as u32,
                     hd as u32,
-                )?;
+                )
+                .map_err(|e| anyhow::anyhow!("batched V norm+permuted bf16 L{layer_idx}: {e}"))?;
                 if let Some(t0) = t0_head_norm_rope {
                     bucket_finish!(
                         s,
@@ -6905,5 +6904,145 @@ mod cold_prefill_handoff_tests {
         );
         // Short budgets keep at least the sliding window.
         assert_eq!(gemma_lcp_snapshot_rows(16, 16, sw, false), 1_024);
+    }
+}
+
+#[cfg(test)]
+mod v_norm_dispatch_tests {
+    use mlx_native::ops::encode_helpers::{encode_threadgroups_with_args_and_shared, KernelArg};
+    use mlx_native::ops::rms_norm::dispatch_rms_norm_no_scale_f32_dual_perm;
+    use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+
+    /// The raw encode the prefill V norm used before mlx-native 0.18.0: one
+    /// threadgroup of `min(256, next_pow2(dim))` threads per (token, head) row.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_one_row_per_threadgroup(
+        encoder: &mut mlx_native::CommandEncoder,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        output: &MlxBuffer,
+        output_bf16_perm: &MlxBuffer,
+        params: &MlxBuffer,
+        n_heads: u32,
+        seq_len: u32,
+        dim: u32,
+    ) {
+        let pipeline = registry
+            .get_pipeline("rms_norm_no_scale_f32_dual_perm", device.metal_device())
+            .unwrap();
+        let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
+        let aux: [u32; 2] = [n_heads, seq_len];
+        encode_threadgroups_with_args_and_shared(
+            encoder,
+            pipeline,
+            &[
+                (0, KernelArg::Buffer(input)),
+                (1, KernelArg::Buffer(output)),
+                (2, KernelArg::Buffer(params)),
+                (3, KernelArg::Buffer(output_bf16_perm)),
+                (4, KernelArg::Bytes(bytemuck::cast_slice(&aux))),
+            ],
+            &[(0, tg_size * 4)],
+            mlx_native::MTLSize::new(u64::from(n_heads) * u64::from(seq_len), 1, 1),
+            mlx_native::MTLSize::new(tg_size, 1, 1),
+        );
+    }
+
+    fn filled(device: &MlxDevice, elements: usize, dtype: DType, byte: u8) -> MlxBuffer {
+        let mut buffer = device
+            .alloc_buffer(elements * dtype.size_of(), dtype, vec![elements])
+            .unwrap();
+        buffer.as_mut_slice::<u8>().unwrap().fill(byte);
+        buffer
+    }
+
+    /// The packed mlx-native dispatcher the prefill V norm now uses writes
+    /// bitwise the f32 and permuted BF16 outputs of the previous raw encode,
+    /// at the Gemma 4 26B sliding (8 × 256) and global (2 × 512) shapes,
+    /// odd row counts (a half-filled last threadgroup), and a cold lane's
+    /// strided row view of the joint stream.
+    #[test]
+    fn gemma_v_norm_packed_dispatch_matches_one_row_per_threadgroup_bitwise() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            eprintln!("skip: no MlxDevice");
+            return;
+        };
+        let mut registry = KernelRegistry::new();
+        for (n_heads, dim) in [(8usize, 256usize), (2, 512)] {
+            for (offset, seq_len, total) in [
+                (0usize, 1usize, 1usize),
+                (0, 33, 33),
+                (0, 458, 458),
+                (37, 1_301, 1_400),
+            ] {
+                let row = n_heads * dim;
+                let mut joint = device
+                    .alloc_buffer(total * row * 4, DType::F32, vec![total, n_heads, dim])
+                    .unwrap();
+                let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ (seq_len * dim) as u64;
+                for value in joint.as_mut_slice::<f32>().unwrap() {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    *value = ((state >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 8.0;
+                }
+                let input = if seq_len == total {
+                    joint.clone()
+                } else {
+                    joint.slice_view((offset * row * 4) as u64, seq_len * row)
+                };
+                let mut params = device.alloc_buffer(8, DType::F32, vec![2]).unwrap();
+                params
+                    .as_mut_slice::<f32>()
+                    .unwrap()
+                    .copy_from_slice(&[1e-6, dim as f32]);
+                let elements = seq_len * row;
+                let old_f32 = filled(&device, elements, DType::F32, 0xa5);
+                let old_bf16 = filled(&device, elements, DType::BF16, 0xa5);
+                let new_f32 = filled(&device, elements, DType::F32, 0x5a);
+                let new_bf16 = filled(&device, elements, DType::BF16, 0x5a);
+                let mut encoder = device.command_encoder().unwrap();
+                encode_one_row_per_threadgroup(
+                    &mut encoder,
+                    &mut registry,
+                    &device,
+                    &input,
+                    &old_f32,
+                    &old_bf16,
+                    &params,
+                    n_heads as u32,
+                    seq_len as u32,
+                    dim as u32,
+                );
+                dispatch_rms_norm_no_scale_f32_dual_perm(
+                    &mut encoder,
+                    &mut registry,
+                    device.metal_device(),
+                    &input,
+                    &new_f32,
+                    &new_bf16,
+                    &params,
+                    n_heads as u32,
+                    seq_len as u32,
+                    dim as u32,
+                )
+                .unwrap();
+                encoder.commit_and_wait().unwrap();
+                let case = format!(
+                    "heads {n_heads} dim {dim} rows [{offset}, {})",
+                    offset + seq_len
+                );
+                assert!(
+                    old_f32.as_slice::<u8>().unwrap() == new_f32.as_slice::<u8>().unwrap(),
+                    "f32 output differs: {case}"
+                );
+                assert!(
+                    old_bf16.as_slice::<u8>().unwrap() == new_bf16.as_slice::<u8>().unwrap(),
+                    "permuted BF16 output differs: {case}"
+                );
+            }
+        }
     }
 }

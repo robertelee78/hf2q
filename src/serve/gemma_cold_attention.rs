@@ -288,7 +288,7 @@ pub(super) fn encode_cold_layer_attention<'e, 'a>(
                 true,
             ).map_err(|e| anyhow::anyhow!("cold lane K norm+RoPE L{layer_idx}: {e}"))?;
             s.barrier_between(&[&v_in], &[&v_normed, pf_v_perm]);
-            dispatch_rms_norm_unit_perhead_dual_perm(
+            mlx_native::ops::rms_norm::dispatch_rms_norm_no_scale_f32_dual_perm(
                 s.encoder_mut(),
                 reg,
                 metal_dev,
@@ -299,7 +299,8 @@ pub(super) fn encode_cold_layer_attention<'e, 'a>(
                 nkv as u32,
                 seq_len as u32,
                 hd as u32,
-            )?;
+            )
+            .map_err(|e| anyhow::anyhow!("cold lane V norm+permuted bf16 L{layer_idx}: {e}"))?;
         }
 
         if route_through_nofa {
