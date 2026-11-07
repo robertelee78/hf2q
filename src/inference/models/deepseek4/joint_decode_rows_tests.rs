@@ -26,13 +26,14 @@ use super::joint_decode_core::{
     encode_compressed_row, encode_window_row, plan_compressed_row, plan_window_row, JointRowInputs,
 };
 use super::joint_decode_rows::{
-    batched_cores_admit, encode_window_layer, plan_compressed_layer, plan_window_layer, AttnCores,
-    JointBatchInputs,
+    batched_cores_admit, encode_window_layer, plan_compressed_layer, plan_window_layer,
+    projection_takes_single_dispatch, AttnCores, JointBatchInputs,
 };
 use super::rope::yarn_frequencies;
 use super::row_matmul::row_view;
 use super::Deepseek4Config;
 use crate::serve::gpu::GpuContext;
+use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 
 fn fill_states(cache: &mut Deepseek4Cache, seed: u64) {
     let mut rng = Rng(seed);
@@ -152,6 +153,19 @@ fn check_layer(
     start: &[usize],
     steps: usize,
 ) {
+    check_layer_with(ctx, cfg, ratio, start, steps, GgmlType::F16);
+}
+
+/// [`check_layer`] with the compressor and indexer projections stored as
+/// `storage` (F16 as in the ds4 file, Q8_0 as in hf2q's own artifact).
+fn check_layer_with(
+    ctx: &mut GpuContext,
+    cfg: &Deepseek4Config,
+    ratio: u32,
+    start: &[usize],
+    steps: usize,
+    storage: GgmlType,
+) {
     let device = ctx.device().clone();
     let layer = (0..cfg.compress_ratios.len())
         .find(|&l| cfg.compress_ratios[l] == ratio)
@@ -170,7 +184,7 @@ fn check_layer(
     };
     let mut per_row = build();
     let mut batched = build();
-    let weights = LayerWeights::new(&device, cfg, ratio, layer as u64);
+    let weights = LayerWeights::with_storage(&device, cfg, ratio, layer as u64, storage);
     let unused = Unused {
         buffer: alloc(&device, DType::F32, vec![1], "test unused").unwrap(),
         shape: [1, 1],
@@ -434,6 +448,55 @@ fn batched_csa_cores_equal_per_row_cores() {
         &[2047],
     ] {
         check_layer(&mut ctx, &cfg, 4, start, 3);
+    }
+}
+
+/// hf2q's own artifact stores the compressor and indexer projections as
+/// Q8_0: the batched cores issue them as one `m = B` dispatch (stock Q8_0
+/// matvec, or the stock-order row-exact kernel), which must still equal the
+/// per-row cores' `m = 1` products bitwise.
+#[test]
+fn batched_cores_with_q8_0_projections_equal_per_row_cores() {
+    let (_lock, mut ctx, cfg) = gpu();
+    check_layer_with(
+        &mut ctx,
+        &cfg,
+        4,
+        &[2046, 757, 2333, 1700],
+        3,
+        GgmlType::Q8_0,
+    );
+    check_layer_with(&mut ctx, &cfg, 128, &[2047, 8100, 400], 2, GgmlType::Q8_0);
+}
+
+/// The batched projections take one `m = B` dispatch only where joint-decode
+/// admission proves `m = B` rows equal to `m = 1` (or row-exact, or one
+/// row); every other storage runs per row, so admission needs no entry for
+/// them.
+#[test]
+fn batched_projections_dispatch_only_proven_routes_at_m_b() {
+    for rows in 2..=8 {
+        // Unproven block storage (a K-quant): per row.
+        for unproven in [GgmlType::Q4_K, GgmlType::Q6_K] {
+            assert!(!projection_takes_single_dispatch(false, unproven, rows));
+        }
+        // Proven block storage: one dispatch.
+        assert!(projection_takes_single_dispatch(
+            false,
+            GgmlType::Q8_0,
+            rows
+        ));
+        // Dense float on the stock family splits per row.
+        assert!(!projection_takes_single_dispatch(
+            false,
+            GgmlType::F16,
+            rows
+        ));
+        // The stock-order row-exact route is one dispatch.
+        assert!(projection_takes_single_dispatch(true, GgmlType::F16, rows));
+    }
+    for storage in [GgmlType::Q4_K, GgmlType::F16, GgmlType::Q8_0] {
+        assert!(projection_takes_single_dispatch(false, storage, 1));
     }
 }
 

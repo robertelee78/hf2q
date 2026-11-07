@@ -177,7 +177,7 @@ this release:
 | `HF2Q_DEEPSEEK4_REQUEST_JSON` | `development-only` | 1 |
 | `HF2Q_DEEPSEEK4_TOKENIZER` | `development-only` | 8 |
 | `HF2Q_DEEPSEEK4_TOKENIZER_JSON` | `development-only` | 2 |
-| `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES` | `development-only` | 2 |
+| `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES` | `development-only` | 10 |
 | `HF2Q_DEEPSEEK_COMPRESSED_STAGE_PROFILE` | `development-only` | 4 |
 | `HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR` | `development-only` | 6 |
 | `HF2Q_DEEPSEEK_DUMP_LAYER_DIR` | `development-only` | 5 |

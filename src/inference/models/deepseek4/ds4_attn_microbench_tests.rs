@@ -73,6 +73,7 @@ use super::ds4_bench_support::{
     bench_cores, bench_matvec, copies_for, f16_matrix, f32_buf, floor_cells, gpu_warmup, median,
     run_once, time_op, Out, Rng, COLD_BYTES, TRIALS,
 };
+use super::ds4_op_microbench_tests::block_weight;
 use super::forward_support::{
     alloc, alloc_host_input, begin_decode_pool_token, end_decode_pool_token, rms_params,
 };
@@ -147,19 +148,38 @@ struct CompressorWeights {
     ape: MlxBuffer,
     norm: MlxBuffer,
     shape: [usize; 2],
+    storage: GgmlType,
+}
+
+/// A synthetic `[n, k]` projection matrix in `storage` (F16 as in the ds4 file, or Q8_0 as in
+/// hf2q's own artifact).
+fn matrix(device: &MlxDevice, storage: GgmlType, n: usize, k: usize, seed: u64) -> MlxBuffer {
+    match storage {
+        GgmlType::F16 => f16_matrix(device, n, k, seed),
+        GgmlType::Q8_0 => block_weight(device, GgmlType::Q8_0, vec![n, k], seed),
+        other => panic!("unsupported synthetic projection storage {other:?}"),
+    }
 }
 
 impl CompressorWeights {
-    fn new(device: &MlxDevice, ratio: usize, dim: usize, hidden: usize, seed: u64) -> Self {
+    fn new(
+        device: &MlxDevice,
+        ratio: usize,
+        dim: usize,
+        hidden: usize,
+        seed: u64,
+        storage: GgmlType,
+    ) -> Self {
         let projected = (usize::from(ratio == 4) + 1) * dim;
         let mut norm = alloc(device, DType::F32, vec![dim], "bench compressor norm").unwrap();
         norm.as_mut_slice::<f32>().unwrap().fill(1.0);
         Self {
-            kv: f16_matrix(device, projected, hidden, seed),
-            gate: f16_matrix(device, projected, hidden, seed + 1),
+            kv: matrix(device, storage, projected, hidden, seed),
+            gate: matrix(device, storage, projected, hidden, seed + 1),
             ape: f32_buf(device, vec![ratio, projected], seed + 2, 0.1),
             norm,
             shape: [projected, hidden],
+            storage,
         }
     }
 
@@ -171,13 +191,13 @@ impl CompressorWeights {
         CompressorWeightsRef {
             kv: RawMatrixRef {
                 buffer: &self.kv,
-                ggml_type: GgmlType::F16,
+                ggml_type: self.storage,
                 shape: &self.shape,
                 matvec: bench_matvec(),
             },
             gate: RawMatrixRef {
                 buffer: &self.gate,
-                ggml_type: GgmlType::F16,
+                ggml_type: self.storage,
                 shape: &self.shape,
                 matvec: bench_matvec(),
             },
@@ -195,30 +215,50 @@ struct IndexerWeights {
     compressor: CompressorWeights,
 }
 
-/// Synthetic F16 weights of one layer as stored in the ds4 file; only what the per-row core reads.
+/// Synthetic weights of one layer (projections F16 as stored in the ds4 file, or Q8_0); only what
+/// the per-row core reads.
 pub(super) struct LayerWeights {
     pub(super) sinks: MlxBuffer,
     compressor: Option<CompressorWeights>,
     indexer: Option<IndexerWeights>,
+    storage: GgmlType,
 }
 
 impl LayerWeights {
     pub(super) fn new(device: &MlxDevice, cfg: &Deepseek4Config, ratio: u32, seed: u64) -> Self {
+        Self::with_storage(device, cfg, ratio, seed, GgmlType::F16)
+    }
+
+    /// Compressor and indexer projections stored as `storage` (F16 or Q8_0).
+    pub(super) fn with_storage(
+        device: &MlxDevice,
+        cfg: &Deepseek4Config,
+        ratio: u32,
+        seed: u64,
+        storage: GgmlType,
+    ) -> Self {
         let hidden = cfg.hidden_size as usize;
         let seed = seed * 64;
         let compressor = (ratio != 0).then(|| {
-            CompressorWeights::new(device, ratio as usize, cfg.head_dim as usize, hidden, seed)
+            CompressorWeights::new(
+                device,
+                ratio as usize,
+                cfg.head_dim as usize,
+                hidden,
+                seed,
+                storage,
+            )
         });
         let indexer = (ratio == 4).then(|| {
             let heads = cfg.index_num_heads as usize;
             let dim = cfg.index_head_dim as usize;
             let q_rank = cfg.q_lora_rank as usize;
             IndexerWeights {
-                q_b: f16_matrix(device, heads * dim, q_rank, seed + 10),
+                q_b: matrix(device, storage, heads * dim, q_rank, seed + 10),
                 q_b_shape: [heads * dim, q_rank],
-                projection: f16_matrix(device, heads, hidden, seed + 11),
+                projection: matrix(device, storage, heads, hidden, seed + 11),
                 projection_shape: [heads, hidden],
-                compressor: CompressorWeights::new(device, 4, dim, hidden, seed + 12),
+                compressor: CompressorWeights::new(device, 4, dim, hidden, seed + 12, storage),
             }
         });
         Self {
@@ -230,6 +270,7 @@ impl LayerWeights {
             ),
             compressor,
             indexer,
+            storage,
         }
     }
 
@@ -273,13 +314,13 @@ impl LayerWeights {
             indexer: self.indexer.as_ref().map(|i| IndexerWeightsRef {
                 q_b: RawMatrixRef {
                     buffer: &i.q_b,
-                    ggml_type: GgmlType::F16,
+                    ggml_type: self.storage,
                     shape: &i.q_b_shape,
                     matvec: bench_matvec(),
                 },
                 projection: RawMatrixRef {
                     buffer: &i.projection,
-                    ggml_type: GgmlType::F16,
+                    ggml_type: self.storage,
                     shape: &i.projection_shape,
                     matvec: bench_matvec(),
                 },
