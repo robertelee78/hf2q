@@ -13,10 +13,10 @@ readonly EXPECTED_PACKAGE_VERSION
   exit 1
 }
 readonly EXPECTED_DEPENDENCY_NAME=mlx-native
-readonly EXPECTED_DEPENDENCY_VERSION=0.16.0
-readonly EXPECTED_DEPENDENCY_REQUIREMENT='=0.16.0'
+readonly EXPECTED_DEPENDENCY_VERSION=0.17.0
+readonly EXPECTED_DEPENDENCY_REQUIREMENT='=0.17.0'
 readonly EXPECTED_DEPENDENCY_SOURCE='registry+https://github.com/rust-lang/crates.io-index'
-readonly EXPECTED_DEPENDENCY_CHECKSUM=64e06c16847575ed975a58df603eecaa398a3e462afc45d7810cc1abfda8dfe6
+readonly EXPECTED_DEPENDENCY_CHECKSUM=5f4258d89bcda2a50c50b7bef58260d4c19094419ed7d22b0389fb1daeeb8617
 
 fail() {
   echo "release dependency provenance: $*" >&2
