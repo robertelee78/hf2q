@@ -434,8 +434,12 @@ impl Qwen35Model {
     /// the GPU buffers the decode kernels read (primes the GPU weight cache):
     /// every layer's attention / DeltaNet projections, the dense FFN down
     /// and native shared-expert projections, the lm head, and the MTP block
-    /// when one is loaded. Dense FFN gate/up are not counted (they run the
-    /// fused gate/up kernels, not the projection selector).
+    /// when one is loaded. Dense FFN gate/up are not counted: on the default
+    /// fused route they run the fused gate/up kernels, not the projection
+    /// selector. They do reach the selector with `HF2Q_FUSED_GATE_UP_SILU=0`,
+    /// for types without a fused kernel, and on the padded shared-weight route;
+    /// Qwen3.6 has no dense FFN and Qwen3.8's gate/up shapes are not in the
+    /// row-exact shape set, so no current artifact is miscounted.
     pub(crate) fn rowexact_proj_route(&self) -> Result<ProjRoute, String> {
         let enabled = qwen_rowexact_proj_requested();
         self.ensure_gpu_cache_primed()
