@@ -1820,6 +1820,37 @@ impl HybridKvCache {
         Ok(())
     }
 
+    /// Whether [`Self::restore_slot_anchor`] would accept `anchor` for `slot`
+    /// now: every live target cursor (and the MTP cursor, with matching
+    /// presence) is at or past the saved one. It proves only the cursor
+    /// precondition; whether the rows below are still the anchor's rows is
+    /// the caller's lifetime contract.
+    pub(crate) fn slot_anchor_cursors_cover(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        anchor: &HybridKvSlotAnchor,
+    ) -> bool {
+        let slot_idx = slot.0 as usize;
+        if slot_idx >= self.n_seqs as usize
+            || anchor.full_attn_current_len.len() != self.full_attn.len()
+            || anchor.linear_conv.len() != self.linear_attn.len()
+            || anchor.linear_recurrent.len() != self.linear_attn.len()
+        {
+            return false;
+        }
+        let target_covered = self
+            .full_attn
+            .iter()
+            .zip(&anchor.full_attn_current_len)
+            .all(|(full, &saved)| full.current_len.get(slot_idx).is_some_and(|&live| live >= saved));
+        let mtp_covered = match (self.mtp_slot.as_ref(), anchor.mtp_current_len) {
+            (Some(mtp), Some(saved)) => mtp.current_len.get(slot_idx).is_some_and(|&live| live >= saved),
+            (None, None) => true,
+            _ => false,
+        };
+        target_covered && mtp_covered
+    }
+
     /// Allocate the full hybrid cache for a Qwen3.5 (dense or MoE) model.
     ///
     /// Allocates:

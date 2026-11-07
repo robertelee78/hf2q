@@ -200,11 +200,16 @@ fn spill_qwen35_victim(
             return;
         }
     };
-    let (retained, anchor) = match mode {
+    let (retained, mut anchor) = match mode {
         VictimSpill::Move => (std::mem::take(retained), anchor.take()),
         VictimSpill::Copy => (retained.clone(), anchor.clone()),
         VictimSpill::Keep => unreachable!("Keep returned above"),
     };
+    // A forced-close anchor is one-shot to its slot's next admission; a
+    // spilled ledger never carries it.
+    if let Some(anchor) = anchor.as_mut() {
+        anchor.forced_close = None;
+    }
     let payload = Qwen35SlotSpill {
         source_slot: slot.0,
         kv: spilled,

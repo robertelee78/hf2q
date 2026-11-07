@@ -1987,6 +1987,10 @@ mod slot_spill;
 #[path = "engine/qwen35_slot_spill.rs"]
 mod qwen35_slot_spill;
 
+#[cfg(test)]
+#[path = "engine/qwen35_forced_close_anchor_tests.rs"]
+mod qwen35_forced_close_anchor_tests;
+
 #[path = "engine/gemma4_slot_spill.rs"]
 mod gemma4_slot_spill;
 
@@ -17800,6 +17804,61 @@ struct Qwen35PromptAnchor {
     prefill_logits: Vec<f32>,
     vision_fingerprint: Option<[u8; 32]>,
     spec: Option<super::engine_qwen35::Qwen35SpecPrefixBoundary>,
+    /// One-shot forced-close anchor of the slot's last request
+    /// (`HF2Q_QWEN_FORCED_CLOSE_ANCHOR`). Held here so every path that drops
+    /// the slot's prompt anchor drops it too; the next admission to the slot
+    /// consumes or discards it, and slot spills never carry it.
+    forced_close: Option<super::engine_qwen35::Qwen35ForcedCloseAnchor>,
+}
+
+impl Qwen35PromptAnchor {
+    /// The forced-close anchor's tokens when it can serve `prompt_tokens`:
+    /// same vision fingerprint, a strict prefix of the prompt (it has no
+    /// prefill logits), and restorable cursors in `kv`.
+    fn forced_close_tokens_for<'a>(
+        &'a self,
+        prompt_tokens: &[u32],
+        vision_fingerprint: Option<[u8; 32]>,
+        kv: &crate::inference::models::qwen35::kv_cache::HybridKvCache,
+        slot: SlotId,
+    ) -> Option<&'a [u32]> {
+        self.forced_close
+            .as_ref()
+            .filter(|forced| {
+                forced.vision_fingerprint == vision_fingerprint
+                    && qwen35_forced_close_anchor_serves(&forced.prompt_tokens, prompt_tokens)
+                    && kv.slot_anchor_cursors_cover(slot, &forced.kv)
+            })
+            .map(|forced| forced.prompt_tokens.as_slice())
+    }
+}
+
+/// A forced-close anchor serves a prompt that strictly extends it.
+fn qwen35_forced_close_anchor_serves(anchor_tokens: &[u32], prompt_tokens: &[u32]) -> bool {
+    !anchor_tokens.is_empty()
+        && anchor_tokens.len() < prompt_tokens.len()
+        && prompt_tokens.starts_with(anchor_tokens)
+}
+
+/// The anchor candidate a slot offers [`qwen35_slot_affinity`]: of the
+/// stable and forced-close anchors that `prompt_tokens` starts with, the
+/// longest (the stable one on a tie, as it also carries prefill logits).
+fn qwen35_effective_anchor_tokens<'a>(
+    stable: Option<&'a [u32]>,
+    forced_close: Option<&'a [u32]>,
+    prompt_tokens: &[u32],
+) -> Option<&'a [u32]> {
+    let forced_close =
+        forced_close.filter(|forced| qwen35_forced_close_anchor_serves(forced, prompt_tokens));
+    match (stable, forced_close) {
+        (Some(stable), Some(forced))
+            if forced.len() > stable.len() || !prompt_tokens.starts_with(stable) =>
+        {
+            Some(forced)
+        }
+        (None, Some(forced)) => Some(forced),
+        (stable, _) => stable,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -17860,7 +17919,61 @@ fn install_qwen35_stable_prompt_checkpoint(
         prefill_logits: checkpoint.prefill_logits,
         vision_fingerprint: checkpoint.vision_fingerprint,
         spec: checkpoint.spec,
+        forced_close: None,
     });
+}
+
+/// Attach a completed request's forced-close anchor to its slot's prompt
+/// anchor (the next admission consumes or discards it). Kept only when it
+/// extends that anchor, lies inside the published live prefix, carries the
+/// same vision fingerprint, and its cursors are still restorable.
+fn publish_qwen35_forced_close_anchor(
+    slot_anchor: &mut Option<Qwen35PromptAnchor>,
+    retained: &[u32],
+    forced_close: Option<super::engine_qwen35::Qwen35ForcedCloseAnchor>,
+    kv: &crate::inference::models::qwen35::kv_cache::HybridKvCache,
+    slot: SlotId,
+) {
+    let Some(slot_anchor) = slot_anchor.as_mut() else {
+        return;
+    };
+    slot_anchor.forced_close = forced_close.filter(|forced| {
+        forced.prompt_tokens.len() > slot_anchor.prompt_tokens.len()
+            && forced.prompt_tokens.starts_with(&slot_anchor.prompt_tokens)
+            && retained.starts_with(&forced.prompt_tokens)
+            && forced.vision_fingerprint == slot_anchor.vision_fingerprint
+            && kv.slot_anchor_cursors_cover(slot, &forced.kv)
+    });
+    if let Some(forced) = slot_anchor.forced_close.as_ref() {
+        tracing::info!(
+            slot = slot.0,
+            anchor_tokens = forced.prompt_tokens.len(),
+            stable_tokens = slot_anchor.prompt_tokens.len(),
+            "Qwen35 forced-close anchor published"
+        );
+    }
+}
+
+/// Admission's one-shot step: take the slot's forced-close anchor out of its
+/// prompt anchor unconditionally (its rows are proven only until the slot
+/// runs another request) and return it only when the selected preference
+/// restores exactly it: an anchor hit at its length, not at the stable
+/// anchor's, for a prompt with its vision fingerprint that strictly extends it.
+fn take_qwen35_forced_close_for_admission(
+    slot_anchor: &mut Option<Qwen35PromptAnchor>,
+    anchor_hit: bool,
+    cached_tokens: usize,
+    prompt_tokens: &[u32],
+    vision_fingerprint: Option<[u8; 32]>,
+) -> Option<super::engine_qwen35::Qwen35ForcedCloseAnchor> {
+    let slot_anchor = slot_anchor.as_mut()?;
+    let forced = slot_anchor.forced_close.take()?;
+    (anchor_hit
+        && slot_anchor.prompt_tokens.len() != cached_tokens
+        && forced.prompt_tokens.len() == cached_tokens
+        && forced.vision_fingerprint == vision_fingerprint
+        && qwen35_forced_close_anchor_serves(&forced.prompt_tokens, prompt_tokens))
+    .then_some(forced)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19434,19 +19547,32 @@ fn admit_qwen35_slot(
     let text_anchor_reuse_limit = vision
         .as_ref()
         .and_then(|vision| vision.text_anchor_reuse_limit(prompt_tokens.len()));
+    let admission_kv = guard.kv.as_ref().expect("kv Some during Qwen35 admission");
     let preferred = preferred_qwen35_slot(
         retained_tokens
             .iter()
             .zip(prompt_anchors.iter())
             .zip(slots.iter())
             .enumerate()
-            .map(|(index, ((retained, anchor), active))| {
-                let (retained, anchor) = qwen35_slot_spill::qwen35_resume_candidate(
+            .map(|(index, ((retained, slot_anchor), active))| {
+                let (retained, stable) = qwen35_slot_spill::qwen35_resume_candidate(
                     retained,
-                    anchor.as_ref(),
+                    slot_anchor.as_ref(),
                     request_vision_fingerprint,
                     text_anchor_reuse_limit,
                 );
+                // An active slot's anchor was consumed at its admission.
+                let forced_close = slot_anchor.as_ref().filter(|_| active.is_none()).and_then(
+                    |slot_anchor| {
+                        slot_anchor.forced_close_tokens_for(
+                            &prompt_tokens,
+                            request_vision_fingerprint,
+                            admission_kv,
+                            SlotId(index as u32),
+                        )
+                    },
+                );
+                let anchor = qwen35_effective_anchor_tokens(stable, forced_close, &prompt_tokens);
                 let active_matches = active.as_ref().is_some_and(|(work, _, _)| {
                     work.vision_fingerprint() == request_vision_fingerprint
                 });
@@ -19596,6 +19722,15 @@ fn admit_qwen35_slot(
     let cached_tokens = selected_preference
         .map(|preference| preference.cached_tokens)
         .unwrap_or(0);
+    // One-shot lifetime: this admission consumes the slot's forced-close
+    // anchor or discards it.
+    let forced_close = take_qwen35_forced_close_for_admission(
+        &mut prompt_anchors[handle.slot_id.0 as usize],
+        anchor_hit,
+        cached_tokens,
+        &prompt_tokens,
+        request_vision_fingerprint,
+    );
     crate::serve::operator_ui::prefill_planned(
         "qwen35",
         operator_request_id,
@@ -19612,11 +19747,12 @@ fn admit_qwen35_slot(
         let anchor = prompt_anchors[slot_idx]
             .as_ref()
             .expect("anchor_preferred matched an existing Qwen prompt anchor");
+        let restore_kv = forced_close.as_ref().map_or(&anchor.kv, |forced| &forced.kv);
         if let Err(e) = guard
             .kv
             .as_mut()
             .expect("kv Some during loop")
-            .restore_slot_anchor(handle.slot_id, &anchor.kv)
+            .restore_slot_anchor(handle.slot_id, restore_kv)
         {
             reply = match reset_qwen35_slot_for_reply(
                 guard,
@@ -19644,7 +19780,8 @@ fn admit_qwen35_slot(
             prompt_tokens = prompt_tokens.len(),
             cached_tokens,
             suffix_tokens = prompt_tokens.len().saturating_sub(cached_tokens),
-            checkpoint_bytes = anchor.kv.total_bytes(),
+            checkpoint_bytes = restore_kv.total_bytes(),
+            forced_close_anchor = forced_close.is_some(),
             "Qwen35 slot-local prompt-boundary cache hit"
         );
         // ADR-059: the anchor's boundary is the physical cursor
@@ -19692,8 +19829,9 @@ fn admit_qwen35_slot(
             }
         }
         // ADR-059: speculative prefix boundaries carry MTP state that never
-        // saw the graft; suppress reuse under a bound graft.
-        let spec_candidate = if graft.is_none() {
+        // saw the graft; suppress reuse under a bound graft. A forced-close
+        // anchor carries no speculative boundary.
+        let spec_candidate = if graft.is_none() && forced_close.is_none() {
             anchor.spec.clone()
         } else {
             None
@@ -19708,7 +19846,7 @@ fn admit_qwen35_slot(
                     .is_ok()
         });
         let cached_logits = selected_preference
-            .filter(|preference| preference.use_prefill_logits)
+            .filter(|preference| preference.use_prefill_logits && forced_close.is_none())
             .map(|_| anchor.prefill_logits.clone());
         if spec_candidate.is_some() && cached_spec.is_none() {
             tracing::warn!(
@@ -20215,6 +20353,7 @@ fn finish_qwen35_prefill(
                     prefill_logits,
                     vision_fingerprint: params.vision_fingerprint,
                     spec,
+                    forced_close: None,
                 });
             }
             Err(error) => {
@@ -20731,6 +20870,13 @@ fn settle_qwen35_decode_lane(
             handle,
             retained_tokens[slot_idx].len(),
             kv_bytes_per_token,
+        );
+        publish_qwen35_forced_close_anchor(
+            &mut prompt_anchors[slot_idx],
+            &retained_tokens[slot_idx],
+            state.take_forced_close_anchor(),
+            guard.kv.as_ref().expect("kv Some during Qwen forced-close publication"),
+            handle.slot_id,
         );
     }
     scheduler.advance_after_decode(handle);
