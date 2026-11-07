@@ -104,7 +104,9 @@ pub(super) fn row_matmul(
             session, registry, device, input, weight, output, m, n, k, label,
         );
     }
-    if let Some(storage) = row_exact_storage(weight) {
+    // The widest chunk decides: stock Q8_0 leaves the NR2 matvec only at 2..=8
+    // rows (`HF2Q_DECODE_MV_EXT=1`) or at every width (`HF2Q_Q8_0_MV_NR2=0`).
+    if let Some(storage) = row_exact_storage(registry, weight, m.min(ROW_EXACT_MAX_ROWS)) {
         if weight.shape != [n, k] {
             bail!(
                 "DeepSeek-V4 {label} shape drift: got {:?}, expected [{n}, {k}]",
