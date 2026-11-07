@@ -8914,6 +8914,57 @@ fn deepseek4_pure_prefill_next(slots: &[Option<Deepseek4Slot>]) -> bool {
     prefill
 }
 
+/// What a prefilling lane offers the next pure-prefill step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Deepseek4PrefillLaneView {
+    handle: SlotHandle,
+    cold_wave: bool,
+    /// The lane's next work is its token-wise recovery tail.
+    recovery_tail: bool,
+}
+
+/// Prefilling lanes in scheduler FIFO order, as the cold-wave ordering rule
+/// sees them.
+fn deepseek4_prefill_lane_views(
+    slots: &[Option<Deepseek4Slot>],
+    fifo: &[SlotHandle],
+) -> Vec<Deepseek4PrefillLaneView> {
+    fifo.iter()
+        .filter_map(|&handle| match slots.get(handle.slot_id.0 as usize)?.as_ref()? {
+            (Deepseek4SlotWork::Prefill(state), _, installed) if *installed == handle => {
+                Some(Deepseek4PrefillLaneView {
+                    handle,
+                    cold_wave: state.is_cold_wave(),
+                    recovery_tail: state.is_recovery_tail(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Cold-wave matrix work before cold-wave tails. When the scheduler's oldest
+/// prefill is a cold-wave lane whose next work is its recovery tail while
+/// another cold-wave lane still has matrix prefill work, the pure-prefill
+/// step leads with the oldest such matrix lane instead. A cold lane that ran
+/// its tail would become a runnable decoder; every later step would then be a
+/// Mixed step whose cold bulk decode quantum runs the early lanes' whole
+/// answers before the stragglers prefill (S3 A/B arm B: two stragglers
+/// waited 3.6 s behind 55 joint decode steps), while the early lanes'
+/// completions stay parked until every cold peer finishes anyway. Holding
+/// the tails lets the stragglers' matrix work cohort first, then the tails
+/// drain and the whole wave decodes together. Scheduling only: no lane's
+/// chunking or numerics change.
+fn deepseek4_cold_wave_matrix_primary(fifo: &[Deepseek4PrefillLaneView]) -> Option<SlotHandle> {
+    let oldest = fifo.first()?;
+    if !(oldest.cold_wave && oldest.recovery_tail) {
+        return None;
+    }
+    fifo.iter()
+        .find(|lane| lane.cold_wave && !lane.recovery_tail)
+        .map(|lane| lane.handle)
+}
+
 /// Cohort widths a prefill quantum may try, widest first: 2 up to the
 /// candidate count. Unequal-plan cohorts let a lane join at its own cursor,
 /// so a cold wave needs no full four-lane minimum (and no alignment
@@ -9460,16 +9511,25 @@ fn run_slot_aware_deepseek4(
                 // cursor and length) share the row-local FFN/MoE work;
                 // recovery tails and sub-33-row chunks keep the serial path.
                 admission_barrier = Deepseek4AdmissionBarrier::Idle;
-                let serial_fallback =
-                    next_deepseek4_prefill_handle(&slots, last_prefill_slot).unwrap_or(handle);
+                let cold_matrix_primary = deepseek4_cold_wave_matrix_primary(
+                    &deepseek4_prefill_lane_views(&slots, &scheduler.prefill_handles_fifo()),
+                );
+                let (primary, require_fifo_primary, serial_fallback) = match cold_matrix_primary {
+                    Some(lane) => (lane, false, lane),
+                    None => (
+                        handle,
+                        true,
+                        next_deepseek4_prefill_handle(&slots, last_prefill_slot).unwrap_or(handle),
+                    ),
+                };
                 let (fatal, used_serial_fallback) = advance_deepseek4_prefill_quantum(
                     &mut model,
                     &mut sessions,
                     &mut slots,
                     &mut scheduler,
                     registration.as_ref(),
-                    handle,
-                    true,
+                    primary,
+                    require_fifo_primary,
                     serial_fallback,
                     kv_bytes_per_token,
                     None,
@@ -31893,6 +31953,126 @@ mod tests {
         assert!(
             plan_deepseek4_prefill_cohort(128, cursor_of, &slots, &scheduler, primary, None, true)
                 .is_err()
+        );
+        drop(receivers);
+    }
+
+    /// S3 A/B arm B, turn 0: requests 0 and 1 cohorted their 749-row cold
+    /// prompts before 2 and 3 reached the server. Then 0's and 1's recovery
+    /// tails ran (FIFO-oldest), both lanes started decoding, and the Mixed
+    /// steps ran their whole answers before the stragglers prefilled. The
+    /// cold-wave rule leads with the stragglers' matrix work instead; once no
+    /// cold lane has matrix work left, the tails drain in FIFO order.
+    #[test]
+    fn deepseek_cold_wave_stragglers_prefill_before_early_lanes_run_their_tails() {
+        use super::super::engine_deepseek4::Deepseek4PrefillState;
+        let request = AdmitRequest {
+            prompt_tokens: 813,
+            max_tokens: 56,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        };
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(4, 4, 0);
+        scheduler.set_prefill_chunk_tokens(u32::MAX);
+        let handles: Vec<SlotHandle> = (0..4)
+            .map(|_| scheduler.admit(request.clone()).unwrap().handle.unwrap())
+            .collect();
+        // The first cohort committed lanes 0 and 1 through their anchor (749).
+        scheduler.advance_after_prefill(handles[0], 749);
+        scheduler.advance_after_prefill(handles[1], 749);
+        let mut receivers = Vec::new();
+        let mut slots_at = |cursors: [usize; 4]| -> Vec<Option<Deepseek4Slot>> {
+            (0..4)
+                .map(|slot| {
+                    let (reply, receiver) = oneshot::channel();
+                    receivers.push(receiver);
+                    Some((
+                        Deepseek4SlotWork::Prefill(Deepseek4PrefillState::for_scheduler_tests(
+                            cursors[slot],
+                            749,
+                            true,
+                        )),
+                        SlotReply::Unary(reply),
+                        handles[slot],
+                    ))
+                })
+                .collect()
+        };
+        let fifo = scheduler.prefill_handles_fifo();
+        assert_eq!(fifo, handles, "every cold lane is still prefilling");
+        match scheduler.step().unwrap() {
+            SchedulerStep::Prefill { handle, .. } => assert_eq!(handle, handles[0]),
+            other => panic!("expected a pure Prefill step, got {other:?}"),
+        }
+
+        // Lanes 0 and 1 are in their tails; 2 and 3 have all their matrix
+        // work left: lead with lane 2, and cohort 2 and 3.
+        let cursors = [749, 749, 0, 0];
+        let slots = slots_at(cursors);
+        let views = deepseek4_prefill_lane_views(&slots, &fifo);
+        assert_eq!(
+            views.iter().map(|lane| lane.recovery_tail).collect::<Vec<_>>(),
+            vec![true, true, false, false]
+        );
+        let primary = deepseek4_cold_wave_matrix_primary(&views);
+        assert_eq!(primary, Some(handles[2]));
+        let cohort = plan_deepseek4_prefill_cohort(
+            128,
+            |slot| (cursors[slot], cursors[slot]),
+            &slots,
+            &scheduler,
+            handles[2],
+            None,
+            false,
+        )
+        .unwrap()
+        .expect("the stragglers' matrix chunks cohort");
+        assert_eq!(
+            cohort
+                .iter()
+                .map(|candidate| (candidate.handle, candidate.plan.start(), candidate.plan.token_count()))
+                .collect::<Vec<_>>(),
+            vec![(handles[2], 0, 749), (handles[3], 0, 749)]
+        );
+
+        // Every cold lane in its tail: the FIFO order drains the tails.
+        let slots = slots_at([749; 4]);
+        assert_eq!(
+            deepseek4_cold_wave_matrix_primary(&deepseek4_prefill_lane_views(&slots, &fifo)),
+            None
+        );
+        // A straggler still mid-matrix after a partial chunk still goes first.
+        let slots = slots_at([749, 749, 749, 128]);
+        assert_eq!(
+            deepseek4_cold_wave_matrix_primary(&deepseek4_prefill_lane_views(&slots, &fifo)),
+            Some(handles[3])
+        );
+        // The rule is cold-wave only: warm tails keep FIFO priority.
+        let warm = |handle, recovery_tail| Deepseek4PrefillLaneView {
+            handle,
+            cold_wave: false,
+            recovery_tail,
+        };
+        assert_eq!(
+            deepseek4_cold_wave_matrix_primary(&[warm(handles[0], true), warm(handles[1], false)]),
+            None
+        );
+        // An oldest lane with matrix work leads as before.
+        assert_eq!(
+            deepseek4_cold_wave_matrix_primary(&[
+                Deepseek4PrefillLaneView {
+                    handle: handles[0],
+                    cold_wave: true,
+                    recovery_tail: false,
+                },
+                Deepseek4PrefillLaneView {
+                    handle: handles[1],
+                    cold_wave: true,
+                    recovery_tail: true,
+                },
+            ]),
+            None
         );
         drop(receivers);
     }
