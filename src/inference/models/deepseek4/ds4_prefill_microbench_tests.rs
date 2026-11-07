@@ -104,7 +104,14 @@ fn time(
 /// `name` as a comma list of usize, or `default`.
 fn env_list(name: &str, default: &[usize]) -> Vec<usize> {
     match std::env::var(name) {
-        Ok(v) => v.split(',').map(|s| s.trim().parse().unwrap()).collect(),
+        Ok(v) => v
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .parse()
+                    .unwrap_or_else(|error| panic!("{name}: {s:?} is not a row count: {error}"))
+            })
+            .collect(),
         Err(_) => default.to_vec(),
     }
 }
