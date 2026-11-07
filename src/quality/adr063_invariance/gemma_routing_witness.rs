@@ -57,7 +57,15 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// `IdMmScratch` accessors, routing-policy field `expert_mm_schedule`) and the
 /// ring-bytes KV restore. `src/ops/routing_selection_witness.rs` and the
 /// routing and routing-witness shaders are unchanged.
-pub const WITNESS_NATIVE_VERSION: &str = "0.16.0";
+/// Re-reviewed 0.16.0 -> 0.17.0 (`1a5fc09` -> `50ed326`): the changes are the
+/// tile-fastest `mm_id` compact schedule, grouped GeGLU expert decode
+/// (`quantized_matmul_id_ggml_mv_grouped_geglu`), GQA `flash_attn_vec_hybrid`,
+/// the opt-in SIMD MoE top-k kernel (`dispatch_moe_softmax_topk_simd`; the
+/// existing `dispatch_moe_softmax_topk` is unchanged), an internal
+/// `atomic_update` helper and submission-observer bookkeeping.
+/// `src/ops/routing_selection_witness.rs` and the routing and routing-witness
+/// shaders are unchanged, so the route label is kept.
+pub const WITNESS_NATIVE_VERSION: &str = "0.17.0";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
