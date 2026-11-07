@@ -1,7 +1,7 @@
 //! ADR-065 J1: the fixed-depth-three MTP (K3) transaction, split at its
 //! state boundaries so the solo tick and a joint verify window share it.
 //!
-//! `decode_tick_mtp_k3` runs, in order: [`Qwen35DecodeState::k3_entry`],
+//! `mtp_k3_round` runs, in order: [`Qwen35DecodeState::k3_entry`],
 //! [`Qwen35DecodeState::k3_draft`], [`Qwen35DecodeState::k3_verify_solo`],
 //! [`Qwen35DecodeState::k3_verify_to_plan`] and
 //! [`Qwen35DecodeState::k3_commit_solo`]. The solo commit runs

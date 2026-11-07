@@ -19238,8 +19238,9 @@ fn run_slot_aware_qwen35(
     let qwen_joint_decode =
         qwen35_joint_decode::qwen35_joint_decode_config(&guard.model.model, n_slots);
     // ADR-063 D1: resolve the unset speculation default for this worker's
-    // width, family and joint-decode selection; every admission, prefill
-    // catch-up and history-lookup check reads the resolved policy.
+    // width and joint-decode selection (`moe` is only logged); every
+    // admission, prefill catch-up and history-lookup check reads the
+    // resolved policy.
     let moe = guard.model.model.cfg.moe.is_some();
     guard
         .model
@@ -20881,6 +20882,7 @@ fn decode_batch_qwen35(
         },
         None => None,
     };
+    let turn_lanes = handles.len();
     let handles = serial_handles.as_deref().unwrap_or(handles);
     for &handle in handles {
         let slot_idx = handle.slot_id.0 as usize;
@@ -20952,6 +20954,22 @@ fn decode_batch_qwen35(
             continue;
         }
 
+        // The tick's single route decision (planned before the joint partition
+        // under the repeatable route, here otherwise), witnessed for the
+        // repeatability gates.
+        let kind = match state.plan_tick() {
+            Ok(Some(kind)) => kind.label(),
+            Ok(None) => "bound",
+            Err(_) => "unplanned",
+        };
+        tracing::debug!(
+            target: "hf2q::serve::api::engine_qwen35::progress",
+            slot = handle.slot_id.0,
+            kind,
+            path = "serial",
+            turn_lanes,
+            "Qwen decode tick route"
+        );
         let _native_invocation =
             scheduler.trace_transaction("qwen35", "ordinary_or_temporal_mtp_decode", &[handle]);
         let tick = state.decode_tick(

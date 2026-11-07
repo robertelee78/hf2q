@@ -25,6 +25,7 @@ use crate::inference::models::qwen35::joint_decode_routes::{
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::serve::api::engine_qwen35::{Qwen35JointLane, Qwen35TickOutcome};
+use crate::serve::api::qwen35_speculation::QwenSpeculationRoute;
 use crate::serve::api::registry::ModelRegistration;
 
 use super::{
@@ -367,13 +368,32 @@ pub(super) fn run_qwen35_joint_decode(
     config: Qwen35JointDecodeConfig,
     supervisor: &EngineSupervisor,
 ) -> Qwen35JointRun {
-    let Some(JointPartition { groups, mut serial }) = ({
-        let kv = guard.kv.as_ref().expect("kv Some during loop");
+    if guard
+        .kv
+        .as_ref()
+        .expect("kv Some during loop")
+        .la_capture_active()
+    {
         // An active DeltaNet capture would make the joint transaction refuse
         // after lanes were prepared; keep such a turn serial up front.
-        if kv.la_capture_active() {
-            return Qwen35JointRun::NotEligible;
+        return Qwen35JointRun::NotEligible;
+    }
+    // Repeatable route: plan every lane's tick from its own state before the
+    // partition, so a lane that speculates or drains verified output never
+    // joins a joint step and the serial loop runs the same decision. A plan
+    // error leaves the lane unplanned; its serial tick reports the error.
+    for &handle in handles {
+        if let Some(Some((Qwen35SlotWork::Decode(state), _, installed))) =
+            slots.get_mut(handle.slot_id.0 as usize)
+        {
+            if *installed == handle && state.speculation_route() == QwenSpeculationRoute::Repeatable
+            {
+                let _ = state.plan_tick();
+            }
         }
+    }
+    let Some(JointPartition { groups, mut serial }) = ({
+        let kv = guard.kv.as_ref().expect("kv Some during loop");
         partition_qwen35_joint_lanes(handles, config.max_rows, config.solo, |handle| match slots
             .get(handle.slot_id.0 as usize)
             .and_then(Option::as_ref)
@@ -383,7 +403,7 @@ pub(super) fn run_qwen35_joint_decode(
                     && !reply.client_closed()
                     && state.joint_decode_ready(kv) =>
             {
-                Some(state.ordinary_target_only())
+                state.joint_lane_class()
             }
             _ => None,
         })
@@ -415,6 +435,7 @@ pub(super) fn run_qwen35_joint_decode(
             registration,
             group,
             serial.len(),
+            handles.len(),
             kv_bytes_per_token,
             config,
             supervisor,
@@ -438,6 +459,7 @@ fn run_qwen35_joint_group(
     registration: Option<&ModelRegistration>,
     group: Vec<SlotHandle>,
     serial_lanes: usize,
+    turn_lanes: usize,
     kv_bytes_per_token: u64,
     config: Qwen35JointDecodeConfig,
     supervisor: &EngineSupervisor,
@@ -465,6 +487,19 @@ fn run_qwen35_joint_group(
                 });
             }
         }
+    }
+
+    for lane in &mut lanes {
+        // The joint row serves the lane's ordinary tick; drop its plan.
+        lane.state.consume_planned_tick();
+        tracing::debug!(
+            target: "hf2q::serve::api::engine_qwen35::progress",
+            slot = lane.handle.slot_id.0,
+            kind = "ordinary",
+            path = "joint",
+            turn_lanes,
+            "Qwen decode tick route"
+        );
     }
 
     static FIRST_JOINT_DECODE: Once = Once::new();

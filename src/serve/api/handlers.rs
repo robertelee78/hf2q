@@ -8771,7 +8771,7 @@ hf2q_qwen_speculation_rejected_tokens_total{{proposer=\"mtp\"}} {}\n\
 # TYPE hf2q_qwen_speculation_target_forwards_total counter\n\
 hf2q_qwen_speculation_target_forwards_total{{proposer=\"history_lookup\"}} {}\n\
 hf2q_qwen_speculation_target_forwards_total{{proposer=\"mtp\"}} {}\n\
-# HELP hf2q_qwen_speculation_cost_disabled_total Generations whose measured proposer cost was not better than equivalent ordinary decode.\n\
+# HELP hf2q_qwen_speculation_cost_disabled_total Generations whose proposer cost (modelled under the repeatable route, measured under adaptive) was not better than equivalent ordinary decode.\n\
 # TYPE hf2q_qwen_speculation_cost_disabled_total counter\n\
 hf2q_qwen_speculation_cost_disabled_total{{proposer=\"history_lookup\"}} {}\n\
 hf2q_qwen_speculation_cost_disabled_total{{proposer=\"mtp\"}} {}\n\

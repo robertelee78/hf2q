@@ -45,9 +45,11 @@ One scheduler turn advances every eligible decoding slot (2–4 rows by default)
 - Slots with MTP state take `decode_tick_mtp_warmup`'s coherent path.
   - After the shared target forward they run their own MTP catch-up over the same token (`process_target_batch`).
   - Target and MTP cursors therefore stay equal, and `spec_prefix_candidate` stays valid.
-  - A later solo turn resumes K3 drafting.
-  - The cost controllers observe each lane's wall time from prepare to its own finish (the shared forward plus earlier lanes' catch-ups) as the ordinary baseline.
-- History proposals are suppressed. The lookup ledger catches up from the committed tokens on the slot's next solo round, exactly as after a serial lookup miss.
+  - A later K3 round resumes drafting.
+- Which lanes may join (`HF2Q_QWEN_SPECULATION_ROUTE`; `docs/research/adr063-qwen-spec-repeatable.md`):
+  - **`repeatable` (default):** before the partition, each lane plans its tick from its own state (`Qwen35DecodeState::next_tick_kind`: pending output, history drafts, MTP with at least four outputs left and an open gate). Only lanes whose tick is ordinary join; a lane that speculates runs its serial K3 or history round whatever the cohort. The cost gates read a fixed cost model instead of wall time.
+  - **`adaptive` (phase 1):** a speculation-capable joint-ready lane joins any group of two or more as an M1 row with drafting suppressed, and runs K3 or history only when alone. The cost controllers observe each lane's wall time from prepare to its own finish as the ordinary baseline.
+- History proposals in a joint row are not made. The lookup ledger catches up from the committed tokens when the lane next plans a tick.
 
 Consequence: joint rows commit M1 (one-token target) decisions where stock decode would commit K3 verify-row decisions whenever its cost gate admits K3. "Bitwise" below is therefore per target forward; per-request outputs can differ from stock.
 

@@ -6,7 +6,11 @@ measured number of joint steps (`joint:M`). It tests whether the target's output
 many of its decode steps ran jointly, the defect #717 fixes. CPU-only client; it never starts a
 server or loads a model.
 
-  run      --manifest M --arm solo|joint:M [--logprobs] --base-url URL --out DIR
+An `order:XYZ` arm instead tests arrival order: a lead request starts decoding alone, then three
+agents' requests arrive in the permutation XYZ, so the same bodies join the cohort in different
+orders. Each of those outputs must be byte-identical across order arms.
+
+  run      --manifest M --arm solo|joint:M|order:XYZ [--logprobs] --base-url URL --out DIR
   analyze  ARM_DIR...   (each holds client/summary.json; server.stderr is read when present)
 
 Manifest (JSON, schema `hf2q.qwen-cohort-replay.manifest.v1`):
@@ -18,6 +22,27 @@ Manifest (JSON, schema `hf2q.qwen-cohort-replay.manifest.v1`):
                   that agent's recorded body plus one appended user message, streamed with usage
   pre_events      companion token events before the target is sent (int, default 4)
   references      optional {"label": path to assembled-assistant.json} for output classes
+  order           optional, required by order arms:
+                  {"lead": {"agent": int, "turn": int}, "agents": [a, b, c], "turn": int,
+                   "first_delay_s": float, "spacing_s": [float, float], "max_completion_tokens": int}
+                  the lead body is sent verbatim at T=0; the `turn` bodies of `agents`, in the
+                  arm's order XYZ (a permutation of `agents`, one digit each), are sent at
+                  first_delay_s, first_delay_s+spacing_s[0], first_delay_s+spacing_s[1], each
+                  capped at max_completion_tokens
+  warm_extra      optional [{"turn": int, "agents": [int]}]: order arms warm turns
+                  0..warm_turns-1 for order.agents only, then these per-agent turns in sequence
+  witness_required optional list of route-witness counter names that must be > 0 in every arm
+                  (see below); a missing server.stderr or zero counter invalidates the report
+
+Route witness: `analyze` parses server.stderr lines (ANSI codes stripped)
+  Qwen decode tick route slot=<u32> kind="<commit|history|k3|ordinary|bound|unplanned>" path="<serial|joint>" turn_lanes=<n>
+emitted once per lane per decode turn, into per-arm `route_witness` counters:
+  spec_in_busy_turn     kind k3|history with turn_lanes >= 2
+  ordinary_alone_joint  kind ordinary, path joint, turn_lanes == 1
+  ordinary_in_company   kind ordinary, turn_lanes >= 2
+  kind:<kind>           totals per kind
+For order arms the report also carries `order_targets`: per test/agent-N/turn-`turn` label, the
+distinct output digests across order arms and whether they are byte_identical.
 
 Warm-up turns are sent verbatim except `max_completion_tokens=1` and `stream=false`. Slot-local
 prompt-boundary anchors are captured during prefill, so each slot's anchor chain is rebuilt
@@ -60,6 +85,8 @@ def load_manifest(path):
             raise SystemExit(f"{path}: missing {key}")
     manifest.setdefault("pre_events", 4)
     manifest.setdefault("references", {})
+    manifest.setdefault("warm_extra", [])
+    manifest.setdefault("witness_required", [])
     return manifest
 
 
@@ -171,6 +198,45 @@ def joint_turn_lines(stderr_text):
     return counts
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+ROUTE = re.compile(r'Qwen decode tick route slot=(\d+) kind="?(\w+)"? path="?(\w+)"? turn_lanes=(\d+)')
+
+
+def route_witness(stderr_text):
+    """Route-witness counters from the per-lane decode tick debug lines."""
+    counts = {"spec_in_busy_turn": 0, "ordinary_alone_joint": 0, "ordinary_in_company": 0}
+    for line in stderr_text.splitlines():
+        match = ROUTE.search(ANSI.sub("", line))
+        if not match:
+            continue
+        kind, path, lanes = match.group(2), match.group(3), int(match.group(4))
+        counts[f"kind:{kind}"] = counts.get(f"kind:{kind}", 0) + 1
+        if kind in ("k3", "history") and lanes >= 2:
+            counts["spec_in_busy_turn"] += 1
+        if kind == "ordinary" and path == "joint" and lanes == 1:
+            counts["ordinary_alone_joint"] += 1
+        if kind == "ordinary" and lanes >= 2:
+            counts["ordinary_in_company"] += 1
+    return counts
+
+
+def order_schedule(order, arm):
+    """[(offset_s, agent, turn, cap)] for an order:XYZ arm; the lead has cap None."""
+    match = re.fullmatch(r"order:(\d+)", arm)
+    agents = [int(c) for c in match.group(1)] if match else None
+    if agents is None or sorted(agents) != sorted(order["agents"]) or len(agents) != 3:
+        raise SystemExit(f"unknown arm {arm!r}; expected order: plus a permutation of {order['agents']}")
+    first = order["first_delay_s"]
+    offsets = [first] + [first + s for s in order["spacing_s"]]
+    lead = order["lead"]
+    return [(0.0, lead["agent"], lead["turn"], None)] + [
+        (offset, agent, order["turn"], order["max_completion_tokens"]) for offset, agent in zip(offsets, agents)]
+
+
+def is_order_arm(arm):
+    return arm.startswith("order:")
+
+
 class Client:
     def __init__(self, base_url, out):
         self.base = urllib.parse.urlparse(base_url)
@@ -240,10 +306,19 @@ def concurrent(jobs):
         raise errors[0]
 
 
-def warm(client, manifest):
-    for turn in range(manifest["warm_turns"]):
+def warm_plan(manifest, arm):
+    """[(turn, agents)] replayed in sequence before the test."""
+    if is_order_arm(arm):
+        agents = list(manifest["order"]["agents"])
+        return [(t, agents) for t in range(manifest["warm_turns"])] + [
+            (extra["turn"], list(extra["agents"])) for extra in manifest["warm_extra"]]
+    return [(t, list(range(manifest["agents"]))) for t in range(manifest["warm_turns"])]
+
+
+def warm(client, manifest, arm):
+    for turn, agents in warm_plan(manifest, arm):
         jobs = []
-        for agent in range(manifest["agents"]):
+        for agent in agents:
             body = recorded(manifest, agent, turn)
             body["max_completion_tokens"] = 1
             body["stream"] = False
@@ -252,7 +327,33 @@ def warm(client, manifest):
         concurrent(jobs)
 
 
+def run_order_arm(client, manifest, arm, logprobs):
+    start = time.monotonic()
+
+    def at(offset, label, body):
+        def go():
+            delay = start + offset - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            client.post(label, body)
+        return go
+
+    jobs = []
+    for offset, agent, turn, cap in order_schedule(manifest["order"], arm):
+        body = recorded(manifest, agent, turn)
+        if cap is not None:
+            body["max_completion_tokens"] = cap
+        if logprobs:
+            body["logprobs"], body["top_logprobs"] = True, 5
+        jobs.append(at(offset, f"test/agent-{agent}/turn-{turn}", body))
+    concurrent(jobs)
+
+
 def run_arm(client, manifest, arm, logprobs):
+    if is_order_arm(arm):
+        if "order" not in manifest:
+            raise SystemExit("order arms need a manifest order block")
+        return run_order_arm(client, manifest, arm, logprobs)
     target_spec = manifest["target"]
     target = recorded(manifest, target_spec["agent"], target_spec["turn"])
     if logprobs:
@@ -263,7 +364,7 @@ def run_arm(client, manifest, arm, logprobs):
         return
     match = re.fullmatch(r"joint:(\d+)", arm)
     if not match:
-        raise SystemExit(f"unknown arm {arm!r}; expected solo or joint:M")
+        raise SystemExit(f"unknown arm {arm!r}; expected solo, joint:M or order:XYZ")
     spec = manifest["companion"]
     companion = recorded(manifest, spec["agent"], spec["turn"])
     companion["messages"].append({"role": "user", "content": spec["question"]})
@@ -289,7 +390,7 @@ def cmd_run(args):
     client = Client(args.base_url, args.out)
     error = None
     try:
-        warm(client, manifest)
+        warm(client, manifest, args.arm)
         run_arm(client, manifest, args.arm, args.logprobs)
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
@@ -300,8 +401,19 @@ def cmd_run(args):
     return 1 if error else 0
 
 
+def order_targets(order_rows):
+    """Per-label byte identity of the order block's turn outputs across order arms."""
+    labels = sorted({label for _, labels in order_rows for label in labels})
+    result = {}
+    for label in labels:
+        digests = [labels[label] for _, labels in order_rows if label in labels]
+        result[label] = {"distinct": len(set(digests)),
+                         "byte_identical": len(digests) == len(order_rows) and len(set(digests)) == 1}
+    return result
+
+
 def analyze(arm_dirs):
-    arms, cached = [], []
+    arms, cached, order_rows, reasons = [], [], [], []
     for arm_dir in arm_dirs:
         summary = read_json(os.path.join(arm_dir, "client", "summary.json"))
         manifest = summary["manifest"]
@@ -320,18 +432,37 @@ def analyze(arm_dirs):
                 row["joint_window"] = joint_window(companion["events"], target["send_ns"], target["done_ns"])
             row["decode_tokens_per_sec"] = (target.get("timing") or {}).get("decode_tokens_per_sec")
         stderr = os.path.join(arm_dir, "server.stderr")
+        row["route_witness"] = None
         if os.path.exists(stderr):
             with open(stderr, errors="replace") as f:
-                row["joint_turn_lines"] = joint_turn_lines(f.read())
+                text = f.read()
+            row["joint_turn_lines"] = joint_turn_lines(text)
+            row["route_witness"] = route_witness(text)
+        for name in manifest.get("witness_required") or []:
+            if row["route_witness"] is None:
+                reasons.append(f"{arm_dir}: witness {name} required but server.stderr missing")
+            elif row["route_witness"].get(name, 0) <= 0:
+                reasons.append(f"{arm_dir}: witness {name} is 0")
+        if is_order_arm(summary["arm"]) and "order" in manifest and not summary["logprobs"]:
+            turn = manifest["order"]["turn"]
+            order_rows.append((arm_dir, {f"test/agent-{a}/turn-{turn}": output_digest(r)
+                                         for a in manifest["order"]["agents"]
+                                         for r in [records.get(f"test/agent-{a}/turn-{turn}")] if r is not None}))
         arms.append(row)
         cached.append((arm_dir, cached_map(records)))
     mismatches = cached_mismatches(cached)
     plain = [row["digest"] for row in arms if not row["logprobs"] and row["digest"]]
-    return {"schema": REPORT_SCHEMA, "arms": arms,
-            "valid": not mismatches and all(row["error"] is None for row in arms),
-            "cached_mismatches": mismatches,
-            "distinct_outputs": len(set(plain)),
-            "byte_identical": len(set(plain)) == 1 and len(plain) == sum(1 for row in arms if not row["logprobs"])}
+    if mismatches:
+        reasons.append("cached_tokens mismatch")
+    reasons += [f"{row['dir']}: error {row['error']}" for row in arms if row["error"] is not None]
+    report = {"schema": REPORT_SCHEMA, "arms": arms,
+              "valid": not reasons, "invalid_reasons": reasons,
+              "cached_mismatches": mismatches,
+              "distinct_outputs": len(set(plain)),
+              "byte_identical": len(set(plain)) == 1 and len(plain) == sum(1 for row in arms if not row["logprobs"])}
+    if order_rows:
+        report["order_targets"] = order_targets(order_rows)
+    return report
 
 
 def reference_record(path):
