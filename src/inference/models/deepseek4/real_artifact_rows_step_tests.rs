@@ -62,7 +62,12 @@ fn official_artifact_rows_step_matches_one_token_steps_bitwise() {
     for (index, case) in CASES.iter().enumerate() {
         let total: usize = case.chunks.iter().sum();
         assert!(case.chunks.iter().all(|&rows| (2..=MAX_JOINT_DECODE_ROWS).contains(&rows)));
-        let capacity = case.prefix + total + 2;
+        // A DeepSeek-V4 cache needs at least one full sliding window: the window ring is
+        // min(capacity, sliding_window) rows and both the matrix-prefill and the one-token
+        // attention paths require it to equal the configured window (serving caches start at
+        // 131,072 tokens). Case 3's tiny prefix would otherwise get an 18-row ring.
+        let capacity = (case.prefix + total + 2).max(model.cfg.sliding_window as usize);
+        eprintln!("rows step case {index}: prefix {}, chunks {:?}, capacity {capacity}", case.prefix, case.chunks);
         let mut serial = prefilled(&mut model, index, case.prefix, capacity);
         let mut stepped = prefilled(&mut model, index, case.prefix, capacity);
         assert_cache_exact(&format!("case {index} prefix"), &serial, &stepped);
@@ -142,6 +147,8 @@ fn official_artifact_rows_step_matches_one_token_steps_bitwise() {
             );
             assert_cache_exact(&format!("case {index} replay"), &serial, &stepped);
         }
+
+        eprintln!("rows step case {index}: rows, logits, caches and anchor replay bitwise equal");
 
         // A rejected commit gate poisons the cache without publishing.
         let position = stepped.position();
