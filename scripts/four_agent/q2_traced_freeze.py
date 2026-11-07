@@ -67,6 +67,11 @@ def load_run(run):
             "trace header identity differs from the frozen identity")
     require(approval.get("engine_kind") == "hf2q" and approval.get("server_pid") == receipt.get("server_pid"),
             "hf2q client approval bound to the launched server")
+    # Q2 windows and certification are Qwen3.8 only: scoring DeepSeek-V4/Gemma windows waits for the F1
+    # multi-owner-epoch rule (ADR-063, Q2 v3). Other traced families are read with f2_trace/q4_trace_attribution.
+    require(approval.get("family") == "qwen" and
+            config.get("native_observer", {}).get("witness_manifest", {}).get("input_sources") ==
+            traced.WITNESS_SOURCES["qwen38"], "Q2 freezing takes a Qwen3.8 traced run only")
     return {"run": run, "receipt": receipt, "approval": approval, "config": config, "header": header}
 
 

@@ -63,9 +63,8 @@ WITNESS_SOURCES = {
                   "deepseek4.prefill.actual_cooperative_pack", "deepseek4.prefill.actual_cache_span",
                   "deepseek4.scalar_verifier"],
 }
-# Families whose traced case serves a text-only locator: readiness must show no vision projector.
-TEXT_ONLY = {"qwen38"}
-WITNESS = {"schema": "hf2q.f2.forward-witness-policy.v1", "operator": "target_input_rms_norm",
+# Key order is part of native-config.json's bytes (config_sha256): input_sources stays third.
+WITNESS = {"schema": "hf2q.f2.forward-witness-policy.v1", "operator": "target_input_rms_norm", "input_sources": None,
            "coverage": "each_admitted_lane_in_first_fixed_window",
            "batching_scope": "operator_only_full_body_unknown"}
 ARM_READBACK_LIMIT = 8 * MIB  # the pre-client trace holds only header, baseline and arm ACK
@@ -95,7 +94,9 @@ def phase_plan(population):
 
 def witness(family):
     require(family in WITNESS_SOURCES, "traced families: " + ", ".join(sorted(WITNESS_SOURCES)))
-    return {**json.loads(json.dumps(WITNESS)), "input_sources": list(WITNESS_SOURCES[family])}
+    manifest = json.loads(json.dumps(WITNESS))
+    manifest["input_sources"] = list(WITNESS_SOURCES[family])
+    return manifest
 
 
 def traced_case(case, population):
@@ -141,7 +142,7 @@ def check_identity(identity, *, binary_sha256, build, template_sha256, model_sha
     require(identity["profile_sha256"] == template_sha256,
             "profile_sha256 is not the sha256 of the client approval template")
     require(model_sha256 is not None and identity["model_sha256"] == model_sha256,
-            "model_sha256 differs from the artifact's conversion-receipt sha256")
+            "model_sha256 differs from the artifact sha256 (conversion receipt, or the case's declared digest)")
     require((identity["native_version"], identity["native_checksum"]) == tuple(native),
             "native_version/native_checksum differ from mlx-native in the server_source Cargo.lock")
     return identity
@@ -162,7 +163,7 @@ def trace_config(out, run_id, identity, nonce, family, gpu_timestamps=False):
             "identity": dict(identity)}
 
 
-def readiness_envelope(health, runtime, readyz, *, model_id, server_pid, identity, family):
+def readiness_envelope(health, runtime, readyz, *, model_id, server_pid, identity):
     """The single readiness file q2_certify reads, checked against the launched process."""
     require(isinstance(readyz, dict) and readyz.get("ready") is True, "readyz is not ready")
     require(isinstance(health, dict) and health.get("model") == model_id and health.get("context_length") == 262144,
@@ -171,9 +172,8 @@ def readiness_envelope(health, runtime, readyz, *, model_id, server_pid, identit
     snapshot = runtime.get("measurement_snapshot") or {} if isinstance(runtime, dict) else {}
     require(serve.get("max_slots") == 4, "runtime serve.max_slots is not 4")
     require(snapshot.get("process_pid") == server_pid, "measurement_snapshot.process_pid is not the launched server pid")
-    if family in TEXT_ONLY:
-        require((snapshot.get("active_controls") or {}).get("vision_projector") is False,
-                "vision projector loaded: the traced cohort is text-only")
+    require((snapshot.get("active_controls") or {}).get("vision_projector") is False,
+            "vision projector loaded: the traced cohort is text-only")
     require(snapshot.get("tokenizer_sha256") == identity["tokenizer_sha256"]
             and snapshot.get("template_sha256") == identity["template_sha256"],
             "served tokenizer/template sha256 differ from the frozen identity")
@@ -327,7 +327,7 @@ def prepare(args, environ):
             "artifact": artifact, "latency_ns": latency, "binary_sha256": binary_sha, "template": template}
 
 
-def wait_ready(plan, server, latch, stop, identity, family):
+def wait_ready(plan, server, latch, stop, identity):
     spec, start = plan["readiness"], time.monotonic()
     while not latch.event.is_set():
         if INTERRUPTED:
@@ -348,7 +348,7 @@ def wait_ready(plan, server, latch, stop, identity, family):
     try:
         return readiness_envelope(q5.get_json(base + "/health"), q5.get_json(base + "/hf2q/v1/runtime"),
                                   q5.get_json(base + "/readyz"), model_id=plan["variables"]["MODEL_ID"],
-                                  server_pid=server.pid, identity=identity, family=family)
+                                  server_pid=server.pid, identity=identity)
     except (OSError, ValueError) as error:
         return stop("readiness_mismatch", str(error))
 
@@ -370,14 +370,24 @@ def wait_arm(path, config, server, latch, stop):
     return None
 
 
+def serve_locator(plan, out, receipt, state):
+    """A text-only hard-link locator, only for a case that declares one (qwen38); other cases serve the
+    model path itself, which the plan already resolved as SERVED_MODEL."""
+    if not plan["artifact"].get("text_only_locator"):
+        require(plan["served_model"] == plan["artifact"]["path"], "case without a locator must serve its model path")
+        return None
+    locator = q5_artifacts.create_locator(plan["artifact"]["path"], str(out))
+    state["locator"] = receipt["text_only_locator"] = locator
+    require(locator["served_path"] == plan["served_model"], "text-only locator path differs from SERVED_MODEL")
+    return locator
+
+
 def supervise(prepared, out, receipt, state):
     plan, values, config = prepared["plan"], prepared["values"], prepared["config"]
     policy = plan["policy"]
     reason = q5.preflight(plan, policy, receipt)
     require(reason is None, f"preflight refused: {reason}")
-    locator = q5_artifacts.create_locator(plan["artifact"]["path"], str(out))
-    state["locator"] = receipt["text_only_locator"] = locator
-    require(locator["served_path"] == plan["served_model"], "text-only locator path differs from SERVED_MODEL")
+    serve_locator(plan, out, receipt, state)
     fd = os.open(out / CONFIG_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as handle:
         handle.write(json.dumps(config, indent=2) + "\n")
@@ -400,7 +410,7 @@ def supervise(prepared, out, receipt, state):
         latch.groups.append(server.pid)
         sampler.pgid, sampler.roots = server.pid, {server.pid}
         values["SERVER_PID"] = receipt["server_pid"] = server.pid
-        envelope = wait_ready(plan, server, latch, stop, prepared["identity"], plan["family"])
+        envelope = wait_ready(plan, server, latch, stop, prepared["identity"])
         if envelope is None:
             return
         q5.save(out / "readiness.json", envelope)

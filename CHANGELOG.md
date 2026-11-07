@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Diagnostics: `scripts/four_agent/q2_traced_run.py` now traces DeepSeek-V4 four-slot cases as well as Qwen3.8 (gap program S3). The case's family selects the witness manifest of sources its engine publishes, and the text-only readiness check applies only to Qwen3.8. With `--gpu-timestamps`, a traced DeepSeek-V4 run records per-command GPU time.
+- Diagnostics: `scripts/four_agent/q2_traced_run.py` now traces DeepSeek-V4 four-slot cases as well as Qwen3.8 (gap program S3). The case's family selects the witness manifest of sources its engine publishes, and only a case that declares a text-only locator gets one. Q2 window freezing still takes Qwen3.8 runs only. With `--gpu-timestamps`, a traced DeepSeek-V4 run records per-command GPU time.
 - Diagnostics (ADR-063 Q4-TRACE-GPU-TIMING): traced runs can opt in to per-command GPU timestamps (`native_observer.gpu_timestamps: true`; `q2_traced_run.py --gpu-timestamps`).
   - The phase trace records mlx-native's existing per-command GPU timing stream (Metal command-buffer start and end) in the same ordered queue as the native events, plus the joint forward's command plan and paired host clock samples.
   - The reducer validates the records fail closed and checks clock-free duration bounds. The attribution tool reports per-epoch GPU busy time and bubbles and per-chain GPU time, so a Qwen joint step's completion tail can be split by layer chain.

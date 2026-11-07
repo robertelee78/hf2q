@@ -120,6 +120,13 @@ class RunIdentityTest(unittest.TestCase):
             traced.trace_config(Path("/r"), "bad id", IDENTITY, NONCE, "qwen38")
         with self.assertRaisesRegex(ValueError, "traced families"):
             traced.trace_config(Path("/r"), RUN, IDENTITY, NONCE, "gemma4")
+        # The qwen38 config bytes (and so config_sha256) are those of the pre-family runner.
+        self.assertEqual(json.dumps(cfg["native_observer"]["witness_manifest"], indent=2), json.dumps({
+            "schema": "hf2q.f2.forward-witness-policy.v1", "operator": "target_input_rms_norm",
+            "input_sources": ["qwen35.greedy.actual_tokens", "qwen35.forward.actual_tokens",
+                              "qwen35.joint_decode.actual_slot_rows"],
+            "coverage": "each_admitted_lane_in_first_fixed_window",
+            "batching_scope": "operator_only_full_body_unknown"}, indent=2))
         ds4 = traced.trace_config(Path("/r"), RUN, IDENTITY, NONCE, "deepseek4")["native_observer"]["witness_manifest"]
         self.assertEqual(ds4, {**cfg["native_observer"]["witness_manifest"], "input_sources": [
             "deepseek4.sorted_cache_lane", "deepseek4.prefill.actual_cooperative_lane",
@@ -138,7 +145,7 @@ class RunIdentityTest(unittest.TestCase):
             (IDENTITY, facts(build={"source": "0" * 40, "sha256": SHA["binary"]}),
              "server_source differs from the build receipt source"),
             (IDENTITY, facts(template_sha256=SHA["template"]), "profile_sha256 is not the sha256 of the client approval"),
-            (IDENTITY, facts(model_sha256=None), "model_sha256 differs from the artifact's conversion-receipt"),
+            (IDENTITY, facts(model_sha256=None), "model_sha256 differs from the artifact sha256"),
             (IDENTITY, facts(native=("0.15.9", SHA["native"])), "native_version/native_checksum differ from mlx-native"),
         ]
         for identity, given, reason in refusals:
@@ -174,14 +181,14 @@ class CaseAndReadinessTest(unittest.TestCase):
                                                       "HF2Q_PHASE_TRACE_CONFIG": "{OUT}/native-config.json"})
         self.assertEqual(traced.traced_case(ds4, "n1")["client"]["argv"], ds4["client"]["argv"] + ["--phase-plan", "1"])
 
-    def ready(self, family="qwen38", **change):
+    def ready(self, **change):
         runtime = {"serve": {"max_slots": 4}, "measurement_snapshot": {
             "process_pid": 41, "active_controls": {"vision_projector": False},
             "tokenizer_sha256": SHA["tokenizer"], "template_sha256": SHA["template"]}}
         values = dict(health={"model": "Qwen3.8 27B", "context_length": 262144}, runtime=runtime, readyz={"ready": True})
         values.update(change)
         return traced.readiness_envelope(values["health"], values["runtime"], values["readyz"],
-                                         model_id="Qwen3.8 27B", server_pid=41, identity=IDENTITY, family=family)
+                                         model_id="Qwen3.8 27B", server_pid=41, identity=IDENTITY)
 
     def test_readiness_envelope_is_checked_against_the_launched_process(self):
         self.assertEqual(set(self.ready()), {"health", "runtime", "readyz"})
@@ -197,13 +204,26 @@ class CaseAndReadinessTest(unittest.TestCase):
         for change, reason in refusals:
             with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
                 self.ready(**change)
-        # The vision check binds the text-only (qwen38) family only; every other check binds every family.
-        loaded = snap(active_controls={"vision_projector": True})
-        self.assertEqual(set(self.ready("deepseek4", runtime=loaded)), {"health", "runtime", "readyz"})
-        for change, reason in refusals:
-            if reason != "vision projector loaded":
-                with self.subTest(family="deepseek4", reason=reason), self.assertRaisesRegex(ValueError, reason):
-                    self.ready("deepseek4", **change)
+
+    def test_only_a_case_that_declares_a_locator_gets_one(self):
+        from unittest import mock
+        out = Path("/runs/x")
+        for name, declared in (("qwen38.json", True), ("deepseek4-ds4file.json", False)):
+            case = traced.traced_case(case_loads((HERE / "q5_cases" / name).read_bytes()), "n4")
+            plan = traced.q5_case.build_plan(case, {**traced.q5.builtins(out), "RUN_ID": RUN},
+                                             {"HF2Q_Q5_HF2Q_BIN": "/b/hf2q", "HF2Q_Q5_MODEL": "/m/model.gguf"})
+            receipt, state = {}, {}
+            made = {"served_path": plan["served_model"], "directory": str(out / "text-model")}
+            with self.subTest(case=name), mock.patch.object(traced.q5_artifacts, "create_locator",
+                                                             return_value=made) as create:
+                traced.serve_locator(plan, out, receipt, state)
+                self.assertEqual(create.called, declared)
+                self.assertEqual(("text_only_locator" in receipt, "locator" in state), (declared, declared))
+                if not declared:
+                    self.assertEqual(plan["served_model"], plan["artifact"]["path"])
+        plan["served_model"] = "/elsewhere/model.gguf"
+        with self.assertRaisesRegex(ValueError, "must serve its model path"):
+            traced.serve_locator(plan, out, {}, {})
 
 
 class TraceReadbackTest(unittest.TestCase):
@@ -311,6 +331,17 @@ class FreezeTest(unittest.TestCase):
                             ("native-config.json", self.cfg)):
             (self.run / name).write_text(json.dumps(value))
         write_lines(self.run / "native-phase-trace.jsonl", [header(self.cfg)])
+
+    def test_q2_freezing_takes_qwen38_runs_only(self):
+        self.approval["family"] = "deepseek4"
+        self.write()
+        with self.assertRaisesRegex(ValueError, "Qwen3.8 traced run only"):
+            freeze.load_run(self.run)
+        self.approval["family"] = "qwen"
+        self.cfg = traced.trace_config(self.run, RUN, IDENTITY, NONCE, "deepseek4")
+        self.write()
+        with self.assertRaisesRegex(ValueError, "Qwen3.8 traced run only"):
+            freeze.load_run(self.run)
 
     def test_one_run_id_across_receipt_approval_config_and_trace(self):
         self.assertEqual(freeze.load_run(self.run)["header"]["origin_monotonic_ns"], 5_000)
