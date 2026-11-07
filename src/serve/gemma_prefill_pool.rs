@@ -26,16 +26,20 @@
 //! queue.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use anyhow::{Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxBufferPool, MlxDevice};
 
-/// Upper bound on the power-of-two bucket bytes one forward draws from the
-/// arena, and so on what the arena retains between forwards. A warm
-/// four-lane forward of 1,420 rows takes about 0.9 GiB of buckets and the
-/// joint cold forward of 1,832 rows about 1.4 GiB. Requests past the bound
-/// fall back to a fresh zero-filled `alloc_buffer`, the pre-arena behavior.
+/// Upper bound on the power-of-two bucket bytes the arena holds — handed out
+/// and free together — at every moment, during a forward and between
+/// forwards. A warm four-lane forward of 1,420 rows takes about 0.9 GiB of
+/// buckets and the joint cold forward of 1,832 rows about 1.4 GiB. A request
+/// that would grow the arena past the bound first releases the free buckets
+/// (earlier forwards' buffers this forward has not reused); one that still
+/// does not fit falls back to a fresh zero-filled `alloc_buffer`, the
+/// pre-arena behavior.
 const POOL_LIMIT_BYTES: usize = 2 << 30;
 
 /// Initialization contract of one pooled activation (module docs).
@@ -48,7 +52,12 @@ pub(crate) enum Init {
 struct Arena {
     pool: MlxBufferPool,
     limit: usize,
-    /// Bucket bytes handed out by the active cycle.
+    /// Free buckets by size, mirroring the pool's free list so a request
+    /// knows whether it reuses a bucket or grows the arena.
+    free: HashMap<usize, usize>,
+    /// Buckets handed out by the active (or unwound) cycle.
+    in_use: Vec<usize>,
+    /// Sum of `in_use`.
     issued: usize,
     active: bool,
     /// The previous cycle ended without declaring its GPU work complete.
@@ -60,20 +69,45 @@ impl Arena {
         Self {
             pool: MlxBufferPool::new(),
             limit,
+            free: HashMap::new(),
+            in_use: Vec::new(),
             issued: 0,
             active: false,
             undrained: false,
         }
     }
 
-    /// Return the last cycle's handouts to the free list. Free buckets the
-    /// last cycle did not reuse are released first when keeping them would
-    /// retain more than the limit.
-    fn recycle(&mut self) {
-        if self.pool.free_bytes().saturating_add(self.issued) > self.limit {
-            self.pool.clear();
+    /// Bucket bytes the arena holds, handed out and free.
+    fn held_bytes(&self) -> usize {
+        self.pool.free_bytes().saturating_add(self.issued)
+    }
+
+    /// Take `bucket` for the active cycle: `false` when it fits neither a
+    /// free bucket nor the limit, even after releasing every free bucket.
+    fn reserve(&mut self, bucket: usize) -> bool {
+        match self.free.get_mut(&bucket) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => {
+                if self.issued.saturating_add(bucket) > self.limit {
+                    return false;
+                }
+                if self.held_bytes().saturating_add(bucket) > self.limit {
+                    self.pool.clear();
+                    self.free.clear();
+                }
+            }
         }
+        self.in_use.push(bucket);
+        self.issued += bucket;
+        true
+    }
+
+    /// Return the last cycle's handouts to the free list.
+    fn recycle(&mut self) {
         self.pool.reset();
+        for bucket in self.in_use.drain(..) {
+            *self.free.entry(bucket).or_default() += 1;
+        }
         self.issued = 0;
         self.undrained = false;
     }
@@ -136,7 +170,7 @@ impl PrefillPoolCycle {
         let fill = self.fill_byte(init);
         ARENA.with(|arena| {
             let mut arena = arena.borrow_mut();
-            let mut buffer = if bytes == 0 || arena.issued.saturating_add(bucket) > arena.limit {
+            let mut buffer = if bytes == 0 || !arena.reserve(bucket) {
                 let buffer = device
                     .alloc_buffer(bytes, dtype, vec![elements])
                     .map_err(|e| anyhow::anyhow!("batched alloc {label}: {e}"))?;
@@ -146,12 +180,21 @@ impl PrefillPoolCycle {
                 }
                 buffer
             } else {
-                let buffer = arena
+                match arena
                     .pool
                     .alloc_uninitialized(device, bytes, dtype, vec![elements])
-                    .map_err(|e| anyhow::anyhow!("batched pooled alloc {label}: {e}"))?;
-                arena.issued += bucket;
-                buffer
+                {
+                    Ok(buffer) => buffer,
+                    Err(e) => {
+                        // Undo the reservation; the pool's free list may have
+                        // lost the bucket, so drop the free side entirely.
+                        arena.in_use.pop();
+                        arena.issued -= bucket;
+                        arena.pool.clear();
+                        arena.free.clear();
+                        anyhow::bail!("batched pooled alloc {label}: {e}");
+                    }
+                }
             };
             if let Some(byte) = fill {
                 buffer
@@ -200,6 +243,17 @@ impl Drop for PrefillPoolCycle {
 #[cfg(test)]
 fn set_limit_for_test(limit: usize) {
     ARENA.with(|arena| arena.borrow_mut().limit = limit);
+}
+
+/// Bucket bytes the arena holds on this thread (handed out plus free), as
+/// counted by the pool itself and by the arena's mirror.
+#[cfg(test)]
+fn held_bytes_for_test() -> (usize, usize) {
+    ARENA.with(|arena| {
+        let arena = arena.borrow();
+        let mirrored: usize = arena.free.iter().map(|(bucket, n)| bucket * n).sum();
+        (arena.held_bytes(), mirrored + arena.issued)
+    })
 }
 
 #[cfg(test)]

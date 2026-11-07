@@ -3168,12 +3168,20 @@ impl MlxModelWeights {
                             // proven iter-84 path.  D=256 uses BF16-cache.
                             let _q_n_elems = nh * seq_len * hd;
                             let kv_full_elems = nkv * (layer_kv.capacity) * hd;
+                            // Per-layer scratch, dropped with this layer: kept
+                            // out of the prefill arena (zero-filled anyway).
+                            let alloc_layer_scratch = |dtype: DType, name: &str| {
+                                dev.alloc_buffer(
+                                    kv_full_elems * dtype.size_of(),
+                                    dtype,
+                                    vec![kv_full_elems],
+                                )
+                                .map_err(|e| anyhow::anyhow!("batched alloc {name}: {e}"))
+                            };
                             let f32_kv_scratch =
-                                alloc_f32(kv_full_elems, Init::Zeroed, "xlen_d512_kv_f32_scratch")?;
-                            let bf16_k =
-                                alloc_bf16(kv_full_elems, Init::Zeroed, "xlen_d512_bf16_k")?;
-                            let bf16_v =
-                                alloc_bf16(kv_full_elems, Init::Zeroed, "xlen_d512_bf16_v")?;
+                                alloc_layer_scratch(DType::F32, "xlen_d512_kv_f32_scratch")?;
+                            let bf16_k = alloc_layer_scratch(DType::BF16, "xlen_d512_bf16_k")?;
+                            let bf16_v = alloc_layer_scratch(DType::BF16, "xlen_d512_bf16_v")?;
                             s.barrier_between(&[&layer_kv.k], &[&f32_kv_scratch]);
                             mlx_native::ops::elementwise::cast(
                                 s.encoder_mut(),

@@ -197,3 +197,79 @@ fn requests_past_the_limit_fall_back_to_zeroed_device_buffers() {
     assert!(direct.as_slice::<u8>().unwrap().iter().all(|&b| b == 0));
     cycle.gpu_quiescent();
 }
+
+#[test]
+fn arena_holds_at_most_the_limit_during_a_forward() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let ctx = GpuContext::new().unwrap();
+    let device = ctx.device().clone();
+    set_limit_for_test(4096);
+    let assert_bounded = |when: &str| {
+        let (held, mirrored) = held_bytes_for_test();
+        assert_eq!(
+            held, mirrored,
+            "{when}: free-list mirror drifted from the pool"
+        );
+        assert!(
+            held <= 4096,
+            "{when}: arena holds {held} bytes past the 4096 limit"
+        );
+    };
+
+    {
+        let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
+        let _a = cycle
+            .alloc(&device, DType::F32, 1024, Init::Overwritten, "a")
+            .unwrap();
+        assert_bounded("first forward");
+        cycle.gpu_quiescent();
+    }
+    assert_eq!(
+        held_bytes_for_test().0,
+        4096,
+        "the 4096-byte bucket is kept free"
+    );
+
+    // A differently shaped forward: before growing, the arena releases the
+    // earlier forward's free bucket instead of holding both (8 KiB).
+    let shapes = [(256, "b"), (512, "c"), (256, "d")];
+    let first: Vec<_> = {
+        let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
+        let mut ptrs = Vec::new();
+        for (elements, label) in shapes {
+            let buffer = cycle
+                .alloc(&device, DType::F32, elements, Init::Overwritten, label)
+                .unwrap();
+            ptrs.push(buffer.contents_ptr());
+            assert_bounded(label);
+        }
+        let direct = cycle
+            .alloc(&device, DType::F32, 1, Init::Overwritten, "e")
+            .unwrap();
+        assert_eq!(
+            direct.byte_len(),
+            4,
+            "a full arena falls back to a direct buffer"
+        );
+        assert_bounded("direct");
+        cycle.gpu_quiescent();
+        ptrs
+    };
+    assert_bounded("between forwards");
+
+    // The same shapes again reuse every bucket at the limit without evicting.
+    let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
+    let mut second = Vec::new();
+    for (elements, label) in shapes {
+        let buffer = cycle
+            .alloc(&device, DType::F32, elements, Init::Overwritten, label)
+            .unwrap();
+        second.push(buffer.contents_ptr());
+        assert_bounded(label);
+    }
+    let mut first = first;
+    first.sort();
+    second.sort();
+    assert_eq!(second, first, "every bucket is reused");
+    cycle.gpu_quiescent();
+}

@@ -2321,10 +2321,9 @@ where
     // When the request carries a grammar (response_format=json_object /
     // json_schema, OR tool_choice=required / function via T1.8 Option B),
     // attach the per-vocab token-bytes table so the worker can mask invalid
-    // tokens at every decode step. The table is lazily built + cached on
-    // the Engine — first grammar request pays ~50-200 ms (CPU work, off
-    // the worker thread); every subsequent request gets a free Arc clone.
-    // No grammar ⇒ no table attachment ⇒ zero extra cost.
+    // tokens at every decode step. The Engine builds the table once at
+    // construction (concurrently with the worker warmup), so every request
+    // gets a free Arc clone. No grammar ⇒ no table attachment.
     let grammar_token_bytes: Option<std::sync::Arc<Vec<Vec<u8>>>> = if effective_grammar.is_some() {
         Some(engine.token_bytes_table())
     } else {
