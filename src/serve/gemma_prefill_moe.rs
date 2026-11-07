@@ -169,6 +169,33 @@ pub(crate) fn published_mm_id_schedule() -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
+/// The native Q5_0 tensor-MM opt-in the process resolves
+/// (`HF2Q_Q5_0_TENSOR_MM=1`), for the runtime-controls surface.
+pub(crate) fn published_q5_0_tensor_mm() -> bool {
+    mlx_native::ggml_routing_policy_from_environment().q5_0_tensor_mm
+}
+
+/// Logs the native routing switches the process resolves, once per process
+/// at the first Gemma model load: `Gemma4 native routing:
+/// q5_0_tensor_mm=<true|false> mm_id_schedule=<grid|compact>` (the
+/// `HF2Q_MM_ID_SCHEDULE` spellings). The environment is fixed for the
+/// process, so later loads resolve the same values. Campaign checkers match
+/// this line; keep its text stable.
+pub(crate) fn log_native_routing() {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        let policy = mlx_native::ggml_routing_policy_from_environment();
+        let mm_id_schedule = match policy.expert_mm_schedule {
+            mlx_native::ExpertMmSchedule::UniformGrid => "grid",
+            mlx_native::ExpertMmSchedule::CompactTiles => "compact",
+        };
+        tracing::info!(
+            "Gemma4 native routing: q5_0_tensor_mm={} mm_id_schedule={mm_id_schedule}",
+            policy.q5_0_tensor_mm
+        );
+    });
+}
+
 /// Test-only record of every down entry point the prefill body chose on the
 /// calling thread, in dispatch order (real-artifact gates assert reuse vs
 /// fallback with it).
@@ -279,5 +306,41 @@ mod tests {
             published_mm_id_schedule().as_str(),
             Some("uniform_grid" | "compact_tiles")
         ));
+    }
+
+    /// `active_controls.q5_0_tensor_mm` follows `HF2Q_Q5_0_TENSOR_MM`: only
+    /// `1` opts in. Each value runs in a fresh process so the test never
+    /// mutates this process's environment.
+    #[test]
+    fn published_q5_0_tensor_mm_follows_the_native_opt_in() {
+        const EXPECT: &str = "HF2Q_Q5_0_TENSOR_MM_TEST_EXPECT";
+        if let Some(expected) = std::env::var_os(EXPECT) {
+            assert_eq!(published_q5_0_tensor_mm(), expected == "1");
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        for (value, expected) in [
+            (None, "0"),
+            (Some("1"), "1"),
+            (Some("0"), "0"),
+            (Some("true"), "0"),
+        ] {
+            let mut child = std::process::Command::new(&exe);
+            child
+                .arg("serve::gemma_prefill_moe::tests::published_q5_0_tensor_mm_follows_the_native_opt_in")
+                .arg("--exact")
+                .env(EXPECT, expected);
+            match value {
+                Some(value) => child.env("HF2Q_Q5_0_TENSOR_MM", value),
+                None => child.env_remove("HF2Q_Q5_0_TENSOR_MM"),
+            };
+            let output = child.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "HF2Q_Q5_0_TENSOR_MM={value:?}: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

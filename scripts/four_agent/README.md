@@ -556,6 +556,13 @@ HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_T
   python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
   --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-gemma4-prefill-moe-A-$(date -u +%Y%m%dT%H%M%SZ)"
+# Gemma4 native Q5_0 tensor-MM opt-in (mlx-native #99, needs mlx-native 0.18.0): the launcher forwards
+# HF2Q_Q5_0_TENSOR_MM=1 (only the value 1; anything else refuses); /hf2q/v1/runtime records active_controls.q5_0_tensor_mm.
+HF2Q_Q5_Q5_0_TENSOR_MM=1 \
+HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
+  python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
+  --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/q5-gemma4-q5-0-tensor-mm-$(date -u +%Y%m%dT%H%M%SZ)"
 # Gemma4 V2 decode-workload diagnostic (ADR-063 Q4-GEMMA-DECODE §7.4; untimed): prints [ROUTING_OVERLAP] at worker exit
 HF2Q_Q5_GEMMA_ROUTING_OVERLAP=1 \
 HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
