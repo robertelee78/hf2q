@@ -358,7 +358,9 @@ pub(crate) fn gemma_lcp_snapshot_estimate_bytes(
 /// where `use_no_fa` = HF2Q_NO_FA tri-state (default false) and
 /// `force_global_nofa` = `HF2Q_GLOBAL_FA != "1"` (**default TRUE**).
 /// Setting `HF2Q_GLOBAL_FA=1` eliminates this term entirely (FA globals)
-/// and extends the batched envelope from ~12K to ~35-40K tokens.
+/// and widens the batched envelope 3× (72 → 8 B/seq²; ~16K → ~50K tokens
+/// on a 128 GiB host with the 26B Q4_K_M model, see
+/// [`gemma_batched_route_scratch_budget`]).
 fn nofa_scratch_engaged(seq_len: usize) -> bool {
     let env_no_fa = match std::env::var("HF2Q_NO_FA").as_deref() {
         Ok("0") | Ok("false") | Ok("off") => Some(false),
@@ -411,10 +413,48 @@ pub fn batched_route_overhead_bytes(
     masks + f16 + kq
 }
 
+/// Share of the load-time scratch headroom the batched route's O(n²)
+/// overhead may claim.  The ÷6 margin is the one the per-request predicate
+/// used before #738; it leaves room for KV growth, the O(n) activations and
+/// command-buffer transients the overhead estimate does not count.
+const BATCHED_ROUTE_HEADROOM_DIVISOR: u64 = 6;
+
+/// Scratch budget for the Gemma batched prefill route, fixed once at model
+/// load (#738): `(total physical memory − model file bytes) / 6`.
+///
+/// Both inputs are constant for a loaded model on a given host, so the
+/// route choice — and through `gemma_lcp_resume_worthwhile` the LCP-resume
+/// vs. cold-prefill choice — is a pure function of the prompt length, the
+/// model and this budget.  Free host memory at request time is NOT an
+/// input: it moves with other processes, KV growth and other requests, and
+/// the batched and linear routes are different arithmetic (Class B), so a
+/// free-memory input made the same request produce different bytes.
+///
+/// Why this bound: the batched route's extra allocations over the linear
+/// route are the O(n²) terms in [`batched_route_overhead_bytes`] (masks,
+/// F16 mask casts, the tensor-mm `pf_kq` global scratch); everything else
+/// is O(n) and common to both routes.  Those transients must fit in
+/// physical memory beside the resident weights, so the weights (the GGUF
+/// file size, a deterministic stand-in for weight residency) are taken off
+/// the top and the ÷6 margin covers KV, OS and other residents.  On a
+/// 128 GiB host with the ~16 GB Gemma 4 26B Q4_K_M file this admits
+/// ≈18.8 GiB of overhead (≈16.7K tokens at the default 72 B/seq² with 16
+/// heads), about the envelope the old `available / 6` rule gave on a
+/// freshly started server.
+///
+/// Not covered (operator decision on #738, speed over a ceiling-sized
+/// reservation): other models the serve pool keeps resident beside this
+/// one.  A multi-model server loaded near its pool budget can still OOM a
+/// long cold batched prefill; such operators set
+/// `HF2Q_SERVE_BATCHED_PREFILL=0` to force the linear route.
+pub fn gemma_batched_route_scratch_budget(total_physical_bytes: u64, model_file_bytes: u64) -> u64 {
+    total_physical_bytes.saturating_sub(model_file_bytes) / BATCHED_ROUTE_HEADROOM_DIVISOR
+}
+
 /// Per-request auto-route predicate: engage the batched route only when
-/// its O(n²) overhead fits a conservative share (÷6) of CURRENTLY
-/// available unified memory.  Read fresh each call so the decision
-/// adapts to model residency + KV growth over the process lifetime.
+/// its O(n²) overhead fits `scratch_budget_bytes`, the load-time budget from
+/// [`gemma_batched_route_scratch_budget`].  Reads no host state, so the
+/// same prompt on the same loaded model always takes the same route (#738).
 ///
 /// Motivation: on 2026-08-03 a 92K-token opencode first turn took the
 /// batched route by default, allocated ~120 GB transient, and died
@@ -424,16 +464,17 @@ pub fn batched_route_overhead_bytes(
 /// prompts that died the same way.  With this predicate the engine
 /// falls back to the linear-memory route automatically;
 /// `HF2Q_SERVE_BATCHED_PREFILL=1` remains as an explicit force-on.
-pub fn serve_batched_route_viable(seq_len: usize, n_attn_heads: usize) -> bool {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    let avail = sys.available_memory();
+pub fn serve_batched_route_viable(
+    seq_len: usize,
+    n_attn_heads: usize,
+    scratch_budget_bytes: u64,
+) -> bool {
     batched_route_overhead_bytes(
         seq_len,
         n_attn_heads,
         nofa_scratch_engaged(seq_len),
         f16_masks_engaged(),
-    ) <= avail / 6
+    ) <= scratch_budget_bytes
 }
 
 /// Decide whether Gemma's linear LCP-resume route is preferable to a viable
@@ -6494,9 +6535,81 @@ impl MlxModelWeights {
 #[cfg(test)]
 mod route_viability_tests {
     use super::{
-        batched_route_overhead_bytes as overhead, gemma_batched_mask_seq_len,
-        gemma_lcp_resume_worthwhile, validate_batched_prefill_argmax,
+        batched_route_overhead_bytes as overhead, f16_masks_engaged, gemma_batched_mask_seq_len,
+        gemma_batched_route_scratch_budget, gemma_lcp_resume_worthwhile, nofa_scratch_engaged,
+        serve_batched_route_viable, validate_batched_prefill_argmax,
     };
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn batched_route_budget_is_a_function_of_host_constants_only() {
+        // (total − model file) / 6; saturates instead of underflowing.
+        assert_eq!(gemma_batched_route_scratch_budget(128 * GIB, 8 * GIB), 20 * GIB);
+        assert_eq!(gemma_batched_route_scratch_budget(4 * GIB, 8 * GIB), 0);
+        assert_eq!(
+            gemma_batched_route_scratch_budget(128 * GIB, 16 * GIB),
+            gemma_batched_route_scratch_budget(128 * GIB, 16 * GIB)
+        );
+    }
+
+    #[test]
+    fn batched_route_viability_is_pure_in_seq_heads_and_budget() {
+        // #738: the route is decided by (seq_len, heads, injected budget)
+        // and the fixed process config only. The threshold sits exactly at
+        // the overhead, and repeated calls agree regardless of what the
+        // host is doing between them.
+        for &(seq, heads) in &[(1usize, 16usize), (4096, 16), (16_384, 16), (92_066, 8)] {
+            let need = overhead(seq, heads, nofa_scratch_engaged(seq), f16_masks_engaged());
+            for _ in 0..3 {
+                assert!(serve_batched_route_viable(seq, heads, need));
+                assert!(serve_batched_route_viable(seq, heads, u64::MAX));
+                assert!(!serve_batched_route_viable(seq, heads, need - 1));
+            }
+        }
+        assert!(serve_batched_route_viable(0, 16, 0));
+    }
+
+    #[test]
+    fn batched_route_predicate_reads_no_host_memory_state() {
+        let src = include_str!("forward_prefill_batched.rs");
+        let start = src
+            .find("pub fn serve_batched_route_viable(")
+            .expect("route predicate");
+        let end = src[start..].find("\n}\n").expect("predicate end") + start;
+        let body = &src[start..end];
+        for ambient in ["sysinfo", "available_memory", "refresh_memory"] {
+            assert!(
+                !body.contains(ambient),
+                "serve_batched_route_viable must not read host memory per request ({ambient})"
+            );
+        }
+
+        // Both Gemma serve paths pass the load-time budget and read no
+        // free memory of their own.
+        let engine = include_str!("api/engine.rs");
+        for name in ["fn generate_once_with_soft_tokens(", "fn generate_stream_once("] {
+            let start = engine.find(name).expect("Gemma serve fn");
+            let end = engine[start..].find("\n}\n").expect("serve fn end") + start;
+            let body = &engine[start..end];
+            let call = body
+                .find("serve_batched_route_viable(")
+                .unwrap_or_else(|| panic!("{name} must call serve_batched_route_viable"));
+            // The call is the last arm of the `batched_allowed` match.
+            let args_end = body[call..].find("\n    };").expect("batched_allowed match end");
+            let args = &body[call..call + args_end];
+            assert!(
+                args.contains("loaded.batched_route_scratch_budget_bytes"),
+                "{name} must pass the load-time route budget"
+            );
+            for ambient in ["available_memory", "refresh_memory"] {
+                assert!(
+                    !body.contains(ambient),
+                    "{name} must not read host memory per request ({ambient})"
+                );
+            }
+        }
+    }
 
     #[test]
     fn batched_prefill_rejects_non_finite_argmax_poison() {

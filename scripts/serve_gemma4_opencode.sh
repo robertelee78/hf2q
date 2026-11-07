@@ -56,12 +56,15 @@
 #   native turn, tool-call, and tool-response markers before inference.
 #
 #   Short cold prompts still auto-route through the existing eager batched
-#   path when its O(n²) overhead fits 1/6 of currently available RAM.
-#   Overhead is config-dependent:
+#   path when its O(n²) overhead fits a budget fixed once at model load:
+#   (total physical RAM − model file bytes) / 6 (#738). Free RAM at request
+#   time is not an input, so a prompt always takes the same route. Other
+#   models a multi-model pool keeps resident are not reserved; such servers
+#   should set HF2Q_SERVE_BATCHED_PREFILL=0. Overhead is config-dependent:
 #     default (tensor-mm globals): ~72 B/seq² — masks + pf_kq scratch
-#       ⇒ batched envelope ≈ ≤12K tokens on a 128 GB box
+#       ⇒ batched envelope ≈ ≤16K tokens on a 128 GB box (16 GB model)
 #     HF2Q_GLOBAL_FA=1 (FA globals): ~8 B/seq² — masks only
-#       ⇒ batched envelope ≈ ≤35-40K tokens
+#       ⇒ batched envelope ≈ ≤50K tokens
 #   Long plain-text SlotAware prompts instead install resumable states. Each
 #   Metal transaction contains at most 4,096 aggregate rows; compatible
 #   installed lanes may divide those rows (four equal lanes advance 1,024

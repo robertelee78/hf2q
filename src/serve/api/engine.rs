@@ -2271,6 +2271,12 @@ pub struct GemmaLoadedModel {
     /// on `weights`. The next compatible request consumes this ledger before
     /// mutating those buffers; any miss or failure leaves it empty.
     pub live_prefix_tokens: Vec<u32>,
+    /// Load-time scratch budget for the batched prefill route (#738):
+    /// `(total physical memory − model file bytes) / 6`, fixed for the
+    /// model's lifetime so the batched/linear and LCP-resume route choices
+    /// never depend on free host memory at request time. See
+    /// `forward_prefill_batched::gemma_batched_route_scratch_budget`.
+    pub batched_route_scratch_budget_bytes: u64,
     /// ADR-017 Phase E option (a) iter-2 — LCP partial-prefix
     /// observability registry. Detects whether the current request's
     /// prompt shares a non-trivial prefix with a previously-served
@@ -3717,6 +3723,32 @@ impl GemmaLoadedModel {
             weights.glp = Some(bound);
         }
 
+        // #738: the batched-prefill route budget is fixed here, once, from
+        // host constants (total physical memory, this model's file size) —
+        // never from free memory per request, which made the route and its
+        // arithmetic depend on ambient host state. Other models the serve
+        // pool keeps resident are not reserved (operator decision); such
+        // servers force the linear route with HF2Q_SERVE_BATCHED_PREFILL=0.
+        let batched_route_scratch_budget_bytes = {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_memory();
+            let total_physical_bytes = sys.total_memory();
+            let model_file_bytes = std::fs::metadata(model_path)
+                .with_context(|| format!("stat model file {}", model_path.display()))?
+                .len();
+            let budget = crate::serve::forward_prefill_batched::gemma_batched_route_scratch_budget(
+                total_physical_bytes,
+                model_file_bytes,
+            );
+            tracing::info!(
+                total_physical_bytes,
+                model_file_bytes,
+                batched_route_scratch_budget_bytes = budget,
+                "Gemma batched prefill route budget fixed at load"
+            );
+            budget
+        };
+
         Ok(Self {
             weights,
             ctx,
@@ -3733,6 +3765,7 @@ impl GemmaLoadedModel {
             load_duration,
             prompt_cache: PromptCache::new(),
             live_prefix_tokens: Vec::new(),
+            batched_route_scratch_budget_bytes,
             // ADR-017 Phase E.a — LCP registry. Capacity = 1 for v1.
             //
             // ADR-017 Phase E.a default-on — byte-budget LcpRegistry.
@@ -24086,6 +24119,7 @@ fn generate_once_with_soft_tokens(
         None => crate::serve::forward_prefill_batched::serve_batched_route_viable(
             prompt_tokens.len(),
             loaded.weights.num_attention_heads,
+            loaded.batched_route_scratch_budget_bytes,
         ),
     };
 
@@ -24570,16 +24604,18 @@ fn generate_once_with_soft_tokens(
     // Tri-state (2026-08-03 auto-fallback): explicit =1 FORCES the
     // batched route (operator override); explicit =0/=false/=off forces
     // the linear route; UNSET = auto — engage batched only when this
-    // request's O(n²) mask overhead fits the available-memory budget.
+    // request's O(n²) mask overhead fits the load-time batched route budget
+    // (#738: fixed at load, never free memory at request time).
     // A 92K-token opencode first turn allocated ~120 GB transient on
     // 2026-08-03 and died in Metal with a command-buffer error — no
     // user should need to know BATCHED=0 exists.
     if serve_batched_env.is_none() && !batched_allowed && resume_lcp.is_none() {
         eprintln!(
             "[hf2q batched prefill] auto-fallback to linear route: \
-             seq_len={} O(n²) mask overhead exceeds the available- \
-             memory budget (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
-            prompt_tokens.len()
+             seq_len={} O(n²) mask overhead exceeds the load-time batched \
+             route budget of {} bytes (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
+            prompt_tokens.len(),
+            loaded.batched_route_scratch_budget_bytes
         );
     }
     let live_batched_resume = live_resume.filter(|&k| {
@@ -29335,6 +29371,7 @@ fn generate_stream_once(
         None => crate::serve::forward_prefill_batched::serve_batched_route_viable(
             prompt_tokens.len(),
             loaded.weights.num_attention_heads,
+            loaded.batched_route_scratch_budget_bytes,
         ),
     };
 
@@ -29926,16 +29963,18 @@ fn generate_stream_once(
     // Tri-state (2026-08-03 auto-fallback): explicit =1 FORCES the
     // batched route (operator override); explicit =0/=false/=off forces
     // the linear route; UNSET = auto — engage batched only when this
-    // request's O(n²) mask overhead fits the available-memory budget.
+    // request's O(n²) mask overhead fits the load-time batched route budget
+    // (#738: fixed at load, never free memory at request time).
     // A 92K-token opencode first turn allocated ~120 GB transient on
     // 2026-08-03 and died in Metal with a command-buffer error — no
     // user should need to know BATCHED=0 exists.
     if serve_batched_env.is_none() && !batched_allowed && resume_lcp.is_none() {
         eprintln!(
             "[hf2q batched prefill] auto-fallback to linear route: \
-             seq_len={} O(n²) mask overhead exceeds the available- \
-             memory budget (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
-            prompt_tokens.len()
+             seq_len={} O(n²) mask overhead exceeds the load-time batched \
+             route budget of {} bytes (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
+            prompt_tokens.len(),
+            loaded.batched_route_scratch_budget_bytes
         );
     }
     let live_batched_resume = live_resume.filter(|&k| {
