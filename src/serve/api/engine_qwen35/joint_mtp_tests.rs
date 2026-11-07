@@ -238,6 +238,12 @@ fn drive(
 ) -> (HashMap<u32, Outcome>, usize) {
     let supervisor = EngineSupervisor::new();
     let spec_on = drafter.is_some();
+    // The loaded model may have moved since it was primed (the GPU cache is
+    // keyed by the model's address): prime it where it now lives before
+    // allocating the cache on its device.
+    qwen.model
+        .ensure_gpu_cache_primed()
+        .expect("prime GPU cache at the model's final address");
     let mut kv = qwen
         .model
         .with_gpu_cache_mut(|device, _registry| {
