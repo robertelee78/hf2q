@@ -163,7 +163,7 @@ pub(super) enum CueRoute {
     /// `forward_decode_slot_aware`.
     Replay,
     /// Every lane has at least 33 cue rows: one joint
-    /// `forward_prefill_batched_multi_seq_live` with `PerSlotExact`.
+    /// `forward_prefill_batched_multi_seq_live` (the single-slot warm route).
     JointLive,
     /// A 32-row cue, or a long cue beside a short one: the per-slot resume
     /// inside the same transaction (exact by identity).

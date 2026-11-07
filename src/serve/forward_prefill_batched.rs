@@ -31,9 +31,7 @@ use super::config::LayerType;
 use super::gpu::GpuContext;
 use crate::debug::INVESTIGATION_ENV;
 use crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers;
-use crate::inference::models::gemma4::model::{
-    GemmaLiveAttention, MultiSeqPrefillOutput, MultiSeqPrefillState,
-};
+use crate::inference::models::gemma4::model::{MultiSeqPrefillOutput, MultiSeqPrefillState};
 use crate::inference::models::gemma4::{
     DenseKvBuffers, HbKvBuffers, HybridKvBuffers, MlxModelWeights,
 };
@@ -1014,13 +1012,8 @@ impl MlxModelWeights {
         let profile_buckets_on = profile_gpu_ts_on || std::env::var("HF2Q_PROFILE_BUCKETS").is_ok();
 
         // Live resume attention route (ADR-063 Stage 2): a single-slot
-        // resume and a `PerSlotExact` cohort resolve the same route.
-        let live_route = live_prefix_resume.then(|| {
-            LiveRoute::resolve(
-                self.multi_seq_prefill.as_ref().map(|ms| ms.live_attention),
-                self.warm_live_kernel,
-            )
-        });
+        // resume and every multi-sequence lane resolve the same route.
+        let live_route = live_prefix_resume.then(|| LiveRoute::resolve(self.warm_live_kernel));
         if live_prefix_resume && crate::serve::gemma_prefill_catsplit::enabled() {
             crate::serve::gemma_prefill_catsplit::forward(
                 seq_len,
@@ -6384,8 +6377,6 @@ impl MlxModelWeights {
             slot_ids: seqs.iter().map(|(_, slot_id)| *slot_id).collect(),
             slot_views_hybrid,
             full_views_hybrid: self.build_full_views_hybrid(scaffold)?,
-            // Cold prefill never reads slot history; the route is unused.
-            live_attention: GemmaLiveAttention::Tiled,
             out_first_tokens: Vec::new(),
             out_logits: Vec::new(),
         });
@@ -6425,20 +6416,17 @@ impl MlxModelWeights {
     /// over the concatenated suffix stream; attention reads and writes the
     /// caller's persistent per-slot KV regions.
     ///
-    /// `attention` selects the per-sequence attention route; every route runs
-    /// the one shared live attention (`gemma_live_attention`).
-    /// [`GemmaLiveAttention::PerSlotExact`] resolves exactly the single-slot
-    /// live-resume route (`warm_live_kernel`), so each lane's logits and KV
-    /// bytes equal its own `forward_prefill_batched_live_resume_slot_mounted`
-    /// call, provided every lane has more than 32 suffix rows: at 32 or fewer
-    /// a per-slot MoE takes the `mv_id` route while the joint stream takes
-    /// `mm_id`.
+    /// Every lane runs the one shared live attention (`gemma_live_attention`)
+    /// on exactly the single-slot live-resume route (`warm_live_kernel`), so
+    /// each lane's logits and KV bytes equal its own
+    /// `forward_prefill_batched_live_resume_slot_mounted` call, provided every
+    /// lane has more than 32 suffix rows: at 32 or fewer a per-slot MoE takes
+    /// the `mv_id` route while the joint stream takes `mm_id`.
     pub fn forward_prefill_batched_multi_seq_live(
         &mut self,
         seqs: &[(Vec<u32>, SlotId, usize)],
         scaffold: &[MultiSeqHybridKvBuffers],
         max_decode_tokens: usize,
-        attention: GemmaLiveAttention,
         gpu: &mut GpuContext,
     ) -> Result<MultiSeqPrefillOutput> {
         anyhow::ensure!(
@@ -6491,7 +6479,6 @@ impl MlxModelWeights {
             slot_ids,
             slot_views_hybrid,
             full_views_hybrid,
-            live_attention: attention,
             out_first_tokens: Vec::new(),
             out_logits: Vec::new(),
         });

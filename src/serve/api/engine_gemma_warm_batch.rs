@@ -6,8 +6,7 @@
 //! worker yields, so later slots are admitted between decode steps and pay the
 //! fixed per-forward cost again. Here a contiguous FIFO prefix of such
 //! requests is admitted without GPU work and prefilled in one
-//! `forward_prefill_batched_multi_seq_live` call with
-//! [`GemmaLiveAttention::PerSlotExact`]:
+//! `forward_prefill_batched_multi_seq_live` call:
 //!
 //! * projections, norms, dense FFN/MoE and the per-row head run once over
 //!   every suffix row;
@@ -612,7 +611,6 @@ pub(super) fn advance(
                     &seqs,
                     scaffold,
                     max_decode_tokens,
-                    GemmaLiveAttention::PerSlotExact,
                     &mut guard.model.ctx,
                 )
             })

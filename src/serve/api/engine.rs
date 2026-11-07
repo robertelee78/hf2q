@@ -71,9 +71,7 @@ const GEMMA4_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(120);
 const QWEN35_GPU_WARMUP_TIMEOUT: Duration = Duration::from_secs(240);
 const ENGINE_SYNC_CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 
-use crate::inference::models::gemma4::{
-    GemmaLiveAttention, MlxModelWeights, MultiSeqPrefillOutput, ProfileAccumulator,
-};
+use crate::inference::models::gemma4::{MlxModelWeights, MultiSeqPrefillOutput, ProfileAccumulator};
 use crate::serve::config::Gemma4Config;
 use crate::serve::forward_prefill::SoftTokenInjection;
 use crate::serve::gpu::GpuContext;
@@ -14808,9 +14806,6 @@ fn advance_gemma4_prefill_quantum(
                 &seqs,
                 scaffold,
                 max_decode_tokens,
-                // Issue #725: the single-slot resume route, so a lane is
-                // bitwise equal to the same chunk prefilled alone.
-                GemmaLiveAttention::PerSlotExact,
                 &mut guard.model.ctx,
             )
         })

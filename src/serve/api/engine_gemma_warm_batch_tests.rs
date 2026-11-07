@@ -6,7 +6,7 @@
 //! * `gemma_joint_warm_prefill_matches_per_slot_bitwise` (tiled F16 warm
 //!   attention, the `HF2Q_GEMMA_WARM_TILED_ATTENTION=1` opt-in) and
 //!   `..._vec_hybrid` (the default route): one joint
-//!   `forward_prefill_batched_multi_seq_live` (`PerSlotExact`) over 4, 2 and
+//!   `forward_prefill_batched_multi_seq_live` over 4, 2 and
 //!   3 restored slots equals each slot's own per-slot warm prefill on the
 //!   same route: first token, final logits bits, every layer's K / TQ-HB V
 //!   codes / V scales bytes over the valid (ring) rows, and the slot cursors.
@@ -328,7 +328,7 @@ impl WarmFixture {
     }
 
     /// Joint arm: restore every lane's history, then one shared
-    /// `PerSlotExact` forward with the given decode reserve.
+    /// live multi-sequence forward with the given decode reserve.
     pub(super) fn joint(
         &self,
         guard: &mut Gemma4KvGuard<'_>,
@@ -349,7 +349,6 @@ impl WarmFixture {
             &seqs,
             guard.hybrid.as_deref().unwrap(),
             reserve,
-            GemmaLiveAttention::PerSlotExact,
             &mut guard.model.ctx,
         );
         clear_gemma4_self_mounts(guard.model);
@@ -436,7 +435,7 @@ fn joint_warm_prefill_matches_per_slot(kernel: GemmaLiveKernel) {
     };
     let mut guard = Gemma4KvGuard::take(g).unwrap();
     // Both arms read this one route: per-slot resumes directly, the
-    // `PerSlotExact` cohort through `LiveRoute::resolve`.
+    // multi-sequence cohort through `LiveRoute::resolve`.
     guard.model.weights.warm_live_kernel = kernel;
     let fixture = WarmFixture::build(&mut guard);
     let prompts = &fixture.prompts;

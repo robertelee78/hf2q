@@ -70,6 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Diagnostics: traced four-agent Qwen runs now witness joint decode forwards (ADR-063 Q4-TRACE). Each joint ordinary decode forward publishes one source-bound input manifest (`qwen35.joint_decode.actual_slot_rows`, padding rows declared owner-less), one operator witness at its first DeltaNet pre-norm, and a `forward_input_end` marker that separates the forward's own native commands from the per-lane sampling and MTP catch-up of the same turn. Before, every DeltaNet pre-norm of a joint forward was recorded as an unmapped operator attempt (43,008 in one traced n4 run). The phase-trace reducer binds each joint input to its transaction, reports joint forwards (owners, logical and padded width, forward and settle spans) under `joint_ordinary_decode`, and keeps them out of the Q2 v2 window counting. The hook only runs with a native diagnostic trace armed; untraced serving does two atomic loads per joint forward and is otherwise unchanged. New tools `q4_trace_verdict.py` (acceptance, Q2 isolation, pre-registered exactness rule) `q4_trace_overhead.py` (traced overhead extractor) and `q4_trace_attribution.py` (per-phase and per-pipeline attribution of a traced run).
 
+### Removed
+
+- `HF2Q_GEMMA_TILED_LIVE` and the Gemma `Tiled` live attention route it switched. After #728 (stable-boundary groups are admitted per slot) and #725 (installed long-prompt lanes take the single-slot warm route), no serving path selected it. Every live resume, single-slot or multi-sequence, now resolves one route from `HF2Q_GEMMA_WARM_TILED_ATTENTION`, and `forward_prefill_batched_multi_seq_live` no longer takes an attention-route argument. Setting the variable has no effect.
+
 ## [0.1.29] — 2026-11-03
 
 ### Changed
