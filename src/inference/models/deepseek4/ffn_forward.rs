@@ -1,6 +1,6 @@
 //! Exact one-token DeepSeek-V4 hash- and score-routed MoE layers.
 
-use std::sync::Once;
+use std::sync::{LazyLock, Once};
 
 use anyhow::{bail, Context, Result};
 use mlx_native::graph::GraphSession;
@@ -28,8 +28,13 @@ use super::Deepseek4Model;
 
 static PAIRED_MOE_PREFILL_LOG: Once = Once::new();
 
+/// `HF2Q_DEEPSEEK_ENCODER_STAGES=1` (diagnostic stage profiling), read once
+/// per process.
+pub(super) static ENCODER_STAGES: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("HF2Q_DEEPSEEK_ENCODER_STAGES").as_deref() == Ok("1"));
+
 fn split_profile_stage(session: &mut GraphSession<'_>, label: &str) -> Result<()> {
-    if std::env::var("HF2Q_DEEPSEEK_ENCODER_STAGES").as_deref() == Ok("1") {
+    if *ENCODER_STAGES {
         session
             .encoder_mut()
             .profile_stage_boundary(label)
@@ -284,9 +289,12 @@ impl Deepseek4Model {
         // (same ids, rows, top-k, experts, scratch and encoder) instead of a
         // second map0c; the schedule depends only on the ids, so the output
         // is byte-identical. Stage profiling may split the encoder in
-        // between, so it keeps the self-scheduling call.
-        let reuse_down_schedule =
-            std::env::var("HF2Q_DEEPSEEK_ENCODER_STAGES").as_deref() != Ok("1");
+        // between, so it keeps the self-scheduling call. Reuse fails closed:
+        // mlx-native refuses a schedule recorded for other ids, shapes or
+        // encoder, and that refusal is a wiring bug in this sequence, so it
+        // fails the prefill rather than silently falling back to a second
+        // map0c that would hide the bug.
+        let reuse_down_schedule = !*ENCODER_STAGES;
 
         let registry = &mut self.ctx.registry;
         let mut encode = |session: &mut GraphSession<'_>| -> Result<()> {

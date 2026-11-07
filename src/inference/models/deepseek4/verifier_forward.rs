@@ -1228,7 +1228,7 @@ impl Deepseek4Model {
             layer,
             span.start_position + span.token_count,
         )?;
-        if std::env::var("HF2Q_DEEPSEEK_ENCODER_STAGES").as_deref() == Ok("1") {
+        if *super::ffn_forward::ENCODER_STAGES {
             session
                 .encoder_mut()
                 .profile_stage_boundary(match self.cfg.compress_ratios[layer] {

@@ -6,7 +6,11 @@
 //! slotted Q2_K down call — and requires the schedule-reusing down call to be
 //! byte-identical to the self-scheduling one, in a plain session and in a
 //! recorded session finished with the graph reorder pass (the multi-layer
-//! prefill graph). A schedule built for other ids is refused.
+//! prefill graph). A schedule built for other ids is refused. Two consecutive
+//! MoE layers sharing one scratch in one recorded, reordered session (the
+//! next layer's `map0c` overwrites the schedule the previous down call
+//! reads) equal the same layers run in separate committed sessions with
+//! self-scheduling down calls.
 
 use mlx_native::graph::GraphSession;
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
@@ -221,4 +225,71 @@ fn down_schedule_reuse_refuses_a_schedule_for_other_ids() {
     );
     assert!(refused.is_err());
     session.finish().unwrap();
+}
+
+/// Cross-layer scratch hazards with reuse: layer A (ids A) and layer B (ids
+/// B) run back to back in one recorded session finished with the reorder
+/// pass, both reusing the paired schedule from the one shared scratch, with
+/// no data dependency between the layers (the worst case for reordering:
+/// only the declared scratch ranges keep B's `map0c` after A's down reads).
+/// Reference: each layer alone in a committed plain session with the
+/// self-scheduling down call.
+#[test]
+fn down_schedule_reuse_across_two_layers_in_one_recorded_session_is_bitwise() {
+    const ROWS: usize = 333;
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut ctx = GpuContext::new().unwrap();
+    let device = ctx.device().clone();
+    let fixture = Fixture::new(&device, ROWS);
+    let layer_ids = [ids(&device, ROWS, 11), ids(&device, ROWS, 23)];
+    assert_ne!(
+        layer_ids[0].as_slice::<u32>().unwrap(),
+        layer_ids[1].as_slice::<u32>().unwrap(),
+        "the two layers must route differently"
+    );
+    let mut scratch = IdMmScratch::alloc(&device, EXPERTS as u32, ROWS as u32).unwrap();
+
+    let reference: Vec<MlxBuffer> = layer_ids
+        .iter()
+        .map(|id| {
+            let out = output(&device, ROWS);
+            let (executor, registry) = ctx.split();
+            let mut session = executor.begin().unwrap();
+            fixture
+                .encode(&mut session, registry, &device, &mut scratch, id, id, ExpertMatmulRoute::SlottedMm, &out)
+                .unwrap();
+            session.finish().unwrap();
+            out
+        })
+        .collect();
+
+    let reused: Vec<MlxBuffer> = (0..layer_ids.len()).map(|_| output(&device, ROWS)).collect();
+    {
+        let (executor, registry) = ctx.split();
+        let mut session = executor.begin_recorded().unwrap();
+        for (id, out) in layer_ids.iter().zip(&reused) {
+            fixture
+                .encode(
+                    &mut session,
+                    registry,
+                    &device,
+                    &mut scratch,
+                    id,
+                    id,
+                    ExpertMatmulRoute::SlottedMmReusingSchedule,
+                    out,
+                )
+                .unwrap();
+            session.barrier();
+        }
+        session.finish_with_reorder().unwrap();
+    }
+    for (layer, (expected, actual)) in reference.iter().zip(&reused).enumerate() {
+        let expected = expected.as_slice::<u32>().unwrap();
+        assert!(expected.iter().any(|&bits| bits != 0), "layer {layer} down never ran");
+        assert!(
+            expected == actual.as_slice::<u32>().unwrap(),
+            "layer {layer}: reused schedule in the two-layer recorded session differs"
+        );
+    }
 }
