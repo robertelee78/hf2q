@@ -612,6 +612,7 @@ fn run_gate(env: &str) {
         glp_path: None,
         glp_alpha: None,
         kv_graft_path: None,
+        lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
     };
     let mut loaded = LoadedModel::load(&options).expect("load Qwen artifact");
     let LoadedModel::Qwen35(qwen) = &mut loaded else {
