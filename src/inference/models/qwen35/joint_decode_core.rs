@@ -9,7 +9,10 @@
 //!    dispatch per row, see [`JointProductRoute`]),
 //! 2. a per-slot core that reads and writes only that slot's cache region
 //!    (DeltaNet conv + gated delta net against the slot's ping-pong parity;
-//!    TQ/F32 KV write + SDPA against the slot's cursor), and
+//!    TQ/F32 KV write + SDPA against the slot's cursor; on the production TQ
+//!    cache the full-attention core and its gate run every row in one pass,
+//!    [`super::gpu_full_attn::apply_tq_sdpa_rows_gated_into`], with the
+//!    per-row arithmetic unchanged), and
 //! 3. a packed epilogue (gated norm / sigmoid gate + output projection).
 //!
 //! Row-independent kernels (RMS norms, IMROPE with per-row positions,
@@ -42,7 +45,8 @@ use super::gpu_delta_net::{
 use super::gpu_full_attn::{
     apply_imrope, apply_linear_projection_f32_pooled_with_ggml_type, apply_pre_attn_rms_norm,
     apply_q_gate_projection_f32, apply_q_or_k_per_head_rms_norm,
-    apply_sdpa_with_kv_cache_decode_into, apply_sigmoid_gate_multiply, FullAttnQGateWeightsGpu,
+    apply_sdpa_with_kv_cache_decode_into, apply_sigmoid_gate_multiply,
+    apply_tq_sdpa_rows_gated_into, tq_sdpa_rows_route, FullAttnQGateWeightsGpu,
     FullAttnWeightsGpu,
 };
 use super::joint_decode_routes::{projection_route, JointProductRoute};
@@ -801,67 +805,89 @@ pub(crate) fn encode_joint_full_attn_layer(
     )?;
     enc.memory_barrier();
 
-    // ---- Per slot: KV write at the slot cursor + SDPA over the slot ----
+    // ---- KV write at each slot's cursor + attention over each slot + gate ----
     let max_seq_len = kv_cache.max_seq_len;
     let slot = &mut kv_cache.full_attn[rank];
-    let mut row_outputs = Vec::with_capacity(rows.real());
-    for (row, &slot_id) in rows.slots.iter().enumerate() {
-        if row > 0 {
-            enc.memory_barrier();
-        }
-        let q_row = row_view(&q_rope, row, vec![1, n_heads as usize, head_dim as usize])?;
-        let k_row = row_view(
-            &k_rope,
-            row,
-            vec![1, n_kv_heads as usize, head_dim as usize],
-        )?;
-        let v_row = row_view(&v_flat, row, vec![1, kv_total as usize])?;
-        let output = apply_sdpa_with_kv_cache_decode_into(
+    let gated = if tq_sdpa_rows_route(slot, rows.slots, head_dim, max_seq_len) {
+        // Production TQ cache: every row in one pass, no per-row barriers.
+        apply_tq_sdpa_rows_gated_into(
             enc,
             device,
             registry,
-            &q_row,
-            &k_row,
-            &v_row,
+            &q_rope,
+            &k_rope,
+            &v_flat,
+            &gate_flat,
             slot,
-            1,
+            rows.slots,
+            width,
             n_heads,
             n_kv_heads,
             head_dim,
             max_seq_len,
-            slot_id,
         )
-        .with_context(|| format!("Qwen joint SDPA layer {layer_idx} row {row}"))?;
-        row_outputs.push(output);
-    }
-    enc.memory_barrier();
-    let attention = pooled_f32(device, vec![width, q_total], "attention output")?;
-    for (row, output) in row_outputs.iter().enumerate() {
-        copy_row(enc, registry, device, output, &attention, row, q_total)?;
-    }
-    for row in rows.real()..width {
-        copy_row(
+        .with_context(|| format!("Qwen joint row-batched attention layer {layer_idx}"))?
+    } else {
+        // F32 control cache (or a full slot): the serial chain per row.
+        let mut row_outputs = Vec::with_capacity(rows.real());
+        for (row, &slot_id) in rows.slots.iter().enumerate() {
+            if row > 0 {
+                enc.memory_barrier();
+            }
+            let q_row = row_view(&q_rope, row, vec![1, n_heads as usize, head_dim as usize])?;
+            let k_row = row_view(
+                &k_rope,
+                row,
+                vec![1, n_kv_heads as usize, head_dim as usize],
+            )?;
+            let v_row = row_view(&v_flat, row, vec![1, kv_total as usize])?;
+            let output = apply_sdpa_with_kv_cache_decode_into(
+                enc,
+                device,
+                registry,
+                &q_row,
+                &k_row,
+                &v_row,
+                slot,
+                1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq_len,
+                slot_id,
+            )
+            .with_context(|| format!("Qwen joint SDPA layer {layer_idx} row {row}"))?;
+            row_outputs.push(output);
+        }
+        enc.memory_barrier();
+        let attention = pooled_f32(device, vec![width, q_total], "attention output")?;
+        for (row, output) in row_outputs.iter().enumerate() {
+            copy_row(enc, registry, device, output, &attention, row, q_total)?;
+        }
+        for row in rows.real()..width {
+            copy_row(
+                enc,
+                registry,
+                device,
+                &row_outputs[0],
+                &attention,
+                row,
+                q_total,
+            )?;
+        }
+        enc.memory_barrier();
+        apply_sigmoid_gate_multiply(
             enc,
             registry,
             device,
-            &row_outputs[0],
             &attention,
-            row,
-            q_total,
-        )?;
-    }
+            &gate_flat,
+            (width * q_total) as u32,
+        )?
+    };
     enc.memory_barrier();
 
-    // ---- Packed: sigmoid gate and output projection ----
-    let gated = apply_sigmoid_gate_multiply(
-        enc,
-        registry,
-        device,
-        &attention,
-        &gate_flat,
-        (width * q_total) as u32,
-    )?;
-    enc.memory_barrier();
+    // ---- Packed: output projection ----
     let gated = gated
         .with_shape(vec![width, q_total])
         .map_err(|e| anyhow!("shape Qwen joint gated attention: {e}"))?;

@@ -63,6 +63,8 @@ pub use dn_prefill_arena::DnPrefillArena;
 pub use fa_prefill_arena::FaPrefillArena;
 pub use fa_projections_arena::FaProjectionsArena;
 pub mod io_heads;
+#[cfg(test)]
+mod joint_attn_rows_tests;
 pub(crate) mod joint_decode_core;
 #[cfg(test)]
 mod joint_decode_ffn_tests;
