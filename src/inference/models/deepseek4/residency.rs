@@ -80,8 +80,11 @@ pub enum MatvecKernels {
     Stock,
     /// mlx-native `row_exact_matvec_stock` where it reproduces the stock
     /// route bitwise: F16 at `m = 1` and independent F16 rows, Q8_0 at
-    /// `m <= 8`, Q8_0 grouped output-A at `rows <= 8`. One dispatch reads the
-    /// weights once for all rows, and every row is the stock one-row result.
+    /// `m <= 8` and Q8_0 grouped output-A at `rows <= 8` while the stock Q8_0
+    /// route at that width is the NR2 matvec (not under
+    /// `HF2Q_Q8_0_MV_NR2=0`, nor at 2..=8 rows under `HF2Q_DECODE_MV_EXT=1`;
+    /// those products keep the stock route). One dispatch reads the weights
+    /// once for all rows, and every row is the stock one-row result.
     RowExact,
 }
 

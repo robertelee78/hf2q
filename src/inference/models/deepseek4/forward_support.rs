@@ -1,6 +1,7 @@
 //! Shared allocation and resident block-matmul helpers for DeepSeek-V4 graphs.
 
 use std::cell::{Cell, RefCell};
+use std::sync::LazyLock;
 
 use anyhow::{bail, Context, Result};
 use mlx_native::graph::GraphSession;
@@ -19,7 +20,10 @@ use mlx_native::ops::row_exact_matvec::{
 };
 use mlx_native::ops::row_exact_matvec_stock::dispatch_row_exact_matvec_stock;
 use mlx_native::ops::transpose::permute_021_f32;
-use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxBufferPool, MlxDevice};
+use mlx_native::{
+    ggml_routing_policy_from_environment, DType, GgmlRoutingPolicy, KernelRegistry, MlxBuffer,
+    MlxBufferPool, MlxDevice,
+};
 
 use super::residency::{MatvecKernels, RawMatrixRef};
 
@@ -290,17 +294,52 @@ pub(super) fn rms_params(
 /// Largest row count one row-exact dispatch takes.
 pub(super) const ROW_EXACT_MAX_ROWS: usize = ROW_EXACT_MATVEC_MAX_ROWS as usize;
 
-/// The row-exact storage of `weight` when its model selected
-/// [`MatvecKernels::RowExact`] and the storage has a row-exact kernel.
-pub(super) fn row_exact_storage(weight: &RawMatrixRef<'_>) -> Option<RowExactWeight> {
+/// The row-exact storage of `weight` for a `rows`-row (`<= 8`) dispatch when
+/// its model selected [`MatvecKernels::RowExact`], the storage has a
+/// row-exact kernel and the stock route at `rows` is the kernel that
+/// `row_exact_matvec_stock` replays. Otherwise the caller takes the stock
+/// route, so both families stay bitwise equal under every routing policy.
+pub(super) fn row_exact_storage(
+    registry: &KernelRegistry,
+    weight: &RawMatrixRef<'_>,
+    rows: usize,
+) -> Option<RowExactWeight> {
     if weight.matvec != MatvecKernels::RowExact {
         return None;
     }
     match weight.ggml_type {
         GgmlType::F16 => Some(RowExactWeight::F16),
-        GgmlType::Q8_0 => Some(RowExactWeight::Q8_0),
+        GgmlType::Q8_0 if stock_q8_0_rows_take_nr2(&stock_routing_policy(registry), rows) => {
+            Some(RowExactWeight::Q8_0)
+        }
         _ => None,
     }
+}
+
+/// Whether stock Q8_0 at `rows` runs the NR2 matvec (`m <= 8`; the serial
+/// grouped output-A takes its batched twin under the same flag), whose rows
+/// `row_exact_matvec_stock` replays. `HF2Q_Q8_0_MV_NR2=0` moves every width
+/// to the plain matvec, and `HF2Q_DECODE_MV_EXT=1` (set in-process by a
+/// Qwen3.8 load) moves 2..=8 rows to the non-exact `mul_mv_ext`.
+pub(super) fn stock_q8_0_rows_take_nr2(policy: &GgmlRoutingPolicy, rows: usize) -> bool {
+    (1..=ROW_EXACT_MAX_ROWS).contains(&rows)
+        && policy.dense_q8_0_mv_nr2
+        && (rows == 1 || !policy.dense_decode_mv_ext)
+}
+
+/// Process routing policy as mlx-native resolves it. mlx-native caches the
+/// two Q8_0 flags process-wide on their first read, and this read goes
+/// through the same cache, so one resolution matches every later dispatch.
+static PROCESS_ROUTING_POLICY: LazyLock<GgmlRoutingPolicy> =
+    LazyLock::new(ggml_routing_policy_from_environment);
+
+/// The routing policy the stock Q8_0 dispatch of `registry` resolves: the
+/// registry's frozen policy, else the process policy.
+fn stock_routing_policy(registry: &KernelRegistry) -> GgmlRoutingPolicy {
+    registry
+        .ggml_routing_policy()
+        .copied()
+        .unwrap_or(*PROCESS_ROUTING_POLICY)
 }
 
 /// Encode `m <= 8` rows through mlx-native `row_exact_matvec_stock`: every
@@ -359,14 +398,13 @@ pub(super) fn raw_matmul(
         );
     }
     // Row-exact family, where it reproduces the stock route bitwise: Q8_0 at
-    // m <= 8 (stock is the NR2 matvec, whose rows equal m = 1) and F16 at
-    // m = 1 (stock is the F32-input matvec). F16 at m > 1 keeps the stock
-    // tiled kernel here (prefill rows); independent decode rows take the
-    // row-exact kernel through `row_matmul`.
-    if let Some(storage) = row_exact_storage(weight).filter(|&storage| match storage {
-        RowExactWeight::Q8_0 => m <= ROW_EXACT_MAX_ROWS,
-        RowExactWeight::F16 => m == 1,
-    }) {
+    // m <= 8 while the stock route is the NR2 matvec (whose rows equal
+    // m = 1) and F16 at m = 1 (stock is the F32-input matvec). F16 at m > 1
+    // keeps the stock tiled kernel here (prefill rows); independent decode
+    // rows take the row-exact kernel through `row_matmul`.
+    if let Some(storage) = row_exact_storage(registry, weight, m)
+        .filter(|&storage| storage == RowExactWeight::Q8_0 || m == 1)
+    {
         return row_exact_matmul(
             session, registry, device, storage, input, weight, output, m, n, k, label,
         );
@@ -494,11 +532,11 @@ fn grouped_output_a_row_exact(
 
 /// Row-exact storage for grouped output-A (Q8_0 only) at `rows`.
 fn grouped_output_a_row_exact_storage(
+    registry: &KernelRegistry,
     weight: &RawMatrixRef<'_>,
     rows: usize,
 ) -> Option<RowExactWeight> {
-    row_exact_storage(weight)
-        .filter(|&storage| storage == RowExactWeight::Q8_0 && rows <= ROW_EXACT_MAX_ROWS)
+    row_exact_storage(registry, weight, rows).filter(|&storage| storage == RowExactWeight::Q8_0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -538,7 +576,7 @@ pub(super) fn grouped_output_a(
         .checked_div(block)
         .and_then(|blocks| blocks.checked_mul(weight.ggml_type.block_bytes() as usize))
         .context("DeepSeek-V4 output-A row-byte overflow")?;
-    if let Some(storage) = grouped_output_a_row_exact_storage(weight, 1) {
+    if let Some(storage) = grouped_output_a_row_exact_storage(registry, weight, 1) {
         return grouped_output_a_row_exact(
             session,
             registry,
@@ -684,7 +722,7 @@ pub(super) fn grouped_output_a_batched(
         .checked_div(block)
         .and_then(|blocks| blocks.checked_mul(weight.ggml_type.block_bytes() as usize))
         .context("DeepSeek-V4 output-A row-byte overflow")?;
-    if let Some(storage) = grouped_output_a_row_exact_storage(weight, rows) {
+    if let Some(storage) = grouped_output_a_row_exact_storage(registry, weight, rows) {
         return grouped_output_a_row_exact(
             session,
             registry,
