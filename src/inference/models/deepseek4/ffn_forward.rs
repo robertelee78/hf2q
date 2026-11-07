@@ -280,6 +280,11 @@ impl Deepseek4Model {
         } else {
             ExpertMatmulRoute::Auto
         };
+        // Fix 2 (gap program): the slotted down call reuses the paired
+        // gate/up schedule (same ids and encoder) instead of a second map0c,
+        // unless stage profiling may split the encoder in between.
+        let reuse_down_schedule = self.moe_down_schedule_reuse.enabled()
+            && std::env::var("HF2Q_DEEPSEEK_ENCODER_STAGES").as_deref() != Ok("1");
 
         let registry = &mut self.ctx.registry;
         let mut encode = |session: &mut GraphSession<'_>| -> Result<()> {
@@ -416,12 +421,13 @@ impl Deepseek4Model {
                 }
             }
             split_profile_stage(session, "DeepSeek-V4 FFN router")?;
-            if use_paired_expert_prefill(
+            let paired = use_paired_expert_prefill(
                 rows,
                 routed_projection,
                 id_mm_scratch.is_some(),
                 std::env::var_os("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some(),
-            ) {
+            );
+            if paired {
                 let scratch = id_mm_scratch
                     .as_deref_mut()
                     .context("DeepSeek-V4 paired routed projections require scratch")?;
@@ -554,7 +560,11 @@ impl Deepseek4Model {
                     experts,
                     hidden,
                     inter,
-                    ExpertMatmulRoute::SlottedMm,
+                    if paired && reuse_down_schedule {
+                        ExpertMatmulRoute::SlottedMmReusingSchedule
+                    } else {
+                        ExpertMatmulRoute::SlottedMm
+                    },
                     id_mm_scratch.as_deref_mut().map(|scratch| &mut scratch[0]),
                     "routed down",
                 )?;
