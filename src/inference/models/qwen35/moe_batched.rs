@@ -10,11 +10,16 @@
 //! | A | shared gate, shared up `[rows, shared_i]` | `quantized_matmul_ggml` m = rows (`kernel_mul_mv_<q>_f32` at 1 row, `_mN_r1_<rows>` at 2..5) |
 //! | B | softmax + top-k + renorm over all rows | `moe_softmax_topk_simd_f32` |
 //! | B | shared SwiGLU | `silu_mul_f32` |
-//! | C | expert gate, expert up over `rows * top_k` pairs | `kernel_mul_mv_id_q4_K_f32_nr2` (Q4_K) or `kernel_mul_mv_id_<q>_f32` (forced matvec route) |
+//! | C | expert gate + up + SwiGLU over `rows * top_k` pairs (F5) | `kernel_mul_mv_id_q4_K_f32_nr2_swiglu` |
 //! | C | shared down `[rows, hidden]` | `quantized_matmul_ggml` m = rows |
-//! | D | expert SwiGLU | `silu_mul_f32` |
-//! | E | expert down over `rows * top_k` pairs | `kernel_mul_mv_id_q4_K_f32_nr2` (Q4_K) or `kernel_mul_mv_id_<q>_f32[_nr2]` (forced matvec route) |
-//! | F | weighted reduce + sigmoid(shared gate) * shared + residual | `moe_weighted_reduce_f32` |
+//! | E | expert down + weighted reduce + sigmoid(shared gate) * shared + residual (F5) | `kernel_mul_mv_id_<q4_K\|q6_K>_f32_nr2_moe_reduce` |
+//!
+//! The F5 kernels are bitwise the unfused F2b sequence they replace: C as
+//! expert gate and up (`kernel_mul_mv_id_q4_K_f32_nr2`), D as expert
+//! `silu_mul_f32`, E as expert down (nr2 mv_id), F as `moe_weighted_reduce_f32`.
+//! Layers outside F5's types (gate/up not Q4_K, down not Q4_K/Q6_K, top-k
+//! above [`MOE_DOWN_REDUCE_MAX_TOP_K`], odd Q6_K hidden width) run that
+//! unfused sequence (`kernel_mul_mv_id_<q>_f32` for non-Q4_K experts).
 //!
 //! Every kernel computes a row (or a `(row, expert)` pair) with arithmetic
 //! that does not depend on how many rows share the dispatch, so a row's
@@ -35,8 +40,9 @@ use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk_simd;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    quantized_matmul_id_ggml_mv, quantized_matmul_id_ggml_mv_q4_k_nr2,
-    GgmlQuantizedMatmulIdParams,
+    quantized_matmul_id_ggml_mv, quantized_matmul_id_ggml_mv_nr2_moe_reduce,
+    quantized_matmul_id_ggml_mv_q4_k_nr2, quantized_matmul_id_ggml_mv_q4_k_nr2_swiglu,
+    GgmlQuantizedMatmulIdParams, MoeDownReduceOperands, MOE_DOWN_REDUCE_MAX_TOP_K,
 };
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -218,20 +224,12 @@ pub(crate) fn encode_native_dense_proj(
     }
 }
 
-/// Expert matvec over `params.n_tokens * params.top_k` pairs on the forced
-/// `mv_id` route (never the grouped `mm_id` route, whose reduction differs),
-/// behind the same imatrix intercept as the serial builder. Q4_K experts take
-/// the peer-layout kernel (`kernel_mul_mv_id_q4_K_f32_nr2`) at every width,
-/// including one row, so a pair's result never depends on the width.
-#[allow(clippy::too_many_arguments)]
-fn dispatch_expert_mv(
+/// The imatrix intercept the serial builder runs before an expert matvec
+/// (a no-op unless an imatrix capture is active).
+fn intercept_expert_input(
     enc: &mut CommandEncoder,
-    registry: &mut KernelRegistry,
-    device: &MlxDevice,
     input: &MlxBuffer,
-    weight: &MlxBuffer,
     ids: &MlxBuffer,
-    output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
     tag: &'static str,
     layer: usize,
@@ -250,13 +248,64 @@ fn dispatch_expert_mv(
         },
         || ids.as_slice::<u32>().ok().map(|sl| sl.to_vec()),
     )
-    .map_err(|e| anyhow!("imatrix moe intercept ({tag}): {e}"))?;
+    .map_err(|e| anyhow!("imatrix moe intercept ({tag}): {e}"))
+}
+
+/// Expert matvec over `params.n_tokens * params.top_k` pairs on the forced
+/// `mv_id` route (never the grouped `mm_id` route, whose reduction differs),
+/// behind the same imatrix intercept as the serial builder. Q4_K experts take
+/// the peer-layout kernel (`kernel_mul_mv_id_q4_K_f32_nr2`) at every width,
+/// including one row, so a pair's result never depends on the width.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_expert_mv(
+    enc: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ids: &MlxBuffer,
+    output: &MlxBuffer,
+    params: &GgmlQuantizedMatmulIdParams,
+    tag: &'static str,
+    layer: usize,
+) -> Result<()> {
+    intercept_expert_input(enc, input, ids, params, tag, layer)?;
     let dispatched = if params.ggml_type == GgmlType::Q4_K {
         quantized_matmul_id_ggml_mv_q4_k_nr2(enc, registry, device, input, weight, ids, output, params)
     } else {
         quantized_matmul_id_ggml_mv(enc, registry, device, input, weight, ids, output, params)
     };
     dispatched.map_err(|e| anyhow!("{tag} mul_mv_id: {e}"))
+}
+
+/// How a batched layer encodes its routed experts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MoeExpertRoute {
+    /// F5: gate + up + SwiGLU in one mv_id, down + weighted reduce in one.
+    Fused,
+    /// F2b: gate and up mv_id, `silu_mul`, down mv_id, `moe_weighted_reduce`.
+    Unfused,
+}
+
+impl MoeExpertRoute {
+    /// F5 where its kernels cover the layer's types and shape; the bitwise
+    /// equal unfused sequence elsewhere.
+    pub(crate) fn for_layer(weights: &MoeFfnWeightsGpuQ, shape: MoeFfnShape) -> Self {
+        let down_ok = match weights.ggml_type_down {
+            GgmlType::Q4_K => true,
+            GgmlType::Q6_K => shape.hidden_size % 2 == 0,
+            _ => false,
+        };
+        if weights.ggml_type_gate_up == GgmlType::Q4_K
+            && weights.expert_gate_stride == weights.expert_up_stride
+            && down_ok
+            && (1..=MOE_DOWN_REDUCE_MAX_TOP_K).contains(&shape.num_experts_per_tok)
+        {
+            Self::Fused
+        } else {
+            Self::Unfused
+        }
+    }
 }
 
 /// Routing produced by one batched layer: `[rows * top_k]` expert ids and
@@ -277,7 +326,7 @@ fn pooled(device: &MlxDevice, elements: usize, dtype: DType, shape: Vec<usize>, 
 /// Encode one MoE FFN layer over `rows` packed decode rows into `out`
 /// (`[rows, hidden]`), adding `residual` (`[rows, hidden]`) when given.
 /// `x` is `[rows, hidden]` F32. Scratch comes from the decode pool. Does not
-/// commit.
+/// commit. Routed experts take [`MoeExpertRoute::for_layer`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     enc: &mut CommandEncoder,
@@ -291,6 +340,42 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     rows: u32,
     layer_idx: usize,
 ) -> Result<MoeBatchedRouting> {
+    build_moe_ffn_layer_gpu_batched_route_into(
+        enc,
+        device,
+        registry,
+        x,
+        weights,
+        shape,
+        residual,
+        out,
+        rows,
+        layer_idx,
+        MoeExpertRoute::for_layer(weights, shape),
+    )
+}
+
+/// [`build_moe_ffn_layer_gpu_batched_into`] on an explicit expert route.
+/// `MoeExpertRoute::Fused` requires a layer [`MoeExpertRoute::for_layer`]
+/// admits.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_moe_ffn_layer_gpu_batched_route_into(
+    enc: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &MoeFfnWeightsGpuQ,
+    shape: MoeFfnShape,
+    residual: Option<&MlxBuffer>,
+    out: &mut MlxBuffer,
+    rows: u32,
+    layer_idx: usize,
+    route: MoeExpertRoute,
+) -> Result<MoeBatchedRouting> {
+    ensure!(
+        route == MoeExpertRoute::Unfused || MoeExpertRoute::for_layer(weights, shape) == route,
+        "batched MoE layer {layer_idx}: the fused expert route does not cover this layer"
+    );
     ensure!(
         (1..=MOE_BATCHED_MAX_ROWS).contains(&(rows as usize)),
         "batched MoE layer {layer_idx} accepts 1..={MOE_BATCHED_MAX_ROWS} rows, got {rows}"
@@ -326,28 +411,12 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     let y_s = pooled(device, r * h, DType::F32, vec![r, h], "shared down")?;
     let ids = pooled(device, pairs, DType::U32, vec![pairs], "expert ids")?;
     let routing_weights = pooled(device, pairs, DType::F32, vec![pairs], "routing weights")?;
-    let gate_all = pooled(device, pairs * m_moe, DType::F32, vec![pairs, m_moe], "expert gate")?;
-    let up_all = pooled(device, pairs * m_moe, DType::F32, vec![pairs, m_moe], "expert up")?;
     let h_all = pooled(device, pairs * m_moe, DType::F32, vec![pairs, m_moe], "expert swiglu")?;
-    let y_all = pooled(device, pairs * h, DType::F32, vec![pairs, h], "expert down")?;
     let mut silu_sh_params = pooled(device, 1, DType::U32, vec![1], "shared swiglu params")?;
-    let mut silu_params = pooled(device, 1, DType::U32, vec![1], "expert swiglu params")?;
     let n_h_s = (r * m_sh) as u32;
-    let n_h_all = (pairs * m_moe) as u32;
     silu_sh_params
         .as_mut_slice::<u32>()
         .map_err(|e| anyhow!("batched MoE shared swiglu params: {e}"))?[0] = n_h_s;
-    silu_params
-        .as_mut_slice::<u32>()
-        .map_err(|e| anyhow!("batched MoE expert swiglu params: {e}"))?[0] = n_h_all;
-    let dummy_residual;
-    let residual_ref = match residual {
-        Some(buffer) => buffer,
-        None => {
-            dummy_residual = pooled(device, 1, DType::F32, vec![1], "dummy residual")?;
-            &dummy_residual
-        }
-    };
 
     let h32 = shape.hidden_size;
     let m_sh32 = shape.shared_intermediate_size;
@@ -391,8 +460,8 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     .map_err(|e| anyhow!("batched MoE layer {layer_idx} shared swiglu: {e}"))?;
     enc.memory_barrier();
 
-    // ---- C: expert gate/up over rows * top_k pairs (row t feeds pairs
-    // t * top_k ..), shared down ----
+    // ---- C: expert gate/up (+ SwiGLU on the fused route) over rows * top_k
+    // pairs (row t feeds pairs t * top_k ..), shared down ----
     let gate_params = GgmlQuantizedMatmulIdParams {
         n_tokens: rows,
         top_k: shape.num_experts_per_tok,
@@ -406,14 +475,38 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         expert_stride: weights.expert_up_stride,
         ..gate_params
     };
-    dispatch_expert_mv(
-        enc, registry, device, x, &weights.expert_gate_q, &ids, &gate_all, &gate_params,
-        "ffn_gate_exps", layer_idx,
-    )?;
-    dispatch_expert_mv(
-        enc, registry, device, x, &weights.expert_up_q, &ids, &up_all, &up_params,
-        "ffn_up_exps", layer_idx,
-    )?;
+    let unfused_gate_up = match route {
+        MoeExpertRoute::Fused => {
+            intercept_expert_input(enc, x, &ids, &gate_params, "ffn_gate_exps", layer_idx)?;
+            intercept_expert_input(enc, x, &ids, &up_params, "ffn_up_exps", layer_idx)?;
+            quantized_matmul_id_ggml_mv_q4_k_nr2_swiglu(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.expert_gate_q,
+                &weights.expert_up_q,
+                &ids,
+                &h_all,
+                &gate_params,
+            )
+            .map_err(|e| anyhow!("batched MoE layer {layer_idx} expert gate+up+swiglu: {e}"))?;
+            None
+        }
+        MoeExpertRoute::Unfused => {
+            let gate_all = pooled(device, pairs * m_moe, DType::F32, vec![pairs, m_moe], "expert gate")?;
+            let up_all = pooled(device, pairs * m_moe, DType::F32, vec![pairs, m_moe], "expert up")?;
+            dispatch_expert_mv(
+                enc, registry, device, x, &weights.expert_gate_q, &ids, &gate_all, &gate_params,
+                "ffn_gate_exps", layer_idx,
+            )?;
+            dispatch_expert_mv(
+                enc, registry, device, x, &weights.expert_up_q, &ids, &up_all, &up_params,
+                "ffn_up_exps", layer_idx,
+            )?;
+            Some((gate_all, up_all))
+        }
+    };
     encode_native_dense_proj(
         enc,
         registry,
@@ -429,21 +522,29 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     .with_context(|| format!("batched MoE layer {layer_idx}"))?;
     enc.memory_barrier();
 
-    // ---- D: expert SwiGLU ----
-    dispatch_silu_mul(
-        enc,
-        registry,
-        device.metal_device(),
-        &gate_all,
-        &up_all,
-        &h_all,
-        &silu_params,
-        n_h_all,
-    )
-    .map_err(|e| anyhow!("batched MoE layer {layer_idx} expert swiglu: {e}"))?;
-    enc.memory_barrier();
+    // ---- D (unfused route): expert SwiGLU ----
+    if let Some((gate_all, up_all)) = &unfused_gate_up {
+        let n_h_all = (pairs * m_moe) as u32;
+        let mut silu_params = pooled(device, 1, DType::U32, vec![1], "expert swiglu params")?;
+        silu_params
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow!("batched MoE expert swiglu params: {e}"))?[0] = n_h_all;
+        dispatch_silu_mul(
+            enc,
+            registry,
+            device.metal_device(),
+            gate_all,
+            up_all,
+            &h_all,
+            &silu_params,
+            n_h_all,
+        )
+        .map_err(|e| anyhow!("batched MoE layer {layer_idx} expert swiglu: {e}"))?;
+        enc.memory_barrier();
+    }
 
-    // ---- E: expert down, one pair per input row ----
+    // ---- E: expert down, one pair per input row (+ F: weighted reduce +
+    // sigmoid(shared gate) * shared + residual, fused on the F5 route) ----
     let down_params = GgmlQuantizedMatmulIdParams {
         n_tokens: pairs as u32,
         top_k: 1,
@@ -453,29 +554,65 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         expert_stride: weights.expert_down_stride,
         ggml_type: weights.ggml_type_down,
     };
-    dispatch_expert_mv(
-        enc, registry, device, &h_all, &weights.expert_down_q, &ids, &y_all, &down_params,
-        "ffn_down_exps", layer_idx,
-    )?;
-    enc.memory_barrier();
-
-    // ---- F: weighted reduce + sigmoid(shared gate) * shared + residual ----
-    dispatch_moe_weighted_reduce(
-        enc,
-        registry,
-        device,
-        &routing_weights,
-        &y_all,
-        &sh_logit,
-        &y_s,
-        residual_ref,
-        out,
-        rows,
-        shape.num_experts_per_tok,
-        h32,
-        residual.is_some(),
-    )
-    .map_err(|e| anyhow!("batched MoE layer {layer_idx} weighted reduce: {e}"))?;
+    match route {
+        MoeExpertRoute::Fused => {
+            intercept_expert_input(enc, &h_all, &ids, &down_params, "ffn_down_exps", layer_idx)?;
+            let reduce_params = GgmlQuantizedMatmulIdParams {
+                n_tokens: rows,
+                top_k: shape.num_experts_per_tok,
+                ..down_params
+            };
+            quantized_matmul_id_ggml_mv_nr2_moe_reduce(
+                enc,
+                registry,
+                device,
+                &h_all,
+                &weights.expert_down_q,
+                &ids,
+                &MoeDownReduceOperands {
+                    route_weights: &routing_weights,
+                    sh_logit: &sh_logit,
+                    y_shared: &y_s,
+                    residual,
+                },
+                out,
+                &reduce_params,
+            )
+            .map_err(|e| anyhow!("batched MoE layer {layer_idx} expert down+reduce: {e}"))?;
+        }
+        MoeExpertRoute::Unfused => {
+            let y_all = pooled(device, pairs * h, DType::F32, vec![pairs, h], "expert down")?;
+            dispatch_expert_mv(
+                enc, registry, device, &h_all, &weights.expert_down_q, &ids, &y_all, &down_params,
+                "ffn_down_exps", layer_idx,
+            )?;
+            enc.memory_barrier();
+            let dummy_residual;
+            let residual_ref = match residual {
+                Some(buffer) => buffer,
+                None => {
+                    dummy_residual = pooled(device, 1, DType::F32, vec![1], "dummy residual")?;
+                    &dummy_residual
+                }
+            };
+            dispatch_moe_weighted_reduce(
+                enc,
+                registry,
+                device,
+                &routing_weights,
+                &y_all,
+                &sh_logit,
+                &y_s,
+                residual_ref,
+                out,
+                rows,
+                shape.num_experts_per_tok,
+                h32,
+                residual.is_some(),
+            )
+            .map_err(|e| anyhow!("batched MoE layer {layer_idx} weighted reduce: {e}"))?;
+        }
+    }
 
     #[cfg(test)]
     {
