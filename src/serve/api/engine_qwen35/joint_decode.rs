@@ -100,11 +100,13 @@ impl Qwen35DecodeState {
 
     /// Prepare the target input this slot's serial tick would feed. Mutates
     /// only what the serial tick mutates before its forward (the thinking
-    /// budget's forced cursor on the ordinary path).
+    /// budget's forced cursor on the ordinary path, and the forced-close
+    /// anchor that the serial tick would capture at the same cursor).
     pub(in crate::serve::api) fn prepare_joint_tick(
         &mut self,
         kv_cache: &HybridKvCache,
     ) -> Result<Qwen35JointLane> {
+        self.capture_forced_close_anchor(kv_cache, super::QWEN35_FORCED_CLOSE_LOOKAHEAD_ORDINARY);
         if self.mtp.is_some() {
             let target = self.coherent_ordinary_target(kv_cache)?;
             return Ok(Qwen35JointLane {

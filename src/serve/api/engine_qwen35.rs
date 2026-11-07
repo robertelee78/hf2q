@@ -3657,6 +3657,84 @@ pub(crate) struct Qwen35StablePromptCheckpoint {
     pub spec: Option<Qwen35SpecPrefixBoundary>,
 }
 
+/// Switch for the one-shot forced-close anchor (ADR-063 Q4-QWEN36,
+/// forced-close design option B). Default off: unset, blank or
+/// `0`/`off`/`false` takes no anchor; `1`/`on`/`true` enables it.
+pub(crate) const QWEN_FORCED_CLOSE_ANCHOR_ENV: &str = "HF2Q_QWEN_FORCED_CLOSE_ANCHOR";
+
+/// Parse the switch; an invalid value warns and keeps the default (off).
+pub(crate) fn parse_qwen_forced_close_anchor(raw: Option<&str>) -> bool {
+    crate::inference::models::qwen35::joint_step_options::parse_switch(
+        QWEN_FORCED_CLOSE_ANCHOR_ENV,
+        raw,
+    )
+    .unwrap_or_else(|error| {
+        tracing::warn!(error, fallback = false, "invalid Qwen forced-close anchor switch");
+        false
+    })
+}
+
+static QWEN_FORCED_CLOSE_ANCHOR: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    parse_qwen_forced_close_anchor(std::env::var(QWEN_FORCED_CLOSE_ANCHOR_ENV).ok().as_deref())
+});
+
+/// Whether `HF2Q_QWEN_FORCED_CLOSE_ANCHOR` is on (read once per process).
+pub(crate) fn qwen_forced_close_anchor_enabled() -> bool {
+    *QWEN_FORCED_CLOSE_ANCHOR
+}
+
+/// Lookahead of an ordinary or joint step: the one token it commits plus a
+/// one-token margin.
+pub(crate) const QWEN35_FORCED_CLOSE_LOOKAHEAD_ORDINARY: usize = 2;
+
+/// Slot checkpoint taken while a thinking-budget forced close is imminent,
+/// before any forced token reaches the cache. Its boundary excludes the
+/// newest generated token: that token has not been fed through the model yet,
+/// and the last model token before the force can merge with the forced text
+/// when the client re-renders the reasoning. A follow-up whose prompt starts
+/// with `prompt_tokens` restores it instead of the shorter stable anchor.
+///
+/// The anchor owns no full-attention rows, so it is valid only until the next
+/// admission to its slot (one-shot); the engine keeps it inside the slot's
+/// prompt anchor so every path that drops that anchor drops this one too.
+#[derive(Clone)]
+pub(crate) struct Qwen35ForcedCloseAnchor {
+    pub prompt_tokens: Vec<u32>,
+    pub kv: HybridKvSlotAnchor,
+    pub vision_fingerprint: Option<[u8; 32]>,
+}
+
+/// Token boundary at which a decode step snapshots the forced-close anchor,
+/// or `None`. The boundary is prompt + generated − 1 (the newest generated
+/// token is the step's input, not yet in the cache) and is taken only when
+/// the live physical cursor proves exactly those rows are committed.
+pub(crate) fn qwen35_forced_close_anchor_boundary(
+    enabled: bool,
+    force_imminent: bool,
+    prompt_len: usize,
+    generated_len: usize,
+    graft_len: usize,
+    live_cursor: usize,
+) -> Option<usize> {
+    if !enabled || !force_imminent || generated_len == 0 {
+        return None;
+    }
+    let tokens = prompt_len + generated_len - 1;
+    (graft_len + tokens == live_cursor).then_some(tokens)
+}
+
+/// Forced-close lookahead of one tick route: the most tokens the step can
+/// commit plus a one-token margin. A drain tick runs no forward and its cache
+/// is already ahead of the ledger, so it never snapshots.
+fn qwen35_forced_close_lookahead(kind: &Qwen35TickKind) -> Option<usize> {
+    match kind {
+        Qwen35TickKind::Commit => None,
+        Qwen35TickKind::History(drafts) => Some(drafts.len() + 2),
+        Qwen35TickKind::K3 => Some(K3_VERIFY_ROWS + 1),
+        Qwen35TickKind::Ordinary => Some(QWEN35_FORCED_CLOSE_LOOKAHEAD_ORDINARY),
+    }
+}
+
 /// Model-semantic state paired with a physically snapshotted prompt prefix.
 /// `Some` is the coherence marker: consumers must still validate that target
 /// and MTP cursors both equal `token_count` after any restore.
@@ -4450,6 +4528,11 @@ pub(crate) struct Qwen35DecodeState {
     /// This turn's decision, planned before the joint partition and executed
     /// by the joint step (Ordinary) or the serial loop (every kind).
     planned_tick: Option<Qwen35TickKind>,
+    /// `HF2Q_QWEN_FORCED_CLOSE_ANCHOR`, captured at admission.
+    forced_close_anchor_enabled: bool,
+    /// Checkpoint taken while the thinking-budget force was imminent;
+    /// published only if the request was in fact force-closed.
+    forced_close_anchor: Option<Qwen35ForcedCloseAnchor>,
 }
 
 /// Route of one decode tick, decided from the request's own state by
@@ -4503,6 +4586,12 @@ use k3_transaction::K3_VERIFY_ROWS;
 #[cfg(test)]
 #[path = "engine_qwen35/speculation_qualification_tests.rs"]
 mod speculation_qualification_tests;
+#[cfg(test)]
+#[path = "engine_qwen35/forced_close_anchor_tests.rs"]
+mod forced_close_anchor_tests;
+#[cfg(test)]
+#[path = "engine_qwen35/forced_close_anchor_real_artifact_tests.rs"]
+mod forced_close_anchor_real_artifact_tests;
 #[cfg(test)]
 #[path = "engine_qwen35/speculation_real_artifact_tests.rs"]
 mod speculation_real_artifact_tests;
@@ -4716,6 +4805,15 @@ impl Qwen35ThinkingBudgetState {
 
     fn was_forced_closed(&self) -> bool {
         self.forced_cursor.is_some() && self.closed
+    }
+
+    /// A forced close may begin within the next `lookahead` committed
+    /// tokens: the budget is open, not yet forcing, and its count is within
+    /// `lookahead` of the limit.
+    fn force_imminent(&self, lookahead: usize) -> bool {
+        !self.closed
+            && self.forced_cursor.is_none()
+            && self.reasoning_tokens.saturating_add(lookahead) >= self.limit
     }
 }
 
@@ -5151,6 +5249,8 @@ impl Qwen35DecodeState {
             }),
             route: qwen.speculation.route(),
             planned_tick: None,
+            forced_close_anchor_enabled: qwen_forced_close_anchor_enabled(),
+            forced_close_anchor: None,
         })
     }
 
@@ -5184,6 +5284,77 @@ impl Qwen35DecodeState {
             tick.fragment.push_str(&tail);
         }
         tick
+    }
+
+    /// Snapshot the forced-close anchor at the start of a step (GPU idle)
+    /// when the switch is on, no anchor is held yet, the thinking-budget
+    /// force is within `lookahead` tokens, and the live cursor is exactly
+    /// prompt + generated − 1 rows past the graft. A step that does not meet
+    /// these conditions takes nothing; a failed snapshot only loses the
+    /// saving, so it is logged and never fails the request.
+    pub(in crate::serve::api) fn capture_forced_close_anchor(
+        &mut self,
+        kv_cache: &HybridKvCache,
+        lookahead: usize,
+    ) {
+        if !self.forced_close_anchor_enabled || self.forced_close_anchor.is_some() {
+            return;
+        }
+        let imminent = self
+            .thinking_budget
+            .as_ref()
+            .is_some_and(|budget| budget.force_imminent(lookahead));
+        if !imminent {
+            return;
+        }
+        let (Ok(live), Ok(graft)) = (
+            kv_cache.sequence_len_for_slot(self.slot_id),
+            kv_cache.graft_region_for_slot(self.slot_id),
+        ) else {
+            return;
+        };
+        let Some(tokens) = qwen35_forced_close_anchor_boundary(
+            true,
+            true,
+            self.prompt_tokens.len(),
+            self.generated_tokens.len(),
+            graft as usize,
+            live as usize,
+        ) else {
+            return;
+        };
+        match kv_cache.snapshot_slot_anchor(self.slot_id, graft as usize + tokens) {
+            Ok(kv) => {
+                tracing::info!(
+                    slot = self.slot_id.0,
+                    anchor_tokens = tokens,
+                    generated_tokens = self.generated_tokens.len(),
+                    checkpoint_bytes = kv.total_bytes(),
+                    "Qwen35 forced-close anchor captured"
+                );
+                self.forced_close_anchor = Some(Qwen35ForcedCloseAnchor {
+                    prompt_tokens: self.retained_prefix(tokens),
+                    kv,
+                    vision_fingerprint: self.params.vision_fingerprint,
+                });
+            }
+            Err(error) => tracing::warn!(
+                slot = self.slot_id.0,
+                anchor_tokens = tokens,
+                error = %error,
+                "Qwen35 forced-close anchor capture skipped"
+            ),
+        }
+    }
+
+    /// The forced-close anchor, only if this request was force-closed; a
+    /// natural close inside the lookahead discards it.
+    pub(crate) fn take_forced_close_anchor(&mut self) -> Option<Qwen35ForcedCloseAnchor> {
+        let anchor = self.forced_close_anchor.take()?;
+        self.thinking_budget
+            .as_ref()
+            .is_some_and(Qwen35ThinkingBudgetState::was_forced_closed)
+            .then_some(anchor)
     }
 
     /// Exact input-token prefix represented by the live KV/recurrent state.
@@ -5285,6 +5456,9 @@ impl Qwen35DecodeState {
             Some(kind) => kind,
             None => self.next_tick_kind()?,
         };
+        if let Some(lookahead) = qwen35_forced_close_lookahead(&kind) {
+            self.capture_forced_close_anchor(kv_cache, lookahead);
+        }
         match kind {
             Qwen35TickKind::Commit => {
                 let token = take_pending_speculation_output(&mut self.pending_speculation_output)

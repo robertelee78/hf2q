@@ -219,6 +219,7 @@ fn seat_conversation(
             prefill_logits: vec![0.25; 8],
             vision_fingerprint: None,
             spec: None,
+            forced_close: None,
         }),
     )
 }
