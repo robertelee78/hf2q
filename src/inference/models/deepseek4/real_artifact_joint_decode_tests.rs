@@ -74,6 +74,13 @@ fn official_artifact_joint_decode_matches_serial_decode_bitwise() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let mut model = Deepseek4Model::load_from_gguf(&gguf)
         .unwrap_or_else(|error| panic!("load official artifact {}: {error:#}", path.display()));
+    eprintln!(
+        "artifact {} matvec {:?} attn cores {:?}",
+        path.display(),
+        // The loader resolved the family the same way.
+        super::residency::MatvecKernels::from_env().expect("matvec switch"),
+        model.attn_cores
+    );
     assert!(model.cfg.compress_ratios.contains(&4));
     assert!(model.cfg.compress_ratios.contains(&128));
     assert_eq!(model.joint_decode_unavailable_reason(), None);

@@ -36,7 +36,7 @@ use super::row_matmul::{row_matmul, row_view, RowMatmul};
 use crate::serve::gpu::GpuContext;
 
 /// Random block bytes with every block's f16 scale fields set to small normal values.
-fn block_weight(
+pub(super) fn block_weight(
     device: &MlxDevice,
     ggml_type: GgmlType,
     shape: Vec<usize>,

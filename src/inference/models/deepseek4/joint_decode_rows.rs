@@ -46,6 +46,7 @@ use mlx_native::ops::deepseek_tail_rope::{
 };
 use mlx_native::ops::elementwise::scalar_mul_f32;
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy;
+use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::attention::window_indices;
@@ -59,6 +60,7 @@ use super::compressed_attention_weights::{
 use super::forward_support::{
     alloc, alloc_host_input, raw_matmul, row_exact_storage, ROW_EXACT_MAX_ROWS,
 };
+use super::joint_decode_routes::{joint_route_is_exact, JointProduct};
 use super::prefill_annotations;
 use super::residency::RawMatrixRef;
 use super::row_matmul::{row_matmul, row_view, splits_independent_rows, RowMatmul};
@@ -132,12 +134,31 @@ fn sparse_scale(cfg: &Deepseek4Config) -> f32 {
     1.0 / (cfg.head_dim as f32).sqrt()
 }
 
-/// `row_matmul(IndependentRows)` of `input [B, k]` into `output [B, n]`.
-/// Where that splits into one-row products (dense float weights on the stock
-/// matvec family), each row writes its own buffer, so the B products carry no
-/// write hazard on each other and overlap as the per-row cores' do; one
-/// gather then forms the contiguous operand (an exact copy). Every other
-/// family is already one `m = B` dispatch.
+/// Whether a batched compressor/indexer projection over `rows` rows may run
+/// as one `m = rows` dispatch. Joint-decode admission
+/// (`joint_decode_routes::joint_product_names`) assumes these projections
+/// run per row (`m = 1`, exact for any storage), so a single dispatch is
+/// allowed only where its rows are proven equal to `m = 1`: the stock-order
+/// row-exact route, one row, or a storage whose `m = rows` route joint
+/// decode already proves (`joint_route_is_exact(RowMatmul, _)`) and that
+/// `row_matmul` does not split. Everything else runs per row.
+pub(super) fn projection_takes_single_dispatch(
+    row_exact: bool,
+    ggml_type: GgmlType,
+    rows: usize,
+) -> bool {
+    row_exact
+        || rows == 1
+        || (!splits_independent_rows(ggml_type, rows)
+            && joint_route_is_exact(JointProduct::RowMatmul, ggml_type))
+}
+
+/// A compressor/indexer projection of `input [B, k]` into `output [B, n]`.
+/// When [`projection_takes_single_dispatch`] holds, one
+/// `row_matmul(IndependentRows)`; otherwise one-row products (the per-row
+/// cores' `m = 1` route, exact for any storage), each into its own buffer so
+/// the B products carry no write hazard on each other and overlap, then one
+/// exact row gather into the contiguous operand.
 #[allow(clippy::too_many_arguments)]
 fn project_rows(
     session: &mut GraphSession<'_>,
@@ -151,10 +172,9 @@ fn project_rows(
     k: usize,
     label: &str,
 ) -> Result<()> {
-    // Same decision as `row_matmul`: the stock-order row-exact route when it
-    // reproduces the stock route at these rows, else stock.
+    // Same row-exact decision as `row_matmul` at these rows.
     let row_exact = row_exact_storage(registry, weight, rows.min(ROW_EXACT_MAX_ROWS)).is_some();
-    if row_exact || !splits_independent_rows(weight.ggml_type, rows) {
+    if projection_takes_single_dispatch(row_exact, weight.ggml_type, rows) {
         return row_matmul(
             RowMatmul::IndependentRows,
             session,
