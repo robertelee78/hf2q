@@ -10,8 +10,9 @@
 //! the order across rows is free and each row's arithmetic is the one-row
 //! graph's:
 //! - window writes stay one `kv_cache_copy` per row;
-//! - compressor and indexer F16 projections: one `m = B` row-exact dispatch
-//!   under `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC=1`; on the stock family the
+//! - compressor and indexer F16 projections: one `m = B` stock-order
+//!   dispatch (`row_matmul` -> `row_exact_matvec_stock`, every row bitwise the
+//!   stock one-row matvec) under `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC=1`; on the stock family the
 //!   per-row one-row matvecs, each into its own buffer (no write hazard
 //!   between rows), then one exact row gather (`project_rows`);
 //! - compressor recurrences, indexer score + top-k and sparse attention are
