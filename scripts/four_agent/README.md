@@ -808,7 +808,12 @@ The co-progress width is the largest set of agents whose streamed requests stay 
 
 ### Q2 traced cohort (`q2_traced_run.py`, `q2_traced_freeze.py`)
 
-`q2_traced_run.py` runs one supervised attempt of the Qwen3.8 four-slot case (`q5_cases/qwen38.json`) on a given hf2q binary with `HF2Q_PHASE_TRACE_CONFIG` set. `--population` is `n4` (the canonical release of all four agents) or a Q3 control (`n1`, `3+1`, `2+2`, `1+3`, passed to the client as `--phase-plan`). It reuses the Q5 preflight, memory sampler, stop latch and owned-group cleanup. It never retries.
+`q2_traced_run.py` runs one supervised attempt of a four-slot case on a given hf2q binary with `HF2Q_PHASE_TRACE_CONFIG` set. The default case is `q5_cases/qwen38.json`; `--case q5_cases/deepseek4-ds4file.json` and the other DeepSeek-V4 cases also work. The case's family selects the predeclared witness manifest, i.e. the actual-input sources that family's engine publishes:
+
+- `qwen38`: `qwen35.greedy.actual_tokens`, `qwen35.forward.actual_tokens`, `qwen35.joint_decode.actual_slot_rows`.
+- `deepseek4`: `deepseek4.sorted_cache_lane`, `deepseek4.prefill.actual_cooperative_lane`, `deepseek4.prefill.actual_cooperative_pack`, `deepseek4.prefill.actual_cache_span`, `deepseek4.scalar_verifier`.
+
+Readiness requires no vision projector for every family; `/hf2q/v1/runtime` reports it for all of them. Only a case that declares `artifact.text_only_locator` (Qwen3.8) gets the hard-link locator; other cases serve their model path. `q2_traced_freeze.py` (`plan` and `windows`) and q2_certify accept Qwen3.8 traced runs only: scoring DeepSeek-V4 or Gemma windows waits for the F1 multi-owner-epoch rule (ADR-063, Q2 v3). DeepSeek-V4 traces are read with `f2_trace.validate_trace` and `q4_trace_attribution.py`. Their `model_sha256` is the case's declared digest, so cite the full-file digest receipt for it, not a conversion receipt. `--population` is `n4` (the canonical release of all four agents) or a Q3 control (`n1`, `3+1`, `2+2`, `1+3`, passed to the client as `--phase-plan`). It reuses the Q5 preflight, memory sampler, stop latch and owned-group cleanup. It never retries.
 
 - **One identity.** `--identity` is the eight-key q2_certify identity. Before launch it must match the binary sha256, the build receipt (`source`, `sha256`), the client approval template sha256 (`profile_sha256`), the model's conversion-receipt sha256 and the mlx-native pin in `<server_source>:Cargo.lock`. At readiness, the served tokenizer and template sha256 and the server pid must match too.
 - **One run id.** The run id is `q2t-<output directory name>`. The client approval and `native-config.json` both carry it, and the trace header must repeat it.

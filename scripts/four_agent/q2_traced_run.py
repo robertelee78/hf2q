@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""ADR-063 Q2 items 4 and 6: one-attempt traced Qwen3.8 cohort for q2_certify.
+"""ADR-063 Q2 items 4 and 6: one-attempt traced four-agent cohort (Qwen3.8 or DeepSeek-V4).
 
-Runs ONE canonical four-agent coding cohort (`--population n4`) or one Q3 population
+The family comes from the --case (`qwen38` or `deepseek4`) and selects the predeclared witness manifest:
+the input sources that family's engine actually publishes. Runs ONE canonical four-agent coding cohort (`--population n4`) or one Q3 population
 control (`n1`, `3+1`, `2+2`, `1+3`: the client's --phase-plan) on the given hf2q binary
 with HF2Q_PHASE_TRACE_CONFIG set, under the Q5 supervision (q5_calibration preflight,
 500 ms memory sampler, stop latch and owned process-group cleanup). Client and trace share
@@ -54,9 +55,16 @@ CONFIG_NAME, TRACE_NAME = "native-config.json", "native-phase-trace.jsonl"
 SERVER_BUDGET, CLIENT_BUDGET = 6 * GIB, 128 * MIB
 EVENT_LIMIT, METADATA_LIMIT = 8_000_000, 16 * MIB
 PROFILE = "native_command_capture_v3"
-WITNESS = {"schema": "hf2q.f2.forward-witness-policy.v1", "operator": "target_input_rms_norm",
-           "input_sources": ["qwen35.greedy.actual_tokens", "qwen35.forward.actual_tokens",
-                             "qwen35.joint_decode.actual_slot_rows"],
+# Per family: the actual-input witness sources its engine publishes (native_observation adapters).
+WITNESS_SOURCES = {
+    "qwen38": ["qwen35.greedy.actual_tokens", "qwen35.forward.actual_tokens",
+               "qwen35.joint_decode.actual_slot_rows"],
+    "deepseek4": ["deepseek4.sorted_cache_lane", "deepseek4.prefill.actual_cooperative_lane",
+                  "deepseek4.prefill.actual_cooperative_pack", "deepseek4.prefill.actual_cache_span",
+                  "deepseek4.scalar_verifier"],
+}
+# Key order is part of native-config.json's bytes (config_sha256): input_sources stays third.
+WITNESS = {"schema": "hf2q.f2.forward-witness-policy.v1", "operator": "target_input_rms_norm", "input_sources": None,
            "coverage": "each_admitted_lane_in_first_fixed_window",
            "batching_scope": "operator_only_full_body_unknown"}
 ARM_READBACK_LIMIT = 8 * MIB  # the pre-client trace holds only header, baseline and arm ACK
@@ -84,10 +92,17 @@ def phase_plan(population):
     return q3_campaign.WORKLOADS[population]
 
 
+def witness(family):
+    require(family in WITNESS_SOURCES, "traced families: " + ", ".join(sorted(WITNESS_SOURCES)))
+    manifest = json.loads(json.dumps(WITNESS))
+    manifest["input_sources"] = list(WITNESS_SOURCES[family])
+    return manifest
+
+
 def traced_case(case, population):
-    """The Qwen3.8 four-slot case for one population, with the server phase trace config added."""
-    require(case.get("family") == "qwen38" and case.get("workload", {}).get("slots") == 4,
-            "the traced cohort runs the Qwen3.8 four-slot case")
+    """A traced family's four-slot case for one population, with the server phase trace config added."""
+    require(case.get("family") in WITNESS_SOURCES and case.get("workload", {}).get("slots") == 4,
+            "the traced cohort runs a four-slot case of a traced family (" + ", ".join(sorted(WITNESS_SOURCES)) + ")")
     derived = q3_campaign.derive_case(case, population)
     env = derived["serve"].setdefault("env", {})
     require("HF2Q_PHASE_TRACE_CONFIG" not in env, "case already sets HF2Q_PHASE_TRACE_CONFIG")
@@ -127,13 +142,13 @@ def check_identity(identity, *, binary_sha256, build, template_sha256, model_sha
     require(identity["profile_sha256"] == template_sha256,
             "profile_sha256 is not the sha256 of the client approval template")
     require(model_sha256 is not None and identity["model_sha256"] == model_sha256,
-            "model_sha256 differs from the artifact's conversion-receipt sha256")
+            "model_sha256 differs from the artifact sha256 (conversion receipt, or the case's declared digest)")
     require((identity["native_version"], identity["native_checksum"]) == tuple(native),
             "native_version/native_checksum differ from mlx-native in the server_source Cargo.lock")
     return identity
 
 
-def trace_config(out, run_id, identity, nonce, gpu_timestamps=False):
+def trace_config(out, run_id, identity, nonce, family, gpu_timestamps=False):
     require(RUN_ID.fullmatch(run_id) is not None, "invalid run id")
     require(32 <= len(nonce) <= 128 and re.fullmatch(r"[A-Za-z0-9_-]+", nonce) is not None, "invalid control nonce")
     return {"schema": "hf2q.f2.phase-trace.v1", "output": str(out / TRACE_NAME), "run_id": run_id,
@@ -141,7 +156,7 @@ def trace_config(out, run_id, identity, nonce, gpu_timestamps=False):
             "metadata_budget_profile": PROFILE,
             "native_observer": {"event_limit": EVENT_LIMIT, "metadata_limit_bytes": METADATA_LIMIT,
                                 "diagnostic_case": True, "control_nonce": nonce,
-                                "witness_manifest": json.loads(json.dumps(WITNESS)),
+                                "witness_manifest": witness(family),
                                 # ADR-063 Q4-TRACE-GPU-TIMING: present only when on, so default
                                 # configs (and config_sha256) are unchanged.
                                 **({"gpu_timestamps": True} if gpu_timestamps else {})},
@@ -305,7 +320,8 @@ def prepare(args, environ):
     check_identity(identity, binary_sha256=binary_sha, build=q5.load_json(args.build_receipt),
                    template_sha256=sha256(template), model_sha256=artifact["sha256"],
                    native=native_pin(git_lock(identity["server_source"])))
-    config = trace_config(out, base["RUN_ID"], identity, "q2t_" + secrets.token_hex(24), args.gpu_timestamps)
+    config = trace_config(out, base["RUN_ID"], identity, "q2t_" + secrets.token_hex(24), case["family"],
+                          args.gpu_timestamps)
     latency = q5_admission.negative_control_latency(q5.load_json(args.negative_control_receipt))
     return {"plan": plan, "values": {**base, **plan["variables"]}, "config": config, "identity": identity,
             "artifact": artifact, "latency_ns": latency, "binary_sha256": binary_sha, "template": template}
@@ -354,14 +370,24 @@ def wait_arm(path, config, server, latch, stop):
     return None
 
 
+def serve_locator(plan, out, receipt, state):
+    """A text-only hard-link locator, only for a case that declares one (qwen38); other cases serve the
+    model path itself, which the plan already resolved as SERVED_MODEL."""
+    if not plan["artifact"].get("text_only_locator"):
+        require(plan["served_model"] == plan["artifact"]["path"], "case without a locator must serve its model path")
+        return None
+    locator = q5_artifacts.create_locator(plan["artifact"]["path"], str(out))
+    state["locator"] = receipt["text_only_locator"] = locator
+    require(locator["served_path"] == plan["served_model"], "text-only locator path differs from SERVED_MODEL")
+    return locator
+
+
 def supervise(prepared, out, receipt, state):
     plan, values, config = prepared["plan"], prepared["values"], prepared["config"]
     policy = plan["policy"]
     reason = q5.preflight(plan, policy, receipt)
     require(reason is None, f"preflight refused: {reason}")
-    locator = q5_artifacts.create_locator(plan["artifact"]["path"], str(out))
-    state["locator"] = receipt["text_only_locator"] = locator
-    require(locator["served_path"] == plan["served_model"], "text-only locator path differs from SERVED_MODEL")
+    serve_locator(plan, out, receipt, state)
     fd = os.open(out / CONFIG_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as handle:
         handle.write(json.dumps(config, indent=2) + "\n")
