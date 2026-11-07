@@ -96,9 +96,9 @@ fn warm_kernel_for_switch(raw: Option<&str>) -> GemmaLiveKernel {
     }
 }
 
-/// Kernel for warm live-resume attention (single-slot resumes and joint warm
-/// cohorts), resolved once per model load from
-/// `HF2Q_GEMMA_WARM_TILED_ATTENTION`.
+/// Kernel for warm live-resume attention (single-slot resumes, joint warm
+/// cohorts and installed long-prompt lanes), resolved once per model load
+/// from `HF2Q_GEMMA_WARM_TILED_ATTENTION`.
 pub(crate) fn warm_live_kernel_from_env() -> GemmaLiveKernel {
     let raw = std::env::var(WARM_TILED_ATTENTION_ENV).ok();
     let kernel = warm_kernel_for_switch(raw.as_deref());
@@ -113,8 +113,9 @@ pub(crate) fn default_warm_live_kernel() -> GemmaLiveKernel {
     warm_kernel_for_switch(None)
 }
 
-/// `HF2Q_GEMMA_TILED_LIVE`: installed long-prompt multi-sequence lanes
-/// ([`GemmaLiveAttention::Tiled`]) only.
+/// `HF2Q_GEMMA_TILED_LIVE`: the `Tiled` route
+/// ([`GemmaLiveAttention::Tiled`]), which no serving path selects since #725
+/// and #728.
 fn tiled_live_enabled() -> bool {
     !matches!(
         std::env::var("HF2Q_GEMMA_TILED_LIVE").as_deref(),
@@ -1042,11 +1043,11 @@ mod tests {
     }
 
     #[test]
-    fn installed_lanes_keep_their_own_switch_and_tile_every_length() {
-        // `HF2Q_GEMMA_WARM_TILED_ATTENTION` never moves installed lanes.
+    fn tiled_route_keeps_its_own_switch_and_tiles_every_length() {
+        // `HF2Q_GEMMA_WARM_TILED_ATTENTION` never moves the `Tiled` route.
         for warm in [TiledF16, VecHybrid] {
             let on = LiveRoute::select(Some(GemmaLiveAttention::Tiled), warm, true);
-            assert_eq!(on.seq_kernel(1), TiledF16, "a 4096+4096+1 tail stays tiled");
+            assert_eq!(on.seq_kernel(1), TiledF16, "a 1-row sequence stays tiled");
             assert_eq!(on.seq_kernel(4096), TiledF16);
             let off = LiveRoute::select(Some(GemmaLiveAttention::Tiled), warm, false);
             assert_eq!(off.seq_kernel(4096), VecHybrid);

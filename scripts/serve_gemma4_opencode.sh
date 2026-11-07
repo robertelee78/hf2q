@@ -66,9 +66,10 @@
 #     HF2Q_GLOBAL_FA=1 (FA globals): ~8 B/seq² — masks only
 #       ⇒ batched envelope ≈ ≤50K tokens
 #   Long plain-text SlotAware prompts instead install resumable states. Each
-#   Metal transaction contains at most 4,096 aggregate rows; compatible
-#   installed lanes may divide those rows (four equal lanes advance 1,024
-#   rows each) without multiplying the watchdog boundary by MAX_SLOTS.
+#   Metal transaction contains at most 4,096 aggregate rows; each installed
+#   lane keeps its own chunk of up to 4,096 rows (as when prefilled alone),
+#   and only chunks that fit together share a transaction (#725), so the
+#   watchdog boundary is never multiplied by MAX_SLOTS.
 #   Long soft-token work remains fail-closed until it has a resumable graph.
 #
 #   Normal follow-ups use zero-copy live-prefix reuse and process only the

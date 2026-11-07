@@ -6634,34 +6634,55 @@ fn gemma4_batch_decode_reserve(lanes: impl IntoIterator<Item = (usize, usize)>) 
     max_need.saturating_sub(max_end).max(1)
 }
 
+/// Whether installed long-prompt lanes may share one transaction (issue
+/// #725), resolved once per worker: cross-slot admission on, and no
+/// diagnostic setting that moves the per-slot reference route the lanes must
+/// equal ([`gemma_warm_batch::per_slot_route_override`]). Off, every lane
+/// prefills per slot.
+fn gemma4_installed_prefill_cohort_enabled(
+    cross_slot_admit: bool,
+    env: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let unavailable = gemma_warm_batch::per_slot_route_override(env);
+    tracing::info!(
+        cross_slot_admit,
+        unavailable,
+        "Gemma installed long-prompt cohort worker decision"
+    );
+    cross_slot_admit && unavailable.is_none()
+}
+
+/// Plan one installed long-prompt cohort (issue #725).
+///
+/// Every lane is planned on its own, exactly as the single-slot path plans it
+/// (`progress.plan(aggregate_tokens)`, the bounded transaction cap), so a
+/// lane's chunk boundaries never depend on which other prompts happen to be
+/// mid-prefill. Lanes are then admitted in order (the scheduled primary first)
+/// while the cohort stays within `aggregate_tokens` rows. A lane is left out
+/// (`None`) and advances per slot on its own turn when its chunk has fewer
+/// than [`gemma_warm_batch::MIN_SUFFIX_TOKENS`] rows (its MoE would take
+/// `mv_id` alone but `mm_id` in the joint stream) or when it does not fit the
+/// remaining budget. The caller batches only when the primary and at least
+/// one more lane are admitted.
 fn gemma4_prefill_batch_plans(
     progresses: &[Gemma4PrefillProgress],
     aggregate_tokens: usize,
-) -> Result<Vec<Gemma4PrefillPlan>> {
+) -> Result<Vec<Option<Gemma4PrefillPlan>>> {
     anyhow::ensure!(!progresses.is_empty(), "Gemma4 prefill batch is empty");
-    anyhow::ensure!(
-        aggregate_tokens >= progresses.len(),
-        "Gemma4 aggregate prefill budget {aggregate_tokens} is smaller than {} lanes",
-        progresses.len()
-    );
     let mut budget = aggregate_tokens;
-    let mut plans = Vec::with_capacity(progresses.len());
-    for (index, progress) in progresses.iter().enumerate() {
-        let lanes_left = progresses.len() - index;
-        let lane_budget = (budget / lanes_left).max(1);
-        let plan = progress.plan(lane_budget)?;
-        budget = budget.saturating_sub(plan.end - plan.start);
-        plans.push(plan);
-    }
-    anyhow::ensure!(
-        plans
-            .iter()
-            .map(|plan| plan.end - plan.start)
-            .sum::<usize>()
-            <= aggregate_tokens,
-        "Gemma4 prefill batch exceeded its aggregate token budget"
-    );
-    Ok(plans)
+    progresses
+        .iter()
+        .map(|progress| {
+            let plan = progress.plan(aggregate_tokens)?;
+            let rows = plan.end - plan.start;
+            Ok(
+                (rows >= gemma_warm_batch::MIN_SUFFIX_TOKENS && rows <= budget).then(|| {
+                    budget -= rows;
+                    plan
+                }),
+            )
+        })
+        .collect()
 }
 
 impl Gemma4PrefillProgress {
@@ -6756,6 +6777,24 @@ fn finish_gemma4_operator_request(handle: SlotHandle, outcome: &'static str) {
         gemma4_operator_request_id(handle),
         outcome,
     );
+}
+
+/// Test recorder of committed Gemma bounded-prefill chunks, armed by `Some`
+/// on the calling (worker) thread (issue #725 gate).
+#[cfg(test)]
+#[derive(Default)]
+struct Gemma4PrefillRecord {
+    /// `(slot, start, end, joint)` of every committed chunk, in commit order;
+    /// `joint` marks a multi-lane transaction.
+    chunks: Vec<(u32, usize, usize, bool)>,
+    /// `(slot, first token, final logits)` of every lane that became ready.
+    seeds: Vec<(u32, u32, Vec<f32>)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static GEMMA4_PREFILL_RECORD: std::cell::RefCell<Option<Gemma4PrefillRecord>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 enum Gemma4PrefillAdvance {
@@ -6983,6 +7022,27 @@ impl Gemma4PrefillState {
             Gemma4PrefillCommit::Pending { advanced_tokens }
             | Gemma4PrefillCommit::Ready { advanced_tokens } => advanced_tokens,
         };
+        #[cfg(test)]
+        GEMMA4_PREFILL_RECORD.with(|record| {
+            if let Some(record) = record.borrow_mut().as_mut() {
+                let slot = self.slot_id.0;
+                record
+                    .chunks
+                    .push((slot, plan.start, plan.end, first_logits.is_some()));
+                if plan.ready {
+                    let logits = match first_logits {
+                        Some(logits) => logits.to_vec(),
+                        None => guard
+                            .model
+                            .weights
+                            .logits_view()
+                            .expect("Gemma bounded prefill logits")
+                            .to_vec(),
+                    };
+                    record.seeds.push((slot, first_token, logits));
+                }
+            }
+        });
         if matches!(committed, Gemma4PrefillCommit::Pending { .. }) {
             self.pending_anchor = rollback_anchor;
             return Ok(Gemma4PrefillAdvance::Pending {
@@ -12076,6 +12136,10 @@ fn run_slot_aware_gemma4(
     // boundary share one bitwise-exact transaction;
     // `HF2Q_GEMMA_JOINT_COLD_PREFILL=0` keeps per-slot admission.
     let joint_cold_prefill = gemma_cold_batch::worker_enabled(cross_slot_admit);
+    // Issue #725: installed long-prompt lanes share a transaction only where
+    // each lane stays bitwise equal to its per-slot prefill.
+    let installed_prefill_cohort =
+        gemma4_installed_prefill_cohort_enabled(cross_slot_admit, |name| std::env::var(name).ok());
 
     // ADR-040 production profiling — zero the buckets at worker entry so the
     // worker-exit dump reflects THIS worker's lifetime, not leftover state.
@@ -13152,7 +13216,7 @@ fn run_slot_aware_gemma4(
                     n_tokens,
                     kv_bytes_per_token,
                     &supervisor,
-                    cross_slot_admit,
+                    installed_prefill_cohort,
                 ) {
                     fail_stop_gemma4_worker(
                         &supervisor,
@@ -13249,7 +13313,7 @@ fn run_slot_aware_gemma4(
                     n_prefill_tokens,
                     kv_bytes_per_token,
                     &supervisor,
-                    cross_slot_admit,
+                    installed_prefill_cohort,
                 ) {
                     fail_stop_gemma4_worker(
                         &supervisor,
@@ -14492,7 +14556,7 @@ fn advance_gemma4_prefill_quantum(
     requested_tokens: u32,
     kv_bytes_per_token: u64,
     supervisor: &EngineSupervisor,
-    cross_slot_admit: bool,
+    installed_prefill_cohort: bool,
 ) -> Option<SlotAwareGpuFatal> {
     let primary_index = handle.slot_id.0 as usize;
     let Some((Gemma4SlotWork::Prefill(primary), primary_reply, installed)) =
@@ -14542,7 +14606,7 @@ fn advance_gemma4_prefill_quantum(
         );
     }
     let start_at_zero = primary.progress.cursor() == 0;
-    let batch_supported = cross_slot_admit
+    let batch_supported = installed_prefill_cohort
         && primary.soft_token_data.is_empty()
         && guard.hybrid.is_some()
         && crate::debug::INVESTIGATION_ENV.hybrid_kv
@@ -14574,27 +14638,43 @@ fn advance_gemma4_prefill_quantum(
         );
     }
 
-    let candidate_indices: Vec<usize> = (0..slots.len())
+    let candidates: Vec<(usize, Gemma4PrefillProgress)> = (0..slots.len())
         .map(|offset| (primary_index + offset) % slots.len())
-        .filter(|&slot_index| {
-            matches!(
-                slots[slot_index].as_ref(),
-                Some((Gemma4SlotWork::Prefill(state), reply, _))
-                    if state.joint_warm.is_none()
-                        && (state.progress.cursor() == 0) == start_at_zero
-                        && state.soft_token_data.is_empty()
-                        && crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
-                            state
-                                .prompt_tokens
-                                .len()
-                                .saturating_sub(state.progress.cursor()),
-                            false,
-                        )
-                        && !reply.client_closed()
-            )
+        .filter_map(|slot_index| match slots[slot_index].as_ref() {
+            Some((Gemma4SlotWork::Prefill(state), reply, _))
+                if state.joint_warm.is_none()
+                    && (state.progress.cursor() == 0) == start_at_zero
+                    && state.soft_token_data.is_empty()
+                    && crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
+                        state
+                            .prompt_tokens
+                            .len()
+                            .saturating_sub(state.progress.cursor()),
+                        false,
+                    )
+                    && !reply.client_closed() =>
+            {
+                Some((slot_index, state.progress))
+            }
+            _ => None,
         })
         .collect();
-    if candidate_indices.len() < 2 {
+    // Issue #725: each lane keeps its single-slot chunk plan; a cohort forms
+    // only from the lanes whose own chunks fit one transaction together.
+    let admitted: Vec<(usize, Gemma4PrefillPlan)> = if candidates.len() < 2 {
+        Vec::new()
+    } else {
+        let progresses: Vec<_> = candidates.iter().map(|&(_, progress)| progress).collect();
+        match gemma4_prefill_batch_plans(&progresses, GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize) {
+            Ok(plans) => candidates
+                .iter()
+                .zip(plans)
+                .filter_map(|(&(slot_index, _), plan)| plan.map(|plan| (slot_index, plan)))
+                .collect(),
+            Err(error) => return Some(SlotAwareGpuFatal::invariant(error)),
+        }
+    };
+    if admitted.len() < 2 || admitted[0].0 != primary_index {
         return advance_gemma4_prefill(
             guard,
             scheduler,
@@ -14610,8 +14690,8 @@ fn advance_gemma4_prefill_quantum(
         );
     }
 
-    let mut lanes = Vec::with_capacity(candidate_indices.len());
-    for slot_index in candidate_indices {
+    let mut lanes = Vec::with_capacity(admitted.len());
+    for (slot_index, plan) in admitted {
         let Some((work, reply, installed)) = slots[slot_index].take() else {
             let fatal = gemma4_prefill_batch_fatal(
                 lanes,
@@ -14644,13 +14724,15 @@ fn advance_gemma4_prefill_quantum(
             handle: installed,
             state,
             reply,
-            plan: Gemma4PrefillPlan {
-                start: 0,
-                end: 0,
-                capture_anchor: false,
-                ready: false,
-            },
+            plan,
         });
+        if let Err(error) = validate_gemma4_slot_cursor(guard, installed.slot_id, plan.start) {
+            return Some(gemma4_prefill_batch_fatal(
+                lanes,
+                error,
+                SlotAwareFatalKind::Invariant,
+            ));
+        }
     }
     if lanes.first().is_none_or(|lane| lane.handle != handle) {
         return Some(gemma4_prefill_batch_fatal(
@@ -14658,29 +14740,6 @@ fn advance_gemma4_prefill_quantum(
             anyhow::anyhow!("Gemma4 installed prefill batch lost its scheduled primary handle"),
             SlotAwareFatalKind::Invariant,
         ));
-    }
-
-    let progresses: Vec<_> = lanes.iter().map(|lane| lane.state.progress).collect();
-    let plans =
-        match gemma4_prefill_batch_plans(&progresses, GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize) {
-            Ok(plans) => plans,
-            Err(error) => {
-                return Some(gemma4_prefill_batch_fatal(
-                    lanes,
-                    error,
-                    SlotAwareFatalKind::Invariant,
-                ));
-            }
-        };
-    for (lane, plan) in lanes.iter_mut().zip(plans) {
-        lane.plan = plan;
-        if let Err(error) = validate_gemma4_slot_cursor(guard, lane.handle.slot_id, plan.start) {
-            return Some(gemma4_prefill_batch_fatal(
-                lanes,
-                error,
-                SlotAwareFatalKind::Invariant,
-            ));
-        }
     }
 
     let _native_invocation = crate::serve::phase_trace::enabled().then(|| {
@@ -14751,7 +14810,9 @@ fn advance_gemma4_prefill_quantum(
                 &seqs,
                 scaffold,
                 max_decode_tokens,
-                GemmaLiveAttention::Tiled,
+                // Issue #725: the single-slot resume route, so a lane is
+                // bitwise equal to the same chunk prefilled alone.
+                GemmaLiveAttention::PerSlotExact,
                 &mut guard.model.ctx,
             )
         })
@@ -43698,52 +43759,101 @@ mod gemma4_bounded_prefill_tests {
     }
 
     #[test]
-    fn gemma_installed_prefill_batch_shares_one_aggregate_transaction() {
-        let progresses = vec![
-            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
-            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
-            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
-            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
-        ];
-        let plans =
-            gemma4_prefill_batch_plans(&progresses, GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize)
-                .unwrap();
+    fn gemma_installed_prefill_cohort_refuses_per_slot_route_overrides() {
+        let env = |set: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                set.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        assert!(gemma4_installed_prefill_cohort_enabled(true, env(&[])));
+        assert!(!gemma4_installed_prefill_cohort_enabled(false, env(&[])));
+        assert!(gemma4_installed_prefill_cohort_enabled(
+            true,
+            env(&[("HF2Q_PREFILL_SLOT_BATCHED", "1")])
+        ));
+        assert!(!gemma4_installed_prefill_cohort_enabled(
+            true,
+            env(&[("HF2Q_PREFILL_SLOT_BATCHED", "0")])
+        ));
+        assert!(!gemma4_installed_prefill_cohort_enabled(
+            true,
+            env(&[("HF2Q_MM_ID_ROUTING_THRESHOLD", "64")])
+        ));
+        // The same predicate keeps the joint warm and joint cold paths off.
         assert_eq!(
-            plans
-                .iter()
-                .map(|plan| (plan.start, plan.end))
-                .collect::<Vec<_>>(),
-            vec![
-                (7_174, 8_198),
-                (7_174, 8_198),
-                (7_174, 8_198),
-                (7_174, 8_198),
-            ]
+            gemma_warm_batch::per_slot_route_override(env(&[(
+                "HF2Q_MM_ID_ROUTING_THRESHOLD",
+                "64"
+            )])),
+            Some("HF2Q_MM_ID_ROUTING_THRESHOLD moves the MoE route boundary of the lane rule")
         );
-        assert_eq!(
-            plans
-                .iter()
-                .map(|plan| plan.end - plan.start)
-                .sum::<usize>(),
-            4_096
-        );
+    }
 
-        let uneven = vec![
+    #[test]
+    fn gemma_installed_prefill_batch_plans_each_lane_alone_and_admits_fifo() {
+        let cap = GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize;
+        let rows = |plans: &[Option<Gemma4PrefillPlan>]| {
+            plans
+                .iter()
+                .map(|plan| plan.map(|plan| plan.end - plan.start))
+                .collect::<Vec<_>>()
+        };
+
+        // Issue #725: four 13,506-token prompts at cursor 7,174. Each lane
+        // keeps its single-slot 4,096-row chunk, so the primary fills the
+        // transaction alone and the cohort has one lane (single-slot path).
+        let wide = vec![Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(); 4];
+        let plans = gemma4_prefill_batch_plans(&wide, cap).unwrap();
+        assert_eq!(plans[0], Some(wide[0].plan(cap).unwrap()));
+        assert_eq!(
+            plans[0].map(|plan| (plan.start, plan.end)),
+            Some((7_174, 11_270))
+        );
+        assert_eq!(rows(&plans), vec![Some(4_096), None, None, None]);
+
+        // Tails batch in FIFO order while the cohort stays within the cap;
+        // a lane that does not fit, or whose chunk has exactly 32 rows (MoE
+        // `mv_id` alone but `mm_id` jointly), is left to its own turn.
+        let tails = vec![
             Gemma4PrefillProgress::new(9_900, 10_000, None).unwrap(),
             Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
-            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
+            Gemma4PrefillProgress::new(12_000, 13_000, None).unwrap(),
+            Gemma4PrefillProgress::new(12_500, 12_532, None).unwrap(),
+            Gemma4PrefillProgress::new(1_000, 9_000, Some(1_032)).unwrap(),
+            Gemma4PrefillProgress::new(12_000, 12_033, None).unwrap(),
         ];
-        let plans = gemma4_prefill_batch_plans(&uneven, 4_096).unwrap();
-        assert_eq!(plans[0].end - plans[0].start, 100);
-        assert_eq!(plans[1].end - plans[1].start, 1_998);
-        assert_eq!(plans[2].end - plans[2].start, 1_998);
+        let plans = gemma4_prefill_batch_plans(&tails, cap).unwrap();
         assert_eq!(
-            plans
-                .iter()
-                .map(|plan| plan.end - plan.start)
-                .sum::<usize>(),
-            4_096
+            rows(&plans),
+            vec![Some(100), None, Some(1_000), None, None, Some(33)]
         );
+        // Every admitted lane's plan is the one it would get alone.
+        for (progress, plan) in tails.iter().zip(&plans) {
+            if let Some(plan) = plan {
+                assert_eq!(*plan, progress.plan(cap).unwrap());
+            }
+        }
+
+        // Lanes fill the transaction exactly; the next lane waits.
+        let exact = vec![
+            Gemma4PrefillProgress::new(8_000, 10_048, None).unwrap(),
+            Gemma4PrefillProgress::new(8_000, 10_048, None).unwrap(),
+            Gemma4PrefillProgress::new(8_000, 8_033, None).unwrap(),
+        ];
+        let plans = gemma4_prefill_batch_plans(&exact, cap).unwrap();
+        assert_eq!(rows(&plans), vec![Some(2_048), Some(2_048), None]);
+
+        // A primary with exactly 32 rows left is never admitted, so the
+        // caller prefills it per slot.
+        let short_primary = vec![
+            Gemma4PrefillProgress::new(12_500, 12_532, None).unwrap(),
+            Gemma4PrefillProgress::new(12_000, 12_100, None).unwrap(),
+            Gemma4PrefillProgress::new(12_000, 12_100, None).unwrap(),
+        ];
+        let plans = gemma4_prefill_batch_plans(&short_primary, cap).unwrap();
+        assert_eq!(rows(&plans), vec![None, Some(100), Some(100)]);
     }
 
     #[test]

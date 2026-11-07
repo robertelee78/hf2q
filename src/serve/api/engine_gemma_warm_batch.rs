@@ -120,6 +120,21 @@ fn parse_switch(raw: Option<&str>) -> std::result::Result<bool, String> {
     }
 }
 
+/// The diagnostic setting, if any, that changes the per-slot reference route
+/// a multi-lane Gemma prefill must equal bitwise. Shared by the joint warm,
+/// joint cold and installed long-prompt cohorts; `env` reads one variable.
+pub(super) fn per_slot_route_override(
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<&'static str> {
+    if env("HF2Q_PREFILL_SLOT_BATCHED").is_some_and(|value| value.trim() == "0") {
+        Some("HF2Q_PREFILL_SLOT_BATCHED=0 replaces the per-slot route lanes must equal")
+    } else if env("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some() {
+        Some("HF2Q_MM_ID_ROUTING_THRESHOLD moves the MoE route boundary of the lane rule")
+    } else {
+        None
+    }
+}
+
 /// Resolve the switch once when the Gemma SlotAware worker starts. Diagnostic
 /// settings that change the per-slot reference route keep it off.
 pub(super) fn worker_enabled() -> bool {
@@ -132,13 +147,7 @@ pub(super) fn worker_enabled() -> bool {
         );
         JOINT_WARM_PREFILL_DEFAULT
     });
-    let unavailable = if std::env::var("HF2Q_PREFILL_SLOT_BATCHED").as_deref() == Ok("0") {
-        Some("HF2Q_PREFILL_SLOT_BATCHED=0 replaces the per-slot route lanes must equal")
-    } else if std::env::var_os("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some() {
-        Some("HF2Q_MM_ID_ROUTING_THRESHOLD moves the MoE route boundary of the lane rule")
-    } else {
-        None
-    };
+    let unavailable = per_slot_route_override(|name| std::env::var(name).ok());
     let active = requested && unavailable.is_none();
     tracing::info!(
         requested,
