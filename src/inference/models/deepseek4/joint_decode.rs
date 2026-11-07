@@ -6,9 +6,12 @@
 //! output projections, the complete FFN (router, routed experts, shared
 //! expert), and — at the caller — the output head. Work that reads or writes
 //! a request cache (window write, compressor and indexer recurrences, sparse
-//! attention) runs per row against that row's cache and position. Every row is
-//! bit-identical to `forward_verifier_one` on the same cache; see
-//! `row_matmul` for the matmul half of that contract.
+//! attention) runs per row against that row's cache and position: one row at
+//! a time (`joint_decode_core`), or phase-major as one rows dispatch per op
+//! over all rows when the model selected `AttnCores::Batched`
+//! (`joint_decode_rows`). Every row is bit-identical to
+//! `forward_verifier_one` on the same cache; see `row_matmul` for the matmul
+//! half of that contract.
 
 use anyhow::{ensure, Context, Result};
 use mlx_native::graph::GraphSession;
@@ -32,7 +35,13 @@ use super::decode_cohort::publish_verifier_cohort_after_gate;
 use super::forward_support::{
     alloc, alloc_host_input, begin_decode_pool_token, end_decode_pool_token,
 };
-use super::joint_decode_core::{encode_row_cores, plan_row_cores, JointRowInputs, RowCaches};
+use super::joint_decode_core::{
+    encode_row_cores, plan_row_cores, JointRowCore, JointRowInputs, RowCaches,
+};
+use super::joint_decode_rows::{
+    batched_cores_admit, encode_window_layer, plan_compressed_layer, plan_window_layer, AttnCores,
+    JointBatchInputs, JointCompressedLayer, JointWindowLayer,
+};
 use super::rope::yarn_frequencies;
 use super::row_matmul::{row_view, RowMatmul};
 use super::submission::{drain, retained_reference_pipeline_enabled, SubmissionChain};
@@ -120,6 +129,12 @@ impl JointRopeFrequencies {
     }
 }
 
+/// A layer's cache-dependent cores: per row, or batched over all rows.
+enum JointLayerCores {
+    PerRow(Vec<JointRowCore>),
+    Window(JointWindowLayer),
+    Compressed(JointCompressedLayer),
+}
 impl Deepseek4Model {
     /// Advance `token_ids.len()` independent caches by one token each in one
     /// layer-major transaction and return their `[B, hc, hidden]` final
@@ -368,7 +383,63 @@ impl Deepseek4Model {
             vec![1, rows, heads, head_dim],
             "joint sparse attention",
         )?;
-        let row_cores = plan_row_cores(&device, &self.cfg, caches, steps, layer, ratio)?;
+        let row_positions = steps.iter().map(|step| step.position).collect::<Vec<_>>();
+        let layer_caches = caches
+            .iter()
+            .enumerate()
+            .map(|(row, cache)| {
+                cache
+                    .layers()
+                    .get(layer)
+                    .with_context(|| format!("missing layer-{layer} joint row-{row} cache"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let layer_steps = steps
+            .iter()
+            .enumerate()
+            .map(|(row, step)| {
+                step.layers
+                    .get(layer)
+                    .with_context(|| format!("missing layer-{layer} joint row-{row} cache step"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let layer_cores = if order == RowCaches::Independent
+            && self.attn_cores == AttnCores::Batched
+            && batched_cores_admit(ratio, &row_positions)
+        {
+            if ratio == 0 {
+                JointLayerCores::Window(
+                    plan_window_layer(&device, &layer_caches, &row_positions, head_dim)
+                        .with_context(|| format!("plan DeepSeek-V4 joint layer-{layer} rows"))?,
+                )
+            } else {
+                let grafts = caches
+                    .iter()
+                    .map(|cache| cache.graft_slots())
+                    .collect::<Vec<_>>();
+                JointLayerCores::Compressed(
+                    plan_compressed_layer(
+                        &device,
+                        &self.cfg,
+                        &layer_caches,
+                        &grafts,
+                        ratio,
+                        &row_positions,
+                        &layer_steps,
+                    )
+                    .with_context(|| format!("plan DeepSeek-V4 joint layer-{layer} rows"))?,
+                )
+            }
+        } else {
+            JointLayerCores::PerRow(plan_row_cores(
+                &device,
+                &self.cfg,
+                caches,
+                steps,
+                layer,
+                ratio,
+            )?)
+        };
         let row_inputs = (0..rows)
             .map(|row| {
                 Ok(JointRowInputs {
@@ -454,21 +525,58 @@ impl Deepseek4Model {
             },
         )?;
 
-        encode_row_cores(
-            session,
-            registry,
-            &device,
-            cfg,
-            caches,
-            steps,
-            layer,
-            &row_cores,
-            &row_inputs,
-            attention_weights.sinks,
-            compressed_weights.as_ref(),
-            frequency_buffer,
-            order,
-        )?;
+        let batch_inputs = JointBatchInputs {
+            q_rope: &q_rope,
+            kv_rope: &kv_rope,
+            attention: &attention,
+            attn_norm: &core.attn_norm,
+            q_a_norm: &core.q_a_norm,
+            positions,
+        };
+        match &layer_cores {
+            JointLayerCores::PerRow(row_cores) => encode_row_cores(
+                session,
+                registry,
+                &device,
+                cfg,
+                caches,
+                steps,
+                layer,
+                row_cores,
+                &row_inputs,
+                attention_weights.sinks,
+                compressed_weights.as_ref(),
+                frequency_buffer,
+                order,
+            )?,
+            JointLayerCores::Window(window) => encode_window_layer(
+                session,
+                registry,
+                &device,
+                cfg,
+                &layer_caches,
+                &layer_steps,
+                window,
+                attention_weights.sinks,
+                &batch_inputs,
+            )
+            .with_context(|| format!("encode DeepSeek-V4 joint layer-{layer} row cores"))?,
+            JointLayerCores::Compressed(compressed) => compressed
+                .encode(
+                    session,
+                    registry,
+                    &device,
+                    cfg,
+                    &layer_caches,
+                    &layer_steps,
+                    compressed_weights
+                        .as_ref()
+                        .context("DeepSeek-V4 compressed joint weights missing")?,
+                    frequency_buffer,
+                    &batch_inputs,
+                )
+                .with_context(|| format!("encode DeepSeek-V4 joint layer-{layer} row cores"))?,
+        }
 
         encode_compressed_attention_epilogue(
             session,
