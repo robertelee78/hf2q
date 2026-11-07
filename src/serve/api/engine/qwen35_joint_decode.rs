@@ -190,13 +190,23 @@ pub(super) fn qwen35_joint_decode_config(
         solo_requested,
         n_slots,
     );
+    let proj = model.rowexact_proj_route().map_err(|error| {
+        tracing::warn!(
+            error,
+            "Qwen row-exact projection route could not be resolved"
+        );
+    });
     tracing::info!(
         target: "hf2q::serve::api::engine_qwen35::progress",
         requested,
         explicit = explicit.is_some(),
         moe,
         moe_ffn = model.moe_ffn_decode_route(),
-        proj = crate::inference::models::qwen35::rowexact_proj::route_label(),
+        proj = proj.map_or("unavailable", |route| route.total().label()),
+        proj_admitted = %proj.map_or("unavailable".to_string(), |route| route.total().to_string()),
+        proj_mtp = %proj.map_or("unavailable".to_string(), |route| {
+            route.mtp.map_or("none".to_string(), |mtp| mtp.to_string())
+        }),
         max_rows = selected.map_or(max_rows, |config| config.max_rows),
         selected = selected.is_some(),
         mode = selected.map_or("serial", |config| config.mode.label()),

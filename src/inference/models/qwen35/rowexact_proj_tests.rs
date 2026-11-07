@@ -37,8 +37,8 @@ use super::gpu_full_attn::{
     download_f32, upload_f32,
 };
 use super::rowexact_proj::{
-    parse_qwen_rowexact_proj, row_exact_weight, select, with_rowexact_proj_for_test,
-    ROW_EXACT_PROJ_SHAPES,
+    parse_qwen_rowexact_proj, row_exact_weight, select, with_rowexact_proj_for_test, ProjRoute,
+    ProjRouteCount, ROW_EXACT_PROJ_SHAPES,
 };
 
 const ROWS: usize = 8;
@@ -620,6 +620,88 @@ fn admission_depends_on_the_weight_and_the_decode_width_only() {
     let base = u8_buffer(q6 + 2);
     assert!(row_exact_weight(true, GgmlType::Q6_K, 8192, 2048, &base.slice_view(2, q6)).is_some());
     assert!(row_exact_weight(true, GgmlType::Q6_K, 8192, 2048, &base.slice_view(1, q6)).is_none());
+}
+
+/// The worker-start `proj` label counts the loaded buffers: only weights in
+/// the selected-shape set are eligible; `stock` when the switch is off or
+/// none is admitted, `row_exact` when every eligible weight is, else `mixed`.
+#[test]
+fn route_label_counts_admitted_eligible_buffers() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let Ok(device) = MlxDevice::new() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let q4 = 512 * 2048 / 256 * block_bytes(GgmlType::Q4_K);
+    let q6 = 8192 * 2048 / 256 * block_bytes(GgmlType::Q6_K);
+    let base = device
+        .alloc_buffer(q6 + 16, DType::U8, vec![q6 + 16])
+        .expect("allocate");
+    let aligned_q4 = base.slice_view(16, q4);
+    let misaligned_q4 = base.slice_view(8, q4);
+    let q6_weight = base.slice_view(0, q6);
+    let excluded_q6 = base.slice_view(0, 512 * 2048 / 256 * 210);
+    let count = |enabled: bool, weights: &[(GgmlType, u32, u32, &MlxBuffer)]| {
+        let mut count = ProjRouteCount::default();
+        for &(t, n, k, weight) in weights {
+            count.add(enabled, t, n, k, weight);
+        }
+        count
+    };
+    // A Qwen3.6-like mix: two eligible weights plus shapes outside the set
+    // (Q6_K attn_v 512x2048, Q4_K ssm_alpha 32x2048), which never count.
+    let all_admitted = [
+        (GgmlType::Q4_K, 512, 2048, &aligned_q4),
+        (GgmlType::Q6_K, 8192, 2048, &q6_weight),
+        (GgmlType::Q6_K, 512, 2048, &excluded_q6),
+        (GgmlType::Q4_K, 32, 2048, &aligned_q4),
+    ];
+    let on = count(true, &all_admitted);
+    assert_eq!(
+        (on.label(), on.to_string()),
+        ("row_exact", "2/2".to_string())
+    );
+    let off = count(false, &all_admitted);
+    assert_eq!((off.label(), off.to_string()), ("stock", "0/2".to_string()));
+    let partly = count(
+        true,
+        &[
+            (GgmlType::Q4_K, 512, 2048, &misaligned_q4),
+            (GgmlType::Q6_K, 8192, 2048, &q6_weight),
+        ],
+    );
+    assert_eq!(
+        (partly.label(), partly.to_string()),
+        ("mixed", "1/2".to_string())
+    );
+    let none = count(true, &[(GgmlType::Q4_K, 512, 2048, &misaligned_q4)]);
+    assert_eq!(
+        (none.label(), none.to_string()),
+        ("stock", "0/1".to_string())
+    );
+    // An artifact with no eligible shape (Qwen3.8 Q4_0/Q8_0) logs stock.
+    let other = count(true, &[(GgmlType::Q6_K, 512, 2048, &excluded_q6)]);
+    assert_eq!(
+        (other.label(), other.to_string()),
+        ("stock", "0/0".to_string())
+    );
+    // The MTP block joins the total.
+    let route = ProjRoute {
+        main: on,
+        mtp: Some(count(true, &[(GgmlType::Q4_K, 512, 2048, &misaligned_q4)])),
+    };
+    assert_eq!(
+        (route.total().label(), route.total().to_string()),
+        ("mixed", "2/3".to_string())
+    );
+    assert_eq!(
+        ProjRoute {
+            main: on,
+            mtp: None
+        }
+        .total(),
+        on
+    );
 }
 
 /// Q6_K 2048x512 and 512x2048 measured slower on the row-exact kernel and

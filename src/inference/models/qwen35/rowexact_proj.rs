@@ -115,12 +115,74 @@ pub(crate) fn with_rowexact_proj_for_test<T>(enabled: bool, operation: impl FnOn
     operation()
 }
 
-/// Route of this process, for the worker-start configuration log.
-pub(crate) fn route_label() -> &'static str {
-    if qwen_rowexact_proj_requested() {
-        "row_exact"
-    } else {
-        "stock"
+/// Resolved route over a set of loaded projection weights: how many of the
+/// weights whose `(type, N, K)` is in [`ROW_EXACT_PROJ_SHAPES`] (`eligible`)
+/// the row-exact kernel admits under the switch (`admitted`). Weights of
+/// other shapes always run stock and are not counted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProjRouteCount {
+    pub(crate) admitted: usize,
+    pub(crate) eligible: usize,
+}
+
+impl ProjRouteCount {
+    /// Count one loaded projection weight read by a decode dispatch as
+    /// `[n, k]` of `ggml_type` (the Metal buffer the kernel reads).
+    pub(crate) fn add(
+        &mut self,
+        enabled: bool,
+        ggml_type: GgmlType,
+        n: u32,
+        k: u32,
+        weight: &MlxBuffer,
+    ) {
+        if ROW_EXACT_PROJ_SHAPES.contains(&(ggml_type, n, k)) {
+            self.eligible += 1;
+            self.admitted +=
+                usize::from(row_exact_weight(enabled, ggml_type, n, k, weight).is_some());
+        }
+    }
+
+    /// Sum of two counts.
+    pub(crate) fn merged(self, other: Self) -> Self {
+        Self {
+            admitted: self.admitted + other.admitted,
+            eligible: self.eligible + other.eligible,
+        }
+    }
+
+    /// `stock` when nothing is admitted (switch off, or no eligible weight
+    /// passes admission), `row_exact` when every eligible weight is admitted,
+    /// `mixed` otherwise.
+    pub(crate) fn label(self) -> &'static str {
+        if self.admitted == 0 {
+            "stock"
+        } else if self.admitted == self.eligible {
+            "row_exact"
+        } else {
+            "mixed"
+        }
+    }
+}
+
+impl std::fmt::Display for ProjRouteCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.admitted, self.eligible)
+    }
+}
+
+/// Resolved projection route of a loaded model: the main decode graph (every
+/// layer plus the lm head) and the MTP block, when one is loaded.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProjRoute {
+    pub(crate) main: ProjRouteCount,
+    pub(crate) mtp: Option<ProjRouteCount>,
+}
+
+impl ProjRoute {
+    /// Main graph and MTP block together.
+    pub(crate) fn total(self) -> ProjRouteCount {
+        self.mtp.map_or(self.main, |mtp| self.main.merged(mtp))
     }
 }
 
