@@ -10,10 +10,10 @@
 //! the order across rows is free and each row's arithmetic is the one-row
 //! graph's:
 //! - window writes stay one `kv_cache_copy` per row;
-//! - compressor and indexer F16 projections are one `row_matmul`
-//!   (`IndependentRows`) over the rows: per-row one-row matvecs on the
-//!   stock family, one `m = B` row-exact dispatch under
-//!   `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC=1`;
+//! - compressor and indexer F16 projections: one `m = B` row-exact dispatch
+//!   under `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC=1`; on the stock family the
+//!   per-row one-row matvecs, each into its own buffer (no write hazard
+//!   between rows), then one exact row gather (`project_rows`);
 //! - compressor recurrences, indexer score + top-k and sparse attention are
 //!   one rows dispatch each (the flash path once per distinct width);
 //! - the indexer query RoPE, Hadamard and weight scale and the compressed-row
@@ -34,9 +34,10 @@ use mlx_native::ops::deepseek_activation_quant::{
 use mlx_native::ops::deepseek_rows::{
     deepseek_indexer_rows_workspace_elements, deepseek_sparse_attention_rows_scratch_elements,
     deepseek_sparse_flash_rows_contiguous, dispatch_deepseek_compressor_rows,
-    dispatch_deepseek_indexer_rows, dispatch_deepseek_sparse_attention_flash_rows,
-    dispatch_deepseek_sparse_attention_rows, DeepSeekCompressorRow, DeepSeekIndexerRow,
-    DeepSeekSparseAttentionRow, DeepSeekSparseFlashRowsWorkspace, DEEPSEEK_ROWS_MAX,
+    dispatch_deepseek_indexer_rows, dispatch_deepseek_rows_gather_f32,
+    dispatch_deepseek_sparse_attention_flash_rows, dispatch_deepseek_sparse_attention_rows,
+    DeepSeekCompressorRow, DeepSeekIndexerRow, DeepSeekSparseAttentionRow,
+    DeepSeekSparseFlashRowsWorkspace, DEEPSEEK_ROWS_MAX,
 };
 use mlx_native::ops::deepseek_sparse_attention::DEEPSEEK_SPARSE_HEADS;
 use mlx_native::ops::deepseek_tail_rope::{
@@ -54,9 +55,12 @@ use super::compressed_attention_indexer::layout::prepare_layout;
 use super::compressed_attention_weights::{
     CompressedAttentionWeightsRef, CompressorWeightsRef, IndexerWeightsRef,
 };
-use super::forward_support::{alloc, alloc_host_input};
+use super::forward_support::{
+    alloc, alloc_host_input, raw_matmul, row_exact_storage, ROW_EXACT_MAX_ROWS,
+};
 use super::prefill_annotations;
-use super::row_matmul::{row_matmul, row_view, RowMatmul};
+use super::residency::RawMatrixRef;
+use super::row_matmul::{row_matmul, row_view, splits_independent_rows, RowMatmul};
 use super::Deepseek4Config;
 
 /// How joint decode encodes the per-row, cache-dependent attention cores.
@@ -125,6 +129,73 @@ fn host_zero_u32(device: &MlxDevice, len: usize, label: &str) -> Result<MlxBuffe
 
 fn sparse_scale(cfg: &Deepseek4Config) -> f32 {
     1.0 / (cfg.head_dim as f32).sqrt()
+}
+
+/// `row_matmul(IndependentRows)` of `input [B, k]` into `output [B, n]`.
+/// Where that splits into one-row products (dense float weights on the stock
+/// matvec family), each row writes its own buffer, so the B products carry no
+/// write hazard on each other and overlap as the per-row cores' do; one
+/// gather then forms the contiguous operand (an exact copy). Every other
+/// family is already one `m = B` dispatch.
+#[allow(clippy::too_many_arguments)]
+fn project_rows(
+    session: &mut GraphSession<'_>,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &RawMatrixRef<'_>,
+    output: &MlxBuffer,
+    rows: usize,
+    n: usize,
+    k: usize,
+    label: &str,
+) -> Result<()> {
+    // Same decision as `row_matmul`: the stock-order row-exact route when it
+    // reproduces the stock route at these rows, else stock.
+    let row_exact = row_exact_storage(registry, weight, rows.min(ROW_EXACT_MAX_ROWS)).is_some();
+    if row_exact || !splits_independent_rows(weight.ggml_type, rows) {
+        return row_matmul(
+            RowMatmul::IndependentRows,
+            session,
+            registry,
+            device,
+            input,
+            weight,
+            output,
+            rows,
+            n,
+            k,
+            label,
+        );
+    }
+    let mut row_outputs = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let row_output = alloc(device, DType::F32, vec![1, n], label)?;
+        raw_matmul(
+            session,
+            registry,
+            device,
+            &row_view(input, row, vec![1, k])?,
+            weight,
+            &row_output,
+            1,
+            n,
+            k,
+            label,
+        )?;
+        row_outputs.push(row_output);
+    }
+    let sources: Vec<&MlxBuffer> = row_outputs.iter().collect();
+    session.barrier_between(&sources, &[output]);
+    dispatch_deepseek_rows_gather_f32(
+        session.encoder_mut(),
+        registry,
+        device,
+        &sources,
+        output,
+        n,
+    )?;
+    Ok(())
 }
 
 /// Every row's window write (one `kv_cache_copy` per row, as the per-row cores).
@@ -632,8 +703,7 @@ fn encode_rows_compressor(
     } else {
         ("main compressor KV", "main compressor gate")
     };
-    row_matmul(
-        RowMatmul::IndependentRows,
+    project_rows(
         session,
         registry,
         device,
@@ -645,8 +715,7 @@ fn encode_rows_compressor(
         hidden,
         kv_label,
     )?;
-    row_matmul(
-        RowMatmul::IndependentRows,
+    project_rows(
         session,
         registry,
         device,
@@ -925,8 +994,7 @@ impl JointCompressedLayer {
         let q_rank = cfg.q_lora_rank as usize;
         let heads = cfg.index_num_heads as usize;
         let dim = cfg.index_head_dim as usize;
-        row_matmul(
-            RowMatmul::IndependentRows,
+        project_rows(
             session,
             registry,
             device,
@@ -938,8 +1006,7 @@ impl JointCompressedLayer {
             q_rank,
             "index query",
         )?;
-        row_matmul(
-            RowMatmul::IndependentRows,
+        project_rows(
             session,
             registry,
             device,
