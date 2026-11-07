@@ -98,15 +98,16 @@ fn prefill_chunked(
     logits
 }
 
-/// One `hf2q.adr063.invariance.v2` store of full-vocabulary logit rows.
-struct LogitStore {
+/// One `hf2q.adr063.invariance.v2` store of full-vocabulary logit rows
+/// (shared with `real_artifact_prefill_tensor_attn_q1_tests`).
+pub(super) struct LogitStore {
     directory: PathBuf,
     expected: Vec<serde_json::Value>,
     captured: Vec<serde_json::Value>,
 }
 
 impl LogitStore {
-    fn create(directory: PathBuf) -> Self {
+    pub(super) fn create(directory: PathBuf) -> Self {
         std::fs::create_dir_all(&directory).expect("create trace directory");
         Self {
             directory,
@@ -115,7 +116,14 @@ impl LogitStore {
         }
     }
 
-    fn push(&mut self, agent: u32, row: usize, layer: usize, step: usize, logits: &[f32]) {
+    pub(super) fn push(
+        &mut self,
+        agent: u32,
+        row: usize,
+        layer: usize,
+        step: usize,
+        logits: &[f32],
+    ) {
         let at = serde_json::json!({
             "stage": "Logits",
             "agent": format!("agent-{agent}"),
@@ -138,7 +146,7 @@ impl LogitStore {
         self.captured.push(captured);
     }
 
-    fn finish(self, provenance: &serde_json::Value) -> PathBuf {
+    pub(super) fn finish(self, provenance: &serde_json::Value) -> PathBuf {
         let path = self.directory.join("trace.json");
         let trace = serde_json::json!({
             "schema": Q1_TRACE_SCHEMA,

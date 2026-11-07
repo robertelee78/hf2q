@@ -77,6 +77,8 @@ mod real_artifact_joint_decode_invariance_tests;
 #[cfg(test)]
 mod real_artifact_joint_decode_q1_tests;
 #[cfg(test)]
+mod real_artifact_prefill_tensor_attn_q1_tests;
+#[cfg(test)]
 mod real_artifact_joint_decode_witness_tests;
 #[cfg(test)]
 mod real_artifact_joint_decode_gpu_timing_tests;

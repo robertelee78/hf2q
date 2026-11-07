@@ -27,7 +27,7 @@
 //! outside a scope (MTP drafts, direct helpers) resumed prefill keeps the
 //! bridge.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::flash_attn_prefill_blk::{
@@ -140,6 +140,15 @@ pub fn resolve_prefill_attention_from_process() -> Result<QwenPrefillAttention> 
 
 thread_local! {
     static ACTIVE_CHUNK: RefCell<Option<TensorResumeChunk>> = const { RefCell::new(None) };
+    /// Tensor flash-attention dispatches encoded on this thread (run logs).
+    static TENSOR_DISPATCHES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Tensor flash-attention dispatches encoded on this thread so far; the
+/// difference across a forward is that chunk's count (Q1 run logs).
+#[cfg(test)]
+pub(crate) fn tensor_dispatch_count() -> u64 {
+    TENSOR_DISPATCHES.with(Cell::get)
 }
 
 /// Per-forward scope that enables route (c′) on this thread and owns the
@@ -319,7 +328,9 @@ fn dispatch_tensor(
             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
         },
     )
-    .map_err(|e| anyhow!("tensor resume flash attention: {e}"))
+    .map_err(|e| anyhow!("tensor resume flash attention: {e}"))?;
+    TENSOR_DISPATCHES.with(|count| count.set(count.get() + 1));
+    Ok(())
 }
 
 /// Route (c′) for one FA layer of a resumed chunk. `q_seq_major` (F32
