@@ -196,6 +196,7 @@ pub(super) fn qwen35_joint_decode_config(
         explicit = explicit.is_some(),
         moe,
         moe_ffn = model.moe_ffn_decode_route(),
+        proj = crate::inference::models::qwen35::rowexact_proj::route_label(),
         max_rows = selected.map_or(max_rows, |config| config.max_rows),
         selected = selected.is_some(),
         mode = selected.map_or("serial", |config| config.mode.label()),

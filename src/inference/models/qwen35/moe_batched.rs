@@ -7,11 +7,11 @@
 //! |---|---|---|
 //! | A | router logits `[rows, n_experts]` | `dense_matvec_f32_rows` (F32) |
 //! | A | shared-expert gate logit `[rows, 1]` | `dense_matvec_f32_rows` (F32) |
-//! | A | shared gate, shared up `[rows, shared_i]` | `quantized_matmul_ggml` m = rows (`kernel_mul_mv_<q>_f32` at 1 row, `_mN_r1_<rows>` at 2..5) |
+//! | A | shared gate, shared up `[rows, shared_i]` | `quantized_matmul_ggml` m = rows (`kernel_mul_mv_<q>_f32` at 1 row, `_mN_r1_<rows>` at 2..5; Q4_K `row_exact_matvec` under `HF2Q_QWEN_ROWEXACT_PROJ=1`) |
 //! | B | softmax + top-k + renorm over all rows | `moe_softmax_topk_simd_f32` |
 //! | B | shared SwiGLU | `silu_mul_f32` |
 //! | C | expert gate, expert up over `rows * top_k` pairs | `kernel_mul_mv_id_q4_K_f32_nr2` (Q4_K) or `kernel_mul_mv_id_<q>_f32` (forced matvec route) |
-//! | C | shared down `[rows, hidden]` | `quantized_matmul_ggml` m = rows |
+//! | C | shared down `[rows, hidden]` | `quantized_matmul_ggml` m = rows (Q4_K `row_exact_matvec` under `HF2Q_QWEN_ROWEXACT_PROJ=1`) |
 //! | D | expert SwiGLU | `silu_mul_f32` |
 //! | E | expert down over `rows * top_k` pairs | `kernel_mul_mv_id_q4_K_f32_nr2` (Q4_K) or `kernel_mul_mv_id_<q>_f32[_nr2]` (forced matvec route) |
 //! | F | weighted reduce + sigmoid(shared gate) * shared + residual | `moe_weighted_reduce_f32` |
