@@ -61,7 +61,8 @@ use serde_json::{json, Value};
 use super::attention::{append_prefill_window_indices, window_indices};
 use super::compressed_attention_indexer::layout::prepare_layout;
 use super::ds4_bench_support::{
-    copies_for, f16_matrix, f32_buf, floor_cells, gpu_warmup, time_op_reps, Out, Rng, Timing,
+    bench_matvec, copies_for, f16_matrix, f32_buf, floor_cells, gpu_warmup, time_op_reps, Out, Rng,
+    Timing,
 };
 use super::ds4_op_microbench_tests::block_weight;
 use super::forward_support::{
@@ -208,6 +209,7 @@ fn dense_q8_cells(ctx: &mut GpuContext, out: &mut Out) {
                     buffer: &ws[rep % ws.len()],
                     ggml_type: GgmlType::Q8_0,
                     shape: &shape,
+                    matvec: bench_matvec(),
                 };
                 raw_matmul(s, r, d, &x, &wr, &y, rows, n, k, name)
             });
@@ -237,6 +239,7 @@ fn dense_q8_cells(ctx: &mut GpuContext, out: &mut Out) {
                 buffer: &ws[rep % ws.len()],
                 ggml_type: GgmlType::Q8_0,
                 shape: &shape,
+                matvec: bench_matvec(),
             };
             grouped_output_a_batched(s, r, d, &x, &wr, &y, &arena, rows, groups, rank, HEADS, DIM)
         });
@@ -277,6 +280,7 @@ fn dense_f16_cells(ctx: &mut GpuContext, out: &mut Out) {
                     buffer: &ws[rep % ws.len()],
                     ggml_type: GgmlType::F16,
                     shape: &shape,
+                    matvec: bench_matvec(),
                 };
                 raw_matmul(s, r, d, &x, &wr, &y, rows, n, k, name)
             });
@@ -317,6 +321,7 @@ fn expert_cells(ctx: &mut GpuContext, out: &mut Out) {
                         buffer: w,
                         ggml_type: GgmlType::IQ2_XXS,
                         shape: &gu_shape,
+                        matvec: bench_matvec(),
                     };
                     expert_matmul(
                         s,
@@ -348,6 +353,7 @@ fn expert_cells(ctx: &mut GpuContext, out: &mut Out) {
                     buffer: &down,
                     ggml_type: GgmlType::Q2_K,
                     shape: &d_shape,
+                    matvec: bench_matvec(),
                 };
                 expert_matmul(
                     s,
@@ -381,11 +387,13 @@ fn expert_cells(ctx: &mut GpuContext, out: &mut Out) {
                 buffer: &gate,
                 ggml_type: GgmlType::IQ2_XXS,
                 shape: &gu_shape,
+                matvec: bench_matvec(),
             };
             let uw = RawMatrixRef {
                 buffer: &up,
                 ggml_type: GgmlType::IQ2_XXS,
                 shape: &gu_shape,
+                matvec: bench_matvec(),
             };
             expert_matmul_pair(
                 s,
@@ -416,6 +424,7 @@ fn expert_cells(ctx: &mut GpuContext, out: &mut Out) {
                 buffer: &down,
                 ggml_type: GgmlType::Q2_K,
                 shape: &d_shape,
+                matvec: bench_matvec(),
             };
             expert_matmul(
                 s,
