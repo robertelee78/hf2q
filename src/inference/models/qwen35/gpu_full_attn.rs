@@ -1116,13 +1116,13 @@ pub fn apply_linear_projection_f32_with_ggml_type(
     );
 
     let out_bytes = (seq_len * out_features) as usize * 4;
-    let mut dst = device
-        .alloc_buffer(
-            out_bytes,
-            DType::F32,
-            vec![seq_len as usize, out_features as usize],
-        )
-        .map_err(|e| anyhow!("alloc projection output: {e}"))?;
+    let shape = vec![seq_len as usize, out_features as usize];
+    let mut dst = if super::decode_pool::step_pooled_outputs() {
+        super::decode_pool::pooled_alloc_buffer(device, out_bytes, DType::F32, shape)
+    } else {
+        device.alloc_buffer(out_bytes, DType::F32, shape)
+    }
+    .map_err(|e| anyhow!("alloc projection output: {e}"))?;
 
     match weight.dtype() {
         DType::U8 => {
@@ -1602,7 +1602,7 @@ pub(super) fn apply_q_gate_projection_f32(
             .map_err(|e| anyhow!("shape native fused Q/gate activation: {e}"))?;
             let alloc_output = |label: &str| -> Result<MlxBuffer> {
                 let bytes = (seq_len * q_total) as usize * std::mem::size_of::<f32>();
-                if seq_len == 1 {
+                if seq_len == 1 || super::decode_pool::step_pooled_outputs() {
                     super::decode_pool::pooled_alloc_buffer(
                         device,
                         bytes,

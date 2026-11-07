@@ -23,6 +23,9 @@ use crate::inference::models::qwen35::joint_decode_routes::{
     joint_mode_max_rows, select_dense_ffn_route, JointDenseFfnRoute, JointRouteMode,
     JointRoutingEnvironment, MAX_JOINT_DECODE_ROWS,
 };
+use crate::inference::models::qwen35::joint_step_options::{
+    switch_from_process, JointStepOptions, QWEN_JOINT_POOLED_OUTPUTS_ENV,
+};
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::serve::api::engine_qwen35::{Qwen35JointLane, Qwen35TickOutcome};
 use crate::serve::api::qwen35_speculation::QwenSpeculationRoute;
@@ -70,6 +73,8 @@ pub(super) struct Qwen35JointDecodeConfig {
     /// eligible lane joins a joint group, and a lone ordinary lane runs a
     /// one-lane joint step instead of the serial forward.
     pub solo: bool,
+    /// Per-step options; their switches are read here, once.
+    pub step: JointStepOptions,
 }
 
 /// `Ok(None)` when unset, so the caller applies the default (on).
@@ -124,6 +129,7 @@ fn select_qwen_joint_decode(
     ffn_shared: bool,
     solo_requested: bool,
     n_slots: usize,
+    pooled_outputs: bool,
 ) -> Option<Qwen35JointDecodeConfig> {
     match (requested, mode) {
         (true, Ok(mode)) => Some(Qwen35JointDecodeConfig {
@@ -131,6 +137,7 @@ fn select_qwen_joint_decode(
             mode,
             dense_ffn: select_dense_ffn_route(mode, ffn_shared),
             solo: solo_requested && mode == JointRouteMode::PaddedMvExt && n_slots >= 2,
+            step: JointStepOptions { pooled_outputs },
         }),
         _ => None,
     }
@@ -182,6 +189,15 @@ pub(super) fn qwen35_joint_decode_config(
         tracing::warn!(error, fallback = true, "invalid Qwen joint solo switch");
         true
     });
+    let pooled_outputs =
+        switch_from_process(QWEN_JOINT_POOLED_OUTPUTS_ENV).unwrap_or_else(|error| {
+            tracing::warn!(
+                error,
+                fallback = false,
+                "invalid Qwen joint pooled outputs switch"
+            );
+            false
+        });
     let selected = select_qwen_joint_decode(
         requested,
         max_rows,
@@ -189,6 +205,7 @@ pub(super) fn qwen35_joint_decode_config(
         ffn_shared,
         solo_requested,
         n_slots,
+        pooled_outputs,
     );
     tracing::info!(
         target: "hf2q::serve::api::engine_qwen35::progress",
@@ -200,6 +217,7 @@ pub(super) fn qwen35_joint_decode_config(
         mode = selected.map_or("serial", |config| config.mode.label()),
         dense_ffn = selected.map_or("serial", |config| config.dense_ffn.label()),
         solo = selected.is_some_and(|config| config.solo),
+        pooled_outputs = selected.is_some_and(|config| config.step.pooled_outputs),
         unavailable = unavailable.as_deref().unwrap_or("none"),
         "Qwen joint decode configuration"
     );
@@ -550,6 +568,7 @@ fn run_qwen35_joint_group(
             guard.kv.as_mut().expect("kv Some during loop"),
             config.mode,
             config.dense_ffn,
+            config.step,
             supervisor,
         );
         match forward {
@@ -674,12 +693,15 @@ mod tests {
     #[test]
     fn refused_artifacts_and_disabled_switch_keep_serial_decode() {
         assert_eq!(
-            select_qwen_joint_decode(true, 4, Ok(JointRouteMode::Exact), true, true, 4),
+            select_qwen_joint_decode(true, 4, Ok(JointRouteMode::Exact), true, true, 4, true),
             Some(Qwen35JointDecodeConfig {
                 max_rows: 4,
                 mode: JointRouteMode::Exact,
                 dense_ffn: JointDenseFfnRoute::SerialBuilder,
                 solo: false,
+                step: JointStepOptions {
+                    pooled_outputs: true
+                },
             })
         );
         assert_eq!(
@@ -689,12 +711,21 @@ mod tests {
                 Err("layer 3: attn_qkv is IQ4_NL, which has no proven joint decode route".into()),
                 true,
                 true,
-                4
+                4,
+                false
             ),
             None
         );
         assert_eq!(
-            select_qwen_joint_decode(false, 4, Ok(JointRouteMode::PaddedMvExt), true, true, 4),
+            select_qwen_joint_decode(
+                false,
+                4,
+                Ok(JointRouteMode::PaddedMvExt),
+                true,
+                true,
+                4,
+                false
+            ),
             None
         );
     }
@@ -709,12 +740,20 @@ mod tests {
                 true,
                 true,
                 4,
+                false,
             )
             .expect("admitted padded mode");
             assert_eq!(padded.max_rows, requested.min(4));
-            let exact =
-                select_qwen_joint_decode(true, requested, Ok(JointRouteMode::Exact), true, true, 4)
-                    .expect("admitted exact mode");
+            let exact = select_qwen_joint_decode(
+                true,
+                requested,
+                Ok(JointRouteMode::Exact),
+                true,
+                true,
+                4,
+                false,
+            )
+            .expect("admitted exact mode");
             assert_eq!(exact.max_rows, requested);
         }
     }
@@ -722,7 +761,7 @@ mod tests {
     #[test]
     fn solo_route_is_padded_mode_on_multi_slot_workers_only() {
         let solo = |mode, solo_requested, n_slots| {
-            select_qwen_joint_decode(true, 4, Ok(mode), true, solo_requested, n_slots)
+            select_qwen_joint_decode(true, 4, Ok(mode), true, solo_requested, n_slots, false)
                 .expect("admitted mode")
                 .solo
         };

@@ -4,7 +4,7 @@ Status (2026-10-31; Qwen3.6 updated 2026-11-05):
 - **Qwen3.8 (dense): default on.** Official-artifact gates passed and the four-agent ABBA A/B passed; see "Measured result".
 - **Qwen3.6 (MoE): default on (2026-11-05).** On the declared repair-turn workload (ADR-063 Q4-QWEN36), the complete A/B against `HF2Q_QWEN_JOINT_DECODE=0` passed task quality and cut makespan by a ratio of 0.800, and a same-prefix fork check found joint decode bitwise identical to serial decode. See "Qwen3.6 verdict".
 - `HF2Q_QWEN_JOINT_DECODE=0` restores the serial path for every family.
-- **Qwen3.8 shared-weight dense FFN (padded mode): default on.** Joint steps no longer re-read the FFN gate/up weights once per packed row; `HF2Q_QWEN_JOINT_FFN_SHARED=0` restores the per-row fused kernel. Hardware gates passed, and the four-agent A/B against the kill switch measured 4.9% less makespan (block-paired 95% CI 2.2–7.6%), well short of the 2.2× bandwidth projection. The real-prompt Q1 envelope is `WithinDecisionEnvelope` for both FFN routes (below). See "Dense FFN weight sharing (padded mode)".
+- **Qwen3.8 shared-weight dense FFN (padded mode): default on.** Joint steps no longer re-read the FFN gate/up weights once per packed row; `HF2Q_QWEN_JOINT_FFN_SHARED=0` restores the per-row fused kernel. Hardware gates passed, and the four-agent A/B against the kill switch measured 4.9% less makespan (block-paired 95% CI 2.2–7.6%), well short of the 2.2× bandwidth projection. The 32-step real-prompt Q1 record (2026-10-31) is `WithinDecisionEnvelope` for both FFN routes. The 144-step measurement of 2026-11-07 found the production shared-weight route `RouteSensitive` (max 0.2835 nat); the per-row route stays within. Root recorded that as an updated Class B measurement (below). See "Dense FFN weight sharing (padded mode)".
 - **Qwen3.8 task quality against stock: Pass.** On the final binary 38485a23 (joint decode and shared FFN at their defaults) against the same binary with `HF2Q_QWEN_JOINT_DECODE=0`: 22/24 vs 22/24 instances, no discordant pairs (`E/quality-qwen38-exp3848-vs-stock-20261031T061243Z`). The earlier pairing against the peer was 23/24 vs 21/24 at 0b959107.
 - **Cancel under joint decode: CancelSmokePass** on Qwen3.8 (`E/s3-cancel-v1/qwen38-20261031T060010Z`). Closing one stream mid-decode left the other three agents finishing with CalibrationPass. All 435 scheduler turns ran joint (width 2: 4, width 3: 199, width 4: 232; no serial lanes).
 - All three cohort-invariance gates passed at 0b959107 (`E/qwen-joint-invariance-v1`), and the padded gate passed again on both FFN routes at c25d7ef2 (`E/qwen-ffn-gates-v1`).
@@ -244,13 +244,24 @@ Measured 2026-10-31 at c25d7ef2 (`E/q1-qwen38-joint-envelope-20261031T*`). Four 
 
 Both routes are inside the 0.25 nat route bound, which closes Q-C2b for the earlier route as well.
 
+**Updated measurement, 2026-11-07 (144 steps).** The same four 1057-token prompts (`E/q1-qwen38-prompts-v1`, sha256 `e77a970b…`), 144 teacher-forced steps, 576 rows. Test binary `9b1b7c1b…` at hf2q `a2773167` (local) with native `071d97f`; evidence in `/Users/robert/.local/state/hf2q/v0130/q38-opparity/q1/` (`RESULT-f1.md`, `decisions/`):
+
+| Route | Against | Classification | Max decision error | p95 | Top-1 agree | Flips |
+|---|---|---|---:|---:|---:|---:|
+| joint, shared-weight FFN | serial | `RouteSensitive` | 0.2835 nat | 0.1040 nat | 576/576 | 0 |
+| joint, per-row fused FFN | serial | `WithinDecisionEnvelope` | 0.1538 nat | 0.0763 nat | 576/576 | 0 |
+| joint, shared-weight FFN, pooled outputs | joint, shared-weight FFN | `ExactEqual` | 0 | 0 | 576/576 | 0 |
+
+The shared-weight FFN route has 3 rows over τ, all at absolute row 1160 (agents 0, 1 and 3). Each keeps its top-1, with margins of 0.95–1.04 nat. The cause is the production route itself, not pooling: the pooled arm is `ExactEqual` to it. Root decision of 2026-11-07 (`/Users/robert/.local/state/hf2q/v0130/q38-opparity/q1/RESULT-f1.md`, "Root decision"): this is recorded as an updated Class B measurement of the production padded route, with no localization required. The 32-step table above stays as the earlier record.
+
 `qwen38_joint_decode_q1_envelope_trace` takes 2–4 real agent prompts (`HF2Q_QWEN_JOINT_Q1_PROMPTS`) and requires the padded mode:
 - **Input format.** A JSON array where each entry is either the exact rendered chat prompt as token IDs, or the rendered prompt text tokenized with the serving `tokenizer.json` at `HF2Q_QWEN35_TOKENIZER`.
-- **Run.** It prefills each prompt into three identical caches, then decodes `HF2Q_QWEN_JOINT_Q1_STEPS` (default 32) teacher-forced steps. Every cache consumes the serial top-1 at every step.
+- **Run.** It prefills each prompt into a serial cache and one cache per joint arm, then decodes `HF2Q_QWEN_JOINT_Q1_STEPS` (default 32) teacher-forced steps. Every cache consumes the serial top-1 at every step. Each joint arm's step options are fixed by the test, not read from the switches.
 - **Stores** (`hf2q.adr063.invariance.v2`, keyed by agent, absolute row and step):
   - `$OUT/serial/trace.json`: the serial one-token `forward_gpu_last_logits` (stock M1 target route);
   - `$OUT/joint_shared_ffn/trace.json`: `forward_gpu_decode_joint` over all agents with the shared-weight FFN (production default);
   - `$OUT/joint_serial_ffn/trace.json`: the same with the per-row fused FFN (`HF2Q_QWEN_JOINT_FFN_SHARED=0`).
+  - `$OUT/joint_shared_ffn_pooled/trace.json`: the production route with pooled layer outputs (`HF2Q_QWEN_JOINT_POOLED_OUTPUTS=1`, Class A). The test asserts its logits bitwise equal to `joint_shared_ffn` at every step.
 
 **Prepared input.** `/tmp/adr063-qwen38-q1-prompts.json` holds four token-ID prompts, entry N = agent-N. They are the recorded turn-2 requests of `E/qwen-joint-ffn-ab-v1/q38-1-ffn1-20261031T034127Z/client/agent-{0,1,2,3}/turn-2/request.json`; agent-1 and agent-3 turn-2 are the turns that forked in the S3 A/B.
 - **Renderer.** They were rendered outside the repo by `/tmp/adr063-q1-render/render.py`. It mirrors `render_chat_prompt_with_tools_generation_prompt`: the GGUF chat template (sha256 `c3cf9e34…`), `enable_thinking=true`, `preserve_thinking=true`, `add_generation_prompt=true`, `strict` dropped from tools, object tool arguments, and serde-style `tojson`.
@@ -277,7 +288,7 @@ python3 -B scripts/four_agent/q1_decision_policy.py envelope "$OUT/serial/trace.
 
 Token-ID entries need no `HF2Q_QWEN35_TOKENIZER`.
 
-The first verdict gates the shared FFN route; the second is Q-C2b for the per-row route that served the S3 A/B. A `WithinDecisionEnvelope` verdict on real prompts closes the respective gate. A `RouteSensitive` verdict requires localization and blocks any "neutral" claim (policy §3.2). The two forked A/B turns are classified separately with the policy's fork rule.
+The first verdict gates the shared FFN route; the second is Q-C2b for the per-row route that served the S3 A/B. A `WithinDecisionEnvelope` verdict on real prompts closes the respective gate. A `RouteSensitive` verdict requires localization and blocks any "neutral" claim (policy §3.2). The exception is the 144-step `RouteSensitive` result of the production shared-weight route above, which root waived on 2026-11-07: it is recorded as an updated measurement, with no localization. The two forked A/B turns are classified separately with the policy's fork rule.
 
 **Focused root commands** for this change:
 

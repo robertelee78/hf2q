@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::joint_decode_routes::{JointDenseFfnRoute, JointRouteMode};
+use super::joint_step_options::JointStepOptions;
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
 use super::real_artifact_joint_decode_invariance_tests::cache_with_capacity;
@@ -26,13 +27,38 @@ const Q1_TOKENIZER_ENV: &str = "HF2Q_QWEN35_TOKENIZER";
 const Q1_TRACE_SCHEMA: &str = "hf2q.adr063.invariance.v2";
 const PREFILL_CHUNK: usize = 512;
 
+const CANONICAL: JointStepOptions = JointStepOptions {
+    pooled_outputs: false,
+};
+
 /// Joint arms of the trace: the production default first, then the
-/// `HF2Q_QWEN_JOINT_FFN_SHARED=0` route. Each arm owns a cache and a store
-/// directory under `$HF2Q_QWEN_JOINT_Q1_OUT`.
-const JOINT_ARMS: [(JointDenseFfnRoute, &str); 2] = [
-    (JointDenseFfnRoute::SharedWeights, "joint_shared_ffn"),
-    (JointDenseFfnRoute::SerialBuilder, "joint_serial_ffn"),
+/// `HF2Q_QWEN_JOINT_FFN_SHARED=0` route, then the production route with
+/// pooled layer outputs (`HF2Q_QWEN_JOINT_POOLED_OUTPUTS=1`, Class A:
+/// asserted bitwise equal to the first arm at every step). Each arm owns a
+/// cache and a store directory under `$HF2Q_QWEN_JOINT_Q1_OUT`.
+const JOINT_ARMS: [(JointDenseFfnRoute, JointStepOptions, &str); 3] = [
+    (
+        JointDenseFfnRoute::SharedWeights,
+        CANONICAL,
+        "joint_shared_ffn",
+    ),
+    (
+        JointDenseFfnRoute::SerialBuilder,
+        CANONICAL,
+        "joint_serial_ffn",
+    ),
+    (
+        JointDenseFfnRoute::SharedWeights,
+        JointStepOptions {
+            pooled_outputs: true,
+        },
+        "joint_shared_ffn_pooled",
+    ),
 ];
+
+/// Index of the arm whose logits the pooled arm must equal bitwise.
+const POOLED_REFERENCE_ARM: usize = 0;
+const POOLED_ARM: usize = 2;
 
 /// Rendered prompts: a JSON array of 2..=4 entries, each either the exact
 /// token IDs or the rendered chat-prompt text (tokenized with the serving
@@ -163,11 +189,15 @@ impl LogitStore {
 /// - `joint_shared_ffn/`: `forward_gpu_decode_joint` over all agents with
 ///   the weight-shared dense FFN (production default);
 /// - `joint_serial_ffn/`: the same with the serial builder's per-row fused
-///   gate/up kernel (`HF2Q_QWEN_JOINT_FFN_SHARED=0`).
+///   gate/up kernel (`HF2Q_QWEN_JOINT_FFN_SHARED=0`);
+/// - `joint_shared_ffn_pooled/`: the production route with pooled layer
+///   outputs (`HF2Q_QWEN_JOINT_POOLED_OUTPUTS=1`), asserted bitwise equal to
+///   `joint_shared_ffn` at every step.
 ///
-/// Then `python3 -B scripts/four_agent/q1_decision_policy.py envelope
+/// Every arm's kernels are fixed here, not read from the switches. Then
+/// `python3 -B scripts/four_agent/q1_decision_policy.py envelope
 /// $OUT/serial/trace.json $OUT/joint_shared_ffn/trace.json` (the gate), and
-/// the same against `joint_serial_ffn` for the kill-switch route.
+/// the same against `joint_serial_ffn` (kill-switch route).
 #[test]
 #[ignore = "requires HF2Q_QWEN38_GGUF, HF2Q_DECODE_MV_EXT=1, HF2Q_QWEN_JOINT_Q1_PROMPTS, HF2Q_QWEN_JOINT_Q1_OUT and Apple Metal"]
 fn qwen38_joint_decode_q1_envelope_trace() {
@@ -217,7 +247,7 @@ fn qwen38_joint_decode_q1_envelope_trace() {
     let mut left = LogitStore::create(out.join("serial"));
     let mut right = JOINT_ARMS
         .iter()
-        .map(|(_, directory)| LogitStore::create(out.join(directory)))
+        .map(|(_, _, directory)| LogitStore::create(out.join(directory)))
         .collect::<Vec<_>>();
     for step in 0..steps {
         let rows = prompts
@@ -230,17 +260,25 @@ fn qwen38_joint_decode_q1_envelope_trace() {
                 output: Qwen35JointOutput::Logits,
             })
             .collect::<Vec<_>>();
-        for (((dense_ffn, _), cache), store) in JOINT_ARMS.iter().zip(&mut joint).zip(&mut right) {
+        let mut arm_bits = Vec::with_capacity(JOINT_ARMS.len());
+        for (((dense_ffn, options, directory), cache), store) in
+            JOINT_ARMS.iter().zip(&mut joint).zip(&mut right)
+        {
             let outputs = model
-                .forward_gpu_decode_joint(&rows, cache, mode, *dense_ffn)
-                .unwrap_or_else(|error| {
-                    panic!("{} joint step {step}: {error:#}", dense_ffn.label())
-                });
+                .forward_gpu_decode_joint_with_options(&rows, cache, mode, *dense_ffn, *options)
+                .unwrap_or_else(|error| panic!("{directory} joint step {step}: {error:#}"));
+            let mut step_bits = Vec::with_capacity(rows.len());
             for (row, output) in rows.iter().zip(outputs) {
                 let logits = output.logits.expect("joint logits");
                 store.push(row.slot_id.0, row.position as usize, layers, step, &logits);
+                step_bits.push(bits(&logits));
             }
+            arm_bits.push(step_bits);
         }
+        assert!(
+            arm_bits[POOLED_ARM] == arm_bits[POOLED_REFERENCE_ARM],
+            "step {step}: pooled layer outputs changed the joint logits (Class A)"
+        );
         for row in &rows {
             let slot = row.slot_id.0;
             let serial_logits = model
@@ -273,17 +311,18 @@ fn qwen38_joint_decode_q1_envelope_trace() {
         "teacher_forcing": "serial top-1",
     });
     let left_path = left.finish(&serde_json::json!({"path": "serial_m1", "run": provenance}));
-    for ((dense_ffn, _), store) in JOINT_ARMS.iter().zip(right) {
+    for ((dense_ffn, options, directory), store) in JOINT_ARMS.iter().zip(right) {
         let path = store.finish(&serde_json::json!({
             "path": "joint",
+            "arm": directory,
             "dense_ffn": dense_ffn.label(),
+            "pooled_outputs": options.pooled_outputs,
             "run": provenance,
         }));
         assert!(Path::new(&path).is_file());
         eprintln!(
-            "Q1 trace ({} dense FFN); run: python3 -B scripts/four_agent/q1_decision_policy.py \
+            "Q1 trace ({directory}); run: python3 -B scripts/four_agent/q1_decision_policy.py \
              envelope {} {}",
-            dense_ffn.label(),
             left_path.display(),
             path.display()
         );
