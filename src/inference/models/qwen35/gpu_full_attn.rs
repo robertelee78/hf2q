@@ -7705,15 +7705,16 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
 
 /// Whether [`apply_tq_sdpa_rows_gated_into`] serves this joint step of a
 /// full-attention slot: TQ-only cache (no F32 shadow), `head_dim == 256`,
-/// distinct slots, and room for one more token in every slot. Otherwise the
-/// caller runs the per-row chain.
+/// distinct slots, and room for one more token in every slot, unless
+/// `HF2Q_QWEN_ATTN_ROWS=0`. Otherwise the caller runs the per-row chain.
 pub(crate) fn tq_sdpa_rows_route(
     slot: &FullAttnKvSlot,
     slots: &[SlotId],
     head_dim: u32,
     max_seq_len: u32,
 ) -> bool {
-    slot.tq.is_some()
+    super::gqa_q2_policy::qwen_attn_rows_enabled()
+        && slot.tq.is_some()
         && slot.k.is_none()
         && head_dim == 256
         && slots.iter().enumerate().all(|(index, slot_id)| {
