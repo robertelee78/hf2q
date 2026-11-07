@@ -273,6 +273,7 @@ fn run() -> Result<()> {
         glp_path: None,
         glp_alpha: None,
         kv_graft_path: None,
+        lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
     };
     let LoadedModel::Qwen35(mut model) =
         LoadedModel::load_with_context(&options, Some(packet.configured_context))?

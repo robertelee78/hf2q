@@ -625,15 +625,13 @@ impl Qwen35LoadedModel {
             vision_special_tokens_present,
             prompt_cache: HybridPromptCache::new(),
             // ADR-017 Phase E.a default-on — byte-budget LcpRegistry.
-            // Budget computed from sysinfo available_memory() × 5%
-            // clamped to [1 GiB, 16 GiB], or overridden via
-            // `HF2Q_KV_LCP_RESUME_CAPACITY` (byte-suffix form e.g. `2g`;
-            // legacy bare-integer < 4096 still accepted as entry-count
-            // × 300 MB with a deprecation warning). See
-            // `qwen35_lcp_registry_byte_budget` for the sizing rationale.
+            // The budget is the operator setting resolved once by `serve`
+            // (`--lcp-resume-budget` > `[serve] lcp_resume_budget` >
+            // host-independent 8 GiB) and carried in `LoadOptions`; it
+            // never depends on free memory or model-load order.
             lcp_registry:
                 crate::serve::kv_persist::lcp_registry::LcpRegistry::with_byte_budget(
-                    qwen35_lcp_registry_byte_budget(),
+                    opts.lcp_resume_budget.bytes(),
                 ),
             // Wired by AppState via LoadedModel::generate at request
             // time; None by default.
@@ -2005,22 +2003,6 @@ fn store_qwen35_latest_turn_checkpoint(
         }
         Err(error) => lcp_snapshot_error_notify(phase, anchor, &error),
     }
-}
-
-/// ADR-017 Phase E.a default-on — byte budget for the Qwen35 LCP registry.
-///
-/// Delegates entirely to `default_lcp_byte_budget()` in `lcp_registry.rs`,
-/// which probes `sysinfo::available_memory() × 5%` clamped to
-/// `[1 GiB, 16 GiB]`, with `HF2Q_KV_LCP_RESUME_CAPACITY` override support.
-///
-/// Rationale: `HybridKvCacheSnapshot::total_bytes()` is the exact per-entry
-/// cost (e.g. ~300 MB on Qwen 3.6 35B-A3B at stride=1024 with 8K tokens,
-/// per the `c04d5d2` motivation for cap=8 ≈ 2.4 GB). The sysinfo-derived
-/// budget on a 128 GB Mac with ~100 GB free ≈ 5 GB ≈ 16 entries at 300 MB
-/// each — a natural replacement for the hard-coded cap=8. Operators who
-/// want more entries raise the budget via `HF2Q_KV_LCP_RESUME_CAPACITY=10g`.
-pub fn qwen35_lcp_registry_byte_budget() -> u64 {
-    crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget()
 }
 
 fn qwen35_reported_cached_tokens(
@@ -11100,6 +11082,7 @@ mod tests {
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
         };

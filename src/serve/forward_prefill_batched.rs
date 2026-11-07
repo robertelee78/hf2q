@@ -5773,8 +5773,7 @@ impl MlxModelWeights {
             kv_elem_bytes,
             self.hybrid_kv.is_some(),
         );
-        let lcp_fits_budget =
-            crate::serve::kv_persist::lcp_registry::gemma_lcp_snapshot_fits_budget(lcp_est_bytes);
+        let lcp_fits_budget = self.lcp_resume_budget.admits(lcp_est_bytes);
         // Snapshots copy the dense handoff, so only its consumer (the
         // SerialFifo LCP registry) gets them. A slot-mounted prefill used to
         // allocate and zero-fill both legs at `seq_len + max_decode_tokens`

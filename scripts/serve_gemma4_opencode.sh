@@ -15,14 +15,13 @@
 #                           Dropped: it only takes effect on fifo-serial
 #                           (inert on this launcher's inflight-batched
 #                           scheduler; ADR-062 D1).
-#   HF2Q_KV_LCP_RESUME_CAPACITY=8g
-#                           Registry budget for short or branched-prefix
-#                           snapshots, still load-bearing on the default
-#                           inflight-batched scheduler: the engine's
-#                           built-in budget is available-memory-derived
-#                           (≈5 GiB on a fresh 128 GB host), and 8 GiB is
-#                           this launcher's qualified capacity. Set
-#                           LCP_CAPACITY= to override.
+#   HF2Q_KV_LCP_RESUME_CAPACITY
+#                           Removed (#730): the registry budget is the typed
+#                           `--lcp-resume-budget` flag, whose built-in
+#                           default is a host-independent 8GiB (this
+#                           launcher's qualified capacity). The launcher
+#                           passes it explicitly; set LCP_RESUME_BUDGET= to
+#                           override.
 #   Cross-slot admission   Built-in Gemma 4 default: an idle slot group waits
 #                           up to 25 ms for peer agent requests so their
 #                           appended suffixes share one transformer-body pass
@@ -144,7 +143,11 @@ MODEL="${MODEL:-/opt/hf2q/models/gemma4/gemma4-ara-2pass-APEX-Q5_K_M.gguf}"
 MMPROJ="${MMPROJ:-/opt/hf2q/models/gemma4/mmproj-gemma4-f16.gguf}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8081}"
-LCP_CAPACITY="${LCP_CAPACITY:-8g}"
+if [[ -n "${LCP_CAPACITY+set}" ]]; then
+    echo "LCP_CAPACITY is retired (#730); set LCP_RESUME_BUDGET (e.g. 8GiB) instead" >&2
+    exit 2
+fi
+LCP_RESUME_BUDGET="${LCP_RESUME_BUDGET:-8GiB}"
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 MAX_SLOTS="${MAX_SLOTS:-4}"
 KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-51539607552}" # 48 GiB shared
@@ -271,7 +274,6 @@ esac
 # 2026-08-03). Branch the exec instead of relying on the expansion.
 if [[ -f "$MMPROJ" ]]; then
     exec env \
-        HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
         ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
@@ -290,10 +292,10 @@ if [[ -f "$MMPROJ" ]]; then
             --scheduler inflight-batched \
             --max-slots "$MAX_SLOTS" \
             --kv-cache-budget "$KV_CACHE_BUDGET_BYTES" \
+            --lcp-resume-budget "$LCP_RESUME_BUDGET" \
             --default-repetition-penalty "${REP_PENALTY:-1.05}"
 else
     exec env \
-        HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
         ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
@@ -311,5 +313,6 @@ else
             --scheduler inflight-batched \
             --max-slots "$MAX_SLOTS" \
             --kv-cache-budget "$KV_CACHE_BUDGET_BYTES" \
+            --lcp-resume-budget "$LCP_RESUME_BUDGET" \
             --default-repetition-penalty "${REP_PENALTY:-1.05}"
 fi

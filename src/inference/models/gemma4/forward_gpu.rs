@@ -3026,6 +3026,7 @@ mod g4_cfa3_tests {
 
         MlxModelWeights {
             kv_graft: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             glp: None,
 embed_weight,
             layers,
@@ -3390,6 +3391,7 @@ embed_weight,
 
         let model = MlxModelWeights {
             kv_graft: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             glp: None,
 embed_weight,
             layers: vec![sliding_layer, global_layer],

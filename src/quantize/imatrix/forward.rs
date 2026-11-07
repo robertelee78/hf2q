@@ -523,6 +523,7 @@ pub fn compute_imatrix(params: &ComputeImatrixParams) -> Result<super::ImatrixDa
         glp_path: None,
         glp_alpha: None,
         kv_graft_path: None,
+        lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
     };
     let mut loaded = crate::serve::api::engine::LoadedModel::load(&load_opts).map_err(|e| {
         ImatrixError::ModelLoadFailed {

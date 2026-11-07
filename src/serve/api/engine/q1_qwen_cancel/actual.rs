@@ -122,6 +122,7 @@ pub(super) fn run() {
         glp_path: None,
         glp_alpha: None,
         kv_graft_path: None,
+        lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
     };
     let loaded = LoadedModel::load_with_context(&opts, Some(packet.configured_context)).unwrap();
     let LoadedModel::Qwen35(mut model) = loaded else {

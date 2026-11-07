@@ -1364,6 +1364,14 @@ pub struct ServeArgs {
     #[command(flatten)]
     pub planning: ServePlanningArgs,
 
+    /// In-memory LCP resume registry byte budget. Overrides
+    /// `[serve] lcp_resume_budget` and accepts bytes or units such as
+    /// `8GiB`. The built-in default is a host-independent 8GiB; the value is
+    /// resolved once at startup and never derived from free memory. Must be
+    /// greater than zero.
+    #[arg(long, value_name = "SIZE")]
+    pub lcp_resume_budget: Option<String>,
+
     #[command(flatten)]
     pub behavior: ServeBehaviorArgs,
 
@@ -1793,6 +1801,8 @@ mod tests {
             "/tmp/hf2q-kv",
             "--kv-persist-budget",
             "32GiB",
+            "--lcp-resume-budget",
+            "6GiB",
             "--default-repetition-penalty",
             "1.05",
             "--default-thinking-token-budget",
@@ -1815,6 +1825,7 @@ mod tests {
             Some(std::path::Path::new("/tmp/hf2q-kv"))
         );
         assert_eq!(serve.planning.kv_persist_budget.as_deref(), Some("32GiB"));
+        assert_eq!(serve.lcp_resume_budget.as_deref(), Some("6GiB"));
         assert_eq!(serve.behavior.default_repetition_penalty, Some(1.05));
         assert_eq!(serve.behavior.default_thinking_token_budget, Some(2048));
         assert_eq!(serve.behavior.default_tool_thinking_token_budget, Some(512));
@@ -1964,6 +1975,7 @@ mod tests {
             "--kv-cache-budget",
             "--kv-persist",
             "--kv-persist-budget",
+            "--lcp-resume-budget",
         ] {
             assert!(
                 serve_help.contains(flag),
@@ -2009,6 +2021,10 @@ mod tests {
                 "info help omitted {flag}: {info_help}"
             );
         }
+        assert!(
+            !info_help.contains("--lcp-resume-budget"),
+            "--lcp-resume-budget is serve-only: {info_help}"
+        );
         assert!(!info_help.contains("--input"), "{info_help}");
         assert!(!info_help.contains("--repo"), "{info_help}");
         assert!(

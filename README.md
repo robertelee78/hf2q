@@ -590,6 +590,8 @@ model's GGUF maximum for DeepSeek, Gemma, and Qwen alike.
 `--kv-persist-budget <SIZE>` caps the separate on-disk persistent-KV store
 selected by `--kv-persist PATH`; it is also available as
 `[serve] kv_persist_budget` and through `hf2q setup`.
+`--lcp-resume-budget <SIZE>` (or `[serve] lcp_resume_budget`) sizes the
+in-memory LCP resume registry; it defaults to a host-independent 8GiB.
 Requests that cannot safely fit wait or fail explicitly instead of silently
 receiving a shorter context. A live `/v1/models` entry reports the effective
 limit as `context_length` and the GGUF capability as `max_context_length`.

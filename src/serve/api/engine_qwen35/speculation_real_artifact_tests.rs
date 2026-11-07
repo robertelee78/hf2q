@@ -159,6 +159,7 @@ fn run_arm(policy: QwenSpeculationPolicy, reference: Option<&Arm>) -> Arm {
         glp_path: None,
         glp_alpha: None,
         kv_graft_path: None,
+        lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
     };
     let mut loaded = LoadedModel::load(&options).expect("load Qwen3.8");
     let tokenizer = {

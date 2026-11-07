@@ -3271,6 +3271,9 @@ pub struct LoadOptions {
     /// ADR-059: optional KV-cache graft artifact (GGUF `graft.*` bank),
     /// loaded + bind-validated at model load. Explicit file only.
     pub kv_graft_path: Option<PathBuf>,
+    /// In-memory LCP resume registry byte budget, resolved once by `serve`
+    /// (`--lcp-resume-budget` > `[serve] lcp_resume_budget` > 8 GiB).
+    pub lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget,
 }
 
 impl LoadedModel {
@@ -3677,6 +3680,9 @@ impl GemmaLoadedModel {
             kv_graft = Some(bound);
         }
         weights.kv_graft = kv_graft;
+        // The per-request pre-copy snapshot gate reads the same resolved
+        // budget the registry below enforces.
+        weights.lcp_resume_budget = opts.lcp_resume_budget;
 
         // ADR-053 dual hook sites (#299, 2026-10-13): bind a GLP steering
         // vector when the operator supplied one. Fail-closed at load; never
@@ -3778,21 +3784,13 @@ impl GemmaLoadedModel {
             // F32). Capacity 16 with that payload would budget ~77 GB
             // for LCP cache alone, OOM-class on a 128-GB M5 Max.
             //
-            // This iter replaces entry-count cap with byte-budget
-            // eviction. The budget is computed from `sysinfo`
-            // `available_memory() × 5%` clamped to `[1 GiB, 16 GiB]`,
-            // giving ≈5 GB on a fresh 128 GB Mac (≈1 Gemma-26B entry at
-            // F32 per the ~4.8 GB estimate). Operators who want more
-            // entries raise the budget via `HF2Q_KV_LCP_RESUME_CAPACITY`
-            // (byte-suffix form: e.g. `10g` = 10 GiB; legacy entry-count
-            // form `8` still accepted with a deprecation warning).
-            //
-            // `HF2Q_KV_LCP_RESUME_CAPACITY` env override is honoured:
-            // bare integers < 4096 = legacy entry-count × 300 MB;
-            // bare integers ≥ 4096 = raw byte count; suffix b/k/m/g =
-            // bytes with multiplier.
+            // Byte-budget eviction. The budget is the operator setting
+            // resolved once by `serve` (`--lcp-resume-budget` >
+            // `[serve] lcp_resume_budget` > host-independent 8 GiB) and
+            // carried in `LoadOptions`; it never depends on free memory,
+            // so snapshot/eviction decisions are identical on every host.
             lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::with_byte_budget(
-                crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget(),
+                opts.lcp_resume_budget.bytes(),
             ),
             // ADR-017 Phase E.a iter-2: metrics sink wired by
             // `serve::load_engine` AFTER this constructor returns
@@ -35953,6 +35951,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let loaded_a = LoadedModel::load(&load_opts).expect("LoadedModel::load (a)");
         let loaded_b = LoadedModel::load(&load_opts).expect("LoadedModel::load (b)");
@@ -36207,6 +36206,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         // Fixed prompt set (the same prompts the N=4 parity + interleave
         // tests use, so golden ↔ parity are directly comparable).
@@ -36271,6 +36271,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -36319,6 +36320,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         // Two DISTINCT prompts so cross-slot contamination is visible.
         let p0: Vec<u32> = vec![1u32, 2, 3, 4, 5];
@@ -36535,6 +36537,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -36598,6 +36601,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -36893,6 +36897,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_tokens = 16usize;
@@ -37141,6 +37146,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_tokens = 16usize;
@@ -37409,6 +37415,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         // Four distinct greedy prompts.
@@ -37511,6 +37518,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let eager_prompt = vec![42u32; GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize];
         let resumed_prompt = vec![43u32; GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize * 2 + 1];
@@ -37646,6 +37654,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         // IDENTICAL prompt in all four slots. Serial ref at the LONGEST budget so
@@ -37779,6 +37788,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         // Eight distinct greedy prompts (the N=4 set + four more distinct ones).
@@ -37942,6 +37952,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt = vec![1u32, 2, 3];
         let params = SamplingParams {
@@ -37983,6 +37994,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt = vec![1u32, 2, 3];
         let params = SamplingParams {
@@ -38059,6 +38071,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         // Eight distinct greedy prompts (same shape as the gemma4 N=8 gate).
@@ -38174,6 +38187,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         let prompt_len: usize = std::env::var("HF2Q_S019_PROMPT_LEN")
@@ -38309,6 +38323,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         // N=1 mechanism gate: a single 70-token prompt exercising the full
@@ -38436,6 +38451,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let lens = [26u32, 40, 13, 55, 70, 19, 33, 48];
         let mk = |i: u32, l: u32| -> Vec<u32> {
@@ -38561,6 +38577,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         // Every request is at or above the conservative tiny-prefill boundary,
         // so this test continues to prove that the eligible multi-seq path
@@ -38700,6 +38717,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         // A len configurable via HF2Q_BISECT_ALEN (default 2 → B offset 2 ≡2 mod4).
         // B len via HF2Q_BISECT_BLEN (default 10). Use larger to hit tensor-mm (>64).
@@ -38861,6 +38879,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         // HF2Q_BENCH_TOKENS = decode length per stream (default 128).
         let bench_tokens: usize = std::env::var("HF2Q_BENCH_TOKENS")
@@ -39211,6 +39230,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         // Same prompt, divergent max_tokens (5 / 50 / 200) so slots finish
@@ -39316,6 +39336,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_decode = 1usize; // first-token prefill logits only
@@ -39669,6 +39690,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let loaded_a = LoadedModel::load(&load_opts).expect("LoadedModel::load (a, H2)");
         let loaded_b = LoadedModel::load(&load_opts).expect("LoadedModel::load (b, H2)");
@@ -44402,6 +44424,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let loaded =
             LoadedModel::load(&opts).expect("H21: LoadedModel::load must succeed for Gemma 4 GGUF");
@@ -44471,6 +44494,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let loaded = LoadedModel::load(&opts).expect("H22: load Gemma 4 GGUF");
         let mut g = match loaded {
@@ -44548,6 +44572,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let loaded = LoadedModel::load(&opts).expect("H23: load Gemma 4 GGUF");
         let g = match loaded {
@@ -44617,6 +44642,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let loaded = LoadedModel::load(&opts).expect("H24: load Gemma 4 GGUF");
         let engine =
