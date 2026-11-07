@@ -179,6 +179,10 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
             // null for other families.
             "gemma_prefill_moe_down": (engine.info().arch_str == "gemma4")
                 .then(crate::serve::gemma_prefill_moe::published_prefill_moe_down),
+            // ADR-063 gap program decode attention head split (`Stock` |
+            // `Ne2` | `Ne4`); null for other families.
+            "gemma_decode_attn_ne": (engine.info().arch_str == "gemma4")
+                .then(crate::serve::gemma_decode_attention::published_decode_attn_ne),
             // ADR-063: the resolved Gemma warm-prefill attention
             // kernel, so a Q5 receipt binds its arm (`null` off Gemma).
             "gemma_warm_attention_kernel": engine.info().gemma_warm_attention_kernel,
