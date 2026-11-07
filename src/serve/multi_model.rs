@@ -182,6 +182,9 @@ pub struct EngineConfig {
     pub kv_persist_dir: Option<PathBuf>,
     /// On-disk persistent-KV ceiling. Zero preserves unlimited behavior.
     pub kv_persist_budget_bytes: u64,
+    /// In-memory LCP resume registry byte budget, resolved once at server
+    /// start so every model load (including swaps) uses the same value.
+    pub lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget,
 }
 
 impl std::fmt::Debug for EngineConfig {
@@ -202,6 +205,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("kv_cache_budget_bytes", &self.kv_cache_budget_bytes)
             .field("kv_persist_dir", &self.kv_persist_dir)
             .field("kv_persist_budget_bytes", &self.kv_persist_budget_bytes)
+            .field("lcp_resume_budget", &self.lcp_resume_budget)
             .finish()
     }
 }
@@ -220,6 +224,7 @@ pub struct EngineConfigIdentity {
     pub kv_cache_budget_bytes: Option<u64>,
     pub kv_persist_enabled: bool,
     pub kv_persist_budget_bytes: u64,
+    pub lcp_resume_budget_bytes: u64,
     pub explicit_tokenizer: bool,
     pub explicit_config: bool,
     pub dwq_overlay: bool,
@@ -249,6 +254,7 @@ impl From<&EngineConfig> for EngineConfigIdentity {
             kv_cache_budget_bytes: config.kv_cache_budget_bytes,
             kv_persist_enabled: config.kv_persist_dir.is_some(),
             kv_persist_budget_bytes: config.kv_persist_budget_bytes,
+            lcp_resume_budget_bytes: config.lcp_resume_budget.bytes(),
             explicit_tokenizer: config.tokenizer_path.is_some(),
             explicit_config: config.config_path.is_some(),
             dwq_overlay: config.dwq_overlay_path.is_some(),

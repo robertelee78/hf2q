@@ -134,6 +134,7 @@ pub(super) fn engine_config_identity_json(
         "kv_cache_budget_bytes": identity.kv_cache_budget_bytes,
         "kv_persist_enabled": identity.kv_persist_enabled,
         "kv_persist_budget_bytes": identity.kv_persist_budget_bytes,
+        "lcp_resume_budget_bytes": identity.lcp_resume_budget_bytes,
         "explicit_tokenizer": identity.explicit_tokenizer,
         "explicit_config": identity.explicit_config,
         "dwq_overlay": identity.dwq_overlay,

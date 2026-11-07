@@ -34,6 +34,7 @@ fn load_options() -> LoadOptions {
         glp_path: None,
         glp_alpha: None,
         kv_graft_path: None,
+        lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         kv_persist_dir: None,
         kv_persist_budget_bytes: 0,
     }

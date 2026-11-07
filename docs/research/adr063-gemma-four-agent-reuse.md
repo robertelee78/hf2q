@@ -507,7 +507,8 @@ SlotAware cold route) did two things nothing reads:
   the SerialFifo engine paths consume. So the worker also held about 5.4 GB
   per worker, about 10.8 GB at the moment the next admission allocated.
   These snapshots require `HF2Q_KV_LCP_RESUME_CAPACITY` to admit them; the
-  four-agent launcher sets it to 8g.
+  four-agent launcher sets it to 8g. (#730: that variable is removed; the
+  budget is now `--lcp-resume-budget`, default a host-independent 8GiB.)
 - **Dense K/V decode handoff.** 774,635,520 bytes, plus the dense flash
   tmp and 30 per-layer copy dispatches. The slot-mounted caller discards it
   immediately, because it restores its own `dense_kvs`. No prefill kernel
@@ -944,7 +945,8 @@ multi-sequence cold prefill and the stable/full-input admissions share the
 changed function.
 
 ```sh
-HF2Q_GEMMA4_GGUF="$GGUF" HF2Q_KV_LCP_RESUME_CAPACITY=8g \
+# #730: the 8 GiB LCP resume budget is now the built-in default; no env needed.
+HF2Q_GEMMA4_GGUF="$GGUF" \
   cargo test --locked --release --bin hf2q \
   serve::api::engine::gemma_cold_prefill_tests::gemma_cold_prefill_handoff_skip_matches_legacy_bitwise \
   -- --exact --ignored --nocapture --test-threads=1

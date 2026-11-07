@@ -120,6 +120,22 @@ use a ring buffer capped at `sliding_window` (1024 on Gemma-4); global
 layers use a linear buffer of `seq_len + max_decode_tokens`. No env var
 controls this — it's a correctness property, not a tunable.
 
+## LCP resume budget (not an environment variable)
+
+The in-memory LCP resume registry budget is the typed
+`hf2q serve --lcp-resume-budget <SIZE>` flag or `[serve] lcp_resume_budget`
+config key (CLI wins over config). Omitted, it is a constant 8GiB on every
+host. Serve resolves it once at startup, logs
+`[hf2q lcp] byte_budget=<bytes> (source=default|config|cli)`, and passes it to
+every Qwen and Gemma engine load, including model swaps. Gemma's per-request
+pre-copy snapshot check uses the same value. Free memory is never consulted,
+so which prompts get snapshotted and which entries are evicted does not depend
+on the host or on load order. Zero and malformed values fail startup. The
+former `HF2Q_KV_LCP_RESUME_CAPACITY` variable (and its `available_memory() ×
+5%` default) is removed and no longer read (#730); replace `=8g` with
+`--lcp-resume-budget 8GiB`, and a legacy entry count `N` with `N × 300MiB`
+(for example `=8` → `--lcp-resume-budget 2400MiB`).
+
 ## Diagnostic dumps
 
 These are for investigation work only. Output goes to `HF2Q_DUMP_DIR`

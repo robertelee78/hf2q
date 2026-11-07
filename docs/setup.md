@@ -109,6 +109,7 @@ deliberately:
 ctx = 262144
 kv_cache_budget = "8GiB"
 kv_persist_budget = "32GiB"
+lcp_resume_budget = "8GiB"
 ```
 
 `ctx` applies to every conversation slot and is never divided by `max_slots`.
@@ -123,6 +124,10 @@ independent of the active-slot residency budget. CLI
 silently inactive. A config value may remain dormant until an invocation
 enables a store. Zero or omission is unlimited, while malformed explicit
 values fail setup or serve.
+`lcp_resume_budget` sizes the in-memory LCP resume registry. Omission means a
+constant 8GiB on every host (never derived from free memory); CLI
+`--lcp-resume-budget <SIZE>` overrides the config value. Zero and malformed
+values fail setup or serve. Setup does not prompt for it.
 
 Model identity, revision, output path, cache location, source retention, auth
 tokens, hardware snapshots, and calibration state remain explicit or owned by

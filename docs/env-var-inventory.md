@@ -46,6 +46,18 @@ accepts 1-8 on every family, checked at the CLI, config load, and the setup
 prompt; raising the bound requires a hands-on qualification at the new
 width). No `src/` occurrence of the three names remains.
 
+## Completed in #730 (2026-11-06)
+
+The `HF2Q_KV_LCP_RESUME_CAPACITY` production reader is removed. The
+in-memory LCP resume registry budget is the typed `serve
+--lcp-resume-budget <SIZE>` / `[serve] lcp_resume_budget` setting with a
+host-independent built-in default of 8GiB, resolved once at server start; the
+former free-memory probe (`available_memory() × 5%`) is gone. Only a
+regression guard names the variable, so its row is now `removed-guard`. The
+`HF2Q_KV_LCP_RESUME` and `HF2Q_KV_LCP_RESUME_CAPACITY` rows were regenerated
+with the audit script for this change (the lexical count of
+`HF2Q_KV_LCP_RESUME` includes the longer name); other rows were not.
+
 ## Added in ADR-063 S3 (2026-10-30)
 
 - `HF2Q_DEEPSEEK_JOINT_DECODE` (`documented-escape`) is the DeepSeek-V4 joint decode kill switch. It is on by default; `0`/`off`/`false` restores serial per-slot decode.
@@ -306,8 +318,8 @@ this release:
 | `HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE` | `development-only` | 2 |
 | `HF2Q_KV_LCP_DISABLE_MID_STORE` | `development-only` | 4 |
 | `HF2Q_KV_LCP_LONG_RESUME` | `promote-or-internalize` | 5 |
-| `HF2Q_KV_LCP_RESUME` | `promote-or-internalize` | 62 |
-| `HF2Q_KV_LCP_RESUME_CAPACITY` | `promote-or-internalize` | 11 |
+| `HF2Q_KV_LCP_RESUME` | `promote-or-internalize` | 52 |
+| `HF2Q_KV_LCP_RESUME_CAPACITY` | `removed-guard` | 1 |
 | `HF2Q_KV_PERSIST` | `promote-or-internalize` | 19 |
 | `HF2Q_KV_PERSIST_PATH` | `promote-or-internalize` | 15 |
 | `HF2Q_KV_PERSIST_PATH_ENV` | `development-only` | 9 |

@@ -238,7 +238,7 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
     };
     let _gpu=crate::inference::hf2q_gpu_test_lock();
     let options=LoadOptions {model_path:p.model.clone(),tokenizer_path:None,config_path:None,
-        dwq_overlay_path:None,kv_persist_dir:None,kv_persist_budget_bytes:0,glp_path:None,glp_alpha:None,kv_graft_path:None};
+        dwq_overlay_path:None,kv_persist_dir:None,kv_persist_budget_bytes:0,glp_path:None,glp_alpha:None,kv_graft_path:None,lcp_resume_budget:crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT};
     let LoadedModel::Gemma(mut model)=LoadedModel::load_with_context(&options,Some(p.configured_context))?
         else {anyhow::bail!("explicit Gemma model required")};
     scope.check_config(&p.identity,&recipe_for(&model.config))?;

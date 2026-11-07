@@ -367,6 +367,10 @@ pub struct MlxModelWeights {
     /// graft-wired refuse requests by name rather than serving
     /// ungrafted (the ADR-059 fail-closed discipline).
     pub kv_graft: Option<crate::inference::graft::BoundGraft>,
+    /// In-memory LCP resume budget used by the prefill routes' pre-copy
+    /// snapshot gate. The serving engine sets it from `LoadOptions` right
+    /// after load; standalone constructions keep the 8 GiB constant.
+    pub lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget,
     /// ADR-053 dual hook sites (#299, 2026-10-13): optional GLP runtime
     /// steering. When bound, each steered layer's complete post-layer
     /// residual stream (`hidden` after the fused end-of-layer norm+add+
@@ -1394,6 +1398,7 @@ impl MlxModelWeights {
             rms_norm_eps: cfg.rms_norm_eps as f32,
             final_logit_softcapping: cfg.final_logit_softcapping.map(|v| v as f32),
             kv_graft: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             glp: None,
             kv_caches,
             activations,

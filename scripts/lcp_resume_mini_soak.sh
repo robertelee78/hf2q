@@ -2,7 +2,8 @@
 # ADR-017 Phase E.a B.5 mini-soak — 5-minute LCP-resume regression check.
 #
 # Spawns ONE server with HF2Q_KV_LCP_CHUNKED_PREFILL=1 + HF2Q_KV_LCP_RESUME=1
-# + HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64 + HF2Q_KV_LCP_RESUME_CAPACITY=4,
+# + HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64 + --lcp-resume-budget 1200MiB
+# (the former 4-entry × 300 MiB registry envelope),
 # then runs ~50 multi-turn chat sequences (turn-1 + turn-2) measuring:
 #   * Sustained correctness — every turn-2 response decoded non-empty + non-error.
 #   * Memory pressure — RSS before/after (operator should see no growth beyond
@@ -34,11 +35,11 @@ echo "[MINI-SOAK] turns: $TURNS"
 HF2Q_KV_LCP_CHUNKED_PREFILL=1 \
 HF2Q_KV_LCP_RESUME=1 \
 HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64 \
-HF2Q_KV_LCP_RESUME_CAPACITY=4 \
 /opt/hf2q/target/release/hf2q serve \
     --model "$MODEL" \
     --host "$HOST" \
     --port "$PORT" \
+    --lcp-resume-budget 1200MiB \
     > "$LOG_DIR/server.stdout" 2> "$LOG_DIR/server.stderr" &
 SERVER_PID=$!
 echo "[MINI-SOAK] server pid=$SERVER_PID"

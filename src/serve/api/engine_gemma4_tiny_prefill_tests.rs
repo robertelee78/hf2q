@@ -42,6 +42,7 @@ fn gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant() {
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         kv_persist_dir: None,
         kv_persist_budget_bytes: 0,
     };

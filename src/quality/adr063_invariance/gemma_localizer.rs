@@ -340,6 +340,7 @@ fn q1_gemma_actual_stage_localizer() {
         glp_path: None,
         glp_alpha: None,
         kv_graft_path: None,
+        lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
     };
     let loaded = LoadedModel::load_with_context(&options, Some(packet.configured_context))
         .expect("actual production family loader");

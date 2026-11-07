@@ -44,11 +44,11 @@ echo "[BENCH] trials per scenario: $TRIALS"
 HF2Q_KV_LCP_CHUNKED_PREFILL=1 \
 HF2Q_KV_LCP_RESUME=1 \
 HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64 \
-HF2Q_KV_LCP_RESUME_CAPACITY=8 \
 /opt/hf2q/target/release/hf2q serve \
     --model "$MODEL" \
     --host "$HOST" \
     --port "$PORT" \
+    --lcp-resume-budget 2400MiB \
     > "$LOG_DIR/server.stdout" 2> "$LOG_DIR/server.stderr" &
 SERVER_PID=$!
 echo "[BENCH] server pid=$SERVER_PID"

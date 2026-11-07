@@ -524,6 +524,7 @@ mod tests {
                 glp_reference: None,
                 glp_alpha: None,
                 kv_graft_path: None,
+                lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
                 // ADR-040 Phase C iter-4 (C4) — test fixture uses
                 // SerialFifo (ADR-005 byte-equivalent path).
                 engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,

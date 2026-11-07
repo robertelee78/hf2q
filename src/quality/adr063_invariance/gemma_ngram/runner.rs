@@ -103,7 +103,7 @@ fn run()->Result<()> {
         "routing+metadata+CPU ledger must join existing pre-load case admission");}
     let _gpu=crate::inference::hf2q_gpu_test_lock();
     let opts=LoadOptions {model_path:p.model.clone(),tokenizer_path:None,config_path:None,dwq_overlay_path:None,
-        kv_persist_dir:None,kv_persist_budget_bytes:0,glp_path:None,glp_alpha:None,kv_graft_path:None};
+        kv_persist_dir:None,kv_persist_budget_bytes:0,glp_path:None,glp_alpha:None,kv_graft_path:None,lcp_resume_budget:crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT};
     let LoadedModel::Gemma(mut m)=LoadedModel::load_with_context(&opts,Some(262144))? else {anyhow::bail!("selected Gemma");};
     acquisition.check_config(&p.identity,&selected_recipe(&m.config,p.routing_witness.is_some()))?;
     ensure!(m.eos_token_ids==[1,106],"frozen actual EOS");

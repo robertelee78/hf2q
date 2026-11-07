@@ -54,7 +54,7 @@
     "env": {
       "MODEL": "{SERVED_MODEL}",
       "MMPROJ": "{OUT}/text-only-no-external-projector.gguf",
-      "LCP_CAPACITY": "8g",
+      "LCP_RESUME_BUDGET": "8GiB",
       "KV_CACHE_BUDGET_BYTES": "51539607552",
       "REP_PENALTY": "1.05",
       "MAX_SLOTS": "4",
