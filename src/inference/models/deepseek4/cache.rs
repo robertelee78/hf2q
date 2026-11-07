@@ -825,15 +825,32 @@ impl Deepseek4Cache {
     /// token without changing logical cache state. The caller commits only
     /// after its Metal command buffer completes successfully.
     pub fn plan_next_step(&self) -> Result<CacheStep, CacheError> {
+        self.plan_step_at(self.next_position)
+    }
+
+    /// [`Self::plan_next_step`] for a token at `position >= next_position`:
+    /// the plan a one-token step at `position` gets once every earlier
+    /// position has been committed. It depends only on `position` and the
+    /// plan, so a rows step can plan consecutive tokens of one cache before
+    /// any of them publishes.
+    pub(in crate::inference::models::deepseek4) fn plan_step_at(
+        &self,
+        position: usize,
+    ) -> Result<CacheStep, CacheError> {
         if self.poisoned {
             return Err(CacheError::Poisoned);
         }
-        if self.next_position >= self.plan.context_length {
+        if position < self.next_position {
+            return Err(CacheError::StepOutOfOrder {
+                expected: self.next_position,
+                actual: position,
+            });
+        }
+        if position >= self.plan.context_length {
             return Err(CacheError::ContextExhausted {
                 maximum: self.plan.context_length,
             });
         }
-        let position = self.next_position;
         let tokens_after = position + 1;
         let layers = self
             .plan

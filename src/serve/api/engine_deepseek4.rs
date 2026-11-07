@@ -749,6 +749,24 @@ impl Deepseek4LoadedModel {
             .forward_verifier_one_with_commit_gate(token_id, &mut self.cache, || lease.finish())
     }
 
+    /// Token-wise prompt tokens: one exact rows step (bitwise equal to the
+    /// same one-token steps), or a one-token step for a single token.
+    fn supervised_verifier_rows(
+        &mut self,
+        tokens: &[u32],
+        supervisor: &EngineSupervisor,
+        kind: &'static str,
+    ) -> Result<MlxBuffer> {
+        if let [token] = tokens {
+            return self.supervised_verifier_one(*token, supervisor, kind);
+        }
+        let lease = supervisor.arm(kind, GPU_TRANSACTION_TIMEOUT)?;
+        self.model
+            .forward_verifier_rows_step_with_commit_gate(tokens, &mut self.cache, || {
+                lease.finish()
+            })
+    }
+
     pub fn load(opts: &LoadOptions) -> Result<Self> {
         Self::load_with_context(opts, None)
     }
@@ -1508,23 +1526,24 @@ impl Deepseek4LoadedModel {
         }
         if incremental {
             let start = plan.cursor;
+            let step_rows = self.model.token_wise_step_rows();
             let mut state = None;
-            for &token in &prompt_tokens[start..segment_end] {
+            for tokens in prompt_tokens[start..segment_end].chunks(step_rows) {
                 anyhow::ensure!(
                     !cancelled(),
                     "DeepSeek-V4 generation cancelled during incremental prefill"
                 );
                 state = Some(
-                    self.supervised_verifier_one(
-                        token,
+                    self.supervised_verifier_rows(
+                        tokens,
                         supervisor,
                         "deepseek4_incremental_prefill",
                     )
-                    .context("execute DeepSeek-V4 resumable incremental token")?,
+                    .context("execute DeepSeek-V4 resumable incremental tokens")?,
                 );
-                self.committed_tokens.push(token);
-                plan.cursor += 1;
-                progress.advance_prefill(1);
+                self.committed_tokens.extend_from_slice(tokens);
+                plan.cursor += tokens.len();
+                progress.advance_prefill(tokens.len());
             }
             let state = state.context("DeepSeek-V4 recovery-tail prefill produced no state")?;
             anyhow::ensure!(
@@ -1624,17 +1643,18 @@ impl Deepseek4LoadedModel {
             offset += batch;
             progress.advance_prefill(batch);
         }
-        for &token in &tokens[offset..] {
+        let step_rows = self.model.token_wise_step_rows();
+        for chunk in tokens[offset..].chunks(step_rows) {
             anyhow::ensure!(
                 !cancelled(),
                 "DeepSeek-V4 generation cancelled during prefill"
             );
             state = Some(
-                self.supervised_verifier_one(token, supervisor, "deepseek4_tail_prefill")
-                    .context("execute DeepSeek-V4 cached-prefix append token")?,
+                self.supervised_verifier_rows(chunk, supervisor, "deepseek4_tail_prefill")
+                    .context("execute DeepSeek-V4 cached-prefix append tokens")?,
             );
-            self.committed_tokens.push(token);
-            progress.advance_prefill(1);
+            self.committed_tokens.extend_from_slice(chunk);
+            progress.advance_prefill(chunk.len());
         }
         Ok(state)
     }
