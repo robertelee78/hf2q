@@ -82,6 +82,13 @@ This row was added by hand.
 
 These rows were added by hand.
 
+## Added for the native Q5_0 tensor-MM opt-in (2026-11-07)
+
+- `HF2Q_Q5_0_TENSOR_MM` (`development-only`) is read by mlx-native 0.18.0, not by hf2q: only `1` routes Q5_0 dense and expert matmuls through the tensor pipeline (default off). hf2q publishes the resolved value as `/hf2q/v1/runtime` `active_controls.q5_0_tensor_mm` and logs it once at the first Gemma 4 load (`Gemma4 native routing: q5_0_tensor_mm=<true|false> mm_id_schedule=<grid|compact>`); the Gemma launcher and Q5 case forward it (`Q5_0_TENSOR_MM`, `HF2Q_Q5_Q5_0_TENSOR_MM`).
+- `HF2Q_Q5_0_TENSOR_MM_TEST_EXPECT` (`development-only`) marks the child process of the unit test of that runtime field.
+
+These rows were added by hand.
+
 ## Remaining promotion queue
 
 The inventory deliberately identifies follow-up work without smuggling it into
@@ -366,6 +373,8 @@ this release:
 | `HF2Q_PROFILE_W5B17` | `development-only` | 5 |
 | `HF2Q_PROFILE_W5B22` | `development-only` | 5 |
 | `HF2Q_PROFILE_W5B8` | `development-only` | 19 |
+| `HF2Q_Q5_0_TENSOR_MM` | `development-only` | 7 |
+| `HF2Q_Q5_0_TENSOR_MM_TEST_EXPECT` | `development-only` | 1 |
 | `HF2Q_Q6K_ID_MV_NR2` | `development-only` | 2 |
 | `HF2Q_Q6K_MV_NR2` | `development-only` | 3 |
 | `HF2Q_Q8_0_ID_MV_NR2` | `development-only` | 1 |

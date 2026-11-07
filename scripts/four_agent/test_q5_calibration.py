@@ -580,6 +580,22 @@ class ArgvAndCases(unittest.TestCase):
         self.assertIn('flat|slotted) PREFILL_MOE_DOWN_ENV="$PREFILL_MOE_DOWN" ;;', launcher)
         self.assertIn('grid|compact) MM_ID_SCHEDULE_ENV="$MM_ID_SCHEDULE" ;;', launcher)
 
+    def test_gemma_case_forwards_only_an_explicit_q5_0_tensor_mm_arm(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        stock = q5_case.build_plan(case, builtins, self.required())
+        self.assertEqual(stock['serve']['env']['Q5_0_TENSOR_MM'], '')
+        self.assertNotIn('HF2Q_Q5_0_TENSOR_MM', stock['serve']['env'])
+        on = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_Q5_0_TENSOR_MM': '1'})
+        self.assertEqual(on['serve']['env']['Q5_0_TENSOR_MM'], '1')
+        self.assertNotIn('HF2Q_Q5_0_TENSOR_MM', on['serve']['env'])
+        self.assertEqual(on['serve']['env']['MM_ID_SCHEDULE'], '', 'arms are independent')
+        self.assertEqual(on['serve']['env']['PREFILL_MOE_DOWN'], '', 'arms are independent')
+        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
+        self.assertEqual(launcher.count('${Q5_0_TENSOR_MM_ENV:+HF2Q_Q5_0_TENSOR_MM="$Q5_0_TENSOR_MM_ENV"}'), 2)
+        self.assertIn('    1) Q5_0_TENSOR_MM_ENV=1 ;;', launcher)
+        self.assertIn('echo "Q5_0_TENSOR_MM must be 1 or unset" >&2', launcher)
+
     def test_gemma_case_forwards_only_an_explicit_routing_overlap_arm(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
         builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
