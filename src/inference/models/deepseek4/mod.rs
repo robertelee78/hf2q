@@ -27,6 +27,7 @@ pub mod hyper_connection;
 mod joint_decode;
 mod joint_decode_core;
 mod joint_decode_routes;
+mod moe_schedule;
 pub mod model;
 mod output_forward;
 mod prefill_annotations;
@@ -99,6 +100,8 @@ mod row_matmul_tests;
 mod row_exact_matvec_tests;
 #[cfg(test)]
 mod rows_step_tests;
+#[cfg(test)]
+mod moe_schedule_tests;
 #[cfg(test)]
 mod ds4_tail_rows_microbench_tests;
 

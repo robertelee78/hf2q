@@ -449,6 +449,61 @@ fn expert_cells(ctx: &mut GpuContext, out: &mut Out) {
             json!({"family": "experts", "op": "down_q2_k", "n": HIDDEN, "k": INTER, "t": rows, "route": "slotted_mm", "copies": 1}),
             &t,
         );
+        // The whole routed sequence of one prefill FFN (fix 2): paired gate/up, then the slotted down
+        // with its own map0c or on the gate/up schedule.
+        for (route, down_route) in [
+            ("fresh_schedule", ExpertMatmulRoute::SlottedMm),
+            ("reused_schedule", ExpertMatmulRoute::SlottedMmReusingSchedule),
+        ] {
+            let t = time(ctx, |s, r, d, _| {
+                let weight = |buffer, ggml_type, shape| RawMatrixRef {
+                    buffer,
+                    ggml_type,
+                    shape,
+                    matvec: bench_matvec(),
+                };
+                expert_matmul_pair(
+                    s,
+                    r,
+                    d,
+                    &x,
+                    &weight(&gate, GgmlType::IQ2_XXS, &gu_shape),
+                    &weight(&up, GgmlType::IQ2_XXS, &gu_shape),
+                    ids,
+                    &g,
+                    &u,
+                    rows,
+                    TOP_K,
+                    EXPERTS,
+                    INTER,
+                    HIDDEN,
+                    &mut scratch,
+                    "paired routed gate/up",
+                )?;
+                expert_matmul(
+                    s,
+                    r,
+                    d,
+                    &act,
+                    &weight(&down, GgmlType::Q2_K, &d_shape),
+                    ids,
+                    &y,
+                    rows,
+                    TOP_K,
+                    EXPERTS,
+                    HIDDEN,
+                    INTER,
+                    down_route,
+                    Some(&mut scratch),
+                    "routed down",
+                )
+            });
+            emit(
+                out,
+                json!({"family": "experts", "op": "routed_gate_up_down", "t": rows, "route": route, "copies": 1}),
+                &t,
+            );
+        }
     }
 }
 

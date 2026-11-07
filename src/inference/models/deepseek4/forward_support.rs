@@ -842,6 +842,10 @@ pub(super) enum ExpertMatmulRoute {
     Auto,
     ForceMv,
     SlottedMm,
+    /// `SlottedMm` on the routing schedule the paired gate/up call left in
+    /// the scratch (same ids, tokens, top-k, experts and encoder): no second
+    /// `map0c`, byte-identical output. mlx-native refuses a mismatched key.
+    SlottedMmReusingSchedule,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1012,7 +1016,18 @@ pub(super) fn expert_matmul(
                 scratch,
                 &params,
             ),
-        (ExpertMatmulRoute::SlottedMm, None) => {
+        (ExpertMatmulRoute::SlottedMmReusingSchedule, Some(scratch)) => session
+            .quantized_matmul_id_ggml_pooled_slotted_reusing_schedule(
+                registry,
+                device,
+                input,
+                weight.buffer,
+                safe_ids,
+                output,
+                scratch,
+                &params,
+            ),
+        (ExpertMatmulRoute::SlottedMm | ExpertMatmulRoute::SlottedMmReusingSchedule, None) => {
             bail!("DeepSeek-V4 {label} slotted mm_id requires caller-owned scratch")
         }
     }
