@@ -244,6 +244,11 @@ pub struct Qwen35LoadedModel {
     /// native runner owns no persistent speculative KV yet, so this state
     /// deliberately contains no cache tensors.
     pub speculation: super::qwen35_speculation::QwenSpeculationController,
+    /// #727: host byte budget of the SlotAware reclaimed-slot spill store
+    /// (`serve.slot_spill_budget`). Load sets the documented default;
+    /// `load_engine` applies the operator's resolved value. `0` disables
+    /// spilling.
+    pub slot_spill_budget_bytes: u64,
 }
 
 impl Qwen35LoadedModel {
@@ -679,6 +684,7 @@ impl Qwen35LoadedModel {
             // worker re-resolves it at start, to `off` when it selected joint
             // decode with max_slots >= 4. Explicit values always win.
             speculation: super::qwen35_speculation::QwenSpeculationController::from_environment(),
+            slot_spill_budget_bytes: crate::serve::operator_settings::DEFAULT_SLOT_SPILL_BUDGET_BYTES,
         };
 
         // ADR-027 sub-iter 23d-γ (2026-08-03) — the TQ × persist and
@@ -4503,6 +4509,9 @@ mod speculation_real_artifact_tests;
 #[cfg(test)]
 #[path = "engine_qwen35/round_slot_independence_tests.rs"]
 mod round_slot_independence_tests;
+#[cfg(test)]
+#[path = "engine_qwen35/slot_spill_resume_tests.rs"]
+mod slot_spill_resume_tests;
 #[cfg(test)]
 #[path = "engine_qwen35/text_decode_tests.rs"]
 mod text_decode_tests;
@@ -11513,6 +11522,7 @@ mod tests {
             speculation: crate::serve::api::qwen35_speculation::QwenSpeculationController::new(
                 crate::serve::api::qwen35_speculation::QwenSpeculationPolicy::Off,
             ),
+            slot_spill_budget_bytes: 0,
         }
     }
 

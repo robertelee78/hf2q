@@ -74,17 +74,17 @@ use crate::serve::multi_seq_kv::SlotId;
 
 const SLOTS: u32 = 4;
 /// The reference target slot; variants also place the target in the others.
-const REFERENCE_SLOT: SlotId = SlotId(2);
+pub(super) const REFERENCE_SLOT: SlotId = SlotId(2);
 const CAPACITY: u32 = 1024;
-const PREFILL_CHUNK: usize = 512;
-const TARGET_MAX_TOKENS: usize = 192;
-const PEER_MAX_TOKENS: usize = 48;
-const PEER_DECODE_STEPS: usize = 4;
+pub(super) const PREFILL_CHUNK: usize = 512;
+pub(super) const TARGET_MAX_TOKENS: usize = 192;
+pub(super) const PEER_MAX_TOKENS: usize = 48;
+pub(super) const PEER_DECODE_STEPS: usize = 4;
 /// Every tick commits one token, so a target that runs to its bound takes at
 /// most this many ticks.
-const MAX_TARGET_TICKS: usize = TARGET_MAX_TOKENS + 1;
+pub(super) const MAX_TARGET_TICKS: usize = TARGET_MAX_TOKENS + 1;
 
-const TARGET_TEXT: &str =
+pub(super) const TARGET_TEXT: &str =
     "Copy this Python function exactly, as one code block with no other text.\n\n\
 ```python\n\
 def merge_intervals(intervals):\n    \
@@ -98,10 +98,10 @@ merged.append([start, end])\n    \
 return merged\n\
 ```";
 /// Free generation: history lookup rarely matches, so K3 rounds dominate.
-const K3_TARGET_TEXT: &str =
+pub(super) const K3_TARGET_TEXT: &str =
     "Explain step by step how inserting a key into a binary search tree works, \
 then show a short Rust implementation of the insert function.";
-const PEER_TEXTS: [&str; 3] = [
+pub(super) const PEER_TEXTS: [&str; 3] = [
     "List the first ten prime numbers, one per line.",
     "Explain in two sentences why the sky looks blue during the day.",
     "Write a haiku about a lighthouse in winter fog, then give it a title.",
@@ -109,7 +109,7 @@ const PEER_TEXTS: [&str; 3] = [
 
 /// What slots 0, 1 and 3 hold while the target runs its rounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Peers {
+pub(super) enum Peers {
     Empty,
     Prefilled,
     MidDecode,
@@ -118,7 +118,7 @@ enum Peers {
 
 /// Route one target tick took.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Route {
+pub(super) enum Route {
     /// One target decision without speculation (cursor + 1).
     Ordinary,
     /// A queued verified token, no forward (cursor unchanged).
@@ -128,11 +128,11 @@ enum Route {
 }
 
 /// The target's observable state after one tick.
-struct Tick {
+pub(super) struct Tick {
     route: Route,
     generated: Vec<u32>,
     pending: Vec<u32>,
-    finished: bool,
+    pub(super) finished: bool,
     target_cursor: u32,
     mtp_cursor: u32,
     verifier_hidden: Vec<u32>,
@@ -142,36 +142,36 @@ struct Tick {
 /// valid K/V rows, the MTP cache likewise, and per DeltaNet layer its parity
 /// and conv/recurrent current and scratch regions.
 #[derive(PartialEq, Eq)]
-struct SlotState {
+pub(super) struct SlotState {
     full_attn: Vec<(u32, Vec<Vec<u8>>)>,
     mtp: (u32, Vec<Vec<u8>>),
     linear_attn: Vec<(bool, Vec<Vec<u8>>)>,
 }
 
-struct TargetTrace {
-    prefill_logits: Vec<u32>,
-    ticks: Vec<Tick>,
-    state: SlotState,
-    probe_logits: Vec<u32>,
+pub(super) struct TargetTrace {
+    pub(super) prefill_logits: Vec<u32>,
+    pub(super) ticks: Vec<Tick>,
+    pub(super) state: SlotState,
+    pub(super) probe_logits: Vec<u32>,
 }
 
 impl TargetTrace {
-    fn routes(&self) -> Vec<Route> {
+    pub(super) fn routes(&self) -> Vec<Route> {
         self.ticks.iter().map(|tick| tick.route).collect()
     }
 }
 
-struct Peer {
-    slot: SlotId,
-    state: Qwen35DecodeState,
-    live: bool,
+pub(super) struct Peer {
+    pub(super) slot: SlotId,
+    pub(super) state: Qwen35DecodeState,
+    pub(super) live: bool,
 }
 
-fn user_turn(text: &str) -> String {
+pub(super) fn user_turn(text: &str) -> String {
     format!("<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
 }
 
-fn bits(values: &[f32]) -> Vec<u32> {
+pub(super) fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|value| value.to_bits()).collect()
 }
 
@@ -238,7 +238,7 @@ fn full_attn_rows(layer: &FullAttnKvSlot, slot: SlotId) -> (u32, Vec<Vec<u8>>) {
     (rows, regions)
 }
 
-fn slot_state(kv: &HybridKvCache, slot: SlotId) -> SlotState {
+pub(super) fn slot_state(kv: &HybridKvCache, slot: SlotId) -> SlotState {
     SlotState {
         full_attn: kv
             .full_attn
@@ -268,7 +268,7 @@ fn slot_state(kv: &HybridKvCache, slot: SlotId) -> SlotState {
 }
 
 /// (target cursor, MTP cursor) of `slot`.
-fn cursors(kv: &HybridKvCache, slot: SlotId) -> (u32, u32) {
+pub(super) fn cursors(kv: &HybridKvCache, slot: SlotId) -> (u32, u32) {
     (
         kv.sequence_len_for_slot(slot).expect("target cursor"),
         kv.mtp_slot.as_ref().expect("MTP cache").current_len[slot.0 as usize],
@@ -283,7 +283,7 @@ fn rounds_recorded() -> (u64, u64) {
     )
 }
 
-fn new_cache(qwen: &Qwen35LoadedModel) -> HybridKvCache {
+pub(super) fn new_cache(qwen: &Qwen35LoadedModel) -> HybridKvCache {
     let kv = qwen
         .model
         .with_gpu_cache_mut(|device, _registry| {
@@ -302,7 +302,7 @@ fn new_cache(qwen: &Qwen35LoadedModel) -> HybridKvCache {
 
 /// Bounded server prefill of `prompt` into `slot`; returns the seeded decode
 /// state and the prompt-boundary logits.
-fn prefill(
+pub(super) fn prefill(
     qwen: &mut Qwen35LoadedModel,
     kv: &mut HybridKvCache,
     slot: SlotId,
@@ -350,7 +350,7 @@ fn prefill(
     }
 }
 
-fn tick_peer(
+pub(super) fn tick_peer(
     qwen: &mut Qwen35LoadedModel,
     kv: &mut HybridKvCache,
     peer: &mut Peer,
@@ -368,7 +368,7 @@ fn tick_peer(
     }
 }
 
-fn tick_target(
+pub(super) fn tick_target(
     qwen: &mut Qwen35LoadedModel,
     kv: &mut HybridKvCache,
     slot: SlotId,
@@ -409,7 +409,7 @@ fn tick_target(
 
 /// Serve the target request in `target_slot` of a fresh cache with `peers`
 /// in the other slots, until it finishes.
-fn run_variant(
+pub(super) fn run_variant(
     qwen: &mut Qwen35LoadedModel,
     target_prompt: &[u32],
     peer_prompts: &[Vec<u32>; 3],
@@ -506,7 +506,7 @@ fn run_variant(
     }
 }
 
-fn assert_same(reference: &TargetTrace, variant: &TargetTrace, peers: &str) {
+pub(super) fn assert_same(reference: &TargetTrace, variant: &TargetTrace, peers: &str) {
     assert!(
         variant.prefill_logits == reference.prefill_logits,
         "{peers:?}: target prefill logits differ"
@@ -596,11 +596,12 @@ fn assert_same(reference: &TargetTrace, variant: &TargetTrace, peers: &str) {
     );
 }
 
-fn run_gate(env: &str, expect_padded: bool) {
-    let _gpu = crate::inference::hf2q_gpu_test_lock();
+/// Load the official artifact named by `env` for a bitwise gate: native MTP
+/// head, no graft, speculation `auto` (the default repeatable route), GPU
+/// cache primed.
+pub(super) fn load_gate_artifact(env: &str) -> LoadedModel {
     let path = PathBuf::from(
-        std::env::var_os(env)
-            .unwrap_or_else(|| panic!("the slot-independence gate requires {env}")),
+        std::env::var_os(env).unwrap_or_else(|| panic!("this gate requires {env}")),
     );
     assert!(path.is_file(), "{env} is not a file: {}", path.display());
     let options = LoadOptions {
@@ -624,19 +625,34 @@ fn run_gate(env: &str, expect_padded: bool) {
         "the gate needs the native MTP head"
     );
     assert!(qwen.model.kv_graft.is_none(), "no graft may be bound");
-    if expect_padded {
-        let policy = qwen.model.ggml_routing_policy();
-        assert!(
-            !policy.dense_decode_mvn && policy.dense_decode_mv_ext,
-            "the padded Qwen3.8 gate needs the model's serve policy (mvN off, mul_mv_ext on): \
-             {env} must name a Qwen3.8 artifact (qwen3.8/qwen38, any case) and \
-             HF2Q_DECODE_MVN/HF2Q_DECODE_MV_EXT must not override it"
-        );
-    }
     qwen.speculation = QwenSpeculationController::new(QwenSpeculationPolicy::Auto);
     qwen.model
         .ensure_gpu_cache_primed()
         .expect("prime GPU cache before allocating caches");
+    loaded
+}
+
+/// The padded Qwen3.8 gates run on the model's own frozen routing policy
+/// (#729), never on process environment the test sets.
+pub(super) fn assert_padded_policy(qwen: &Qwen35LoadedModel, env: &str) {
+    let policy = qwen.model.ggml_routing_policy();
+    assert!(
+        !policy.dense_decode_mvn && policy.dense_decode_mv_ext,
+        "the padded Qwen3.8 gate needs the model's serve policy (mvN off, mul_mv_ext on): \
+         {env} must name a Qwen3.8 artifact (qwen3.8/qwen38, any case) and \
+         HF2Q_DECODE_MVN/HF2Q_DECODE_MV_EXT must not override it"
+    );
+}
+
+fn run_gate(env: &str, expect_padded: bool) {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut loaded = load_gate_artifact(env);
+    let LoadedModel::Qwen35(qwen) = &mut loaded else {
+        unreachable!("load_gate_artifact returns a Qwen model")
+    };
+    if expect_padded {
+        assert_padded_policy(qwen, env);
+    }
 
     let tokenizer = qwen.tokenizer.clone();
     let encode = |text: &str| -> Vec<u32> {

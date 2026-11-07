@@ -1983,6 +1983,9 @@ mod deepseek4_joint_decode;
 #[path = "engine/qwen35_joint_decode.rs"]
 mod qwen35_joint_decode;
 
+#[path = "engine/qwen35_slot_spill.rs"]
+mod qwen35_slot_spill;
+
 pub(super) enum Request {
     /// Internal startup-only diagnostic control, never a public HTTP request.
     ArmNativeObservation {
@@ -17665,6 +17668,7 @@ fn validate_qwen35_generation_request(
     })
 }
 
+#[derive(Clone)]
 struct Qwen35PromptAnchor {
     prompt_tokens: Vec<u32>,
     kv: crate::inference::models::qwen35::kv_cache::HybridKvSlotAnchor,
@@ -17673,7 +17677,7 @@ struct Qwen35PromptAnchor {
     spec: Option<super::engine_qwen35::Qwen35SpecPrefixBoundary>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Qwen35RetainedPrefix {
     tokens: Vec<u32>,
     spec: Option<super::engine_qwen35::Qwen35SpecPrefixBoundary>,
@@ -18673,6 +18677,17 @@ fn run_slot_aware_qwen35(
         .collect();
     let mut prompt_caches: Vec<PromptCache> = (0..n_slots).map(|_| PromptCache::new()).collect();
     let mut prompt_anchors: Vec<Option<Qwen35PromptAnchor>> = (0..n_slots).map(|_| None).collect();
+    // #727: conversations whose slot is reclaimed by another request are
+    // spilled here and restored on their return (`qwen35_slot_spill`).
+    let mut slot_spills = qwen35_slot_spill::Qwen35SlotSpillStore::new(
+        guard.model.slot_spill_budget_bytes,
+        n_slots.saturating_mul(qwen35_slot_spill::QWEN35_SLOT_SPILL_ENTRIES_PER_SLOT),
+    );
+    tracing::info!(
+        budget_bytes = guard.model.slot_spill_budget_bytes,
+        max_entries = n_slots.saturating_mul(qwen35_slot_spill::QWEN35_SLOT_SPILL_ENTRIES_PER_SLOT),
+        "Qwen35 SlotAware reclaimed-slot spill store configured"
+    );
     let qwen_joint_decode =
         qwen35_joint_decode::qwen35_joint_decode_config(&guard.model.model, n_slots);
     // ADR-063 D1: resolve the unset speculation default for this worker's
@@ -18796,6 +18811,7 @@ fn run_slot_aware_qwen35(
                         &mut retained_tokens,
                         &mut prompt_caches,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -18853,6 +18869,7 @@ fn run_slot_aware_qwen35(
                         &mut retained_tokens,
                         &mut prompt_caches,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -18939,6 +18956,7 @@ fn run_slot_aware_qwen35(
                         &mut scheduler,
                         &mut retained_tokens,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
@@ -18979,6 +18997,7 @@ fn run_slot_aware_qwen35(
                         &mut retained_tokens,
                         &mut prompt_caches,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -19232,6 +19251,7 @@ fn admit_qwen35_slot(
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
     prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    slot_spills: &mut qwen35_slot_spill::Qwen35SlotSpillStore,
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -19306,31 +19326,19 @@ fn admit_qwen35_slot(
             .zip(slots.iter())
             .enumerate()
             .map(|(index, ((retained, anchor), active))| {
-                let exact_anchor_matches = anchor
-                    .as_ref()
-                    .is_some_and(|anchor| anchor.vision_fingerprint == request_vision_fingerprint);
-                let anchor_matches = anchor.as_ref().is_some_and(|anchor| {
-                    qwen35_anchor_vision_compatible(
-                        anchor.vision_fingerprint,
-                        anchor.prompt_tokens.len(),
-                        request_vision_fingerprint,
-                        text_anchor_reuse_limit,
-                    )
-                });
+                let (retained, anchor) = qwen35_slot_spill::qwen35_resume_candidate(
+                    retained,
+                    anchor.as_ref(),
+                    request_vision_fingerprint,
+                    text_anchor_reuse_limit,
+                );
                 let active_matches = active.as_ref().is_some_and(|(work, _, _)| {
                     work.vision_fingerprint() == request_vision_fingerprint
                 });
                 (
                     index,
-                    if exact_anchor_matches {
-                        retained.as_slice()
-                    } else {
-                        &[]
-                    },
-                    anchor
-                        .as_ref()
-                        .filter(|_| anchor_matches)
-                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    retained,
+                    anchor,
                     active
                         .as_ref()
                         .filter(|_| active_matches)
@@ -19434,7 +19442,41 @@ fn admit_qwen35_slot(
         params.max_tokens,
     );
 
-    let selected_preference = preferred.filter(|preference| preference.slot == handle.slot_id);
+    // #727: a request granted a slot that holds another conversation's state
+    // spills that state first; a request whose own conversation was spilled
+    // earlier and matches better than the granted slot gets it restored here
+    // and then resumes exactly as it would have in its original slot.
+    let selected_preference = match qwen35_slot_spill::reclaim_qwen35_slot(
+        guard.kv.as_mut().expect("kv Some during Qwen35 admission"),
+        slot_spills,
+        handle.slot_id,
+        &mut retained_tokens[handle.slot_id.0 as usize],
+        &mut prompt_anchors[handle.slot_id.0 as usize],
+        preferred.filter(|preference| preference.slot == handle.slot_id),
+        &prompt_tokens,
+        request_vision_fingerprint,
+        text_anchor_reuse_limit,
+    ) {
+        Ok(preference) => preference,
+        Err(error) => {
+            reply = match reset_qwen35_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
+            retained_tokens[handle.slot_id.0 as usize].clear_all();
+            prompt_anchors[handle.slot_id.0 as usize] = None;
+            scheduler.release(handle);
+            finish_qwen35_operator_request(handle, "failed");
+            slot_fire_done(reply, Err(error), false);
+            return None;
+        }
+    };
     let anchor_hit = selected_preference.is_some_and(|preference| preference.restore_prompt_anchor);
     let cached_tokens = selected_preference
         .map(|preference| preference.cached_tokens)
@@ -20195,11 +20237,13 @@ fn finish_qwen35_prefill(
 /// inline in admit (no decode loop), mirroring the legacy inflight arm
 /// (embed_qwen35_slot_aware, engine_qwen35.rs:5288). Keeps the served-today
 /// capability rather than 501-ing it.
+#[allow(clippy::too_many_arguments)]
 fn embed_qwen35_inline(
     guard: &mut Qwen35KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    slot_spills: &mut qwen35_slot_spill::Qwen35SlotSpillStore,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
@@ -20243,6 +20287,14 @@ fn embed_qwen35_inline(
     // the serving ledger before the first GPU mutation so a later generation
     // can never advertise an anchor whose underlying cursor was reset.
     let slot_idx = handle.slot_id.0 as usize;
+    // #727: the conversation that held this slot is spilled, not lost.
+    qwen35_slot_spill::spill_reclaimed_qwen35_slot(
+        guard.kv.as_ref().expect("kv Some during loop"),
+        slot_spills,
+        handle.slot_id,
+        &mut retained_tokens[slot_idx],
+        &mut prompt_anchors[slot_idx],
+    );
     retained_tokens[slot_idx].clear_all();
     prompt_anchors[slot_idx] = None;
     let result = supervised_gpu_call(supervisor, "qwen35_slot_embed", || {
@@ -35305,6 +35357,7 @@ assistant:
             speculation: super::super::qwen35_speculation::QwenSpeculationController::new(
                 super::super::qwen35_speculation::QwenSpeculationPolicy::Off,
             ),
+            slot_spill_budget_bytes: 0,
         };
         let qwen = LoadedModel::Qwen35(qwen_loaded);
 

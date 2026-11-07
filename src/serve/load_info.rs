@@ -1812,6 +1812,7 @@ mod tests {
             speculation: crate::serve::api::qwen35_speculation::QwenSpeculationController::new(
                 crate::serve::api::qwen35_speculation::QwenSpeculationPolicy::Off,
             ),
+            slot_spill_budget_bytes: 0,
         };
         let info = loaded.build_load_info(
             &gguf,

@@ -532,6 +532,7 @@ mod tests {
                 kv_cache_budget_bytes: None,
                 kv_persist_dir: None,
                 kv_persist_budget_bytes: 0,
+                slot_spill_budget_bytes: None,
             },
         )
     }
