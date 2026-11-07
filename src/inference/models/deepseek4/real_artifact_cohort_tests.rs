@@ -550,12 +550,15 @@ struct RouteReceipt {
 /// (solo 16, Mixed 2, cohort lanes 8/5/4) and `width > 1` runs every
 /// pre-anchor matrix chunk as a cooperative cohort with `width - 1` real
 /// companion lanes. Token-wise chunks replay one row at a time, as the engine
-/// does.
+/// does. `decoding_peers > 0` adds that many warm peer caches that run one
+/// joint decode step (the serving joint path) before every target chunk, as
+/// peers decode between a Mixed lane's prefill slices.
 fn route_receipt(
     model: &mut Deepseek4Model,
     prompt: &[u32],
     windows: usize,
     width: usize,
+    decoding_peers: usize,
 ) -> RouteReceipt {
     use crate::serve::api::engine_deepseek4::{
         plan_resumable_prefill_chunk, ResumablePrefillChunk, RECOVERY_TAIL_TOKENS,
@@ -581,11 +584,31 @@ fn route_receipt(
             .forward_verifier_prefill(&tokens[..PREFIX_ROWS], companion)
             .expect("install companion prefix");
     }
+    let mut peers: Vec<Deepseek4Cache> = (0..decoding_peers)
+        .map(|peer| {
+            let mut peer_cache = model.allocate_cache(capacity).expect("allocate peer cache");
+            model
+                .forward_verifier_prefill(&token_batch(10 + peer, 0, PREFIX_ROWS), &mut peer_cache)
+                .expect("install decoding peer prefix");
+            peer_cache
+        })
+        .collect();
+    let mut peer_step = 0;
     let mut cursor = PREFIX_ROWS;
     let mut chunks = Vec::new();
     let mut suffix_rows = Vec::new();
     let mut last = None;
     while cursor < prompt.len() {
+        if !peers.is_empty() {
+            let tokens: Vec<u32> = (0..peers.len())
+                .map(|peer| token_batch(10 + peer, 3, peer_step + 1)[peer_step])
+                .collect();
+            let mut peer_refs: Vec<&mut Deepseek4Cache> = peers.iter_mut().collect();
+            model
+                .forward_verifier_decode_joint_with_commit_gate(&tokens, &mut peer_refs, || Ok(()))
+                .expect("decoding peers' joint step");
+            peer_step += 1;
+        }
         let segment_end = if cursor < recovery { recovery } else { prompt.len() };
         let slice = plan_resumable_prefill_chunk(cursor, segment_end - cursor, 128, windows, recovery)
             .expect("plan route chunk");
@@ -648,13 +671,17 @@ fn route_receipt(
 }
 
 /// #726 model gate: the same warm long suffix ingested under solo
-/// (2,048-row chunks), Mixed (256-row chunks) and cohort widths 2/3/4
-/// (1,024/640/512-row lanes with real companions). The serving planner keeps
-/// every pre-anchor row on the matrix route and the anchor's last eight rows
-/// token-wise under every route, so every suffix row's final state, every
+/// (2,048-row chunks), Mixed (256-row chunks, alone and with two or three
+/// peers running a joint decode step before every slice) and cohort widths
+/// 2/3/4 (1,024/640/512-row lanes with real companions, and width 2 with
+/// decoding peers). The serving planner keeps every pre-anchor row on the
+/// matrix route and the anchor's last eight rows token-wise under every
+/// route; chunk boundaries still differ by route, and equivalence rests on
+/// matrix-chunk split invariance. So every suffix row's final state, every
 /// physical cache byte, the prompt logits and the first decode step must be
-/// bitwise equal. The 2,312-row pre-anchor segment is nine 256-row Mixed
-/// windows plus 8 rows: before #726 Mixed replayed those 8 rows token-wise.
+/// bitwise equal to solo. The 2,312-row pre-anchor segment is nine 256-row
+/// Mixed windows plus 8 rows: before #726 Mixed replayed those 8 rows
+/// token-wise.
 #[test]
 #[ignore = "loads the release checkpoint; #726 route-boundary model gate"]
 fn official_artifact_prefill_route_boundary_is_route_independent() {
@@ -667,17 +694,22 @@ fn official_artifact_prefill_route_boundary_is_route_independent() {
     let mut prompt = token_batch(0, 0, PREFIX_ROWS);
     prompt.extend(token_batch(0, 2, PRE_ANCHOR_ROWS + RECOVERY_TAIL_TOKENS));
 
-    let routes: [(&str, usize, usize); 5] = [
-        ("solo", 16, 1),
-        ("mixed", 2, 1),
-        ("cohort-2", 8, 2),
-        ("cohort-3", 5, 3),
-        ("cohort-4", 4, 4),
+    // (route, window cap, cohort width, decoding peers)
+    let routes: [(&str, usize, usize, usize); 8] = [
+        ("solo", 16, 1, 0),
+        ("mixed", 2, 1, 0),
+        ("mixed+2-decoding-peers", 2, 1, 2),
+        ("mixed+3-decoding-peers", 2, 1, 3),
+        ("cohort-2", 8, 2, 0),
+        ("cohort-2+2-decoding-peers", 8, 2, 2),
+        ("cohort-3", 5, 3, 0),
+        ("cohort-4", 4, 4, 0),
     ];
-    let reference = route_receipt(&mut model, &prompt, routes[0].1, routes[0].2);
+    let (_, solo_windows, solo_width, solo_peers) = routes[0];
+    let reference = route_receipt(&mut model, &prompt, solo_windows, solo_width, solo_peers);
     eprintln!("DS4_ROUTE_BOUNDARY solo chunks={:?}", reference.chunks);
-    for &(route, windows, width) in &routes[1..] {
-        let receipt = route_receipt(&mut model, &prompt, windows, width);
+    for &(route, windows, width, decoding_peers) in &routes[1..] {
+        let receipt = route_receipt(&mut model, &prompt, windows, width, decoding_peers);
         eprintln!("DS4_ROUTE_BOUNDARY {route} chunks={:?}", receipt.chunks);
         assert_exact_f32(
             &format!("{route} suffix final states"),

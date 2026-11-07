@@ -57,12 +57,16 @@ pub(crate) const RECOVERY_TAIL_TOKENS: usize = 8;
 /// segment therefore takes the matrix route, unless the whole segment is below
 /// the minimum at a nonzero cursor (then every row is token-wise). The route
 /// class of a row is a function of the request alone (prompt length, cached
-/// position, anchor); the window multiplier, which solo, Mixed, cohort width
-/// and alignment catch-up choose, only moves matrix chunk boundaries, and
-/// matrix chunks of at least `MIN_MATRIX_APPEND_TOKENS` rows are bitwise
-/// split-invariant (#726). A shrunk chunk keeps at least
+/// position, anchor). A shrunk chunk keeps at least
 /// `sliding_window - MIN_MATRIX_APPEND_TOKENS + 1` rows, so it is itself a
 /// legal matrix chunk.
+///
+/// Chunk boundaries still vary with the route: the window multiplier that
+/// solo, Mixed, cohort width and alignment catch-up choose moves them, and
+/// only the 33-row floor is guaranteed. Route equivalence therefore rests on
+/// matrix-chunk split invariance, shown model-free at real shapes by
+/// `chunk_split_invariance_tests` and on the release artifact by
+/// `official_artifact_prefill_route_boundary_is_route_independent` (#726).
 fn resumable_matrix_prefill_chunk_len(
     cache_position: usize,
     remaining: usize,
