@@ -357,3 +357,32 @@ fn rows_step_rejects_a_poisoned_cache() {
     cache.poison();
     assert!(cache.plan_step_at(0).is_err());
 }
+
+/// Model-free reproduction of the 2026-11-07 model-gate setup failure: a cache smaller than one
+/// sliding window gets a ring of `capacity` rows, and every compressed-attention path (here the
+/// one-token core the rows step uses; the matrix prefill has the same check) refuses it as
+/// "compressed attention cache shape drift". Real caches start at one full window or more.
+#[test]
+fn caches_below_one_window_are_refused_by_the_compressed_cores() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().unwrap();
+    let cfg = config(RATIOS.to_vec());
+    let window = cfg.sliding_window as usize;
+    for (capacity, refused) in [(18, true), (window, false), (CONTEXT, false)] {
+        let plan = Deepseek4CachePlan::for_context(&cfg, capacity).unwrap();
+        assert_eq!(plan.layers[1].window_kv.shape[0], capacity.min(window));
+        let mut cache = Deepseek4Cache::allocate(&plan, device.clone()).unwrap();
+        for position in 0..3 {
+            cache.commit_step(position).unwrap();
+        }
+        let step = cache.plan_next_step().unwrap();
+        let planned = plan_row_cores(&device, &cfg, &[&cache], &[step], 1, RATIOS[1]);
+        match planned {
+            Err(error) => {
+                assert!(refused, "capacity {capacity}: {error:#}");
+                assert!(format!("{error:#}").contains("compressed attention cache shape drift"));
+            }
+            Ok(_) => assert!(!refused, "capacity {capacity} must be refused"),
+        }
+    }
+}
