@@ -1575,7 +1575,8 @@ pub fn splice_graft_into_hybrid_kv_single_seq(
 pub struct GemmaHybridSlotAnchor {
     prompt_len: usize,
     layers: Vec<Option<GemmaHybridSlidingLayerAnchor>>,
-    // Declared LAST: every payload Vec drops before requested bytes refund.
+    // Declared LAST: every payload Vec is recycled (`Drop`) or dropped before
+    // the requested bytes refund.
     _reservation: Option<anchor_budget::Reservation>,
 }
 
@@ -1634,12 +1635,52 @@ impl GemmaHybridSlotAnchor {
     }
 }
 
-fn gemma4_copy_slot_region_out(
+impl Drop for GemmaHybridSlotAnchor {
+    /// Host P3: a reserved anchor hands its ring buffers to the worker's
+    /// payload pool for the next capture. Runs before the fields drop, so
+    /// before `_reservation` refunds; unreserved anchors free as before.
+    fn drop(&mut self) {
+        let Some(lease) = self._reservation.as_ref() else {
+            return;
+        };
+        for layer in std::mem::take(&mut self.layers).into_iter().flatten() {
+            let GemmaHybridSlidingLayerAnchor {
+                k,
+                v_packed,
+                v_norms,
+                bf16_xlen_k,
+                bf16_xlen_v,
+            } = layer;
+            for buf in [Some(k), Some(v_packed), v_norms, bf16_xlen_k, bf16_xlen_v]
+                .into_iter()
+                .flatten()
+            {
+                lease.recycle_payload(buf);
+            }
+        }
+    }
+}
+
+/// One saved ring buffer of a slot anchor, named only for errors.
+#[derive(Clone, Copy, Debug)]
+struct AnchorRegion {
+    layer: usize,
+    part: &'static str,
+}
+
+impl std::fmt::Display for AnchorRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Gemma slot anchor L{} {}", self.layer, self.part)
+    }
+}
+
+/// The slot's byte range of a slot-major `[n_seqs, ...]` buffer.
+fn gemma4_slot_region(
     buf: &MlxBuffer,
     slot_idx: usize,
     n_seqs: usize,
-    name: &str,
-) -> Result<Vec<u8>> {
+    name: AnchorRegion,
+) -> Result<&[u8]> {
     anyhow::ensure!(n_seqs > 0, "{name}: n_seqs must be positive");
     anyhow::ensure!(
         slot_idx < n_seqs,
@@ -1655,14 +1696,51 @@ fn gemma4_copy_slot_region_out(
     );
     let per_slot = bytes.len() / n_seqs;
     let start = slot_idx * per_slot;
-    if crate::debug::investigation_env::gemma_full_input::worker_active() {
-        let mut copy = Vec::new();
-        copy.try_reserve_exact(per_slot).map_err(|e| anyhow!("{name}: CPU anchor allocation: {e}"))?;
-        copy.extend_from_slice(&bytes[start..start + per_slot]);
-        Ok(copy)
-    } else {
-        Ok(bytes[start..start + per_slot].to_vec())
-    }
+    Ok(&bytes[start..start + per_slot])
+}
+
+/// Copy every region into its own payload buffer, in region order.
+///
+/// Host P3: a buffer of the same length from the lease's worker pool is
+/// overwritten in full instead of allocating (and page-faulting) a fresh one,
+/// and the regions are copied on the rayon pool rather than one by one on
+/// the worker thread. Each output holds exactly its source bytes either way.
+/// `fallible` (activated worker) turns a fresh allocation failure into an
+/// error instead of an abort.
+fn gemma4_copy_anchor_regions(
+    regions: &[(AnchorRegion, &[u8])],
+    lease: Option<&anchor_budget::Reservation>,
+    fallible: bool,
+) -> Result<Vec<Vec<u8>>> {
+    use rayon::prelude::*;
+    let jobs: Vec<_> = regions
+        .iter()
+        .map(|&(name, src)| {
+            (
+                name,
+                src,
+                lease.and_then(|lease| lease.take_payload(src.len())),
+            )
+        })
+        .collect();
+    let copies: Vec<Result<Vec<u8>>> = jobs
+        .into_par_iter()
+        .map(|(name, src, reused)| match reused {
+            Some(mut copy) => {
+                copy.copy_from_slice(src);
+                Ok(copy)
+            }
+            None if fallible => {
+                let mut copy = Vec::new();
+                copy.try_reserve_exact(src.len())
+                    .map_err(|e| anyhow!("{name}: CPU anchor allocation: {e}"))?;
+                copy.extend_from_slice(src);
+                Ok(copy)
+            }
+            None => Ok(src.to_vec()),
+        })
+        .collect();
+    copies.into_iter().collect()
 }
 
 fn gemma4_copy_slot_region_in(
@@ -1707,11 +1785,14 @@ pub fn snapshot_gemma_hybrid_slot_anchor(
         "Gemma slot anchor requires a non-empty prompt"
     );
     // Reserve every planned payload/token-ledger/metadata byte before copies.
-    // Local declaration order also drops partial layers before this lease.
+    // Local declaration order also drops partial copies before this lease.
     let reservation = anchor_budget::reserve(scaffold, slot.0 as usize, prompt_len)?;
-    let mut layers = Vec::with_capacity(scaffold.len());
+    let slot_idx = slot.0 as usize;
+    // Validate and locate every saved region first, then copy them together.
+    // `present` marks V norms / xlen K / xlen V per sliding layer.
+    let mut plans: Vec<Option<[bool; 3]>> = Vec::with_capacity(scaffold.len());
+    let mut regions = Vec::new();
     for (layer_idx, buf) in scaffold.iter().enumerate() {
-        let slot_idx = slot.0 as usize;
         let n_seqs = buf.n_seqs as usize;
         anyhow::ensure!(
             slot_idx < n_seqs,
@@ -1719,63 +1800,50 @@ pub fn snapshot_gemma_hybrid_slot_anchor(
             slot.0
         );
         if !buf.is_sliding {
-            layers.push(None);
+            plans.push(None);
             continue;
         }
-        let k = gemma4_copy_slot_region_out(
-            &buf.k,
-            slot_idx,
-            n_seqs,
-            &format!("Gemma slot anchor L{layer_idx} K"),
-        )?;
-        let v_packed = gemma4_copy_slot_region_out(
-            &buf.v_packed,
-            slot_idx,
-            n_seqs,
-            &format!("Gemma slot anchor L{layer_idx} V"),
-        )?;
-        let v_norms = if buf.v_norms.byte_len() == 4 {
-            None
-        } else {
-            Some(gemma4_copy_slot_region_out(
-                &buf.v_norms,
-                slot_idx,
-                n_seqs,
-                &format!("Gemma slot anchor L{layer_idx} V norms"),
-            )?)
-        };
-        let bf16_xlen_k = buf
-            .bf16_xlen_k
-            .as_ref()
-            .map(|buffer| {
-                gemma4_copy_slot_region_out(
-                    buffer,
-                    slot_idx,
-                    n_seqs,
-                    &format!("Gemma slot anchor L{layer_idx} xlen K"),
-                )
-            })
-            .transpose()?;
-        let bf16_xlen_v = buf
-            .bf16_xlen_v
-            .as_ref()
-            .map(|buffer| {
-                gemma4_copy_slot_region_out(
-                    buffer,
-                    slot_idx,
-                    n_seqs,
-                    &format!("Gemma slot anchor L{layer_idx} xlen V"),
-                )
-            })
-            .transpose()?;
-        layers.push(Some(GemmaHybridSlidingLayerAnchor {
-            k,
-            v_packed,
-            v_norms,
-            bf16_xlen_k,
-            bf16_xlen_v,
-        }));
+        let optional = [
+            (
+                "V norms",
+                (buf.v_norms.byte_len() != 4).then_some(&buf.v_norms),
+            ),
+            ("xlen K", buf.bf16_xlen_k.as_ref()),
+            ("xlen V", buf.bf16_xlen_v.as_ref()),
+        ];
+        let present = optional.map(|(_, buffer)| buffer.is_some());
+        for (part, buffer) in [("K", Some(&buf.k)), ("V", Some(&buf.v_packed))]
+            .into_iter()
+            .chain(optional)
+        {
+            let Some(buffer) = buffer else { continue };
+            let name = AnchorRegion {
+                layer: layer_idx,
+                part,
+            };
+            regions.push((name, gemma4_slot_region(buffer, slot_idx, n_seqs, name)?));
+        }
+        plans.push(Some(present));
     }
+    let copies = gemma4_copy_anchor_regions(
+        &regions,
+        reservation.as_ref(),
+        crate::debug::investigation_env::gemma_full_input::worker_active(),
+    )?;
+    let mut copies = copies.into_iter();
+    let mut next = || copies.next().expect("one copy per planned anchor region");
+    let layers = plans
+        .into_iter()
+        .map(|plan| {
+            plan.map(|[v_norms, xlen_k, xlen_v]| GemmaHybridSlidingLayerAnchor {
+                k: next(),
+                v_packed: next(),
+                v_norms: v_norms.then(&mut next),
+                bf16_xlen_k: xlen_k.then(&mut next),
+                bf16_xlen_v: xlen_v.then(&mut next),
+            })
+        })
+        .collect();
     Ok(GemmaHybridSlotAnchor { prompt_len, layers, _reservation: reservation })
 }
 

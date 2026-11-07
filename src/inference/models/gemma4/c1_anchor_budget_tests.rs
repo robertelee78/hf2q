@@ -30,10 +30,7 @@ fn anchor_c1_gemma_ring_sidecars_xlen_and_real_last_reader_quota() {
             .iter()
             .all(|b| b.shape[0] == 4 && b.bytes % 4 == 0));
         let payload = ring.buffers.iter().map(|b| b.bytes / 4).sum::<usize>();
-        let q = Arc::new(Quota {
-            used: AtomicUsize::new(0),
-            limit: payload,
-        });
+        let q = Arc::new(Quota::new(payload));
         let reservation = acquire(&q, payload).unwrap();
         let layer = GemmaHybridSlidingLayerAnchor {
             k: vec![11; ring.buffers[0].bytes / 4],
