@@ -244,13 +244,24 @@ Measured 2026-10-31 at c25d7ef2 (`E/q1-qwen38-joint-envelope-20261031T*`). Four 
 
 Both routes are inside the 0.25 nat route bound, which closes Q-C2b for the earlier route as well.
 
+**Updated measurement, 2026-11-07 (144 steps).** The same four 1057-token prompts (`E/q1-qwen38-prompts-v1`, sha256 `e77a970b…`), 144 teacher-forced steps, 576 rows. Test binary `9b1b7c1b…` at hf2q `a2773167` (local) with native `071d97f`; evidence in `/Users/robert/.local/state/hf2q/v0130/q38-opparity/q1/` (`RESULT-f1.md`, `decisions/`):
+
+| Route | Against | Classification | Max decision error | p95 | Top-1 agree | Flips |
+|---|---|---|---:|---:|---:|---:|
+| joint, shared-weight FFN | serial | `RouteSensitive` | 0.2835 nat | 0.1040 nat | 576/576 | 0 |
+| joint, per-row fused FFN | serial | `WithinDecisionEnvelope` | 0.1538 nat | 0.0763 nat | 576/576 | 0 |
+| joint, shared-weight FFN, pooled outputs | joint, shared-weight FFN | `ExactEqual` | 0 | 0 | 576/576 | 0 |
+
+The shared-weight FFN route has 3 rows over τ, all at absolute row 1160 (agents 0, 1 and 3). Each keeps its top-1, with margins of 0.95–1.04 nat. This updates the Class B measurement of the production padded route; the 32-step table above stays as the earlier record. No action beyond recording it.
+
 `qwen38_joint_decode_q1_envelope_trace` takes 2–4 real agent prompts (`HF2Q_QWEN_JOINT_Q1_PROMPTS`) and requires the padded mode:
 - **Input format.** A JSON array where each entry is either the exact rendered chat prompt as token IDs, or the rendered prompt text tokenized with the serving `tokenizer.json` at `HF2Q_QWEN35_TOKENIZER`.
-- **Run.** It prefills each prompt into three identical caches, then decodes `HF2Q_QWEN_JOINT_Q1_STEPS` (default 32) teacher-forced steps. Every cache consumes the serial top-1 at every step.
+- **Run.** It prefills each prompt into a serial cache and one cache per joint arm, then decodes `HF2Q_QWEN_JOINT_Q1_STEPS` (default 32) teacher-forced steps. Every cache consumes the serial top-1 at every step. Each joint arm's step options are fixed by the test, not read from the switches.
 - **Stores** (`hf2q.adr063.invariance.v2`, keyed by agent, absolute row and step):
   - `$OUT/serial/trace.json`: the serial one-token `forward_gpu_last_logits` (stock M1 target route);
   - `$OUT/joint_shared_ffn/trace.json`: `forward_gpu_decode_joint` over all agents with the shared-weight FFN (production default);
   - `$OUT/joint_serial_ffn/trace.json`: the same with the per-row fused FFN (`HF2Q_QWEN_JOINT_FFN_SHARED=0`).
+  - `$OUT/joint_shared_ffn_pooled/trace.json`: the production route with pooled layer outputs (`HF2Q_QWEN_JOINT_POOLED_OUTPUTS=1`, Class A). The test asserts its logits bitwise equal to `joint_shared_ffn` at every step.
 
 **Prepared input.** `/tmp/adr063-qwen38-q1-prompts.json` holds four token-ID prompts, entry N = agent-N. They are the recorded turn-2 requests of `E/qwen-joint-ffn-ab-v1/q38-1-ffn1-20261031T034127Z/client/agent-{0,1,2,3}/turn-2/request.json`; agent-1 and agent-3 turn-2 are the turns that forked in the S3 A/B.
 - **Renderer.** They were rendered outside the repo by `/tmp/adr063-q1-render/render.py`. It mirrors `render_chat_prompt_with_tools_generation_prompt`: the GGUF chat template (sha256 `c3cf9e34…`), `enable_thinking=true`, `preserve_thinking=true`, `add_generation_prompt=true`, `strict` dropped from tools, object tool arguments, and serde-style `tojson`.

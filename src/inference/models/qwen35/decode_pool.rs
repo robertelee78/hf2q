@@ -101,6 +101,47 @@ pub fn pooled_alloc_buffer(
     DECODE_POOL.with(|cell| cell.borrow_mut().alloc(device, byte_len, dtype, shape))
 }
 
+thread_local! {
+    /// Whether multi-row layer outputs come from this pool (see
+    /// [`StepPooledOutputs`]).
+    static STEP_POOLED_OUTPUTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, the multi-row (`seq > 1`) layer outputs that otherwise use
+/// `MlxDevice::alloc_buffer` (dense FFN `down_out` / residual sum, attention
+/// projection and Q/gate outputs) come from this pool instead.
+///
+/// Those outputs are fresh device allocations because a prefill chunk resets
+/// this pool between layers while a layer's output becomes the next layer's
+/// input. A joint decode step resets the pool only at its start, after the
+/// previous step drained, so inside its layer loop pooled outputs live long
+/// enough. Every such output is fully written by its producing kernel, so the
+/// arithmetic is unchanged (Class A); only the per-step Metal allocation,
+/// zero-fill and residency-set churn go away.
+pub(crate) struct StepPooledOutputs {
+    previous: bool,
+}
+
+impl StepPooledOutputs {
+    /// Open the scope when `enabled`; a disabled scope changes nothing.
+    pub(crate) fn enter(enabled: bool) -> Self {
+        Self {
+            previous: STEP_POOLED_OUTPUTS.with(|cell| cell.replace(enabled)),
+        }
+    }
+}
+
+impl Drop for StepPooledOutputs {
+    fn drop(&mut self) {
+        STEP_POOLED_OUTPUTS.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Whether a [`StepPooledOutputs`] scope is open on this thread.
+pub(crate) fn step_pooled_outputs() -> bool {
+    STEP_POOLED_OUTPUTS.with(std::cell::Cell::get)
+}
+
 /// Reset the thread-local decode pool — moves every buffer handed out
 /// since the last reset back to the free list.
 ///
