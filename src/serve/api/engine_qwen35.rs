@@ -66,7 +66,9 @@ const QWEN35_VISION_MARKERS: &[&str] = &["<|vision_start|>", "<|image_pad|>", "<
 /// carrying `tokenizer.ggml.*` is self-contained; requiring a sibling
 /// `tokenizer.json` would be a dead precondition and would make externally
 /// produced artifacts needlessly non-portable.
-fn build_qwen35_serving_tokenizer(gguf: &mlx_native::gguf::GgufFile) -> Result<(Tokenizer, bool)> {
+pub(crate) fn build_qwen35_serving_tokenizer(
+    gguf: &mlx_native::gguf::GgufFile,
+) -> Result<(Tokenizer, bool)> {
     let mut tokenizer =
         crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf(gguf)
             .map_err(|e| anyhow::anyhow!("GGUF-driven tokenizer build failed: {e}"))?;
