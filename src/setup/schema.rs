@@ -53,7 +53,7 @@ pub(crate) struct ServeDefaultsV2 {
     /// built-in 8GiB. Zero is rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) lcp_resume_budget: Option<String>,
-    /// Optional host byte budget for Qwen SlotAware conversations spilled
+    /// Optional host byte budget for Qwen and Gemma SlotAware conversations spilled
     /// when another request reclaims their slot (#727). Human-readable units
     /// such as `16GiB` are accepted; omission means the built-in 16 GiB and
     /// `0` disables spilling.

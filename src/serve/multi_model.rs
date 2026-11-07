@@ -185,7 +185,7 @@ pub struct EngineConfig {
     /// In-memory LCP resume registry byte budget, resolved once at server
     /// start so every model load (including swaps) uses the same value.
     pub lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget,
-    /// #727: host byte budget for Qwen SlotAware conversations spilled when
+    /// #727: host byte budget for Qwen and Gemma SlotAware conversations spilled when
     /// another request reclaims their slot. `None` keeps the loaded model's
     /// built-in default; `Some(0)` disables spilling.
     pub slot_spill_budget_bytes: Option<u64>,

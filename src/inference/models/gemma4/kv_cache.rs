@@ -8,6 +8,8 @@ pub(crate) mod cache_scaffold_plan;
 use cache_scaffold_plan::{Modes, Phase, SlotPlan};
 #[path = "anchor_budget.rs"]
 pub(crate) mod anchor_budget;
+#[path = "slot_spill.rs"]
+pub(crate) mod slot_spill;
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
@@ -1605,6 +1607,32 @@ impl GemmaHybridSlotAnchor {
                     + layer.bf16_xlen_v.as_ref().map_or(0, Vec::len)
             })
             .sum()
+    }
+
+    /// #727: an anchor parked in the reclaimed-slot spill store is charged
+    /// to the spill budget, not to this worker's anchor quota (which plans
+    /// at most two generations per live slot), so parking releases its lease.
+    pub fn release_quota(&mut self) {
+        self._reservation = None;
+    }
+
+    /// #727: re-acquire the anchor-quota lease for the slot a parked anchor
+    /// is restored into. An anchor that still holds its lease keeps it.
+    pub fn reacquire_quota(
+        &mut self,
+        scaffold: &[MultiSeqHybridKvBuffers],
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<()> {
+        if self._reservation.is_none() {
+            self._reservation = anchor_budget::reserve(scaffold, slot.0 as usize, self.prompt_len)?;
+        }
+        Ok(())
+    }
+
+    /// Whether this anchor holds an anchor-quota lease (test observability).
+    #[cfg(test)]
+    pub fn holds_quota(&self) -> bool {
+        self._reservation.is_some()
     }
 
     /// SHA-256 over the boundary and every saved byte, in layer order

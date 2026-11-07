@@ -4076,12 +4076,15 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
             }
         }
     }
-    // #727: the operator's reclaimed-slot spill budget reaches the Qwen
-    // SlotAware worker through the loaded model (the worker owns the store).
-    if let (Some(bytes), api::engine::LoadedModel::Qwen35(q)) =
-        (config.slot_spill_budget_bytes, &mut loaded)
-    {
-        q.slot_spill_budget_bytes = bytes;
+    // #727: the operator's reclaimed-slot spill budget reaches the Qwen and
+    // Gemma SlotAware workers through the loaded model (the worker owns the
+    // store).
+    if let Some(bytes) = config.slot_spill_budget_bytes {
+        match &mut loaded {
+            api::engine::LoadedModel::Qwen35(q) => q.slot_spill_budget_bytes = bytes,
+            api::engine::LoadedModel::Gemma(g) => g.slot_spill_budget_bytes = bytes,
+            api::engine::LoadedModel::Qwen3VlText(_) | api::engine::LoadedModel::Deepseek4(_) => {}
+        }
     }
     // ADR-040 Phase C iter-4 (C4) — route through `spawn_with_mode` so
     // the operator-chosen `EngineMode` (resolved from `--scheduler` /

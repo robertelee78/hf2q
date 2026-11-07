@@ -15,12 +15,12 @@
 //! granted slot. Admission then takes the same live-tail or anchor resume it
 //! would have taken had the conversation kept its slot.
 //!
-//! The store has a fixed byte budget (`serve.slot_spill_budget`) and a fixed
-//! entry cap ([`QWEN35_SLOT_SPILL_ENTRIES_PER_SLOT`] per worker slot); it
-//! never reads available memory. Entries are stamped from a monotonic
-//! counter when spilled; eviction removes the oldest stamp first; a restored
-//! entry leaves the store. Every outcome is therefore a function of the
-//! request sequence alone. A spill runs only when admission would otherwise
+//! The store and the reclaim decision ([`plan_reclaim`]) are shared with
+//! the Gemma worker (`slot_spill`): a fixed byte budget
+//! (`serve.slot_spill_budget`), a fixed entry cap
+//! (`SLOT_SPILL_ENTRIES_PER_SLOT` per worker slot) and oldest-stamp
+//! eviction, so every outcome is a function of the request sequence alone.
+//! A spill runs only when admission would otherwise
 //! discard a granted slot's state: the request matches nothing in the slot
 //! (cold), a better-matching spill is restored over it, the request starts
 //! new content exactly at the slot's anchor (a fork, or another conversation
@@ -33,6 +33,7 @@
 
 use anyhow::Context;
 
+use super::slot_spill::{plan_reclaim, ResumePreference, SlotSpillStore, SpillInsert, VictimSpill};
 use super::{
     qwen35_anchor_vision_compatible, qwen35_slot_affinity, Qwen35PromptAnchor, Qwen35RetainedPrefix,
     Qwen35SlotPreference, SlotId,
@@ -42,96 +43,13 @@ use crate::serve::api::engine_qwen35::Qwen35SpecPrefixBoundary;
 
 const LOG_TARGET: &str = "hf2q::serve::api::engine_qwen35::slot_spill";
 
-/// Spill entries kept per worker slot. The byte budget is normally the
-/// binding limit; this cap bounds the prefix lookup done on admission.
-pub(super) const QWEN35_SLOT_SPILL_ENTRIES_PER_SLOT: usize = 4;
-
-pub(super) struct SlotSpillEntry<T> {
-    pub(super) stamp: u64,
-    pub(super) bytes: u64,
-    pub(super) payload: T,
-}
-
-pub(super) enum SpillInsert<T> {
-    Stored {
-        stamp: u64,
-        evicted: Vec<SlotSpillEntry<T>>,
-    },
-    /// The entry alone exceeds the budget (or the store holds no entries);
-    /// the caller keeps ownership and the conversation goes cold later.
-    Rejected(T),
-}
-
-/// Deterministic byte- and count-bounded store with oldest-stamp eviction.
-pub(super) struct SlotSpillStore<T> {
-    budget_bytes: u64,
-    max_entries: usize,
-    next_stamp: u64,
-    resident_bytes: u64,
-    /// Ascending stamp order: the front is the oldest entry.
-    entries: Vec<SlotSpillEntry<T>>,
-}
-
-impl<T> SlotSpillStore<T> {
-    pub(super) fn new(budget_bytes: u64, max_entries: usize) -> Self {
-        Self {
-            budget_bytes,
-            max_entries,
-            next_stamp: 0,
-            resident_bytes: 0,
-            entries: Vec::new(),
-        }
+impl ResumePreference for Qwen35SlotPreference {
+    fn cached_tokens(&self) -> usize {
+        self.cached_tokens
     }
 
-    pub(super) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub(super) fn resident_bytes(&self) -> u64 {
-        self.resident_bytes
-    }
-
-    /// Whether an entry of `bytes` can be stored at all.
-    pub(super) fn admits(&self, bytes: u64) -> bool {
-        self.max_entries > 0 && bytes <= self.budget_bytes
-    }
-
-    /// Store `payload`, first evicting oldest entries until both the entry
-    /// cap and the byte budget hold.
-    pub(super) fn insert(&mut self, bytes: u64, payload: T) -> SpillInsert<T> {
-        if !self.admits(bytes) {
-            return SpillInsert::Rejected(payload);
-        }
-        let mut evicted = Vec::new();
-        while self.entries.len() >= self.max_entries
-            || self.resident_bytes.saturating_add(bytes) > self.budget_bytes
-        {
-            evicted.push(self.take(0));
-        }
-        let stamp = self.next_stamp;
-        self.next_stamp += 1;
-        self.resident_bytes += bytes;
-        self.entries.push(SlotSpillEntry {
-            stamp,
-            bytes,
-            payload,
-        });
-        SpillInsert::Stored { stamp, evicted }
-    }
-
-    /// Entries with their store index, newest stamp first.
-    pub(super) fn newest_first(&self) -> impl Iterator<Item = (usize, &SlotSpillEntry<T>)> {
-        self.entries.iter().enumerate().rev()
-    }
-
-    pub(super) fn take(&mut self, index: usize) -> SlotSpillEntry<T> {
-        let entry = self.entries.remove(index);
-        self.resident_bytes -= entry.bytes;
-        entry
+    fn restores_prompt_anchor(&self) -> bool {
+        self.restore_prompt_anchor
     }
 }
 
@@ -144,71 +62,6 @@ pub(super) struct Qwen35SlotSpill {
 }
 
 pub(super) type Qwen35SlotSpillStore = SlotSpillStore<Qwen35SlotSpill>;
-
-/// What happens to the granted slot's previous conversation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum VictimSpill {
-    /// Nothing is discarded (an in-place live-tail resume, or an empty slot).
-    Keep,
-    /// The slot's ledger is cleared or replaced: move it into the spill.
-    Move,
-    /// An in-place anchor rewind keeps the slot's anchor for this request,
-    /// and the request starts new content exactly at that anchor (another
-    /// conversation sharing it, or a fork): the occupant's live tail beyond
-    /// the anchor would be lost, so spill a copy of the ledger.
-    Copy,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Qwen35ReclaimPlan {
-    /// Store index to restore into the granted slot and the resume it offers.
-    pub(super) restore: Option<(usize, Qwen35SlotPreference)>,
-    pub(super) victim: VictimSpill,
-}
-
-/// Decide the reclaim for one admission. `in_place` is affinity's choice for
-/// the granted slot (`None` when the request was not granted the slot it
-/// matched, or matched none); `spill_match` is the best stored conversation;
-/// `victim_retained` is the occupant's retained token ledger. A spill is
-/// restored only when it resumes strictly more tokens than the granted slot
-/// does in place.
-///
-/// An anchor rewind copies the occupant only when `prompt_tokens` diverges
-/// from `victim_retained` exactly at the anchor boundary. A conversation's
-/// own next turn or retry also rewinds to its stable anchor (the generation
-/// cue and reasoning are rewritten), but it shares at least the assistant
-/// header beyond the anchor, so it keeps the slot without a copy.
-pub(super) fn plan_qwen35_reclaim(
-    in_place: Option<Qwen35SlotPreference>,
-    spill_match: Option<(usize, Qwen35SlotPreference)>,
-    prompt_tokens: &[u32],
-    victim_retained: &[u32],
-    victim_has_ledger: bool,
-) -> Qwen35ReclaimPlan {
-    let in_place_tokens = in_place.map_or(0, |preference| preference.cached_tokens);
-    let restore = spill_match.filter(|(_, preference)| preference.cached_tokens > in_place_tokens);
-    let victim = match in_place {
-        _ if !victim_has_ledger => VictimSpill::Keep,
-        _ if restore.is_some() => VictimSpill::Move,
-        None => VictimSpill::Move,
-        Some(preference)
-            if preference.restore_prompt_anchor
-                && victim_retained.len() > in_place_tokens
-                && common_prefix_len(prompt_tokens, victim_retained) == in_place_tokens =>
-        {
-            VictimSpill::Copy
-        }
-        Some(_) => VictimSpill::Keep,
-    };
-    Qwen35ReclaimPlan { restore, victim }
-}
-
-fn common_prefix_len(left: &[u32], right: &[u32]) -> usize {
-    left.iter()
-        .zip(right)
-        .take_while(|(left, right)| left == right)
-        .count()
-}
 
 /// The (retained, anchor) prefixes a conversation's ledger offers a request,
 /// filtered by vision compatibility exactly as slot affinity filters idle
@@ -425,7 +278,7 @@ pub(super) fn reclaim_qwen35_slot(
         request_vision_fingerprint,
         text_anchor_reuse_limit,
     );
-    let plan = plan_qwen35_reclaim(
+    let plan = plan_reclaim(
         in_place,
         spill_match,
         prompt_tokens,

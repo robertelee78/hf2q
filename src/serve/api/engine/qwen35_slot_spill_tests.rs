@@ -1,93 +1,18 @@
-//! Issue #727: the spill store is deterministic and bounded, admission
-//! decides spill/restore by longest prefix, and a reclaimed conversation is
-//! restored bitwise into whatever slot it is granted on its return.
+//! Issue #727: admission decides spill/restore by longest prefix, and a
+//! reclaimed conversation is restored bitwise into whatever slot it is
+//! granted on its return. The shared store's own tests are in
+//! `slot_spill_tests.rs`.
 
 use mlx_native::MlxDevice;
 
+use super::super::slot_spill::{plan_reclaim, ReclaimPlan, SlotSpillStore, VictimSpill};
 use super::super::{Qwen35PromptAnchor, Qwen35RetainedPrefix, Qwen35SlotPreference, SlotId};
 use super::{
-    plan_qwen35_reclaim, qwen35_best_ledger_match, reclaim_qwen35_slot, spill_reclaimed_qwen35_slot,
-    Qwen35SlotSpillStore, SlotSpillStore, SpillInsert, VictimSpill,
+    qwen35_best_ledger_match, reclaim_qwen35_slot, spill_reclaimed_qwen35_slot,
+    Qwen35SlotSpillStore,
 };
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
 use crate::inference::models::qwen35::{default_layer_types, Qwen35Config, Qwen35Variant};
-
-fn stored<T>(outcome: SpillInsert<T>) -> (u64, Vec<u64>) {
-    match outcome {
-        SpillInsert::Stored { stamp, evicted } => {
-            (stamp, evicted.into_iter().map(|entry| entry.stamp).collect())
-        }
-        SpillInsert::Rejected(_) => panic!("entry rejected"),
-    }
-}
-
-#[test]
-fn store_evicts_oldest_stamps_to_hold_budget_and_entry_cap() {
-    let mut store = SlotSpillStore::new(100, 3);
-    assert!(store.is_empty());
-    assert_eq!(stored(store.insert(40, 'a')), (0, vec![]));
-    assert_eq!(stored(store.insert(40, 'b')), (1, vec![]));
-    // 40 + 40 + 30 > 100: the oldest entry makes room.
-    assert_eq!(stored(store.insert(30, 'c')), (2, vec![0]));
-    assert_eq!(store.resident_bytes(), 70);
-    assert_eq!(stored(store.insert(10, 'd')), (3, vec![]));
-    // The entry cap (3) evicts the oldest even though bytes would fit.
-    assert_eq!(stored(store.insert(5, 'e')), (4, vec![1]));
-    assert_eq!(store.len(), 3);
-    assert_eq!(store.resident_bytes(), 45);
-    let newest: Vec<char> = store
-        .newest_first()
-        .map(|(_, entry)| entry.payload)
-        .collect();
-    assert_eq!(newest, vec!['e', 'd', 'c']);
-
-    // An entry above the whole budget is refused and evicts nothing.
-    match store.insert(101, 'x') {
-        SpillInsert::Rejected(payload) => assert_eq!(payload, 'x'),
-        SpillInsert::Stored { .. } => panic!("oversized entry stored"),
-    }
-    assert_eq!(store.len(), 3);
-
-    // Taking an entry frees its bytes; stamps never repeat.
-    let (index, _) = store
-        .newest_first()
-        .find(|(_, entry)| entry.payload == 'd')
-        .expect("entry d");
-    let taken = store.take(index);
-    assert_eq!((taken.stamp, taken.bytes, taken.payload), (3, 10, 'd'));
-    assert_eq!(store.resident_bytes(), 35);
-    assert_eq!(stored(store.insert(65, 'f')), (5, vec![]));
-    assert_eq!(stored(store.insert(1, 'g')), (6, vec![2]));
-}
-
-#[test]
-fn store_outcome_depends_only_on_the_operation_sequence() {
-    let run = || {
-        let mut store = SlotSpillStore::new(64, 4);
-        let mut log = Vec::new();
-        for (step, bytes) in [17u64, 30, 9, 41, 12, 64, 3, 22].into_iter().enumerate() {
-            if step == 5 {
-                let index = store.newest_first().last().expect("entry").0;
-                log.push(("take", store.take(index).stamp));
-            }
-            let (stamp, evicted) = stored(store.insert(bytes, step));
-            log.push(("insert", stamp));
-            log.extend(evicted.into_iter().map(|stamp| ("evict", stamp)));
-        }
-        (log, store.resident_bytes())
-    };
-    assert_eq!(run(), run());
-}
-
-#[test]
-fn zero_budget_or_zero_entries_disables_the_store() {
-    let mut store = SlotSpillStore::new(0, 4);
-    assert!(!store.admits(1));
-    assert!(matches!(store.insert(1, ()), SpillInsert::Rejected(())));
-    let mut store = SlotSpillStore::new(1 << 30, 0);
-    assert!(!store.admits(1));
-    assert!(matches!(store.insert(1, ()), SpillInsert::Rejected(())));
-}
 
 fn preference(cached_tokens: usize, anchor: bool) -> Qwen35SlotPreference {
     Qwen35SlotPreference {
@@ -96,6 +21,23 @@ fn preference(cached_tokens: usize, anchor: bool) -> Qwen35SlotPreference {
         restore_prompt_anchor: anchor,
         use_prefill_logits: false,
     }
+}
+
+/// The shared reclaim plan at Qwen's types.
+fn qwen_plan(
+    in_place: Option<Qwen35SlotPreference>,
+    spill_match: Option<(usize, Qwen35SlotPreference)>,
+    prompt_tokens: &[u32],
+    victim_retained: &[u32],
+    victim_has_ledger: bool,
+) -> ReclaimPlan<usize, Qwen35SlotPreference> {
+    plan_reclaim(
+        in_place,
+        spill_match,
+        prompt_tokens,
+        victim_retained,
+        victim_has_ledger,
+    )
 }
 
 #[test]
@@ -115,35 +57,35 @@ fn reclaim_plan_spills_only_discarded_state_and_restores_only_longer_matches() {
     extended.push(31);
 
     // Cold admission into an occupied slot: move its ledger into the store.
-    let plan = plan_qwen35_reclaim(None, None, &other, &occupant, true);
+    let plan = qwen_plan(None, None, &other, &occupant, true);
     assert_eq!((plan.restore, plan.victim), (None, VictimSpill::Move));
     // Cold admission into an empty slot spills nothing.
-    let plan = plan_qwen35_reclaim(None, None, &other, &[], false);
+    let plan = qwen_plan(None, None, &other, &[], false);
     assert_eq!(plan.victim, VictimSpill::Keep);
     // A live-tail resume keeps the slot's conversation.
-    let plan = plan_qwen35_reclaim(Some(live), None, &extended, &occupant, true);
+    let plan = qwen_plan(Some(live), None, &extended, &occupant, true);
     assert_eq!((plan.restore, plan.victim), (None, VictimSpill::Keep));
     // The occupant's own next turn or retry rewinds to its stable anchor but
     // shares the assistant header beyond it: no copy.
-    let plan = plan_qwen35_reclaim(Some(anchor), None, &continuation, &occupant, true);
+    let plan = qwen_plan(Some(anchor), None, &continuation, &occupant, true);
     assert_eq!(plan.victim, VictimSpill::Keep);
     // A request that starts new content exactly at the anchor (a fork, or
     // another conversation sharing the anchor) would discard the occupant's
     // tail: copy the ledger, the anchor stays in place for this request.
-    let plan = plan_qwen35_reclaim(Some(anchor), None, &fork, &occupant, true);
+    let plan = qwen_plan(Some(anchor), None, &fork, &occupant, true);
     assert_eq!(plan.victim, VictimSpill::Copy);
     // No tail beyond the anchor: nothing to lose.
-    let plan = plan_qwen35_reclaim(Some(anchor), None, &fork, &occupant[..12], true);
+    let plan = qwen_plan(Some(anchor), None, &fork, &occupant[..12], true);
     assert_eq!(plan.victim, VictimSpill::Keep);
 
     // A spill restores only when it resumes strictly more tokens.
-    let plan = plan_qwen35_reclaim(Some(anchor), spill(16), &continuation, &occupant, true);
+    let plan = qwen_plan(Some(anchor), spill(16), &continuation, &occupant, true);
     assert_eq!(plan.restore, spill(16));
     assert_eq!(plan.victim, VictimSpill::Move);
     // A spill matching no more than the live tail (30 tokens) stays stored.
-    let plan = plan_qwen35_reclaim(Some(live), spill(30), &extended, &occupant, true);
+    let plan = qwen_plan(Some(live), spill(30), &extended, &occupant, true);
     assert_eq!((plan.restore, plan.victim), (None, VictimSpill::Keep));
-    let plan = plan_qwen35_reclaim(None, spill(8), &other, &[], false);
+    let plan = qwen_plan(None, spill(8), &other, &[], false);
     assert_eq!((plan.restore, plan.victim), (spill(8), VictimSpill::Keep));
 }
 

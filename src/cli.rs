@@ -1596,11 +1596,11 @@ pub struct ServePlanningArgs {
     #[arg(long, value_name = "SIZE", requires = "kv_persist_path")]
     pub kv_persist_budget: Option<String>,
 
-    /// Host-memory ceiling for Qwen conversations whose slot another request
-    /// reclaims: their cache state is spilled and restored when they return,
-    /// instead of being recomputed. Overrides `[serve] slot_spill_budget` and
-    /// accepts bytes or units such as `16GiB` (the default); `0` disables
-    /// spilling. Oldest spills are evicted first.
+    /// Host-memory ceiling for Qwen and Gemma conversations whose slot
+    /// another request reclaims: their cache state is spilled and restored
+    /// when they return, instead of being recomputed. Overrides `[serve]
+    /// slot_spill_budget` and accepts bytes or units such as `16GiB` (the
+    /// default); `0` disables spilling. Oldest spills are evicted first.
     #[arg(long, value_name = "SIZE")]
     pub slot_spill_budget: Option<String>,
 }

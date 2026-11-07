@@ -130,10 +130,12 @@ constant 8GiB on every host (never derived from free memory); CLI
 `--lcp-resume-budget <SIZE>` overrides the config value. Zero and malformed
 values fail setup or serve. Setup does not prompt for it.
 
-`slot_spill_budget` caps host memory for Qwen SlotAware conversations whose
-idle slot another request reclaims (#727). The reclaimed slot's cache rows,
-DeltaNet state and resume ledger are copied to host memory and restored when
-that conversation returns, into whatever slot it is granted. CLI
+`slot_spill_budget` caps host memory for Qwen and Gemma SlotAware
+conversations whose idle slot another request reclaims (#727). The reclaimed
+slot's cache rows (Qwen: KV/TQ and MTP rows plus DeltaNet state; Gemma:
+global rows, sliding rings and every cursor) and resume ledger are copied to
+host memory and restored when that conversation returns, into whatever slot
+it is granted. CLI
 `--slot-spill-budget <SIZE>` overrides the config value. Omission means the
 built-in `16GiB`; `0` disables spilling. The budget is fixed: it is never
 derived from available memory, and the oldest spill is evicted first, so the

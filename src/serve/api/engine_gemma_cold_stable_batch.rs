@@ -219,6 +219,7 @@ fn admit_per_slot(
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     registration: Option<&ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -234,6 +235,7 @@ fn admit_per_slot(
             slots,
             retained_tokens,
             prompt_anchors,
+            slot_spills,
             registration,
             scheduler_stats_snapshot,
             per_slot_kv_budget_bytes,
@@ -284,6 +286,7 @@ pub(super) fn admit_cohort(
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     registration: Option<&ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -301,6 +304,7 @@ pub(super) fn admit_cohort(
                 slots,
                 retained_tokens,
                 prompt_anchors,
+                slot_spills,
                 registration,
                 scheduler_stats_snapshot,
                 per_slot_kv_budget_bytes,
@@ -454,9 +458,18 @@ pub(super) fn admit_cohort(
         hook();
     }
 
-    // 2. Reset every lane, then clear the self-mounts (as `prefill_seed`).
+    // 2. Spill each lane's previous conversation (#727), reset every lane,
+    //    then clear the self-mounts (as `prefill_seed`).
     for lane in &lanes {
         let slot = lane.handle.slot_id.0 as usize;
+        gemma4_slot_spill::spill_reclaimed_gemma4_slot(
+            &guard.slot_scaffolds(),
+            slot_spills,
+            graft_len,
+            lane.handle.slot_id,
+            &mut retained_tokens[slot],
+            &mut prompt_anchors[slot],
+        );
         retained_tokens[slot].clear();
         prompt_anchors[slot] = None;
     }
@@ -564,6 +577,7 @@ pub(super) fn admit_cohort(
             slots,
             retained_tokens,
             prompt_anchors,
+            slot_spills,
             registration,
             scheduler_stats_snapshot,
             per_slot_kv_budget_bytes,
@@ -884,6 +898,7 @@ fn recover_cues(
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     registration: Option<&ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -914,6 +929,7 @@ fn recover_cues(
                 slots,
                 retained_tokens,
                 prompt_anchors,
+                slot_spills,
                 registration,
                 scheduler_stats_snapshot,
                 per_slot_kv_budget_bytes,

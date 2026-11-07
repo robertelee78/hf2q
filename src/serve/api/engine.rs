@@ -1981,8 +1981,14 @@ mod deepseek4_joint_decode;
 #[path = "engine/qwen35_joint_decode.rs"]
 mod qwen35_joint_decode;
 
+#[path = "engine/slot_spill.rs"]
+mod slot_spill;
+
 #[path = "engine/qwen35_slot_spill.rs"]
 mod qwen35_slot_spill;
+
+#[path = "engine/gemma4_slot_spill.rs"]
+mod gemma4_slot_spill;
 
 pub(super) enum Request {
     /// Internal startup-only diagnostic control, never a public HTTP request.
@@ -2439,6 +2445,11 @@ pub struct GemmaLoadedModel {
     /// case.  See ADR-040 §6.1.46.
     pub multi_seq_kv_mlx:
         Option<Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>>,
+    /// #727: host byte budget of the SlotAware reclaimed-slot spill store
+    /// (`serve.slot_spill_budget`). Load sets the documented default;
+    /// `load_engine` applies the operator's resolved value. `0` disables
+    /// spilling.
+    pub slot_spill_budget_bytes: u64,
 }
 
 impl LoadedModel {
@@ -3821,6 +3832,7 @@ impl GemmaLoadedModel {
             // the respective env-gate is engaged at process start.
             multi_seq_kv_dense: None,
             multi_seq_kv_mlx: None,
+            slot_spill_budget_bytes: crate::serve::operator_settings::DEFAULT_SLOT_SPILL_BUDGET_BYTES,
         })
     }
 
@@ -11550,6 +11562,18 @@ impl<'a> Gemma4KvGuard<'a> {
             mlx,
         })
     }
+
+    /// #727: the per-slot KV scaffolds the reclaimed-slot spill copies.
+    fn slot_scaffolds(
+        &mut self,
+    ) -> crate::inference::models::gemma4::kv_cache::slot_spill::GemmaSlotScaffolds<'_> {
+        crate::inference::models::gemma4::kv_cache::slot_spill::GemmaSlotScaffolds {
+            hb: &mut self.kv,
+            hybrid: self.hybrid.as_deref_mut(),
+            dense: self.dense.as_deref_mut(),
+            nibble: self.mlx.as_deref_mut(),
+        }
+    }
 }
 
 impl Drop for Gemma4KvGuard<'_> {
@@ -12093,6 +12117,18 @@ fn run_slot_aware_gemma4(
     let mut slots: Vec<Option<Gemma4Slot>> = (0..n_slots).map(|_| None).collect();
     let mut retained_tokens: Vec<Vec<u32>> = (0..n_slots).map(|_| Vec::new()).collect();
     let mut prompt_anchors: Vec<Option<Gemma4PromptAnchor>> = (0..n_slots).map(|_| None).collect();
+    // #727: conversations whose slot is reclaimed by another request are
+    // spilled here and restored on their return (`gemma4_slot_spill`).
+    let mut slot_spills = gemma4_slot_spill::Gemma4SlotSpills::new(
+        guard.model.slot_spill_budget_bytes,
+        n_slots,
+        crate::inference::models::gemma4::kv_cache::slot_spill::GemmaSlotKvRegime::live(),
+    );
+    tracing::info!(
+        budget_bytes = guard.model.slot_spill_budget_bytes,
+        max_entries = n_slots.saturating_mul(slot_spill::SLOT_SPILL_ENTRIES_PER_SLOT),
+        "Gemma4 SlotAware reclaimed-slot spill store configured"
+    );
 
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {
@@ -12299,6 +12335,7 @@ fn run_slot_aware_gemma4(
                         &reqs,
                         &retained_tokens,
                         &prompt_anchors,
+                        &slot_spills,
                         &slots,
                     )
                 } else {
@@ -12354,6 +12391,7 @@ fn run_slot_aware_gemma4(
                         &mut slots,
                         &mut retained_tokens,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -12498,6 +12536,7 @@ fn run_slot_aware_gemma4(
                                 &mut slots,
                                 &mut retained_tokens,
                                 &mut prompt_anchors,
+                                &mut slot_spills,
                                 registration.as_ref(),
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
@@ -12532,6 +12571,7 @@ fn run_slot_aware_gemma4(
                                 &mut slots,
                                 &mut retained_tokens,
                                 &mut prompt_anchors,
+                                &mut slot_spills,
                                 registration.as_ref(),
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
@@ -12557,6 +12597,7 @@ fn run_slot_aware_gemma4(
                                 &mut slots,
                                 &mut retained_tokens,
                                 &mut prompt_anchors,
+                                &mut slot_spills,
                                 registration.as_ref(),
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
@@ -12630,6 +12671,7 @@ fn run_slot_aware_gemma4(
                                 &mut scheduler,
                                 &mut retained_tokens,
                                 &mut prompt_anchors,
+                                &mut slot_spills,
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
                                 kv_bytes_per_token,
@@ -12667,6 +12709,7 @@ fn run_slot_aware_gemma4(
                         &mut slots,
                         &mut retained_tokens,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -12701,6 +12744,7 @@ fn run_slot_aware_gemma4(
                             &mut slots,
                             &mut retained_tokens,
                             &mut prompt_anchors,
+                            &mut slot_spills,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -12737,6 +12781,7 @@ fn run_slot_aware_gemma4(
                         &mut slots,
                         &mut retained_tokens,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -12767,6 +12812,7 @@ fn run_slot_aware_gemma4(
                             &mut slots,
                             &mut retained_tokens,
                             &mut prompt_anchors,
+                            &mut slot_spills,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -12901,6 +12947,7 @@ fn run_slot_aware_gemma4(
                             &mut slots,
                             &mut retained_tokens,
                             &mut prompt_anchors,
+                            &mut slot_spills,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -12948,6 +12995,7 @@ fn run_slot_aware_gemma4(
                             &mut slots,
                             &mut retained_tokens,
                             &mut prompt_anchors,
+                            &mut slot_spills,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -12995,6 +13043,7 @@ fn run_slot_aware_gemma4(
                             &mut slots,
                             &mut retained_tokens,
                             &mut prompt_anchors,
+                            &mut slot_spills,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -13090,6 +13139,7 @@ fn run_slot_aware_gemma4(
                             &mut scheduler,
                             &mut retained_tokens,
                             &mut prompt_anchors,
+                            &mut slot_spills,
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
                             kv_bytes_per_token,
@@ -13501,6 +13551,7 @@ fn admit_gemma4_slot(
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -13520,6 +13571,7 @@ fn admit_gemma4_slot(
         slots,
         retained_tokens,
         prompt_anchors,
+        slot_spills,
         registration,
         scheduler_stats_snapshot,
         per_slot_kv_budget_bytes,
@@ -13546,6 +13598,7 @@ fn admit_gemma4_slot_routed(
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -13686,7 +13739,41 @@ fn admit_gemma4_slot_routed(
     }
     reply.accept_stream_admission();
 
-    let selected_preference = preferred.filter(|preference| preference.slot == handle.slot_id);
+    // #727: a request granted a slot that holds another conversation's state
+    // spills that state first; a request whose conversation was spilled, or
+    // whose own idle slot was not granted, and matches better than the
+    // granted slot gets that state restored here, then resumes exactly as it
+    // would have in its original slot.
+    let selected_preference = match gemma4_slot_spill::reclaim_gemma4_slot(
+        &mut guard.slot_scaffolds(),
+        slot_spills,
+        graft_len,
+        handle.slot_id,
+        retained_tokens,
+        prompt_anchors,
+        preferred,
+        &prompt_tokens,
+        params.vision_fingerprint,
+    ) {
+        Ok(preference) => preference,
+        Err(error) => {
+            reply = match reset_gemma4_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
+            retained_tokens[handle.slot_id.0 as usize].clear();
+            prompt_anchors[handle.slot_id.0 as usize] = None;
+            scheduler.release(handle);
+            slot_fire_done(reply, Err(error), false);
+            return None;
+        }
+    };
     let cached_tokens = selected_preference
         .map(|preference| preference.cached_tokens)
         .unwrap_or(0);
@@ -15126,6 +15213,7 @@ fn admit_gemma4_slots_batched(
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -15135,8 +15223,9 @@ fn admit_gemma4_slots_batched(
 ) -> Option<SlotAwareGpuFatal> {
     // A missing generation cue does not imply a cold conversation. The
     // Gemma tool-response template can render S == P while this request
-    // still extends a retained slot/anchor. Never reset that state in the
-    // cold cohort; the existing single-slot path selects/restores it.
+    // still extends a retained slot/anchor or a spilled conversation (#727).
+    // Never reset that state in the cold cohort; the existing single-slot
+    // path selects/restores it.
     // ADR-063 Q4-GEMMA-COLD D2: graft-bound workers admit cold lanes per slot
     // until a graft bitwise gate exists for the per-sequence cold attention.
     let plan = gemma_cold_batch::plan(
@@ -15148,7 +15237,8 @@ fn admit_gemma4_slots_batched(
                 prompt,
                 params.vision_fingerprint,
             )
-            .map_or(0, |preference| preference.cached_tokens);
+            .map_or(0, |preference| preference.cached_tokens)
+            .max(slot_spills.resume_tokens(prompt, params.vision_fingerprint));
             (prompt.len(), cached)
         }),
         guard.model.weights.kv_graft_len(),
@@ -15171,6 +15261,7 @@ fn admit_gemma4_slots_batched(
                 slots,
                 retained_tokens,
                 prompt_anchors,
+                slot_spills,
                 registration,
                 scheduler_stats_snapshot,
                 per_slot_kv_budget_bytes,
@@ -15309,6 +15400,7 @@ fn admit_gemma4_slots_batched(
                 slots,
                 retained_tokens,
                 prompt_anchors,
+                slot_spills,
                 registration,
                 scheduler_stats_snapshot,
                 per_slot_kv_budget_bytes,
@@ -15343,6 +15435,19 @@ fn admit_gemma4_slots_batched(
             params.max_tokens,
         );
         crate::serve::operator_ui::prefill_planned("gemma4", request_id, 0, prompt_tokens.len());
+    }
+
+    // #727: the conversation each lane's slot held is spilled, not lost.
+    for (handle, _, _, _) in &admitted {
+        let slot_idx = handle.slot_id.0 as usize;
+        gemma4_slot_spill::spill_reclaimed_gemma4_slot(
+            &guard.slot_scaffolds(),
+            slot_spills,
+            graft_len,
+            handle.slot_id,
+            &mut retained_tokens[slot_idx],
+            &mut prompt_anchors[slot_idx],
+        );
     }
 
     // 2. Per-slot entry reset (kv + hybrid) + clear self-mounts (mirror
@@ -15654,6 +15759,7 @@ fn admit_gemma4_slots_stable_batched(
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -15681,13 +15787,24 @@ fn admit_gemma4_slots_stable_batched(
                 .iter()
                 .map(|(prompt, params, _)| (prompt.as_slice(), params)),
             |lane| {
-                preferred_gemma4_slot_for_request(
-                    retained_tokens,
-                    prompt_anchors,
-                    slots,
-                    &requests[lane].0,
-                    None,
-                )
+                let prompt = &requests[lane].0;
+                // #727: a lane whose conversation was spilled is warm; the
+                // per-slot path restores it.
+                [
+                    preferred_gemma4_slot_for_request(
+                        retained_tokens,
+                        prompt_anchors,
+                        slots,
+                        prompt,
+                        None,
+                    ),
+                    slot_spills
+                        .best_match(prompt, None, &[])
+                        .map(|(_, preference)| preference),
+                ]
+                .into_iter()
+                .flatten()
+                .max_by_key(|preference| preference.cached_tokens)
             },
             |lanes| {
                 guard.hybrid.as_deref().is_some_and(|scaffold| {
@@ -15707,6 +15824,7 @@ fn admit_gemma4_slots_stable_batched(
             slots,
             retained_tokens,
             prompt_anchors,
+            slot_spills,
             registration,
             scheduler_stats_snapshot,
             per_slot_kv_budget_bytes,
@@ -15733,6 +15851,7 @@ fn admit_gemma4_slots_stable_batched(
             slots,
             retained_tokens,
             prompt_anchors,
+            slot_spills,
             registration,
             scheduler_stats_snapshot,
             per_slot_kv_budget_bytes,
@@ -15761,6 +15880,7 @@ fn embed_gemma4_inline(
     scheduler: &mut InflightBatchedScheduler,
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
@@ -15823,6 +15943,16 @@ fn embed_gemma4_inline(
     // Embedding owns and resets the chosen physical sequence. Retained
     // generation metadata must be invalidated before that first mutation.
     let slot_idx = handle.slot_id.0 as usize;
+    // #727: the conversation that held this slot is spilled, not lost.
+    let graft_len = guard.model.weights.kv_graft_len();
+    gemma4_slot_spill::spill_reclaimed_gemma4_slot(
+        &guard.slot_scaffolds(),
+        slot_spills,
+        graft_len,
+        handle.slot_id,
+        &mut retained_tokens[slot_idx],
+        &mut prompt_anchors[slot_idx],
+    );
     retained_tokens[slot_idx].clear();
     prompt_anchors[slot_idx] = None;
     clear_gemma4_self_mounts(guard.model);
@@ -18420,23 +18550,18 @@ fn preferred_gemma4_slot_for_request_excluding(
             .zip(active_slots)
             .enumerate()
             .map(|(index, ((retained, anchor), active))| {
-                let identity_matches = anchor
-                    .as_ref()
-                    .is_some_and(|anchor| anchor.vision_fingerprint == vision_fingerprint);
+                let (retained, anchor) = gemma4_slot_spill::gemma4_resume_candidate(
+                    retained,
+                    anchor.as_ref(),
+                    vision_fingerprint,
+                );
                 let active_matches = active
                     .as_ref()
                     .is_some_and(|(work, _, _)| work.vision_fingerprint() == vision_fingerprint);
                 (
                     index,
-                    if identity_matches {
-                        retained.as_slice()
-                    } else {
-                        &[]
-                    },
-                    anchor
-                        .as_ref()
-                        .filter(|_| identity_matches)
-                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    retained,
+                    anchor,
                     active
                         .as_ref()
                         .filter(|_| active_matches)
@@ -18503,23 +18628,18 @@ fn active_gemma4_slot_affinity(
             .zip(slots)
             .enumerate()
             .map(|(index, ((retained, anchor), active))| {
-                let anchor_matches = anchor
-                    .as_ref()
-                    .is_some_and(|anchor| anchor.vision_fingerprint == vision_fingerprint);
+                let (retained, anchor) = gemma4_slot_spill::gemma4_resume_candidate(
+                    retained,
+                    anchor.as_ref(),
+                    vision_fingerprint,
+                );
                 let active_matches = active
                     .as_ref()
                     .is_some_and(|(work, _, _)| work.vision_fingerprint() == vision_fingerprint);
                 (
                     index,
-                    if anchor_matches {
-                        retained.as_slice()
-                    } else {
-                        &[]
-                    },
-                    anchor
-                        .as_ref()
-                        .filter(|_| anchor_matches)
-                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    retained,
+                    anchor,
                     active
                         .as_ref()
                         .filter(|_| active_matches)
@@ -18676,11 +18796,11 @@ fn run_slot_aware_qwen35(
     // spilled here and restored on their return (`qwen35_slot_spill`).
     let mut slot_spills = qwen35_slot_spill::Qwen35SlotSpillStore::new(
         guard.model.slot_spill_budget_bytes,
-        n_slots.saturating_mul(qwen35_slot_spill::QWEN35_SLOT_SPILL_ENTRIES_PER_SLOT),
+        n_slots.saturating_mul(slot_spill::SLOT_SPILL_ENTRIES_PER_SLOT),
     );
     tracing::info!(
         budget_bytes = guard.model.slot_spill_budget_bytes,
-        max_entries = n_slots.saturating_mul(qwen35_slot_spill::QWEN35_SLOT_SPILL_ENTRIES_PER_SLOT),
+        max_entries = n_slots.saturating_mul(slot_spill::SLOT_SPILL_ENTRIES_PER_SLOT),
         "Qwen35 SlotAware reclaimed-slot spill store configured"
     );
     let qwen_joint_decode =
@@ -58317,3 +58437,7 @@ mod gemma_cold_gs3_timing;
 #[cfg(test)]
 #[path = "engine_template_json_order_tests.rs"]
 mod template_json_order_tests;
+
+#[cfg(test)]
+#[path = "engine_gemma_slot_spill_resume_tests.rs"]
+mod gemma_slot_spill_resume_tests;
