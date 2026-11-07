@@ -96,9 +96,9 @@ fn warm_kernel_for_switch(raw: Option<&str>) -> GemmaLiveKernel {
     }
 }
 
-/// Kernel for warm live-resume attention (single-slot resumes and joint warm
-/// cohorts), resolved once per model load from
-/// `HF2Q_GEMMA_WARM_TILED_ATTENTION`.
+/// Kernel for warm live-resume attention (single-slot resumes, joint warm
+/// cohorts and installed long-prompt lanes), resolved once per model load
+/// from `HF2Q_GEMMA_WARM_TILED_ATTENTION`.
 pub(crate) fn warm_live_kernel_from_env() -> GemmaLiveKernel {
     let raw = std::env::var(WARM_TILED_ATTENTION_ENV).ok();
     let kernel = warm_kernel_for_switch(raw.as_deref());

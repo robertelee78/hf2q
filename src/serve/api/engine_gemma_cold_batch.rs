@@ -87,10 +87,8 @@ fn unavailable_reason(
         Some("the hybrid KV regime is off")
     } else if is("HF2Q_BATCHED_BODY", &["0"]) {
         Some("HF2Q_BATCHED_BODY=0 removes the batched decode body of the cue replay")
-    } else if is("HF2Q_PREFILL_SLOT_BATCHED", &["0"]) {
-        Some("HF2Q_PREFILL_SLOT_BATCHED=0 replaces the per-slot route lanes must equal")
-    } else if env("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some() {
-        Some("HF2Q_MM_ID_ROUTING_THRESHOLD moves the MoE route boundary of the lane rule")
+    } else if let Some(reason) = gemma_warm_batch::per_slot_route_override(&env) {
+        Some(reason)
     } else if is("HF2Q_DFLASH_XLEN_SDPA", &["1"]) {
         Some("HF2Q_DFLASH_XLEN_SDPA=1 is not supported by multi-sequence prefill")
     } else if is("HF2Q_FA_F16", &["0", "false", "off"]) {

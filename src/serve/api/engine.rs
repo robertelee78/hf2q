@@ -6601,6 +6601,24 @@ fn gemma4_batch_decode_reserve(lanes: impl IntoIterator<Item = (usize, usize)>) 
     max_need.saturating_sub(max_end).max(1)
 }
 
+/// Whether installed long-prompt lanes may share one transaction (issue
+/// #725), resolved once per worker: cross-slot admission on, and no
+/// diagnostic setting that moves the per-slot reference route the lanes must
+/// equal ([`gemma_warm_batch::per_slot_route_override`]). Off, every lane
+/// prefills per slot.
+fn gemma4_installed_prefill_cohort_enabled(
+    cross_slot_admit: bool,
+    env: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let unavailable = gemma_warm_batch::per_slot_route_override(env);
+    tracing::info!(
+        cross_slot_admit,
+        unavailable,
+        "Gemma installed long-prompt cohort worker decision"
+    );
+    cross_slot_admit && unavailable.is_none()
+}
+
 /// Plan one installed long-prompt cohort (issue #725).
 ///
 /// Every lane is planned on its own, exactly as the single-slot path plans it
@@ -12085,6 +12103,10 @@ fn run_slot_aware_gemma4(
     // boundary share one bitwise-exact transaction;
     // `HF2Q_GEMMA_JOINT_COLD_PREFILL=0` keeps per-slot admission.
     let joint_cold_prefill = gemma_cold_batch::worker_enabled(cross_slot_admit);
+    // Issue #725: installed long-prompt lanes share a transaction only where
+    // each lane stays bitwise equal to its per-slot prefill.
+    let installed_prefill_cohort =
+        gemma4_installed_prefill_cohort_enabled(cross_slot_admit, |name| std::env::var(name).ok());
 
     // ADR-040 production profiling — zero the buckets at worker entry so the
     // worker-exit dump reflects THIS worker's lifetime, not leftover state.
@@ -13161,7 +13183,7 @@ fn run_slot_aware_gemma4(
                     n_tokens,
                     kv_bytes_per_token,
                     &supervisor,
-                    cross_slot_admit,
+                    installed_prefill_cohort,
                 ) {
                     fail_stop_gemma4_worker(
                         &supervisor,
@@ -13258,7 +13280,7 @@ fn run_slot_aware_gemma4(
                     n_prefill_tokens,
                     kv_bytes_per_token,
                     &supervisor,
-                    cross_slot_admit,
+                    installed_prefill_cohort,
                 ) {
                     fail_stop_gemma4_worker(
                         &supervisor,
@@ -14501,7 +14523,7 @@ fn advance_gemma4_prefill_quantum(
     requested_tokens: u32,
     kv_bytes_per_token: u64,
     supervisor: &EngineSupervisor,
-    cross_slot_admit: bool,
+    installed_prefill_cohort: bool,
 ) -> Option<SlotAwareGpuFatal> {
     let primary_index = handle.slot_id.0 as usize;
     let Some((Gemma4SlotWork::Prefill(primary), primary_reply, installed)) =
@@ -14551,7 +14573,7 @@ fn advance_gemma4_prefill_quantum(
         );
     }
     let start_at_zero = primary.progress.cursor() == 0;
-    let batch_supported = cross_slot_admit
+    let batch_supported = installed_prefill_cohort
         && primary.soft_token_data.is_empty()
         && guard.hybrid.is_some()
         && crate::debug::INVESTIGATION_ENV.hybrid_kv
@@ -43695,6 +43717,39 @@ mod gemma4_bounded_prefill_tests {
         assert_eq!((cached_boundary.start, cached_boundary.end), (2_500, 3_000));
         assert!(cached_boundary.capture_anchor);
         assert_eq!(cached.cursor(), 2_500);
+    }
+
+    #[test]
+    fn gemma_installed_prefill_cohort_refuses_per_slot_route_overrides() {
+        let env = |set: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                set.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        assert!(gemma4_installed_prefill_cohort_enabled(true, env(&[])));
+        assert!(!gemma4_installed_prefill_cohort_enabled(false, env(&[])));
+        assert!(gemma4_installed_prefill_cohort_enabled(
+            true,
+            env(&[("HF2Q_PREFILL_SLOT_BATCHED", "1")])
+        ));
+        assert!(!gemma4_installed_prefill_cohort_enabled(
+            true,
+            env(&[("HF2Q_PREFILL_SLOT_BATCHED", "0")])
+        ));
+        assert!(!gemma4_installed_prefill_cohort_enabled(
+            true,
+            env(&[("HF2Q_MM_ID_ROUTING_THRESHOLD", "64")])
+        ));
+        // The same predicate keeps the joint warm and joint cold paths off.
+        assert_eq!(
+            gemma_warm_batch::per_slot_route_override(env(&[(
+                "HF2Q_MM_ID_ROUTING_THRESHOLD",
+                "64"
+            )])),
+            Some("HF2Q_MM_ID_ROUTING_THRESHOLD moves the MoE route boundary of the lane rule")
+        );
     }
 
     #[test]
