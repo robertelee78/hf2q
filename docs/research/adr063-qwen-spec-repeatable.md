@@ -122,6 +122,20 @@ A2 can therefore ship only under `adaptive`, or redesigned with per-lane depth f
    - Qwen3.8 with `QWEN38_SPECULATION=auto`: 4 + 2.
    - Cost gates: not run (operator directive 2026-11-06).
 
+## Results (2026-11-06/07, branch head 3179902d, mlx-native 0.16.0)
+
+Evidence lives under `~/.local/state/hf2q/v0130/q38-det-inv/specrep/`; the runner is `run_specrep_gpu.sh`.
+
+| Gate | Result |
+|---|---|
+| 1 Model-free | `serve::api` 1587 passed, 0 failed; `cost_controller` 7 passed; replay tool 21 passed. |
+| 2 Official-artifact | All pass: T-J1-7 (9/9 identical to off; MTP 151 proposals, history 138), the padded and exact joint gates, and both slot-independence gates (14/14 variants bitwise per family, routes identical across four processes after the MTP barrier fix; `p1-*`, `k3fix-*`). |
+| 3 Qwen3.8 replay | w4 `repeatable` and the controller arm pass: outputs byte-identical across orders 032 and 302, and every agent's route sequence identical; the controller's MTP cost-disable fired in both arms. Four same-order processes: one route sequence per agent (four before the fix). `adaptive` w4 kept outputs but changed routes across orders. w3 and w2 are invalid: anchored slots are lost below four slots, so cached-token resume differs by order (#727). `p2-20261106T232222Z`, `p2c-20261107T000712Z`. |
+| 3 Qwen3.6 replay | Turn-0 order arms, joint on and off. `repeatable` passes: outputs and route sequences identical across orders, and joint on and off give the same route mix. `adaptive` with joint on reproduces the recorded agent-3 turn-0 split. `p2b-*`. |
+| 4 Qwen3.6 Q5 | Default `off` ×4: `ExactTranscripts` (0/30 groups differ). Explicit `auto`, `repeatable` ×4: `ExactTranscripts` (0/30). `adaptive` ×2: `ExactTranscripts`. All `CalibrationPass`, cleanup proven. `p3-repeat`. |
+| 4 Qwen3.8 Q5 | `QWEN38_SPECULATION=auto`, `repeatable` ×4: `ExactTranscripts` (0/28). `adaptive` ×2: `ExactTranscripts`. All `CalibrationPass`, cleanup proven. `p4-repeat`. |
+| Cost gates | Not run (operator directive 2026-11-06). |
+
 ## Audit: other timing- or width-dependent route choices
 
 Read-only audit of main after #721 (RouteAudit; review corrections applied).
