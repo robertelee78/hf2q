@@ -399,7 +399,7 @@ fn run_follow_up(
 fn run_gate(env: &str, expect_padded: bool) {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let mut loaded = load_gate_artifact(env);
-    let LoadedModel::Qwen35(qwen) = &mut loaded else {
+    let LoadedModel::Qwen35(qwen) = loaded.as_mut() else {
         unreachable!("load_gate_artifact returns a Qwen model")
     };
     if expect_padded {

@@ -598,8 +598,9 @@ pub(super) fn assert_same(reference: &TargetTrace, variant: &TargetTrace, peers:
 
 /// Load the official artifact named by `env` for a bitwise gate: native MTP
 /// head, no graft, speculation `auto` (the default repeatable route), GPU
-/// cache primed.
-pub(super) fn load_gate_artifact(env: &str) -> LoadedModel {
+/// cache primed. Boxed: the GPU cache is keyed by the model's address, so
+/// the primed model must not move after this returns.
+pub(super) fn load_gate_artifact(env: &str) -> Box<LoadedModel> {
     let path = PathBuf::from(
         std::env::var_os(env).unwrap_or_else(|| panic!("this gate requires {env}")),
     );
@@ -616,8 +617,8 @@ pub(super) fn load_gate_artifact(env: &str) -> LoadedModel {
         kv_graft_path: None,
         lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
     };
-    let mut loaded = LoadedModel::load(&options).expect("load Qwen artifact");
-    let LoadedModel::Qwen35(qwen) = &mut loaded else {
+    let mut loaded = Box::new(LoadedModel::load(&options).expect("load Qwen artifact"));
+    let LoadedModel::Qwen35(qwen) = loaded.as_mut() else {
         panic!("{env} must name a Qwen3.5-family GGUF")
     };
     assert!(
@@ -647,7 +648,7 @@ pub(super) fn assert_padded_policy(qwen: &Qwen35LoadedModel, env: &str) {
 fn run_gate(env: &str, expect_padded: bool) {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let mut loaded = load_gate_artifact(env);
-    let LoadedModel::Qwen35(qwen) = &mut loaded else {
+    let LoadedModel::Qwen35(qwen) = loaded.as_mut() else {
         unreachable!("load_gate_artifact returns a Qwen model")
     };
     if expect_padded {
