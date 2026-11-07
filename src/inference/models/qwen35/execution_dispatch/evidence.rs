@@ -355,6 +355,13 @@ pub(super) fn quantized_matmul_ggml(
             }
         } else {
             reject_source_teacher_quantized_dispatch(active.as_ref(), "GGML projection dispatch")?;
+            if let Some(result) =
+                crate::inference::models::qwen35::joint_projection::dispatch_in_scope(
+                    encoder, registry, device, input, weight, output, params,
+                )
+            {
+                return result;
+            }
             legacy_quantized_matmul_ggml(encoder, registry, device, input, weight, output, params)
         }
     })

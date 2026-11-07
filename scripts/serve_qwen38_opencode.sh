@@ -37,6 +37,10 @@ fi
 # outside this family launcher.
 export HF2Q_DECODE_MVN="${HF2Q_DECODE_MVN:-0}"
 export HF2Q_DECODE_MV_EXT="${HF2Q_DECODE_MV_EXT:-1}"
+# HF2Q_QWEN_JOINT_MMA=1 (default off, experimental) runs the padded joint
+# step's Q4_K/Q6_K layer products on mlx-native's column-invariant few-row
+# MMA kernel instead of mul_mv_ext (Q1 Class B against the mul_mv_ext route;
+# rows stay cohort-invariant). The output head stays on mul_mv_ext.
 
 case "${QWEN38_SPECULATION:-}" in
     ''|off|auto) ;;
