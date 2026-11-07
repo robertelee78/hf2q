@@ -601,9 +601,8 @@ pub(super) fn assert_same(reference: &TargetTrace, variant: &TargetTrace, peers:
 /// cache primed. Boxed: the GPU cache is keyed by the model's address, so
 /// the primed model must not move after this returns.
 pub(super) fn load_gate_artifact(env: &str) -> Box<LoadedModel> {
-    let path = PathBuf::from(
-        std::env::var_os(env).unwrap_or_else(|| panic!("this gate requires {env}")),
-    );
+    let path =
+        PathBuf::from(std::env::var_os(env).unwrap_or_else(|| panic!("this gate requires {env}")));
     assert!(path.is_file(), "{env} is not a file: {}", path.display());
     let options = LoadOptions {
         model_path: path,

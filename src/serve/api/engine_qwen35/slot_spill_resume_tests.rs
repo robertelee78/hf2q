@@ -224,12 +224,10 @@ fn serve_first_turn(
     let anchor = kv
         .snapshot_slot_anchor(slot, prompt.len())
         .unwrap_or_else(|error| panic!("{label}: prompt anchor: {error:#}"));
-    let anchor_spec = state
-        .spec_prefix_candidate(prompt.len())
-        .filter(|spec| {
-            kv.validate_speculative_cursors_for_slot(slot, spec.token_count)
-                .is_ok()
-        });
+    let anchor_spec = state.spec_prefix_candidate(prompt.len()).filter(|spec| {
+        kv.validate_speculative_cursors_for_slot(slot, spec.token_count)
+            .is_ok()
+    });
     let mut finished = false;
     for _ in 0..MAX_TARGET_TICKS {
         let outcome = state
@@ -475,7 +473,13 @@ fn run_gate(env: &str, expect_padded: bool) {
                 ticks_before_move < routes.len(),
                 "{name}: the reference finishes before tick {ticks_before_move}"
             );
-            let variant = run_moved(qwen, &target_prompt, &peer_prompts[0], dest, ticks_before_move);
+            let variant = run_moved(
+                qwen,
+                &target_prompt,
+                &peer_prompts[0],
+                dest,
+                ticks_before_move,
+            );
             let label = format!(
                 "{name}: moved to slot {} after {ticks_before_move} ticks",
                 dest.0
