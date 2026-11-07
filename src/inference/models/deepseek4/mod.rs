@@ -27,6 +27,7 @@ pub mod hyper_connection;
 mod joint_decode;
 mod joint_decode_core;
 mod joint_decode_routes;
+mod joint_decode_rows;
 pub mod model;
 mod output_forward;
 mod prefill_annotations;
@@ -62,6 +63,8 @@ mod cooperative_fault;
 mod ds4_attn_microbench_tests;
 #[cfg(test)]
 mod ds4_batch_probe_tests;
+#[cfg(test)]
+mod joint_decode_rows_tests;
 #[cfg(test)]
 mod ds4_bench_support;
 #[cfg(test)]

@@ -29,6 +29,11 @@
 //! Positions match the peer's decode FLASH_ATTN_EXT cases: context 2048 (raw kv 1280, HCA
 //! 1280+256, CSA 1280+512 with n_kv_max 640) and 8192 (CSA 1280+2048).
 //!
+//! `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES=1` times the batched cores instead (`joint_decode_rows`: one
+//! `plan_*_layer` and one rows dispatch per op for all B rows) under the same op names; the
+//! compressor tails are then inside `main_compressor` / `indexer` and get no cells of their own.
+//! Every cell records `cores` (and `matvec`).
+//!
 //! Run (standing grant, model-free, <= 15 min):
 //! ```text
 //! HF2Q_DS4_ATTN_BENCH_OUT=<cells.jsonl> cargo test --release --bin hf2q ds4_attn_microbench -- --ignored --nocapture
@@ -65,14 +70,18 @@ use super::compressed_attention_weights::{
 };
 use super::compressor_tail::{encode_indexer_tail, encode_main_tail, CompressorTail};
 use super::ds4_bench_support::{
-    bench_matvec, copies_for, f16_matrix, f32_buf, floor_cells, gpu_warmup, median, run_once,
-    time_op, Out, Rng, COLD_BYTES, TRIALS,
+    bench_cores, bench_matvec, copies_for, f16_matrix, f32_buf, floor_cells, gpu_warmup, median,
+    run_once, time_op, Out, Rng, COLD_BYTES, TRIALS,
 };
 use super::forward_support::{
     alloc, alloc_host_input, begin_decode_pool_token, end_decode_pool_token, rms_params,
 };
 use super::joint_decode_core::{
     encode_compressed_row, encode_window_row, plan_compressed_row, plan_window_row, JointRowInputs,
+};
+use super::joint_decode_rows::{
+    encode_window_layer, encode_window_writes, plan_compressed_layer, plan_window_layer, AttnCores,
+    JointBatchInputs, JointCompressedLayer, JointWindowLayer,
 };
 use super::prefill_annotations;
 use super::residency::RawMatrixRef;
@@ -81,11 +90,11 @@ use super::row_matmul::{row_matmul, row_view, RowMatmul};
 use super::Deepseek4Config;
 use crate::serve::gpu::GpuContext;
 
-const CONTEXT: usize = 8192;
+pub(super) const CONTEXT: usize = 8192;
 const MAX_ROWS: usize = 4;
-const LAYERS: usize = 43;
+pub(super) const LAYERS: usize = 43;
 
-fn ds4_ratios() -> Vec<u32> {
+pub(super) fn ds4_ratios() -> Vec<u32> {
     (0..LAYERS)
         .map(|layer| match layer {
             0 | 1 => 0,
@@ -95,20 +104,20 @@ fn ds4_ratios() -> Vec<u32> {
         .collect()
 }
 
-fn fill_bf16(buf: &mut MlxBuffer, seed: u64, scale: f32) {
+pub(super) fn fill_bf16(buf: &mut MlxBuffer, seed: u64, scale: f32) {
     let mut rng = Rng(seed);
     for v in buf.as_mut_slice::<u16>().unwrap() {
         *v = half::bf16::from_f32(rng.unit() * scale).to_bits();
     }
 }
 
-fn bf16_buf(device: &MlxDevice, shape: Vec<usize>, seed: u64, scale: f32) -> MlxBuffer {
+pub(super) fn bf16_buf(device: &MlxDevice, shape: Vec<usize>, seed: u64, scale: f32) -> MlxBuffer {
     let mut buf = alloc(device, DType::BF16, shape, "bench bf16").unwrap();
     fill_bf16(&mut buf, seed, scale);
     buf
 }
 
-fn host_table(device: &MlxDevice, values: Vec<f32>) -> MlxBuffer {
+pub(super) fn host_table(device: &MlxDevice, values: Vec<f32>) -> MlxBuffer {
     let mut buf = alloc_host_input(device, DType::F32, vec![values.len()], "bench table").unwrap();
     buf.as_logical_mut_slice::<f32>()
         .unwrap()
@@ -187,14 +196,14 @@ struct IndexerWeights {
 }
 
 /// Synthetic F16 weights of one layer as stored in the ds4 file; only what the per-row core reads.
-struct LayerWeights {
-    sinks: MlxBuffer,
+pub(super) struct LayerWeights {
+    pub(super) sinks: MlxBuffer,
     compressor: Option<CompressorWeights>,
     indexer: Option<IndexerWeights>,
 }
 
 impl LayerWeights {
-    fn new(device: &MlxDevice, cfg: &Deepseek4Config, ratio: u32, seed: u64) -> Self {
+    pub(super) fn new(device: &MlxDevice, cfg: &Deepseek4Config, ratio: u32, seed: u64) -> Self {
         let hidden = cfg.hidden_size as usize;
         let seed = seed * 64;
         let compressor = (ratio != 0).then(|| {
@@ -233,7 +242,10 @@ impl LayerWeights {
             })
     }
 
-    fn compressed<'a>(&'a self, unused: &'a Unused) -> CompressedAttentionWeightsRef<'a> {
+    pub(super) fn compressed<'a>(
+        &'a self,
+        unused: &'a Unused,
+    ) -> CompressedAttentionWeightsRef<'a> {
         let m = || RawMatrixRef {
             buffer: &unused.buffer,
             ggml_type: GgmlType::F16,
@@ -278,15 +290,15 @@ impl LayerWeights {
 }
 
 /// Stand-in for the projection tensors that the per-row core never reads.
-struct Unused {
-    buffer: MlxBuffer,
-    shape: [usize; 2],
+pub(super) struct Unused {
+    pub(super) buffer: MlxBuffer,
+    pub(super) shape: [usize; 2],
 }
 
 /// Batched projection outputs of one joint step and their per-row views (as joint decode builds them).
 struct RowBatch {
     rows: Vec<JointRowInputs>,
-    _batched: [MlxBuffer; 6],
+    batched: [MlxBuffer; 6],
 }
 
 impl RowBatch {
@@ -324,12 +336,29 @@ impl RowBatch {
             .collect();
         Self {
             rows,
-            _batched: [q_rope, kv_rope, attention, attn_norm, q_a_norm, positions],
+            batched: [q_rope, kv_rope, attention, attn_norm, q_a_norm, positions],
+        }
+    }
+
+    /// The batched buffers, as `encode_joint_attention_layer` hands them to the batched cores.
+    fn inputs(&self) -> JointBatchInputs<'_> {
+        let [q_rope, kv_rope, attention, attn_norm, q_a_norm, positions] = &self.batched;
+        JointBatchInputs {
+            q_rope,
+            kv_rope,
+            attention,
+            attn_norm,
+            q_a_norm,
+            positions,
         }
     }
 }
 
-fn synthetic_cache(device: &MlxDevice, plan: &Deepseek4CachePlan, seed: u64) -> Deepseek4Cache {
+pub(super) fn synthetic_cache(
+    device: &MlxDevice,
+    plan: &Deepseek4CachePlan,
+    seed: u64,
+) -> Deepseek4Cache {
     let mut cache = Deepseek4Cache::allocate(plan, device.clone()).unwrap();
     for (layer, lc) in cache.layers_mut().iter_mut().enumerate() {
         let seed = seed * 1000 + layer as u64 * 2;
@@ -1041,6 +1070,229 @@ fn compressed_cells(
     );
 }
 
+/// `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES=1`: the window layer's cores as joint decode issues them
+/// (`plan_window_layer`/`encode_window_layer`, one rows dispatch for all B rows), same op names.
+fn batched_window_cells(
+    ctx: &mut GpuContext,
+    out: &mut Out,
+    base: &Value,
+    case: &Case<'_>,
+    layers: &[usize],
+) {
+    let cfg = case.cfg;
+    let head_dim = cfg.head_dim as usize;
+    let device = ctx.device().clone();
+    let n = layers.len();
+    let b = case.b;
+    let positions = vec![case.position; b];
+    let caches_of = |layer: usize| (0..b).map(|row| case.lc(row, layer)).collect::<Vec<_>>();
+    let steps_of = |layer: usize| (0..b).map(|row| case.step(row, layer)).collect::<Vec<_>>();
+    let (plans, plan_us): (Vec<JointWindowLayer>, f64) = plan_rows(n, || {
+        layers
+            .iter()
+            .map(|&layer| {
+                plan_window_layer(&device, &caches_of(layer), &positions, head_dim).unwrap()
+            })
+            .collect()
+    });
+    let inputs = case.batch.inputs();
+    let t = time_op(ctx, |s, r, d, rep| {
+        let layer = layers[rep % n];
+        let sinks = &case.weights[layer].as_ref().unwrap().sinks;
+        encode_window_layer(
+            s,
+            r,
+            d,
+            cfg,
+            &caches_of(layer),
+            &steps_of(layer),
+            &plans[rep % n],
+            sinks,
+            &inputs,
+        )
+    });
+    out.cell(base, json!({"op": "core", "plan_us": plan_us}), &t);
+
+    let t = time_op(ctx, |s, r, d, rep| {
+        let layer = layers[rep % n];
+        encode_window_writes(
+            s,
+            r,
+            d,
+            cfg,
+            &caches_of(layer),
+            &steps_of(layer),
+            inputs.kv_rope,
+        )
+    });
+    out.cell(base, json!({"op": "window_write"}), &t);
+
+    let t = time_op(ctx, |s, r, d, rep| {
+        let layer = layers[rep % n];
+        let sinks = &case.weights[layer].as_ref().unwrap().sinks;
+        plans[rep % n].encode_attention(s, r, d, cfg, &caches_of(layer), sinks, &inputs)
+    });
+    out.cell(
+        base,
+        json!({"op": "attention", "kernel": "sparse_score_reduce_rows",
+               "attention_width": plans[0].widths()[0]}),
+        &t,
+    );
+}
+
+/// `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES=1`: a compressed layer's cores and sub-ops as joint decode
+/// issues them (`plan_compressed_layer` + the `JointCompressedLayer` phases), same op names as
+/// `compressed_cells` (the compressor tails are inside `main_compressor` / `indexer`).
+fn batched_compressed_cells(
+    ctx: &mut GpuContext,
+    out: &mut Out,
+    base: &Value,
+    case: &Case<'_>,
+    layers: &[usize],
+) {
+    let cfg = case.cfg;
+    let device = ctx.device().clone();
+    let n = layers.len();
+    let b = case.b;
+    let ratio = case.ratio;
+    let positions = vec![case.position; b];
+    let caches_of = |layer: usize| (0..b).map(|row| case.lc(row, layer)).collect::<Vec<_>>();
+    let steps_of = |layer: usize| (0..b).map(|row| case.step(row, layer)).collect::<Vec<_>>();
+    let grafts: Vec<usize> = (0..b).map(|row| case.caches[row].graft_slots()).collect();
+    let refs: Vec<CompressedAttentionWeightsRef<'_>> = layers
+        .iter()
+        .map(|&layer| {
+            case.weights[layer]
+                .as_ref()
+                .unwrap()
+                .compressed(case.unused)
+        })
+        .collect();
+    let (plans, plan_us): (Vec<JointCompressedLayer>, f64) = plan_rows(n, || {
+        layers
+            .iter()
+            .map(|&layer| {
+                plan_compressed_layer(
+                    &device,
+                    cfg,
+                    &caches_of(layer),
+                    &grafts,
+                    ratio,
+                    &positions,
+                    &steps_of(layer),
+                )
+                .unwrap()
+            })
+            .collect()
+    });
+    let inputs = case.batch.inputs();
+    let t = time_op(ctx, |s, r, d, rep| {
+        let layer = layers[rep % n];
+        plans[rep % n].encode(
+            s,
+            r,
+            d,
+            cfg,
+            &caches_of(layer),
+            &steps_of(layer),
+            &refs[rep % n],
+            case.frequencies,
+            &inputs,
+        )
+    });
+    out.cell(base, json!({"op": "core", "plan_us": plan_us}), &t);
+
+    let t = time_op(ctx, |s, r, d, rep| {
+        let layer = layers[rep % n];
+        encode_window_writes(
+            s,
+            r,
+            d,
+            cfg,
+            &caches_of(layer),
+            &steps_of(layer),
+            inputs.kv_rope,
+        )
+    });
+    out.cell(base, json!({"op": "window_write"}), &t);
+
+    let t = time_op(ctx, |s, r, d, rep| {
+        let layer = layers[rep % n];
+        plans[rep % n].encode_main_compressor(
+            s,
+            r,
+            d,
+            cfg,
+            &caches_of(layer),
+            &refs[rep % n].compressor,
+            case.frequencies,
+            inputs.attn_norm,
+        )
+    });
+    out.cell(base, json!({"op": "main_compressor"}), &t);
+
+    let valid = case.step(0, layers[0]).compressed_valid_after;
+    if ratio == 4 {
+        let t = time_op(ctx, |s, r, d, rep| {
+            let layer = layers[rep % n];
+            plans[rep % n].encode_indexer(
+                s,
+                r,
+                d,
+                cfg,
+                &caches_of(layer),
+                refs[rep % n].indexer.as_ref().unwrap(),
+                case.frequencies,
+                &inputs,
+            )
+        });
+        out.cell(base, json!({"op": "indexer"}), &t);
+
+        let t = time_op(ctx, |s, r, d, rep| {
+            plans[rep % n].encode_selection(s, r, d, &caches_of(layers[rep % n]))
+        });
+        out.cell(
+            base,
+            json!({"op": "indexer_select", "kernel": "indexer_rows", "index_keys": valid,
+                   "top_k": cfg.index_top_k}),
+            &t,
+        );
+
+        // The attention-only cell must read real top-k indices, not the -1 placeholders.
+        run_once(ctx, |s, r, d| {
+            for (i, plan) in plans.iter().enumerate() {
+                plan.encode_selection(s, r, d, &caches_of(layers[i]))?;
+            }
+            Ok(())
+        });
+    }
+
+    let t = time_op(ctx, |s, r, d, rep| {
+        let layer = layers[rep % n];
+        plans[rep % n].encode_attention(
+            s,
+            r,
+            d,
+            cfg,
+            &caches_of(layer),
+            refs[rep % n].attention.sinks,
+            &inputs,
+        )
+    });
+    let (width, physical_kv_len, flash) = plans[0].row_shape(0);
+    let kernel = if flash {
+        "sparse_flash_rows"
+    } else {
+        "sparse_score_reduce_rows"
+    };
+    out.cell(
+        base,
+        json!({"op": "attention", "kernel": kernel, "attention_width": width,
+               "physical_kv_len": physical_kv_len}),
+        &t,
+    );
+}
+
 /// One HC site's buffers at B rows, encoded with the calls of `encode_compressed_attention_prelude`
 /// (norm, hc_fn, split + Sinkhorn, pre) and `encode_compressed_attention_epilogue` (post).
 struct HcRows<'a> {
@@ -1373,10 +1625,19 @@ fn ds4_attn_microbench() {
                                           "position": position, "emit": emit, "valid_compressed": valid,
                                           "b": b, "warm": warm, "layers_rotated": set.len(),
                                           "peer_kv": peer_kv, "peer_n_kv_max": peer_n_kv_max});
-                        if ratio == 0 {
-                            window_cells(&mut ctx, &mut out, &base, &case, set);
-                        } else {
-                            compressed_cells(&mut ctx, &mut out, &base, &case, set);
+                        match (ratio, bench_cores()) {
+                            (0, AttnCores::PerRow) => {
+                                window_cells(&mut ctx, &mut out, &base, &case, set)
+                            }
+                            (0, AttnCores::Batched) => {
+                                batched_window_cells(&mut ctx, &mut out, &base, &case, set)
+                            }
+                            (_, AttnCores::PerRow) => {
+                                compressed_cells(&mut ctx, &mut out, &base, &case, set)
+                            }
+                            (_, AttnCores::Batched) => {
+                                batched_compressed_cells(&mut ctx, &mut out, &base, &case, set)
+                            }
                         }
                     }
                 }

@@ -22,6 +22,7 @@ use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 use serde_json::{json, Value};
 
 use super::forward_support::{alloc, raw_matmul};
+use super::joint_decode_rows::AttnCores;
 use super::residency::{MatvecKernels, RawMatrixRef};
 use crate::serve::gpu::GpuContext;
 
@@ -54,6 +55,15 @@ impl Rng {
 pub(super) fn bench_matvec() -> MatvecKernels {
     static MATVEC: std::sync::OnceLock<MatvecKernels> = std::sync::OnceLock::new();
     *MATVEC.get_or_init(|| MatvecKernels::from_env().expect("HF2Q_DEEPSEEK_ROW_EXACT_MATVEC"))
+}
+
+/// Joint-decode attention cores for the M2b cells: `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES`, read the
+/// way the model loader reads it (each cell records it).
+pub(super) fn bench_cores() -> AttnCores {
+    static CORES: std::sync::LazyLock<AttnCores> = std::sync::LazyLock::new(|| {
+        AttnCores::from_env().expect("HF2Q_DEEPSEEK_BATCHED_ATTN_CORES")
+    });
+    *CORES
 }
 
 /// Copies needed for `bytes` per copy to exceed `COLD_BYTES` (1 when warm), capped at `MIN_REPS`.
@@ -234,6 +244,7 @@ impl Out {
             }
         }
         target.insert("matvec".into(), json!(format!("{:?}", bench_matvec())));
+        target.insert("cores".into(), json!(format!("{:?}", bench_cores())));
         eprintln!("{cell}");
         writeln!(self.0, "{cell}").unwrap();
     }
