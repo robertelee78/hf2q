@@ -261,7 +261,9 @@ fn dispatch_expert_mv(
 
 /// Routing produced by one batched layer: `[rows * top_k]` expert ids and
 /// renormalized weights, row-major. Pooled; valid until the next decode-pool
-/// reset.
+/// reset. Production callers drop it; the batched-vs-serial tests read the
+/// routing back.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct MoeBatchedRouting {
     pub ids: MlxBuffer,
     pub weights: MlxBuffer,
