@@ -40,6 +40,7 @@
 //! rather than duplicate.
 
 use anyhow::{anyhow, Context, Result};
+use mlx_native::ops::flash_attn_vec_tq_hb::{TqHbDecodeRow, TqHbRowKernel};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
 pub use super::gqa_q2_policy::Qwen35TqSdpaParams;
@@ -450,6 +451,30 @@ impl FullAttnKvSlot {
         registry: &mut mlx_native::KernelRegistry,
         device: &MlxDevice,
     ) -> Result<()> {
+        let row = self.tq_decode_row_for_slot(params, slot_id, 1)?;
+        mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_rows(
+            encoder,
+            registry,
+            device,
+            &[row.bind(q, output, tmp)],
+        )
+        .map_err(|e| anyhow!("dispatch_tq_sdpa: {:?} TQ-HB attention: {e}", row.kernel))?;
+        Ok(())
+    }
+
+    /// The decode attention of `slot_id` under `params` as one of the `rows`
+    /// rows of an `mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_rows`
+    /// pass: the slot's cache views, the kernel parameters, and the kernel
+    /// (`use_gqa_q2_tq_sdpa` selects the cooperative GQA-Q2 kernel, otherwise
+    /// the scalar one; both give the same bits). A single row issues exactly
+    /// the dispatches of the single-row mlx-native call; several rows share
+    /// one barrier.
+    pub(crate) fn tq_decode_row_for_slot(
+        &self,
+        params: &Qwen35TqSdpaParams,
+        slot_id: crate::serve::multi_seq_kv::SlotId,
+        rows: usize,
+    ) -> Result<TqDecodeRow> {
         let tq = self.tq.as_ref().ok_or_else(|| {
             anyhow!(
                 "FullAttnKvSlot::dispatch_tq_sdpa: slot.tq is None — slot was \
@@ -484,7 +509,7 @@ impl FullAttnKvSlot {
             // cross-simdgroup reduce is verified at NSG=2,4.
             nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(params.kv_seq_len),
         };
-        if use_gqa_q2_tq_sdpa(params) {
+        let kernel = if use_gqa_q2_tq_sdpa(params, rows) {
             static FIRST_GQA_Q2: std::sync::Once = std::sync::Once::new();
             FIRST_GQA_Q2.call_once(|| {
                 tracing::info!(
@@ -494,36 +519,110 @@ impl FullAttnKvSlot {
                     "Qwen TQ-HB decode selected GQA-cooperative Q2 attention"
                 );
             });
-            mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_gqa(
-                encoder,
-                registry,
-                device,
-                q,
-                &views.k_packed,
-                &views.k_norms,
-                &views.v_packed,
-                &views.v_norms,
-                output,
-                tmp,
-                &kernel_params,
-                mlx_native::ops::flash_attn_vec_tq_hb::GqaTile::Q2,
-            )
-            .map_err(|e| anyhow!("dispatch_tq_sdpa: cooperative TQ-HB Q2: {e}"))?;
+            TqHbRowKernel::Gqa(mlx_native::ops::flash_attn_vec_tq_hb::GqaTile::Q2)
         } else {
-            mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
+            TqHbRowKernel::Scalar
+        };
+        Ok(TqDecodeRow {
+            views,
+            params: kernel_params,
+            kernel,
+        })
+    }
+
+    /// Write one new decode token per joint row into this layer's TQ cache:
+    /// row `r` of `k_rows` / `v_rows` (`[rows, n_kv_heads * head_dim]` F32,
+    /// rows `0..rows.len()`) lands at position `rows[r].1` of slot
+    /// `rows[r].0`, with one batched dispatch per side and no barrier.
+    ///
+    /// Each row's codes and norms are bitwise those of
+    /// [`Self::encode_seq_tokens_to_tq_for_slot`] with `n_tokens = 1` at the
+    /// same position (same Hadamard + Lloyd-Max arithmetic; only the slot and
+    /// position addressing is per row — mlx-native's batched-encode parity
+    /// gate and `test_qwen36_attn_rows`). The slots must be distinct and every
+    /// position inside the capacity. The caller orders readers of the cache
+    /// after this call with a barrier and advances the cursors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rows_to_tq(
+        &self,
+        k_rows: &MlxBuffer,
+        v_rows: &MlxBuffer,
+        rows: &[(crate::serve::multi_seq_kv::SlotId, u32)],
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_capacity: u32,
+        codebook_bits: u32,
+        encoder: &mut mlx_native::CommandEncoder,
+        registry: &mut mlx_native::KernelRegistry,
+        device: &MlxDevice,
+    ) -> Result<()> {
+        let tq = self
+            .tq
+            .as_ref()
+            .ok_or_else(|| anyhow!("encode_rows_to_tq: slot.tq is None"))?;
+        let n_seqs = tq.k_packed.shape().first().copied().unwrap_or(0);
+        for (index, &(slot_id, position)) in rows.iter().enumerate() {
+            anyhow::ensure!(
+                (slot_id.0 as usize) < n_seqs && position < cache_capacity,
+                "encode_rows_to_tq: row {index} slot {} position {position} outside \
+                 n_seqs={n_seqs}, capacity={cache_capacity}",
+                slot_id.0
+            );
+            anyhow::ensure!(
+                rows[..index].iter().all(|&(other, _)| other != slot_id),
+                "encode_rows_to_tq: slot {} appears twice",
+                slot_id.0
+            );
+        }
+        let row_elements = (n_kv_heads as usize) * (head_dim as usize);
+        anyhow::ensure!(
+            k_rows.element_count() >= rows.len() * row_elements
+                && v_rows.element_count() >= rows.len() * row_elements,
+            "encode_rows_to_tq: K/V rows hold fewer than {} rows of {row_elements}",
+            rows.len()
+        );
+        let u32_rows = |values: &mut dyn Iterator<Item = u32>, label: &str| -> Result<MlxBuffer> {
+            let mut buffer = super::decode_pool::pooled_alloc_buffer(
+                device,
+                rows.len() * std::mem::size_of::<u32>(),
+                DType::U32,
+                vec![rows.len()],
+            )
+            .map_err(|e| anyhow!("encode_rows_to_tq: allocate {label}: {e}"))?;
+            for (dst, value) in buffer
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow!("encode_rows_to_tq: map {label}: {e}"))?
+                .iter_mut()
+                .zip(values)
+            {
+                *dst = value;
+            }
+            Ok(buffer)
+        };
+        let slot_ids = u32_rows(&mut rows.iter().map(|&(slot, _)| slot.0), "slot ids")?;
+        let positions = u32_rows(&mut rows.iter().map(|&(_, position)| position), "positions")?;
+        for (side, src, packed, norms) in [
+            ("K", k_rows, &tq.k_packed, &tq.k_norms),
+            ("V", v_rows, &tq.v_packed, &tq.v_norms),
+        ] {
+            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_batched(
                 encoder,
                 registry,
-                device,
-                q,
-                &views.k_packed,
-                &views.k_norms,
-                &views.v_packed,
-                &views.v_norms,
-                output,
-                tmp,
-                &kernel_params,
+                device.metal_device(),
+                src,
+                packed,
+                norms,
+                &slot_ids,
+                &positions,
+                rows.len() as u32,
+                n_kv_heads,
+                head_dim,
+                cache_capacity,
+                false,
+                1.0,
+                codebook_bits,
             )
-            .map_err(|e| anyhow!("dispatch_tq_sdpa: flash_attn_vec_tq_hb: {e}"))?;
+            .map_err(|e| anyhow!("encode_rows_to_tq: {side} batched encode: {e}"))?;
         }
         Ok(())
     }
@@ -4314,6 +4413,37 @@ struct TqFullAttnSlotViews {
     k_norms: MlxBuffer,
     v_packed: MlxBuffer,
     v_norms: MlxBuffer,
+}
+
+/// One slot's TQ-HB decode attention, ready to bind to its Q, output and
+/// split-K scratch (see [`FullAttnKvSlot::tq_decode_row_for_slot`]).
+pub(crate) struct TqDecodeRow {
+    views: TqFullAttnSlotViews,
+    params: mlx_native::ops::flash_attn_vec_tq_hb::FlashAttnVecTqHbParams,
+    kernel: TqHbRowKernel,
+}
+
+impl TqDecodeRow {
+    /// The `flash_attn_vec_tq_hb_rows` row reading the pre-rotated `q`
+    /// (`[num_heads, head_dim]`) and writing the rotated-domain `output`.
+    pub(crate) fn bind<'a>(
+        &'a self,
+        q: &'a MlxBuffer,
+        output: &'a MlxBuffer,
+        tmp: &'a MlxBuffer,
+    ) -> TqHbDecodeRow<'a> {
+        TqHbDecodeRow {
+            q,
+            k_packed: &self.views.k_packed,
+            k_norms: &self.views.k_norms,
+            v_packed: &self.views.v_packed,
+            v_norms: &self.views.v_norms,
+            output,
+            tmp,
+            params: self.params,
+            kernel: self.kernel,
+        }
+    }
 }
 
 impl TqFullAttnKvBuffers {
