@@ -126,6 +126,11 @@ mod production {
         params: &GgmlQuantizedMatmulParams,
     ) -> mlx_native::Result<()> {
         reject_source_teacher_quantized_dispatch("GGML projection dispatch")?;
+        if let Some(result) = crate::inference::models::qwen35::joint_projection::dispatch_in_scope(
+            encoder, registry, device, input, weight, output, params,
+        ) {
+            return result;
+        }
         legacy_quantized_matmul_ggml(encoder, registry, device, input, weight, output, params)
     }
 
