@@ -80,6 +80,8 @@ mod real_artifact_joint_decode_q1_tests;
 mod real_artifact_joint_decode_witness_tests;
 #[cfg(test)]
 mod real_artifact_joint_decode_gpu_timing_tests;
+#[cfg(test)]
+mod real_artifact_moe_batched_q1_tests;
 pub mod kernels;
 pub mod kv_cache;
 pub mod model;
