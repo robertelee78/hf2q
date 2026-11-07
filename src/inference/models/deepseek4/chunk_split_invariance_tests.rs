@@ -32,6 +32,7 @@ use std::fs::File;
 use std::io::BufWriter;
 
 use mlx_native::gguf::GgufFile;
+use mlx_native::MlxBuffer;
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 
 use crate::backends::gguf::writer::GgufWriter;
@@ -571,4 +572,363 @@ enum Expect {
     Differ,
     /// Below the matrix minimum: recorded, not asserted.
     Report,
+}
+
+/// One lane of a cooperative arm: its own tokens (from `seed`), `prefix` rows
+/// prefilled solo before the cohort, then one `chunk`-row cohort chunk.
+#[derive(Clone, Copy, Debug)]
+struct Lane {
+    seed: u64,
+    prefix: usize,
+    chunk: usize,
+}
+
+fn lane_tokens(lane: Lane, vocab: u32) -> Vec<u32> {
+    let mut rng = SplitMix(lane.seed);
+    (0..lane.prefix + lane.chunk)
+        .map(|_| (rng.next() % u64::from(vocab)) as u32)
+        .collect()
+}
+
+/// A cache holding `lane`'s prefix, prefilled solo in matrix chunks of at most
+/// 2048 rows (every prefix used here splits into chunks of at least 33 rows).
+fn prefilled(model: &mut Deepseek4Model, lane: Lane, tokens: &[u32]) -> Deepseek4Cache {
+    let mut cache = model.allocate_cache(CONTEXT).unwrap();
+    let mut offset = 0;
+    while offset < lane.prefix {
+        let len = (lane.prefix - offset).min(GROUP_A_ROWS);
+        assert!(len >= MIN_MATRIX_APPEND_TOKENS || offset == 0);
+        model
+            .forward_verifier_prefill(&tokens[offset..offset + len], &mut cache)
+            .unwrap();
+        offset += len;
+    }
+    cache
+}
+
+fn lane_capture(model: &mut Deepseek4Model, cache: &Deepseek4Cache, state: &MlxBuffer) -> Capture {
+    let last = model.last_token_state(state).unwrap();
+    let logits = model.forward_logits(&last).unwrap();
+    Capture {
+        rows: bytemuck::cast_slice(state.as_logical_slice::<f32>().unwrap()).to_vec(),
+        cache: cache_bytes(cache),
+        logits: bytemuck::cast_slice(logits.as_logical_slice::<f32>().unwrap()).to_vec(),
+    }
+}
+
+fn digest(capture: &Capture) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&capture.rows);
+    for buffer in &capture.cache {
+        hasher.update(buffer.label.as_bytes());
+        hasher.update(&buffer.bytes);
+    }
+    hasher.update(&capture.logits);
+    format!("{:x}", hasher.finalize())
+}
+
+/// `lane`'s solo route: its prefix, then its chunk as one matrix transaction.
+fn solo_lane(model: &mut Deepseek4Model, lane: Lane) -> Capture {
+    let tokens = lane_tokens(lane, model.cfg.vocab_size);
+    let mut cache = prefilled(model, lane, &tokens);
+    let state = model
+        .forward_verifier_prefill(&tokens[lane.prefix..], &mut cache)
+        .unwrap();
+    assert_eq!(cache.position(), lane.prefix + lane.chunk);
+    lane_capture(model, &cache, &state)
+}
+
+/// `lanes` (in pack order) ingest their chunks as one cooperative prefill
+/// after solo prefixes; one capture per lane, in pack order.
+fn cohort_lanes(model: &mut Deepseek4Model, lanes: &[Lane]) -> Vec<Capture> {
+    let tokens: Vec<Vec<u32>> = lanes
+        .iter()
+        .map(|&lane| lane_tokens(lane, model.cfg.vocab_size))
+        .collect();
+    let mut caches: Vec<Deepseek4Cache> = lanes
+        .iter()
+        .zip(&tokens)
+        .map(|(&lane, tokens)| prefilled(model, lane, tokens))
+        .collect();
+    let batches: Vec<&[u32]> = lanes
+        .iter()
+        .zip(&tokens)
+        .map(|(lane, tokens)| &tokens[lane.prefix..])
+        .collect();
+    let states = {
+        let mut refs: Vec<&mut Deepseek4Cache> = caches.iter_mut().collect();
+        model
+            .forward_verifier_prefill_cohort(&batches, &mut refs)
+            .unwrap_or_else(|error| panic!("cohort {lanes:?}: {error:#}"))
+    };
+    lanes
+        .iter()
+        .zip(&caches)
+        .zip(&states)
+        .map(|((lane, cache), state)| {
+            assert_eq!(cache.position(), lane.prefix + lane.chunk);
+            lane_capture(model, cache, state)
+        })
+        .collect()
+}
+
+/// Lanes at different cache positions and chunk lengths (aggregate 1751 rows):
+/// lane 1 crosses the ratio-128 block at 384, lane 3 runs the ratio-4 indexer
+/// over more than `index_top_k` (512) compressed rows.
+const UNEQUAL_LANES: [Lane; 4] = [
+    Lane { seed: 0x5101, prefix: 0, chunk: 512 },
+    Lane { seed: 0x5102, prefix: 300, chunk: 333 },
+    Lane { seed: 0x5103, prefix: 1111, chunk: 129 },
+    Lane { seed: 0x5104, prefix: 2111, chunk: 777 },
+];
+
+/// Lanes at different cache positions and chunk lengths ingest one cohort
+/// chunk each: every lane equals its solo route bitwise at every pack offset,
+/// and the transaction repeats bitwise. Every lane's digest is printed
+/// (`DS4_COHORT_DIGEST`) so a second process run can be compared line for
+/// line.
+#[test]
+#[ignore = "model-free but GPU-heavy: writes a ~12 GB synthetic GGUF and runs real-shape prefill; run under the lane hold"]
+fn ds4_cohort_unequal_lanes_equal_solo_and_repeat_bitwise() {
+    const REPEATS: usize = 5;
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let cfg = config();
+    let (_directory, gguf) = write_fixture(&cfg);
+    let mut model = Deepseek4Model::load_from_gguf(&gguf).unwrap();
+    let row_bytes = (cfg.hyper_connection_count * cfg.hidden_size) as usize * 4;
+    assert!(UNEQUAL_LANES[3].prefix / 4 > cfg.index_top_k as usize);
+
+    let solo: Vec<Capture> = UNEQUAL_LANES
+        .iter()
+        .map(|&lane| solo_lane(&mut model, lane))
+        .collect();
+    for (index, capture) in solo.iter().enumerate() {
+        println!("DS4_COHORT_DIGEST arm=solo lane={index} sha={}", digest(capture));
+    }
+
+    let mut failures = Vec::new();
+    let mut check = |arm: &str, order: &[usize], captures: &[Capture]| -> Vec<String> {
+        let mut digests = Vec::new();
+        for (offset, (&lane, capture)) in order.iter().zip(captures).enumerate() {
+            let label = format!("{arm} lane={lane} offset={offset}");
+            if !compare(
+                "cohort",
+                &[UNEQUAL_LANES[lane].chunk],
+                &solo[lane],
+                capture,
+                row_bytes,
+            ) {
+                failures.push(format!("{label} differs from solo"));
+            }
+            let digest = digest(capture);
+            println!("DS4_COHORT_DIGEST arm={arm} lane={lane} offset={offset} sha={digest}");
+            digests.push(digest);
+        }
+        digests
+    };
+
+    // Every lane at every pack offset.
+    let orders: [[usize; 4]; 4] = [[0, 1, 2, 3], [1, 0, 3, 2], [3, 2, 1, 0], [2, 3, 0, 1]];
+    let mut first = Vec::new();
+    for order in orders {
+        let lanes: Vec<Lane> = order.iter().map(|&lane| UNEQUAL_LANES[lane]).collect();
+        let captures = cohort_lanes(&mut model, &lanes);
+        let digests = check(&format!("cohort{order:?}"), &order, &captures);
+        if first.is_empty() {
+            first = digests;
+        }
+    }
+
+    // Run-to-run.
+    let order = [0, 1, 2, 3];
+    let mut repeat_failures = Vec::new();
+    for repeat in 0..REPEATS {
+        let captures = cohort_lanes(&mut model, &UNEQUAL_LANES);
+        if check(&format!("repeat{repeat}"), &order, &captures) != first {
+            repeat_failures.push(format!("repeat {repeat} digests differ"));
+        }
+    }
+    failures.extend(repeat_failures);
+    println!("DS4_COHORT_EQUALITY failures={failures:?}");
+    assert!(failures.is_empty(), "cohort arms: {failures:?}");
+}
+
+/// Wall milliseconds of one cohort transaction over `lanes` (prefixes
+/// prefilled first, untimed), or of the same chunks run solo one after another
+/// when `solo` is set.
+fn timed_chunks(model: &mut Deepseek4Model, lanes: &[Lane], solo: bool) -> f64 {
+    let tokens: Vec<Vec<u32>> = lanes
+        .iter()
+        .map(|&lane| lane_tokens(lane, model.cfg.vocab_size))
+        .collect();
+    let mut caches: Vec<Deepseek4Cache> = lanes
+        .iter()
+        .zip(&tokens)
+        .map(|(&lane, tokens)| prefilled(model, lane, tokens))
+        .collect();
+    let started = std::time::Instant::now();
+    if solo {
+        for ((lane, tokens), cache) in lanes.iter().zip(&tokens).zip(caches.iter_mut()) {
+            model
+                .forward_verifier_prefill(&tokens[lane.prefix..], cache)
+                .unwrap();
+        }
+    } else {
+        let batches: Vec<&[u32]> = lanes
+            .iter()
+            .zip(&tokens)
+            .map(|(lane, tokens)| &tokens[lane.prefix..])
+            .collect();
+        let mut refs: Vec<&mut Deepseek4Cache> = caches.iter_mut().collect();
+        model
+            .forward_verifier_prefill_cohort(&batches, &mut refs)
+            .unwrap();
+    }
+    started.elapsed().as_secs_f64() * 1e3
+}
+
+/// Cohort timing microbench (model-free, five real-shape layers): wall time of
+/// one cohort transaction, including every command buffer's commit and wait,
+/// against the same chunks run solo one after another, at the S3 n4 run's
+/// shapes. Prints the median of `HF2Q_DS4_COHORT_BENCH_REPEATS` (default 5)
+/// timed runs after one warm-up; asserts nothing. Decision-grade numbers need
+/// a quiet host.
+#[test]
+#[ignore = "model-free microbench: writes a ~12 GB synthetic GGUF; run alone in a quiet window"]
+fn ds4_cohort_microbench() {
+    let repeats = std::env::var("HF2Q_DS4_COHORT_BENCH_REPEATS")
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(5);
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let cfg = config();
+    let (_directory, gguf) = write_fixture(&cfg);
+    let mut model = Deepseek4Model::load_from_gguf(&gguf).unwrap();
+    let lane = |seed, prefix, chunk| Lane {
+        seed,
+        prefix,
+        chunk,
+    };
+    // (shape, lanes): the cold wave's two cohort chunks (4 x 512 from 0, then
+    // 4 x 237 from 512), turn 2's 4 x 119 rows after 896 cached rows, and a
+    // Mixed slice of 2 x 128 rows after 1000.
+    let shapes: Vec<(&str, Vec<Lane>)> = vec![
+        (
+            "cold_4x512_at0",
+            (0..4).map(|i| lane(0x6100 + i, 0, 512)).collect(),
+        ),
+        (
+            "cold_4x237_at512",
+            (0..4).map(|i| lane(0x6110 + i, 512, 237)).collect(),
+        ),
+        (
+            "warm_4x119_at896",
+            (0..4).map(|i| lane(0x6120 + i, 896, 119)).collect(),
+        ),
+        (
+            "mixed_2x128_at1000",
+            (0..2).map(|i| lane(0x6130 + i, 1000, 128)).collect(),
+        ),
+    ];
+    let median = |mut values: Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    };
+    for (shape, lanes) in &shapes {
+        for (arm, solo) in [("solo_sum", true), ("cohort", false)] {
+            timed_chunks(&mut model, lanes, solo);
+            let times: Vec<f64> = (0..repeats)
+                .map(|_| timed_chunks(&mut model, lanes, solo))
+                .collect();
+            println!(
+                "DS4_COHORT_BENCH shape={shape} arm={arm} layers={} median_ms={:.2} min_ms={:.2} max_ms={:.2}",
+                cfg.num_hidden_layers,
+                median(times.clone()),
+                times.iter().copied().fold(f64::INFINITY, f64::min),
+                times.iter().copied().fold(0.0, f64::max),
+            );
+        }
+    }
+}
+
+/// Transient prefill scratch (`MlxBufferPool` holdings: every buffer the
+/// transaction's pool generations allocated, kept for reuse until released)
+/// of one transaction over `lanes`, run as a cohort or, with `solo`, as one
+/// solo chunk per lane. Prefixes are installed and the pool released first.
+fn transaction_scratch_bytes(model: &mut Deepseek4Model, lanes: &[Lane], solo: bool) -> usize {
+    use super::forward_support::{prefill_scratch_stats, release_prefill_scratch};
+    let tokens: Vec<Vec<u32>> = lanes
+        .iter()
+        .map(|&lane| lane_tokens(lane, model.cfg.vocab_size))
+        .collect();
+    let mut caches: Vec<Deepseek4Cache> = lanes
+        .iter()
+        .zip(&tokens)
+        .map(|(&lane, tokens)| prefilled(model, lane, tokens))
+        .collect();
+    release_prefill_scratch();
+    if solo {
+        let mut peak = 0;
+        for ((lane, tokens), cache) in lanes.iter().zip(&tokens).zip(caches.iter_mut()) {
+            model
+                .forward_verifier_prefill(&tokens[lane.prefix..], cache)
+                .unwrap();
+            peak = peak.max(prefill_scratch_stats().free_bytes);
+            release_prefill_scratch();
+        }
+        return peak;
+    }
+    let batches: Vec<&[u32]> = lanes
+        .iter()
+        .zip(&tokens)
+        .map(|(lane, tokens)| &tokens[lane.prefix..])
+        .collect();
+    let mut refs: Vec<&mut Deepseek4Cache> = caches.iter_mut().collect();
+    model
+        .forward_verifier_prefill_cohort(&batches, &mut refs)
+        .unwrap();
+    let bytes = prefill_scratch_stats().free_bytes;
+    release_prefill_scratch();
+    bytes
+}
+
+/// Peak transient prefill scratch of cohort transactions against solo chunks
+/// at the same aggregate rows (1 x 2048 vs 3 x 640 vs 4 x 512, cold and after
+/// 896 cached rows). Prints `DS4_COHORT_SCRATCH` lines and asserts that every
+/// cohort stays at or below the solo 2,048-row chunk's peak (the serving
+/// envelope a cohort may not exceed).
+#[test]
+#[ignore = "model-free but GPU-heavy: writes a ~12 GB synthetic GGUF and runs real-shape prefill; run under the lane hold"]
+fn ds4_cohort_prefill_scratch_against_solo() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let cfg = config();
+    let (_directory, gguf) = write_fixture(&cfg);
+    let mut model = Deepseek4Model::load_from_gguf(&gguf).unwrap();
+    let lane = |seed, prefix, chunk| Lane {
+        seed,
+        prefix,
+        chunk,
+    };
+    let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+    for prefix in [0, 896] {
+        let solo_2048 = transaction_scratch_bytes(&mut model, &[lane(0x8100, prefix, 2048)], true);
+        println!("DS4_COHORT_SCRATCH s0={prefix} shape=solo_1x2048 bytes={solo_2048} gib={:.3}", gib(solo_2048));
+        for (shape, lanes) in [
+            ("3x640", (0..3).map(|i| lane(0x8110 + i, prefix, 640)).collect::<Vec<_>>()),
+            ("4x512", (0..4).map(|i| lane(0x8120 + i, prefix, 512)).collect::<Vec<_>>()),
+        ] {
+            let solo = transaction_scratch_bytes(&mut model, &lanes, true);
+            println!("DS4_COHORT_SCRATCH s0={prefix} shape={shape} arm=solo_per_lane bytes={solo} gib={:.3}", gib(solo));
+            let cohort = transaction_scratch_bytes(&mut model, &lanes, false);
+            println!(
+                "DS4_COHORT_SCRATCH s0={prefix} shape={shape} arm=cohort bytes={cohort} gib={:.3} vs_solo_2048={:.3}",
+                gib(cohort),
+                cohort as f64 / solo_2048 as f64
+            );
+            assert!(
+                cohort <= solo_2048,
+                "s0={prefix} {shape} cohort holds {cohort} bytes of scratch, above the solo 2048-row chunk's {solo_2048}"
+            );
+        }
+    }
 }
