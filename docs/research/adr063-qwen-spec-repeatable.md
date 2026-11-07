@@ -4,7 +4,7 @@ Status: revised after review (ReviewSpecRep: REVISE, 10 findings, all applied). 
 
 ## Problem
 
-With speculation `auto`, identical requests can produce different transcripts. Before this change `auto` was the default for Qwen3.6 at every width, for Qwen3.8 on one slot (N1) and on 2–3 slots, and was opt-in for Qwen3.8 at 4 or more slots. There are two causes.
+With speculation `auto`, identical requests can produce different transcripts. Before this change `auto` was the default for Qwen3.6 at every width, for Qwen3.8 on one slot (N1) and on 2–3 slots, and was opt-in for Qwen3.8 at 4 or more slots. Causes 1 and 2 were known at design time; cause 3 was found by the gates.
 
 1. **Wall-time cost controllers** (`src/inference/spec_decode/cost_controller.rs`).
    - Each proposer (MTP and history lookup) learns the ordinary target-token time from `Instant` measurements.
@@ -15,8 +15,12 @@ With speculation `auto`, identical requests can produce different transcripts. B
    - A lane with MTP or history state that is joint-ready joins any joint group of two or more as an M1 row, with drafting suppressed (`qwen35_joint_decode.rs` partition, both modes).
    - Alone, or when not joint-ready, the same lane runs its serial K3 or history round.
    - Whether a lane is alone depends on when other agents' requests arrive and finish. Pending verified output, drained without a forward over the following turns, changes other lanes' cohorts too.
+3. **MTP draft race** (found 2026-11-06 by gates 2 and 3; fixed in 3179902d).
+   - The MTP attention-output encoder dispatched the sigmoid gate multiply and the `wo` projection concurrently, with no barrier.
+   - Identical K3 rounds therefore drafted different tokens in every process, even for a solo request. The K3 accept pattern, and with it which verify row committed each token, changed from run to run.
+   - Part of the earlier run-to-run `auto` divergence came from this race [INFERENCE: possibly part of T-J1-8 (b) as well]: before the fix, four same-order processes gave four route sequences per agent.
 
-T-J1-8 (b) shows this. With Qwen3.8 `auto`, the diverging turn-6 agent was always the first to arrive, and the #717 replay reproduced it (agent-0's output depended on whether it arrived first, 2/2 each way). With speculation off, arrival order did not matter.
+T-J1-8 (b) shows cause 2. With Qwen3.8 `auto`, the diverging turn-6 agent was always the first to arrive, and the #717 replay reproduced it (agent-0's output depended on whether it arrived first, 2/2 each way). With speculation off, arrival order did not matter.
 
 ## Decision (root, 2026-11-06)
 
@@ -130,11 +134,12 @@ Evidence lives under `~/.local/state/hf2q/v0130/q38-det-inv/specrep/`; the runne
 |---|---|
 | 1 Model-free | `serve::api` 1587 passed, 0 failed; `cost_controller` 7 passed; replay tool 21 passed. |
 | 2 Official-artifact | All pass: T-J1-7 (9/9 identical to off; MTP 151 proposals, history 138), the padded and exact joint gates, and both slot-independence gates (14/14 variants bitwise per family, routes identical across four processes after the MTP barrier fix; `p1-*`, `k3fix-*`). |
-| 3 Qwen3.8 replay | w4 `repeatable` and the controller arm pass: outputs byte-identical across orders 032 and 302, and every agent's route sequence identical; the controller's MTP cost-disable fired in both arms. Four same-order processes: one route sequence per agent (four before the fix). `adaptive` w4 kept outputs but changed routes across orders. w3 and w2 are invalid: anchored slots are lost below four slots, so cached-token resume differs by order (#727). `p2-20261106T232222Z`, `p2c-20261107T000712Z`. |
+| 3 Qwen3.8 replay | w4 `repeatable` and the controller arm pass: outputs byte-identical across orders 032 and 302, and every agent's route sequence identical; the controller's MTP cost-disable fired in both arms. Four same-order processes: one route sequence per agent (four before the fix). `adaptive` w4 kept outputs but changed routes across orders. That control did not split, which is weak evidence under the pre-registered rule; the Qwen3.8 pass therefore rests on route identity rather than on a contrasting output split. w3 and w2 are invalid: anchored slots are lost below four slots, so cached-token resume differs by order (#727). `p2-20261106T232222Z`, `p2c-20261107T000712Z`. |
 | 3 Qwen3.6 replay | Turn-0 order arms, joint on and off. `repeatable` passes: outputs and route sequences identical across orders, and joint on and off give the same route mix. `adaptive` with joint on reproduces the recorded agent-3 turn-0 split. `p2b-*`. |
-| 4 Qwen3.6 Q5 | Default `off` ×4: `ExactTranscripts` (0/30 groups differ). Explicit `auto`, `repeatable` ×4: `ExactTranscripts` (0/30). `adaptive` ×2: `ExactTranscripts`. All `CalibrationPass`, cleanup proven. `p3-repeat`. |
-| 4 Qwen3.8 Q5 | `QWEN38_SPECULATION=auto`, `repeatable` ×4: `ExactTranscripts` (0/28). `adaptive` ×2: `ExactTranscripts`. All `CalibrationPass`, cleanup proven. `p4-repeat`. |
+| 4 Qwen3.6 Q5 | Default `off` ×4: `ExactTranscripts` (0/30 groups differ). Explicit `auto`, `repeatable` ×4: `ExactTranscripts` (0/30). `adaptive` ×2: `ExactTranscripts`; that control did not split (weak evidence). All `CalibrationPass`, cleanup proven. `p3-repeat`. |
+| 4 Qwen3.8 Q5 | `QWEN38_SPECULATION=auto`, `repeatable` ×4: `ExactTranscripts` (0/28). `adaptive` ×2: `ExactTranscripts`; that control did not split (weak evidence; both arms ran with the MTP barrier fix). All `CalibrationPass`, cleanup proven. `p4-repeat`. |
 | Cost gates | Not run (operator directive 2026-11-06). |
+| Scope | The route decision is request-local at every width. End-to-end repeatability is shown at four slots (replay and Q5, both families) and for one request per slot. When requests outnumber slots, an anchored slot can be lost and prefix resume then differs by arrival order (#727; the host-memory resume budget, #730, can do the same). |
 
 ## Audit: other timing- or width-dependent route choices
 
