@@ -46,8 +46,9 @@ struct EngineSupervisorInner {
 }
 
 /// RAII count of one request being prepared for the worker
-/// ([`EngineSupervisor::begin_admission`]).
-pub(super) struct AdmissionGuard {
+/// ([`EngineSupervisor::begin_admission`]). Nominally `pub` so engine entry
+/// points can take it; the module is private to the API.
+pub struct AdmissionGuard {
     supervisor: EngineSupervisor,
 }
 

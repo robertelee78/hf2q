@@ -156,6 +156,34 @@ impl Deepseek4PrefillState {
         })
     }
 
+    /// Scheduler-test fixture: a prefill paused at `cursor` with its
+    /// recovery anchor at `recovery_position` and a 64-token tail. `cold`
+    /// selects a cold-wave prompt (cursor 0 at admission), else a cached one.
+    #[cfg(test)]
+    pub(crate) fn for_scheduler_tests(cursor: usize, recovery_position: usize, cold: bool) -> Self {
+        let prompt_len = recovery_position + 64;
+        Self {
+            prompt_tokens: (0..prompt_len).map(|token| (token % 120_000) as u32).collect(),
+            params: SamplingParams::default(),
+            stream: false,
+            request_started: Instant::now(),
+            prefill_started: Instant::now(),
+            progress: RequestProgress::start("cooperative-plan-test", prompt_len, 1),
+            scratch_guard: RequestScratchGuard::new(),
+            plan: Deepseek4ResumablePrefill {
+                cursor,
+                recovery_position,
+                window_multiplier: 16,
+                cached_tokens: if cold { 0 } else { cursor },
+                origin: if cold {
+                    super::Deepseek4PrefillOrigin::Cold
+                } else {
+                    super::Deepseek4PrefillOrigin::Cached
+                },
+            },
+        }
+    }
+
     /// Owning-worker metadata only; does not predict sampled decode tokens.
     pub(crate) fn f2_forward_ready(&self) -> bool {
         self.plan.cursor < self.prompt_tokens.len()
@@ -727,28 +755,10 @@ impl Deepseek4SlotState {
 
 #[cfg(test)]
 mod tests {
-    use super::super::Deepseek4PrefillOrigin;
     use super::*;
 
     fn cached_prefill_state(cursor: usize, recovery_position: usize) -> Deepseek4PrefillState {
-        Deepseek4PrefillState {
-            prompt_tokens: (0..recovery_position + 64)
-                .map(|token| (token % 120_000) as u32)
-                .collect(),
-            params: SamplingParams::default(),
-            stream: false,
-            request_started: Instant::now(),
-            prefill_started: Instant::now(),
-            progress: RequestProgress::start("cooperative-plan-test", recovery_position + 64, 1),
-            scratch_guard: RequestScratchGuard::new(),
-            plan: Deepseek4ResumablePrefill {
-                cursor,
-                recovery_position,
-                window_multiplier: 16,
-                cached_tokens: cursor,
-                origin: Deepseek4PrefillOrigin::Cached,
-            },
-        }
+        Deepseek4PrefillState::for_scheduler_tests(cursor, recovery_position, false)
     }
 
     fn thinking_budget_params(limit: usize) -> SamplingParams {

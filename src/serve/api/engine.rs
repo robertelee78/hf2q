@@ -5519,6 +5519,29 @@ impl Engine {
         prompt_tokens: Vec<u32>,
         params: SamplingParams,
     ) -> Result<GenerationResult> {
+        self.generate_with_admission(prompt_tokens, params, None)
+            .await
+    }
+
+    /// [`Self::generate`] for a request whose handler holds an admission
+    /// guard ([`Self::begin_admission`]): the guard is released right after
+    /// the request is in the worker queue (or on any earlier error).
+    pub(super) async fn generate_admitted(
+        &self,
+        prompt_tokens: Vec<u32>,
+        params: SamplingParams,
+        admission: super::engine_supervisor::AdmissionGuard,
+    ) -> Result<GenerationResult> {
+        self.generate_with_admission(prompt_tokens, params, Some(admission))
+            .await
+    }
+
+    async fn generate_with_admission(
+        &self,
+        prompt_tokens: Vec<u32>,
+        params: SamplingParams,
+        admission: Option<super::engine_supervisor::AdmissionGuard>,
+    ) -> Result<GenerationResult> {
         self.ensure_worker_healthy()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         let req = Request::Generate {
@@ -5527,7 +5550,9 @@ impl Engine {
             reply: reply_tx,
         };
         // Use `try_send` so we can distinguish queue-full from a closed worker.
-        match self.inner.tx.try_send(req) {
+        let sent = self.inner.tx.try_send(req);
+        drop(admission);
+        match sent {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 anyhow::bail!("queue_full");
@@ -5562,6 +5587,7 @@ impl Engine {
             events_tx,
             cancellation_counter,
             soft_tokens,
+            None,
             None,
             None,
         )
@@ -5606,6 +5632,7 @@ impl Engine {
         soft_tokens: Vec<SoftTokenData>,
         deepstack: Option<DeepstackData>,
         positions_flat: Option<Vec<i32>>,
+        inflight: Option<super::engine_supervisor::AdmissionGuard>,
     ) -> Result<()> {
         self.ensure_worker_healthy()?;
         let prompt_token_count = prompt_tokens.len();
@@ -5626,7 +5653,10 @@ impl Engine {
             deepstack,
             positions_flat,
         };
-        match self.inner.tx.try_send(req) {
+        // Release the handler's admission guard once the request is queued.
+        let sent = self.inner.tx.try_send(req);
+        drop(inflight);
+        match sent {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => anyhow::bail!("queue_full"),
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -9439,6 +9469,7 @@ fn run_slot_aware_deepseek4(
                     &mut scheduler,
                     registration.as_ref(),
                     handle,
+                    true,
                     serial_fallback,
                     kv_bytes_per_token,
                     None,
@@ -9527,7 +9558,10 @@ fn run_slot_aware_deepseek4(
                 admission_barrier = Deepseek4AdmissionBarrier::Idle;
                 // With decoders runnable the slice keeps the Mixed row budget:
                 // the selected lane alone, or a cohort of at most two lanes
-                // at one window each (`plan_deepseek4_prefill_cohort`).
+                // at one window each. When the only decoders are parked
+                // completions the budget is `None` and the full cohort budget
+                // applies. Either way the primary is the round-robin Mixed
+                // lane, not necessarily the scheduler's oldest prefill.
                 let (fatal, _used_serial_fallback) = advance_deepseek4_prefill_quantum(
                     &mut model,
                     &mut sessions,
@@ -9535,6 +9569,7 @@ fn run_slot_aware_deepseek4(
                     &mut scheduler,
                     registration.as_ref(),
                     prefill,
+                    false,
                     prefill,
                     kv_bytes_per_token,
                     mixed_budget.max_prefill_windows,
@@ -10083,27 +10118,31 @@ fn deepseek4_cohort_lane_rows(
         .saturating_mul(sliding_window)
 }
 
-/// Plan a cooperative prefill led by `primary`. Pure-prefill steps
-/// (`mixed_windows == None`) lead with the scheduler's oldest prefill and
-/// take up to four lanes over at most `MAX_COOPERATIVE_PREFILL_ROWS`; Mixed
-/// steps lead with the selected Mixed lane and take at most two lanes over
-/// the Mixed row budget, one window per lane.
+/// Plan a cooperative prefill led by `primary`. Without a Mixed row budget
+/// (`mixed_windows == None`: a pure-prefill step, or a Mixed step whose only
+/// decoders are parked completions) the cohort takes up to four lanes over at
+/// most `MAX_COOPERATIVE_PREFILL_ROWS`; with one it takes at most two lanes
+/// over the Mixed budget, one window per lane. Only the pure-prefill step
+/// requires `primary` to be the scheduler's oldest prefill
+/// (`require_fifo_primary`); a Mixed step leads with its round-robin lane.
+/// `cursor_of(slot)` is the slot session's `(cache position, committed
+/// tokens)`.
 fn plan_deepseek4_prefill_cohort(
-    model: &super::engine_deepseek4::Deepseek4LoadedModel,
-    sessions: &[super::engine_deepseek4::Deepseek4Session],
+    sliding_window: usize,
+    cursor_of: impl Fn(usize) -> (usize, usize),
     slots: &[Option<Deepseek4Slot>],
     scheduler: &InflightBatchedScheduler,
     primary: SlotHandle,
     mixed_windows: Option<usize>,
+    require_fifo_primary: bool,
 ) -> Result<Option<Vec<Deepseek4CooperativeCandidate>>> {
     let handles = scheduler.prefill_handles_fifo();
-    if mixed_windows.is_none() {
+    if require_fifo_primary {
         anyhow::ensure!(
             handles.first().copied() == Some(primary),
             "DeepSeek-V4 cooperative primary is not the oldest scheduler prefill"
         );
     }
-    let sliding_window = model.model.cfg.sliding_window as usize;
     anyhow::ensure!(sliding_window > 0, "DeepSeek-V4 sliding window is zero");
     let prefilling = |handle: SlotHandle| match slots
         .get(handle.slot_id.0 as usize)
@@ -10150,14 +10189,9 @@ fn plan_deepseek4_prefill_cohort(
         |width| deepseek4_cohort_lane_rows(width, sliding_window, mixed_windows),
         |index, rows| {
             let (lane, state) = lanes[index];
-            let session = &sessions[lane.handle.slot_id.0 as usize];
+            let (cache_position, committed_tokens) = cursor_of(lane.handle.slot_id.0 as usize);
             Ok(state
-                .plan_cooperative_prefill(
-                    session.cache_position(),
-                    session.committed_tokens().len(),
-                    sliding_window,
-                    rows,
-                )?
+                .plan_cooperative_prefill(cache_position, committed_tokens, sliding_window, rows)?
                 .map(|plan| (plan, plan.token_count())))
         },
     )?;
@@ -10200,19 +10234,30 @@ fn advance_deepseek4_prefill_quantum(
     scheduler: &mut InflightBatchedScheduler,
     registration: Option<&super::registry::ModelRegistration>,
     primary: SlotHandle,
+    require_fifo_primary: bool,
     serial_fallback: SlotHandle,
     kv_bytes_per_token: u64,
     max_matrix_prefill_windows: Option<usize>,
     supervisor: &EngineSupervisor,
 ) -> (Option<SlotAwareGpuFatal>, bool) {
-    let candidates = match plan_deepseek4_prefill_cohort(
-        model,
-        sessions,
-        slots,
-        scheduler,
-        primary,
-        max_matrix_prefill_windows,
-    ) {
+    let planned = {
+        let sessions = &*sessions;
+        plan_deepseek4_prefill_cohort(
+            model.model.cfg.sliding_window as usize,
+            |slot| {
+                (
+                    sessions[slot].cache_position(),
+                    sessions[slot].committed_tokens().len(),
+                )
+            },
+            slots,
+            scheduler,
+            primary,
+            max_matrix_prefill_windows,
+            require_fifo_primary,
+        )
+    };
+    let candidates = match planned {
         Ok(Some(candidates)) => candidates,
         Ok(None) => {
             return (
@@ -31780,6 +31825,78 @@ mod tests {
         .is_none());
     }
 
+    /// Review P1: a Mixed step whose only decoders are parked cold
+    /// completions has no Mixed budget (`max_prefill_windows == None`) and a
+    /// round-robin primary that is not the scheduler's oldest prefill. The
+    /// planner must cohort the stragglers (or run serially), never raise the
+    /// pure-prefill FIFO invariant that would fail-stop the worker.
+    #[test]
+    fn deepseek_mixed_step_with_only_parked_decoders_plans_from_a_round_robin_primary() {
+        use super::super::engine_deepseek4::Deepseek4PrefillState;
+        let request = AdmitRequest {
+            prompt_tokens: 757,
+            max_tokens: 1,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        };
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(4, 4, 0);
+        scheduler.set_prefill_chunk_tokens(u32::MAX);
+        let handles: Vec<SlotHandle> = (0..4)
+            .map(|_| scheduler.admit(request.clone()).unwrap().handle.unwrap())
+            .collect();
+        // Cold lanes 0 and 1 finished prefill: the scheduler counts them as
+        // decoding while the worker holds their completions parked.
+        scheduler.advance_after_prefill(handles[0], 757);
+        scheduler.advance_after_prefill(handles[1], 757);
+        match scheduler.step().unwrap() {
+            SchedulerStep::Mixed { decode_handles, .. } => {
+                assert_eq!(decode_handles, vec![handles[0], handles[1]]);
+            }
+            other => panic!("expected a Mixed step, got {other:?}"),
+        }
+        // No runnable decoder (only parked completions): no Mixed budget.
+        assert_eq!(deepseek4_mixed_work_budget(8, false, true).max_prefill_windows, None);
+        assert_eq!(scheduler.prefill_handles_fifo(), vec![handles[2], handles[3]]);
+        // Stragglers 2 (cursor 0) and 3 (cursor 512) prefill the cold wave.
+        let cursors = [0, 0, 0, 512];
+        let mut receivers = Vec::new();
+        let slots: Vec<Option<Deepseek4Slot>> = (0..4)
+            .map(|slot| {
+                (slot >= 2).then(|| {
+                    let (reply, receiver) = oneshot::channel();
+                    receivers.push(receiver);
+                    (
+                        Deepseek4SlotWork::Prefill(Deepseek4PrefillState::for_scheduler_tests(
+                            cursors[slot],
+                            749,
+                            true,
+                        )),
+                        SlotReply::Unary(reply),
+                        handles[slot],
+                    )
+                })
+            })
+            .collect();
+        let cursor_of = |slot: usize| (cursors[slot], cursors[slot]);
+        // The round-robin Mixed primary is lane 3, behind lane 2 in FIFO.
+        let primary = handles[3];
+        let cohort = plan_deepseek4_prefill_cohort(128, cursor_of, &slots, &scheduler, primary, None, false)
+            .expect("a Mixed step never raises the pure-prefill FIFO invariant")
+            .expect("both stragglers have matrix chunks");
+        let members: Vec<(SlotHandle, usize, usize)> = cohort
+            .iter()
+            .map(|candidate| (candidate.handle, candidate.plan.start(), candidate.plan.token_count()))
+            .collect();
+        assert_eq!(members, vec![(handles[3], 512, 237), (handles[2], 0, 749)]);
+        // The pure-prefill step keeps the invariant.
+        assert!(
+            plan_deepseek4_prefill_cohort(128, cursor_of, &slots, &scheduler, primary, None, true)
+                .is_err()
+        );
+        drop(receivers);
+    }
+
     #[test]
     fn deepseek_admission_barrier_is_bounded_and_free_for_a_lone_request() {
         use Deepseek4AdmissionBarrier::{Armed, Idle, Spent};
@@ -34069,6 +34186,7 @@ assistant:
                 events,
                 None,
                 Vec::new(),
+                None,
                 None,
                 None,
             )

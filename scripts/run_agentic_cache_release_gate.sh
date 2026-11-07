@@ -828,7 +828,7 @@ run_deepseek_wave() {
   local decode_cohort_transactions
   local required_tool_budget_resolutions
   local required_tool_forced_closes
-  local staggered_alignment_catchups
+  local unequal_span_cohorts
   local measurement_samples
   local measurement_duration_seconds
   local non_nominal_measurement_samples
@@ -1042,19 +1042,12 @@ run_deepseek_wave() {
     echo "DeepSeek wave $wave did not force all 16 bounded required-tool reasoning phases" >&2
     return 1
   }
-  staggered_alignment_catchups=$(rg -c \
-    'DeepSeek-V4 staggered warm prefill alignment catch-up' "$current_log" || true)
-  [[ "$staggered_alignment_catchups" =~ ^[0-9]+$ ]]
-  ((staggered_alignment_catchups > 0)) || {
-    echo "DeepSeek wave $wave observed no staggered warm-prefill alignment catch-up" >&2
-    return 1
-  }
-  awk '
-    /DeepSeek-V4 staggered warm prefill alignment catch-up/ { catchup = 1; next }
-    catchup && /DeepSeek-V4 cooperative prefill complete lanes=4 / { resumed = 1; exit }
-    END { exit(resumed ? 0 : 1) }
-  ' "$current_log" || {
-    echo "DeepSeek wave $wave did not resume a four-lane cooperative prefill after catch-up" >&2
+  # Staggered agents share cooperative prefill at their own cursors (unequal
+  # plans): require at least one cohort whose lanes ingested different spans.
+  unequal_span_cohorts=$(deepseek_unequal_span_cohorts "$current_log")
+  [[ "$unequal_span_cohorts" =~ ^[0-9]+$ ]]
+  ((unequal_span_cohorts > 0)) || {
+    echo "DeepSeek wave $wave observed no cooperative prefill across unequal lane spans" >&2
     return 1
   }
   cold_prefill_rates_json=$(
@@ -1078,16 +1071,40 @@ run_deepseek_wave() {
     --argjson decode_cohort_transactions "$decode_cohort_transactions" \
     --argjson required_tool_budget_resolutions "$required_tool_budget_resolutions" \
     --argjson required_tool_forced_closes "$required_tool_forced_closes" \
-    --argjson staggered_alignment_catchups "$staggered_alignment_catchups" \
+    --argjson unequal_span_cohorts "$unequal_span_cohorts" \
     --argjson cold_prefill_tokens_per_second "$cold_prefill_rates_json" \
     --slurpfile thermal "$thermal_summary" \
     --slurpfile receipt "$out/summary.json" \
-    '{wave:$wave,status:"pass",binary_sha256:$binary_sha256,model_sha256:$model_sha256,ready_http:200,fatal_log_signatures:0,summary_sha256:$summary_sha256,server_log_sha256:$server_log_sha256,cooperative_prefill_transactions:$cooperative_prefill_transactions,decode_cohort_transactions:$decode_cohort_transactions,required_tool_budget_resolutions:$required_tool_budget_resolutions,required_tool_forced_closes:$required_tool_forced_closes,staggered_alignment_catchups:$staggered_alignment_catchups,cold_prefill_tokens_per_second:$cold_prefill_tokens_per_second,thermal:$thermal[0],receipt:$receipt[0]}' \
+    '{wave:$wave,status:"pass",binary_sha256:$binary_sha256,model_sha256:$model_sha256,ready_http:200,fatal_log_signatures:0,summary_sha256:$summary_sha256,server_log_sha256:$server_log_sha256,cooperative_prefill_transactions:$cooperative_prefill_transactions,decode_cohort_transactions:$decode_cohort_transactions,required_tool_budget_resolutions:$required_tool_budget_resolutions,required_tool_forced_closes:$required_tool_forced_closes,unequal_span_cohorts:$unequal_span_cohorts,cold_prefill_tokens_per_second:$cold_prefill_tokens_per_second,thermal:$thermal[0],receipt:$receipt[0]}' \
     >"$out/envelope.json.tmp"
   mv "$out/envelope.json.tmp" "$out/envelope.json"
   scripts/verify_macos_thermal_receipt.sh "$wave" "$out/envelope.json" \
     "$thermal_summary" "$thermal_measurement_log" "$thermal_settle_log" \
     "$out/agents" "$contention_measurement_log" "$contention_settle_log"
+}
+
+# Count `DeepSeek-V4 cooperative prefill complete` lines whose `spans=[(slot,
+# start, rows), ...]` field lists lanes at different starts or row counts.
+deepseek_unequal_span_cohorts() {
+  { rg -o 'DeepSeek-V4 cooperative prefill complete .*spans=\[[^]]*\]' "$1" || true; } | awk '
+    {
+      spans = $0
+      sub(/.*spans=\[/, "", spans)
+      sub(/\]$/, "", spans)
+      lanes = split(spans, lane, /\), *\(/)
+      first = ""
+      unequal = 0
+      for (i = 1; i <= lanes; i++) {
+        entry = lane[i]
+        gsub(/[()]/, "", entry)
+        split(entry, field, /, */)
+        key = field[2] "," field[3]
+        if (i == 1) first = key
+        else if (key != first) unequal = 1
+      }
+      count += unequal
+    }
+    END { print count + 0 }'
 }
 
 run_deepseek_release_gates() {

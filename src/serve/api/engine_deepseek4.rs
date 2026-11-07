@@ -62,8 +62,10 @@ pub(crate) const RECOVERY_TAIL_TOKENS: usize = 8;
 /// legal matrix chunk.
 ///
 /// Chunk boundaries still vary with the route: the window multiplier that
-/// solo, Mixed, cohort width and alignment catch-up choose moves them, and
-/// only the 33-row floor is guaranteed. Route equivalence therefore rests on
+/// solo, Mixed, the Mixed cohort slice and the cohort width choose moves
+/// them (an unequal-plan cohort plans every lane at the cohort's per-lane
+/// cap, whatever the companions' cursors), and only the 33-row floor is
+/// guaranteed. Route equivalence therefore rests on
 /// matrix-chunk split invariance, shown model-free at real shapes by
 /// `chunk_split_invariance_tests` and on the release artifact by
 /// `official_artifact_prefill_route_boundary_is_route_independent` (#726).
@@ -2029,7 +2031,7 @@ mod tests {
     /// Walk one request's prompt through the serving planner the way
     /// `advance_resumable_prefill` does: matrix work up to the recovery
     /// anchor, then the anchor tail. `cap(turn)` is the window cap the route
-    /// imposes on that turn (Mixed, cohort lane rows, alignment catch-up).
+    /// imposes on that turn (Mixed, Mixed cohort slice, cohort lane rows).
     /// Returns every row's route class (`true` = matrix) and the turn count.
     fn walk_request(
         prompt: usize,
@@ -2085,17 +2087,22 @@ mod tests {
             .collect()
     }
 
-    /// Window caps per route: solo (plan only), Mixed (2 windows), cohort
-    /// lanes at widths 2/3/4 (1,024/640/512 rows), and turn-varying caps as
-    /// peers start and stop decoding or alignment catch-up trims a turn.
+    /// Window caps per route: solo (plan only), Mixed (2 windows), the Mixed
+    /// cohort slice (1 window per lane), cohort lanes at widths 2/3/4
+    /// (1,024/640/512 rows), unequal-plan cohorts whose width changes turn
+    /// by turn as companions at other cursors join, finish or reach their
+    /// tails (and Mixed turns interleave), and turn-varying caps as peers
+    /// start and stop decoding.
     fn route_policies() -> Vec<(&'static str, fn(usize) -> usize)> {
         vec![
             ("solo", (|_| usize::MAX) as fn(usize) -> usize),
             ("mixed", |_| 2),
+            ("mixed-cohort", |_| 1),
             ("cohort-2", |_| 8),
             ("cohort-3", |_| 5),
             ("cohort-4", |_| 4),
-            ("catch-up", |_| 1),
+            ("cohort-unequal", |turn| [4, 8, 5, 4, 16, 8][turn % 6]),
+            ("cohort-unequal+mixed", |turn| [4, 1, 2, 8, 1, 5, 16][turn % 7]),
             ("interleaved", |turn| [2, 16, 4, 5, 8, 1][turn % 6]),
             ("varying", |turn| 1 + (turn * 7 + 3) % 16),
         ]
