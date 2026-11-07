@@ -34,12 +34,20 @@ const NEAR_TIE_NAT: f64 = 0.10;
 /// Q1 §3.2 τ_route.
 const TAU_ROUTE_NAT: f64 = 0.25;
 /// Warm routes measured against `VecHybrid` by the envelope and localization diagnostics.
-const ENVELOPE_ROUTES: [GemmaLiveKernel; 1] = [GemmaLiveKernel::TiledF16];
+const ENVELOPE_ROUTES: [GemmaLiveKernel; 2] = [GemmaLiveKernel::TiledF16, GemmaLiveKernel::TensorF16];
 
 #[test]
 #[ignore = "official Gemma 4 GGUF: tiled F16 warm attention repeats bit for bit"]
 fn gemma_warm_tiled_attention_is_deterministic() {
     warm_route_is_deterministic(GemmaLiveKernel::TiledF16);
+}
+
+/// ADR-063 gap program F1 gate (Class A): the tensor route repeats bit for
+/// bit, and the joint cohort equals per-slot.
+#[test]
+#[ignore = "official Gemma 4 GGUF: tensor F16 warm attention repeats bit for bit"]
+fn gemma_warm_tensor_attention_is_deterministic() {
+    warm_route_is_deterministic(GemmaLiveKernel::TensorF16);
 }
 
 fn warm_route_is_deterministic(kernel: GemmaLiveKernel) {

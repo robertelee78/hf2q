@@ -36,11 +36,11 @@ pub(super) struct Packet {
 /// in `config_sha256`. `VecHybrid` is the shipped default since #544 and the
 /// kernel of every retained Gemma Q1 run; `TiledF16` must be declared.
 #[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
-pub(super) enum WarmLiveKernel {#[default] VecHybrid,TiledF16}
+pub(super) enum WarmLiveKernel {#[default] VecHybrid,TiledF16,TensorF16}
 /// Refuses a loaded model whose warm kernel is not the packet's declared one.
 pub(super) fn require_warm_kernel(declared:WarmLiveKernel,resolved:crate::inference::models::gemma4::GemmaLiveKernel)->Result<WarmLiveKernel> {
     use crate::inference::models::gemma4::GemmaLiveKernel as K;
-    let resolved=match resolved {K::VecHybrid=>WarmLiveKernel::VecHybrid,K::TiledF16=>WarmLiveKernel::TiledF16};
+    let resolved=match resolved {K::VecHybrid=>WarmLiveKernel::VecHybrid,K::TiledF16=>WarmLiveKernel::TiledF16,K::TensorF16=>WarmLiveKernel::TensorF16};
     ensure!(resolved==declared,"resolved Gemma warm live kernel {resolved:?} differs from the packet's {declared:?} (absent = shipped VecHybrid)");
     Ok(resolved)
 }
