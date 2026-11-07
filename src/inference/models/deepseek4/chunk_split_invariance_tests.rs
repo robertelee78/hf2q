@@ -844,3 +844,98 @@ fn ds4_cohort_executor_microbench() {
         }
     }
 }
+
+/// Transient prefill scratch (`MlxBufferPool` holdings: every buffer the
+/// transaction's pool generations allocated, kept for reuse until released)
+/// of one transaction over `lanes`, run as a cohort or, with `solo`, as one
+/// solo chunk per lane. Prefixes are installed and the pool released first.
+fn transaction_scratch_bytes(model: &mut Deepseek4Model, lanes: &[Lane], solo: bool) -> usize {
+    use super::forward_support::{prefill_scratch_stats, release_prefill_scratch};
+    let tokens: Vec<Vec<u32>> = lanes
+        .iter()
+        .map(|&lane| lane_tokens(lane, model.cfg.vocab_size))
+        .collect();
+    let mut caches: Vec<Deepseek4Cache> = lanes
+        .iter()
+        .zip(&tokens)
+        .map(|(&lane, tokens)| prefilled(model, lane, tokens))
+        .collect();
+    release_prefill_scratch();
+    if solo {
+        let mut peak = 0;
+        for ((lane, tokens), cache) in lanes.iter().zip(&tokens).zip(caches.iter_mut()) {
+            model
+                .forward_verifier_prefill(&tokens[lane.prefix..], cache)
+                .unwrap();
+            peak = peak.max(prefill_scratch_stats().free_bytes);
+            release_prefill_scratch();
+        }
+        return peak;
+    }
+    let batches: Vec<&[u32]> = lanes
+        .iter()
+        .zip(&tokens)
+        .map(|(lane, tokens)| &tokens[lane.prefix..])
+        .collect();
+    let mut refs: Vec<&mut Deepseek4Cache> = caches.iter_mut().collect();
+    model
+        .forward_verifier_prefill_cohort(&batches, &mut refs)
+        .unwrap();
+    let bytes = prefill_scratch_stats().free_bytes;
+    release_prefill_scratch();
+    bytes
+}
+
+/// Peak transient prefill scratch of cohort transactions against solo chunks
+/// at the same aggregate rows (1 x 2048 vs 3 x 640 vs 4 x 512, cold and after
+/// 896 cached rows), per executor and layer-group size. Prints
+/// `DS4_COHORT_SCRATCH` lines and asserts that every cohort arm stays at or
+/// below the solo 2,048-row chunk's peak (the serving envelope a cohort may
+/// not exceed).
+#[test]
+#[ignore = "model-free but GPU-heavy: writes a ~12 GB synthetic GGUF and runs real-shape prefill; run under the lane hold"]
+fn ds4_cohort_prefill_scratch_against_solo() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let cfg = config();
+    let (_directory, gguf) = write_fixture(&cfg);
+    let mut model = Deepseek4Model::load_from_gguf(&gguf).unwrap();
+    let lane = |seed, prefix, chunk| Lane {
+        seed,
+        prefix,
+        chunk,
+    };
+    let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+    for prefix in [0, 896] {
+        let solo_2048 = transaction_scratch_bytes(&mut model, &[lane(0x8100, prefix, 2048)], true);
+        println!("DS4_COHORT_SCRATCH s0={prefix} shape=solo_1x2048 bytes={solo_2048} gib={:.3}", gib(solo_2048));
+        for (shape, lanes) in [
+            ("3x640", (0..3).map(|i| lane(0x8110 + i, prefix, 640)).collect::<Vec<_>>()),
+            ("4x512", (0..4).map(|i| lane(0x8120 + i, prefix, 512)).collect::<Vec<_>>()),
+        ] {
+            let solo = transaction_scratch_bytes(&mut model, &lanes, true);
+            println!("DS4_COHORT_SCRATCH s0={prefix} shape={shape} arm=solo_per_lane bytes={solo} gib={:.3}", gib(solo));
+            let previous = super::verifier_forward::set_per_session_cohort_executor(true);
+            let per_session = transaction_scratch_bytes(&mut model, &lanes, false);
+            super::verifier_forward::set_per_session_cohort_executor(previous);
+            println!("DS4_COHORT_SCRATCH s0={prefix} shape={shape} arm=per_session bytes={per_session} gib={:.3}", gib(per_session));
+            for group in ["1", "2", "4"] {
+                std::env::set_var("HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB", group);
+                let grouped = transaction_scratch_bytes(&mut model, &lanes, false);
+                std::env::remove_var("HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB");
+                println!(
+                    "DS4_COHORT_SCRATCH s0={prefix} shape={shape} arm=grouped_layers_per_cb_{group} bytes={grouped} gib={:.3} vs_solo_2048={:.3}",
+                    gib(grouped),
+                    grouped as f64 / solo_2048 as f64
+                );
+                assert!(
+                    grouped <= solo_2048,
+                    "s0={prefix} {shape} grouped (layers per command buffer {group}) holds {grouped} bytes of scratch, above the solo 2048-row chunk's {solo_2048}"
+                );
+            }
+            assert!(
+                per_session <= solo_2048,
+                "s0={prefix} {shape} per-session cohort scratch {per_session} exceeds solo 2048 {solo_2048}"
+            );
+        }
+    }
+}

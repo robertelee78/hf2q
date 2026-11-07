@@ -750,39 +750,45 @@ impl Deepseek4Model {
                                 )
                             })?;
                         for layer in start..end {
-                            // One pool generation per layer, as in the solo
-                            // multi-layer graph: lanes of a layer never share
-                            // scratch; the next layer may recycle it, ordered
-                            // by the range-derived WAR barriers.
-                            begin_prefill_pool_layer();
-                            let layer_result: Result<MlxBuffer> = (|| {
-                                for sequence in 0..token_batches.len() {
-                                    self.encode_cooperative_lane_attention(
-                                        &mut session,
-                                        &lanes,
-                                        caches,
-                                        sequence,
-                                        layer,
-                                        state.as_ref(),
-                                        &combined_attention,
-                                    )?;
-                                }
-                                self.encode_cooperative_ffn(
+                            // One pool generation per lane attention and one
+                            // for the packed FFN, as the per-session executor
+                            // and the solo graph's per-layer generations do:
+                            // a later lane or layer recycles earlier scratch
+                            // inside the command buffer, ordered after every
+                            // earlier reader and writer by the range-derived
+                            // WAR/WAW barriers. Peak scratch is one lane's
+                            // attention or the packed FFN, not the sum over
+                            // lanes (which exceeded a solo 2,048-row chunk).
+                            for sequence in 0..token_batches.len() {
+                                begin_prefill_pool_layer();
+                                let lane_result = self.encode_cooperative_lane_attention(
                                     &mut session,
                                     &lanes,
-                                    &combined_attention,
-                                    &combined_tokens,
+                                    caches,
+                                    sequence,
                                     layer,
-                                    &mut completion,
-                                    reusable_states[layer % reusable_states.len()].clone(),
-                                    id_mm_scratch.as_mut(),
-                                )
-                            })();
-                            if layer_result.is_ok() && layer + 1 < end {
+                                    state.as_ref(),
+                                    &combined_attention,
+                                );
+                                end_prefill_pool_layer();
+                                lane_result?;
+                            }
+                            begin_prefill_pool_layer();
+                            let ffn_result = self.encode_cooperative_ffn(
+                                &mut session,
+                                &lanes,
+                                &combined_attention,
+                                &combined_tokens,
+                                layer,
+                                &mut completion,
+                                reusable_states[layer % reusable_states.len()].clone(),
+                                id_mm_scratch.as_mut(),
+                            );
+                            if ffn_result.is_ok() && layer + 1 < end {
                                 session.barrier();
                             }
                             end_prefill_pool_layer();
-                            state = Some(layer_result?);
+                            state = Some(ffn_result?);
                         }
                         // Encoding errors above drop an uncommitted command
                         // buffer. Once the commit begins, cache writes may have
