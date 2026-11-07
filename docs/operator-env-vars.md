@@ -294,7 +294,8 @@ tiled route was evaluated and falsified (ADR-063 Q4-GEMMA-ATTN,
 `HF2Q_GEMMA_DECODE_DENSE` selects the kernel of the dense GGUF matmuls of
 Gemma 4 decode (attention q/k/v/o, dense FFN gate/up/down and the lm head) in
 the solo decode, the `[N,hidden]` batched body, the batched and fused lm head,
-and the speculative verify heads and tree-verify layers (ADR-063
+the speculative verify heads and tree-verify layers, and the prefill
+first-token head, so every logit row comes from the same per-row kernel (ADR-063
 Q4-GEMMA-DECODE op parity). It is read once per process, at model load.
 - **Unset or `stock` (default):** the existing routes.
 - **`row_exact`:** the row-exact few-row mat-vec (`row_exact_matvec`) for
@@ -310,8 +311,8 @@ Under `row_exact` and `mma` each row's result is bitwise the same however many
 rows share the dispatch, so a slot's logits do not depend on the decode width
 or path; products wider than 8 rows run in chunks of at most 8 rows. Whether a
 weight takes the kernel depends on the weight alone, never on the width; every
-other weight (F32 router, F16/BF16, other types) and prefill keep their
-routes. `/hf2q/v1/runtime` publishes the resolved kernel (`Stock`,
+other weight (F32 router, F16/BF16, other types) and the other prefill
+matmuls keep their routes. `/hf2q/v1/runtime` publishes the resolved kernel (`Stock`,
 `RowExact` or `ColumnInvariantMma`) as
 `measurement_snapshot.active_controls.gemma_decode_dense_kernel`; Gemma Q1
 endpoint and localizer packets declare it as `decode_dense_kernel`.

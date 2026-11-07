@@ -5197,7 +5197,9 @@ impl MlxModelWeights {
                 &[&self.activations.norm_out, &lm_head.buffer],
                 &[&self.activations.logits],
             );
-            crate::serve::forward_mlx_shared::dispatch_qmatmul(
+            // m=1 head row: same per-row kernel as every decode head
+            // (`HF2Q_GEMMA_DECODE_DENSE`).
+            crate::inference::models::gemma4::decode_dense::dispatch_decode_dense(
                 &mut s,
                 reg,
                 dev,

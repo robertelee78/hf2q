@@ -6,8 +6,9 @@
 //! The selector covers every decode-width GGUF dense matmul of Gemma 4 —
 //! attention q/k/v/o, dense FFN gate/up/down and the lm head — in the solo
 //! decode, the `[N,hidden]` batched body, the batched/fused lm head, the
-//! kernel-profile decode, and the speculative verify heads and tree-verify
-//! layers:
+//! kernel-profile decode, the speculative verify heads and tree-verify
+//! layers, and the m=1 prefill first-token head, so every logit row the model
+//! emits comes from the same per-row kernel:
 //! - `stock`: the existing `dispatch_qmatmul` / encoder routes.
 //! - `row_exact`: `mlx_native::ops::row_exact_matvec` (row-exact across
 //!   m = 1..8).
@@ -22,8 +23,8 @@
 //! Admission ([`route`]) depends on the weight alone — (type, N, K), its
 //! storage and its start alignment — never on `m`; a weight the selected
 //! kernel does not admit keeps the stock route at every width. Router
-//! projections (F32), F16/BF16, affine weights, expert matmuls and prefill are
-//! not routed here. The resolved kernel is published as
+//! projections (F32), F16/BF16, affine weights, expert matmuls and the other
+//! (m > 8) prefill matmuls are not routed here. The resolved kernel is published as
 //! `active_controls.gemma_decode_dense_kernel` in `/hf2q/v1/runtime` and
 //! declared as `decode_dense_kernel` in ADR-063 Gemma Q1 packets.
 use std::sync::LazyLock;
