@@ -86,6 +86,25 @@ use mlx_native::ops::rms_norm;
 mod joint_decode;
 pub(crate) use joint_decode::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput};
 
+/// Joint MTP verify windows and their replay commit run the joint graph.
+#[path = "joint_verify.rs"]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the joint MTP scheduler (H4) is the production caller; until it lands only tests call the verify window"
+    )
+)]
+mod joint_verify;
+#[cfg_attr(
+    not(test),
+    allow(
+        unused_imports,
+        reason = "the joint MTP scheduler (H4) is the production caller; until it lands only tests call the verify window"
+    )
+)]
+pub(crate) use joint_verify::Qwen35JointVerifyLane;
+
 /// Large Qwen prefills are intentionally drained at every layer boundary.
 /// K>1 is a decode/short-row throughput optimization; on a substantial
 /// prompt it widens the asynchronous error-observation window after a Metal

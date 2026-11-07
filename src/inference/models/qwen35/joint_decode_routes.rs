@@ -138,6 +138,26 @@ pub(crate) fn joint_mode_max_rows(mode: JointRouteMode, requested: usize) -> usi
     }
 }
 
+/// Packed width of a joint MTP verify step with `rows` real rows (the lane
+/// windows, `1..=`[`MAX_JOINT_DECODE_ROWS`]). Exact steps pack only real
+/// rows: their products are bitwise one-row at every admitted width. The
+/// padded mode packs 4 rows up to 4 real rows and 8 above. At `m = 4` and
+/// `m = 8` the canonical `mul_mv_ext` products and the output head use the
+/// same tile (`r1ptg` 4, `nxpsg` 8) as the spec-off width-4 step, whose rows
+/// they must reproduce; `m = 5, 6, 7` would select other tiles or a partial
+/// tile. The column-invariant MMA products are invariant at any `m <= 8`.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the joint MTP verify window's production caller is H4")
+)]
+pub(crate) fn joint_verify_padded_width(mode: JointRouteMode, rows: usize) -> usize {
+    match mode {
+        JointRouteMode::Exact => rows,
+        JointRouteMode::PaddedMvExt if rows <= PADDED_MV_EXT_WIDTH => PADDED_MV_EXT_WIDTH,
+        JointRouteMode::PaddedMvExt => MAX_JOINT_DECODE_ROWS,
+    }
+}
+
 /// Block storage whose packed route is proven (or, for `PaddedMvExt`,
 /// width-consistent) on the default matvec family.
 fn packed_block_type(ggml_type: GgmlType) -> bool {
@@ -301,6 +321,19 @@ mod tests {
         assert!(check_mode_policy(JointRouteMode::Exact, on).is_err());
         assert!(check_mode_policy(JointRouteMode::Exact, off).is_ok());
         assert!(check_mode_policy(JointRouteMode::PaddedMvExt, on).is_ok());
+    }
+
+    #[test]
+    fn verify_width_keeps_the_spec_off_tile() {
+        for rows in 1..=MAX_JOINT_DECODE_ROWS {
+            assert_eq!(
+                joint_verify_padded_width(JointRouteMode::Exact, rows),
+                rows
+            );
+            let padded = joint_verify_padded_width(JointRouteMode::PaddedMvExt, rows);
+            assert!(padded >= rows);
+            assert_eq!(padded, if rows <= 4 { 4 } else { 8 });
+        }
     }
 
     #[test]
