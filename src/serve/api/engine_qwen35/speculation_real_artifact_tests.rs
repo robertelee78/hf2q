@@ -28,7 +28,6 @@
 //! must stop on EOS, so the comparison is not vacuous.
 //!
 //! ```text
-//! HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 \
 //! HF2Q_QWEN38_GGUF=/abs/Qwen3.8-27B-vanilla.gguf \
 //!   cargo test --release --lib qwen38_slot_aware_speculation_auto_matches_off \
 //!   -- --ignored --exact --nocapture --test-threads=1
