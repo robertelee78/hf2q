@@ -33,7 +33,9 @@ use super::decode_pool;
 use super::ffn::MoeFfnShape;
 use super::gpu_ffn::{build_moe_ffn_layer_gpu_q_into, MoeDenseStorage, MoeFfnWeightsGpuQ};
 use super::gpu_full_attn::{upload_bf16_from_f32, upload_f32};
-use super::moe_batched::build_moe_ffn_layer_gpu_batched_into;
+use super::moe_batched::{
+    build_moe_ffn_layer_gpu_batched_into, build_moe_ffn_layer_gpu_batched_route_into, MoeExpertRoute,
+};
 
 const H: usize = 2048;
 const NE: usize = 256;
@@ -498,6 +500,80 @@ fn batched_rows_equal_single_row_route_bitwise_down_q6_k() {
 #[test]
 fn batched_rows_equal_single_row_route_bitwise_down_q4_k() {
     batched_equals_serial(GgmlType::Q4_K, 0x36_04);
+}
+
+/// One layer over `rows` packed rows on an explicit expert route, with or
+/// without a residual; the output bits.
+#[allow(clippy::too_many_arguments)]
+fn run_route(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    weights: &MoeFfnWeightsGpuQ,
+    x: &[Vec<f32>],
+    residual: &[Vec<f32>],
+    select: &[usize],
+    with_residual: bool,
+    route: MoeExpertRoute,
+) -> Vec<u32> {
+    decode_pool::checked_reset_decode_pool().expect("reset decode pool");
+    let r = select.len();
+    let xin = packed(x, select, device);
+    let res = packed(residual, select, device);
+    let mut out = device.alloc_buffer(r * H * 4, DType::F32, vec![r, H]).expect("alloc out");
+    let mut enc = device.command_encoder().expect("encoder");
+    build_moe_ffn_layer_gpu_batched_route_into(
+        &mut enc,
+        device,
+        registry,
+        &xin,
+        weights,
+        shape(),
+        with_residual.then_some(&res),
+        &mut out,
+        r as u32,
+        0,
+        route,
+    )
+    .expect("batched MoE layer");
+    enc.commit_and_wait_labeled("test.qwen.moe_batched.route").expect("commit");
+    bits(out.as_slice::<f32>().expect("read out"))
+}
+
+/// F5 (fused gate+up+SwiGLU, fused down+reduce) is bitwise the F2b layer.
+fn fused_equals_unfused(down_t: GgmlType, seed: u64) {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let layer = Layer::random(down_t, seed);
+    let weights = layer.gpu(&device, true, &layer.gpu_experts(&device));
+    assert_eq!(MoeExpertRoute::for_layer(&weights, shape()), MoeExpertRoute::Fused);
+    let (x, residual) = rows(8, seed ^ 0x5eed);
+    let mut selects: Vec<Vec<usize>> = (1..=8).map(|w| (0..w).collect()).collect();
+    selects.extend([vec![5], vec![7, 0, 5, 2], vec![6, 4, 6]]);
+    for select in &selects {
+        for with_residual in [true, false] {
+            let run = |registry: &mut KernelRegistry, route| {
+                run_route(&device, registry, &weights, &x, &residual, select, with_residual, route)
+            };
+            let fused = run(&mut registry, MoeExpertRoute::Fused);
+            let unfused = run(&mut registry, MoeExpertRoute::Unfused);
+            assert_eq!(
+                fused, unfused,
+                "{down_t:?} rows {select:?} residual={with_residual}: F5 differs from F2b"
+            );
+        }
+    }
+    eprintln!("moe_batched {down_t:?}: F5 == F2b bitwise over {} row sets x residual on/off", selects.len());
+}
+
+#[test]
+fn fused_f5_layer_equals_unfused_f2b_layer_bitwise_down_q6_k() {
+    fused_equals_unfused(GgmlType::Q6_K, 0xf5_06);
+}
+
+#[test]
+fn fused_f5_layer_equals_unfused_f2b_layer_bitwise_down_q4_k() {
+    fused_equals_unfused(GgmlType::Q4_K, 0xf5_04);
 }
 
 const REFERENCE_ROWS: usize = 32;
