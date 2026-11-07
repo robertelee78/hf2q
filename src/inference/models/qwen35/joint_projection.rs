@@ -32,6 +32,12 @@ use super::joint_decode_routes::JointRouteMode;
 /// `mul_mv_ext`.
 pub(crate) const QWEN_JOINT_MMA_ENV: &str = "HF2Q_QWEN_JOINT_MMA";
 
+/// Switch for [`JointStepOptions::pooled_outputs`]: `1`/`on`/`true` takes the
+/// joint layer chain's multi-row outputs from the decode pool
+/// ([`super::decode_pool::StepPooledOutputs`]); unset, blank or
+/// `0`/`off`/`false` keeps fresh device allocations. Either mode.
+pub(crate) const QWEN_JOINT_POOLED_OUTPUTS_ENV: &str = "HF2Q_QWEN_JOINT_POOLED_OUTPUTS";
+
 /// K step of the MMA kernel's generic (Q4_K / Q6_K) kind.
 const MMA_K_STEP: u32 = 64;
 
@@ -44,8 +50,28 @@ pub(crate) enum JointProjectionKernel {
     ColumnInvariantMma,
 }
 
-/// Parse [`QWEN_JOINT_MMA_ENV`]; unset or blank means off.
-pub(crate) fn parse_joint_mma(raw: Option<&str>) -> Result<bool, String> {
+/// Per-step execution choices of a joint step that its route mode does not
+/// fix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JointStepOptions {
+    pub projection: JointProjectionKernel,
+    /// Multi-row layer outputs from the decode pool (Class A).
+    pub pooled_outputs: bool,
+}
+
+impl JointStepOptions {
+    /// The switches over the process environment for `mode`.
+    pub(crate) fn from_process(mode: JointRouteMode) -> Result<Self, String> {
+        let read = |name: &str| parse_switch(name, std::env::var(name).ok().as_deref());
+        Ok(Self {
+            projection: select_joint_projection_kernel(mode, read(QWEN_JOINT_MMA_ENV)?),
+            pooled_outputs: read(QWEN_JOINT_POOLED_OUTPUTS_ENV)?,
+        })
+    }
+}
+
+/// Parse an on/off switch named `name`; unset or blank means off.
+pub(crate) fn parse_switch(name: &str, raw: Option<&str>) -> Result<bool, String> {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
         return Ok(false);
     };
@@ -53,7 +79,7 @@ pub(crate) fn parse_joint_mma(raw: Option<&str>) -> Result<bool, String> {
         "1" | "on" | "true" => Ok(true),
         "0" | "off" | "false" => Ok(false),
         _ => Err(format!(
-            "{QWEN_JOINT_MMA_ENV} must be 1/on/true or 0/off/false, got {raw:?}"
+            "{name} must be 1/on/true or 0/off/false, got {raw:?}"
         )),
     }
 }
@@ -68,14 +94,6 @@ pub(crate) fn select_joint_projection_kernel(
         JointRouteMode::PaddedMvExt if mma => JointProjectionKernel::ColumnInvariantMma,
         JointRouteMode::Exact | JointRouteMode::PaddedMvExt => JointProjectionKernel::Canonical,
     }
-}
-
-/// [`select_joint_projection_kernel`] over the process environment.
-pub(crate) fn joint_projection_kernel_from_process(
-    mode: JointRouteMode,
-) -> Result<JointProjectionKernel, String> {
-    let mma = parse_joint_mma(std::env::var(QWEN_JOINT_MMA_ENV).ok().as_deref())?;
-    Ok(select_joint_projection_kernel(mode, mma))
 }
 
 thread_local! {
@@ -139,15 +157,16 @@ mod tests {
 
     #[test]
     fn switch_parses_on_off_and_rejects_other_values() {
-        assert_eq!(parse_joint_mma(None), Ok(false));
-        assert_eq!(parse_joint_mma(Some("  ")), Ok(false));
+        let parse = |raw| parse_switch(QWEN_JOINT_MMA_ENV, raw);
+        assert_eq!(parse(None), Ok(false));
+        assert_eq!(parse(Some("  ")), Ok(false));
         for on in ["1", "on", "TRUE"] {
-            assert_eq!(parse_joint_mma(Some(on)), Ok(true));
+            assert_eq!(parse(Some(on)), Ok(true));
         }
         for off in ["0", "off", "False"] {
-            assert_eq!(parse_joint_mma(Some(off)), Ok(false));
+            assert_eq!(parse(Some(off)), Ok(false));
         }
-        assert!(parse_joint_mma(Some("mma")).is_err());
+        assert!(parse(Some("mma")).is_err());
     }
 
     #[test]

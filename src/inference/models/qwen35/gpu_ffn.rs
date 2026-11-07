@@ -1281,7 +1281,7 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     //     and it is not consumed across decode tokens (output head consumes it
     //     within the same token via `apply_output_head_gpu_greedy`).  Keeps the
     //     W-5b.14 fully-pooled decode path bit-for-bit when residual=None.
-    let mut down_out = if seq_len == 1 {
+    let mut down_out = if seq_len == 1 || super::decode_pool::step_pooled_outputs() {
         super::decode_pool::pooled_alloc_buffer(
             device,
             n_out * 4,
@@ -1522,7 +1522,7 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     // above — device-alloc at prefill (survives per-layer reset), pooled at
     // decode (recycled by the per-token `reset_decode_pool`).
     let result = if let Some(res) = add_residual {
-        let sum_buf = if seq_len == 1 {
+        let sum_buf = if seq_len == 1 || super::decode_pool::step_pooled_outputs() {
             super::decode_pool::pooled_alloc_buffer(device, n_out * 4, DType::F32, vec![n_out])
                 .map_err(|e| anyhow!("alloc dense_q residual sum (pooled, decode): {e}"))?
         } else {

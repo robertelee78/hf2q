@@ -51,7 +51,7 @@ use crate::inference::models::qwen35::joint_decode_routes::{
     JointRoutingEnvironment, MAX_JOINT_DECODE_ROWS,
 };
 use crate::inference::models::qwen35::joint_projection::{
-    joint_projection_kernel_from_process, JointProjectionKernel, JointProjectionScope,
+    JointProjectionKernel, JointProjectionScope, JointStepOptions,
 };
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
 use crate::inference::models::qwen35::model::Qwen35Model;
@@ -240,6 +240,23 @@ impl Qwen35Model {
         mode: JointRouteMode,
         dense_ffn: JointDenseFfnRoute,
     ) -> Result<Vec<Qwen35JointRowOutput>> {
+        let options = JointStepOptions::from_process(mode)
+            .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
+        self.forward_gpu_decode_joint_with_options(rows, kv_cache, mode, dense_ffn, options)
+    }
+
+    /// [`Self::forward_gpu_decode_joint`] with the step options given instead
+    /// of read from their switches (the Q1 trace runs several in one
+    /// process). The column-invariant MMA kernel is admitted only in the
+    /// padded mode.
+    pub(crate) fn forward_gpu_decode_joint_with_options(
+        &self,
+        rows: &[Qwen35JointRow],
+        kv_cache: &mut HybridKvCache,
+        mode: JointRouteMode,
+        dense_ffn: JointDenseFfnRoute,
+        options: JointStepOptions,
+    ) -> Result<Vec<Qwen35JointRowOutput>> {
         let max_rows = joint_mode_max_rows(mode, MAX_JOINT_DECODE_ROWS);
         ensure!(
             (1..=max_rows).contains(&rows.len()),
@@ -285,8 +302,12 @@ impl Qwen35Model {
             .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
         check_dense_ffn_route(mode, dense_ffn)
             .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
-        let projection_kernel = joint_projection_kernel_from_process(mode)
-            .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
+        ensure!(
+            options.projection == JointProjectionKernel::Canonical
+                || mode == JointRouteMode::PaddedMvExt,
+            "Qwen joint decode unavailable: the column-invariant MMA projections are \
+             admitted only in the padded mode"
+        );
         self.ensure_gpu_cache_primed()?;
 
         let pool_operation = decode_pool::profile::Operation::enter(self as *const _ as usize)?;
@@ -320,7 +341,7 @@ impl Qwen35Model {
                 kv_cache,
                 mode,
                 dense_ffn,
-                projection_kernel,
+                options,
             )
         });
         pool_operation.complete()?;
@@ -339,7 +360,7 @@ impl Qwen35Model {
         kv_cache: &mut HybridKvCache,
         mode: JointRouteMode,
         dense_ffn: JointDenseFfnRoute,
-        projection_kernel: JointProjectionKernel,
+        options: JointStepOptions,
     ) -> Result<Vec<Qwen35JointRowOutput>> {
         let cfg = &self.cfg;
         let hidden_size = cfg.hidden_size;
@@ -413,8 +434,10 @@ impl Qwen35Model {
         let mut hidden = embedded;
         let mut retained = Vec::with_capacity(n_layers);
         let mut chain: Option<CommandEncoder> = None;
-        // Packed layer products only; the output head stays canonical.
-        let projection_scope = JointProjectionScope::enter(projection_kernel, width_u32);
+        // Layer chains only; the output head stays canonical and allocates
+        // its outputs as before.
+        let projection_scope = JointProjectionScope::enter(options.projection, width_u32);
+        let pooled_scope = decode_pool::StepPooledOutputs::enter(options.pooled_outputs);
         for (layer_idx, (weights, routes)) in layer_weights.iter().zip(&plan.layers).enumerate() {
             if let Some(enc) = chain.as_mut() {
                 // Cross-layer RAW: this layer reads the previous FFN output.
@@ -570,6 +593,7 @@ impl Qwen35Model {
         if let Some(mut enc) = chain.take() {
             enc.commit_labeled("qwen35.joint_decode.layers.flush");
         }
+        drop(pooled_scope);
         drop(projection_scope);
 
         // ---- Output head: final norm, lm_head, per-row argmax ----
@@ -703,7 +727,9 @@ mod tests {
     use crate::inference::models::qwen35::gpu_ffn::{
         build_dense_ffn_layer_gpu_q_into, DenseFfnWeightsGpuQ,
     };
-    use crate::inference::models::qwen35::gpu_full_attn::upload_f32;
+    use crate::inference::models::qwen35::gpu_full_attn::{
+        apply_linear_projection_f32_pooled_with_ggml_type, upload_f32,
+    };
     use crate::inference::models::qwen35::joint_decode_core::project_rows;
     use crate::inference::models::qwen35::joint_decode_test_support::{
         bits, random_f32, synthetic_blocks,
@@ -1036,6 +1062,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Pooled step outputs (Class A): the packed shared-weights dense FFN
+    /// and an attention-style projection give the same bytes with and
+    /// without [`decode_pool::StepPooledOutputs`].
+    #[test]
+    fn step_pooled_outputs_keep_packed_ffn_and_projection_bitwise() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (hidden, intermediate) = (512_u32, 1024_u32);
+        let h = hidden as usize;
+        let m = 4_usize;
+        let mut seed = 0x51A7_0005_u32;
+        let weights = DenseFfnWeightsGpuQ {
+            gate_q: synthetic_blocks(&device, GgmlType::Q4_K, intermediate, hidden, &mut seed),
+            up_q: synthetic_blocks(&device, GgmlType::Q4_K, intermediate, hidden, &mut seed),
+            down_q: synthetic_blocks(&device, GgmlType::Q6_K, hidden, intermediate, &mut seed),
+            ggml_type_gate_up: GgmlType::Q4_K,
+            ggml_type_down: GgmlType::Q6_K,
+            intermediate_size: intermediate,
+            hidden_size: hidden,
+        };
+        let projection = synthetic_blocks(&device, GgmlType::Q4_K, 256, hidden, &mut seed);
+        let x = upload_f32(&random_f32(&mut seed, m * h), &device)
+            .expect("upload x")
+            .with_shape(vec![m, h])
+            .expect("shape x");
+        let residual = upload_f32(&random_f32(&mut seed, m * h), &device)
+            .expect("upload residual")
+            .with_shape(vec![m, h])
+            .expect("shape residual");
+        decode_pool::checked_reset_decode_pool().expect("reset pool");
+        let mut enc = device.command_encoder().expect("encoder");
+        let mut run = |enc: &mut CommandEncoder, pooled: bool| {
+            let _scope = decode_pool::StepPooledOutputs::enter(pooled);
+            let ffn = build_dense_ffn_layer_gpu_q_into_with_gate_up(
+                enc,
+                &device,
+                &mut registry,
+                &x,
+                &weights,
+                Some(&residual),
+                DenseGateUpDispatch::Separate,
+            )
+            .expect("dense FFN");
+            let proj = apply_linear_projection_f32_pooled_with_ggml_type(
+                enc,
+                &mut registry,
+                &device,
+                &x,
+                &projection,
+                GgmlType::Q4_K,
+                m as u32,
+                hidden,
+                256,
+            )
+            .expect("projection");
+            (ffn, proj)
+        };
+        let (fresh_ffn, fresh_proj) = run(&mut enc, false);
+        let (pooled_ffn, pooled_proj) = run(&mut enc, true);
+        enc.commit_and_wait_labeled("test.qwen.joint.pooled_outputs")
+            .expect("complete pooled outputs");
+        assert_eq!(bits(&fresh_ffn, m * h), bits(&pooled_ffn, m * h));
+        assert_eq!(bits(&fresh_proj, m * 256), bits(&pooled_proj, m * 256));
+        decode_pool::checked_reset_decode_pool().expect("reset pool");
     }
 
     #[test]
