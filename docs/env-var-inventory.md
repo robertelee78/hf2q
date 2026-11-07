@@ -78,6 +78,7 @@ with the audit script for this change (the lexical count of
 - `HF2Q_QWEN_SPECULATION_ROUTE` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects how speculating Qwen SlotAware lanes are routed and gated. Unset or `repeatable`: each tick's route is decided from the request's own state, a speculating lane never joins a joint step, and the proposer gates use fixed round costs instead of wall time. `adaptive`: the phase-1 cohort-dependent route and measured gates. Read once at engine load; invalid values warn and keep the default (`docs/research/adr063-qwen-spec-repeatable.md`).
 - `HF2Q_QWEN_SPEC_COST_MTP` and `HF2Q_QWEN_SPEC_COST_HISTORY` (`development-only`) override the repeatable route's modelled round costs, in ordinary decisions (defaults 1.26 and 1.49). The repeatability gate uses them to force a cost-disabled proposer. Non-positive or invalid values warn and keep the default.
 - `HF2Q_QWEN_MOE_BATCHED` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects the batched Qwen3.6 MoE decode route. Unset or `0`/`off`/`false` (default): router and shared expert are uploaded as BF16 and every MoE layer runs once per row. `1`/`on`/`true`: they load in GGUF storage (F32 router and gate logit, Q4_K/Q6_K shared expert, no BF16 copies) and serial and joint decode both run one batched layer over the step's rows, row-exact (a row's output is the same solo or in a joint step). Read once at model load; invalid values warn and keep the default.
+- `HF2Q_QWEN_ATTN_ROWS` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects the row-batched Qwen TQ full-attention decode core. Unset or `1`/`on`/`true` (default): serial and joint decode run every row's K/V encode, Q rotation, attention and output gate in one pass, and `HF2Q_QWEN_GQA_Q2=auto` uses the measured Qwen3.6 crossovers (KV ≥ 4,096 for one row, ≥ 1,024 for several). `0`/`off`/`false`: the per-row chain and the single 8,192 crossover. Both give the same bits (Class A). Read once; invalid values warn and keep the default.
 - `HF2Q_QWEN_JOINT_Q1_PROMPTS`, `HF2Q_QWEN_JOINT_Q1_OUT` and `HF2Q_QWEN_JOINT_Q1_STEPS` (`development-only`) drive the ignored Q1 Class B trace test.
 - `HF2Q_QWEN_MOE_Q1_PROMPTS`, `HF2Q_QWEN_MOE_Q1_OUT`, `HF2Q_QWEN_MOE_Q1_STEPS` and `HF2Q_QWEN_MOE_Q1_FORCED` (`development-only`) drive the ignored two-process Q1 trace test of the batched MoE route (`qwen36_moe_route_q1_envelope_trace`).
 - `HF2Q_QWEN36_GGUF` and `HF2Q_QWEN38_GGUF` (`development-only`) select the official artifacts for the ignored Qwen joint decode hardware gates.
@@ -411,6 +412,7 @@ this release:
 | `HF2Q_QWEN38_GGUF` | `development-only` | 1 |
 | `HF2Q_QWEN3VL_E2E` | `development-only` | 1 |
 | `HF2Q_QWEN3VL_LM_LOAD` | `development-only` | 9 |
+| `HF2Q_QWEN_ATTN_ROWS` | `documented-escape` | 5 |
 | `HF2Q_QWEN_GQA_Q2` | `documented-escape` | 2 |
 | `HF2Q_QWEN_JOINT_DECODE` | `documented-escape` | 1 |
 | `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` | `development-only` | 1 |

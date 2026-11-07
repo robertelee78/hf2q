@@ -22,14 +22,39 @@ const QWEN36_GQA_Q2_MIN_KV_ONE_ROW: u32 = 4_096;
 const QWEN36_GQA_Q2_MIN_KV_ROWS: u32 = 1_024;
 
 /// Shortest KV length at which `auto` selects the cooperative kernel for an
-/// attention pass over `rows` decode rows.
+/// attention pass over `rows` decode rows. `HF2Q_QWEN_ATTN_ROWS=0` restores
+/// the single 8,192 crossover together with the per-row attention chain.
 fn gqa_q2_min_kv_seq_len(params: &Qwen35TqSdpaParams, rows: usize) -> u32 {
-    if (params.num_heads, params.num_kv_heads) != QWEN36_GQA_GEOMETRY {
+    if !qwen_attn_rows_enabled() || (params.num_heads, params.num_kv_heads) != QWEN36_GQA_GEOMETRY
+    {
         GQA_Q2_MIN_KV_SEQ_LEN
     } else if rows > 1 {
         QWEN36_GQA_Q2_MIN_KV_ROWS
     } else {
         QWEN36_GQA_Q2_MIN_KV_ONE_ROW
+    }
+}
+
+/// `HF2Q_QWEN_ATTN_ROWS` (documented escape, read once): unset, `1`/`on`/
+/// `true` (default) run the Qwen TQ full-attention decode core as one
+/// row-batched pass with the measured Qwen3.6 GQA-Q2 crossovers;
+/// `0`/`off`/`false` restore the per-row chain and the 8,192 crossover.
+/// Both give the same bits. Invalid values warn and keep the default.
+pub(super) fn qwen_attn_rows_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        parse_qwen_attn_rows(std::env::var("HF2Q_QWEN_ATTN_ROWS").ok().as_deref())
+    });
+    *ON
+}
+
+fn parse_qwen_attn_rows(value: Option<&str>) -> bool {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("" | "1" | "on" | "true") => true,
+        Some("0" | "off" | "false") => false,
+        Some(other) => {
+            tracing::warn!(value = other, "invalid HF2Q_QWEN_ATTN_ROWS value; keeping the default (on)");
+            true
+        }
     }
 }
 
@@ -199,5 +224,15 @@ mod tests {
         assert_eq!(parse_gqa_q2_mode(Some("on")), GqaQ2Mode::On);
         assert_eq!(parse_gqa_q2_mode(Some("1")), GqaQ2Mode::On);
         assert_eq!(parse_gqa_q2_mode(Some("invalid")), GqaQ2Mode::Off);
+    }
+
+    #[test]
+    fn attn_rows_switch_defaults_on_and_parses_explicit_arms() {
+        for on in [None, Some(""), Some("1"), Some("on"), Some("TRUE"), Some("bogus")] {
+            assert!(parse_qwen_attn_rows(on), "{on:?}");
+        }
+        for off in [Some("0"), Some("off"), Some(" false ")] {
+            assert!(!parse_qwen_attn_rows(off), "{off:?}");
+        }
     }
 }
