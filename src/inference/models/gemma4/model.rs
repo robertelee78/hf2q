@@ -646,7 +646,7 @@ pub struct MlxModelWeights {
 
     /// ADR-063 Stage 2 — kernel of warm live-resume attention: every
     /// single-slot resume and every [`GemmaLiveAttention::PerSlotExact`]
-    /// cohort lane (installed lanes follow [`GemmaLiveAttention::Tiled`]).
+    /// cohort lane (joint warm, stable cue and installed long-prompt lanes).
     /// Resolved once at load from `HF2Q_GEMMA_WARM_TILED_ATTENTION` (default
     /// [`GemmaLiveKernel::VecHybrid`]; `1` opts in to
     /// [`GemmaLiveKernel::TiledF16`]).
@@ -709,16 +709,18 @@ pub struct MultiSeqPrefillState {
 /// (`serve::gemma_live_attention`). Only the kernel policy differs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GemmaLiveAttention {
-    /// Installed long-prompt lanes: tiled F16 flash attention for every
-    /// suffix length, or the vec-hybrid kernel when `HF2Q_GEMMA_TILED_LIVE=0`.
-    /// Not bitwise equal to a per-slot resume. (Stable-boundary groups of at
-    /// most 4,096 rows are admitted per slot since #728; longer prompts become
-    /// installed lanes and can still take this route, #725.)
+    /// Tiled F16 flash attention for every suffix length, or the vec-hybrid
+    /// kernel when `HF2Q_GEMMA_TILED_LIVE=0`. Not bitwise equal to a per-slot
+    /// resume. No serving path selects it any more: stable-boundary groups of
+    /// at most 4,096 rows are admitted per slot since #728, and installed
+    /// long-prompt lanes take `PerSlotExact` since #725. Cold multi-sequence
+    /// prefill carries it as an unused placeholder.
     Tiled,
-    /// Joint warm tool-turn cohort: exactly the single-slot live-resume
-    /// route ([`MlxModelWeights::warm_live_kernel`], with suffixes under 32
-    /// rows on vec-hybrid), the slot view addressed as slot 0, so every lane
-    /// is bitwise equal to its per-slot resume.
+    /// Joint warm tool-turn cohort and installed long-prompt lanes: exactly
+    /// the single-slot live-resume route
+    /// ([`MlxModelWeights::warm_live_kernel`], with suffixes under 32 rows on
+    /// vec-hybrid), the slot view addressed as slot 0, so every lane is
+    /// bitwise equal to its per-slot resume.
     PerSlotExact,
 }
 

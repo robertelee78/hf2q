@@ -280,8 +280,9 @@ the model loads.
   quality gate (2026-11-01).
 - **Any other value:** logs a warning and keeps the default.
 
-Installed long-prompt lanes (prompts over 4,096 tokens) keep their own
-switch, `HF2Q_GEMMA_TILED_LIVE`. The model load logs `Gemma warm live
+The switch also covers installed long-prompt lanes (prompts over 4,096
+tokens), which run the single-slot warm route (#725); `HF2Q_GEMMA_TILED_LIVE`
+no longer affects any serving path. The model load logs `Gemma warm live
 attention kernel`, each live prefill banner prints `live=`, and
 `/hf2q/v1/runtime` publishes the resolved kernel (`VecHybrid` or `TiledF16`)
 as `measurement_snapshot.active_controls.gemma_warm_attention_kernel`.
