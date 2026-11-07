@@ -7,7 +7,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -31,6 +31,10 @@ pub(super) struct EngineSupervisor {
 
 struct EngineSupervisorInner {
     pool_census: Mutex<pool_census::Store>,
+    /// Requests an HTTP handler is preparing for this engine (template
+    /// render, tokenization) that have not been handed to the worker yet.
+    /// The DeepSeek-V4 worker's admission barrier reads it.
+    admissions_in_flight: AtomicUsize,
     health: AtomicU8,
     next_epoch: AtomicU64,
     armed: Mutex<Option<ArmedTransaction>>,
@@ -39,6 +43,22 @@ struct EngineSupervisorInner {
     /// reported by `/readyz` as `engine failed: <summary>`.
     summary: Mutex<Option<String>>,
     health_tx: watch::Sender<bool>,
+}
+
+/// RAII count of one request being prepared for the worker
+/// ([`EngineSupervisor::begin_admission`]). Nominally `pub` so engine entry
+/// points can take it; the module is private to the API.
+pub struct AdmissionGuard {
+    supervisor: EngineSupervisor,
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.supervisor
+            .inner
+            .admissions_in_flight
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +85,7 @@ impl EngineSupervisor {
         let (health_tx, _health_rx) = watch::channel(true);
         let inner = Arc::new(EngineSupervisorInner {
             pool_census: Mutex::new(pool_census::Store::default()),
+            admissions_in_flight: AtomicUsize::new(0),
             health: AtomicU8::new(HEALTHY),
             next_epoch: AtomicU64::new(1),
             armed: Mutex::new(None),
@@ -98,6 +119,21 @@ impl EngineSupervisor {
     }
 
     /// HTTP reads immutable numeric publication only, never native/TLS state.
+    /// Count one request as in flight to this engine until the returned
+    /// guard drops: right before it is handed to the worker, or on any
+    /// early return, client disconnect or panic of the preparing handler.
+    pub(super) fn begin_admission(&self) -> AdmissionGuard {
+        self.inner.admissions_in_flight.fetch_add(1, Ordering::AcqRel);
+        AdmissionGuard {
+            supervisor: self.clone(),
+        }
+    }
+
+    /// Requests counted by live [`AdmissionGuard`]s.
+    pub(super) fn admissions_in_flight(&self) -> usize {
+        self.inner.admissions_in_flight.load(Ordering::Acquire)
+    }
+
     pub(super) fn pool_census_json(&self, supported: bool) -> serde_json::Value {
         if !crate::debug::INVESTIGATION_ENV.worker_pool_census {
             return pool_census::unavailable("Disabled");
@@ -517,6 +553,36 @@ pub(super) fn spawn_supervised_worker(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admission_guards_count_until_dropped_on_every_path() {
+        let supervisor = super::EngineSupervisor::new_with_monitor_start(|_| Ok(()));
+        assert_eq!(supervisor.admissions_in_flight(), 0);
+        let first = supervisor.begin_admission();
+        let second = supervisor.clone().begin_admission();
+        assert_eq!(supervisor.admissions_in_flight(), 2);
+        drop(first);
+        assert_eq!(supervisor.admissions_in_flight(), 1);
+        // A preparing handler that panics still releases its count.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = supervisor.begin_admission();
+            panic!("handler failed while preparing");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(supervisor.admissions_in_flight(), 1);
+        // A dropped (disconnected) handler future releases its count too.
+        let future = {
+            let guard = supervisor.begin_admission();
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            }
+        };
+        assert_eq!(supervisor.admissions_in_flight(), 2);
+        drop(future);
+        drop(second);
+        assert_eq!(supervisor.admissions_in_flight(), 0);
+    }
+
     use super::*;
 
     #[tokio::test]
