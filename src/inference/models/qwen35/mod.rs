@@ -81,6 +81,8 @@ mod real_artifact_joint_decode_q1_tests;
 mod real_artifact_joint_decode_witness_tests;
 #[cfg(test)]
 mod real_artifact_joint_decode_gpu_timing_tests;
+#[cfg(test)]
+mod real_artifact_resume_attn_fast_tests;
 pub mod kernels;
 pub mod kv_cache;
 pub mod model;
@@ -89,6 +91,7 @@ pub mod mtp;
 pub mod mtp_weights_load;
 mod source_config;
 pub(crate) mod source_precision;
+pub(crate) mod resume_attn_fast;
 pub mod routing_policy;
 pub mod spec_decode;
 pub mod tokenizer;

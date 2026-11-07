@@ -4820,26 +4820,7 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
     // the buffer's own byte_offset, not in a slot_id parameter.
     // `apply_sdpa_with_kv_cache` does the slice_view above this
     // dispatcher.
-    if head_dim != 256 {
-        return Err(anyhow!(
-            "apply_flash_attn_prefill_seq_major_resume: head_dim must be 256 \
-             (D=256 dispatcher); got {head_dim}. Other head_dims need a \
-             different mlx-native dispatcher (D=64 / D=512) or a new port."
-        ));
-    }
-    if cur_len + seq_len != kv_seq_len {
-        return Err(anyhow!(
-            "apply_flash_attn_prefill_seq_major_resume: cur_len ({cur_len}) + \
-             seq_len ({seq_len}) != kv_seq_len ({kv_seq_len}) — \
-             append-prefill semantics require cur_len + seq_len == kv_seq_len."
-        ));
-    }
-    if kv_seq_len > kv_capacity {
-        return Err(anyhow!(
-            "apply_flash_attn_prefill_seq_major_resume: kv_seq_len \
-             ({kv_seq_len}) > kv_capacity ({kv_capacity}) — slot overflow."
-        ));
-    }
+    validate_flash_attn_prefill_resume_shape(seq_len, cur_len, kv_seq_len, kv_capacity, head_dim)?;
 
     let seq = seq_len as usize;
     let nh = n_heads as usize;
@@ -4871,7 +4852,7 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
     let v_bf16_slot = device
         .alloc_buffer(kv_slot_elems * 2, DType::BF16, vec![1, nkv, cap, d])
         .map_err(|e| anyhow!("alloc v_bf16_slot: {e}"))?;
-    let mut out_bf16_hm = device
+    let out_bf16_hm = device
         .alloc_buffer(out_elems * 2, DType::BF16, vec![1, nh, seq, d])
         .map_err(|e| anyhow!("alloc out_bf16_hm: {e}"))?;
     let out_seq = device
@@ -4882,24 +4863,129 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
         .command_encoder().map(crate::inference::native_observation::encoder)
         .context("FA resume bridge encoder")?;
 
+    encode_flash_attn_prefill_seq_major_resume(
+        &mut enc,
+        device,
+        registry,
+        q_seq_major,
+        slot_k_head_major,
+        slot_v_head_major,
+        &FaResumeBridgeBuffers {
+            q_bf16_seq: &q_bf16_seq,
+            q_bf16_hm: &q_bf16_hm,
+            k_bf16: &k_bf16_slot,
+            v_bf16: &v_bf16_slot,
+            out_bf16_hm: &out_bf16_hm,
+            out_seq: &out_seq,
+        },
+        seq_len,
+        cur_len,
+        kv_seq_len,
+        kv_capacity,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+    )?;
+
+    enc.commit_and_wait()
+        .context("FA resume bridge: commit+wait")?;
+
+    Ok(out_seq)
+}
+
+/// Shape preconditions of [`apply_flash_attn_prefill_seq_major_resume`].
+pub(crate) fn validate_flash_attn_prefill_resume_shape(
+    seq_len: u32,
+    cur_len: u32,
+    kv_seq_len: u32,
+    kv_capacity: u32,
+    head_dim: u32,
+) -> Result<()> {
+    if head_dim != 256 {
+        return Err(anyhow!(
+            "apply_flash_attn_prefill_seq_major_resume: head_dim must be 256 \
+             (D=256 dispatcher); got {head_dim}. Other head_dims need a \
+             different mlx-native dispatcher (D=64 / D=512) or a new port."
+        ));
+    }
+    if cur_len + seq_len != kv_seq_len {
+        return Err(anyhow!(
+            "apply_flash_attn_prefill_seq_major_resume: cur_len ({cur_len}) + \
+             seq_len ({seq_len}) != kv_seq_len ({kv_seq_len}) — \
+             append-prefill semantics require cur_len + seq_len == kv_seq_len."
+        ));
+    }
+    if kv_seq_len > kv_capacity {
+        return Err(anyhow!(
+            "apply_flash_attn_prefill_seq_major_resume: kv_seq_len \
+             ({kv_seq_len}) > kv_capacity ({kv_capacity}) — slot overflow."
+        ));
+    }
+    Ok(())
+}
+
+/// Scratch of the resume bridge: BF16 Q (seq- and head-major), the BF16 K/V
+/// mirror at `kv_capacity` head stride, the BF16 head-major output and the
+/// F32 seq-major result. Every element the bridge reads from these is
+/// written earlier in the same bridge, so reused storage of at least these
+/// sizes gives the same bytes as fresh storage.
+pub(crate) struct FaResumeBridgeBuffers<'a> {
+    pub q_bf16_seq: &'a MlxBuffer,
+    pub q_bf16_hm: &'a MlxBuffer,
+    pub k_bf16: &'a MlxBuffer,
+    pub v_bf16: &'a MlxBuffer,
+    pub out_bf16_hm: &'a MlxBuffer,
+    pub out_seq: &'a MlxBuffer,
+}
+
+/// Encode steps 1–6 of [`apply_flash_attn_prefill_seq_major_resume`] (casts,
+/// permutes, the resume kernel and the output permute) into `enc`, without
+/// committing. Shapes must already satisfy
+/// [`validate_flash_attn_prefill_resume_shape`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_flash_attn_prefill_seq_major_resume(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_seq_major: &MlxBuffer,
+    slot_k_head_major: &MlxBuffer,
+    slot_v_head_major: &MlxBuffer,
+    bufs: &FaResumeBridgeBuffers<'_>,
+    seq_len: u32,
+    cur_len: u32,
+    kv_seq_len: u32,
+    kv_capacity: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) -> Result<()> {
+    let seq = seq_len as usize;
+    let nh = n_heads as usize;
+    let nkv = n_kv_heads as usize;
+    let d = head_dim as usize;
+    let cap = kv_capacity as usize;
+
+    let q_elems = seq * nh * d;
+    let kv_slot_elems = nkv * cap * d;
+
     // ── Step 1+2: Q F32 seq-major → BF16 seq-major → BF16 head-major ──
     cast(
-        &mut enc,
+        enc,
         registry,
         device.metal_device(),
         q_seq_major,
-        &q_bf16_seq,
+        bufs.q_bf16_seq,
         q_elems,
         CastDirection::F32ToBF16,
     )
     .context("FA resume bridge: cast Q F32→BF16")?;
     enc.memory_barrier();
     permute_021_bf16(
-        &mut enc,
+        enc,
         registry,
         device.metal_device(),
-        &q_bf16_seq,
-        &q_bf16_hm,
+        bufs.q_bf16_seq,
+        bufs.q_bf16_hm,
         seq,
         nh,
         d,
@@ -4914,11 +5000,11 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
     // unused tail; the kernel reads only `[0..kv_seq_len]` per head thanks
     // to kL-aware tile bounds).
     cast(
-        &mut enc,
+        enc,
         registry,
         device.metal_device(),
         slot_k_head_major,
-        &k_bf16_slot,
+        bufs.k_bf16,
         kv_slot_elems,
         CastDirection::F32ToBF16,
     )
@@ -4927,11 +5013,11 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
 
     // ── Step 4: cast slot V F32 head-major → BF16 head-major ──
     cast(
-        &mut enc,
+        enc,
         registry,
         device.metal_device(),
         slot_v_head_major,
-        &v_bf16_slot,
+        bufs.v_bf16,
         kv_slot_elems,
         CastDirection::F32ToBF16,
     )
@@ -4944,13 +5030,13 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
     //   - do_causal     = true       (causal mask via qL_off)
     let scale = 1.0 / (d as f32).sqrt();
     dispatch_flash_attn_prefill_bf16_d256_resume(
-        &mut enc,
+        enc,
         device,
         registry,
-        &q_bf16_hm,
-        &k_bf16_slot,
-        &v_bf16_slot,
-        &mut out_bf16_hm,
+        bufs.q_bf16_hm,
+        bufs.k_bf16,
+        bufs.v_bf16,
+        bufs.out_bf16_hm,
         &FlashAttnPrefillResumeParams {
             n_heads,
             n_kv_heads,
@@ -4970,11 +5056,11 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
 
     // ── Step 6: BF16 head-major → F32 seq-major (fused permute+cast) ──
     permute_021_bf16_to_f32(
-        &mut enc,
+        enc,
         registry,
         device.metal_device(),
-        &out_bf16_hm,
-        &out_seq,
+        bufs.out_bf16_hm,
+        bufs.out_seq,
         nh,
         seq,
         d,
@@ -4983,11 +5069,7 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
         "FA resume bridge: permute_021_bf16_to_f32 out [nh, seq, d] → \
          [seq, nh, d] F32",
     )?;
-
-    enc.commit_and_wait()
-        .context("FA resume bridge: commit+wait")?;
-
-    Ok(out_seq)
+    Ok(())
 }
 
 /// ADR-027 Phase B iter-33 (sub-sub-iter 23c-β.4) — TQ-cache-backed
@@ -5998,6 +6080,27 @@ pub fn apply_sdpa_with_kv_cache(
                         n_kv_heads,
                         head_dim,
                         slot_id,
+                    )?
+                } else if let Some(arena) =
+                    fa_arena.filter(|_| super::resume_attn_fast::resume_attn_fast_enabled())
+                {
+                    // HF2Q_QWEN_RESUME_ATTN_FAST: the same dispatches on the
+                    // prefill's arena scratch, one command buffer, no host
+                    // wait (Class A against the branch below).
+                    super::resume_attn_fast::apply_flash_attn_prefill_seq_major_resume_via_tq_cache_fast(
+                        device,
+                        registry,
+                        slot,
+                        q_seq_major,
+                        seq_len,
+                        cur_len as u32,
+                        kv_seq_len,
+                        max_seq_len,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        slot_id,
+                        arena,
                     )?
                 } else {
                     apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
