@@ -15,9 +15,9 @@ use mlx_native::ops::quantized_matmul_ggml::{
 };
 use mlx_native::ops::quantized_matmul_id_ggml::{GgmlQuantizedMatmulIdParams, IdMmScratch};
 use mlx_native::ops::row_exact_matvec::{
-    dispatch_row_exact_matvec, dispatch_row_exact_matvec_scheduled, RowExactMatvecSchedule,
     RowExactMatvecShape, RowExactWeight, ROW_EXACT_MATVEC_MAX_ROWS,
 };
+use mlx_native::ops::row_exact_matvec_stock::dispatch_row_exact_matvec_stock;
 use mlx_native::ops::transpose::permute_021_f32;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxBufferPool, MlxDevice};
 
@@ -303,6 +303,42 @@ pub(super) fn row_exact_storage(weight: &RawMatrixRef<'_>) -> Option<RowExactWei
     }
 }
 
+/// Encode `m <= 8` rows through mlx-native `row_exact_matvec_stock`: every
+/// row is bitwise the stock one-row kernel's (`dense_matvec_f16w_f32io` for
+/// F16, the Q8_0 NR2 matvec for Q8_0). The caller has checked the shape.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn row_exact_matmul(
+    session: &mut GraphSession<'_>,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    storage: RowExactWeight,
+    input: &MlxBuffer,
+    weight: &RawMatrixRef<'_>,
+    output: &MlxBuffer,
+    m: usize,
+    n: usize,
+    k: usize,
+    label: &str,
+) -> Result<()> {
+    let shape = RowExactMatvecShape::contiguous(
+        u32::try_from(m).context("DeepSeek-V4 matvec rows exceed u32")?,
+        u32::try_from(n).context("DeepSeek-V4 matvec outputs exceed u32")?,
+        u32::try_from(k).context("DeepSeek-V4 matvec input exceeds u32")?,
+    );
+    session.barrier_between(&[input, weight.buffer], &[output]);
+    dispatch_row_exact_matvec_stock(
+        session.encoder_mut(),
+        registry,
+        device.metal_device(),
+        storage,
+        weight.buffer,
+        input,
+        output,
+        &shape,
+    )
+    .with_context(|| format!("encode DeepSeek-V4 row-exact {label}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn raw_matmul(
     session: &mut GraphSession<'_>,
@@ -322,27 +358,20 @@ pub(super) fn raw_matmul(
             weight.shape
         );
     }
-    session.barrier_between(&[input, weight.buffer], &[output]);
-    // Row-exact family: one m <= 8 dispatch whose rows equal their m = 1
-    // results bitwise. Larger m keep the matrix routes below.
-    if let Some(storage) = row_exact_storage(weight).filter(|_| m <= ROW_EXACT_MAX_ROWS) {
-        let shape = RowExactMatvecShape::contiguous(
-            u32::try_from(m).context("DeepSeek-V4 matvec rows exceed u32")?,
-            u32::try_from(n).context("DeepSeek-V4 matvec outputs exceed u32")?,
-            u32::try_from(k).context("DeepSeek-V4 matvec input exceeds u32")?,
+    // Row-exact family, where it reproduces the stock route bitwise: Q8_0 at
+    // m <= 8 (stock is the NR2 matvec, whose rows equal m = 1) and F16 at
+    // m = 1 (stock is the F32-input matvec). F16 at m > 1 keeps the stock
+    // tiled kernel here (prefill rows); independent decode rows take the
+    // row-exact kernel through `row_matmul`.
+    if let Some(storage) = row_exact_storage(weight).filter(|&storage| match storage {
+        RowExactWeight::Q8_0 => m <= ROW_EXACT_MAX_ROWS,
+        RowExactWeight::F16 => m == 1,
+    }) {
+        return row_exact_matmul(
+            session, registry, device, storage, input, weight, output, m, n, k, label,
         );
-        return dispatch_row_exact_matvec(
-            session.encoder_mut(),
-            registry,
-            device.metal_device(),
-            storage,
-            weight.buffer,
-            input,
-            output,
-            &shape,
-        )
-        .with_context(|| format!("encode DeepSeek-V4 row-exact {label}"));
     }
+    session.barrier_between(&[input, weight.buffer], &[output]);
     match weight.ggml_type {
         GgmlType::F32 if m == 1 => dispatch_dense_matvec_f32(
             session.encoder_mut(),
@@ -427,8 +456,8 @@ pub(super) fn raw_matmul(
 /// Grouped output-A through one row-exact dispatch on token-major input
 /// `[rows, groups * group_width]` and output `[rows, groups * rank]`.
 ///
-/// The schedule is pinned from the weight shape alone (`m = 1`), so the
-/// serial `rows = 1` and joint `rows = B` products are bitwise equal per row.
+/// Every row is bitwise the stock grouped matvec's one-row result (the Q8_0
+/// NR2 matvec per group), at any `rows <= 8`.
 #[allow(clippy::too_many_arguments)]
 fn grouped_output_a_row_exact(
     session: &mut GraphSession<'_>,
@@ -443,17 +472,14 @@ fn grouped_output_a_row_exact(
     rank: usize,
     group_width: usize,
 ) -> Result<()> {
-    let shape = |m: usize| -> Result<RowExactMatvecShape> {
-        Ok(RowExactMatvecShape::grouped_token_major(
-            u32::try_from(m).context("DeepSeek-V4 output-A rows exceed u32")?,
-            u32::try_from(groups).context("DeepSeek-V4 output-A groups exceed u32")?,
-            u32::try_from(rank).context("DeepSeek-V4 output-A rank exceeds u32")?,
-            u32::try_from(group_width).context("DeepSeek-V4 output-A group width exceeds u32")?,
-        ))
-    };
-    let schedule = RowExactMatvecSchedule::auto(storage, &shape(1)?);
+    let shape = RowExactMatvecShape::grouped_token_major(
+        u32::try_from(rows).context("DeepSeek-V4 output-A rows exceed u32")?,
+        u32::try_from(groups).context("DeepSeek-V4 output-A groups exceed u32")?,
+        u32::try_from(rank).context("DeepSeek-V4 output-A rank exceeds u32")?,
+        u32::try_from(group_width).context("DeepSeek-V4 output-A group width exceeds u32")?,
+    );
     session.barrier_between(&[input, weight.buffer], &[output]);
-    dispatch_row_exact_matvec_scheduled(
+    dispatch_row_exact_matvec_stock(
         session.encoder_mut(),
         registry,
         device.metal_device(),
@@ -461,8 +487,7 @@ fn grouped_output_a_row_exact(
         weight.buffer,
         input,
         output,
-        &shape(rows)?,
-        &schedule,
+        &shape,
     )
     .context("encode row-exact DeepSeek-V4 grouped output-A")
 }

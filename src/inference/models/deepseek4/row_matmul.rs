@@ -10,14 +10,15 @@
 //! float weights switch from a matvec at `m = 1` to tiled tensor kernels at
 //! `m > 1`, so independent rows apply them one row at a time. A model that
 //! selected `MatvecKernels::RowExact` issues F16 and Q8_0 independent rows
-//! as row-exact dispatches of at most 8 rows instead.
+//! as `row_exact_matvec_stock` dispatches of at most 8 rows instead, whose
+//! every row is bitwise the stock one-row product.
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use mlx_native::graph::GraphSession;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlType, MM_ROUTING_THRESHOLD};
 use mlx_native::{KernelRegistry, MlxBuffer, MlxDevice};
 
-use super::forward_support::{raw_matmul, row_exact_storage, ROW_EXACT_MAX_ROWS};
+use super::forward_support::{raw_matmul, row_exact_matmul, row_exact_storage, ROW_EXACT_MAX_ROWS};
 use super::residency::RawMatrixRef;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,20 +104,28 @@ pub(super) fn row_matmul(
             session, registry, device, input, weight, output, m, n, k, label,
         );
     }
-    if row_exact_storage(weight).is_some() {
-        if m <= ROW_EXACT_MAX_ROWS {
-            return raw_matmul(
-                session, registry, device, input, weight, output, m, n, k, label,
+    if let Some(storage) = row_exact_storage(weight) {
+        if weight.shape != [n, k] {
+            bail!(
+                "DeepSeek-V4 {label} shape drift: got {:?}, expected [{n}, {k}]",
+                weight.shape
             );
         }
         for first in (0..m).step_by(ROW_EXACT_MAX_ROWS) {
             let rows = ROW_EXACT_MAX_ROWS.min(m - first);
-            let input_rows = rows_view(input, first, rows, k)?;
-            let output_rows = rows_view(output, first, rows, n)?;
-            raw_matmul(
+            let (input_rows, output_rows) = if rows == m {
+                (input.clone(), output.clone())
+            } else {
+                (
+                    rows_view(input, first, rows, k)?,
+                    rows_view(output, first, rows, n)?,
+                )
+            };
+            row_exact_matmul(
                 session,
                 registry,
                 device,
+                storage,
                 &input_rows,
                 weight,
                 &output_rows,
