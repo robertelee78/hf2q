@@ -82,6 +82,12 @@ This row was added by hand.
 
 These rows were added by hand.
 
+## Added in ADR-063 Q4-GEMMA-DECODE op parity (2026-11-06)
+
+- `HF2Q_GEMMA_DECODE_DENSE` (`development-only`) selects the kernel of every Gemma 4 decode dense GGUF matmul — attention q/k/v/o, dense FFN gate/up/down and the lm head, in the solo decode, the `[N,hidden]` batched body, the batched/fused lm head, the speculative verify heads and tree-verify layers, and the m=1 prefill first-token head. `stock` or unset (default): the existing routes. `row_exact`: mlx-native's row-exact few-row mat-vec for Q4_K/Q6_K with `K % 256 == 0` (Q4_K also with a 16-byte-aligned weight start) and Q5_0/Q8_0 with `K % 32 == 0`. `mma`: the column-invariant few-row MMA mat-vec for Q4_K/Q6_K/Q5_0 with `K % 64 == 0` (and the block size) and Q8_0 with `K % 32 == 0` (numerics class B). Any other value fails the model load; the switch is read once per process. Admission depends on the weight alone, never on the decode width; products wider than 8 rows run in chunks of at most 8 rows, so each row is bitwise equal at every width. Other weights (F32 router, F16/BF16, affine, other block types) and the other (m > 8) prefill matmuls keep their routes. Published as `measurement_snapshot.active_controls.gemma_decode_dense_kernel` (`Stock` / `RowExact` / `ColumnInvariantMma`) and declared as `decode_dense_kernel` in Gemma Q1 endpoint and localizer packets.
+
+This row was added by hand.
+
 ## Remaining promotion queue
 
 The inventory deliberately identifies follow-up work without smuggling it into
@@ -272,6 +278,7 @@ this release:
 | `HF2Q_GEMMA_COLD_GS3_REPEATS` | `development-only` | 2 |
 | `HF2Q_GEMMA_COLD_TURN0_PROMPTS` | `development-only` | 5 |
 | `HF2Q_GEMMA_COLD_TURN0_RUN` | `development-only` | 1 |
+| `HF2Q_GEMMA_DECODE_DENSE` | `development-only` | 11 |
 | `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` | `documented-escape` | 4 |
 | `HF2Q_GEMMA_JOINT_COLD_PREFILL` | `documented-escape` | 4 |
 | `HF2Q_GEMMA_JOINT_WARM_PREFILL` | `documented-escape` | 3 |

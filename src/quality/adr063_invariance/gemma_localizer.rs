@@ -53,6 +53,9 @@ struct Packet {
     /// Warm live-resume kernel the loaded model must resolve; absent = VecHybrid.
     #[serde(default)]
     warm_live_kernel: super::gemma_actual::WarmLiveKernel,
+    /// Decode dense/lm-head kernel the process must resolve; absent = Stock.
+    #[serde(default)]
+    decode_dense_kernel: super::gemma_actual::DecodeDenseKernel,
 }
 fn all128() -> Vec<usize> {
     vec![128]
@@ -353,6 +356,11 @@ fn q1_gemma_actual_stage_localizer() {
     let warm_live_kernel =
         super::gemma_actual::require_warm_kernel(packet.warm_live_kernel, model.weights.warm_live_kernel)
             .unwrap();
+    let decode_dense_kernel = super::gemma_actual::require_decode_dense_kernel(
+        packet.decode_dense_kernel,
+        crate::inference::models::gemma4::decode_dense::resolve().unwrap(),
+    )
+    .unwrap();
     acquisition_scope
         .check_config(
             &packet.identity,
@@ -449,7 +457,7 @@ fn q1_gemma_actual_stage_localizer() {
         trace.coverage.errors
     );
     let evidence = serde_json::json!({"schema":"hf2q.adr063.q1.stage-localizer.v1","packet_sha256":hash(&raw),"rerun_id":packet.rerun_id,
-        "route":"GemmaActualHybridSlotAwareWithCheckedDiagnosticLayerSplits","prefill_chunks":packet.prefill_chunks,"warm_live_kernel":warm_live_kernel,
+        "route":"GemmaActualHybridSlotAwareWithCheckedDiagnosticLayerSplits","prefill_chunks":packet.prefill_chunks,"warm_live_kernel":warm_live_kernel,"decode_dense_kernel":decode_dense_kernel,
         "logical_lane":"slot0","declared_slots":4,
         "tokens":144,"records":trace.coverage.captured.len(),"whole_q1_qualified":false,
         "full_prefill_logits":"NotEstablishedByLastRowProductionHead","other_three_lane_execution":"NotClaimedBySingleLaneLocalizer",
