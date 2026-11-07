@@ -8,6 +8,11 @@
 //!   `grouped_output_a`). The row-exact pipelines must be the ones that ran.
 //! - F64 bound on one shape per family: `|y - ref| <= gamma_K * sum |w x|`,
 //!   `gamma_K = K u / (1 - K u)`, `u = 2^-24`.
+//! - Class A against the stock switch: for B = 1..=8, every row of the
+//!   row-exact joint product equals the `MatvecKernels::Stock` one-row
+//!   product of that row bitwise (F16 and Q8_0 independent rows, the Q8_0
+//!   head, grouped output-A), and prefill-style `RowMatmul::Matrix` products
+//!   at m = 2..=8 equal the stock matrix route bitwise.
 //! - `MatvecKernels::Stock` is the main-branch route: its wrapper outputs equal
 //!   direct dispatches of the stock kernels bitwise and no row-exact pipeline
 //!   is ever built.
@@ -20,6 +25,7 @@ use mlx_native::ops::quantized_matmul_ggml::{
     GgmlType,
 };
 use mlx_native::ops::row_exact_matvec::row_exact_matvec_kernel_names;
+use mlx_native::ops::row_exact_matvec_stock::row_exact_matvec_stock_kernel_names;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::ds4_bench_support::Rng;
@@ -130,10 +136,22 @@ fn run<'c>(
     registry
 }
 
+/// Row-exact pipelines (stock-order and Class-B) this registry has built.
 fn row_exact_pipelines_built(registry: &KernelRegistry) -> Vec<&'static str> {
-    row_exact_matvec_kernel_names()
+    row_exact_matvec_stock_kernel_names()
+        .chain(row_exact_matvec_kernel_names())
         .filter(|name| registry.pipeline_identity(name).is_ok())
         .collect()
+}
+
+/// The wired family must be the stock-order kernels, never Class B.
+fn assert_only_stock_order_built(built: &[&str]) {
+    assert!(
+        built
+            .iter()
+            .all(|name| name.starts_with("row_exact_stock_mv_")),
+        "a Class-B row-exact pipeline ran: {built:?}"
+    );
 }
 
 /// Joint `product(m = B)` rows equal serial `product(m = 1)` rows, B = 2..=4.
@@ -238,11 +256,12 @@ fn row_exact_f16_joint_rows_equal_serial_rows_bitwise() {
     }
     let (_, registry) = ctx.split();
     let built = row_exact_pipelines_built(registry);
+    assert_only_stock_order_built(&built);
     for m in 1..=4 {
         assert!(
             built
                 .iter()
-                .any(|name| name.starts_with("row_exact_mv_f16_")
+                .any(|name| name.starts_with("row_exact_stock_mv_f16_")
                     && name.ends_with(&format!("_m{m}"))),
             "row-exact F16 m={m} pipeline did not run: {built:?}"
         );
@@ -280,11 +299,12 @@ fn row_exact_q8_0_joint_rows_equal_serial_rows_bitwise() {
     );
     let (_, registry) = ctx.split();
     let built = row_exact_pipelines_built(registry);
+    assert_only_stock_order_built(&built);
     for m in 1..=4 {
         assert!(
             built
                 .iter()
-                .any(|name| name.starts_with("row_exact_mv_q8_0_")
+                .any(|name| name.starts_with("row_exact_stock_mv_q8_0_")
                     && name.ends_with(&format!("_m{m}"))),
             "row-exact Q8_0 m={m} pipeline did not run: {built:?}"
         );
@@ -327,10 +347,11 @@ fn row_exact_grouped_output_a_joint_rows_equal_serial_rows_bitwise() {
     );
     let (_, registry) = ctx.split();
     let built = row_exact_pipelines_built(registry);
+    assert_only_stock_order_built(&built);
     assert!(
         built
             .iter()
-            .any(|name| name.starts_with("row_exact_mv_q8_0_")),
+            .any(|name| name.starts_with("row_exact_stock_mv_q8_0_")),
         "row-exact grouped output-A did not run: {built:?}"
     );
 }
@@ -680,6 +701,240 @@ fn stock_matvec_kernels_keep_the_main_routes_bitwise() {
     });
     assert_eq!(bits(&wrapper), bits(&direct), "grouped output-A serial");
     assert_eq!(row_exact_pipelines_built(registry), Vec::<&str>::new());
+}
+
+const MAX_ROWS: usize = 8;
+
+/// For B = 1..=8, every row of the row-exact product equals the stock
+/// switch's one-row product of that row bitwise. `x` holds 8 input rows of
+/// `width_in`.
+fn assert_rows_equal_stock_one_row(
+    label: &str,
+    ctx: &mut GpuContext,
+    width_in: usize,
+    width_out: usize,
+    x: &MlxBuffer,
+    row_exact: impl Fn(
+        &mut GraphSession<'_>,
+        &mut KernelRegistry,
+        &MlxDevice,
+        &MlxBuffer,
+        &MlxBuffer,
+        usize,
+    ),
+    stock_one_row: impl Fn(
+        &mut GraphSession<'_>,
+        &mut KernelRegistry,
+        &MlxDevice,
+        &MlxBuffer,
+        &MlxBuffer,
+    ),
+) {
+    let device = ctx.device().clone();
+    let stock = output(&device, MAX_ROWS, width_out);
+    run(ctx, |s, r, d| {
+        for row in 0..MAX_ROWS {
+            let xr = row_view(x, row, vec![1, width_in]).unwrap();
+            let yr = row_view(&stock, row, vec![1, width_out]).unwrap();
+            stock_one_row(s, r, d, &xr, &yr);
+        }
+    });
+    let stock_bits = bits(&stock);
+    let values = stock.as_slice::<f32>().unwrap();
+    assert!(
+        values.iter().all(|v| v.is_finite()) && values.iter().any(|v| *v != 0.0),
+        "{label}: stock output is not a finite non-zero result"
+    );
+    for b in 1..=MAX_ROWS {
+        let y = output(&device, b, width_out);
+        let xb = x
+            .slice_view(0, b * width_in)
+            .with_shape(vec![b, width_in])
+            .unwrap();
+        run(ctx, |s, r, d| row_exact(s, r, d, &xb, &y, b));
+        let got = bits(&y);
+        if let Some(i) = got
+            .iter()
+            .zip(&stock_bits[..b * width_out])
+            .position(|(a, b)| a != b)
+        {
+            panic!(
+                "{label}: B={b} row {} col {}: row-exact {:#010x}, stock one-row {:#010x}",
+                i / width_out,
+                i % width_out,
+                got[i],
+                stock_bits[i]
+            );
+        }
+    }
+}
+
+/// Class A: with the switch on, every row of every DS decode product at
+/// B = 1..=8 is bitwise the stock switch's one-row output, so joint and
+/// serial decode reproduce today's serial decode exactly.
+#[test]
+fn row_exact_rows_equal_stock_switch_one_row_bitwise() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut ctx = GpuContext::new().unwrap();
+    let device = ctx.device().clone();
+    let products = F16_SHAPES
+        .iter()
+        .map(|&(label, n, k)| (label, GgmlType::F16, n, k))
+        .chain(
+            Q8_0_ROW_SHAPES
+                .iter()
+                .map(|&(label, n, k)| (label, GgmlType::Q8_0, n, k)),
+        );
+    for (index, (label, ggml_type, n, k)) in products.enumerate() {
+        let buffer = match ggml_type {
+            GgmlType::F16 => f16_weight(&device, n, k, 0x5700 + index as u64),
+            _ => q8_0_weight(&device, n, k, 0x5700 + index as u64),
+        };
+        let shape = [n, k];
+        let on = matrix(&buffer, ggml_type, &shape, MatvecKernels::RowExact);
+        let off = matrix(&buffer, ggml_type, &shape, MatvecKernels::Stock);
+        let x = input(&device, MAX_ROWS, k, 0x5800 + index as u64);
+        assert_rows_equal_stock_one_row(
+            label,
+            &mut ctx,
+            k,
+            n,
+            &x,
+            |s, r, d, xb, y, b| {
+                if b == 1 {
+                    // Serial decode issues one-row products through raw_matmul.
+                    raw_matmul(s, r, d, xb, &on, y, 1, n, k, label).unwrap();
+                } else {
+                    row_matmul(
+                        RowMatmul::IndependentRows,
+                        s,
+                        r,
+                        d,
+                        xb,
+                        &on,
+                        y,
+                        b,
+                        n,
+                        k,
+                        label,
+                    )
+                    .unwrap();
+                }
+            },
+            |s, r, d, xr, yr| raw_matmul(s, r, d, xr, &off, yr, 1, n, k, label).unwrap(),
+        );
+    }
+
+    // Output head: forward_logits issues it through raw_matmul at m = B.
+    let (n, k) = HEAD;
+    let buffer = q8_0_weight(&device, n, k, 0x57ff);
+    let shape = [n, k];
+    let on = matrix(&buffer, GgmlType::Q8_0, &shape, MatvecKernels::RowExact);
+    let off = matrix(&buffer, GgmlType::Q8_0, &shape, MatvecKernels::Stock);
+    let x = input(&device, MAX_ROWS, k, 0x58ff);
+    assert_rows_equal_stock_one_row(
+        "output head",
+        &mut ctx,
+        k,
+        n,
+        &x,
+        |s, r, d, xb, y, b| raw_matmul(s, r, d, xb, &on, y, b, n, k, "output head").unwrap(),
+        |s, r, d, xr, yr| raw_matmul(s, r, d, xr, &off, yr, 1, n, k, "output head").unwrap(),
+    );
+
+    // Grouped output-A: grouped_output_a (serial) and
+    // grouped_output_a_batched (joint) against the stock serial route.
+    let (groups, rank, heads, head_dim) = OUTPUT_A;
+    let gw = heads * head_dim / groups;
+    let width = heads * head_dim;
+    let buffer = q8_0_weight(&device, groups * rank, gw, 0x5a0a);
+    let shape = [groups * rank, gw];
+    let on = matrix(&buffer, GgmlType::Q8_0, &shape, MatvecKernels::RowExact);
+    let off = matrix(&buffer, GgmlType::Q8_0, &shape, MatvecKernels::Stock);
+    let x = input(&device, MAX_ROWS, width, 0x5a0b);
+    assert_rows_equal_stock_one_row(
+        "grouped output-A",
+        &mut ctx,
+        width,
+        groups * rank,
+        &x,
+        |s, r, d, xb, y, b| {
+            let xb = xb.with_shape(vec![b, heads, head_dim]).unwrap();
+            if b == 1 {
+                grouped_output_a(s, r, d, &xb, &on, y, groups, rank, heads, head_dim).unwrap();
+            } else {
+                let arena = BatchedGroupedOutputArena::new(d, b, groups, gw, rank).unwrap();
+                grouped_output_a_batched(
+                    s, r, d, &xb, &on, y, &arena, b, groups, rank, heads, head_dim,
+                )
+                .unwrap();
+            }
+        },
+        |s, r, d, xr, yr| {
+            let xr = xr.with_shape(vec![1, heads, head_dim]).unwrap();
+            grouped_output_a(s, r, d, &xr, &off, yr, groups, rank, heads, head_dim).unwrap();
+        },
+    );
+
+    let (_, registry) = ctx.split();
+    let built = row_exact_pipelines_built(registry);
+    assert_only_stock_order_built(&built);
+    assert!(!built.is_empty(), "no row-exact pipeline ran");
+}
+
+/// Prefill rows (`RowMatmul::Matrix`) at m = 2..=8 keep the stock route with
+/// the switch on: F16 keeps the tiled tensor kernel, Q8_0's row-exact rows
+/// equal the stock NR2 matvec. Outputs equal the stock switch bitwise.
+#[test]
+fn row_exact_switch_keeps_matrix_rows_on_the_stock_result() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut ctx = GpuContext::new().unwrap();
+    let device = ctx.device().clone();
+    for (label, ggml_type, n, k) in [
+        ("router", GgmlType::F16, 256, 4096),
+        ("hc_fn", GgmlType::F16, 24, 16384),
+        ("attn_q_a", GgmlType::Q8_0, 1024, 4096),
+    ] {
+        let buffer = match ggml_type {
+            GgmlType::F16 => f16_weight(&device, n, k, 0x5c00),
+            _ => q8_0_weight(&device, n, k, 0x5c01),
+        };
+        let shape = [n, k];
+        let on = matrix(&buffer, ggml_type, &shape, MatvecKernels::RowExact);
+        let off = matrix(&buffer, ggml_type, &shape, MatvecKernels::Stock);
+        let x = input(&device, MAX_ROWS, k, 0x5c02);
+        for m in 2..=MAX_ROWS {
+            let xm = x.slice_view(0, m * k).with_shape(vec![m, k]).unwrap();
+            let y_on = output(&device, m, n);
+            let y_off = output(&device, m, n);
+            run(&mut ctx, |s, r, d| {
+                row_matmul(RowMatmul::Matrix, s, r, d, &xm, &on, &y_on, m, n, k, label).unwrap();
+                row_matmul(
+                    RowMatmul::Matrix,
+                    s,
+                    r,
+                    d,
+                    &xm,
+                    &off,
+                    &y_off,
+                    m,
+                    n,
+                    k,
+                    label,
+                )
+                .unwrap();
+            });
+            assert_eq!(bits(&y_on), bits(&y_off), "{label} Matrix m={m}");
+        }
+    }
+    let (_, registry) = ctx.split();
+    let built = row_exact_pipelines_built(registry);
+    assert!(
+        built
+            .iter()
+            .all(|name| !name.starts_with("row_exact_stock_mv_f16_")),
+        "F16 Matrix rows must keep the stock tiled route: {built:?}"
+    );
 }
 
 /// Resolution order: the runtime switch when set (`0`/`1` only), else the

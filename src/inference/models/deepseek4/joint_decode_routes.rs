@@ -11,17 +11,10 @@
 //! ds4-file S3 joint == serial hardware check, ADR-063 Q4-DS4-RACE L7);
 //! grouped output-A only for Q8_0. Any other storage (for example a float
 //! output head, or K-quant `mN` routes) keeps the serial path.
-//!
-//! A model that selected `MatvecKernels::RowExact` issues F16 and Q8_0
-//! products at `m <= 8` (and Q8_0 grouped output-A) through mlx-native's
-//! `row_exact_matvec`, proven row-exact by its Metal tests (every row of an
-//! `m = B` dispatch equals the `m = 1` dispatch, B = 1..8) and by the hf2q
-//! wrapper tests in `row_matmul_tests.rs`. That family additionally admits an
-//! F16 output head.
 
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 
-use super::residency::{Deepseek4Weights, MatvecKernels};
+use super::residency::Deepseek4Weights;
 use super::Deepseek4Config;
 
 /// How joint decode issues one batched product.
@@ -59,15 +52,10 @@ pub(super) fn output_hc_fn_product(ggml_type: GgmlType) -> JointProduct {
     }
 }
 
-pub(super) fn joint_route_is_exact(
-    product: JointProduct,
-    ggml_type: GgmlType,
-    matvec: MatvecKernels,
-) -> bool {
-    let row_exact_f16 = matvec == MatvecKernels::RowExact && ggml_type == GgmlType::F16;
+pub(super) fn joint_route_is_exact(product: JointProduct, ggml_type: GgmlType) -> bool {
     match product {
         JointProduct::RowMatmul => proven_block_type(ggml_type) || dense_float_type(ggml_type),
-        JointProduct::OutputHead => proven_block_type(ggml_type) || row_exact_f16,
+        JointProduct::OutputHead => proven_block_type(ggml_type),
         JointProduct::RoutedExperts => {
             proven_block_type(ggml_type) || ggml_type == GgmlType::IQ2_XXS
         }
@@ -75,23 +63,15 @@ pub(super) fn joint_route_is_exact(
     }
 }
 
-/// First product whose storage is outside the proven set for `matvec`, as a
-/// log reason.
+/// First product whose storage is outside the proven set, as a log reason.
 pub(super) fn first_unproven_joint_route<'a>(
     products: impl IntoIterator<Item = (JointProduct, &'a str, GgmlType)>,
-    matvec: MatvecKernels,
 ) -> Option<String> {
     products
         .into_iter()
-        .find(|&(product, _, ggml_type)| !joint_route_is_exact(product, ggml_type, matvec))
+        .find(|&(product, _, ggml_type)| !joint_route_is_exact(product, ggml_type))
         .map(|(product, name, ggml_type)| {
-            let reason = format!(
-                "{name} is {ggml_type:?}, which has no proven-exact joint {product:?} route"
-            );
-            match matvec {
-                MatvecKernels::Stock => reason,
-                MatvecKernels::RowExact => format!("{reason} with row-exact matvec kernels"),
-            }
+            format!("{name} is {ggml_type:?}, which has no proven-exact joint {product:?} route")
         })
 }
 
@@ -154,14 +134,12 @@ pub(super) fn unproven_joint_route(
         products
             .iter()
             .map(|(product, name, ggml_type)| (*product, name.as_str(), *ggml_type)),
-        weights.matvec_kernels(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use MatvecKernels::{RowExact, Stock};
 
     fn official_products(head: GgmlType) -> Vec<(JointProduct, &'static str, GgmlType)> {
         vec![
@@ -212,7 +190,7 @@ mod tests {
     #[test]
     fn official_artifact_types_admit_joint_decode() {
         assert_eq!(
-            first_unproven_joint_route(official_products(GgmlType::Q8_0), Stock),
+            first_unproven_joint_route(official_products(GgmlType::Q8_0)),
             None
         );
     }
@@ -220,7 +198,7 @@ mod tests {
     #[test]
     fn float_output_head_falls_back_to_serial() {
         for head in [GgmlType::F32, GgmlType::F16, GgmlType::BF16] {
-            let reason = first_unproven_joint_route(official_products(head), Stock)
+            let reason = first_unproven_joint_route(official_products(head))
                 .expect("float head must keep serial decode");
             assert!(reason.contains("output.weight"), "{reason}");
         }
@@ -228,65 +206,29 @@ mod tests {
 
     #[test]
     fn unproven_block_types_fall_back_to_serial() {
-        for matvec in [Stock, RowExact] {
-            for (product, ggml_type) in [
-                (JointProduct::RowMatmul, GgmlType::Q4_K),
-                (JointProduct::RowMatmul, GgmlType::Q6_K),
-                (JointProduct::RowMatmul, GgmlType::Q4_0),
-                (JointProduct::GroupedOutputA, GgmlType::Q2_K),
-                (JointProduct::GroupedOutputA, GgmlType::F32),
-                (JointProduct::GroupedOutputA, GgmlType::F16),
-                (JointProduct::RoutedExperts, GgmlType::Q4_K),
-                (JointProduct::OutputHead, GgmlType::Q6_K),
-            ] {
-                assert!(
-                    !joint_route_is_exact(product, ggml_type, matvec),
-                    "{product:?} {ggml_type:?} {matvec:?}"
-                );
-                let mut products = official_products(GgmlType::Q8_0);
-                products.push((product, "blk.1.unproven.weight", ggml_type));
-                assert!(first_unproven_joint_route(products, matvec).is_some());
-            }
+        for (product, ggml_type) in [
+            (JointProduct::RowMatmul, GgmlType::Q4_K),
+            (JointProduct::RowMatmul, GgmlType::Q6_K),
+            (JointProduct::RowMatmul, GgmlType::Q4_0),
+            (JointProduct::GroupedOutputA, GgmlType::Q2_K),
+            (JointProduct::GroupedOutputA, GgmlType::F32),
+            (JointProduct::RoutedExperts, GgmlType::Q4_K),
+            (JointProduct::OutputHead, GgmlType::Q6_K),
+        ] {
+            assert!(
+                !joint_route_is_exact(product, ggml_type),
+                "{product:?} {ggml_type:?}"
+            );
+            let mut products = official_products(GgmlType::Q8_0);
+            products.push((product, "blk.1.unproven.weight", ggml_type));
+            assert!(first_unproven_joint_route(products).is_some());
         }
-    }
-
-    #[test]
-    fn official_artifact_types_admit_joint_decode_with_row_exact_kernels() {
-        assert_eq!(
-            first_unproven_joint_route(official_products(GgmlType::Q8_0), RowExact),
-            None
-        );
-    }
-
-    /// The row-exact family issues an F16 head as one row-exact `m = B`
-    /// dispatch; F32 and BF16 heads still take matrix kernels at `m > 1`.
-    #[test]
-    fn row_exact_kernels_admit_only_an_f16_float_head() {
-        assert_eq!(
-            first_unproven_joint_route(official_products(GgmlType::F16), RowExact),
-            None
-        );
-        for head in [GgmlType::F32, GgmlType::BF16] {
-            let reason = first_unproven_joint_route(official_products(head), RowExact)
-                .expect("F32/BF16 head keeps serial decode");
-            assert!(reason.contains("output.weight"), "{reason}");
-            assert!(reason.contains("row-exact"), "{reason}");
-        }
-        let stock = first_unproven_joint_route(official_products(GgmlType::F32), Stock)
-            .expect("float head keeps serial decode");
-        assert!(!stock.contains("row-exact"), "{stock}");
     }
 
     #[test]
     fn row_split_float_weights_are_exact() {
         for ggml_type in [GgmlType::F32, GgmlType::F16, GgmlType::BF16] {
-            for matvec in [Stock, RowExact] {
-                assert!(joint_route_is_exact(
-                    JointProduct::RowMatmul,
-                    ggml_type,
-                    matvec
-                ));
-            }
+            assert!(joint_route_is_exact(JointProduct::RowMatmul, ggml_type));
         }
     }
 
@@ -375,12 +317,7 @@ mod tests {
 
     #[test]
     fn ds4_file_types_admit_joint_decode() {
-        for matvec in [Stock, RowExact] {
-            assert_eq!(
-                first_unproven_joint_route(ds4_file_products(), matvec),
-                None
-            );
-        }
+        assert_eq!(first_unproven_joint_route(ds4_file_products()), None);
     }
 
     #[test]
@@ -398,30 +335,25 @@ mod tests {
             assert_eq!(output_hc_fn_product(ggml_type), JointProduct::OutputHead);
         }
         // Without the L6 row split the F16 hc head would fall back to serial.
-        let reason = first_unproven_joint_route(
-            [(JointProduct::OutputHead, OUTPUT_HC_FN, GgmlType::F16)],
-            Stock,
-        )
-        .expect("unsplit float output_hc_fn is not proven");
+        let reason =
+            first_unproven_joint_route([(JointProduct::OutputHead, OUTPUT_HC_FN, GgmlType::F16)])
+                .expect("unsplit float output_hc_fn is not proven");
         assert!(reason.contains(OUTPUT_HC_FN), "{reason}");
     }
 
     #[test]
     fn iq2_xxs_is_proven_only_for_routed_experts() {
-        for matvec in [Stock, RowExact] {
-            assert!(joint_route_is_exact(
-                JointProduct::RoutedExperts,
-                GgmlType::IQ2_XXS,
-                matvec
-            ));
-        }
+        assert!(joint_route_is_exact(
+            JointProduct::RoutedExperts,
+            GgmlType::IQ2_XXS
+        ));
         for product in [
             JointProduct::RowMatmul,
             JointProduct::OutputHead,
             JointProduct::GroupedOutputA,
         ] {
             assert!(
-                !joint_route_is_exact(product, GgmlType::IQ2_XXS, RowExact),
+                !joint_route_is_exact(product, GgmlType::IQ2_XXS),
                 "{product:?}"
             );
         }
@@ -432,7 +364,7 @@ mod tests {
             GgmlType::Q6_K,
         ] {
             assert!(
-                !joint_route_is_exact(JointProduct::RoutedExperts, unproven, RowExact),
+                !joint_route_is_exact(JointProduct::RoutedExperts, unproven),
                 "{unproven:?}"
             );
         }

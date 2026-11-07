@@ -66,17 +66,22 @@ struct ResidentTensor {
     buffer: MlxBuffer,
 }
 
-/// Kernel family of every few-row (`m <= 8`) F16 and Q8_0 product one model
+/// Kernel family of the few-row (`m <= 8`) F16 and Q8_0 products one model
 /// issues. Chosen once at model load, so the serial, joint-decode, prefill
-/// and verifier graphs of a process share one family.
+/// and verifier graphs of a process share one family. Both families produce
+/// the same bits; they differ in how many dispatches and weight reads a
+/// joint step costs.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MatvecKernels {
     /// Existing routes: the F16 `m = 1` matvec (L9) with tiled kernels above
-    /// it, the canonical GGUF matvec family (Q8_0 NR2) for block storage.
+    /// it, the canonical GGUF matvec family (Q8_0 NR2) for block storage;
+    /// independent F16 rows run one dispatch per row.
     #[default]
     Stock,
-    /// mlx-native `row_exact_matvec` for F16 and Q8_0 at `m <= 8`: one
-    /// dispatch whose every row equals its `m = 1` result bitwise.
+    /// mlx-native `row_exact_matvec_stock` where it reproduces the stock
+    /// route bitwise: F16 at `m = 1` and independent F16 rows, Q8_0 at
+    /// `m <= 8`, Q8_0 grouped output-A at `rows <= 8`. One dispatch reads the
+    /// weights once for all rows, and every row is the stock one-row result.
     RowExact,
 }
 
@@ -279,11 +284,6 @@ impl Deepseek4Weights {
     /// Number of shared Metal resources spanning the file-backed tensors.
     pub fn mapped_segment_count(&self) -> usize {
         self.mapped_segment_count
-    }
-
-    /// Few-row kernel family handed to every [`RawMatrixRef`].
-    pub fn matvec_kernels(&self) -> MatvecKernels {
-        self.matvec
     }
 
     /// Select the few-row kernel family; the model loader calls this once,
