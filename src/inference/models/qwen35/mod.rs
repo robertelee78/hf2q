@@ -89,6 +89,7 @@ pub mod mtp;
 pub mod mtp_weights_load;
 mod source_config;
 pub(crate) mod source_precision;
+pub(crate) mod resume_attn_fast;
 pub mod routing_policy;
 pub mod spec_decode;
 pub mod tokenizer;

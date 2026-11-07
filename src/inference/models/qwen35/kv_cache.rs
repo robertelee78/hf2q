@@ -605,25 +605,14 @@ impl FullAttnKvSlot {
         registry: &mut mlx_native::KernelRegistry,
         device: &MlxDevice,
     ) -> Result<MlxBuffer> {
-        let tq = self.tq.as_ref().ok_or_else(|| {
-            anyhow!(
+        // Fail before allocating, as before the `_into` split.
+        if self.tq.is_none() {
+            return Err(anyhow!(
                 "FullAttnKvSlot::dequant_seq_to_temp_f32: slot.tq is None — slot \
                  was not constructed in TQ-active mode (HybridKvCache::new_with_options \
                  tq_kv_active=true required)"
-            )
-        })?;
-
-        // Codebook-bits source: same INVESTIGATION_ENV cache the
-        // write-side uses, with the same {5,6,8} validation + fallback to
-        // 8 (mirrors gpu_full_attn::write_kv_with_optional_tq_encode and
-        // dispatch_decode_sdpa_with_optional_tq). Reading via LazyLock
-        // avoids per-call env::var().
-        let cb_env = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
-        let codebook_bits: u32 = if matches!(cb_env, 5 | 6 | 8) {
-            cb_env
-        } else {
-            8
-        };
+            ));
+        }
 
         let n_elems = (n_kv_heads as usize) * (n_tokens as usize) * (head_dim as usize);
         let dst = device
@@ -637,6 +626,68 @@ impl FullAttnKvSlot {
                 "dequant_seq_to_temp_f32: alloc temp [{n_kv_heads},{n_tokens},{head_dim}] f32: {e}"
             )
             })?;
+
+        self.dequant_seq_into_f32_for_slot(
+            is_k,
+            n_tokens,
+            start_pos,
+            cache_capacity,
+            n_kv_heads,
+            head_dim,
+            slot_id,
+            &dst,
+            encoder,
+            registry,
+            device,
+        )?;
+
+        Ok(dst)
+    }
+
+    /// [`Self::dequant_seq_to_temp_f32_for_slot`] into the caller's F32 `dst`
+    /// instead of a fresh allocation: the same dispatch writes the first
+    /// `n_kv_heads · n_tokens · head_dim` elements of `dst` as
+    /// `[n_kv_heads, n_tokens, head_dim]` (FWHT-rotated domain).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dequant_seq_into_f32_for_slot(
+        &self,
+        is_k: bool,
+        n_tokens: u32,
+        start_pos: u32,
+        cache_capacity: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        slot_id: crate::serve::multi_seq_kv::SlotId,
+        dst: &MlxBuffer,
+        encoder: &mut mlx_native::CommandEncoder,
+        registry: &mut mlx_native::KernelRegistry,
+        device: &MlxDevice,
+    ) -> Result<()> {
+        let tq = self
+            .tq
+            .as_ref()
+            .ok_or_else(|| anyhow!("FullAttnKvSlot::dequant_seq_into_f32: slot.tq is None"))?;
+        let n_elems = (n_kv_heads as usize) * (n_tokens as usize) * (head_dim as usize);
+        if dst.dtype() != DType::F32 || dst.byte_len() < n_elems * 4 {
+            return Err(anyhow!(
+                "dequant_seq_into_f32: dst must be F32 with at least {n_elems} elements, \
+                 got {:?} of {} bytes",
+                dst.dtype(),
+                dst.byte_len()
+            ));
+        }
+
+        // Codebook-bits source: same INVESTIGATION_ENV cache the
+        // write-side uses, with the same {5,6,8} validation + fallback to
+        // 8 (mirrors gpu_full_attn::write_kv_with_optional_tq_encode and
+        // dispatch_decode_sdpa_with_optional_tq). Reading via LazyLock
+        // avoids per-call env::var().
+        let cb_env = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
+        let codebook_bits: u32 = if matches!(cb_env, 5 | 6 | 8) {
+            cb_env
+        } else {
+            8
+        };
 
         let views = tq.slot_views(slot_id, n_kv_heads, cache_capacity, head_dim)?;
         let (packed, norms) = if is_k {
@@ -654,7 +705,7 @@ impl FullAttnKvSlot {
             device.metal_device(),
             packed,
             norms,
-            &dst,
+            dst,
             n_kv_heads,
             head_dim,
             cache_capacity,
@@ -663,9 +714,7 @@ impl FullAttnKvSlot {
             /*scale_factor_d512=*/ 1.0,
             codebook_bits,
         )
-        .map_err(|e| anyhow!("dequant_seq_to_temp_f32: dispatch_tq_dequantize_hb_kv_seq: {e}"))?;
-
-        Ok(dst)
+        .map_err(|e| anyhow!("dequant_seq_to_temp_f32: dispatch_tq_dequantize_hb_kv_seq: {e}"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -757,7 +806,62 @@ impl FullAttnKvSlot {
             registry,
             device,
         )?;
+        Self::undo_dequant_rotation_in_place(
+            &dst, n_tokens, n_kv_heads, head_dim, encoder, registry, device,
+        )?;
 
+        Ok(dst)
+    }
+
+    /// [`Self::dequant_seq_to_temp_f32_unrotated_for_slot`] into the caller's
+    /// F32 `dst` instead of a fresh allocation: the same two dispatches (and
+    /// the barrier between them) leave the first
+    /// `n_kv_heads · n_tokens · head_dim` elements of `dst` in the unrotated
+    /// domain as `[n_kv_heads, n_tokens, head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dequant_seq_into_f32_unrotated_for_slot(
+        &self,
+        is_k: bool,
+        n_tokens: u32,
+        start_pos: u32,
+        cache_capacity: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        slot_id: crate::serve::multi_seq_kv::SlotId,
+        dst: &MlxBuffer,
+        encoder: &mut mlx_native::CommandEncoder,
+        registry: &mut mlx_native::KernelRegistry,
+        device: &MlxDevice,
+    ) -> Result<()> {
+        self.dequant_seq_into_f32_for_slot(
+            is_k,
+            n_tokens,
+            start_pos,
+            cache_capacity,
+            n_kv_heads,
+            head_dim,
+            slot_id,
+            dst,
+            encoder,
+            registry,
+            device,
+        )?;
+        Self::undo_dequant_rotation_in_place(
+            dst, n_tokens, n_kv_heads, head_dim, encoder, registry, device,
+        )
+    }
+
+    /// Steps (2)–(3) of the unrotated dequant: barrier, then FWHT × sign-undo
+    /// over the first `n_kv_heads · n_tokens` rows of `head_dim` in `dst`.
+    fn undo_dequant_rotation_in_place(
+        dst: &MlxBuffer,
+        n_tokens: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        encoder: &mut mlx_native::CommandEncoder,
+        registry: &mut mlx_native::KernelRegistry,
+        device: &MlxDevice,
+    ) -> Result<()> {
         // (2) RAW barrier: FWHT-undo kernel reads what dequant just wrote.
         encoder.memory_barrier();
 
@@ -778,15 +882,11 @@ impl FullAttnKvSlot {
             encoder,
             registry,
             device.metal_device(),
-            &dst,
+            dst,
             total_chunks,
             head_dim,
         )
-        .map_err(|e| {
-            anyhow!("dequant_seq_to_temp_f32_unrotated: dispatch_fwht_sign_undo_f32: {e}")
-        })?;
-
-        Ok(dst)
+        .map_err(|e| anyhow!("dequant_seq_to_temp_f32_unrotated: dispatch_fwht_sign_undo_f32: {e}"))
     }
 
     #[allow(clippy::too_many_arguments)]
