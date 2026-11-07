@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::joint_decode_routes::{JointDenseFfnRoute, JointRouteMode};
+use super::joint_projection::JointProjectionKernel;
 use super::joint_step_options::JointStepOptions;
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
@@ -28,15 +29,18 @@ const Q1_TRACE_SCHEMA: &str = "hf2q.adr063.invariance.v2";
 const PREFILL_CHUNK: usize = 512;
 
 const CANONICAL: JointStepOptions = JointStepOptions {
+    projection: JointProjectionKernel::Canonical,
     pooled_outputs: false,
 };
 
 /// Joint arms of the trace: the production default first, then the
-/// `HF2Q_QWEN_JOINT_FFN_SHARED=0` route, then the production route with
-/// pooled layer outputs (`HF2Q_QWEN_JOINT_POOLED_OUTPUTS=1`, Class A:
-/// asserted bitwise equal to the first arm at every step). Each arm owns a
-/// cache and a store directory under `$HF2Q_QWEN_JOINT_Q1_OUT`.
-const JOINT_ARMS: [(JointDenseFfnRoute, JointStepOptions, &str); 3] = [
+/// `HF2Q_QWEN_JOINT_FFN_SHARED=0` route, then the production FFN route with
+/// the column-invariant MMA projections (`HF2Q_QWEN_JOINT_MMA=1`), then the
+/// production route with pooled layer outputs
+/// (`HF2Q_QWEN_JOINT_POOLED_OUTPUTS=1`, Class A: asserted bitwise equal to
+/// the first arm at every step). Each arm owns a cache and a store directory
+/// under `$HF2Q_QWEN_JOINT_Q1_OUT`.
+const JOINT_ARMS: [(JointDenseFfnRoute, JointStepOptions, &str); 4] = [
     (
         JointDenseFfnRoute::SharedWeights,
         CANONICAL,
@@ -50,6 +54,15 @@ const JOINT_ARMS: [(JointDenseFfnRoute, JointStepOptions, &str); 3] = [
     (
         JointDenseFfnRoute::SharedWeights,
         JointStepOptions {
+            projection: JointProjectionKernel::ColumnInvariantMma,
+            pooled_outputs: false,
+        },
+        "joint_shared_ffn_mma",
+    ),
+    (
+        JointDenseFfnRoute::SharedWeights,
+        JointStepOptions {
+            projection: JointProjectionKernel::Canonical,
             pooled_outputs: true,
         },
         "joint_shared_ffn_pooled",
@@ -58,7 +71,7 @@ const JOINT_ARMS: [(JointDenseFfnRoute, JointStepOptions, &str); 3] = [
 
 /// Index of the arm whose logits the pooled arm must equal bitwise.
 const POOLED_REFERENCE_ARM: usize = 0;
-const POOLED_ARM: usize = 2;
+const POOLED_ARM: usize = 3;
 
 /// Rendered prompts: a JSON array of 2..=4 entries, each either the exact
 /// token IDs or the rendered chat-prompt text (tokenized with the serving
@@ -190,6 +203,9 @@ impl LogitStore {
 ///   the weight-shared dense FFN (production default);
 /// - `joint_serial_ffn/`: the same with the serial builder's per-row fused
 ///   gate/up kernel (`HF2Q_QWEN_JOINT_FFN_SHARED=0`);
+/// - `joint_shared_ffn_mma/`: the production FFN route with the packed
+///   layer products on the column-invariant MMA kernel
+///   (`HF2Q_QWEN_JOINT_MMA=1`);
 /// - `joint_shared_ffn_pooled/`: the production route with pooled layer
 ///   outputs (`HF2Q_QWEN_JOINT_POOLED_OUTPUTS=1`), asserted bitwise equal to
 ///   `joint_shared_ffn` at every step.
@@ -197,7 +213,8 @@ impl LogitStore {
 /// Every arm's kernels are fixed here, not read from the switches. Then
 /// `python3 -B scripts/four_agent/q1_decision_policy.py envelope
 /// $OUT/serial/trace.json $OUT/joint_shared_ffn/trace.json` (the gate), and
-/// the same against `joint_serial_ffn` (kill-switch route).
+/// the same against `joint_serial_ffn` (kill-switch route) and
+/// `joint_shared_ffn_mma` (MMA route).
 #[test]
 #[ignore = "requires HF2Q_QWEN38_GGUF, HF2Q_DECODE_MV_EXT=1, HF2Q_QWEN_JOINT_Q1_PROMPTS, HF2Q_QWEN_JOINT_Q1_OUT and Apple Metal"]
 fn qwen38_joint_decode_q1_envelope_trace() {
@@ -316,6 +333,7 @@ fn qwen38_joint_decode_q1_envelope_trace() {
             "path": "joint",
             "arm": directory,
             "dense_ffn": dense_ffn.label(),
+            "column_invariant_mma": options.projection == JointProjectionKernel::ColumnInvariantMma,
             "pooled_outputs": options.pooled_outputs,
             "run": provenance,
         }));
