@@ -75,6 +75,8 @@ mod ds4_file_kernel_parity_tests;
 #[cfg(test)]
 mod ds4_op_microbench_tests;
 #[cfg(test)]
+mod ds4_prefill_microbench_tests;
+#[cfg(test)]
 mod ds4_file_parity_tests;
 #[cfg(test)]
 mod ffn_forward_tests;
