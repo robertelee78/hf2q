@@ -359,7 +359,7 @@ fn q1_gemma_actual_stage_localizer() {
             .unwrap();
     let decode_dense_kernel = super::gemma_actual::require_decode_dense_kernel(
         packet.decode_dense_kernel,
-        crate::inference::models::gemma4::decode_mma::kernel(),
+        crate::inference::models::gemma4::decode_dense::resolve().unwrap(),
     )
     .unwrap();
     acquisition_scope

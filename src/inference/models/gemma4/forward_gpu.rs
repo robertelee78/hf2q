@@ -989,7 +989,7 @@ impl MlxModelWeights {
                 &[&self.activations.norm_out, &lm_head.buffer],
                 &[&self.activations.logits],
             );
-            super::decode_mma::dispatch_decode_dense(
+            super::decode_dense::dispatch_decode_dense(
                 &mut s,
                 reg,
                 dev,
@@ -1552,7 +1552,7 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("pre-attn norm L{layer_idx}: {e}"))?;
 
                 // Q proj
-                super::decode_mma::dispatch_decode_dense(
+                super::decode_dense::dispatch_decode_dense(
                     &mut s,
                     reg,
                     dev,
@@ -1566,7 +1566,7 @@ impl MlxModelWeights {
                     },
                 )?;
                 // K proj
-                super::decode_mma::dispatch_decode_dense(
+                super::decode_dense::dispatch_decode_dense(
                     &mut s,
                     reg,
                     dev,
@@ -1581,7 +1581,7 @@ impl MlxModelWeights {
                 )?;
                 // V proj (if not k_eq_v)
                 if !v_is_k {
-                    super::decode_mma::dispatch_decode_dense(
+                    super::decode_dense::dispatch_decode_dense(
                         &mut s,
                         reg,
                         dev,
@@ -1837,7 +1837,7 @@ impl MlxModelWeights {
                     .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("oproj begin L{layer_idx}: {e}"))?;
 
-                super::decode_mma::dispatch_decode_dense(
+                super::decode_dense::dispatch_decode_dense(
                     &mut s,
                     reg,
                     dev,
@@ -1898,7 +1898,7 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("pre-FF norm L{layer_idx}: {e}"))?;
 
                 // gate
-                super::decode_mma::dispatch_decode_dense(
+                super::decode_dense::dispatch_decode_dense(
                     &mut s,
                     reg,
                     dev,
@@ -1912,7 +1912,7 @@ impl MlxModelWeights {
                     },
                 )?;
                 // up
-                super::decode_mma::dispatch_decode_dense(
+                super::decode_dense::dispatch_decode_dense(
                     &mut s,
                     reg,
                     dev,
@@ -1948,7 +1948,7 @@ impl MlxModelWeights {
                     );
                 }
                 // down
-                super::decode_mma::dispatch_decode_dense(
+                super::decode_dense::dispatch_decode_dense(
                     &mut s,
                     reg,
                     dev,
@@ -2218,7 +2218,7 @@ impl MlxModelWeights {
                 &[&self.activations.norm_out, &lm_head.buffer],
                 &[&self.activations.logits],
             );
-            super::decode_mma::dispatch_decode_dense(
+            super::decode_dense::dispatch_decode_dense(
                 &mut s,
                 reg,
                 dev,
@@ -2701,7 +2701,7 @@ impl MlxModelWeights {
         let mut head_session = exec
             .begin().map(crate::inference::native_observation::session)
             .map_err(|e| anyhow!("forward_tree_verify_gpu: begin head session: {e}"))?;
-        super::decode_mma::dispatch_decode_dense(
+        super::decode_dense::dispatch_decode_dense(
             &mut head_session,
             registry,
             device,
