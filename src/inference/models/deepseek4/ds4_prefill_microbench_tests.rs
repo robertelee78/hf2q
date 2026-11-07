@@ -15,6 +15,12 @@
 //! every weight is reused across all rows of the chunk, and the routed-expert tensors (1.1-1.8 GB per
 //! layer) exceed the system cache anyway.
 //!
+//! Small chunks (fix-1 design: recovery tail and short suffixes): `HF2Q_DS4_PREFILL_BENCH_ROWS` (comma list)
+//! replaces both row lists and `HF2Q_DS4_PREFILL_BENCH_STARTS` the cache starts. Below `COLD_BELOW_ROWS` the
+//! dense and expert cells rotate weight copies (cold, as a chunk of a real prompt reads each layer's weights
+//! once), and routed experts take the production small-chunk route: separate gate and up plus down through
+//! `ExpertMatmulRoute::Auto` without scratch, i.e. `mv_id` at `T <= MM_ID_ROUTING_THRESHOLD`.
+//!
 //! Run (standing grant, model-free, <= 15 min):
 //! ```text
 //! HF2Q_DS4_PREFILL_BENCH_OUT=<cells.jsonl> cargo test --release --bin hf2q ds4_prefill_microbench -- --ignored --nocapture
@@ -49,13 +55,13 @@ use mlx_native::ops::deepseek_tail_rope::{
 use mlx_native::ops::elementwise::dispatch_cast_bf16_to_f32_with_encoder;
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy;
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
-use mlx_native::{DType, IdMmScratch, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{DType, IdMmScratch, KernelRegistry, MlxBuffer, MlxDevice, MM_ID_ROUTING_THRESHOLD};
 use serde_json::{json, Value};
 
 use super::attention::{append_prefill_window_indices, window_indices};
 use super::compressed_attention_indexer::layout::prepare_layout;
 use super::ds4_bench_support::{
-    f16_matrix, f32_buf, floor_cells, gpu_warmup, time_op_reps, Out, Rng, Timing,
+    copies_for, f16_matrix, f32_buf, floor_cells, gpu_warmup, time_op_reps, Out, Rng, Timing,
 };
 use super::ds4_op_microbench_tests::block_weight;
 use super::forward_support::{
@@ -72,6 +78,8 @@ use crate::serve::gpu::GpuContext;
 const ROWS: [usize; 4] = [256, 512, 1024, 2048];
 const ATTN_ROWS: [usize; 2] = [512, 1024];
 const STARTS: [usize; 2] = [0, 8192];
+/// Chunks below this many rows read cold (rotated) weight copies.
+const COLD_BELOW_ROWS: usize = 256;
 const MIN_REPS: usize = 2;
 const HIDDEN: usize = 4096;
 const HEADS: usize = 64;
@@ -90,6 +98,27 @@ fn time(
     encode: impl FnMut(&mut GraphSession<'_>, &mut KernelRegistry, &MlxDevice, usize) -> Result<()>,
 ) -> Timing {
     time_op_reps(ctx, MIN_REPS, encode)
+}
+
+/// `name` as a comma list of usize, or `default`.
+fn env_list(name: &str, default: &[usize]) -> Vec<usize> {
+    match std::env::var(name) {
+        Ok(v) => v.split(',').map(|s| s.trim().parse().unwrap()).collect(),
+        Err(_) => default.to_vec(),
+    }
+}
+
+fn rows_list(default: &[usize]) -> Vec<usize> {
+    env_list("HF2Q_DS4_PREFILL_BENCH_ROWS", default)
+}
+
+fn starts_list() -> Vec<usize> {
+    env_list("HF2Q_DS4_PREFILL_BENCH_STARTS", &STARTS)
+}
+
+/// Weight copies for a T-row cell: one when warm-equivalent (T >= COLD_BELOW_ROWS), else enough to go cold.
+fn weight_copies(rows: usize, bytes: usize) -> usize {
+    copies_for(bytes, rows >= COLD_BELOW_ROWS)
 }
 
 fn bf16_buf(device: &MlxDevice, shape: Vec<usize>, seed: u64, scale: f32) -> MlxBuffer {
@@ -162,15 +191,21 @@ fn dense_q8_cells(ctx: &mut GpuContext, out: &mut Out) {
         ("shexp_gate_up", 2048, 4096),
         ("shexp_down", 4096, 2048),
     ];
+    let rows_set = rows_list(&ROWS);
     for (name, n, k) in ops {
-        let w = block_weight(&device, GgmlType::Q8_0, vec![n, k], 1);
+        let bytes = n * k / 32 * 34;
+        let most = rows_set.iter().map(|&t| weight_copies(t, bytes)).max().unwrap();
+        let all: Vec<MlxBuffer> = (0..most)
+            .map(|c| block_weight(&device, GgmlType::Q8_0, vec![n, k], 1 + 1000 * c as u64))
+            .collect();
         let shape = [n, k];
-        for rows in ROWS {
+        for &rows in &rows_set {
+            let ws = &all[..weight_copies(rows, bytes)];
             let x = f32_buf(&device, vec![rows, k], 2, 1.0);
             let y = alloc(&device, DType::F32, vec![rows, n], "y").unwrap();
-            let t = time(ctx, |s, r, d, _| {
+            let t = time(ctx, |s, r, d, rep| {
                 let wr = RawMatrixRef {
-                    buffer: &w,
+                    buffer: &ws[rep % ws.len()],
                     ggml_type: GgmlType::Q8_0,
                     shape: &shape,
                 };
@@ -178,7 +213,7 @@ fn dense_q8_cells(ctx: &mut GpuContext, out: &mut Out) {
             });
             emit(
                 out,
-                json!({"family": "dense_q8_0", "op": name, "n": n, "k": k, "t": rows}),
+                json!({"family": "dense_q8_0", "op": name, "n": n, "k": k, "t": rows, "copies": ws.len()}),
                 &t,
             );
         }
@@ -186,15 +221,20 @@ fn dense_q8_cells(ctx: &mut GpuContext, out: &mut Out) {
     // grouped output_a: 8 groups of [1024, 4096] over token-major attention
     let (groups, rank) = (8usize, 1024usize);
     let gw = HEADS * DIM / groups;
-    let w = block_weight(&device, GgmlType::Q8_0, vec![groups * rank, gw], 3);
+    let bytes = groups * rank * gw / 32 * 34;
+    let most = rows_set.iter().map(|&t| weight_copies(t, bytes)).max().unwrap();
+    let all: Vec<MlxBuffer> = (0..most)
+        .map(|c| block_weight(&device, GgmlType::Q8_0, vec![groups * rank, gw], 3 + 1000 * c as u64))
+        .collect();
     let shape = [groups * rank, gw];
-    for rows in ROWS {
+    for &rows in &rows_set {
+        let ws = &all[..weight_copies(rows, bytes)];
         let x = f32_buf(&device, vec![rows, HEADS * DIM], 4, 1.0);
         let y = alloc(&device, DType::F32, vec![rows, groups * rank], "y").unwrap();
         let arena = BatchedGroupedOutputArena::new(&device, rows, groups, gw, rank).unwrap();
-        let t = time(ctx, |s, r, d, _| {
+        let t = time(ctx, |s, r, d, rep| {
             let wr = RawMatrixRef {
-                buffer: &w,
+                buffer: &ws[rep % ws.len()],
                 ggml_type: GgmlType::Q8_0,
                 shape: &shape,
             };
@@ -202,7 +242,7 @@ fn dense_q8_cells(ctx: &mut GpuContext, out: &mut Out) {
         });
         emit(
             out,
-            json!({"family": "dense_q8_0", "op": "attn_output_a_grouped", "n": groups * rank, "k": gw, "t": rows}),
+            json!({"family": "dense_q8_0", "op": "attn_output_a_grouped", "n": groups * rank, "k": gw, "t": rows, "copies": ws.len()}),
             &t,
         );
     }
@@ -220,15 +260,21 @@ fn dense_f16_cells(ctx: &mut GpuContext, out: &mut Out) {
         ("indexer_proj", 64, 4096),
         ("indexer_compressor", 256, 4096),
     ];
+    let rows_set = rows_list(&ROWS);
     for (name, n, k) in ops {
-        let w = f16_matrix(&device, n, k, 10);
+        let bytes = n * k * 2;
+        let most = rows_set.iter().map(|&t| weight_copies(t, bytes)).max().unwrap();
+        let all: Vec<MlxBuffer> = (0..most)
+            .map(|c| f16_matrix(&device, n, k, 10 + 1000 * c as u64))
+            .collect();
         let shape = [n, k];
-        for rows in ROWS {
+        for &rows in &rows_set {
+            let ws = &all[..weight_copies(rows, bytes)];
             let x = f32_buf(&device, vec![rows, k], 11, 1.0);
             let y = alloc(&device, DType::F32, vec![rows, n], "y").unwrap();
-            let t = time(ctx, |s, r, d, _| {
+            let t = time(ctx, |s, r, d, rep| {
                 let wr = RawMatrixRef {
-                    buffer: &w,
+                    buffer: &ws[rep % ws.len()],
                     ggml_type: GgmlType::F16,
                     shape: &shape,
                 };
@@ -236,14 +282,16 @@ fn dense_f16_cells(ctx: &mut GpuContext, out: &mut Out) {
             });
             emit(
                 out,
-                json!({"family": "dense_f16", "op": name, "n": n, "k": k, "t": rows}),
+                json!({"family": "dense_f16", "op": name, "n": n, "k": k, "t": rows, "copies": ws.len()}),
                 &t,
             );
         }
     }
 }
 
-/// Routed experts: paired IQ2_XXS gate/up (`expert_matmul_pair`) and slotted Q2_K down.
+/// Routed experts: paired IQ2_XXS gate/up (`expert_matmul_pair`) and slotted Q2_K down; at
+/// `T <= MM_ID_ROUTING_THRESHOLD` the production small-chunk route (separate gate, up and down, `Auto`
+/// without scratch). Small chunks rotate expert-id sets so each copy reads different experts (cold).
 fn expert_cells(ctx: &mut GpuContext, out: &mut Out) {
     let device = ctx.device().clone();
     let gate = block_weight(&device, GgmlType::IQ2_XXS, vec![EXPERTS, INTER, HIDDEN], 20);
@@ -251,13 +299,82 @@ fn expert_cells(ctx: &mut GpuContext, out: &mut Out) {
     let down = block_weight(&device, GgmlType::Q2_K, vec![EXPERTS, HIDDEN, INTER], 22);
     let gu_shape = [EXPERTS, INTER, HIDDEN];
     let d_shape = [EXPERTS, HIDDEN, INTER];
-    for rows in ROWS {
-        let ids = expert_ids(&device, rows, rows as u64);
+    let iq2_expert = INTER * HIDDEN / 256 * 66;
+    for rows in rows_list(&ROWS) {
+        let id_sets: Vec<MlxBuffer> = (0..weight_copies(rows, iq2_expert * rows * TOP_K))
+            .map(|c| expert_ids(&device, rows, rows as u64 + 1000 * c as u64))
+            .collect();
         let x = f32_buf(&device, vec![rows, HIDDEN], 23, 1.0);
         let g = alloc(&device, DType::F32, vec![rows * TOP_K, INTER], "g").unwrap();
         let u = alloc(&device, DType::F32, vec![rows * TOP_K, INTER], "u").unwrap();
         let act = f32_buf(&device, vec![rows * TOP_K, INTER], 24, 1.0);
         let y = alloc(&device, DType::F32, vec![rows * TOP_K, HIDDEN], "y").unwrap();
+        if rows <= MM_ID_ROUTING_THRESHOLD as usize {
+            let t = time(ctx, |s, r, d, rep| {
+                let ids = &id_sets[rep % id_sets.len()];
+                for (w, o, label) in [(&gate, &g, "routed gate"), (&up, &u, "routed up")] {
+                    let wr = RawMatrixRef {
+                        buffer: w,
+                        ggml_type: GgmlType::IQ2_XXS,
+                        shape: &gu_shape,
+                    };
+                    expert_matmul(
+                        s,
+                        r,
+                        d,
+                        &x,
+                        &wr,
+                        ids,
+                        o,
+                        rows,
+                        TOP_K,
+                        EXPERTS,
+                        INTER,
+                        HIDDEN,
+                        ExpertMatmulRoute::Auto,
+                        None,
+                        label,
+                    )?;
+                }
+                Ok(())
+            });
+            emit(
+                out,
+                json!({"family": "experts", "op": "gate_up_pair_iq2_xxs", "n": INTER, "k": HIDDEN, "t": rows, "route": "auto_mv_id_separate", "copies": id_sets.len()}),
+                &t,
+            );
+            let t = time(ctx, |s, r, d, rep| {
+                let dw = RawMatrixRef {
+                    buffer: &down,
+                    ggml_type: GgmlType::Q2_K,
+                    shape: &d_shape,
+                };
+                expert_matmul(
+                    s,
+                    r,
+                    d,
+                    &act,
+                    &dw,
+                    &id_sets[rep % id_sets.len()],
+                    &y,
+                    rows,
+                    TOP_K,
+                    EXPERTS,
+                    HIDDEN,
+                    INTER,
+                    ExpertMatmulRoute::Auto,
+                    None,
+                    "routed down",
+                )
+            });
+            emit(
+                out,
+                json!({"family": "experts", "op": "down_q2_k", "n": HIDDEN, "k": INTER, "t": rows, "route": "auto_mv_id", "copies": id_sets.len()}),
+                &t,
+            );
+            continue;
+        }
+        let ids = &id_sets[0];
         let mut scratch = IdMmScratch::alloc(&device, EXPERTS as u32, rows as u32).unwrap();
         let t = time(ctx, |s, r, d, _| {
             let gw = RawMatrixRef {
@@ -277,7 +394,7 @@ fn expert_cells(ctx: &mut GpuContext, out: &mut Out) {
                 &x,
                 &gw,
                 &uw,
-                &ids,
+                ids,
                 &g,
                 &u,
                 rows,
@@ -291,7 +408,7 @@ fn expert_cells(ctx: &mut GpuContext, out: &mut Out) {
         });
         emit(
             out,
-            json!({"family": "experts", "op": "gate_up_pair_iq2_xxs", "n": INTER, "k": HIDDEN, "t": rows, "route": "paired_mm_id"}),
+            json!({"family": "experts", "op": "gate_up_pair_iq2_xxs", "n": INTER, "k": HIDDEN, "t": rows, "route": "paired_mm_id", "copies": 1}),
             &t,
         );
         let t = time(ctx, |s, r, d, _| {
@@ -306,7 +423,7 @@ fn expert_cells(ctx: &mut GpuContext, out: &mut Out) {
                 d,
                 &act,
                 &dw,
-                &ids,
+                ids,
                 &y,
                 rows,
                 TOP_K,
@@ -320,7 +437,7 @@ fn expert_cells(ctx: &mut GpuContext, out: &mut Out) {
         });
         emit(
             out,
-            json!({"family": "experts", "op": "down_q2_k", "n": HIDDEN, "k": INTER, "t": rows, "route": "slotted_mm"}),
+            json!({"family": "experts", "op": "down_q2_k", "n": HIDDEN, "k": INTER, "t": rows, "route": "slotted_mm", "copies": 1}),
             &t,
         );
     }
@@ -330,7 +447,7 @@ fn expert_cells(ctx: &mut GpuContext, out: &mut Out) {
 fn moe_misc_cells(ctx: &mut GpuContext, out: &mut Out) {
     let device = ctx.device().clone();
     let bias = f32_buf(&device, vec![EXPERTS], 30, 0.1);
-    for rows in ROWS {
+    for rows in rows_list(&ROWS) {
         let logits = f32_buf(&device, vec![rows, EXPERTS], 31, 2.0);
         let indices = zeros(&device, DType::I32, vec![rows, TOP_K]);
         let weights = zeros(&device, DType::F32, vec![rows, TOP_K]);
@@ -446,7 +563,7 @@ fn rowwise_cells(ctx: &mut GpuContext, out: &mut Out) {
     let rank_w = ones(&device, 1024);
     let head_w = ones(&device, DIM);
     let freqs = rope_freqs(&device);
-    for rows in ROWS {
+    for rows in rows_list(&ROWS) {
         let r32 = rows as u32;
         let base = |op: &str| json!({"family": "rowwise", "op": op, "t": rows});
         let state = f32_buf(&device, vec![rows, HC, HIDDEN], 43, 1.0);
@@ -717,11 +834,11 @@ fn picks(rng: &mut Rng, valid: usize, k: usize) -> Vec<i32> {
 fn attention_cells(ctx: &mut GpuContext, out: &mut Out) {
     let device = ctx.device().clone();
     let sinks = f32_buf(&device, vec![HEADS], 60, 1.0);
-    for rows in ATTN_ROWS {
+    for rows in rows_list(&ATTN_ROWS) {
         let q = bf16_buf(&device, vec![1, rows, HEADS, DIM], 61, 1.0);
         let kv = bf16_buf(&device, vec![1, rows, 1, DIM], 62, 0.5);
         let o = alloc(&device, DType::BF16, vec![1, rows, HEADS, DIM], "o").unwrap();
-        for s0 in STARTS {
+        for s0 in starts_list() {
             let prefix = (s0 > 0).then(|| bf16_buf(&device, vec![1, WINDOW, 1, DIM], 63, 0.5));
             for (kind, ratio) in [("window", 0u32), ("hca", 128), ("csa", 4)] {
                 let valid = if ratio == 0 {
@@ -820,7 +937,7 @@ fn attention_cells(ctx: &mut GpuContext, out: &mut Out) {
 fn indexer_cells(ctx: &mut GpuContext, out: &mut Out) {
     let device = ctx.device().clone();
     let (stride, column) = (640usize, 128usize);
-    for rows in ATTN_ROWS {
+    for rows in rows_list(&ATTN_ROWS) {
         let q = bf16_buf(&device, vec![1, rows, IDX_HEADS, IDX_DIM], 70, 1.0);
         let w = f32_buf(
             &device,
@@ -829,7 +946,7 @@ fn indexer_cells(ctx: &mut GpuContext, out: &mut Out) {
             1.0 / ((IDX_DIM * IDX_HEADS) as f32).sqrt(),
         );
         let o = zeros(&device, DType::I32, vec![1, rows, stride]);
-        for s0 in STARTS {
+        for s0 in starts_list() {
             let keys = (s0 + rows) / 4;
             let kv = bf16_buf(&device, vec![1, keys, IDX_DIM], 72, 0.5);
             let params = DeepSeekIndexerParams {
@@ -890,8 +1007,8 @@ fn compressor_cells(ctx: &mut GpuContext, out: &mut Out) {
         let projected = coff * dim;
         let ape = f32_buf(&device, vec![ratio, projected], 81, 0.1);
         let norm = ones(&device, dim);
-        for rows in ATTN_ROWS {
-            for s0 in STARTS {
+        for rows in rows_list(&ATTN_ROWS) {
+            for s0 in starts_list() {
                 let params = DeepSeekCompressorParams {
                     batch: 1,
                     seq_len: rows as u32,
