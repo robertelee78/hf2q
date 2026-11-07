@@ -1,11 +1,10 @@
 //! Per-step execution choices of a Qwen joint decode step and their
 //! switches.
 //!
-//! [`JointStepOptions::from_process`] reads the switches;
-//! `forward_gpu_decode_joint_with_options` takes the options explicitly so
-//! one process can run several (the Q1 trace).
-
-use super::joint_decode_routes::JointRouteMode;
+//! The serving worker parses the switches once at start
+//! (`qwen35_joint_decode_config`); `forward_gpu_decode_joint_with_options`
+//! takes the options explicitly, so one process can run several (the Q1
+//! trace).
 
 /// Switch for [`JointStepOptions::pooled_outputs`]: `1`/`on`/`true` takes the
 /// joint layer chain's multi-row outputs from the decode pool
@@ -14,21 +13,11 @@ use super::joint_decode_routes::JointRouteMode;
 pub(crate) const QWEN_JOINT_POOLED_OUTPUTS_ENV: &str = "HF2Q_QWEN_JOINT_POOLED_OUTPUTS";
 
 /// Per-step execution choices of a joint step that its route mode does not
-/// fix.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// fix. The default turns every choice off.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct JointStepOptions {
     /// Multi-row layer outputs from the decode pool (Class A).
     pub pooled_outputs: bool,
-}
-
-impl JointStepOptions {
-    /// The switches over the process environment for `mode`.
-    pub(crate) fn from_process(_mode: JointRouteMode) -> Result<Self, String> {
-        let read = |name: &str| parse_switch(name, std::env::var(name).ok().as_deref());
-        Ok(Self {
-            pooled_outputs: read(QWEN_JOINT_POOLED_OUTPUTS_ENV)?,
-        })
-    }
 }
 
 /// Parse an on/off switch named `name`; unset or blank means off.
@@ -43,6 +32,11 @@ pub(crate) fn parse_switch(name: &str, raw: Option<&str>) -> Result<bool, String
             "{name} must be 1/on/true or 0/off/false, got {raw:?}"
         )),
     }
+}
+
+/// [`parse_switch`] over the process environment.
+pub(crate) fn switch_from_process(name: &str) -> Result<bool, String> {
+    parse_switch(name, std::env::var(name).ok().as_deref())
 }
 
 #[cfg(test)]

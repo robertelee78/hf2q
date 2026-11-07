@@ -225,12 +225,9 @@ impl Qwen35Model {
         })
     }
 
-    /// Advance `rows.len()` distinct slots by one token each in one
-    /// layer-major transaction. Under [`JointRouteMode::Exact`] every row's
-    /// logits, hidden, KV codes, recurrent state, cursor and parity are
-    /// bitwise those of its serial one-token forward. `dense_ffn` must be
-    /// admitted for `mode` ([`check_dense_ffn_route`]). Refusal (admission,
-    /// shape, slot range) happens before any cache write.
+    /// [`Self::forward_gpu_decode_joint_with_options`] with the default
+    /// step options (every switch off).
+    #[cfg(test)]
     pub(crate) fn forward_gpu_decode_joint(
         &self,
         rows: &[Qwen35JointRow],
@@ -238,14 +235,18 @@ impl Qwen35Model {
         mode: JointRouteMode,
         dense_ffn: JointDenseFfnRoute,
     ) -> Result<Vec<Qwen35JointRowOutput>> {
-        let options = JointStepOptions::from_process(mode)
-            .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
+        let options = JointStepOptions::default();
         self.forward_gpu_decode_joint_with_options(rows, kv_cache, mode, dense_ffn, options)
     }
 
-    /// [`Self::forward_gpu_decode_joint`] with the step options given instead
-    /// of read from their switches (the Q1 trace runs several in one
-    /// process).
+    /// Advance `rows.len()` distinct slots by one token each in one
+    /// layer-major transaction. Under [`JointRouteMode::Exact`] every row's
+    /// logits, hidden, KV codes, recurrent state, cursor and parity are
+    /// bitwise those of its serial one-token forward. `dense_ffn` must be
+    /// admitted for `mode` ([`check_dense_ffn_route`]). `options` are
+    /// resolved by the caller (the serving worker reads their switches once
+    /// at start; the Q1 trace runs several in one process). Refusal
+    /// (admission, shape, slot range) happens before any cache write.
     pub(crate) fn forward_gpu_decode_joint_with_options(
         &self,
         rows: &[Qwen35JointRow],
