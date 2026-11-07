@@ -192,6 +192,8 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
             "gemma_warm_attention_kernel": engine.info().gemma_warm_attention_kernel,
             // Native expert-matmul tile schedule (`HF2Q_MM_ID_SCHEDULE`).
             "mm_id_schedule": crate::serve::gemma_prefill_moe::published_mm_id_schedule(),
+            // Native Q5_0 tensor-MM opt-in (`HF2Q_Q5_0_TENSOR_MM=1`).
+            "q5_0_tensor_mm": crate::serve::gemma_prefill_moe::published_q5_0_tensor_mm(),
         },
     }))
 }

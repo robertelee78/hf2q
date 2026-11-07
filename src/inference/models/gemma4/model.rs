@@ -1460,6 +1460,7 @@ impl MlxModelWeights {
             prefill_moe_down: crate::serve::gemma_prefill_moe::prefill_moe_down_from_env(),
             decode_attn_ne: crate::serve::gemma_decode_attention::decode_attn_ne_from_env(),
         });
+        crate::serve::gemma_prefill_moe::log_native_routing();
 
         // Pre-initialize constant param buffers so we never write them
         // inside the hot forward_decode path.

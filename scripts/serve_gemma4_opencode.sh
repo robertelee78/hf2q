@@ -110,6 +110,11 @@
 #                                    HF2Q_MM_ID_SCHEDULE; unset keeps the
 #                                    mlx-native expert-matmul schedule
 #                                    default. grid is the bitwise A/B arm.
+#     Q5_0_TENSOR_MM=1               (this script) forwards
+#                                    HF2Q_Q5_0_TENSOR_MM=1, the mlx-native
+#                                    Q5_0 tensor-MM opt-in (published as
+#                                    active_controls.q5_0_tensor_mm); unset
+#                                    keeps the native default (off).
 #     ROUTING_OVERLAP=0|1            (this script) forwards
 #                                    HF2Q_GEMMA_ROUTING_OVERLAP; unset keeps
 #                                    it off. 1 prints the V2 [ROUTING_OVERLAP]
@@ -265,6 +270,15 @@ case "${MM_ID_SCHEDULE:-}" in
         exit 2
         ;;
 esac
+Q5_0_TENSOR_MM_ENV=""
+case "${Q5_0_TENSOR_MM:-}" in
+    "") ;;
+    1) Q5_0_TENSOR_MM_ENV=1 ;;
+    *)
+        echo "Q5_0_TENSOR_MM must be 1 or unset" >&2
+        exit 2
+        ;;
+esac
 ROUTING_OVERLAP_ENV=""
 case "${ROUTING_OVERLAP:-}" in
     "") ;;
@@ -296,6 +310,7 @@ if [[ -f "$MMPROJ" ]]; then
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
+        ${Q5_0_TENSOR_MM_ENV:+HF2Q_Q5_0_TENSOR_MM="$Q5_0_TENSOR_MM_ENV"} \
         ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
         ${DECODE_ATTN_NE_ENV:+HF2Q_GEMMA_DECODE_ATTN_NE="$DECODE_ATTN_NE_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
@@ -319,6 +334,7 @@ else
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
+        ${Q5_0_TENSOR_MM_ENV:+HF2Q_Q5_0_TENSOR_MM="$Q5_0_TENSOR_MM_ENV"} \
         ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
         ${DECODE_ATTN_NE_ENV:+HF2Q_GEMMA_DECODE_ATTN_NE="$DECODE_ATTN_NE_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
