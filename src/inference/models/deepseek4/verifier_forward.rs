@@ -589,12 +589,15 @@ impl Deepseek4Model {
                 );
             }
         }
-        let step_rows = self.token_wise_step_rows();
-        for tokens in token_ids[offset..].chunks(step_rows) {
+        while offset < token_ids.len() {
+            // Width per chunk: rows steps can be revoked mid-prompt.
+            let rows = self.token_wise_step_rows().min(token_ids.len() - offset);
+            let tokens = &token_ids[offset..offset + rows];
             state = Some(match tokens {
                 [token] => self.forward_verifier_one(*token, cache)?,
                 _ => self.forward_verifier_rows_step_with_commit_gate(tokens, cache, || Ok(()))?,
             });
+            offset += rows;
         }
         state.context("DeepSeek-V4 prompt encoded zero chunks")
     }
