@@ -297,6 +297,10 @@ pub struct QwenSpeculationController {
     route: QwenSpeculationRoute,
     /// Round costs of the repeatable gates.
     cost_model: QwenSpeculationCostModel,
+    /// Joint MTP verify (`HF2Q_QWEN_JOINT_MTP`): speculating lanes verify
+    /// their MTP drafts as windows of the joint step, and no request runs a
+    /// serial K3 round or history lookup.
+    joint_mtp: bool,
     conversation_prompt: Option<Vec<u32>>,
 }
 
@@ -312,6 +316,7 @@ impl QwenSpeculationController {
                 mtp_round: MTP_ROUND_COST_UNITS,
                 history_round: HISTORY_ROUND_COST_UNITS,
             },
+            joint_mtp: false,
             conversation_prompt: None,
         }
     }
@@ -333,6 +338,7 @@ impl QwenSpeculationController {
                     HISTORY_ROUND_COST_UNITS,
                 ),
             },
+            joint_mtp: false,
             conversation_prompt: None,
         }
     }
@@ -358,6 +364,31 @@ impl QwenSpeculationController {
             reason,
             "Qwen speculation worker policy"
         );
+    }
+
+    /// Select the joint MTP verify route for a joint-decode worker after
+    /// [`Self::resolve_for_worker`]. An unset policy resolves to `auto` (the
+    /// route needs MTP prompt catch-up and per-request MTP state); an
+    /// explicit `off` keeps speculation and the route off. Returns whether
+    /// the route is active.
+    pub fn select_joint_mtp(&mut self, requested: bool) -> bool {
+        if requested && self.requested.is_none() {
+            self.policy = QwenSpeculationPolicy::Auto;
+        }
+        self.joint_mtp = requested && self.policy == QwenSpeculationPolicy::Auto;
+        tracing::info!(
+            target: "hf2q::serve::api::engine_qwen35::progress",
+            requested,
+            policy = self.policy.label(),
+            joint_mtp = self.joint_mtp,
+            "Qwen joint MTP verify route"
+        );
+        self.joint_mtp
+    }
+
+    /// Whether the joint MTP verify route is active.
+    pub fn joint_mtp(&self) -> bool {
+        self.joint_mtp
     }
 
     pub fn policy(&self) -> QwenSpeculationPolicy {
@@ -700,6 +731,34 @@ mod tests {
         let mut explicit_off = QwenSpeculationController::new(QwenSpeculationPolicy::Off);
         explicit_off.resolve_for_worker(1, true, false);
         assert_eq!(explicit_off.policy(), QwenSpeculationPolicy::Off);
+    }
+
+    /// The joint MTP route turns an unset four-slot `off` into `auto`; an
+    /// explicit `off` wins and keeps the route off.
+    #[test]
+    fn joint_mtp_selection_overrides_only_the_unset_default() {
+        let mut unset = QwenSpeculationController {
+            requested: None,
+            ..QwenSpeculationController::new(QwenSpeculationPolicy::Auto)
+        };
+        unset.resolve_for_worker(4, false, true);
+        assert_eq!(unset.policy(), QwenSpeculationPolicy::Off);
+        assert!(unset.select_joint_mtp(true));
+        assert_eq!(unset.policy(), QwenSpeculationPolicy::Auto);
+        assert!(unset.joint_mtp());
+
+        let mut explicit_off = QwenSpeculationController::new(QwenSpeculationPolicy::Off);
+        explicit_off.resolve_for_worker(4, false, true);
+        assert!(!explicit_off.select_joint_mtp(true));
+        assert_eq!(explicit_off.policy(), QwenSpeculationPolicy::Off);
+
+        let mut not_requested = QwenSpeculationController {
+            requested: None,
+            ..QwenSpeculationController::new(QwenSpeculationPolicy::Auto)
+        };
+        not_requested.resolve_for_worker(4, false, true);
+        assert!(!not_requested.select_joint_mtp(false));
+        assert_eq!(not_requested.policy(), QwenSpeculationPolicy::Off);
     }
 
     #[test]

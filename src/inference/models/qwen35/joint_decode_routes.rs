@@ -146,10 +146,6 @@ pub(crate) fn joint_mode_max_rows(mode: JointRouteMode, requested: usize) -> usi
 /// same tile (`r1ptg` 4, `nxpsg` 8) as the spec-off width-4 step, whose rows
 /// they must reproduce; `m = 5, 6, 7` would select other tiles or a partial
 /// tile. The column-invariant MMA products are invariant at any `m <= 8`.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the joint MTP verify window's production caller is H4")
-)]
 pub(crate) fn joint_verify_padded_width(mode: JointRouteMode, rows: usize) -> usize {
     match mode {
         JointRouteMode::Exact => rows,

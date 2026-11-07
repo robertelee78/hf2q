@@ -72,6 +72,22 @@ pub(crate) enum Qwen35JointOutput {
     Logits,
     /// Full logits plus the post-output-norm hidden row MTP consumes.
     LogitsAndHidden,
+    /// GPU argmax plus the post-output-norm hidden row (a greedy MTP lane).
+    GreedyTokenAndHidden,
+}
+
+impl Qwen35JointOutput {
+    fn wants_argmax(self) -> bool {
+        matches!(self, Self::GreedyToken | Self::GreedyTokenAndHidden)
+    }
+
+    fn wants_logits(self) -> bool {
+        matches!(self, Self::Logits | Self::LogitsAndHidden)
+    }
+
+    fn wants_hidden(self) -> bool {
+        matches!(self, Self::LogitsAndHidden | Self::GreedyTokenAndHidden)
+    }
 }
 
 /// One slot's input to a joint step.
@@ -344,6 +360,7 @@ impl Qwen35Model {
                 options,
                 None,
             )
+            .map(|(outputs, _normed)| outputs)
         })
     }
 
@@ -428,7 +445,9 @@ impl Qwen35Model {
     }
 
     /// Encode and run one joint forward over `packing`. `replay` (MTP
-    /// verify only) retains the multi-row windows' DeltaNet inputs.
+    /// verify only) retains the multi-row windows' DeltaNet inputs. Returns
+    /// the real rows' outputs and the packed `[width, hidden]`
+    /// post-output-norm rows (a durable allocation).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn encode_joint_decode(
         &self,
@@ -442,7 +461,7 @@ impl Qwen35Model {
         dense_ffn: JointDenseFfnRoute,
         options: JointStepOptions,
         mut replay: Option<&mut DeltaNetReplay>,
-    ) -> Result<Vec<Qwen35JointRowOutput>> {
+    ) -> Result<(Vec<Qwen35JointRowOutput>, MlxBuffer)> {
         let arena_setup =
             crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
         let cfg = &self.cfg;
@@ -791,7 +810,7 @@ impl Qwen35Model {
         let argmax_params = host_buffer(device, DType::U32, &[cfg.vocab_size], "argmax params")?;
         let mut argmax = Vec::with_capacity(rows.len());
         for (row, input) in rows.iter().enumerate() {
-            if input.output != Qwen35JointOutput::GreedyToken {
+            if !input.output.wants_argmax() {
                 argmax.push(None);
                 continue;
             }
@@ -838,9 +857,13 @@ impl Qwen35Model {
                             .map_err(|e| anyhow!("read Qwen joint argmax row {row}: {e}"))
                     })
                     .transpose()?;
-                let logits = (input.output != Qwen35JointOutput::GreedyToken)
+                let logits = input
+                    .output
+                    .wants_logits()
                     .then(|| all_logits[row * vocab..(row + 1) * vocab].to_vec());
-                let nextn_hidden = (input.output == Qwen35JointOutput::LogitsAndHidden)
+                let nextn_hidden = input
+                    .output
+                    .wants_hidden()
                     .then(|| nth_hidden_row(&normed, hidden_size, row as u64))
                     .transpose()?;
                 Ok(Qwen35JointRowOutput {
@@ -849,9 +872,9 @@ impl Qwen35Model {
                     nextn_hidden,
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>();
         drop(readback);
-        outputs
+        outputs.map(|outputs| (outputs, normed))
     }
 }
 

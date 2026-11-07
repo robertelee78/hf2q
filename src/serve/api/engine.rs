@@ -19062,6 +19062,15 @@ fn run_slot_aware_qwen35(
         .model
         .speculation
         .resolve_for_worker(n_slots, moe, qwen_joint_decode.is_some());
+    // HF2Q_QWEN_JOINT_MTP: the joint MTP verify route needs per-request MTP
+    // state, so it resolves an unset speculation policy to `auto`; an
+    // explicit `off` keeps it off. Without joint decode it never engages.
+    let qwen_joint_decode = qwen_joint_decode.map(|config| {
+        qwen35_joint_decode::Qwen35JointDecodeConfig {
+            joint_mtp: guard.model.speculation.select_joint_mtp(config.joint_mtp),
+            ..config
+        }
+    });
 
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {

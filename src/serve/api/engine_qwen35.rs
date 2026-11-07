@@ -4533,6 +4533,10 @@ pub(crate) struct Qwen35DecodeState {
     /// This turn's decision, planned before the joint partition and executed
     /// by the joint step (Ordinary) or the serial loop (every kind).
     planned_tick: Option<Qwen35TickKind>,
+    /// Joint MTP verify route (captured at admission): this request's MTP
+    /// drafts are verified only as joint windows, so its own ticks never
+    /// choose a serial K3 round, and it keeps no history lookup.
+    joint_mtp: bool,
 }
 
 /// Route of one decode tick, decided from the request's own state by
@@ -4584,6 +4588,9 @@ pub(in crate::serve::api) mod critical_path;
 #[path = "engine_qwen35/joint_decode.rs"]
 mod joint_decode;
 pub(in crate::serve::api) use joint_decode::{Qwen35JointLane, Qwen35LaneRefusal};
+#[path = "engine_qwen35/joint_mtp.rs"]
+mod joint_mtp;
+pub(in crate::serve::api) use joint_mtp::{run_joint_mtp_step, Qwen35JointMtpForward};
 #[path = "engine_qwen35/k3_transaction.rs"]
 mod k3_transaction;
 use k3_transaction::K3_VERIFY_ROWS;
@@ -4883,6 +4890,14 @@ fn plan_qwen35_verified_block(
     })
 }
 
+/// Where a canonical decision comes from: the host sampler over full logits,
+/// or the GPU argmax the ordinary greedy route uses (`is_greedy` requests
+/// without logprobs).
+enum Qwen35DecisionSource<'a> {
+    Logits(&'a mut [f32]),
+    Argmax(u32),
+}
+
 #[derive(Clone)]
 struct Qwen35SpecSemanticState {
     generated_tokens: Vec<u32>,
@@ -4911,23 +4926,37 @@ impl Qwen35SpecSemanticState {
         params: &SamplingParams,
         logits: &mut [f32],
     ) -> Result<Qwen35CanonicalDecision> {
+        self.select_and_observe_from(qwen, params, Qwen35DecisionSource::Logits(logits))
+    }
+
+    /// The canonical decision from `source`, then its observation. A forced
+    /// thinking-budget token wins over either source, as on the ordinary
+    /// path.
+    fn select_and_observe_from(
+        &mut self,
+        qwen: &Qwen35LoadedModel,
+        params: &SamplingParams,
+        source: Qwen35DecisionSource<'_>,
+    ) -> Result<Qwen35CanonicalDecision> {
         let forced = self
             .thinking_budget
             .as_mut()
             .and_then(Qwen35ThinkingBudgetState::next_forced_token)
             .map(|(token, _)| token);
-        let token = if let Some(forced) = forced {
-            forced
-        } else {
-            sample_logits_qwen35_constrained(
-                logits,
-                params,
-                &self.sampling_history,
-                self.grammar_runtime.as_ref(),
-                &qwen.eos_token_ids,
-                false,
-            )?
-            .0
+        let token = match (forced, source) {
+            (Some(forced), _) => forced,
+            (None, Qwen35DecisionSource::Argmax(token)) => token,
+            (None, Qwen35DecisionSource::Logits(logits)) => {
+                sample_logits_qwen35_constrained(
+                    logits,
+                    params,
+                    &self.sampling_history,
+                    self.grammar_runtime.as_ref(),
+                    &qwen.eos_token_ids,
+                    false,
+                )?
+                .0
+            }
         };
         advance_qwen35_grammar(
             &mut self.grammar_runtime,
@@ -5183,7 +5212,9 @@ impl Qwen35DecodeState {
             }
         }
 
+        let joint_mtp = qwen.speculation.joint_mtp();
         let history_lookup = if finish_reason == "length"
+            && !joint_mtp
             && qwen.speculation.policy() == super::qwen35_speculation::QwenSpeculationPolicy::Auto
             && is_qwen_server_speculation_exact_eligible(&params)
             && cached_tokens != prompt_len
@@ -5247,6 +5278,7 @@ impl Qwen35DecodeState {
             }),
             route: qwen.speculation.route(),
             planned_tick: None,
+            joint_mtp,
         })
     }
 
@@ -5443,6 +5475,7 @@ impl Qwen35DecodeState {
         }
         if self.shadow_draft.is_none()
             && self.mtp.is_some()
+            && !self.joint_mtp
             && remaining >= K3_VERIFY_ROWS
             && self.mtp_cost.may_speculate()
         {

@@ -35,13 +35,15 @@ use mlx_native::{DType, MlxBuffer, MlxDevice};
 
 use super::forward_gpu::Qwen35JointVerifyLane;
 use super::gpu_delta_net::DeltaNetWeightsGpu;
-use super::gpu_full_attn::{FullAttnQGateWeightsGpu, FullAttnWeightsGpu};
+use super::gpu_ffn::DenseFfnWeightsGpuQ;
+use super::gpu_full_attn::{upload_f32, FullAttnQGateWeightsGpu, FullAttnWeightsGpu};
 use super::joint_decode_routes::{JointDenseFfnRoute, JointRouteMode};
 use super::joint_decode_test_support::{next, random_f32};
 use super::joint_projection::JointProjectionKernel;
 use super::joint_step_options::JointStepOptions;
 use super::kv_cache::HybridKvCache;
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
+use super::mtp::{MtpFfnWeightsGpu, MtpFullAttnWeightsGpu, MtpQGateWeightsGpu, MtpWeights};
 use super::weight_loader::DenseFfnWeightsQ;
 use super::{
     default_layer_types, Qwen35Config, Qwen35JointOutput, Qwen35JointRow, Qwen35LayerKind,
@@ -551,9 +553,17 @@ fn synthetic_cfg() -> Qwen35Config {
     }
 }
 
-/// The synthetic model under `policy`, its GPU cache primed.
-fn synthetic_model(device: &MlxDevice, policy: mlx_native::GgmlRoutingPolicy) -> Qwen35Model {
-    let cfg = synthetic_cfg();
+/// The synthetic model under `policy`, its GPU cache primed. With `mtp` it
+/// also carries a synthetic MTP block (gated attention, dense Q4_K/Q6_K
+/// FFN, Q6_K shared head) and its config declares one MTP layer, so caches
+/// allocate the MTP arena.
+pub(crate) fn synthetic_model(
+    device: &MlxDevice,
+    policy: mlx_native::GgmlRoutingPolicy,
+    mtp: bool,
+) -> Qwen35Model {
+    let mut cfg = synthetic_cfg();
+    cfg.mtp_num_hidden_layers = u32::from(mtp);
     let mut model = Qwen35Model::empty_from_cfg(cfg.clone());
     let mut seed = 0x0A11_7E57_u32;
     let h = cfg.hidden_size as usize;
@@ -651,13 +661,74 @@ fn synthetic_model(device: &MlxDevice, policy: mlx_native::GgmlRoutingPolicy) ->
         };
         model.layers.push(native);
     }
+    if mtp {
+        model.mtp = Some(synthetic_mtp(device, &cfg, &mut seed));
+    }
     model.bind_ggml_routing_policy(policy);
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     model
 }
 
+fn ones(device: &MlxDevice, n: usize) -> MlxBuffer {
+    upload_f32(&vec![1.0; n], device).expect("upload norm weight")
+}
+
+/// A synthetic MTP block for [`synthetic_model`].
+fn synthetic_mtp(device: &MlxDevice, cfg: &Qwen35Config, seed: &mut u32) -> MtpWeights {
+    let h = cfg.hidden_size as usize;
+    let vocab = cfg.vocab_size as usize;
+    let inter = cfg.intermediate_size.expect("dense FFN") as usize;
+    let (nh, nkv, hd) = (
+        cfg.num_attention_heads as usize,
+        cfg.num_key_value_heads as usize,
+        cfg.head_dim as usize,
+    );
+    MtpWeights {
+        layer_index: cfg.num_hidden_layers,
+        hidden_size: cfg.hidden_size,
+        vocab_size: cfg.vocab_size,
+        intermediate_size: inter as u32,
+        loaded_tensor_names: Vec::new(),
+        enorm: ones(device, h),
+        hnorm: ones(device, h),
+        eh_proj: quant_blocks(device, GgmlType::Q4_K, h, 2 * h, seed),
+        eh_proj_ggml_type: GgmlType::Q4_K,
+        embed_tokens: None,
+        shared_head_norm: ones(device, h),
+        shared_head_head: quant_blocks(device, GgmlType::Q6_K, vocab, h, seed),
+        shared_head_head_ggml_type: GgmlType::Q6_K,
+        attn: MtpFullAttnWeightsGpu {
+            attn_norm: ones(device, h),
+            post_attn_norm: ones(device, h),
+            q_gate: MtpQGateWeightsGpu::Gated(FullAttnQGateWeightsGpu::Fused {
+                weight: quant_blocks(device, GgmlType::Q4_K, 2 * nh * hd, h, seed),
+                ggml_type: GgmlType::Q4_K,
+            }),
+            wk: quant_blocks(device, GgmlType::Q4_K, nkv * hd, h, seed),
+            wk_ggml_type: GgmlType::Q4_K,
+            wv: quant_blocks(device, GgmlType::Q6_K, nkv * hd, h, seed),
+            wv_ggml_type: GgmlType::Q6_K,
+            attn_q_norm: ones(device, hd),
+            attn_k_norm: ones(device, hd),
+            wo: quant_blocks(device, GgmlType::Q4_K, h, nh * hd, seed),
+            wo_ggml_type: GgmlType::Q4_K,
+        },
+        ffn: MtpFfnWeightsGpu::DenseQ {
+            weights: DenseFfnWeightsGpuQ {
+                gate_q: quant_blocks(device, GgmlType::Q4_K, inter, h, seed),
+                up_q: quant_blocks(device, GgmlType::Q4_K, inter, h, seed),
+                down_q: quant_blocks(device, GgmlType::Q6_K, h, inter, seed),
+                ggml_type_gate_up: GgmlType::Q4_K,
+                ggml_type_down: GgmlType::Q6_K,
+                intermediate_size: inter as u32,
+                hidden_size: cfg.hidden_size,
+            },
+        },
+    }
+}
+
 /// Qwen3.8's serve policy: mvN off, `mul_mv_ext` on (the padded mode).
-fn padded_policy() -> mlx_native::GgmlRoutingPolicy {
+pub(crate) fn padded_policy() -> mlx_native::GgmlRoutingPolicy {
     let mut policy = mlx_native::ggml_routing_policy_from_environment();
     policy.dense_decode_mvn = false;
     policy.dense_decode_mv_ext = true;
@@ -665,7 +736,7 @@ fn padded_policy() -> mlx_native::GgmlRoutingPolicy {
 }
 
 /// The operator policy with `mul_mv_ext` off (the exact mode).
-fn exact_policy() -> mlx_native::GgmlRoutingPolicy {
+pub(crate) fn exact_policy() -> mlx_native::GgmlRoutingPolicy {
     let mut policy = mlx_native::ggml_routing_policy_from_environment();
     policy.dense_decode_mv_ext = false;
     policy
@@ -720,7 +791,7 @@ fn with_synthetic_fixture(
     let Ok(device) = MlxDevice::new() else {
         return;
     };
-    let model = synthetic_model(&device, policy);
+    let model = synthetic_model(&device, policy, false);
     assert_eq!(model.joint_decode_mode(), Ok(arm.mode), "joint mode admitted");
     let new_cache = || synthetic_cache(&model, arm);
     let token = |slot, position| synthetic_token(slot, position);
