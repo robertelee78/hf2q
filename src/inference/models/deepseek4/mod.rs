@@ -55,6 +55,8 @@ pub(crate) use verifier_forward::{
 #[cfg(test)]
 mod attention_forward_tests;
 #[cfg(test)]
+mod chunk_split_invariance_tests;
+#[cfg(test)]
 mod cache_tests;
 #[cfg(test)]
 mod cooperative_fault;

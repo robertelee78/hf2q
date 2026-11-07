@@ -47,8 +47,26 @@ use super::engine_error::EngineRequestError;
 use super::engine_supervisor::EngineSupervisor;
 
 const INITIAL_CACHE_LENGTH: usize = 131_072;
-pub(super) const RECOVERY_TAIL_TOKENS: usize = 8;
+pub(crate) const RECOVERY_TAIL_TOKENS: usize = 8;
 
+/// Rows of the next matrix chunk of one prompt segment (cursor to recovery
+/// anchor, or anchor to prompt end), or 0 when the segment replays token-wise.
+///
+/// The chunk never leaves a 1..`MIN_MATRIX_APPEND_TOKENS` row remainder: it
+/// shrinks so the remainder is exactly the matrix minimum. Every row of a
+/// segment therefore takes the matrix route, unless the whole segment is below
+/// the minimum at a nonzero cursor (then every row is token-wise). The route
+/// class of a row is a function of the request alone (prompt length, cached
+/// position, anchor). A shrunk chunk keeps at least
+/// `sliding_window - MIN_MATRIX_APPEND_TOKENS + 1` rows, so it is itself a
+/// legal matrix chunk.
+///
+/// Chunk boundaries still vary with the route: the window multiplier that
+/// solo, Mixed, cohort width and alignment catch-up choose moves them, and
+/// only the 33-row floor is guaranteed. Route equivalence therefore rests on
+/// matrix-chunk split invariance, shown model-free at real shapes by
+/// `chunk_split_invariance_tests` and on the release artifact by
+/// `official_artifact_prefill_route_boundary_is_route_independent` (#726).
 fn resumable_matrix_prefill_chunk_len(
     cache_position: usize,
     remaining: usize,
@@ -57,9 +75,9 @@ fn resumable_matrix_prefill_chunk_len(
 ) -> usize {
     let mut chunk =
         matrix_prefill_chunk_len(cache_position, remaining, sliding_window, window_multiplier);
-    if remaining > chunk {
+    if chunk > 0 && remaining > chunk {
         let tail = remaining - chunk;
-        if tail > RECOVERY_TAIL_TOKENS && tail < MIN_MATRIX_APPEND_TOKENS {
+        if tail < MIN_MATRIX_APPEND_TOKENS {
             chunk = chunk.saturating_sub(MIN_MATRIX_APPEND_TOKENS - tail);
         }
     }
@@ -67,18 +85,18 @@ fn resumable_matrix_prefill_chunk_len(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResumablePrefillChunk {
+pub(crate) enum ResumablePrefillChunk {
     Matrix(usize),
     Incremental(usize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ResumablePrefillSlice {
-    chunk: ResumablePrefillChunk,
-    capture_anchor_after: bool,
+pub(crate) struct ResumablePrefillSlice {
+    pub(crate) chunk: ResumablePrefillChunk,
+    pub(crate) capture_anchor_after: bool,
 }
 
-fn plan_resumable_prefill_chunk(
+pub(crate) fn plan_resumable_prefill_chunk(
     cache_position: usize,
     remaining: usize,
     sliding_window: usize,
@@ -1598,7 +1616,7 @@ impl Deepseek4LoadedModel {
         let mut offset = 0;
         let window_multiplier = self.prefill_window_multiplier(tokens.len())?;
         while offset < tokens.len() {
-            let batch = matrix_prefill_chunk_len(
+            let batch = resumable_matrix_prefill_chunk_len(
                 self.cache.position(),
                 tokens.len() - offset,
                 self.model.cfg.sliding_window as usize,
@@ -1991,11 +2009,187 @@ mod tests {
     }
 
     #[test]
-    fn interactive_prefill_cap_leaves_a_legal_matrix_or_recovery_tail() {
+    fn interactive_prefill_cap_leaves_a_legal_matrix_remainder() {
         assert_eq!(resumable_matrix_prefill_chunk_len(1, 285, 128, 2), 252);
         assert_eq!(285 - 252, 33);
-        assert_eq!(resumable_matrix_prefill_chunk_len(1, 264, 128, 2), 256);
-        assert_eq!(264 - 256, 8);
+        // #726: an 8-row remainder used to replay token-wise only under the
+        // two-window Mixed cap; it is now a matrix chunk under every cap.
+        assert_eq!(resumable_matrix_prefill_chunk_len(1, 264, 128, 2), 231);
+        assert_eq!(264 - 231, MIN_MATRIX_APPEND_TOKENS);
+        assert_eq!(resumable_matrix_prefill_chunk_len(1, 2_048 + 32, 128, 16), 2_047);
+        assert_eq!(resumable_matrix_prefill_chunk_len(1, 2_048 + 1, 128, 16), 2_016);
+        assert_eq!(resumable_matrix_prefill_chunk_len(1, 2_048 + 33, 128, 16), 2_048);
+        assert_eq!(resumable_matrix_prefill_chunk_len(1, 2_048, 128, 16), 2_048);
+        assert_eq!(resumable_matrix_prefill_chunk_len(1, 33, 128, 1), 33);
+        assert_eq!(resumable_matrix_prefill_chunk_len(1, 32, 128, 16), 0);
+        // Position zero keeps one whole matrix transaction for short prompts.
+        assert_eq!(resumable_matrix_prefill_chunk_len(0, 32, 128, 16), 32);
+    }
+
+    /// Walk one request's prompt through the serving planner the way
+    /// `advance_resumable_prefill` does: matrix work up to the recovery
+    /// anchor, then the anchor tail. `cap(turn)` is the window cap the route
+    /// imposes on that turn (Mixed, cohort lane rows, alignment catch-up).
+    /// Returns every row's route class (`true` = matrix) and the turn count.
+    fn walk_request(
+        prompt: usize,
+        cached: usize,
+        plan_windows: usize,
+        mut cap: impl FnMut(usize) -> usize,
+    ) -> (Vec<bool>, usize) {
+        let recovery = prompt.saturating_sub(RECOVERY_TAIL_TOKENS);
+        let mut cursor = cached;
+        let mut classes = Vec::with_capacity(prompt - cached);
+        let mut turns = 0;
+        while cursor < prompt {
+            let segment_end = if cursor < recovery { recovery } else { prompt };
+            let windows = plan_windows.min(cap(turns));
+            let slice = plan_resumable_prefill_chunk(
+                cursor,
+                segment_end - cursor,
+                128,
+                windows,
+                recovery,
+            )
+            .unwrap();
+            let (rows, matrix) = match slice.chunk {
+                ResumablePrefillChunk::Matrix(rows) => (rows, true),
+                ResumablePrefillChunk::Incremental(rows) => (rows, false),
+            };
+            let label = format!("prompt {prompt} cached {cached} cursor {cursor} windows {windows}");
+            assert!(rows > 0 && cursor + rows <= segment_end, "{label}: rows {rows}");
+            assert!(rows <= 128 * windows, "{label}: rows {rows} exceed the route cap");
+            if matrix && cursor > 0 {
+                assert!(rows >= MIN_MATRIX_APPEND_TOKENS, "{label}: rows {rows}");
+            }
+            assert_eq!(slice.capture_anchor_after, cursor + rows == recovery, "{label}");
+            classes.extend(std::iter::repeat_n(matrix, rows));
+            cursor += rows;
+            turns += 1;
+        }
+        (classes, turns)
+    }
+
+    /// The route class as a function of the request alone.
+    fn request_route_classes(prompt: usize, cached: usize) -> Vec<bool> {
+        let recovery = prompt.saturating_sub(RECOVERY_TAIL_TOKENS);
+        (cached..prompt)
+            .map(|row| {
+                let (start, end) = if row < recovery {
+                    (cached, recovery)
+                } else {
+                    (cached.max(recovery), prompt)
+                };
+                start == 0 || end - start >= MIN_MATRIX_APPEND_TOKENS
+            })
+            .collect()
+    }
+
+    /// Window caps per route: solo (plan only), Mixed (2 windows), cohort
+    /// lanes at widths 2/3/4 (1,024/640/512 rows), and turn-varying caps as
+    /// peers start and stop decoding or alignment catch-up trims a turn.
+    fn route_policies() -> Vec<(&'static str, fn(usize) -> usize)> {
+        vec![
+            ("solo", (|_| usize::MAX) as fn(usize) -> usize),
+            ("mixed", |_| 2),
+            ("cohort-2", |_| 8),
+            ("cohort-3", |_| 5),
+            ("cohort-4", |_| 4),
+            ("catch-up", |_| 1),
+            ("interleaved", |turn| [2, 16, 4, 5, 8, 1][turn % 6]),
+            ("varying", |turn| 1 + (turn * 7 + 3) % 16),
+        ]
+    }
+
+    #[test]
+    fn route_class_of_every_prompt_row_is_independent_of_the_route() {
+        let mut prompts: Vec<usize> = (128..=300).collect();
+        for boundary in [2_048, 4_096, 6_144] {
+            // Prompts ending on a 2,048 boundary and 1..=40 rows past it,
+            // and recovery anchors on and past the boundary.
+            prompts.extend((0..=40).map(|past| boundary + past));
+            prompts.extend((0..=40).map(|past| boundary + RECOVERY_TAIL_TOKENS + past));
+        }
+        prompts.sort_unstable();
+        prompts.dedup();
+        let mut walks = 0;
+        for &prompt in &prompts {
+            let recovery = prompt - RECOVERY_TAIL_TOKENS;
+            let mut cached_positions = vec![0, 1, 100, 148, 1_000, 2_015, 2_048];
+            for back in [1, 32, 33, 34, 64, 96, 128, 129] {
+                cached_positions.push(recovery.saturating_sub(back));
+            }
+            cached_positions.extend([recovery, recovery + 1, prompt - 1]);
+            cached_positions.retain(|&cached| cached < prompt);
+            cached_positions.sort_unstable();
+            cached_positions.dedup();
+            for cached in cached_positions {
+                let expected = request_route_classes(prompt, cached);
+                for plan_windows in [16, 13, 8] {
+                    for (route, cap) in route_policies() {
+                        let (classes, _) = walk_request(prompt, cached, plan_windows, cap);
+                        assert_eq!(
+                            classes, expected,
+                            "prompt {prompt} cached {cached} plan {plan_windows} route {route}"
+                        );
+                        walks += 1;
+                    }
+                }
+            }
+        }
+        assert!(walks > 50_000, "grid shrank to {walks} walks");
+    }
+
+    #[test]
+    fn route_class_edges_are_fixed_per_request() {
+        let prompt = 4_096;
+        let recovery = prompt - RECOVERY_TAIL_TOKENS;
+        // Exactly 33 pre-anchor rows: one matrix chunk, then the token-wise
+        // anchor tail.
+        let classes = request_route_classes(prompt, recovery - 33);
+        assert!(classes[..33].iter().all(|&matrix| matrix));
+        assert!(classes[33..].iter().all(|&matrix| !matrix));
+        // Exactly 32 pre-anchor rows (a segment below the minimum):
+        // token-wise for every route.
+        let classes = request_route_classes(prompt, recovery - 32);
+        assert!(classes.iter().all(|&matrix| !matrix));
+        for (route, cap) in route_policies() {
+            for cached in [recovery - 33, recovery - 32] {
+                assert_eq!(
+                    walk_request(prompt, cached, 16, cap).0,
+                    request_route_classes(prompt, cached),
+                    "route {route} cached {cached}"
+                );
+            }
+        }
+        // The anchor tail is always the last eight rows, token-wise.
+        for past in 1..=32 {
+            let classes = request_route_classes(2_048 + past, 148);
+            let tail = classes.len() - RECOVERY_TAIL_TOKENS;
+            assert!(classes[..tail].iter().all(|&matrix| matrix), "past {past}");
+            assert!(classes[tail..].iter().all(|&matrix| !matrix), "past {past}");
+        }
+    }
+
+    #[test]
+    fn continuous_peer_decode_never_starves_prefill() {
+        // No route defers a turn: under a permanently capped route each turn
+        // commits at least `128 - 32` rows until the remainder itself is a
+        // final matrix chunk or the anchor tail.
+        for prompt in [300_usize, 2_048, 2_080, 6_676, 131_072] {
+            for cached in [0, 148, prompt / 2] {
+                let rows = prompt - cached;
+                let bound = rows.div_ceil(128 - (MIN_MATRIX_APPEND_TOKENS - 1)) + 2;
+                for (route, cap) in route_policies() {
+                    let (classes, turns) = walk_request(prompt, cached, 16, cap);
+                    assert_eq!(classes.len(), rows);
+                    assert!(
+                        turns <= bound,
+                        "prompt {prompt} cached {cached} route {route}: {turns} turns > {bound}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -196,8 +196,8 @@ impl Deepseek4PrefillState {
 
     /// Validate that the existing serial prefill planner will land exactly on
     /// `target_cursor`. Near a recovery boundary it may intentionally shorten
-    /// a nominal window-aligned chunk to preserve a legal incremental tail;
-    /// such a chunk is not an alignment catch-up.
+    /// a nominal window-aligned chunk so the remainder stays a legal matrix
+    /// chunk; such a chunk is not an alignment catch-up.
     pub(crate) fn exact_warm_matrix_alignment_window_cap(
         &self,
         target_cursor: usize,
@@ -859,7 +859,7 @@ mod tests {
         assert_eq!(
             shrink_band.exact_warm_matrix_alignment_window_cap(980, 128),
             None,
-            "the prefill planner shortens this nominal 128-token catch-up to preserve a legal tail"
+            "the prefill planner shortens this nominal 128-token catch-up to keep a legal matrix remainder"
         );
     }
 

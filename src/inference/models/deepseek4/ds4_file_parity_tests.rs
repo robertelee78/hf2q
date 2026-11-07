@@ -50,7 +50,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Design §2.3: the storage type of every ds4 tensor class.
-fn expected_ds4_type(name: &str) -> GgmlType {
+pub(super) fn expected_ds4_type(name: &str) -> GgmlType {
     let suffix = name.rsplit_once("blk.").map_or(name, |(_, rest)| {
         rest.split_once('.').map_or(rest, |(_, suffix)| suffix)
     });
