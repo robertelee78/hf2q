@@ -8,12 +8,13 @@
 //! - [`JointRouteMode::Exact`]: each row must be bitwise identical to its
 //!   serial one-token forward. Packed products are admitted only for block
 //!   storage whose canonical `m = 2..=8` route keeps one-row arithmetic
-//!   (`Mv`, the `mvN` K-quant tiles, canonical Q5_K), and only while
-//!   `HF2Q_DECODE_MV_EXT` is not `1`. Float storage switches from a matvec at
-//!   `m = 1` to tiled kernels at `m > 1`, so it runs per row.
+//!   (`Mv`, the `mvN` K-quant tiles, canonical Q5_K), and only while the
+//!   model's routing policy keeps `mul_mv_ext` off. Float storage switches
+//!   from a matvec at `m = 1` to tiled kernels at `m > 1`, so it runs per row.
 //! - [`JointRouteMode::PaddedMvExt`]: the Qwen3.8 production policy
-//!   (`HF2Q_DECODE_MV_EXT=1`) routes K-quants through the non-exact
-//!   `mul_mv_ext` kernel at widths 4..=8. Every step is padded to exactly
+//!   (`dense_decode_mv_ext`, the model default or `HF2Q_DECODE_MV_EXT=1`)
+//!   routes K-quants through the non-exact `mul_mv_ext` kernel at widths
+//!   4..=8. Every step is padded to exactly
 //!   [`PADDED_MV_EXT_WIDTH`] rows (joint width is capped there), so a row's
 //!   packed width never depends on how many tenants share the step; the
 //!   cohort-invariance gate checks the resulting bytes per row. Against
@@ -72,45 +73,48 @@ pub(crate) enum JointProductRoute {
     PerRow,
 }
 
-/// Process routing switches that decide the joint contract.
+/// The model's routing switches that decide the joint contract. Derived from
+/// the model-lifetime [`mlx_native::GgmlRoutingPolicy`] frozen into its
+/// kernel registry (#729), never from the live process environment.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct JointRoutingEnvironment {
+pub(crate) struct JointRoutingPolicy {
     pub mv_ext: bool,
 }
 
-impl JointRoutingEnvironment {
-    pub(crate) fn from_process() -> Self {
+impl JointRoutingPolicy {
+    pub(crate) fn from_ggml(policy: &mlx_native::GgmlRoutingPolicy) -> Self {
         Self {
-            mv_ext: std::env::var("HF2Q_DECODE_MV_EXT").as_deref() == Ok("1"),
+            mv_ext: policy.dense_decode_mv_ext,
         }
     }
 }
 
-/// Route mode for this artifact family under the process routing policy,
+/// Route mode for this artifact family under the model's routing policy,
 /// or the reason joint decode must stay serial.
 pub(crate) fn select_joint_route_mode(
-    environment: JointRoutingEnvironment,
+    policy: JointRoutingPolicy,
     moe: bool,
 ) -> Result<JointRouteMode, String> {
-    match (environment.mv_ext, moe) {
+    match (policy.mv_ext, moe) {
         (false, _) => Ok(JointRouteMode::Exact),
         (true, false) => Ok(JointRouteMode::PaddedMvExt),
         (true, true) => Err(
-            "HF2Q_DECODE_MV_EXT=1 routes packed MoE rows through non-exact mul_mv_ext \
-             and no Q1 gate covers MoE artifacts on that route"
+            "the mul_mv_ext routing policy routes packed MoE rows through non-exact \
+             mul_mv_ext and no Q1 gate covers MoE artifacts on that route"
                 .into(),
         ),
     }
 }
 
-/// Reject a mode the current routing policy cannot honour.
-pub(crate) fn check_mode_environment(
+/// Reject a mode the model's routing policy cannot honour.
+pub(crate) fn check_mode_policy(
     mode: JointRouteMode,
-    environment: JointRoutingEnvironment,
+    policy: JointRoutingPolicy,
 ) -> Result<(), String> {
-    if mode == JointRouteMode::Exact && environment.mv_ext {
+    if mode == JointRouteMode::Exact && policy.mv_ext {
         return Err(
-            "exact joint decode requires HF2Q_DECODE_MV_EXT!=1 (mul_mv_ext is not bitwise)".into(),
+            "exact joint decode requires a routing policy without mul_mv_ext (it is not bitwise)"
+                .into(),
         );
     }
     Ok(())
@@ -273,8 +277,8 @@ mod tests {
 
     #[test]
     fn exact_mode_is_selected_unless_mv_ext_is_on() {
-        let off = JointRoutingEnvironment { mv_ext: false };
-        let on = JointRoutingEnvironment { mv_ext: true };
+        let off = JointRoutingPolicy { mv_ext: false };
+        let on = JointRoutingPolicy { mv_ext: true };
         assert_eq!(
             select_joint_route_mode(off, false),
             Ok(JointRouteMode::Exact)
@@ -292,11 +296,20 @@ mod tests {
 
     #[test]
     fn exact_mode_refuses_mv_ext_policy() {
-        let on = JointRoutingEnvironment { mv_ext: true };
-        let off = JointRoutingEnvironment { mv_ext: false };
-        assert!(check_mode_environment(JointRouteMode::Exact, on).is_err());
-        assert!(check_mode_environment(JointRouteMode::Exact, off).is_ok());
-        assert!(check_mode_environment(JointRouteMode::PaddedMvExt, on).is_ok());
+        let on = JointRoutingPolicy { mv_ext: true };
+        let off = JointRoutingPolicy { mv_ext: false };
+        assert!(check_mode_policy(JointRouteMode::Exact, on).is_err());
+        assert!(check_mode_policy(JointRouteMode::Exact, off).is_ok());
+        assert!(check_mode_policy(JointRouteMode::PaddedMvExt, on).is_ok());
+    }
+
+    #[test]
+    fn joint_policy_reads_only_the_model_policy() {
+        let mut ggml = mlx_native::GgmlRoutingPolicy::default();
+        ggml.dense_decode_mv_ext = false;
+        assert_eq!(JointRoutingPolicy::from_ggml(&ggml), JointRoutingPolicy { mv_ext: false });
+        ggml.dense_decode_mv_ext = true;
+        assert_eq!(JointRoutingPolicy::from_ggml(&ggml), JointRoutingPolicy { mv_ext: true });
     }
 
     #[test]

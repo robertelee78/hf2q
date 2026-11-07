@@ -171,6 +171,12 @@ pub struct Qwen35Model {
     /// positions `0..n_slots`; the request path applies the resulting
     /// position offset. Off unless `--kv-graft` bound one at serve time.
     pub kv_graft: Option<crate::inference::graft::BoundGraft>,
+    /// GGML routing policy of this model, resolved once at load (#729) and
+    /// frozen into every `KernelRegistry` its forwards use. Loaders start
+    /// from the operator environment; `hf2q serve` rebinds it from the
+    /// model's identity with [`Self::bind_ggml_routing_policy`] before the
+    /// first forward.
+    pub(crate) ggml_routing_policy: mlx_native::GgmlRoutingPolicy,
     /// Present only on the evidence-bearing copied-load path. Ordinary Qwen
     /// loading remains behaviorally unchanged until it opts into that path.
     #[cfg(test)]
@@ -227,6 +233,7 @@ impl Qwen35Model {
             mtp: None,
             glp: None,
             kv_graft: None,
+            ggml_routing_policy: mlx_native::ggml_routing_policy_from_environment(),
             #[cfg(test)]
             loaded_candidate_identity: None,
             cfg,
@@ -474,9 +481,23 @@ impl Qwen35Model {
             mtp,
             glp: None,
             kv_graft: None,
+            ggml_routing_policy: mlx_native::ggml_routing_policy_from_environment(),
             #[cfg(test)]
             loaded_candidate_identity: None,
         })
+    }
+
+    /// Bind the model-lifetime GGML routing policy before serving. The GPU
+    /// cache freezes the bound policy into its registry and only matches a
+    /// model whose policy equals the frozen one, so a cache primed under a
+    /// different policy is rebuilt rather than reused.
+    pub fn bind_ggml_routing_policy(&mut self, policy: mlx_native::GgmlRoutingPolicy) {
+        self.ggml_routing_policy = policy;
+    }
+
+    /// The model-lifetime GGML routing policy.
+    pub fn ggml_routing_policy(&self) -> &mlx_native::GgmlRoutingPolicy {
+        &self.ggml_routing_policy
     }
 
     /// Report the active FFN variant (Dense or Moe) determined by config.

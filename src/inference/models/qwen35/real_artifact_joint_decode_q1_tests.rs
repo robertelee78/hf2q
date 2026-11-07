@@ -15,7 +15,7 @@ use super::joint_step_options::JointStepOptions;
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
 use super::real_artifact_joint_decode_invariance_tests::cache_with_capacity;
-use super::real_artifact_joint_decode_tests::{argmax, bits, load, SLOTS};
+use super::real_artifact_joint_decode_tests::{argmax, bits, load, GateRouting, SLOTS};
 use super::spec_decode::positions_for_range;
 use super::{Qwen35JointOutput, Qwen35JointRow};
 use crate::serve::multi_seq_kv::SlotId;
@@ -199,7 +199,7 @@ impl LogitStore {
 /// $OUT/serial/trace.json $OUT/joint_shared_ffn/trace.json` (the gate), and
 /// the same against `joint_serial_ffn` (kill-switch route).
 #[test]
-#[ignore = "requires HF2Q_QWEN38_GGUF, HF2Q_DECODE_MV_EXT=1, HF2Q_QWEN_JOINT_Q1_PROMPTS, HF2Q_QWEN_JOINT_Q1_OUT and Apple Metal"]
+#[ignore = "requires HF2Q_QWEN38_GGUF (a Qwen3.8-named path), HF2Q_QWEN_JOINT_Q1_PROMPTS, HF2Q_QWEN_JOINT_Q1_OUT and Apple Metal"]
 fn qwen38_joint_decode_q1_envelope_trace() {
     let out = std::env::var_os(Q1_OUT_ENV)
         .map(PathBuf::from)
@@ -211,15 +211,15 @@ fn qwen38_joint_decode_q1_envelope_trace() {
         .unwrap_or(32);
     let prompts = q1_prompts();
     let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let model = load("HF2Q_QWEN38_GGUF");
+    let model = load("HF2Q_QWEN38_GGUF", GateRouting::Serve);
     let mode = model
         .joint_decode_mode()
         .unwrap_or_else(|reason| panic!("joint decode not admitted: {reason}"));
     assert_eq!(
         mode,
         JointRouteMode::PaddedMvExt,
-        "the Class B trace needs the Qwen3.8 padded policy \
-         (HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1)"
+        "the Class B trace needs the Qwen3.8 padded policy (a Qwen3.8-named artifact path \
+         without an operator HF2Q_DECODE_MV_EXT override)"
     );
     let longest = prompts.iter().map(Vec::len).max().expect("prompts");
     let capacity = u32::try_from((longest + steps + 16).next_multiple_of(256)).expect("capacity");
@@ -306,8 +306,8 @@ fn qwen38_joint_decode_q1_envelope_trace() {
         "prompt_tokens": prompts.iter().map(Vec::len).collect::<Vec<_>>(),
         "steps": steps,
         "joint_mode": mode.label(),
-        "decode_mvn": std::env::var("HF2Q_DECODE_MVN").ok(),
-        "decode_mv_ext": std::env::var("HF2Q_DECODE_MV_EXT").ok(),
+        "decode_mvn": model.ggml_routing_policy().dense_decode_mvn,
+        "decode_mv_ext": model.ggml_routing_policy().dense_decode_mv_ext,
         "teacher_forcing": "serial top-1",
     });
     let left_path = left.finish(&serde_json::json!({"path": "serial_m1", "run": provenance}));

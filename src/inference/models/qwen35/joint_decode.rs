@@ -45,10 +45,10 @@ use crate::inference::models::qwen35::joint_decode_core::{
     FullAttnRoutes, JointRows,
 };
 use crate::inference::models::qwen35::joint_decode_routes::{
-    check_dense_ffn_route, check_mode_environment, dense_ffn_route,
+    check_dense_ffn_route, check_mode_policy, dense_ffn_route,
     joint_decode_env_unavailable_reason, joint_mode_max_rows, joint_padded_width, projection_route,
     select_joint_route_mode, JointDenseFfnRoute, JointProductRoute, JointRouteMode,
-    JointRoutingEnvironment, MAX_JOINT_DECODE_ROWS,
+    JointRoutingPolicy, MAX_JOINT_DECODE_ROWS,
 };
 use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
@@ -195,7 +195,7 @@ fn host_buffer<T: bytemuck::Pod>(
 }
 
 impl Qwen35Model {
-    /// Joint route mode for this artifact and process, or why decode must
+    /// Joint route mode for this artifact and its routing policy, or why decode must
     /// stay serial. Primes the GPU weight cache so storage types are known.
     pub(crate) fn joint_decode_mode(&self) -> Result<JointRouteMode, String> {
         if let Some(reason) = joint_decode_env_unavailable_reason() {
@@ -207,9 +207,9 @@ impl Qwen35Model {
         if self.glp.is_some() {
             return Err("GLP steering requires the serial graph".into());
         }
-        let environment = JointRoutingEnvironment::from_process();
-        let mode = select_joint_route_mode(environment, self.cfg.moe.is_some())?;
-        check_mode_environment(mode, environment)?;
+        let policy = JointRoutingPolicy::from_ggml(&self.ggml_routing_policy);
+        let mode = select_joint_route_mode(policy, self.cfg.moe.is_some())?;
+        check_mode_policy(mode, policy)?;
         self.ensure_gpu_cache_primed()
             .map_err(|error| format!("GPU cache priming failed: {error:#}"))?;
         GPU_CACHE.with(|cell| -> Result<JointRouteMode, String> {
@@ -296,7 +296,7 @@ impl Qwen35Model {
             self.glp.is_none(),
             "Qwen joint decode unavailable: GLP steering requires the serial graph"
         );
-        check_mode_environment(mode, JointRoutingEnvironment::from_process())
+        check_mode_policy(mode, JointRoutingPolicy::from_ggml(&self.ggml_routing_policy))
             .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
         check_dense_ffn_route(mode, dense_ffn)
             .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
@@ -726,6 +726,18 @@ mod tests {
     };
     use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 
+    /// A registry frozen to the operator policy with `mul_mv_ext` off, so the
+    /// exact-policy proofs below run whatever the process environment says.
+    fn exact_policy_registry() -> KernelRegistry {
+        let mut policy = mlx_native::ggml_routing_policy_from_environment();
+        policy.dense_decode_mv_ext = false;
+        let mut registry = KernelRegistry::new();
+        registry
+            .freeze_ggml_routing_policy(policy)
+            .expect("freeze exact routing policy");
+        registry
+    }
+
     /// Admitted block storage: one packed dispatch at `m = 2..=4` must equal
     /// the serial `m = 1` dispatch of every row, bit for bit, on the default
     /// (exact) routing policy. A failing type must leave
@@ -733,15 +745,11 @@ mod tests {
     #[test]
     fn packed_block_projections_match_per_row_dispatch_bitwise() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        if JointRoutingEnvironment::from_process().mv_ext {
-            eprintln!("skipping: HF2Q_DECODE_MV_EXT=1 selects the non-exact policy");
-            return;
-        }
         let device = match MlxDevice::new() {
             Ok(device) => device,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = exact_policy_registry();
         let (k, n) = (512_u32, 256_u32);
         let mut seed = 0x51A7_0001_u32;
         for ggml_type in [
@@ -795,15 +803,11 @@ mod tests {
     #[test]
     fn packed_dense_ffn_matches_per_row_ffn_bitwise() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        if JointRoutingEnvironment::from_process().mv_ext {
-            eprintln!("skipping: HF2Q_DECODE_MV_EXT=1 selects the non-exact policy");
-            return;
-        }
         let device = match MlxDevice::new() {
             Ok(device) => device,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = exact_policy_registry();
         let (hidden, intermediate) = (256_u32, 512_u32);
         let h = hidden as usize;
         let mut seed = 0x51A7_0002_u32;

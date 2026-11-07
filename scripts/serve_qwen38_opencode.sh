@@ -31,12 +31,10 @@ if [[ -n "${QWEN38_SPECULATION:-}" ]]; then
 fi
 # Qwen3.8 K=3 verifies four target positions at once. The native qL4
 # decision/cache gate and matched ABBA receipt qualify the weight-amortized
-# K-quant width-four route here. These two are genuinely non-default
-# mlx-native routing choices (MVN default-on, MV_EXT default-off), so the
-# launcher keeps setting them; process-wide defaults remain unchanged
-# outside this family launcher.
-export HF2Q_DECODE_MVN="${HF2Q_DECODE_MVN:-0}"
-export HF2Q_DECODE_MV_EXT="${HF2Q_DECODE_MV_EXT:-1}"
+# K-quant width-four route (mvN off, mul_mv_ext on). hf2q resolves that route
+# per model at load from the Qwen3.8 identity (#729), so the launcher does not
+# export HF2Q_DECODE_MVN / HF2Q_DECODE_MV_EXT: an exported value is a
+# process-wide operator override that applies to every model in the process.
 
 case "${QWEN38_SPECULATION:-}" in
     ''|off|auto) ;;
@@ -45,15 +43,19 @@ case "${QWEN38_SPECULATION:-}" in
         exit 3
         ;;
 esac
-case "$HF2Q_DECODE_MVN:$HF2Q_DECODE_MV_EXT" in
-    0:1|0:0|1:0|1:1) ;;
-    *)
-        echo "HF2Q_DECODE_MVN and HF2Q_DECODE_MV_EXT must each be 0 or 1" >&2
-        exit 3
-        ;;
-esac
+for routing_var in HF2Q_DECODE_MVN HF2Q_DECODE_MV_EXT; do
+    if [[ -n "${!routing_var+x}" ]]; then
+        case "${!routing_var}" in
+            0|1) ;;
+            *)
+                echo "$routing_var must be 0 or 1 when set (got: ${!routing_var})" >&2
+                exit 3
+                ;;
+        esac
+    fi
+done
 
 echo "Qwen3.8 exact speculation policy: ${QWEN38_SPECULATION:-engine default (off at MAX_SLOTS>=4, auto below)}" >&2
-echo "Qwen3.8 K-quant width routing: mvN=$HF2Q_DECODE_MVN mv_ext=$HF2Q_DECODE_MV_EXT" >&2
+echo "Qwen3.8 K-quant width routing: mvN=${HF2Q_DECODE_MVN-per-model default} mv_ext=${HF2Q_DECODE_MV_EXT-per-model default}" >&2
 
 exec "$script_dir/serve_qwen36_opencode.sh"

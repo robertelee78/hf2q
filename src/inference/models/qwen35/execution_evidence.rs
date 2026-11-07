@@ -290,8 +290,11 @@ pub(crate) fn load_no_dwq_qwen35_candidate(
             )?;
             execution.validate()?;
             let ((model, execution), catalog) = capture_loaded_tensor_catalog(conversion, || {
-                let model = Qwen35Model::load_from_gguf(gguf, progress)
+                let mut model = Qwen35Model::load_from_gguf(gguf, progress)
                     .context("load copied no-DWQ Qwen weights from retained GGUF")?;
+                // The evidence profile's resolved policy is the model's
+                // policy, so its registry freezes exactly what is certified.
+                model.bind_ggml_routing_policy(*execution.ggml_routing_policy());
                 if model.cfg != expected {
                     bail!("loaded Qwen configuration drifted from authenticated source geometry");
                 }

@@ -31,7 +31,8 @@ pub(super) fn state(kv:&HybridKvCache,layer:usize,slot:SlotId)->Result<Value> {
         "state_read":"host encode-side fields, not GPU Running/completion"}))
 }
 pub(super) fn layer(weights:&LayerWeightsGpu,kv:&HybridKvCache,layer:usize,slot:SlotId,
-    rows:u32,cfg:&super::super::Qwen35Config,before:&Value)->Result<Value> {
+    rows:u32,cfg:&super::super::Qwen35Config,routing:&mlx_native::GgmlRoutingPolicy,
+    native_frozen:Option<&mlx_native::GgmlRoutingPolicy>,before:&Value)->Result<Value> {
     let (kind,projections,ffn_weights)=match weights {
         LayerWeightsGpu::LinearAttn{attn,ffn}=> ("DeltaNet",json!({
             "qkv":weight("qkv",&attn.attn_qkv,attn.attn_qkv_ggml_type),
@@ -69,6 +70,5 @@ pub(super) fn layer(weights:&LayerWeightsGpu,kv:&HybridKvCache,layer:usize,slot:
         "actual_m":rows,"projections":projections,"ffn":ffn(w),"before":before,
         "after_attention":state(kv,layer,slot)?,"gdn_chunk_parallel_eligible":false,
         "native_kernel_route":"UnknownNotObserved",
-        "native_cached_policy":"UnknownNotObserved","selected_process_env":{"HF2Q_DECODE_MVN":std::env::var("HF2Q_DECODE_MVN").ok(),
-            "HF2Q_DECODE_MV_EXT":std::env::var("HF2Q_DECODE_MV_EXT").ok()}}))
+        "native_cached_policy":native_frozen,"model_routing_policy":routing}))
 }

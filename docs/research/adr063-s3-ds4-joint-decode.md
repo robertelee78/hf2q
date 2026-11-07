@@ -163,7 +163,7 @@ The existing `Mixed` step still runs the decode turn, then one prefill slice cap
 
 `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` sets the joint width. The default is 4, and 2..8 are accepted. Widths 5–8 are covered only by the official-artifact bitwise test, not by any serving measurement. Invalid values warn and use 4.
 
-**When it is read.** Both variables are read once, when the DeepSeek-V4 worker starts (`deepseek4_joint_decode_rows`), which is after model load and before the first request. Each decode turn re-checks admissibility. A routing variable can change later, for example when loading a Qwen3.8 model sets `HF2Q_DECODE_MV_EXT=1`. If that happens, the turn runs serially and a single warning is logged; requests do not fail.
+**When it is read.** Both variables are read once, when the DeepSeek-V4 worker starts (`deepseek4_joint_decode_rows`), which is after model load and before the first request. Each decode turn re-checks admissibility. The routing policy (`HF2Q_DECODE_MV_EXT`) is frozen into the model's kernel registries at load (#729), so it cannot change mid-run and loading another model (for example Qwen3.8) does not affect it; only the diagnostic variables can change later. If one does, the turn runs serially and a single warning is logged; requests do not fail.
 
 **What keeps serial decode** even when requested:
 - `MLX_UNRETAINED_REFS`;

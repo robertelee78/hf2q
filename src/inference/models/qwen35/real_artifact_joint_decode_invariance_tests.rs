@@ -11,13 +11,16 @@
 //! the padded `mul_mv_ext` mode (packed width always 4) on both dense FFN
 //! routes (shared weights, the default, and the serial builder).
 //!
+//! Exact arms bind the operator environment with `mul_mv_ext` off; the padded
+//! arm binds the policy `hf2q serve` resolves from the Qwen3.8-named artifact
+//! path, so no routing variable needs to be exported (#729).
+//!
 //! ```text
 //! HF2Q_QWEN36_GGUF=/path/qwen36.gguf cargo test --release --bin hf2q \
 //!   qwen36_joint_decode_rows_are_cohort_invariant_bitwise -- --ignored --exact
-//! HF2Q_QWEN38_GGUF=/path/qwen38.gguf cargo test --release --bin hf2q \
+//! HF2Q_QWEN38_GGUF=/path/qwen3.8.gguf cargo test --release --bin hf2q \
 //!   qwen38_joint_decode_mvn_rows_are_cohort_invariant_bitwise -- --ignored --exact
-//! HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 HF2Q_QWEN38_GGUF=/path/qwen38.gguf \
-//!   cargo test --release --bin hf2q \
+//! HF2Q_QWEN38_GGUF=/path/qwen3.8.gguf cargo test --release --bin hf2q \
 //!   qwen38_joint_decode_padded_mv_ext_rows_are_cohort_invariant_bitwise -- --ignored --exact
 //! ```
 
@@ -27,7 +30,7 @@ use super::joint_decode_routes::{JointDenseFfnRoute, JointRouteMode};
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
 use super::real_artifact_joint_decode_tests::{
-    argmax, bits, buffer_bytes, hidden_bits, load, prompt, SLOTS,
+    argmax, bits, buffer_bytes, hidden_bits, load, prompt, GateRouting, SLOTS,
 };
 use super::spec_decode::positions_for_range;
 use super::{Qwen35JointOutput, Qwen35JointRow};
@@ -188,7 +191,11 @@ fn run_variant(
 
 fn run_cohort_invariance(env: &str, mode: JointRouteMode, dense_ffns: &[JointDenseFfnRoute]) {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let model = load(env);
+    let routing = match mode {
+        JointRouteMode::Exact => GateRouting::Exact,
+        JointRouteMode::PaddedMvExt => GateRouting::Serve,
+    };
+    let model = load(env, routing);
     assert_eq!(
         model.joint_decode_mode(),
         Ok(mode),
@@ -222,11 +229,6 @@ fn run_cohort_invariance(env: &str, mode: JointRouteMode, dense_ffns: &[JointDen
 #[test]
 #[ignore = "requires HF2Q_QWEN36_GGUF (official Qwen3.6 artifact) and Apple Metal"]
 fn qwen36_joint_decode_rows_are_cohort_invariant_bitwise() {
-    assert_ne!(
-        std::env::var("HF2Q_DECODE_MV_EXT").as_deref(),
-        Ok("1"),
-        "the exact arm needs HF2Q_DECODE_MV_EXT unset"
-    );
     run_cohort_invariance(
         "HF2Q_QWEN36_GGUF",
         JointRouteMode::Exact,
@@ -237,11 +239,6 @@ fn qwen36_joint_decode_rows_are_cohort_invariant_bitwise() {
 #[test]
 #[ignore = "requires HF2Q_QWEN38_GGUF (official Qwen3.8 artifact) and Apple Metal"]
 fn qwen38_joint_decode_mvn_rows_are_cohort_invariant_bitwise() {
-    assert_ne!(
-        std::env::var("HF2Q_DECODE_MV_EXT").as_deref(),
-        Ok("1"),
-        "the exact arm needs HF2Q_DECODE_MV_EXT unset"
-    );
     run_cohort_invariance(
         "HF2Q_QWEN38_GGUF",
         JointRouteMode::Exact,
@@ -250,15 +247,8 @@ fn qwen38_joint_decode_mvn_rows_are_cohort_invariant_bitwise() {
 }
 
 #[test]
-#[ignore = "requires HF2Q_QWEN38_GGUF, HF2Q_DECODE_MVN=0, HF2Q_DECODE_MV_EXT=1 and Apple Metal"]
+#[ignore = "requires HF2Q_QWEN38_GGUF (a Qwen3.8-named path) and Apple Metal"]
 fn qwen38_joint_decode_padded_mv_ext_rows_are_cohort_invariant_bitwise() {
-    for (name, value) in [("HF2Q_DECODE_MVN", "0"), ("HF2Q_DECODE_MV_EXT", "1")] {
-        assert_eq!(
-            std::env::var(name).as_deref(),
-            Ok(value),
-            "the padded arm requires externally-set {name}={value}"
-        );
-    }
     run_cohort_invariance(
         "HF2Q_QWEN38_GGUF",
         JointRouteMode::PaddedMvExt,

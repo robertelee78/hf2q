@@ -47,7 +47,8 @@
 //! Rows at or above a cursor are not observable and are not compared.
 //!
 //! ```text
-//! HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 \
+//! # The Qwen3.8 padded route comes from the model's own routing policy
+//! # (artifact path names qwen3.8/qwen38; no HF2Q_DECODE_MVN/MV_EXT override).
 //! HF2Q_QWEN38_GGUF=/abs/Qwen3.8-27B-vanilla.gguf \
 //!   cargo test --release --bin hf2q qwen38_k3_and_history_rounds_are_slot_independent_bitwise \
 //!   -- --ignored --exact --nocapture --test-threads=1
@@ -595,7 +596,7 @@ fn assert_same(reference: &TargetTrace, variant: &TargetTrace, peers: &str) {
     );
 }
 
-fn run_gate(env: &str) {
+fn run_gate(env: &str, expect_padded: bool) {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let path = PathBuf::from(
         std::env::var_os(env)
@@ -623,6 +624,15 @@ fn run_gate(env: &str) {
         "the gate needs the native MTP head"
     );
     assert!(qwen.model.kv_graft.is_none(), "no graft may be bound");
+    if expect_padded {
+        let policy = qwen.model.ggml_routing_policy();
+        assert!(
+            !policy.dense_decode_mvn && policy.dense_decode_mv_ext,
+            "the padded Qwen3.8 gate needs the model's serve policy (mvN off, mul_mv_ext on): \
+             {env} must name a Qwen3.8 artifact (qwen3.8/qwen38, any case) and \
+             HF2Q_DECODE_MVN/HF2Q_DECODE_MV_EXT must not override it"
+        );
+    }
     qwen.speculation = QwenSpeculationController::new(QwenSpeculationPolicy::Auto);
     qwen.model
         .ensure_gpu_cache_primed()
@@ -698,16 +708,9 @@ fn run_gate(env: &str) {
 /// and whether the other slots are empty, prefilled, mid-decode, or decoding
 /// in the same turns.
 #[test]
-#[ignore = "requires HF2Q_QWEN38_GGUF (official Qwen3.8 artifact with its MTP head), HF2Q_DECODE_MVN=0, HF2Q_DECODE_MV_EXT=1 and Apple Metal"]
+#[ignore = "requires HF2Q_QWEN38_GGUF (official Qwen3.8 artifact with its MTP head) and Apple Metal"]
 fn qwen38_k3_and_history_rounds_are_slot_independent_bitwise() {
-    for (name, value) in [("HF2Q_DECODE_MVN", "0"), ("HF2Q_DECODE_MV_EXT", "1")] {
-        assert_eq!(
-            std::env::var(name).as_deref(),
-            Ok(value),
-            "the padded Qwen3.8 gate requires externally-set {name}={value}"
-        );
-    }
-    run_gate("HF2Q_QWEN38_GGUF");
+    run_gate("HF2Q_QWEN38_GGUF", true);
 }
 
 /// Class A (Q1 §3.1) on the official Qwen3.6 artifact: a request's K3 MTP and
@@ -718,5 +721,5 @@ fn qwen38_k3_and_history_rounds_are_slot_independent_bitwise() {
 #[test]
 #[ignore = "requires HF2Q_QWEN36_GGUF (official Qwen3.6 artifact with its MTP head) and Apple Metal"]
 fn qwen36_k3_and_history_rounds_are_slot_independent_bitwise() {
-    run_gate("HF2Q_QWEN36_GGUF");
+    run_gate("HF2Q_QWEN36_GGUF", false);
 }

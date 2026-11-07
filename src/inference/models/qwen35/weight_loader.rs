@@ -1021,6 +1021,7 @@ impl Qwen35Model {
             mtp: None,
             glp: None,
             kv_graft: None,
+            ggml_routing_policy: mlx_native::ggml_routing_policy_from_environment(),
             #[cfg(test)]
             loaded_candidate_identity: None,
         })
