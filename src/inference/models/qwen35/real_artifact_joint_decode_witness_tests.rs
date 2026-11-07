@@ -7,11 +7,12 @@
 //! post-norm hidden, and every slot's cursor, parity, KV codes/scales and
 //! conv/recurrent bytes, must be bitwise equal. The armed arm must actually
 //! take the hook: one input manifest, one witness, no unmapped pre-norm and
-//! one end marker per forward. The test arms process-global state, so run it
-//! alone:
+//! one end marker per forward. The model binds the padded policy `hf2q serve`
+//! resolves for a Qwen3.8-named path (#729). The test arms process-global
+//! state, so run it alone:
 //!
 //! ```text
-//! HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 HF2Q_QWEN38_GGUF=/path/qwen38.gguf \
+//! HF2Q_QWEN38_GGUF=/path/qwen3.8.gguf \
 //!   cargo test --release --bin hf2q \
 //!   inference::models::qwen35::real_artifact_joint_decode_witness_tests::qwen38_joint_decode_witness_armed_rows_are_bitwise_unarmed \
 //!   -- --ignored --exact
@@ -29,7 +30,9 @@ use super::model::Qwen35Model;
 use super::real_artifact_joint_decode_invariance_tests::{
     cache_with_capacity, slot_state, SlotState,
 };
-use super::real_artifact_joint_decode_tests::{argmax, bits, hidden_bits, load, prompt, SLOTS};
+use super::real_artifact_joint_decode_tests::{
+    argmax, bits, hidden_bits, load, prompt, GateRouting, SLOTS,
+};
 use super::spec_decode::positions_for_range;
 use super::{Qwen35JointOutput, Qwen35JointRow};
 use crate::inference::native_observation::{armed_transaction_for_test, take_hook_counts};
@@ -157,15 +160,8 @@ pub(super) fn run_arm(model: &Qwen35Model, label: &str, cohort: &[u32], armed: b
 }
 
 #[test]
-#[ignore = "requires HF2Q_QWEN38_GGUF, HF2Q_DECODE_MVN=0, HF2Q_DECODE_MV_EXT=1, Apple Metal; run alone with --exact"]
+#[ignore = "requires HF2Q_QWEN38_GGUF (a Qwen3.8-named path), Apple Metal; run alone with --exact"]
 fn qwen38_joint_decode_witness_armed_rows_are_bitwise_unarmed() {
-    for (name, value) in [("HF2Q_DECODE_MVN", "0"), ("HF2Q_DECODE_MV_EXT", "1")] {
-        assert_eq!(
-            std::env::var(name).as_deref(),
-            Ok(value),
-            "the padded arm requires externally-set {name}={value}"
-        );
-    }
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     mlx_native::submission_observer::install_submission_observer(
         Arc::new(CountingSink),
@@ -173,7 +169,7 @@ fn qwen38_joint_decode_witness_armed_rows_are_bitwise_unarmed() {
         16 * 1024 * 1024,
     )
     .expect("install the native submission observer (run this test alone)");
-    let model = load("HF2Q_QWEN38_GGUF");
+    let model = load("HF2Q_QWEN38_GGUF", GateRouting::Serve);
     assert_eq!(
         model.joint_decode_mode(),
         Ok(JointRouteMode::PaddedMvExt),

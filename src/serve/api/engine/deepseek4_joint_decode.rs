@@ -108,10 +108,11 @@ pub(super) fn deepseek4_joint_decode_rows(model: &Deepseek4Model) -> Option<usiz
     selected
 }
 
-/// Re-check admissibility each turn. Process-wide routing variables can
-/// change after worker start (loading a Qwen3.8 model sets
-/// `HF2Q_DECODE_MV_EXT=1`); a turn that is no longer provably exact runs
-/// serially instead of failing its requests.
+/// Re-check admissibility each turn. The routing policy is frozen into this
+/// model's registry at load (#729), so no other model's load can revoke it;
+/// the diagnostic variables (layer dumps, stage profiling) are still read
+/// live, and a turn that is no longer provably exact runs serially instead of
+/// failing its requests.
 pub(super) fn deepseek4_joint_decode_turn_rows(
     model: &Deepseek4Model,
     worker_rows: Option<usize>,

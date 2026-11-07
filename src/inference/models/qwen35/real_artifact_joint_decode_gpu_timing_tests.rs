@@ -5,10 +5,11 @@
 //! the same cohort unarmed and armed; every row's logits and hidden and every slot's
 //! cache bytes must be bitwise equal. Each armed forward must emit exactly one timing
 //! event per observed command, all `Available`: every armed joint command (embed, the
-//! layer chains, the output head) is submitted and checked. Run alone:
+//! layer chains, the output head) is submitted and checked. The model binds the
+//! padded policy `hf2q serve` resolves for a Qwen3.8-named path (#729). Run alone:
 //!
 //! ```text
-//! HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 HF2Q_QWEN38_GGUF=/path/qwen38.gguf \
+//! HF2Q_QWEN38_GGUF=/path/qwen3.8.gguf \
 //!   cargo test --release --bin hf2q \
 //!   inference::models::qwen35::real_artifact_joint_decode_gpu_timing_tests::qwen38_joint_decode_gpu_timing_armed_rows_are_bitwise_unarmed \
 //!   -- --ignored --exact
@@ -24,7 +25,7 @@ use mlx_native::submission_observer::{
 use mlx_native::CompletedGpuTimestamps;
 
 use super::joint_decode_routes::JointRouteMode;
-use super::real_artifact_joint_decode_tests::load;
+use super::real_artifact_joint_decode_tests::{load, GateRouting};
 use super::real_artifact_joint_decode_witness_tests::{run_arm, COHORTS, STEPS};
 
 /// Qwen3.8 joint forward: embed, 16 four-layer chains, output head.
@@ -59,15 +60,8 @@ fn counts() -> [u64; 3] {
 }
 
 #[test]
-#[ignore = "requires HF2Q_QWEN38_GGUF, HF2Q_DECODE_MVN=0, HF2Q_DECODE_MV_EXT=1, Apple Metal; run alone with --exact"]
+#[ignore = "requires HF2Q_QWEN38_GGUF (a Qwen3.8-named path), Apple Metal; run alone with --exact"]
 fn qwen38_joint_decode_gpu_timing_armed_rows_are_bitwise_unarmed() {
-    for (name, value) in [("HF2Q_DECODE_MVN", "0"), ("HF2Q_DECODE_MV_EXT", "1")] {
-        assert_eq!(
-            std::env::var(name).as_deref(),
-            Ok(value),
-            "the padded arm requires externally-set {name}={value}"
-        );
-    }
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     mlx_native::submission_observer::install_submission_observer_with_gpu_timestamps(
         Arc::new(CountingSink),
@@ -75,7 +69,7 @@ fn qwen38_joint_decode_gpu_timing_armed_rows_are_bitwise_unarmed() {
         16 * 1024 * 1024,
     )
     .expect("install the native observer with GPU timestamps (run this test alone)");
-    let model = load("HF2Q_QWEN38_GGUF");
+    let model = load("HF2Q_QWEN38_GGUF", GateRouting::Serve);
     assert_eq!(
         model.joint_decode_mode(),
         Ok(JointRouteMode::PaddedMvExt),

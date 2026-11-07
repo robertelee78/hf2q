@@ -167,8 +167,8 @@ this release:
 | `HF2Q_DECODE_EMIT` | `development-only` | 9 |
 | `HF2Q_DECODE_EMIT_TOKENS` | `development-only` | 3 |
 | `HF2Q_DECODE_INPUT_TOKENS` | `development-only` | 5 |
-| `HF2Q_DECODE_MVN` | `promote-or-internalize` | 5 |
-| `HF2Q_DECODE_MV_EXT` | `promote-or-internalize` | 5 |
+| `HF2Q_DECODE_MVN` | `promote-or-internalize` | 4 |
+| `HF2Q_DECODE_MV_EXT` | `promote-or-internalize` | 9 |
 | `HF2Q_DECODE_PROFILE` | `development-only` | 8 |
 | `HF2Q_DECODE_SPLIT_CB_AT_LAYER` | `development-only` | 2 |
 | `HF2Q_DECODE_TRACE` | `development-only` | 3 |

@@ -137,6 +137,10 @@ Qwen3.8-identified model applies the launcher's qualified decode route
 (`HF2Q_DECODE_MVN=0` + `HF2Q_DECODE_MV_EXT=1`) at engine load when those
 variables are unset; the route stays Qwen3.8-scoped because `mul_mv_ext`
 is not bit-exact and no other family carries the qualifying receipt.
+Since #729 that route is a per-model policy (mvN off, `mul_mv_ext` on)
+resolved at load and frozen into the Qwen3.8 model's kernel registries; the
+process environment is no longer written, so other models in the process
+keep the environment default regardless of load order.
 Also since 2026-08-21, `hf2q setup` persists the qualified agentic serving
 profile (repetition penalty 1.05, thinking budget 2048, tool-continuation
 budget 512) into `config.toml` when the operator optimizes for long agent
@@ -320,8 +324,9 @@ performance authority.
 
 Source profiling localized most of the gap to target width-four verification:
 the exact-tree Q4_K/Q6_K mvN path cost roughly 98-147 ms per K3 target round.
-The qualified Qwen3.8 launcher instead uses `mul_mv_ext` for K-quant widths
-4-8 while leaving the process-wide default unchanged. The real Qwen3.8 gate proves the
+The qualified Qwen3.8 route instead uses `mul_mv_ext` for K-quant widths
+4-8; since #729 it is the Qwen3.8 model's own load-time policy (the launcher
+no longer exports it) and the process-wide default is unchanged. The real Qwen3.8 gate proves the
 Q4_K and Q6_K width-four routes were dispatched, all four target decisions
 match four independent sequential forwards, all hybrid-cache cursors agree,
 and eight subsequent sequential decisions remain exact. The verifier phase

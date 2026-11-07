@@ -51,7 +51,8 @@ impl Deepseek4Model {
     /// otherwise the reason it must stay serial. Diagnostic layer dumps and
     /// stage profiling change the one-token graph's submission shape,
     /// unretained Metal references require the synchronous serial path,
-    /// `HF2Q_DECODE_MV_EXT=1` moves Q8_0 at 2..=8 rows onto the non-exact
+    /// a model routing policy with `mul_mv_ext` (frozen into this model's
+    /// registry at load from `HF2Q_DECODE_MV_EXT=1`) moves Q8_0 at 2..=8 rows onto the non-exact
     /// `mul_mv_ext` kernel, and unproven matrix storage could make a row
     /// depend on its batch peers.
     pub(crate) fn joint_decode_unavailable_reason(&self) -> Option<String> {
@@ -69,9 +70,10 @@ impl Deepseek4Model {
         if std::env::var("HF2Q_DEEPSEEK_STAGE_PROFILE").as_deref() == Ok("1") {
             return Some("HF2Q_DEEPSEEK_STAGE_PROFILE=1 requires the serial graph".into());
         }
-        if std::env::var("HF2Q_DECODE_MV_EXT").as_deref() == Ok("1") {
+        if self.ctx.ggml_routing_policy().dense_decode_mv_ext {
             return Some(
-                "HF2Q_DECODE_MV_EXT=1 routes Q8_0 at 2..=8 rows through non-exact mul_mv_ext"
+                "the model's routing policy (HF2Q_DECODE_MV_EXT=1) routes Q8_0 at 2..=8 rows \
+                 through non-exact mul_mv_ext"
                     .into(),
             );
         }

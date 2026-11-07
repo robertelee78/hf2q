@@ -1149,9 +1149,10 @@ pub(crate) enum DenseGateUpDispatch {
     PreferFused,
     /// Separate gate and up products through the canonical GGML dispatcher,
     /// then `silu_mul`. Weight reuse is whatever that dispatcher's route
-    /// gives for the type, width and routing policy. At width 4 under
-    /// `HF2Q_DECODE_MV_EXT=1` (the padded joint mode) every admitted type
-    /// reads each weight block once for all rows. At widths 2..=3 with
+    /// gives for the type, width and routing policy. At width 4 under a
+    /// model routing policy with `mul_mv_ext` on (the padded joint mode: the
+    /// Qwen3.8 per-model default or `HF2Q_DECODE_MV_EXT=1`) every admitted
+    /// type reads each weight block once for all rows. At widths 2..=3 with
     /// `mvN` off, K-quants take the per-row `Mv` kernel instead.
     Separate,
 }

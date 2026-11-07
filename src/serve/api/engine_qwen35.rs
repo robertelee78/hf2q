@@ -260,37 +260,6 @@ impl Qwen35LoadedModel {
     /// - GGUF open / parse
     /// - `Qwen35Model::load_from_gguf` (weights load via mlx-native)
     /// - tokenizer file resolution + parse
-    /// ADR-044: the Qwen3.8-qualified K-quant width-four decode route
-    /// (`HF2Q_DECODE_MVN=0` + `HF2Q_DECODE_MV_EXT=1`, qualified by the
-    /// native qL4 decision/cache gate and the matched ABBA receipt) was
-    /// previously applied only by the canonical `serve_qwen38_opencode.sh`
-    /// launcher. Loading a Qwen3.8-identified model now applies the same
-    /// route by default, at engine load, before the first quantized matmul
-    /// snapshots mlx-native's process-global routing policy. Explicit
-    /// operator-exported values always win.
-    ///
-    /// The route stays Qwen3.8-scoped on purpose: unlike the default-on
-    /// byte-exact mvN route, `mul_mv_ext` is not bit-exact, and no other
-    /// model family carries the qualifying receipt. The id match mirrors
-    /// the serve registry's deliberately fuzzy substring philosophy.
-    ///
-    /// Multi-model note: mlx-native's routing policy is process-global and
-    /// cached on first dispatch, so this default can only take effect when
-    /// the Qwen3.8 load precedes the process's first quantized matmul —
-    /// the same per-process scope the launcher always had.
-    fn apply_qwen38_qualified_decode_route(model_path: &std::path::Path) {
-        let id = model_path.to_string_lossy().to_ascii_lowercase();
-        if !(id.contains("qwen38") || id.contains("qwen3.8")) {
-            return;
-        }
-        for (key, value) in [("HF2Q_DECODE_MVN", "0"), ("HF2Q_DECODE_MV_EXT", "1")] {
-            if std::env::var_os(key).is_none() {
-                std::env::set_var(key, value);
-                tracing::info!(key, value, "applied Qwen3.8-qualified decode route default");
-            }
-        }
-    }
-
     pub fn load(opts: &LoadOptions) -> Result<Self> {
         Self::load_with_context(opts, None)
     }
@@ -305,7 +274,6 @@ impl Qwen35LoadedModel {
     ) -> Result<Self> {
         let load_start = Instant::now();
         let model_path = &opts.model_path;
-        Self::apply_qwen38_qualified_decode_route(model_path);
         anyhow::ensure!(
             model_path.exists(),
             "Model not found: {}",
@@ -363,6 +331,23 @@ impl Qwen35LoadedModel {
         );
         let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
             .context("Qwen35Model::load_from_gguf")?;
+        // ADR-044 / #729: Qwen3.8 is qualified on the K-quant width-four
+        // decode route (mvN off, `mul_mv_ext` on); no other family carries
+        // that receipt because `mul_mv_ext` is not bit-exact. The route is a
+        // property of this model, resolved from its identity and the explicit
+        // operator environment and frozen into this model's kernel
+        // registries. The process environment is never written, so models
+        // loaded before or after this one keep their own policy.
+        let routing_policy =
+            crate::inference::models::qwen35::routing_policy::resolve_qwen_ggml_routing_policy(
+                model_path,
+            );
+        model.bind_ggml_routing_policy(routing_policy);
+        tracing::info!(
+            dense_decode_mvn = routing_policy.dense_decode_mvn,
+            dense_decode_mv_ext = routing_policy.dense_decode_mv_ext,
+            "Qwen GGML routing policy bound to model"
+        );
 
         // ADR-053: bind a GLP steering vector when the operator supplied one.
         // Fail-closed: any loader/conformance error aborts the serve load

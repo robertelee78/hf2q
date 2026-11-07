@@ -88,6 +88,7 @@ pub mod mtp;
 pub mod mtp_weights_load;
 mod source_config;
 pub(crate) mod source_precision;
+pub mod routing_policy;
 pub mod spec_decode;
 pub mod tokenizer;
 pub mod wave5b8_profile;

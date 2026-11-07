@@ -19,9 +19,8 @@
 use std::sync::Once;
 
 use crate::inference::models::qwen35::joint_decode_routes::{
-    check_mode_environment, joint_decode_env_unavailable_reason, joint_ffn_shared_from_process,
-    joint_mode_max_rows, select_dense_ffn_route, JointDenseFfnRoute, JointRouteMode,
-    JointRoutingEnvironment, MAX_JOINT_DECODE_ROWS,
+    joint_decode_env_unavailable_reason, joint_ffn_shared_from_process, joint_mode_max_rows,
+    select_dense_ffn_route, JointDenseFfnRoute, JointRouteMode, MAX_JOINT_DECODE_ROWS,
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::serve::api::engine_qwen35::{Qwen35JointLane, Qwen35TickOutcome};
@@ -195,6 +194,8 @@ pub(super) fn qwen35_joint_decode_config(
         requested,
         explicit = explicit.is_some(),
         moe,
+        dense_decode_mvn = model.ggml_routing_policy().dense_decode_mvn,
+        dense_decode_mv_ext = model.ggml_routing_policy().dense_decode_mv_ext,
         max_rows = selected.map_or(max_rows, |config| config.max_rows),
         selected = selected.is_some(),
         mode = selected.map_or("serial", |config| config.mode.label()),
@@ -206,18 +207,17 @@ pub(super) fn qwen35_joint_decode_config(
     selected
 }
 
-/// Re-check the process routing policy every turn: routing variables can
-/// change after worker start; a turn that no longer satisfies the worker's
-/// mode runs serially (logged once), and a later turn that satisfies it again
-/// runs jointly.
+/// Re-check the serial-graph diagnostics every turn. The worker's mode came
+/// from the model's routing policy, which is frozen into its kernel registry
+/// at load (#729) and cannot change mid-run, so only the live diagnostic
+/// switches (`HF2Q_LEGACY_PER_LAYER_CB`, `MLX_UNRETAINED_REFS`) can revoke
+/// it: such a turn runs serially (logged once), and a later turn that
+/// satisfies them again runs jointly.
 pub(super) fn qwen35_joint_decode_turn_config(
     worker: Option<Qwen35JointDecodeConfig>,
 ) -> Option<Qwen35JointDecodeConfig> {
     let config = worker?;
-    let reason = joint_decode_env_unavailable_reason().or_else(|| {
-        check_mode_environment(config.mode, JointRoutingEnvironment::from_process()).err()
-    });
-    let Some(reason) = reason else {
+    let Some(reason) = joint_decode_env_unavailable_reason() else {
         return Some(config);
     };
     static REVOKED: Once = Once::new();
