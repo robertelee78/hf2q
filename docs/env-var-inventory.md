@@ -76,6 +76,7 @@ with the audit script for this change (the lexical count of
 - `HF2Q_QWEN_SPEC_COST_MTP` and `HF2Q_QWEN_SPEC_COST_HISTORY` (`development-only`) override the repeatable route's modelled round costs, in ordinary decisions (defaults 1.26 and 1.49). The repeatability gate uses them to force a cost-disabled proposer. Non-positive or invalid values warn and keep the default.
 - `HF2Q_QWEN_MOE_BATCHED` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects the batched Qwen3.6 MoE decode route. Unset or `0`/`off`/`false` (default): router and shared expert are uploaded as BF16 and every MoE layer runs once per row. `1`/`on`/`true`: they load in GGUF storage (F32 router and gate logit, Q4_K/Q6_K shared expert, no BF16 copies) and serial and joint decode both run one batched layer over the step's rows, row-exact (a row's output is the same solo or in a joint step). Read once at model load; invalid values warn and keep the default.
 - `HF2Q_QWEN_JOINT_Q1_PROMPTS`, `HF2Q_QWEN_JOINT_Q1_OUT` and `HF2Q_QWEN_JOINT_Q1_STEPS` (`development-only`) drive the ignored Q1 Class B trace test.
+- `HF2Q_QWEN_MOE_Q1_PROMPTS`, `HF2Q_QWEN_MOE_Q1_OUT`, `HF2Q_QWEN_MOE_Q1_STEPS` and `HF2Q_QWEN_MOE_Q1_FORCED` (`development-only`) drive the ignored two-process Q1 trace test of the batched MoE route (`qwen36_moe_route_q1_envelope_trace`).
 - `HF2Q_QWEN36_GGUF` and `HF2Q_QWEN38_GGUF` (`development-only`) select the official artifacts for the ignored Qwen joint decode hardware gates.
 
 These rows were added by hand. The rest of this snapshot was not regenerated.
@@ -412,7 +413,11 @@ this release:
 | `HF2Q_QWEN_JOINT_Q1_OUT` | `development-only` | 1 |
 | `HF2Q_QWEN_JOINT_Q1_PROMPTS` | `development-only` | 1 |
 | `HF2Q_QWEN_JOINT_Q1_STEPS` | `development-only` | 1 |
-| `HF2Q_QWEN_MOE_BATCHED` | `documented-escape` | 9 |
+| `HF2Q_QWEN_MOE_BATCHED` | `documented-escape` | 14 |
+| `HF2Q_QWEN_MOE_Q1_FORCED` | `development-only` | 2 |
+| `HF2Q_QWEN_MOE_Q1_OUT` | `development-only` | 4 |
+| `HF2Q_QWEN_MOE_Q1_PROMPTS` | `development-only` | 4 |
+| `HF2Q_QWEN_MOE_Q1_STEPS` | `development-only` | 2 |
 | `HF2Q_QWEN_RESUME_ATTN_FAST` | `documented-escape` | 7 |
 | `HF2Q_QWEN_RESUME_FAST_PROMPTS` | `development-only` | 3 |
 | `HF2Q_QWEN_SPECULATION` | `promote-or-internalize` | 6 |
