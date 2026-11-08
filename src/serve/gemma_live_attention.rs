@@ -1313,16 +1313,22 @@ mod tests {
 
     #[test]
     fn tensor_route_takes_the_tiled_chunks_and_keeps_tiny_suffixes_on_vec_hybrid() {
-        for tiled_live in [true, false] {
-            let route = LiveRoute::select(None, TensorF16, tiled_live);
-            assert_eq!(route.seq_kernel(31), VecHybrid);
-            assert_eq!(route.seq_kernel(32), TensorF16);
-            assert_eq!(route.label(), "tensor-f16 (vec-hybrid below 32 rows)");
+        let route = LiveRoute::resolve(TensorF16);
+        assert_eq!(route.seq_kernel(31), VecHybrid);
+        assert_eq!(route.seq_kernel(32), TensorF16);
+        assert_eq!(route.label(), "tensor-f16 (vec-hybrid below 32 rows)");
+        for (is_ring, start, rows) in
+            [(true, 0, 2_500), (false, 7, 9_000), (true, 465, 385)]
+        {
+            assert_eq!(
+                chunk_list(TensorF16, is_ring, start, rows),
+                chunk_list(TiledF16, is_ring, start, rows)
+            );
         }
-        for (is_ring, start, rows) in [(true, 0, 2_500), (false, 7, 9_000), (true, 465, 385)] {
-            assert_eq!(chunk_list(TensorF16, is_ring, start, rows), chunk_list(TiledF16, is_ring, start, rows));
-        }
-        assert_eq!(stage_query_rows(TensorF16, 2_000), stage_query_rows(TiledF16, 2_000));
+        assert_eq!(
+            stage_query_rows(TensorF16, 2_000),
+            stage_query_rows(TiledF16, 2_000)
+        );
     }
 
     #[test]
