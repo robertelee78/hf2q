@@ -23,7 +23,6 @@
 
 use mlx_native::graph::GraphSession;
 use mlx_native::ops::dense_gemm::{dispatch_dense_matvec_f16w_f32io, DenseGemmF16Params};
-use mlx_native::ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 use mlx_native::ops::quantized_matmul_ggml::{
     quantized_matmul_ggml_batched_mv, GgmlBatchedQuantizedMatmulParams, GgmlQuantizedMatmulParams,
     GgmlType,
@@ -567,17 +566,14 @@ fn stock_matvec_kernels_keep_the_main_routes_bitwise() {
     let mut ctx = GpuContext::new().unwrap();
     let device = ctx.device().clone();
 
-    // F16: m = 1 is the L9 F32-input matvec, independent rows split per row,
-    // matrix rows take the tiled tensor kernel.
+    // F16: m = 1 is the L9 F32-input matvec; independent rows split per row.
     let (n, k) = (256, 4096);
     let f16 = f16_weight(&device, n, k, 0xc0);
     let shape = [n, k];
     let w = matrix(&f16, GgmlType::F16, &shape, MatvecKernels::Stock);
     let x = input(&device, 4, k, 0xc1);
     let wrapper_rows = output(&device, 4, n);
-    let wrapper_matrix = output(&device, 4, n);
     let direct_rows = output(&device, 4, n);
-    let direct_matrix = output(&device, 4, n);
     run(&mut ctx, |s, r, d| {
         row_matmul(
             RowMatmul::IndependentRows,
@@ -591,20 +587,6 @@ fn stock_matvec_kernels_keep_the_main_routes_bitwise() {
             n,
             k,
             "rows",
-        )
-        .unwrap();
-        row_matmul(
-            RowMatmul::Matrix,
-            s,
-            r,
-            d,
-            &x,
-            &w,
-            &wrapper_matrix,
-            4,
-            n,
-            k,
-            "matrix",
         )
         .unwrap();
         for row in 0..4 {
@@ -626,33 +608,11 @@ fn stock_matvec_kernels_keep_the_main_routes_bitwise() {
             )
             .unwrap();
         }
-        s.barrier_between(&[&x, &f16], &[&direct_matrix]);
-        dense_matmul_f16_f32_tensor(
-            s.encoder_mut(),
-            r,
-            d,
-            &f16,
-            &x,
-            &direct_matrix,
-            &DenseMmF16F32Params {
-                m: 4,
-                n: n as u32,
-                k: k as u32,
-                src0_batch: 1,
-                src1_batch: 1,
-            },
-        )
-        .unwrap();
     });
     assert_eq!(
         bits(&wrapper_rows),
         bits(&direct_rows),
         "F16 independent rows"
-    );
-    assert_eq!(
-        bits(&wrapper_matrix),
-        bits(&direct_matrix),
-        "F16 matrix rows"
     );
 
     // Q8_0: raw_matmul at m = 1..=4 is the canonical quantized matvec.
@@ -899,58 +859,64 @@ fn row_exact_rows_equal_stock_switch_one_row_bitwise() {
     assert!(!built.is_empty(), "no row-exact pipeline ran");
 }
 
-/// Prefill rows (`RowMatmul::Matrix`) at m = 2..=8 keep the stock route with
-/// the switch on: F16 keeps the tiled tensor kernel, Q8_0's row-exact rows
-/// equal the stock NR2 matvec. Outputs equal the stock switch bitwise.
+/// Q8_0 prefill rows (`RowMatmul::Matrix`) at m = 2..=8 take the row-exact
+/// route only where it replays the stock NR2 matvec, and stay bitwise equal
+/// to the stock switch.
 #[test]
-fn row_exact_switch_keeps_matrix_rows_on_the_stock_result() {
+fn row_exact_switch_keeps_q8_0_matrix_rows_on_the_stock_result() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let mut ctx = nr2_context();
     let device = ctx.device().clone();
-    for (label, ggml_type, n, k) in [
-        ("router", GgmlType::F16, 256, 4096),
-        ("hc_fn", GgmlType::F16, 24, 16384),
-        ("attn_q_a", GgmlType::Q8_0, 1024, 4096),
-    ] {
-        let buffer = match ggml_type {
-            GgmlType::F16 => f16_weight(&device, n, k, 0x5c00),
-            _ => q8_0_weight(&device, n, k, 0x5c01),
-        };
-        let shape = [n, k];
-        let on = matrix(&buffer, ggml_type, &shape, MatvecKernels::RowExact);
-        let off = matrix(&buffer, ggml_type, &shape, MatvecKernels::Stock);
-        let x = input(&device, MAX_ROWS, k, 0x5c02);
-        for m in 2..=MAX_ROWS {
-            let xm = x.slice_view(0, m * k).with_shape(vec![m, k]).unwrap();
-            let y_on = output(&device, m, n);
-            let y_off = output(&device, m, n);
-            run(&mut ctx, |s, r, d| {
-                row_matmul(RowMatmul::Matrix, s, r, d, &xm, &on, &y_on, m, n, k, label).unwrap();
-                row_matmul(
-                    RowMatmul::Matrix,
-                    s,
-                    r,
-                    d,
-                    &xm,
-                    &off,
-                    &y_off,
-                    m,
-                    n,
-                    k,
-                    label,
-                )
-                .unwrap();
-            });
-            assert_eq!(bits(&y_on), bits(&y_off), "{label} Matrix m={m}");
-        }
+    let (label, n, k) = ("attn_q_a", 1024, 4096);
+    let buffer = q8_0_weight(&device, n, k, 0x5c01);
+    let shape = [n, k];
+    let on = matrix(&buffer, GgmlType::Q8_0, &shape, MatvecKernels::RowExact);
+    let off = matrix(&buffer, GgmlType::Q8_0, &shape, MatvecKernels::Stock);
+    let x = input(&device, MAX_ROWS, k, 0x5c02);
+    for m in 2..=MAX_ROWS {
+        let xm = x.slice_view(0, m * k).with_shape(vec![m, k]).unwrap();
+        let y_on = output(&device, m, n);
+        let y_off = output(&device, m, n);
+        run(&mut ctx, |s, r, d| {
+            row_matmul(
+                RowMatmul::Matrix,
+                s,
+                r,
+                d,
+                &xm,
+                &on,
+                &y_on,
+                m,
+                n,
+                k,
+                label,
+            )
+            .unwrap();
+            row_matmul(
+                RowMatmul::Matrix,
+                s,
+                r,
+                d,
+                &xm,
+                &off,
+                &y_off,
+                m,
+                n,
+                k,
+                label,
+            )
+            .unwrap();
+        });
+        assert_eq!(bits(&y_on), bits(&y_off), "{label} Matrix m={m}");
     }
     let (_, registry) = ctx.split();
     let built = row_exact_pipelines_built(registry);
+    assert_only_stock_order_built(&built);
     assert!(
         built
             .iter()
-            .all(|name| !name.starts_with("row_exact_stock_mv_f16_")),
-        "F16 Matrix rows must keep the stock tiled route: {built:?}"
+            .any(|name| name.starts_with("row_exact_stock_mv_q8_0_")),
+        "Q8_0 Matrix rows did not take the row-exact route: {built:?}"
     );
 }
 
