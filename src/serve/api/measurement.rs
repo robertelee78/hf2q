@@ -179,6 +179,21 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
             // null for other families.
             "gemma_prefill_moe_down": (engine.info().arch_str == "gemma4")
                 .then(crate::serve::gemma_prefill_moe::published_prefill_moe_down),
+            // Gemma decode dense/lm-head kernel (`HF2Q_GEMMA_DECODE_DENSE`):
+            // `Stock` | `RowExact` | `ColumnInvariantMma`; null off Gemma.
+            "gemma_decode_dense_kernel": (engine.info().arch_str == "gemma4")
+                .then(crate::inference::models::gemma4::decode_dense::published_kernel),
+            // ADR-063 gap program decode attention head split (`Stock` |
+            // `Ne2` | `Ne4`); null for other families.
+            "gemma_decode_attn_ne": (engine.info().arch_str == "gemma4")
+                .then(crate::serve::gemma_decode_attention::published_decode_attn_ne),
+            // ADR-063: the resolved Gemma warm-prefill attention
+            // kernel, so a Q5 receipt binds its arm (`null` off Gemma).
+            "gemma_warm_attention_kernel": engine.info().gemma_warm_attention_kernel,
+            // Native expert-matmul tile schedule (`HF2Q_MM_ID_SCHEDULE`).
+            "mm_id_schedule": crate::serve::gemma_prefill_moe::published_mm_id_schedule(),
+            // Native Q5_0 tensor-MM opt-in (`HF2Q_Q5_0_TENSOR_MM=1`).
+            "q5_0_tensor_mm": crate::serve::gemma_prefill_moe::published_q5_0_tensor_mm(),
         },
     }))
 }

@@ -900,11 +900,13 @@ impl AppState {
             glp_reference: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             engine_mode: super::engine::EngineMode::SerialFifo,
             requested_context: None,
             kv_cache_budget_bytes: None,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
+            slot_spill_budget_bytes: None,
         };
         Ok(Self {
             config: Arc::new(config),
@@ -977,11 +979,13 @@ impl AppState {
             glp_reference: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             engine_mode: super::engine::EngineMode::SerialFifo,
             requested_context: None,
             kv_cache_budget_bytes: None,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
+            slot_spill_budget_bytes: None,
         };
         // Synthetic cache root in a per-process tempdir.  Tests that need
         // a specific cache state should construct via `new_for_serve` or

@@ -319,78 +319,7 @@ pub fn dispatch_qmatmul(
     m: u32,
     imatrix_hint: ImatrixHint<'_>,
 ) -> Result<()> {
-    // ADR-033 §Pi Stage 2 — imatrix collector intercept (inline-hint API).
-    //
-    // When a Phase-B driver has installed an `ImatrixCollector`, capture
-    // the input activations BEFORE the matmul fires. The hint is a
-    // cheap inline enum (no thread-local, no allocation) that the
-    // intercept formats lazily only when a collector is present.
-    //
-    // In the production decode path (no collector installed), the
-    // intercept adds one `is_active()` load + branch and falls through —
-    // the materialize closure (which would `commit_and_wait` and read
-    // the input buffer to host) is never invoked.
-    //
-    // Per ADR-033 §Risk 2 amendment (2026-05-19): Metal-native
-    // accumulation is acceptable; we read the input buffer post-sync on
-    // this same Metal-backed GraphSession instead of re-running on CPU.
-    intercept_qmatmul_with_hint(imatrix_hint, m as usize, weight.info.cols, || {
-        // Materialize the input buffer. We must drain any pending GPU
-        // work that wrote to `input` before reading it on the host,
-        // AND rotate to a fresh CB so subsequent dispatches don't
-        // hit Metal's `MTLCommandBufferStatusCommitted` assertion.
-        // `commit_wait_and_rotate` is a hard sync — only acceptable
-        // because this closure is gated on collector-present.
-        if let Err(e) = session.encoder_mut().commit_wait_and_rotate() {
-            eprintln!("[hf2q imatrix intercept] commit_wait_and_rotate failed: {e}");
-            return None;
-        }
-        match input.as_slice::<f32>() {
-            Ok(slice) => Some(slice.to_vec()),
-            Err(e) => {
-                eprintln!("[hf2q imatrix intercept] input.as_slice::<f32>() failed: {e}");
-                None
-            }
-        }
-    })
-    .map_err(|e| anyhow::anyhow!("imatrix intercept: {e}"))?;
-
-    // ADR-029 iter-40 H40 — annotate the next-captured dispatch with this
-    // call's exact reads/writes so the graph_opt reorder pass (graph.rs
-    // `ComputeGraph::reorder`) can detect non-conflicts between adjacent
-    // dispatches (e.g. Q/K/V which write to disjoint outputs from the
-    // same input).  Without per-dispatch annotation, the prior
-    // `barrier_between` carries the union of write targets and the reorder
-    // pass treats the dispatches as conflicting.  The annotation only
-    // takes effect in `begin_recorded` mode (HF2Q_GRAPH_OPT_PREFILL=1).
-    //
-    // ADR-029 iter-175 Step 1c — gate on `is_capturing()`.  Previously
-    // this block unconditionally heap-allocated two `Vec<MemRange>` per
-    // `dispatch_qmatmul` call (~91/token: QKV proj × 3 × 30 layers +
-    // lm_head). `CommandEncoder::set_pending_buffer_ranges` doc:
-    // "Only meaningful in capture mode — has no effect on direct-dispatch."
-    // In production decode (capture None), the allocated vectors were
-    // taken + dropped on the next encode call — ~182 heap allocs/token
-    // of pure waste. First substep of multi-week DispatchRecord refactor.
-    //
-    // Weights are read-only (never mutated post-load), so we annotate
-    // reads=[input] only — weight RANGES would force conservative
-    // RAW-conflict checks against the load-time dequant pass that ran
-    // hours ago (already complete, no live dependency).
-    {
-        let encoder = session.encoder_mut();
-        if encoder.is_capturing() {
-            let input_range = {
-                let start = input.contents_ptr() as usize;
-                (start, start + input.byte_len())
-            };
-            let output_range = {
-                let start = output.contents_ptr() as usize;
-                (start, start + output.byte_len())
-            };
-            encoder.set_pending_buffer_ranges(vec![input_range], vec![output_range]);
-        }
-    }
+    qmatmul_preamble(session, input, weight, output, m, imatrix_hint)?;
 
     // ADR-020 AC#5 Iter C — affine route MUST be checked first (before
     // F32/GGML).  When `weight.affine` is `Some`, the buffer holds
@@ -631,6 +560,92 @@ pub fn dispatch_qmatmul(
         .map_err(|e| anyhow::anyhow!("quantized_matmul_ggml failed: {e}"))
 }
 
+/// Imatrix intercept and capture-mode range annotation of a dense matmul
+/// dispatch, shared by [`dispatch_qmatmul`] and the Gemma 4 decode dense
+/// selector (`gemma4::decode_dense`).
+pub(crate) fn qmatmul_preamble(
+    session: &mut GraphSession<'_>,
+    input: &MlxBuffer,
+    weight: &MlxQWeight,
+    output: &MlxBuffer,
+    m: u32,
+    imatrix_hint: ImatrixHint<'_>,
+) -> Result<()> {
+    // ADR-033 §Pi Stage 2 — imatrix collector intercept (inline-hint API).
+    //
+    // When a Phase-B driver has installed an `ImatrixCollector`, capture
+    // the input activations BEFORE the matmul fires. The hint is a
+    // cheap inline enum (no thread-local, no allocation) that the
+    // intercept formats lazily only when a collector is present.
+    //
+    // In the production decode path (no collector installed), the
+    // intercept adds one `is_active()` load + branch and falls through —
+    // the materialize closure (which would `commit_and_wait` and read
+    // the input buffer to host) is never invoked.
+    //
+    // Per ADR-033 §Risk 2 amendment (2026-05-19): Metal-native
+    // accumulation is acceptable; we read the input buffer post-sync on
+    // this same Metal-backed GraphSession instead of re-running on CPU.
+    intercept_qmatmul_with_hint(imatrix_hint, m as usize, weight.info.cols, || {
+        // Materialize the input buffer. We must drain any pending GPU
+        // work that wrote to `input` before reading it on the host,
+        // AND rotate to a fresh CB so subsequent dispatches don't
+        // hit Metal's `MTLCommandBufferStatusCommitted` assertion.
+        // `commit_wait_and_rotate` is a hard sync — only acceptable
+        // because this closure is gated on collector-present.
+        if let Err(e) = session.encoder_mut().commit_wait_and_rotate() {
+            eprintln!("[hf2q imatrix intercept] commit_wait_and_rotate failed: {e}");
+            return None;
+        }
+        match input.as_slice::<f32>() {
+            Ok(slice) => Some(slice.to_vec()),
+            Err(e) => {
+                eprintln!("[hf2q imatrix intercept] input.as_slice::<f32>() failed: {e}");
+                None
+            }
+        }
+    })
+    .map_err(|e| anyhow::anyhow!("imatrix intercept: {e}"))?;
+
+    // ADR-029 iter-40 H40 — annotate the next-captured dispatch with this
+    // call's exact reads/writes so the graph_opt reorder pass (graph.rs
+    // `ComputeGraph::reorder`) can detect non-conflicts between adjacent
+    // dispatches (e.g. Q/K/V which write to disjoint outputs from the
+    // same input).  Without per-dispatch annotation, the prior
+    // `barrier_between` carries the union of write targets and the reorder
+    // pass treats the dispatches as conflicting.  The annotation only
+    // takes effect in `begin_recorded` mode (HF2Q_GRAPH_OPT_PREFILL=1).
+    //
+    // ADR-029 iter-175 Step 1c — gate on `is_capturing()`.  Previously
+    // this block unconditionally heap-allocated two `Vec<MemRange>` per
+    // `dispatch_qmatmul` call (~91/token: QKV proj × 3 × 30 layers +
+    // lm_head). `CommandEncoder::set_pending_buffer_ranges` doc:
+    // "Only meaningful in capture mode — has no effect on direct-dispatch."
+    // In production decode (capture None), the allocated vectors were
+    // taken + dropped on the next encode call — ~182 heap allocs/token
+    // of pure waste. First substep of multi-week DispatchRecord refactor.
+    //
+    // Weights are read-only (never mutated post-load), so we annotate
+    // reads=[input] only — weight RANGES would force conservative
+    // RAW-conflict checks against the load-time dequant pass that ran
+    // hours ago (already complete, no live dependency).
+    {
+        let encoder = session.encoder_mut();
+        if encoder.is_capturing() {
+            let input_range = {
+                let start = input.contents_ptr() as usize;
+                (start, start + input.byte_len())
+            };
+            let output_range = {
+                let start = output.contents_ptr() as usize;
+                (start, start + output.byte_len())
+            };
+            encoder.set_pending_buffer_ranges(vec![input_range], vec![output_range]);
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Cluster 2 — DWQ overlay parsing
 // ---------------------------------------------------------------------------
@@ -815,67 +830,6 @@ pub fn dispatch_rms_norm_unit_perhead(
         &[(0, args.input), (1, args.output), (2, args.params_buf)],
         &[(0, shared_mem_bytes)],
         mlx_native::MTLSize::new(args.rows as u64, 1, 1),
-        mlx_native::MTLSize::new(tg_size, 1, 1),
-    );
-    Ok(())
-}
-
-/// Dual-output variant: writes both f32 (for KV cache copy) AND bf16
-/// (for the bf16 attention island) — ADR-011 Phase 3 Wave P3b-tensor.3.
-///
-/// Used by batched prefill V-norm to fuse the f32→bf16 cast that was
-/// previously a separate `cast_f32_to_bf16` dispatch.  Same compute,
-/// one extra device write per element (effectively free on Apple
-/// unified memory since the f32 result is in registers).
-#[allow(clippy::too_many_arguments)]
-/// Fused per-head V-norm + permute (Wave P4.16).
-///
-/// Same compute as `dispatch_rms_norm_unit_perhead_dual` but writes the
-/// bf16 output at the permuted [n_heads, seq_len, head_dim] layout
-/// instead of the natural [seq_len, n_heads, head_dim] layout.  Saves
-/// the post-norm `permute_021_bf16` dispatch on V (~30 dispatches/
-/// prefill on Gemma 4) and ~10 MB of intermediate-buffer traffic at
-/// pp2455.
-///
-/// The f32 output stays at natural layout — KV cache copy reads it.
-pub fn dispatch_rms_norm_unit_perhead_dual_perm(
-    encoder: &mut mlx_native::CommandEncoder,
-    registry: &mut mlx_native::KernelRegistry,
-    device: &mlx_native::metal::DeviceRef,
-    input: &MlxBuffer,
-    output: &MlxBuffer,
-    output_bf16_perm: &MlxBuffer,
-    params_buf: &MlxBuffer,
-    n_heads: u32,
-    seq_len: u32,
-    dim: u32,
-) -> Result<()> {
-    use mlx_native::ops::encode_helpers::{encode_threadgroups_with_args_and_shared, KernelArg};
-    let pipeline = registry
-        .get_pipeline("rms_norm_no_scale_f32_dual_perm", device)
-        .map_err(|e| anyhow::anyhow!("rms_norm_no_scale_f32_dual_perm pipeline: {e}"))?;
-    let rows = (n_heads as u64) * (seq_len as u64);
-    let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
-    let shared_mem_bytes = tg_size * 4;
-    let aux_bytes: [u32; 2] = [n_heads, seq_len];
-    let aux_bytes_b: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            aux_bytes.as_ptr() as *const u8,
-            std::mem::size_of_val(&aux_bytes),
-        )
-    };
-    encode_threadgroups_with_args_and_shared(
-        encoder,
-        pipeline,
-        &[
-            (0, KernelArg::Buffer(input)),
-            (1, KernelArg::Buffer(output)),
-            (2, KernelArg::Buffer(params_buf)),
-            (3, KernelArg::Buffer(output_bf16_perm)),
-            (4, KernelArg::Bytes(aux_bytes_b)),
-        ],
-        &[(0, shared_mem_bytes)],
-        mlx_native::MTLSize::new(rows, 1, 1),
         mlx_native::MTLSize::new(tg_size, 1, 1),
     );
     Ok(())

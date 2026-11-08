@@ -28,7 +28,6 @@
 //! must stop on EOS, so the comparison is not vacuous.
 //!
 //! ```text
-//! HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 \
 //! HF2Q_QWEN38_GGUF=/abs/Qwen3.8-27B-vanilla.gguf \
 //!   cargo test --release --lib qwen38_slot_aware_speculation_auto_matches_off \
 //!   -- --ignored --exact --nocapture --test-threads=1
@@ -159,6 +158,7 @@ fn run_arm(policy: QwenSpeculationPolicy, reference: Option<&Arm>) -> Arm {
         glp_path: None,
         glp_alpha: None,
         kv_graft_path: None,
+        lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
     };
     let mut loaded = LoadedModel::load(&options).expect("load Qwen3.8");
     let tokenizer = {

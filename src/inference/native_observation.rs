@@ -1,12 +1,16 @@
 //! Explicit HF-side native observation. Never controls inference or scheduling.
 //! A caller supplies actual logical input spans; constructors do not infer rows.
+use crate::inference::models::qwen35::joint_decode_routes::MAX_JOINT_DECODE_ROWS;
 use mlx_native::submission_observer::{ObservationScope, ObservationStatus};
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 mod witness;
+#[cfg(test)]
+pub(crate) use witness::take_hook_counts;
 pub(crate) use witness::{input, single_input, witness_command_rms_norm, witness_rms_norm, Input};
+use witness::{input_rows, JOINT_SOURCE};
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -64,12 +68,13 @@ pub(crate) fn arm_on_worker(
     );
     device.command_encoder()?.commit_and_wait()?;
     let baseline = arm().map_err(anyhow::Error::msg)?;
-    crate::serve::phase_trace::publish(
-        "native_arm_ack",
-        serde_json::json!({
-        "nonce":nonce,"clock_id":"CLOCK_MONOTONIC","worker_queue_checked":true,
-        "quiescent":true,"baseline":baseline,"scope":"one_fresh_phase_diagnostic"}),
-    );
+    let mut ack = serde_json::json!({
+    "nonce":nonce,"clock_id":"CLOCK_MONOTONIC","worker_queue_checked":true,
+    "quiescent":true,"baseline":baseline,"scope":"one_fresh_phase_diagnostic"});
+    if let Some(pair) = crate::serve::phase_trace::native_clock_pair() {
+        ack["clock_pair"] = pair;
+    }
+    crate::serve::phase_trace::publish("native_arm_ack", ack);
     Ok(())
 }
 
@@ -98,7 +103,11 @@ pub(crate) fn arm() -> Result<ObservationStatus, &'static str> {
 pub(crate) fn finish() -> ObservationStatus {
     ARMED.store(false, Ordering::Release);
     let status = mlx_native::submission_observer::submission_observation_status();
-    crate::serve::phase_trace::publish("native_final", serde_json::json!(status));
+    let mut payload = serde_json::json!(status);
+    if let Some(pair) = crate::serve::phase_trace::native_clock_pair() {
+        payload["clock_pair"] = pair;
+    }
+    crate::serve::phase_trace::publish("native_final", payload);
     if status.pending_commands != 0 || status.pending_command_limit != 1024 {
         crate::serve::phase_trace::invalidate("native submitted command ownership not retired");
     }
@@ -131,6 +140,20 @@ pub(crate) fn update_owners(owners: &[crate::serve::phase_trace::SlotState]) {
         return;
     }
     OWNERS.with(|value| *value.borrow_mut() = owners.to_vec());
+}
+
+static CHAIN_PLAN: AtomicBool = AtomicBool::new(false);
+/// Q4-TRACE-GPU-TIMING: publish the joint forward's command plan once per
+/// process, only in an armed trace with GPU timestamps on. Off path: one load.
+pub(crate) fn joint_chain_plan(payload: impl FnOnce() -> serde_json::Value) {
+    if !ARMED.load(Ordering::Acquire)
+        || CHAIN_PLAN.load(Ordering::Acquire)
+        || !crate::serve::phase_trace::native_gpu_timestamps()
+        || CHAIN_PLAN.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    crate::serve::phase_trace::publish("joint_chain_plan", payload());
 }
 
 /// Constructed from the actual selected input, never from a scheduler width.
@@ -167,6 +190,39 @@ pub(crate) fn qwen_input(
             }],
         ),
         _ => input(source, &[]),
+    }
+}
+
+/// Joint ordinary decode: one actual one-token span per packed row, in matrix
+/// order (slot, fed position); `matrix_rows` is the physical packed width.
+/// Rows past the logical ones are padding and have no owner.
+pub(crate) fn joint_decode_input(
+    rows: impl Iterator<Item = (u32, i32)>,
+    matrix_rows: usize,
+) -> Input {
+    if !ARMED.load(Ordering::Acquire) {
+        return input(JOINT_SOURCE, &[]);
+    }
+    let spans: Option<Vec<InputSpan>> = rows
+        .take(MAX_JOINT_DECODE_ROWS + 1)
+        .map(|(slot, position)| {
+            Some(InputSpan {
+                slot,
+                start: u64::try_from(position).ok()?,
+                count: 1,
+            })
+        })
+        .collect();
+    match spans {
+        Some(spans)
+            if !spans.is_empty()
+                && spans.len() <= matrix_rows
+                && matrix_rows <= MAX_JOINT_DECODE_ROWS =>
+        {
+            // Both bounded by MAX_JOINT_DECODE_ROWS above.
+            input_rows(JOINT_SOURCE, &spans, (matrix_rows - spans.len()) as u32)
+        }
+        _ => input(JOINT_SOURCE, &[]),
     }
 }
 
@@ -363,10 +419,15 @@ pub(crate) fn invocation(owners: Vec<crate::serve::phase_trace::SlotState>) -> I
 }
 
 fn next_id() -> Option<u64> {
-    NEXT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-        value.checked_add(1)
-    })
-    .ok()
+    // Same loop as the deprecated `fetch_update`; `try_update` is newer than the MSRV.
+    let mut current = NEXT.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1)?;
+        match NEXT.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return Some(previous),
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// Fully observed native work with deliberately opaque logical membership.
@@ -576,6 +637,43 @@ fn attach(encoder: &mut mlx_native::CommandEncoder) {
         crate::serve::phase_trace::invalidate("native session observation refused");
     } else {
         encoder.set_observation_scope(current);
+    }
+}
+
+/// GPU-test stand-in for an armed owning-worker transaction: arms the
+/// process-global observer and binds `owners` as this thread's selected and
+/// live owners under a fresh epoch. Its test must run alone (`--exact`).
+#[cfg(test)]
+pub(crate) struct ArmedTransaction {
+    previous_owners: Vec<crate::serve::phase_trace::SlotState>,
+    _invocation: Invocation,
+}
+#[cfg(test)]
+impl Drop for ArmedTransaction {
+    fn drop(&mut self) {
+        OWNERS.with(|value| *value.borrow_mut() = std::mem::take(&mut self.previous_owners));
+        ARMED.store(false, Ordering::Release);
+    }
+}
+#[cfg(test)]
+pub(crate) fn armed_transaction_for_test(
+    owners: Vec<crate::serve::phase_trace::SlotState>,
+) -> ArmedTransaction {
+    assert!(
+        !ARMED.swap(true, Ordering::AcqRel),
+        "native observer already armed"
+    );
+    let previous_owners = OWNERS.with(|value| value.replace(owners.clone()));
+    let previous = SELECTED.with(|value| value.replace(owners));
+    let epoch = next_id().expect("native scope identity");
+    let previous_epoch = EPOCH.with(|value| value.replace(epoch));
+    ArmedTransaction {
+        previous_owners,
+        _invocation: Invocation {
+            previous: Some(previous),
+            previous_epoch,
+            _thread_bound: PhantomData,
+        },
     }
 }
 

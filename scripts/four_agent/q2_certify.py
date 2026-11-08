@@ -135,18 +135,21 @@ def replay_response(raw, request, turn, seen, engine, semantic_frames=None, *, a
     return parser.result()
 
 
-def request_wire(request, request_raw, family, engine):
-    """The archived request bytes are the actual canonical wire: no altered allowance or silent truncation."""
+def request_wire(request, request_raw, family, engine, setup=None):
+    """The archived request bytes are the actual canonical wire: no altered allowance or silent truncation.
+    `setup` is the agent's recorded request_setup.py name; None for the canonical request."""
     if engine == "hf2q":
-        require(wire(request, family) == request_raw, "canonical wire/no silent truncation")
+        require(wire(request, family, setup) == request_raw, "canonical wire/no silent truncation")
     else:
         # Same validation boundary as actual native-engine exchange, retaining native metadata.
         if engine == "peer":
             from family_peer import canonical
+            native = canonical(request, family, setup)
         else:
+            require(setup is None, "request setups run on hf2q or the same-GGUF peer only")
             from native_peers import adapter
-            canonical = adapter(engine).canonical
-        wire(canonical(request, family), family)
+            native = adapter(engine).canonical(request, family)
+        wire(native, family, setup)
         require(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
                 == request_raw, "canonical native peer wire")
 

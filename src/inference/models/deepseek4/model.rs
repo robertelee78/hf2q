@@ -31,6 +31,12 @@ pub struct Deepseek4Model {
     /// Why this artifact's matrix storage cannot use joint decode, or `None`
     /// when every batched product has a proven-exact route.
     pub(super) joint_route_unproven: Option<String>,
+    /// `HF2Q_DEEPSEEK_TAIL_ROWS_STEP`, read once at load: run token-wise
+    /// prompt work as exact rows steps.
+    pub(super) tail_rows_step: super::rows_step::TailRowsStep,
+    /// How joint decode encodes the cache-dependent attention cores
+    /// (`HF2Q_DEEPSEEK_BATCHED_ATTN_CORES`, read once at load).
+    pub(super) attn_cores: super::joint_decode_rows::AttnCores,
 }
 
 impl Deepseek4Model {
@@ -70,10 +76,14 @@ impl Deepseek4Model {
     /// verifier catalog and belong in their own artifact.
     pub fn load_from_gguf(gguf: &GgufFile) -> Result<Self> {
         let cfg = Deepseek4Config::from_gguf(gguf).context("Deepseek4Config::from_gguf")?;
+        let matvec = super::residency::MatvecKernels::from_env()?;
+        let tail_rows_step = super::rows_step::TailRowsStep::from_env()?;
+        let attn_cores = super::joint_decode_rows::AttnCores::from_env()?;
         let ctx = GpuContext::new()
             .map_err(|source| anyhow::anyhow!("DeepSeek-V4 Metal initialization: {source}"))?;
-        let weights = Deepseek4Weights::load_from_gguf(gguf, &cfg, ctx.device().clone())
+        let mut weights = Deepseek4Weights::load_from_gguf(gguf, &cfg, ctx.device().clone())
             .context("Deepseek4Weights::load_from_gguf")?;
+        weights.set_matvec_kernels(matvec);
         let joint_route_unproven = super::joint_decode_routes::unproven_joint_route(&cfg, &weights);
         Ok(Self {
             cfg,
@@ -82,6 +92,8 @@ impl Deepseek4Model {
             glp: None,
             kv_graft: None,
             joint_route_unproven,
+            tail_rows_step,
+            attn_cores,
         })
     }
 

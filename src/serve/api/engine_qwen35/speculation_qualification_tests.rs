@@ -108,6 +108,7 @@ pub(super) fn loaded_model(policy: QwenSpeculationPolicy) -> Qwen35LoadedModel {
         tq_kv_active: false,
         persistent_kv_cache: None,
         speculation: QwenSpeculationController::new(policy),
+        slot_spill_budget_bytes: 0,
     }
 }
 
@@ -241,8 +242,8 @@ impl Lane {
         self.assert_cache_matches_ledger();
     }
 
-    /// One verified block as `decode_tick_mtp_k3` and
-    /// `decode_tick_history_lookup` commit it, through the first token
+    /// One verified block as `mtp_k3_round` and
+    /// `history_round` commit it, through the first token
     /// streamed in the same tick. Later tokens stay queued.
     fn verify(&mut self, qwen: &Qwen35LoadedModel, target: ToyTarget, drafts: &[u32]) -> Round {
         assert!(!self.finished && self.state.pending_speculation_output.is_empty());

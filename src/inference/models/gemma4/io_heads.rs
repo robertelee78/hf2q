@@ -143,7 +143,7 @@ impl MlxModelWeights {
                 &[&self.activations.norm_out, &lm_head.buffer],
                 &[&self.activations.logits],
             );
-            crate::serve::forward_mlx_shared::dispatch_qmatmul(
+            super::decode_dense::dispatch_decode_dense(
                 &mut s,
                 reg,
                 dev,
@@ -316,9 +316,11 @@ impl MlxModelWeights {
         // (b) ONE lm_head dispatch with m=n.  dispatch_qmatmul routes
         //     m<=8 through mat-vec (multiple matvecs per dispatch) and
         //     m>8 through mat-mat (simdgroup MMA, tile kernel).
+        //     `decode_dense` routes admitted weights to the
+        //     `HF2Q_GEMMA_DECODE_DENSE` row-invariant kernel (≤ 8-row chunks).
         let lm_head = self.resolved_lm_head();
         s.barrier_between(&[&norm_out_batched, &lm_head.buffer], &[&logits_batched]);
-        crate::serve::forward_mlx_shared::dispatch_qmatmul(
+        super::decode_dense::dispatch_decode_dense(
             &mut s,
             reg,
             dev,

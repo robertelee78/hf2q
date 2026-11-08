@@ -17,7 +17,8 @@ SLOT_KEYS = {"request_id", "slot_id", "generation", "phase", "active",
              "runnable_forward", "runnable_emit", "inflight", "blocked"}
 ROW_KEYS = {"request_id", "slot_id", "generation", "token_position", "token_count", "phase"}
 NATIVE_KINDS = {"native_baseline", "native_arm_ack", "scope_definition", "forward_input",
-                "forward_witness", "forward_witness_unmapped", "native_event", "native_final"}
+                "forward_witness", "forward_witness_unmapped", "native_event", "native_final",
+                "forward_input_end", "native_gpu_timing", "joint_chain_plan"}
 
 
 def require(ok, why):
@@ -196,6 +197,8 @@ def validate_trace(records, expected_identity, scenario):
                         lineage(lane) in latest and lane["request_id"] == latest[lineage(lane)]["request_id"],
                         "transaction has unknown logical owner")
             demand.transaction(payload, header)
+            if native is not None:
+                native.transaction(payload)
         elif kind in NATIVE_KINDS:
             require(native is not None, "native record without explicit diagnostic configuration")
             native.consume(record, latest)
@@ -248,6 +251,8 @@ def qualify_window(records, composition, arrival_ns, window_ns=2_000_000_000,
             latest = {lineage(slot): slot for slot in record["payload"]["slots"]}
         elif record["kind"] in NATIVE_KINDS and parser is not None:
             parser.consume(record, latest)
+        elif record["kind"] == "transaction" and parser is not None:
+            parser.transaction(record["payload"])
         elif record["kind"] == "drain" and record["payload"]["success"] is True:
             drained.add(record["payload"]["submission_id"])
     require(header is not None, "header and final bound required")

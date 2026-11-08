@@ -189,5 +189,111 @@ class RowsOfRecord(base.Harness):
         self.assertEqual((args.of_record, args.quality_gate), (True, ["stock-hf2q=/q/m.json"]))
 
 
+def write_receipt(run, binary, artifact):
+    run.mkdir(parents=True, exist_ok=True)
+    (run / "receipt.json").write_text(json.dumps({"binary": {"sha256": binary}, "artifact": {"sha256": artifact}}))
+
+
+class StockRecordGates(unittest.TestCase):
+    """ADR-063 Q4-DS4-RACE decision D1: in a stock-record campaign the stock-hf2q gate is bound to the record's stock
+    binary and hf2q artifact, and the peer gate to this campaign's peer binary and artifact (ds4's file)."""
+    HF2Q_ART, DS4_ART = "a" * 64, "d" * 64
+    BOUND = {"stock_binary_sha256": STOCK, "experiment_binary_sha256": EXP, "artifact_sha256": HF2Q_ART}
+    CAMPAIGN = {"experiment": {"binary": {"sha256": EXP}}, "peer": {"binary": {"sha256": PEER}, "artifact": {"sha256": DS4_ART}}}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def manifest(self, name, reference, binary, artifact, subject=(EXP, None)):
+        subject_run, reference_run = self.root / name / "subject-run", self.root / name / "ref-0"
+        write_receipt(subject_run, subject[0], subject[1] or artifact)
+        write_receipt(reference_run, binary, artifact)
+        path = self.root / name / "manifest.json"
+        path.write_text(json.dumps({
+            "plan": {"reference_kind": reference, "arms": {"subject": {"family": "deepseek4"}, "reference": {"engine_kind": "hf2q"}}},
+            "status": "Complete", "verdict": {"verdict": "Pass"},
+            "runs": [{"arm": "subject", "attempts": [{"output": str(subject_run)}]},
+                     {"arm": "reference", "attempts": [{"output": str(reference_run)}]}]}))
+        return json.loads(path.read_text())
+
+    def status(self, document, reference, bound=BOUND, arms=CAMPAIGN):
+        return tier.gate_status(document, reference, "deepseek4", arms, bound)
+
+    def test_the_stock_hf2q_gate_runs_the_records_stock_binary_on_hf2qs_artifact(self):
+        self.assertEqual(self.status(self.manifest("s", "stock-hf2q", STOCK, self.HF2Q_ART), "stock-hf2q"),
+                         ("Pass", "Pass", STOCK))
+        with self.assertRaisesRegex(ValueError, "not run on the stock record's hf2q artifact"):
+            self.status(self.manifest("s-ds4", "stock-hf2q", STOCK, self.DS4_ART), "stock-hf2q")
+        with self.assertRaisesRegex(ValueError, "not run on the stock record's hf2q artifact"):  # subject on the other file
+            self.status(self.manifest("s-mixed", "stock-hf2q", STOCK, self.HF2Q_ART, subject=(EXP, self.DS4_ART)), "stock-hf2q")
+        with self.assertRaisesRegex(ValueError, "reference runs are not on the campaign's v0.1.28 stock binary"):
+            self.status(self.manifest("s-other", "stock-hf2q", "6" * 64, self.HF2Q_ART), "stock-hf2q")
+        with self.assertRaisesRegex(ValueError, "not run on the experiment binary"):
+            self.status(self.manifest("s-subject", "stock-hf2q", STOCK, self.HF2Q_ART, subject=(STOCK, None)), "stock-hf2q")
+        with self.assertRaisesRegex(ValueError, "the stock record's experiment binary is not this campaign's"):
+            self.status(self.manifest("s-rebuilt", "stock-hf2q", STOCK, self.HF2Q_ART), "stock-hf2q",
+                        bound={**self.BOUND, "experiment_binary_sha256": "7" * 64})
+        # without a binding (a campaign with a stock arm) there is still no stock arm to bind here
+        with self.assertRaisesRegex(ValueError, "the campaign has no stock arm"):
+            self.status(self.manifest("s-unbound", "stock-hf2q", STOCK, self.HF2Q_ART), "stock-hf2q", bound=None)
+
+    def test_the_peer_gate_runs_on_the_peer_arms_artifact(self):
+        self.assertEqual(self.status(self.manifest("p", "peer", PEER, self.DS4_ART), "peer"), ("Pass", "Pass", PEER))
+        with self.assertRaisesRegex(ValueError, "not run on the peer arm's artifact"):
+            self.status(self.manifest("p-hf2q", "peer", PEER, self.HF2Q_ART), "peer")
+        with self.assertRaisesRegex(ValueError, "reference runs are not on the campaign's peer binary"):
+            self.status(self.manifest("p-other", "peer", STOCK, self.DS4_ART), "peer")
+
+
+class StockRecordRows(base.StockRecordHarness):
+    """The record of a stock-record campaign: --of-record rows, gates bound through build_record, --verify."""
+
+    def test_rows_of_record_bind_the_gates_and_cite_the_record(self):
+        record = self.record()
+        driver, _ = self.campaign(record)
+        base.q3.write_verdict(self.out, driver.run(), [], None)
+        stock, peer = self.root / "qg" / "stock" / "manifest.json", self.root / "qg" / "peer" / "manifest.json"
+        for path, binary, artifact in ((stock, base.STOCK_SHA, base.MODEL_SHA), (peer, base.PEER_SHA, base.DS4_ART)):
+            write_receipt(path.parent / "ref-run", binary, artifact)
+            write_receipt(path.parent / "subject-run", base.EXP_SHA, artifact)
+            path.write_text(json.dumps({
+                "plan": {"reference_kind": path.parent.name.replace("stock", "stock-hf2q"),
+                         "arms": {"subject": {"family": "qwen38"}, "reference": {"engine_kind": "hf2q"}}},
+                "status": "Complete", "verdict": {"verdict": "Pass"},
+                "runs": [{"arm": "subject", "attempts": [{"output": str(path.parent / "subject-run")}]},
+                         {"arm": "reference", "attempts": [{"output": str(path.parent / "ref-run")}]}]}))
+        rows = q3_report.rows(self.out, self.root, True, [("stock-hf2q", stock), ("peer", peer)])
+        rec = rows["groups"]["qwen38-q3-record"]["q3_record"]
+        self.assertEqual([(g["reference"], g["status"], g["reference_sha256"]) for g in rec["quality_gate"]],
+                         [("stock-hf2q", "Pass", base.STOCK_SHA), ("peer", "Pass", base.PEER_SHA)])
+        self.assertEqual(rec["stock_record"]["verdict_ref"], "$E/evidence/q3-qwen38/verdict.json")
+        stock_rows = [x for x in rows["rows"] if x.get("baseline_arm") == "v0128_stock"]
+        self.assertTrue(stock_rows and all(x["verification"]["key"].startswith("verdict.json stock_record.")
+                                           and x["artifact_sha256"] == base.MODEL_SHA for x in stock_rows))
+        document = {"schema": r.ROWS_SCHEMA, "evidence_root_symbol": "$E", "neutral_band_ratio": 1.025,
+                    "families": {"qwen38": {"title": "Qwen3.8 27B", "artifact_sha256": base.DS4_ART, "note": ""}}, **rows}
+        r.validate_manifest(document)
+        self.assertEqual(r.verify_rows(document, self.root), [x["id"] for x in rows["rows"]])
+        # --verify re-derives the stock_record field: an edited or deleted one is drift
+        for change in ({"stock_label": "v0.1.29 release"}, None):
+            with self.subTest(change=change):
+                edited = json.loads(json.dumps(document))
+                rec = edited["groups"]["qwen38-q3-record"]["q3_record"]
+                if change is None:
+                    del rec["stock_record"]
+                else:
+                    rec["stock_record"].update(change)
+                with self.assertRaisesRegex(ValueError, "q3_record stock_record drift"):
+                    r.verify_rows(r.validate_manifest(edited), self.root)
+        # a stock gate run on ds4's file is refused when the record is built
+        write_receipt(stock.parent / "ref-run", base.STOCK_SHA, base.DS4_ART)
+        with self.assertRaisesRegex(ValueError, "not run on the stock record's hf2q artifact"):
+            q3_report.rows(self.out, self.root, True, [("stock-hf2q", stock), ("peer", peer)])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -128,6 +128,96 @@ pub(crate) fn mm_id_threshold_override_present() -> bool {
     std::env::var_os("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some()
 }
 
+/// Expert entry point of one down call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DownEntry {
+    /// `dispatch_expert_matmul_id_pooled` (flattened rows).
+    Flat,
+    /// `dispatch_expert_matmul_id_pooled_slotted`: builds its own schedule.
+    Slotted,
+    /// `dispatch_expert_matmul_id_pooled_slotted_reusing_schedule`: reuses
+    /// the schedule the gate/up `map0` left in the scratch (design §4.3).
+    SlottedReusingSchedule,
+}
+
+/// Entry point of a down call (design §4.3, P2b). The gate/up call built a
+/// reusable schedule only when both expert stacks are block-quantized (a
+/// scalar stack never writes the scratch) and the call is slotted (the same
+/// `mm_id` rows, ids, `n_tokens` and `top_k` as gate/up). A session the
+/// body rotated between gate/up and down (profiling pre-finishes, the
+/// imatrix intercept) takes the self-scheduling slotted call, so a valid
+/// run never meets a key mismatch; without rotation a reuse error is a bug
+/// and propagates.
+pub(crate) fn down_entry(
+    call: DownCall,
+    both_stacks_block_quantized: bool,
+    session_rotated: bool,
+) -> DownEntry {
+    if !call.slotted {
+        DownEntry::Flat
+    } else if both_stacks_block_quantized && !session_rotated {
+        DownEntry::SlottedReusingSchedule
+    } else {
+        DownEntry::Slotted
+    }
+}
+
+/// The native expert-matmul tile schedule the process resolves
+/// (`HF2Q_MM_ID_SCHEDULE`), for the runtime-controls surface.
+pub(crate) fn published_mm_id_schedule() -> serde_json::Value {
+    serde_json::to_value(mlx_native::ggml_routing_policy_from_environment().expert_mm_schedule)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// The native Q5_0 tensor-MM opt-in the process resolves
+/// (`HF2Q_Q5_0_TENSOR_MM=1`), for the runtime-controls surface.
+pub(crate) fn published_q5_0_tensor_mm() -> bool {
+    mlx_native::ggml_routing_policy_from_environment().q5_0_tensor_mm
+}
+
+/// Logs the native routing switches the process resolves, once per process
+/// at the first Gemma model load: `Gemma4 native routing:
+/// q5_0_tensor_mm=<true|false> mm_id_schedule=<grid|compact>` (the
+/// `HF2Q_MM_ID_SCHEDULE` spellings). The environment is fixed for the
+/// process, so later loads resolve the same values. Campaign checkers match
+/// this line; keep its text stable.
+pub(crate) fn log_native_routing() {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        let policy = mlx_native::ggml_routing_policy_from_environment();
+        let mm_id_schedule = match policy.expert_mm_schedule {
+            mlx_native::ExpertMmSchedule::UniformGrid => "grid",
+            mlx_native::ExpertMmSchedule::CompactTiles => "compact",
+        };
+        tracing::info!(
+            "Gemma4 native routing: q5_0_tensor_mm={} mm_id_schedule={mm_id_schedule}",
+            policy.q5_0_tensor_mm
+        );
+    });
+}
+
+/// Test-only record of every down entry point the prefill body chose on the
+/// calling thread, in dispatch order (real-artifact gates assert reuse vs
+/// fallback with it).
+#[cfg(test)]
+pub(crate) mod entry_probe {
+    use super::DownEntry;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ENTRIES: RefCell<Vec<DownEntry>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record(entry: DownEntry) {
+        ENTRIES.with(|entries| entries.borrow_mut().push(entry));
+    }
+
+    /// Every entry since the previous `take`.
+    pub(crate) fn take() -> Vec<DownEntry> {
+        ENTRIES.with(|entries| std::mem::take(&mut *entries.borrow_mut()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +282,64 @@ mod tests {
                     slotted: false
                 },
                 "top_k {top_k} has no mm_id route: flattened call"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma_prefill_moe_down_schedule_reuse_falls_back_on_rotation() {
+        let slotted = down_call(Slotted, 232, 8, false, false);
+        let flat = down_call(Flat, 232, 8, false, false);
+        // Not rotated, block-quantized stacks: reuse the gate/up schedule.
+        assert_eq!(
+            down_entry(slotted, true, false),
+            DownEntry::SlottedReusingSchedule
+        );
+        // Rotated (profile buckets, imatrix): self-scheduling slotted call.
+        assert_eq!(down_entry(slotted, true, true), DownEntry::Slotted);
+        // A scalar stack wrote no schedule.
+        assert_eq!(down_entry(slotted, false, false), DownEntry::Slotted);
+        for rotated in [false, true] {
+            assert_eq!(down_entry(flat, true, rotated), DownEntry::Flat);
+        }
+        assert!(matches!(
+            published_mm_id_schedule().as_str(),
+            Some("uniform_grid" | "compact_tiles")
+        ));
+    }
+
+    /// `active_controls.q5_0_tensor_mm` follows `HF2Q_Q5_0_TENSOR_MM`: only
+    /// `1` opts in. Each value runs in a fresh process so the test never
+    /// mutates this process's environment.
+    #[test]
+    fn published_q5_0_tensor_mm_follows_the_native_opt_in() {
+        const EXPECT: &str = "HF2Q_Q5_0_TENSOR_MM_TEST_EXPECT";
+        if let Some(expected) = std::env::var_os(EXPECT) {
+            assert_eq!(published_q5_0_tensor_mm(), expected == "1");
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        for (value, expected) in [
+            (None, "0"),
+            (Some("1"), "1"),
+            (Some("0"), "0"),
+            (Some("true"), "0"),
+        ] {
+            let mut child = std::process::Command::new(&exe);
+            child
+                .arg("serve::gemma_prefill_moe::tests::published_q5_0_tensor_mm_follows_the_native_opt_in")
+                .arg("--exact")
+                .env(EXPECT, expected);
+            match value {
+                Some(value) => child.env("HF2Q_Q5_0_TENSOR_MM", value),
+                None => child.env_remove("HF2Q_Q5_0_TENSOR_MM"),
+            };
+            let output = child.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "HF2Q_Q5_0_TENSOR_MM={value:?}: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
             );
         }
     }

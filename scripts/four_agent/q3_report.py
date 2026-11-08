@@ -82,10 +82,10 @@ def stage_effects(stage, arms):
 
 
 def required_effects(stage, manifest):
-    """Contrasts the stopping rule waits for: stock always, the peer and Splash while each is available and has
-    not failed."""
+    """Contrasts the stopping rule waits for: stock whenever the plan has a stock arm, the peer and Splash while each
+    is available and has not failed. A stock-record campaign (no stock arm) therefore waits on the peer."""
     effects = stage_effects(stage, stage_arms(manifest["plan"], stage["workload"]))["effects"]
-    required = {"vs_stock": effects["vs_stock"]}
+    required = {"vs_stock": effects["vs_stock"]} if "vs_stock" in effects else {}
     for name, arm in (("vs_peer", "peer"), ("vs_splash", "splash")):
         if name in effects and arm not in manifest["unavailable"] and not failures(manifest, arm):
             required[name] = effects[name]
@@ -208,6 +208,37 @@ def stopped_experiment_failures(manifest):
                 yield stage["workload"], path, entry
 
 
+def tristate_and(*values):
+    """False when any is False, True when all are True, else None (unrecorded)."""
+    return False if False in values else (True if all(v is True for v in values) else None)
+
+
+def bound_stock_record(bound):
+    """verdict.json `stock_record` of a --stock-record campaign (ADR-063 Q4-DS4-RACE decision D1): the bound record's
+    identity, re-checked by sha256, and its primary vs-stock effects, fairness, failures and validity. A missing,
+    changed or non-Complete record carries no effect: family_verdict then returns Pending with its reason."""
+    out = {"path": bound["verdict"]["path"], "sha256": bound["verdict"]["sha256"], "campaign": bound["campaign"],
+           "verdict_of_record": bound["verdict_of_record"], "stock": bound["stock"],
+           "artifact_sha256": bound["artifact_sha256"], "stock_binary_sha256": bound["stock_binary_sha256"],
+           "experiment_binary_sha256": bound["experiment_binary_sha256"], "status": "Complete", "reason": None,
+           "effects": {}, "secondary": {}, "stock_failures": [], "experiment_failures": [],
+           "thermal_valid": None, "memory_valid": False}
+    for name in ("verdict", "campaign"):
+        path = Path(bound[name]["path"])
+        if not path.is_file():
+            return {**out, "status": "Missing", "reason": f"{path} no longer exists"}
+        if sha256(path) != bound[name]["sha256"]:
+            return {**out, "status": "Changed", "reason": f"{path} changed since the campaign bound it"}
+    verdict = json.loads(Path(out["path"]).read_text())
+    primary = verdict.get("primary") or {}
+    if primary.get("status") != "Complete":
+        return {**out, "status": primary.get("status") or "Missing", "reason": "its primary stage is not Complete"}
+    return {**out, "effects": {"vs_stock": primary["effects"]["vs_stock"]},
+            "secondary": {m: {"vs_stock": primary["secondary"][m]["vs_stock"]} for m in FAIRNESS},
+            "stock_failures": verdict["stock_failures"], "experiment_failures": verdict["experiment_failures"],
+            "thermal_valid": verdict["thermal_valid"], "memory_valid": verdict["memory_valid"]}
+
+
 def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha256=None):
     plan = manifest["plan"]
     record = plan.get("controls_of")  # controls-only: the primary is of record in another campaign
@@ -220,12 +251,20 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
     quality = quality_state(manifest, quality_paths, review_path)
     measured = [e for e in entries(manifest, kind="measured") if e.get("metrics")]
     thermal = [e["metrics"]["thermal"]["valid"] for e in measured]
-    state = {"experiment_failures": failures(manifest, "experiment"),
+    stock_record = None if "stock_record" not in plan else bound_stock_record(plan["stock_record"])
+    tagged = lambda items: [f"{f} (stock record {stock_record['path']})" for f in items]
+    state = {"experiment_failures": failures(manifest, "experiment")
+                                    + (tagged(stock_record["experiment_failures"]) if stock_record else []),
              "peer_unavailable": manifest["unavailable"].get("peer"),
              "peer_failures": failures(manifest, "peer"), "quality": quality,
              "thermal_valid": False if False in thermal else (True if thermal and None not in thermal else None),
              "memory_valid": all(e["metrics"]["memory"]["q5_pass"] for e in measured
                                  if e["arm"] == "experiment" and e["outcome"] == "Pass")}
+    if stock_record:  # both campaigns: thermal and memory validity are the conjunction
+        state.update(thermal_valid=tristate_and(state["thermal_valid"], stock_record["thermal_valid"]),
+                     memory_valid=state["memory_valid"] and stock_record["memory_valid"],
+                     stock_source={"record": stock_record["path"], "sha256": stock_record["sha256"],
+                                   "status": stock_record["status"], "reason": stock_record["reason"]})
     required = bool(plan.get("splash_required"))  # set at plan time (campaigns planned before Splash have none)
     splash_measured = "splash" in plan["measured_arms"]
     if required or splash_measured:
@@ -238,11 +277,15 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
     if record:
         verdict, reasons = CONTROLS_ONLY, controls_only_reasons(manifest, record, state)
     else:
-        effects = report[plan["primary"]]["effects"]
-        state.update(complete=primary["stop"] is not None, vs_stock=effects["vs_stock"],
+        effects, secondary = report[plan["primary"]]["effects"], report[plan["primary"]]["secondary"]
+        if stock_record:  # no stock arm: the vs-stock terms come from the bound same-artifact record
+            effects, secondary = {**effects, **stock_record["effects"]}, {
+                m: {**secondary[m], **stock_record["secondary"].get(m, {})} for m in secondary}
+        state.update(complete=primary["stop"] is not None,
+                     vs_stock=effects.get("vs_stock", q3_stats.paired_effect([])),
                      vs_peer=effects.get("vs_peer", q3_stats.paired_effect([])),
                      vs_splash=effects.get("vs_splash", q3_stats.paired_effect([])),
-                     fairness={m: report[plan["primary"]]["secondary"][m]["vs_stock"] for m in FAIRNESS})
+                     fairness={m: secondary[m]["vs_stock"] for m in FAIRNESS if "vs_stock" in secondary[m]})
         if native:  # the native arm never yields the same-GGUF verdict; it is reported separately as native_peer
             state["peer_unavailable"] = {"reason": comparison or native_peers.adapter(native).SAME_GGUF_UNAVAILABLE,
                                          "evidence": plan["peer_unavailable_evidence"]}
@@ -263,7 +306,9 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
                            "failures": state["splash_failures"],
                            "label": plan["arms"].get("splash", {}).get("label")}}
                if "splash_required" in state else {}),
-            "stock_failures": failures(manifest, "stock"), "experiment_failures": state["experiment_failures"],
+            "stock_failures": failures(manifest, "stock") + (tagged(stock_record["stock_failures"]) if stock_record else []),
+            "experiment_failures": state["experiment_failures"],
+            **({"stock_record": stock_record} if stock_record else {}),
             "quality": quality, "thermal_valid": state["thermal_valid"], "memory_valid": state["memory_valid"],
             "rejected_trials": [{"name": e["name"], "outcome": e["outcome"], "reason": e.get("reason")}
                                 for e in entries(manifest) if e["outcome"] in ("Invalid", "Abandoned", "Skipped")
@@ -472,7 +517,9 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
     native = native_peers.peer_kind(plan)
     native_label = peer_arm.get("label") if native else None
     comparison = f2_q3_tier.NATIVE_COMPARISON if plan.get("native_comparison") else None
-    peer_note = (f"{native_label}; different artifact, task makespan only, not the same-GGUF peer verdict"
+    native_baseline = native_peers.baseline_of(native, native_label) if native_label else "peer"
+    relation = "same file" if native_baseline in native_peers.same_file_baselines() else "different artifact"
+    peer_note = (f"{native_label}; {relation}, task makespan only, not the same-GGUF peer verdict"
                  if native_label else f2_q3_tier.PEER_SPEC_OFF if peer_speculation_off(manifest)
                  else "peer best valid configuration")
     if native_label:
@@ -495,7 +542,16 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
         if not of_record_path.is_relative_to(root):
             raise ValueError("the primary of record must be under --evidence-root to be cited as $E/...")
         control_of = "$E/" + str(of_record_path.relative_to(root))
-    native_baseline = native_peers.baseline_of(native, native_label) if native_label else "peer"
+    # --stock-record (no stock arm): the vs-stock effect comes from the bound same-artifact record on hf2q's artifact
+    stock_rec = verdict.get("stock_record")
+    stock_ref = None if stock_rec is None else cite(stock_rec["path"], root, "the bound stock record")
+    stock_declared = plan["declared"]["stock"]
+    stock_text = (f"stock {stock_declared['label']} vs " if stock_declared is not None else
+                  f"stock {stock_rec['stock']['label']} on hf2q's artifact, from record {stock_ref}; "
+                  if stock_rec is not None else "no stock arm; ")
+    stock_baseline = (f"stock {stock_declared['label']}" if stock_declared is not None else
+                      f"stock {stock_rec['stock']['label']}, from the same-artifact record {stock_ref} on hf2q's "
+                      "artifact" if stock_rec is not None else None)
     group = (f"{family}-q3-record" if of_record else f"{family}-q3-superseded" if superseded_by is not None
              else (f"{family}-q3" if record is None else f"{family}-q3-controls")
              + ("" if comparison is None else f"-{native_baseline.replace('_', '-')}"))
@@ -508,8 +564,8 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
                                         f"{family} Q3 three-arm campaign"
                                         if record is None else f"{family} Q3 controls of the primary of record")
                                        + (f" ({comparison})" if comparison else ""),
-                              "workload": "Four-agent coding client, 262144 context, 4 slots; stock "
-                                          f"{plan['declared']['stock']['label']} vs experiment {experiment} vs "
+                              "workload": "Four-agent coding client, 262144 context, 4 slots; " + stock_text
+                                          + f"experiment {experiment} vs "
                                           + (native_label or ("the peer" if gone is None else f"the peer (peer unavailable: {gone})"))
                                           + ", Williams blocks."
                                           + ("" if record is None else f" Controls (client --phase-plan) of the primary "
@@ -555,16 +611,22 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
         for metric, where, table in tables:
             for name, baseline in contrasts:
                 e = table.get(name)
+                path = f"{prefix}.{where}.{name}"
+                artifact_sha = arms["experiment"]["artifact"]["sha256"]
+                if name == "vs_stock" and stock_declared is None:  # the bound record's primary effects only
+                    bound = stock_rec if stock_rec is not None and control is None else {}
+                    e = (bound.get("effects", {}) if where == "effects"
+                         else bound.get("secondary", {}).get(metric, {})).get(name)
+                    path, artifact_sha = f"stock_record.{where}.{name}", (stock_rec or {}).get("artifact_sha256")
                 withheld = native_label and (section_native or {}).get("statement_withheld")
                 if e is None or e["improvement_percent"] is None or (name == "vs_peer" and (
                         withheld or (peer_gone and not native_label))) or (name == "vs_splash" and splash_gone):
                     continue
-                path = f"{prefix}.{where}.{name}"
                 what = "makespan" if metric == "makespan_s" else metric.replace("_", "-")
                 extract = {"value": {"kind": "json", "file": ref, "path": f"{path}.improvement_percent", "reduce": "one"},
                            "ci95": {"kind": "json", "file": ref, "path": f"{path}.improvement_ci95.*", "reduce": "list"}}
                 blocks = (f"{e['blocks']} paired blocks, half-width {e['half_width_pp']:.2f} points "
-                          f"(baseline {'stock ' + plan['declared']['stock']['label'] if name == 'vs_stock' else 'Splash best valid configuration (same GGUF)' if name == 'vs_splash' else peer_note}).")
+                          f"(baseline {stock_baseline if name == 'vs_stock' else 'Splash best valid configuration (same GGUF)' if name == 'vs_splash' else peer_note}).")
                 if (control is not None or superseded_by is not None) and name == "vs_peer" and not native_label:
                     blocks += " " + peer_sentence(next(s for s in manifest["stages"] if s["workload"] == (control or plan["primary"])),
                                                   stage, root, experiment)
@@ -580,7 +642,7 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
                     "value": round(e["improvement_percent"], 3), "decimals": 3, "unit": "% improvement",
                     "ci95": [round(x, 3) for x in e["improvement_ci95"]], "baseline_arm": baseline,
                     "source": {"commit": declared["commit"], "binary_sha256": arms["experiment"]["binary"]["sha256"]},
-                    "artifact_sha256": arms["experiment"]["artifact"]["sha256"], "receipt": ref,
+                    "artifact_sha256": artifact_sha, "receipt": ref,
                     "status": status if control is None else "Descriptive",
                     "verification": {"state": "Verified", "key": f"verdict.json {path}.improvement_percent", "extract": extract},
                     "note": (f"Q3 verdict of record ({'task makespan only' if name in ('vs_peer', 'vs_splash') else 'see the tier'}); {blocks}"

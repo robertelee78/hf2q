@@ -11,6 +11,8 @@ MAX_BLOCKS = 20
 HALF_WIDTH_PP = 2.5    # target 95% half-width, percentage points of the arm ratio
 PEER_MARGIN = 0.95     # Q4: at least 5% lower four-agent makespan than the peer
 NEUTRAL_RATIO = 1.025  # fairness regression band (the F2 2.5-point neutral band)
+# Stop reason of a no-stock stage (--no-stock-arm) whose only contrast (the peer) became unavailable or failed.
+NO_CONTRAST = "no_contrast"
 # Two-sided 95% Student t quantiles, df = complete blocks - 1 (blocks <= 20).
 T975 = {1: 12.7062, 2: 4.3027, 3: 3.1824, 4: 2.7764, 5: 2.5706, 6: 2.4469, 7: 2.3646, 8: 2.3060,
         9: 2.2622, 10: 2.2281, 11: 2.2010, 12: 2.1788, 13: 2.1604, 14: 2.1448, 15: 2.1314,
@@ -95,9 +97,14 @@ def family_verdict(state):
     (False only when a serious/critical state was observed), memory_valid (bool). Optional (ADR-063 "Splash
     peer of record for the Qwen families"): splash_required (bool), splash_unavailable (dict or None),
     splash_failures (list), vs_splash (effect). Where Splash is required, a missing, unavailable or failed Splash
-    arm never yields a Win and the vs-Splash ratio must meet the same PEER_MARGIN as the peer's.
+    arm never yields a Win and the vs-Splash ratio must meet the same PEER_MARGIN as the peer's. Optional (ADR-063
+    Q4-DS4-RACE decision D1, a --stock-record campaign without a stock arm): stock_source ({"record", "sha256",
+    "status", "reason"}) names the bound same-artifact record that vs_stock and fairness come from; every vs-stock
+    reason names it, and a missing or non-Complete record yields Pending with its reason.
     """
     splash = bool(state.get("splash_required"))
+    source = state.get("stock_source")
+    named = "" if source is None else f" (from the bound stock record {source['record']}, sha256 {source['sha256']})"
     if state["experiment_failures"]:
         return "Failed", ["experiment arm failed its task: " + "; ".join(state["experiment_failures"])]
     if state["quality"]["status"] == "loss":
@@ -112,6 +119,9 @@ def family_verdict(state):
     if splash and state.get("splash_failures"):
         return "Failed", ["Splash arm failed its task (a failed Splash arm cannot yield a win): "
                           + "; ".join(state["splash_failures"])]
+    if source is not None and source["status"] != "Complete":
+        return "Pending", [f"the bound stock record {source['record']} is {source['status']}: {source['reason']}; "
+                           "no vs-stock effect"]
     if not state["complete"]:
         return "Pending", ["primary workload has not reached its stopping rule"]
     vs_stock, vs_peer = state["vs_stock"], state["vs_peer"]
@@ -123,16 +133,17 @@ def family_verdict(state):
     reasons = []
     if not (precise(vs_stock) and precise(vs_peer) and (not splash or precise(vs_splash))):
         reasons.append(f"precision not reached: 95% half-width must be <= {HALF_WIDTH_PP} points for "
-                       + ("every contrast (stock, peer, Splash)" if splash else "both contrasts"))
+                       + ("every contrast (stock, peer, Splash)" if splash else "both contrasts")
+                       + ("" if precise(vs_stock) else named))
     if vs_stock["ratio_ci95"] is None or vs_stock["ratio_ci95"][1] >= 1:
-        reasons.append("no demonstrated makespan gain over stock (95% CI of the ratio reaches 1)")
+        reasons.append("no demonstrated makespan gain over stock (95% CI of the ratio reaches 1)" + named)
     if vs_peer["ratio_ci95"] is None or vs_peer["ratio_ci95"][1] > PEER_MARGIN:
         reasons.append("peer margin not demonstrated (95% CI upper bound of the ratio above 0.95)")
     if splash and (vs_splash["ratio_ci95"] is None or vs_splash["ratio_ci95"][1] > PEER_MARGIN):
         reasons.append("Splash margin not demonstrated (95% CI upper bound of the ratio above 0.95)")
     for name, effect in sorted(state["fairness"].items()):
         if regression(effect):
-            reasons.append(f"fairness regression vs stock: {name}")
+            reasons.append(f"fairness regression vs stock: {name}" + named)
     if state["quality"]["status"] == "unresolved":
         reasons.append("task quality unresolved: " + state["quality"]["reason"])
     if state["thermal_valid"] is False:

@@ -20,13 +20,19 @@
 //! * `gemma_joint_cold_prefill_deterministic`: 20 cohort repeats of the
 //!   turn-0 set, byte-identical to the first.
 //! * `gemma_cold_multi_seq_matches_per_slot_bitwise`: the D2 cutover — the
-//!   iter-G(a) cold batch and the installed cursor-0 chunk equal per-slot
-//!   cold prefill bitwise; a 32-row lane takes the per-slot route.
+//!   iter-G(a) cold batch equals per-slot cold prefill bitwise, and a 32-row
+//!   lane takes the per-slot route; installed long prompts (#725), driven
+//!   through every chunk by `advance_gemma4_prefill_quantum` (two 6000-token
+//!   prompts, a lane with exactly 32 remaining rows, a joint cursor-0 chunk
+//!   at a stable boundary), equal each prompt prefilled alone.
 //! * `gemma_joint_cold_engine_cohort_matches_serial_turn0`: engine level,
 //!   switch on against off, then turn 1 (joint warm) from both.
 //! * `gemma_joint_cold_forward_fault_retries_each_lane_per_slot`,
 //!   `gemma_joint_cold_cue_fault_restores_from_boundary_anchors`,
 //!   `gemma_joint_cold_cancel_during_transaction`: failure semantics.
+//! * `gemma_stable_warm_group_is_independent_of_the_admission_window` (#728):
+//!   a cached stable-boundary group is admitted per slot, bitwise equal at
+//!   coalesce windows 0 (serial) and 100 ms (concurrent), anchors included.
 use super::gemma_cold_batch::{self, CueRoute, StableContext, StableLane};
 use super::gemma_cold_stable_batch::{self as cohort, Lane};
 use super::gemma_warm_batch_tests::{
@@ -733,41 +739,239 @@ fn gemma_cold_multi_seq_matches_per_slot_bitwise() {
     // The D2 floor: a group with a 32-row lane is admitted per slot.
     assert!(gemma_cold_batch::plan([(32, 0), (458, 0)], 0).has_tiny_prefill);
 
-    // Installed long prompts: only the cursor-0 chunk forward is claimed
-    // exact, for its planned chunk `prompt[..end]`.
-    let long: Vec<Vec<u32>> = (0..2)
-        .map(|lane| synthetic_prompt(lane + 9, 6_000, vocab))
-        .collect();
-    let progress = Gemma4PrefillProgress::new(0, 6_000, None).unwrap();
-    let plans = gemma4_prefill_batch_plans(
-        &[progress, progress],
-        GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize,
-    )
-    .unwrap();
-    let chunks: Vec<Vec<u32>> = long
-        .iter()
-        .zip(&plans)
-        .map(|(prompt, plan)| {
-            assert_eq!(plan.start, 0);
-            prompt[..plan.end].to_vec()
-        })
-        .collect();
-    let reference = cold_per_slot(&mut guard, &chunks);
-    let joint = cold_multi_seq(&mut guard, &chunks);
-    for (lane, (joint, reference)) in joint.iter().zip(&reference).enumerate() {
-        super::gemma_warm_batch_tests::assert_lane_equal(
-            &format!(
-                "installed cursor-0 chunk lane {lane} rows {}",
-                chunks[lane].len()
-            ),
-            joint,
-            reference,
-        );
+    // Issue #725: installed long prompts, driven through every chunk by
+    // `advance_gemma4_prefill_quantum`, equal each prompt prefilled alone.
+    let supervisor = EngineSupervisor::new();
+    let long = |seed: usize, len: usize| synthetic_prompt(seed, len, vocab);
+    // `(label, lanes (prompt, stable boundary), expected chunks per lane as
+    // (start, end, joint))`.
+    type Chunks = Vec<(usize, usize, bool)>;
+    let cases: Vec<(&str, Vec<(Vec<u32>, Option<usize>)>, Vec<Chunks>)> = vec![
+        (
+            "two 6000-token prompts",
+            vec![(long(9, 6_000), None), (long(10, 6_000), None)],
+            vec![vec![(0, 4_096, false), (4_096, 6_000, true)]; 2],
+        ),
+        (
+            "a lane with exactly 32 remaining rows",
+            vec![
+                (long(9, 6_000), None),
+                (long(11, 4_128), None),
+                (long(10, 6_000), None),
+            ],
+            vec![
+                vec![(0, 4_096, false), (4_096, 6_000, true)],
+                vec![(0, 4_096, false), (4_096, 4_128, false)],
+                vec![(0, 4_096, false), (4_096, 6_000, true)],
+            ],
+        ),
+        (
+            "stable boundary 1000 (joint cursor-0 chunk)",
+            vec![
+                (long(9, 6_000), Some(1_000)),
+                (long(10, 6_000), Some(1_000)),
+            ],
+            vec![vec![(0, 1_000, true), (1_000, 5_096, false), (5_096, 6_000, true)]; 2],
+        ),
+    ];
+    for (label, lanes, expected) in &cases {
+        let all: Vec<usize> = (0..lanes.len()).collect();
+        let joint = installed_prefill(&mut guard, &supervisor, lanes, &all);
+        for (slot, (image, chunks)) in joint.iter().enumerate() {
+            assert_eq!(chunks, &expected[slot], "{label}: lane {slot} chunks");
+            let alone = installed_prefill(&mut guard, &supervisor, lanes, &[slot]);
+            let (reference, alone_chunks) = &alone[0];
+            let alone_expected: Chunks = expected[slot]
+                .iter()
+                .map(|&(start, end, _)| (start, end, false))
+                .collect();
+            assert_eq!(
+                alone_chunks, &alone_expected,
+                "{label}: lane {slot} alone chunks"
+            );
+            super::gemma_warm_batch_tests::assert_lane_equal(
+                &format!("{label}: installed lane {slot}"),
+                image,
+                reference,
+            );
+        }
     }
     println!(
-        "GEMMA_COLD_MULTI_SEQ_BITWISE_COMPLETE iter_g_a_lanes=[33,64,458,900] installed_chunk_rows={:?} floor_33=true",
-        chunks.iter().map(Vec::len).collect::<Vec<_>>()
+        "GEMMA_COLD_MULTI_SEQ_BITWISE_COMPLETE iter_g_a_lanes=[33,64,458,900] installed_cases={} floor_33=true",
+        cases.len()
     );
+}
+
+/// ADR-063 Q4-GEMMA host P1 on the cold routes: per-slot cold prefills and
+/// the per-sequence cold multi-sequence prefill give the same bytes when
+/// every `Init::Overwritten` activation is handed out `0xFF`-filled (NaN in
+/// every float dtype) as when it is zero-filled (the pre-arena state).
+#[test]
+#[ignore = "official Gemma 4 GGUF: 0xFF-filled pooled cold prefill activations give the zero-filled bytes"]
+fn gemma_cold_prefill_pool_hostile_fill_matches_zero_fill_bitwise() {
+    use crate::serve::forward_prefill_batched::gemma_prefill_pool::set_overwritten_fill_for_test;
+    let mut loaded = load_gate_model();
+    let mut guard = gate_guard(&mut loaded);
+    let vocab = guard.model.weights.vocab_size;
+    // FA lanes (33, 64 rows) and tensor-mm-global lanes (458, 900 rows).
+    let prompts: Vec<Vec<u32>> = [33usize, 64, 458, 900]
+        .iter()
+        .enumerate()
+        .map(|(lane, &len)| synthetic_prompt(lane + 5, len, vocab))
+        .collect();
+    let mut arms = Vec::new();
+    for fill in [0x00, 0xFF] {
+        set_overwritten_fill_for_test(Some(fill));
+        let per_slot = cold_per_slot(&mut guard, &prompts);
+        let joint = cold_multi_seq(&mut guard, &prompts);
+        arms.push((per_slot, joint));
+    }
+    set_overwritten_fill_for_test(None);
+    let (zero, hostile) = (&arms[0], &arms[1]);
+    for (lane, prompt) in prompts.iter().enumerate() {
+        let rows = prompt.len();
+        super::gemma_warm_batch_tests::assert_lane_equal(
+            &format!("per-slot cold lane {lane} rows {rows}"),
+            &hostile.0[lane],
+            &zero.0[lane],
+        );
+        super::gemma_warm_batch_tests::assert_lane_equal(
+            &format!("multi-seq cold lane {lane} rows {rows}"),
+            &hostile.1[lane],
+            &zero.1[lane],
+        );
+    }
+}
+
+/// Issue #725 driver: install `lanes` (prompt, stable boundary) as bounded
+/// prefills on slots `0..`, keep only the `live` ones, and advance every
+/// live lane in slot order through `advance_gemma4_prefill_quantum` (cross-
+/// slot admission on) until all have seeded. Returns, per live lane, its
+/// image and its committed chunks `(start, end, joint)`.
+fn installed_prefill(
+    guard: &mut Gemma4KvGuard<'_>,
+    supervisor: &EngineSupervisor,
+    lanes: &[(Vec<u32>, Option<usize>)],
+    live: &[usize],
+) -> Vec<(LaneImage, Vec<(usize, usize, bool)>)> {
+    let n_slots = guard.hybrid.as_ref().unwrap()[0].n_seqs as usize;
+    let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(8, n_slots as u32, 0);
+    scheduler.set_prefill_chunk_tokens(GEMMA4_SLOT_PREFILL_CHUNK_TOKENS);
+    // A fresh scheduler mints slot ids in order.
+    let handles: Vec<SlotHandle> = lanes
+        .iter()
+        .enumerate()
+        .map(|(slot, (prompt, _))| {
+            let handle = scheduler
+                .admit(AdmitRequest {
+                    prompt_tokens: prompt.len() as u32,
+                    max_tokens: MAX_DECODE as u32,
+                    kv_bytes_needed: 0,
+                    prompt_kv_bytes: 0,
+                    preferred_slot: None,
+                })
+                .unwrap()
+                .handle
+                .unwrap();
+            assert_eq!(handle.slot_id, SlotId(slot as u32));
+            handle
+        })
+        .collect();
+    let mut slots: Vec<Option<Gemma4Slot>> = (0..n_slots).map(|_| None).collect();
+    let mut receivers = Vec::new();
+    for (slot, ((prompt, boundary), handle)) in lanes.iter().zip(&handles).enumerate() {
+        if !live.contains(&slot) {
+            scheduler.release(*handle);
+            continue;
+        }
+        reset_slot(guard, slot);
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: MAX_DECODE,
+            stable_prompt_prefix_tokens: *boundary,
+            ..SamplingParams::default()
+        };
+        let state = Gemma4PrefillState::new(
+            handle.slot_id,
+            prompt.clone(),
+            Vec::new(),
+            params,
+            0,
+            None,
+            *boundary,
+        )
+        .unwrap();
+        let (send, receive) = oneshot::channel();
+        receivers.push(receive);
+        slots[slot] = Some((
+            Gemma4SlotWork::Prefill(state),
+            SlotReply::Unary(send),
+            *handle,
+        ));
+    }
+    let mut retained = vec![Vec::new(); n_slots];
+    let mut anchors: Vec<Option<Gemma4PromptAnchor>> = (0..n_slots).map(|_| None).collect();
+    let stats = Arc::new(Mutex::new(scheduler.stats()));
+    GEMMA4_PREFILL_RECORD.with(|record| {
+        *record.borrow_mut() = Some(Gemma4PrefillRecord::default());
+    });
+    loop {
+        let mut advanced = false;
+        for slot in 0..n_slots {
+            let Some((Gemma4SlotWork::Prefill(state), _, handle)) = slots[slot].as_ref() else {
+                continue;
+            };
+            let handle = *handle;
+            let remaining = state.prompt_tokens.len() - state.progress.cursor();
+            let requested = (remaining as u32).min(GEMMA4_SLOT_PREFILL_CHUNK_TOKENS);
+            if let Some(fatal) = advance_gemma4_prefill_quantum(
+                guard,
+                &mut scheduler,
+                &mut slots,
+                &mut retained,
+                &mut anchors,
+                None,
+                &stats,
+                handle,
+                requested,
+                0,
+                supervisor,
+                true,
+            ) {
+                panic!("installed prefill slot {slot}: {:#}", fatal.error);
+            }
+            advanced = true;
+        }
+        if !advanced {
+            break;
+        }
+    }
+    let record = GEMMA4_PREFILL_RECORD
+        .with(|record| record.borrow_mut().take())
+        .unwrap();
+    live.iter()
+        .map(|&slot| {
+            assert!(
+                matches!(slots[slot], Some((Gemma4SlotWork::Decode(_), _, _))),
+                "slot {slot} did not seed"
+            );
+            let (_, token, logits) = record
+                .seeds
+                .iter()
+                .find(|(seeded, _, _)| *seeded == slot as u32)
+                .unwrap_or_else(|| panic!("slot {slot} recorded no seed"));
+            let chunks = record
+                .chunks
+                .iter()
+                .filter(|(chunked, ..)| *chunked == slot as u32)
+                .map(|&(_, start, end, joint)| (start, end, joint))
+                .collect();
+            (
+                lane_image(guard, slot, lanes[slot].0.len(), *token, logits),
+                chunks,
+            )
+        })
+        .collect()
 }
 
 /// An engine whose worker resolves `HF2Q_GEMMA_JOINT_COLD_PREFILL=switch`.
@@ -1122,4 +1326,100 @@ fn gemma_cold_permissive_turn0_grammar_parses_and_runs() {
         .expect("permissive grammar");
     let root = grammar.rule_id("root").expect("root rule");
     assert!(crate::serve::api::grammar::GrammarRuntime::new(grammar, root).is_some());
+}
+
+/// #728: a group of cached stable-boundary requests whose boundary and cue
+/// phases both reach 32 rows (the shape that used to form the tiled stable
+/// batch) is admitted per slot, so the admission coalesce window cannot
+/// change a request's numerics. Reference: window 0 and every request alone.
+/// Arm: the 100 ms window with the requests concurrent. Turn 2 resumes each
+/// turn-1 boundary anchor, so it also compares the anchors' KV.
+#[test]
+#[ignore = "official Gemma 4 GGUF: a cached stable-boundary group is bitwise independent of the admission window"]
+fn gemma_stable_warm_group_is_independent_of_the_admission_window() {
+    const COALESCE_ENV: &str = "HF2Q_ADMIT_COALESCE_US";
+    // Turn 1 boundary phase and cue phase, both above the 32-row floor.
+    const HISTORY: usize = 48;
+    const CUE: usize = 40;
+    let rt = runtime();
+    let serve = |engine: &Engine, requests: &[(Vec<u32>, SamplingParams)], together: bool| {
+        if together {
+            concurrent(&rt, engine, requests)
+                .into_iter()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        } else {
+            requests
+                .iter()
+                .map(|(prompt, params)| {
+                    rt.block_on(engine.generate(prompt.clone(), params.clone()))
+                        .unwrap()
+                })
+                .collect()
+        }
+    };
+    let run = |coalesce_us: &str, together: bool| {
+        std::env::set_var(COALESCE_ENV, coalesce_us);
+        let engine = spawn("1");
+        let lanes = engine_turn0(&engine);
+        // Turn 0 alone per lane: every slot then holds its boundary anchor.
+        let turn0: Vec<_> = lanes
+            .iter()
+            .map(|(prompt, boundary)| (prompt.clone(), greedy(4, Some(*boundary))))
+            .collect();
+        let t0 = serve(&engine, &turn0, false);
+        let grouped_before = GEMMA4_STABLE_GROUP_LANES.load(Ordering::Relaxed);
+        let turn1: Vec<_> = lanes
+            .iter()
+            .enumerate()
+            .map(|(agent, (prompt, boundary))| {
+                let mut next = prompt[..*boundary].to_vec();
+                next.extend((0..HISTORY + CUE).map(|i| 3_000 + ((agent * 97 + i) % 500) as u32));
+                (next, greedy(16, Some(boundary + HISTORY)))
+            })
+            .collect();
+        let t1 = serve(&engine, &turn1, together);
+        let grouped = GEMMA4_STABLE_GROUP_LANES.load(Ordering::Relaxed) - grouped_before;
+        let turn2: Vec<_> = turn1
+            .iter()
+            .enumerate()
+            .map(|(agent, (prompt, params))| {
+                let mut next = prompt[..params.stable_prompt_prefix_tokens.unwrap()].to_vec();
+                next.extend((0..64).map(|i| 3_600 + ((agent * 61 + i) % 300) as u32));
+                (next, greedy(16, None))
+            })
+            .collect();
+        let t2 = serve(&engine, &turn2, together);
+        shutdown(&rt, engine);
+        std::env::remove_var(COALESCE_ENV);
+        (lanes, grouped, [t0, t1, t2])
+    };
+    let (lanes, serial_grouped, expected) = run("0", false);
+    assert_eq!(
+        serial_grouped, 0,
+        "serial turn-1 requests never share a window"
+    );
+    for (agent, (_, boundary)) in lanes.iter().enumerate() {
+        assert_eq!(
+            expected[1][agent].cached_tokens, *boundary,
+            "reference turn 1 agent {agent} resumed its turn-0 boundary anchor"
+        );
+        assert_eq!(
+            expected[2][agent].cached_tokens,
+            boundary + HISTORY,
+            "reference turn 2 agent {agent} resumed its turn-1 boundary anchor"
+        );
+    }
+    let (_, grouped, actual) = run("100000", true);
+    assert!(
+        grouped >= 2,
+        "the 100 ms window must group turn-1 lanes into one stable-boundary group (got {grouped})"
+    );
+    for (turn, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+        assert_turns(&format!("window 100 ms turn {turn}"), actual, expected);
+    }
+    println!(
+        "GEMMA_STABLE_WARM_WINDOW_INDEPENDENT_COMPLETE lanes={} grouped_lanes={grouped} boundary_rows={HISTORY} cue_rows={CUE} outputs_bitwise=true anchors_bitwise=true",
+        lanes.len()
+    );
 }

@@ -21,6 +21,21 @@ struct Active {
 thread_local! {static ACTIVE:RefCell<Option<Active>>=const{RefCell::new(None)};}
 /// Same-thread lease: unwinding removes all capture buffers/TLS state.
 static NEXT_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Relaxed checked increment of a scope-identity counter; returns the previous
+/// value. Same loop as the deprecated `fetch_update`; `try_update` is newer
+/// than the MSRV.
+pub(crate) fn next_scope_id(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut current = counter.load(Relaxed);
+    loop {
+        let next = current.checked_add(1)?;
+        match counter.compare_exchange_weak(current, next, Relaxed, Relaxed) {
+            Ok(previous) => return Some(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
 #[must_use]
 pub struct Scope {
     id: u64,
@@ -58,11 +73,7 @@ pub fn install_or_return(
         if slot.is_some() {
             return Err(("nested family diagnostic".into(), Box::new(store)));
         }
-        let Ok(id) = NEXT_SCOPE.fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |v| v.checked_add(1),
-        ) else {
+        let Some(id) = next_scope_id(&NEXT_SCOPE) else {
             return Err(("capture scope identity overflow".into(), Box::new(store)));
         };
         *slot = Some(Active {

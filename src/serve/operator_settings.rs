@@ -14,6 +14,7 @@ use crate::cli;
 use crate::setup::{ServeDefaultsV2, GUIDE_MAX_SLOTS, GUIDE_SCHEDULER};
 
 use super::api::engine::EngineMode;
+use super::kv_persist::lcp_registry::LcpResumeBudget;
 
 pub(crate) const DEFAULT_MAX_SLOTS_UNDER_INFLIGHT: u32 = GUIDE_MAX_SLOTS;
 
@@ -73,6 +74,26 @@ pub(crate) struct ResolvedContext {
 pub(crate) struct ResolvedKvBudget {
     pub(crate) bytes: Option<u64>,
     pub(crate) origin: Option<SettingOrigin>,
+}
+
+/// #727: built-in host byte budget of the Qwen and Gemma SlotAware
+/// reclaimed-slot spill store when neither `--slot-spill-budget` nor
+/// `[serve] slot_spill_budget` sets one. A fixed constant, never derived
+/// from available memory, so the spill/evict sequence depends only on the
+/// request sequence. One 32K-token Qwen spill (cache rows, both DeltaNet
+/// ping-pong buffers, and the prompt anchor) is about 1.6 GB on Qwen3.8 27B
+/// and 0.57 GB on Qwen3.6 35B-A3B, so 16 GiB holds about ten or thirty such
+/// conversations. A Gemma 4 spill holds the global rows below the cursor
+/// plus two copies of the sliding rings (the live slot's and the prompt
+/// anchor's); one ring copy is the ~150 MiB per-slot anchor plan on Gemma 4
+/// 26B-A4B.
+pub(crate) const DEFAULT_SLOT_SPILL_BUDGET_BYTES: u64 = 16 << 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedSlotSpillBudget {
+    /// Host bytes the spill store may hold; `0` disables spilling.
+    pub(crate) bytes: u64,
+    pub(crate) origin: SettingOrigin,
 }
 
 /// ADR-062 D1 — provenance of the effective scheduler and slot count,
@@ -386,6 +407,102 @@ pub(crate) fn resolve_kv_persist_budget(
     })
 }
 
+/// Effective in-memory LCP resume budget and the layer that supplied it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedLcpResumeBudget {
+    pub(crate) budget: LcpResumeBudget,
+    pub(crate) origin: SettingOrigin,
+}
+
+impl ResolvedLcpResumeBudget {
+    /// Label for the `[hf2q lcp] byte_budget=... (source=...)` startup line.
+    pub(crate) const fn source_label(self) -> &'static str {
+        match self.origin {
+            SettingOrigin::Cli => "cli",
+            SettingOrigin::Config => "config",
+            SettingOrigin::Gguf | SettingOrigin::BuiltIn => "default",
+        }
+    }
+}
+
+/// Parse one LCP resume budget value. Zero is rejected: a zero-byte registry
+/// would evict every snapshot on store.
+pub(crate) fn parse_lcp_resume_budget(value: &str) -> Result<u64, String> {
+    let bytes = parse_byte_size(value)?;
+    if bytes == 0 {
+        return Err("must be greater than zero".to_owned());
+    }
+    Ok(bytes)
+}
+
+/// Resolve the LCP resume registry budget: `--lcp-resume-budget` >
+/// `[serve] lcp_resume_budget` > [`LcpResumeBudget::DEFAULT`]. A pure
+/// function of operator input; host memory is never consulted.
+pub(crate) fn resolve_lcp_resume_budget(
+    cli_value: Option<&str>,
+    defaults: Option<&ServeDefaultsV2>,
+) -> Result<ResolvedLcpResumeBudget, String> {
+    let selected = cli_value
+        .map(|value| (value, SettingOrigin::Cli))
+        .or_else(|| {
+            defaults
+                .and_then(|defaults| defaults.lcp_resume_budget.as_deref())
+                .map(|value| (value, SettingOrigin::Config))
+        });
+    let Some((value, origin)) = selected else {
+        return Ok(ResolvedLcpResumeBudget {
+            budget: LcpResumeBudget::DEFAULT,
+            origin: SettingOrigin::BuiltIn,
+        });
+    };
+    let bytes = parse_lcp_resume_budget(value).map_err(|error| {
+        let setting = match origin {
+            SettingOrigin::Cli => "--lcp-resume-budget",
+            SettingOrigin::Config => "serve.lcp_resume_budget",
+            SettingOrigin::Gguf | SettingOrigin::BuiltIn => {
+                unreachable!("only the CLI and config layers supply an LCP resume budget")
+            }
+        };
+        format!("{setting}: {error}")
+    })?;
+    Ok(ResolvedLcpResumeBudget {
+        budget: LcpResumeBudget::from_bytes(bytes),
+        origin,
+    })
+}
+
+/// #727: resolve the reclaimed-slot spill budget, CLI > `[serve]` config >
+/// [`DEFAULT_SLOT_SPILL_BUDGET_BYTES`]. An explicit `0` disables spilling.
+pub(crate) fn resolve_slot_spill_budget(
+    cli_value: Option<&str>,
+    defaults: Option<&ServeDefaultsV2>,
+) -> Result<ResolvedSlotSpillBudget, String> {
+    let selected = cli_value
+        .map(|value| (value, SettingOrigin::Cli))
+        .or_else(|| {
+            defaults
+                .and_then(|defaults| defaults.slot_spill_budget.as_deref())
+                .map(|value| (value, SettingOrigin::Config))
+        });
+    let Some((value, origin)) = selected else {
+        return Ok(ResolvedSlotSpillBudget {
+            bytes: DEFAULT_SLOT_SPILL_BUDGET_BYTES,
+            origin: SettingOrigin::BuiltIn,
+        });
+    };
+    let bytes = parse_byte_size(value).map_err(|error| {
+        let setting = match origin {
+            SettingOrigin::Cli => "--slot-spill-budget",
+            SettingOrigin::Config => "serve.slot_spill_budget",
+            SettingOrigin::Gguf | SettingOrigin::BuiltIn => {
+                unreachable!("only the CLI and config.toml supply a spill budget string")
+            }
+        };
+        format!("{setting}: {error}")
+    })?;
+    Ok(ResolvedSlotSpillBudget { bytes, origin })
+}
+
 /// Reject a command-line disk budget that cannot affect the requested
 /// invocation. A setup-level budget may remain dormant until a particular
 /// serve/info invocation supplies `--kv-persist PATH`.
@@ -577,6 +694,97 @@ mod tests {
     }
 
     #[test]
+    fn lcp_resume_budget_default_is_exactly_8gib_and_host_independent() {
+        assert_eq!(LcpResumeBudget::DEFAULT.bytes(), 8 * (1u64 << 30));
+        assert_eq!(LcpResumeBudget::default(), LcpResumeBudget::DEFAULT);
+        let resolved = resolve_lcp_resume_budget(None, None).unwrap();
+        assert_eq!(resolved.budget, LcpResumeBudget::DEFAULT);
+        assert_eq!(resolved.origin, SettingOrigin::BuiltIn);
+        assert_eq!(resolved.source_label(), "default");
+        // A config without the key also resolves to the constant.
+        let config = crate::setup::OperatorConfigV2::guide_defaults().unwrap();
+        let resolved = resolve_lcp_resume_budget(None, Some(&config.serve)).unwrap();
+        assert_eq!(resolved.budget, LcpResumeBudget::DEFAULT);
+        assert_eq!(resolved.origin, SettingOrigin::BuiltIn);
+    }
+
+    #[test]
+    fn lcp_resume_budget_precedence_is_cli_then_config_then_default() {
+        let mut config = crate::setup::OperatorConfigV2::guide_defaults().unwrap();
+        config.serve.lcp_resume_budget = Some("12GiB".to_owned());
+
+        let from_config = resolve_lcp_resume_budget(None, Some(&config.serve)).unwrap();
+        assert_eq!(from_config.budget.bytes(), 12 * (1u64 << 30));
+        assert_eq!(from_config.origin, SettingOrigin::Config);
+        assert_eq!(from_config.source_label(), "config");
+
+        let from_cli = resolve_lcp_resume_budget(Some("2GiB"), Some(&config.serve)).unwrap();
+        assert_eq!(from_cli.budget.bytes(), 2 * (1u64 << 30));
+        assert_eq!(from_cli.origin, SettingOrigin::Cli);
+        assert_eq!(from_cli.source_label(), "cli");
+
+        let bare = resolve_lcp_resume_budget(Some("8589934592"), None).unwrap();
+        assert_eq!(bare.budget, LcpResumeBudget::DEFAULT);
+    }
+
+    #[test]
+    fn lcp_resume_budget_rejects_zero_and_garbage_naming_the_layer() {
+        let error = resolve_lcp_resume_budget(Some("0"), None).unwrap_err();
+        assert!(error.contains("--lcp-resume-budget"), "{error}");
+        assert!(error.contains("greater than zero"), "{error}");
+        let mut config = crate::setup::OperatorConfigV2::guide_defaults().unwrap();
+        config.serve.lcp_resume_budget = Some("lots".to_owned());
+        let error = resolve_lcp_resume_budget(None, Some(&config.serve)).unwrap_err();
+        assert!(error.contains("serve.lcp_resume_budget"), "{error}");
+    }
+
+    #[test]
+    fn lcp_resume_budget_admits_entries_up_to_the_budget_inclusive() {
+        let budget = LcpResumeBudget::from_bytes(1_000);
+        assert!(budget.admits(999));
+        assert!(budget.admits(1_000));
+        assert!(!budget.admits(1_001));
+    }
+
+    #[test]
+    fn lcp_resume_budget_path_reads_no_env_or_host_memory() {
+        // #730 removed-guard: the retired env knob and the free-memory probe
+        // must not return to the registry budget path.
+        let registry_src = include_str!("kv_persist/lcp_registry.rs");
+        let serve_src = include_str!("mod.rs");
+        for src in [registry_src, serve_src] {
+            assert!(!src.contains("std::env::var(\"HF2Q_KV_LCP_RESUME_CAPACITY\")"));
+        }
+        assert!(!registry_src.contains("sysinfo"));
+        assert!(!registry_src.contains("available_memory"));
+        assert!(serve_src.contains("operator_settings::resolve_lcp_resume_budget"));
+        // Model swaps reuse the once-resolved value.
+        assert!(serve_src.contains("lcp_resume_budget: config.lcp_resume_budget,"));
+
+        // Both engines build their registry from the load options, and Gemma's
+        // per-request snapshot gate reads the same value off the weights.
+        let gemma_engine_src = include_str!("api/engine.rs");
+        assert!(gemma_engine_src.contains("weights.lcp_resume_budget = opts.lcp_resume_budget;"));
+        assert!(gemma_engine_src.contains("opts.lcp_resume_budget.bytes(),"));
+        let qwen_engine_src = include_str!("api/engine_qwen35.rs");
+        assert!(qwen_engine_src.contains("opts.lcp_resume_budget.bytes(),"));
+
+        // The batched file keeps an unrelated per-request route probe
+        // (`serve_batched_route_viable`), so the LCP gate is pinned by its exact
+        // statement rather than by banning the probe file-wide.
+        let gate = "let lcp_fits_budget = self.lcp_resume_budget.admits(lcp_est_bytes);";
+        let prefill_src = include_str!("forward_prefill.rs");
+        let batched_src = include_str!("forward_prefill_batched.rs");
+        for src in [prefill_src, batched_src, gemma_engine_src, qwen_engine_src] {
+            assert!(!src.contains("default_lcp_byte_budget"));
+            assert!(!src.contains("gemma_lcp_snapshot_fits_budget"));
+        }
+        assert!(prefill_src.contains(gate));
+        assert!(batched_src.contains(gate));
+        assert!(!prefill_src.contains("available_memory"));
+    }
+
+    #[test]
     fn byte_budget_accepts_human_units_and_legacy_bare_bytes() {
         assert_eq!(parse_byte_size("8GiB").unwrap(), 8 * (1u64 << 30));
         assert_eq!(parse_byte_size(" 2 GB ").unwrap(), 2_000_000_000);
@@ -705,6 +913,7 @@ mod tests {
             kv_cache_budget: Some("2GiB".to_owned()),
             kv_persist_path: Some("/tmp/hf2q-kv".into()),
             kv_persist_budget: Some("32GiB".to_owned()),
+            slot_spill_budget: None,
         };
         let requested = requested_context(planning.ctx, Some(&config.serve))
             .unwrap()
@@ -736,9 +945,37 @@ mod tests {
             kv_cache_budget: None,
             kv_persist_path: None,
             kv_persist_budget: None,
+            slot_spill_budget: None,
         };
         let error = resolve_scheduler(&planning, None).unwrap_err();
         assert!(error.contains("inflight-batched"), "{error}");
+    }
+
+    #[test]
+    fn slot_spill_budget_is_cli_then_config_then_a_fixed_default() {
+        let builtin = resolve_slot_spill_budget(None, None).unwrap();
+        assert_eq!(builtin.bytes, DEFAULT_SLOT_SPILL_BUDGET_BYTES);
+        assert_eq!(builtin.bytes, 16 * (1u64 << 30));
+        assert_eq!(builtin.origin, SettingOrigin::BuiltIn);
+
+        let mut config = crate::setup::OperatorConfigV2::guide_defaults().unwrap();
+        let unset = resolve_slot_spill_budget(None, Some(&config.serve)).unwrap();
+        assert_eq!(unset, builtin);
+
+        config.serve.slot_spill_budget = Some("6GiB".to_owned());
+        let configured = resolve_slot_spill_budget(None, Some(&config.serve)).unwrap();
+        assert_eq!(configured.bytes, 6 * (1u64 << 30));
+        assert_eq!(configured.origin, SettingOrigin::Config);
+
+        let cli = resolve_slot_spill_budget(Some("0"), Some(&config.serve)).unwrap();
+        assert_eq!(cli.bytes, 0, "an explicit zero disables spilling");
+        assert_eq!(cli.origin, SettingOrigin::Cli);
+
+        let error = resolve_slot_spill_budget(Some("lots"), None).unwrap_err();
+        assert!(error.starts_with("--slot-spill-budget:"), "{error}");
+        config.serve.slot_spill_budget = Some("lots".to_owned());
+        let error = resolve_slot_spill_budget(None, Some(&config.serve)).unwrap_err();
+        assert!(error.starts_with("serve.slot_spill_budget:"), "{error}");
     }
 
     #[test]

@@ -8,15 +8,18 @@
 //! and a slot that is reset and re-prefilled (a new conversation) before it
 //! rejoins. Refused steps must leave both caches untouched.
 //!
-//! Run (one artifact per process; mlx-native snapshots its routing policy):
+//! Each gate binds its routing policy on the model before the first forward
+//! (#729): exact arms freeze the operator environment with `mul_mv_ext` off;
+//! padded arms bind the policy `hf2q serve` resolves from the artifact's
+//! identity, so `HF2Q_QWEN38_GGUF` must name a Qwen3.8 path (`qwen3.8` or
+//! `qwen38`) and no routing variable needs to be exported. Run:
 //!
 //! ```text
 //! HF2Q_QWEN36_GGUF=/path/qwen36.gguf cargo test --release --bin hf2q \
 //!   qwen36_joint_decode_matches_serial_decode_bitwise -- --ignored --exact
-//! HF2Q_QWEN38_GGUF=/path/qwen38.gguf cargo test --release --bin hf2q \
+//! HF2Q_QWEN38_GGUF=/path/qwen3.8.gguf cargo test --release --bin hf2q \
 //!   qwen38_joint_decode_mvn_matches_serial_decode_bitwise -- --ignored --exact
-//! HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 HF2Q_QWEN38_GGUF=/path/qwen38.gguf \
-//!   cargo test --release --bin hf2q \
+//! HF2Q_QWEN38_GGUF=/path/qwen3.8.gguf cargo test --release --bin hf2q \
 //!   qwen38_joint_decode_padded_mv_ext_keeps_decision_parity -- --ignored --exact
 //! ```
 //!
@@ -41,7 +44,17 @@ pub(super) const SLOTS: u32 = 4;
 const CAPACITY: u32 = 160;
 const BASE: [u32; 5] = [9707, 374, 279, 15, 1_782];
 
-pub(super) fn load(env: &str) -> Qwen35Model {
+/// Routing policy a gate binds before its first forward (#729).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum GateRouting {
+    /// The policy `hf2q serve` resolves from the artifact path: Qwen3.8
+    /// identity selects padded `mul_mv_ext` unless the operator overrides it.
+    Serve,
+    /// The operator environment with `mul_mv_ext` off: the exact arm.
+    Exact,
+}
+
+pub(super) fn load(env: &str, routing: GateRouting) -> Qwen35Model {
     use crate::serve::header::LoadProgress;
     use mlx_native::gguf::GgufFile;
 
@@ -49,9 +62,28 @@ pub(super) fn load(env: &str) -> Qwen35Model {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| panic!("ignored joint decode gate requires {env}"));
     assert!(path.is_file(), "artifact is absent at {}", path.display());
+    let policy = match routing {
+        GateRouting::Serve => {
+            let policy = super::routing_policy::resolve_qwen_ggml_routing_policy(&path);
+            assert!(
+                !policy.dense_decode_mvn && policy.dense_decode_mv_ext,
+                "padded gate needs the Qwen3.8 serve policy (mvN off, mul_mv_ext on): \
+                 {env}={} must name a Qwen3.8 artifact (qwen3.8/qwen38, any case) and \
+                 HF2Q_DECODE_MVN/HF2Q_DECODE_MV_EXT must not override it",
+                path.display()
+            );
+            policy
+        }
+        GateRouting::Exact => {
+            let mut policy = mlx_native::ggml_routing_policy_from_environment();
+            policy.dense_decode_mv_ext = false;
+            policy
+        }
+    };
     let gguf = GgufFile::open(&path).expect("open GGUF");
     let mut progress = LoadProgress::new(false, 1, 0);
-    let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
+    let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
+    model.bind_ggml_routing_policy(policy);
     model
         .ensure_gpu_cache_primed()
         .expect("prime GPU cache before allocating caches");
@@ -109,7 +141,11 @@ pub(super) fn hidden_bits(buffer: &MlxBuffer, hidden: usize) -> Vec<u32> {
 }
 
 /// Cursors, parities, KV codes/scales and conv/recurrent state, all slots.
-fn assert_caches_equal(serial: &HybridKvCache, joint: &HybridKvCache, label: &str) {
+pub(super) fn assert_caches_equal(
+    serial: &HybridKvCache,
+    joint: &HybridKvCache,
+    label: &str,
+) {
     for slot in 0..SLOTS {
         assert_eq!(
             serial.sequence_len_for_slot(SlotId(slot)).ok(),
@@ -279,13 +315,8 @@ fn assert_refusal_writes_nothing(
 /// Bitwise gate: every joint row equals its serial one-token forward, and
 /// both caches stay byte-identical across the whole schedule.
 fn run_bitwise_gate(env: &str) {
-    assert_ne!(
-        std::env::var("HF2Q_DECODE_MV_EXT").as_deref(),
-        Ok("1"),
-        "the bitwise arm needs the exact routing policy (unset HF2Q_DECODE_MV_EXT)"
-    );
     let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let model = load(env);
+    let model = load(env, GateRouting::Exact);
     assert_eq!(
         model.joint_decode_mode(),
         Ok(JointRouteMode::Exact),
@@ -410,21 +441,11 @@ fn qwen38_joint_decode_mvn_matches_serial_decode_bitwise() {
 /// real-prompt trace written by
 /// `qwen38_joint_decode_q1_envelope_trace` (see the design note).
 #[test]
-#[ignore = "requires HF2Q_QWEN38_GGUF, HF2Q_DECODE_MVN=0, HF2Q_DECODE_MV_EXT=1 and Apple Metal"]
+#[ignore = "requires HF2Q_QWEN38_GGUF (a Qwen3.8-named path) and Apple Metal"]
 fn qwen38_joint_decode_padded_mv_ext_keeps_decision_parity() {
     const FOLLOW_ON: usize = 16;
-    assert_eq!(
-        std::env::var("HF2Q_DECODE_MVN").as_deref(),
-        Ok("0"),
-        "padded decision diagnostic requires externally-set HF2Q_DECODE_MVN=0"
-    );
-    assert_eq!(
-        std::env::var("HF2Q_DECODE_MV_EXT").as_deref(),
-        Ok("1"),
-        "padded decision diagnostic requires externally-set HF2Q_DECODE_MV_EXT=1"
-    );
     let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let model = load("HF2Q_QWEN38_GGUF");
+    let model = load("HF2Q_QWEN38_GGUF", GateRouting::Serve);
     assert_eq!(
         model.joint_decode_mode(),
         Ok(JointRouteMode::PaddedMvExt),

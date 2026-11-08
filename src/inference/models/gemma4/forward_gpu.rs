@@ -989,7 +989,7 @@ impl MlxModelWeights {
                 &[&self.activations.norm_out, &lm_head.buffer],
                 &[&self.activations.logits],
             );
-            dispatch_qmatmul(
+            super::decode_dense::dispatch_decode_dense(
                 &mut s,
                 reg,
                 dev,
@@ -1552,7 +1552,7 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("pre-attn norm L{layer_idx}: {e}"))?;
 
                 // Q proj
-                dispatch_qmatmul(
+                super::decode_dense::dispatch_decode_dense(
                     &mut s,
                     reg,
                     dev,
@@ -1566,7 +1566,7 @@ impl MlxModelWeights {
                     },
                 )?;
                 // K proj
-                dispatch_qmatmul(
+                super::decode_dense::dispatch_decode_dense(
                     &mut s,
                     reg,
                     dev,
@@ -1581,7 +1581,7 @@ impl MlxModelWeights {
                 )?;
                 // V proj (if not k_eq_v)
                 if !v_is_k {
-                    dispatch_qmatmul(
+                    super::decode_dense::dispatch_decode_dense(
                         &mut s,
                         reg,
                         dev,
@@ -1837,7 +1837,7 @@ impl MlxModelWeights {
                     .begin().map(crate::inference::native_observation::session)
                     .map_err(|e| anyhow::anyhow!("oproj begin L{layer_idx}: {e}"))?;
 
-                dispatch_qmatmul(
+                super::decode_dense::dispatch_decode_dense(
                     &mut s,
                     reg,
                     dev,
@@ -1898,7 +1898,7 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("pre-FF norm L{layer_idx}: {e}"))?;
 
                 // gate
-                dispatch_qmatmul(
+                super::decode_dense::dispatch_decode_dense(
                     &mut s,
                     reg,
                     dev,
@@ -1912,7 +1912,7 @@ impl MlxModelWeights {
                     },
                 )?;
                 // up
-                dispatch_qmatmul(
+                super::decode_dense::dispatch_decode_dense(
                     &mut s,
                     reg,
                     dev,
@@ -1948,7 +1948,7 @@ impl MlxModelWeights {
                     );
                 }
                 // down
-                dispatch_qmatmul(
+                super::decode_dense::dispatch_decode_dense(
                     &mut s,
                     reg,
                     dev,
@@ -2218,7 +2218,7 @@ impl MlxModelWeights {
                 &[&self.activations.norm_out, &lm_head.buffer],
                 &[&self.activations.logits],
             );
-            dispatch_qmatmul(
+            super::decode_dense::dispatch_decode_dense(
                 &mut s,
                 reg,
                 dev,
@@ -2701,7 +2701,7 @@ impl MlxModelWeights {
         let mut head_session = exec
             .begin().map(crate::inference::native_observation::session)
             .map_err(|e| anyhow!("forward_tree_verify_gpu: begin head session: {e}"))?;
-        dispatch_qmatmul(
+        super::decode_dense::dispatch_decode_dense(
             &mut head_session,
             registry,
             device,
@@ -3026,6 +3026,7 @@ mod g4_cfa3_tests {
 
         MlxModelWeights {
             kv_graft: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             glp: None,
 embed_weight,
             layers,
@@ -3061,6 +3062,7 @@ embed_weight,
             multi_seq_prefill: None,
             warm_live_kernel: crate::inference::models::gemma4::GemmaLiveKernel::TiledF16,
             prefill_moe_down: crate::serve::gemma_prefill_moe::GemmaPrefillMoeDown::Slotted,
+            decode_attn_ne: crate::serve::gemma_decode_attention::GemmaDecodeAttnNe::Stock,
         }
     }
 
@@ -3390,6 +3392,7 @@ embed_weight,
 
         let model = MlxModelWeights {
             kv_graft: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             glp: None,
 embed_weight,
             layers: vec![sliding_layer, global_layer],
@@ -3425,6 +3428,7 @@ embed_weight,
             multi_seq_prefill: None,
             warm_live_kernel: crate::inference::models::gemma4::GemmaLiveKernel::TiledF16,
             prefill_moe_down: crate::serve::gemma_prefill_moe::GemmaPrefillMoeDown::Slotted,
+            decode_attn_ne: crate::serve::gemma_decode_attention::GemmaDecodeAttnNe::Stock,
         };
 
         let tokens: Vec<u32> = vec![0, 1];

@@ -30,11 +30,14 @@ import coding_long_context
 from f2_semantic import CLOCK_ID, clock_ns, semantic_timing_v3
 import qwen38_n1_process as child
 from qwen38_n1_smoke import build_request, exchange, initial_messages
-from qwen38_n1_verdict import EXPECTED, loads, qualify
+from qwen38_n1_verdict import EXPECTED, Workflow, loads, max_tools, qualify
 import qwen_n4_live_smoke as coordinator
+from native_peer_splash import MODEL_IDS as splash_ids
+from native_peer_splash_ready import TEMPLATE_FIELDS as SPLASH_TEMPLATE_FIELDS
 
 HERE = Path(__file__).resolve().parent
 MODEL = "fake-q2-model"
+SPLASH_MODEL = splash_ids["qwen36"]   # the pinned served id of the Qwen3.6 Splash arm
 RUN = "q2-fake-run-0000000001"
 TOKEN = "0123456789abcdef0123456789abcdef"
 SERVER_PID = 4242
@@ -55,8 +58,13 @@ class Timing:
         return Timing(self.first * factor, self.gap * factor, self.unary * factor)
 
 
-def tool_arguments(turn):
-    name, arguments = EXPECTED[turn]
+# A repaired agent (--repair-turns 1): its first run_tests ports fails (StubTools fail_first_test), then
+# one repair write and rerun, then the six steps resume; the summary is turn 8.
+REPAIR_SCRIPT = list(EXPECTED[:4]) + [("write_file", None), ("run_tests", {"target": "ports"})] + list(EXPECTED[4:])
+
+
+def tool_arguments(turn, repair=False):
+    name, arguments = (REPAIR_SCRIPT if repair else EXPECTED)[turn]
     return name, ({"path": "src/ports.rs", "content": FIXED_SOURCE} if arguments is None else arguments)
 
 
@@ -150,11 +158,17 @@ class FakeService:
     - `admit_together=N` holds the first N requests until all N are open (deterministic HTTP overlap).
     A rendezvous, admission or close wait that fails is recorded and fails `__exit__` loudly.
     `bursty=True` streams the low-frame shape of hf2q Gemma: one reasoning frame, a pause of
-    `timing.gap`, then the tool name and two argument frames back to back (four progress frames)."""
+    `timing.gap`, then the tool name and two argument frames back to back (four progress frames).
+    `repair=True` answers every agent with REPAIR_SCRIPT (one repair cycle; summary at turn 8).
+    `splash=True` speaks the closed Splash wire (native_peer_splash.check_unary/check_frame: ids, metrics,
+    timings, reasoning usage), serves the closing /apply-template and /tokenize render endpoints (the prompt is
+    the request's template fields, its token count the turn's usage.prompt_tokens) and logs Splash's Started/Done
+    status lines in `self.log` (native_peer_splash_audit)."""
 
     def __init__(self, timing=None, faults=None, model=MODEL, slots=None, bursty=False, rendezvous=(),
-                 admit_together=None):
-        self.timing, self.model, self.bursty = timing or Timing(), model, bursty
+                 admit_together=None, repair=False, splash=False):
+        self.timing, self.model, self.bursty, self.repair = timing or Timing(), model, bursty, repair
+        self.splash, self.prompts, self.log = splash, {}, []
         assert not (slots and rendezvous), "a slot-capped service cannot hold a rendezvous group open"
         self.slots = None if slots is None else threading.BoundedSemaphore(slots)
         self.acks = Path(tempfile.mkdtemp(prefix="q2-rendezvous-")) if rendezvous else None
@@ -176,6 +190,9 @@ class FakeService:
             def do_POST(self):
                 accepted = clock_ns()
                 body = self.rfile.read(int(self.headers["Content-Length"]))
+                if service.splash and self.path in ("/apply-template", "/tokenize"):
+                    service.render(self, json.loads(body))
+                    return
                 if service.admission is not None:
                     service.admit()
                 if service.slots is not None:
@@ -248,7 +265,7 @@ class FakeService:
             if fault == "reused_response_id":
                 rid = self.response_ids[(agent, 0)]
             self.response_ids.setdefault((agent, turn), rid)
-            cid = f"call_{agent}_{turn}_{self.counter:06d}"
+            cid = f"call_{uuid.uuid4().hex}_0" if self.splash else f"call_{agent}_{turn}_{self.counter:06d}"
             if fault == "reused_call_id":
                 cid = self.call_ids[(agent, 0)]
             self.call_ids.setdefault((agent, turn), cid)
@@ -268,15 +285,19 @@ class FakeService:
             usage["prompt_tokens_details"]["cached_tokens"] = 64
         elif fault == "no_reuse":
             usage["prompt_tokens_details"]["cached_tokens"] = 0
+        native = {}
+        if self.splash:
+            usage["completion_tokens_details"] = {"reasoning_tokens": 8}
+            native = self.splash_record(request, usage)
         reasoning = f"Step {turn + 1}: following the six-step workflow."
         if fault == "foreign_identity":
             other = coordinator.AGENTS[(coordinator.AGENTS.index(agent) + 1) % len(coordinator.AGENTS)]
             reasoning += f" Independent coding agent {other}, workload {coordinator.WORKLOAD_ID}."
-        if turn == 6:
+        if turn == (len(REPAIR_SCRIPT) if self.repair else 6):
             call, finish, content = None, "stop", "" if fault == "empty_final" else \
                 "Fixed parse_port: it rejects zero and values above 65535; ports and all tests passed."
         else:
-            name, arguments = tool_arguments(turn)
+            name, arguments = tool_arguments(turn, self.repair)
             if fault == "wrong_args":
                 arguments = {"path": "tests/ports.rs"} if name == "read_file" else {"target": "everything"}
             text = json.dumps(arguments, separators=(",", ":"))
@@ -287,7 +308,7 @@ class FakeService:
         if fault == "length_finish":
             finish = "length"
         if request.get("stream"):
-            frames = self.stream_frames(rid, model, reasoning, call, content, finish, usage, fault)
+            frames = self.stream_frames(rid, model, reasoning, call, content, finish, usage, fault, native)
             handler.send_response(200)
             handler.send_header("Content-Type", "text/event-stream")
             handler.send_header("Connection", "close")
@@ -311,7 +332,7 @@ class FakeService:
                 message["tool_calls"] = [call]
             payload = json.dumps({"id": rid, "object": "chat.completion", "model": model,
                                   "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-                                  "usage": usage}).encode()
+                                  "usage": usage, **native}).encode()
             handler.send_response(200)
             handler.send_header("Content-Type", "application/json")
             handler.send_header("Content-Length", str(len(payload)))
@@ -323,16 +344,48 @@ class FakeService:
             self.requests.append({"agent": agent, "turn": turn, "accepted_ns": accepted, "started_ns": started,
                                   "finished_ns": clock_ns(), "stream": bool(request.get("stream"))})
 
-    def stream_frames(self, rid, model, reasoning, call, content, finish, usage, fault):
+    def splash_record(self, request, usage):
+        """Splash's Started/Done lines and the turn's render key; returns the reply's created/metrics/timings."""
+        cached, prompt = usage["prompt_tokens_details"]["cached_tokens"], usage["prompt_tokens"]
+        key = json.dumps({k: request.get(k) for k in SPLASH_TEMPLATE_FIELDS}, sort_keys=True, ensure_ascii=False)
+        with self.state:
+            self.prompts[key] = prompt
+            self.log += [f"00:00:00 Started · input {prompt:,} · cached {cached:,} · high · thinking on",
+                         f"00:00:01 Done · input {prompt:,} · cached {cached:,} · output {usage['completion_tokens']:,}"
+                         " · TTFT 0.1s · 50.0 tok/s · 5.0 tok/cycle"]
+        return {"created": 1, "metrics": {"prefill": {}, "decode": {}, "request_latency": {}, "cache": {}},
+                "timings": {"prompt_n": prompt, "prompt_ms": 1.0, "prompt_per_second": 1.0,
+                            "predicted_n": usage["completion_tokens"], "predicted_ms": 1.0,
+                            "predicted_per_second": 1.0, "cache_n": cached}}
+
+    def render(self, handler, body):
+        """Splash /apply-template (the prompt is the request's template fields) and /tokenize (prompt_tokens ids)."""
+        if handler.path == "/apply-template":
+            doc = {"prompt": json.dumps(body, sort_keys=True, ensure_ascii=False)}
+        else:
+            doc = {"tokens": list(range(self.prompts[body["content"]]))}
+        payload = json.dumps(doc).encode()
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.write(payload)
+        handler.close_connection = True
+
+    def stream_frames(self, rid, model, reasoning, call, content, finish, usage, fault, native=None):
+        splash = bool(native)
+
         def frame(choices, extra=None):
-            obj = {"id": rid, "object": "chat.completion.chunk", "model": model, "choices": choices, **(extra or {})}
+            obj = {"id": rid, "object": "chat.completion.chunk", **({"created": native["created"]} if splash else {}),
+                   "model": model, "choices": choices, **(extra or {})}
             return ("data: " + json.dumps(obj) + "\n\n").encode()
 
         def delta(value):
-            return frame([{"index": 0, "delta": value}])
+            return frame([{"index": 0, "delta": value, **({"finish_reason": None} if splash else {})}])
 
         gap = self.timing.gap
-        frames = [(0, delta({"role": "assistant"}))]
+        frames = [(0, delta({"role": "assistant", "content": ""} if splash else {"role": "assistant"}))]
         if fault != "role_only":
             pieces = 1 if self.bursty else REASONING_FRAMES
             size = -(-len(reasoning) // pieces)
@@ -349,8 +402,9 @@ class FakeService:
                                        delta({"tool_calls": [{"index": 0, "function": {"arguments": part}}]})))
                 else:
                     frames.append((gap, delta({"content": content})))
-        frames.append((0, frame([{"index": 0, "delta": {}, "finish_reason": finish}])))
-        frames.append((0, frame([], {"usage": usage})))
+        frames.append((0, frame([{"index": 0, "delta": {}, "finish_reason": finish}],
+                                {"timings": native["timings"]} if splash else None)))
+        frames.append((0, frame([], {"usage": usage, **({"metrics": native["metrics"]} if splash else {})})))
         frames.append((0, b"data: [DONE]\n\n"))
         return frames
 
@@ -358,7 +412,8 @@ class FakeService:
 class StubTools:
     """Tool-receipt shape the coordinator scores; no file system sandbox or compiler is involved."""
 
-    def __init__(self, root, workload=None, variant=None):
+    def __init__(self, root, workload=None, variant=None, fail_first_test=False):
+        self.fail_next_test = fail_first_test
         self.fixture = Path(root) / "tools" / "fixture"
         (self.fixture / "src").mkdir(parents=True)
         self.files = {"src/ports.rs": "pub fn parse_port(s: &str) -> u16 { s.parse().unwrap() }\n" if workload is None
@@ -384,20 +439,24 @@ class StubTools:
             self.save()
             result = f"wrote {len(args['content'].encode())} bytes"
         else:
-            receipt.update(target=args["target"], passed=True)
-            result = json.dumps({"target": args["target"], "passed": True, "source_sha256": self.source_hash,
-                                 "output": "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"})
+            passed, self.fail_next_test = not self.fail_next_test, False
+            receipt.update(target=args["target"], passed=passed)
+            result = json.dumps({"target": args["target"], "passed": passed, "source_sha256": self.source_hash,
+                                 "output": "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
+                                 if passed else "error[E0282]: type annotations needed"})
         receipt.update(result=result, source_sha256=self.source_hash, cleanup=True, status="Complete")
         self.receipts.append(receipt)
         return result
 
 
 def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", family="qwen", instance=None,
-                phase=None, release_ns=None, on_first_token=None, server_pid=SERVER_PID, acks=None, variant=None):
+                phase=None, release_ns=None, on_first_token=None, server_pid=SERVER_PID, acks=None, variant=None,
+                repair_turns=0):
     """The agent child's turn loop with stub tools; raises the actual client rejection on a bad response.
 
     `acks` (a rendezvous service's `acks` directory): acknowledge the first progress frame of every
-    streamed turn there, after the actual `exchange` stamped it."""
+    streamed turn there, after the actual `exchange` stamped it. `repair_turns=1` runs the child's
+    repair-turn Workflow with a first run_tests that fails (pair it with FakeService(repair=True))."""
     out = Path(out)
     out.mkdir(parents=True)
     workload = None if instance is None else coding_instances.select(instance)
@@ -425,8 +484,11 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
         summary["workload_variant"] = selected.record()
     if phase is not None:
         summary["phase"] = phase
-    tools, seen = StubTools(out, workload, selected), set()
-    for turn in range(7):
+    if repair_turns:
+        summary["repair_turns"] = repair_turns
+    tools, seen = StubTools(out, workload, selected, fail_first_test=bool(repair_turns)), set()
+    protocol = Workflow(repair_turns) if repair_turns else None
+    for turn in range(max_tools(repair_turns) + 1):
         request = build_request(model, messages, schemas, turn, family, engine_kind)
         turn_out = out / f"turn-{turn}"
         turn_out.mkdir()
@@ -434,15 +496,21 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
         if acks is not None:
             callback = acknowledging(first_progress_ack(acks, agent, turn), callback)
         message, call, receipt = exchange(base, request, turn_out, turn, seen, deadline=30, engine_kind=engine_kind,
-                                          family=family, on_first_token=callback)
+                                          family=family, on_first_token=callback,
+                                          assistant_policy=None if protocol is None else protocol.policy)
         summary["turns"].append(receipt)
         messages.append(message)
         if call is not None:
             cid, name, arguments = call
             seen.add(cid)
             messages.append({"role": "tool", "tool_call_id": cid, "name": name, "content": tools.invoke(name, arguments)})
+        if protocol is not None:
+            protocol.advance(None if call is None else call[1],
+                             tools.receipts[-1]["passed"] if call is not None and call[1] == "run_tests" else None)
+        if call is None:
+            break
     summary["tools"] = tools.receipts
-    summary["status"] = qualify(summary["turns"], tools.receipts, True, tools.source_hash, tools.source_hash)
+    summary["status"] = qualify(summary["turns"], tools.receipts, True, tools.source_hash, tools.source_hash, repair_turns)
     summary.update(cleanup=True, final_source_sha256=tools.source_hash, task_completed_monotonic_ns=clock_ns(),
                    observed_final_source_sha256=child.digest(tools.fixture / "src" / "ports.rs"))
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -450,7 +518,7 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
 
 
 def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="hf2q", family="qwen", instance=None,
-             cleanup=None, run=RUN, server_pid=SERVER_PID, variant=None):
+             cleanup=None, run=RUN, server_pid=SERVER_PID, variant=None, repair_turns=0):
     """Coordinator summary over `results`; its status is the actual coordinator aggregate."""
     agents = coordinator.active_agents(phase_plan)
     cleanup = cleanup or {agent: copy.deepcopy(CLEAN) for agent in agents}
@@ -468,12 +536,15 @@ def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="h
         summary["instance"] = record
     if variant_record is not None:
         summary["workload_variant"] = variant_record
+    if repair_turns:
+        summary["repair_turns"] = repair_turns
     if phase_plan is not None:
         summary["phase"] = {"plan": phase_plan, "cohorts": [list(c) for c in coordinator.phase_cohorts(phase_plan)],
                             "releases": [{"cohort": i + 1, "release_monotonic_ns": at, "trigger_first_decode_monotonic_ns": t}
                                          for i, (at, t) in enumerate(zip(releases, triggers))]}
     summary["status"] = coordinator.aggregate(results, exits, {a: cleanup[a]["verified"] for a in agents}, server_pid, run,
-                                              engine_kind, family, record, phase_plan, variant_record)
+                                              engine_kind, family, record, phase_plan, variant_record,
+                                              repair_turns=repair_turns)
     finished = max(results[a]["task_completed_monotonic_ns"] for a in agents)
     summary.update(makespan_finished_ns=finished, own_output_four_task_makespan_seconds=(finished - releases[0]) / 1e9,
                    agents=results, exits=exits, client_cleanup=cleanup, cleanup=True,
@@ -497,7 +568,8 @@ def retime(results, phase_plan, makespan_s, slots=None, origin=10 ** 12):
     assert slots is None or len(cohorts) == 1, "slot-capped retiming is for single-release plans"
     groups = 1 if slots is None else -(-len(agents) // slots)
     total = round(makespan_s * 1e9)
-    duration = total // (7 * groups + (2 if len(cohorts) > 1 else 0) + 1)
+    steps = max(len(results[a]["turns"]) for a in agents)  # 7, or 9 for a repaired agent
+    duration = total // (steps * groups + (2 if len(cohorts) > 1 else 0) + 1)
     gap = duration // 10
     releases, triggers, start = [origin], [None], {}
     for index, cohort in enumerate(cohorts):
@@ -507,7 +579,7 @@ def retime(results, phase_plan, makespan_s, slots=None, origin=10 ** 12):
             triggers.append(trigger)
         for agent in cohort:
             group = 0 if slots is None else agents.index(agent) // slots
-            start[agent] = releases[index] + 1 + group * 7 * duration
+            start[agent] = releases[index] + 1 + group * steps * duration
     for agent in agents:
         lane = agents.index(agent) * (gap // 8)
         cohort = [agent in c for c in cohorts].index(True)
@@ -536,39 +608,58 @@ def retime(results, phase_plan, makespan_s, slots=None, origin=10 ** 12):
 
 
 _TEMPLATES = {}
+_SPLASH_EVIDENCE = {}   # template key -> (per-agent render proofs, Splash status log lines)
 _TEMPLATE_ROOT = None
 
 
-def template(engine_kind="hf2q", phase_plan=None, instance=None, family="qwen", variant=None):
-    """Raw evidence of one honest run (cached per process): directory and per-agent results."""
+def template(engine_kind="hf2q", phase_plan=None, instance=None, family="qwen", variant=None, repair_turns=0):
+    """Raw evidence of one honest run (cached per process): directory and per-agent results.
+    `repair_turns=1`: every agent fails its first run_tests and repairs it (REPAIR_SCRIPT).
+    `engine_kind="splash"`: the Splash wire with the pinned Qwen3.6 served id, and the closing render proofs."""
     global _TEMPLATE_ROOT
-    key = (engine_kind, phase_plan, instance, family, variant)
+    key = (engine_kind, phase_plan, instance, family, variant, repair_turns)
     if key not in _TEMPLATES:
         if _TEMPLATE_ROOT is None:
             _TEMPLATE_ROOT = tempfile.TemporaryDirectory(prefix="q2-fake-templates-")
             atexit.register(_TEMPLATE_ROOT.cleanup)
         root = Path(_TEMPLATE_ROOT.name) / f"t{len(_TEMPLATES)}"
         results = {}
-        with FakeService() as service:
+        splash = engine_kind == "splash"
+        with FakeService(repair=bool(repair_turns), splash=splash) as service:
             for agent in coordinator.active_agents(phase_plan):
                 results[agent] = drive_agent(service.url, root / agent, agent, engine_kind=engine_kind, family=family,
                                              instance=instance, phase=coordinator.agent_phase(phase_plan, agent),
-                                             variant=variant)
+                                             variant=variant, repair_turns=repair_turns,
+                                             **({"model": SPLASH_MODEL} if splash else {}))
+            if splash:
+                from native_peer_splash_ready import render_proof
+                _SPLASH_EVIDENCE[key] = ({agent: render_proof(service.url, root / agent, result["turns"])
+                                          for agent, result in results.items()}, list(service.log))
         _TEMPLATES[key] = (root, results)
     return _TEMPLATES[key]
 
 
 def honest_run(client_dir, makespan_s=100.0, engine_kind="hf2q", phase_plan=None, instance=None, slots=None,
-               family="qwen", variant=None):
+               family="qwen", variant=None, repair_turns=0):
     """Write a complete client directory (raw turns + coordinator summary) whose evidence re-derives its Pass."""
-    root, results = template(engine_kind, phase_plan, instance, family, variant)
+    root, results = template(engine_kind, phase_plan, instance, family, variant, repair_turns)
     client_dir = Path(client_dir)
     client_dir.mkdir(parents=True)
     for agent in results:
         shutil.copytree(root / agent, client_dir / agent)
     results = copy.deepcopy(results)
     releases, triggers = retime(results, phase_plan, makespan_s, slots)
-    return assemble(client_dir, results, releases, triggers, phase_plan, engine_kind, family, instance, variant=variant)
+    summary = assemble(client_dir, results, releases, triggers, phase_plan, engine_kind, family, instance,
+                       variant=variant, repair_turns=repair_turns)
+    if engine_kind == "splash":  # the coordinator's readiness and closing records and the server's status log
+        from native_peer_splash import SPLASH_COMMIT
+        render, log = _SPLASH_EVIDENCE[(engine_kind, phase_plan, instance, family, variant, repair_turns)]
+        summary.update(native_readiness={"engine_kind": "splash", "source_revision": SPLASH_COMMIT,
+                                         "q3_family": "qwen36"}, native_closing={"render": copy.deepcopy(render)})
+        (client_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        (client_dir.parent / "server.stdout").write_text("\n".join(log) + "\n")
+        (client_dir.parent / "server.stderr").write_text("")
+    return summary
 
 
 def write_json(path, value):

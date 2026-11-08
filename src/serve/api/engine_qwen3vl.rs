@@ -481,6 +481,7 @@ impl LoadInfoBuilder for Qwen3VlTextLoadedModel {
             // arch. `None` means "no override".
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
+            gemma_warm_attention_kernel: None,
         }
     }
 }

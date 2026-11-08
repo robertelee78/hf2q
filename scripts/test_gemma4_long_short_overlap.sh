@@ -264,11 +264,11 @@ qwen36_extract_append_only_log_delta "$SERVER_LOG" \
 qwen36_reject_fatal_log "$OUT_DIR/server-log-delta.log"
 
 bounded_log="$OUT_DIR/bounded-transactions.log"
-rg 'Gemma4 (bounded prefill transaction complete|installed prefills advanced in one aggregate-bounded transaction|stable agent suffixes prefilled in one multi-slot body)' \
+rg 'Gemma4 (bounded prefill transaction complete|installed prefills advanced in one aggregate-bounded transaction)' \
   "$OUT_DIR/server-log-delta.log" >"$bounded_log"
 [[ -s "$bounded_log" ]] || exit 1
 if awk '
-  { for (i=1; i<=NF; i++) if ($i ~ /^(advanced_tokens|suffix_tokens)=/) {
+  { for (i=1; i<=NF; i++) if ($i ~ /^advanced_tokens=/) {
       split($i, a, "="); if (a[2] !~ /^[0-9]+$/ || a[2] > 4096) exit 1
     }
   }

@@ -68,7 +68,9 @@ use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    quantized_matmul_id_ggml_pooled, GgmlQuantizedMatmulIdParams,
+    quantized_matmul_id_ggml_pooled, quantized_matmul_id_ggml_pooled_pair,
+    quantized_matmul_id_ggml_pooled_slotted_reusing_schedule, GgmlQuantizedMatmulIdParams,
+    MM_ID_ROUTING_THRESHOLD,
 };
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -218,9 +220,89 @@ fn dispatch_moe_id_routed(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: force the prefill MoE FFN onto one `mm_id` schedule per
+    /// expert call (the pre-P1 route) so bitwise tests can compare both.
+    static FORCE_PER_CALL_EXPERT_SCHEDULE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static SHARED_EXPERT_SCHEDULE_ADMISSIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn with_forced_per_call_expert_schedule<T>(
+    forced: bool,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(bool);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_PER_CALL_EXPERT_SCHEDULE.with(|state| state.set(self.0));
+        }
+    }
+
+    let restore =
+        Restore(FORCE_PER_CALL_EXPERT_SCHEDULE.with(|state| state.replace(forced)));
+    let output = run();
+    drop(restore);
+    output
+}
+
+#[cfg(test)]
+pub(super) fn take_shared_expert_schedule_admissions() -> usize {
+    SHARED_EXPERT_SCHEDULE_ADMISSIONS.with(|count| count.replace(0))
+}
+
+/// Whether the prefill MoE FFN builds the expert `mm_id` schedule once per
+/// layer: gate/up through `quantized_matmul_id_ggml_pooled_pair` and the
+/// down projection through the slotted schedule-reusing call (ADR-063
+/// Qwen3.6 prefill P1). The schedule depends only on the `[seq_len, top_k]`
+/// expert ids, so the outputs are bitwise those of three self-scheduling
+/// calls. Requires the `mm_id` route at the stock threshold for both calls
+/// (`top_k` in {1, 6, 8}, K ≥ 32), block-quantized GGML stacks with
+/// identical gate/up geometry, and no imatrix collector (its intercept
+/// commits and rotates the command buffer between the calls). Any
+/// `HF2Q_MM_ID_ROUTING_THRESHOLD` value, even the stock one, keeps the
+/// per-call route. The check mirrors the production (environment) routing
+/// policy; a registry carrying a custom `expert_mm_threshold` above the
+/// stock value would make the pair call refuse chunks between the two
+/// thresholds with an error rather than fall back.
+fn moe_prefill_shares_expert_schedule(
+    seq_len: u32,
+    shape: MoeFfnShape,
+    weights: &MoeFfnWeightsGpuQ,
+    fused_gate_up: bool,
+) -> bool {
+    #[cfg(test)]
+    if FORCE_PER_CALL_EXPERT_SCHEDULE.with(std::cell::Cell::get) {
+        return false;
+    }
+    let admitted = !fused_gate_up
+        && seq_len > MM_ID_ROUTING_THRESHOLD
+        && matches!(shape.num_experts_per_tok, 1 | 6 | 8)
+        && shape.hidden_size >= 32
+        && shape.moe_intermediate_size >= 32
+        && weights.expert_gate_affine.is_none()
+        && weights.expert_up_affine.is_none()
+        && weights.expert_gate_stride == weights.expert_up_stride
+        && std::env::var_os("HF2Q_MM_ID_ROUTING_THRESHOLD").is_none()
+        && !crate::quantize::imatrix::is_active();
+    #[cfg(test)]
+    if admitted {
+        SHARED_EXPERT_SCHEDULE_ADMISSIONS.with(|count| count.set(count.get() + 1));
+    }
+    admitted
+}
+
 use super::ffn::{DenseFfnShape, DenseFfnWeights, MoeFfnShape, MoeFfnWeights};
 use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32, upload_f32_weight};
-use super::weight_loader::DenseFfnWeightsQ;
+use super::moe_batched::{
+    build_moe_ffn_layer_gpu_batched_into, encode_native_dense_proj, MoeDenseRole,
+};
+pub use super::moe_batched::MoeDenseStorage;
+use super::weight_loader::{DenseFfnWeightsQ, MoeFfnWeightsQ};
 
 // ================================================================
 // GPU weight containers
@@ -367,10 +449,13 @@ impl MoeFfnWeightsGpu {
 ///   Q5_K+Q6_K path: ~0.78 GB per layer
 ///   Savings per layer: ~2.4 GB; across 40 MoE layers: ~96 GB
 ///
-/// Router (`[num_experts, hidden]`) and shared-expert weights are kept
-/// as F32 because they are small: router ≈ 2 MB, shared ≈ 8 MB.
+/// Router (`[num_experts, hidden]`) and shared-expert weights are small. With
+/// [`MoeDenseStorage::Bf16`] they are dequantized at load and uploaded as
+/// BF16; with [`MoeDenseStorage::Native`] (`HF2Q_QWEN_MOE_BATCHED=1`) they
+/// keep their GGUF storage (router and shared gate logit F32, shared
+/// gate/up/down raw GGML blocks) and decode runs the batched route.
 pub struct MoeFfnWeightsGpuQ {
-    /// Router F32 projection: `[num_experts, hidden_size]`.
+    /// Router projection: `[num_experts, hidden_size]` (BF16 or native F32).
     pub router: MlxBuffer,
     /// Stacked expert gate projections, raw GGML blocks.
     pub expert_gate_q: MlxBuffer,
@@ -388,14 +473,16 @@ pub struct MoeFfnWeightsGpuQ {
     pub expert_down_stride: u64,
     /// Number of experts.
     pub num_experts: u32,
-    /// Shared-expert sigmoid gate: `[1, hidden_size]` F32.
+    /// Shared-expert sigmoid gate: `[1, hidden_size]` (BF16 or native F32).
     pub shared_gate_inp: MlxBuffer,
-    /// Shared-expert gate_proj: `[shared_intermediate, hidden_size]` F32.
+    /// Shared-expert gate_proj: `[shared_intermediate, hidden_size]`.
     pub shared_gate: MlxBuffer,
-    /// Shared-expert up_proj: `[shared_intermediate, hidden_size]` F32.
+    /// Shared-expert up_proj: `[shared_intermediate, hidden_size]`.
     pub shared_up: MlxBuffer,
-    /// Shared-expert down_proj: `[hidden_size, shared_intermediate]` F32.
+    /// Shared-expert down_proj: `[hidden_size, shared_intermediate]`.
     pub shared_down: MlxBuffer,
+    /// Storage of the five router / shared-expert buffers above.
+    pub dense_storage: MoeDenseStorage,
     /// ADR-020 AC#5 Iter C2.4 #4 — DWQ-overlay mlx-affine expert
     /// stacks (cloned from the originating `MoeFfnWeightsQ` after the
     /// overlay was applied at load time).  When `Some`, the matching
@@ -422,28 +509,21 @@ fn ggml_type_stride(t: GgmlType, rows: usize, cols: usize) -> Result<u64> {
 }
 
 impl MoeFfnWeightsGpuQ {
-    /// Construct from pre-loaded quantized Metal buffers.
+    /// Construct from a loaded [`MoeFfnWeightsQ`].
     ///
-    /// `expert_{gate,up,down}_q` are already on the Metal device (loaded via
-    /// `GgufFile::load_tensor`).  Router and shared-expert weights are f32
-    /// vecs that need uploading.
-    #[allow(clippy::too_many_arguments)]
+    /// Expert buffers are already on the Metal device (ARC retain, no copy).
+    /// With `w.native_dense` the router / shared-expert buffers are retained
+    /// in their GGUF storage ([`MoeDenseStorage::Native`]); otherwise the F32
+    /// vecs are uploaded as BF16 ([`MoeDenseStorage::Bf16`]).
     pub fn from_quantized(
-        expert_gate_q: MlxBuffer,
-        expert_up_q: MlxBuffer,
-        expert_down_q: MlxBuffer,
-        ggml_type_gate_up: GgmlType,
-        ggml_type_down: GgmlType,
+        w: &MoeFfnWeightsQ,
         num_experts: u32,
         moe_intermediate_size: u32,
         hidden_size: u32,
-        router_f32: &[f32],
-        shared_gate_inp_f32: &[f32],
-        shared_gate_f32: &[f32],
-        shared_up_f32: &[f32],
-        shared_down_f32: &[f32],
         device: &MlxDevice,
     ) -> Result<Self> {
+        let ggml_type_gate_up = w.ggml_type_gate_up;
+        let ggml_type_down = w.ggml_type_down;
         // Gate/up: [num_experts, moe_intermediate_size, hidden_size]
         // Each expert slice: moe_intermediate_size rows × hidden_size cols.
         let gate_stride = ggml_type_stride(
@@ -462,29 +542,51 @@ impl MoeFfnWeightsGpuQ {
         )
         .context("down stride")?;
 
+        let (router, shared_gate_inp, shared_gate, shared_up, shared_down, dense_storage) =
+            match &w.native_dense {
+                Some(native) => (
+                    native.router.clone(),
+                    native.shared_gate_inp.clone(),
+                    native.shared_gate.clone(),
+                    native.shared_up.clone(),
+                    native.shared_down.clone(),
+                    MoeDenseStorage::Native {
+                        shared_gate_up: native.ggml_type_shared_gate_up,
+                        shared_down: native.ggml_type_shared_down,
+                    },
+                ),
+                // Pre-cast router and shared expert weights to BF16 so the
+                // projections never cast per inference.
+                None => (
+                    upload_bf16_from_f32(&w.router, device).context("upload router bf16")?,
+                    upload_bf16_from_f32(&w.shared_gate_logit, device)
+                        .context("upload shared_gate_inp bf16")?,
+                    upload_bf16_from_f32(&w.shared_gate, device)
+                        .context("upload shared_gate bf16")?,
+                    upload_bf16_from_f32(&w.shared_up, device)
+                        .context("upload shared_up bf16")?,
+                    upload_bf16_from_f32(&w.shared_down, device)
+                        .context("upload shared_down bf16")?,
+                    MoeDenseStorage::Bf16,
+                ),
+            };
+
         Ok(Self {
-            // Router is small (~2MB) but also benefits from pre-cast since
-            // `proj()` now checks dtype — keep BF16 for consistency.
-            router: upload_bf16_from_f32(router_f32, device).context("upload router bf16")?,
-            expert_gate_q,
-            expert_up_q,
-            expert_down_q,
+            router,
+            expert_gate_q: w.expert_gate_q.clone(),
+            expert_up_q: w.expert_up_q.clone(),
+            expert_down_q: w.expert_down_q.clone(),
             ggml_type_gate_up,
             ggml_type_down,
             expert_gate_stride: gate_stride,
             expert_up_stride: gate_stride, // gate and up have the same dimensions
             expert_down_stride: down_stride,
             num_experts,
-            // Pre-cast shared expert weights to BF16 to avoid per-inference
-            // F32→BF16 cast in proj() (~46MB each × 40 layers).
-            shared_gate_inp: upload_bf16_from_f32(shared_gate_inp_f32, device)
-                .context("upload shared_gate_inp bf16")?,
-            shared_gate: upload_bf16_from_f32(shared_gate_f32, device)
-                .context("upload shared_gate bf16")?,
-            shared_up: upload_bf16_from_f32(shared_up_f32, device)
-                .context("upload shared_up bf16")?,
-            shared_down: upload_bf16_from_f32(shared_down_f32, device)
-                .context("upload shared_down bf16")?,
+            shared_gate_inp,
+            shared_gate,
+            shared_up,
+            shared_down,
+            dense_storage,
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
@@ -497,15 +599,24 @@ impl MoeFfnWeightsGpuQ {
     /// has populated `expert_*_affine` slots (from
     /// `Qwen35Model::apply_dwq_overlay`).  Cheap clone — `MlxBuffer`
     /// is internally Arc-wrapped (no GPU copy).
+    ///
+    /// Native router/shared-expert storage (the batched decode route) has no
+    /// affine expert path; attaching an overlay to it is an error.
     pub fn attach_affine_overlay(
         &mut self,
         gate: Option<&crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
         up: Option<&crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
         down: Option<&crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
-    ) {
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.dense_storage.is_native() || (gate.is_none() && up.is_none() && down.is_none()),
+            "{} does not support DWQ affine expert overlays; unset it to load this artifact",
+            super::moe_batched::QWEN_MOE_BATCHED_ENV
+        );
         self.expert_gate_affine = gate.cloned();
         self.expert_up_affine = up.cloned();
         self.expert_down_affine = down.cloned();
+        Ok(())
     }
 }
 
@@ -836,6 +947,97 @@ fn proj_into(
     Ok(())
 }
 
+/// [`proj_pooled`] for a MoE router / shared-expert projection under the
+/// layer's [`MoeDenseStorage`]: BF16 storage keeps [`proj_pooled`]; native
+/// storage reads the GGUF-typed weight ([`encode_native_dense_proj`]).
+#[allow(clippy::too_many_arguments)]
+fn moe_dense_proj_pooled(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weights: &MoeFfnWeightsGpuQ,
+    role: MoeDenseRole,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<MlxBuffer> {
+    if !weights.dense_storage.is_native() {
+        return proj_pooled(
+            encoder,
+            registry,
+            device,
+            input,
+            role.weight(weights),
+            seq_len,
+            in_features,
+            out_features,
+        );
+    }
+    let dst = super::decode_pool::pooled_alloc_buffer(
+        device,
+        (seq_len * out_features) as usize * 4,
+        DType::F32,
+        vec![seq_len as usize, out_features as usize],
+    )
+    .map_err(|e| anyhow!("alloc native MoE proj dst (pooled): {e}"))?;
+    encode_native_dense_proj(
+        encoder,
+        registry,
+        device,
+        input,
+        weights,
+        role,
+        &dst,
+        seq_len,
+        in_features,
+        out_features,
+    )?;
+    Ok(dst)
+}
+
+/// [`proj_into`] for a MoE router / shared-expert projection under the
+/// layer's [`MoeDenseStorage`] (see [`moe_dense_proj_pooled`]).
+#[allow(clippy::too_many_arguments)]
+fn moe_dense_proj_into(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weights: &MoeFfnWeightsGpuQ,
+    role: MoeDenseRole,
+    dst: &mut MlxBuffer,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<()> {
+    if !weights.dense_storage.is_native() {
+        return proj_into(
+            encoder,
+            registry,
+            device,
+            input,
+            role.weight(weights),
+            dst,
+            seq_len,
+            in_features,
+            out_features,
+        );
+    }
+    encode_native_dense_proj(
+        encoder,
+        registry,
+        device,
+        input,
+        weights,
+        role,
+        dst,
+        seq_len,
+        in_features,
+        out_features,
+    )
+}
+
 // ================================================================
 // CPU SiLU helper for legacy parity-only paths
 // ================================================================
@@ -1149,9 +1351,10 @@ pub(crate) enum DenseGateUpDispatch {
     PreferFused,
     /// Separate gate and up products through the canonical GGML dispatcher,
     /// then `silu_mul`. Weight reuse is whatever that dispatcher's route
-    /// gives for the type, width and routing policy. At width 4 under
-    /// `HF2Q_DECODE_MV_EXT=1` (the padded joint mode) every admitted type
-    /// reads each weight block once for all rows. At widths 2..=3 with
+    /// gives for the type, width and routing policy. At width 4 under a
+    /// model routing policy with `mul_mv_ext` on (the padded joint mode: the
+    /// Qwen3.8 per-model default or `HF2Q_DECODE_MV_EXT=1`) every admitted
+    /// type reads each weight block once for all rows. At widths 2..=3 with
     /// `mvN` off, K-quants take the per-row `Mv` kernel instead.
     Separate,
 }
@@ -1281,7 +1484,7 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     //     and it is not consumed across decode tokens (output head consumes it
     //     within the same token via `apply_output_head_gpu_greedy`).  Keeps the
     //     W-5b.14 fully-pooled decode path bit-for-bit when residual=None.
-    let mut down_out = if seq_len == 1 {
+    let mut down_out = if seq_len == 1 || super::decode_pool::step_pooled_outputs() {
         super::decode_pool::pooled_alloc_buffer(
             device,
             n_out * 4,
@@ -1522,7 +1725,7 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     // above — device-alloc at prefill (survives per-layer reset), pooled at
     // decode (recycled by the per-token `reset_decode_pool`).
     let result = if let Some(res) = add_residual {
-        let sum_buf = if seq_len == 1 {
+        let sum_buf = if seq_len == 1 || super::decode_pool::step_pooled_outputs() {
             super::decode_pool::pooled_alloc_buffer(device, n_out * 4, DType::F32, vec![n_out])
                 .map_err(|e| anyhow!("alloc dense_q residual sum (pooled, decode): {e}"))?
         } else {
@@ -2551,6 +2754,27 @@ pub fn build_moe_ffn_layer_gpu_q_into(
     let m_moe32 = shape.moe_intermediate_size;
     let m_sh32 = shape.shared_intermediate_size;
 
+    // HF2Q_QWEN_MOE_BATCHED: one-row decode on native router/shared storage
+    // runs the batched route at one row, the same kernels a joint step runs
+    // over its rows, so a row's output does not depend on the joint width.
+    if seq_len == 1 && weights.dense_storage.is_native() {
+        let mut out = super::decode_pool::pooled_alloc_buffer(device, h * 4, DType::F32, vec![1, h])
+            .map_err(|e| anyhow!("alloc batched moe output (pooled, decode): {e}"))?;
+        build_moe_ffn_layer_gpu_batched_into(
+            enc,
+            device,
+            registry,
+            x,
+            weights,
+            shape,
+            add_residual,
+            &mut out,
+            1,
+            layer_idx,
+        )?;
+        return Ok(out);
+    }
+
     // ADR-013 P13.3 perf: entire MoE FFN in ONE command buffer.
     // By fusing all projections + routing + expert matmuls + weighted combine into a
     // single encoder (single commit_and_wait per MoE layer), we eliminate the second
@@ -2706,42 +2930,46 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseAProj,
             );
-            let logits_buf = proj_pooled(
+            let logits_buf = moe_dense_proj_pooled(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.router,
+                weights,
+                MoeDenseRole::Router,
                 seq_len,
                 h32,
                 ne32,
             )?;
-            let sh_logit_buf = proj_pooled(
+            let sh_logit_buf = moe_dense_proj_pooled(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.shared_gate_inp,
+                weights,
+                MoeDenseRole::SharedGateLogit,
                 seq_len,
                 h32,
                 1,
             )?;
-            let a_s_buf = proj_pooled(
+            let a_s_buf = moe_dense_proj_pooled(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.shared_gate,
+                weights,
+                MoeDenseRole::SharedGate,
                 seq_len,
                 h32,
                 m_sh32,
             )?;
-            let b_s_buf = proj_pooled(
+            let b_s_buf = moe_dense_proj_pooled(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.shared_up,
+                weights,
+                MoeDenseRole::SharedUp,
                 seq_len,
                 h32,
                 m_sh32,
@@ -2885,6 +3113,9 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                     ne32,
                     seq_len * shape.num_experts_per_tok,
                     |scratch| {
+                        // The legacy map0 inside the fused kernel writes the
+                        // scratch: take it through the key-invalidating accessor.
+                        let (htpe, hids) = scratch.buffers_mut();
                         mlx_native::ops::quantized_matmul_id_ggml::dispatch_id_mm_fused_gate_up_silu_for_test(
                             enc,
                             registry,
@@ -2893,8 +3124,8 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                             &weights.expert_gate_q,
                             &weights.expert_up_q,
                             &ids_buf,
-                            &scratch.htpe,
-                            &scratch.hids,
+                            htpe,
+                            hids,
                             &h_all_buf, // direct fused output — skip up_all
                             &fused_dispatch_params,
                         )
@@ -2943,12 +3174,13 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             }
             // ADR-015 iter7b — pooled (q_into path; y_s_buf flows into
             // dispatch_moe_weighted_reduce, no CPU download).
-            proj_pooled(
+            moe_dense_proj_pooled(
                 enc,
                 registry,
                 device,
                 &h_s_buf,
-                &weights.shared_down,
+                weights,
+                MoeDenseRole::SharedDown,
                 seq_len,
                 m_sh32,
                 h32,
@@ -3211,45 +3443,49 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseAProj,
             );
-            proj_into(
+            moe_dense_proj_into(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.router,
+                weights,
+                MoeDenseRole::Router,
                 &mut arena.logits_buf,
                 seq_len,
                 h32,
                 ne32,
             )?;
-            proj_into(
+            moe_dense_proj_into(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.shared_gate_inp,
+                weights,
+                MoeDenseRole::SharedGateLogit,
                 &mut arena.sh_logit_buf,
                 seq_len,
                 h32,
                 1,
             )?;
-            proj_into(
+            moe_dense_proj_into(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.shared_gate,
+                weights,
+                MoeDenseRole::SharedGate,
                 &mut arena.a_s_buf,
                 seq_len,
                 h32,
                 m_sh32,
             )?;
-            proj_into(
+            moe_dense_proj_into(
                 enc,
                 registry,
                 device,
                 x,
-                &weights.shared_up,
+                weights,
+                MoeDenseRole::SharedUp,
                 &mut arena.b_s_buf,
                 seq_len,
                 h32,
@@ -3331,6 +3567,8 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             && (shape.num_experts_per_tok == 1 || shape.num_experts_per_tok == 8);
         let fused_moe_mm_id_on_pf = fused_moe_mm_id_eligible_pf
             && std::env::var("HF2Q_FUSED_MOE_GATE_UP_MM_ID").as_deref() == Ok("1");
+        let shared_schedule =
+            moe_prefill_shares_expert_schedule(seq_len, shape, weights, fused_moe_mm_id_on_pf);
 
         let y_s_buf = {
             let _w5b = super::wave5b8_profile::Section::start(
@@ -3353,6 +3591,9 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                     ne32,
                     seq_len * shape.num_experts_per_tok,
                     |scratch| {
+                        // The legacy map0 inside the fused kernel writes the
+                        // scratch: take it through the key-invalidating accessor.
+                        let (htpe, hids) = scratch.buffers_mut();
                         mlx_native::ops::quantized_matmul_id_ggml::dispatch_id_mm_fused_gate_up_silu_for_test(
                             enc,
                             registry,
@@ -3361,14 +3602,39 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                             &weights.expert_gate_q,
                             &weights.expert_up_q,
                             &arena.ids_buf,
-                            &scratch.htpe,
-                            &scratch.hids,
+                            htpe,
+                            hids,
                             &arena.h_all_buf, // direct fused output
                             &fused_dispatch_params,
                         )
                     },
                 )
                 .map_err(|e| anyhow!("fused gate_up_silu_mm_id Q6_K (pf): {e}"))?;
+            } else if shared_schedule {
+                // P1: one `mm_id` schedule for gate and up; it stays in the
+                // Gate slot's scratch for the down call in Phase E.
+                super::decode_pool::with_id_mm_scratch(
+                    super::decode_pool::MmIdSlot::Gate,
+                    device,
+                    ne32,
+                    seq_len * shape.num_experts_per_tok,
+                    |scratch| {
+                        quantized_matmul_id_ggml_pooled_pair(
+                            enc,
+                            registry,
+                            device,
+                            x,
+                            &weights.expert_gate_q,
+                            &weights.expert_up_q,
+                            &arena.ids_buf,
+                            &arena.gate_all_buf,
+                            &arena.up_all_buf,
+                            scratch,
+                            &gate_params,
+                        )
+                    },
+                )
+                .map_err(|e| anyhow!("gate_up_all_pf qmatmul_id_pooled_pair: {e}"))?;
             } else {
                 dispatch_moe_id_routed(
                     enc,
@@ -3409,12 +3675,13 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                     },
                 )?;
             }
-            proj_pooled(
+            moe_dense_proj_pooled(
                 enc,
                 registry,
                 device,
                 &arena.h_s_buf,
-                &weights.shared_down,
+                weights,
+                MoeDenseRole::SharedDown,
                 seq_len,
                 m_sh32,
                 h32,
@@ -3472,25 +3739,58 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseEDown,
             );
-            dispatch_moe_id_routed(
-                enc,
-                registry,
-                device,
-                &arena.h_all_buf,
-                &weights.expert_down_q,
-                weights.expert_down_affine.as_ref(),
-                &arena.ids_buf,
-                &mut arena.y_all_buf,
-                &down_params,
-                super::decode_pool::MmIdSlot::Down,
-                ne32,
-                total_rows as u32,
-                "y_all_pf",
-                crate::quantize::imatrix::ImatrixHint::Layered {
-                    tag: "ffn_down_exps",
-                    layer: layer_idx,
-                },
-            )?;
+            if shared_schedule && weights.expert_down_affine.is_none() {
+                // P1: `h_all` is `[seq_len, top_k, m_moe]`, so the slotted
+                // call over gate/up's `[seq_len, top_k]` ids reuses their
+                // schedule; bitwise equal to the flattened top_k = 1 call.
+                let slotted_down_params = GgmlQuantizedMatmulIdParams {
+                    n_tokens: seq_len,
+                    top_k: shape.num_experts_per_tok,
+                    ..down_params
+                };
+                super::decode_pool::with_id_mm_scratch(
+                    super::decode_pool::MmIdSlot::Gate,
+                    device,
+                    ne32,
+                    seq_len * shape.num_experts_per_tok,
+                    |scratch| {
+                        quantized_matmul_id_ggml_pooled_slotted_reusing_schedule(
+                            enc,
+                            registry,
+                            device,
+                            &arena.h_all_buf,
+                            &weights.expert_down_q,
+                            &arena.ids_buf,
+                            &arena.y_all_buf,
+                            scratch,
+                            &slotted_down_params,
+                        )
+                    },
+                )
+                .map_err(|e| {
+                    anyhow!("y_all_pf qmatmul_id_pooled_slotted (reused schedule): {e}")
+                })?;
+            } else {
+                dispatch_moe_id_routed(
+                    enc,
+                    registry,
+                    device,
+                    &arena.h_all_buf,
+                    &weights.expert_down_q,
+                    weights.expert_down_affine.as_ref(),
+                    &arena.ids_buf,
+                    &mut arena.y_all_buf,
+                    &down_params,
+                    super::decode_pool::MmIdSlot::Down,
+                    ne32,
+                    total_rows as u32,
+                    "y_all_pf",
+                    crate::quantize::imatrix::ImatrixHint::Layered {
+                        tag: "ffn_down_exps",
+                        layer: layer_idx,
+                    },
+                )?;
+            }
         }
 
         // Barrier E→F.
@@ -4440,6 +4740,7 @@ mod tests {
             shared_gate: upload_f32(&shared_gate_f32, &device).expect("sh_gate"),
             shared_up: upload_f32(&shared_up_f32, &device).expect("sh_up"),
             shared_down: upload_f32(&shared_down_f32, &device).expect("sh_down"),
+            dense_storage: MoeDenseStorage::Bf16,
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
@@ -4491,4 +4792,583 @@ mod tests {
     // LEGACY ↔ NEW invocations at seq_len=16 prior to removal.  See
     // `docs/wave5b3-walkbar-results.md` "Wave 5b.25" section for the
     // sunset audit trail.
+
+    // ────────────────────────────────────────────────────────────────
+    // ADR-063 Qwen3.6 prefill P1: one expert `mm_id` schedule per layer
+    // ────────────────────────────────────────────────────────────────
+
+    struct ArenaMoeRun {
+        out: Vec<u32>,
+        ids: Vec<u32>,
+        gate_all: Vec<u32>,
+        up_all: Vec<u32>,
+        y_all: Vec<u32>,
+    }
+
+    fn bits(buf: &MlxBuffer, n: usize) -> Vec<u32> {
+        buf.as_slice::<u32>().expect("download bits")[..n].to_vec()
+    }
+
+    /// One `build_moe_ffn_layer_gpu_q_into_with_arena` call in its own
+    /// command buffer, on a fresh arena, under the requested schedule route.
+    #[allow(clippy::too_many_arguments)]
+    fn run_arena_moe(
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        x: &MlxBuffer,
+        residual: &MlxBuffer,
+        weights: &MoeFfnWeightsGpuQ,
+        shape: MoeFfnShape,
+        seq: usize,
+        per_call_schedule: bool,
+    ) -> ArenaMoeRun {
+        let h = shape.hidden_size as usize;
+        let topk = shape.num_experts_per_tok as usize;
+        let m = shape.moe_intermediate_size as usize;
+        let mut arena = super::super::MoeFfnArena::new(
+            device,
+            seq as u32,
+            shape.hidden_size,
+            shape.num_experts_per_tok,
+            shape.moe_intermediate_size,
+            shape.shared_intermediate_size,
+            shape.num_experts,
+        )
+        .expect("MoeFfnArena");
+        let mut out_slot = device
+            .alloc_buffer(seq * h * 4, DType::F32, vec![seq, h])
+            .expect("out slot");
+        FORCE_PER_CALL_EXPERT_SCHEDULE.with(|force| force.set(per_call_schedule));
+        let mut enc = device
+            .command_encoder()
+            .map(crate::inference::native_observation::encoder)
+            .expect("encoder");
+        let built = build_moe_ffn_layer_gpu_q_into_with_arena(
+            &mut enc,
+            device,
+            registry,
+            x,
+            weights,
+            shape,
+            Some(residual),
+            &mut arena,
+            &mut out_slot,
+            0,
+        );
+        FORCE_PER_CALL_EXPERT_SCHEDULE.with(|force| force.set(false));
+        built.expect("moe ffn arena build");
+        enc.commit_and_wait().expect("commit moe ffn");
+        let rows = seq * topk;
+        ArenaMoeRun {
+            out: bits(&out_slot, seq * h),
+            ids: bits(&arena.ids_buf, rows),
+            gate_all: bits(&arena.gate_all_buf, rows * m),
+            up_all: bits(&arena.up_all_buf, rows * m),
+            y_all: bits(&arena.y_all_buf, rows * h),
+        }
+    }
+
+    fn quantized_expert_stack(
+        device: &MlxDevice,
+        ggml_type: GgmlType,
+        values: &[f32],
+        n_per_row: usize,
+    ) -> MlxBuffer {
+        let bytes = match ggml_type {
+            GgmlType::Q4_K => crate::quantize::ggml_quants::q4_k::quantize(values, n_per_row, None),
+            GgmlType::Q6_K => crate::quantize::ggml_quants::q6_k::quantize(values, n_per_row, None),
+            other => panic!("unsupported test expert type {other:?}"),
+        };
+        let mut buf = device
+            .alloc_buffer(bytes.len(), DType::U8, vec![bytes.len()])
+            .expect("expert stack");
+        buf.as_mut_slice::<u8>()
+            .expect("expert stack slice")
+            .copy_from_slice(&bytes);
+        buf
+    }
+
+    /// The per-layer shared expert schedule (gate/up pair + slotted down
+    /// reusing it) is bitwise equal to three self-scheduling calls, for
+    /// Q4_K gate/up with Q6_K or Q4_K down, at mm_id row counts from just
+    /// above the routing threshold to a 512-row chunk, with uniform and
+    /// fully collapsed (every token on the same eight experts) routing; and
+    /// the shared route is deterministic across repeated runs.
+    #[test]
+    fn moe_prefill_shared_expert_schedule_bitwise_matches_per_call_schedule() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("Metal device unavailable");
+        let mut registry = KernelRegistry::new();
+        let shape = MoeFfnShape {
+            hidden_size: 256,
+            num_experts: 64,
+            num_experts_per_tok: 8,
+            moe_intermediate_size: 256,
+            shared_intermediate_size: 256,
+        };
+        let h = shape.hidden_size as usize;
+        let ne = shape.num_experts as usize;
+        let m = shape.moe_intermediate_size as usize;
+        let ms = shape.shared_intermediate_size as usize;
+        let mut seed = 0x9E37_79B9_u32;
+        let router = mk_rand(&mut seed, ne * h, 0.3);
+        let gate = mk_rand(&mut seed, ne * m * h, 0.1);
+        let up = mk_rand(&mut seed, ne * m * h, 0.1);
+        let down = mk_rand(&mut seed, ne * h * m, 0.1);
+        let shared_gate_logit = mk_rand(&mut seed, h, 0.1);
+        let shared_gate = mk_rand(&mut seed, ms * h, 0.1);
+        let shared_up = mk_rand(&mut seed, ms * h, 0.1);
+        let shared_down = mk_rand(&mut seed, h * ms, 0.1);
+        let gate_q = quantized_expert_stack(&device, GgmlType::Q4_K, &gate, h);
+        let up_q = quantized_expert_stack(&device, GgmlType::Q4_K, &up, h);
+        let gate_up_stride = (m * h / 256 * GgmlType::Q4_K.block_bytes() as usize) as u64;
+
+        for down_type in [GgmlType::Q6_K, GgmlType::Q4_K] {
+            let weights = MoeFfnWeightsGpuQ {
+                router: upload_bf16_from_f32(&router, &device).expect("router"),
+                expert_gate_q: gate_q.clone(),
+                expert_up_q: up_q.clone(),
+                expert_down_q: quantized_expert_stack(&device, down_type, &down, m),
+                ggml_type_gate_up: GgmlType::Q4_K,
+                ggml_type_down: down_type,
+                expert_gate_stride: gate_up_stride,
+                expert_up_stride: gate_up_stride,
+                expert_down_stride: (h * m / 256 * down_type.block_bytes() as usize) as u64,
+                num_experts: ne as u32,
+                shared_gate_inp: upload_bf16_from_f32(&shared_gate_logit, &device)
+                    .expect("sh_gate_inp"),
+                shared_gate: upload_bf16_from_f32(&shared_gate, &device).expect("sh_gate"),
+                shared_up: upload_bf16_from_f32(&shared_up, &device).expect("sh_up"),
+                shared_down: upload_bf16_from_f32(&shared_down, &device).expect("sh_down"),
+                dense_storage: MoeDenseStorage::Bf16,
+                expert_gate_affine: None,
+                expert_up_affine: None,
+                expert_down_affine: None,
+            };
+            for seq in [33usize, 85, 157, 512] {
+                for collapsed in [false, true] {
+                    let x_host = if collapsed {
+                        let row = mk_rand(&mut seed, h, 0.4);
+                        row.iter()
+                            .copied()
+                            .cycle()
+                            .take(seq * h)
+                            .collect::<Vec<_>>()
+                    } else {
+                        mk_rand(&mut seed, seq * h, 0.4)
+                    };
+                    let x = upload_f32(&x_host, &device).expect("x");
+                    let residual =
+                        upload_f32(&mk_rand(&mut seed, seq * h, 0.5), &device).expect("residual");
+                    let case = format!("down={down_type:?} seq={seq} collapsed={collapsed}");
+                    assert!(moe_prefill_shares_expert_schedule(
+                        seq as u32, shape, &weights, false
+                    ));
+                    let per_call = run_arena_moe(
+                        &device,
+                        &mut registry,
+                        &x,
+                        &residual,
+                        &weights,
+                        shape,
+                        seq,
+                        true,
+                    );
+                    let shared = run_arena_moe(
+                        &device,
+                        &mut registry,
+                        &x,
+                        &residual,
+                        &weights,
+                        shape,
+                        seq,
+                        false,
+                    );
+                    let again = run_arena_moe(
+                        &device,
+                        &mut registry,
+                        &x,
+                        &residual,
+                        &weights,
+                        shape,
+                        seq,
+                        false,
+                    );
+                    assert!(
+                        per_call.out.iter().any(|&b| f32::from_bits(b) != 0.0)
+                            && per_call.out.iter().all(|&b| f32::from_bits(b).is_finite()),
+                        "{case}: degenerate reference output"
+                    );
+                    if collapsed {
+                        assert!(
+                            per_call.ids.chunks(8).all(|row| row == &per_call.ids[..8]),
+                            "{case}: routing did not collapse"
+                        );
+                    }
+                    assert_eq!(per_call.ids, shared.ids, "{case}: ids");
+                    assert!(
+                        per_call.gate_all == shared.gate_all,
+                        "{case}: gate_all bits"
+                    );
+                    assert!(per_call.up_all == shared.up_all, "{case}: up_all bits");
+                    assert!(per_call.y_all == shared.y_all, "{case}: y_all bits");
+                    assert!(per_call.out == shared.out, "{case}: output bits");
+                    assert!(
+                        shared.out == again.out,
+                        "{case}: shared route not deterministic"
+                    );
+                    assert!(
+                        shared.y_all == again.y_all,
+                        "{case}: shared y_all not deterministic"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Routes that cannot share one schedule keep the per-call route.
+    #[test]
+    fn moe_prefill_shared_expert_schedule_eligibility() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("Metal device unavailable");
+        let shape = MoeFfnShape {
+            hidden_size: 256,
+            num_experts: 16,
+            num_experts_per_tok: 8,
+            moe_intermediate_size: 256,
+            shared_intermediate_size: 256,
+        };
+        let stub = |len: usize| device.alloc_buffer(len, DType::U8, vec![len]).expect("buf");
+        let weights = MoeFfnWeightsGpuQ {
+            router: stub(4),
+            expert_gate_q: stub(4),
+            expert_up_q: stub(4),
+            expert_down_q: stub(4),
+            ggml_type_gate_up: GgmlType::Q4_K,
+            ggml_type_down: GgmlType::Q6_K,
+            expert_gate_stride: 144,
+            expert_up_stride: 144,
+            expert_down_stride: 210,
+            num_experts: 16,
+            shared_gate_inp: stub(4),
+            shared_gate: stub(4),
+            shared_up: stub(4),
+            shared_down: stub(4),
+            dense_storage: MoeDenseStorage::Bf16,
+            expert_gate_affine: None,
+            expert_up_affine: None,
+            expert_down_affine: None,
+        };
+        let threshold = MM_ID_ROUTING_THRESHOLD;
+        assert!(moe_prefill_shares_expert_schedule(
+            threshold + 1,
+            shape,
+            &weights,
+            false
+        ));
+        assert!(!moe_prefill_shares_expert_schedule(
+            threshold, shape, &weights, false
+        ));
+        assert!(!moe_prefill_shares_expert_schedule(
+            5, shape, &weights, false
+        ));
+        assert!(!moe_prefill_shares_expert_schedule(
+            512, shape, &weights, true
+        ));
+        let odd_top_k = MoeFfnShape {
+            num_experts_per_tok: 4,
+            ..shape
+        };
+        assert!(!moe_prefill_shares_expert_schedule(
+            512, odd_top_k, &weights, false
+        ));
+        struct NullCollector;
+        impl crate::quantize::imatrix::ImatrixCollector for NullCollector {
+            fn record(&mut self, _tensor_name: &str, _input_row: &[f32]) {}
+            fn record_moe(
+                &mut self,
+                _tensor_name: &str,
+                _expert_id: usize,
+                _input_row: &[f32],
+            ) {}
+        }
+        crate::quantize::imatrix::with_collector(NullCollector, || {
+            assert!(!moe_prefill_shares_expert_schedule(
+                512, shape, &weights, false
+            ));
+        });
+        assert!(moe_prefill_shares_expert_schedule(
+            512, shape, &weights, false
+        ));
+        let drifted = MoeFfnWeightsGpuQ {
+            expert_up_stride: 288,
+            ..weights
+        };
+        assert!(!moe_prefill_shares_expert_schedule(
+            512, shape, &drifted, false
+        ));
+    }
+
+    /// Model-free GPU time of one Qwen3.6-35B-A3B prefill MoE FFN layer
+    /// (hidden 2048, 256 experts, top-8, expert width 512, shared 512; Q4_K
+    /// gate/up, Q6_K down) under the per-call and the shared expert schedule,
+    /// alternating routes. Weights are random block bytes with small scales
+    /// (timing only). Prints one JSON line per row count. Run with
+    /// `--ignored --nocapture` while holding the GPU lane.
+    #[test]
+    #[ignore = "GPU timing; run explicitly under the GPU lane"]
+    fn moe_prefill_shared_expert_schedule_bench() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("Metal device unavailable");
+        let mut registry = KernelRegistry::new();
+        let shape = MoeFfnShape {
+            hidden_size: 2048,
+            num_experts: 256,
+            num_experts_per_tok: 8,
+            moe_intermediate_size: 512,
+            shared_intermediate_size: 512,
+        };
+        let (h, ne, m) = (2048usize, 256usize, 512usize);
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut random_blocks = |ggml_type: GgmlType, elems: usize| -> MlxBuffer {
+            let block_bytes = ggml_type.block_bytes() as usize;
+            let n_blocks = elems / 256;
+            let mut buf = device
+                .alloc_buffer(
+                    n_blocks * block_bytes,
+                    DType::U8,
+                    vec![n_blocks * block_bytes],
+                )
+                .expect("expert stack");
+            let bytes = buf.as_mut_slice::<u8>().expect("expert stack slice");
+            for chunk in bytes.chunks_mut(8) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let word = state.to_le_bytes();
+                chunk.copy_from_slice(&word[..chunk.len()]);
+            }
+            let scale = half::f16::from_f32(1.0e-3).to_le_bytes();
+            for block in bytes.chunks_mut(block_bytes) {
+                match ggml_type {
+                    // d, dmin at the block head.
+                    GgmlType::Q4_K => {
+                        block[0..2].copy_from_slice(&scale);
+                        block[2..4].copy_from_slice(&scale);
+                    }
+                    // d at the block tail.
+                    GgmlType::Q6_K => block[208..210].copy_from_slice(&scale),
+                    other => panic!("unsupported bench expert type {other:?}"),
+                }
+            }
+            buf
+        };
+        let gate_up_stride = (m * h / 256 * GgmlType::Q4_K.block_bytes() as usize) as u64;
+        let down_stride = (h * m / 256 * GgmlType::Q6_K.block_bytes() as usize) as u64;
+        let expert_gate_q = random_blocks(GgmlType::Q4_K, ne * m * h);
+        let expert_up_q = random_blocks(GgmlType::Q4_K, ne * m * h);
+        let expert_down_q = random_blocks(GgmlType::Q6_K, ne * h * m);
+        let mut seed = 0xBE7C_0001_u32;
+        let weights = MoeFfnWeightsGpuQ {
+            router: upload_bf16_from_f32(&mk_rand(&mut seed, ne * h, 0.05), &device)
+                .expect("router"),
+            expert_gate_q,
+            expert_up_q,
+            expert_down_q,
+            ggml_type_gate_up: GgmlType::Q4_K,
+            ggml_type_down: GgmlType::Q6_K,
+            expert_gate_stride: gate_up_stride,
+            expert_up_stride: gate_up_stride,
+            expert_down_stride: down_stride,
+            num_experts: ne as u32,
+            shared_gate_inp: upload_bf16_from_f32(&mk_rand(&mut seed, h, 0.05), &device)
+                .expect("sh_gate_inp"),
+            shared_gate: upload_bf16_from_f32(&mk_rand(&mut seed, m * h, 0.05), &device)
+                .expect("sh_gate"),
+            shared_up: upload_bf16_from_f32(&mk_rand(&mut seed, m * h, 0.05), &device)
+                .expect("sh_up"),
+            shared_down: upload_bf16_from_f32(&mk_rand(&mut seed, h * m, 0.05), &device)
+                .expect("sh_down"),
+            dense_storage: MoeDenseStorage::Bf16,
+            expert_gate_affine: None,
+            expert_up_affine: None,
+            expert_down_affine: None,
+        };
+        const REPS: usize = 15;
+        for seq in [85usize, 157, 271, 512, 682] {
+            let x = upload_f32(&mk_rand(&mut seed, seq * h, 1.0), &device).expect("x");
+            let residual = upload_f32(&mk_rand(&mut seed, seq * h, 1.0), &device).expect("res");
+            let mut arena =
+                super::super::MoeFfnArena::new(&device, seq as u32, 2048, 8, 512, 512, 256)
+                    .expect("MoeFfnArena");
+            let mut out_slot = device
+                .alloc_buffer(seq * h * 4, DType::F32, vec![seq, h])
+                .expect("out slot");
+            let mut samples = [Vec::new(), Vec::new()];
+            for rep in 0..REPS + 2 {
+                for per_call in [rep % 2 == 0, rep % 2 != 0] {
+                    FORCE_PER_CALL_EXPERT_SCHEDULE.with(|force| force.set(per_call));
+                    let mut enc = device.command_encoder().expect("encoder");
+                    let built = build_moe_ffn_layer_gpu_q_into_with_arena(
+                        &mut enc,
+                        &device,
+                        &mut registry,
+                        &x,
+                        &weights,
+                        shape,
+                        Some(&residual),
+                        &mut arena,
+                        &mut out_slot,
+                        0,
+                    );
+                    FORCE_PER_CALL_EXPERT_SCHEDULE.with(|force| force.set(false));
+                    built.expect("moe ffn arena build");
+                    let (start, end) = enc.commit_wait_with_gpu_time().expect("commit");
+                    if rep >= 2 {
+                        samples[usize::from(!per_call)].push((end - start) * 1.0e6);
+                    }
+                }
+            }
+            let median = |values: &mut Vec<f64>| {
+                values.sort_by(f64::total_cmp);
+                values[values.len() / 2]
+            };
+            let per_call_us = median(&mut samples[0]);
+            let shared_us = median(&mut samples[1]);
+            println!(
+                "{{\"bench\":\"qwen36_prefill_moe_ffn_layer\",\"seq\":{seq},\"reps\":{REPS},\"per_call_schedule_gpu_us\":{per_call_us:.1},\"shared_schedule_gpu_us\":{shared_us:.1},\"delta_us\":{:.1}}}",
+                shared_us - per_call_us
+            );
+        }
+    }
+
+    /// P1 top-k gate: prefill may move to the SIMD routing kernel only if it
+    /// reproduces the legacy `moe_softmax_topk_f32` ids and weights bit for
+    /// bit at prefill shapes (256 experts, top-8; real-like logits, ties,
+    /// ±0, denormals, NaN, ±inf). Ignored because it fails on mlx-native
+    /// 0.17.0: the SIMD kernel's softmax sum is reduced in SIMD order, so its
+    /// weights differ in the last bits on about a third of real-like rows,
+    /// and it orders NaN/±inf logits differently. Run it to re-check a newer
+    /// kernel.
+    #[test]
+    #[ignore = "fails on mlx-native 0.17.0; the prefill top-k stays on the legacy kernel"]
+    fn moe_prefill_topk_simd_bitwise_gate() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk_simd;
+        let device = MlxDevice::new().expect("Metal device unavailable");
+        let mut registry = KernelRegistry::new();
+        let (ne, k) = (256usize, 8usize);
+        let mut seed = 0x5EED_1234_u32;
+        let mut report = Vec::new();
+        let mut total_bad = 0usize;
+        for t in [5usize, 31, 85, 157, 271, 512, 682, 2048] {
+            for kind in ["real", "ties", "zeros", "denormal", "nan", "huge"] {
+                let mut logits = Vec::with_capacity(t * ne);
+                for row in 0..t {
+                    let base = mk_rand(&mut seed, ne, 1.0);
+                    for (e, &u) in base.iter().enumerate() {
+                        let v = match kind {
+                            "real" => {
+                                // Sum of uniforms ~ normal, router-like scale + row offset.
+                                let s: f32 = mk_rand(&mut seed, 3, 1.0).iter().sum();
+                                s * 2.5 + (row % 7) as f32 * 0.3
+                            }
+                            "ties" => {
+                                if row % 3 == 0 {
+                                    0.75
+                                } else {
+                                    (u * 4.0).round() / 4.0
+                                }
+                            }
+                            "zeros" => match e % 4 {
+                                0 => 0.0,
+                                1 => -0.0,
+                                2 => {
+                                    if u > 0.5 {
+                                        u
+                                    } else {
+                                        -0.0
+                                    }
+                                }
+                                _ => u * 1e-3,
+                            },
+                            "denormal" => u * f32::MIN_POSITIVE * 0.5,
+                            "nan" => {
+                                if (e + row) % 37 == 0 {
+                                    f32::NAN
+                                } else {
+                                    u * 3.0
+                                }
+                            }
+                            _ => match e % 5 {
+                                0 => u * 1e30,
+                                1 => f32::INFINITY * u.signum(),
+                                _ => u * 80.0,
+                            },
+                        };
+                        logits.push(v);
+                    }
+                }
+                let logits_buf = upload_f32(&logits, &device).expect("logits");
+                let alloc = |dtype: DType| {
+                    device
+                        .alloc_buffer(t * k * 4, dtype, vec![t * k])
+                        .expect("out")
+                };
+                let (ids_a, w_a, ids_b, w_b) = (
+                    alloc(DType::U32),
+                    alloc(DType::F32),
+                    alloc(DType::U32),
+                    alloc(DType::F32),
+                );
+                let mut enc = device.command_encoder().expect("encoder");
+                dispatch_moe_softmax_topk(
+                    &mut enc,
+                    &mut registry,
+                    &device,
+                    &logits_buf,
+                    &ids_a,
+                    &w_a,
+                    t as u32,
+                    ne as u32,
+                    k as u32,
+                )
+                .expect("legacy topk");
+                dispatch_moe_softmax_topk_simd(
+                    &mut enc,
+                    &mut registry,
+                    &device,
+                    &logits_buf,
+                    &ids_b,
+                    &w_b,
+                    t as u32,
+                    ne as u32,
+                    k as u32,
+                )
+                .expect("simd topk");
+                enc.commit_and_wait().expect("commit topk");
+                let (ia, ib) = (bits(&ids_a, t * k), bits(&ids_b, t * k));
+                let (wa, wb) = (bits(&w_a, t * k), bits(&w_b, t * k));
+                let bad_ids = ia.iter().zip(&ib).filter(|(a, b)| a != b).count();
+                let bad_w = wa.iter().zip(&wb).filter(|(a, b)| a != b).count();
+                let bad_rows = (0..t)
+                    .filter(|r| {
+                        ia[r * k..(r + 1) * k] != ib[r * k..(r + 1) * k]
+                            || wa[r * k..(r + 1) * k] != wb[r * k..(r + 1) * k]
+                    })
+                    .count();
+                total_bad += bad_rows;
+                report.push(format!(
+                    "T={t} kind={kind} rows={t} bad_rows={bad_rows} id_mismatch={bad_ids} weight_bit_mismatch={bad_w}"
+                ));
+            }
+        }
+        for line in &report {
+            eprintln!("topk_gate {line}");
+        }
+        assert_eq!(
+            total_bad, 0,
+            "SIMD top-k is not bitwise equal to the legacy kernel"
+        );
+    }
 }

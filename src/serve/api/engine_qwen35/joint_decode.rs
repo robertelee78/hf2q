@@ -21,13 +21,15 @@ use anyhow::{Context, Result};
 use std::time::Instant;
 
 use crate::inference::models::qwen35::joint_decode_routes::{JointDenseFfnRoute, JointRouteMode};
+use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
 use crate::inference::models::qwen35::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput};
 use crate::serve::api::engine_supervisor::EngineSupervisor;
+use crate::serve::api::qwen35_speculation::QwenSpeculationRoute;
 
 use super::{
     mtp_cursor_for_slot, rollback_slot_mtp_error, Qwen35CoherentTarget, Qwen35DecodeState,
-    Qwen35LoadedModel, Qwen35TickOutcome, QWEN35_WORKER_TRANSACTION_TIMEOUT,
+    Qwen35LoadedModel, Qwen35TickKind, Qwen35TickOutcome, QWEN35_WORKER_TRANSACTION_TIMEOUT,
 };
 
 /// How a prepared joint row commits its target result.
@@ -69,6 +71,30 @@ impl Qwen35DecodeState {
         match self.mtp {
             Some(_) => mtp_cursor_for_slot(kv_cache, self.slot_id).is_ok_and(|mtp| mtp == cursor),
             None => true,
+        }
+    }
+
+    /// Whether this slot's serial tick is the ordinary target forward: no
+    /// MTP state and no history lookup, so a one-lane joint step replaces
+    /// exactly that forward and suppresses no speculation (#717).
+    pub(in crate::serve::api) fn ordinary_target_only(&self) -> bool {
+        self.mtp.is_none() && self.history_lookup.is_none()
+    }
+
+    /// Joint-partition class of a joint-ready lane: `Some(ordinary)` lets it
+    /// join, `None` keeps it on the serial loop.
+    /// - Repeatable route: only a lane whose planned tick is `Ordinary` joins,
+    ///   as an ordinary row (alone included in padded mode); a lane that
+    ///   speculates, drains verified output or has no plan stays serial, so
+    ///   its route never depends on the cohort.
+    /// - Adaptive route (phase 1): any joint-ready lane joins a group of two
+    ///   or more as an M1 row; alone it joins only without speculation state.
+    pub(in crate::serve::api) fn joint_lane_class(&self) -> Option<bool> {
+        match self.speculation_route() {
+            QwenSpeculationRoute::Repeatable => {
+                matches!(self.planned_tick(), Some(Qwen35TickKind::Ordinary)).then_some(true)
+            }
+            QwenSpeculationRoute::Adaptive => Some(self.ordinary_target_only()),
         }
     }
 
@@ -173,16 +199,17 @@ impl Qwen35LoadedModel {
         kv_cache: &mut HybridKvCache,
         mode: JointRouteMode,
         dense_ffn: JointDenseFfnRoute,
+        options: JointStepOptions,
         supervisor: &EngineSupervisor,
     ) -> Result<Vec<Qwen35JointRowOutput>> {
         let lease = supervisor.arm("Qwen35 joint decode", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
         let forward = self
             .model
-            .forward_gpu_decode_joint(rows, kv_cache, mode, dense_ffn);
+            .forward_gpu_decode_joint_with_options(rows, kv_cache, mode, dense_ffn, options);
         lease.finish()?;
         let outputs = forward.with_context(|| {
             format!(
-                "Qwen35Model::forward_gpu_decode_joint ({} rows, {} mode, {} dense FFN)",
+                "Qwen35Model::forward_gpu_decode_joint_with_options ({} rows, {} mode, {} dense FFN, {options:?})",
                 rows.len(),
                 mode.label(),
                 dense_ffn.label()

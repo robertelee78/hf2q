@@ -244,6 +244,11 @@ pub struct Qwen35LoadedModel {
     /// native runner owns no persistent speculative KV yet, so this state
     /// deliberately contains no cache tensors.
     pub speculation: super::qwen35_speculation::QwenSpeculationController,
+    /// #727: host byte budget of the SlotAware reclaimed-slot spill store
+    /// (`serve.slot_spill_budget`). Load sets the documented default;
+    /// `load_engine` applies the operator's resolved value. `0` disables
+    /// spilling.
+    pub slot_spill_budget_bytes: u64,
 }
 
 impl Qwen35LoadedModel {
@@ -260,37 +265,6 @@ impl Qwen35LoadedModel {
     /// - GGUF open / parse
     /// - `Qwen35Model::load_from_gguf` (weights load via mlx-native)
     /// - tokenizer file resolution + parse
-    /// ADR-044: the Qwen3.8-qualified K-quant width-four decode route
-    /// (`HF2Q_DECODE_MVN=0` + `HF2Q_DECODE_MV_EXT=1`, qualified by the
-    /// native qL4 decision/cache gate and the matched ABBA receipt) was
-    /// previously applied only by the canonical `serve_qwen38_opencode.sh`
-    /// launcher. Loading a Qwen3.8-identified model now applies the same
-    /// route by default, at engine load, before the first quantized matmul
-    /// snapshots mlx-native's process-global routing policy. Explicit
-    /// operator-exported values always win.
-    ///
-    /// The route stays Qwen3.8-scoped on purpose: unlike the default-on
-    /// byte-exact mvN route, `mul_mv_ext` is not bit-exact, and no other
-    /// model family carries the qualifying receipt. The id match mirrors
-    /// the serve registry's deliberately fuzzy substring philosophy.
-    ///
-    /// Multi-model note: mlx-native's routing policy is process-global and
-    /// cached on first dispatch, so this default can only take effect when
-    /// the Qwen3.8 load precedes the process's first quantized matmul —
-    /// the same per-process scope the launcher always had.
-    fn apply_qwen38_qualified_decode_route(model_path: &std::path::Path) {
-        let id = model_path.to_string_lossy().to_ascii_lowercase();
-        if !(id.contains("qwen38") || id.contains("qwen3.8")) {
-            return;
-        }
-        for (key, value) in [("HF2Q_DECODE_MVN", "0"), ("HF2Q_DECODE_MV_EXT", "1")] {
-            if std::env::var_os(key).is_none() {
-                std::env::set_var(key, value);
-                tracing::info!(key, value, "applied Qwen3.8-qualified decode route default");
-            }
-        }
-    }
-
     pub fn load(opts: &LoadOptions) -> Result<Self> {
         Self::load_with_context(opts, None)
     }
@@ -305,7 +279,6 @@ impl Qwen35LoadedModel {
     ) -> Result<Self> {
         let load_start = Instant::now();
         let model_path = &opts.model_path;
-        Self::apply_qwen38_qualified_decode_route(model_path);
         anyhow::ensure!(
             model_path.exists(),
             "Model not found: {}",
@@ -363,6 +336,23 @@ impl Qwen35LoadedModel {
         );
         let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
             .context("Qwen35Model::load_from_gguf")?;
+        // ADR-044 / #729: Qwen3.8 is qualified on the K-quant width-four
+        // decode route (mvN off, `mul_mv_ext` on); no other family carries
+        // that receipt because `mul_mv_ext` is not bit-exact. The route is a
+        // property of this model, resolved from its identity and the explicit
+        // operator environment and frozen into this model's kernel
+        // registries. The process environment is never written, so models
+        // loaded before or after this one keep their own policy.
+        let routing_policy =
+            crate::inference::models::qwen35::routing_policy::resolve_qwen_ggml_routing_policy(
+                model_path,
+            );
+        model.bind_ggml_routing_policy(routing_policy);
+        tracing::info!(
+            dense_decode_mvn = routing_policy.dense_decode_mvn,
+            dense_decode_mv_ext = routing_policy.dense_decode_mv_ext,
+            "Qwen GGML routing policy bound to model"
+        );
 
         // ADR-053: bind a GLP steering vector when the operator supplied one.
         // Fail-closed: any loader/conformance error aborts the serve load
@@ -625,15 +615,13 @@ impl Qwen35LoadedModel {
             vision_special_tokens_present,
             prompt_cache: HybridPromptCache::new(),
             // ADR-017 Phase E.a default-on — byte-budget LcpRegistry.
-            // Budget computed from sysinfo available_memory() × 5%
-            // clamped to [1 GiB, 16 GiB], or overridden via
-            // `HF2Q_KV_LCP_RESUME_CAPACITY` (byte-suffix form e.g. `2g`;
-            // legacy bare-integer < 4096 still accepted as entry-count
-            // × 300 MB with a deprecation warning). See
-            // `qwen35_lcp_registry_byte_budget` for the sizing rationale.
+            // The budget is the operator setting resolved once by `serve`
+            // (`--lcp-resume-budget` > `[serve] lcp_resume_budget` >
+            // host-independent 8 GiB) and carried in `LoadOptions`; it
+            // never depends on free memory or model-load order.
             lcp_registry:
                 crate::serve::kv_persist::lcp_registry::LcpRegistry::with_byte_budget(
-                    qwen35_lcp_registry_byte_budget(),
+                    opts.lcp_resume_budget.bytes(),
                 ),
             // Wired by AppState via LoadedModel::generate at request
             // time; None by default.
@@ -693,9 +681,10 @@ impl Qwen35LoadedModel {
             persistent_kv_cache: None,
             // ADR-044 (2026-08-21) / ADR-063 D1: an unset
             // HF2Q_QWEN_SPECULATION is `auto` here (one slot); a SlotAware
-            // worker re-resolves it at start, to `off` for dense artifacts
-            // with max_slots >= 4. Explicit values always win.
+            // worker re-resolves it at start, to `off` when it selected joint
+            // decode with max_slots >= 4. Explicit values always win.
             speculation: super::qwen35_speculation::QwenSpeculationController::from_environment(),
+            slot_spill_budget_bytes: crate::serve::operator_settings::DEFAULT_SLOT_SPILL_BUDGET_BYTES,
         };
 
         // ADR-027 sub-iter 23d-γ (2026-08-03) — the TQ × persist and
@@ -1096,6 +1085,7 @@ impl LoadInfoBuilder for Qwen35LoadedModel {
                 self.tq_kv_active,
             )),
             kv_fixed_bytes_per_slot_override: Some(load_info::qwen35_fixed_kv_bytes_per_slot(cfg)),
+            gemma_warm_attention_kernel: None,
         }
     }
 }
@@ -2004,22 +1994,6 @@ fn store_qwen35_latest_turn_checkpoint(
         }
         Err(error) => lcp_snapshot_error_notify(phase, anchor, &error),
     }
-}
-
-/// ADR-017 Phase E.a default-on — byte budget for the Qwen35 LCP registry.
-///
-/// Delegates entirely to `default_lcp_byte_budget()` in `lcp_registry.rs`,
-/// which probes `sysinfo::available_memory() × 5%` clamped to
-/// `[1 GiB, 16 GiB]`, with `HF2Q_KV_LCP_RESUME_CAPACITY` override support.
-///
-/// Rationale: `HybridKvCacheSnapshot::total_bytes()` is the exact per-entry
-/// cost (e.g. ~300 MB on Qwen 3.6 35B-A3B at stride=1024 with 8K tokens,
-/// per the `c04d5d2` motivation for cap=8 ≈ 2.4 GB). The sysinfo-derived
-/// budget on a 128 GB Mac with ~100 GB free ≈ 5 GB ≈ 16 entries at 300 MB
-/// each — a natural replacement for the hard-coded cap=8. Operators who
-/// want more entries raise the budget via `HF2Q_KV_LCP_RESUME_CAPACITY=10g`.
-pub fn qwen35_lcp_registry_byte_budget() -> u64 {
-    crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget()
 }
 
 fn qwen35_reported_cached_tokens(
@@ -4471,6 +4445,37 @@ pub(crate) struct Qwen35DecodeState {
     /// History lookup has negligible proposal cost, but its block target
     /// verifier can still lose on a particular model/device.
     history_cost: SpeculationCostController,
+    /// Routing and cost-gate mode captured at admission.
+    route: super::qwen35_speculation::QwenSpeculationRoute,
+    /// This turn's decision, planned before the joint partition and executed
+    /// by the joint step (Ordinary) or the serial loop (every kind).
+    planned_tick: Option<Qwen35TickKind>,
+}
+
+/// Route of one decode tick, decided from the request's own state by
+/// [`Qwen35DecodeState::next_tick_kind`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Qwen35TickKind {
+    /// Drain one already verified output token; no forward.
+    Commit,
+    /// A history-lookup verify round over these drafts.
+    History(Vec<u32>),
+    /// A fixed-depth-three MTP round.
+    K3,
+    /// One ordinary target decision (plus MTP catch-up when MTP state is
+    /// held): the only kind a joint step serves under the repeatable route.
+    Ordinary,
+}
+
+impl Qwen35TickKind {
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::History(_) => "history",
+            Self::K3 => "k3",
+            Self::Ordinary => "ordinary",
+        }
+    }
 }
 
 struct Qwen35SlotMtpState {
@@ -4492,6 +4497,9 @@ pub(in crate::serve::api) struct Qwen35CoherentTarget {
 #[path = "engine_qwen35/joint_decode.rs"]
 mod joint_decode;
 pub(in crate::serve::api) use joint_decode::Qwen35JointLane;
+#[path = "engine_qwen35/k3_transaction.rs"]
+mod k3_transaction;
+use k3_transaction::K3_VERIFY_ROWS;
 #[cfg(test)]
 #[path = "engine_qwen35/speculation_qualification_tests.rs"]
 mod speculation_qualification_tests;
@@ -4499,8 +4507,17 @@ mod speculation_qualification_tests;
 #[path = "engine_qwen35/speculation_real_artifact_tests.rs"]
 mod speculation_real_artifact_tests;
 #[cfg(test)]
+#[path = "engine_qwen35/round_slot_independence_tests.rs"]
+mod round_slot_independence_tests;
+#[cfg(test)]
+#[path = "engine_qwen35/slot_spill_resume_tests.rs"]
+mod slot_spill_resume_tests;
+#[cfg(test)]
 #[path = "engine_qwen35/text_decode_tests.rs"]
 mod text_decode_tests;
+#[cfg(test)]
+#[path = "engine_qwen35/tick_route_tests.rs"]
+mod tick_route_tests;
 
 const QWEN35_REPETITION_WINDOW: usize = 64;
 
@@ -5094,6 +5111,8 @@ impl Qwen35DecodeState {
         } else {
             None
         };
+        // Repeatable route: fixed-cost proposer gates; adaptive: wall time.
+        let cost_model = qwen.speculation.cost_model();
 
         Ok(Self {
             slot_id,
@@ -5124,8 +5143,14 @@ impl Qwen35DecodeState {
             history_lookup,
             pending_speculation_output: VecDeque::new(),
             terminal_after_pending: false,
-            mtp_cost: SpeculationCostController::new(),
-            history_cost: SpeculationCostController::new(),
+            mtp_cost: cost_model.map_or_else(SpeculationCostController::new, |model| {
+                SpeculationCostController::modelled(model.mtp_round)
+            }),
+            history_cost: cost_model.map_or_else(SpeculationCostController::new, |model| {
+                SpeculationCostController::modelled(model.history_round)
+            }),
+            route: qwen.speculation.route(),
+            planned_tick: None,
         })
     }
 
@@ -5256,15 +5281,111 @@ impl Qwen35DecodeState {
                 finished: true,
             });
         }
-        if let Some(token) = take_pending_speculation_output(&mut self.pending_speculation_output) {
-            return self.commit_speculation_output(qwen, token);
+        let kind = match self.planned_tick.take() {
+            Some(kind) => kind,
+            None => self.next_tick_kind()?,
+        };
+        match kind {
+            Qwen35TickKind::Commit => {
+                let token = take_pending_speculation_output(&mut self.pending_speculation_output)
+                    .context("Qwen commit tick without pending verified output")?;
+                self.commit_speculation_output(qwen, token)
+            }
+            Qwen35TickKind::History(drafts) => {
+                self.history_round(qwen, kv_cache, supervisor, drafts)
+            }
+            Qwen35TickKind::K3 => self.mtp_k3_round(qwen, kv_cache, supervisor),
+            Qwen35TickKind::Ordinary if self.mtp.is_some() => {
+                self.decode_tick_mtp_warmup(qwen, kv_cache, supervisor)
+            }
+            Qwen35TickKind::Ordinary => self.ordinary_target_tick(qwen, kv_cache, supervisor),
         }
-        if self.history_lookup.is_some() {
-            return self.decode_tick_history_lookup(qwen, kv_cache, supervisor);
+    }
+
+    /// The single decision point for a tick's route (the repeatable route's
+    /// contract): it reads only this request's own state (pending verified
+    /// output, proposer ledgers, step bound and proposer cost gates) and never
+    /// the cohort or wall time, apart from the gates' measured inputs under
+    /// `HF2Q_QWEN_SPECULATION_ROUTE=adaptive`. Mutates only what the former
+    /// tick did before choosing: the history ledger sync, the no-match
+    /// counter and the permanent MTP drop after a cost-disabled history miss.
+    pub(in crate::serve::api) fn next_tick_kind(&mut self) -> Result<Qwen35TickKind> {
+        if !self.pending_speculation_output.is_empty() {
+            return Ok(Qwen35TickKind::Commit);
         }
-        if self.mtp.is_some() {
-            return self.decode_tick_mtp_k3(qwen, kv_cache, supervisor);
+        let remaining = self.max_tokens.saturating_sub(self.generated_tokens.len());
+        if let Some(lookup) = self.history_lookup.as_mut() {
+            if self.history_cost.may_speculate() {
+                let expected_len = self.prompt_tokens.len() + self.generated_tokens.len();
+                if lookup.verified_len() < expected_len {
+                    let generated_cursor = lookup
+                        .verified_len()
+                        .checked_sub(self.prompt_tokens.len())
+                        .context("Qwen history lookup precedes prompt boundary")?;
+                    lookup.extend_verified(&self.generated_tokens[generated_cursor..]);
+                }
+                anyhow::ensure!(
+                    lookup.verified_len() == expected_len,
+                    "Qwen history lookup ledger cursor mismatch"
+                );
+                let mut drafts = lookup.propose();
+                drafts.truncate(remaining.saturating_sub(1).min(3));
+                if !drafts.is_empty() {
+                    return Ok(Qwen35TickKind::History(drafts));
+                }
+                super::qwen35_speculation::record_history_lookup_no_match();
+                if self.mtp.is_some() && !may_route_history_miss_to_mtp(true, &self.mtp_cost) {
+                    // Once MTP is cost-disabled, ordinary target decode may
+                    // advance without reconciling its cache. Drop the semantic
+                    // state permanently rather than restore a lagging proposer.
+                    self.mtp = None;
+                }
+            }
         }
+        if self.mtp.is_some() && remaining >= K3_VERIFY_ROWS && self.mtp_cost.may_speculate() {
+            return Ok(Qwen35TickKind::K3);
+        }
+        Ok(Qwen35TickKind::Ordinary)
+    }
+
+    /// Plan this tick before a decode turn partitions its lanes, so the joint
+    /// partition and the serial loop execute the same decision. Returns the
+    /// planned kind for the partition's eligibility, or `None` for a lane at
+    /// its step bound: `decode_tick` finishes it without a route decision.
+    pub(in crate::serve::api) fn plan_tick(&mut self) -> Result<Option<&Qwen35TickKind>> {
+        if self.step >= self.max_tokens {
+            return Ok(None);
+        }
+        if self.planned_tick.is_none() {
+            self.planned_tick = Some(self.next_tick_kind()?);
+        }
+        Ok(self.planned_tick.as_ref())
+    }
+
+    /// The planned kind, if this turn planned one.
+    pub(in crate::serve::api) fn planned_tick(&self) -> Option<&Qwen35TickKind> {
+        self.planned_tick.as_ref()
+    }
+
+    /// Discard a plan that a joint step consumed (its ordinary row ran there).
+    pub(in crate::serve::api) fn consume_planned_tick(&mut self) {
+        self.planned_tick = None;
+    }
+
+    /// The speculation route this request was admitted with.
+    pub(in crate::serve::api) fn speculation_route(
+        &self,
+    ) -> super::qwen35_speculation::QwenSpeculationRoute {
+        self.route
+    }
+
+    /// One ordinary target decision without MTP state.
+    fn ordinary_target_tick(
+        &mut self,
+        qwen: &mut Qwen35LoadedModel,
+        kv_cache: &mut HybridKvCache,
+        supervisor: &EngineSupervisor,
+    ) -> Result<Qwen35TickOutcome> {
         let ordinary_target_started = Instant::now();
         let pos = self.decode_position_base + self.step - 1;
         let pos_i32 = pos as i32;
@@ -5435,69 +5556,18 @@ impl Qwen35DecodeState {
         })
     }
 
-    /// Target-verified request-history speculation. The lookup may return up
-    /// to three continuation tokens; one target batch verifies the block and,
-    /// when MTP is available, reconciles that same batch into its K/V cache so
-    /// proposer selection can change on the next round without state drift.
-    fn decode_tick_history_lookup(
+    /// Target-verified request-history speculation over `drafts` (one to
+    /// three continuation tokens chosen by [`Self::next_tick_kind`]); one
+    /// target batch verifies the block and, when MTP is available, reconciles
+    /// that same batch into its K/V cache so proposer selection can change on
+    /// the next round without state drift.
+    fn history_round(
         &mut self,
         qwen: &mut Qwen35LoadedModel,
         kv_cache: &mut HybridKvCache,
         supervisor: &EngineSupervisor,
+        drafts: Vec<u32>,
     ) -> Result<Qwen35TickOutcome> {
-        if let Some(token) = take_pending_speculation_output(&mut self.pending_speculation_output) {
-            return self.commit_speculation_output(qwen, token);
-        }
-        if !self.history_cost.may_speculate() {
-            let lookup = self
-                .history_lookup
-                .take()
-                .expect("history lookup checked above");
-            let outcome = self.decode_tick(qwen, kv_cache, supervisor);
-            self.history_lookup = Some(lookup);
-            return outcome;
-        }
-
-        let expected_len = self.prompt_tokens.len() + self.generated_tokens.len();
-        let lookup = self
-            .history_lookup
-            .as_mut()
-            .expect("history lookup checked above");
-        if lookup.verified_len() < expected_len {
-            let generated_cursor = lookup
-                .verified_len()
-                .checked_sub(self.prompt_tokens.len())
-                .context("Qwen history lookup precedes prompt boundary")?;
-            lookup.extend_verified(&self.generated_tokens[generated_cursor..]);
-        }
-        anyhow::ensure!(
-            lookup.verified_len() == expected_len,
-            "Qwen history lookup ledger cursor mismatch"
-        );
-        let remaining = self.max_tokens.saturating_sub(self.generated_tokens.len());
-        let mut drafts = lookup.propose();
-        drafts.truncate(remaining.saturating_sub(1).min(3));
-        if drafts.is_empty() {
-            super::qwen35_speculation::record_history_lookup_no_match();
-            let mut lookup = self
-                .history_lookup
-                .take()
-                .expect("history lookup checked above");
-            if self.mtp.is_some() && !may_route_history_miss_to_mtp(true, &self.mtp_cost) {
-                // Once MTP is cost-disabled, ordinary target decode may
-                // advance without reconciling its cache. Drop the semantic
-                // state permanently rather than restore a lagging proposer.
-                self.mtp = None;
-            }
-            let committed_before = self.generated_tokens.len();
-            let outcome = self.decode_tick(qwen, kv_cache, supervisor);
-            if self.generated_tokens.len() > committed_before {
-                lookup.extend_verified(&self.generated_tokens[committed_before..]);
-            }
-            self.history_lookup = Some(lookup);
-            return outcome;
-        }
-
         let round_started = Instant::now();
         let next_token = *self
             .generated_tokens
@@ -5757,337 +5827,25 @@ impl Qwen35DecodeState {
     /// reconciles the MTP K/V cache.
     /// Partial rejection commits the valid prefix directly from captured
     /// target state; no ordinary replay is required.
-    fn decode_tick_mtp_k3(
+    /// The transaction units live in `k3_transaction` (ADR-065 J1); this
+    /// wrapper keeps the solo-only policy: phase profile, proposer timing and
+    /// the cost controller. [`Self::next_tick_kind`] admits it (MTP state, at
+    /// least four output tokens remaining, the MTP gate open).
+    pub(in crate::serve::api) fn mtp_k3_round(
         &mut self,
         qwen: &mut Qwen35LoadedModel,
         kv_cache: &mut HybridKvCache,
         supervisor: &EngineSupervisor,
     ) -> Result<Qwen35TickOutcome> {
-        const DRAFT_DEPTH: usize = 3;
-        const VERIFY_ROWS: usize = DRAFT_DEPTH + 1;
-
-        if let Some(token) = take_pending_speculation_output(&mut self.pending_speculation_output) {
-            return self.commit_speculation_output(qwen, token);
-        }
-        let remaining = self.max_tokens.saturating_sub(self.generated_tokens.len());
-        if remaining < VERIFY_ROWS || !self.mtp_cost.may_speculate() {
-            return self.decode_tick_mtp_warmup(qwen, kv_cache, supervisor);
-        }
-
         let round_started = Instant::now();
         let phase_profile = std::env::var("HF2Q_MTP_PHASE_PROFILE").as_deref() == Ok("1");
-        let next_token = *self
-            .generated_tokens
-            .last()
-            .context("Qwen SlotAware MTP K3 needs a seeded output token")?;
-        let next_pos = (self.decode_position_base + self.generated_tokens.len() - 1) as i32;
-        let prior_target_len = kv_cache
-            .sequence_len_for_slot(self.slot_id)
-            .context("Qwen SlotAware MTP K3 read target cursor")?;
-        let prior_mtp_len = mtp_cursor_for_slot(kv_cache, self.slot_id)?;
-        anyhow::ensure!(
-            prior_target_len == prior_mtp_len,
-            "Qwen SlotAware MTP K3 requires equal entry cursors (target={prior_target_len}, mtp={prior_mtp_len})"
-        );
-
-        let mtp = qwen
-            .model
-            .mtp
-            .as_ref()
-            .context("Qwen SlotAware MTP K3 weights missing")?;
-        let initial_hidden = &self
-            .mtp
-            .as_ref()
-            .context("Qwen SlotAware MTP K3 state missing")?
-            .verifier_hidden;
-        if let Err(error) = qwen.model.with_gpu_cache_mut(|device, _registry| {
-            kv_cache
-                .ensure_la_capture(&qwen.model.cfg, device, VERIFY_ROWS as u32)
-                .context("Qwen SlotAware MTP K3 allocate recurrent capture")
-        }) {
-            kv_cache.clear_la_capture();
-            return Err(error);
-        }
-        let draft_lease = match supervisor.arm(
-            "Qwen35 SlotAware MTP K3 draft",
-            QWEN35_WORKER_TRANSACTION_TIMEOUT,
-        ) {
-            Ok(lease) => lease,
-            Err(error) => {
-                kv_cache.clear_la_capture();
-                return Err(error.context("Qwen SlotAware MTP K3 draft admission"));
-            }
-        };
-        let drafted = qwen.model.with_gpu_cache_mut(|device, registry| {
-            let mut drafts = Vec::with_capacity(DRAFT_DEPTH);
-            let mut chain_hidden: Option<MlxBuffer> = None;
-            let mut chain_token = next_token;
-            for depth in 0..DRAFT_DEPTH {
-                let shared_embed =
-                    qwen.model
-                        .embed_tokens_gpu_in_context(&[chain_token], device, registry)?;
-                let previous = chain_hidden.as_ref().unwrap_or(initial_hidden);
-                let (token, next_hidden) = mtp.forward_draft_greedy_for_token(
-                    previous,
-                    chain_token,
-                    &shared_embed,
-                    kv_cache,
-                    self.slot_id,
-                    &[next_pos + depth as i32; 4],
-                    device,
-                    registry,
-                    &qwen.model.cfg,
-                )?;
-                drafts.push(token);
-                chain_token = token;
-                chain_hidden = Some(next_hidden);
-            }
-            Ok::<_, anyhow::Error>(drafts)
-        });
-        let draft_supervision = draft_lease.finish();
-        if let Err(error) = draft_supervision.and(
-            drafted
-                .as_ref()
-                .map(|_| ())
-                .map_err(|e| anyhow::anyhow!("{e:#}")),
-        ) {
-            kv_cache.clear_la_capture();
-            return rollback_slot_mtp_draft_error(
-                kv_cache,
-                self.slot_id,
-                prior_mtp_len,
-                error,
-                "Qwen SlotAware MTP K3 draft",
-            );
-        }
-        let drafts = drafted.expect("draft result checked above");
-        if let Err(error) = kv_cache.truncate_mtp_to_for_slot(self.slot_id, prior_mtp_len) {
-            kv_cache.clear_la_capture();
-            return rollback_slot_mtp_draft_error(
-                kv_cache,
-                self.slot_id,
-                prior_mtp_len,
-                error,
-                "Qwen SlotAware MTP K3 discard speculative draft cache",
-            );
-        }
-        #[cfg(test)]
-        q1_speculation::first_fork::after_draft_discard(next_pos, kv_cache)?;
+        let entry = self.k3_entry(kv_cache)?;
+        let draft = self.k3_draft(qwen, kv_cache, supervisor, entry)?;
         let draft_elapsed = round_started.elapsed();
-        #[cfg(test)]
-        let drafts = q1_speculation::after_drafts(next_pos, prior_target_len, prior_mtp_len, drafts)?;
-
-
-        let mut verify_input = Vec::with_capacity(VERIFY_ROWS);
-        verify_input.push(next_token);
-        verify_input.extend_from_slice(&drafts);
-        let verify_positions = crate::inference::models::qwen35::spec_decode::positions_for_range(
-            next_pos,
-            VERIFY_ROWS,
-        );
-        let verify_lease = match supervisor.arm(
-            "Qwen35 SlotAware MTP K3 verify",
-            QWEN35_WORKER_TRANSACTION_TIMEOUT,
-        ) {
-            Ok(lease) => lease,
-            Err(error) => {
-                kv_cache.clear_la_capture();
-                return Err(error.context("Qwen SlotAware MTP K3 verify admission"));
-            }
-        };
-        let verify_started = Instant::now();
-        let verified = {
-            let _native_role = crate::inference::native_observation::target_verify();
-            qwen.model.forward_gpu_with_nextn_hidden_buffer(
-                &verify_input,
-                &verify_positions,
-                kv_cache,
-                self.slot_id,
-            )
-        };
-        let verify_supervision = verify_lease.finish();
-        let (mut verify_logits, verify_hidden) = match (verify_supervision, verified) {
-            (Ok(()), Ok(value)) => value,
-            (supervision, forward) => {
-                let error = supervision
-                    .err()
-                    .or_else(|| forward.err())
-                    .expect("failed verification has an error");
-                kv_cache.clear_la_capture();
-                kv_cache.reset_for_slot(self.slot_id).with_context(|| {
-                    format!("Qwen SlotAware MTP K3 verify failed ({error:#}); fail-closed reset")
-                })?;
-                return Err(error.context("Qwen SlotAware MTP K3 verify"));
-            }
-        };
-        #[cfg(test)]
-        q1_speculation::first_fork::verifier_pre_catchup(next_pos, &verify_logits, &verify_hidden)?;
-        let verify_elapsed = verify_started.elapsed();
-        let vocab = qwen.vocab_size;
-        if verify_logits.element_count() != VERIFY_ROWS * vocab
-            || verify_hidden.element_count() != VERIFY_ROWS * qwen.model.cfg.hidden_size as usize
-        {
-            let error = anyhow::anyhow!(
-                "Qwen SlotAware MTP K3 verify shape mismatch: logits={} expected={}, hidden={} expected={}",
-                verify_logits.element_count(),
-                VERIFY_ROWS * vocab,
-                verify_hidden.element_count(),
-                VERIFY_ROWS * qwen.model.cfg.hidden_size as usize,
-            );
-            kv_cache.clear_la_capture();
-            kv_cache
-                .reset_for_slot(self.slot_id)
-                .context("Qwen SlotAware MTP K3 shape failure reset")?;
-            return Err(error);
-        }
-
-        let embed_started = Instant::now();
-        let shared_embed_rows = match qwen.model.embed_tokens_gpu(&verify_input) {
-            Ok(rows) => rows,
-            Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 embedding failure reset")?;
-                return Err(error.context("Qwen SlotAware MTP K3 verifier embeddings"));
-            }
-        };
-        let embed_elapsed = embed_started.elapsed();
-        let catchup_lease = match supervisor.arm(
-            "Qwen35 SlotAware MTP K3 target catch-up",
-            QWEN35_WORKER_TRANSACTION_TIMEOUT,
-        ) {
-            Ok(lease) => lease,
-            Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 catch-up admission reset")?;
-                return Err(error.context("Qwen SlotAware MTP K3 catch-up admission"));
-            }
-        };
-        let catchup_started = Instant::now();
-        let caught_up = qwen.model.with_gpu_cache_mut(|device, registry| {
-            mtp.process_target_batch(
-                &verify_input,
-                Some(initial_hidden),
-                &verify_hidden,
-                &shared_embed_rows,
-                kv_cache,
-                self.slot_id,
-                &verify_positions,
-                device,
-                registry,
-                &qwen.model.cfg,
-            )
-        });
-        let catchup_supervision = catchup_lease.finish();
-        if let Err(error) = catchup_supervision.and(caught_up) {
-            kv_cache.clear_la_capture();
-            kv_cache.reset_for_slot(self.slot_id).with_context(|| {
-                format!("Qwen SlotAware MTP K3 catch-up failed ({error:#}); fail-closed reset")
-            })?;
-            return Err(error.context("Qwen SlotAware MTP K3 target catch-up"));
-        }
-        let catchup_elapsed = catchup_started.elapsed();
-
-        #[cfg(test)]
-        q1_speculation::verified_buffers(next_pos, &verify_logits, &verify_hidden)?;
-        let verify_logits = match verify_logits.as_mut_slice::<f32>() {
-            Ok(logits) => logits,
-            Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 logits view failure reset")?;
-                return Err(anyhow::anyhow!("{error}").context("Qwen SlotAware MTP K3 logits view"));
-            }
-        };
-        let semantic_started = Instant::now();
-        let mut semantic = Qwen35SpecSemanticState::from_decode(self);
-        let plan = match plan_qwen35_verified_block(&drafts, |row| {
-            let start = row * vocab;
-            let decision = semantic.select_and_observe(
-                qwen,
-                &self.params,
-                &mut verify_logits[start..start + vocab],
-            )?;
-            #[cfg(test)]
-            q1_speculation::canonical_decision(next_pos, row, decision.token, decision.terminal)?;
-            Ok(decision)
-        }) {
-            Ok(plan) => plan,
-            Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 semantic failure reset")?;
-                return Err(error.context("Qwen SlotAware MTP K3 canonical accept walk"));
-            }
-        };
-        let semantic_elapsed = semantic_started.elapsed();
-
-        let committed_cursor = prior_target_len + plan.valid_input_tokens as u32;
-        let state_started = Instant::now();
-        let mut rollback_elapsed = Duration::ZERO;
-        let state_result = (|| -> Result<()> {
-            kv_cache
-                .truncate_full_attn_to_for_slot(self.slot_id, committed_cursor)
-                .context("Qwen SlotAware MTP K3 target truncate")?;
-            kv_cache
-                .truncate_mtp_to_for_slot(self.slot_id, committed_cursor)
-                .context("Qwen SlotAware MTP K3 MTP truncate")?;
-            if plan.valid_input_tokens < VERIFY_ROWS {
-                let rollback_started = Instant::now();
-                kv_cache
-                    .rollback_la_to(self.slot_id, plan.carry_hidden_row as u32)
-                    .context("Qwen SlotAware MTP K3 recurrent rollback")?;
-                rollback_elapsed = rollback_started.elapsed();
-            }
-            kv_cache.clear_la_capture();
-            kv_cache
-                .validate_speculative_cursors_for_slot(self.slot_id, committed_cursor as usize)
-                .context("Qwen SlotAware MTP K3 committed cursor equality")?;
-            Ok(())
-        })();
-        let state_elapsed = state_started.elapsed();
-        if let Err(error) = state_result {
-            kv_cache.clear_la_capture();
-            kv_cache.reset_for_slot(self.slot_id).with_context(|| {
-                format!("Qwen SlotAware MTP K3 commit failed ({error:#}); fail-closed reset")
-            })?;
-            return Err(error);
-        }
-
-        let carry_hidden = match crate::inference::models::qwen35::spec_decode::nth_hidden_row(
-            &verify_hidden,
-            qwen.model.cfg.hidden_size,
-            plan.carry_hidden_row as u64,
-        ) {
-            Ok(hidden) => hidden,
-            Err(error) => {
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 carry-hidden failure reset")?;
-                return Err(error.context("Qwen SlotAware MTP K3 carry hidden"));
-            }
-        };
-        self.mtp
-            .as_mut()
-            .expect("MTP state checked above")
-            .verifier_hidden = carry_hidden;
-        #[cfg(test)]
-        q1_speculation::state_committed(next_pos, kv_cache, &plan)?;
-        self.pending_speculation_output = plan.output;
-        self.terminal_after_pending = plan.terminal_after_pending;
-        super::qwen35_speculation::record_proposer_outcome(
-            super::qwen35_speculation::QwenSpeculationProposer::Mtp,
-            DRAFT_DEPTH,
-            plan.matched_drafts,
-            plan.rejected_drafts,
-            1,
-            0,
-        );
+        let rows = self.k3_verify_solo(qwen, kv_cache, supervisor, &draft)?;
+        let plan = self.k3_verify_to_plan(qwen, kv_cache, supervisor, draft, rows)?;
+        let timing = plan.timing;
+        let commit = self.k3_commit_solo(qwen, kv_cache, plan)?;
         let equivalent_decisions = equivalent_target_decisions(
             &self.pending_speculation_output,
             self.terminal_after_pending,
@@ -6097,20 +5855,20 @@ impl Qwen35DecodeState {
             eprintln!(
                 "[MTP_PHASE] draft={:.2}ms verify={:.2}ms embed={:.2}ms catchup={:.2}ms semantic={:.2}ms state={:.2}ms rollback={:.2}ms partial={} remainder={:.2}ms total={:.2}ms",
                 draft_elapsed.as_secs_f64() * 1000.0,
-                verify_elapsed.as_secs_f64() * 1000.0,
-                embed_elapsed.as_secs_f64() * 1000.0,
-                catchup_elapsed.as_secs_f64() * 1000.0,
-                semantic_elapsed.as_secs_f64() * 1000.0,
-                state_elapsed.as_secs_f64() * 1000.0,
-                rollback_elapsed.as_secs_f64() * 1000.0,
-                plan.valid_input_tokens < VERIFY_ROWS,
+                timing.verify.as_secs_f64() * 1000.0,
+                timing.embed.as_secs_f64() * 1000.0,
+                timing.catchup.as_secs_f64() * 1000.0,
+                timing.semantic.as_secs_f64() * 1000.0,
+                commit.state_elapsed.as_secs_f64() * 1000.0,
+                commit.rollback_elapsed.as_secs_f64() * 1000.0,
+                commit.committed.valid_input_tokens < K3_VERIFY_ROWS,
                 round_elapsed
                     .saturating_sub(draft_elapsed)
-                    .saturating_sub(verify_elapsed)
-                    .saturating_sub(embed_elapsed)
-                    .saturating_sub(catchup_elapsed)
-                    .saturating_sub(semantic_elapsed)
-                    .saturating_sub(state_elapsed)
+                    .saturating_sub(timing.verify)
+                    .saturating_sub(timing.embed)
+                    .saturating_sub(timing.catchup)
+                    .saturating_sub(timing.semantic)
+                    .saturating_sub(commit.state_elapsed)
                     .as_secs_f64()
                     * 1000.0,
                 round_elapsed.as_secs_f64() * 1000.0,
@@ -11318,6 +11076,7 @@ mod tests {
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
         };
@@ -11763,6 +11522,7 @@ mod tests {
             speculation: crate::serve::api::qwen35_speculation::QwenSpeculationController::new(
                 crate::serve::api::qwen35_speculation::QwenSpeculationPolicy::Off,
             ),
+            slot_spill_budget_bytes: 0,
         }
     }
 

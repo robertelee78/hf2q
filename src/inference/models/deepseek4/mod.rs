@@ -27,6 +27,7 @@ pub mod hyper_connection;
 mod joint_decode;
 mod joint_decode_core;
 mod joint_decode_routes;
+mod joint_decode_rows;
 pub mod model;
 mod output_forward;
 mod prefill_annotations;
@@ -35,6 +36,7 @@ pub mod residency;
 pub mod rope;
 pub mod routing;
 mod row_matmul;
+mod rows_step;
 mod submission;
 pub mod tokenizer;
 mod verifier_forward;
@@ -55,9 +57,27 @@ pub(crate) use verifier_forward::{
 #[cfg(test)]
 mod attention_forward_tests;
 #[cfg(test)]
+mod chunk_split_invariance_tests;
+#[cfg(test)]
 mod cache_tests;
 #[cfg(test)]
 mod cooperative_fault;
+#[cfg(test)]
+mod ds4_attn_microbench_tests;
+#[cfg(test)]
+mod ds4_batch_probe_tests;
+#[cfg(test)]
+mod joint_decode_rows_tests;
+#[cfg(test)]
+mod ds4_bench_support;
+#[cfg(test)]
+mod ds4_file_kernel_parity_tests;
+#[cfg(test)]
+mod ds4_op_microbench_tests;
+#[cfg(test)]
+mod ds4_prefill_microbench_tests;
+#[cfg(test)]
+mod ds4_file_parity_tests;
 #[cfg(test)]
 mod ffn_forward_tests;
 #[cfg(test)]
@@ -77,9 +97,19 @@ mod real_artifact_mixed_step_tests;
 #[cfg(test)]
 mod real_artifact_tests;
 #[cfg(test)]
+mod real_artifact_rows_step_tests;
+#[cfg(test)]
 mod residency_tests;
 #[cfg(test)]
 mod row_matmul_tests;
+#[cfg(test)]
+mod row_exact_matvec_tests;
+#[cfg(test)]
+mod rows_step_tests;
+#[cfg(test)]
+mod moe_schedule_tests;
+#[cfg(test)]
+mod ds4_tail_rows_microbench_tests;
 
 pub const ARCH_DEEPSEEK4: &str = "deepseek4";
 

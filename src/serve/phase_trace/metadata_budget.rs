@@ -92,6 +92,7 @@ mod tests {
                     coverage: "each_admitted_lane_in_first_fixed_window".into(),
                     batching_scope: "operator_only_full_body_unknown".into(),
                 },
+                gpu_timestamps: None,
             }),
             identity,
         }

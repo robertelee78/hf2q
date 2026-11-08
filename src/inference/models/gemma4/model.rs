@@ -367,6 +367,10 @@ pub struct MlxModelWeights {
     /// graft-wired refuse requests by name rather than serving
     /// ungrafted (the ADR-059 fail-closed discipline).
     pub kv_graft: Option<crate::inference::graft::BoundGraft>,
+    /// In-memory LCP resume budget used by the prefill routes' pre-copy
+    /// snapshot gate. The serving engine sets it from `LoadOptions` right
+    /// after load; standalone constructions keep the 8 GiB constant.
+    pub lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget,
     /// ADR-053 dual hook sites (#299, 2026-10-13): optional GLP runtime
     /// steering. When bound, each steered layer's complete post-layer
     /// residual stream (`hidden` after the fused end-of-layer norm+add+
@@ -645,17 +649,22 @@ pub struct MlxModelWeights {
     pub multi_seq_prefill: Option<MultiSeqPrefillState>,
 
     /// ADR-063 Stage 2 — kernel of warm live-resume attention: every
-    /// single-slot resume and every [`GemmaLiveAttention::PerSlotExact`]
-    /// cohort lane (installed lanes follow [`GemmaLiveAttention::Tiled`]).
+    /// single-slot resume and every resumed multi-sequence lane (joint warm,
+    /// stable cue and installed long-prompt lanes).
     /// Resolved once at load from `HF2Q_GEMMA_WARM_TILED_ATTENTION` (default
     /// [`GemmaLiveKernel::VecHybrid`]; `1` opts in to
-    /// [`GemmaLiveKernel::TiledF16`]).
+    /// [`GemmaLiveKernel::TiledF16`], `tensor` to [`GemmaLiveKernel::TensorF16`]).
     pub warm_live_kernel: GemmaLiveKernel,
 
     /// ADR-063 Q4-GEMMA-PREFILL-MOE — shape of the prefill MoE down call
     /// (flattened or slotted; bitwise equal). Resolved once at load from
     /// `HF2Q_GEMMA_PREFILL_MOE_DOWN` (default slotted).
     pub(crate) prefill_moe_down: crate::serve::gemma_prefill_moe::GemmaPrefillMoeDown,
+
+    /// ADR-063 gap program — decode attention head split of d256 layers on
+    /// every decode path. Resolved once at load from
+    /// `HF2Q_GEMMA_DECODE_ATTN_NE` (default stock).
+    pub(crate) decode_attn_ne: crate::serve::gemma_decode_attention::GemmaDecodeAttnNe,
 }
 
 /// ADR-040 iter-G(a) — per-call descriptor for cross-slot batched prefill.
@@ -688,9 +697,6 @@ pub struct MultiSeqPrefillState {
     /// multi-sequence attention reads layer geometry (capacity, ring, V
     /// dtype) from them and mounts them as the model's hybrid KV for the call.
     pub full_views_hybrid: Vec<HybridKvBuffers>,
-    /// Attention route of a resumed (live) multi-sequence prefill. Ignored by
-    /// cold multi-sequence prefill, which never reads a slot's history.
-    pub live_attention: GemmaLiveAttention,
     /// Filled by the head delta: each seq's first decoded (greedy argmax)
     /// token. Length `== seq_lens.len()` on return. Empty until the head runs.
     pub out_first_tokens: Vec<u32>,
@@ -700,24 +706,6 @@ pub struct MultiSeqPrefillState {
     /// transformer-body pass. Returning only argmax tokens would silently
     /// weaken native tool semantics for batched agent requests.
     pub out_logits: Vec<Vec<f32>>,
-}
-
-/// Attention route for resumed multi-sequence Gemma prefill. Row-parallel work
-/// (projections, norms, FFN/MoE, per-row head) runs once over every suffix row
-/// in both routes; per-sequence attention against each slot's own KV runs
-/// through the one shared live-attention function
-/// (`serve::gemma_live_attention`). Only the kernel policy differs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GemmaLiveAttention {
-    /// Installed long-prompt lanes and the stable cue batch: tiled F16 flash
-    /// attention for every suffix length, or the vec-hybrid kernel when
-    /// `HF2Q_GEMMA_TILED_LIVE=0`. Not bitwise equal to a per-slot resume.
-    Tiled,
-    /// Joint warm tool-turn cohort: exactly the single-slot live-resume
-    /// route ([`MlxModelWeights::warm_live_kernel`], with suffixes under 32
-    /// rows on vec-hybrid), the slot view addressed as slot 0, so every lane
-    /// is bitwise equal to its per-slot resume.
-    PerSlotExact,
 }
 
 /// Kernel of the per-sequence live (warm-resume) attention.
@@ -730,6 +718,20 @@ pub enum GemmaLiveKernel {
     /// `flash_attn_vec_hybrid_batched`: one decode-style threadgroup per
     /// (query, head) over F16 K and TQ-HB V.
     VecHybrid,
+    /// ADR-063 gap program F1: mlx-native's tensor-API flash attention over
+    /// compacted K and dequantized V (`HF2Q_GEMMA_WARM_TILED_ATTENTION=tensor`).
+    TensorF16,
+}
+
+impl GemmaLiveKernel {
+    /// Stable wire name (`/hf2q/v1/runtime` active controls).
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::TiledF16 => "TiledF16",
+            Self::VecHybrid => "VecHybrid",
+            Self::TensorF16 => "TensorF16",
+        }
+    }
 }
 
 /// Per-request head output from one shared multi-sequence Gemma prefill.
@@ -911,6 +913,10 @@ impl MlxModelWeights {
         let t_pre = std::time::Instant::now();
         let io_plan = preflight_io(gguf, cfg.vocab_size, cfg.hidden_size)?;
         preflight_projections(gguf, cfg)?;
+        // `HF2Q_GEMMA_DECODE_DENSE` is read here first, so an invalid value
+        // refuses the load instead of failing mid-decode.
+        let decode_dense = super::decode_dense::resolve()?;
+        tracing::info!(kernel = decode_dense.wire_name(), "Gemma decode dense kernel");
         let mapped = gguf
             .map_tensor_data(mlx_device)
             .map_err(|e| anyhow::anyhow!("map GGUF tensor data: {e}"))?;
@@ -1382,6 +1388,7 @@ impl MlxModelWeights {
             rms_norm_eps: cfg.rms_norm_eps as f32,
             final_logit_softcapping: cfg.final_logit_softcapping.map(|v| v as f32),
             kv_graft: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             glp: None,
             kv_caches,
             activations,
@@ -1451,7 +1458,9 @@ impl MlxModelWeights {
             multi_seq_prefill: None,
             warm_live_kernel: crate::serve::gemma_live_attention::warm_live_kernel_from_env(),
             prefill_moe_down: crate::serve::gemma_prefill_moe::prefill_moe_down_from_env(),
+            decode_attn_ne: crate::serve::gemma_decode_attention::decode_attn_ne_from_env(),
         });
+        crate::serve::gemma_prefill_moe::log_native_routing();
 
         // Pre-initialize constant param buffers so we never write them
         // inside the hot forward_decode path.

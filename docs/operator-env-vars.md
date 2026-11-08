@@ -83,24 +83,28 @@ architecture.
 
 | Var | Default | Values | Effect |
 |---|---|---|---|
-| `HF2Q_QWEN_SPECULATION` | unset: `off` for dense artifacts (Qwen3.8) on SlotAware workers that selected joint decode and have `max_slots` ≥ 4; `auto` otherwise (SerialFifo, fewer than 4 slots, joint decode off or unavailable, MoE/Qwen3.6) | `off`, `auto` | Controls the live SlotAware Qwen server path. `auto` measures ordinary decode first, tries exact request-history lookup (6-12-token match, up to three draft tokens), then fixed-K3 native MTP when available; each proposer disables itself for the generation after two consecutive four-round windows are not better than equivalent ordinary output. Stochastic sampling, logprobs, stop strings, logit bias, frequency/presence/min-p, parallel tool calls, and unsupported tool policy stay on ordinary target decode. The unset default was `auto` from 2026-08-21; since ADR-063 D1 it resolves once at worker start from the slot count, family and joint-decode decision, logged as `Qwen speculation worker policy`. At four slots with joint decode, Qwen3.8 `auto` was slower than `off` (own-output makespan ratio 1.020, 95% CI 1.0095–1.0308, 8 adjacent ABBA pairs, every pair slower, `ExactTranscripts`; receipts `$E/d1-speculation-ext-v2` with `E=~/.local/state/hf2q/campaigns/adr063-preflight-20261023`; `docs/research/adr063-d1-speculation-qualification.md` §7). Other dense Qwen artifacts get the same default without their own measurement. Explicit values always win: `auto` opts back in, `off` is the escape hatch. Invalid values warn and fail safe to `off`. |
-| `HF2Q_DECODE_MVN` | `1`; `0` applied automatically when loading a Qwen3.8-identified model | `0`, `1` | Controls exact-tree Q4_K/Q6_K multi-column matvec routing. The Qwen3.8-qualified route disables it because the K=3 verifier is qualified on the weight-amortized width-four route. Previously only `serve_qwen38_opencode.sh` applied this; `hf2q serve` now applies it at engine load for Qwen3.8-identified models. |
-| `HF2Q_DECODE_MV_EXT` | `0`; `1` applied automatically when loading a Qwen3.8-identified model | `0`, `1` | Enables weight-amortized multi-column matvec. K-quants route only at widths 4-8; legacy Q4_0/Q8_0 retain widths 2-8. Enabled after the real-model four-position decision, hybrid-cache cursor, and eight-step continuation gate. Unlike the byte-exact default-on mvN route, `mul_mv_ext` is not bit-exact, so the default stays Qwen3.8-scoped — no other family carries the qualifying receipt. |
-| `HF2Q_QWEN_GQA_Q2` | `auto` | `auto`, `off`/`0`/`false`, `on`/`1`/`true` | Qwen3.8 TQ-HB decode shares each KV-head load/dequantization across two query heads when the exact D=256/GQA/no-mask geometry is supported. `auto` selects it at KV length ≥8,192; `off` is the production escape hatch; `on` forces the candidate only where its hard geometry checks pass. Invalid values fail safe to `off`. Release requires the exact-output, thermally supervised short/long receipt in the shipping contract. |
+| `HF2Q_QWEN_SPECULATION` | unset: `off` on SlotAware workers that selected joint decode and have `max_slots` ≥ 4 (dense Qwen3.8 and MoE Qwen3.6); `auto` otherwise (SerialFifo, fewer than 4 slots, joint decode off or unavailable) | `off`, `auto` | Controls the live SlotAware Qwen server path. `auto` observes ordinary decode first, tries exact request-history lookup (6-12-token match, up to three draft tokens), then fixed-K3 native MTP when available; each proposer disables itself for the generation after two consecutive four-round windows that are not better than equivalent ordinary output, judged as `HF2Q_QWEN_SPECULATION_ROUTE` selects. Stochastic sampling, logprobs, stop strings, logit bias, frequency/presence/min-p, parallel tool calls, and unsupported tool policy stay on ordinary target decode. The unset default resolves once at worker start from the slot count and joint-decode decision, logged as `Qwen speculation worker policy`. Dense (Qwen3.8): at four slots with joint decode, `auto` was slower than `off` (own-output makespan ratio 1.020, 95% CI 1.0095–1.0308, 8 adjacent ABBA pairs, every pair slower, `ExactTranscripts`; receipts `$E/d1-speculation-ext-v2` with `E=~/.local/state/hf2q/campaigns/adr063-preflight-20261023`; `docs/research/adr063-d1-speculation-qualification.md` §7). MoE (Qwen3.6): off since 2026-11-06 for repeatable four-agent serving (operator ruling; supported by #719, where per-slot serial K3 at N4 cost about 25% against mostly-joint M1 rows; `docs/research/adr063-qwen-spec-repeatable.md`). Explicit values always win: `auto` opts back in, `off` is the escape hatch. Invalid values warn and fail safe to `off`. |
+| `HF2Q_QWEN_SPECULATION_ROUTE` | `repeatable` | `repeatable`, `adaptive` | How speculating SlotAware lanes are routed and gated. `repeatable`: each tick's route (commit verified output, history round, K3 round, or ordinary decision) is decided from the request's own state only; a lane that speculates never joins a joint step, and the proposer gates compare acceptance with fixed round costs (MTP 1.26, history 1.49 ordinary decisions, from the D2 receipts' controller counters) instead of wall time, so identical requests take identical routes. `adaptive`: the phase-1 behaviour, where a speculation-capable lane joins joint steps as an M1 row when it has company and the gates compare measured wall time; kept for A/B and as an escape hatch. Read once at engine load and logged with the worker policy. Invalid values warn and use `repeatable`. `/metrics` proposer timing stays wall-clock under both. |
+| `HF2Q_DECODE_MVN` | `1`; `0` for a Qwen3.8-identified model unless set explicitly | `0`, `1` | Controls exact-tree Q4_K/Q6_K multi-column matvec routing. The Qwen3.8-qualified route disables it because the K=3 verifier is qualified on the weight-amortized width-four route. That default is resolved per model at load from the model's identity and frozen into its kernel registries; the process environment is never written, so other models in the same process keep `1` whatever the load order. An explicit value is an operator override and applies to every model in the process. |
+| `HF2Q_DECODE_MV_EXT` | `0`; `1` for a Qwen3.8-identified model unless set explicitly | `0`, `1` | Enables weight-amortized multi-column matvec. K-quants route only at widths 4-8; legacy Q4_0/Q8_0 retain widths 2-8. Enabled after the real-model four-position decision, hybrid-cache cursor, and eight-step continuation gate. Unlike the byte-exact default-on mvN route, `mul_mv_ext` is not bit-exact, so the default stays Qwen3.8-scoped — no other family carries the qualifying receipt. The Qwen3.8 default is resolved per model at load and frozen into its kernel registries; an explicit value is an operator override and applies to every model in the process. |
+| `HF2Q_QWEN_ATTN_ROWS` | on | `0`/`off`/`false`, `1`/`on`/`true` | Qwen TQ full-attention decode. On: joint decode and the greedy single-command-buffer serial layer run every row's K/V encode, Q rotation, attention and output gate in one pass (no per-row barriers or row copies), and `HF2Q_QWEN_GQA_Q2=auto` uses the measured Qwen3.6 (16/2 heads) crossovers. `0` restores the per-row chain and the single 8,192 crossover. Both give the same bits. Read once. Invalid values warn and use on. |
+| `HF2Q_QWEN_GQA_Q2` | `auto` | `auto`, `off`/`0`/`false`, `on`/`1`/`true` | Qwen3.8 TQ-HB decode shares each KV-head load/dequantization across two query heads when the exact D=256/GQA/no-mask geometry is supported. `auto` selects it at KV length ≥8,192 (Qwen3.6's 16/2-head geometry with `HF2Q_QWEN_ATTN_ROWS` on: ≥4,096 for one row, ≥1,024 when several rows share the pass); `off` is the production escape hatch; `on` forces the candidate only where its hard geometry checks pass. Invalid values fail safe to `off`. Release requires the exact-output, thermally supervised short/long receipt in the shipping contract. |
 
 ## Qwen joint decode
 
-With two or more Qwen agents decoding at once, eligible slots can advance through one shared target forward per scheduler turn instead of one forward per slot. Joint rows run ordinary target decode: MTP drafting and history proposals are suppressed for them (slots with MTP state still run their MTP catch-up, so a later solo turn resumes K3). With fewer than two eligible slots the turn is serial, including MTP K3 and history speculation.
+With two or more Qwen agents decoding at once, eligible slots can advance through one shared target forward per scheduler turn instead of one forward per slot. Joint rows run ordinary target decode: MTP drafting and history proposals are suppressed for them (slots with MTP state still run their MTP catch-up, so a later solo turn resumes K3). In exact mode, a turn with fewer than two eligible slots is serial, including MTP K3 and history speculation, and slots beyond the joint width stay serial that turn. In the padded mode (below), every eligible slot runs in consecutive joint steps of at most the joint width. That includes a lone slot whose next tick is ordinary target decode, so an ordinary request's arithmetic does not depend on which tenants share its turns (#717). A lone slot with MTP or history speculation state keeps its serial speculative round.
 
-Under the default exact routing policy each joint row is bitwise identical to its serial target forward and independent of which slots share its step; per-request output can still differ from stock because joint rows do not speculate. Under the Qwen3.8 production policy (`HF2Q_DECODE_MV_EXT=1`) dense artifacts use the padded `mul_mv_ext` mode: every step packs exactly 4 rows (joint width is capped at 4), so a row's packed width never depends on how many tenants share the step. In that mode the dense FFN gate and up products are also shared across the packed rows (each weight read once per step) unless `HF2Q_QWEN_JOINT_FFN_SHARED=0`. That mode is an ADR-063 Q1 Class B route against stock (decision envelope, not bitwise; `docs/research/adr063-q1-numeric-policy.md`).
+Under the default exact routing policy each joint row is bitwise identical to its serial target forward and independent of which slots share its step; per-request output can still differ from stock because joint rows do not speculate. Under the Qwen3.8 production policy (the per-model Qwen3.8 default, or an explicit `HF2Q_DECODE_MV_EXT=1`) dense artifacts use the padded `mul_mv_ext` mode: every step packs exactly 4 rows (joint width is capped at 4), so a row's packed width never depends on how many tenants share the step. In that mode the dense FFN gate and up products are also shared across the packed rows (each weight read once per step) unless `HF2Q_QWEN_JOINT_FFN_SHARED=0`. That mode is an ADR-063 Q1 Class B route against stock (decision envelope, not bitwise; `docs/research/adr063-q1-numeric-policy.md`).
 
-Joint decode is on by default for dense artifacts (Qwen3.8) and off by default for MoE artifacts (Qwen3.6), whose four-agent A/B is incomplete. MoE artifacts with `HF2Q_DECODE_MV_EXT=1`, block storage outside Q4_0/Q8_0/Q4_K/Q5_K/Q6_K, float FFN storage, GLP steering, layer dumps, `HF2Q_LEGACY_PER_LAYER_CB=1` and `MLX_UNRETAINED_REFS=1` keep serial decode. The decision and its reason are logged once at worker start; the routing policy is re-checked every turn. See [ADR-063 S3](research/adr063-s3-qwen-joint-decode.md).
+Joint decode is on by default for dense (Qwen3.8) and MoE (Qwen3.6) artifacts. MoE artifacts whose routing policy enables `mul_mv_ext`, block storage outside Q4_0/Q8_0/Q4_K/Q5_K/Q6_K, float FFN storage, GLP steering, layer dumps, `HF2Q_LEGACY_PER_LAYER_CB=1` and `MLX_UNRETAINED_REFS=1` keep serial decode. The decision and its reason are logged once at worker start, with the model's routing policy. That policy is frozen at load and cannot change mid-run; `HF2Q_LEGACY_PER_LAYER_CB` and `MLX_UNRETAINED_REFS` are re-checked every turn. See [ADR-063 S3](research/adr063-s3-qwen-joint-decode.md).
 
 | Var | Default | Values | Effect |
 |---|---|---|---|
-| `HF2Q_QWEN_JOINT_DECODE` | on for dense (Qwen3.8), off for MoE (Qwen3.6) | `0`/`off`/`false`, `1`/`on`/`true` | Escape hatch and A/B switch. `0` restores serial per-slot decode; `1` opts MoE artifacts in. Read once at worker start. Invalid values warn and use the per-family default. |
-| `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` | `4` | `2`–`8` | Widest joint step; further eligible slots stay serial that turn. The padded `mul_mv_ext` mode caps at 4 regardless. Widths above 4 have no serving measurement. Invalid values warn and use 4. |
+| `HF2Q_QWEN_JOINT_DECODE` | on (Qwen3.8 and Qwen3.6) | `0`/`off`/`false`, `1`/`on`/`true` | Escape hatch and A/B switch. `0` restores serial per-slot decode. Read once at worker start. Invalid values warn and use the default (on). |
+| `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` | `4` | `2`–`8` | Widest joint step. In exact mode, or with `HF2Q_QWEN_JOINT_SOLO=0`, further eligible slots stay serial that turn. In the padded mode they run in further joint steps. The padded `mul_mv_ext` mode caps at 4 regardless. Widths above 4 have no serving measurement. Invalid values warn and use 4. |
 | `HF2Q_QWEN_JOINT_FFN_SHARED` | on | `0`/`off`/`false`, `1`/`on`/`true` | Padded mode only. `0` restores the serial builder's per-row fused gate/up/SiLU kernel, which reads the gate and up weights once per packed row (four times per step). Read once at worker start. Invalid values warn and use on. |
+| `HF2Q_QWEN_JOINT_SOLO` | on | `0`/`off`/`false`, `1`/`on`/`true` | Padded mode on workers with two or more slots only. On: every eligible slot joins a joint step, and a lone ordinary slot runs a one-lane padded step instead of the serial forward, so N4 output with speculation off no longer depends on request timing. `0` restores the serial forward for a lone slot and for slots beyond the joint width (A/B and escape hatch). Read once at worker start. Invalid values warn and use on. |
+| `HF2Q_QWEN_MOE_BATCHED` | off | `0`/`off`/`false`, `1`/`on`/`true` | Qwen3.6 MoE artifacts. `1` loads the router (`ffn_gate_inp`, F32), shared-expert gate logit (F32) and shared expert (Q4_K or Q6_K) in their GGUF storage instead of BF16 copies, and every MoE decode layer then runs one batched route over the step's rows (F32 row-exact router mat-vec, SIMD-group top-k over all rows, one `mul_mv_id` each for expert gate/up/down over rows × top-k pairs, one weighted reduce). A row's output is bitwise the same solo (serial decode, MTP drafting) and in a joint step of 2–8 rows, but differs from the default BF16 route (Class B: the router and shared expert are no longer BF16-rounded). Prefill reads the same native weights. Layers with other storage types keep the default route; DWQ affine expert overlays refuse to load. Read once at model load; the worker-start `Qwen joint decode configuration` line logs `moe_ffn=batched_native`. Invalid values warn and use off. |
 
 ## DeepSeek-V4 decode
 
@@ -108,7 +112,7 @@ With two or more agents decoding at once, DeepSeek-V4 advances every eligible sl
 
 | Var | Default | Values | Effect |
 |---|---|---|---|
-| `HF2Q_DEEPSEEK_JOINT_DECODE` | on | `0`/`off`/`false`, `1`/`on`/`true` | Escape hatch. `0` restores serial per-slot decode, including the exact B=4 cohort. Read once at worker start. It is also forced serial by `MLX_UNRETAINED_REFS`, DeepSeek layer dumps or stage profiling, and `HF2Q_DECODE_MV_EXT=1`. Loading a Qwen3.8 model sets `HF2Q_DECODE_MV_EXT=1` for the whole process; DeepSeek turns then decode serially. |
+| `HF2Q_DEEPSEEK_JOINT_DECODE` | on | `0`/`off`/`false`, `1`/`on`/`true` | Escape hatch. `0` restores serial per-slot decode, including the exact B=4 cohort. Read once at worker start. It is also forced serial by `MLX_UNRETAINED_REFS`, DeepSeek layer dumps or stage profiling, and an explicit `HF2Q_DECODE_MV_EXT=1`. The routing policy is frozen into the DeepSeek-V4 model's registries at load, so loading a Qwen3.8 model in the same process does not affect it. |
 | `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` | `4` | `2`–`8` | Widest joint step. Widths above 4 are covered only by the official-artifact bitwise test and have no serving measurement; use them only for experiments. Invalid values warn and use 4. |
 
 ## Dense KV / decode layout
@@ -117,6 +121,22 @@ With two or more agents decoding at once, DeepSeek-V4 advances every eligible sl
 use a ring buffer capped at `sliding_window` (1024 on Gemma-4); global
 layers use a linear buffer of `seq_len + max_decode_tokens`. No env var
 controls this — it's a correctness property, not a tunable.
+
+## LCP resume budget (not an environment variable)
+
+The in-memory LCP resume registry budget is the typed
+`hf2q serve --lcp-resume-budget <SIZE>` flag or `[serve] lcp_resume_budget`
+config key (CLI wins over config). Omitted, it is a constant 8GiB on every
+host. Serve resolves it once at startup, logs
+`[hf2q lcp] byte_budget=<bytes> (source=default|config|cli)`, and passes it to
+every Qwen and Gemma engine load, including model swaps. Gemma's per-request
+pre-copy snapshot check uses the same value. Free memory is never consulted,
+so which prompts get snapshotted and which entries are evicted does not depend
+on the host or on load order. Zero and malformed values fail startup. The
+former `HF2Q_KV_LCP_RESUME_CAPACITY` variable (and its `available_memory() ×
+5%` default) is removed and no longer read (#730); replace `=8g` with
+`--lcp-resume-budget 8GiB`, and a legacy entry count `N` with `N × 300MiB`
+(for example `=8` → `--lcp-resume-budget 2400MiB`).
 
 ## Diagnostic dumps
 
@@ -278,7 +298,53 @@ the model loads.
   quality gate (2026-11-01).
 - **Any other value:** logs a warning and keeps the default.
 
-Installed long-prompt lanes (prompts over 4,096 tokens) keep their own
-switch, `HF2Q_GEMMA_TILED_LIVE`. The model load logs `Gemma warm live
-attention kernel`, and each live prefill banner prints `live=`. Evidence:
-`docs/research/adr063-gemma-four-agent-reuse.md`.
+The switch also covers installed long-prompt lanes (prompts over 4,096
+tokens), which run the single-slot warm route (#725). The model load logs `Gemma warm live
+attention kernel`, each live prefill banner prints `live=`, and
+`/hf2q/v1/runtime` publishes the resolved kernel (`VecHybrid` or `TiledF16`)
+as `measurement_snapshot.active_controls.gemma_warm_attention_kernel`.
+Evidence: `docs/research/adr063-gemma-four-agent-reuse.md`. A precise F32
+tiled route was evaluated and falsified (ADR-063 Q4-GEMMA-ATTN,
+`docs/research/adr063-gemma-tiled-attn-design.md` §12).
+
+### Gemma decode dense kernel (default `stock`)
+
+`HF2Q_GEMMA_DECODE_DENSE` selects the kernel of the dense GGUF matmuls of
+Gemma 4 decode (attention q/k/v/o, dense FFN gate/up/down and the lm head) in
+the solo decode, the `[N,hidden]` batched body, the batched and fused lm head,
+the speculative verify heads and tree-verify layers, and the prefill
+first-token head, so every logit row comes from the same per-row kernel (ADR-063
+Q4-GEMMA-DECODE op parity). It is read once per process, at model load.
+- **Unset or `stock` (default):** the existing routes.
+- **`row_exact`:** the row-exact few-row mat-vec (`row_exact_matvec`) for
+  Q4_K or Q6_K weights with `K % 256 == 0` (Q4_K also needs a 16-byte-aligned
+  weight start) and Q5_0 or Q8_0 weights with `K % 32 == 0`.
+- **`mma`:** the column-invariant few-row MMA mat-vec (the peer's
+  `mul_mv_mma` technique) for Q4_K, Q6_K or Q5_0 weights with `K % 64 == 0`
+  (and the type's block size) and Q8_0 weights with `K % 32 == 0`. Numerics
+  class B against the default routes.
+- **Any other value:** the model load fails.
+
+Under `row_exact` and `mma` each row's result is bitwise the same however many
+rows share the dispatch, so a slot's logits do not depend on the decode width
+or path; products wider than 8 rows run in chunks of at most 8 rows. Whether a
+weight takes the kernel depends on the weight alone, never on the width; every
+other weight (F32 router, F16/BF16, other types) and the other prefill
+matmuls keep their routes. `/hf2q/v1/runtime` publishes the resolved kernel (`Stock`,
+`RowExact` or `ColumnInvariantMma`) as
+`measurement_snapshot.active_controls.gemma_decode_dense_kernel`; Gemma Q1
+endpoint and localizer packets declare it as `decode_dense_kernel`.
+
+### Native Q5_0 tensor matmul (default off)
+
+`HF2Q_Q5_0_TENSOR_MM` is read by mlx-native (0.18.0 and later), not by hf2q.
+Only the exact value `1` routes Q5_0 dense and expert matrix multiplications
+through the tensor pipeline; unset or any other value keeps the simdgroup
+route. It exists for the Gemma combined-candidate quality campaign; the
+tensor route is not yet qualified as a default. The first Gemma 4 model load
+of a process logs one line `Gemma4 native routing: q5_0_tensor_mm=<true|false>
+mm_id_schedule=<grid|compact>`, and
+`/hf2q/v1/runtime` publishes the resolved value as
+`measurement_snapshot.active_controls.q5_0_tensor_mm` (`true`/`false`) beside
+`mm_id_schedule`. The Gemma launcher forwards it from `Q5_0_TENSOR_MM=1`
+and the Q5 case from `HF2Q_Q5_Q5_0_TENSOR_MM=1`.

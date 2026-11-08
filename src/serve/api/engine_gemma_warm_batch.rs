@@ -6,8 +6,7 @@
 //! worker yields, so later slots are admitted between decode steps and pay the
 //! fixed per-forward cost again. Here a contiguous FIFO prefix of such
 //! requests is admitted without GPU work and prefilled in one
-//! `forward_prefill_batched_multi_seq_live` call with
-//! [`GemmaLiveAttention::PerSlotExact`]:
+//! `forward_prefill_batched_multi_seq_live` call:
 //!
 //! * projections, norms, dense FFN/MoE and the per-row head run once over
 //!   every suffix row;
@@ -22,14 +21,15 @@
 //! and `..._vec_hybrid` (real artifact).
 //!
 //! Lane eligibility: text only (no soft tokens, vision identity or stable cue
-//! split), the slot selected at admission holds `cached > 0` tokens, the
-//! suffix exceeds 32 rows, and the cohort stays within the 4,096-row
-//! transaction cap. Planning and installation are model-free; a lane whose
-//! actually selected slot fails the rule is admitted inline exactly as
-//! before. Lanes are submitted, captured and seeded in FIFO admission order,
-//! and the decode reserve passed to the forward is the binding lane's own
-//! (`gemma4_batch_decode_reserve`), so a cohort fits whenever every lane fits
-//! alone.
+//! split), the slot selected at admission holds `cached > 0` tokens (in
+//! place, or restored there from a spill or the lane's own ungranted slot by
+//! #727's reclaim), the suffix exceeds 32 rows, and the cohort stays within
+//! the 4,096-row transaction cap. Planning and installation are model-free;
+//! a lane whose actually selected slot fails the rule is admitted inline
+//! exactly as before. Lanes are submitted, captured and seeded in FIFO
+//! admission order, and the decode reserve passed to the forward is the
+//! binding lane's own (`gemma4_batch_decode_reserve`), so a cohort fits
+//! whenever every lane fits alone.
 //!
 //! Failure semantics:
 //! * a pre-submission check failure (substrate, plan, cursor) leaves every
@@ -120,6 +120,21 @@ fn parse_switch(raw: Option<&str>) -> std::result::Result<bool, String> {
     }
 }
 
+/// The diagnostic setting, if any, that changes the per-slot reference route
+/// a multi-lane Gemma prefill must equal bitwise. Shared by the joint warm,
+/// joint cold and installed long-prompt cohorts; `env` reads one variable.
+pub(super) fn per_slot_route_override(
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<&'static str> {
+    if env("HF2Q_PREFILL_SLOT_BATCHED").is_some_and(|value| value.trim() == "0") {
+        Some("HF2Q_PREFILL_SLOT_BATCHED=0 replaces the per-slot route lanes must equal")
+    } else if env("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some() {
+        Some("HF2Q_MM_ID_ROUTING_THRESHOLD moves the MoE route boundary of the lane rule")
+    } else {
+        None
+    }
+}
+
 /// Resolve the switch once when the Gemma SlotAware worker starts. Diagnostic
 /// settings that change the per-slot reference route keep it off.
 pub(super) fn worker_enabled() -> bool {
@@ -132,13 +147,7 @@ pub(super) fn worker_enabled() -> bool {
         );
         JOINT_WARM_PREFILL_DEFAULT
     });
-    let unavailable = if std::env::var("HF2Q_PREFILL_SLOT_BATCHED").as_deref() == Ok("0") {
-        Some("HF2Q_PREFILL_SLOT_BATCHED=0 replaces the per-slot route lanes must equal")
-    } else if std::env::var_os("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some() {
-        Some("HF2Q_MM_ID_ROUTING_THRESHOLD moves the MoE route boundary of the lane rule")
-    } else {
-        None
-    };
+    let unavailable = per_slot_route_override(|name| std::env::var(name).ok());
     let active = requested && unavailable.is_none();
     tracing::info!(
         requested,
@@ -222,14 +231,16 @@ fn warm_text_request(request: &Request) -> Option<(&[u32], &SamplingParams)> {
     .then_some((prompt_tokens.as_slice(), params))
 }
 
-/// Plan with an injected slot preference; `prefer` receives the slots
-/// already claimed by earlier cohort lanes.
+/// Plan with an injected preference over `claims` distinct ledgers (slots,
+/// then spilled conversations); `prefer` receives the ledgers already
+/// claimed by earlier cohort lanes and returns a preference whose `slot`
+/// is the claimed ledger's index.
 fn plan_requests(
     requests: &[Request],
-    n_slots: usize,
+    claims: usize,
     mut prefer: impl FnMut(&[u32], Option<[u8; 32]>, &[bool]) -> Option<Gemma4SlotPreference>,
 ) -> usize {
-    let mut claimed = vec![false; n_slots];
+    let mut claimed = vec![false; claims];
     plan_prefix(
         requests.iter().map(|request| {
             let (prompt_tokens, params) = warm_text_request(request)?;
@@ -246,25 +257,45 @@ fn plan_requests(
     )
 }
 
-/// Joint cohort length at the head of one admission quantum.
+/// Joint cohort length at the head of one admission quantum. A lane's
+/// reusable prefix is the longer of its idle slot's and a spilled
+/// conversation's (#727): per-slot admission restores the spill into the
+/// lane's granted slot before it is installed, so it joins the cohort exactly
+/// as it would have from its own slot. Each slot and each spill backs at most
+/// one lane.
 pub(super) fn cohort_prefix_len(
     requests: &[Request],
     retained_tokens: &[Vec<u32>],
     prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    slot_spills: &gemma4_slot_spill::Gemma4SlotSpills,
     slots: &[Option<Gemma4Slot>],
 ) -> usize {
+    let n_slots = slots.len();
     plan_requests(
         requests,
-        slots.len(),
+        n_slots + slot_spills.len(),
         |prompt_tokens, vision_fingerprint, claimed| {
-            preferred_gemma4_slot_for_request_excluding(
+            let in_slot = preferred_gemma4_slot_for_request_excluding(
                 retained_tokens,
                 prompt_anchors,
                 slots,
                 prompt_tokens,
                 vision_fingerprint,
-                claimed,
-            )
+                &claimed[..n_slots],
+            );
+            let spilled = slot_spills
+                .best_match(prompt_tokens, vision_fingerprint, &claimed[n_slots..])
+                .map(|(index, preference)| Gemma4SlotPreference {
+                    slot: SlotId((n_slots + index) as u32),
+                    ..preference
+                });
+            match (in_slot, spilled) {
+                (Some(in_slot), Some(spilled)) if spilled.cached_tokens > in_slot.cached_tokens => {
+                    Some(spilled)
+                }
+                (Some(in_slot), _) => Some(in_slot),
+                (None, spilled) => spilled,
+            }
         },
     )
 }
@@ -278,6 +309,7 @@ pub(super) fn admit_cohort(
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     registration: Option<&ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -325,6 +357,7 @@ pub(super) fn admit_cohort(
             slots,
             retained_tokens,
             prompt_anchors,
+            slot_spills,
             registration,
             scheduler_stats_snapshot,
             per_slot_kv_budget_bytes,
@@ -603,7 +636,6 @@ pub(super) fn advance(
                     &seqs,
                     scaffold,
                     max_decode_tokens,
-                    GemmaLiveAttention::PerSlotExact,
                     &mut guard.model.ctx,
                 )
             })
@@ -777,7 +809,7 @@ mod tests {
         assert_eq!(
             plan(&stable_second, &anchors()),
             0,
-            "a stable cue split stays in the stable batch class"
+            "a stable cue split stays out of the joint warm cohort (admitted per slot)"
         );
     }
 

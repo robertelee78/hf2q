@@ -2,11 +2,20 @@
 //! worker with the full-input checkpoint active. Each worker thread owns its
 //! own quota, so the per-worker fit check (`QuotaPlan`) is the whole story:
 //! two activated Gemma engines in one process never draw on one budget.
+//!
+//! The quota also owns the worker's payload pool (host P3): a reserved
+//! anchor's ring buffers return to it when the anchor drops, and the next
+//! capture overwrites them instead of allocating and page-faulting a fresh
+//! ~158 MB per slot per turn. Pooled bytes are bounded by the room the quota
+//! leaves (`used + pooled <= limit`), so the worker never holds more CPU
+//! payload than its plan already admits as live anchors, and refusal
+//! decisions still depend on `used` alone.
 use super::{GemmaHybridSlidingLayerAnchor, MultiSeqHybridKvBuffers};
 use anyhow::{anyhow, Result};
+use std::collections::BTreeMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex, MutexGuard, PoisonError,
 };
 
 #[cfg(test)]
@@ -20,10 +29,7 @@ pub const GENERATIONS_PER_SLOT: usize = 2;
 thread_local! {
     /// The calling worker's quota. A `Reservation` keeps its `Arc`, so a
     /// payload dropped on another thread still refunds the owning worker.
-    static QUOTA: Arc<Quota> = Arc::new(Quota {
-        used: AtomicUsize::new(0),
-        limit: LIMIT,
-    });
+    static QUOTA: Arc<Quota> = Arc::new(Quota::new(LIMIT));
 }
 fn worker_quota() -> Arc<Quota> {
     QUOTA.with(Arc::clone)
@@ -31,6 +37,72 @@ fn worker_quota() -> Arc<Quota> {
 struct Quota {
     used: AtomicUsize,
     limit: usize,
+    pool: Mutex<PayloadPool>,
+}
+impl Quota {
+    fn new(limit: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            limit,
+            pool: Mutex::new(PayloadPool::default()),
+        }
+    }
+    fn lock_pool(&self) -> MutexGuard<'_, PayloadPool> {
+        // Every pool mutation completes before it can unwind, so a poisoned
+        // pool is still consistent.
+        self.pool.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Free pooled buffers until `used + pooled <= limit` again.
+    fn trim_pool(&self) {
+        let evicted = {
+            let mut pool = self.lock_pool();
+            let room = self.limit.saturating_sub(self.used.load(Ordering::Acquire));
+            pool.trim(room)
+        };
+        drop(evicted);
+    }
+}
+/// Recycled anchor payload buffers keyed by exact byte length. Contents are
+/// stale; a capture overwrites every byte of a buffer it takes.
+#[derive(Default)]
+struct PayloadPool {
+    by_len: BTreeMap<usize, Vec<Vec<u8>>>,
+    bytes: usize,
+}
+impl PayloadPool {
+    fn push(&mut self, buf: Vec<u8>) {
+        self.bytes += buf.len();
+        self.by_len.entry(buf.len()).or_default().push(buf);
+    }
+    fn take(&mut self, len: usize) -> Option<Vec<u8>> {
+        let bucket = self.by_len.get_mut(&len)?;
+        let buf = bucket.pop()?;
+        if bucket.is_empty() {
+            self.by_len.remove(&len);
+        }
+        self.bytes -= buf.len();
+        Some(buf)
+    }
+    /// Evict largest buffers first until at most `room` bytes stay pooled.
+    /// The caller frees the returned buffers outside the lock.
+    fn trim(&mut self, room: usize) -> Vec<Vec<u8>> {
+        let mut evicted = Vec::new();
+        while self.bytes > room {
+            let Some(mut bucket) = self.by_len.last_entry() else {
+                break;
+            };
+            let Some(buf) = bucket.get_mut().pop() else {
+                bucket.remove();
+                continue;
+            };
+            if bucket.get().is_empty() {
+                bucket.remove();
+            }
+            self.bytes -= buf.len();
+            evicted.push(buf);
+        }
+        evicted
+    }
 }
 #[derive(Debug, thiserror::Error)]
 #[error("Gemma CPU anchor reservation refused: requested={requested} used={used} limit={limit}")]
@@ -46,6 +118,38 @@ pub struct Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.quota.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+impl Reservation {
+    /// A pooled payload buffer of exactly `len` bytes, if the worker has one.
+    pub(super) fn take_payload(&self, len: usize) -> Option<Vec<u8>> {
+        self.quota.lock_pool().take(len)
+    }
+    /// Offer one payload buffer of the anchor this lease pays for, while the
+    /// lease is still held (before its refund). The pool keeps it only if
+    /// `pooled` still fits the room left once this lease is refunded;
+    /// otherwise the buffer is freed here.
+    pub(super) fn recycle_payload(&self, buf: Vec<u8>) {
+        let rejected = {
+            let mut pool = self.quota.lock_pool();
+            let others = self
+                .quota
+                .used
+                .load(Ordering::Acquire)
+                .saturating_sub(self.bytes);
+            let room = self.quota.limit.saturating_sub(others);
+            let fits = pool
+                .bytes
+                .checked_add(buf.len())
+                .is_some_and(|pooled| pooled <= room);
+            if fits && !buf.is_empty() {
+                pool.push(buf);
+                None
+            } else {
+                Some(buf)
+            }
+        };
+        drop(rejected);
     }
 }
 fn acquire(quota: &Arc<Quota>, bytes: usize) -> Result<Reservation> {
@@ -64,10 +168,14 @@ fn acquire(quota: &Arc<Quota>, bytes: usize) -> Result<Reservation> {
             .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => {
-                return Ok(Reservation {
+                let reservation = Reservation {
                     quota: Arc::clone(quota),
                     bytes,
-                })
+                };
+                // The new lease shrinks the pool's room; free the excess
+                // before the capture allocates anything.
+                quota.trim_pool();
+                return Ok(reservation);
             }
             Err(actual) => used = actual,
         }
@@ -229,10 +337,7 @@ pub fn used_bytes() -> usize {
 /// The exact error a refused reservation returns (for degrade-path tests).
 #[cfg(test)]
 pub fn refusal_for_test() -> anyhow::Error {
-    let quota = Arc::new(Quota {
-        used: AtomicUsize::new(0),
-        limit: 0,
-    });
+    let quota = Arc::new(Quota::new(0));
     acquire(&quota, 1).err().expect("zero quota refuses")
 }
 #[cfg(test)]
@@ -240,10 +345,7 @@ mod tests {
     use super::*;
     #[test]
     fn gemma_anchor_budget_denial_preserves_existing_reservation() {
-        let q = Arc::new(Quota {
-            used: AtomicUsize::new(0),
-            limit: 10,
-        });
+        let q = Arc::new(Quota::new(10));
         let a = acquire(&q, 7).unwrap();
         assert!(acquire(&q, 4).is_err());
         assert_eq!(q.used.load(Ordering::Acquire), 7);
@@ -253,10 +355,7 @@ mod tests {
     }
     #[test]
     fn gemma_anchor_budget_covers_four_old_and_new_generations() {
-        let q = Arc::new(Quota {
-            used: AtomicUsize::new(0),
-            limit: LIMIT,
-        });
+        let q = Arc::new(Quota::new(LIMIT));
         let bytes = 158_105_600 + 262_144 * 4 + 30 * 256;
         let held: Vec<_> = (0..8).map(|_| acquire(&q, bytes).unwrap()).collect();
         assert_eq!(q.used.load(Ordering::Acquire), 8 * bytes);
@@ -266,10 +365,7 @@ mod tests {
     }
     #[test]
     fn gemma_anchor_budget_four_concurrent_captures_do_not_overbook() {
-        let q = Arc::new(Quota {
-            used: AtomicUsize::new(0),
-            limit: LIMIT,
-        });
+        let q = Arc::new(Quota::new(LIMIT));
         let hold = Arc::new(std::sync::Barrier::new(5));
         let release = Arc::new(std::sync::Barrier::new(5));
         let joins: Vec<_> = (0..4)
@@ -309,10 +405,7 @@ mod tests {
             _payload: Payload,
             _reservation: Reservation,
         }
-        let q = Arc::new(Quota {
-            used: AtomicUsize::new(0),
-            limit: 10,
-        });
+        let q = Arc::new(Quota::new(10));
         drop(Owned {
             _payload: Payload { q: Arc::clone(&q) },
             _reservation: acquire(&q, 7).unwrap(),
@@ -353,6 +446,131 @@ mod tests {
             assert_eq!(after, 0);
         }
         assert_eq!(used_bytes(), 0, "the test thread's quota was never touched");
+    }
+    fn pooled(q: &Quota) -> usize {
+        q.lock_pool().bytes
+    }
+    fn layer(
+        k: Vec<u8>,
+        v_packed: Vec<u8>,
+        v_norms: Option<Vec<u8>>,
+    ) -> Option<GemmaHybridSlidingLayerAnchor> {
+        Some(GemmaHybridSlidingLayerAnchor {
+            k,
+            v_packed,
+            v_norms,
+            bf16_xlen_k: None,
+            bf16_xlen_v: None,
+        })
+    }
+    fn anchor(
+        lease: Option<Reservation>,
+        layers: Vec<Option<GemmaHybridSlidingLayerAnchor>>,
+    ) -> super::super::GemmaHybridSlotAnchor {
+        super::super::GemmaHybridSlotAnchor {
+            prompt_len: 1,
+            layers,
+            _reservation: lease,
+        }
+    }
+    /// Host P3: a dropped reserved anchor feeds the worker pool only within
+    /// the room its quota leaves, a new lease trims the pool largest-first,
+    /// and refusals still depend on live leases alone.
+    #[test]
+    fn gemma_anchor_payload_pool_stays_within_quota_room() {
+        let q = Arc::new(Quota::new(100));
+        let state = |q: &Quota| (q.used.load(Ordering::Acquire), pooled(q));
+        let other = acquire(&q, 60).unwrap();
+        drop(anchor(
+            Some(acquire(&q, 30).unwrap()),
+            vec![layer(vec![1; 20], vec![2; 20], None), None],
+        ));
+        assert_eq!(state(&q), (60, 40));
+        // An unreserved anchor (checkpoint inactive, or parked) never pools.
+        drop(anchor(None, vec![layer(vec![3; 5], vec![4; 5], None)]));
+        assert_eq!(state(&q), (60, 40));
+        // The new lease leaves room 30: one 20-byte buffer is freed.
+        let lease = acquire(&q, 10).unwrap();
+        assert_eq!(state(&q), (70, 20));
+        // After this refund the room is 40: both 10s fit, the 4-byte norms do not.
+        drop(anchor(
+            Some(lease),
+            vec![layer(vec![5; 10], vec![6; 10], Some(vec![7; 4]))],
+        ));
+        assert_eq!(state(&q), (60, 40));
+        // Pooled bytes never cause a refusal: the live-lease bound is unchanged.
+        assert!(acquire(&q, 41).is_err());
+        let full = acquire(&q, 40).unwrap();
+        assert_eq!(state(&q), (100, 0));
+        drop((full, other));
+        assert_eq!(state(&q), (0, 0));
+    }
+    /// Host P3: a capture overwrites every byte of a pooled buffer of the same
+    /// length (stale bytes never survive), allocates the rest, keeps region
+    /// order, and yields exactly the source bytes, fallible or not.
+    #[test]
+    fn gemma_anchor_capture_copy_reuses_pooled_buffers_bitwise() {
+        use super::super::{gemma4_copy_anchor_regions, AnchorRegion};
+        let sources: Vec<Vec<u8>> = (0..48)
+            .map(|i| {
+                let len = [4096, 1536, 64, 7][i % 4] + i;
+                (0..len)
+                    .map(|j| ((i * 31 + j * 7 + j / 251) % 251) as u8)
+                    .collect()
+            })
+            .collect();
+        let stale = |i: usize| vec![0xFF; sources[i].len()];
+        let q = Arc::new(Quota::new(1 << 20));
+        // Regions 4m..4m+2 have a stale pooled buffer; every 4m+3 is fresh.
+        let layers: Vec<_> = (0..12)
+            .map(|m| layer(stale(4 * m), stale(4 * m + 1), Some(stale(4 * m + 2))))
+            .collect();
+        let stale_ptrs: std::collections::HashSet<usize> = layers
+            .iter()
+            .flatten()
+            .flat_map(|l| {
+                [
+                    l.k.as_ptr(),
+                    l.v_packed.as_ptr(),
+                    l.v_norms.as_ref().unwrap().as_ptr(),
+                ]
+            })
+            .map(|ptr| ptr as usize)
+            .collect();
+        let stale_bytes: usize = (0..48)
+            .filter(|i| i % 4 != 3)
+            .map(|i| sources[i].len())
+            .sum();
+        drop(anchor(Some(acquire(&q, stale_bytes).unwrap()), layers));
+        assert_eq!(pooled(&q), stale_bytes);
+        let regions: Vec<_> = sources
+            .iter()
+            .enumerate()
+            .map(|(i, src)| {
+                (
+                    AnchorRegion {
+                        layer: i,
+                        part: "K",
+                    },
+                    src.as_slice(),
+                )
+            })
+            .collect();
+        let lease = acquire(&q, 1 << 19).unwrap();
+        let copies = gemma4_copy_anchor_regions(&regions, Some(&lease), true).unwrap();
+        assert_eq!(copies, sources, "pooled reuse is bitwise the source");
+        for (i, copy) in copies.iter().enumerate() {
+            assert_eq!(
+                stale_ptrs.contains(&(copy.as_ptr() as usize)),
+                i % 4 != 3,
+                "region {i}: reused iff a same-length buffer was pooled"
+            );
+        }
+        assert_eq!(pooled(&q), 0, "every pooled buffer was taken");
+        for fallible in [true, false] {
+            let fresh = gemma4_copy_anchor_regions(&regions, None, fallible).unwrap();
+            assert_eq!(fresh, sources, "fresh copy (fallible={fallible})");
+        }
     }
 }
 
@@ -427,8 +645,21 @@ mod actual_cpu {
             }
             assert_eq!(layer.seq_lens, [6, 7]);
         }
+        let saved_digest = anchor.digest();
+        let saved_bytes = anchor.total_bytes();
         drop(anchor);
         assert_eq!(used_bytes(), 0);
-        println!("GEMMA_ANCHOR_CPU_COMPLETE roots=6 requested_metal_bytes=30880 cpu_packet_max_bytes=262144 gpu_submissions=0 restored=7_to_6 quota_released=true");
+        // Host P3: the dropped anchor's ring buffers wait in the worker pool,
+        // and the next capture of the restored slot overwrites them into the
+        // same bytes as the first capture.
+        assert_eq!(worker_quota().lock_pool().bytes, saved_bytes);
+        let again =
+            snapshot_gemma_hybrid_slot_anchor(&layers, crate::serve::multi_seq_kv::SlotId(0), 7)
+                .unwrap();
+        assert_eq!(worker_quota().lock_pool().bytes, 0, "every region reused");
+        assert_eq!(again.digest(), saved_digest);
+        drop(again);
+        assert_eq!(used_bytes(), 0);
+        println!("GEMMA_ANCHOR_CPU_COMPLETE roots=6 requested_metal_bytes=30880 cpu_packet_max_bytes=262144 gpu_submissions=0 restored=7_to_6 quota_released=true pooled_recapture_bitwise=true");
     }
 }

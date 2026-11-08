@@ -87,10 +87,8 @@ fn unavailable_reason(
         Some("the hybrid KV regime is off")
     } else if is("HF2Q_BATCHED_BODY", &["0"]) {
         Some("HF2Q_BATCHED_BODY=0 removes the batched decode body of the cue replay")
-    } else if is("HF2Q_PREFILL_SLOT_BATCHED", &["0"]) {
-        Some("HF2Q_PREFILL_SLOT_BATCHED=0 replaces the per-slot route lanes must equal")
-    } else if env("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some() {
-        Some("HF2Q_MM_ID_ROUTING_THRESHOLD moves the MoE route boundary of the lane rule")
+    } else if let Some(reason) = gemma_warm_batch::per_slot_route_override(&env) {
+        Some(reason)
     } else if is("HF2Q_DFLASH_XLEN_SDPA", &["1"]) {
         Some("HF2Q_DFLASH_XLEN_SDPA=1 is not supported by multi-sequence prefill")
     } else if is("HF2Q_FA_F16", &["0", "false", "off"]) {
@@ -165,7 +163,7 @@ pub(super) enum CueRoute {
     /// `forward_decode_slot_aware`.
     Replay,
     /// Every lane has at least 33 cue rows: one joint
-    /// `forward_prefill_batched_multi_seq_live` with `PerSlotExact`.
+    /// `forward_prefill_batched_multi_seq_live` (the single-slot warm route).
     JointLive,
     /// A 32-row cue, or a long cue beside a short one: the per-slot resume
     /// inside the same transaction (exact by identity).

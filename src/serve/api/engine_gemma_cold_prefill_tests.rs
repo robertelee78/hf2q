@@ -1,9 +1,10 @@
 //! ADR-063 turn 0: slot-mounted cold prefill without the SerialFifo dense
 //! handoff and LCP snapshots. Real-artifact bitwise gate.
 //!
-//! Ignored. `HF2Q_GEMMA4_GGUF` names the official Gemma 4 26B-A4B GGUF, and
-//! `HF2Q_KV_LCP_RESUME_CAPACITY=8g` (the four-agent launcher's value) lets
-//! the legacy arm actually build its ~5.4 GB snapshots. Run alone with
+//! Ignored. `HF2Q_GEMMA4_GGUF` names the official Gemma 4 26B-A4B GGUF; the
+//! built-in 8 GiB LCP resume budget (`LcpResumeBudget::DEFAULT`, the
+//! four-agent launcher's value) lets the legacy arm actually build its
+//! ~5.4 GB snapshots. Run alone with
 //! `--exact --ignored --nocapture --test-threads=1`.
 //!
 //! Each arm loads a fresh model and runs the same schedule of cold
@@ -165,7 +166,7 @@ fn gemma_cold_prefill_handoff_skip_matches_legacy_bitwise() {
         if CONVERSATIONS[conversation] <= 1_024 {
             assert!(
                 legacy.snapshot_left_on_model[index],
-                "{label}: the legacy arm built no snapshot; set HF2Q_KV_LCP_RESUME_CAPACITY=8g"
+                "{label}: the legacy arm built no snapshot under the 8 GiB LCP resume budget"
             );
         }
     }

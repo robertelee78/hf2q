@@ -28,9 +28,7 @@ use mlx_native::{DType, GraphExecutor, KernelRegistry, MlxBuffer, MlxDevice};
 use crate::debug::INVESTIGATION_ENV;
 use crate::quantize::imatrix::ImatrixHint;
 use crate::serve::config::LayerType;
-use crate::serve::forward_mlx_shared::{
-    dispatch_qmatmul, dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
-};
+use crate::serve::forward_mlx_shared::{dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs};
 use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
 
 use super::batched_head::BatchedHeadOut;
@@ -122,6 +120,9 @@ pub struct BatchedDecodeBuffers {
     /// queries' NWG partials + S/M land in disjoint regions. Unused by the
     /// default per-slot flash.
     pub sdpa_tmp: MlxBuffer,
+    /// `[layers, N, top_k]` per-step copy of every layer's `moe_expert_ids`
+    /// for the V2 diagnostic (`HF2Q_GEMMA_ROUTING_OVERLAP=1`); `None` when off.
+    pub routing_overlap_ids: Option<MlxBuffer>,
 }
 
 /// Element count of an F32/U32 buffer (4 bytes/element).
@@ -179,6 +180,7 @@ impl BatchedDecodeBuffers {
             moe_down_id_out: f32n(&acts.moe_down_id_out, "moe_down_id_out")?,
             moe_accum: f32n(&acts.moe_accum, "moe_accum")?,
             sdpa_tmp: f32n(&acts.sdpa_tmp, "sdpa_tmp")?,
+            routing_overlap_ids: None,
         })
     }
 
@@ -447,6 +449,11 @@ fn cat_boundary<'a>(
 /// per-row matvec; otherwise loop m=1 per row (correct, weight re-read N times —
 /// these are the minority dense projections; the dominant MoE experts batch
 /// bit-identically via `quantized_matmul_id_ggml`).
+///
+/// Both arms go through [`super::decode_dense::dispatch_decode_dense`]: under
+/// `HF2Q_GEMMA_DECODE_DENSE=row_exact|mma` an admitted weight takes the
+/// row-invariant kernel at m=N (and at m=1 in the per-row loop for N > 8),
+/// the same per-row result as the solo m=1 decode.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_dense_rowident(
     session: &mut GraphSession<'_>,
@@ -472,7 +479,9 @@ pub(super) fn dispatch_dense_rowident(
     ) && (n as u32)
         <= mlx_native::ops::quantized_matmul_ggml::MM_ROUTING_THRESHOLD;
     if batched_rowident {
-        dispatch_qmatmul(session, reg, dev, input, weight, output, n as u32, hint)
+        super::decode_dense::dispatch_decode_dense(
+            session, reg, dev, input, weight, output, n as u32, hint,
+        )
     } else {
         // Measured (ADR-040 M4): amortizing the F16/F32 weight read across rows
         // (dispatch row 0 only) was throughput-NEUTRAL (152.3 vs 151.8 @ N=4) —
@@ -481,7 +490,9 @@ pub(super) fn dispatch_dense_rowident(
         for i in 0..n {
             let in_i = input.slice_view(row_off(in_stride, i), in_stride);
             let out_i = output.slice_view(row_off(out_stride, i), out_stride);
-            dispatch_qmatmul(session, reg, dev, &in_i, weight, &out_i, 1, hint)?;
+            super::decode_dense::dispatch_decode_dense(
+                session, reg, dev, &in_i, weight, &out_i, 1, hint,
+            )?;
         }
         Ok(())
     }
@@ -1060,29 +1071,51 @@ impl MlxModelWeights {
                         ],
                         &[&bufs.sdpa_out, &bufs.sdpa_tmp],
                     );
-                    mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
-                        session.encoder_mut(),
-                        reg,
-                        dev,
-                        n as u32,
-                        &bufs.attn_q_normed,
-                        &buf.k,
-                        &buf.v_packed,
-                        &buf.v_norms,
-                        &bufs.sdpa_out,
-                        &bufs.sdpa_tmp,
-                        slot_id_buf,
-                        // ADR-059 (3c): sliding rings derive their per-query
-                        // read extents prompt-indexed (no graft rows in the
-                        // ring); full layers keep the absolute positions (the
-                        // graft rows participate in their reads).
-                        if is_ring {
-                            ring_positions_buf.unwrap_or(positions_buf)
-                        } else {
-                            positions_buf
-                        },
-                        &p_hyb,
-                    )
+                    // ADR-059 (3c): sliding rings derive their per-query read
+                    // extents prompt-indexed (no graft rows in the ring); full
+                    // layers keep the absolute positions (the graft rows
+                    // participate in their reads).
+                    let flash_positions = if is_ring {
+                        ring_positions_buf.unwrap_or(positions_buf)
+                    } else {
+                        positions_buf
+                    };
+                    // Gap program: the NE head split on d256 layers, the same
+                    // per-row math as the per-slot fallback and single-slot
+                    // paths below (`gemma_decode_attention`).
+                    match self.decode_attn_ne.for_head_dim(hd) {
+                        Some(ne) => mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched_ne(
+                            session.encoder_mut(),
+                            reg,
+                            dev,
+                            n as u32,
+                            &bufs.attn_q_normed,
+                            &buf.k,
+                            &buf.v_packed,
+                            &buf.v_norms,
+                            &bufs.sdpa_out,
+                            &bufs.sdpa_tmp,
+                            slot_id_buf,
+                            flash_positions,
+                            &p_hyb,
+                            ne,
+                        ),
+                        None => mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
+                            session.encoder_mut(),
+                            reg,
+                            dev,
+                            n as u32,
+                            &bufs.attn_q_normed,
+                            &buf.k,
+                            &buf.v_packed,
+                            &buf.v_norms,
+                            &bufs.sdpa_out,
+                            &bufs.sdpa_tmp,
+                            slot_id_buf,
+                            flash_positions,
+                            &p_hyb,
+                        ),
+                    }
                     .map_err(|e| anyhow::anyhow!("batched flash L{layer_idx}: {e}"))?;
                     // PHASE 3 — FWHT-undo. ATTNPRE: ONE batched undo over all N queries
                     // (num_heads=N*nh; kernel base=head_idx*hd over tight [N, nh*hd] ⇒
@@ -1311,18 +1344,33 @@ impl MlxModelWeights {
                                 fuse_fwht_pre: 0,
                                 nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(kv_seq_len),
                             };
-                        mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
-                            session.encoder_mut(),
-                            reg,
-                            dev,
-                            &q_i,
-                            &k_view,
-                            &v_view,
-                            &v_norms_view,
-                            &sdpa_i,
-                            &tmp_i,
-                            &p_hyb,
-                        )
+                        match self.decode_attn_ne.for_head_dim(hd) {
+                            Some(ne) => mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_ne(
+                                session.encoder_mut(),
+                                reg,
+                                dev,
+                                &q_i,
+                                &k_view,
+                                &v_view,
+                                &v_norms_view,
+                                &sdpa_i,
+                                &tmp_i,
+                                &p_hyb,
+                                ne,
+                            ),
+                            None => mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
+                                session.encoder_mut(),
+                                reg,
+                                dev,
+                                &q_i,
+                                &k_view,
+                                &v_view,
+                                &v_norms_view,
+                                &sdpa_i,
+                                &tmp_i,
+                                &p_hyb,
+                            ),
+                        }
                         .map_err(|e| {
                             anyhow::anyhow!("batched flash_attn_vec_hybrid L{layer_idx} s{i}: {e}")
                         })?;
@@ -1980,6 +2028,15 @@ impl MlxModelWeights {
             .map_err(|e| anyhow::anyhow!("batched MoE routing L{layer_idx} slot{i}: {e}"))?;
             }
         }
+        // V2 diagnostic (HF2Q_GEMMA_ROUTING_OVERLAP=1): copy this layer's ids
+        // into the per-step buffer; read after the step's final wait.
+        if let Some(dst) = bufs.routing_overlap_ids.as_ref() {
+            let bytes = (n * ids_stride * 4) as u64;
+            session
+                .encoder_mut()
+                .blit_copy_bytes(&bufs.moe_expert_ids, 0, dst, layer_idx as u64 * bytes, bytes)
+                .map_err(|e| anyhow::anyhow!("routing overlap ids copy L{layer_idx}: {e}"))?;
+        }
         // catsplit: fused_gelu_mul (dense SwiGLU) + per-slot MoE routing/top-k.
         cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
         #[cfg(test)]
@@ -2392,7 +2449,14 @@ impl MlxModelWeights {
         let (exec, reg) = gpu.split();
         let dev = exec.device();
 
-        let bufs = BatchedDecodeBuffers::new(dev, &self.activations, n)?;
+        let mut bufs = BatchedDecodeBuffers::new(dev, &self.activations, n)?;
+        if super::routing_overlap::enabled() {
+            let count = self.layers.len() * n * (elems(&bufs.moe_expert_ids) / n);
+            bufs.routing_overlap_ids = Some(
+                dev.alloc_buffer(count * 4, DType::U32, vec![count])
+                    .map_err(|e| anyhow::anyhow!("body_batched routing overlap alloc: {e}"))?,
+            );
+        }
 
         // Positions buffer [N] u32 for per-slot RoPE.
         let mut positions_buf = dev
@@ -2582,6 +2646,7 @@ impl MlxModelWeights {
                 enc.accumulate_gpu_busy();
             }
             drop(committed);
+            self.record_routing_overlap(&bufs, n, seq_positions, regime)?;
 
             // §25 iter-L: fused head — read exact native-head logits after the
             // single wait. The normed GPU operand is retained through the wait
@@ -2662,6 +2727,7 @@ impl MlxModelWeights {
                 host_phases::Phase::BodyWait,
                 _hp.elapsed().as_nanos() as u64,
             );
+            self.record_routing_overlap(&bufs, n, seq_positions, regime)?;
         }
 
         // Final hidden rows [n, hidden] (pre-final-norm).
@@ -2676,5 +2742,46 @@ impl MlxModelWeights {
             _hp.elapsed().as_nanos() as u64,
         );
         Ok(v)
+    }
+
+    /// V2 diagnostic (`HF2Q_GEMMA_ROUTING_OVERLAP=1`): fold this step's routed
+    /// ids and per-layer KV lengths into the worker-lifetime histograms. Called
+    /// only after the step's final wait; no-op when the buffer was not
+    /// allocated. KV lengths mirror each regime's `ksl_of` in
+    /// [`Self::encode_one_layer_batched`] (hybrid rings subtract the graft).
+    fn record_routing_overlap(
+        &self,
+        bufs: &BatchedDecodeBuffers,
+        n: usize,
+        seq_positions: &[usize],
+        regime: &BatchedKvRegime<'_>,
+    ) -> Result<()> {
+        use super::routing_overlap::{kv_len, record_step, StepLayer};
+        let Some(ids_buf) = bufs.routing_overlap_ids.as_ref() else {
+            return Ok(());
+        };
+        let ids: &[u32] = ids_buf
+            .as_slice()
+            .map_err(|e| anyhow::anyhow!("routing overlap read ids: {e}"))?;
+        let stride = elems(&bufs.moe_expert_ids) / n;
+        let graft_len = self.kv_graft_len();
+        let layers: Vec<StepLayer> = (0..self.layers.len())
+            .map(|l| {
+                let (capacity, ring, offset) = match regime {
+                    BatchedKvRegime::Hybrid(kv) => (kv[l].capacity, kv[l].is_sliding, graft_len),
+                    BatchedKvRegime::FullTq(kv) => (kv[l].capacity, kv[l].is_sliding, 0),
+                };
+                StepLayer {
+                    sliding: self.layers[l].layer_type == LayerType::Sliding,
+                    top_k: self.layers[l].moe.top_k,
+                    kv_lens: seq_positions
+                        .iter()
+                        .map(|&sp| kv_len(sp, capacity, ring, offset))
+                        .collect(),
+                }
+            })
+            .collect();
+        record_step(ids, n, stride, &layers);
+        Ok(())
     }
 }

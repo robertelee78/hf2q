@@ -108,10 +108,11 @@ pub(super) fn deepseek4_joint_decode_rows(model: &Deepseek4Model) -> Option<usiz
     selected
 }
 
-/// Re-check admissibility each turn. Process-wide routing variables can
-/// change after worker start (loading a Qwen3.8 model sets
-/// `HF2Q_DECODE_MV_EXT=1`); a turn that is no longer provably exact runs
-/// serially instead of failing its requests.
+/// Re-check admissibility each turn. The routing policy is frozen into this
+/// model's registry at load (#729), so no other model's load can revoke it;
+/// the diagnostic variables (layer dumps, stage profiling) are still read
+/// live, and a turn that is no longer provably exact runs serially instead of
+/// failing its requests.
 pub(super) fn deepseek4_joint_decode_turn_rows(
     model: &Deepseek4Model,
     worker_rows: Option<usize>,
@@ -340,16 +341,12 @@ pub(super) fn run_deepseek4_joint_decode(
             }
         }
 
-        let _native_invocation = crate::serve::phase_trace::enabled().then(|| {
-            scheduler.trace_transaction(
-                "deepseek4",
-                "joint_decode_input",
-                &pending
-                    .iter()
-                    .map(|&(index, _)| lanes[index].handle)
-                    .collect::<Vec<_>>(),
-            )
-        });
+        let _native_invocation = crate::serve::phase_trace::enabled()
+            .then(|| joint_turn_transaction_lanes(&pending, |index| lanes[index].handle))
+            .flatten()
+            .map(|handles| {
+                scheduler.trace_transaction("deepseek4", "joint_decode_input", &handles)
+            });
         if let [(index, token)] = pending[..] {
             // A lone survivor keeps the exact one-row decode graph.
             let lane = &mut lanes[index];
@@ -425,6 +422,19 @@ pub(super) fn run_deepseek4_joint_decode(
         }
     }
     Deepseek4JointRun::Ran { serial }
+}
+
+/// The lanes a joint decode turn's `joint_decode_input` transaction names:
+/// the lanes that still commit a token this turn, in turn order. `None` when
+/// every remaining lane finished in `prepare_tick` (EOS, stop string,
+/// max_tokens or a terminal tool call): that turn runs no forward, and a
+/// transaction without lanes cannot be attributed (the phase-trace validator
+/// refuses it, `f2_trace.validate_trace`: "transaction cannot invent rows").
+fn joint_turn_transaction_lanes(
+    pending: &[(usize, u32)],
+    handle_of: impl Fn(usize) -> SlotHandle,
+) -> Option<Vec<SlotHandle>> {
+    (!pending.is_empty()).then(|| pending.iter().map(|&(index, _)| handle_of(index)).collect())
 }
 
 #[cfg(test)]
@@ -529,5 +539,18 @@ mod tests {
             partition_deepseek4_joint_lanes(&handles, 3, |_| true).expect("capped joint step");
         assert_eq!(joint, [handle(2, 1), handle(3, 1), handle(4, 1)]);
         assert_eq!(serial, [handle(1, 1)]);
+    }
+
+    #[test]
+    fn a_joint_turn_without_pending_lanes_opens_no_transaction() {
+        let lanes = [handle(0, 1), handle(2, 5), handle(3, 7)];
+        assert_eq!(
+            joint_turn_transaction_lanes(&[], |index| lanes[index]),
+            None
+        );
+        assert_eq!(
+            joint_turn_transaction_lanes(&[(2, 11), (0, 17)], |index| lanes[index]),
+            Some(vec![handle(3, 7), handle(0, 1)])
+        );
     }
 }

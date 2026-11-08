@@ -286,6 +286,7 @@ fn run_inner(first_fork: bool,target_layers:bool) -> Result<()> {
         glp_path: None,
         glp_alpha: None,
         kv_graft_path: None,
+        lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
     };
     let mut model = Qwen35LoadedModel::load_with_context(&options, Some(262144))?;
     model.speculation = super::super::super::qwen35_speculation::QwenSpeculationController::new(

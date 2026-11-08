@@ -589,8 +589,15 @@ impl Deepseek4Model {
                 );
             }
         }
-        for &token in &token_ids[offset..] {
-            state = Some(self.forward_verifier_one(token, cache)?);
+        while offset < token_ids.len() {
+            // Width per chunk: rows steps can be revoked mid-prompt.
+            let rows = self.token_wise_step_rows().min(token_ids.len() - offset);
+            let tokens = &token_ids[offset..offset + rows];
+            state = Some(match tokens {
+                [token] => self.forward_verifier_one(*token, cache)?,
+                _ => self.forward_verifier_rows_step_with_commit_gate(tokens, cache, || Ok(()))?,
+            });
+            offset += rows;
         }
         state.context("DeepSeek-V4 prompt encoded zero chunks")
     }
@@ -1221,7 +1228,7 @@ impl Deepseek4Model {
             layer,
             span.start_position + span.token_count,
         )?;
-        if std::env::var("HF2Q_DEEPSEEK_ENCODER_STAGES").as_deref() == Ok("1") {
+        if *super::ffn_forward::ENCODER_STAGES {
             session
                 .encoder_mut()
                 .profile_stage_boundary(match self.cfg.compress_ratios[layer] {

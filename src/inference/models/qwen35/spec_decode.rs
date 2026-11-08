@@ -1730,8 +1730,8 @@ mod tests {
     /// hosted tests. Run this exact ignored test with an explicit
     /// `HF2Q_TEST_QWEN38_GGUF` path. Set
     /// `HF2Q_TEST_QWEN38_EXPECT_Q4K_MVN=1` to prove the exact Q4_K mvN route,
-    /// or `HF2Q_TEST_QWEN38_EXPECT_MV_EXT=1` with
-    /// `HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1` to prove the same width-four
+    /// or `HF2Q_TEST_QWEN38_EXPECT_MV_EXT=1` to bind the routing policy
+    /// `hf2q serve` resolves for a Qwen3.8-named path (#729) and prove the
     /// qualified weight-amortized width-four route. Set
     /// `HF2Q_TEST_QWEN38_EXPECT_Q5_K_M=1` with a Q5_K_M artifact path to bind
     /// the storage assertions to file type 17, a Q5_K embedding/projection,
@@ -1755,18 +1755,6 @@ mod tests {
                 std::env::var("MLX_DISP_BUCKET").as_deref(),
                 Ok("1"),
                 "Qwen3.8 qL4 route proof requires externally-set MLX_DISP_BUCKET=1"
-            );
-        }
-        if expect_mv_ext {
-            assert_eq!(
-                std::env::var("HF2Q_DECODE_MVN").as_deref(),
-                Ok("0"),
-                "Q4_K mv_ext route proof requires externally-set HF2Q_DECODE_MVN=0"
-            );
-            assert_eq!(
-                std::env::var("HF2Q_DECODE_MV_EXT").as_deref(),
-                Ok("1"),
-                "Q4_K mv_ext route proof requires externally-set HF2Q_DECODE_MV_EXT=1"
             );
         }
         let _gpu = crate::inference::hf2q_gpu_test_lock();
@@ -1794,7 +1782,20 @@ mod tests {
             );
         }
         let mut progress = LoadProgress::new(false, 1, 0);
-        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen3.8 model");
+        let mut model =
+            Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen3.8 model");
+        if expect_mv_ext {
+            let policy =
+                crate::inference::models::qwen35::routing_policy::resolve_qwen_ggml_routing_policy(
+                    &path,
+                );
+            assert!(
+                !policy.dense_decode_mvn && policy.dense_decode_mv_ext,
+                "Q4_K mv_ext route proof needs the Qwen3.8 serve policy (a Qwen3.8-named \
+                 path without operator HF2Q_DECODE_MVN/HF2Q_DECODE_MV_EXT overrides)"
+            );
+            model.bind_ggml_routing_policy(policy);
+        }
         use crate::inference::models::qwen35::gpu_full_attn::FullAttnQGateWeightsGpu;
         use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35LayerWeights};
         use crate::inference::models::qwen35::mtp::MtpFfnWeightsGpu;

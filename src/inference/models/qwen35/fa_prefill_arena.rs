@@ -79,6 +79,13 @@ pub struct FaPrefillArena {
     pub n_kv_heads: u32,
     /// The `head_dim` value the arena was allocated for.
     pub head_dim: u32,
+
+    /// Route (c) scratch for `HF2Q_QWEN_RESUME_ATTN_FAST`: the TQ-dequant
+    /// K/V temps, their BF16 casts and the F32 output, sized for the
+    /// prefill's `(seq_len, kv_seq_len)`. Allocated by the first resumed FA
+    /// layer and shared by the rest, so it lives through the forward's
+    /// terminal wait like the buffers above. `None` otherwise.
+    pub(crate) resume_tq: Option<super::resume_attn_fast::ResumeTqScratch>,
 }
 
 impl FaPrefillArena {
@@ -122,6 +129,7 @@ impl FaPrefillArena {
             n_heads,
             n_kv_heads,
             head_dim,
+            resume_tq: None,
         })
     }
 

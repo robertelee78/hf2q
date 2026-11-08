@@ -42,7 +42,8 @@ SUCCESS = "FourAgentProtocolCompleteAwaitingIndependentReview"
 # Supervisor stops that are the arm's own failure once the task has started.
 ARM_FAILURE_STOPS = ("server_exited", "client_timeout")
 # Reference kind -> the reference client's --engine-kind. "<kind>-native" is a separately labeled
-# native-engine arm (different artifact; native_peers.py), never the same-GGUF peer. "splash" is the same-artifact
+# native-engine arm (native_peers.py: its own different artifact, or for a ds4 case declaring artifact_relation
+# same_as_hf2q the ds4 file the hf2q arm loads), never the same-GGUF peer. "splash" is the same-artifact
 # Splash peer of record (Qwen families; ADR-063 "Splash peer of record for the Qwen families").
 REFERENCE_KINDS = {"peer": "peer", "stock-hf2q": "hf2q", "splash": "splash",
                    **{f"{kind}-native": kind for kind in native_peers.KINDS}}
@@ -177,6 +178,10 @@ def build_plan(args, environ):
                      "engine_kind": engine_kind(cases[arm]),
                      "overrides": overrides(cases[arm], explicit or [], environ)}
     require(arms["subject"]["engine_kind"] == "hf2q", "the subject arm must be an hf2q case")
+    require(len({q5_case.repair_turns(case) for case in cases.values()}) == 1,
+            "both arms must grant the same repair turns (client --repair-turns)")
+    require(len({q5_case.request_setup(case) for case in cases.values()}) == 1,
+            "both arms must use the same request setup (client --request-setup)")
     if "reference" in arms:
         require(arms["reference"]["family"] == arms["subject"]["family"], "arms must be the same model family")
         require(arms["reference"]["engine_kind"] == REFERENCE_KINDS[args.reference_kind],

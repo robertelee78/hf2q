@@ -3031,7 +3031,9 @@ impl MlxModelWeights {
                     &[&self.activations.norm_out, &lm_head.buffer],
                     &[&self.activations.logits],
                 );
-                crate::serve::forward_mlx_shared::dispatch_qmatmul(
+                // m=1 head row: same per-row kernel as every decode head
+                // (`HF2Q_GEMMA_DECODE_DENSE`).
+                crate::inference::models::gemma4::decode_dense::dispatch_decode_dense(
                     &mut s,
                     reg,
                     dev,
@@ -3227,14 +3229,13 @@ impl MlxModelWeights {
             };
             dense + hybrid
         };
-        let lcp_fits_budget =
-            crate::serve::kv_persist::lcp_registry::gemma_lcp_snapshot_fits_budget(lcp_est_bytes);
+        let lcp_fits_budget = self.lcp_resume_budget.admits(lcp_est_bytes);
         if crate::debug::INVESTIGATION_ENV.kv_lcp_resume && lcp_resumable_regime && !lcp_fits_budget
         {
             tracing::debug!(
                 "lcp_snapshot skipped (budget): est entry {} bytes > registry budget                  ({} bytes) — snapshots skipped, registry stays without this prompt",
                 lcp_est_bytes,
-                crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget(),
+                self.lcp_resume_budget.bytes(),
             );
         }
         let snapshot_for_lcp: Option<Vec<std::sync::Arc<DenseKvBuffers>>> =

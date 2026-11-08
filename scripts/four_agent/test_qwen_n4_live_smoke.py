@@ -178,7 +178,8 @@ def client_args(phase_plan=None):
     return argparse.Namespace(base_url="http://127.0.0.1:18238/v1", model="Qwen3.8 27B", cargo="/x/cargo",
                               toolchain="stable", sandbox_exec="/usr/bin/sandbox-exec", sandbox_proof="/x/proof.json",
                               sandbox_proof_sha256="b" * 64, server_pid=PID, family="qwen", engine_kind="hf2q",
-                              benchmark_profile=None, instance=None, workload=None, phase_plan=phase_plan)
+                              benchmark_profile=None, instance=None, workload=None, phase_plan=phase_plan,
+                              request_setup=None, repair_turns=0)
 
 
 class PhasePlans(unittest.TestCase):

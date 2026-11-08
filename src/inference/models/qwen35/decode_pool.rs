@@ -101,6 +101,47 @@ pub fn pooled_alloc_buffer(
     DECODE_POOL.with(|cell| cell.borrow_mut().alloc(device, byte_len, dtype, shape))
 }
 
+thread_local! {
+    /// Whether multi-row layer outputs come from this pool (see
+    /// [`StepPooledOutputs`]).
+    static STEP_POOLED_OUTPUTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, the multi-row (`seq > 1`) layer outputs that otherwise use
+/// `MlxDevice::alloc_buffer` (dense FFN `down_out` / residual sum, attention
+/// projection and Q/gate outputs) come from this pool instead.
+///
+/// Those outputs are fresh device allocations because a prefill chunk resets
+/// this pool between layers while a layer's output becomes the next layer's
+/// input. A joint decode step resets the pool only at its start, after the
+/// previous step drained, so inside its layer loop pooled outputs live long
+/// enough. Every such output is fully written by its producing kernel, so the
+/// arithmetic is unchanged (Class A); only the per-step Metal allocation,
+/// zero-fill and residency-set churn go away.
+pub(crate) struct StepPooledOutputs {
+    previous: bool,
+}
+
+impl StepPooledOutputs {
+    /// Open the scope when `enabled`; a disabled scope changes nothing.
+    pub(crate) fn enter(enabled: bool) -> Self {
+        Self {
+            previous: STEP_POOLED_OUTPUTS.with(|cell| cell.replace(enabled)),
+        }
+    }
+}
+
+impl Drop for StepPooledOutputs {
+    fn drop(&mut self) {
+        STEP_POOLED_OUTPUTS.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Whether a [`StepPooledOutputs`] scope is open on this thread.
+pub(crate) fn step_pooled_outputs() -> bool {
+    STEP_POOLED_OUTPUTS.with(std::cell::Cell::get)
+}
+
 /// Reset the thread-local decode pool — moves every buffer handed out
 /// since the last reset back to the free list.
 ///
@@ -222,30 +263,13 @@ where
     };
     cell.with(|cell| {
         let mut guard = cell.borrow_mut();
-        // Capacity check: the inner scratch's caps are private, so we
-        // proxy via `IdMmScratch::alloc`'s error-returning check_capacity
-        // path indirectly — easier to just track the caps we requested
-        // and grow when we exceed them.  Using the option's None state
-        // for first-time allocation, plus a stored cap pair on Some.
-        //
-        // We tag the cap pair onto a side-table of static AtomicU32s
-        // keyed off slot — but a simpler approach: stash the caps in
-        // adjacent thread_local cells.  Inline that via the helper
-        // closure here: any check_capacity error reallocates.
+        // Reallocate when the cached scratch's constructor bounds (its
+        // capacity accessors) do not cover this call.
         let needs_realloc = match guard.as_ref() {
             None => true,
             Some(scratch) => {
-                // Probe the public api: scratch.htpe.element_count is
-                // the n_experts cap; scratch.hids.element_count() ==
-                // n_experts_cap × n_tokens_cap.  Both fields pub.
-                let cap_n_experts = scratch.htpe.element_count() as u32;
-                let cap_total = scratch.hids.element_count() as u64;
-                let cap_n_tokens = if cap_n_experts == 0 {
-                    0
-                } else {
-                    (cap_total / cap_n_experts as u64) as u32
-                };
-                n_experts > cap_n_experts || max_n_tokens > cap_n_tokens
+                n_experts > scratch.capacity_n_experts()
+                    || max_n_tokens > scratch.capacity_n_tokens()
             }
         };
         if needs_realloc {

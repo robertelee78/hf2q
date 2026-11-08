@@ -183,10 +183,20 @@ def wait_ready(plan, server, latch, receipt):
             actual = field(get_json(check['url']), check['field'])
         except (OSError, ValueError) as error:
             actual = 'unavailable: ' + repr(error)
-        receipt['readiness']['checks'].append({**check, 'actual': actual, 'ok': same(actual, check['equals'])})
+        receipt['readiness']['checks'].append(readiness_check(check, actual))
     if not all(c['ok'] for c in receipt['readiness']['checks']):
         return 'readiness_mismatch'
     return True
+
+
+def readiness_check(check, actual):
+    """Receipt row of one readiness check. A check that opts in with `skip_if_empty` (e.g. the Gemma
+    warm-attention kernel, which stock binaries before v0.1.30 do not publish) and whose expected value
+    expands to the empty string is recorded with its actual value and skipped, never compared. Every
+    other check compares, so an empty override of an identity check still fails."""
+    if check.get('skip_if_empty') and check['equals'] == '':
+        return {**check, 'actual': actual, 'ok': True, 'skipped': 'empty expected value'}
+    return {**check, 'actual': actual, 'ok': same(actual, check['equals'])}
 
 
 def client_outcome(plan, client, started):

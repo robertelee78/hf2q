@@ -329,13 +329,17 @@ class Registry(unittest.TestCase):
 
     def test_ds4_resolves_to_its_unchanged_arm(self):
         self.assertIs(native_peers.adapter('ds4'), nd)
-        self.assertEqual(nd.BASELINES, {'ds4_native': nd.LABEL})
+        self.assertEqual(nd.BASELINES, {'ds4_native': nd.LABEL, 'ds4_samefile': nd.SAMEFILE_LABEL})
+        self.assertEqual(native_peers.same_file_baselines(), {'ds4_samefile'})
         self.assertIsNone(nd.closing)
         self.assertTrue(nd.PEER_CASE_REFUSAL.startswith('a native ds4 --peer-case needs --peer-unavailable-evidence'))
-        self.assertIsNone(nd.NATIVE_COMPARISON)
+        # Q4-DS4-RACE decision D2: the same-file ds4 case runs as a --native-comparison campaign
+        self.assertIsNotNone(nd.NATIVE_COMPARISON)
+        self.assertTrue(nd.NATIVE_COMPARISON.startswith("same-file native comparison on ds4's GGUF; not the verdict of record"))
         self.assertEqual(nd.label({}), nd.LABEL)
         self.assertEqual(nd.q3_role({}), nd.Q3_ROLE)
         self.assertEqual(native_peers.baseline_of('ds4', nd.LABEL), 'ds4_native')
+        self.assertEqual(native_peers.baseline_of('ds4', nd.SAMEFILE_LABEL), 'ds4_samefile')
         self.assertIsNone(SSE('m', 0, set()).native_frame)
         self.assertIs(SSE('m', 0, set(), 'ds4').native_frame, nd.check_frame)
         self.assertIs(SSE('m', 0, set(), 'tensorfold').native_frame, tf.check_frame)
@@ -345,7 +349,8 @@ class Registry(unittest.TestCase):
 
     def test_consumer_vocabularies_come_from_the_registry(self):
         import native_peer_omlx as om
-        self.assertEqual(f2.NATIVE_BASELINES, {'ds4_native': nd.LABEL, 'tensorfold_native': tf.LABELS['none'],
+        self.assertEqual(f2.NATIVE_BASELINES, {'ds4_native': nd.LABEL, 'ds4_samefile': nd.SAMEFILE_LABEL,
+                                               'tensorfold_native': tf.LABELS['none'],
                                                'tensorfold_dflash2_native': tf.LABELS['dflash2'],
                                                **{f'omlx_{q3}_native': om.LABELS[q3] for q3 in om.Q3_FAMILIES}})
         self.assertFalse(set(f2.NATIVE_BASELINES) & set(f2.ARMS))

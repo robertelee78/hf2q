@@ -30,7 +30,8 @@ and does not receive local-path candidates.
 Because the adapters project the live public Clap grammar, both `serve` and
 `info` complete `--ctx`, `--scheduler`, `--max-slots`, and
 `--kv-cache-budget` plus the independent disk-backed
-`--kv-persist` / `--kv-persist-budget` pair. Setup completes
+`--kv-persist` / `--kv-persist-budget` pair and the host-memory
+`--slot-spill-budget`. Setup completes
 `--serve-kv-persist-budget`. Serve
 additionally completes its typed behavior-default
 flags. Removed `--max-seq-len`, `--kv-cache-budget-bytes`, and old

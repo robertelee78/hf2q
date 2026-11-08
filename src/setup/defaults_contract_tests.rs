@@ -11,6 +11,7 @@ fn operator_config_v2_is_canonical_strict_and_uses_the_guide_defaults() {
     assert_eq!(config.serve.ctx, None);
     assert_eq!(config.serve.kv_cache_budget, None);
     assert_eq!(config.serve.kv_persist_budget, None);
+    assert_eq!(config.serve.lcp_resume_budget, None);
 
     let bytes = config.to_canonical_bytes().expect("canonical config");
     assert_eq!(bytes, include_bytes!("testdata/config_v2.toml"));
@@ -44,6 +45,8 @@ fn operator_config_v2_rejects_incoherent_fifo_slots_and_invalid_quant() {
                 ctx: None,
                 kv_cache_budget: None,
                 kv_persist_budget: None,
+                lcp_resume_budget: None,
+                slot_spill_budget: None,
             },
         )
         .is_err()
@@ -62,6 +65,8 @@ fn operator_config_v2_rejects_incoherent_fifo_slots_and_invalid_quant() {
                 ctx: None,
                 kv_cache_budget: None,
                 kv_persist_budget: None,
+                lcp_resume_budget: None,
+                slot_spill_budget: None,
             },
         )
         .is_err()
@@ -107,6 +112,7 @@ max_slots = 4
     assert_eq!(config.serve.ctx, None);
     assert_eq!(config.serve.kv_cache_budget, None);
     assert_eq!(config.serve.kv_persist_budget, None);
+    assert_eq!(config.serve.lcp_resume_budget, None);
 
     let retired = br#"kind = "hf2q.config"
 schema_version = 2
@@ -145,16 +151,23 @@ max_slots = 4
 ctx = 262144
 kv_cache_budget = "8GiB"
 kv_persist_budget = "32GiB"
+lcp_resume_budget = "6GiB"
+slot_spill_budget = "12GiB"
 "#;
     let config = OperatorConfigV2::parse(configured.as_bytes()).expect("operator controls parse");
     assert_eq!(config.serve.ctx, Some(262_144));
     assert_eq!(config.serve.kv_cache_budget.as_deref(), Some("8GiB"));
     assert_eq!(config.serve.kv_persist_budget.as_deref(), Some("32GiB"));
+    assert_eq!(config.serve.lcp_resume_budget.as_deref(), Some("6GiB"));
+    assert_eq!(config.serve.slot_spill_budget.as_deref(), Some("12GiB"));
 
     for invalid in [
         configured.replace("ctx = 262144", "ctx = 0"),
         configured.replace("8GiB", "eight-ish"),
         configured.replace("32GiB", "lots"),
+        configured.replace("6GiB", "plenty"),
+        configured.replace("6GiB", "0"),
+        configured.replace("12GiB", "plenty"),
     ] {
         assert!(OperatorConfigV2::parse(invalid.as_bytes()).is_err());
     }

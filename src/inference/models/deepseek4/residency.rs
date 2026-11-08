@@ -66,10 +66,76 @@ struct ResidentTensor {
     buffer: MlxBuffer,
 }
 
+/// Kernel family of the few-row (`m <= 8`) F16 and Q8_0 products one model
+/// issues. Chosen once at model load, so the serial, joint-decode, prefill
+/// and verifier graphs of a process share one family. Both families produce
+/// the same bits; they differ in how many dispatches and weight reads a
+/// joint step costs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MatvecKernels {
+    /// Existing routes: the F16 `m = 1` matvec (L9) with tiled kernels above
+    /// it, the canonical GGUF matvec family (Q8_0 NR2) for block storage;
+    /// independent F16 rows run one dispatch per row.
+    #[default]
+    Stock,
+    /// mlx-native `row_exact_matvec_stock` where it reproduces the stock
+    /// route bitwise: F16 at `m = 1` and independent F16 rows, Q8_0 at
+    /// `m <= 8` and Q8_0 grouped output-A at `rows <= 8` while the stock Q8_0
+    /// route at that width is the NR2 matvec (not under
+    /// `HF2Q_Q8_0_MV_NR2=0`, nor at 2..=8 rows under `HF2Q_DECODE_MV_EXT=1`;
+    /// those products keep the stock route). One dispatch reads the weights
+    /// once for all rows, and every row is the stock one-row result.
+    RowExact,
+}
+
+impl MatvecKernels {
+    /// Process switch read by [`Self::from_env`].
+    pub const ENV: &'static str = "HF2Q_DEEPSEEK_ROW_EXACT_MATVEC";
+
+    /// Family used when [`Self::ENV`] is unset: the build-time
+    /// `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT` (`1` = [`Self::RowExact`],
+    /// `0` or unset = [`Self::Stock`]; any other value fails the build).
+    /// Lets a harness that strips `HF2Q_*` from the runtime environment run
+    /// the row-exact family from a separately built binary.
+    pub const BUILD_DEFAULT: Self =
+        Self::build_default(option_env!("HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT"));
+
+    const fn build_default(value: Option<&str>) -> Self {
+        match value {
+            None => Self::Stock,
+            Some(value) => match value.as_bytes() {
+                b"0" => Self::Stock,
+                b"1" => Self::RowExact,
+                _ => panic!("HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT must be 0 or 1"),
+            },
+        }
+    }
+
+    /// `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC`: `1` selects [`Self::RowExact`], `0`
+    /// [`Self::Stock`]; unset falls back to [`Self::BUILD_DEFAULT`]; anything
+    /// else is an error.
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::resolve(std::env::var_os(Self::ENV).as_deref(), Self::BUILD_DEFAULT)
+    }
+
+    /// Resolution order of [`Self::from_env`]: the runtime value when set,
+    /// else `build_default`.
+    pub fn resolve(value: Option<&std::ffi::OsStr>, build_default: Self) -> anyhow::Result<Self> {
+        match value.map(|value| value.to_str()) {
+            None => Ok(build_default),
+            Some(Some("0")) => Ok(Self::Stock),
+            Some(Some("1")) => Ok(Self::RowExact),
+            Some(_) => anyhow::bail!("{} must be 0 or 1 (got {value:?})", Self::ENV),
+        }
+    }
+}
+
 pub struct RawMatrixRef<'a> {
     pub buffer: &'a MlxBuffer,
     pub ggml_type: GgmlType,
     pub shape: &'a [usize],
+    /// The owning model's few-row kernel family.
+    pub matvec: MatvecKernels,
 }
 
 pub struct Deepseek4Weights {
@@ -78,6 +144,7 @@ pub struct Deepseek4Weights {
     file_backed_bytes: u64,
     anonymous_bytes: u64,
     mapped_segment_count: usize,
+    matvec: MatvecKernels,
     _device: MlxDevice,
 }
 
@@ -188,6 +255,7 @@ impl Deepseek4Weights {
             file_backed_bytes,
             anonymous_bytes,
             mapped_segment_count,
+            matvec: MatvecKernels::Stock,
             _device: device,
         })
     }
@@ -219,6 +287,12 @@ impl Deepseek4Weights {
     /// Number of shared Metal resources spanning the file-backed tensors.
     pub fn mapped_segment_count(&self) -> usize {
         self.mapped_segment_count
+    }
+
+    /// Select the few-row kernel family; the model loader calls this once,
+    /// before any graph is built.
+    pub fn set_matvec_kernels(&mut self, matvec: MatvecKernels) {
+        self.matvec = matvec;
     }
 
     pub fn tensor(
@@ -264,6 +338,7 @@ impl Deepseek4Weights {
             buffer: &entry.buffer,
             ggml_type: entry.ggml_type,
             shape: &entry.shape,
+            matvec: self.matvec,
         })
     }
 
@@ -349,6 +424,6 @@ fn validate_loaded_buffer(
 }
 
 #[cfg(test)]
-pub(super) fn metadata_storage_valid(spec:&super::weights::TensorSpec,actual:GgmlType)->bool {
-    validate_storage_type(&spec.name,spec.role,actual).is_ok()
+pub(super) fn metadata_storage_valid(spec: &super::weights::TensorSpec, actual: GgmlType) -> bool {
+    validate_storage_type(&spec.name, spec.role, actual).is_ok()
 }

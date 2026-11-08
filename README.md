@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.89+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF; full-model MLX-affine safetensors output is planned under [ADR-046](docs/adr/ADR-046-evidence-driven-apple-auto-quant.md). |
-| **Status** | This checkout describes the hf2q 0.1.29 release line and resolves published, checksum-pinned `mlx-native 0.15.18`. Treat 0.1.29 as a release candidate until the `v0.1.29` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | This checkout describes the hf2q 0.1.29 release line and resolves published, checksum-pinned `mlx-native 0.18.0`. Treat 0.1.29 as a release candidate until the `v0.1.29` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 curl -fsSL https://hf2q.us/install.sh | sh
@@ -590,6 +590,16 @@ model's GGUF maximum for DeepSeek, Gemma, and Qwen alike.
 `--kv-persist-budget <SIZE>` caps the separate on-disk persistent-KV store
 selected by `--kv-persist PATH`; it is also available as
 `[serve] kv_persist_budget` and through `hf2q setup`.
+`--lcp-resume-budget <SIZE>` (or `[serve] lcp_resume_budget`) sizes the
+in-memory LCP resume registry; it defaults to a host-independent 8GiB.
+`--slot-spill-budget <SIZE>` (`[serve] slot_spill_budget`, default `16GiB`,
+`0` disables) caps host memory for Qwen and Gemma conversations whose idle slot
+another request reclaims: their cache state is spilled and restored into
+whatever slot they are granted when they return, instead of recomputing the
+prefix. The oldest spill is evicted first. A conversation's own next turn or
+retry in its own slot resumes in place and copies nothing; a Gemma
+conversation whose own idle slot the shared KV budget refuses is moved into
+the slot it is granted and resumes there.
 Requests that cannot safely fit wait or fail explicitly instead of silently
 receiving a shorter context. A live `/v1/models` entry reports the effective
 limit as `context_length` and the GGUF capability as `max_context_length`.

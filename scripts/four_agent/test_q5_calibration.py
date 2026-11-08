@@ -431,8 +431,9 @@ class ArgvAndCases(unittest.TestCase):
         self.assertTrue(variables['MODEL'].endswith(
             '/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf'))
         self.assertEqual(variables['MODEL_SHA256'], 'ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0')
+        # Q4-DS4-RACE: the provisional best valid configuration (none/1024) until the section 7.1 re-sweep
         self.assertEqual((variables['LOAD_MODE'], variables['UBATCH'], variables['PEER_LOG_VERBOSITY']),
-                         ('auto', '512', '4'))
+                         ('none', '1024', '4'))
         tuning = {'MODEL', 'MODEL_SHA256', 'PORT', 'LOAD_MODE', 'UBATCH', 'PEER_LOG_VERBOSITY'}
         self.assertEqual({k: v for k, v in variables.items() if k not in tuning},
                          {k: v for k, v in base['variables'].items() if k not in tuning})
@@ -510,9 +511,53 @@ class ArgvAndCases(unittest.TestCase):
         self.assertEqual(off['serve']['env']['WARM_TILED_ATTENTION'], '0')
         self.assertEqual(off['serve']['env']['JOINT_WARM_PREFILL'], '', 'arms are independent')
         self.assertEqual(off['serve']['env']['FULL_INPUT_CHECKPOINT'], '', 'arms are independent')
+        tiled = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION': '1',
+                                                    'HF2Q_Q5_GEMMA_WARM_ATTENTION_KERNEL': 'TiledF16'})
+        self.assertEqual(tiled['serve']['env']['WARM_TILED_ATTENTION'], '1')
+        # Readiness binds each experiment arm's resolved kernel (/hf2q/v1/runtime); the stock
+        # default leaves the check empty, so binaries without the field (v0.1.28) still pass.
+        field = 'measurement_snapshot.active_controls.gemma_warm_attention_kernel'
+        kernel = lambda plan: [c for c in plan['readiness']['checks'] if c['field'] == field]
+        self.assertEqual([c['equals'] for c in kernel(stock)], [''])
+        self.assertEqual([c['equals'] for c in kernel(off)], [''])
+        self.assertEqual([c['equals'] for c in kernel(tiled)], ['TiledF16'])
+        [stock_check], [tiled_check] = kernel(stock), kernel(tiled)
+        for actual in (None, 'unavailable: KeyError()', 'VecHybrid', 'TiledF16'):
+            row = q5_calibration.readiness_check(stock_check, actual)
+            self.assertEqual((row['ok'], row['skipped'], row['actual']), (True, 'empty expected value', actual))
+        self.assertTrue(q5_calibration.readiness_check(tiled_check, 'TiledF16')['ok'])
+        for actual in (None, 'VecHybrid', 'tiled-f16', 'unavailable: KeyError()'):
+            row = q5_calibration.readiness_check(tiled_check, actual)
+            self.assertFalse(row['ok'], actual)
+            self.assertNotIn('skipped', row)
+        # The skip is opt-in per check: only the Gemma kernel check carries skip_if_empty, so an empty
+        # override of any identity check (model id, max_slots, vision) still fails readiness.
+        opted = [c['field'] for c in stock['readiness']['checks'] if c.get('skip_if_empty')]
+        self.assertEqual(opted, [field])
+        self.assertIs(stock_check['skip_if_empty'], True)
+        vision = next(c for c in stock['readiness']['checks'] if c['field'].endswith('vision_projector'))
+        self.assertFalse(q5_calibration.readiness_check(vision, True)['ok'])
+        # The model-id check expands {MODEL_ID}; with it empty (the client argv refuses an empty
+        # MODEL_ID at plan time, so build the row directly) the check still compares and fails.
+        model_check = {**next(c for c in stock['readiness']['checks'] if c['field'] == 'model'), 'equals': ''}
+        self.assertNotIn('skip_if_empty', model_check)
+        row = q5_calibration.readiness_check(model_check, 'Gemma 4 26B A4B It')
+        self.assertFalse(row['ok'])
+        self.assertNotIn('skipped', row)
+        self.assertFalse(q5_calibration.readiness_check({**stock_check, 'skip_if_empty': False}, 'VecHybrid')['ok'])
+        # Case validation: the flag is optional, boolean only, and no other keys are accepted.
+        for bad in ('yes', 1, None):
+            broken = json.loads(json.dumps(case))
+            next(c for c in broken['readiness']['checks'] if c['field'] == field)['skip_if_empty'] = bad
+            with self.assertRaises(q5_case.CaseError):
+                q5_case.validate(broken)
+        broken = json.loads(json.dumps(case))
+        broken['readiness']['checks'][0]['optional'] = True
+        with self.assertRaises(q5_case.CaseError):
+            q5_case.validate(broken)
         launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
         self.assertEqual(launcher.count('${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"}'), 2)
-        self.assertIn('0|1) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;', launcher)
+        self.assertIn('0|1|tensor) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;', launcher)
 
     def test_gemma_case_forwards_only_explicit_prefill_moe_arms(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
@@ -534,6 +579,48 @@ class ArgvAndCases(unittest.TestCase):
         self.assertEqual(launcher.count('${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"}'), 2)
         self.assertIn('flat|slotted) PREFILL_MOE_DOWN_ENV="$PREFILL_MOE_DOWN" ;;', launcher)
         self.assertIn('grid|compact) MM_ID_SCHEDULE_ENV="$MM_ID_SCHEDULE" ;;', launcher)
+
+    def test_gemma_case_forwards_only_an_explicit_q5_0_tensor_mm_arm(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        stock = q5_case.build_plan(case, builtins, self.required())
+        self.assertEqual(stock['serve']['env']['Q5_0_TENSOR_MM'], '')
+        self.assertNotIn('HF2Q_Q5_0_TENSOR_MM', stock['serve']['env'])
+        on = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_Q5_0_TENSOR_MM': '1'})
+        self.assertEqual(on['serve']['env']['Q5_0_TENSOR_MM'], '1')
+        self.assertNotIn('HF2Q_Q5_0_TENSOR_MM', on['serve']['env'])
+        self.assertEqual(on['serve']['env']['MM_ID_SCHEDULE'], '', 'arms are independent')
+        self.assertEqual(on['serve']['env']['PREFILL_MOE_DOWN'], '', 'arms are independent')
+        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
+        self.assertEqual(launcher.count('${Q5_0_TENSOR_MM_ENV:+HF2Q_Q5_0_TENSOR_MM="$Q5_0_TENSOR_MM_ENV"}'), 2)
+        self.assertIn('    1) Q5_0_TENSOR_MM_ENV=1 ;;', launcher)
+        self.assertIn('echo "Q5_0_TENSOR_MM must be 1 or unset" >&2', launcher)
+
+    def test_gemma_case_forwards_only_an_explicit_routing_overlap_arm(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        stock = q5_case.build_plan(case, builtins, self.required())
+        self.assertEqual(stock['serve']['env']['ROUTING_OVERLAP'], '')
+        self.assertNotIn('HF2Q_GEMMA_ROUTING_OVERLAP', stock['serve']['env'])
+        on = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_ROUTING_OVERLAP': '1'})
+        self.assertEqual(on['serve']['env']['ROUTING_OVERLAP'], '1')
+        self.assertEqual(on['serve']['env']['WARM_TILED_ATTENTION'], '', 'arms are independent')
+        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
+        self.assertEqual(launcher.count('${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"}'), 2)
+        self.assertIn('0|1) ROUTING_OVERLAP_ENV="$ROUTING_OVERLAP" ;;', launcher)
+
+    def test_gemma_case_forwards_only_an_explicit_decode_attn_ne_arm(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        stock = q5_case.build_plan(case, builtins, self.required())
+        self.assertEqual(stock['serve']['env']['DECODE_ATTN_NE'], '')
+        self.assertNotIn('HF2Q_GEMMA_DECODE_ATTN_NE', stock['serve']['env'])
+        on = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_DECODE_ATTN_NE': '4'})
+        self.assertEqual(on['serve']['env']['DECODE_ATTN_NE'], '4')
+        self.assertEqual(on['serve']['env']['ROUTING_OVERLAP'], '', 'arms are independent')
+        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
+        self.assertEqual(launcher.count('${DECODE_ATTN_NE_ENV:+HF2Q_GEMMA_DECODE_ATTN_NE="$DECODE_ATTN_NE_ENV"}'), 2)
+        self.assertIn('0|2|4) DECODE_ATTN_NE_ENV="$DECODE_ATTN_NE" ;;', launcher)
 
     def test_run_id_matches_client_identity_rule(self):
         for name in ('x', 'q5-qwen38-20261030T120000Z', 'a.b c' * 30):

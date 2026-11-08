@@ -47,6 +47,7 @@ import copy
 import json
 import re
 
+import native_peers
 import qwen_n4_peer
 from family_peer import SHARED_KEYS, same
 from qwen38_n1_verdict import integer, require
@@ -114,9 +115,15 @@ CLIENT_MODULES = ('native_peers.py', 'native_peer_tensorfold.py', 'native_peer_t
 PROCESSES = ('tensorfold', 'tensorfold-native')  # packaging/homebrew/tensorfold.rb.in:18-23, README.md:375
 PYTHON_MODULES = ()
 BASELINES = {'tensorfold_native': LABELS['none'], 'tensorfold_dflash2_native': LABELS['dflash2']}
+SAME_FILE_BASELINES = ()                # TensorFold serves its own safetensors snapshot, never the hf2q GGUF
 AUDIT = 'native_peer_tensorfold_audit'
 PEER_CASE_REFUSAL = ('a native TensorFold --peer-case needs --native-comparison (Qwen3.8 has a runnable same-GGUF '
                      'peer, ADR-063 Q4)')
+
+
+def mode_problems(case, evidence, comparison):
+    """No relation-dependent mode: SAME_GGUF_UNAVAILABLE and PEER_CASE_REFUSAL already fix --native-comparison."""
+    return []
 
 
 def _family(family):
@@ -373,6 +380,8 @@ def campaign_identity(plan):
     return identity(plan)
 
 
-def launch_problems(name, artifact, hf2q_sha256):
+def launch_problems(name, artifact, hf2q_sha256, case=None):
     from native_peer_tensorfold_ready import launch_problems as problems
-    return problems(name, artifact, hf2q_sha256)
+    refused = ([f'{name}: a TensorFold case is never artifact_relation same_as_hf2q (it serves its own snapshot)']
+               if native_peers.artifact_relation(case) == native_peers.SAME_AS_HF2Q else [])
+    return refused + problems(name, artifact, hf2q_sha256)

@@ -334,7 +334,8 @@ struct DecodeBuffers {
 ///
 /// Weights are uploaded once at session start and reused across all decode
 /// tokens. The ordinary path is keyed by the raw pointer of the
-/// `Qwen35Model`. Evidence-bearing models additionally bind the exact D2b
+/// `Qwen35Model` and by the model's GGML routing policy, which the cache's
+/// registry freezes (#729). Evidence-bearing models additionally bind the exact D2b
 /// conversion receipt plus graph/routing configuration so address reuse or
 /// an authority change cannot retain stale uploaded bytes. Since the serve
 /// loop runs single-threaded, a `thread_local` RefCell is safe and avoids
@@ -379,12 +380,29 @@ fn gpu_cache_matches_model(cache: &ForwardGpuCache, model: &Qwen35Model) -> bool
         }
         _ => false,
     };
-    cache.model_ptr == model_ptr && authority_matches
+    cache.model_ptr == model_ptr && authority_matches && gpu_cache_policy_matches(cache, model)
 }
 
 #[cfg(not(test))]
 fn gpu_cache_matches_model(cache: &ForwardGpuCache, model: &Qwen35Model) -> bool {
-    cache.model_ptr == model as *const _ as *const ()
+    cache.model_ptr == model as *const _ as *const () && gpu_cache_policy_matches(cache, model)
+}
+
+/// The thread-local cache is keyed by model, and its registry carries that
+/// model's frozen routing policy (#729). A cache whose registry was frozen
+/// under another policy never serves this model, so no policy can leak
+/// between models that share a thread, whatever their load order.
+fn gpu_cache_policy_matches(cache: &ForwardGpuCache, model: &Qwen35Model) -> bool {
+    cache.registry.ggml_routing_policy() == Some(&model.ggml_routing_policy)
+}
+
+/// A fresh registry for `model`'s GPU cache with its routing policy frozen.
+fn new_model_registry(model: &Qwen35Model) -> Result<KernelRegistry> {
+    let mut registry = KernelRegistry::new();
+    registry
+        .freeze_ggml_routing_policy(model.ggml_routing_policy)
+        .map_err(|error| anyhow!("freeze Qwen GGML routing policy: {error}"))?;
+    Ok(registry)
 }
 
 thread_local! {
@@ -3601,7 +3619,7 @@ impl Qwen35Model {
                 super::decode_pool::profile::before_device_creation(self as *const _ as usize)?;
                 let device = MlxDevice::new().context("ensure_gpu_cache_primed: MlxDevice::new")?;
                 super::decode_pool::profile::bind(self as *const _ as usize, &device)?;
-                let mut registry = KernelRegistry::new();
+                let mut registry = new_model_registry(self)?;
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
                 // Register flash_attn_vec for decode-path SDPA instead of the
                 // single-threadgroup serial kernel previously used here.
@@ -3703,6 +3721,20 @@ impl Qwen35Model {
                         // for MoE (top_k=8 routed) + (top_k=1 down).
                         "kernel_mul_mm_id_map0_ne20_1",
                         "kernel_mul_mm_id_map0_ne20_8",
+                        // Compact-schedule (default) variants of the same
+                        // mm_id kernels and map0 (ADR-063 Q4-GEMMA-PREFILL-MOE).
+                        "kernel_mul_mm_id_q4_0_f32_c",
+                        "kernel_mul_mm_id_q4_0_tensor_f32_c",
+                        "kernel_mul_mm_id_q8_0_f32_c",
+                        "kernel_mul_mm_id_q8_0_tensor_f32_c",
+                        "kernel_mul_mm_id_q4_K_f32_c",
+                        "kernel_mul_mm_id_q4_K_tensor_f32_c",
+                        "kernel_mul_mm_id_q5_K_f32_c",
+                        "kernel_mul_mm_id_q5_K_tensor_f32_c",
+                        "kernel_mul_mm_id_q6_K_f32_c",
+                        "kernel_mul_mm_id_q6_K_tensor_f32_c",
+                        "kernel_mul_mm_id_map0c_ne20_1",
+                        "kernel_mul_mm_id_map0c_ne20_8",
                     ];
                     let warmed = registry.prewarm_pipelines(device.metal_device(), hot_kernels);
 
@@ -5424,6 +5456,7 @@ impl Qwen35Model {
                     snapshots.snapshot(enc.encoder(),&ffn_residual_buf,layer_idx,
                         crate::adr063_invariance::receipt::Stage::Residual,
                         q1_layer_metadata::layer(layer_gpu,kv_cache,layer_idx,slot_id,seq_len,cfg,
+                            &self.ggml_routing_policy,registry.ggml_routing_policy(),
                             q1_layer_before.as_ref().context("missing layer state")?)?)?;
                 }
                 if any_fused_eligible {
@@ -6586,7 +6619,7 @@ impl Qwen35Model {
                 super::decode_pool::profile::before_device_creation(self as *const _ as usize)?;
                 let device = MlxDevice::new().context("forward_gpu_greedy: MlxDevice::new")?;
                 super::decode_pool::profile::bind(self as *const _ as usize, &device)?;
-                let mut registry = KernelRegistry::new();
+                let mut registry = new_model_registry(self)?;
                 // Wave 5b.10: register flash_attn_prefill kernel family for
                 // the Qwen3.5 FA prefill path (replaces legacy `sdpa`).
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
@@ -7948,38 +7981,31 @@ impl Qwen35Model {
                         .with_context(|| format!("upload moe_ffn layer {i}"))?,
                 ),
                 Qwen35FfnWeights::MoeQ(w) => {
-                    // Expert buffers already on Metal device; only router and
-                    // shared-expert F32 vecs need uploading.
+                    // Expert buffers already on Metal device; router and
+                    // shared-expert weights are uploaded as BF16 or, on the
+                    // batched route, retained in GGUF storage.
                     let moe_cfg = cfg
                         .moe
                         .as_ref()
                         .ok_or_else(|| anyhow!("layer {i}: MoeQ but no moe config"))?;
                     let mut moe_gpu = MoeFfnWeightsGpuQ::from_quantized(
-                        // Clone the Metal buffer handle (ARC retain — no data copy).
-                        w.expert_gate_q.clone(),
-                        w.expert_up_q.clone(),
-                        w.expert_down_q.clone(),
-                        w.ggml_type_gate_up,
-                        w.ggml_type_down,
+                        w,
                         moe_cfg.num_experts,
                         moe_cfg.moe_intermediate_size,
                         cfg.hidden_size,
-                        &w.router,
-                        &w.shared_gate_logit,
-                        &w.shared_gate,
-                        &w.shared_up,
-                        &w.shared_down,
                         device,
                     )
                     .with_context(|| format!("upload moe_ffn_q layer {i}"))?;
                     // ADR-020 AC#5 Iter C2.4 #4 — propagate DWQ overlay
                     // affine stacks from MoeFfnWeightsQ into the GPU
                     // bundle.  Cheap clone (Arc-wrapped MlxBuffer).
-                    moe_gpu.attach_affine_overlay(
-                        w.expert_gate_affine.as_ref(),
-                        w.expert_up_affine.as_ref(),
-                        w.expert_down_affine.as_ref(),
-                    );
+                    moe_gpu
+                        .attach_affine_overlay(
+                            w.expert_gate_affine.as_ref(),
+                            w.expert_up_affine.as_ref(),
+                            w.expert_down_affine.as_ref(),
+                        )
+                        .with_context(|| format!("moe_ffn_q layer {i} affine overlay"))?;
                     FfnWeightsGpu::MoeQ(moe_gpu)
                 }
             };
@@ -8675,6 +8701,42 @@ mod tests {
                 "logit[{i}] = {v} is non-finite (zero model should produce finite output)"
             );
         }
+    }
+
+    /// #729: the GPU cache's registry freezes the model's bound routing
+    /// policy, and rebinding a different policy rebuilds the cache with it
+    /// instead of reusing the registry frozen under the old one.
+    #[test]
+    fn gpu_cache_registry_freezes_model_routing_policy() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut m = Qwen35Model::empty_from_cfg(tiny_hybrid_cfg());
+        let frozen_policy = |m: &Qwen35Model| {
+            m.with_gpu_cache_mut(|_device, registry| {
+                registry
+                    .ggml_routing_policy()
+                    .copied()
+                    .ok_or_else(|| anyhow!("GPU cache registry has no frozen routing policy"))
+            })
+            .expect("read frozen routing policy")
+        };
+
+        let mut padded = mlx_native::ggml_routing_policy_from_environment();
+        padded.dense_decode_mvn = !padded.dense_decode_mvn;
+        padded.dense_decode_mv_ext = !padded.dense_decode_mv_ext;
+        m.bind_ggml_routing_policy(padded);
+        m.ensure_gpu_cache_primed().expect("prime under first policy");
+        assert_eq!(frozen_policy(&m), padded);
+
+        let mut exact = padded;
+        exact.dense_decode_mvn = !padded.dense_decode_mvn;
+        exact.dense_decode_mv_ext = !padded.dense_decode_mv_ext;
+        m.bind_ggml_routing_policy(exact);
+        assert!(
+            m.with_gpu_cache_mut(|_, _| Ok(())).is_err(),
+            "a cache frozen under another policy must not serve the model"
+        );
+        m.ensure_gpu_cache_primed().expect("re-prime under second policy");
+        assert_eq!(frozen_policy(&m), exact);
     }
 
     /// Determinism: same model + tokens + positions → same logits bit-for-bit.

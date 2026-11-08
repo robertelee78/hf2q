@@ -23,9 +23,9 @@
 //!     Strategy A; §6 R3).
 //! - **Byte-budget LRU eviction** (iter E.a default-on): entries are
 //!   evicted LRU-first until `current_bytes + new_bytes <= byte_budget`.
-//!   The budget is computed from sysinfo `available_memory() × 5%`
-//!   (clamped to `[1 GiB, 16 GiB]`) or overridden via
-//!   `HF2Q_KV_LCP_RESUME_CAPACITY`. `lookup` promotes hit entries to MRU.
+//!   The budget is the operator setting `--lcp-resume-budget` /
+//!   `[serve] lcp_resume_budget` (default [`LcpResumeBudget::DEFAULT`],
+//!   8 GiB, host-independent). `lookup` promotes hit entries to MRU.
 //!   Entry count is secondarily bounded by a `capacity` ceiling (default
 //!   `usize::MAX` in byte-budget mode; set explicitly by `new(n)` shim).
 //!
@@ -85,149 +85,53 @@ pub trait ByteSized {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Dynamic byte-budget probe
+// LCP resume byte budget
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Compute the byte budget for `LcpRegistry` at engine-init time.
+/// Byte budget of the in-memory LCP resume registry.
 ///
-/// Priority order:
-///
-/// 1. **`HF2Q_KV_LCP_RESUME_CAPACITY` env override** — accepts:
-///    - Bare integer with a suffix (`b`/`B` = bytes; `k`/`K` = ×1024;
-///      `m`/`M` = ×1024²; `g`/`G` = ×1024³). E.g. `2g` = 2 GiB.
-///    - Bare integer ≥ 4096 → treated as a raw byte count.
-///    - Bare integer < 4096 → **legacy entry-count** (backward-compat):
-///      converts via `n × 300 MB` heuristic (300 MB was the measured
-///      per-entry cost on Qwen 3.6 35B-A3B at cap=8 time; see
-///      `c04d5d2` motivation). Emits a one-time deprecation
-///      `eprintln!` directing operators to the byte-suffix form.
-///
-/// 2. **sysinfo probe** (env unset): `available_memory() × 5%` clamped
-///    to `[1 GiB, 16 GiB]`. The 5% / floor / ceiling triple ensures we
-///    claim a defensible slice of free RAM (≈5 GB on a fresh 128 GB Mac,
-///    ~16 Gemma-26B entries or ~16 Qwen35-35B entries) without OOM-
-///    class budgets that cap=64 (19 GB) would cause.
-///
-///    If `available_memory()` returns 0 (shouldn't happen, but paranoia
-///    rule: no magic number fallback), the floor (1 GiB) is returned
-///    with a one-time warning.
-///
-/// Always emits one info-level `eprintln!` naming the chosen budget and
-/// source on the first call (guards the invariant: no silent feature flip).
-/// Pre-copy LCP snapshot budget gate (2026-08-03, "gemma-hybrid-lcp"
-/// long-resume follow-up): TRUE when an entry of `est_bytes` would be
-/// admitted by the registry's byte budget (mirrors the single-entry
-/// rule behind `LcpStoreError::EntryExceedsBudget`). The gemma prefill
-/// routes use this to SKIP the expensive snapshot alloc+memcpy when
-/// the entry cannot possibly fit — at a ~97K-token opencode prompt
-/// the dual-leg (dense F32 + hybrid) snapshot is ~64 GB, and copying
-/// it only to be rejected at store time swap-storms a 128 GB box
-/// (measured live: 900s+ stall, OOM-adjacent).
-pub fn gemma_lcp_snapshot_fits_budget(est_bytes: u64) -> bool {
-    est_bytes <= default_lcp_byte_budget()
+/// The value is a pure function of operator configuration: `serve` resolves
+/// `--lcp-resume-budget` > `[serve] lcp_resume_budget` > [`Self::DEFAULT`]
+/// once at startup and passes it explicitly into every engine load. Nothing
+/// on this path reads host memory, so which requests are snapshotted and
+/// which entries are evicted does not depend on the host, on free memory at
+/// load time, or on model-load order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LcpResumeBudget {
+    bytes: u64,
 }
 
-pub fn default_lcp_byte_budget() -> u64 {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const FLOOR: u64 = GIB; // 1 GiB minimum
-    const CEILING: u64 = 16 * GIB; // 16 GiB maximum
+impl LcpResumeBudget {
+    /// Built-in host-independent budget: 8 GiB. Library, test, and tool
+    /// callers that do not take an operator setting use this constant.
+    pub const DEFAULT: Self = Self::from_bytes(8 * 1024 * 1024 * 1024);
 
-    static LOG_ONCE: Once = Once::new();
-
-    let env_val = std::env::var("HF2Q_KV_LCP_RESUME_CAPACITY").ok();
-
-    if let Some(raw) = env_val {
-        // Try to parse as integer + optional suffix.
-        let trimmed = raw.trim();
-        let (digits, suffix) = if let Some(last) = trimmed.chars().last() {
-            match last {
-                'b' | 'B' | 'k' | 'K' | 'm' | 'M' | 'g' | 'G' => {
-                    (&trimmed[..trimmed.len() - 1], Some(last))
-                }
-                _ => (trimmed, None),
-            }
-        } else {
-            (trimmed, None)
-        };
-
-        if let Ok(n) = digits.parse::<u64>() {
-            let budget = if let Some(suffix_char) = suffix {
-                // Suffix form: always byte-budget.
-                let multiplier: u64 = match suffix_char {
-                    'b' | 'B' => 1,
-                    'k' | 'K' => 1024,
-                    'm' | 'M' => 1024 * 1024,
-                    'g' | 'G' => 1024 * 1024 * 1024,
-                    _ => unreachable!("suffix already validated above"),
-                };
-                n.saturating_mul(multiplier)
-            } else if n < 4096 {
-                // Legacy entry-count path: n × 300 MB heuristic.
-                let bytes = n.saturating_mul(300 * 1024 * 1024);
-                // Emit deprecation warning exactly once.
-                static LEGACY_ONCE: Once = Once::new();
-                LEGACY_ONCE.call_once(|| {
-                    eprintln!(
-                        "[hf2q lcp] HF2Q_KV_LCP_RESUME_CAPACITY={n} interpreted as \
-                         legacy entry-count (={bytes} bytes); use {n}g for byte-budget"
-                    );
-                });
-                bytes
-            } else {
-                // Bare integer ≥ 4096: raw byte count.
-                n
-            };
-
-            LOG_ONCE.call_once(|| {
-                eprintln!(
-                    "[hf2q lcp] byte_budget={} MB (source=env HF2Q_KV_LCP_RESUME_CAPACITY={})",
-                    budget / (1024 * 1024),
-                    raw.trim()
-                );
-            });
-            return budget;
-        }
-        // Unparsable env value: fall through to sysinfo probe.
-        static PARSE_WARN_ONCE: Once = Once::new();
-        PARSE_WARN_ONCE.call_once(|| {
-            eprintln!(
-                "[hf2q lcp] WARNING: HF2Q_KV_LCP_RESUME_CAPACITY={:?} is not a \
-                 parsable integer (with optional b/k/m/g suffix); falling back to \
-                 sysinfo probe",
-                raw
-            );
-        });
+    pub const fn from_bytes(bytes: u64) -> Self {
+        Self { bytes }
     }
 
-    // sysinfo probe path.
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    let avail = sys.available_memory();
+    pub const fn bytes(self) -> u64 {
+        self.bytes
+    }
 
-    let budget = if avail == 0 {
-        // Paranoia: sysinfo returned 0 — use floor and warn.
-        static ZERO_AVAIL_ONCE: Once = Once::new();
-        ZERO_AVAIL_ONCE.call_once(|| {
-            eprintln!(
-                "[hf2q lcp] WARNING: sysinfo available_memory() returned 0 bytes; \
-                 using floor budget of 1 GiB"
-            );
-        });
-        FLOOR
-    } else {
-        let computed = (avail as f64 * 0.05) as u64;
-        computed.clamp(FLOOR, CEILING)
-    };
+    /// Pre-copy LCP snapshot budget gate (2026-08-03, "gemma-hybrid-lcp"
+    /// long-resume follow-up): TRUE when an entry of `est_bytes` would be
+    /// admitted by the registry's byte budget (mirrors the single-entry
+    /// rule behind `LcpStoreError::EntryExceedsBudget`). The gemma prefill
+    /// routes use this to SKIP the expensive snapshot alloc+memcpy when
+    /// the entry cannot possibly fit — at a ~97K-token opencode prompt
+    /// the dual-leg (dense F32 + hybrid) snapshot is ~64 GB, and copying
+    /// it only to be rejected at store time swap-storms a 128 GB box
+    /// (measured live: 900s+ stall, OOM-adjacent).
+    pub const fn admits(self, est_bytes: u64) -> bool {
+        est_bytes <= self.bytes
+    }
+}
 
-    LOG_ONCE.call_once(|| {
-        eprintln!(
-            "[hf2q lcp] byte_budget={} MB (source=sysinfo available_memory={} GB × 5%)",
-            budget / (1024 * 1024),
-            avail / (1024 * 1024 * 1024)
-        );
-    });
-
-    budget
+impl Default for LcpResumeBudget {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -475,6 +475,13 @@ Delivery boundary: Decision record merged to main.
 
 ## A. Cost-priced row allocation
 
+**Repeatability constraint (2026-11-06, `docs/research/adr063-qwen-spec-repeatable.md`).** Speculation-on Qwen serving is now repeatable by default (`HF2Q_QWEN_SPECULATION_ROUTE=repeatable`): a lane's route comes from its own state, and the proposer gates read a fixed cost model. A1 and A2 as specified conflict with that.
+
+- A1's table is timed on the host at load and re-timed while idle on drift, so it can differ between runs.
+- A2 scores the 256 four-slot allocations jointly with a least-recently-served tie-break, so a lane's draft depth depends on the cohort.
+
+Under the repeatable route, A2 MUST use per-lane depths from a static table. The cohort-scored allocator may ship only under `adaptive`. J6 MUST route solo windows through REF(w), so a window's arithmetic is the same alone and in a cohort.
+
 ### A1. Build a cost table for window compositions
 
 Outcome: Joint-round cost is known per route, KV format, window composition and context bucket on the running host.

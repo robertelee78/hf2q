@@ -8,10 +8,12 @@
 //! head. Work that touches a slot's cache (DeltaNet conv + recurrence, KV
 //! write + SDPA) runs per row against that slot's cursor and ping-pong
 //! parity; see
-//! [`super::super::joint_decode_core`]. MoE FFNs run per row through the
-//! serial helper: the router and shared expert are float projections whose
-//! packed route differs from `m = 1`, and routed experts are mostly distinct
-//! per row, so packing them would trade exactness for little weight reuse.
+//! [`super::super::joint_decode_core`]. MoE FFNs with native router and
+//! shared-expert storage (`HF2Q_QWEN_MOE_BATCHED=1`) run one batched layer
+//! over the packed rows ([`super::super::moe_batched`]), whose kernels are
+//! row-exact, so serial decode runs the same route at one row. Otherwise
+//! they run per row through the serial helper: the BF16 router and shared
+//! expert are float projections whose packed route differs from `m = 1`.
 //!
 //! Admission ([`super::super::joint_decode_routes`]) runs before the first
 //! write. Cursors and parities advance at encode time exactly as in the
@@ -45,13 +47,15 @@ use crate::inference::models::qwen35::joint_decode_core::{
     FullAttnRoutes, JointRows,
 };
 use crate::inference::models::qwen35::joint_decode_routes::{
-    check_dense_ffn_route, check_mode_environment, dense_ffn_route,
+    check_dense_ffn_route, check_mode_policy, dense_ffn_route,
     joint_decode_env_unavailable_reason, joint_mode_max_rows, joint_padded_width, projection_route,
     select_joint_route_mode, JointDenseFfnRoute, JointProductRoute, JointRouteMode,
-    JointRoutingEnvironment, MAX_JOINT_DECODE_ROWS,
+    JointRoutingPolicy, MAX_JOINT_DECODE_ROWS,
 };
+use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
-use crate::inference::models::qwen35::model::Qwen35Model;
+use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35Model};
+use crate::inference::models::qwen35::moe_batched::build_moe_ffn_layer_gpu_batched_into;
 use crate::inference::models::qwen35::spec_decode::nth_hidden_row;
 use crate::inference::models::qwen35::Qwen35Config;
 use crate::serve::multi_seq_kv::SlotId;
@@ -149,6 +153,34 @@ fn joint_chain_n(cfg: &Qwen35Config, layer_weights: &[LayerWeightsGpu]) -> usize
         .unwrap_or_else(|| default_chain_n(cfg, layer_weights))
 }
 
+/// Whether the joint layer chain closes (commits) after `layer_idx`.
+fn closes_chain(layer_idx: usize, chain_n: usize, n_layers: usize) -> bool {
+    (layer_idx + 1) % chain_n == 0 || layer_idx + 1 == n_layers
+}
+
+/// The observed native commands of one joint forward, in commit order: the
+/// embedding gather (an observed command only on the native embedding route),
+/// one command per closed layer chain, an open-chain flush (never, while every
+/// chain closes at `n_layers`) and the output head.
+fn joint_command_plan(n_layers: usize, chain_n: usize, native_embedding: bool) -> Vec<String> {
+    let mut commands = Vec::new();
+    if native_embedding {
+        commands.push("embed".to_string());
+    }
+    let mut start = 0;
+    for layer in 0..n_layers {
+        if closes_chain(layer, chain_n, n_layers) {
+            commands.push(format!("layers[{start},{})", layer + 1));
+            start = layer + 1;
+        }
+    }
+    if start < n_layers {
+        commands.push(format!("layers.flush[{start},{n_layers})"));
+    }
+    commands.push("output_head".into());
+    commands
+}
+
 fn host_buffer<T: bytemuck::Pod>(
     device: &MlxDevice,
     dtype: DType,
@@ -166,7 +198,31 @@ fn host_buffer<T: bytemuck::Pod>(
 }
 
 impl Qwen35Model {
-    /// Joint route mode for this artifact and process, or why decode must
+    /// Decode route of this model's MoE FFN layers, from the loaded weights:
+    /// `batched_native` (every MoE layer has native router/shared storage,
+    /// `HF2Q_QWEN_MOE_BATCHED=1`), `per_row_bf16`, `mixed`, or `none` for a
+    /// dense artifact.
+    pub(crate) fn moe_ffn_decode_route(&self) -> &'static str {
+        let (mut moe, mut native) = (0_usize, 0_usize);
+        for layer in &self.layers {
+            match layer.ffn() {
+                Qwen35FfnWeights::MoeQ(weights) => {
+                    moe += 1;
+                    native += usize::from(weights.native_dense.is_some());
+                }
+                Qwen35FfnWeights::Moe(_) => moe += 1,
+                Qwen35FfnWeights::Dense(_) | Qwen35FfnWeights::DenseQ(_) => {}
+            }
+        }
+        match (moe, native) {
+            (0, _) => "none",
+            (moe, native) if native == moe => "batched_native",
+            (_, 0) => "per_row_bf16",
+            _ => "mixed",
+        }
+    }
+
+    /// Joint route mode for this artifact and its routing policy, or why decode must
     /// stay serial. Primes the GPU weight cache so storage types are known.
     pub(crate) fn joint_decode_mode(&self) -> Result<JointRouteMode, String> {
         if let Some(reason) = joint_decode_env_unavailable_reason() {
@@ -178,9 +234,9 @@ impl Qwen35Model {
         if self.glp.is_some() {
             return Err("GLP steering requires the serial graph".into());
         }
-        let environment = JointRoutingEnvironment::from_process();
-        let mode = select_joint_route_mode(environment, self.cfg.moe.is_some())?;
-        check_mode_environment(mode, environment)?;
+        let policy = JointRoutingPolicy::from_ggml(&self.ggml_routing_policy);
+        let mode = select_joint_route_mode(policy, self.cfg.moe.is_some())?;
+        check_mode_policy(mode, policy)?;
         self.ensure_gpu_cache_primed()
             .map_err(|error| format!("GPU cache priming failed: {error:#}"))?;
         GPU_CACHE.with(|cell| -> Result<JointRouteMode, String> {
@@ -196,18 +252,35 @@ impl Qwen35Model {
         })
     }
 
-    /// Advance `rows.len()` distinct slots by one token each in one
-    /// layer-major transaction. Under [`JointRouteMode::Exact`] every row's
-    /// logits, hidden, KV codes, recurrent state, cursor and parity are
-    /// bitwise those of its serial one-token forward. `dense_ffn` must be
-    /// admitted for `mode` ([`check_dense_ffn_route`]). Refusal (admission,
-    /// shape, slot range) happens before any cache write.
+    /// [`Self::forward_gpu_decode_joint_with_options`] with the default
+    /// step options (every switch off).
+    #[cfg(test)]
     pub(crate) fn forward_gpu_decode_joint(
         &self,
         rows: &[Qwen35JointRow],
         kv_cache: &mut HybridKvCache,
         mode: JointRouteMode,
         dense_ffn: JointDenseFfnRoute,
+    ) -> Result<Vec<Qwen35JointRowOutput>> {
+        let options = JointStepOptions::default();
+        self.forward_gpu_decode_joint_with_options(rows, kv_cache, mode, dense_ffn, options)
+    }
+
+    /// Advance `rows.len()` distinct slots by one token each in one
+    /// layer-major transaction. Under [`JointRouteMode::Exact`] every row's
+    /// logits, hidden, KV codes, recurrent state, cursor and parity are
+    /// bitwise those of its serial one-token forward. `dense_ffn` must be
+    /// admitted for `mode` ([`check_dense_ffn_route`]). `options` are
+    /// resolved by the caller (the serving worker reads their switches once
+    /// at start; the Q1 trace runs several in one process). Refusal
+    /// (admission, shape, slot range) happens before any cache write.
+    pub(crate) fn forward_gpu_decode_joint_with_options(
+        &self,
+        rows: &[Qwen35JointRow],
+        kv_cache: &mut HybridKvCache,
+        mode: JointRouteMode,
+        dense_ffn: JointDenseFfnRoute,
+        options: JointStepOptions,
     ) -> Result<Vec<Qwen35JointRowOutput>> {
         let max_rows = joint_mode_max_rows(mode, MAX_JOINT_DECODE_ROWS);
         ensure!(
@@ -250,7 +323,7 @@ impl Qwen35Model {
             self.glp.is_none(),
             "Qwen joint decode unavailable: GLP steering requires the serial graph"
         );
-        check_mode_environment(mode, JointRoutingEnvironment::from_process())
+        check_mode_policy(mode, JointRoutingPolicy::from_ggml(&self.ggml_routing_policy))
             .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
         check_dense_ffn_route(mode, dense_ffn)
             .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
@@ -287,6 +360,7 @@ impl Qwen35Model {
                 kv_cache,
                 mode,
                 dense_ffn,
+                options,
             )
         });
         pool_operation.complete()?;
@@ -305,6 +379,7 @@ impl Qwen35Model {
         kv_cache: &mut HybridKvCache,
         mode: JointRouteMode,
         dense_ffn: JointDenseFfnRoute,
+        options: JointStepOptions,
     ) -> Result<Vec<Qwen35JointRowOutput>> {
         let cfg = &self.cfg;
         let hidden_size = cfg.hidden_size;
@@ -331,6 +406,13 @@ impl Qwen35Model {
             }
         }
         let positions = host_buffer(device, DType::I32, positions.as_slice(), "positions")?;
+        // The forward's actual input manifest (trace on only): one row per
+        // packed slot in matrix order, padding rows owner-less. Its drop at
+        // return closes the forward before the caller's per-lane settle work.
+        let _native_input = crate::inference::native_observation::joint_decode_input(
+            rows.iter().map(|row| (row.slot_id.0, row.position)),
+            width,
+        );
         let mut embedded = device
             .alloc_buffer(width * h * 4, DType::F32, vec![width, h])
             .map_err(|e| anyhow!("allocate Qwen joint embeddings: {e}"))?;
@@ -355,9 +437,25 @@ impl Qwen35Model {
             "Qwen joint plan covers {} of {n_layers} layers",
             plan.layers.len()
         );
+        crate::inference::native_observation::joint_chain_plan(|| {
+            let kinds: Vec<_> = layer_weights
+                .iter()
+                .map(|weights| match weights {
+                    LayerWeightsGpu::FullAttn { .. } => "full",
+                    LayerWeightsGpu::LinearAttn { .. } => "linear",
+                })
+                .collect();
+            let native_embedding = self.token_embd_native.is_some();
+            serde_json::json!({"model":"qwen35","n_layers":n_layers,"chain_n":chain_n,
+                "native_embedding":native_embedding,"layer_kinds":kinds,
+                "commands":joint_command_plan(n_layers, chain_n, native_embedding)})
+        });
         let mut hidden = embedded;
         let mut retained = Vec::with_capacity(n_layers);
         let mut chain: Option<CommandEncoder> = None;
+        // Layer chains only; the output head allocates its outputs as
+        // before.
+        let pooled_scope = decode_pool::StepPooledOutputs::enter(options.pooled_outputs);
         for (layer_idx, (weights, routes)) in layer_weights.iter().zip(&plan.layers).enumerate() {
             if let Some(enc) = chain.as_mut() {
                 // Cross-layer RAW: this layer reads the previous FFN output.
@@ -457,53 +555,76 @@ impl Qwen35Model {
                         moe_intermediate_size: moe.moe_intermediate_size,
                         shared_intermediate_size: moe.shared_expert_intermediate_size,
                     };
-                    let mut per_row = Vec::with_capacity(rows.len());
-                    for row in 0..rows.len() {
-                        if row > 0 {
-                            enc.memory_barrier();
-                        }
-                        per_row.push(
-                            build_moe_ffn_layer_gpu_q_into(
-                                enc,
-                                device,
-                                registry,
-                                &row_view(&ffn_input, row, vec![1, h])?,
-                                weights,
-                                shape,
-                                Some(&row_view(&ffn_residual, row, vec![1, h])?),
-                                layer_idx,
-                            )
-                            .with_context(|| {
-                                format!("Qwen joint MoE FFN layer {layer_idx} row {row}")
-                            })?,
-                        );
-                    }
-                    enc.memory_barrier();
-                    let packed_output = device
-                        .alloc_buffer(width * h * 4, DType::F32, vec![width, h])
-                        .map_err(|e| anyhow!("allocate Qwen joint MoE output: {e}"))?;
-                    for index in 0..width {
-                        let source = &per_row[if index < rows.len() { index } else { 0 }];
-                        dispatch_copy_f32(
-                            enc,
-                            registry,
-                            device.metal_device(),
-                            source,
-                            &packed_output,
-                            0,
-                            index * h,
-                            h,
+                    if weights.dense_storage.is_native() {
+                        let mut output = decode_pool::pooled_alloc_buffer(
+                            device,
+                            width * h * 4,
+                            DType::F32,
+                            vec![width, h],
                         )
-                        .map_err(|e| anyhow!("gather Qwen joint MoE row {index}: {e}"))?;
+                        .map_err(|e| anyhow!("allocate Qwen joint MoE output: {e}"))?;
+                        build_moe_ffn_layer_gpu_batched_into(
+                            enc,
+                            device,
+                            registry,
+                            &ffn_input,
+                            weights,
+                            shape,
+                            Some(&ffn_residual),
+                            &mut output,
+                            width_u32,
+                            layer_idx,
+                        )
+                        .with_context(|| format!("Qwen joint batched MoE FFN layer {layer_idx}"))?;
+                        output
+                    } else {
+                        let mut per_row = Vec::with_capacity(rows.len());
+                        for row in 0..rows.len() {
+                            if row > 0 {
+                                enc.memory_barrier();
+                            }
+                            per_row.push(
+                                build_moe_ffn_layer_gpu_q_into(
+                                    enc,
+                                    device,
+                                    registry,
+                                    &row_view(&ffn_input, row, vec![1, h])?,
+                                    weights,
+                                    shape,
+                                    Some(&row_view(&ffn_residual, row, vec![1, h])?),
+                                    layer_idx,
+                                )
+                                .with_context(|| {
+                                    format!("Qwen joint MoE FFN layer {layer_idx} row {row}")
+                                })?,
+                            );
+                        }
+                        enc.memory_barrier();
+                        let packed_output = device
+                            .alloc_buffer(width * h * 4, DType::F32, vec![width, h])
+                            .map_err(|e| anyhow!("allocate Qwen joint MoE output: {e}"))?;
+                        for index in 0..width {
+                            let source = &per_row[if index < rows.len() { index } else { 0 }];
+                            dispatch_copy_f32(
+                                enc,
+                                registry,
+                                device.metal_device(),
+                                source,
+                                &packed_output,
+                                0,
+                                index * h,
+                                h,
+                            )
+                            .map_err(|e| anyhow!("gather Qwen joint MoE row {index}: {e}"))?;
+                        }
+                        packed_output
                     }
-                    packed_output
                 }
                 FfnWeightsGpu::Dense(_) | FfnWeightsGpu::Moe(_) => {
                     bail!("Qwen joint layer {layer_idx} has no admitted FFN arm")
                 }
             };
-            let last_in_group = (layer_idx + 1) % chain_n == 0 || layer_idx + 1 == n_layers;
-            if last_in_group {
+            if closes_chain(layer_idx, chain_n, n_layers) {
                 chain
                     .take()
                     .expect("joint layer encoder opened above")
@@ -514,6 +635,7 @@ impl Qwen35Model {
         if let Some(mut enc) = chain.take() {
             enc.commit_labeled("qwen35.joint_decode.layers.flush");
         }
+        drop(pooled_scope);
 
         // ---- Output head: final norm, lm_head, per-row argmax ----
         let mut enc = device
@@ -542,9 +664,16 @@ impl Qwen35Model {
         )
         .context("Qwen joint output norm")?;
         enc.memory_barrier();
-        let mut logits = device
-            .alloc_buffer(width * vocab * 4, DType::F32, vec![width, vocab])
-            .map_err(|e| anyhow!("allocate Qwen joint logits: {e}"))?;
+        // Pooled: the head writes every row and every result leaves this
+        // function as an owned copy before the next forward resets the pool,
+        // so a step pays no fresh `[width, vocab]` allocation and CPU zeroing.
+        let mut logits = decode_pool::pooled_alloc_buffer(
+            device,
+            width * vocab * 4,
+            DType::F32,
+            vec![width, vocab],
+        )
+        .map_err(|e| anyhow!("allocate Qwen joint logits: {e}"))?;
         match plan.head {
             JointProductRoute::Batched => apply_linear_projection_f32_into_with_ggml_type(
                 &mut enc,
@@ -586,11 +715,9 @@ impl Qwen35Model {
                 argmax.push(None);
                 continue;
             }
-            let index = device
-                .alloc_buffer(4, DType::U32, vec![1])
+            let index = decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
                 .map_err(|e| anyhow!("allocate Qwen joint argmax index: {e}"))?;
-            let value = device
-                .alloc_buffer(4, DType::F32, vec![1])
+            let value = decode_pool::pooled_alloc_buffer(device, 4, DType::F32, vec![1])
                 .map_err(|e| anyhow!("allocate Qwen joint argmax value: {e}"))?;
             dispatch_argmax_f32(
                 &mut enc,
@@ -646,12 +773,26 @@ mod tests {
     use crate::inference::models::qwen35::gpu_ffn::{
         build_dense_ffn_layer_gpu_q_into, DenseFfnWeightsGpuQ,
     };
-    use crate::inference::models::qwen35::gpu_full_attn::upload_f32;
+    use crate::inference::models::qwen35::gpu_full_attn::{
+        apply_linear_projection_f32_pooled_with_ggml_type, upload_f32,
+    };
     use crate::inference::models::qwen35::joint_decode_core::project_rows;
     use crate::inference::models::qwen35::joint_decode_test_support::{
         bits, random_f32, synthetic_blocks,
     };
     use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+
+    /// A registry frozen to the operator policy with `mul_mv_ext` off, so the
+    /// exact-policy proofs below run whatever the process environment says.
+    fn exact_policy_registry() -> KernelRegistry {
+        let mut policy = mlx_native::ggml_routing_policy_from_environment();
+        policy.dense_decode_mv_ext = false;
+        let mut registry = KernelRegistry::new();
+        registry
+            .freeze_ggml_routing_policy(policy)
+            .expect("freeze exact routing policy");
+        registry
+    }
 
     /// Admitted block storage: one packed dispatch at `m = 2..=4` must equal
     /// the serial `m = 1` dispatch of every row, bit for bit, on the default
@@ -660,15 +801,11 @@ mod tests {
     #[test]
     fn packed_block_projections_match_per_row_dispatch_bitwise() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        if JointRoutingEnvironment::from_process().mv_ext {
-            eprintln!("skipping: HF2Q_DECODE_MV_EXT=1 selects the non-exact policy");
-            return;
-        }
         let device = match MlxDevice::new() {
             Ok(device) => device,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = exact_policy_registry();
         let (k, n) = (512_u32, 256_u32);
         let mut seed = 0x51A7_0001_u32;
         for ggml_type in [
@@ -722,15 +859,11 @@ mod tests {
     #[test]
     fn packed_dense_ffn_matches_per_row_ffn_bitwise() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        if JointRoutingEnvironment::from_process().mv_ext {
-            eprintln!("skipping: HF2Q_DECODE_MV_EXT=1 selects the non-exact policy");
-            return;
-        }
         let device = match MlxDevice::new() {
             Ok(device) => device,
             Err(_) => return,
         };
-        let mut registry = KernelRegistry::new();
+        let mut registry = exact_policy_registry();
         let (hidden, intermediate) = (256_u32, 512_u32);
         let h = hidden as usize;
         let mut seed = 0x51A7_0002_u32;
@@ -795,5 +928,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Pooled step outputs (Class A): the packed shared-weights dense FFN
+    /// and an attention-style projection give the same bytes with and
+    /// without [`decode_pool::StepPooledOutputs`].
+    #[test]
+    fn step_pooled_outputs_keep_packed_ffn_and_projection_bitwise() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (hidden, intermediate) = (512_u32, 1024_u32);
+        let h = hidden as usize;
+        let m = 4_usize;
+        let mut seed = 0x51A7_0005_u32;
+        let weights = DenseFfnWeightsGpuQ {
+            gate_q: synthetic_blocks(&device, GgmlType::Q4_K, intermediate, hidden, &mut seed),
+            up_q: synthetic_blocks(&device, GgmlType::Q4_K, intermediate, hidden, &mut seed),
+            down_q: synthetic_blocks(&device, GgmlType::Q6_K, hidden, intermediate, &mut seed),
+            ggml_type_gate_up: GgmlType::Q4_K,
+            ggml_type_down: GgmlType::Q6_K,
+            intermediate_size: intermediate,
+            hidden_size: hidden,
+        };
+        let projection = synthetic_blocks(&device, GgmlType::Q4_K, 256, hidden, &mut seed);
+        let x = upload_f32(&random_f32(&mut seed, m * h), &device)
+            .expect("upload x")
+            .with_shape(vec![m, h])
+            .expect("shape x");
+        let residual = upload_f32(&random_f32(&mut seed, m * h), &device)
+            .expect("upload residual")
+            .with_shape(vec![m, h])
+            .expect("shape residual");
+        decode_pool::checked_reset_decode_pool().expect("reset pool");
+        let mut enc = device.command_encoder().expect("encoder");
+        let mut run = |enc: &mut CommandEncoder, pooled: bool| {
+            let _scope = decode_pool::StepPooledOutputs::enter(pooled);
+            let ffn = build_dense_ffn_layer_gpu_q_into_with_gate_up(
+                enc,
+                &device,
+                &mut registry,
+                &x,
+                &weights,
+                Some(&residual),
+                DenseGateUpDispatch::Separate,
+            )
+            .expect("dense FFN");
+            let proj = apply_linear_projection_f32_pooled_with_ggml_type(
+                enc,
+                &mut registry,
+                &device,
+                &x,
+                &projection,
+                GgmlType::Q4_K,
+                m as u32,
+                hidden,
+                256,
+            )
+            .expect("projection");
+            (ffn, proj)
+        };
+        let (fresh_ffn, fresh_proj) = run(&mut enc, false);
+        let (pooled_ffn, pooled_proj) = run(&mut enc, true);
+        enc.commit_and_wait_labeled("test.qwen.joint.pooled_outputs")
+            .expect("complete pooled outputs");
+        assert_eq!(bits(&fresh_ffn, m * h), bits(&pooled_ffn, m * h));
+        assert_eq!(bits(&fresh_proj, m * 256), bits(&pooled_proj, m * 256));
+        decode_pool::checked_reset_decode_pool().expect("reset pool");
+    }
+
+    #[test]
+    fn joint_command_plan_follows_the_commit_points() {
+        let plan = joint_command_plan(64, 4, true);
+        assert_eq!(plan.len(), 18);
+        assert_eq!(plan[0], "embed");
+        assert_eq!(plan[1], "layers[0,4)");
+        assert_eq!(plan[16], "layers[60,64)");
+        assert_eq!(plan[17], "output_head");
+        // A remainder group closes at the last layer; no open-chain flush.
+        assert_eq!(
+            joint_command_plan(10, 4, true),
+            [
+                "embed",
+                "layers[0,4)",
+                "layers[4,8)",
+                "layers[8,10)",
+                "output_head"
+            ]
+        );
+        assert_eq!(joint_command_plan(3, 1, true).len(), 5);
+        // Host embedding (no native table): no observed embed command.
+        assert_eq!(
+            joint_command_plan(8, 4, false),
+            ["layers[0,4)", "layers[4,8)", "output_head"]
+        );
+        let closes = (0..10).filter(|&layer| closes_chain(layer, 4, 10)).count();
+        assert_eq!(closes, 3);
     }
 }

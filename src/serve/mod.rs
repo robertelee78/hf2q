@@ -19,6 +19,7 @@ pub mod forward_prefill;
 pub mod forward_prefill_batched;
 pub(crate) mod gemma_live_attention;
 pub(crate) mod gemma_prefill_catsplit;
+pub(crate) mod gemma_decode_attention;
 pub(crate) mod gemma_prefill_moe;
 pub mod gpu;
 pub(crate) mod gemma_cold_masks;
@@ -992,6 +993,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         glp_path: None,
         glp_alpha: None,
         kv_graft_path: None,
+        lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
     };
     let load_start = std::time::Instant::now();
     let loaded =
@@ -3045,6 +3047,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         glp_path: None,
         glp_alpha: None,
         kv_graft_path: None,
+        lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
     };
     let load_start = std::time::Instant::now();
     let loaded = Qwen35LoadedModel::load(&load_opts).context("Qwen35LoadedModel::load")?;
@@ -4038,6 +4041,7 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         // root and disk ceiling as the generic block-prefix store.
         kv_persist_dir: config.kv_persist_dir.clone(),
         kv_persist_budget_bytes: config.kv_persist_budget_bytes,
+        lcp_resume_budget: config.lcp_resume_budget,
     };
     let mut loaded = api::engine::LoadedModel::load_with_context(
         &load_opts,
@@ -4071,6 +4075,16 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
             api::engine::LoadedModel::Deepseek4(_) => {
                 // DeepSeek-V4 accounts exact-prefix hits in generation stats.
             }
+        }
+    }
+    // #727: the operator's reclaimed-slot spill budget reaches the Qwen and
+    // Gemma SlotAware workers through the loaded model (the worker owns the
+    // store).
+    if let Some(bytes) = config.slot_spill_budget_bytes {
+        match &mut loaded {
+            api::engine::LoadedModel::Qwen35(q) => q.slot_spill_budget_bytes = bytes,
+            api::engine::LoadedModel::Gemma(g) => g.slot_spill_budget_bytes = bytes,
+            api::engine::LoadedModel::Qwen3VlText(_) | api::engine::LoadedModel::Deepseek4(_) => {}
         }
     }
     // ADR-040 Phase C iter-4 (C4) — route through `spawn_with_mode` so
@@ -4465,7 +4479,23 @@ pub fn cmd_serve(
     )
     .map_err(anyhow::Error::msg)?;
     let kv_persist_budget_bytes = kv_persist_budget.bytes.unwrap_or(0);
+    let slot_spill_budget = operator_settings::resolve_slot_spill_budget(
+        args.planning.slot_spill_budget.as_deref(),
+        operator_defaults,
+    )
+    .map_err(anyhow::Error::msg)?;
     let kv_persist_dir = args.planning.kv_persist_path.clone();
+    let resolved_lcp_resume_budget = operator_settings::resolve_lcp_resume_budget(
+        args.lcp_resume_budget.as_deref(),
+        operator_defaults,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let lcp_resume_budget = resolved_lcp_resume_budget.budget;
+    eprintln!(
+        "[hf2q lcp] byte_budget={} (source={})",
+        lcp_resume_budget.bytes(),
+        resolved_lcp_resume_budget.source_label()
+    );
     let behavior = operator_settings::resolve_serve_behavior(&args.behavior)
         .map_err(anyhow::Error::msg)?;
     tracing::info!(
@@ -4478,6 +4508,10 @@ pub fn cmd_serve(
         kv_cache_budget_origin = ?kv_cache_budget.origin,
         kv_persist_budget_bytes,
         kv_persist_budget_origin = ?kv_persist_budget.origin,
+        lcp_resume_budget_bytes = lcp_resume_budget.bytes(),
+        lcp_resume_budget_origin = resolved_lcp_resume_budget.source_label(),
+        slot_spill_budget_bytes = slot_spill_budget.bytes,
+        slot_spill_budget_origin = ?slot_spill_budget.origin,
         "resolved serving plan"
     );
 
@@ -4577,11 +4611,13 @@ pub fn cmd_serve(
         glp_reference: None,
         glp_alpha: None,
         kv_graft_path: None,
+        lcp_resume_budget,
         engine_mode,
         requested_context,
         kv_cache_budget_bytes,
         kv_persist_dir: kv_persist_dir.clone(),
         kv_persist_budget_bytes,
+        slot_spill_budget_bytes: Some(slot_spill_budget.bytes),
     }
     .with_serve_steering(&args));
 
@@ -7356,6 +7392,7 @@ mod tests {
             tq_kv_active: false,
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
+            gemma_warm_attention_kernel: None,
         }
     }
 
@@ -7562,6 +7599,7 @@ mod tests {
             glp_reference: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7571,6 +7609,7 @@ mod tests {
             kv_cache_budget_bytes: None,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
+            slot_spill_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         // 0-tensor GGUF can't fully load, but the FAILURE shape proves
@@ -7608,6 +7647,7 @@ mod tests {
             glp_reference: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7617,6 +7657,7 @@ mod tests {
             kv_cache_budget_bytes: None,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
+            slot_spill_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "0-tensor synthetic GGUF must fail load");
@@ -7657,6 +7698,7 @@ mod tests {
             glp_reference: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7666,6 +7708,7 @@ mod tests {
             kv_cache_budget_bytes: None,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
+            slot_spill_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(
@@ -7716,6 +7759,7 @@ mod tests {
             glp_reference: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7725,6 +7769,7 @@ mod tests {
             kv_cache_budget_bytes: None,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
+            slot_spill_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -7750,6 +7795,7 @@ mod tests {
             glp_reference: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7759,6 +7805,7 @@ mod tests {
             kv_cache_budget_bytes: None,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
+            slot_spill_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -7784,6 +7831,7 @@ mod tests {
             glp_reference: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
@@ -7793,6 +7841,7 @@ mod tests {
             kv_cache_budget_bytes: None,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
+            slot_spill_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "unknown architecture must fail dispatch");
@@ -7823,6 +7872,7 @@ mod tests {
             glp_reference: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
@@ -7830,6 +7880,7 @@ mod tests {
             kv_cache_budget_bytes: None,
             kv_persist_dir: None,
             kv_persist_budget_bytes: 0,
+            slot_spill_budget_bytes: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(
@@ -7873,9 +7924,11 @@ mod tests {
                 kv_cache_budget_bytes: None,
                 kv_persist_dir: None,
                 kv_persist_budget_bytes: 0,
+                slot_spill_budget_bytes: None,
                 glp_reference: None,
                 glp_alpha: None,
                 kv_graft_path: None,
+                lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
             };
             let result = super::load_engine(tmp.path(), &cfg);
             assert!(
@@ -9154,6 +9207,7 @@ mod tests {
                 kv_cache_budget: None,
                 kv_persist_path: None,
                 kv_persist_budget: None,
+                slot_spill_budget: None,
             },
             Some(&config.serve),
         )
@@ -9171,6 +9225,7 @@ mod tests {
                 kv_cache_budget: None,
                 kv_persist_path: None,
                 kv_persist_budget: None,
+                slot_spill_budget: None,
             },
             Some(&config.serve),
         )
@@ -9188,6 +9243,7 @@ mod tests {
                 kv_cache_budget: None,
                 kv_persist_path: None,
                 kv_persist_budget: None,
+                slot_spill_budget: None,
             },
             Some(&config.serve),
         )

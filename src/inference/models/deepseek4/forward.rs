@@ -5,7 +5,8 @@ use mlx_native::graph::GraphSession;
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::ops::repeat_tiled::{dispatch_repeat_tiled_f32, RepeatTiledParams};
 use mlx_native::{
-    DType, EmbeddingQ2KParams, EmbeddingQ8_0Params, KernelRegistry, MlxBuffer, MlxDevice,
+    embedding_gather_dense, DType, EmbeddingDenseParams, EmbeddingQ2KParams, EmbeddingQ8_0Params,
+    KernelRegistry, MlxBuffer, MlxDevice,
 };
 
 use super::Deepseek4Model;
@@ -135,8 +136,25 @@ impl Deepseek4Model {
                     },
                 )
                 .context("encode DeepSeek-V4 Q8_0 embedding gather")?,
+            // ds4's 0731 file stores `token_embd` as F16 (ADR-063
+            // Q4-DS4-RACE L5); the dense gather converts only the selected
+            // rows to F32.
+            GgmlType::F16 | GgmlType::BF16 | GgmlType::F32 => embedding_gather_dense(
+                session.encoder_mut(),
+                registry,
+                device,
+                embedding,
+                &arena.ids,
+                &arena.gathered,
+                &EmbeddingDenseParams {
+                    vocab_size: vocab,
+                    embed_dim: hidden,
+                    n_tokens: tokens,
+                },
+            )
+            .context("encode DeepSeek-V4 dense token embedding gather")?,
             other => bail!(
-                "DeepSeek-V4 optimized runtime requires Q2_K or Q8_0 token embeddings, got {other:?}"
+                "DeepSeek-V4 optimized runtime requires Q2_K, Q8_0, F16, BF16 or F32 token embeddings, got {other:?}"
             ),
         }
         session.barrier_between(&[&arena.gathered], &[&arena.state]);

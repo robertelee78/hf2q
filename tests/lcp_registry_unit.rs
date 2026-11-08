@@ -22,9 +22,9 @@
 
 use hf2q::serve::kv_persist::format::ModelFingerprint;
 use hf2q::serve::kv_persist::lcp_registry::{
-    default_lcp_byte_budget, ByteSized, LcpKey, LcpRegistry, LcpStoreError,
+    ByteSized, LcpKey, LcpRegistry, LcpResumeBudget, LcpStoreError,
 };
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Marker payload for unit tests.
@@ -854,115 +854,37 @@ fn byte_budget_zero_panics() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Memory-probe smoke tests — ADR-017 Phase E.a default-on (subtask D)
+// Operator budget contract (#730)
 //
-// These three tests pin the contract of `default_lcp_byte_budget()`:
-//   (i)   The probe result falls within the documented [1 GiB, 16 GiB] clamp
-//          when no override env is set.
-//   (ii)  A `2g` byte-suffix override is parsed correctly.
-//   (iii) A legacy bare-integer entry-count (< 4096) is converted via the
-//          300 MB heuristic.
-//
-// `default_lcp_byte_budget()` reads a process-global env var. Tests that
-// inspect or mutate it must hold `ENV_LOCK` and restore mutations before
-// returning. A process-local mutex plus the RAII guard below provides that
-// isolation without adding a `serial_test` dependency.
+// The LCP resume budget is a pure function of operator configuration
+// (`--lcp-resume-budget` > `[serve] lcp_resume_budget` > 8 GiB). These tests
+// pin the built-in constant and that a registry built from it enforces
+// exactly that value; nothing on the path reads host memory or the
+// environment, so no env isolation is needed.
 // ─────────────────────────────────────────────────────────────────────────────
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// RAII guard that restores `HF2Q_KV_LCP_RESUME_CAPACITY` to its original
-/// value (or removes it if it was absent) when dropped.
-struct EnvGuard {
-    key: &'static str,
-    original: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let original = std::env::var(key).ok();
-        // SAFETY: every test in this process that reads or mutates this key
-        // holds ENV_LOCK for the full lifetime of this guard.
-        unsafe { std::env::set_var(key, value) };
-        Self { key, original }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.original {
-            Some(v) => unsafe { std::env::set_var(self.key, v) },
-            None => unsafe { std::env::remove_var(self.key) },
-        }
-    }
-}
-
-/// Smoke test: verify `default_lcp_byte_budget()` returns a value within
-/// the documented [1 GiB, 16 GiB] clamp range.
-///
-/// This test does NOT set any env override, so it exercises the sysinfo
-/// probe path. On any machine with nonzero available memory the result
-/// must fall in [1 GiB, 16 GiB].
-///
-/// Env-isolation note: if `HF2Q_KV_LCP_RESUME_CAPACITY` is already set in
-/// the test process env (e.g. by a parent test), the value tested here
-/// reflects that override, not the sysinfo path. The clamp assertion still
-/// holds for any conforming value in the documented range.
 #[test]
-fn default_lcp_byte_budget_within_clamp_range() {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let _env_lock = lock_env();
-    let budget = default_lcp_byte_budget();
-    assert!(
-        budget >= GIB,
-        "default_lcp_byte_budget() returned {budget} bytes — below 1 GiB floor. \
-         Check the sysinfo probe path in lcp_registry.rs."
-    );
-    assert!(
-        budget <= 16 * GIB,
-        "default_lcp_byte_budget() returned {budget} bytes — above 16 GiB ceiling. \
-         Check the clamp in lcp_registry.rs."
-    );
+fn lcp_resume_budget_default_is_constant_8gib() {
+    const EIGHT_GIB: u64 = 8 * 1024 * 1024 * 1024;
+    assert_eq!(LcpResumeBudget::DEFAULT.bytes(), EIGHT_GIB);
+    assert_eq!(LcpResumeBudget::default(), LcpResumeBudget::DEFAULT);
+    let reg: LcpRegistry<Marker> =
+        LcpRegistry::with_byte_budget(LcpResumeBudget::DEFAULT.bytes());
+    assert_eq!(reg.byte_budget(), EIGHT_GIB);
 }
 
-/// Env override: `HF2Q_KV_LCP_RESUME_CAPACITY=2g` must parse to exactly
-/// 2 × 1024³ bytes.
-///
-/// The `EnvGuard` restores the env after the test returns (or panics).
 #[test]
-fn default_lcp_byte_budget_env_override_2g() {
+fn lcp_resume_budget_explicit_value_is_carried_exactly() {
     const TWO_GIB: u64 = 2 * 1024 * 1024 * 1024;
-    let _env_lock = lock_env();
-    let _guard = EnvGuard::set("HF2Q_KV_LCP_RESUME_CAPACITY", "2g");
-    let budget = default_lcp_byte_budget();
-    assert_eq!(
-        budget, TWO_GIB,
-        "HF2Q_KV_LCP_RESUME_CAPACITY=2g must parse to {TWO_GIB} bytes, \
-         got {budget}. Check the g-suffix multiplier in default_lcp_byte_budget()."
-    );
+    let budget = LcpResumeBudget::from_bytes(TWO_GIB);
+    assert_eq!(budget.bytes(), TWO_GIB);
+    let reg: LcpRegistry<Marker> = LcpRegistry::with_byte_budget(budget.bytes());
+    assert_eq!(reg.byte_budget(), TWO_GIB);
 }
 
-/// Legacy entry-count path: bare integer < 4096 is converted via
-/// `n × 300 MiB`. `HF2Q_KV_LCP_RESUME_CAPACITY=8` → `8 × 300 × 1024² bytes`.
-///
-/// This preserves backward-compat for operators who had `CAPACITY=8` set
-/// (the original default from commit c04d5d2 — see chesterton_findings).
 #[test]
-fn default_lcp_byte_budget_legacy_entry_count_8() {
-    const EXPECTED: u64 = 8 * 300 * 1024 * 1024;
-    let _env_lock = lock_env();
-    let _guard = EnvGuard::set("HF2Q_KV_LCP_RESUME_CAPACITY", "8");
-    let budget = default_lcp_byte_budget();
-    assert_eq!(
-        budget, EXPECTED,
-        "HF2Q_KV_LCP_RESUME_CAPACITY=8 (legacy entry-count) must give \
-         8 × 300 MiB = {EXPECTED} bytes, got {budget}. \
-         Check the bare-integer < 4096 path in default_lcp_byte_budget()."
-    );
+fn lcp_resume_budget_snapshot_gate_matches_registry_admission() {
+    let budget = LcpResumeBudget::from_bytes(1024);
+    assert!(budget.admits(1024));
+    assert!(!budget.admits(1025));
 }

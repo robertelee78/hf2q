@@ -6,7 +6,7 @@
 //! * `gemma_joint_warm_prefill_matches_per_slot_bitwise` (tiled F16 warm
 //!   attention, the `HF2Q_GEMMA_WARM_TILED_ATTENTION=1` opt-in) and
 //!   `..._vec_hybrid` (the default route): one joint
-//!   `forward_prefill_batched_multi_seq_live` (`PerSlotExact`) over 4, 2 and
+//!   `forward_prefill_batched_multi_seq_live` over 4, 2 and
 //!   3 restored slots equals each slot's own per-slot warm prefill on the
 //!   same route: first token, final logits bits, every layer's K / TQ-HB V
 //!   codes / V scales bytes over the valid (ring) rows, and the slot cursors.
@@ -14,6 +14,9 @@
 //!   concurrent tagged tool turns through the real admission path form one
 //!   cohort and answer byte-identically to the same turns sent one at a time;
 //!   a lane whose suffix is 32 rows falls back to per-slot prefill.
+//! * `gemma_prefill_pool_hostile_fill_matches_zero_fill_bitwise`: the
+//!   prefill arena's `Overwritten` activations handed out `0xFF`-filled give
+//!   the same cold, per-slot warm and joint warm bytes as zero-filled ones.
 use super::*;
 use crate::inference::models::gemma4::kv_cache::{
     restore_gemma_hybrid_slot_anchor, snapshot_gemma_hybrid_slot_anchor, GemmaHybridSlotAnchor,
@@ -44,6 +47,7 @@ pub(super) fn load_options() -> LoadOptions {
         glp_path: None,
         glp_alpha: None,
         kv_graft_path: None,
+        lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         kv_persist_dir: None,
         kv_persist_budget_bytes: 0,
     }
@@ -324,7 +328,7 @@ impl WarmFixture {
     }
 
     /// Joint arm: restore every lane's history, then one shared
-    /// `PerSlotExact` forward with the given decode reserve.
+    /// live multi-sequence forward with the given decode reserve.
     pub(super) fn joint(
         &self,
         guard: &mut Gemma4KvGuard<'_>,
@@ -345,7 +349,6 @@ impl WarmFixture {
             &seqs,
             guard.hybrid.as_deref().unwrap(),
             reserve,
-            GemmaLiveAttention::PerSlotExact,
             &mut guard.model.ctx,
         );
         clear_gemma4_self_mounts(guard.model);
@@ -387,6 +390,55 @@ fn gemma_joint_warm_prefill_matches_per_slot_bitwise_vec_hybrid() {
     joint_warm_prefill_matches_per_slot(GemmaLiveKernel::VecHybrid);
 }
 
+/// ADR-063 Q4-GEMMA host P1: every `Init::Overwritten` prefill activation is
+/// fully written before any read. Fill each such hand-out with `0xFF` (NaN in
+/// F32, BF16 and F16) and compare against zero-filled hand-outs (the
+/// pre-arena allocation state): the cold per-slot prefills, a per-slot warm
+/// resume and a four-lane joint warm prefill must be bit for bit equal.
+#[test]
+#[ignore = "official Gemma 4 GGUF: 0xFF-filled pooled prefill activations give the zero-filled bytes"]
+fn gemma_prefill_pool_hostile_fill_matches_zero_fill_bitwise() {
+    use crate::serve::forward_prefill_batched::gemma_prefill_pool::set_overwritten_fill_for_test;
+    let mut loaded = load_gate_model();
+    let LoadedModel::Gemma(g) = &mut loaded else {
+        unreachable!("load_gate_model returns Gemma")
+    };
+    let mut guard = Gemma4KvGuard::take(g).unwrap();
+    for kernel in [
+        GemmaLiveKernel::VecHybrid,
+        GemmaLiveKernel::TiledF16,
+        GemmaLiveKernel::TensorF16,
+    ] {
+        guard.model.weights.warm_live_kernel = kernel;
+        let mut arms = Vec::new();
+        for fill in [0x00, 0xFF] {
+            set_overwritten_fill_for_test(Some(fill));
+            let fixture = WarmFixture::build(&mut guard);
+            let per_slot =
+                fixture.per_slot(&mut guard, 1, &fixture.prompts[1], HISTORIES[1], MAX_DECODE);
+            let lanes: Vec<_> = (0..4).map(|slot| fixture.lane(slot)).collect();
+            let joint = fixture
+                .joint(&mut guard, &lanes, reserve_for(&lanes))
+                .unwrap();
+            arms.push((fixture.cold.clone(), per_slot, joint));
+        }
+        set_overwritten_fill_for_test(None);
+        let (zero, hostile) = (&arms[0], &arms[1]);
+        assert_eq!(hostile.0, zero.0, "{kernel:?}: cold per-slot prefills");
+        assert_lane_equal(&format!("{kernel:?} per-slot warm"), &hostile.1, &zero.1);
+        for (slot, (h, z)) in hostile.2.iter().zip(&zero.2).enumerate() {
+            assert_lane_equal(&format!("{kernel:?} joint lane {slot}"), h, z);
+        }
+    }
+}
+
+/// ADR-063 gap program F1 gate (Class A).
+#[test]
+#[ignore = "official Gemma 4 GGUF: joint warm prefill lanes equal per-slot warm prefill bit for bit (tensor F16 route)"]
+fn gemma_joint_warm_prefill_matches_per_slot_bitwise_tensor_f16() {
+    joint_warm_prefill_matches_per_slot(GemmaLiveKernel::TensorF16);
+}
+
 fn joint_warm_prefill_matches_per_slot(kernel: GemmaLiveKernel) {
     let mut loaded = load_gate_model();
     let LoadedModel::Gemma(g) = &mut loaded else {
@@ -394,7 +446,7 @@ fn joint_warm_prefill_matches_per_slot(kernel: GemmaLiveKernel) {
     };
     let mut guard = Gemma4KvGuard::take(g).unwrap();
     // Both arms read this one route: per-slot resumes directly, the
-    // `PerSlotExact` cohort through `LiveRoute::resolve`.
+    // multi-sequence cohort through `LiveRoute::resolve`.
     guard.model.weights.warm_live_kernel = kernel;
     let fixture = WarmFixture::build(&mut guard);
     let prompts = &fixture.prompts;

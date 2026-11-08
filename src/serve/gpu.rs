@@ -9,7 +9,7 @@
 //! directly from GGUF via `mlx_native::gguf::GgufFile` into `MlxBuffer`s.
 //! The `QuantWeightInfo` struct now uses `mlx_native::GgmlType` directly.
 
-use mlx_native::{GraphExecutor, KernelRegistry, MlxDevice};
+use mlx_native::{GgmlRoutingPolicy, GraphExecutor, KernelRegistry, MlxDevice};
 
 /// GPU context for the mlx-native backend.
 ///
@@ -32,6 +32,8 @@ pub struct GpuContext {
     /// via mpsc; `put_worker_registry` stores it back so the next token
     /// finds it here again.
     pub worker_registry: Option<KernelRegistry>,
+    /// GGML routing policy frozen into both registries at construction.
+    routing_policy: GgmlRoutingPolicy,
 }
 
 // SAFETY: The metal::DeviceRef is Send+Sync (MTLDevice is thread-safe).
@@ -50,14 +52,30 @@ impl GpuContext {
     /// parallel-encode worker thread.  One-time ~5 ms startup cost; paid only
     /// on opt-in.
     ///
+    /// Both registries freeze the operator-environment GGML routing policy
+    /// (#729), so this model's routes are fixed at load: no later environment
+    /// change, and no other model's load, can alter them.
+    ///
     /// # Errors
     ///
     /// Returns an error if no Metal device is available.
     pub fn new() -> mlx_native::Result<Self> {
+        Self::new_with_routing_policy(mlx_native::ggml_routing_policy_from_environment())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_routing_policy_for_test(
+        routing_policy: GgmlRoutingPolicy,
+    ) -> mlx_native::Result<Self> {
+        Self::new_with_routing_policy(routing_policy)
+    }
+
+    fn new_with_routing_policy(routing_policy: GgmlRoutingPolicy) -> mlx_native::Result<Self> {
         let device = MlxDevice::new()?;
         let gpu_name = device.name();
         let executor = GraphExecutor::new(device);
         let mut registry = KernelRegistry::new();
+        registry.freeze_ggml_routing_policy(routing_policy)?;
         // Register all inference kernels.
         mlx_native::ops::hadamard_quantize_kv::register(&mut registry);
         mlx_native::ops::flash_attn_vec_tq::register(&mut registry);
@@ -105,6 +123,7 @@ impl GpuContext {
         // and sufficient for this single binary decision at model load.
         let worker_registry = if std::env::var("HF2Q_PARALLEL_ENCODE").as_deref() == Ok("1") {
             let mut wreg = KernelRegistry::new();
+            wreg.freeze_ggml_routing_policy(routing_policy)?;
             // Mirror the EXACT same registrations as the main registry above.
             // Chesterton's fence: if a new kernel family is added to the main
             // registry block, it MUST also be added here to keep the worker
@@ -145,6 +164,7 @@ impl GpuContext {
             executor,
             registry,
             worker_registry,
+            routing_policy,
         })
     }
 
@@ -157,6 +177,11 @@ impl GpuContext {
     /// Human-readable GPU name (e.g. "Apple M5 Max").
     pub fn gpu_name(&self) -> String {
         self.device().name()
+    }
+
+    /// The GGML routing policy frozen into this context's registries.
+    pub fn ggml_routing_policy(&self) -> &GgmlRoutingPolicy {
+        &self.routing_policy
     }
 
     /// Split borrow: returns (&GraphExecutor, &mut KernelRegistry) to avoid
@@ -215,6 +240,28 @@ mod tests {
             "worker_registry should be None when HF2Q_PARALLEL_ENCODE is unset"
         );
         println!("GpuContext GPU: {}", ctx.gpu_name());
+    }
+
+    /// Every registry the context owns carries the frozen routing policy
+    /// (#729), so a later environment change or another model's load cannot
+    /// re-resolve it at dispatch time.
+    #[test]
+    fn gpu_context_registries_freeze_routing_policy() {
+        let ctx = GpuContext::new().expect("GpuContext::new");
+        assert_eq!(
+            ctx.registry.ggml_routing_policy(),
+            Some(ctx.ggml_routing_policy())
+        );
+        assert_eq!(
+            *ctx.ggml_routing_policy(),
+            mlx_native::ggml_routing_policy_from_environment()
+        );
+        if let Some(worker) = ctx.worker_registry.as_ref() {
+            assert_eq!(
+                worker.ggml_routing_policy(),
+                Some(ctx.ggml_routing_policy())
+            );
+        }
     }
 
     #[test]

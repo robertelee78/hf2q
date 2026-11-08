@@ -48,6 +48,17 @@ pub(crate) struct ServeDefaultsV2 {
     /// such as `32GiB` are accepted; omission/zero means no explicit ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kv_persist_budget: Option<String>,
+    /// Optional in-memory LCP resume registry byte budget. Human-readable
+    /// units such as `8GiB` are accepted; omission means the host-independent
+    /// built-in 8GiB. Zero is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lcp_resume_budget: Option<String>,
+    /// Optional host byte budget for Qwen and Gemma SlotAware conversations spilled
+    /// when another request reclaims their slot (#727). Human-readable units
+    /// such as `16GiB` are accepted; omission means the built-in 16 GiB and
+    /// `0` disables spilling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) slot_spill_budget: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +140,8 @@ impl OperatorConfigV2 {
             ctx: None,
             kv_cache_budget: None,
             kv_persist_budget: None,
+            lcp_resume_budget: None,
+            slot_spill_budget: None,
         };
         Self::new(
             ConvertDefaultsV2 {
@@ -240,6 +253,16 @@ impl ServeDefaultsV2 {
         if let Some(value) = self.kv_persist_budget.as_deref() {
             crate::serve::operator_settings::parse_byte_size(value).map_err(|error| {
                 SetupError::InvalidConfig(format!("serve.kv_persist_budget is invalid: {error}"))
+            })?;
+        }
+        if let Some(value) = self.lcp_resume_budget.as_deref() {
+            crate::serve::operator_settings::parse_lcp_resume_budget(value).map_err(|error| {
+                SetupError::InvalidConfig(format!("serve.lcp_resume_budget is invalid: {error}"))
+            })?;
+        }
+        if let Some(value) = self.slot_spill_budget.as_deref() {
+            crate::serve::operator_settings::parse_byte_size(value).map_err(|error| {
+                SetupError::InvalidConfig(format!("serve.slot_spill_budget is invalid: {error}"))
             })?;
         }
         Ok(())

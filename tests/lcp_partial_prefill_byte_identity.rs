@@ -1912,11 +1912,8 @@ fn gemma_hybrid_long_resume_byte_identity() {
             ("HF2Q_KV_LCP_RESUME", "1"),
             ("HF2Q_KV_LCP_LONG_RESUME", "1"),
             // Long-resume snapshots over-allocate 4096 tokens of
-            // multi-turn headroom per layer; the resulting ~4.5 GB entry
-            // exceeds the default ~5%-of-avail byte budget and is
-            // rejected (EntryExceedsBudget → registry stays empty).
-            // 8g is the documented gemma LCP envelope at ~8-12K prompts.
-            ("HF2Q_KV_LCP_RESUME_CAPACITY", "8g"),
+            // multi-turn headroom per layer (~4.5 GB entry); the built-in
+            // host-independent 8 GiB `--lcp-resume-budget` admits it.
         ],
     );
     wait_for_readyz(&server_a);

@@ -45,13 +45,8 @@ pub fn install(
         if slot.is_some() {
             return Err("nested Qwen diagnostic".into());
         }
-        let id = NEXT_SCOPE
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |v| v.checked_add(1),
-            )
-            .map_err(|_| "capture scope identity overflow")?;
+        let id = super::family::next_scope_id(&NEXT_SCOPE)
+            .ok_or("capture scope identity overflow")?;
         *slot = Some(Active {
             scope_id: id,
             store,

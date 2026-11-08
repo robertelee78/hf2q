@@ -1,8 +1,11 @@
 """Native ds4 (DeepSeek-V4 Flash, antirez ds4 c97964b) benchmark arm: engine_kind 'ds4'.
 
-Harness-only: no server launch, model load or inference fallback. ds4 serves its own
-native artifact (the ds4f-q2 Flash 0731 GGUF, download_model.sh:16), not the hf2q GGUF, so
-this arm is a separately labeled different-artifact comparison, never the same-GGUF peer.
+Harness-only: no server launch, model load or inference fallback. By default ds4 serves its own
+native artifact (the ds4f-q2 Flash 0731 GGUF, download_model.sh:16), not the hf2q GGUF, so this
+arm is a separately labeled different-artifact comparison, never the same-GGUF peer. A case whose
+approval native_ds4 block declares artifact_relation same_as_hf2q serves that same ds4 file that the
+hf2q arm loads (ADR-063 Q4-DS4-RACE decision D2): a separately labeled same-file native comparison,
+still task makespan only and never the verdict of record.
 
 Source inspected: /opt/ds4 at c97964b8aa77034a8e17afb10ca7a686c40ab511 (clean tree).
 Request (ds4_server.c parse_chat_request 4115-4310):
@@ -32,6 +35,7 @@ import re
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
+import native_peers
 import qwen_n4_peer
 from family_peer import CANONICAL_KEYS as PEER_CANONICAL_KEYS, same
 from qwen38_n1_verdict import integer, loads, require
@@ -40,6 +44,8 @@ ENGINE = 'ds4'
 FAMILY = 'deepseek4'
 DS4_COMMIT = 'c97964b8aa77034a8e17afb10ca7a686c40ab511'
 LABEL = 'ds4 c97964b (native Flash-0731 q2 artifact)'
+SAMEFILE_LABEL = 'ds4 c97964b (same ds4 file)'
+LABELS = {native_peers.DIFFERENT: LABEL, native_peers.SAME_AS_HF2Q: SAMEFILE_LABEL}
 MODEL_FILE = 'DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf'
 MODEL_ID = 'deepseek-v4-flash'          # /v1/models id for a Flash GGUF (ds4_server.c:15183-15187)
 SHAPE_NAME = 'DeepSeek V4 Flash'        # ds4.c:603; Vision-Exp and Pro report other names
@@ -113,28 +119,52 @@ SUPPORTED = ['tools', 'tool_choice', 'max_tokens', 'temperature', 'top_p', 'top_
              'stop', 'seed', 'stream', 'reasoning_effort']  # ds4_server.c:15124-15136
 Q3_ROLE = (f'{LABEL}: separately labeled different-artifact comparison, task makespan only; '
            'not the same-GGUF peer verdict (ADR-063 Q4)')
+Q3_ROLE_SAMEFILE = (f'{SAMEFILE_LABEL}: separately labeled same-file native comparison (ds4 serves the ds4 file the '
+                    'hf2q arm loads), task makespan only; not the verdict of record (ADR-063 Q4-DS4-RACE)')
 SAME_GGUF_UNAVAILABLE = ('same-GGUF peer unavailable; the peer arm is the native ds4 different-artifact '
                          'comparison, reported separately as native_peer (ADR-063 Q4)')
-NATIVE_COMPARISON = None  # DeepSeek-V4 runs only with the same-GGUF --peer-unavailable-evidence
+NATIVE_COMPARISON = ("same-file native comparison on ds4's GGUF; not the verdict of record: the DeepSeek-V4 verdict "
+                     "of record is the same-GGUF peer campaign, and the ds4 arm is reported separately as native_peer "
+                     "(ADR-063 Q4-DS4-RACE)")
 # native_peers.py interface (the registry resolves kind 'ds4' to this module).
 TITLE = 'DeepSeek-V4'
 FAMILIES = Q3_FAMILIES = (FAMILY,)
 CLIENT_MODULES = ('native_peers.py', 'native_peer_ds4.py', 'test_native_peer_ds4.py')
 PROCESSES = ('ds4', 'ds4-server', 'ds4-agent', 'ds4-bench', 'ds4-eval')  # native ds4 binaries (/opt/ds4 Makefile:78)
 PYTHON_MODULES = ()
-BASELINES = {'ds4_native': LABEL}
+BASELINES = {'ds4_native': LABEL, 'ds4_samefile': SAMEFILE_LABEL}
+SAME_FILE_BASELINES = ('ds4_samefile',)
 AUDIT = 'native_peer_ds4_audit'
 closing = None
-PEER_CASE_REFUSAL = ('a native ds4 --peer-case needs --peer-unavailable-evidence for the same-GGUF peer (ADR-063 Q4), '
-                     'and that evidence admits no same-GGUF peer case')
+PEER_CASE_REFUSAL = ('a native ds4 --peer-case needs --peer-unavailable-evidence for the same-GGUF peer (ADR-063 Q4) '
+                     'when its artifact_relation is different, or --native-comparison when it is same_as_hf2q (ds4 on '
+                     'the ds4 file the hf2q arm loads, ADR-063 Q4-DS4-RACE); neither admits a same-GGUF peer case')
+
+
+def relation(case):
+    """The case's declared artifact relation (approval native_ds4.artifact_relation; 'different' by default)."""
+    return native_peers.artifact_relation(case)
 
 
 def label(case):
-    return LABEL
+    return LABELS[relation(case)]
 
 
 def q3_role(case):
-    return Q3_ROLE
+    return Q3_ROLE_SAMEFILE if relation(case) == native_peers.SAME_AS_HF2Q else Q3_ROLE
+
+
+def mode_problems(case, evidence, comparison):
+    """The campaign mode the relation admits: a same-file ds4 arm runs (Q4-DS4 Fit), so it is never the
+    unavailable-peer stand-in; the different-artifact arm stays that stand-in, never a native comparison."""
+    same = relation(case) == native_peers.SAME_AS_HF2Q
+    if same and evidence:
+        return ['a same_as_hf2q ds4 case runs only with --native-comparison: the same-file peer is runnable, so '
+                '--peer-unavailable-evidence is refused (ADR-063 Q4-DS4-RACE decision D2)']
+    if not same and comparison:
+        return ['a different-artifact ds4 case runs only with --peer-unavailable-evidence (the unavailable-peer '
+                'stand-in, ADR-063 Q4); --native-comparison needs artifact_relation same_as_hf2q']
+    return []
 
 
 def _family(family):
@@ -291,26 +321,39 @@ def runtime_identity(ds4_dir):
 
 
 def campaign_identity(plan):
+    """Frozen per campaign; a same-file case also binds its declared artifact_relation, so drift halts the campaign
+    (a different-artifact case keeps the identity it always had)."""
     variables = plan['variables']
-    return {'peer_build_info': build_info(variables.get('DS4_COMMIT'), variables.get('DS4_BIN_SHA256')),
-            'native_runtime': runtime_identity(variables.get('DS4_DIR'))}
+    identity = {'peer_build_info': build_info(variables.get('DS4_COMMIT'), variables.get('DS4_BIN_SHA256')),
+                'native_runtime': runtime_identity(variables.get('DS4_DIR'))}
+    if relation(plan) == native_peers.SAME_AS_HF2Q:
+        identity['artifact_relation'] = native_peers.SAME_AS_HF2Q
+    return identity
 
 
-def launch_problems(name, artifact, hf2q_sha256):
-    """Q3 launch refusals: an ambient hf2q MODEL/MODEL_SHA256 must never stand in for the native artifact."""
+def launch_problems(name, artifact, hf2q_sha256, case=None):
+    """Q3 launch refusals. Different artifact: an ambient hf2q MODEL/MODEL_SHA256 must never stand in for the native
+    artifact. Same file (artifact_relation same_as_hf2q): both sha256 values must be present and equal."""
     problems = []
     if artifact and Path(artifact['path']).name != MODEL_FILE:
         problems.append(f'{name}: native artifact must be {MODEL_FILE} (set --peer-var MODEL)')
-    if artifact.get('sha256') and artifact['sha256'] == hf2q_sha256:
+    if relation(case) == native_peers.SAME_AS_HF2Q:
+        if not (artifact.get('sha256') and hf2q_sha256 and artifact['sha256'] == hf2q_sha256):
+            problems.append(f"{name}: a same_as_hf2q ds4 case needs the native and the hf2q artifact sha256 both "
+                            "present and equal (set MODEL_SHA256 in both cases)")
+    elif artifact.get('sha256') and artifact['sha256'] == hf2q_sha256:
         problems.append(f"{name}: native artifact sha256 equals the hf2q artifact's (set --peer-var MODEL_SHA256)")
     return problems
 
 
 def native_spec(spec):
-    """The approval's `native_ds4` block (q5 case client.approval.set)."""
+    """The approval's `native_ds4` block (q5 case client.approval.set); artifact_relation is optional and closed
+    (default 'different')."""
     keys = {'binary', 'binary_sha256', 'commit', 'chdir', 'model', 'model_sha256', 'ctx', 'port', 'server_log', 'trace'}
-    require(isinstance(spec, dict) and set(spec) == keys and all(isinstance(spec[k], str) for k in keys),
-            'closed native_ds4 approval block')
+    require(isinstance(spec, dict) and set(spec) in (keys, keys | {'artifact_relation'})
+            and all(isinstance(spec[k], str) for k in spec), 'closed native_ds4 approval block')
+    declared = spec.get('artifact_relation', native_peers.DIFFERENT)
+    require(declared in native_peers.RELATIONS, 'native_ds4 artifact_relation must be different or same_as_hf2q')
     paths = {k: Path(spec[k]) for k in ('binary', 'chdir', 'model', 'server_log', 'trace')}
     require(all(p.is_absolute() for p in paths.values()), 'native_ds4 paths must be absolute')
     require(paths['binary'].name == 'ds4-server' and paths['binary'].parent == paths['chdir'],
@@ -324,7 +367,7 @@ def native_spec(spec):
     require(spec['port'].isdecimal(), 'native_ds4 port')
     require(paths['server_log'].name == 'server.stderr' and paths['trace'].name == TRACE_NAME
             and paths['trace'].parent == paths['server_log'].parent, 'ds4 server log/trace must be in the run directory')
-    return {**spec, 'ctx': int(spec['ctx']), 'port': int(spec['port'])}
+    return {**spec, 'ctx': int(spec['ctx']), 'port': int(spec['port']), 'artifact_relation': declared}
 
 
 def verify_identity(spec):
@@ -403,10 +446,10 @@ def startup(log, ctx, port=None, trace=None):
                                         'resident_model': float(memory[4]), 'planned_one_session': float(memory[5])})}
 
 
-def validate_readiness(models, log, model, ctx=None, port=None, trace=None):
+def validate_readiness(models, log, model, ctx=None, port=None, trace=None, artifact_relation=native_peers.DIFFERENT):
     ctx = validate_models(models, model, ctx)
     facts = startup(log, ctx, port, trace)
-    return {'engine_kind': ENGINE, 'family': FAMILY, 'label': LABEL, 'source_revision': DS4_COMMIT,
+    return {'engine_kind': ENGINE, 'family': FAMILY, 'label': LABELS[artifact_relation], 'source_revision': DS4_COMMIT,
             'logical_slots': SLOTS, 'context_per_slot': CONTEXT_PER_SLOT, 'native_ctx_per_session': ctx,
             'think_mode': 'max', 'sampling': dict(SAMPLING), 'startup': facts, 'chat_template': TEMPLATE,
             'physical_cohort': 'Unavailable:not proved by readiness or HTTP overlap',
@@ -437,5 +480,6 @@ def readiness(base, model, output, packet):
     models = fetch_models(base, output)
     log = Path(spec['server_log']).read_bytes()
     (Path(output) / 'ds4-startup.log').write_bytes(log)
-    record = validate_readiness(models, log.decode('utf-8', 'replace'), model, spec['ctx'], spec['port'], spec['trace'])
+    record = validate_readiness(models, log.decode('utf-8', 'replace'), model, spec['ctx'], spec['port'], spec['trace'],
+                                spec['artifact_relation'])
     return {**record, 'identity': identity, 'build_info': build_info(spec['commit'], spec['binary_sha256'])}

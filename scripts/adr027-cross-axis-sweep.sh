@@ -70,7 +70,8 @@ echo ""
 #   - hf2q load: ...           (load banner; varies on quant_label timing)
 #   - prefill: ...             (perf line; absolute ms varies)
 #   - --- mlx-native ...       (perf footer; varies)
-#   - [hf2q lcp] byte_budget=  (sysinfo-derived; varies with available memory)
+#   - [hf2q lcp] byte_budget=  (budget line; config-derived since #730, but
+#                               older binaries printed a free-memory value)
 extract_output() {
     grep -v '^hf2q load\|^prefill:\|^---\|hf2q lcp\] byte_budget=' || true
 }

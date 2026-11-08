@@ -16,7 +16,7 @@
 //! * TQ-HB V is quantized exactly as decode stores it, and the FWHT sign undo
 //!   runs once over the layer's output rows.
 //!
-//! Two kernels implement the attention step:
+//! Three kernels implement the attention step:
 //!
 //! * [`GemmaLiveKernel::TiledF16`]: compact K to dense F16, dequantize (or
 //!   compact) the active V range to F16, then tiled flash attention: d256
@@ -24,6 +24,12 @@
 //!   chunks), `flash_attn_prefill_f16_d512_resume` for global layers
 //!   (4096-query chunks). One `batch = 1` dispatch per (sequence, chunk):
 //!   no block-diagonal mask is involved.
+//! * [`GemmaLiveKernel::TensorF16`] (ADR-063 gap program F1): the same
+//!   compaction and F16 V expansion into a dense range whose 64-row key tiles
+//!   are aligned to absolute positions, then mlx-native's tensor-API flash
+//!   attention (`flash_attn_prefill_tensor_f16_d{256,512}`) reading the
+//!   layer's F32 Q rows and writing its F32 output rows in place; same
+//!   chunks as `TiledF16`.
 //! * [`GemmaLiveKernel::VecHybrid`]: `flash_attn_vec_hybrid_batched`, one
 //!   decode-style threadgroup per (query, head), in 256-query chunks split
 //!   at the 512/1024 cache-length buckets.
@@ -31,12 +37,12 @@
 //! Everything that reaches a kernel is a function of the sequence alone
 //! (its rows, start, KV view and Q/K/V rows), so a lane of a joint cohort is
 //! bitwise equal to the same sequence prefilled alone whenever both resolve
-//! the same kernel. [`LiveRoute`] guarantees that: a single-slot resume and a
-//! [`GemmaLiveAttention::PerSlotExact`] cohort resolve the identical route.
+//! the same kernel. [`LiveRoute`] guarantees that: a single-slot resume and
+//! every multi-sequence lane resolve the one warm route.
 use anyhow::Result;
 use mlx_native::{DType, GraphSession, KernelRegistry, MlxBuffer, MlxDevice};
 
-use crate::inference::models::gemma4::{GemmaLiveAttention, GemmaLiveKernel, HybridKvBuffers};
+use crate::inference::models::gemma4::{GemmaLiveKernel, HybridKvBuffers};
 use crate::serve::forward_prefill::GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS;
 
 /// Vec-hybrid query chunk: bounds the attention scratch while keeping every
@@ -67,38 +73,41 @@ pub(crate) const WARM_TILED_ATTENTION_ENV: &str = "HF2Q_GEMMA_WARM_TILED_ATTENTI
 /// serves unless `1` opts in.
 const WARM_TILED_ATTENTION_DEFAULT: bool = false;
 
-fn parse_warm_tiled_switch(raw: Option<&str>) -> std::result::Result<bool, String> {
-    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return Ok(WARM_TILED_ATTENTION_DEFAULT);
-    };
-    match raw.to_ascii_lowercase().as_str() {
-        "1" | "on" | "true" => Ok(true),
-        "0" | "off" | "false" => Ok(false),
-        _ => Err(format!(
-            "{WARM_TILED_ATTENTION_ENV} must be 1/on/true or 0/off/false, got {raw:?}"
-        )),
-    }
-}
-
-fn warm_kernel_for_switch(raw: Option<&str>) -> GemmaLiveKernel {
-    let tiled = parse_warm_tiled_switch(raw).unwrap_or_else(|error| {
-        tracing::warn!(
-            error,
-            fallback = WARM_TILED_ATTENTION_DEFAULT,
-            "invalid Gemma warm tiled attention switch"
-        );
-        WARM_TILED_ATTENTION_DEFAULT
-    });
-    if tiled {
+fn default_warm_kernel() -> GemmaLiveKernel {
+    if WARM_TILED_ATTENTION_DEFAULT {
         GemmaLiveKernel::TiledF16
     } else {
         GemmaLiveKernel::VecHybrid
     }
 }
 
-/// Kernel for warm live-resume attention (single-slot resumes and joint warm
-/// cohorts), resolved once per model load from
-/// `HF2Q_GEMMA_WARM_TILED_ATTENTION`.
+/// `1`/`on`/`true` selects `TiledF16`, `tensor` the gap-program F1 route
+/// `TensorF16`, `0`/`off`/`false` vec-hybrid.
+fn parse_warm_tiled_switch(raw: Option<&str>) -> std::result::Result<GemmaLiveKernel, String> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(default_warm_kernel());
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" => Ok(GemmaLiveKernel::TiledF16),
+        "tensor" => Ok(GemmaLiveKernel::TensorF16),
+        "0" | "off" | "false" => Ok(GemmaLiveKernel::VecHybrid),
+        _ => Err(format!(
+            "{WARM_TILED_ATTENTION_ENV} must be 1/on/true, tensor or 0/off/false, got {raw:?}"
+        )),
+    }
+}
+
+fn warm_kernel_for_switch(raw: Option<&str>) -> GemmaLiveKernel {
+    parse_warm_tiled_switch(raw).unwrap_or_else(|error| {
+        let fallback = default_warm_kernel();
+        tracing::warn!(error, ?fallback, "invalid Gemma warm tiled attention switch");
+        fallback
+    })
+}
+
+/// Kernel for warm live-resume attention (single-slot resumes, joint warm
+/// cohorts and installed long-prompt lanes), resolved once per model load
+/// from `HF2Q_GEMMA_WARM_TILED_ATTENTION`.
 pub(crate) fn warm_live_kernel_from_env() -> GemmaLiveKernel {
     let raw = std::env::var(WARM_TILED_ATTENTION_ENV).ok();
     let kernel = warm_kernel_for_switch(raw.as_deref());
@@ -113,57 +122,25 @@ pub(crate) fn default_warm_live_kernel() -> GemmaLiveKernel {
     warm_kernel_for_switch(None)
 }
 
-/// `HF2Q_GEMMA_TILED_LIVE`: installed long-prompt multi-sequence lanes and
-/// the stable cue batch ([`GemmaLiveAttention::Tiled`]) only.
-fn tiled_live_enabled() -> bool {
-    !matches!(
-        std::env::var("HF2Q_GEMMA_TILED_LIVE").as_deref(),
-        Ok("0") | Ok("false") | Ok("off")
-    )
-}
-
-/// Attention route of one live-resume forward.
+/// Attention route of one live-resume forward: the model's warm kernel, with
+/// suffixes under [`WARM_TILED_MIN_ROWS`] on `VecHybrid`. Single-slot
+/// resumes and every multi-sequence lane take this one route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LiveRoute {
     kernel: GemmaLiveKernel,
-    /// Under `TiledF16`, sequences with fewer rows keep `VecHybrid`.
-    min_tiled_rows: usize,
 }
 
 impl LiveRoute {
-    /// `attention` is the multi-sequence descriptor's route, `None` for a
-    /// single-slot resume.
-    pub(crate) fn resolve(
-        attention: Option<GemmaLiveAttention>,
-        warm_kernel: GemmaLiveKernel,
-    ) -> Self {
-        Self::select(attention, warm_kernel, tiled_live_enabled())
-    }
-
-    fn select(
-        attention: Option<GemmaLiveAttention>,
-        warm_kernel: GemmaLiveKernel,
-        tiled_live: bool,
-    ) -> Self {
-        match attention {
-            Some(GemmaLiveAttention::Tiled) => Self {
-                kernel: if tiled_live {
-                    GemmaLiveKernel::TiledF16
-                } else {
-                    GemmaLiveKernel::VecHybrid
-                },
-                min_tiled_rows: 0,
-            },
-            None | Some(GemmaLiveAttention::PerSlotExact) => Self {
-                kernel: warm_kernel,
-                min_tiled_rows: WARM_TILED_MIN_ROWS,
-            },
+    pub(crate) fn resolve(warm_kernel: GemmaLiveKernel) -> Self {
+        Self {
+            kernel: warm_kernel,
         }
     }
 
     pub(crate) fn seq_kernel(self, rows: usize) -> GemmaLiveKernel {
         match self.kernel {
-            GemmaLiveKernel::TiledF16 if rows >= self.min_tiled_rows => GemmaLiveKernel::TiledF16,
+            GemmaLiveKernel::TiledF16 if rows >= WARM_TILED_MIN_ROWS => GemmaLiveKernel::TiledF16,
+            GemmaLiveKernel::TensorF16 if rows >= WARM_TILED_MIN_ROWS => GemmaLiveKernel::TensorF16,
             _ => GemmaLiveKernel::VecHybrid,
         }
     }
@@ -176,10 +153,10 @@ impl LiveRoute {
 
     /// Prefill banner fragment.
     pub(crate) fn label(self) -> &'static str {
-        match (self.kernel, self.min_tiled_rows) {
-            (GemmaLiveKernel::VecHybrid, _) => "vec-hybrid",
-            (GemmaLiveKernel::TiledF16, 0) => "tiled-f16",
-            (GemmaLiveKernel::TiledF16, _) => "tiled-f16 (vec-hybrid below 32 rows)",
+        match self.kernel {
+            GemmaLiveKernel::VecHybrid => "vec-hybrid",
+            GemmaLiveKernel::TiledF16 => "tiled-f16 (vec-hybrid below 32 rows)",
+            GemmaLiveKernel::TensorF16 => "tensor-f16 (vec-hybrid below 32 rows)",
         }
     }
 }
@@ -214,8 +191,12 @@ fn vec_query_chunk_len(start_pos: usize, remaining: usize) -> usize {
 fn chunk_len(kernel: GemmaLiveKernel, is_ring: bool, start_pos: usize, remaining: usize) -> usize {
     match kernel {
         GemmaLiveKernel::VecHybrid => vec_query_chunk_len(start_pos, remaining),
-        GemmaLiveKernel::TiledF16 if is_ring => remaining.min(TILED_SLIDING_QUERY_CHUNK),
-        GemmaLiveKernel::TiledF16 => remaining.min(TILED_GLOBAL_QUERY_CHUNK),
+        GemmaLiveKernel::TiledF16 | GemmaLiveKernel::TensorF16 if is_ring => {
+            remaining.min(TILED_SLIDING_QUERY_CHUNK)
+        }
+        GemmaLiveKernel::TiledF16 | GemmaLiveKernel::TensorF16 => {
+            remaining.min(TILED_GLOBAL_QUERY_CHUNK)
+        }
     }
 }
 
@@ -243,7 +224,7 @@ fn chunks(
 fn stage_query_rows(kernel: GemmaLiveKernel, rows: usize) -> usize {
     rows.min(match kernel {
         GemmaLiveKernel::VecHybrid => VEC_QUERY_CHUNK,
-        GemmaLiveKernel::TiledF16 => TILED_SLIDING_QUERY_CHUNK,
+        GemmaLiveKernel::TiledF16 | GemmaLiveKernel::TensorF16 => TILED_SLIDING_QUERY_CHUNK,
     })
 }
 
@@ -702,6 +683,29 @@ fn encode_live_seq(
                 &q,
                 &out,
             )?,
+            GemmaLiveKernel::TensorF16 => {
+                // Absolute position of dense row 0 (the stage starts at the
+                // oldest staged history row; global rows are absolute).
+                let first_key_abs = if is_ring {
+                    absolute_start - keys.query_offset
+                } else {
+                    0
+                };
+                encode_tensor_chunk(
+                    s,
+                    reg,
+                    dev,
+                    layer,
+                    (attn_k, attn_v, attn_norms),
+                    kv_capacity,
+                    is_ring,
+                    keys,
+                    first_key_abs,
+                    len,
+                    &q,
+                    &out,
+                )?
+            }
             GemmaLiveKernel::VecHybrid => {
                 let scratch = layer.vec.ok_or_else(|| {
                     anyhow::anyhow!("live vec-hybrid attention L{layer_idx} has no scratch")
@@ -988,10 +992,162 @@ fn encode_tiled_chunk(
     Ok(())
 }
 
+/// Tensor-API flash attention (gap program F1) for one chunk of one
+/// sequence. The dense K/V range is laid out so that dense row `r` holds
+/// absolute position `first_key_abs - lead + r` with `lead =
+/// first_key_abs % 64`: the kernel's 64-row key tiles then start at absolute
+/// multiples of 64, so a row's result does not depend on where its chunk or
+/// stage begins (design §3). The `lead` rows before the first key and the
+/// rows past the last key up to `kv_pad` are zero and masked `-inf`.
+///
+/// Layout of each dense buffer: `lead · hd` zeros, then the compacted
+/// `[nkv, kv_seq_len, hd]` rows, then `(kv_pad − lead − kv_seq_len) · hd`
+/// zeros. Head `h`, dense row `r` is element `h · kv_seq_len · hd + r · hd`
+/// of the buffer, so rows outside a head's own range read neighbouring
+/// finite rows (another head's, or the zero lead/tail), all masked.
+#[allow(clippy::too_many_arguments)]
+fn encode_tensor_chunk(
+    s: &mut GraphSession<'_>,
+    reg: &mut KernelRegistry,
+    dev: &MlxDevice,
+    layer: &LiveLayer<'_>,
+    (src_k, src_v, src_norms): (&MlxBuffer, &MlxBuffer, &MlxBuffer),
+    src_capacity: usize,
+    is_ring: bool,
+    keys: ChunkKeys,
+    first_key_abs: usize,
+    len: usize,
+    q: &MlxBuffer,
+    out: &MlxBuffer,
+) -> Result<()> {
+    use mlx_native::ops::flash_attn_prefill_tensor as tensor;
+    let metal_dev = dev.metal_device();
+    let (nh, nkv, hd, layer_idx) = (layer.nh, layer.nkv, layer.hd, layer.layer_idx);
+    let kv_seq_len = keys.kv_seq_len;
+    let step = tensor::CACHE_ROWS_PER_STEP as usize;
+    let lead = first_key_abs % step;
+    let kv_pad = tensor::kv_pad((lead + kv_seq_len) as u32) as usize;
+    let tail = kv_pad - lead - kv_seq_len;
+    let dense_elems = (lead + tail) * hd + nkv * kv_seq_len * hd;
+    let dense = |what: &str| -> Result<MlxBuffer> {
+        let mut buffer = dev
+            .alloc_buffer(dense_elems * 2, DType::F16, vec![dense_elems])
+            .map_err(|e| anyhow::anyhow!("live tensor {what} scratch L{layer_idx}: {e}"))?;
+        // The lead and tail rows are read by the kernel (masked) and must be
+        // finite; the compaction below writes everything between them.
+        let halves = buffer
+            .as_mut_slice::<u16>()
+            .map_err(|e| anyhow::anyhow!("live tensor {what} zero fill L{layer_idx}: {e}"))?;
+        halves[..lead * hd].fill(0);
+        halves[dense_elems - tail * hd..].fill(0);
+        Ok(buffer)
+    };
+    let dense_k = dense("K")?;
+    let dense_v = dense("V")?;
+    let body_bytes = (lead * hd * 2) as u64;
+    let body_elems = nkv * kv_seq_len * hd;
+    let k_body = dense_k.slice_view(body_bytes, body_elems);
+    let v_body = dense_v.slice_view(body_bytes, body_elems);
+
+    s.barrier_between(&[src_k, src_v, src_norms], &[&dense_k, &dense_v]);
+    let rings = (src_capacity, kv_seq_len);
+    let range = (kv_seq_len, kv_seq_len);
+    let f16_row = hd * DType::F16.size_of();
+    linearize_rows(
+        s, reg, dev, (src_k, &k_body), nkv, rings, range, f16_row, layer_idx, "tensor K",
+    )?;
+    if src_v.dtype() == DType::F16 {
+        linearize_rows(
+            s, reg, dev, (src_v, &v_body), nkv, rings, range, f16_row, layer_idx, "tensor V",
+        )?;
+    } else {
+        mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_hb_kv_seq_f16(
+            s.encoder_mut(),
+            reg,
+            metal_dev,
+            src_v,
+            src_norms,
+            &v_body,
+            nkv as u32,
+            hd as u32,
+            src_capacity as u32,
+            0,
+            kv_seq_len as u32,
+            layer.tq_scale_factor_d512,
+            layer.tq_codebook_bits,
+        )
+        .map_err(|e| anyhow::anyhow!("live tensor V expand L{layer_idx}: {e}"))?;
+    }
+
+    let mask = mlx_native::ops::flash_attn_prefill_mask::build_sdpa_mask_f16(
+        dev,
+        reg,
+        s.encoder_mut(),
+        &mlx_native::ops::flash_attn_prefill_mask::SdpaMaskParams {
+            seq_len_q: len as u32,
+            seq_len_k: kv_pad as u32,
+            window_size: is_ring.then_some(layer.sliding_window),
+            causal: true,
+            q_abs_offset: (lead + keys.query_offset) as u32,
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("live tensor mask L{layer_idx}: {e}"))?;
+    // The mask is allocated inside its builder, so its write is undeclared:
+    // fence before the blk classifier reads it (see `encode_tiled_chunk`).
+    s.barrier();
+    let blk_params = mlx_native::ops::flash_attn_prefill_blk::BlkParams {
+        seq_len_q: len as u32,
+        seq_len_k: kv_pad as u32,
+        bq: tensor::queries_per_threadgroup(hd as u32)
+            .map_err(|e| anyhow::anyhow!("live tensor L{layer_idx}: {e}"))?,
+        bk: tensor::CACHE_ROWS_PER_STEP,
+    };
+    let blk = mlx_native::ops::flash_attn_prefill_blk::alloc_blk_buffer(dev, &blk_params)
+        .map_err(|e| anyhow::anyhow!("live tensor blk alloc L{layer_idx}: {e}"))?;
+    s.barrier_between(&[&mask], &[&blk]);
+    mlx_native::ops::flash_attn_prefill_blk::dispatch_flash_attn_prefill_blk_f16(
+        s.encoder_mut(),
+        dev,
+        reg,
+        &mask,
+        &blk,
+        &blk_params,
+    )
+    .map_err(|e| anyhow::anyhow!("live tensor blk L{layer_idx}: {e}"))?;
+    s.barrier_between(&[q, &dense_k, &dense_v, &mask, &blk], &[out]);
+    tensor::dispatch_flash_attn_prefill_tensor_f16(
+        s.encoder_mut(),
+        reg,
+        dev,
+        q,
+        &dense_k,
+        &dense_v,
+        &mask,
+        &blk,
+        out,
+        &tensor::FlashAttnPrefillTensorParams {
+            rows: len as u32,
+            n_heads: nh as u32,
+            n_kv_heads: nkv as u32,
+            head_dim: hd as u32,
+            kv_pad: kv_pad as u32,
+            q_row_stride: (nh * hd) as u32,
+            q_head_stride: hd as u32,
+            k_row_stride: hd as u32,
+            k_head_stride: (kv_seq_len * hd) as u32,
+            v_row_stride: hd as u32,
+            v_head_stride: (kv_seq_len * hd) as u32,
+            scale: 1.0,
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("live tensor FA L{layer_idx}: {e}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::models::gemma4::GemmaLiveKernel::{TiledF16, VecHybrid};
+    use crate::inference::models::gemma4::GemmaLiveKernel::{TensorF16, TiledF16, VecHybrid};
 
     fn chunk_list(kernel: GemmaLiveKernel, is_ring: bool, start: usize, rows: usize) -> Vec<usize> {
         chunks(kernel, is_ring, start, rows)
@@ -1007,50 +1163,28 @@ mod tests {
         for raw in ["1", "on", "TRUE"] {
             assert_eq!(warm_kernel_for_switch(Some(raw)), TiledF16, "{raw:?}");
         }
+        for raw in ["tensor", " Tensor "] {
+            assert_eq!(warm_kernel_for_switch(Some(raw)), TensorF16, "{raw:?}");
+        }
         assert!(parse_warm_tiled_switch(Some("yes")).is_err());
         // An invalid value keeps the vec-hybrid default rather than opting in.
         assert_eq!(warm_kernel_for_switch(Some("yes")), VecHybrid);
     }
 
     #[test]
-    fn single_slot_and_joint_cohort_always_resolve_the_same_route() {
-        for warm in [TiledF16, VecHybrid] {
-            for tiled_live in [true, false] {
-                let single = LiveRoute::select(None, warm, tiled_live);
-                let joint =
-                    LiveRoute::select(Some(GemmaLiveAttention::PerSlotExact), warm, tiled_live);
-                assert_eq!(single, joint, "warm={warm:?} tiled_live={tiled_live}");
-                for rows in [1, 31, 32, 33, 56, 385, 4096] {
-                    assert_eq!(single.seq_kernel(rows), joint.seq_kernel(rows));
-                }
-            }
-        }
-    }
-
-    #[test]
     fn warm_route_follows_its_switch_and_keeps_tiny_suffixes_on_vec_hybrid() {
-        // `HF2Q_GEMMA_TILED_LIVE` never moves the warm route.
-        for tiled_live in [true, false] {
-            let tiled = LiveRoute::select(None, TiledF16, tiled_live);
-            assert_eq!(tiled.seq_kernel(1), VecHybrid);
-            assert_eq!(tiled.seq_kernel(31), VecHybrid);
-            assert_eq!(tiled.seq_kernel(32), TiledF16);
-            assert_eq!(tiled.seq_kernel(385), TiledF16);
-            let vec = LiveRoute::select(None, VecHybrid, tiled_live);
-            assert_eq!(vec.seq_kernel(385), VecHybrid);
-        }
-    }
-
-    #[test]
-    fn installed_lanes_keep_their_own_switch_and_tile_every_length() {
-        // `HF2Q_GEMMA_WARM_TILED_ATTENTION` never moves installed lanes.
-        for warm in [TiledF16, VecHybrid] {
-            let on = LiveRoute::select(Some(GemmaLiveAttention::Tiled), warm, true);
-            assert_eq!(on.seq_kernel(1), TiledF16, "a 4096+4096+1 tail stays tiled");
-            assert_eq!(on.seq_kernel(4096), TiledF16);
-            let off = LiveRoute::select(Some(GemmaLiveAttention::Tiled), warm, false);
-            assert_eq!(off.seq_kernel(4096), VecHybrid);
-        }
+        let tiled = LiveRoute::resolve(TiledF16);
+        assert_eq!(tiled.seq_kernel(1), VecHybrid);
+        assert_eq!(tiled.seq_kernel(31), VecHybrid);
+        assert_eq!(tiled.seq_kernel(32), TiledF16);
+        assert_eq!(tiled.seq_kernel(385), TiledF16);
+        let tensor = LiveRoute::resolve(TensorF16);
+        assert_eq!(tensor.seq_kernel(1), VecHybrid);
+        assert_eq!(tensor.seq_kernel(31), VecHybrid);
+        assert_eq!(tensor.seq_kernel(32), TensorF16);
+        assert_eq!(tensor.seq_kernel(385), TensorF16);
+        let vec = LiveRoute::resolve(VecHybrid);
+        assert_eq!(vec.seq_kernel(385), VecHybrid);
     }
 
     #[test]
@@ -1060,10 +1194,10 @@ mod tests {
             rows,
             start: 465,
         };
-        let tiled = LiveRoute::select(None, TiledF16, true);
+        let tiled = LiveRoute::resolve(TiledF16);
         assert!(!tiled.uses_vec(&[span(56), span(385)]));
         assert!(tiled.uses_vec(&[span(56), span(5)]));
-        assert!(LiveRoute::select(None, VecHybrid, true).uses_vec(&[span(56)]));
+        assert!(LiveRoute::resolve(VecHybrid).uses_vec(&[span(56)]));
     }
 
     #[test]
@@ -1175,5 +1309,33 @@ mod tests {
         assert_eq!(stage_history_len(2_005, 18_404), 2_005);
         assert_eq!(stage_history_len(2_005, 1_024), 1_023);
         assert_eq!(stage_history_len(0, 0), 0);
+    }
+
+    #[test]
+    fn tensor_route_takes_the_tiled_chunks_and_keeps_tiny_suffixes_on_vec_hybrid() {
+        let route = LiveRoute::resolve(TensorF16);
+        assert_eq!(route.seq_kernel(31), VecHybrid);
+        assert_eq!(route.seq_kernel(32), TensorF16);
+        assert_eq!(route.label(), "tensor-f16 (vec-hybrid below 32 rows)");
+        for (is_ring, start, rows) in
+            [(true, 0, 2_500), (false, 7, 9_000), (true, 465, 385)]
+        {
+            assert_eq!(
+                chunk_list(TensorF16, is_ring, start, rows),
+                chunk_list(TiledF16, is_ring, start, rows)
+            );
+        }
+        assert_eq!(
+            stage_query_rows(TensorF16, 2_000),
+            stage_query_rows(TiledF16, 2_000)
+        );
+    }
+
+    #[test]
+    fn gemma_live_kernel_wire_names_are_the_variant_names() {
+        // `/hf2q/v1/runtime` and the Q5 readiness check use the variant names.
+        for kernel in [TiledF16, VecHybrid, TensorF16] {
+            assert_eq!(kernel.wire_name(), format!("{kernel:?}"));
+        }
     }
 }

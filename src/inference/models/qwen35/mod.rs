@@ -63,12 +63,15 @@ pub use dn_prefill_arena::DnPrefillArena;
 pub use fa_prefill_arena::FaPrefillArena;
 pub use fa_projections_arena::FaProjectionsArena;
 pub mod io_heads;
+#[cfg(test)]
+mod joint_attn_rows_tests;
 pub(crate) mod joint_decode_core;
 #[cfg(test)]
 mod joint_decode_ffn_tests;
 pub(crate) mod joint_decode_routes;
 #[cfg(test)]
 pub(crate) mod joint_decode_test_support;
+pub(crate) mod joint_step_options;
 pub(crate) use forward_gpu::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput};
 #[cfg(test)]
 mod real_artifact_joint_decode_tests;
@@ -76,14 +79,29 @@ mod real_artifact_joint_decode_tests;
 mod real_artifact_joint_decode_invariance_tests;
 #[cfg(test)]
 mod real_artifact_joint_decode_q1_tests;
+#[cfg(test)]
+mod real_artifact_joint_decode_witness_tests;
+#[cfg(test)]
+mod real_artifact_joint_decode_gpu_timing_tests;
+#[cfg(test)]
+mod real_artifact_resume_attn_fast_tests;
+#[cfg(test)]
+mod real_artifact_moe_batched_q1_tests;
+#[cfg(test)]
+mod real_artifact_prefill_schedule_tests;
 pub mod kernels;
 pub mod kv_cache;
 pub mod model;
 pub mod moe;
+pub(crate) mod moe_batched;
+#[cfg(test)]
+mod moe_batched_tests;
 pub mod mtp;
 pub mod mtp_weights_load;
 mod source_config;
 pub(crate) mod source_precision;
+pub(crate) mod resume_attn_fast;
+pub mod routing_policy;
 pub mod spec_decode;
 pub mod tokenizer;
 pub mod wave5b8_profile;

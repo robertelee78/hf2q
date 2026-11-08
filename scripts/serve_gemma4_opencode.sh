@@ -15,14 +15,13 @@
 #                           Dropped: it only takes effect on fifo-serial
 #                           (inert on this launcher's inflight-batched
 #                           scheduler; ADR-062 D1).
-#   HF2Q_KV_LCP_RESUME_CAPACITY=8g
-#                           Registry budget for short or branched-prefix
-#                           snapshots, still load-bearing on the default
-#                           inflight-batched scheduler: the engine's
-#                           built-in budget is available-memory-derived
-#                           (≈5 GiB on a fresh 128 GB host), and 8 GiB is
-#                           this launcher's qualified capacity. Set
-#                           LCP_CAPACITY= to override.
+#   HF2Q_KV_LCP_RESUME_CAPACITY
+#                           Removed (#730): the registry budget is the typed
+#                           `--lcp-resume-budget` flag, whose built-in
+#                           default is a host-independent 8GiB (this
+#                           launcher's qualified capacity). The launcher
+#                           passes it explicitly; set LCP_RESUME_BUDGET= to
+#                           override.
 #   Cross-slot admission   Built-in Gemma 4 default: an idle slot group waits
 #                           up to 25 ms for peer agent requests so their
 #                           appended suffixes share one transformer-body pass
@@ -56,16 +55,20 @@
 #   native turn, tool-call, and tool-response markers before inference.
 #
 #   Short cold prompts still auto-route through the existing eager batched
-#   path when its O(n²) overhead fits 1/6 of currently available RAM.
-#   Overhead is config-dependent:
+#   path when its O(n²) overhead fits a budget fixed once at model load:
+#   (total physical RAM − model file bytes) / 6 (#738). Free RAM at request
+#   time is not an input, so a prompt always takes the same route. Other
+#   models a multi-model pool keeps resident are not reserved; such servers
+#   should set HF2Q_SERVE_BATCHED_PREFILL=0. Overhead is config-dependent:
 #     default (tensor-mm globals): ~72 B/seq² — masks + pf_kq scratch
-#       ⇒ batched envelope ≈ ≤12K tokens on a 128 GB box
+#       ⇒ batched envelope ≈ ≤16K tokens on a 128 GB box (16 GB model)
 #     HF2Q_GLOBAL_FA=1 (FA globals): ~8 B/seq² — masks only
-#       ⇒ batched envelope ≈ ≤35-40K tokens
+#       ⇒ batched envelope ≈ ≤50K tokens
 #   Long plain-text SlotAware prompts instead install resumable states. Each
-#   Metal transaction contains at most 4,096 aggregate rows; compatible
-#   installed lanes may divide those rows (four equal lanes advance 1,024
-#   rows each) without multiplying the watchdog boundary by MAX_SLOTS.
+#   Metal transaction contains at most 4,096 aggregate rows; each installed
+#   lane keeps its own chunk of up to 4,096 rows (as when prefilled alone),
+#   and only chunks that fit together share a transaction (#725), so the
+#   watchdog boundary is never multiplied by MAX_SLOTS.
 #   Long soft-token work remains fail-closed until it has a resumable graph.
 #
 #   Normal follow-ups use zero-copy live-prefix reuse and process only the
@@ -93,10 +96,11 @@
 #                                    HF2Q_GEMMA_JOINT_COLD_PREFILL; unset
 #                                    keeps the hf2q default (on). 0 is the
 #                                    A/B kill switch (per-slot cold turn 0).
-#     WARM_TILED_ATTENTION=0|1       (this script) forwards
+#     WARM_TILED_ATTENTION=0|1|tensor (this script) forwards
 #                                    HF2Q_GEMMA_WARM_TILED_ATTENTION; unset
 #                                    keeps the hf2q default (off, vec-hybrid
-#                                    warm attention). 1 opts in to tiled F16.
+#                                    warm attention). 1 opts in to tiled F16,
+#                                    tensor to the tensor-API route (gap F1).
 #     PREFILL_MOE_DOWN=flat|slotted  (this script) forwards
 #                                    HF2Q_GEMMA_PREFILL_MOE_DOWN; unset
 #                                    keeps the hf2q default (slotted). flat
@@ -106,6 +110,21 @@
 #                                    HF2Q_MM_ID_SCHEDULE; unset keeps the
 #                                    mlx-native expert-matmul schedule
 #                                    default. grid is the bitwise A/B arm.
+#     Q5_0_TENSOR_MM=1               (this script) forwards
+#                                    HF2Q_Q5_0_TENSOR_MM=1, the mlx-native
+#                                    Q5_0 tensor-MM opt-in (published as
+#                                    active_controls.q5_0_tensor_mm); unset
+#                                    keeps the native default (off).
+#     ROUTING_OVERLAP=0|1            (this script) forwards
+#                                    HF2Q_GEMMA_ROUTING_OVERLAP; unset keeps
+#                                    it off. 1 prints the V2 [ROUTING_OVERLAP]
+#                                    decode-workload histograms at worker exit
+#                                    (diagnostic, untimed runs only).
+#     DECODE_ATTN_NE=0|2|4           (this script) forwards
+#                                    HF2Q_GEMMA_DECODE_ATTN_NE; unset keeps
+#                                    the stock decode attention. 4 is the
+#                                    gap-program NE head split of d256
+#                                    decode attention (Class B A/B arm).
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):
 #   * Disk persistence of the LCP registry for gemma (ADR-017 spiller
@@ -135,7 +154,11 @@ MODEL="${MODEL:-/opt/hf2q/models/gemma4/gemma4-ara-2pass-APEX-Q5_K_M.gguf}"
 MMPROJ="${MMPROJ:-/opt/hf2q/models/gemma4/mmproj-gemma4-f16.gguf}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8081}"
-LCP_CAPACITY="${LCP_CAPACITY:-8g}"
+if [[ -n "${LCP_CAPACITY+set}" ]]; then
+    echo "LCP_CAPACITY is retired (#730); set LCP_RESUME_BUDGET (e.g. 8GiB) instead" >&2
+    exit 2
+fi
+LCP_RESUME_BUDGET="${LCP_RESUME_BUDGET:-8GiB}"
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 MAX_SLOTS="${MAX_SLOTS:-4}"
 KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-51539607552}" # 48 GiB shared
@@ -223,9 +246,9 @@ esac
 WARM_TILED_ENV=""
 case "${WARM_TILED_ATTENTION:-}" in
     "") ;;
-    0|1) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;
+    0|1|tensor) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;
     *)
-        echo "WARM_TILED_ATTENTION must be 0, 1 or unset" >&2
+        echo "WARM_TILED_ATTENTION must be 0, 1, tensor or unset" >&2
         exit 2
         ;;
 esac
@@ -247,13 +270,39 @@ case "${MM_ID_SCHEDULE:-}" in
         exit 2
         ;;
 esac
+Q5_0_TENSOR_MM_ENV=""
+case "${Q5_0_TENSOR_MM:-}" in
+    "") ;;
+    1) Q5_0_TENSOR_MM_ENV=1 ;;
+    *)
+        echo "Q5_0_TENSOR_MM must be 1 or unset" >&2
+        exit 2
+        ;;
+esac
+ROUTING_OVERLAP_ENV=""
+case "${ROUTING_OVERLAP:-}" in
+    "") ;;
+    0|1) ROUTING_OVERLAP_ENV="$ROUTING_OVERLAP" ;;
+    *)
+        echo "ROUTING_OVERLAP must be 0, 1 or unset" >&2
+        exit 2
+        ;;
+esac
+DECODE_ATTN_NE_ENV=""
+case "${DECODE_ATTN_NE:-}" in
+    "") ;;
+    0|2|4) DECODE_ATTN_NE_ENV="$DECODE_ATTN_NE" ;;
+    *)
+        echo "DECODE_ATTN_NE must be 0, 2, 4 or unset" >&2
+        exit 2
+        ;;
+esac
 
 # macOS bash 3.2 + `set -u`: expanding an EMPTY array via "${MMARGS[@]}"
 # is an unbound-variable error (this killed the no-mmproj boot
 # 2026-08-03). Branch the exec instead of relying on the expansion.
 if [[ -f "$MMPROJ" ]]; then
     exec env \
-        HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
         ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
@@ -261,6 +310,9 @@ if [[ -f "$MMPROJ" ]]; then
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
+        ${Q5_0_TENSOR_MM_ENV:+HF2Q_Q5_0_TENSOR_MM="$Q5_0_TENSOR_MM_ENV"} \
+        ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
+        ${DECODE_ATTN_NE_ENV:+HF2Q_GEMMA_DECODE_ATTN_NE="$DECODE_ATTN_NE_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
@@ -271,10 +323,10 @@ if [[ -f "$MMPROJ" ]]; then
             --scheduler inflight-batched \
             --max-slots "$MAX_SLOTS" \
             --kv-cache-budget "$KV_CACHE_BUDGET_BYTES" \
+            --lcp-resume-budget "$LCP_RESUME_BUDGET" \
             --default-repetition-penalty "${REP_PENALTY:-1.05}"
 else
     exec env \
-        HF2Q_KV_LCP_RESUME_CAPACITY="$LCP_CAPACITY" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
         ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
@@ -282,6 +334,9 @@ else
         ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
+        ${Q5_0_TENSOR_MM_ENV:+HF2Q_Q5_0_TENSOR_MM="$Q5_0_TENSOR_MM_ENV"} \
+        ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
+        ${DECODE_ATTN_NE_ENV:+HF2Q_GEMMA_DECODE_ATTN_NE="$DECODE_ATTN_NE_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
@@ -291,5 +346,6 @@ else
             --scheduler inflight-batched \
             --max-slots "$MAX_SLOTS" \
             --kv-cache-budget "$KV_CACHE_BUDGET_BYTES" \
+            --lcp-resume-budget "$LCP_RESUME_BUDGET" \
             --default-repetition-penalty "${REP_PENALTY:-1.05}"
 fi

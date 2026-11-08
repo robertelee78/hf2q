@@ -24,7 +24,8 @@ captured from actual readiness; omission is not a peer-default claim.
 
 Canonical operator entrypoint is `scripts/serve_gemma4_opencode.sh`. It uses
 inflight-batched, maxslots4 default, sharedKV48GiB, repetition1.05,
-HF2Q_KV_LCP_RESUME_CAPACITY8g, BATCHED unset/auto and optional existing mmproj.
+HF2Q_KV_LCP_RESUME_CAPACITY8g (#730: now `--lcp-resume-budget 8GiB`, the
+built-in default), BATCHED unset/auto and optional existing mmproj.
 Do not claim no projector merely because requests have no images. Launcher
 MODEL default is a different APEX Q5 artifact: this diagnostic MUST explicitly
 bind the selected hf2q-produced Google Gemma4 Q4_K_M artifact, declared F1SHA

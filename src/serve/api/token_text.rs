@@ -26,6 +26,16 @@ pub(crate) fn token_raw_bytes(tokenizer: &Tokenizer, token: u32) -> Vec<u8> {
     raw_piece_bytes(tokenizer, token).unwrap_or_else(|| text.into_bytes())
 }
 
+/// The grammar mask's per-vocab byte table: entry `id` is
+/// [`token_raw_bytes`] of `id` for every id below `vocab_size`. An id the
+/// tokenizer cannot decode yields empty bytes, which the mask treats as an
+/// unprintable special token.
+pub(crate) fn token_bytes_table(tokenizer: &Tokenizer, vocab_size: usize) -> Vec<Vec<u8>> {
+    (0..vocab_size)
+        .map(|id| token_raw_bytes(tokenizer, id as u32))
+        .collect()
+}
+
 fn raw_piece_bytes(tokenizer: &Tokenizer, token: u32) -> Option<Vec<u8>> {
     let decoder = tokenizer.get_decoder()?;
     let piece = tokenizer.id_to_token(token)?;

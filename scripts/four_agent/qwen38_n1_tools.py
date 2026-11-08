@@ -59,8 +59,12 @@ IMMUTABLE = {"Cargo.toml": MANIFEST, "Cargo.lock": LOCK,
 
 
 class Tools:
-    def __init__(self, root, cargo, sandbox, sdk, immutable=IMMUTABLE, initial=INITIAL, read_limit=FILE_LIMIT):
-        """`read_limit` bounds read_file results only (coding_long_context.py raises it for its tests file)."""
+    def __init__(self, root, cargo, sandbox, sdk, immutable=IMMUTABLE, initial=INITIAL, read_limit=FILE_LIMIT,
+                 max_calls=6):
+        """`read_limit` bounds read_file results only (coding_long_context.py raises it for its tests file).
+        `max_calls` is the six steps plus two per repair cycle (qwen38_n1_verdict.max_tools)."""
+        require(type(max_calls) is int and max_calls >= 6, "tool call bound below the six steps")
+        self.max_calls = max_calls
         require(set(immutable) == set(IMMUTABLE), "fixture file set")
         require(type(read_limit) is int and read_limit >= FILE_LIMIT, "read limit below the canonical bound")
         self.immutable = dict(immutable)
@@ -227,7 +231,7 @@ class Tools:
     def invoke(self, name, args):
         self.invariant()
         self.calls += 1
-        require(self.calls <= 6, "extra tool invocation")
+        require(self.calls <= self.max_calls, "extra tool invocation")
         log = self.root / f"tool-{self.calls:02d}"
         log.mkdir(mode=0o700)
         receipt = {"name": name, "arguments": args, "cleanup": False, "status": "Pending"}

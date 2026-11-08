@@ -12,7 +12,7 @@ use mlx_native::{DType, MlxBuffer, MlxDevice};
 use super::forward_support::{
     alloc, grouped_output_a, grouped_output_a_batched, raw_matmul, BatchedGroupedOutputArena,
 };
-use super::residency::RawMatrixRef;
+use super::residency::{MatvecKernels, RawMatrixRef};
 use super::row_matmul::{row_matmul, row_view, splits_independent_rows, RowMatmul};
 use crate::serve::gpu::GpuContext;
 
@@ -98,6 +98,7 @@ fn q8_0_independent_rows_match_one_row_matvec_bitwise() {
         buffer: &weight,
         ggml_type: GgmlType::Q8_0,
         shape: &shape,
+        matvec: MatvecKernels::Stock,
     };
     let input = f32_input(&device, vec![ROWS, K], 3);
     let joint = alloc(&device, DType::F32, vec![ROWS, N], "joint output").unwrap();
@@ -156,6 +157,7 @@ fn dense_f32_independent_rows_match_one_row_matvec_bitwise() {
         buffer: &weight,
         ggml_type: GgmlType::F32,
         shape: &shape,
+        matvec: MatvecKernels::Stock,
     };
     let input = f32_input(&device, vec![ROWS, K], 5);
     let joint = alloc(&device, DType::F32, vec![ROWS, N], "joint output").unwrap();
@@ -212,6 +214,7 @@ fn q8_0_grouped_output_rows_match_one_row_groups_bitwise() {
         buffer: &weight,
         ggml_type: GgmlType::Q8_0,
         shape: &shape,
+        matvec: MatvecKernels::Stock,
     };
     let input = f32_input(&device, vec![ROWS, HEADS, HEAD_DIM], 7);
     let joint = alloc(
@@ -258,6 +261,184 @@ fn q8_0_grouped_output_rows_match_one_row_groups_bitwise() {
             RANK,
             HEADS,
             HEAD_DIM,
+        )
+        .unwrap();
+    }
+    session.finish().unwrap();
+    assert!(serial
+        .as_slice::<f32>()
+        .unwrap()
+        .iter()
+        .any(|value| *value != 0.0));
+    assert_eq!(bits(&joint), bits(&serial));
+}
+
+fn f16_weight(device: &MlxDevice, n: usize, k: usize, seed: usize) -> (MlxBuffer, Vec<f32>) {
+    let values: Vec<half::f16> = (0..n * k)
+        .map(|index| half::f16::from_f32((((index + seed) * 53 % 199) as f32 - 99.0) * 0.0041))
+        .collect();
+    let mut weight = device
+        .alloc_buffer(values.len() * 2, DType::F16, vec![n, k])
+        .unwrap();
+    weight.as_mut_slice::<u16>().unwrap().copy_from_slice(
+        &values
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+    );
+    (weight, values.iter().map(|value| value.to_f32()).collect())
+}
+
+fn encode_one_row(
+    ctx: &mut GpuContext,
+    input: &MlxBuffer,
+    weight: &RawMatrixRef<'_>,
+    output: &MlxBuffer,
+    n: usize,
+    k: usize,
+) {
+    let device = ctx.device().clone();
+    let (executor, registry) = ctx.split();
+    let mut session = executor.begin().unwrap();
+    raw_matmul(
+        &mut session,
+        registry,
+        &device,
+        input,
+        weight,
+        output,
+        1,
+        n,
+        k,
+        "F16 matvec",
+    )
+    .unwrap();
+    session.finish().unwrap();
+}
+
+/// L9 (ADR-063 Q4-DS4-RACE): a one-row F16 product is the F32-input matvec,
+/// within the design §3.7 matvec bound `2.5e-4 · Σ|wᵢxᵢ|` of an F64 dot, at
+/// ds4's router (256 × 4096) and HC-function (24 × 4096) shapes.
+#[test]
+fn dense_f16_one_row_matvec_matches_f64_dot() {
+    const K: usize = 4096;
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut ctx = GpuContext::new().unwrap();
+    let device = ctx.device().clone();
+    for n in [256_usize, 24] {
+        let (weight, values) = f16_weight(&device, n, K, n);
+        let shape = [n, K];
+        let weight = RawMatrixRef {
+            buffer: &weight,
+            ggml_type: GgmlType::F16,
+            shape: &shape,
+            matvec: MatvecKernels::Stock,
+        };
+        let input = f32_input(&device, vec![1, K], 7);
+        let output = alloc(&device, DType::F32, vec![1, n], "F16 matvec output").unwrap();
+        encode_one_row(&mut ctx, &input, &weight, &output, n, K);
+        let x = input.as_slice::<f32>().unwrap();
+        let got = output.as_slice::<f32>().unwrap();
+        for row in 0..n {
+            let w = &values[row * K..(row + 1) * K];
+            let want: f64 = w.iter().zip(x).map(|(w, x)| *w as f64 * *x as f64).sum();
+            let magnitude: f64 = w
+                .iter()
+                .zip(x)
+                .map(|(w, x)| (*w as f64 * *x as f64).abs())
+                .sum();
+            assert!(magnitude > 0.0);
+            assert!(
+                (got[row] as f64 - want).abs() <= 2.5e-4 * magnitude,
+                "n={n} row {row}: got {} want {want} bound {}",
+                got[row],
+                2.5e-4 * magnitude
+            );
+        }
+    }
+}
+
+/// The one-row F16 route keeps the input in F32: `1 + 2⁻¹²` is not a half
+/// value (it rounds to 1.0), and a unit weight must return it exactly.
+#[test]
+fn dense_f16_one_row_matvec_does_not_round_the_input_to_half() {
+    const N: usize = 8;
+    const K: usize = 256;
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut ctx = GpuContext::new().unwrap();
+    let device = ctx.device().clone();
+    let one = half::f16::ONE.to_bits();
+    let mut weight = device
+        .alloc_buffer(N * K * 2, DType::F16, vec![N, K])
+        .unwrap();
+    weight.as_mut_slice::<u16>().unwrap().fill(one);
+    let shape = [N, K];
+    let weight = RawMatrixRef {
+        buffer: &weight,
+        ggml_type: GgmlType::F16,
+        shape: &shape,
+        matvec: MatvecKernels::Stock,
+    };
+    let value = 1.0_f32 + 2.0_f32.powi(-12);
+    assert_eq!(half::f16::from_f32(value).to_f32(), 1.0);
+    let mut input = alloc(&device, DType::F32, vec![1, K], "F16 precision input").unwrap();
+    let x = input.as_mut_slice::<f32>().unwrap();
+    x.fill(0.0);
+    x[17] = value;
+    let output = alloc(&device, DType::F32, vec![1, N], "F16 precision output").unwrap();
+    encode_one_row(&mut ctx, &input, &weight, &output, N, K);
+    for got in output.as_slice::<f32>().unwrap() {
+        assert_eq!(got.to_bits(), value.to_bits());
+    }
+}
+
+#[test]
+fn dense_f16_independent_rows_match_one_row_matvec_bitwise() {
+    const ROWS: usize = 2;
+    const N: usize = 24;
+    const K: usize = 4096;
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut ctx = GpuContext::new().unwrap();
+    let device = ctx.device().clone();
+    let (weight, _) = f16_weight(&device, N, K, 3);
+    let shape = [N, K];
+    let weight = RawMatrixRef {
+        buffer: &weight,
+        ggml_type: GgmlType::F16,
+        shape: &shape,
+        matvec: MatvecKernels::Stock,
+    };
+    let input = f32_input(&device, vec![ROWS, K], 9);
+    let joint = alloc(&device, DType::F32, vec![ROWS, N], "joint output").unwrap();
+    let serial = alloc(&device, DType::F32, vec![ROWS, N], "serial output").unwrap();
+    let (executor, registry) = ctx.split();
+    let mut session = executor.begin().unwrap();
+    row_matmul(
+        RowMatmul::IndependentRows,
+        &mut session,
+        registry,
+        &device,
+        &input,
+        &weight,
+        &joint,
+        ROWS,
+        N,
+        K,
+        "joint F16 HC function",
+    )
+    .unwrap();
+    for row in 0..ROWS {
+        raw_matmul(
+            &mut session,
+            registry,
+            &device,
+            &row_view(&input, row, vec![1, K]).unwrap(),
+            &weight,
+            &row_view(&serial, row, vec![1, N]).unwrap(),
+            1,
+            N,
+            K,
+            "serial F16 HC function",
         )
         .unwrap();
     }

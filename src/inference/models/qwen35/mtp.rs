@@ -920,14 +920,20 @@ impl MtpWeights {
 
         let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("MTP enc attn output")?;
         let gated_or_attn = if let Some(gate) = gate_flat.as_ref() {
-            apply_sigmoid_gate_multiply(
+            let gated = apply_sigmoid_gate_multiply(
                 &mut enc,
                 registry,
                 device,
                 &attn_out,
                 gate,
                 seq_len * q_total,
-            )?
+            )?;
+            // RAW: the output projection reads `gated`. The encoder
+            // dispatches concurrently, so without this barrier the
+            // projection can read partially written rows and the MTP draft
+            // changes from run to run (the target path's ADR-015 iter21 fix).
+            enc.memory_barrier();
+            gated
         } else {
             attn_out
         };

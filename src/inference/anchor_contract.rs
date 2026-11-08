@@ -95,8 +95,15 @@ pub(crate) struct RestoreTicket {
 fn next_origin() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-        .expect("fixture origin exhausted")
+    // Same loop as the deprecated `fetch_update`; `try_update` is newer than the MSRV.
+    let mut current = NEXT.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).expect("fixture origin exhausted");
+        match NEXT.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(previous) => return previous,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

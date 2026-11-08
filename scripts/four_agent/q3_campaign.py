@@ -20,6 +20,9 @@ at most 20, stopping once the 95% half-width of every required experiment contra
 and root commands: docs/research/adr063-q3-campaign.md.
 --controls-of runs control stages only, as controls of a primary verdict of record (#369
 amendment): its family and arm identities must match that campaign's frozen ones.
+--no-stock-arm runs without the stock arm (ADR-063 Q4-DS4-RACE decision D1): either with --stock-record, binding a
+same-artifact stock campaign's verdict.json whose vs-stock effects, fairness and failures enter this verdict, or as a
+--native-comparison campaign, which has no vs-stock row anyway.
 """
 import argparse
 import datetime
@@ -129,9 +132,52 @@ def primary_of_record(path, family):
             "harness": {"git_commit": harness["git_commit"], "sources": harness["sources"]}}
 
 
+# --stock-record (ADR-063 Q4-DS4-RACE decision D1): the families whose stock binary cannot open the campaign's artifact.
+STOCK_RECORD_FAMILIES = ("deepseek4",)
+
+
+def stock_record_of(path, family):
+    """--stock-record: the same-artifact stock campaign of record on hf2q's own artifact, bound by path and sha256 (the
+    primary_of_record pattern). It must be a complete default primary of this family with a measured stock arm."""
+    verdict_path = Path(path).resolve()
+    campaign_path = verdict_path.parent / "campaign.json"
+    verdict, manifest = q3_metrics.load_json(verdict_path), q3_metrics.load_json(campaign_path)
+    qc.require(verdict_path.name == "verdict.json" and isinstance(verdict, dict)
+               and verdict.get("schema") == q3_report.VERDICT_SCHEMA
+               and isinstance(manifest, dict) and manifest.get("schema") == SCHEMA,
+               f"--stock-record {verdict_path} must be a Q3 verdict.json beside its campaign.json")
+    qc.require(family in STOCK_RECORD_FAMILIES, f"--stock-record applies to {', '.join(STOCK_RECORD_FAMILIES)} only")
+    record_plan = manifest["plan"]
+    qc.require(verdict["family"] == record_plan["family"] == family,
+               f"the stock record {verdict_path} is family {verdict['family']}, not {family}")
+    qc.require(verdict.get("primary") is not None and record_plan.get("controls_of") is None,
+               f"the stock record {verdict_path} carries no primary verdict")
+    qc.require(verdict["primary"]["status"] == "Complete",
+               f"the stock record {verdict_path} is not a complete {family} primary (stage {verdict['primary']['status']})")
+    qc.require("stock" in record_plan["measured_arms"] and record_plan["declared"].get("stock") is not None
+               and "stock_record" not in record_plan,
+               f"the stock record {verdict_path} is a no-stock campaign itself")
+    qc.require(native_peers.peer_kind(record_plan) is None and not record_plan.get("native_comparison"),
+               f"the stock record {verdict_path} is a native campaign")
+    qc.require(verdict["campaign_sha256"] == sha256(campaign_path)
+               and verdict["identities_sha256"] == manifest["identities_sha256"] == qc.plan_sha256(manifest["identities"]),
+               f"{verdict_path} does not bind {campaign_path}")
+    qc.require("vs_stock" in verdict["primary"]["effects"], f"the stock record {verdict_path} has no vs-stock effect")
+    arms = manifest["identities"]["arms"]
+    artifact = (arms["experiment"]["artifact"] or {}).get("sha256")
+    qc.require(artifact is not None, f"the stock record {verdict_path} has no hf2q artifact sha256")
+    return {"verdict": {"path": str(verdict_path), "sha256": sha256(verdict_path)},
+            "campaign": {"path": str(campaign_path), "sha256": verdict["campaign_sha256"]},
+            "family": family, "primary_status": verdict["primary"]["status"], "verdict_of_record": verdict["verdict"],
+            "stock": record_plan["declared"]["stock"], "experiment": record_plan["declared"]["experiment"],
+            "stock_binary_sha256": arms["stock"]["binary"]["sha256"],
+            "experiment_binary_sha256": arms["experiment"]["binary"]["sha256"], "artifact_sha256": artifact}
+
+
 def arm_cases(args, family, splash=False):
-    paths = {"stock": args.hf2q_case or HERE / "q5_cases" / f"{family}.json",
-             "experiment": args.hf2q_case or HERE / "q5_cases" / f"{family}.json"}
+    paths = {"experiment": args.hf2q_case or HERE / "q5_cases" / f"{family}.json"}
+    if not args.no_stock_arm:
+        paths = {"stock": args.hf2q_case or HERE / "q5_cases" / f"{family}.json", **paths}
     if args.peer_case or not args.peer_unavailable_evidence:
         paths["peer"] = args.peer_case or HERE / "q5_cases" / f"peer-{family}.json"
         if args.peer_matched_case:
@@ -156,17 +202,45 @@ def splash_arm(args, family, record):
     return not args.splash_unavailable_evidence
 
 
+STOCK_LABEL = "v0.1.28 release"
+
+
+def no_stock_refusal(args):
+    """The --no-stock-arm/--stock-record argument matrix (ADR-063 Q4-DS4-RACE decision D1); None when admissible."""
+    if args.stock_record is not None and not args.no_stock_arm:
+        return "--stock-record needs --no-stock-arm (a campaign with a stock arm measures its own vs-stock effect)"
+    if not args.no_stock_arm:
+        return None
+    if (args.stock_record is not None) == bool(args.native_comparison):
+        return ("--no-stock-arm needs exactly one of --stock-record VERDICT_JSON (the verdict-of-record mode) or "
+                "--native-comparison (no vs-stock row exists)")
+    given = [flag for flag, value in (("--stock-bin", args.stock_bin), ("--stock-commit", args.stock_commit),
+                                      ("--stock-label", args.stock_label), ("--stock-var", args.stock_var)) if value]
+    if given:
+        return f"--no-stock-arm runs no stock arm: {', '.join(given)} refused"
+    if args.controls_of is not None:
+        return "--no-stock-arm has no controls-only mode: run its controls in the same campaign"
+    if args.stock_record is not None and args.peer_unavailable_evidence:
+        return ("--stock-record is judged against the peer: --peer-unavailable-evidence would leave this campaign no "
+                "contrast to measure")
+    return None
+
+
 def build_plan(args, environ, family):
     """(plan, cases). The plan is everything a resume must reproduce exactly."""
     qc.require("HF2Q_Q5_HF2Q_BIN" not in environ, "set the hf2q binaries with --stock-bin/--experiment-bin, "
                "not HF2Q_Q5_HF2Q_BIN (it would apply to both hf2q arms)")
+    refusal = no_stock_refusal(args)
+    qc.require(refusal is None, refusal)
     record = None if args.controls_of is None else primary_of_record(args.controls_of, family)
+    stock_record = None if args.stock_record is None else stock_record_of(args.stock_record, family)
+    hf2q = ("experiment",) if args.no_stock_arm else ("stock", "experiment")
     cases, arms = {}, {}
-    explicit = {"stock": [f"HF2Q_BIN={args.stock_bin}"] if args.stock_bin else [],
-                "experiment": [f"HF2Q_BIN={args.experiment_bin}"] if args.experiment_bin else []}
+    explicit = {"experiment": [f"HF2Q_BIN={args.experiment_bin}"] if args.experiment_bin else [],
+                **({} if args.no_stock_arm else {"stock": [f"HF2Q_BIN={args.stock_bin}"] if args.stock_bin else []})}
     extra = {"stock": args.stock_var, "experiment": args.experiment_var, "peer": args.peer_var,
              "peer_matched": args.peer_matched_var, "splash": args.splash_var}
-    qc.require(not any(v.startswith("HF2Q_BIN=") for arm in ("stock", "experiment") for v in extra[arm] or []),
+    qc.require(not any(v.startswith("HF2Q_BIN=") for arm in hf2q for v in extra[arm] or []),
                "set the hf2q binaries with --stock-bin/--experiment-bin")
     for arm, path in arm_cases(args, family, splash_arm(args, family, record)).items():
         cases[arm] = q5_case.validate(q5_case.loads(path.read_bytes()))
@@ -183,6 +257,12 @@ def build_plan(args, environ, family):
     qc.require(all(flag == approved for flag, approved in selections.values()) and len(set(selections.values())) == 1,
                "every arm must run the same workload variant (client --workload equal to the approval "
                "workload_variant): " + ", ".join(f"{arm}={flag}" for arm, (flag, _) in sorted(selections.items())))
+    repairs = {arm: q5_case.repair_turns(case) for arm, case in cases.items()}
+    qc.require(len(set(repairs.values())) == 1, "every arm must grant the same repair turns (client --repair-turns): "
+               + ", ".join(f"{arm}={value}" for arm, value in sorted(repairs.items())))
+    setups = {arm: q5_case.request_setup(case) for arm, case in cases.items()}
+    qc.require(len(set(setups.values())) == 1, "every arm must use the same request setup (client --request-setup): "
+               + ", ".join(f"{arm}={value}" for arm, value in sorted(setups.items())))
     native = native_peers.peer_kind({"arms": arms})
     evidence, comparison = bool(args.peer_unavailable_evidence), bool(args.native_comparison)
     qc.require((native is None and not comparison and not (args.peer_case and evidence))
@@ -196,7 +276,9 @@ def build_plan(args, environ, family):
         qc.require((module.SAME_GGUF_UNAVAILABLE if evidence else module.NATIVE_COMPARISON) is not None,
                    f"the native {native} arm does not run with "
                    + ("--peer-unavailable-evidence" if evidence else "--native-comparison"))
-    for arm in ("stock", "experiment"):  # without --<arm>-bin the case default would silently stand in
+        mode = module.mode_problems(cases["peer"], evidence, comparison)
+        qc.require(not mode, "; ".join(mode))
+    for arm in hf2q:  # without --<arm>-bin the case default would silently stand in
         arms[arm]["overrides"].setdefault("HF2Q_BIN", None)
     ambient = {k[len(qc.OVERRIDE):] for k in environ if k.startswith(qc.OVERRIDE)}
     unused = sorted(ambient - {n for case in cases.values() for n in case.get("variables", {})})
@@ -218,7 +300,8 @@ def build_plan(args, environ, family):
                        "max_blocks": q3_stats.MAX_BLOCKS, "half_width_pp": q3_stats.HALF_WIDTH_PP,
                        "peer_margin_ratio": q3_stats.PEER_MARGIN, "fairness_neutral_ratio": q3_stats.NEUTRAL_RATIO,
                        "warmup": "one discarded run per measured arm per stage per driver session"},
-            "declared": {"stock": {"label": args.stock_label, "commit": args.stock_commit, "binary": args.stock_bin},
+            "declared": {"stock": None if args.no_stock_arm else {"label": args.stock_label or STOCK_LABEL,
+                                                                  "commit": args.stock_commit, "binary": args.stock_bin},
                          "experiment": {"label": args.experiment_label, "commit": args.experiment_commit,
                                         "binary": args.experiment_bin},
                          "qe_identity": args.qe_identity}}
@@ -229,6 +312,8 @@ def build_plan(args, environ, family):
         plan["negative_control_receipt"] = {"path": str(receipt), "sha256": sha256(receipt)}
     if record is not None:
         plan["controls_of"] = record
+    if stock_record is not None:
+        plan["stock_record"] = stock_record
     if "splash" in plan["measured_arms"] or splash_evidence:
         # Recorded in the plan, so campaigns planned before Splash keep their rules. Only a campaign that runs the
         # arm or declares Splash unavailable needs it: a peer-unavailable campaign is Unavailable already, and a
@@ -367,10 +452,15 @@ class Driver:
         return self.manifest
 
     def finished(self, stage):
-        """Apply the stopping rule once the last block is complete; True when the stage is done."""
-        if not stage["blocks"] or not q3_report.block_complete(stage["blocks"][-1]):
+        """Apply the stopping rule once the last block is complete; True when the stage is done. A no-stock plan whose
+        only contrast became unavailable or failed has nothing left to measure: its stage stops at once (no_contrast)."""
+        required = q3_report.required_effects(stage, self.manifest)
+        if not required and "stock" not in self.plan["arms"]:
+            reason = q3_stats.NO_CONTRAST
+        elif not stage["blocks"] or not q3_report.block_complete(stage["blocks"][-1]):
             return False
-        reason = q3_stats.stop_decision(len(stage["blocks"]), q3_report.required_effects(stage, self.manifest))
+        else:
+            reason = q3_stats.stop_decision(len(stage["blocks"]), required)
         if reason is not None:
             stage.update(status="Complete", stop={"reason": reason, "blocks": len(stage["blocks"])})
             self.save()
@@ -518,7 +608,14 @@ def parse_args(argv):
                         help="model family (repeatable with --dry-run; default every family in --dry-run)")
     parser.add_argument("--stock-bin", help="stock hf2q binary (the released v0.1.28 standalone binary)")
     parser.add_argument("--stock-commit", help="40-hex source commit of the stock binary")
-    parser.add_argument("--stock-label", default="v0.1.28 release")
+    parser.add_argument("--stock-label", help=f"stock arm label (default {STOCK_LABEL!r})")
+    parser.add_argument("--no-stock-arm", action="store_true",
+                        help="run no stock arm (ADR-063 Q4-DS4-RACE decision D1): needs exactly one of --stock-record "
+                             "or --native-comparison, and refuses --stock-bin/--stock-commit/--stock-label/--stock-var")
+    parser.add_argument("--stock-record", type=Path, metavar="VERDICT_JSON",
+                        help="with --no-stock-arm: the same-artifact stock campaign's verdict.json on hf2q's artifact "
+                             "(a complete deepseek4 primary on this --experiment-bin), bound by sha256; its vs-stock "
+                             "effects, fairness, failures, thermal and memory validity enter this verdict")
     parser.add_argument("--experiment-bin", help="experiment hf2q binary (root-built main HEAD)")
     parser.add_argument("--experiment-commit", help="40-hex source commit of the experiment binary")
     parser.add_argument("--experiment-label", default="main HEAD")
@@ -530,8 +627,8 @@ def parse_args(argv):
                         help="receipt proving no runnable same-GGUF peer arm (repeatable); runs stock and "
                              "experiment only, or a native --peer-case whose arm accepts it (ds4)")
     parser.add_argument("--native-comparison", action="store_true",
-                        help="the native --peer-case (TensorFold) runs beside a runnable same-GGUF peer: a separately "
-                             "labeled campaign whose verdict and rows are never the verdict of record")
+                        help="the native --peer-case (TensorFold, oMLX, or a same_as_hf2q ds4 case) runs as a "
+                             "separately labeled campaign whose verdict and rows are never the verdict of record")
     parser.add_argument("--splash-case", help="Splash best valid configuration (default q5_cases/splash-<family>.json "
                         "for qwen38/qwen36, whose default campaign always runs it; ADR-063 Splash peer of record)")
     parser.add_argument("--splash-unavailable-evidence", action="append", metavar="FILE",
@@ -581,8 +678,8 @@ def parse_args(argv):
             parser.error("--hf2q-case applies to one family")
         if args.splash_case and args.family and len(args.family) > 1:
             parser.error("--splash-case applies to one family")
-        if args.controls_of is not None and (not args.family or len(args.family) != 1):
-            parser.error("--controls-of applies to exactly one --family")
+        if (args.controls_of is not None or args.stock_record is not None) and (not args.family or len(args.family) != 1):
+            parser.error("--controls-of and --stock-record apply to exactly one --family")
         if (args.peer_unavailable_evidence or args.native_comparison) and args.peer_matched_case:
             parser.error("--peer-unavailable-evidence and --native-comparison run no same-GGUF peer arm")
     return args

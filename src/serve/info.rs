@@ -168,6 +168,14 @@ fn inspect(
         kv_persist_budget,
     )
     .map_err(anyhow::Error::msg)?;
+    // #727: reject an invalid spill budget exactly as serve would. The budget
+    // only bounds host memory used after slot reclaims, so the static
+    // capacity preview below does not include it.
+    operator_settings::resolve_slot_spill_budget(
+        args.planning.slot_spill_budget.as_deref(),
+        operator_defaults,
+    )
+    .map_err(anyhow::Error::msg)?;
 
     let file_bytes = validate_tensor_headers(&gguf, &args.model)?;
 

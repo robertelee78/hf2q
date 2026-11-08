@@ -191,6 +191,7 @@ fn static_generation_is_public_stdout_only_and_broken_pipe_safe() {
             "--kv-cache-budget",
             "--kv-persist",
             "--kv-persist-budget",
+            "--lcp-resume-budget",
             "--mmproj",
         ] {
             assert!(renders_flag(flag), "{shell} omitted {flag}");
@@ -344,6 +345,7 @@ fn dynamic_protocol_is_public_semantic_and_side_effect_free() {
         "--default-repetition-penalty",
         "--default-thinking-token-budget",
         "--default-tool-thinking-token-budget",
+        "--lcp-resume-budget",
     ] {
         assert!(
             serve_options
@@ -357,6 +359,10 @@ fn dynamic_protocol_is_public_semantic_and_side_effect_free() {
     assert!(
         !info_options.contains("--default-repetition-penalty"),
         "info leaked serve-only behavior flags: {info_options}"
+    );
+    assert!(
+        !info_options.contains("--lcp-resume-budget"),
+        "info leaked the serve-only LCP resume budget flag: {info_options}"
     );
     let setup_options = dynamic(&home, "bash", 2, &["hf2q", "setup", "--"]);
     assert!(

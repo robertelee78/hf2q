@@ -1,5 +1,7 @@
 //! Source-bound optional native event adapter. No process-wide auto opt-in.
-use mlx_native::submission_observer::{ObserverSinkError, SubmissionEvent, SubmissionObserver};
+use mlx_native::submission_observer::{
+    CompletedGpuTimingEvent, ObserverSinkError, SubmissionEvent, SubmissionObserver,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TryRecvError};
@@ -17,6 +19,10 @@ pub(super) struct Config {
     pub diagnostic_case: bool,
     pub control_nonce: String,
     pub witness_manifest: WitnessManifest,
+    /// Q4-TRACE-GPU-TIMING opt-in: absent (off) or `true`. An explicit `false`
+    /// is refused so an off-path config and header stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_timestamps: Option<bool>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +47,7 @@ impl WitnessManifest {
             "deepseek4.sorted_cache_lane",
             "deepseek4.prefill.actual_cooperative_lane",
             "deepseek4.prefill.actual_cooperative_pack",
+            "qwen35.joint_decode.actual_slot_rows",
         ];
         self.schema == "hf2q.f2.forward-witness-policy.v1"
             && self.operator == "target_input_rms_norm"
@@ -54,10 +61,16 @@ impl WitnessManifest {
     }
 }
 impl Config {
+    pub(super) fn gpu_timestamps(&self) -> bool {
+        self.gpu_timestamps == Some(true)
+    }
     pub(super) fn reservation_bytes(&self) -> u64 {
         self.metadata_limit_bytes + BOOKKEEPING_BYTES
     }
     pub(super) fn validate(&self, server: u64, event_limit: u64) -> Result<(), String> {
+        if self.gpu_timestamps == Some(false) {
+            return Err("native gpu_timestamps is absent or true, never false".into());
+        }
         if !self.diagnostic_case
             || !self.witness_manifest.validate()
             || !(32..=128).contains(&self.control_nonce.len())
@@ -89,16 +102,85 @@ const QUEUED_EVENTS: usize = 2048;
 /// without holding the trace lock long against the worker's own records.
 const WRITE_BATCH: usize = 64;
 static STOP: AtomicBool = AtomicBool::new(false);
+/// The installed diagnostic's GPU-timestamp opt-in, cached at install so hot
+/// paths never take the trace lock to read it.
+static GPU_TIMESTAMPS: AtomicBool = AtomicBool::new(false);
+pub(super) fn gpu_timestamps_installed() -> bool {
+    GPU_TIMESTAMPS.load(Ordering::Acquire)
+}
 static WRITER: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
-struct Sink(SyncSender<SubmissionEvent>);
-impl SubmissionObserver for Sink {
-    fn record(&self, event: &SubmissionEvent) -> Result<(), ObserverSinkError> {
+/// One ordered queue for both native streams: mlx-native emits a command's
+/// timing right after its checked drain and before its drop, and a single
+/// queue keeps that causal order in the trace.
+#[derive(Clone, Copy)]
+enum Item {
+    Event(SubmissionEvent),
+    Timing(CompletedGpuTimingEvent),
+}
+impl Item {
+    fn event(&self) -> Option<&SubmissionEvent> {
+        match self {
+            Item::Event(event) => Some(event),
+            Item::Timing(_) => None,
+        }
+    }
+    fn timing(&self) -> Option<&CompletedGpuTimingEvent> {
+        match self {
+            Item::Timing(event) => Some(event),
+            Item::Event(_) => None,
+        }
+    }
+}
+/// Maximal same-kind runs of `items`, in order: `(is_timing, range)`.
+fn runs(items: &[Item]) -> impl Iterator<Item = (bool, std::ops::Range<usize>)> + '_ {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        let first = items.get(start)?;
+        let timing = matches!(first, Item::Timing(_));
+        let end = items[start..]
+            .iter()
+            .position(|item| matches!(item, Item::Timing(_)) != timing)
+            .map_or(items.len(), |offset| start + offset);
+        let run = (timing, start..end);
+        start = end;
+        Some(run)
+    })
+}
+fn publish_items(items: &[Item]) {
+    for (timing, range) in runs(items) {
+        if timing {
+            super::publish_all(
+                "native_gpu_timing",
+                items[range].iter().filter_map(Item::timing),
+            );
+        } else {
+            super::publish_all("native_event", items[range].iter().filter_map(Item::event));
+        }
+    }
+}
+struct Sink {
+    queue: SyncSender<Item>,
+    gpu_timestamps: bool,
+}
+impl Sink {
+    fn send(&self, item: Item) -> Result<(), ObserverSinkError> {
         // Fixed-size Copy payload, bounded nonblocking queue; no filesystem,
         // serialization, blocking mutex or native reentry from the callback.
         if STOP.load(Ordering::Acquire) {
             return Err(ObserverSinkError);
         }
-        self.0.try_send(*event).map_err(|_| ObserverSinkError)
+        self.queue.try_send(item).map_err(|_| ObserverSinkError)
+    }
+}
+impl SubmissionObserver for Sink {
+    fn record(&self, event: &SubmissionEvent) -> Result<(), ObserverSinkError> {
+        self.send(Item::Event(*event))
+    }
+    fn record_gpu_timing(&self, event: &CompletedGpuTimingEvent) -> Result<(), ObserverSinkError> {
+        if !self.gpu_timestamps {
+            return Err(ObserverSinkError);
+        }
+        self.send(Item::Timing(*event))
     }
 }
 
@@ -106,9 +188,7 @@ static INSTALL: OnceLock<Result<(), String>> = OnceLock::new();
 pub(super) fn install(config: &Config) -> Result<(), String> {
     INSTALL
         .get_or_init(|| {
-            if QUEUED_EVENTS * std::mem::size_of::<SubmissionEvent>()
-                > BOOKKEEPING_BYTES as usize / 2
-            {
+            if QUEUED_EVENTS * std::mem::size_of::<Item>() > BOOKKEEPING_BYTES as usize / 2 {
                 return Err("native event queue exceeds reserved bookkeeping".into());
             }
             let (sender, receiver) = sync_channel(QUEUED_EVENTS);
@@ -129,7 +209,8 @@ pub(super) fn install(config: &Config) -> Result<(), String> {
                             }
                         }
                         if !batch.is_empty() {
-                            super::publish_all("native_event", batch.drain(..));
+                            publish_items(&batch);
+                            batch.clear();
                             continue;
                         }
                         match idle {
@@ -143,15 +224,28 @@ pub(super) fn install(config: &Config) -> Result<(), String> {
             *WRITER
                 .lock()
                 .map_err(|_| "native writer ownership poisoned")? = Some(writer);
-            mlx_native::submission_observer::install_submission_observer(
-                Arc::new(Sink(sender)),
-                config.event_limit,
-                config.metadata_limit_bytes,
-            )
-            .map_err(|error| {
+            let sink = Arc::new(Sink {
+                queue: sender,
+                gpu_timestamps: config.gpu_timestamps(),
+            });
+            let installed = if config.gpu_timestamps() {
+                mlx_native::submission_observer::install_submission_observer_with_gpu_timestamps(
+                    sink,
+                    config.event_limit,
+                    config.metadata_limit_bytes,
+                )
+            } else {
+                mlx_native::submission_observer::install_submission_observer(
+                    sink,
+                    config.event_limit,
+                    config.metadata_limit_bytes,
+                )
+            };
+            installed.map_err(|error| {
                 STOP.store(true, Ordering::Release);
                 error.to_owned()
             })?;
+            GPU_TIMESTAMPS.store(config.gpu_timestamps(), Ordering::Release);
             crate::inference::native_observation::installed();
             Ok(())
         })
@@ -183,9 +277,14 @@ mod tests {
     fn queue_and_write_batch_fit_reserved_bookkeeping() {
         // `install` refuses a queue past half the bookkeeping; a native pin
         // that grows the event must fail here, not at a traced launch.
-        let event = std::mem::size_of::<SubmissionEvent>();
-        assert!(QUEUED_EVENTS * event <= BOOKKEEPING_BYTES as usize / 2);
-        assert!((QUEUED_EVENTS + WRITE_BATCH) * event <= BOOKKEEPING_BYTES as usize);
+        let item = std::mem::size_of::<Item>();
+        assert!(
+            item <= std::mem::size_of::<SubmissionEvent>()
+                .max(std::mem::size_of::<CompletedGpuTimingEvent>())
+                + 8
+        );
+        assert!(QUEUED_EVENTS * item <= BOOKKEEPING_BYTES as usize / 2);
+        assert!((QUEUED_EVENTS + WRITE_BATCH) * item <= BOOKKEEPING_BYTES as usize);
     }
     #[test]
     fn native_budget_is_carved_not_added_to_packet() {
@@ -201,6 +300,7 @@ mod tests {
                 coverage: "each_admitted_lane_in_first_fixed_window".into(),
                 batching_scope: "operator_only_full_body_unknown".into(),
             },
+            gpu_timestamps: None,
         };
         assert!(config.validate(128 * 1024 * 1024, 1_000_000).is_ok());
         assert_eq!(
@@ -232,5 +332,118 @@ mod tests {
             .input_sources
             .push("unreviewed_arbitrary_source".into());
         assert!(!manifest.validate());
+    }
+    #[test]
+    fn qwen_traced_manifest_admits_the_joint_decode_source_once() {
+        let mut manifest = WitnessManifest {
+            schema: "hf2q.f2.forward-witness-policy.v1".into(),
+            operator: "target_input_rms_norm".into(),
+            input_sources: vec![
+                "qwen35.greedy.actual_tokens".into(),
+                "qwen35.forward.actual_tokens".into(),
+                "qwen35.joint_decode.actual_slot_rows".into(),
+            ],
+            coverage: "each_admitted_lane_in_first_fixed_window".into(),
+            batching_scope: "operator_only_full_body_unknown".into(),
+        };
+        assert!(manifest.validate());
+        manifest
+            .input_sources
+            .push("qwen35.joint_decode.actual_slot_rows".into());
+        assert!(!manifest.validate());
+    }
+    fn sample_config(gpu_timestamps: Option<bool>) -> Config {
+        Config {
+            event_limit: 1_000_000,
+            metadata_limit_bytes: 1024 * 1024,
+            diagnostic_case: true,
+            control_nonce: "n".repeat(32),
+            witness_manifest: WitnessManifest {
+                schema: "hf2q.f2.forward-witness-policy.v1".into(),
+                operator: "target_input_rms_norm".into(),
+                input_sources: vec!["qwen35.greedy.actual_tokens".into()],
+                coverage: "each_admitted_lane_in_first_fixed_window".into(),
+                batching_scope: "operator_only_full_body_unknown".into(),
+            },
+            gpu_timestamps,
+        }
+    }
+    #[test]
+    fn gpu_timestamps_is_absent_or_true_and_off_configs_serialize_unchanged() {
+        let off = sample_config(None);
+        let json = serde_json::to_value(&off).unwrap();
+        assert!(json.get("gpu_timestamps").is_none());
+        let parsed: Config = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+        assert!(!off.gpu_timestamps());
+        let on = sample_config(Some(true));
+        assert!(on.gpu_timestamps());
+        assert_eq!(serde_json::to_value(&on).unwrap()["gpu_timestamps"], true);
+        assert!(on.validate(128 * 1024 * 1024, 1_000_000).is_ok());
+        assert!(sample_config(Some(false))
+            .validate(128 * 1024 * 1024, 1_000_000)
+            .is_err());
+        let not_diagnostic = Config {
+            diagnostic_case: false,
+            ..sample_config(Some(true))
+        };
+        assert!(not_diagnostic
+            .validate(128 * 1024 * 1024, 1_000_000)
+            .is_err());
+    }
+    fn event(command: u64) -> SubmissionEvent {
+        serde_json::from_value(serde_json::json!({
+            "clock_id":"CLOCK_MONOTONIC","command_id":command,"invocation_epoch":3,
+            "queue_identity":4,"device_registry_id":5,"kind":"CheckedDrain",
+            "begin_monotonic_ns":1,"end_monotonic_ns":2,"dispatch_ordinal":1,
+            "noncompute_operations":0,"scope":null,"captured_scope":null,
+            "capture_command_id":null,"capture_generation":null,"replay_binding":"Direct",
+            "tainted":false,"geometry":null,"submitted":true,"checked_status":4}))
+        .unwrap()
+    }
+    fn timing(command: u64) -> CompletedGpuTimingEvent {
+        serde_json::from_value(serde_json::json!({
+            "schema_version":1,"command_id":command,"invocation_epoch":3,"queue_identity":4,
+            "device_registry_id":5,"timestamps":{"Available":{
+                "clock":"MetalCommandBufferHostSecondsSystemMachTime",
+                "start_seconds":1.5,"end_seconds":1.75}}}))
+        .unwrap()
+    }
+    #[test]
+    fn one_queue_keeps_causal_order_as_same_kind_runs() {
+        let items = [
+            Item::Event(event(1)),
+            Item::Timing(timing(1)),
+            Item::Event(event(1)),
+            Item::Event(event(2)),
+            Item::Timing(timing(2)),
+        ];
+        let runs: Vec<_> = runs(&items).collect();
+        assert_eq!(
+            runs,
+            [(false, 0..1), (true, 1..2), (false, 2..4), (true, 4..5)]
+        );
+        assert_eq!(super::runs(&[]).count(), 0);
+        // Every item is published exactly once, in order.
+        let covered: Vec<_> = runs.iter().flat_map(|(_, range)| range.clone()).collect();
+        assert_eq!(covered, (0..items.len()).collect::<Vec<_>>());
+    }
+    #[test]
+    fn timing_sink_refuses_when_off_or_full() {
+        let (sender, receiver) = sync_channel(1);
+        let off = Sink {
+            queue: sender.clone(),
+            gpu_timestamps: false,
+        };
+        assert!(off.record_gpu_timing(&timing(1)).is_err());
+        let on = Sink {
+            queue: sender,
+            gpu_timestamps: true,
+        };
+        assert!(on.record_gpu_timing(&timing(1)).is_ok());
+        assert!(on.record(&event(1)).is_err(), "full queue");
+        assert!(matches!(receiver.try_recv(), Ok(Item::Timing(_))));
+        assert!(on.record(&event(2)).is_ok());
+        assert!(matches!(receiver.try_recv(), Ok(Item::Event(_))));
     }
 }

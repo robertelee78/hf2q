@@ -109,6 +109,8 @@ deliberately:
 ctx = 262144
 kv_cache_budget = "8GiB"
 kv_persist_budget = "32GiB"
+lcp_resume_budget = "8GiB"
+slot_spill_budget = "16GiB"
 ```
 
 `ctx` applies to every conversation slot and is never divided by `max_slots`.
@@ -123,6 +125,21 @@ independent of the active-slot residency budget. CLI
 silently inactive. A config value may remain dormant until an invocation
 enables a store. Zero or omission is unlimited, while malformed explicit
 values fail setup or serve.
+`lcp_resume_budget` sizes the in-memory LCP resume registry. Omission means a
+constant 8GiB on every host (never derived from free memory); CLI
+`--lcp-resume-budget <SIZE>` overrides the config value. Zero and malformed
+values fail setup or serve. Setup does not prompt for it.
+
+`slot_spill_budget` caps host memory for Qwen and Gemma SlotAware
+conversations whose idle slot another request reclaims (#727). The reclaimed
+slot's cache rows (Qwen: KV/TQ and MTP rows plus DeltaNet state; Gemma:
+global rows, sliding rings and every cursor) and resume ledger are copied to
+host memory and restored when that conversation returns, into whatever slot
+it is granted. CLI
+`--slot-spill-budget <SIZE>` overrides the config value. Omission means the
+built-in `16GiB`; `0` disables spilling. The budget is fixed: it is never
+derived from available memory, and the oldest spill is evicted first, so the
+outcome depends only on the request sequence. Setup does not prompt for it.
 
 Model identity, revision, output path, cache location, source retention, auth
 tokens, hardware snapshots, and calibration state remain explicit or owned by

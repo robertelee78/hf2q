@@ -1116,13 +1116,13 @@ pub fn apply_linear_projection_f32_with_ggml_type(
     );
 
     let out_bytes = (seq_len * out_features) as usize * 4;
-    let mut dst = device
-        .alloc_buffer(
-            out_bytes,
-            DType::F32,
-            vec![seq_len as usize, out_features as usize],
-        )
-        .map_err(|e| anyhow!("alloc projection output: {e}"))?;
+    let shape = vec![seq_len as usize, out_features as usize];
+    let mut dst = if super::decode_pool::step_pooled_outputs() {
+        super::decode_pool::pooled_alloc_buffer(device, out_bytes, DType::F32, shape)
+    } else {
+        device.alloc_buffer(out_bytes, DType::F32, shape)
+    }
+    .map_err(|e| anyhow!("alloc projection output: {e}"))?;
 
     match weight.dtype() {
         DType::U8 => {
@@ -1602,7 +1602,7 @@ pub(super) fn apply_q_gate_projection_f32(
             .map_err(|e| anyhow!("shape native fused Q/gate activation: {e}"))?;
             let alloc_output = |label: &str| -> Result<MlxBuffer> {
                 let bytes = (seq_len * q_total) as usize * std::mem::size_of::<f32>();
-                if seq_len == 1 {
+                if seq_len == 1 || super::decode_pool::step_pooled_outputs() {
                     super::decode_pool::pooled_alloc_buffer(
                         device,
                         bytes,
@@ -4820,26 +4820,7 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
     // the buffer's own byte_offset, not in a slot_id parameter.
     // `apply_sdpa_with_kv_cache` does the slice_view above this
     // dispatcher.
-    if head_dim != 256 {
-        return Err(anyhow!(
-            "apply_flash_attn_prefill_seq_major_resume: head_dim must be 256 \
-             (D=256 dispatcher); got {head_dim}. Other head_dims need a \
-             different mlx-native dispatcher (D=64 / D=512) or a new port."
-        ));
-    }
-    if cur_len + seq_len != kv_seq_len {
-        return Err(anyhow!(
-            "apply_flash_attn_prefill_seq_major_resume: cur_len ({cur_len}) + \
-             seq_len ({seq_len}) != kv_seq_len ({kv_seq_len}) — \
-             append-prefill semantics require cur_len + seq_len == kv_seq_len."
-        ));
-    }
-    if kv_seq_len > kv_capacity {
-        return Err(anyhow!(
-            "apply_flash_attn_prefill_seq_major_resume: kv_seq_len \
-             ({kv_seq_len}) > kv_capacity ({kv_capacity}) — slot overflow."
-        ));
-    }
+    validate_flash_attn_prefill_resume_shape(seq_len, cur_len, kv_seq_len, kv_capacity, head_dim)?;
 
     let seq = seq_len as usize;
     let nh = n_heads as usize;
@@ -4871,7 +4852,7 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
     let v_bf16_slot = device
         .alloc_buffer(kv_slot_elems * 2, DType::BF16, vec![1, nkv, cap, d])
         .map_err(|e| anyhow!("alloc v_bf16_slot: {e}"))?;
-    let mut out_bf16_hm = device
+    let out_bf16_hm = device
         .alloc_buffer(out_elems * 2, DType::BF16, vec![1, nh, seq, d])
         .map_err(|e| anyhow!("alloc out_bf16_hm: {e}"))?;
     let out_seq = device
@@ -4882,24 +4863,129 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
         .command_encoder().map(crate::inference::native_observation::encoder)
         .context("FA resume bridge encoder")?;
 
+    encode_flash_attn_prefill_seq_major_resume(
+        &mut enc,
+        device,
+        registry,
+        q_seq_major,
+        slot_k_head_major,
+        slot_v_head_major,
+        &FaResumeBridgeBuffers {
+            q_bf16_seq: &q_bf16_seq,
+            q_bf16_hm: &q_bf16_hm,
+            k_bf16: &k_bf16_slot,
+            v_bf16: &v_bf16_slot,
+            out_bf16_hm: &out_bf16_hm,
+            out_seq: &out_seq,
+        },
+        seq_len,
+        cur_len,
+        kv_seq_len,
+        kv_capacity,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+    )?;
+
+    enc.commit_and_wait()
+        .context("FA resume bridge: commit+wait")?;
+
+    Ok(out_seq)
+}
+
+/// Shape preconditions of [`apply_flash_attn_prefill_seq_major_resume`].
+pub(crate) fn validate_flash_attn_prefill_resume_shape(
+    seq_len: u32,
+    cur_len: u32,
+    kv_seq_len: u32,
+    kv_capacity: u32,
+    head_dim: u32,
+) -> Result<()> {
+    if head_dim != 256 {
+        return Err(anyhow!(
+            "apply_flash_attn_prefill_seq_major_resume: head_dim must be 256 \
+             (D=256 dispatcher); got {head_dim}. Other head_dims need a \
+             different mlx-native dispatcher (D=64 / D=512) or a new port."
+        ));
+    }
+    if cur_len + seq_len != kv_seq_len {
+        return Err(anyhow!(
+            "apply_flash_attn_prefill_seq_major_resume: cur_len ({cur_len}) + \
+             seq_len ({seq_len}) != kv_seq_len ({kv_seq_len}) — \
+             append-prefill semantics require cur_len + seq_len == kv_seq_len."
+        ));
+    }
+    if kv_seq_len > kv_capacity {
+        return Err(anyhow!(
+            "apply_flash_attn_prefill_seq_major_resume: kv_seq_len \
+             ({kv_seq_len}) > kv_capacity ({kv_capacity}) — slot overflow."
+        ));
+    }
+    Ok(())
+}
+
+/// Scratch of the resume bridge: BF16 Q (seq- and head-major), the BF16 K/V
+/// mirror at `kv_capacity` head stride, the BF16 head-major output and the
+/// F32 seq-major result. Every element the bridge reads from these is
+/// written earlier in the same bridge, so reused storage of at least these
+/// sizes gives the same bytes as fresh storage.
+pub(crate) struct FaResumeBridgeBuffers<'a> {
+    pub q_bf16_seq: &'a MlxBuffer,
+    pub q_bf16_hm: &'a MlxBuffer,
+    pub k_bf16: &'a MlxBuffer,
+    pub v_bf16: &'a MlxBuffer,
+    pub out_bf16_hm: &'a MlxBuffer,
+    pub out_seq: &'a MlxBuffer,
+}
+
+/// Encode steps 1–6 of [`apply_flash_attn_prefill_seq_major_resume`] (casts,
+/// permutes, the resume kernel and the output permute) into `enc`, without
+/// committing. Shapes must already satisfy
+/// [`validate_flash_attn_prefill_resume_shape`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_flash_attn_prefill_seq_major_resume(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_seq_major: &MlxBuffer,
+    slot_k_head_major: &MlxBuffer,
+    slot_v_head_major: &MlxBuffer,
+    bufs: &FaResumeBridgeBuffers<'_>,
+    seq_len: u32,
+    cur_len: u32,
+    kv_seq_len: u32,
+    kv_capacity: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) -> Result<()> {
+    let seq = seq_len as usize;
+    let nh = n_heads as usize;
+    let nkv = n_kv_heads as usize;
+    let d = head_dim as usize;
+    let cap = kv_capacity as usize;
+
+    let q_elems = seq * nh * d;
+    let kv_slot_elems = nkv * cap * d;
+
     // ── Step 1+2: Q F32 seq-major → BF16 seq-major → BF16 head-major ──
     cast(
-        &mut enc,
+        enc,
         registry,
         device.metal_device(),
         q_seq_major,
-        &q_bf16_seq,
+        bufs.q_bf16_seq,
         q_elems,
         CastDirection::F32ToBF16,
     )
     .context("FA resume bridge: cast Q F32→BF16")?;
     enc.memory_barrier();
     permute_021_bf16(
-        &mut enc,
+        enc,
         registry,
         device.metal_device(),
-        &q_bf16_seq,
-        &q_bf16_hm,
+        bufs.q_bf16_seq,
+        bufs.q_bf16_hm,
         seq,
         nh,
         d,
@@ -4914,11 +5000,11 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
     // unused tail; the kernel reads only `[0..kv_seq_len]` per head thanks
     // to kL-aware tile bounds).
     cast(
-        &mut enc,
+        enc,
         registry,
         device.metal_device(),
         slot_k_head_major,
-        &k_bf16_slot,
+        bufs.k_bf16,
         kv_slot_elems,
         CastDirection::F32ToBF16,
     )
@@ -4927,11 +5013,11 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
 
     // ── Step 4: cast slot V F32 head-major → BF16 head-major ──
     cast(
-        &mut enc,
+        enc,
         registry,
         device.metal_device(),
         slot_v_head_major,
-        &v_bf16_slot,
+        bufs.v_bf16,
         kv_slot_elems,
         CastDirection::F32ToBF16,
     )
@@ -4944,13 +5030,13 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
     //   - do_causal     = true       (causal mask via qL_off)
     let scale = 1.0 / (d as f32).sqrt();
     dispatch_flash_attn_prefill_bf16_d256_resume(
-        &mut enc,
+        enc,
         device,
         registry,
-        &q_bf16_hm,
-        &k_bf16_slot,
-        &v_bf16_slot,
-        &mut out_bf16_hm,
+        bufs.q_bf16_hm,
+        bufs.k_bf16,
+        bufs.v_bf16,
+        bufs.out_bf16_hm,
         &FlashAttnPrefillResumeParams {
             n_heads,
             n_kv_heads,
@@ -4970,11 +5056,11 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
 
     // ── Step 6: BF16 head-major → F32 seq-major (fused permute+cast) ──
     permute_021_bf16_to_f32(
-        &mut enc,
+        enc,
         registry,
         device.metal_device(),
-        &out_bf16_hm,
-        &out_seq,
+        bufs.out_bf16_hm,
+        bufs.out_seq,
         nh,
         seq,
         d,
@@ -4983,11 +5069,7 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
         "FA resume bridge: permute_021_bf16_to_f32 out [nh, seq, d] → \
          [seq, nh, d] F32",
     )?;
-
-    enc.commit_and_wait()
-        .context("FA resume bridge: commit+wait")?;
-
-    Ok(out_seq)
+    Ok(())
 }
 
 /// ADR-027 Phase B iter-33 (sub-sub-iter 23c-β.4) — TQ-cache-backed
@@ -5998,6 +6080,27 @@ pub fn apply_sdpa_with_kv_cache(
                         n_kv_heads,
                         head_dim,
                         slot_id,
+                    )?
+                } else if let Some(arena) =
+                    fa_arena.filter(|_| super::resume_attn_fast::resume_attn_fast_enabled())
+                {
+                    // HF2Q_QWEN_RESUME_ATTN_FAST: the same dispatches on the
+                    // prefill's arena scratch, one command buffer, no host
+                    // wait (Class A against the branch below).
+                    super::resume_attn_fast::apply_flash_attn_prefill_seq_major_resume_via_tq_cache_fast(
+                        device,
+                        registry,
+                        slot,
+                        q_seq_major,
+                        seq_len,
+                        cur_len as u32,
+                        kv_seq_len,
+                        max_seq_len,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        slot_id,
+                        arena,
                     )?
                 } else {
                     apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
@@ -7703,6 +7806,208 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
     Ok(out_buf)
 }
 
+/// Whether [`apply_tq_sdpa_rows_gated_into`] serves this joint step of a
+/// full-attention slot: TQ-only cache (no F32 shadow), `head_dim == 256`,
+/// distinct slots, and room for one more token in every slot, unless
+/// `HF2Q_QWEN_ATTN_ROWS=0`. Otherwise the caller runs the per-row chain.
+pub(crate) fn tq_sdpa_rows_route(
+    slot: &FullAttnKvSlot,
+    slots: &[SlotId],
+    head_dim: u32,
+    max_seq_len: u32,
+) -> bool {
+    super::gqa_q2_policy::qwen_attn_rows_enabled()
+        && slot.tq.is_some()
+        && slot.k.is_none()
+        && head_dim == 256
+        && slots.iter().enumerate().all(|(index, slot_id)| {
+            slot.current_len
+                .get(slot_id.0 as usize)
+                .is_some_and(|&len| len < max_seq_len)
+                && !slots[..index].contains(slot_id)
+        })
+}
+
+/// Row-batched TQ decode attention and output gate of one joint
+/// full-attention layer (ADR-063 Q4-QWEN36, per-row small ops).
+///
+/// The rows are packed: `q_rows` `[width, n_heads, head_dim]` (after IMROPE),
+/// `k_rows` / `v_rows` `[width, n_kv_heads * head_dim]`, `gate_rows`
+/// `[width, n_heads * head_dim]`; the first `slots.len()` rows are real and
+/// row `r` belongs to `slots[r]`. Encodes, with no per-row barrier:
+/// 1. one batched TQ encode each for K and V at every row's cursor, and the
+///    Q sign premultiply over all real rows' heads (in place);
+/// 2. every row's TQ-HB attention (`flash_attn_vec_tq_hb_rows`: all split-K
+///    mains, one barrier, all reduces) straight into packed rotated rows;
+/// 3. for padding rows (`width > slots.len()`), copies of row 0;
+/// 4. one fused FWHT undo + sigmoid gate over all `width` rows,
+///
+/// then advances every slot's cursor. Returns the gated `[width, n_heads *
+/// head_dim]` rows; the caller orders their reader with a barrier.
+///
+/// Row `r`'s cache bytes and gated output are bitwise those of the per-row
+/// chain ([`apply_sdpa_with_kv_cache_decode_into`], row copy,
+/// [`apply_sigmoid_gate_multiply`]) and so of the serial single-token layer,
+/// at any width and row order: each kernel computes row `r` from row `r`'s
+/// inputs and slot alone, with the per-row kernels' arithmetic (mlx-native
+/// `test_qwen36_attn_rows`). Requires [`tq_sdpa_rows_route`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_tq_sdpa_rows_gated_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_rows: &MlxBuffer,
+    k_rows: &MlxBuffer,
+    v_rows: &MlxBuffer,
+    gate_rows: &MlxBuffer,
+    slot: &mut FullAttnKvSlot,
+    slots: &[SlotId],
+    width: usize,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_seq_len: u32,
+) -> Result<MlxBuffer> {
+    ensure!(
+        tq_sdpa_rows_route(slot, slots, head_dim, max_seq_len),
+        "row-batched TQ attention needs a TQ-only slot, head_dim 256, distinct slots with room"
+    );
+    let real = slots.len();
+    ensure!(real > 0 && real <= width, "row-batched TQ attention: {real} real rows of {width}");
+    let q_total = (n_heads * head_dim) as usize;
+    ensure!(
+        q_rows.element_count() >= width * q_total && gate_rows.element_count() >= width * q_total,
+        "row-batched TQ attention: Q/gate rows hold fewer than {width} rows of {q_total}"
+    );
+    let codebook_bits = match crate::debug::INVESTIGATION_ENV.tq_codebook_bits {
+        bits @ (5 | 6 | 8) => bits,
+        _ => 8,
+    };
+    let cursors: Vec<u32> = slots
+        .iter()
+        .map(|slot_id| slot.current_len[slot_id.0 as usize])
+        .collect();
+
+    // (1) K/V of every row at its cursor; Q pre-rotation of every real row.
+    let writes: Vec<(SlotId, u32)> = slots.iter().copied().zip(cursors.iter().copied()).collect();
+    slot.encode_rows_to_tq(
+        k_rows,
+        v_rows,
+        &writes,
+        n_kv_heads,
+        head_dim,
+        max_seq_len,
+        codebook_bits,
+        enc,
+        registry,
+        device,
+    )
+    .context("row-batched TQ K/V encode")?;
+    mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
+        enc,
+        registry,
+        device.metal_device(),
+        q_rows,
+        real as u32 * n_heads,
+        head_dim,
+    )
+    .context("row-batched TQ Q pre-rotation")?;
+    enc.memory_barrier();
+
+    // (2) Every row's attention over its slot, written into its packed row.
+    let attention = super::decode_pool::pooled_alloc_buffer(
+        device,
+        width * q_total * 4,
+        DType::F32,
+        vec![width, q_total],
+    )
+    .map_err(|e| anyhow!("alloc row-batched attention: {e}"))?;
+    let tmp_bytes = flash_attn_vec_tmp_bytes(n_heads, head_dim);
+    let mut decode_rows = Vec::with_capacity(real);
+    let mut row_buffers = Vec::with_capacity(real);
+    for (row, (&slot_id, &cursor)) in slots.iter().zip(&cursors).enumerate() {
+        let params = super::kv_cache::Qwen35TqSdpaParams {
+            num_heads: n_heads,
+            num_kv_heads: n_kv_heads,
+            head_dim,
+            kv_seq_len: cursor + 1,
+            kv_capacity: max_seq_len,
+            scale: 1.0_f32 / (head_dim as f32).sqrt(),
+            mask_type: 0,
+            sliding_window: 0,
+            softcap: 0.0,
+            ring_start: 0,
+            scale_factor_d512: 1.0,
+            codebook_bits,
+        };
+        decode_rows.push(slot.tq_decode_row_for_slot(&params, slot_id, real)?);
+        let byte_offset = (row * q_total * 4) as u64;
+        let tmp = super::decode_pool::pooled_alloc_buffer(
+            device,
+            tmp_bytes,
+            DType::F32,
+            vec![tmp_bytes / 4],
+        )
+        .map_err(|e| anyhow!("alloc row-batched attention tmp: {e}"))?;
+        row_buffers.push((
+            q_rows.slice_view(byte_offset, q_total),
+            attention.slice_view(byte_offset, q_total),
+            tmp,
+        ));
+    }
+    let bound: Vec<_> = decode_rows
+        .iter()
+        .zip(&row_buffers)
+        .map(|(row, (q, output, tmp))| row.bind(q, output, tmp))
+        .collect();
+    mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_rows(enc, registry, device, &bound)
+        .context("row-batched TQ attention")?;
+    enc.memory_barrier();
+
+    // (3) Padding rows read row 0's (still rotated) attention.
+    if width > real {
+        for row in real..width {
+            mlx_native::ops::copy::dispatch_copy_f32(
+                enc,
+                registry,
+                device.metal_device(),
+                &attention,
+                &attention,
+                0,
+                row * q_total,
+                q_total,
+            )
+            .map_err(|e| anyhow!("copy row-batched attention padding row {row}: {e}"))?;
+        }
+        enc.memory_barrier();
+    }
+
+    // (4) Un-rotate and gate every packed row in one dispatch.
+    let gated = super::decode_pool::pooled_alloc_buffer(
+        device,
+        width * q_total * 4,
+        DType::F32,
+        vec![width * q_total],
+    )
+    .map_err(|e| anyhow!("alloc row-batched gated attention: {e}"))?;
+    mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_sigmoid_mul_f32(
+        enc,
+        registry,
+        device.metal_device(),
+        &attention,
+        gate_rows,
+        &gated,
+        width as u32 * n_heads,
+        head_dim,
+    )
+    .context("row-batched TQ un-rotation + sigmoid gate")?;
+
+    for (&slot_id, &cursor) in slots.iter().zip(&cursors) {
+        slot.current_len[slot_id.0 as usize] = cursor + 1;
+    }
+    Ok(gated)
+}
+
 /// Decode-only Qwen3.5/3.6 gated full-attention layer encoded into the
 /// caller's command buffer.
 ///
@@ -7885,31 +8190,51 @@ pub fn apply_gated_attn_layer_decode_into(
     // Suppress unused warnings — same pattern as legacy build_gated_attn_layer.
     let _ = (x_norm, q_flat, k_flat, q_normed, k_normed);
 
-    // ---- Op 5: SDPA decode-fast-path (kv-cache write + sdpa_decode) ----
-    let attn_out = apply_sdpa_with_kv_cache_decode_into(
-        enc,
-        device,
-        registry,
-        &q_rope,
-        &k_rope,
-        &v_flat,
-        slot,
-        seq_len,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        max_seq_len,
-        slot_id,
-    )?;
-
-    // INTER-STAGE BARRIER (NEW): sdpa_kv → ops6-7 (replaces the former
-    // CB boundary at legacy :1245 / :1211).  sigmoid_gate_multiply reads
-    // attn_out written above.
-    enc.memory_barrier();
-
-    // ---- Ops 6-7: sigmoid-gate multiply + output projection ----
+    // ---- Ops 5-6: kv-cache write + SDPA decode, then the sigmoid gate ----
+    // On the production TQ cache this is the joint step's row-batched pass at
+    // one row (encode + Q rotation, attention, fused un-rotation + gate), so
+    // a row's serial and joint results are the same kernels' bits.
     let n_elem = seq_len * q_total;
-    let gated = apply_sigmoid_gate_multiply(enc, registry, device, &attn_out, &gate_flat, n_elem)?;
+    let gated = if seq_len == 1 && tq_sdpa_rows_route(slot, &[slot_id], head_dim, max_seq_len) {
+        apply_tq_sdpa_rows_gated_into(
+            enc,
+            device,
+            registry,
+            &q_rope,
+            &k_rope,
+            &v_flat,
+            &gate_flat,
+            slot,
+            &[slot_id],
+            1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+        )?
+    } else {
+        let attn_out = apply_sdpa_with_kv_cache_decode_into(
+            enc,
+            device,
+            registry,
+            &q_rope,
+            &k_rope,
+            &v_flat,
+            slot,
+            seq_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            slot_id,
+        )?;
+
+        // INTER-STAGE BARRIER (NEW): sdpa_kv → ops6-7 (replaces the former
+        // CB boundary at legacy :1245 / :1211).  sigmoid_gate_multiply reads
+        // attn_out written above.
+        enc.memory_barrier();
+        apply_sigmoid_gate_multiply(enc, registry, device, &attn_out, &gate_flat, n_elem)?
+    };
     // ADR-015 iter21: memory_barrier between Op 6 (sigmoid_gate_multiply
     // writes `gated`) and Op 7 (linear_projection reads `gated`).
     //
@@ -13742,6 +14067,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
         };
 
         let cpu_weights = super::super::ffn::MoeFfnWeights {
@@ -14159,6 +14485,7 @@ mod tests {
                 expert_gate_affine: None,
                 expert_up_affine: None,
                 expert_down_affine: None,
+                dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
             }
         };
 
@@ -14908,6 +15235,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
         };
 
         let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
@@ -15012,6 +15340,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
         };
         let hidden_in_a = upload_f32(&hidden_data, &device).unwrap();
         let mask =
@@ -15055,6 +15384,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
         };
         let hidden_in_b = upload_f32(&hidden_data, &device).unwrap();
         let mut k_b = alloc_kv_cache(nkv, cap, d, &device);

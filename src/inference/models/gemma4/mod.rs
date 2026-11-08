@@ -20,6 +20,7 @@
 pub(crate) mod admission;
 pub mod batched_body;
 pub mod batched_head;
+pub(crate) mod decode_dense;
 pub mod forward_gpu;
 pub mod gpu_ffn;
 pub mod gpu_full_attn;
@@ -31,13 +32,14 @@ pub mod native_matrix;
 mod native_storage;
 mod native_embedding;
 pub mod profile;
+pub(crate) mod routing_overlap;
 pub mod tokenizer;
 
 // Re-exports collapse import-site churn for the most-touched types.
 pub use kv_cache::{
     DecodeRegime, DenseKvBuffers, GemmaLcpLayerKv, HbKvBuffers, HybridKvBuffers, MlxKvCache,
 };
-pub use model::{GemmaLiveAttention, GemmaLiveKernel, MlxModelWeights, MultiSeqPrefillOutput};
+pub use model::{GemmaLiveKernel, MlxModelWeights, MultiSeqPrefillOutput};
 pub use profile::{KernelTypeProfile, ProfileAccumulator, TokenProfile};
 
 #[cfg(test)]

@@ -71,9 +71,7 @@ const GEMMA4_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(120);
 const QWEN35_GPU_WARMUP_TIMEOUT: Duration = Duration::from_secs(240);
 const ENGINE_SYNC_CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 
-use crate::inference::models::gemma4::{
-    GemmaLiveAttention, MlxModelWeights, MultiSeqPrefillOutput, ProfileAccumulator,
-};
+use crate::inference::models::gemma4::{MlxModelWeights, MultiSeqPrefillOutput, ProfileAccumulator};
 use crate::serve::config::Gemma4Config;
 use crate::serve::forward_prefill::SoftTokenInjection;
 use crate::serve::gpu::GpuContext;
@@ -356,7 +354,7 @@ pub struct SamplingParams {
     /// when `grammar` is also `None` (no grammar, no need for the
     /// table).  When `grammar` is `Some`, this MUST be `Some(table)`
     /// — the chat handler obtains it via `Engine::token_bytes_table()`
-    /// (lazily built + cached on the Engine).  Cheap to attach: an
+    /// (built once when the Engine is constructed).  Cheap to attach: an
     /// Arc clone (no copy of the underlying vector).
     pub token_bytes: Option<Arc<Vec<Vec<u8>>>>,
     /// Kind discriminant for the grammar attached above.
@@ -1381,7 +1379,7 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
             chat_template: Arc::new(String::new()),
             registration: None,
             vision_consumer_contract: None,
-            token_bytes: std::sync::OnceLock::new(),
+            token_bytes: Arc::default(),
             kv_spill_descriptor: Some(descriptor_for_engine),
             tq_packed_descriptor: None,
             mode: EngineMode::SerialFifo,
@@ -1440,7 +1438,7 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
             chat_template: Arc::new(String::new()),
             registration: None,
             vision_consumer_contract: None,
-            token_bytes: std::sync::OnceLock::new(),
+            token_bytes: Arc::default(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
             mode: EngineMode::SerialFifo,
@@ -1516,7 +1514,7 @@ pub(crate) fn make_synthetic_engine_over_budget(
             chat_template: Arc::new(String::new()),
             registration: None,
             vision_consumer_contract: None,
-            token_bytes: std::sync::OnceLock::new(),
+            token_bytes: Arc::default(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
             mode: EngineMode::SerialFifo,
@@ -1582,7 +1580,7 @@ pub(crate) fn make_synthetic_engine_aggregate_stream_pressure(arch: LoadedArch) 
             chat_template: Arc::new(String::new()),
             registration: None,
             vision_consumer_contract: None,
-            token_bytes: std::sync::OnceLock::new(),
+            token_bytes: Arc::default(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
             mode: EngineMode::SlotAware { max_slots: 4 },
@@ -1668,7 +1666,7 @@ pub(crate) fn make_synthetic_engine_that_panics(
             chat_template: Arc::new(String::new()),
             registration: None,
             vision_consumer_contract: None,
-            token_bytes: std::sync::OnceLock::new(),
+            token_bytes: Arc::default(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
             mode: EngineMode::SlotAware { max_slots: 4 },
@@ -1757,7 +1755,7 @@ pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
             chat_template: Arc::new(String::new()),
             registration: None,
             vision_consumer_contract: None,
-            token_bytes: std::sync::OnceLock::new(),
+            token_bytes: Arc::default(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
             mode: EngineMode::SerialFifo,
@@ -1812,8 +1810,7 @@ struct EngineInner {
     /// embedder (Phase 2a Task #8) — used to validate the OpenAI
     /// `dimensions` parameter and to size the response payload.
     hidden_size: usize,
-    /// Vocabulary size — needed to size the per-vocab token_bytes table
-    /// (built lazily on first grammar request).
+    /// Vocabulary size — sizes the per-vocab token_bytes table.
     vocab_size: usize,
     eos_token_ids: Vec<u32>,
     /// Tokenizer cloned per-request so handlers can tokenize without a lock.
@@ -1826,13 +1823,12 @@ struct EngineInner {
     registration: Option<super::registry::ModelRegistration>,
     vision_consumer_contract: Option<VisionConsumerContract>,
     /// Per-vocab raw token byte table — `token_bytes[id]` is the bytes
-    /// token `id` contributes to the output when sampled.  Built on
-    /// first grammar request via `Engine::token_bytes_table()` and
-    /// cached for the engine's lifetime (vocab × ~3-5 bytes ≈ 1 MB at
-    /// 256K vocab — trivial vs the model weights).  `OnceLock` so
-    /// concurrent first-callers race only on the build, not on reads.
-    /// Phase 2a Task #5 / iter-95.
-    token_bytes: std::sync::OnceLock<Arc<Vec<Vec<u8>>>>,
+    /// token `id` contributes to the output when sampled.  Built once
+    /// while the Engine is constructed, concurrently with the worker's
+    /// warmup, so no request waits for it (vocab × ~3-5 bytes ≈ 1 MB at
+    /// 256K vocab — trivial vs the model weights).  Phase 2a Task #5 /
+    /// iter-95; ADR-063 Q4-GEMMA host P2.
+    token_bytes: Arc<Vec<Vec<u8>>>,
     /// Phase B-dense.2 follow-up: cached KV-spill shape descriptor for
     /// the Gemma 4 dense F32/F16 K/V cache. Populated at `Engine::spawn`
     /// time from the `GemmaLoadedModel`'s `MlxModelWeights` BEFORE the
@@ -1920,6 +1916,18 @@ struct EngineInner {
     scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
 }
 
+/// Build [`EngineInner::token_bytes`]: one tokenizer decode per vocabulary
+/// id (~50-200 ms of CPU at Gemma 4's 262,144 ids).
+fn build_token_bytes_table(tokenizer: &Tokenizer, vocab_size: usize) -> Arc<Vec<Vec<u8>>> {
+    let table = super::token_text::token_bytes_table(tokenizer, vocab_size);
+    tracing::info!(
+        "Engine: built per-vocab token_bytes table ({} ids, ~{:.1} MB)",
+        vocab_size,
+        table.iter().map(Vec::len).sum::<usize>() as f64 / 1e6
+    );
+    Arc::new(table)
+}
+
 #[cfg(test)]
 fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
     Arc::new(LoadInfo {
@@ -1955,6 +1963,7 @@ fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
         tq_kv_active: false,
         kv_bytes_per_token_override: None,
         kv_fixed_bytes_per_slot_override: None,
+        gemma_warm_attention_kernel: None,
     })
 }
 
@@ -1971,6 +1980,15 @@ mod deepseek4_joint_decode;
 
 #[path = "engine/qwen35_joint_decode.rs"]
 mod qwen35_joint_decode;
+
+#[path = "engine/slot_spill.rs"]
+mod slot_spill;
+
+#[path = "engine/qwen35_slot_spill.rs"]
+mod qwen35_slot_spill;
+
+#[path = "engine/gemma4_slot_spill.rs"]
+mod gemma4_slot_spill;
 
 pub(super) enum Request {
     /// Internal startup-only diagnostic control, never a public HTTP request.
@@ -2260,6 +2278,12 @@ pub struct GemmaLoadedModel {
     /// on `weights`. The next compatible request consumes this ledger before
     /// mutating those buffers; any miss or failure leaves it empty.
     pub live_prefix_tokens: Vec<u32>,
+    /// Load-time scratch budget for the batched prefill route (#738):
+    /// `(total physical memory − model file bytes) / 6`, fixed for the
+    /// model's lifetime so the batched/linear and LCP-resume route choices
+    /// never depend on free host memory at request time. See
+    /// `forward_prefill_batched::gemma_batched_route_scratch_budget`.
+    pub batched_route_scratch_budget_bytes: u64,
     /// ADR-017 Phase E option (a) iter-2 — LCP partial-prefix
     /// observability registry. Detects whether the current request's
     /// prompt shares a non-trivial prefix with a previously-served
@@ -2421,6 +2445,11 @@ pub struct GemmaLoadedModel {
     /// case.  See ADR-040 §6.1.46.
     pub multi_seq_kv_mlx:
         Option<Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>>,
+    /// #727: host byte budget of the SlotAware reclaimed-slot spill store
+    /// (`serve.slot_spill_budget`). Load sets the documented default;
+    /// `load_engine` applies the operator's resolved value. `0` disables
+    /// spilling.
+    pub slot_spill_budget_bytes: u64,
 }
 
 impl LoadedModel {
@@ -3254,6 +3283,9 @@ pub struct LoadOptions {
     /// ADR-059: optional KV-cache graft artifact (GGUF `graft.*` bank),
     /// loaded + bind-validated at model load. Explicit file only.
     pub kv_graft_path: Option<PathBuf>,
+    /// In-memory LCP resume registry byte budget, resolved once by `serve`
+    /// (`--lcp-resume-budget` > `[serve] lcp_resume_budget` > 8 GiB).
+    pub lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget,
 }
 
 impl LoadedModel {
@@ -3660,6 +3692,9 @@ impl GemmaLoadedModel {
             kv_graft = Some(bound);
         }
         weights.kv_graft = kv_graft;
+        // The per-request pre-copy snapshot gate reads the same resolved
+        // budget the registry below enforces.
+        weights.lcp_resume_budget = opts.lcp_resume_budget;
 
         // ADR-053 dual hook sites (#299, 2026-10-13): bind a GLP steering
         // vector when the operator supplied one. Fail-closed at load; never
@@ -3706,6 +3741,32 @@ impl GemmaLoadedModel {
             weights.glp = Some(bound);
         }
 
+        // #738: the batched-prefill route budget is fixed here, once, from
+        // host constants (total physical memory, this model's file size) —
+        // never from free memory per request, which made the route and its
+        // arithmetic depend on ambient host state. Other models the serve
+        // pool keeps resident are not reserved (operator decision); such
+        // servers force the linear route with HF2Q_SERVE_BATCHED_PREFILL=0.
+        let batched_route_scratch_budget_bytes = {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_memory();
+            let total_physical_bytes = sys.total_memory();
+            let model_file_bytes = std::fs::metadata(model_path)
+                .with_context(|| format!("stat model file {}", model_path.display()))?
+                .len();
+            let budget = crate::serve::forward_prefill_batched::gemma_batched_route_scratch_budget(
+                total_physical_bytes,
+                model_file_bytes,
+            );
+            tracing::info!(
+                total_physical_bytes,
+                model_file_bytes,
+                batched_route_scratch_budget_bytes = budget,
+                "Gemma batched prefill route budget fixed at load"
+            );
+            budget
+        };
+
         Ok(Self {
             weights,
             ctx,
@@ -3722,6 +3783,7 @@ impl GemmaLoadedModel {
             load_duration,
             prompt_cache: PromptCache::new(),
             live_prefix_tokens: Vec::new(),
+            batched_route_scratch_budget_bytes,
             // ADR-017 Phase E.a — LCP registry. Capacity = 1 for v1.
             //
             // ADR-017 Phase E.a default-on — byte-budget LcpRegistry.
@@ -3734,21 +3796,13 @@ impl GemmaLoadedModel {
             // F32). Capacity 16 with that payload would budget ~77 GB
             // for LCP cache alone, OOM-class on a 128-GB M5 Max.
             //
-            // This iter replaces entry-count cap with byte-budget
-            // eviction. The budget is computed from `sysinfo`
-            // `available_memory() × 5%` clamped to `[1 GiB, 16 GiB]`,
-            // giving ≈5 GB on a fresh 128 GB Mac (≈1 Gemma-26B entry at
-            // F32 per the ~4.8 GB estimate). Operators who want more
-            // entries raise the budget via `HF2Q_KV_LCP_RESUME_CAPACITY`
-            // (byte-suffix form: e.g. `10g` = 10 GiB; legacy entry-count
-            // form `8` still accepted with a deprecation warning).
-            //
-            // `HF2Q_KV_LCP_RESUME_CAPACITY` env override is honoured:
-            // bare integers < 4096 = legacy entry-count × 300 MB;
-            // bare integers ≥ 4096 = raw byte count; suffix b/k/m/g =
-            // bytes with multiplier.
+            // Byte-budget eviction. The budget is the operator setting
+            // resolved once by `serve` (`--lcp-resume-budget` >
+            // `[serve] lcp_resume_budget` > host-independent 8 GiB) and
+            // carried in `LoadOptions`; it never depends on free memory,
+            // so snapshot/eviction decisions are identical on every host.
             lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::with_byte_budget(
-                crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget(),
+                opts.lcp_resume_budget.bytes(),
             ),
             // ADR-017 Phase E.a iter-2: metrics sink wired by
             // `serve::load_engine` AFTER this constructor returns
@@ -3778,6 +3832,7 @@ impl GemmaLoadedModel {
             // the respective env-gate is engaged at process start.
             multi_seq_kv_dense: None,
             multi_seq_kv_mlx: None,
+            slot_spill_budget_bytes: crate::serve::operator_settings::DEFAULT_SLOT_SPILL_BUDGET_BYTES,
         })
     }
 
@@ -4022,6 +4077,7 @@ impl LoadInfoBuilder for GemmaLoadedModel {
             kv_fixed_bytes_per_slot_override: Some(load_info::gemma4_fixed_kv_bytes_per_slot(
                 &self.config,
             )),
+            gemma_warm_attention_kernel: Some(self.weights.warm_live_kernel.wire_name()),
         }
     }
 }
@@ -4318,6 +4374,9 @@ impl Engine {
         )
         .expect("spawn hf2q-engine thread");
 
+        // The worker thread (and its warmup) runs from here on; build the
+        // grammar byte table on this thread meanwhile.
+        let token_bytes = build_token_bytes_table(&tokenizer, vocab_size);
         Engine {
             inner: Arc::new(EngineInner {
                 tx,
@@ -4335,7 +4394,7 @@ impl Engine {
                 chat_template,
                 registration,
                 vision_consumer_contract,
-                token_bytes: std::sync::OnceLock::new(),
+                token_bytes,
                 kv_spill_descriptor,
                 tq_packed_descriptor,
                 mode: initial_mode,
@@ -4919,6 +4978,9 @@ impl Engine {
         )
         .expect("spawn hf2q-engine-slotaware thread");
 
+        // The worker thread (and its warmup) runs from here on; build the
+        // grammar byte table on this thread meanwhile.
+        let token_bytes = build_token_bytes_table(&tokenizer, vocab_size);
         Engine {
             inner: Arc::new(EngineInner {
                 tx,
@@ -4936,7 +4998,7 @@ impl Engine {
                 chat_template,
                 registration,
                 vision_consumer_contract,
-                token_bytes: std::sync::OnceLock::new(),
+                token_bytes,
                 kv_spill_descriptor,
                 tq_packed_descriptor,
                 mode: initial_mode,
@@ -4972,6 +5034,14 @@ impl Engine {
     /// request on the same command queue.
     pub fn is_worker_healthy(&self) -> bool {
         self.inner.supervisor.is_healthy() && !self.inner.tx.is_closed()
+    }
+
+    /// Count a request as in flight to this engine's worker while the
+    /// handler renders and tokenizes it; drop the guard right before the
+    /// request is enqueued. The DeepSeek-V4 worker waits a bounded time for
+    /// such requests before it starts a prefill transaction.
+    pub(super) fn begin_admission(&self) -> super::engine_supervisor::AdmissionGuard {
+        self.inner.supervisor.begin_admission()
     }
 
     /// Short cause of a dead engine for readiness reporting, or `None`
@@ -5196,8 +5266,8 @@ impl Engine {
         self.inner.vision_consumer_contract.clone()
     }
 
-    /// Lazily build + cache the per-vocab raw byte table used by the
-    /// grammar mask (Phase 2a Task #5 / iter-95).
+    /// The per-vocab raw byte table used by the grammar mask (Phase 2a
+    /// Task #5 / iter-95), built when the Engine was constructed.
     ///
     /// `token_bytes[id]` is the bytes token `id` contributes to the output
     /// (`token_text::token_raw_bytes`): `tokenizer.decode(&[id], false)`
@@ -5207,36 +5277,11 @@ impl Engine {
     /// grammar mask. Model EOG ids are handled separately and survive only
     /// once the grammar is accepting.
     ///
-    /// Cost: vocab × one tokenizer.decode call.  At Gemma-4's vocab=256K
-    /// this is ~50-200 ms on first call (CPU work; not on hot path),
-    /// then ~free for every subsequent grammar request through this
-    /// Engine.  The build runs on the calling thread so the worker
-    /// thread is unaffected.
-    ///
     /// Returned as `Arc<Vec<Vec<u8>>>` — the chat handler attaches it
     /// to `SamplingParams.token_bytes` (cheap Arc clone) so the worker
     /// thread can consume it without re-resolving on every request.
     pub fn token_bytes_table(&self) -> Arc<Vec<Vec<u8>>> {
-        self.inner
-            .token_bytes
-            .get_or_init(|| {
-                let v = self.inner.vocab_size;
-                let tok = &self.inner.tokenizer;
-                let mut out: Vec<Vec<u8>> = Vec::with_capacity(v);
-                for id in 0..v as u32 {
-                    // Failure (out-of-range id, unsupported token) yields
-                    // empty bytes so the mask treats it as a "special" /
-                    // unprintable token.
-                    out.push(super::token_text::token_raw_bytes(tok, id));
-                }
-                tracing::info!(
-                    "Engine: built per-vocab token_bytes table ({} ids, ~{:.1} MB)",
-                    v,
-                    out.iter().map(|v| v.len()).sum::<usize>() as f64 / 1e6
-                );
-                Arc::new(out)
-            })
-            .clone()
+        Arc::clone(&self.inner.token_bytes)
     }
 
     pub fn model_id(&self) -> &str {
@@ -5489,6 +5534,29 @@ impl Engine {
         prompt_tokens: Vec<u32>,
         params: SamplingParams,
     ) -> Result<GenerationResult> {
+        self.generate_with_admission(prompt_tokens, params, None)
+            .await
+    }
+
+    /// [`Self::generate`] for a request whose handler holds an admission
+    /// guard ([`Self::begin_admission`]): the guard is released right after
+    /// the request is in the worker queue (or on any earlier error).
+    pub(super) async fn generate_admitted(
+        &self,
+        prompt_tokens: Vec<u32>,
+        params: SamplingParams,
+        admission: super::engine_supervisor::AdmissionGuard,
+    ) -> Result<GenerationResult> {
+        self.generate_with_admission(prompt_tokens, params, Some(admission))
+            .await
+    }
+
+    async fn generate_with_admission(
+        &self,
+        prompt_tokens: Vec<u32>,
+        params: SamplingParams,
+        admission: Option<super::engine_supervisor::AdmissionGuard>,
+    ) -> Result<GenerationResult> {
         self.ensure_worker_healthy()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         let req = Request::Generate {
@@ -5497,7 +5565,9 @@ impl Engine {
             reply: reply_tx,
         };
         // Use `try_send` so we can distinguish queue-full from a closed worker.
-        match self.inner.tx.try_send(req) {
+        let sent = self.inner.tx.try_send(req);
+        drop(admission);
+        match sent {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 anyhow::bail!("queue_full");
@@ -5532,6 +5602,7 @@ impl Engine {
             events_tx,
             cancellation_counter,
             soft_tokens,
+            None,
             None,
             None,
         )
@@ -5576,6 +5647,7 @@ impl Engine {
         soft_tokens: Vec<SoftTokenData>,
         deepstack: Option<DeepstackData>,
         positions_flat: Option<Vec<i32>>,
+        inflight: Option<super::engine_supervisor::AdmissionGuard>,
     ) -> Result<()> {
         self.ensure_worker_healthy()?;
         let prompt_token_count = prompt_tokens.len();
@@ -5596,7 +5668,10 @@ impl Engine {
             deepstack,
             positions_flat,
         };
-        match self.inner.tx.try_send(req) {
+        // Release the handler's admission guard once the request is queued.
+        let sent = self.inner.tx.try_send(req);
+        drop(inflight);
+        match sent {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => anyhow::bail!("queue_full"),
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -6608,34 +6683,55 @@ fn gemma4_batch_decode_reserve(lanes: impl IntoIterator<Item = (usize, usize)>) 
     max_need.saturating_sub(max_end).max(1)
 }
 
+/// Whether installed long-prompt lanes may share one transaction (issue
+/// #725), resolved once per worker: cross-slot admission on, and no
+/// diagnostic setting that moves the per-slot reference route the lanes must
+/// equal ([`gemma_warm_batch::per_slot_route_override`]). Off, every lane
+/// prefills per slot.
+fn gemma4_installed_prefill_cohort_enabled(
+    cross_slot_admit: bool,
+    env: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let unavailable = gemma_warm_batch::per_slot_route_override(env);
+    tracing::info!(
+        cross_slot_admit,
+        unavailable,
+        "Gemma installed long-prompt cohort worker decision"
+    );
+    cross_slot_admit && unavailable.is_none()
+}
+
+/// Plan one installed long-prompt cohort (issue #725).
+///
+/// Every lane is planned on its own, exactly as the single-slot path plans it
+/// (`progress.plan(aggregate_tokens)`, the bounded transaction cap), so a
+/// lane's chunk boundaries never depend on which other prompts happen to be
+/// mid-prefill. Lanes are then admitted in order (the scheduled primary first)
+/// while the cohort stays within `aggregate_tokens` rows. A lane is left out
+/// (`None`) and advances per slot on its own turn when its chunk has fewer
+/// than [`gemma_warm_batch::MIN_SUFFIX_TOKENS`] rows (its MoE would take
+/// `mv_id` alone but `mm_id` in the joint stream) or when it does not fit the
+/// remaining budget. The caller batches only when the primary and at least
+/// one more lane are admitted.
 fn gemma4_prefill_batch_plans(
     progresses: &[Gemma4PrefillProgress],
     aggregate_tokens: usize,
-) -> Result<Vec<Gemma4PrefillPlan>> {
+) -> Result<Vec<Option<Gemma4PrefillPlan>>> {
     anyhow::ensure!(!progresses.is_empty(), "Gemma4 prefill batch is empty");
-    anyhow::ensure!(
-        aggregate_tokens >= progresses.len(),
-        "Gemma4 aggregate prefill budget {aggregate_tokens} is smaller than {} lanes",
-        progresses.len()
-    );
     let mut budget = aggregate_tokens;
-    let mut plans = Vec::with_capacity(progresses.len());
-    for (index, progress) in progresses.iter().enumerate() {
-        let lanes_left = progresses.len() - index;
-        let lane_budget = (budget / lanes_left).max(1);
-        let plan = progress.plan(lane_budget)?;
-        budget = budget.saturating_sub(plan.end - plan.start);
-        plans.push(plan);
-    }
-    anyhow::ensure!(
-        plans
-            .iter()
-            .map(|plan| plan.end - plan.start)
-            .sum::<usize>()
-            <= aggregate_tokens,
-        "Gemma4 prefill batch exceeded its aggregate token budget"
-    );
-    Ok(plans)
+    progresses
+        .iter()
+        .map(|progress| {
+            let plan = progress.plan(aggregate_tokens)?;
+            let rows = plan.end - plan.start;
+            Ok(
+                (rows >= gemma_warm_batch::MIN_SUFFIX_TOKENS && rows <= budget).then(|| {
+                    budget -= rows;
+                    plan
+                }),
+            )
+        })
+        .collect()
 }
 
 impl Gemma4PrefillProgress {
@@ -6730,6 +6826,24 @@ fn finish_gemma4_operator_request(handle: SlotHandle, outcome: &'static str) {
         gemma4_operator_request_id(handle),
         outcome,
     );
+}
+
+/// Test recorder of committed Gemma bounded-prefill chunks, armed by `Some`
+/// on the calling (worker) thread (issue #725 gate).
+#[cfg(test)]
+#[derive(Default)]
+struct Gemma4PrefillRecord {
+    /// `(slot, start, end, joint)` of every committed chunk, in commit order;
+    /// `joint` marks a multi-lane transaction.
+    chunks: Vec<(u32, usize, usize, bool)>,
+    /// `(slot, first token, final logits)` of every lane that became ready.
+    seeds: Vec<(u32, u32, Vec<f32>)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static GEMMA4_PREFILL_RECORD: std::cell::RefCell<Option<Gemma4PrefillRecord>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 enum Gemma4PrefillAdvance {
@@ -6957,6 +7071,27 @@ impl Gemma4PrefillState {
             Gemma4PrefillCommit::Pending { advanced_tokens }
             | Gemma4PrefillCommit::Ready { advanced_tokens } => advanced_tokens,
         };
+        #[cfg(test)]
+        GEMMA4_PREFILL_RECORD.with(|record| {
+            if let Some(record) = record.borrow_mut().as_mut() {
+                let slot = self.slot_id.0;
+                record
+                    .chunks
+                    .push((slot, plan.start, plan.end, first_logits.is_some()));
+                if plan.ready {
+                    let logits = match first_logits {
+                        Some(logits) => logits.to_vec(),
+                        None => guard
+                            .model
+                            .weights
+                            .logits_view()
+                            .expect("Gemma bounded prefill logits")
+                            .to_vec(),
+                    };
+                    record.seeds.push((slot, first_token, logits));
+                }
+            }
+        });
         if matches!(committed, Gemma4PrefillCommit::Pending { .. }) {
             self.pending_anchor = rollback_anchor;
             return Ok(Gemma4PrefillAdvance::Pending {
@@ -8730,69 +8865,129 @@ fn deepseek4_should_redrain_admission(
     admission_open && has_free_slot && receiver_has_pending
 }
 
+/// Longest the worker holds a pure-prefill transaction for requests an HTTP
+/// handler is still rendering and tokenizing, so near-simultaneous agents
+/// start in one cohort (S3 cohort design §3.2). A fixed constant, not
+/// adaptive: it decides cohort membership only, never numerics, and a lone
+/// request (nothing else in flight) never waits.
+const DEEPSEEK4_ADMISSION_BARRIER: Duration = Duration::from_millis(25);
+
+/// Admission barrier state between two prefill transactions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Deepseek4PrefillAlignmentCatchup {
+enum Deepseek4AdmissionBarrier {
+    /// Not armed since the last prefill transaction.
+    Idle,
+    /// Armed at this instant; the worker redrains admission until it ends.
+    Armed(Instant),
+    /// Already used before the next prefill transaction; never re-arms.
+    Spent,
+}
+
+/// Whether the worker should wait (park briefly and redrain admission)
+/// before its next step. Arms only when the next step is a pure prefill (no
+/// runnable decoder), a slot is free, admission is open and another request
+/// is in flight; ends at the bound, or as soon as nothing is in flight or a
+/// condition fails; at most once per prefill transaction.
+fn deepseek4_admission_barrier_wait(
+    barrier: &mut Deepseek4AdmissionBarrier,
+    now: Instant,
+    admission_open: bool,
+    has_free_slot: bool,
+    pure_prefill_next: bool,
+    admissions_in_flight: usize,
+) -> bool {
+    let wanted = admission_open && has_free_slot && pure_prefill_next && admissions_in_flight > 0;
+    match *barrier {
+        Deepseek4AdmissionBarrier::Idle if wanted => {
+            *barrier = Deepseek4AdmissionBarrier::Armed(now);
+            true
+        }
+        Deepseek4AdmissionBarrier::Idle | Deepseek4AdmissionBarrier::Spent => false,
+        Deepseek4AdmissionBarrier::Armed(armed_at)
+            if wanted && now.saturating_duration_since(armed_at) < DEEPSEEK4_ADMISSION_BARRIER =>
+        {
+            true
+        }
+        Deepseek4AdmissionBarrier::Armed(_) => {
+            *barrier = Deepseek4AdmissionBarrier::Spent;
+            false
+        }
+    }
+}
+
+/// The next scheduler step is pure prefill: some slot prefills and none
+/// decodes (a parked completion is not runnable decode).
+fn deepseek4_pure_prefill_next(slots: &[Option<Deepseek4Slot>]) -> bool {
+    let mut prefill = false;
+    for (work, _, _) in slots.iter().flatten() {
+        match work {
+            Deepseek4SlotWork::Prefill(_) => prefill = true,
+            Deepseek4SlotWork::Decode { .. } => return false,
+            Deepseek4SlotWork::ParkedCompletion { .. } => {}
+        }
+    }
+    prefill
+}
+
+/// What a prefilling lane offers the next pure-prefill step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Deepseek4PrefillLaneView {
     handle: SlotHandle,
-    cursor: usize,
-    target_cursor: usize,
-    window_cap: usize,
+    cold_wave: bool,
+    /// The lane's next work is its token-wise recovery tail.
+    recovery_tail: bool,
 }
 
-/// Select one lagging warm matrix lane and advance it only as far as the
-/// current leading cursor. A request that arrives just after a cooperative
-/// transaction can then join the widest cohort on the next scheduler step,
-/// without an admission timer or sleep.
-fn deepseek4_prefill_alignment_catchup(
-    lanes: impl IntoIterator<Item = (SlotHandle, Option<(usize, usize, usize)>)>,
-    sliding_window: usize,
-) -> Option<Deepseek4PrefillAlignmentCatchup> {
-    if sliding_window == 0 {
-        return None;
-    }
-    let lanes = lanes
-        .into_iter()
-        .map(|(handle, state)| state.map(|state| (handle, state)))
-        .collect::<Option<Vec<_>>>()?;
-    if lanes.len() < 2 {
-        return None;
-    }
-    let (_, (_, recovery_position, _)) = lanes.first()?;
-    let recovery_position = *recovery_position;
-    if lanes
-        .iter()
-        .any(|(_, (_, recovery, _))| *recovery != recovery_position)
-    {
-        return None;
-    }
-    let target_cursor = lanes.iter().map(|(_, (cursor, _, _))| *cursor).max()?;
-    let (handle, (cursor, _, window_multiplier)) = lanes
-        .iter()
-        .filter(|(_, (cursor, _, _))| *cursor < target_cursor)
-        .min_by_key(|(_, (cursor, _, _))| *cursor)
-        .copied()?;
-    let delta = target_cursor.checked_sub(cursor)?;
-    if delta == 0 || delta % sliding_window != 0 {
-        return None;
-    }
-    let window_cap = (delta / sliding_window).min(window_multiplier);
-    (window_cap > 0).then_some(Deepseek4PrefillAlignmentCatchup {
-        handle,
-        cursor,
-        target_cursor,
-        window_cap,
-    })
+/// Prefilling lanes in scheduler FIFO order, as the cold-wave ordering rule
+/// sees them.
+fn deepseek4_prefill_lane_views(
+    slots: &[Option<Deepseek4Slot>],
+    fifo: &[SlotHandle],
+) -> Vec<Deepseek4PrefillLaneView> {
+    fifo.iter()
+        .filter_map(|&handle| match slots.get(handle.slot_id.0 as usize)?.as_ref()? {
+            (Deepseek4SlotWork::Prefill(state), _, installed) if *installed == handle => {
+                Some(Deepseek4PrefillLaneView {
+                    handle,
+                    cold_wave: state.is_cold_wave(),
+                    recovery_tail: state.is_recovery_tail(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
+/// Cold-wave matrix work before cold-wave tails. When the scheduler's oldest
+/// prefill is a cold-wave lane whose next work is its recovery tail while
+/// another cold-wave lane still has matrix prefill work, the pure-prefill
+/// step leads with the oldest such matrix lane instead. A cold lane that ran
+/// its tail would become a runnable decoder; every later step would then be a
+/// Mixed step whose cold bulk decode quantum runs the early lanes' whole
+/// answers before the stragglers prefill (S3 A/B arm B: two stragglers
+/// waited 3.6 s behind 55 joint decode steps), while the early lanes'
+/// completions stay parked until every cold peer finishes anyway. Holding
+/// the tails lets the stragglers' matrix work cohort first, then the tails
+/// drain and the whole wave decodes together. Scheduling only: no lane's
+/// chunking or numerics change.
+fn deepseek4_cold_wave_matrix_primary(fifo: &[Deepseek4PrefillLaneView]) -> Option<SlotHandle> {
+    let oldest = fifo.first()?;
+    if !(oldest.cold_wave && oldest.recovery_tail) {
+        return None;
+    }
+    fifo.iter()
+        .find(|lane| lane.cold_wave && !lane.recovery_tail)
+        .map(|lane| lane.handle)
+}
+
+/// Cohort widths a prefill quantum may try, widest first: 2 up to the
+/// candidate count. Unequal-plan cohorts let a lane join at its own cursor,
+/// so a cold wave needs no full four-lane minimum (and no alignment
+/// catch-up) to share work.
 fn deepseek4_cooperative_prefill_widths(
     maximum_width: usize,
-    cold_wave: bool,
 ) -> Option<std::ops::RangeInclusive<usize>> {
-    let minimum_width = if cold_wave {
-        DEEPSEEK4_COLD_PREFILL_WAVE_SLOTS
-    } else {
-        2
-    };
-    (maximum_width >= minimum_width).then_some(minimum_width..=maximum_width)
+    (maximum_width >= 2).then_some(2..=maximum_width)
 }
 
 fn choose_full_context_slot(
@@ -8834,10 +9029,12 @@ fn choose_full_context_slot(
 /// prefills. Lopsided `Mixed` work advances a visible decoder between
 /// two-window prefill slices. Terminal cold lanes retain one scheduler tick
 /// until their unfinished cold peers drain, publishing the cohort together.
-/// Recovery tails align before decode; complete four-request cold matrix waves
-/// and compatible warm waves may share cooperative prefill. Larger lopsided
-/// tool-result prefills remain interleavable. No more than one prefill
-/// transaction owns the shared scratch arena at any instant.
+/// Recovery tails align before decode. Prefilling lanes whose next work is a
+/// matrix chunk of at least 33 rows share cooperative prefill at their own
+/// cursors and chunk lengths (up to four lanes; two lanes within the Mixed
+/// slice budget while decoders run), after a bounded admission barrier for
+/// requests still being tokenized. No more than one prefill transaction owns
+/// the shared scratch arena at any instant.
 #[allow(clippy::too_many_arguments)]
 fn run_slot_aware_deepseek4(
     mut model: super::engine_deepseek4::Deepseek4LoadedModel,
@@ -8874,6 +9071,7 @@ fn run_slot_aware_deepseek4(
     let mut cold_cohort_phase = Deepseek4ColdCohortPhase::Idle;
     let mut pending_affinity_wait: Option<(SlotId, usize)> = None;
     let mut shutdown_requested = false;
+    let mut admission_barrier = Deepseek4AdmissionBarrier::Idle;
     tracing::info!(
         slots = sessions.len(),
         decode_quantum,
@@ -9210,9 +9408,21 @@ fn run_slot_aware_deepseek4(
             !rx.is_empty(),
         ) {
             // Seeding can take long enough for another member of the same
-            // cold wave to reach the receiver. Re-enter admission before an
-            // expensive matrix transaction so a complete four-lane wave can
-            // start aligned without a timer or batching delay.
+            // wave to reach the receiver. Re-enter admission before an
+            // expensive matrix transaction so the wave starts as one cohort.
+            continue 'worker;
+        }
+        if deepseek4_admission_barrier_wait(
+            &mut admission_barrier,
+            Instant::now(),
+            admission_open,
+            slots.iter().any(Option::is_none),
+            deepseek4_pure_prefill_next(&slots),
+            supervisor.admissions_in_flight(),
+        ) {
+            // Another request is still being rendered and tokenized by its
+            // handler: hold the prefill (bounded) and redrain admission.
+            std::thread::sleep(Duration::from_millis(1));
             continue 'worker;
         }
         let slots_empty = slots.iter().all(Option::is_none);
@@ -9312,93 +9522,34 @@ fn run_slot_aware_deepseek4(
             }
             Ok(SchedulerStep::Prefill { handle, .. }) => {
                 // A pure-prefill step exposes the scheduler's oldest FIFO
-                // handle. Compatible aligned peers may share row-local
-                // FFN/MoE work without waiting; recovery checkpoints, tails,
-                // and mixed work retain the proven serial transaction path.
-                let serial_fallback =
-                    next_deepseek4_prefill_handle(&slots, last_prefill_slot).unwrap_or(handle);
-                let sliding_window = model.model.cfg.sliding_window as usize;
-                let alignment = deepseek4_prefill_alignment_catchup(
-                    scheduler
-                        .prefill_handles_fifo()
-                        .into_iter()
-                        .map(|candidate| {
-                            let state = slots
-                                .get(candidate.slot_id.0 as usize)
-                                .and_then(Option::as_ref)
-                                .and_then(|(work, _, installed)| {
-                                    if *installed != candidate {
-                                        return None;
-                                    }
-                                    match work {
-                                        Deepseek4SlotWork::Prefill(state) => {
-                                            state.warm_matrix_alignment_state()
-                                        }
-                                        _ => None,
-                                    }
-                                });
-                            (candidate, state)
-                        }),
-                    sliding_window,
-                )
-                .and_then(|mut alignment| {
-                    let state = slots
-                        .get(alignment.handle.slot_id.0 as usize)
-                        .and_then(Option::as_ref)
-                        .and_then(|(work, _, installed)| {
-                            if *installed != alignment.handle {
-                                return None;
-                            }
-                            match work {
-                                Deepseek4SlotWork::Prefill(state) => Some(state),
-                                _ => None,
-                            }
-                        })?;
-                    alignment.window_cap = state.exact_warm_matrix_alignment_window_cap(
-                        alignment.target_cursor,
-                        sliding_window,
-                    )?;
-                    Some(alignment)
-                });
-                let (fatal, used_serial_fallback, serial_fallback) =
-                    if let Some(alignment) = alignment {
-                        tracing::info!(
-                            slot = alignment.handle.slot_id.0,
-                            cursor = alignment.cursor,
-                            target_cursor = alignment.target_cursor,
-                            window_cap = alignment.window_cap,
-                            "DeepSeek-V4 staggered warm prefill alignment catch-up"
-                        );
-                        (
-                            advance_deepseek4_prefill(
-                                &mut model,
-                                &mut sessions,
-                                &mut slots,
-                                &mut scheduler,
-                                registration.as_ref(),
-                                alignment.handle,
-                                kv_bytes_per_token,
-                                Some(alignment.window_cap),
-                                &supervisor,
-                            ),
-                            true,
-                            alignment.handle,
-                        )
-                    } else {
-                        let (fatal, used_serial_fallback) = advance_deepseek4_prefill_quantum(
-                            &mut model,
-                            &mut sessions,
-                            &mut slots,
-                            &mut scheduler,
-                            registration.as_ref(),
-                            handle,
-                            serial_fallback,
-                            kv_bytes_per_token,
-                            None,
-                            &supervisor,
-                        );
-                        (fatal, used_serial_fallback, serial_fallback)
-                    };
+                // handle. Prefilling peers with compatible matrix chunks (any
+                // cursor and length) share the row-local FFN/MoE work;
+                // recovery tails and sub-33-row chunks keep the serial path.
+                admission_barrier = Deepseek4AdmissionBarrier::Idle;
+                let cold_matrix_primary = deepseek4_cold_wave_matrix_primary(
+                    &deepseek4_prefill_lane_views(&slots, &scheduler.prefill_handles_fifo()),
+                );
+                let (primary, require_fifo_primary, serial_fallback) = match cold_matrix_primary {
+                    Some(lane) => (lane, false, lane),
+                    None => (
+                        handle,
+                        true,
+                        next_deepseek4_prefill_handle(&slots, last_prefill_slot).unwrap_or(handle),
+                    ),
+                };
+                let (fatal, used_serial_fallback) = advance_deepseek4_prefill_quantum(
+                    &mut model,
+                    &mut sessions,
+                    &mut slots,
+                    &mut scheduler,
+                    registration.as_ref(),
+                    primary,
+                    require_fifo_primary,
+                    serial_fallback,
+                    kv_bytes_per_token,
+                    None,
+                    &supervisor,
+                );
                 record_deepseek4_serial_prefill_fallback(
                     &mut last_prefill_slot,
                     serial_fallback,
@@ -9479,17 +9630,27 @@ fn run_slot_aware_deepseek4(
                     break 'worker;
                 }
                 last_prefill_slot = Some(prefill.slot_id);
-                if let Some(fatal) = advance_deepseek4_prefill(
+                admission_barrier = Deepseek4AdmissionBarrier::Idle;
+                // With decoders runnable the slice keeps the Mixed row budget:
+                // the selected lane alone, or a cohort of at most two lanes
+                // at one window each. When the only decoders are parked
+                // completions the budget is `None` and the full cohort budget
+                // applies. Either way the primary is the round-robin Mixed
+                // lane, not necessarily the scheduler's oldest prefill.
+                let (fatal, _used_serial_fallback) = advance_deepseek4_prefill_quantum(
                     &mut model,
                     &mut sessions,
                     &mut slots,
                     &mut scheduler,
                     registration.as_ref(),
                     prefill,
+                    false,
+                    prefill,
                     kv_bytes_per_token,
                     mixed_budget.max_prefill_windows,
                     &supervisor,
-                ) {
+                );
+                if let Some(fatal) = fatal {
                     fail_stop_deepseek4_worker(
                         &supervisor,
                         &mut rx,
@@ -9948,92 +10109,182 @@ fn reinstall_deepseek4_decode_cohort_lanes(
     }
 }
 
-fn plan_deepseek4_prefill_cohort(
-    model: &super::engine_deepseek4::Deepseek4LoadedModel,
-    sessions: &[super::engine_deepseek4::Deepseek4Session],
-    slots: &[Option<Deepseek4Slot>],
-    scheduler: &InflightBatchedScheduler,
-    primary: SlotHandle,
-) -> Result<Option<Vec<Deepseek4CooperativeCandidate>>> {
-    let handles = scheduler.prefill_handles_fifo();
-    anyhow::ensure!(
-        handles.first().copied() == Some(primary),
-        "DeepSeek-V4 cooperative primary is not the oldest scheduler prefill"
-    );
-    let sliding_window = model.model.cfg.sliding_window as usize;
-    anyhow::ensure!(sliding_window > 0, "DeepSeek-V4 sliding window is zero");
-    let maximum_width = handles.len().min(4);
-    let primary_index = primary.slot_id.0 as usize;
-    let primary_cold_wave = matches!(
-        slots.get(primary_index).and_then(Option::as_ref),
-        Some((Deepseek4SlotWork::Prefill(state), _, installed))
-            if *installed == primary && state.is_cold_wave()
-    );
-    let Some(widths) = deepseek4_cooperative_prefill_widths(maximum_width, primary_cold_wave)
-    else {
+/// Widest Mixed cohort: with decoders runnable a cohort slice keeps the
+/// single-lane Mixed row budget, split across at most two lanes.
+const DEEPSEEK4_MIXED_COHORT_WIDTH: usize = 2;
+
+/// One prefilling lane as the cohort selector sees it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Deepseek4CohortLane {
+    handle: SlotHandle,
+    cold_wave: bool,
+    reply_class: Deepseek4ReplyClass,
+}
+
+/// Choose the members of one cooperative prefill. `lanes[0]` is the primary,
+/// the rest are candidates in scheduler FIFO order. For each width, widest
+/// first, every member's chunk is its own plan at `lane_rows(width)`
+/// (`plan(lane, rows)` returns the plan and its row count): lanes may sit at
+/// different cursors and ingest different row counts, because a lane's
+/// attention runs on its own cache and span and the packed FFN is row-local.
+/// A member's chunk must be a matrix chunk of at least
+/// `MIN_MATRIX_APPEND_TOKENS` rows, so its dense (`m > 8`) and expert
+/// (`rows > 32`) routes are the same alone and packed. Companions must share
+/// the primary's cold-wave flag and reply class. An ineligible candidate is
+/// skipped; the primary must be a member, so the oldest request is never
+/// starved by later arrivals.
+fn select_deepseek4_prefill_cohort<P>(
+    lanes: &[Deepseek4CohortLane],
+    widths: std::ops::RangeInclusive<usize>,
+    lane_rows: impl Fn(usize) -> usize,
+    mut plan: impl FnMut(usize, usize) -> Result<Option<(P, usize)>>,
+) -> Result<Option<Vec<(usize, P)>>> {
+    let Some(primary) = lanes.first().copied() else {
         return Ok(None);
     };
-    for width in widths.rev() {
-        let lane_rows = crate::inference::models::deepseek4::MAX_COOPERATIVE_PREFILL_ROWS
-            .checked_div(width)
-            .unwrap_or(0)
-            / sliding_window
-            * sliding_window;
-        if lane_rows == 0 {
+    'width: for width in widths.rev() {
+        let rows = lane_rows(width);
+        if rows == 0 {
             continue;
         }
-        let mut candidates = Vec::with_capacity(width);
-        let mut expected_plan = None;
-        let mut expected_reply_class = None;
-        let mut compatible = true;
-        for handle in handles.iter().copied().take(width) {
-            let index = handle.slot_id.0 as usize;
-            let Some((Deepseek4SlotWork::Prefill(state), reply, installed)) =
-                slots.get(index).and_then(Option::as_ref)
-            else {
-                compatible = false;
+        let mut members = Vec::with_capacity(width);
+        for (index, lane) in lanes.iter().enumerate() {
+            if members.len() == width {
                 break;
+            }
+            let compatible = index == 0
+                || (lane.cold_wave == primary.cold_wave && lane.reply_class == primary.reply_class);
+            let member = if compatible {
+                plan(index, rows)?.filter(|(_, tokens)| {
+                    *tokens >= crate::inference::models::deepseek4::MIN_MATRIX_APPEND_TOKENS
+                })
+            } else {
+                None
             };
-            if *installed != handle || reply.client_closed() {
-                compatible = false;
-                break;
+            match member {
+                Some((lane_plan, _)) => members.push((index, lane_plan)),
+                None if index == 0 => continue 'width,
+                None => {}
             }
-            if state.is_cold_wave() != primary_cold_wave {
-                compatible = false;
-                break;
-            }
-            let reply_class = deepseek4_reply_class(reply);
-            if expected_reply_class.is_some_and(|expected| expected != reply_class) {
-                compatible = false;
-                break;
-            }
-            expected_reply_class = Some(reply_class);
-            let Some(plan) = state.plan_cooperative_prefill(
-                sessions[index].cache_position(),
-                sessions[index].committed_tokens().len(),
-                sliding_window,
-                lane_rows,
-            )?
-            else {
-                compatible = false;
-                break;
-            };
-            if expected_plan.is_some_and(|expected| expected != plan) {
-                compatible = false;
-                break;
-            }
-            expected_plan = Some(plan);
-            candidates.push(Deepseek4CooperativeCandidate {
-                handle,
-                plan,
-                tokens: state.cooperative_tokens(plan)?.to_vec(),
-            });
         }
-        if compatible && candidates.len() == width {
-            return Ok(Some(candidates));
+        if members.len() == width {
+            return Ok(Some(members));
         }
     }
     Ok(None)
+}
+
+/// Per-lane row cap of a cohort of `width` lanes: the aggregate budget (the
+/// cooperative maximum, or the Mixed slice's `windows`) split evenly, in
+/// whole sliding windows.
+fn deepseek4_cohort_lane_rows(
+    width: usize,
+    sliding_window: usize,
+    mixed_windows: Option<usize>,
+) -> usize {
+    let aggregate = mixed_windows.map_or(
+        crate::inference::models::deepseek4::MAX_COOPERATIVE_PREFILL_ROWS,
+        |windows| windows.saturating_mul(sliding_window),
+    );
+    aggregate
+        .checked_div(width)
+        .and_then(|rows| rows.checked_div(sliding_window))
+        .unwrap_or(0)
+        .saturating_mul(sliding_window)
+}
+
+/// Plan a cooperative prefill led by `primary`. Without a Mixed row budget
+/// (`mixed_windows == None`: a pure-prefill step, or a Mixed step whose only
+/// decoders are parked completions) the cohort takes up to four lanes over at
+/// most `MAX_COOPERATIVE_PREFILL_ROWS`; with one it takes at most two lanes
+/// over the Mixed budget, one window per lane. Only the pure-prefill step
+/// requires `primary` to be the scheduler's oldest prefill
+/// (`require_fifo_primary`); a Mixed step leads with its round-robin lane.
+/// `cursor_of(slot)` is the slot session's `(cache position, committed
+/// tokens)`.
+fn plan_deepseek4_prefill_cohort(
+    sliding_window: usize,
+    cursor_of: impl Fn(usize) -> (usize, usize),
+    slots: &[Option<Deepseek4Slot>],
+    scheduler: &InflightBatchedScheduler,
+    primary: SlotHandle,
+    mixed_windows: Option<usize>,
+    require_fifo_primary: bool,
+) -> Result<Option<Vec<Deepseek4CooperativeCandidate>>> {
+    let handles = scheduler.prefill_handles_fifo();
+    if require_fifo_primary {
+        anyhow::ensure!(
+            handles.first().copied() == Some(primary),
+            "DeepSeek-V4 cooperative primary is not the oldest scheduler prefill"
+        );
+    }
+    anyhow::ensure!(sliding_window > 0, "DeepSeek-V4 sliding window is zero");
+    let prefilling = |handle: SlotHandle| match slots
+        .get(handle.slot_id.0 as usize)
+        .and_then(Option::as_ref)
+    {
+        Some((Deepseek4SlotWork::Prefill(state), reply, installed))
+            if *installed == handle && !reply.client_closed() =>
+        {
+            Some((state, reply))
+        }
+        _ => None,
+    };
+    let lanes: Vec<(Deepseek4CohortLane, &super::engine_deepseek4::Deepseek4PrefillState)> =
+        std::iter::once(primary)
+            .chain(handles.iter().copied().filter(|handle| *handle != primary))
+            .filter_map(|handle| {
+                prefilling(handle).map(|(state, reply)| {
+                    (
+                        Deepseek4CohortLane {
+                            handle,
+                            cold_wave: state.is_cold_wave(),
+                            reply_class: deepseek4_reply_class(reply),
+                        },
+                        state,
+                    )
+                })
+            })
+            .collect();
+    if lanes.first().map(|(lane, _)| lane.handle) != Some(primary) {
+        return Ok(None);
+    }
+    let maximum_width = lanes.len().min(if mixed_windows.is_some() {
+        DEEPSEEK4_MIXED_COHORT_WIDTH
+    } else {
+        4
+    });
+    let Some(widths) = deepseek4_cooperative_prefill_widths(maximum_width) else {
+        return Ok(None);
+    };
+    let views: Vec<Deepseek4CohortLane> = lanes.iter().map(|(lane, _)| *lane).collect();
+    let members = select_deepseek4_prefill_cohort(
+        &views,
+        widths,
+        |width| deepseek4_cohort_lane_rows(width, sliding_window, mixed_windows),
+        |index, rows| {
+            let (lane, state) = lanes[index];
+            let (cache_position, committed_tokens) = cursor_of(lane.handle.slot_id.0 as usize);
+            Ok(state
+                .plan_cooperative_prefill(cache_position, committed_tokens, sliding_window, rows)?
+                .map(|plan| (plan, plan.token_count())))
+        },
+    )?;
+    members
+        .map(|members| {
+            members
+                .into_iter()
+                .map(|(index, plan)| {
+                    let (lane, state) = lanes[index];
+                    Ok(Deepseek4CooperativeCandidate {
+                        handle: lane.handle,
+                        plan,
+                        tokens: state.cooperative_tokens(plan)?.to_vec(),
+                    })
+                })
+                .collect()
+        })
+        .transpose()
 }
 
 fn reinstall_deepseek4_cooperative_lanes(
@@ -10058,29 +10309,30 @@ fn advance_deepseek4_prefill_quantum(
     scheduler: &mut InflightBatchedScheduler,
     registration: Option<&super::registry::ModelRegistration>,
     primary: SlotHandle,
+    require_fifo_primary: bool,
     serial_fallback: SlotHandle,
     kv_bytes_per_token: u64,
     max_matrix_prefill_windows: Option<usize>,
     supervisor: &EngineSupervisor,
 ) -> (Option<SlotAwareGpuFatal>, bool) {
-    if max_matrix_prefill_windows.is_some() {
-        return (
-            advance_deepseek4_prefill(
-                model,
-                sessions,
-                slots,
-                scheduler,
-                registration,
-                serial_fallback,
-                kv_bytes_per_token,
-                max_matrix_prefill_windows,
-                supervisor,
-            ),
-            true,
-        );
-    }
-    let candidates = match plan_deepseek4_prefill_cohort(model, sessions, slots, scheduler, primary)
-    {
+    let planned = {
+        let sessions = &*sessions;
+        plan_deepseek4_prefill_cohort(
+            model.model.cfg.sliding_window as usize,
+            |slot| {
+                (
+                    sessions[slot].cache_position(),
+                    sessions[slot].committed_tokens().len(),
+                )
+            },
+            slots,
+            scheduler,
+            primary,
+            max_matrix_prefill_windows,
+            require_fifo_primary,
+        )
+    };
+    let candidates = match planned {
         Ok(Some(candidates)) => candidates,
         Ok(None) => {
             return (
@@ -10092,7 +10344,7 @@ fn advance_deepseek4_prefill_quantum(
                     registration,
                     serial_fallback,
                     kv_bytes_per_token,
-                    None,
+                    max_matrix_prefill_windows,
                     supervisor,
                 ),
                 true,
@@ -10177,7 +10429,7 @@ fn advance_deepseek4_prefill_quantum(
                 registration,
                 serial_fallback,
                 kv_bytes_per_token,
-                None,
+                max_matrix_prefill_windows,
                 supervisor,
             ),
             true,
@@ -10225,7 +10477,6 @@ fn advance_deepseek4_prefill_quantum(
             return (Some(fatal), false);
         }
     };
-    let completed_plan = lanes[0].plan;
     drop(outputs);
 
     for lane in &lanes {
@@ -10262,12 +10513,17 @@ fn advance_deepseek4_prefill_quantum(
     for lane in &lanes {
         scheduler.advance_after_prefill(lane.handle, lane.plan.token_count() as u32);
     }
+    // Members may sit at different cursors and ingest different row counts:
+    // report every lane's own span, never one lane's plan for the cohort.
     tracing::info!(
         lanes = lanes.len(),
-        start = completed_plan.start(),
-        rows_per_lane = completed_plan.token_count(),
-        aggregate_rows = lanes.len().saturating_mul(completed_plan.token_count()),
-        recovery_anchor = completed_plan.captures_anchor(),
+        mixed = max_matrix_prefill_windows.is_some(),
+        spans = ?lanes
+            .iter()
+            .map(|lane| (lane.handle.slot_id.0, lane.plan.start(), lane.plan.token_count()))
+            .collect::<Vec<_>>(),
+        aggregate_rows = lanes.iter().map(|lane| lane.plan.token_count()).sum::<usize>(),
+        recovery_anchors = lanes.iter().filter(|lane| lane.plan.captures_anchor()).count(),
         "DeepSeek-V4 cooperative prefill complete"
     );
 
@@ -11465,6 +11721,18 @@ impl<'a> Gemma4KvGuard<'a> {
             mlx,
         })
     }
+
+    /// #727: the per-slot KV scaffolds the reclaimed-slot spill copies.
+    fn slot_scaffolds(
+        &mut self,
+    ) -> crate::inference::models::gemma4::kv_cache::slot_spill::GemmaSlotScaffolds<'_> {
+        crate::inference::models::gemma4::kv_cache::slot_spill::GemmaSlotScaffolds {
+            hb: &mut self.kv,
+            hybrid: self.hybrid.as_deref_mut(),
+            dense: self.dense.as_deref_mut(),
+            nibble: self.mlx.as_deref_mut(),
+        }
+    }
 }
 
 impl Drop for Gemma4KvGuard<'_> {
@@ -12008,6 +12276,18 @@ fn run_slot_aware_gemma4(
     let mut slots: Vec<Option<Gemma4Slot>> = (0..n_slots).map(|_| None).collect();
     let mut retained_tokens: Vec<Vec<u32>> = (0..n_slots).map(|_| Vec::new()).collect();
     let mut prompt_anchors: Vec<Option<Gemma4PromptAnchor>> = (0..n_slots).map(|_| None).collect();
+    // #727: conversations whose slot is reclaimed by another request are
+    // spilled here and restored on their return (`gemma4_slot_spill`).
+    let mut slot_spills = gemma4_slot_spill::Gemma4SlotSpills::new(
+        guard.model.slot_spill_budget_bytes,
+        n_slots,
+        crate::inference::models::gemma4::kv_cache::slot_spill::GemmaSlotKvRegime::live(),
+    );
+    tracing::info!(
+        budget_bytes = guard.model.slot_spill_budget_bytes,
+        max_entries = n_slots.saturating_mul(slot_spill::SLOT_SPILL_ENTRIES_PER_SLOT),
+        "Gemma4 SlotAware reclaimed-slot spill store configured"
+    );
 
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {
@@ -12050,6 +12330,10 @@ fn run_slot_aware_gemma4(
     // boundary share one bitwise-exact transaction;
     // `HF2Q_GEMMA_JOINT_COLD_PREFILL=0` keeps per-slot admission.
     let joint_cold_prefill = gemma_cold_batch::worker_enabled(cross_slot_admit);
+    // Issue #725: installed long-prompt lanes share a transaction only where
+    // each lane stays bitwise equal to its per-slot prefill.
+    let installed_prefill_cohort =
+        gemma4_installed_prefill_cohort_enabled(cross_slot_admit, |name| std::env::var(name).ok());
 
     // ADR-040 production profiling — zero the buckets at worker entry so the
     // worker-exit dump reflects THIS worker's lifetime, not leftover state.
@@ -12210,6 +12494,7 @@ fn run_slot_aware_gemma4(
                         &reqs,
                         &retained_tokens,
                         &prompt_anchors,
+                        &slot_spills,
                         &slots,
                     )
                 } else {
@@ -12265,6 +12550,7 @@ fn run_slot_aware_gemma4(
                         &mut slots,
                         &mut retained_tokens,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -12409,6 +12695,7 @@ fn run_slot_aware_gemma4(
                                 &mut slots,
                                 &mut retained_tokens,
                                 &mut prompt_anchors,
+                                &mut slot_spills,
                                 registration.as_ref(),
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
@@ -12443,6 +12730,7 @@ fn run_slot_aware_gemma4(
                                 &mut slots,
                                 &mut retained_tokens,
                                 &mut prompt_anchors,
+                                &mut slot_spills,
                                 registration.as_ref(),
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
@@ -12468,6 +12756,7 @@ fn run_slot_aware_gemma4(
                                 &mut slots,
                                 &mut retained_tokens,
                                 &mut prompt_anchors,
+                                &mut slot_spills,
                                 registration.as_ref(),
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
@@ -12541,6 +12830,7 @@ fn run_slot_aware_gemma4(
                                 &mut scheduler,
                                 &mut retained_tokens,
                                 &mut prompt_anchors,
+                                &mut slot_spills,
                                 &scheduler_stats_snapshot,
                                 per_slot_kv_budget_bytes,
                                 kv_bytes_per_token,
@@ -12578,6 +12868,7 @@ fn run_slot_aware_gemma4(
                         &mut slots,
                         &mut retained_tokens,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -12612,6 +12903,7 @@ fn run_slot_aware_gemma4(
                             &mut slots,
                             &mut retained_tokens,
                             &mut prompt_anchors,
+                            &mut slot_spills,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -12648,6 +12940,7 @@ fn run_slot_aware_gemma4(
                         &mut slots,
                         &mut retained_tokens,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -12678,6 +12971,7 @@ fn run_slot_aware_gemma4(
                             &mut slots,
                             &mut retained_tokens,
                             &mut prompt_anchors,
+                            &mut slot_spills,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -12812,6 +13106,7 @@ fn run_slot_aware_gemma4(
                             &mut slots,
                             &mut retained_tokens,
                             &mut prompt_anchors,
+                            &mut slot_spills,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -12859,6 +13154,7 @@ fn run_slot_aware_gemma4(
                             &mut slots,
                             &mut retained_tokens,
                             &mut prompt_anchors,
+                            &mut slot_spills,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -12906,6 +13202,7 @@ fn run_slot_aware_gemma4(
                             &mut slots,
                             &mut retained_tokens,
                             &mut prompt_anchors,
+                            &mut slot_spills,
                             registration.as_ref(),
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
@@ -13001,6 +13298,7 @@ fn run_slot_aware_gemma4(
                             &mut scheduler,
                             &mut retained_tokens,
                             &mut prompt_anchors,
+                            &mut slot_spills,
                             &scheduler_stats_snapshot,
                             per_slot_kv_budget_bytes,
                             kv_bytes_per_token,
@@ -13126,7 +13424,7 @@ fn run_slot_aware_gemma4(
                     n_tokens,
                     kv_bytes_per_token,
                     &supervisor,
-                    cross_slot_admit,
+                    installed_prefill_cohort,
                 ) {
                     fail_stop_gemma4_worker(
                         &supervisor,
@@ -13223,7 +13521,7 @@ fn run_slot_aware_gemma4(
                     n_prefill_tokens,
                     kv_bytes_per_token,
                     &supervisor,
-                    cross_slot_admit,
+                    installed_prefill_cohort,
                 ) {
                     fail_stop_gemma4_worker(
                         &supervisor,
@@ -13316,6 +13614,7 @@ fn run_slot_aware_gemma4(
         }
     }
     crate::serve::gemma_prefill_catsplit::emit_worker_exit();
+    crate::inference::models::gemma4::routing_overlap::emit_worker_exit();
 
     // Guard drops here → KV restored into `model` on every exit path.
     drop(guard);
@@ -13411,6 +13710,7 @@ fn admit_gemma4_slot(
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -13430,6 +13730,7 @@ fn admit_gemma4_slot(
         slots,
         retained_tokens,
         prompt_anchors,
+        slot_spills,
         registration,
         scheduler_stats_snapshot,
         per_slot_kv_budget_bytes,
@@ -13456,6 +13757,7 @@ fn admit_gemma4_slot_routed(
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -13596,7 +13898,41 @@ fn admit_gemma4_slot_routed(
     }
     reply.accept_stream_admission();
 
-    let selected_preference = preferred.filter(|preference| preference.slot == handle.slot_id);
+    // #727: a request granted a slot that holds another conversation's state
+    // spills that state first; a request whose conversation was spilled, or
+    // whose own idle slot was not granted, and matches better than the
+    // granted slot gets that state restored here, then resumes exactly as it
+    // would have in its original slot.
+    let selected_preference = match gemma4_slot_spill::reclaim_gemma4_slot(
+        &mut guard.slot_scaffolds(),
+        slot_spills,
+        graft_len,
+        handle.slot_id,
+        retained_tokens,
+        prompt_anchors,
+        preferred,
+        &prompt_tokens,
+        params.vision_fingerprint,
+    ) {
+        Ok(preference) => preference,
+        Err(error) => {
+            reply = match reset_gemma4_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
+            retained_tokens[handle.slot_id.0 as usize].clear();
+            prompt_anchors[handle.slot_id.0 as usize] = None;
+            scheduler.release(handle);
+            slot_fire_done(reply, Err(error), false);
+            return None;
+        }
+    };
     let cached_tokens = selected_preference
         .map(|preference| preference.cached_tokens)
         .unwrap_or(0);
@@ -14465,7 +14801,7 @@ fn advance_gemma4_prefill_quantum(
     requested_tokens: u32,
     kv_bytes_per_token: u64,
     supervisor: &EngineSupervisor,
-    cross_slot_admit: bool,
+    installed_prefill_cohort: bool,
 ) -> Option<SlotAwareGpuFatal> {
     let primary_index = handle.slot_id.0 as usize;
     let Some((Gemma4SlotWork::Prefill(primary), primary_reply, installed)) =
@@ -14515,7 +14851,7 @@ fn advance_gemma4_prefill_quantum(
         );
     }
     let start_at_zero = primary.progress.cursor() == 0;
-    let batch_supported = cross_slot_admit
+    let batch_supported = installed_prefill_cohort
         && primary.soft_token_data.is_empty()
         && guard.hybrid.is_some()
         && crate::debug::INVESTIGATION_ENV.hybrid_kv
@@ -14547,27 +14883,43 @@ fn advance_gemma4_prefill_quantum(
         );
     }
 
-    let candidate_indices: Vec<usize> = (0..slots.len())
+    let candidates: Vec<(usize, Gemma4PrefillProgress)> = (0..slots.len())
         .map(|offset| (primary_index + offset) % slots.len())
-        .filter(|&slot_index| {
-            matches!(
-                slots[slot_index].as_ref(),
-                Some((Gemma4SlotWork::Prefill(state), reply, _))
-                    if state.joint_warm.is_none()
-                        && (state.progress.cursor() == 0) == start_at_zero
-                        && state.soft_token_data.is_empty()
-                        && crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
-                            state
-                                .prompt_tokens
-                                .len()
-                                .saturating_sub(state.progress.cursor()),
-                            false,
-                        )
-                        && !reply.client_closed()
-            )
+        .filter_map(|slot_index| match slots[slot_index].as_ref() {
+            Some((Gemma4SlotWork::Prefill(state), reply, _))
+                if state.joint_warm.is_none()
+                    && (state.progress.cursor() == 0) == start_at_zero
+                    && state.soft_token_data.is_empty()
+                    && crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
+                        state
+                            .prompt_tokens
+                            .len()
+                            .saturating_sub(state.progress.cursor()),
+                        false,
+                    )
+                    && !reply.client_closed() =>
+            {
+                Some((slot_index, state.progress))
+            }
+            _ => None,
         })
         .collect();
-    if candidate_indices.len() < 2 {
+    // Issue #725: each lane keeps its single-slot chunk plan; a cohort forms
+    // only from the lanes whose own chunks fit one transaction together.
+    let admitted: Vec<(usize, Gemma4PrefillPlan)> = if candidates.len() < 2 {
+        Vec::new()
+    } else {
+        let progresses: Vec<_> = candidates.iter().map(|&(_, progress)| progress).collect();
+        match gemma4_prefill_batch_plans(&progresses, GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize) {
+            Ok(plans) => candidates
+                .iter()
+                .zip(plans)
+                .filter_map(|(&(slot_index, _), plan)| plan.map(|plan| (slot_index, plan)))
+                .collect(),
+            Err(error) => return Some(SlotAwareGpuFatal::invariant(error)),
+        }
+    };
+    if admitted.len() < 2 || admitted[0].0 != primary_index {
         return advance_gemma4_prefill(
             guard,
             scheduler,
@@ -14583,8 +14935,8 @@ fn advance_gemma4_prefill_quantum(
         );
     }
 
-    let mut lanes = Vec::with_capacity(candidate_indices.len());
-    for slot_index in candidate_indices {
+    let mut lanes = Vec::with_capacity(admitted.len());
+    for (slot_index, plan) in admitted {
         let Some((work, reply, installed)) = slots[slot_index].take() else {
             let fatal = gemma4_prefill_batch_fatal(
                 lanes,
@@ -14617,13 +14969,15 @@ fn advance_gemma4_prefill_quantum(
             handle: installed,
             state,
             reply,
-            plan: Gemma4PrefillPlan {
-                start: 0,
-                end: 0,
-                capture_anchor: false,
-                ready: false,
-            },
+            plan,
         });
+        if let Err(error) = validate_gemma4_slot_cursor(guard, installed.slot_id, plan.start) {
+            return Some(gemma4_prefill_batch_fatal(
+                lanes,
+                error,
+                SlotAwareFatalKind::Invariant,
+            ));
+        }
     }
     if lanes.first().is_none_or(|lane| lane.handle != handle) {
         return Some(gemma4_prefill_batch_fatal(
@@ -14631,29 +14985,6 @@ fn advance_gemma4_prefill_quantum(
             anyhow::anyhow!("Gemma4 installed prefill batch lost its scheduled primary handle"),
             SlotAwareFatalKind::Invariant,
         ));
-    }
-
-    let progresses: Vec<_> = lanes.iter().map(|lane| lane.state.progress).collect();
-    let plans =
-        match gemma4_prefill_batch_plans(&progresses, GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize) {
-            Ok(plans) => plans,
-            Err(error) => {
-                return Some(gemma4_prefill_batch_fatal(
-                    lanes,
-                    error,
-                    SlotAwareFatalKind::Invariant,
-                ));
-            }
-        };
-    for (lane, plan) in lanes.iter_mut().zip(plans) {
-        lane.plan = plan;
-        if let Err(error) = validate_gemma4_slot_cursor(guard, lane.handle.slot_id, plan.start) {
-            return Some(gemma4_prefill_batch_fatal(
-                lanes,
-                error,
-                SlotAwareFatalKind::Invariant,
-            ));
-        }
     }
 
     let _native_invocation = crate::serve::phase_trace::enabled().then(|| {
@@ -14724,7 +15055,6 @@ fn advance_gemma4_prefill_quantum(
                 &seqs,
                 scaffold,
                 max_decode_tokens,
-                GemmaLiveAttention::Tiled,
                 &mut guard.model.ctx,
             )
         })
@@ -15042,6 +15372,7 @@ fn admit_gemma4_slots_batched(
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -15051,8 +15382,9 @@ fn admit_gemma4_slots_batched(
 ) -> Option<SlotAwareGpuFatal> {
     // A missing generation cue does not imply a cold conversation. The
     // Gemma tool-response template can render S == P while this request
-    // still extends a retained slot/anchor. Never reset that state in the
-    // cold cohort; the existing single-slot path selects/restores it.
+    // still extends a retained slot/anchor or a spilled conversation (#727).
+    // Never reset that state in the cold cohort; the existing single-slot
+    // path selects/restores it.
     // ADR-063 Q4-GEMMA-COLD D2: graft-bound workers admit cold lanes per slot
     // until a graft bitwise gate exists for the per-sequence cold attention.
     let plan = gemma_cold_batch::plan(
@@ -15064,7 +15396,8 @@ fn admit_gemma4_slots_batched(
                 prompt,
                 params.vision_fingerprint,
             )
-            .map_or(0, |preference| preference.cached_tokens);
+            .map_or(0, |preference| preference.cached_tokens)
+            .max(slot_spills.resume_tokens(prompt, params.vision_fingerprint));
             (prompt.len(), cached)
         }),
         guard.model.weights.kv_graft_len(),
@@ -15087,6 +15420,7 @@ fn admit_gemma4_slots_batched(
                 slots,
                 retained_tokens,
                 prompt_anchors,
+                slot_spills,
                 registration,
                 scheduler_stats_snapshot,
                 per_slot_kv_budget_bytes,
@@ -15225,6 +15559,7 @@ fn admit_gemma4_slots_batched(
                 slots,
                 retained_tokens,
                 prompt_anchors,
+                slot_spills,
                 registration,
                 scheduler_stats_snapshot,
                 per_slot_kv_budget_bytes,
@@ -15259,6 +15594,19 @@ fn admit_gemma4_slots_batched(
             params.max_tokens,
         );
         crate::serve::operator_ui::prefill_planned("gemma4", request_id, 0, prompt_tokens.len());
+    }
+
+    // #727: the conversation each lane's slot held is spilled, not lost.
+    for (handle, _, _, _) in &admitted {
+        let slot_idx = handle.slot_id.0 as usize;
+        gemma4_slot_spill::spill_reclaimed_gemma4_slot(
+            &guard.slot_scaffolds(),
+            slot_spills,
+            graft_len,
+            handle.slot_id,
+            &mut retained_tokens[slot_idx],
+            &mut prompt_anchors[slot_idx],
+        );
     }
 
     // 2. Per-slot entry reset (kv + hybrid) + clear self-mounts (mirror
@@ -15554,12 +15902,13 @@ fn admit_gemma4_slots_batched(
     None
 }
 
-/// Batch exact Gemma agentic continuations without weakening the native
-/// pre-generation boundary contract. Every request keeps its own full logical
-/// slot and exact prompt anchor; only the appended suffix transformer body is
-/// shared. Cold or incompatible requests go through the proven single-request
-/// path instead of receiving guessed cache credit.
-pub(crate) static GEMMA4_STABLE_RESUME_BATCH_COUNT: std::sync::atomic::AtomicUsize =
+/// Admit a group of Gemma requests that carry an exact pre-generation
+/// boundary. A cold group that qualifies runs as the exact joint cold
+/// transaction (ADR-063 Q4-GEMMA-COLD); every other group is admitted per
+/// slot through the single-request resume, so a request's numerics never
+/// depend on which requests shared its admission window (#728).
+#[cfg(test)]
+pub(crate) static GEMMA4_STABLE_GROUP_LANES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 #[allow(clippy::too_many_arguments)]
@@ -15569,6 +15918,7 @@ fn admit_gemma4_slots_stable_batched(
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -15596,13 +15946,24 @@ fn admit_gemma4_slots_stable_batched(
                 .iter()
                 .map(|(prompt, params, _)| (prompt.as_slice(), params)),
             |lane| {
-                preferred_gemma4_slot_for_request(
-                    retained_tokens,
-                    prompt_anchors,
-                    slots,
-                    &requests[lane].0,
-                    None,
-                )
+                let prompt = &requests[lane].0;
+                // #727: a lane whose conversation was spilled is warm; the
+                // per-slot path restores it.
+                [
+                    preferred_gemma4_slot_for_request(
+                        retained_tokens,
+                        prompt_anchors,
+                        slots,
+                        prompt,
+                        None,
+                    ),
+                    slot_spills
+                        .best_match(prompt, None, &[])
+                        .map(|(_, preference)| preference),
+                ]
+                .into_iter()
+                .flatten()
+                .max_by_key(|preference| preference.cached_tokens)
             },
             |lanes| {
                 guard.hybrid.as_deref().is_some_and(|scaffold| {
@@ -15622,6 +15983,7 @@ fn admit_gemma4_slots_stable_batched(
             slots,
             retained_tokens,
             prompt_anchors,
+            slot_spills,
             registration,
             scheduler_stats_snapshot,
             per_slot_kv_budget_bytes,
@@ -15631,682 +15993,37 @@ fn admit_gemma4_slots_stable_batched(
             plan,
         );
     }
-    let fallback_single = |guard: &mut Gemma4KvGuard<'_>,
-                           scheduler: &mut InflightBatchedScheduler,
-                           slots: &mut [Option<Gemma4Slot>],
-                           retained_tokens: &mut [Vec<u32>],
-                           prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
-                           requests: Vec<(Vec<u32>, SamplingParams, SlotReply)>|
-     -> Option<SlotAwareGpuFatal> {
-        let mut requests = requests.into_iter();
-        while let Some((prompt_tokens, params, reply)) = requests.next() {
-            if let Some(mut fatal) = admit_gemma4_slot(
-                guard,
-                scheduler,
-                slots,
-                retained_tokens,
-                prompt_anchors,
-                registration,
-                scheduler_stats_snapshot,
-                per_slot_kv_budget_bytes,
-                kv_bytes_per_token,
-                supervisor,
-                prompt_tokens,
-                Vec::new(),
-                params,
-                reply,
-            ) {
-                fatal.extend_slots(requests.map(|(_, _, reply)| (None, reply)));
-                return Some(fatal);
-            }
-        }
-        None
-    };
-
-    // Full-input tags are never a split-cue batch or an empty cue forward.
-    if requests
-        .iter()
-        .any(|(_, params, _)| gemma_full_input::effective(params).is_some())
-    {
-        return fallback_single(
+    // ADR-063 #728: every other stable-boundary group is admitted per slot,
+    // in FIFO order, through the single-request resume. A shared multi-slot
+    // suffix body would be a different attention route (not bitwise equal to
+    // the per-slot resume), and whether a group forms depends on the
+    // admission coalesce window, so the window may only change throughput.
+    #[cfg(test)]
+    if requests.len() >= 2 {
+        GEMMA4_STABLE_GROUP_LANES.fetch_add(requests.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut requests = requests.into_iter();
+    while let Some((prompt_tokens, params, reply)) = requests.next() {
+        if let Some(mut fatal) = admit_gemma4_slot(
             guard,
             scheduler,
             slots,
             retained_tokens,
             prompt_anchors,
-            requests,
-        );
-    }
-
-    // Both stable phases are multi-sequence Metal transactions. Conservatively
-    // cap the sum of full rendered rows; their actual boundary/cue suffix sums
-    // can only be smaller. This keeps each phase within the same 4,096-row
-    // watchdog boundary as ordinary Gemma prefill.
-    if !gemma4_batch_rows_within_transaction_limit(
-        requests.iter().map(|(prompt, _, _)| prompt.len()),
-    ) {
-        return fallback_single(
-            guard,
-            scheduler,
-            slots,
-            retained_tokens,
-            prompt_anchors,
-            requests,
-        );
-    }
-
-    let max_seq_len = guard
-        .model
-        .context_length
-        .unwrap_or(guard.model.config.max_position_embeddings as usize);
-    // ADR-059 (3c): the bound graft's rows count against every planned
-    // request's per-slot capacity.
-    let graft_len = guard.model.weights.kv_graft_len();
-
-    // Plan against both installed and newly reserved slots. Without the
-    // second bitmap, two similar conversations could select the same longest
-    // anchor before the scheduler reservation becomes visible in `slots`.
-    let mut selected = vec![false; slots.len()];
-    let mut plan = Vec::with_capacity(requests.len());
-    for (prompt_tokens, params, reply) in &requests {
-        if reply.client_closed() {
-            break;
-        }
-        let Ok(shape) = validate_gemma4_generation_request(
-            prompt_tokens.len(),
-            params.max_tokens,
-            max_seq_len,
-            graft_len,
-        ) else {
-            break;
-        };
-        let Some(boundary) = params.stable_prompt_prefix_tokens else {
-            break;
-        };
-        let preference = preferred_gemma4_slot_excluding(
-            retained_tokens,
-            prompt_anchors,
-            slots,
-            prompt_tokens,
-            &selected,
-        );
-        let Some(preference) = preference.filter(|p| {
-            p.cached_tokens > 0
-                && p.cached_tokens <= boundary
-                && boundary > 0
-                && boundary < prompt_tokens.len()
-        }) else {
-            break;
-        };
-        selected[preference.slot.0 as usize] = true;
-        plan.push((preference, boundary, shape));
-    }
-
-    // Planning is deliberately side-effect free. If any lane cannot join the
-    // stable batch, execute the entire contiguous group through the proven
-    // single-request path in original FIFO order. A later cold/incompatible
-    // lane must never run before an earlier cached lane has reserved its slot.
-    let has_tiny_phase =
-        requests
-            .iter()
-            .zip(plan.iter())
-            .any(|((prompt, _, _), (preference, boundary, _))| {
-                let boundary_work = boundary.saturating_sub(preference.cached_tokens);
-                let cue_work = prompt.len().saturating_sub(*boundary);
-                (boundary_work > 0
-                    && !crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
-                        boundary_work,
-                        false,
-                    ))
-                    || !crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
-                        cue_work, false,
-                    )
-            });
-    if plan.len() != requests.len() || plan.len() < 2 || has_tiny_phase {
-        return fallback_single(
-            guard,
-            scheduler,
-            slots,
-            retained_tokens,
-            prompt_anchors,
-            requests,
-        );
-    }
-
-    let planned = requests.into_iter().zip(plan).map(
-        |((prompt, params, reply), (preference, boundary, shape))| {
-            (prompt, params, reply, preference, boundary, shape)
-        },
-    );
-
-    let mut admitted = Vec::with_capacity(selected.iter().filter(|value| **value).count());
-    for (prompt_tokens, params, reply, preference, boundary, shape) in planned {
-        let needed_bytes = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
-            0
-        } else {
-            // ADR-059 (3c): the graft rows count against the per-request
-            // KV-byte estimate (the cached slots carry them resident).
-            u64::from(shape.prompt_tokens)
-                .saturating_add(u64::try_from(graft_len).unwrap_or(u64::MAX))
-                .saturating_add(u64::from(shape.max_tokens))
-                .saturating_mul(kv_bytes_per_token)
-        };
-        let admit = scheduler.admit(AdmitRequest {
-            prompt_tokens: shape.prompt_tokens,
-            max_tokens: shape.max_tokens,
-            kv_bytes_needed: needed_bytes,
-            prompt_kv_bytes: if needed_bytes == 0 {
-                0
-            } else {
-                (prompt_tokens.len() as u64).saturating_mul(kv_bytes_per_token)
-            },
-            preferred_slot: Some(preference.slot),
-        });
-        match admit {
-            Ok(a) if a.handle.is_some_and(|h| h.slot_id == preference.slot) => {
-                admitted.push((
-                    a.handle.expect("checked Some"),
-                    prompt_tokens,
-                    params,
-                    reply,
-                    preference,
-                    boundary,
-                ));
-            }
-            Ok(a) => {
-                if let Some(handle) = a.handle {
-                    // Admission selected a different arena, but no prefill or
-                    // cache mutation occurred. Commit the measured zero
-                    // growth before release so the scheduler does not retain
-                    // the request's worst-case prompt reservation as phantom
-                    // physical residency.
-                    scheduler.record_slot_high_water(handle, 0);
-                    scheduler.release(handle);
-                }
-                slot_fire_done(
-                    reply,
-                    Err(anyhow::anyhow!(
-                        "Gemma stable resume could not reserve exact cache slot {}",
-                        preference.slot.0
-                    )),
-                    false,
-                );
-            }
-            Err(AdmitError::SlotBudgetExceeded {
-                needed_bytes,
-                budget_bytes,
-            }) => slot_fire_done(
-                reply,
-                Err(anyhow::anyhow!(
-                    "slot_budget_exceeded: shared physical KV budget exceeded \
-                     (needed_bytes={needed_bytes}, budget_bytes={budget_bytes}); \
-                     logical context was not divided by slot count"
-                )),
-                false,
-            ),
-            // Guarantees tune-up item 4 (2026-08-20): never-fits →
-            // non-retryable 400 mapping upstream.
-            Err(AdmitError::KvBudgetUnsatisfiable {
-                needed_bytes,
-                budget_bytes,
-            }) => slot_fire_done(
-                reply,
-                Err(anyhow::anyhow!(
-                    "kv_budget_unsatisfiable: request can never fit the shared \
-                     physical KV budget (needed_bytes={needed_bytes}, \
-                     budget_bytes={budget_bytes}); non-retryable — reduce \
-                     max_tokens or shorten the prompt"
-                )),
-                false,
-            ),
-            Err(e) => slot_fire_done(
-                reply,
-                Err(anyhow::anyhow!("Gemma stable resume admit failed: {e}")),
-                false,
-            ),
-        }
-    }
-
-    // Admission and preference planning may take long enough for an SSE
-    // receiver to disappear. Filter again before anchor restore/cache writes.
-    let mut live_admitted = Vec::with_capacity(admitted.len());
-    for (handle, prompt, params, reply, preference, boundary) in admitted {
-        if reply.client_closed() {
-            reply.record_client_cancellation();
-            scheduler.record_slot_high_water(handle, 0);
-            scheduler.release(handle);
-            slot_fire_done(
-                reply,
-                Err(anyhow::anyhow!(
-                    "client disconnected before Gemma4 stable prefill"
-                )),
-                true,
-            );
-        } else {
-            live_admitted.push((handle, prompt, params, reply, preference, boundary));
-        }
-    }
-    let mut admitted = live_admitted;
-
-    if admitted.len() < 2 {
-        for (handle, prompt, params, reply, _, _) in admitted {
-            // The stable batch did not execute, so this arena is unchanged.
-            // Preserve only its prior measured high-water before retrying the
-            // request through the single-request path.
-            scheduler.record_slot_high_water(handle, 0);
-            scheduler.release(handle);
-            if let Some(fatal) = fallback_single(
-                guard,
-                scheduler,
-                slots,
-                retained_tokens,
-                prompt_anchors,
-                vec![(prompt, params, reply)],
-            ) {
-                return Some(fatal);
-            }
-        }
-        return None;
-    }
-
-    for (_, _, _, reply, _, _) in &mut admitted {
-        reply.accept_stream_admission();
-    }
-    for (handle, prompt, params, reply, preference, _) in &admitted {
-        let request_id = gemma4_operator_request_id(*handle);
-        crate::serve::operator_ui::request_started(
-            "gemma4",
-            request_id,
-            Some(handle.slot_id.0),
-            if matches!(reply, SlotReply::Stream { .. }) {
-                "slot-stream-cached"
-            } else {
-                "slot-unary-cached"
-            },
-            prompt.len(),
-            params.max_tokens,
-        );
-        crate::serve::operator_ui::prefill_planned(
-            "gemma4",
-            request_id,
-            preference.cached_tokens,
-            prompt.len().saturating_sub(preference.cached_tokens),
-        );
-    }
-
-    // Restore every exact anchor before mutating any suffix. A failed restore
-    // aborts the complete batch so no peer is left with partially advanced KV.
-    let restore_result = (|| -> Result<()> {
-        let hybrid = guard
-            .hybrid
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("Gemma stable batched resume requires hybrid KV"))?;
-        for (handle, prompt, _, _, preference, _) in &admitted {
-            if preference.restore_prompt_anchor {
-                let anchor = prompt_anchors[handle.slot_id.0 as usize]
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Gemma prompt anchor disappeared"))?;
-                crate::inference::models::gemma4::kv_cache::restore_gemma_hybrid_slot_anchor(
-                    hybrid,
-                    handle.slot_id,
-                    &anchor.kv,
-                    // ADR-059 (3c): the restore boundary is the PHYSICAL
-                    // cursor — graft rows + prompt rows.
-                    guard.model.weights.kv_graft_len() + preference.cached_tokens,
-                )?;
-            }
-            anyhow::ensure!(
-                preference.cached_tokens < prompt.len(),
-                "Gemma stable cached prefix must leave a suffix"
-            );
-        }
-        Ok(())
-    })();
-    if let Err(e) = restore_result {
-        return fail_gemma4_stable_batch(
-            guard,
-            scheduler,
-            retained_tokens,
-            prompt_anchors,
-            admitted,
-            kv_bytes_per_token,
-            e,
-        );
-    }
-    for (handle, _, _, _, preference, _) in &admitted {
-        let cursor_result = if preference.restore_prompt_anchor {
-            install_gemma4_slot_cursor(guard, handle.slot_id, preference.cached_tokens)
-        } else {
-            validate_gemma4_slot_cursor(guard, handle.slot_id, preference.cached_tokens)
-        };
-        if let Err(error) = cursor_result {
-            return fail_gemma4_stable_batch(
-                guard,
-                scheduler,
-                retained_tokens,
-                prompt_anchors,
-                admitted,
-                kv_bytes_per_token,
-                error,
-            );
-        }
-    }
-
-    clear_gemma4_self_mounts(guard.model);
-    let prefill_started = Instant::now();
-    // Each pass reserves only what its binding lane needs at its own end.
-    let boundary_max_decode = gemma4_batch_decode_reserve(
-        admitted
-            .iter()
-            .filter(|(_, _, _, _, preference, boundary)| preference.cached_tokens < *boundary)
-            .map(|(_, _, params, _, _, boundary)| (*boundary, params.max_tokens)),
-    );
-    let cue_max_decode = gemma4_batch_decode_reserve(
-        admitted
-            .iter()
-            .map(|(_, prompt, params, _, _, _)| (prompt.len(), params.max_tokens)),
-    );
-
-    // Phase one advances only requests that have an appended conversation
-    // suffix before their exact native generation cue.
-    let boundary_suffix_tokens: usize = admitted
-        .iter()
-        .map(|(_, _, _, _, preference, boundary)| boundary.saturating_sub(preference.cached_tokens))
-        .sum();
-    let boundary_seqs: Vec<(Vec<u32>, SlotId, usize)> = admitted
-        .iter()
-        .filter_map(|(handle, prompt, _, _, preference, boundary)| {
-            (preference.cached_tokens < *boundary).then(|| {
-                (
-                    prompt[preference.cached_tokens..*boundary].to_vec(),
-                    handle.slot_id,
-                    preference.cached_tokens,
-                )
-            })
-        })
-        .collect();
-    let forward_result = (|| -> Result<MultiSeqPrefillOutput> {
-        let scaffold = guard
-            .hybrid
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Gemma stable batched resume lost hybrid KV"))?;
-        if !boundary_seqs.is_empty() {
-            let _ =
-                supervised_gemma4_gpu_call(supervisor, "gemma4_stable_prefill_boundary", || {
-                    guard.model.weights.forward_prefill_batched_multi_seq_live(
-                        &boundary_seqs,
-                        scaffold,
-                        boundary_max_decode,
-                        GemmaLiveAttention::Tiled,
-                        &mut guard.model.ctx,
-                    )
-                })?;
-            clear_gemma4_self_mounts(guard.model);
-        }
-
-        for (handle, prompt, _, _, _, boundary) in &admitted {
-            let anchor = gemma_full_input::capture_or_skip(
-                handle.slot_id,
-                gemma_full_input::AnchorRole::StableBatchBoundary,
-                crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
-                    scaffold,
-                    handle.slot_id,
-                    // ADR-059 (3c): the anchor boundary is the PHYSICAL
-                    // cursor — graft rows + prompt rows.
-                    graft_len + *boundary,
-                ),
-            )?;
-            // A quota refusal keeps the slot's previous (restored) anchor.
-            if let Some(anchor) = anchor {
-                prompt_anchors[handle.slot_id.0 as usize] = Some(Gemma4PromptAnchor {
-                    prompt_tokens: prompt[..*boundary].to_vec(),
-                    kv: anchor,
-                    vision_fingerprint: None,
-                });
-            }
-        }
-
-        let cue_seqs: Vec<(Vec<u32>, SlotId, usize)> = admitted
-            .iter()
-            .map(|(handle, prompt, _, _, _, boundary)| {
-                (prompt[*boundary..].to_vec(), handle.slot_id, *boundary)
-            })
-            .collect();
-        supervised_gemma4_gpu_call(supervisor, "gemma4_stable_prefill_cue", || {
-            guard.model.weights.forward_prefill_batched_multi_seq_live(
-                &cue_seqs,
-                scaffold,
-                cue_max_decode,
-                GemmaLiveAttention::Tiled,
-                &mut guard.model.ctx,
-            )
-        })
-    })();
-
-    let output = match forward_result {
-        Ok(output) => {
-            clear_gemma4_self_mounts(guard.model);
-            output
-        }
-        Err(e) => {
-            if is_worker_fatal(supervisor, &e) {
-                let mut fatal = SlotAwareGpuFatal {
-                    error: e,
-                    kind: SlotAwareFatalKind::Gpu,
-                    owned: Vec::with_capacity(admitted.len()),
-                };
-                fatal.extend_slots(
-                    admitted
-                        .into_iter()
-                        .map(|(handle, _, _, reply, _, _)| (Some(handle), reply)),
-                );
-                return Some(fatal);
-            }
-            clear_gemma4_self_mounts(guard.model);
-            return fail_gemma4_stable_batch(
-                guard,
-                scheduler,
-                retained_tokens,
-                prompt_anchors,
-                admitted,
-                kv_bytes_per_token,
-                e,
-            );
-        }
-    };
-    let prefill_duration = prefill_started.elapsed();
-    GEMMA4_STABLE_RESUME_BATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    tracing::info!(
-        requests = admitted.len(),
-        suffix_tokens = boundary_suffix_tokens,
-        elapsed_ms = prefill_duration.as_secs_f64() * 1000.0,
-        "Gemma4 stable agent suffixes prefilled in one multi-slot body"
-    );
-
-    let cursor_commits: Vec<(SlotId, usize, usize)> = admitted
-        .iter()
-        .map(|(handle, prompt, _, _, preference, _)| {
-            (handle.slot_id, preference.cached_tokens, prompt.len())
-        })
-        .collect();
-    if let Err(error) = commit_gemma4_slot_cursors(guard, &cursor_commits) {
-        let mut fatal = SlotAwareGpuFatal {
-            error,
-            kind: SlotAwareFatalKind::Invariant,
-            owned: Vec::with_capacity(admitted.len()),
-        };
-        fatal.extend_slots(
-            admitted
-                .into_iter()
-                .map(|(handle, _, _, reply, _, _)| (Some(handle), reply)),
-        );
-        return Some(fatal);
-    }
-
-    let mut installs = admitted.into_iter().zip(
-        output
-            .first_tokens
-            .into_iter()
-            .zip(output.logits.into_iter()),
-    );
-    while let Some((
-        (handle, prompt, params, mut reply, preference, _),
-        (first_token, first_logits),
-    )) = installs.next()
-    {
-        let state = match Gemma4DecodeState::from_first_token(
-            guard.model,
-            &prompt,
-            &params,
+            slot_spills,
             registration,
-            handle.slot_id,
-            first_token,
-            Some(&first_logits),
-            prefill_duration,
-            preference.cached_tokens,
-        ) {
-            Ok(state) => state,
-            Err(e) => {
-                reply = match reset_gemma4_slot_for_reply(
-                    guard,
-                    scheduler,
-                    handle,
-                    kv_bytes_per_token,
-                    reply,
-                ) {
-                    Ok(reply) => reply,
-                    Err(mut fatal) => {
-                        fatal.extend_slots(installs.map(
-                            |((remaining_handle, _, _, remaining_reply, _, _), _)| {
-                                (Some(remaining_handle), remaining_reply)
-                            },
-                        ));
-                        return Some(fatal);
-                    }
-                };
-                retained_tokens[handle.slot_id.0 as usize].clear();
-                prompt_anchors[handle.slot_id.0 as usize] = None;
-                scheduler.release(handle);
-                slot_fire_done(reply, Err(e), false);
-                continue;
-            }
-        };
-        let (completed, work, rate) = state.operator_prefill_progress();
-        crate::serve::operator_ui::prefill_progress(
-            "gemma4",
-            gemma4_operator_request_id(handle),
-            completed,
-            work,
-            rate,
-        );
-        let (generated, max_tokens, decode_rate) = state.operator_progress();
-        crate::serve::operator_ui::decode_progress(
-            "gemma4",
-            gemma4_operator_request_id(handle),
-            generated,
-            max_tokens,
-            decode_rate,
-        );
-        scheduler.advance_after_prefill(
-            handle,
-            u32::try_from(prompt.len()).expect("Gemma stable batch request was validated"),
-        );
-        if slot_emit_token(&mut reply, &state.seed_tick()) {
-            let slot_idx = handle.slot_id.0 as usize;
-            reply = match recover_gemma4_slot_after_cancellation_for_reply(
-                guard,
-                scheduler,
-                handle,
-                kv_bytes_per_token,
-                &mut retained_tokens[slot_idx],
-                &mut prompt_anchors[slot_idx],
-                None,
-                false,
-                reply,
-            ) {
-                Ok(reply) => reply,
-                Err(mut fatal) => {
-                    fatal.extend_slots(installs.map(
-                        |((remaining_handle, _, _, remaining_reply, _, _), _)| {
-                            (Some(remaining_handle), remaining_reply)
-                        },
-                    ));
-                    return Some(fatal);
-                }
-            };
-            scheduler.release(handle);
-            finish_gemma4_operator_request(handle, "cancelled");
-            slot_fire_done(reply, state.finish(registration), true);
-        } else if state.finished_at_seed() {
-            retained_tokens[handle.slot_id.0 as usize] = state.retained_prefix();
-            record_retained_slot_kv(
-                scheduler,
-                handle,
-                retained_tokens[handle.slot_id.0 as usize].len(),
-                kv_bytes_per_token,
-            );
-            scheduler.advance_after_decode(handle);
-            scheduler.release(handle);
-            finish_gemma4_operator_request(handle, "complete");
-            slot_fire_done(reply, state.finish(registration), false);
-        } else {
-            slots[handle.slot_id.0 as usize] = Some((Gemma4SlotWork::Decode(state), reply, handle));
-        }
-    }
-    if let Ok(mut stats) = scheduler_stats_snapshot.lock() {
-        *stats = scheduler.stats();
-    }
-    None
-}
-
-fn fail_gemma4_stable_batch(
-    guard: &mut Gemma4KvGuard<'_>,
-    scheduler: &mut InflightBatchedScheduler,
-    retained_tokens: &mut [Vec<u32>],
-    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
-    admitted: Vec<(
-        SlotHandle,
-        Vec<u32>,
-        SamplingParams,
-        SlotReply,
-        Gemma4SlotPreference,
-        usize,
-    )>,
-    kv_bytes_per_token: u64,
-    error: anyhow::Error,
-) -> Option<SlotAwareGpuFatal> {
-    let message = format!("Gemma stable multi-slot prefill failed: {error:#}");
-    let reset_failure = admitted.iter().find_map(|(handle, _, _, _, _, _)| {
-        let slot_idx = handle.slot_id.0 as usize;
-        recover_gemma4_slot_after_cancellation(
-            guard,
-            scheduler,
-            *handle,
+            scheduler_stats_snapshot,
+            per_slot_kv_budget_bytes,
             kv_bytes_per_token,
-            &mut retained_tokens[slot_idx],
-            &mut prompt_anchors[slot_idx],
-            None,
-            false,
-        )
-        .err()
-        .map(|reset_error| (*handle, reset_error))
-    });
-    if let Some((_failed_handle, reset_error)) = reset_failure {
-        let mut fatal = SlotAwareGpuFatal {
-            error: reset_error,
-            kind: SlotAwareFatalKind::Invariant,
-            owned: Vec::with_capacity(admitted.len()),
-        };
-        fatal.extend_slots(
-            admitted
-                .into_iter()
-                .map(|(handle, _, _, reply, _, _)| (Some(handle), reply)),
-        );
-        return Some(fatal);
-    }
-    for (handle, _, _, reply, _, _) in admitted {
-        scheduler.release(handle);
-        slot_fire_done(reply, Err(anyhow::anyhow!(message.clone())), false);
+            supervisor,
+            prompt_tokens,
+            Vec::new(),
+            params,
+            reply,
+        ) {
+            fatal.extend_slots(requests.map(|(_, _, reply)| (None, reply)));
+            return Some(fatal);
+        }
     }
     None
 }
@@ -16322,6 +16039,7 @@ fn embed_gemma4_inline(
     scheduler: &mut InflightBatchedScheduler,
     retained_tokens: &mut [Vec<u32>],
     prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    slot_spills: &mut gemma4_slot_spill::Gemma4SlotSpills,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
@@ -16384,6 +16102,16 @@ fn embed_gemma4_inline(
     // Embedding owns and resets the chosen physical sequence. Retained
     // generation metadata must be invalidated before that first mutation.
     let slot_idx = handle.slot_id.0 as usize;
+    // #727: the conversation that held this slot is spilled, not lost.
+    let graft_len = guard.model.weights.kv_graft_len();
+    gemma4_slot_spill::spill_reclaimed_gemma4_slot(
+        &guard.slot_scaffolds(),
+        slot_spills,
+        graft_len,
+        handle.slot_id,
+        &mut retained_tokens[slot_idx],
+        &mut prompt_anchors[slot_idx],
+    );
     retained_tokens[slot_idx].clear();
     prompt_anchors[slot_idx] = None;
     clear_gemma4_self_mounts(guard.model);
@@ -18224,6 +17952,7 @@ fn validate_qwen35_generation_request(
     })
 }
 
+#[derive(Clone)]
 struct Qwen35PromptAnchor {
     prompt_tokens: Vec<u32>,
     kv: crate::inference::models::qwen35::kv_cache::HybridKvSlotAnchor,
@@ -18232,7 +17961,7 @@ struct Qwen35PromptAnchor {
     spec: Option<super::engine_qwen35::Qwen35SpecPrefixBoundary>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Qwen35RetainedPrefix {
     tokens: Vec<u32>,
     spec: Option<super::engine_qwen35::Qwen35SpecPrefixBoundary>,
@@ -18980,23 +18709,18 @@ fn preferred_gemma4_slot_for_request_excluding(
             .zip(active_slots)
             .enumerate()
             .map(|(index, ((retained, anchor), active))| {
-                let identity_matches = anchor
-                    .as_ref()
-                    .is_some_and(|anchor| anchor.vision_fingerprint == vision_fingerprint);
+                let (retained, anchor) = gemma4_slot_spill::gemma4_resume_candidate(
+                    retained,
+                    anchor.as_ref(),
+                    vision_fingerprint,
+                );
                 let active_matches = active
                     .as_ref()
                     .is_some_and(|(work, _, _)| work.vision_fingerprint() == vision_fingerprint);
                 (
                     index,
-                    if identity_matches {
-                        retained.as_slice()
-                    } else {
-                        &[]
-                    },
-                    anchor
-                        .as_ref()
-                        .filter(|_| identity_matches)
-                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    retained,
+                    anchor,
                     active
                         .as_ref()
                         .filter(|_| active_matches)
@@ -19063,23 +18787,18 @@ fn active_gemma4_slot_affinity(
             .zip(slots)
             .enumerate()
             .map(|(index, ((retained, anchor), active))| {
-                let anchor_matches = anchor
-                    .as_ref()
-                    .is_some_and(|anchor| anchor.vision_fingerprint == vision_fingerprint);
+                let (retained, anchor) = gemma4_slot_spill::gemma4_resume_candidate(
+                    retained,
+                    anchor.as_ref(),
+                    vision_fingerprint,
+                );
                 let active_matches = active
                     .as_ref()
                     .is_some_and(|(work, _, _)| work.vision_fingerprint() == vision_fingerprint);
                 (
                     index,
-                    if anchor_matches {
-                        retained.as_slice()
-                    } else {
-                        &[]
-                    },
-                    anchor
-                        .as_ref()
-                        .filter(|_| anchor_matches)
-                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    retained,
+                    anchor,
                     active
                         .as_ref()
                         .filter(|_| active_matches)
@@ -19232,10 +18951,23 @@ fn run_slot_aware_qwen35(
         .collect();
     let mut prompt_caches: Vec<PromptCache> = (0..n_slots).map(|_| PromptCache::new()).collect();
     let mut prompt_anchors: Vec<Option<Qwen35PromptAnchor>> = (0..n_slots).map(|_| None).collect();
-    let qwen_joint_decode = qwen35_joint_decode::qwen35_joint_decode_config(&guard.model.model);
+    // #727: conversations whose slot is reclaimed by another request are
+    // spilled here and restored on their return (`qwen35_slot_spill`).
+    let mut slot_spills = qwen35_slot_spill::Qwen35SlotSpillStore::new(
+        guard.model.slot_spill_budget_bytes,
+        n_slots.saturating_mul(slot_spill::SLOT_SPILL_ENTRIES_PER_SLOT),
+    );
+    tracing::info!(
+        budget_bytes = guard.model.slot_spill_budget_bytes,
+        max_entries = n_slots.saturating_mul(slot_spill::SLOT_SPILL_ENTRIES_PER_SLOT),
+        "Qwen35 SlotAware reclaimed-slot spill store configured"
+    );
+    let qwen_joint_decode =
+        qwen35_joint_decode::qwen35_joint_decode_config(&guard.model.model, n_slots);
     // ADR-063 D1: resolve the unset speculation default for this worker's
-    // width, family and joint-decode selection; every admission, prefill
-    // catch-up and history-lookup check reads the resolved policy.
+    // width and joint-decode selection (`moe` is only logged); every
+    // admission, prefill catch-up and history-lookup check reads the
+    // resolved policy.
     let moe = guard.model.model.cfg.moe.is_some();
     guard
         .model
@@ -19353,6 +19085,7 @@ fn run_slot_aware_qwen35(
                         &mut retained_tokens,
                         &mut prompt_caches,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -19410,6 +19143,7 @@ fn run_slot_aware_qwen35(
                         &mut retained_tokens,
                         &mut prompt_caches,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -19496,6 +19230,7 @@ fn run_slot_aware_qwen35(
                         &mut scheduler,
                         &mut retained_tokens,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
@@ -19536,6 +19271,7 @@ fn run_slot_aware_qwen35(
                         &mut retained_tokens,
                         &mut prompt_caches,
                         &mut prompt_anchors,
+                        &mut slot_spills,
                         registration.as_ref(),
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
@@ -19789,6 +19525,7 @@ fn admit_qwen35_slot(
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
     prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    slot_spills: &mut qwen35_slot_spill::Qwen35SlotSpillStore,
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -19863,31 +19600,19 @@ fn admit_qwen35_slot(
             .zip(slots.iter())
             .enumerate()
             .map(|(index, ((retained, anchor), active))| {
-                let exact_anchor_matches = anchor
-                    .as_ref()
-                    .is_some_and(|anchor| anchor.vision_fingerprint == request_vision_fingerprint);
-                let anchor_matches = anchor.as_ref().is_some_and(|anchor| {
-                    qwen35_anchor_vision_compatible(
-                        anchor.vision_fingerprint,
-                        anchor.prompt_tokens.len(),
-                        request_vision_fingerprint,
-                        text_anchor_reuse_limit,
-                    )
-                });
+                let (retained, anchor) = qwen35_slot_spill::qwen35_resume_candidate(
+                    retained,
+                    anchor.as_ref(),
+                    request_vision_fingerprint,
+                    text_anchor_reuse_limit,
+                );
                 let active_matches = active.as_ref().is_some_and(|(work, _, _)| {
                     work.vision_fingerprint() == request_vision_fingerprint
                 });
                 (
                     index,
-                    if exact_anchor_matches {
-                        retained.as_slice()
-                    } else {
-                        &[]
-                    },
-                    anchor
-                        .as_ref()
-                        .filter(|_| anchor_matches)
-                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    retained,
+                    anchor,
                     active
                         .as_ref()
                         .filter(|_| active_matches)
@@ -19991,7 +19716,41 @@ fn admit_qwen35_slot(
         params.max_tokens,
     );
 
-    let selected_preference = preferred.filter(|preference| preference.slot == handle.slot_id);
+    // #727: a request granted a slot that holds another conversation's state
+    // spills that state first; a request whose own conversation was spilled
+    // earlier and matches better than the granted slot gets it restored here
+    // and then resumes exactly as it would have in its original slot.
+    let selected_preference = match qwen35_slot_spill::reclaim_qwen35_slot(
+        guard.kv.as_mut().expect("kv Some during Qwen35 admission"),
+        slot_spills,
+        handle.slot_id,
+        &mut retained_tokens[handle.slot_id.0 as usize],
+        &mut prompt_anchors[handle.slot_id.0 as usize],
+        preferred.filter(|preference| preference.slot == handle.slot_id),
+        &prompt_tokens,
+        request_vision_fingerprint,
+        text_anchor_reuse_limit,
+    ) {
+        Ok(preference) => preference,
+        Err(error) => {
+            reply = match reset_qwen35_slot_for_reply(
+                guard,
+                scheduler,
+                handle,
+                kv_bytes_per_token,
+                reply,
+            ) {
+                Ok(reply) => reply,
+                Err(fatal) => return Some(fatal),
+            };
+            retained_tokens[handle.slot_id.0 as usize].clear_all();
+            prompt_anchors[handle.slot_id.0 as usize] = None;
+            scheduler.release(handle);
+            finish_qwen35_operator_request(handle, "failed");
+            slot_fire_done(reply, Err(error), false);
+            return None;
+        }
+    };
     let anchor_hit = selected_preference.is_some_and(|preference| preference.restore_prompt_anchor);
     let cached_tokens = selected_preference
         .map(|preference| preference.cached_tokens)
@@ -20752,11 +20511,13 @@ fn finish_qwen35_prefill(
 /// inline in admit (no decode loop), mirroring the legacy inflight arm
 /// (embed_qwen35_slot_aware, engine_qwen35.rs:5288). Keeps the served-today
 /// capability rather than 501-ing it.
+#[allow(clippy::too_many_arguments)]
 fn embed_qwen35_inline(
     guard: &mut Qwen35KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    slot_spills: &mut qwen35_slot_spill::Qwen35SlotSpillStore,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
@@ -20800,6 +20561,14 @@ fn embed_qwen35_inline(
     // the serving ledger before the first GPU mutation so a later generation
     // can never advertise an anchor whose underlying cursor was reset.
     let slot_idx = handle.slot_id.0 as usize;
+    // #727: the conversation that held this slot is spilled, not lost.
+    qwen35_slot_spill::spill_reclaimed_qwen35_slot(
+        guard.kv.as_ref().expect("kv Some during loop"),
+        slot_spills,
+        handle.slot_id,
+        &mut retained_tokens[slot_idx],
+        &mut prompt_anchors[slot_idx],
+    );
     retained_tokens[slot_idx].clear_all();
     prompt_anchors[slot_idx] = None;
     let result = supervised_gpu_call(supervisor, "qwen35_slot_embed", || {
@@ -20877,6 +20646,7 @@ fn decode_batch_qwen35(
         },
         None => None,
     };
+    let turn_lanes = handles.len();
     let handles = serial_handles.as_deref().unwrap_or(handles);
     for &handle in handles {
         let slot_idx = handle.slot_id.0 as usize;
@@ -20948,6 +20718,22 @@ fn decode_batch_qwen35(
             continue;
         }
 
+        // The tick's single route decision (planned before the joint partition
+        // under the repeatable route, here otherwise), witnessed for the
+        // repeatability gates.
+        let kind = match state.plan_tick() {
+            Ok(Some(kind)) => kind.label(),
+            Ok(None) => "bound",
+            Err(_) => "unplanned",
+        };
+        tracing::debug!(
+            target: "hf2q::serve::api::engine_qwen35::progress",
+            slot = handle.slot_id.0,
+            kind,
+            path = "serial",
+            turn_lanes,
+            "Qwen decode tick route"
+        );
         let _native_invocation =
             scheduler.trace_transaction("qwen35", "ordinary_or_temporal_mtp_decode", &[handle]);
         let tick = state.decode_tick(
@@ -24718,6 +24504,7 @@ fn generate_once_with_soft_tokens(
         None => crate::serve::forward_prefill_batched::serve_batched_route_viable(
             prompt_tokens.len(),
             loaded.weights.num_attention_heads,
+            loaded.batched_route_scratch_budget_bytes,
         ),
     };
 
@@ -25202,16 +24989,18 @@ fn generate_once_with_soft_tokens(
     // Tri-state (2026-08-03 auto-fallback): explicit =1 FORCES the
     // batched route (operator override); explicit =0/=false/=off forces
     // the linear route; UNSET = auto — engage batched only when this
-    // request's O(n²) mask overhead fits the available-memory budget.
+    // request's O(n²) mask overhead fits the load-time batched route budget
+    // (#738: fixed at load, never free memory at request time).
     // A 92K-token opencode first turn allocated ~120 GB transient on
     // 2026-08-03 and died in Metal with a command-buffer error — no
     // user should need to know BATCHED=0 exists.
     if serve_batched_env.is_none() && !batched_allowed && resume_lcp.is_none() {
         eprintln!(
             "[hf2q batched prefill] auto-fallback to linear route: \
-             seq_len={} O(n²) mask overhead exceeds the available- \
-             memory budget (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
-            prompt_tokens.len()
+             seq_len={} O(n²) mask overhead exceeds the load-time batched \
+             route budget of {} bytes (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
+            prompt_tokens.len(),
+            loaded.batched_route_scratch_budget_bytes
         );
     }
     let live_batched_resume = live_resume.filter(|&k| {
@@ -29967,6 +29756,7 @@ fn generate_stream_once(
         None => crate::serve::forward_prefill_batched::serve_batched_route_viable(
             prompt_tokens.len(),
             loaded.weights.num_attention_heads,
+            loaded.batched_route_scratch_budget_bytes,
         ),
     };
 
@@ -30558,16 +30348,18 @@ fn generate_stream_once(
     // Tri-state (2026-08-03 auto-fallback): explicit =1 FORCES the
     // batched route (operator override); explicit =0/=false/=off forces
     // the linear route; UNSET = auto — engage batched only when this
-    // request's O(n²) mask overhead fits the available-memory budget.
+    // request's O(n²) mask overhead fits the load-time batched route budget
+    // (#738: fixed at load, never free memory at request time).
     // A 92K-token opencode first turn allocated ~120 GB transient on
     // 2026-08-03 and died in Metal with a command-buffer error — no
     // user should need to know BATCHED=0 exists.
     if serve_batched_env.is_none() && !batched_allowed && resume_lcp.is_none() {
         eprintln!(
             "[hf2q batched prefill] auto-fallback to linear route: \
-             seq_len={} O(n²) mask overhead exceeds the available- \
-             memory budget (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
-            prompt_tokens.len()
+             seq_len={} O(n²) mask overhead exceeds the load-time batched \
+             route budget of {} bytes (force-on with HF2Q_SERVE_BATCHED_PREFILL=1)",
+            prompt_tokens.len(),
+            loaded.batched_route_scratch_budget_bytes
         );
     }
     let live_batched_resume = live_resume.filter(|&k| {
@@ -32088,90 +31880,467 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_cold_cooperative_prefill_requires_full_four_lane_wave() {
-        assert_eq!(deepseek4_cooperative_prefill_widths(1, false), None);
-        assert_eq!(deepseek4_cooperative_prefill_widths(2, false), Some(2..=2));
-        assert_eq!(deepseek4_cooperative_prefill_widths(4, false), Some(2..=4));
-        assert_eq!(deepseek4_cooperative_prefill_widths(3, true), None);
-        assert_eq!(deepseek4_cooperative_prefill_widths(4, true), Some(4..=4));
+    fn deepseek_cooperative_prefill_widths_start_at_two_for_every_wave() {
+        assert_eq!(deepseek4_cooperative_prefill_widths(0), None);
+        assert_eq!(deepseek4_cooperative_prefill_widths(1), None);
+        assert_eq!(deepseek4_cooperative_prefill_widths(2), Some(2..=2));
+        assert_eq!(deepseek4_cooperative_prefill_widths(3), Some(2..=3));
+        assert_eq!(deepseek4_cooperative_prefill_widths(4), Some(2..=4));
     }
 
     #[test]
-    fn deepseek_staggered_warm_prefill_catches_lagging_lane_to_aligned_cursor() {
-        let handles = (0..4)
-            .map(|slot| SlotHandle {
+    fn deepseek_cohort_lane_rows_split_the_aggregate_budget_in_windows() {
+        assert_eq!(deepseek4_cohort_lane_rows(2, 128, None), 1_024);
+        assert_eq!(deepseek4_cohort_lane_rows(3, 128, None), 640);
+        assert_eq!(deepseek4_cohort_lane_rows(4, 128, None), 512);
+        // Mixed: the two-window slice budget over two lanes, one window each.
+        assert_eq!(
+            deepseek4_cohort_lane_rows(
+                DEEPSEEK4_MIXED_COHORT_WIDTH,
+                128,
+                Some(DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS)
+            ),
+            128
+        );
+        assert_eq!(deepseek4_cohort_lane_rows(4, 0, None), 0);
+    }
+
+    fn cohort_lane(slot: u32, cold_wave: bool, reply_class: Deepseek4ReplyClass) -> Deepseek4CohortLane {
+        Deepseek4CohortLane {
+            handle: SlotHandle {
                 slot_id: SlotId(slot),
                 generation: 1,
-            })
-            .collect::<Vec<_>>();
-        let plan = deepseek4_prefill_alignment_catchup(
-            [
-                (handles[0], Some((7_316, 9_466, 8))),
-                (handles[1], Some((7_316, 9_466, 8))),
-                (handles[2], Some((7_316, 9_466, 8))),
-                (handles[3], Some((6_676, 9_466, 8))),
-            ],
-            128,
-        )
-        .expect("the fourth lane is five native windows behind");
-        assert_eq!(plan.handle, handles[3]);
-        assert_eq!(plan.cursor, 6_676);
-        assert_eq!(plan.target_cursor, 7_316);
-        assert_eq!(plan.window_cap, 5);
+            },
+            cold_wave,
+            reply_class,
+        }
+    }
 
-        assert!(deepseek4_prefill_alignment_catchup(
-            handles
-                .iter()
-                .copied()
-                .map(|handle| (handle, Some((7_316, 9_466, 8)))),
-            128,
-        )
-        .is_none());
-
-        let multi_laggard = deepseek4_prefill_alignment_catchup(
-            [
-                (handles[0], Some((6_676, 12_000, 2))),
-                (handles[1], Some((6_932, 12_000, 8))),
-                (handles[2], Some((7_316, 12_000, 8))),
-            ],
-            128,
-        )
-        .expect("the lowest cursor advances first");
-        assert_eq!(multi_laggard.handle, handles[0]);
-        assert_eq!(multi_laggard.target_cursor, 7_316);
-        assert_eq!(
-            multi_laggard.window_cap, 2,
-            "the catch-up remains bounded by the lagging lane's native window multiplier"
-        );
+    /// `(start, rows)` of a lane's own plan under a per-lane cap: each lane
+    /// has its own cursor and remaining rows; `None` is token-wise work.
+    fn lane_plan(cursor: usize, remaining: Option<usize>, cap: usize) -> Option<((usize, usize), usize)> {
+        remaining.map(|remaining| {
+            let rows = remaining.min(cap);
+            ((cursor, rows), rows)
+        })
     }
 
     #[test]
-    fn deepseek_prefill_alignment_rejects_incompatible_or_non_matrix_lanes() {
-        let handle = |slot| SlotHandle {
-            slot_id: SlotId(slot),
-            generation: 1,
+    fn deepseek_cohort_accepts_unequal_plans_each_at_its_own_cursor() {
+        use Deepseek4ReplyClass::Unary;
+        let lanes = [
+            cohort_lane(0, false, Unary),
+            cohort_lane(1, false, Unary),
+            cohort_lane(2, false, Unary),
+            cohort_lane(3, false, Unary),
+        ];
+        let cursors = [0, 300, 1_111, 2_111];
+        let remaining = [Some(749), Some(333), Some(129), Some(2_000)];
+        let mut caps = Vec::new();
+        let members = select_deepseek4_prefill_cohort(
+            &lanes,
+            deepseek4_cooperative_prefill_widths(4).unwrap(),
+            |width| deepseek4_cohort_lane_rows(width, 128, None),
+            |lane, cap| {
+                caps.push((lane, cap));
+                Ok(lane_plan(cursors[lane], remaining[lane], cap))
+            },
+        )
+        .unwrap()
+        .expect("four unequal matrix plans form one cohort");
+        assert_eq!(
+            members,
+            vec![(0, (0, 512)), (1, (300, 333)), (2, (1_111, 129)), (3, (2_111, 512))]
+        );
+        assert!(caps.iter().all(|&(_, cap)| cap == 512), "every lane planned at the width-4 cap");
+        let aggregate: usize = members.iter().map(|(_, (_, rows))| rows).sum();
+        assert!(aggregate <= crate::inference::models::deepseek4::MAX_COOPERATIVE_PREFILL_ROWS);
+    }
+
+    #[test]
+    fn deepseek_cohort_skips_sub_matrix_and_incompatible_lanes_but_never_the_primary() {
+        use Deepseek4ReplyClass::{Stream, Unary};
+        let plans = |remaining: [Option<usize>; 5]| {
+            move |lane: usize, cap: usize| -> Result<Option<((usize, usize), usize)>> {
+                Ok(lane_plan(lane * 1_000, remaining[lane], cap))
+            }
         };
-        assert!(deepseek4_prefill_alignment_catchup(
-            [
-                (handle(0), Some((6_676, 9_466, 8))),
-                (handle(1), Some((7_316, 9_594, 8))),
-            ],
-            128,
+        let lanes = [
+            cohort_lane(0, false, Unary),
+            cohort_lane(1, false, Unary),
+            cohort_lane(2, false, Stream),
+            cohort_lane(3, true, Unary),
+            cohort_lane(4, false, Unary),
+        ];
+        let rows = |width| deepseek4_cohort_lane_rows(width, 128, None);
+        // Lane 1's chunk is 20 rows (a cold sub-33 prompt): packing it would
+        // move its experts from mv_id to mm_id. Lanes 2 and 3 differ in reply
+        // class and cold flag. The cohort is the primary plus lane 4.
+        let members = select_deepseek4_prefill_cohort(
+            &lanes,
+            2..=4,
+            rows,
+            plans([Some(600), Some(20), Some(600), Some(600), Some(600)]),
         )
-        .is_none());
-        assert!(deepseek4_prefill_alignment_catchup(
-            [
-                (handle(0), Some((6_700, 9_466, 8))),
-                (handle(1), Some((7_316, 9_466, 8))),
-            ],
-            128,
+        .unwrap()
+        .expect("primary and lane 4 are compatible matrix lanes");
+        assert_eq!(members.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(), vec![0, 4]);
+        // A token-wise companion (its recovery tail) is never a member.
+        let members = select_deepseek4_prefill_cohort(
+            &lanes,
+            2..=4,
+            rows,
+            plans([Some(600), None, None, None, Some(33)]),
         )
-        .is_none());
-        assert!(deepseek4_prefill_alignment_catchup(
-            [(handle(0), Some((6_676, 9_466, 8))), (handle(1), None)],
-            128,
+        .unwrap()
+        .unwrap();
+        assert_eq!(members.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(), vec![0, 4]);
+        // An ineligible primary (sub-33 or token-wise) runs serially.
+        for primary in [Some(32), None] {
+            assert!(select_deepseek4_prefill_cohort(
+                &lanes,
+                2..=4,
+                rows,
+                plans([primary, Some(600), Some(600), Some(600), Some(600)]),
+            )
+            .unwrap()
+            .is_none());
+        }
+        // No compatible companion: serial.
+        assert!(select_deepseek4_prefill_cohort(
+            &lanes,
+            2..=4,
+            rows,
+            plans([Some(600), None, Some(600), Some(600), None]),
         )
+        .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn deepseek_mixed_cohort_keeps_the_slice_budget_and_excludes_tails() {
+        use Deepseek4ReplyClass::Unary;
+        let lanes = [
+            cohort_lane(2, false, Unary),
+            cohort_lane(0, false, Unary),
+            cohort_lane(1, false, Unary),
+            cohort_lane(3, false, Unary),
+        ];
+        let budget = DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS * 128;
+        let widths =
+            deepseek4_cooperative_prefill_widths(lanes.len().min(DEEPSEEK4_MIXED_COHORT_WIDTH))
+                .unwrap();
+        // Lane 0 is in its token-wise recovery tail (no matrix plan): the
+        // Mixed cohort pairs the selected lane with the next matrix lane.
+        let remaining = [Some(5_000), None, Some(96), Some(5_000)];
+        let members = select_deepseek4_prefill_cohort(
+            &lanes,
+            widths,
+            |width| deepseek4_cohort_lane_rows(width, 128, Some(DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS)),
+            |lane, cap| Ok(lane_plan(lane, remaining[lane], cap)),
+        )
+        .unwrap()
+        .expect("two matrix lanes form a Mixed cohort");
+        assert_eq!(members.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(), vec![0, 2]);
+        assert!(members.len() <= DEEPSEEK4_MIXED_COHORT_WIDTH);
+        assert!(members.iter().map(|(_, (_, rows))| rows).sum::<usize>() <= budget);
+        // A selected lane in its tail is never cohorted: the Mixed slice
+        // drains the tail serially first.
+        let tail_first = [None, Some(5_000), Some(5_000), Some(5_000)];
+        assert!(select_deepseek4_prefill_cohort(
+            &lanes,
+            2..=2,
+            |width| deepseek4_cohort_lane_rows(width, 128, Some(DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS)),
+            |lane, cap| Ok(lane_plan(lane, tail_first[lane], cap)),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// Review P1: a Mixed step whose only decoders are parked cold
+    /// completions has no Mixed budget (`max_prefill_windows == None`) and a
+    /// round-robin primary that is not the scheduler's oldest prefill. The
+    /// planner must cohort the stragglers (or run serially), never raise the
+    /// pure-prefill FIFO invariant that would fail-stop the worker.
+    #[test]
+    fn deepseek_mixed_step_with_only_parked_decoders_plans_from_a_round_robin_primary() {
+        use super::super::engine_deepseek4::Deepseek4PrefillState;
+        let request = AdmitRequest {
+            prompt_tokens: 757,
+            max_tokens: 1,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        };
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(4, 4, 0);
+        scheduler.set_prefill_chunk_tokens(u32::MAX);
+        let handles: Vec<SlotHandle> = (0..4)
+            .map(|_| scheduler.admit(request.clone()).unwrap().handle.unwrap())
+            .collect();
+        // Cold lanes 0 and 1 finished prefill: the scheduler counts them as
+        // decoding while the worker holds their completions parked.
+        scheduler.advance_after_prefill(handles[0], 757);
+        scheduler.advance_after_prefill(handles[1], 757);
+        match scheduler.step().unwrap() {
+            SchedulerStep::Mixed { decode_handles, .. } => {
+                assert_eq!(decode_handles, vec![handles[0], handles[1]]);
+            }
+            other => panic!("expected a Mixed step, got {other:?}"),
+        }
+        // No runnable decoder (only parked completions): no Mixed budget.
+        assert_eq!(deepseek4_mixed_work_budget(8, false, true).max_prefill_windows, None);
+        assert_eq!(scheduler.prefill_handles_fifo(), vec![handles[2], handles[3]]);
+        // Stragglers 2 (cursor 0) and 3 (cursor 512) prefill the cold wave.
+        let cursors = [0, 0, 0, 512];
+        let mut receivers = Vec::new();
+        let slots: Vec<Option<Deepseek4Slot>> = (0..4)
+            .map(|slot| {
+                (slot >= 2).then(|| {
+                    let (reply, receiver) = oneshot::channel();
+                    receivers.push(receiver);
+                    (
+                        Deepseek4SlotWork::Prefill(Deepseek4PrefillState::for_scheduler_tests(
+                            cursors[slot],
+                            749,
+                            true,
+                        )),
+                        SlotReply::Unary(reply),
+                        handles[slot],
+                    )
+                })
+            })
+            .collect();
+        let cursor_of = |slot: usize| (cursors[slot], cursors[slot]);
+        // The round-robin Mixed primary is lane 3, behind lane 2 in FIFO.
+        let primary = handles[3];
+        let cohort = plan_deepseek4_prefill_cohort(128, cursor_of, &slots, &scheduler, primary, None, false)
+            .expect("a Mixed step never raises the pure-prefill FIFO invariant")
+            .expect("both stragglers have matrix chunks");
+        let members: Vec<(SlotHandle, usize, usize)> = cohort
+            .iter()
+            .map(|candidate| (candidate.handle, candidate.plan.start(), candidate.plan.token_count()))
+            .collect();
+        assert_eq!(members, vec![(handles[3], 512, 237), (handles[2], 0, 749)]);
+        // The pure-prefill step keeps the invariant.
+        assert!(
+            plan_deepseek4_prefill_cohort(128, cursor_of, &slots, &scheduler, primary, None, true)
+                .is_err()
+        );
+        drop(receivers);
+    }
+
+    /// S3 A/B arm B, turn 0: requests 0 and 1 cohorted their 749-row cold
+    /// prompts before 2 and 3 reached the server. Then 0's and 1's recovery
+    /// tails ran (FIFO-oldest), both lanes started decoding, and the Mixed
+    /// steps ran their whole answers before the stragglers prefilled. The
+    /// cold-wave rule leads with the stragglers' matrix work instead; once no
+    /// cold lane has matrix work left, the tails drain in FIFO order.
+    #[test]
+    fn deepseek_cold_wave_stragglers_prefill_before_early_lanes_run_their_tails() {
+        use super::super::engine_deepseek4::Deepseek4PrefillState;
+        let request = AdmitRequest {
+            prompt_tokens: 813,
+            max_tokens: 56,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        };
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(4, 4, 0);
+        scheduler.set_prefill_chunk_tokens(u32::MAX);
+        let handles: Vec<SlotHandle> = (0..4)
+            .map(|_| scheduler.admit(request.clone()).unwrap().handle.unwrap())
+            .collect();
+        // The first cohort committed lanes 0 and 1 through their anchor (749).
+        scheduler.advance_after_prefill(handles[0], 749);
+        scheduler.advance_after_prefill(handles[1], 749);
+        let mut receivers = Vec::new();
+        let mut slots_at = |cursors: [usize; 4]| -> Vec<Option<Deepseek4Slot>> {
+            (0..4)
+                .map(|slot| {
+                    let (reply, receiver) = oneshot::channel();
+                    receivers.push(receiver);
+                    Some((
+                        Deepseek4SlotWork::Prefill(Deepseek4PrefillState::for_scheduler_tests(
+                            cursors[slot],
+                            749,
+                            true,
+                        )),
+                        SlotReply::Unary(reply),
+                        handles[slot],
+                    ))
+                })
+                .collect()
+        };
+        let fifo = scheduler.prefill_handles_fifo();
+        assert_eq!(fifo, handles, "every cold lane is still prefilling");
+        match scheduler.step().unwrap() {
+            SchedulerStep::Prefill { handle, .. } => assert_eq!(handle, handles[0]),
+            other => panic!("expected a pure Prefill step, got {other:?}"),
+        }
+
+        // Lanes 0 and 1 are in their tails; 2 and 3 have all their matrix
+        // work left: lead with lane 2, and cohort 2 and 3.
+        let cursors = [749, 749, 0, 0];
+        let slots = slots_at(cursors);
+        let views = deepseek4_prefill_lane_views(&slots, &fifo);
+        assert_eq!(
+            views.iter().map(|lane| lane.recovery_tail).collect::<Vec<_>>(),
+            vec![true, true, false, false]
+        );
+        let primary = deepseek4_cold_wave_matrix_primary(&views);
+        assert_eq!(primary, Some(handles[2]));
+        let cohort = plan_deepseek4_prefill_cohort(
+            128,
+            |slot| (cursors[slot], cursors[slot]),
+            &slots,
+            &scheduler,
+            handles[2],
+            None,
+            false,
+        )
+        .unwrap()
+        .expect("the stragglers' matrix chunks cohort");
+        assert_eq!(
+            cohort
+                .iter()
+                .map(|candidate| (candidate.handle, candidate.plan.start(), candidate.plan.token_count()))
+                .collect::<Vec<_>>(),
+            vec![(handles[2], 0, 749), (handles[3], 0, 749)]
+        );
+
+        // Every cold lane in its tail: the FIFO order drains the tails.
+        let slots = slots_at([749; 4]);
+        assert_eq!(
+            deepseek4_cold_wave_matrix_primary(&deepseek4_prefill_lane_views(&slots, &fifo)),
+            None
+        );
+        // A straggler still mid-matrix after a partial chunk still goes first.
+        let slots = slots_at([749, 749, 749, 128]);
+        assert_eq!(
+            deepseek4_cold_wave_matrix_primary(&deepseek4_prefill_lane_views(&slots, &fifo)),
+            Some(handles[3])
+        );
+        // The rule is cold-wave only: warm tails keep FIFO priority.
+        let warm = |handle, recovery_tail| Deepseek4PrefillLaneView {
+            handle,
+            cold_wave: false,
+            recovery_tail,
+        };
+        assert_eq!(
+            deepseek4_cold_wave_matrix_primary(&[warm(handles[0], true), warm(handles[1], false)]),
+            None
+        );
+        // An oldest lane with matrix work leads as before.
+        assert_eq!(
+            deepseek4_cold_wave_matrix_primary(&[
+                Deepseek4PrefillLaneView {
+                    handle: handles[0],
+                    cold_wave: true,
+                    recovery_tail: false,
+                },
+                Deepseek4PrefillLaneView {
+                    handle: handles[1],
+                    cold_wave: true,
+                    recovery_tail: true,
+                },
+            ]),
+            None
+        );
+        drop(receivers);
+    }
+
+    #[test]
+    fn deepseek_admission_barrier_is_bounded_and_free_for_a_lone_request() {
+        use Deepseek4AdmissionBarrier::{Armed, Idle, Spent};
+        let start = Instant::now();
+        let mut barrier = Idle;
+        // A lone request: nothing else in flight, no wait.
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, true, true, 0));
+        assert_eq!(barrier, Idle);
+        // Decoders runnable, no free slot or admission closed: never armed.
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, true, false, 3));
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, false, true, 3));
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, false, true, true, 3));
+        assert_eq!(barrier, Idle);
+        // Another request in flight: wait, bounded by the constant.
+        assert!(deepseek4_admission_barrier_wait(&mut barrier, start, true, true, true, 2));
+        assert_eq!(barrier, Armed(start));
+        let almost = start + DEEPSEEK4_ADMISSION_BARRIER - Duration::from_micros(1);
+        assert!(deepseek4_admission_barrier_wait(&mut barrier, almost, true, true, true, 1));
+        assert!(!deepseek4_admission_barrier_wait(
+            &mut barrier,
+            start + DEEPSEEK4_ADMISSION_BARRIER,
+            true,
+            true,
+            true,
+            1
+        ));
+        assert_eq!(barrier, Spent);
+        // At most once per prefill transaction.
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, almost, true, true, true, 1));
+        // Ends as soon as nothing is in flight (or the slots fill).
+        let mut barrier = Idle;
+        assert!(deepseek4_admission_barrier_wait(&mut barrier, start, true, true, true, 1));
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, true, true, 0));
+        assert_eq!(barrier, Spent);
+        let mut barrier = Armed(start);
+        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, false, true, 1));
+        assert_eq!(barrier, Spent);
+    }
+
+    #[test]
+    fn deepseek_partial_cold_wave_admits_stragglers_and_releases_every_parked_completion() {
+        use Deepseek4ColdCohortPhase::{Draining, Filling};
+        // The barrier expired with two cold lanes seeded; two more cold
+        // requests arrive while they prefill. Admission stays open for them
+        // and they join the same wave.
+        let filling = deepseek4_reconcile_cold_cohort(Filling, false, false, true, 2, 2, true, true);
+        assert_eq!((filling.phase, filling.admission_open), (Filling, true));
+        assert!(filling.rerun_admission);
+        let full = deepseek4_reconcile_cold_cohort(Filling, true, false, false, 4, 4, false, false);
+        assert_eq!((full.phase, full.admission_open), (Draining, false));
+        // Release depends on remaining cold work only, never on which lanes
+        // shared a cohort transaction: an early finisher parks while the
+        // stragglers still prefill or decode, then finalizes.
+        let request = AdmitRequest {
+            prompt_tokens: 757,
+            max_tokens: 1,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        };
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(4, 4, 0);
+        scheduler.set_prefill_chunk_tokens(u32::MAX);
+        let early = scheduler.admit(request).unwrap().handle.unwrap();
+        scheduler.advance_after_prefill(early, 757);
+        let mut disposition = account_deepseek4_decode_turn(
+            &mut scheduler,
+            early,
+            Deepseek4DecodeAccounting::Fresh {
+                completed_ticks: 1,
+                finished: true,
+            },
+            true,
+            3,
+            757,
+            0,
+        );
+        for pending in [3, 2, 1] {
+            let Deepseek4DecodeDisposition::Park { deferred_ticks } = disposition else {
+                panic!("parked while {pending} cold peers remain, got {disposition:?}");
+            };
+            disposition = account_deepseek4_decode_turn(
+                &mut scheduler,
+                early,
+                Deepseek4DecodeAccounting::Parked { deferred_ticks },
+                true,
+                pending - 1,
+                757,
+                0,
+            );
+        }
+        assert_eq!(disposition, Deepseek4DecodeDisposition::Finalize);
+        assert_eq!(scheduler.stats().completed_total, 1);
     }
 
     #[test]
@@ -34278,7 +34447,7 @@ assistant:
                 chat_template: Arc::new(String::new()),
                 registration: None,
                 vision_consumer_contract: None,
-                token_bytes: std::sync::OnceLock::new(),
+                token_bytes: Arc::default(),
                 kv_spill_descriptor: None,
                 tq_packed_descriptor: None,
                 mode: EngineMode::SerialFifo,
@@ -34369,6 +34538,7 @@ assistant:
                 events,
                 None,
                 Vec::new(),
+                None,
                 None,
                 None,
             )
@@ -35839,6 +36009,7 @@ assistant:
             speculation: super::super::qwen35_speculation::QwenSpeculationController::new(
                 super::super::qwen35_speculation::QwenSpeculationPolicy::Off,
             ),
+            slot_spill_budget_bytes: 0,
         };
         let qwen = LoadedModel::Qwen35(qwen_loaded);
 
@@ -36161,7 +36332,7 @@ assistant:
                 chat_template: Arc::new(String::new()),
                 registration: None,
                 vision_consumer_contract: None,
-                token_bytes: std::sync::OnceLock::new(),
+                token_bytes: Arc::default(),
                 kv_spill_descriptor: descriptor,
                 tq_packed_descriptor: None,
                 mode: EngineMode::SerialFifo,
@@ -36485,6 +36656,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let loaded_a = LoadedModel::load(&load_opts).expect("LoadedModel::load (a)");
         let loaded_b = LoadedModel::load(&load_opts).expect("LoadedModel::load (b)");
@@ -36739,6 +36911,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         // Fixed prompt set (the same prompts the N=4 parity + interleave
         // tests use, so golden ↔ parity are directly comparable).
@@ -36803,6 +36976,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -36851,6 +37025,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         // Two DISTINCT prompts so cross-slot contamination is visible.
         let p0: Vec<u32> = vec![1u32, 2, 3, 4, 5];
@@ -37067,6 +37242,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -37130,6 +37306,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -37425,6 +37602,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_tokens = 16usize;
@@ -37673,6 +37851,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_tokens = 16usize;
@@ -37941,6 +38120,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         // Four distinct greedy prompts.
@@ -38043,6 +38223,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let eager_prompt = vec![42u32; GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize];
         let resumed_prompt = vec![43u32; GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize * 2 + 1];
@@ -38178,6 +38359,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         // IDENTICAL prompt in all four slots. Serial ref at the LONGEST budget so
@@ -38311,6 +38493,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         // Eight distinct greedy prompts (the N=4 set + four more distinct ones).
@@ -38474,6 +38657,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt = vec![1u32, 2, 3];
         let params = SamplingParams {
@@ -38515,6 +38699,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt = vec![1u32, 2, 3];
         let params = SamplingParams {
@@ -38591,6 +38776,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         // Eight distinct greedy prompts (same shape as the gemma4 N=8 gate).
@@ -38706,6 +38892,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         let prompt_len: usize = std::env::var("HF2Q_S019_PROMPT_LEN")
@@ -38841,6 +39028,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         // N=1 mechanism gate: a single 70-token prompt exercising the full
@@ -38968,6 +39156,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let lens = [26u32, 40, 13, 55, 70, 19, 33, 48];
         let mk = |i: u32, l: u32| -> Vec<u32> {
@@ -39093,6 +39282,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         // Every request is at or above the conservative tiny-prefill boundary,
         // so this test continues to prove that the eligible multi-seq path
@@ -39232,6 +39422,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         // A len configurable via HF2Q_BISECT_ALEN (default 2 → B offset 2 ≡2 mod4).
         // B len via HF2Q_BISECT_BLEN (default 10). Use larger to hit tensor-mm (>64).
@@ -39393,6 +39584,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         // HF2Q_BENCH_TOKENS = decode length per stream (default 128).
         let bench_tokens: usize = std::env::var("HF2Q_BENCH_TOKENS")
@@ -39743,6 +39935,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
 
         // Same prompt, divergent max_tokens (5 / 50 / 200) so slots finish
@@ -39848,6 +40041,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_decode = 1usize; // first-token prefill logits only
@@ -40201,6 +40395,7 @@ assistant:
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let loaded_a = LoadedModel::load(&load_opts).expect("LoadedModel::load (a, H2)");
         let loaded_b = LoadedModel::load(&load_opts).expect("LoadedModel::load (b, H2)");
@@ -44291,52 +44486,101 @@ mod gemma4_bounded_prefill_tests {
     }
 
     #[test]
-    fn gemma_installed_prefill_batch_shares_one_aggregate_transaction() {
-        let progresses = vec![
-            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
-            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
-            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
-            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
-        ];
-        let plans =
-            gemma4_prefill_batch_plans(&progresses, GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize)
-                .unwrap();
+    fn gemma_installed_prefill_cohort_refuses_per_slot_route_overrides() {
+        let env = |set: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                set.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        assert!(gemma4_installed_prefill_cohort_enabled(true, env(&[])));
+        assert!(!gemma4_installed_prefill_cohort_enabled(false, env(&[])));
+        assert!(gemma4_installed_prefill_cohort_enabled(
+            true,
+            env(&[("HF2Q_PREFILL_SLOT_BATCHED", "1")])
+        ));
+        assert!(!gemma4_installed_prefill_cohort_enabled(
+            true,
+            env(&[("HF2Q_PREFILL_SLOT_BATCHED", "0")])
+        ));
+        assert!(!gemma4_installed_prefill_cohort_enabled(
+            true,
+            env(&[("HF2Q_MM_ID_ROUTING_THRESHOLD", "64")])
+        ));
+        // The same predicate keeps the joint warm and joint cold paths off.
         assert_eq!(
-            plans
-                .iter()
-                .map(|plan| (plan.start, plan.end))
-                .collect::<Vec<_>>(),
-            vec![
-                (7_174, 8_198),
-                (7_174, 8_198),
-                (7_174, 8_198),
-                (7_174, 8_198),
-            ]
+            gemma_warm_batch::per_slot_route_override(env(&[(
+                "HF2Q_MM_ID_ROUTING_THRESHOLD",
+                "64"
+            )])),
+            Some("HF2Q_MM_ID_ROUTING_THRESHOLD moves the MoE route boundary of the lane rule")
         );
-        assert_eq!(
-            plans
-                .iter()
-                .map(|plan| plan.end - plan.start)
-                .sum::<usize>(),
-            4_096
-        );
+    }
 
-        let uneven = vec![
+    #[test]
+    fn gemma_installed_prefill_batch_plans_each_lane_alone_and_admits_fifo() {
+        let cap = GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize;
+        let rows = |plans: &[Option<Gemma4PrefillPlan>]| {
+            plans
+                .iter()
+                .map(|plan| plan.map(|plan| plan.end - plan.start))
+                .collect::<Vec<_>>()
+        };
+
+        // Issue #725: four 13,506-token prompts at cursor 7,174. Each lane
+        // keeps its single-slot 4,096-row chunk, so the primary fills the
+        // transaction alone and the cohort has one lane (single-slot path).
+        let wide = vec![Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(); 4];
+        let plans = gemma4_prefill_batch_plans(&wide, cap).unwrap();
+        assert_eq!(plans[0], Some(wide[0].plan(cap).unwrap()));
+        assert_eq!(
+            plans[0].map(|plan| (plan.start, plan.end)),
+            Some((7_174, 11_270))
+        );
+        assert_eq!(rows(&plans), vec![Some(4_096), None, None, None]);
+
+        // Tails batch in FIFO order while the cohort stays within the cap;
+        // a lane that does not fit, or whose chunk has exactly 32 rows (MoE
+        // `mv_id` alone but `mm_id` jointly), is left to its own turn.
+        let tails = vec![
             Gemma4PrefillProgress::new(9_900, 10_000, None).unwrap(),
             Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
-            Gemma4PrefillProgress::new(7_174, 13_506, None).unwrap(),
+            Gemma4PrefillProgress::new(12_000, 13_000, None).unwrap(),
+            Gemma4PrefillProgress::new(12_500, 12_532, None).unwrap(),
+            Gemma4PrefillProgress::new(1_000, 9_000, Some(1_032)).unwrap(),
+            Gemma4PrefillProgress::new(12_000, 12_033, None).unwrap(),
         ];
-        let plans = gemma4_prefill_batch_plans(&uneven, 4_096).unwrap();
-        assert_eq!(plans[0].end - plans[0].start, 100);
-        assert_eq!(plans[1].end - plans[1].start, 1_998);
-        assert_eq!(plans[2].end - plans[2].start, 1_998);
+        let plans = gemma4_prefill_batch_plans(&tails, cap).unwrap();
         assert_eq!(
-            plans
-                .iter()
-                .map(|plan| plan.end - plan.start)
-                .sum::<usize>(),
-            4_096
+            rows(&plans),
+            vec![Some(100), None, Some(1_000), None, None, Some(33)]
         );
+        // Every admitted lane's plan is the one it would get alone.
+        for (progress, plan) in tails.iter().zip(&plans) {
+            if let Some(plan) = plan {
+                assert_eq!(*plan, progress.plan(cap).unwrap());
+            }
+        }
+
+        // Lanes fill the transaction exactly; the next lane waits.
+        let exact = vec![
+            Gemma4PrefillProgress::new(8_000, 10_048, None).unwrap(),
+            Gemma4PrefillProgress::new(8_000, 10_048, None).unwrap(),
+            Gemma4PrefillProgress::new(8_000, 8_033, None).unwrap(),
+        ];
+        let plans = gemma4_prefill_batch_plans(&exact, cap).unwrap();
+        assert_eq!(rows(&plans), vec![Some(2_048), Some(2_048), None]);
+
+        // A primary with exactly 32 rows left is never admitted, so the
+        // caller prefills it per slot.
+        let short_primary = vec![
+            Gemma4PrefillProgress::new(12_500, 12_532, None).unwrap(),
+            Gemma4PrefillProgress::new(12_000, 12_100, None).unwrap(),
+            Gemma4PrefillProgress::new(12_000, 12_100, None).unwrap(),
+        ];
+        let plans = gemma4_prefill_batch_plans(&short_primary, cap).unwrap();
+        assert_eq!(rows(&plans), vec![None, Some(100), Some(100)]);
     }
 
     #[test]
@@ -44885,6 +45129,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let loaded =
             LoadedModel::load(&opts).expect("H21: LoadedModel::load must succeed for Gemma 4 GGUF");
@@ -44954,6 +45199,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let loaded = LoadedModel::load(&opts).expect("H22: load Gemma 4 GGUF");
         let mut g = match loaded {
@@ -45031,6 +45277,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let loaded = LoadedModel::load(&opts).expect("H23: load Gemma 4 GGUF");
         let g = match loaded {
@@ -45100,6 +45347,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             glp_path: None,
             glp_alpha: None,
             kv_graft_path: None,
+            lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
         };
         let loaded = LoadedModel::load(&opts).expect("H24: load Gemma 4 GGUF");
         let engine =
@@ -58726,3 +58974,7 @@ mod gemma_cold_gs3_timing;
 #[cfg(test)]
 #[path = "engine_template_json_order_tests.rs"]
 mod template_json_order_tests;
+
+#[cfg(test)]
+#[path = "engine_gemma_slot_spill_resume_tests.rs"]
+mod gemma_slot_spill_resume_tests;

@@ -52,7 +52,7 @@ pub(super) fn tiny_config() -> Deepseek4Config {
     }
 }
 
-fn metadata(cfg: &Deepseek4Config) -> Vec<(String, MetaValue)> {
+pub(super) fn metadata(cfg: &Deepseek4Config) -> Vec<(String, MetaValue)> {
     let p = "deepseek4";
     vec![
         ("general.architecture".into(), MetaValue::String(p.into())),

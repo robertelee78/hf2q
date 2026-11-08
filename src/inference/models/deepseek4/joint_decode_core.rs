@@ -1,11 +1,13 @@
-//! Per-row, cache-dependent attention cores for joint decode.
+//! Per-row, cache-dependent attention cores for joint decode and rows steps.
 //!
 //! Every function here encodes exactly the one-token decode branch of
 //! `forward_uncompressed_attention_rows` / `forward_compressed_attention_rows`
-//! for one row of a joint step: the row's window write, compressor and
+//! for one row of a multi-row step: the row's window write, compressor and
 //! indexer recurrences, and sparse attention read only that row's cache at
 //! that row's position. Inputs are zero-copy row views of the batched
 //! projection buffers, so the dispatched arithmetic is the one-row graph's.
+//! A joint step's rows own independent caches; a rows step's rows are
+//! consecutive positions of one cache ([`RowCaches`]).
 
 use anyhow::{ensure, Context, Result};
 use mlx_native::graph::GraphSession;
@@ -16,7 +18,7 @@ use mlx_native::ops::deepseek_sparse_attention::{
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::attention::window_indices;
-use super::cache::{Deepseek4Cache, LayerCache, LayerCacheStep};
+use super::cache::{CacheStep, Deepseek4Cache, LayerCache, LayerCacheStep};
 use super::cache_window_write::encode_window_write;
 use super::compressed_attention::{
     sparse_attention_scratch_shape, SparseFlashDecodeArena, SPARSE_FLASH_MIN_TOP_K,
@@ -67,6 +69,134 @@ pub(super) struct CompressedRowCore {
     main_compressor: MainCompressorArena,
     indexer: Option<RatioFourIndexerArena>,
     sparse: SparseDecodeWorkspace,
+}
+
+/// One row's planned cache-dependent core.
+pub(super) enum JointRowCore {
+    Window(WindowRowCore),
+    Compressed(CompressedRowCore),
+}
+
+/// How the rows of one multi-row step share caches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RowCaches {
+    /// Joint decode: one row per independent cache.
+    Independent,
+    /// Rows step: consecutive positions of one cache. Row `i + 1`'s window
+    /// write overwrites the slot of position `p + i + 1 - window`, which row
+    /// `i` still attends to, and its compressor and indexer read row `i`'s
+    /// recurrent state; so the cores run in row order, each behind a full
+    /// barrier, exactly as consecutive one-token steps order them.
+    Sequential,
+}
+
+/// Plan every row's core for `layer` (host only).
+pub(super) fn plan_row_cores(
+    device: &MlxDevice,
+    cfg: &Deepseek4Config,
+    caches: &[&Deepseek4Cache],
+    steps: &[CacheStep],
+    layer: usize,
+    ratio: u32,
+) -> Result<Vec<JointRowCore>> {
+    ensure!(
+        caches.len() == steps.len(),
+        "DeepSeek-V4 row cores need one step per cache row, got {} caches and {} steps",
+        caches.len(),
+        steps.len()
+    );
+    let head_dim = cfg.head_dim as usize;
+    caches
+        .iter()
+        .zip(steps)
+        .enumerate()
+        .map(|(row, (&cache, step))| {
+            let planned = if ratio == 0 {
+                plan_window_row(device, cache, layer, step.position, head_dim)
+                    .map(JointRowCore::Window)
+            } else {
+                let layer_step = step
+                    .layers
+                    .get(layer)
+                    .with_context(|| format!("missing layer-{layer} row cache step"))?;
+                plan_compressed_row(device, cfg, cache, layer, ratio, step.position, layer_step)
+                    .map(JointRowCore::Compressed)
+            };
+            planned.with_context(|| format!("plan DeepSeek-V4 layer-{layer} row {row} core"))
+        })
+        .collect()
+}
+
+/// Encode every row's core for `layer`, in row order.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_row_cores(
+    session: &mut GraphSession<'_>,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    cfg: &Deepseek4Config,
+    caches: &[&Deepseek4Cache],
+    steps: &[CacheStep],
+    layer: usize,
+    cores: &[JointRowCore],
+    inputs: &[JointRowInputs],
+    sinks: &MlxBuffer,
+    compressed_weights: Option<&CompressedAttentionWeightsRef<'_>>,
+    frequencies: &MlxBuffer,
+    order: RowCaches,
+) -> Result<()> {
+    ensure!(
+        caches.len() == steps.len() && cores.len() == steps.len() && inputs.len() == steps.len(),
+        "DeepSeek-V4 layer-{layer} row cores are misaligned"
+    );
+    for (row, ((&cache, step), (core, inputs))) in caches
+        .iter()
+        .zip(steps)
+        .zip(cores.iter().zip(inputs))
+        .enumerate()
+    {
+        if order == RowCaches::Sequential && row > 0 {
+            session.barrier();
+        }
+        let layer_cache = layer_cache(cache, layer)?;
+        let layer_step = step
+            .layers
+            .get(layer)
+            .with_context(|| format!("missing layer-{layer} row-{row} cache step"))?;
+        let encoded = match core {
+            JointRowCore::Window(window) => encode_window_row(
+                session,
+                registry,
+                device,
+                cfg,
+                layer_cache,
+                layer_step,
+                window,
+                sinks,
+                inputs,
+            ),
+            JointRowCore::Compressed(compressed) => encode_compressed_row(
+                session,
+                registry,
+                device,
+                cfg,
+                layer_cache,
+                layer_step,
+                compressed,
+                compressed_weights.context("DeepSeek-V4 compressed row weights missing")?,
+                frequencies,
+                inputs,
+            ),
+        };
+        encoded.with_context(|| format!("encode DeepSeek-V4 layer-{layer} row {row} core"))?;
+    }
+    Ok(())
+}
+#[cfg(test)]
+impl CompressedRowCore {
+    /// The row's attention index storage (window, graft and indexer slots).
+    pub(super) fn index_storage(&self) -> &MlxBuffer {
+        &self.indices
+    }
 }
 
 fn layer_cache<'a>(cache: &'a Deepseek4Cache, layer: usize) -> Result<&'a LayerCache> {
