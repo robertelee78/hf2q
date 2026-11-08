@@ -150,8 +150,9 @@ After an independent review of this file, the campaign file and the baseline rec
 
 The first full Qwen3.8 baseline campaign at `$B1/baseline-v2/qwen38` is retained as `Invalid`. At measured `3+1` block 5, Q5 passed and four HTTP requests overlapped, but the independent Q2 audit observed only three concurrently progressing streamed requests. The campaign correctly halted and is never pooled or resumed.
 
-That recurrence invalidated the fixed half-turn-0 head-start trigger that had passed one hardware smoke. Mixed phase plans now gate every cohort immediately before its first streamed request: first-cohort readiness releases the later cohort into turn-0 prefill, later-cohort readiness proves that prefill completed, and one bound clock then releases both cohorts into streaming. The audit binds both marker sets to raw turn-0 receipts and still requires width 4. A fresh campaign and fresh ceilings are required after the corrected protocol passes its focused suite and hardware smoke.
+That recurrence invalidated the fixed half-turn-0 head-start trigger that had passed one hardware smoke. Mixed phase plans now gate every cohort immediately before its first streamed request: first-cohort readiness releases the later cohort into turn-0 prefill, later-cohort readiness proves that prefill completed, and one bound clock then releases both cohorts into streaming. The audit binds both marker sets to raw turn-0 receipts and still requires width 4.
 
+The correction at `6da49c254f6ebb01b54d4ee042f5f9303d98611c` passed 106 focused protocol/campaign tests and 137 campaign/calibration/peer integration tests. The Qwen3.8 `3+1` hardware smoke at `$B1/phase-trigger-smoke-6da49c25-r2` then passed Q5 with cleanup proven. Its independent Q2 audit observed HTTP overlap 4 and decode co-progress width 4 on every agent's turn 1, with a 1.0 overlap fraction and 131/132/129/121 frames in the common window. A fresh campaign and fresh ceilings remain required.
 
 ## Draft ADR-065 amendment (for the root to land)
 
