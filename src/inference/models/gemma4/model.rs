@@ -904,6 +904,10 @@ impl MlxModelWeights {
         let t_pre = std::time::Instant::now();
         let io_plan = preflight_io(gguf, cfg.vocab_size, cfg.hidden_size)?;
         preflight_projections(gguf, cfg)?;
+        // `HF2Q_GEMMA_DECODE_DENSE` is read here first, so an invalid value
+        // refuses the load instead of failing mid-decode.
+        let decode_dense = super::decode_dense::resolve()?;
+        tracing::info!(kernel = decode_dense.wire_name(), "Gemma decode dense kernel");
         let mapped = gguf
             .map_tensor_data(mlx_device)
             .map_err(|e| anyhow::anyhow!("map GGUF tensor data: {e}"))?;

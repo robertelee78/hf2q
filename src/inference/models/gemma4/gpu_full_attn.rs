@@ -122,7 +122,7 @@ impl MlxModelWeights {
         // is the sequential cost on critical path.  Garbage
         // attention output downstream.
         if !INVESTIGATION_ENV.skip_attn_qkv {
-            dispatch_qmatmul(
+            super::decode_dense::dispatch_decode_dense(
                 session,
                 reg,
                 dev,
@@ -139,7 +139,7 @@ impl MlxModelWeights {
             // Per-dispatch range annotation for the reorder pass. The
             // single barrier_between above only annotates the first
             // dispatch; concurrent K and V need their own ranges.
-            dispatch_qmatmul(
+            super::decode_dense::dispatch_decode_dense(
                 session,
                 reg,
                 dev,
@@ -157,7 +157,7 @@ impl MlxModelWeights {
         }
         let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
         if !v_is_k && !INVESTIGATION_ENV.skip_attn_qkv {
-            dispatch_qmatmul(
+            super::decode_dense::dispatch_decode_dense(
                 session,
                 reg,
                 dev,
@@ -2061,7 +2061,7 @@ impl MlxModelWeights {
                 ],
                 &[&self.activations.attn_out],
             );
-            dispatch_qmatmul(
+            super::decode_dense::dispatch_decode_dense(
                 session,
                 reg,
                 dev,
@@ -2359,7 +2359,7 @@ impl MlxModelWeights {
         // ADR-028 iter-200: SKIP_DENSE_MLP bisect — skip mlp_gate +
         // mlp_up dispatches.  Router proj must run (MoE depends on it).
         if !INVESTIGATION_ENV.skip_dense_mlp {
-            dispatch_qmatmul(
+            super::decode_dense::dispatch_decode_dense(
                 session,
                 reg,
                 dev,
@@ -2376,7 +2376,7 @@ impl MlxModelWeights {
             if b9_sequential {
                 session.encoder_mut().memory_barrier();
             }
-            dispatch_qmatmul(
+            super::decode_dense::dispatch_decode_dense(
                 session,
                 reg,
                 dev,
@@ -2503,7 +2503,7 @@ impl MlxModelWeights {
                     ],
                     &[&self.activations.mlp_down],
                 );
-                dispatch_qmatmul(
+                super::decode_dense::dispatch_decode_dense(
                     session,
                     reg,
                     dev,
@@ -3651,9 +3651,9 @@ pub fn gemma4_tree_verify_attention_block(
     // ADR-038 G4-CFA-5d: use the ggml_dtype-aware projection helper. The
     // legacy `apply_linear_projection_f32` hardcodes Q4_0 (Qwen DWQ
     // assumption), which corrupts every Q4_K/Q5_K/Q6_K projection on real
-    // Gemma 4 31B Q4_K_M GGUFs.
-    let apply_proj =
-        crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_qweight;
+    // Gemma 4 31B Q4_K_M GGUFs. `decode_dense` routes admitted weights to the
+    // `HF2Q_GEMMA_DECODE_DENSE` row-invariant kernel (≤ 8-row chunks).
+    let apply_proj = super::decode_dense::apply_tree_verify_projection;
 
     let q_flat = apply_proj(
         &mut enc,
@@ -3892,18 +3892,17 @@ pub fn gemma4_tree_verify_attention_block(
 
     enc2.memory_barrier();
 
-    let o_out =
-        crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_qweight(
-            &mut enc2,
-            registry,
-            device,
-            &attn_out,
-            &layer_weights.attn.o_proj,
-            shape.tree_seq_len,
-            (nq * d) as u32,
-            shape.hidden_size,
-        )
-        .context("gemma4_tree_verify_attention_block: step 7 O proj")?;
+    let o_out = super::decode_dense::apply_tree_verify_projection(
+        &mut enc2,
+        registry,
+        device,
+        &attn_out,
+        &layer_weights.attn.o_proj,
+        shape.tree_seq_len,
+        (nq * d) as u32,
+        shape.hidden_size,
+    )
+    .context("gemma4_tree_verify_attention_block: step 7 O proj")?;
 
     enc2.memory_barrier();
 
@@ -4085,8 +4084,7 @@ pub fn gemma4_tree_verify_full_layer_q(
     // ADR-038 G4-CFA-5d: ggml_dtype-aware projection (see attention block).
     let gate_buf = {
         let _out_bytes = seq * m * std::mem::size_of::<f32>();
-        let apply_proj =
-            crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_qweight;
+        let apply_proj = super::decode_dense::apply_tree_verify_projection;
         apply_proj(
             &mut enc2,
             registry,
@@ -4100,8 +4098,7 @@ pub fn gemma4_tree_verify_full_layer_q(
         .context("gemma4_tree_verify_full_layer_q: gate_proj")?
     };
     let up_buf = {
-        let apply_proj =
-            crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_qweight;
+        let apply_proj = super::decode_dense::apply_tree_verify_projection;
         apply_proj(
             &mut enc2,
             registry,
@@ -4163,18 +4160,17 @@ pub fn gemma4_tree_verify_full_layer_q(
 
     enc2.memory_barrier();
 
-    let down_out =
-        crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_qweight(
-            &mut enc2,
-            registry,
-            device,
-            &activated_buf,
-            &layer_weights.mlp.down_proj,
-            shape.attn.tree_seq_len,
-            shape.intermediate_size,
-            shape.attn.hidden_size,
-        )
-        .context("gemma4_tree_verify_full_layer_q: down_proj")?;
+    let down_out = super::decode_dense::apply_tree_verify_projection(
+        &mut enc2,
+        registry,
+        device,
+        &activated_buf,
+        &layer_weights.mlp.down_proj,
+        shape.attn.tree_seq_len,
+        shape.intermediate_size,
+        shape.attn.hidden_size,
+    )
+    .context("gemma4_tree_verify_full_layer_q: down_proj")?;
 
     enc2.memory_barrier();
 

@@ -190,6 +190,26 @@ fn q1_gemma_warm_kernel_defaults_to_shipped_vec_hybrid_and_refuses_undeclared_ti
     assert!(serde_json::from_value::<WarmLiveKernel>(serde_json::json!("Tiled")).is_err());
 }
 #[test]
+fn q1_gemma_decode_dense_kernel_defaults_to_shipped_stock_and_refuses_undeclared_kernels() {
+    use crate::inference::models::gemma4::decode_dense::DecodeDenseKernel as K;
+    assert_eq!(DecodeDenseKernel::default(),DecodeDenseKernel::Stock);
+    let pairs=[(DecodeDenseKernel::Stock,K::Stock),(DecodeDenseKernel::RowExact,K::RowExact),
+        (DecodeDenseKernel::ColumnInvariantMma,K::ColumnInvariantMma)];
+    for (declared,_) in pairs {
+        for (expected,resolved) in pairs {
+            let got=require_decode_dense_kernel(declared,resolved);
+            if declared==expected {assert_eq!(got.unwrap(),declared);} else {assert!(got.is_err(),"{declared:?} vs {resolved:?}");}
+        }
+    }
+    // Receipt wire names equal the runtime-controls wire names.
+    for (receipt,runtime) in pairs {
+        assert_eq!(serde_json::to_value(receipt).unwrap(),serde_json::json!(runtime.wire_name()));
+    }
+    for bad in ["Mma","row_exact","mma","stock"] {
+        assert!(serde_json::from_value::<DecodeDenseKernel>(serde_json::json!(bad)).is_err(),"{bad}");
+    }
+}
+#[test]
 fn complete_active_cache_plan_has_every_head_and_distinct_actual_restore64() {
     let cfg=cfg();
     let t0=gemma_cache::expected(&cfg,&[0,1,2,3],&positions(Trajectory::T0ColdSerial)).unwrap();

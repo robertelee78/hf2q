@@ -179,6 +179,10 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
             // null for other families.
             "gemma_prefill_moe_down": (engine.info().arch_str == "gemma4")
                 .then(crate::serve::gemma_prefill_moe::published_prefill_moe_down),
+            // Gemma decode dense/lm-head kernel (`HF2Q_GEMMA_DECODE_DENSE`):
+            // `Stock` | `RowExact` | `ColumnInvariantMma`; null off Gemma.
+            "gemma_decode_dense_kernel": (engine.info().arch_str == "gemma4")
+                .then(crate::inference::models::gemma4::decode_dense::published_kernel),
             // ADR-063: the resolved Gemma warm-prefill attention
             // kernel, so a Q5 receipt binds its arm (`null` off Gemma).
             "gemma_warm_attention_kernel": engine.info().gemma_warm_attention_kernel,

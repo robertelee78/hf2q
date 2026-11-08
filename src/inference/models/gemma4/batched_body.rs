@@ -28,9 +28,7 @@ use mlx_native::{DType, GraphExecutor, KernelRegistry, MlxBuffer, MlxDevice};
 use crate::debug::INVESTIGATION_ENV;
 use crate::quantize::imatrix::ImatrixHint;
 use crate::serve::config::LayerType;
-use crate::serve::forward_mlx_shared::{
-    dispatch_qmatmul, dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
-};
+use crate::serve::forward_mlx_shared::{dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs};
 use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
 
 use super::batched_head::BatchedHeadOut;
@@ -451,6 +449,11 @@ fn cat_boundary<'a>(
 /// per-row matvec; otherwise loop m=1 per row (correct, weight re-read N times —
 /// these are the minority dense projections; the dominant MoE experts batch
 /// bit-identically via `quantized_matmul_id_ggml`).
+///
+/// Both arms go through [`super::decode_dense::dispatch_decode_dense`]: under
+/// `HF2Q_GEMMA_DECODE_DENSE=row_exact|mma` an admitted weight takes the
+/// row-invariant kernel at m=N (and at m=1 in the per-row loop for N > 8),
+/// the same per-row result as the solo m=1 decode.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_dense_rowident(
     session: &mut GraphSession<'_>,
@@ -476,7 +479,9 @@ pub(super) fn dispatch_dense_rowident(
     ) && (n as u32)
         <= mlx_native::ops::quantized_matmul_ggml::MM_ROUTING_THRESHOLD;
     if batched_rowident {
-        dispatch_qmatmul(session, reg, dev, input, weight, output, n as u32, hint)
+        super::decode_dense::dispatch_decode_dense(
+            session, reg, dev, input, weight, output, n as u32, hint,
+        )
     } else {
         // Measured (ADR-040 M4): amortizing the F16/F32 weight read across rows
         // (dispatch row 0 only) was throughput-NEUTRAL (152.3 vs 151.8 @ N=4) —
@@ -485,7 +490,9 @@ pub(super) fn dispatch_dense_rowident(
         for i in 0..n {
             let in_i = input.slice_view(row_off(in_stride, i), in_stride);
             let out_i = output.slice_view(row_off(out_stride, i), out_stride);
-            dispatch_qmatmul(session, reg, dev, &in_i, weight, &out_i, 1, hint)?;
+            super::decode_dense::dispatch_decode_dense(
+                session, reg, dev, &in_i, weight, &out_i, 1, hint,
+            )?;
         }
         Ok(())
     }
