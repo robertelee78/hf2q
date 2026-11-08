@@ -12,6 +12,8 @@
 //! copy is read in every session); routed experts rotate over as many distinct expert-id sets. Tensors
 //! larger than 256 MiB (output head) have one copy, so their warm and cold cells read the same bytes.
 //!
+//! `HF2Q_DS4_OP_BENCH_ROWS` (comma list) replaces B = 1..4 (the tail rows step uses `1,8`).
+//!
 //! Run (standing grant, model-free, <= 15 min):
 //! ```text
 //! HF2Q_DS4_MICROBENCH_OUT=<cells.jsonl> cargo test --release --bin hf2q ds4_op_microbench -- --ignored --nocapture
@@ -87,6 +89,17 @@ fn expert_ids(device: &MlxDevice, tokens: usize, top_k: usize, seed: u64) -> Mlx
     ids
 }
 
+/// Row counts B: `HF2Q_DS4_OP_BENCH_ROWS` (comma list, e.g. `1,8` for the tail rows step), else 1..=4.
+fn op_rows() -> Vec<usize> {
+    match std::env::var("HF2Q_DS4_OP_BENCH_ROWS") {
+        Ok(list) => list
+            .split(',')
+            .map(|b| b.trim().parse().expect("HF2Q_DS4_OP_BENCH_ROWS: comma list of row counts"))
+            .collect(),
+        Err(_) => (1..=4).collect(),
+    }
+}
+
 #[test]
 #[ignore = "model-free GPU microbenchmarks (gap program M2a; standing grant, <= 15 min)"]
 fn ds4_op_microbench() {
@@ -116,7 +129,7 @@ fn ds4_op_microbench() {
         let shape = [n, k];
         for warm in [false, true] {
             let weights = &all[..copies_for(bytes, warm)];
-            for b in 1..=4usize {
+            for b in op_rows() {
                 let x = input(&device, vec![b, k], 7);
                 let y = alloc(&device, DType::F32, vec![b, n], "bench out").unwrap();
                 for mode in ["batched", "per_row"] {
@@ -156,7 +169,7 @@ fn ds4_op_microbench() {
         let w = block_weight(&device, GgmlType::Q8_0, vec![n, k], 99);
         let shape = [n, k];
         for warm in [false, true] {
-            for b in 1..=4usize {
+            for b in op_rows() {
                 let x = input(&device, vec![b, k], 3);
                 let y = alloc(&device, DType::F32, vec![b, n], "bench out").unwrap();
                 let t = time_op(&mut ctx, |s, r, d, _| {
@@ -197,7 +210,7 @@ fn ds4_op_microbench() {
         let shape = [groups * rank, gw];
         for warm in [false, true] {
             let weights = &all[..copies_for(bytes, warm)];
-            for b in 1..=4usize {
+            for b in op_rows() {
                 let x = input(&device, vec![b, heads * head_dim], 5);
                 let y = alloc(&device, DType::F32, vec![b, groups * rank], "bench out").unwrap();
                 let arena = BatchedGroupedOutputArena::new(&device, b, groups, gw, rank).unwrap();
@@ -241,7 +254,7 @@ fn ds4_op_microbench() {
         let shape = [n, k];
         for warm in [false, true] {
             let weights = &all[..copies_for(bytes, warm)];
-            for b in 1..=4usize {
+            for b in op_rows() {
                 let x = input(&device, vec![b, k], 11);
                 let y = alloc(&device, DType::F32, vec![b, n], "bench out").unwrap();
                 let t = time_op(&mut ctx, |s, r, d, rep| {
@@ -293,7 +306,7 @@ fn ds4_op_microbench() {
         let w = block_weight(&device, ty, vec![256, n, k], 300);
         let shape = [256usize, n, k];
         let expert_bytes = n * k / ty.block_values() as usize * ty.block_bytes() as usize;
-        for b in 1..=4usize {
+        for b in op_rows() {
             let per_copy = expert_bytes * b * 6;
             let all: Vec<MlxBuffer> = (0..copies_for(per_copy, false))
                 .map(|c| expert_ids(&device, b, 6, (b * MIN_REPS + c) as u64))
