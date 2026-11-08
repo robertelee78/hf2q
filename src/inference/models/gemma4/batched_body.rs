@@ -1071,29 +1071,51 @@ impl MlxModelWeights {
                         ],
                         &[&bufs.sdpa_out, &bufs.sdpa_tmp],
                     );
-                    mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
-                        session.encoder_mut(),
-                        reg,
-                        dev,
-                        n as u32,
-                        &bufs.attn_q_normed,
-                        &buf.k,
-                        &buf.v_packed,
-                        &buf.v_norms,
-                        &bufs.sdpa_out,
-                        &bufs.sdpa_tmp,
-                        slot_id_buf,
-                        // ADR-059 (3c): sliding rings derive their per-query
-                        // read extents prompt-indexed (no graft rows in the
-                        // ring); full layers keep the absolute positions (the
-                        // graft rows participate in their reads).
-                        if is_ring {
-                            ring_positions_buf.unwrap_or(positions_buf)
-                        } else {
-                            positions_buf
-                        },
-                        &p_hyb,
-                    )
+                    // ADR-059 (3c): sliding rings derive their per-query read
+                    // extents prompt-indexed (no graft rows in the ring); full
+                    // layers keep the absolute positions (the graft rows
+                    // participate in their reads).
+                    let flash_positions = if is_ring {
+                        ring_positions_buf.unwrap_or(positions_buf)
+                    } else {
+                        positions_buf
+                    };
+                    // Gap program: the NE head split on d256 layers, the same
+                    // per-row math as the per-slot fallback and single-slot
+                    // paths below (`gemma_decode_attention`).
+                    match self.decode_attn_ne.for_head_dim(hd) {
+                        Some(ne) => mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched_ne(
+                            session.encoder_mut(),
+                            reg,
+                            dev,
+                            n as u32,
+                            &bufs.attn_q_normed,
+                            &buf.k,
+                            &buf.v_packed,
+                            &buf.v_norms,
+                            &bufs.sdpa_out,
+                            &bufs.sdpa_tmp,
+                            slot_id_buf,
+                            flash_positions,
+                            &p_hyb,
+                            ne,
+                        ),
+                        None => mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
+                            session.encoder_mut(),
+                            reg,
+                            dev,
+                            n as u32,
+                            &bufs.attn_q_normed,
+                            &buf.k,
+                            &buf.v_packed,
+                            &buf.v_norms,
+                            &bufs.sdpa_out,
+                            &bufs.sdpa_tmp,
+                            slot_id_buf,
+                            flash_positions,
+                            &p_hyb,
+                        ),
+                    }
                     .map_err(|e| anyhow::anyhow!("batched flash L{layer_idx}: {e}"))?;
                     // PHASE 3 — FWHT-undo. ATTNPRE: ONE batched undo over all N queries
                     // (num_heads=N*nh; kernel base=head_idx*hd over tight [N, nh*hd] ⇒
@@ -1322,18 +1344,33 @@ impl MlxModelWeights {
                                 fuse_fwht_pre: 0,
                                 nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(kv_seq_len),
                             };
-                        mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
-                            session.encoder_mut(),
-                            reg,
-                            dev,
-                            &q_i,
-                            &k_view,
-                            &v_view,
-                            &v_norms_view,
-                            &sdpa_i,
-                            &tmp_i,
-                            &p_hyb,
-                        )
+                        match self.decode_attn_ne.for_head_dim(hd) {
+                            Some(ne) => mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_ne(
+                                session.encoder_mut(),
+                                reg,
+                                dev,
+                                &q_i,
+                                &k_view,
+                                &v_view,
+                                &v_norms_view,
+                                &sdpa_i,
+                                &tmp_i,
+                                &p_hyb,
+                                ne,
+                            ),
+                            None => mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
+                                session.encoder_mut(),
+                                reg,
+                                dev,
+                                &q_i,
+                                &k_view,
+                                &v_view,
+                                &v_norms_view,
+                                &sdpa_i,
+                                &tmp_i,
+                                &p_hyb,
+                            ),
+                        }
                         .map_err(|e| {
                             anyhow::anyhow!("batched flash_attn_vec_hybrid L{layer_idx} s{i}: {e}")
                         })?;

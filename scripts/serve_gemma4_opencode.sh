@@ -114,6 +114,11 @@
 #                                    it off. 1 prints the V2 [ROUTING_OVERLAP]
 #                                    decode-workload histograms at worker exit
 #                                    (diagnostic, untimed runs only).
+#     DECODE_ATTN_NE=0|2|4           (this script) forwards
+#                                    HF2Q_GEMMA_DECODE_ATTN_NE; unset keeps
+#                                    the stock decode attention. 4 is the
+#                                    gap-program NE head split of d256
+#                                    decode attention (Class B A/B arm).
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):
 #   * Disk persistence of the LCP registry for gemma (ADR-017 spiller
@@ -268,6 +273,15 @@ case "${ROUTING_OVERLAP:-}" in
         exit 2
         ;;
 esac
+DECODE_ATTN_NE_ENV=""
+case "${DECODE_ATTN_NE:-}" in
+    "") ;;
+    0|2|4) DECODE_ATTN_NE_ENV="$DECODE_ATTN_NE" ;;
+    *)
+        echo "DECODE_ATTN_NE must be 0, 2, 4 or unset" >&2
+        exit 2
+        ;;
+esac
 
 # macOS bash 3.2 + `set -u`: expanding an EMPTY array via "${MMARGS[@]}"
 # is an unbound-variable error (this killed the no-mmproj boot
@@ -282,6 +296,7 @@ if [[ -f "$MMPROJ" ]]; then
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
         ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
+        ${DECODE_ATTN_NE_ENV:+HF2Q_GEMMA_DECODE_ATTN_NE="$DECODE_ATTN_NE_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
@@ -304,6 +319,7 @@ else
         ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
         ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
         ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
+        ${DECODE_ATTN_NE_ENV:+HF2Q_GEMMA_DECODE_ATTN_NE="$DECODE_ATTN_NE_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \

@@ -3062,6 +3062,7 @@ embed_weight,
             multi_seq_prefill: None,
             warm_live_kernel: crate::inference::models::gemma4::GemmaLiveKernel::TiledF16,
             prefill_moe_down: crate::serve::gemma_prefill_moe::GemmaPrefillMoeDown::Slotted,
+            decode_attn_ne: crate::serve::gemma_decode_attention::GemmaDecodeAttnNe::Stock,
         }
     }
 
@@ -3427,6 +3428,7 @@ embed_weight,
             multi_seq_prefill: None,
             warm_live_kernel: crate::inference::models::gemma4::GemmaLiveKernel::TiledF16,
             prefill_moe_down: crate::serve::gemma_prefill_moe::GemmaPrefillMoeDown::Slotted,
+            decode_attn_ne: crate::serve::gemma_decode_attention::GemmaDecodeAttnNe::Stock,
         };
 
         let tokens: Vec<u32> = vec![0, 1];

@@ -660,6 +660,11 @@ pub struct MlxModelWeights {
     /// (flattened or slotted; bitwise equal). Resolved once at load from
     /// `HF2Q_GEMMA_PREFILL_MOE_DOWN` (default slotted).
     pub(crate) prefill_moe_down: crate::serve::gemma_prefill_moe::GemmaPrefillMoeDown,
+
+    /// ADR-063 gap program — decode attention head split of d256 layers on
+    /// every decode path. Resolved once at load from
+    /// `HF2Q_GEMMA_DECODE_ATTN_NE` (default stock).
+    pub(crate) decode_attn_ne: crate::serve::gemma_decode_attention::GemmaDecodeAttnNe,
 }
 
 /// ADR-040 iter-G(a) — per-call descriptor for cross-slot batched prefill.
@@ -1449,6 +1454,7 @@ impl MlxModelWeights {
             multi_seq_prefill: None,
             warm_live_kernel: crate::serve::gemma_live_attention::warm_live_kernel_from_env(),
             prefill_moe_down: crate::serve::gemma_prefill_moe::prefill_moe_down_from_env(),
+            decode_attn_ne: crate::serve::gemma_decode_attention::decode_attn_ne_from_env(),
         });
 
         // Pre-initialize constant param buffers so we never write them
