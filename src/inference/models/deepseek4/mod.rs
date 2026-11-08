@@ -75,6 +75,8 @@ mod ds4_file_kernel_parity_tests;
 #[cfg(test)]
 mod ds4_op_microbench_tests;
 #[cfg(test)]
+mod ds4_prefill_microbench_tests;
+#[cfg(test)]
 mod ds4_file_parity_tests;
 #[cfg(test)]
 mod ffn_forward_tests;
@@ -104,6 +106,8 @@ mod row_matmul_tests;
 mod row_exact_matvec_tests;
 #[cfg(test)]
 mod rows_step_tests;
+#[cfg(test)]
+mod moe_schedule_tests;
 #[cfg(test)]
 mod ds4_tail_rows_microbench_tests;
 

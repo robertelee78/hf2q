@@ -147,14 +147,24 @@ fn run_trial(
 /// Time `encode` (called with the copy index within the session) as described in the module doc.
 pub(super) fn time_op(
     ctx: &mut GpuContext,
+    encode: impl FnMut(&mut GraphSession<'_>, &mut KernelRegistry, &MlxDevice, usize) -> Result<()>,
+) -> Timing {
+    time_op_reps(ctx, MIN_REPS, encode)
+}
+
+/// `time_op` with an explicit minimum copy count per session (prefill cells whose single copy
+/// already runs for milliseconds use a small minimum; sessions still run >= SESSION_GPU_SECS).
+pub(super) fn time_op_reps(
+    ctx: &mut GpuContext,
+    min_reps: usize,
     mut encode: impl FnMut(&mut GraphSession<'_>, &mut KernelRegistry, &MlxDevice, usize) -> Result<()>,
 ) -> Timing {
     let device = ctx.device().clone();
     // Calibration session (also builds pipelines): size reps for >= SESSION_GPU_SECS per session.
-    let probe = run_trial(ctx, &device, MIN_REPS, &mut encode);
-    let per_copy = probe.gpu / MIN_REPS as f64;
+    let probe = run_trial(ctx, &device, min_reps, &mut encode);
+    let per_copy = probe.gpu / min_reps as f64;
     let reps = if per_copy > 0.0 {
-        ((SESSION_GPU_SECS / per_copy).ceil() as usize).clamp(MIN_REPS, MAX_REPS)
+        ((SESSION_GPU_SECS / per_copy).ceil() as usize).clamp(min_reps, MAX_REPS)
     } else {
         MAX_REPS
     };

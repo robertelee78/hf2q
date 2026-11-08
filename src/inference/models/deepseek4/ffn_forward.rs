@@ -1,6 +1,6 @@
 //! Exact one-token DeepSeek-V4 hash- and score-routed MoE layers.
 
-use std::sync::Once;
+use std::sync::{LazyLock, Once};
 
 use anyhow::{bail, Context, Result};
 use mlx_native::graph::GraphSession;
@@ -28,8 +28,13 @@ use super::Deepseek4Model;
 
 static PAIRED_MOE_PREFILL_LOG: Once = Once::new();
 
+/// `HF2Q_DEEPSEEK_ENCODER_STAGES=1` (diagnostic stage profiling), read once
+/// per process.
+pub(super) static ENCODER_STAGES: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("HF2Q_DEEPSEEK_ENCODER_STAGES").as_deref() == Ok("1"));
+
 fn split_profile_stage(session: &mut GraphSession<'_>, label: &str) -> Result<()> {
-    if std::env::var("HF2Q_DEEPSEEK_ENCODER_STAGES").as_deref() == Ok("1") {
+    if *ENCODER_STAGES {
         session
             .encoder_mut()
             .profile_stage_boundary(label)
@@ -280,6 +285,16 @@ impl Deepseek4Model {
         } else {
             ExpertMatmulRoute::Auto
         };
+        // The slotted down call reuses the paired gate/up `mm_id` schedule
+        // (same ids, rows, top-k, experts, scratch and encoder) instead of a
+        // second map0c; the schedule depends only on the ids, so the output
+        // is byte-identical. Stage profiling may split the encoder in
+        // between, so it keeps the self-scheduling call. Reuse fails closed:
+        // mlx-native refuses a schedule recorded for other ids, shapes or
+        // encoder, and that refusal is a wiring bug in this sequence, so it
+        // fails the prefill rather than silently falling back to a second
+        // map0c that would hide the bug.
+        let reuse_down_schedule = !*ENCODER_STAGES;
 
         let registry = &mut self.ctx.registry;
         let mut encode = |session: &mut GraphSession<'_>| -> Result<()> {
@@ -416,12 +431,13 @@ impl Deepseek4Model {
                 }
             }
             split_profile_stage(session, "DeepSeek-V4 FFN router")?;
-            if use_paired_expert_prefill(
+            let paired = use_paired_expert_prefill(
                 rows,
                 routed_projection,
                 id_mm_scratch.is_some(),
                 std::env::var_os("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some(),
-            ) {
+            );
+            if paired {
                 let scratch = id_mm_scratch
                     .as_deref_mut()
                     .context("DeepSeek-V4 paired routed projections require scratch")?;
@@ -554,7 +570,11 @@ impl Deepseek4Model {
                     experts,
                     hidden,
                     inter,
-                    ExpertMatmulRoute::SlottedMm,
+                    if paired && reuse_down_schedule {
+                        ExpertMatmulRoute::SlottedMmReusingSchedule
+                    } else {
+                        ExpertMatmulRoute::SlottedMm
+                    },
                     id_mm_scratch.as_deref_mut().map(|scratch| &mut scratch[0]),
                     "routed down",
                 )?;
