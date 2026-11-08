@@ -664,9 +664,16 @@ impl Qwen35Model {
         )
         .context("Qwen joint output norm")?;
         enc.memory_barrier();
-        let mut logits = device
-            .alloc_buffer(width * vocab * 4, DType::F32, vec![width, vocab])
-            .map_err(|e| anyhow!("allocate Qwen joint logits: {e}"))?;
+        // Pooled: the head writes every row and every result leaves this
+        // function as an owned copy before the next forward resets the pool,
+        // so a step pays no fresh `[width, vocab]` allocation and CPU zeroing.
+        let mut logits = decode_pool::pooled_alloc_buffer(
+            device,
+            width * vocab * 4,
+            DType::F32,
+            vec![width, vocab],
+        )
+        .map_err(|e| anyhow!("allocate Qwen joint logits: {e}"))?;
         match plan.head {
             JointProductRoute::Batched => apply_linear_projection_f32_into_with_ggml_type(
                 &mut enc,
@@ -708,11 +715,9 @@ impl Qwen35Model {
                 argmax.push(None);
                 continue;
             }
-            let index = device
-                .alloc_buffer(4, DType::U32, vec![1])
+            let index = decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
                 .map_err(|e| anyhow!("allocate Qwen joint argmax index: {e}"))?;
-            let value = device
-                .alloc_buffer(4, DType::F32, vec![1])
+            let value = decode_pool::pooled_alloc_buffer(device, 4, DType::F32, vec![1])
                 .map_err(|e| anyhow!("allocate Qwen joint argmax value: {e}"))?;
             dispatch_argmax_f32(
                 &mut enc,

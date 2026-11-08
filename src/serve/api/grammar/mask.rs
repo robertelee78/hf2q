@@ -128,6 +128,12 @@ fn zt_record(pre_finite_logits: &[(usize, f32)], post_logits: &[f32], masked: us
 /// back to the exhaustive mask after a bounded number of misses. The result is
 /// exactly the same highest-logit valid token as mask-then-argmax; only the
 /// amount of rejected work changes.
+///
+/// The first candidate (the usual winner) comes from one vectorizable scan
+/// ([`first_probe_candidate`]); only when it is rejected are the remaining
+/// candidates ordered, with the probe budget reduced by one, so the probe
+/// sequence, the logits it rejects and the fallback are those of ordering
+/// every candidate up front.
 pub fn sample_greedy_valid_token(
     logits: &mut [f32],
     previous_tokens: &[u32],
@@ -145,6 +151,41 @@ pub fn sample_greedy_valid_token(
     }
     if grammar.is_awaiting_trigger() {
         return crate::serve::sampler_pure::sample_greedy(logits);
+    }
+
+    // `Some(token)` accepts; `None` rejects and removes the token from the
+    // candidates by masking its logit.
+    let probe = |logits: &mut [f32], token: usize| -> Option<u32> {
+        let Some(bytes) = token_bytes.get(token) else {
+            return Some(token as u32);
+        };
+        if eog_token_ids.contains(&(token as u32)) {
+            if grammar.is_terminally_accepted() {
+                return Some(token as u32);
+            }
+            logits[token] = f32::NEG_INFINITY;
+            return None;
+        }
+        // the peer rejects empty non-EOG pieces even after acceptance.
+        if bytes.is_empty() || bytes.first() == Some(&0) {
+            logits[token] = f32::NEG_INFINITY;
+            return None;
+        }
+        let mut runtime = grammar.clone();
+        if runtime.accept_token(token as u32, bytes) {
+            return Some(token as u32);
+        }
+        logits[token] = f32::NEG_INFINITY;
+        None
+    };
+
+    let Some(first) = first_probe_candidate(logits) else {
+        // No finite candidate: the exhaustive mask decides, as before.
+        mask_invalid_tokens_with_eog(grammar, token_bytes, eog_token_ids, logits);
+        return crate::serve::sampler_pure::sample_greedy(logits);
+    };
+    if let Some(token) = probe(logits, first) {
+        return token;
     }
 
     let selected = GREEDY_CANDIDATES.with(|cell| {
@@ -168,36 +209,19 @@ pub fn sample_greedy_valid_token(
                 .total_cmp(&left.1)
                 .then_with(|| left.0.cmp(&right.0))
         };
-        let limit = GREEDY_PROBE_LIMIT.min(candidates.len());
+        // The first of the GREEDY_PROBE_LIMIT probes is spent above.
+        let limit = (GREEDY_PROBE_LIMIT - 1).min(candidates.len());
+        if limit == 0 {
+            return None;
+        }
         if candidates.len() > limit {
             candidates.select_nth_unstable_by(limit - 1, compare);
             candidates.truncate(limit);
         }
         candidates.sort_unstable_by(compare);
-
-        for &(token, _) in candidates.iter() {
-            let Some(bytes) = token_bytes.get(token) else {
-                return Some(token as u32);
-            };
-            if eog_token_ids.contains(&(token as u32)) {
-                if grammar.is_terminally_accepted() {
-                    return Some(token as u32);
-                }
-                logits[token] = f32::NEG_INFINITY;
-                continue;
-            }
-            // the peer rejects empty non-EOG pieces even after acceptance.
-            if bytes.is_empty() || bytes.first() == Some(&0) {
-                logits[token] = f32::NEG_INFINITY;
-                continue;
-            }
-            let mut probe = grammar.clone();
-            if probe.accept_token(token as u32, bytes) {
-                return Some(token as u32);
-            }
-            logits[token] = f32::NEG_INFINITY;
-        }
-        None
+        candidates
+            .iter()
+            .find_map(|&(token, _)| probe(logits, token))
     });
     if let Some(token) = selected {
         return token;
@@ -205,6 +229,43 @@ pub fn sample_greedy_valid_token(
 
     mask_invalid_tokens_with_eog(grammar, token_bytes, eog_token_ids, logits);
     crate::serve::sampler_pure::sample_greedy(logits)
+}
+
+/// The first candidate of the probe order: the finite logit that is largest
+/// under [`f32::total_cmp`] (so `0.0` ranks above `-0.0`), lowest index among
+/// equal values; `None` when no logit is finite. Two vectorizable passes over
+/// the total-order integer key `total_cmp` itself compares.
+fn first_probe_candidate(logits: &[f32]) -> Option<usize> {
+    // Non-finite values get `i32::MIN`, which no finite value's key reaches
+    // (only a negative NaN bit pattern maps there).
+    let key = |value: f32| {
+        let bits = value.to_bits() as i32;
+        let key = bits ^ (((bits >> 31) as u32) >> 1) as i32;
+        if value.is_finite() {
+            key
+        } else {
+            i32::MIN
+        }
+    };
+    const LANES: usize = 16;
+    let mut lanes = [i32::MIN; LANES];
+    let chunks = logits.chunks_exact(LANES);
+    let tail = chunks.remainder();
+    for chunk in chunks {
+        for (lane, &value) in lanes.iter_mut().zip(chunk) {
+            *lane = (*lane).max(key(value));
+        }
+    }
+    let best = tail
+        .iter()
+        .map(|&value| key(value))
+        .chain(lanes)
+        .max()
+        .unwrap_or(i32::MIN);
+    if best == i32::MIN {
+        return None;
+    }
+    logits.iter().position(|&value| key(value) == best)
 }
 
 /// Mask tokens whose byte-text would drive the grammar dead.
@@ -505,6 +566,157 @@ mod tests {
 
     fn vocab(strings: &[&str]) -> Vec<Vec<u8>> {
         strings.iter().map(|s| s.as_bytes().to_vec()).collect()
+    }
+
+    /// `sample_greedy_valid_token` before the scanned first probe: every
+    /// finite candidate ordered up front, 64 probes, then the mask.
+    fn sample_greedy_valid_token_ordered(
+        logits: &mut [f32],
+        previous_tokens: &[u32],
+        repetition_penalty: f64,
+        grammar: &GrammarRuntime,
+        token_bytes: &[Vec<u8>],
+        eog_token_ids: &[u32],
+    ) -> u32 {
+        if repetition_penalty != 1.0 && !previous_tokens.is_empty() {
+            crate::serve::sampler_pure::apply_repetition_penalty(
+                logits,
+                previous_tokens,
+                repetition_penalty,
+            );
+        }
+        if grammar.is_awaiting_trigger() {
+            return crate::serve::sampler_pure::sample_greedy(logits);
+        }
+        let mut candidates: Vec<(usize, f32)> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, logit)| logit.is_finite())
+            .collect();
+        let selected = (|| {
+            if candidates.is_empty() {
+                return None;
+            }
+            let compare = |left: &(usize, f32), right: &(usize, f32)| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            };
+            let limit = GREEDY_PROBE_LIMIT.min(candidates.len());
+            if candidates.len() > limit {
+                candidates.select_nth_unstable_by(limit - 1, compare);
+                candidates.truncate(limit);
+            }
+            candidates.sort_unstable_by(compare);
+            for &(token, _) in candidates.iter() {
+                let Some(bytes) = token_bytes.get(token) else {
+                    return Some(token as u32);
+                };
+                if eog_token_ids.contains(&(token as u32)) {
+                    if grammar.is_terminally_accepted() {
+                        return Some(token as u32);
+                    }
+                    logits[token] = f32::NEG_INFINITY;
+                    continue;
+                }
+                if bytes.is_empty() || bytes.first() == Some(&0) {
+                    logits[token] = f32::NEG_INFINITY;
+                    continue;
+                }
+                let mut probe = grammar.clone();
+                if probe.accept_token(token as u32, bytes) {
+                    return Some(token as u32);
+                }
+                logits[token] = f32::NEG_INFINITY;
+            }
+            None
+        })();
+        if let Some(token) = selected {
+            return token;
+        }
+        mask_invalid_tokens_with_eog(grammar, token_bytes, eog_token_ids, logits);
+        crate::serve::sampler_pure::sample_greedy(logits)
+    }
+
+    /// The scanned first probe changes neither the token nor the logits the
+    /// selection leaves behind, over adversarial values (ties, signed zeros,
+    /// NaN, infinities), table gaps, EOG ids, empty pieces, accepting and
+    /// non-accepting grammars, and more than 64 rejected top candidates.
+    #[test]
+    fn greedy_probe_scanned_first_candidate_matches_ordered_probe() {
+        let grammars = [
+            rt("root ::= \"a\" | \"b\"\n", "root"),
+            rt("root ::= [ab]*\n", "root"),
+        ];
+        let pieces = ["x", "a", "b", "", "\0", "ab", "y"];
+        let specials = [
+            0.0_f32,
+            -0.0,
+            1.0,
+            -1.0,
+            5.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            1.0e-45,
+        ];
+        let mut seed = 0x2545_F491_u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            seed >> 8
+        };
+        for case in 0..4_000_u32 {
+            let len = 1 + next() as usize % 40 + if case % 4 == 0 { 160 } else { 0 };
+            // Mostly invalid pieces in some cases, so more than 64 top
+            // candidates are rejected and the mask fallback runs.
+            let invalid_heavy = case % 3 == 0;
+            let table: Vec<Vec<u8>> = (0..len)
+                .map(|_| {
+                    let piece = if invalid_heavy && next() % 50 != 0 {
+                        "x"
+                    } else {
+                        pieces[next() as usize % pieces.len()]
+                    };
+                    piece.as_bytes().to_vec()
+                })
+                .collect();
+            // Some token ids above the table (no decoded entry).
+            let table = &table[..len - (next() as usize % 3).min(len - 1)];
+            let eog: Vec<u32> = (0..next() % 3).map(|_| next() % len as u32).collect();
+            let logits: Vec<f32> = (0..len)
+                .map(|_| {
+                    if next() % 3 == 0 {
+                        (next() % 9) as f32 - 4.0
+                    } else {
+                        specials[next() as usize % specials.len()]
+                    }
+                })
+                .collect();
+            let history: Vec<u32> = (0..next() % 4).map(|_| next() % len as u32).collect();
+            let penalty = if next() % 2 == 0 { 1.05 } else { 1.0 };
+            let grammar = &grammars[case as usize % grammars.len()];
+            let mut scanned = logits.clone();
+            let mut ordered = logits.clone();
+            let token =
+                sample_greedy_valid_token(&mut scanned, &history, penalty, grammar, table, &eog);
+            let reference = sample_greedy_valid_token_ordered(
+                &mut ordered,
+                &history,
+                penalty,
+                grammar,
+                table,
+                &eog,
+            );
+            assert_eq!(token, reference, "case {case}: {logits:?}");
+            assert_eq!(
+                scanned.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                ordered.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "case {case}: selection left different logits"
+            );
+        }
     }
 
     fn assert_candidate_set_matches_clone_oracle(
