@@ -405,17 +405,17 @@ def main():
                            max_calls=max_tools(args.repair_turns))
         protocol = Workflow(args.repair_turns) if args.repair_turns else None
         seen = set()
-        first_decode = []
+        phase_trigger = []
         if n4:
-            from qwen_n4_live_smoke import first_decode_marker, phase_cohorts, wait_barrier
+            from qwen_n4_live_smoke import first_stream_send_marker, phase_cohorts, wait_barrier
             save(output / "summary.json", summary)
             summary["barrier"] = wait_barrier(args.barrier_dir, args.agent_id, args.run_id,
                                                args.server_pid, args.barrier_token, output,
                                                initial_hash, args.approval_sha256, args.instance, phase)
             if phase is not None and phase["cohort"] < len(phase_cohorts(phase["plan"])):
-                # A later cohort is released once this cohort has decoded its first token.
-                first_decode.append(lambda ns: first_decode_marker(args.barrier_dir, args.agent_id, args.run_id,
-                                                                   args.barrier_token, ns))
+                # Release the later cohort once every member has sent its first streamed request.
+                phase_trigger.append(lambda ns: first_stream_send_marker(
+                    args.barrier_dir, args.agent_id, args.run_id, args.barrier_token, ns))
         started = time.monotonic()
         for turn in range(max_tools(args.repair_turns) + 1):
             require(not INTERRUPTED and time.monotonic() - started < 7200, "whole client deadline")
@@ -424,10 +424,11 @@ def main():
                                     args.request_setup)
             turn_output = output / f"turn-{turn}"
             turn_output.mkdir(mode=0o700)
-            on_first_token = first_decode.pop() if first_decode and request["stream"] else None
+            if phase_trigger and request["stream"]:
+                phase_trigger.pop()(clock_ns())
             message, call, receipt = exchange(args.base_url, request, turn_output, turn, seen,
                                                deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind, family=args.family,
-                                               on_first_token=on_first_token, setup=args.request_setup,
+                                               setup=args.request_setup,
                                                assistant_policy=None if protocol is None else protocol.policy)
             summary["turns"].append(receipt)
             messages.append(message)

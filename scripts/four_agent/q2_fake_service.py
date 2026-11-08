@@ -450,7 +450,7 @@ class StubTools:
 
 
 def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", family="qwen", instance=None,
-                phase=None, release_ns=None, on_first_token=None, server_pid=SERVER_PID, acks=None, variant=None,
+                phase=None, release_ns=None, on_first_stream_send=None, server_pid=SERVER_PID, acks=None, variant=None,
                 repair_turns=0):
     """The agent child's turn loop with stub tools; raises the actual client rejection on a bad response.
 
@@ -492,9 +492,11 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
         request = build_request(model, messages, schemas, turn, family, engine_kind)
         turn_out = out / f"turn-{turn}"
         turn_out.mkdir()
-        callback = on_first_token if turn == 1 else None
+        if turn == 1 and on_first_stream_send is not None:
+            on_first_stream_send(clock_ns())
+        callback = None
         if acks is not None:
-            callback = acknowledging(first_progress_ack(acks, agent, turn), callback)
+            callback = acknowledging(first_progress_ack(acks, agent, turn))
         message, call, receipt = exchange(base, request, turn_out, turn, seen, deadline=30, engine_kind=engine_kind,
                                           family=family, on_first_token=callback,
                                           assistant_policy=None if protocol is None else protocol.policy)
@@ -540,7 +542,8 @@ def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="h
         summary["repair_turns"] = repair_turns
     if phase_plan is not None:
         summary["phase"] = {"plan": phase_plan, "cohorts": [list(c) for c in coordinator.phase_cohorts(phase_plan)],
-                            "releases": [{"cohort": i + 1, "release_monotonic_ns": at, "trigger_first_decode_monotonic_ns": t}
+                            "releases": [{"cohort": i + 1, "release_monotonic_ns": at,
+                                          "trigger_first_stream_send_monotonic_ns": t}
                                          for i, (at, t) in enumerate(zip(releases, triggers))]}
     summary["status"] = coordinator.aggregate(results, exits, {a: cleanup[a]["verified"] for a in agents}, server_pid, run,
                                               engine_kind, family, record, phase_plan, variant_record,
@@ -574,7 +577,8 @@ def retime(results, phase_plan, makespan_s, slots=None, origin=10 ** 12):
     releases, triggers, start = [origin], [None], {}
     for index, cohort in enumerate(cohorts):
         if index:
-            trigger = {a: start[a] + duration + agents.index(a) * (gap // 8) + gap for a in cohorts[index - 1]}
+            trigger = {a: start[a] + duration + agents.index(a) * (gap // 8)
+                       for a in cohorts[index - 1]}
             releases.append(max(trigger.values()) + 1)
             triggers.append(trigger)
         for agent in cohort:
@@ -724,9 +728,9 @@ def agent_main(config):
     marker = None
     if phase is not None and cohort < len(coordinator.phase_cohorts(plan)):
         def marker(ns):
-            coordinator.first_decode_marker(barrier, agent, RUN, TOKEN, ns)
+            coordinator.first_stream_send_marker(barrier, agent, RUN, TOKEN, ns)
     drive_agent(config["base"], config["out"], agent, engine_kind=config["engine_kind"], family=config["family"],
-                phase=phase, release_ns=release_ns, on_first_token=marker, acks=config["acks"])
+                phase=phase, release_ns=release_ns, on_first_stream_send=marker, acks=config["acks"])
     return 0
 
 
