@@ -381,8 +381,8 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
         "trajectory":p.trajectory,"actual_cancellation":cancellation,"active64_exact_copy":exact64,"logical_lanes":4,"physical_graph_membership":if p.trajectory==Trajectory::T2ActualCohort {
             "actual packed prefill512 rows with four128-owner spans; actual decode input4rows; operator-specific source geometry, not whole-kernel/F2 membership"
         } else {"per-request ordinary; not T2"},
-        "logit_rows_per_lane":144,"cache_boundaries":positions(p.trajectory),"capture_records":records,"warm_live_kernel":warm_live_kernel,"decode_dense_kernel":decode_dense_kernel,
-        "logit_rows_per_lane":144,"cache_boundaries":positions(p.trajectory),"capture_records":records,"warm_live_kernel":warm_live_kernel,"decode_attn_ne":decode_attn_ne,
+        "logit_rows_per_lane":144,"cache_boundaries":positions(p.trajectory),"capture_records":records,"warm_live_kernel":warm_live_kernel,
+        "decode_dense_kernel":decode_dense_kernel,"decode_attn_ne":decode_attn_ne,
         "planned_tensor_payload":bytes,"oracle_quality_qualified":false,"whole_q1_qualified":false,
         "float_policy":"Unspecified","diagnostic_head_scope":"same production scalar head applied to every actual prefill hidden row"});
     let mut stage_records=0;
