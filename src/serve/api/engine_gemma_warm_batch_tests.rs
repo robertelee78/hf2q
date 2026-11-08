@@ -404,7 +404,11 @@ fn gemma_prefill_pool_hostile_fill_matches_zero_fill_bitwise() {
         unreachable!("load_gate_model returns Gemma")
     };
     let mut guard = Gemma4KvGuard::take(g).unwrap();
-    for kernel in [GemmaLiveKernel::VecHybrid, GemmaLiveKernel::TiledF16] {
+    for kernel in [
+        GemmaLiveKernel::VecHybrid,
+        GemmaLiveKernel::TiledF16,
+        GemmaLiveKernel::TensorF16,
+    ] {
         guard.model.weights.warm_live_kernel = kernel;
         let mut arms = Vec::new();
         for fill in [0x00, 0xFF] {
@@ -426,6 +430,13 @@ fn gemma_prefill_pool_hostile_fill_matches_zero_fill_bitwise() {
             assert_lane_equal(&format!("{kernel:?} joint lane {slot}"), h, z);
         }
     }
+}
+
+/// ADR-063 gap program F1 gate (Class A).
+#[test]
+#[ignore = "official Gemma 4 GGUF: joint warm prefill lanes equal per-slot warm prefill bit for bit (tensor F16 route)"]
+fn gemma_joint_warm_prefill_matches_per_slot_bitwise_tensor_f16() {
+    joint_warm_prefill_matches_per_slot(GemmaLiveKernel::TensorF16);
 }
 
 fn joint_warm_prefill_matches_per_slot(kernel: GemmaLiveKernel) {

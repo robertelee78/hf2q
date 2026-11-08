@@ -557,7 +557,7 @@ class ArgvAndCases(unittest.TestCase):
             q5_case.validate(broken)
         launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
         self.assertEqual(launcher.count('${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"}'), 2)
-        self.assertIn('0|1) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;', launcher)
+        self.assertIn('0|1|tensor) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;', launcher)
 
     def test_gemma_case_forwards_only_explicit_prefill_moe_arms(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
