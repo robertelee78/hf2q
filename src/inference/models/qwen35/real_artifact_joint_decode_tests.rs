@@ -141,7 +141,11 @@ pub(super) fn hidden_bits(buffer: &MlxBuffer, hidden: usize) -> Vec<u32> {
 }
 
 /// Cursors, parities, KV codes/scales and conv/recurrent state, all slots.
-fn assert_caches_equal(serial: &HybridKvCache, joint: &HybridKvCache, label: &str) {
+pub(super) fn assert_caches_equal(
+    serial: &HybridKvCache,
+    joint: &HybridKvCache,
+    label: &str,
+) {
     for slot in 0..SLOTS {
         assert_eq!(
             serial.sequence_len_for_slot(SlotId(slot)).ok(),

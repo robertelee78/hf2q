@@ -226,6 +226,33 @@ thread_local! {
     /// expert call (the pre-P1 route) so bitwise tests can compare both.
     static FORCE_PER_CALL_EXPERT_SCHEDULE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static SHARED_EXPERT_SCHEDULE_ADMISSIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn with_forced_per_call_expert_schedule<T>(
+    forced: bool,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(bool);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_PER_CALL_EXPERT_SCHEDULE.with(|state| state.set(self.0));
+        }
+    }
+
+    let restore =
+        Restore(FORCE_PER_CALL_EXPERT_SCHEDULE.with(|state| state.replace(forced)));
+    let output = run();
+    drop(restore);
+    output
+}
+
+#[cfg(test)]
+pub(super) fn take_shared_expert_schedule_admissions() -> usize {
+    SHARED_EXPERT_SCHEDULE_ADMISSIONS.with(|count| count.replace(0))
 }
 
 /// Whether the prefill MoE FFN builds the expert `mm_id` schedule once per
@@ -252,7 +279,7 @@ fn moe_prefill_shares_expert_schedule(
     if FORCE_PER_CALL_EXPERT_SCHEDULE.with(std::cell::Cell::get) {
         return false;
     }
-    !fused_gate_up
+    let admitted = !fused_gate_up
         && seq_len > MM_ID_ROUTING_THRESHOLD
         && matches!(shape.num_experts_per_tok, 1 | 6 | 8)
         && shape.hidden_size >= 32
@@ -261,7 +288,12 @@ fn moe_prefill_shares_expert_schedule(
         && weights.expert_up_affine.is_none()
         && weights.expert_gate_stride == weights.expert_up_stride
         && std::env::var_os("HF2Q_MM_ID_ROUTING_THRESHOLD").is_none()
-        && !crate::quantize::imatrix::is_active()
+        && !crate::quantize::imatrix::is_active();
+    #[cfg(test)]
+    if admitted {
+        SHARED_EXPERT_SCHEDULE_ADMISSIONS.with(|count| count.set(count.get() + 1));
+    }
+    admitted
 }
 
 use super::ffn::{DenseFfnShape, DenseFfnWeights, MoeFfnShape, MoeFfnWeights};
@@ -4908,6 +4940,7 @@ mod tests {
                 shared_gate: upload_bf16_from_f32(&shared_gate, &device).expect("sh_gate"),
                 shared_up: upload_bf16_from_f32(&shared_up, &device).expect("sh_up"),
                 shared_down: upload_bf16_from_f32(&shared_down, &device).expect("sh_down"),
+                dense_storage: MoeDenseStorage::Bf16,
                 expert_gate_affine: None,
                 expert_up_affine: None,
                 expert_down_affine: None,
@@ -5021,6 +5054,7 @@ mod tests {
             shared_gate: stub(4),
             shared_up: stub(4),
             shared_down: stub(4),
+            dense_storage: MoeDenseStorage::Bf16,
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
@@ -5155,6 +5189,7 @@ mod tests {
                 .expect("sh_up"),
             shared_down: upload_bf16_from_f32(&mk_rand(&mut seed, h * m, 0.05), &device)
                 .expect("sh_down"),
+            dense_storage: MoeDenseStorage::Bf16,
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
