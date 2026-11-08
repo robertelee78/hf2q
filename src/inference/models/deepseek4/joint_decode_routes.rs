@@ -76,7 +76,10 @@ pub(super) fn first_unproven_joint_route<'a>(
 }
 
 /// Every matrix joint decode multiplies with `m = B`. Compressor and indexer
-/// projections run per row (`m = 1`) and are exact for any storage.
+/// projections are exact for any storage without being listed: the per-row
+/// cores run them at `m = 1`, and the batched cores
+/// (`joint_decode_rows::projection_takes_single_dispatch`) use one `m = B`
+/// dispatch only on routes proven here or row-exact, else `m = 1` per row.
 fn joint_product_names(cfg: &Deepseek4Config) -> Vec<(JointProduct, String)> {
     let mut names = Vec::new();
     for layer in 0..cfg.num_hidden_layers as usize {
