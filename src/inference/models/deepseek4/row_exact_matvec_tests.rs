@@ -136,9 +136,7 @@ fn nr2_context() -> GpuContext {
 }
 
 fn policy_context(policy: GgmlRoutingPolicy) -> GpuContext {
-    let mut ctx = GpuContext::new().unwrap();
-    ctx.split().1.freeze_ggml_routing_policy(policy).unwrap();
-    ctx
+    GpuContext::new_with_routing_policy_for_test(policy).unwrap()
 }
 
 /// Encode `encode` in one session and wait; returns the registry for
@@ -972,13 +970,20 @@ fn q8_0_row_exact_admission_follows_the_stock_route_policy() {
     };
     for rows in 0..=MAX_ROWS + 1 {
         let in_range = (1..=MAX_ROWS).contains(&rows);
-        assert_eq!(stock_q8_0_rows_take_nr2(&nr2, rows), in_range, "nr2 rows={rows}");
+        assert_eq!(
+            stock_q8_0_rows_take_nr2(&nr2, rows),
+            in_range,
+            "nr2 rows={rows}"
+        );
         assert_eq!(
             stock_q8_0_rows_take_nr2(&mv_ext, rows),
             rows == 1,
             "mv_ext rows={rows}"
         );
-        assert!(!stock_q8_0_rows_take_nr2(&plain_mv, rows), "plain mv rows={rows}");
+        assert!(
+            !stock_q8_0_rows_take_nr2(&plain_mv, rows),
+            "plain mv rows={rows}"
+        );
     }
 }
 
@@ -1039,7 +1044,10 @@ fn row_exact_switch_equals_stock_under_non_nr2_q8_0_policies() {
         let q8_0_built: Vec<_> = built.iter().filter(|name| name.contains("q8_0")).collect();
         match policy_label {
             "plain_mv" => assert!(q8_0_built.is_empty(), "{policy_label}: {built:?}"),
-            _ => assert!(!q8_0_built.is_empty(), "{policy_label}: m = 1 stays row-exact"),
+            _ => assert!(
+                !q8_0_built.is_empty(),
+                "{policy_label}: m = 1 stays row-exact"
+            ),
         }
     }
 }

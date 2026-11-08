@@ -60,10 +60,20 @@ impl GpuContext {
     ///
     /// Returns an error if no Metal device is available.
     pub fn new() -> mlx_native::Result<Self> {
+        Self::new_with_routing_policy(mlx_native::ggml_routing_policy_from_environment())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_routing_policy_for_test(
+        routing_policy: GgmlRoutingPolicy,
+    ) -> mlx_native::Result<Self> {
+        Self::new_with_routing_policy(routing_policy)
+    }
+
+    fn new_with_routing_policy(routing_policy: GgmlRoutingPolicy) -> mlx_native::Result<Self> {
         let device = MlxDevice::new()?;
         let gpu_name = device.name();
         let executor = GraphExecutor::new(device);
-        let routing_policy = mlx_native::ggml_routing_policy_from_environment();
         let mut registry = KernelRegistry::new();
         registry.freeze_ggml_routing_policy(routing_policy)?;
         // Register all inference kernels.
@@ -247,7 +257,10 @@ mod tests {
             mlx_native::ggml_routing_policy_from_environment()
         );
         if let Some(worker) = ctx.worker_registry.as_ref() {
-            assert_eq!(worker.ggml_routing_policy(), Some(ctx.ggml_routing_policy()));
+            assert_eq!(
+                worker.ggml_routing_policy(),
+                Some(ctx.ggml_routing_policy())
+            );
         }
     }
 
