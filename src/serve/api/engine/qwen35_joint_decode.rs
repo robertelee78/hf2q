@@ -213,6 +213,7 @@ pub(super) fn qwen35_joint_decode_config(
         moe,
         dense_decode_mvn = model.ggml_routing_policy().dense_decode_mvn,
         dense_decode_mv_ext = model.ggml_routing_policy().dense_decode_mv_ext,
+        moe_ffn = model.moe_ffn_decode_route(),
         max_rows = selected.map_or(max_rows, |config| config.max_rows),
         selected = selected.is_some(),
         mode = selected.map_or("serial", |config| config.mode.label()),

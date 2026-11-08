@@ -645,19 +645,10 @@ fn load_mtp_moe_ffn(
     let weights_q = load_moe_ffn_quantized(gguf, layer_index, device)
         .with_context(|| format!("MTP MoE FFN layer {layer_index}"))?;
     let moe_gpu = MoeFfnWeightsGpuQ::from_quantized(
-        weights_q.expert_gate_q.clone(),
-        weights_q.expert_up_q.clone(),
-        weights_q.expert_down_q.clone(),
-        weights_q.ggml_type_gate_up,
-        weights_q.ggml_type_down,
+        &weights_q,
         moe_cfg.num_experts,
         moe_cfg.moe_intermediate_size,
         cfg.hidden_size,
-        &weights_q.router,
-        &weights_q.shared_gate_logit,
-        &weights_q.shared_gate,
-        &weights_q.shared_up,
-        &weights_q.shared_down,
         device,
     )
     .with_context(|| format!("MTP MoE upload layer {layer_index}"))?;
