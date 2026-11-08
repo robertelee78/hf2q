@@ -213,12 +213,14 @@ def cohort_releases(summary, phase_plan, cohorts, results):
     clocks = [started]
     for index, release in enumerate(releases[1:], 1):
         earlier, trigger, at = cohorts[index - 1], release["trigger_first_decode_monotonic_ns"], release["release_monotonic_ns"]
-        require(isinstance(trigger, dict) and set(trigger) == set(earlier) and type(at) is int, "cohort trigger membership")
-        for agent in earlier:
+        require(isinstance(trigger, dict) and trigger and set(trigger) <= set(earlier) and type(at) is int,
+                "cohort trigger membership")
+        for agent in trigger:
             first_stream = results[agent]["turns"][1]
             require(type(trigger[agent]) is int and first_stream["send_monotonic_ns"] <= trigger[agent]
                     <= first_stream["validated_terminal_monotonic_ns"],
                     "first-decode trigger outside the agent's first streamed request")
+        for agent in earlier:
             require(results[agent]["task_completed_monotonic_ns"] > at,
                     f"population never mixed: {agent} finished before cohort {index + 1} was released")
         require(at >= max(trigger.values()) and at >= clocks[-1], "cohort released before its trigger")

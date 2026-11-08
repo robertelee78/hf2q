@@ -313,7 +313,8 @@ class AuditControls(unittest.TestCase):
         self.assertRegex(self.reason(client, summary, plan="3+1"), "population never mixed")
         client, summary = self.run_dir("2+2")
         trigger = summary["phase"]["releases"][1]["trigger_first_decode_monotonic_ns"]
-        trigger["agent-1"] = summary["agents"]["agent-1"]["turns"][1]["send_monotonic_ns"] - 1
+        agent = next(iter(trigger))
+        trigger[agent] = summary["agents"][agent]["turns"][1]["send_monotonic_ns"] - 1
         self.assertRegex(self.reason(client, summary, plan="2+2"), "first-decode trigger outside")
         client, summary = self.run_dir("1+3")
         release = summary["phase"]["releases"][1]
@@ -326,7 +327,7 @@ class AuditControls(unittest.TestCase):
         del summary["phase"]["releases"][1]
         self.assertRegex(self.reason(client, summary, plan="3+1"), "missing cohort release")
         client, summary = self.run_dir("2+2")
-        del summary["phase"]["releases"][1]["trigger_first_decode_monotonic_ns"]["agent-1"]
+        summary["phase"]["releases"][1]["trigger_first_decode_monotonic_ns"].clear()
         self.assertRegex(self.reason(client, summary, plan="2+2"), "cohort trigger membership")
 
 

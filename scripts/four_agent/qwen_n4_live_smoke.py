@@ -229,19 +229,19 @@ def first_decode_marker(directory, agent, run, token, monotonic_ns):
 
 
 def phase_trigger(directory, agents, run, token):
-    """{agent: first-decode clock} once every agent in `agents` has published its marker, else None."""
+    """Validated first-decode clocks already published by `agents`, or None before the first."""
     found = {}
     for agent in agents:
         path = Path(directory) / f"{agent}.first-decode.json"
         if not path.exists():
-            return None
+            continue
         value = loads(path.read_bytes())
         require(value.get("schema") == FIRST_DECODE_SCHEMA and value.get("agent_id") == agent and
                 value.get("run_id") == run and value.get("barrier_token") == token and
                 value.get("f2_clock_id") == CLOCK_ID and type(value.get("first_decode_monotonic_ns")) is int,
                 "first-decode marker binding")
         found[agent] = value["first_decode_monotonic_ns"]
-    return found
+    return found or None
 
 
 def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwen", instance_record=None,

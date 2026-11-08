@@ -253,14 +253,14 @@ class PhasePlans(unittest.TestCase):
         with self.assertRaises(Invalid):
             aggregate(data, *ok, PID, RUN, phase_plan="2+2")
 
-    def test_trigger_waits_for_every_first_cohort_marker(self):
+    def test_trigger_releases_on_the_first_valid_first_cohort_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
             first = phase_cohorts("3+1")[0]
-            for agent, ns in zip(first[:2], (5, 7)):
-                first_decode_marker(tmp, agent, RUN, TOKEN, ns)
             self.assertIsNone(phase_trigger(tmp, first, RUN, TOKEN))
-            first_decode_marker(tmp, first[2], RUN, TOKEN, 9)
-            self.assertEqual(phase_trigger(tmp, first, RUN, TOKEN), {"agent-0": 5, "agent-1": 7, "agent-2": 9})
+            first_decode_marker(tmp, first[0], RUN, TOKEN, 5)
+            self.assertEqual(phase_trigger(tmp, first, RUN, TOKEN), {"agent-0": 5})
+            first_decode_marker(tmp, first[1], RUN, TOKEN, 7)
+            self.assertEqual(phase_trigger(tmp, first, RUN, TOKEN), {"agent-0": 5, "agent-1": 7})
             with self.assertRaises(Invalid):
                 phase_trigger(tmp, first, RUN, "c" * 32)  # a marker from another barrier
             with self.assertRaises(FileExistsError):
