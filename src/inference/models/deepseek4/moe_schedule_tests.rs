@@ -190,18 +190,21 @@ fn assert_reuse_matches(rows: usize, recorded: bool) {
 }
 
 #[test]
+#[ignore = "requires mlx-native tensor expert kernels supported by the host Metal compiler"]
 fn down_schedule_reuse_is_bitwise_in_a_plain_session() {
     assert_reuse_matches(100, false);
     assert_reuse_matches(333, false);
 }
 
 #[test]
+#[ignore = "requires mlx-native tensor expert kernels supported by the host Metal compiler"]
 fn down_schedule_reuse_is_bitwise_in_a_reordered_recorded_session() {
     assert_reuse_matches(100, true);
     assert_reuse_matches(333, true);
 }
 
 #[test]
+#[ignore = "requires mlx-native tensor expert kernels supported by the host Metal compiler"]
 fn down_schedule_reuse_refuses_a_schedule_for_other_ids() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let mut ctx = GpuContext::new().unwrap();
@@ -235,6 +238,7 @@ fn down_schedule_reuse_refuses_a_schedule_for_other_ids() {
 /// Reference: each layer alone in a committed plain session with the
 /// self-scheduling down call.
 #[test]
+#[ignore = "requires mlx-native tensor expert kernels supported by the host Metal compiler"]
 fn down_schedule_reuse_across_two_layers_in_one_recorded_session_is_bitwise() {
     const ROWS: usize = 333;
     let _gpu = crate::inference::hf2q_gpu_test_lock();
