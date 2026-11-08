@@ -65,7 +65,16 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// `atomic_update` helper and submission-observer bookkeeping.
 /// `src/ops/routing_selection_witness.rs` and the routing and routing-witness
 /// shaders are unchanged, so the route label is kept.
-pub const WITNESS_NATIVE_VERSION: &str = "0.17.0";
+/// Re-reviewed 0.17.0 -> 0.18.0 (`50ed326` -> `82bcb3a`, tag `v0.18.0`): the changes are new
+/// opt-in ops (row-exact few-row mat-vecs incl. the stock-order and K-quant
+/// families, DeepSeek rows kernels, tensor prefill flash attention, NE
+/// head-split vec-hybrid attention, column-invariant few-row MMA, dense F32
+/// rows mat-vec, fused head norm + RoPE, GDN decode addressing), the
+/// branch-free and token-parallel `map0c`, the routing-policy field
+/// `q5_0_tensor_mm` (default off) and their kernel registrations.
+/// `src/ops/routing_selection_witness.rs` and the routing and routing-witness
+/// shaders are unchanged, so the route label is kept.
+pub const WITNESS_NATIVE_VERSION: &str = "0.18.0";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
