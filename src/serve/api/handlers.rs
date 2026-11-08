@@ -619,6 +619,7 @@ async fn chat_completions_with_prepared(
 ) -> Response {
     let PreparedChatContext {
         loaded_engine,
+        admission,
         model_lease: _model_lease,
         prompt_tokens,
         params,
@@ -651,23 +652,36 @@ async fn chat_completions_with_prepared(
     // at every placeholder position. Empty `soft_tokens` ⇒ pure-text
     // path (unchanged `Engine::generate`).
     let gen_outcome = if soft_tokens.is_empty() {
-        engine.generate(prompt_tokens, params).await
-    } else if deepstack_data.is_some() || positions_flat.is_some() {
-        // Wedge-4d: Qwen3-VL with augmented embed split + 3D-mRoPE
-        // positions threaded through to the LM forward.
-        engine
-            .generate_with_soft_tokens_and_deepstack(
-                prompt_tokens,
-                soft_tokens,
-                params,
-                deepstack_data,
-                positions_flat,
-            )
-            .await
+        // The engine releases the admission guard right after the request is
+        // in the worker queue.
+        match admission {
+            Some(admission) => {
+                engine
+                    .generate_admitted(prompt_tokens, params, admission)
+                    .await
+            }
+            None => engine.generate(prompt_tokens, params).await,
+        }
     } else {
-        engine
-            .generate_with_soft_tokens(prompt_tokens, soft_tokens, params)
-            .await
+        // Multimodal requests reach engines without an admission barrier.
+        drop(admission);
+        if deepstack_data.is_some() || positions_flat.is_some() {
+            // Wedge-4d: Qwen3-VL with augmented embed split + 3D-mRoPE
+            // positions threaded through to the LM forward.
+            engine
+                .generate_with_soft_tokens_and_deepstack(
+                    prompt_tokens,
+                    soft_tokens,
+                    params,
+                    deepstack_data,
+                    positions_flat,
+                )
+                .await
+        } else {
+            engine
+                .generate_with_soft_tokens(prompt_tokens, soft_tokens, params)
+                .await
+        }
     };
     frontend_timing.finish_unary(gen_outcome.is_ok());
     let result = match gen_outcome {
@@ -1253,6 +1267,10 @@ struct PreparedChatContext {
     /// keep the engine alive through the handler's lifetime even if
     /// the pool evicts it concurrently.
     loaded_engine: Arc<LoadedEngine<Engine>>,
+    /// Counts this request as in flight to the engine's worker from engine
+    /// resolution until it is enqueued (dropped right before the generate
+    /// call, or with the context on any early return or disconnect).
+    admission: Option<super::engine_supervisor::AdmissionGuard>,
     /// Held through unary execution or transferred into the SSE body stream.
     model_lease: Option<ModelLease>,
     prompt_tokens: Vec<u32>,
@@ -1869,6 +1887,7 @@ where
     let loaded_engine = resolved_engine.loaded_engine;
     let model_lease = resolved_engine.model_lease;
     let engine: &Engine = &loaded_engine.engine;
+    let mut admission = Some(engine.begin_admission());
     frontend_timing.set_family(|| format!("{:?}", engine.info().arch_family));
     if let Some(cause) = engine.failure_detail() {
         return Err(ApiError::engine_failed(engine::engine_failed_message(&cause)).into_response());
@@ -2093,6 +2112,7 @@ where
             enable_thinking,
             template_kwargs,
             &mut frontend_timing,
+            &mut admission,
         )
         .await
         {
@@ -2521,6 +2541,7 @@ where
 
     Ok(PreparedChatContext {
         loaded_engine,
+        admission,
         model_lease,
         prompt_tokens: final_prompt_tokens,
         params,
@@ -2928,6 +2949,7 @@ async fn chat_completions_stream(
             prepared.soft_tokens,
             prepared.deepstack_data,
             prepared.positions_flat,
+            prepared.admission,
         )
         .await
     {
@@ -3197,6 +3219,12 @@ pub(crate) fn build_synthetic_summary_message(summary_text: &str) -> super::sche
 /// Summarize policy actually ran a summarization pass — they flow into
 /// `X-HF2Q-Summarized-Messages` / `X-HF2Q-Summary-Tokens` transparency
 /// headers per Decision #23.
+///
+/// `admission` is the request's in-flight guard: the summarize pass runs a
+/// nested generation on the same engine, so the guard is released for it
+/// (the worker must not hold its transactions for a request that is itself
+/// waiting on that worker) and taken again for the rest of preparation.
+#[allow(clippy::too_many_arguments)]
 async fn apply_overflow_policy(
     engine: &engine::Engine,
     messages: &[super::schema::ChatMessage],
@@ -3205,6 +3233,7 @@ async fn apply_overflow_policy(
     enable_thinking: bool,
     template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
     timing: &mut FrontendTiming,
+    admission: &mut Option<super::engine_supervisor::AdmissionGuard>,
 ) -> std::result::Result<(Vec<u32>, usize, Option<usize>, Option<usize>), Response> {
     use super::schema::OverflowPolicy;
 
@@ -3252,7 +3281,8 @@ async fn apply_overflow_policy(
             Ok((t, n, None, None))
         }
         OverflowPolicy::Summarize => {
-            apply_summarize(
+            let counted = admission.take().is_some();
+            let summarized = apply_summarize(
                 engine,
                 messages,
                 ctx_len,
@@ -3260,7 +3290,11 @@ async fn apply_overflow_policy(
                 enable_thinking,
                 template_kwargs,
             )
-            .await
+            .await;
+            if counted {
+                *admission = Some(engine.begin_admission());
+            }
+            summarized
         }
     };
     timing.record(FrontendSpan::OverflowRewrite, span);
@@ -12479,6 +12513,7 @@ mod a5d_handler_429_tests {
         params.max_tokens = max_tokens;
         PreparedChatContext {
             loaded_engine,
+            admission: None,
             model_lease: None,
             prompt_tokens,
             params,
