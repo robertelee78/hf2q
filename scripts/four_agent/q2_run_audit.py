@@ -209,22 +209,40 @@ def cohort_releases(summary, phase_plan, cohorts, results):
     releases = phase["releases"]
     require([r["cohort"] for r in releases] == list(range(1, len(cohorts) + 1)), "missing cohort release")
     require(releases[0]["release_monotonic_ns"] == started and
-            releases[0]["trigger_first_stream_send_monotonic_ns"] is None, "first cohort release")
+            releases[0]["trigger_first_stream_ready"] is None and
+            releases[0]["stream_release_monotonic_ns"] is None and
+            releases[0]["prefill_headstart_ns"] is None, "first cohort release")
     clocks = [started]
     for index, release in enumerate(releases[1:], 1):
-        earlier = cohorts[index - 1]
-        trigger = release["trigger_first_stream_send_monotonic_ns"]
+        earlier, later = cohorts[index - 1], cohorts[index]
+        trigger = release["trigger_first_stream_ready"]
         at = release["release_monotonic_ns"]
-        require(isinstance(trigger, dict) and set(trigger) == set(earlier) and type(at) is int,
+        stream_release = release["stream_release_monotonic_ns"]
+        headstart = release["prefill_headstart_ns"]
+        require(isinstance(trigger, dict) and set(trigger) == set(earlier) and
+                all(type(value) is int for value in (at, stream_release, headstart)),
                 "cohort trigger membership")
+        durations = []
         for agent in earlier:
-            first_stream = results[agent]["turns"][1]
-            send = first_stream["send_monotonic_ns"]
-            require(type(trigger[agent]) is int and send - 1_000_000_000 <= trigger[agent] <= send,
-                    "first-stream-send trigger outside the agent's request-send window")
-            require(results[agent]["task_completed_monotonic_ns"] > at,
-                    f"population never mixed: {agent} finished before cohort {index + 1} was released")
-        require(at >= max(trigger.values()) and at >= clocks[-1], "cohort released before its trigger")
+            record = trigger[agent]
+            turn0, first_stream = results[agent]["turns"][:2]
+            send, terminal = turn0["send_monotonic_ns"], turn0["validated_terminal_monotonic_ns"]
+            ready = record.get("first_stream_ready_monotonic_ns") if isinstance(record, dict) else None
+            require(isinstance(record, dict) and record.get("turn0_send_monotonic_ns") == send and
+                    record.get("turn0_terminal_monotonic_ns") == terminal and
+                    type(ready) is int and terminal <= ready <= at,
+                    "first-stream-ready trigger outside the agent's turn-0-to-release window")
+            require(first_stream["send_monotonic_ns"] >= stream_release,
+                    "first cohort streamed before its stream release")
+            require(results[agent]["task_completed_monotonic_ns"] > stream_release,
+                    f"population never mixed: {agent} finished before cohort {index + 1} streamed")
+            durations.append(terminal - send)
+        require(headstart == max(coordinator.PHASE_MIN_HEADSTART_NS, min(durations) // 2) and
+                at + headstart <= stream_release <= at + headstart + 1_000_000_000,
+                "mixed-phase prefill head start")
+        for agent in later:
+            send = results[agent]["turns"][0]["send_monotonic_ns"]
+            require(at <= send < stream_release, "later cohort did not start prefill before first-cohort stream")
         clocks.append(at)
     return clocks
 

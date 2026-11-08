@@ -12,7 +12,7 @@ from pathlib import Path
 from qwen38_n1_verdict import Invalid, EXPECTED
 import qwen38_n1_process as child
 from qwen_n4_live_smoke import (AGENTS, PROFILE, active_agents, agent_command, agent_phase, aggregate,
-                               barrier_release, first_stream_send_marker, identity, phase_cohorts, phase_trigger,
+                               barrier_release, first_stream_ready_marker, identity, phase_cohorts, phase_trigger,
                                preflight, release_name, validate_agent_binding, validate_ready, validate_release,
                                validate_preflight, wait_barrier)
 
@@ -253,18 +253,21 @@ class PhasePlans(unittest.TestCase):
         with self.assertRaises(Invalid):
             aggregate(data, *ok, PID, RUN, phase_plan="2+2")
 
-    def test_trigger_waits_for_every_first_cohort_stream_send(self):
+    def test_trigger_waits_for_every_first_cohort_stream_ready(self):
         with tempfile.TemporaryDirectory() as tmp:
             first = phase_cohorts("3+1")[0]
-            for agent, ns in zip(first[:2], (5, 7)):
-                first_stream_send_marker(tmp, agent, RUN, TOKEN, ns)
+            turn0 = {"send_monotonic_ns": 1, "validated_terminal_monotonic_ns": 2}
+            for agent in first[:2]:
+                first_stream_ready_marker(tmp, agent, RUN, TOKEN, turn0)
             self.assertIsNone(phase_trigger(tmp, first, RUN, TOKEN))
-            first_stream_send_marker(tmp, first[2], RUN, TOKEN, 9)
-            self.assertEqual(phase_trigger(tmp, first, RUN, TOKEN), {"agent-0": 5, "agent-1": 7, "agent-2": 9})
+            first_stream_ready_marker(tmp, first[2], RUN, TOKEN, turn0)
+            found = phase_trigger(tmp, first, RUN, TOKEN)
+            self.assertEqual(set(found), set(first))
+            self.assertTrue(all(value["turn0_send_monotonic_ns"] == 1 for value in found.values()))
             with self.assertRaises(Invalid):
                 phase_trigger(tmp, first, RUN, "c" * 32)  # a marker from another barrier
             with self.assertRaises(FileExistsError):
-                first_stream_send_marker(tmp, first[0], RUN, TOKEN, 11)  # published once
+                first_stream_ready_marker(tmp, first[0], RUN, TOKEN, turn0)  # published once
 
     def test_later_cohort_waits_for_its_own_release(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -28,10 +28,13 @@ MODULES = ("qwen38_n1_smoke.py", "qwen38_n1_tools.py", "qwen38_n1_verdict.py",
 INTERRUPTED = False
 # ADR-063 Q3 controls (--phase-plan): agents in release cohorts on the same four-slot server.
 # "1" is the one-agent control; "K+M" releases K agents, then the remaining M once every one of
-# the first K has sent its first streamed request. Absent, all four start together (pure phase,
-# the canonical workload), byte-identical to runs before phase plans existed.
+# the first K is ready to send its first streamed request. The first cohort waits half of its
+# shortest unary-turn duration while the later cohort starts prefill, then starts streaming.
+# Absent, all four start together (pure phase), byte-identical to runs before phase plans existed.
 PHASE_PLANS = {"1": (1,), "3+1": (3, 1), "2+2": (2, 2), "1+3": (1, 3)}
-FIRST_STREAM_SEND_SCHEMA = "hf2q.n4-first-stream-send.v1"
+FIRST_STREAM_READY_SCHEMA = "hf2q.n4-first-stream-ready.v1"
+STREAM_RELEASE_SCHEMA = "hf2q.n4-stream-release.v1"
+PHASE_MIN_HEADSTART_NS = 1_000_000_000
 
 
 def phase_cohorts(plan):
@@ -198,7 +201,7 @@ def wait_barrier(directory, agent, run, pid, token, output, initial_hash, approv
         require(agent_phase(phase["plan"], agent) == phase, "agent outside its phase cohort")
         agents, name = active_agents(phase["plan"]), release_name(phase["cohort"])
         if phase["cohort"] > 1:
-            limit = 7200  # a later cohort waits for the earlier cohort's first decoded tokens
+            limit = 7200  # a later cohort waits for the earlier cohort's first-stream-ready markers
     record = {"schema": "hf2q.n4-agent-ready.v1", "agent_id": agent, "run_id": run,
               "server_pid": pid, "barrier_token": token, "output": str(Path(output).resolve()),
               "identity_sha256": hashlib.sha256(identity(agent, run, instance).encode()).hexdigest(),
@@ -221,27 +224,52 @@ def wait_barrier(directory, agent, run, pid, token, output, initial_hash, approv
             "f2_clock_id": value.get("f2_clock_id")}
 
 
-def first_stream_send_marker(directory, agent, run, token, monotonic_ns):
-    """Published immediately before an agent of a non-final cohort sends its first streamed request."""
-    save_new(Path(directory) / f"{agent}.first-stream-send.json",
-             {"schema": FIRST_STREAM_SEND_SCHEMA, "agent_id": agent, "run_id": run, "barrier_token": token,
-              "f2_clock_id": CLOCK_ID, "first_stream_send_monotonic_ns": monotonic_ns})
+def first_stream_ready_marker(directory, agent, run, token, turn0):
+    """Publish after turn 0 and local tool work, immediately before the first streamed request."""
+    send = turn0.get("send_monotonic_ns")
+    terminal = turn0.get("validated_terminal_monotonic_ns")
+    require(type(send) is int and type(terminal) is int and terminal > send, "turn-0 timing for phase marker")
+    ready = clock_ns()
+    save_new(Path(directory) / f"{agent}.first-stream-ready.json",
+             {"schema": FIRST_STREAM_READY_SCHEMA, "agent_id": agent, "run_id": run, "barrier_token": token,
+              "f2_clock_id": CLOCK_ID, "first_stream_ready_monotonic_ns": ready,
+              "turn0_send_monotonic_ns": send, "turn0_terminal_monotonic_ns": terminal})
 
 
 def phase_trigger(directory, agents, run, token):
-    """{agent: first-stream-send clock} once every agent in `agents` has published its marker."""
+    """Every first-cohort agent's ready and unary-turn clocks, or None until all are present."""
     found = {}
     for agent in agents:
-        path = Path(directory) / f"{agent}.first-stream-send.json"
+        path = Path(directory) / f"{agent}.first-stream-ready.json"
         if not path.exists():
             return None
         value = loads(path.read_bytes())
-        require(value.get("schema") == FIRST_STREAM_SEND_SCHEMA and value.get("agent_id") == agent and
+        require(value.get("schema") == FIRST_STREAM_READY_SCHEMA and value.get("agent_id") == agent and
                 value.get("run_id") == run and value.get("barrier_token") == token and
-                value.get("f2_clock_id") == CLOCK_ID and type(value.get("first_stream_send_monotonic_ns")) is int,
-                "first-stream-send marker binding")
-        found[agent] = value["first_stream_send_monotonic_ns"]
+                value.get("f2_clock_id") == CLOCK_ID and
+                all(type(value.get(key)) is int for key in ("first_stream_ready_monotonic_ns",
+                                                            "turn0_send_monotonic_ns",
+                                                            "turn0_terminal_monotonic_ns")) and
+                value["turn0_send_monotonic_ns"] < value["turn0_terminal_monotonic_ns"]
+                <= value["first_stream_ready_monotonic_ns"], "first-stream-ready marker binding")
+        found[agent] = value
     return found
+
+
+def wait_stream_release(directory, cohort, run, token, pid):
+    """Wait until the coordinator starts a first cohort's streamed turns."""
+    path = Path(directory) / f"stream-release-{cohort}.json"
+    started = time.monotonic()
+    while not path.exists():
+        require(time.monotonic() - started < 7200, "stream release timeout")
+        os.kill(pid, 0)
+        time.sleep(0.02)
+    value = loads(path.read_bytes())
+    require(value.get("schema") == STREAM_RELEASE_SCHEMA and value.get("run_id") == run and
+            value.get("barrier_token") == token and value.get("cohort") == cohort and
+            value.get("f2_clock_id") == CLOCK_ID and type(value.get("release_monotonic_ns")) is int,
+            "stream release binding")
+    return value
 
 
 def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwen", instance_record=None,
@@ -501,7 +529,8 @@ def main():
                               "release_monotonic_ns": release["release_monotonic_ns"]}
         if args.phase_plan is not None:
             summary["phase"]["releases"].append({"cohort": 1, "release_monotonic_ns": release["release_monotonic_ns"],
-                                                 "trigger_first_stream_send_monotonic_ns": None})
+                                                 "trigger_first_stream_ready": None,
+                                                 "stream_release_monotonic_ns": None, "prefill_headstart_ns": None})
         next_cohort = 2
         while any(process.poll() is None for process in processes.values()):
             require(not INTERRUPTED and time.monotonic() - started < 7320, "N4 deadline/interruption")
@@ -515,13 +544,28 @@ def main():
                 trigger = phase_trigger(barrier, waiting_on, run, token)
                 if trigger is None:
                     require(all(processes[a].poll() is None for a in waiting_on),
-                            "phase trigger agent exited before its first decoded token")
+                            "phase trigger agent exited before first-stream readiness")
                 else:
                     later = {**release, "cohort": next_cohort, "release_monotonic_ns": clock_ns()}
                     save_new(barrier / release_name(next_cohort), later)
-                    summary["phase"]["releases"].append({"cohort": next_cohort,
-                                                         "release_monotonic_ns": later["release_monotonic_ns"],
-                                                         "trigger_first_stream_send_monotonic_ns": trigger})
+                    durations = [value["turn0_terminal_monotonic_ns"] - value["turn0_send_monotonic_ns"]
+                                 for value in trigger.values()]
+                    headstart = max(PHASE_MIN_HEADSTART_NS, min(durations) // 2)
+                    target = later["release_monotonic_ns"] + headstart
+                    while clock_ns() < target:
+                        require(not INTERRUPTED and all(process.poll() is None for process in processes.values()),
+                                "agent exited during mixed-phase prefill head start")
+                        os.kill(args.server_pid, 0)
+                        time.sleep(0.02)
+                    stream_release = {"schema": STREAM_RELEASE_SCHEMA, "run_id": run, "barrier_token": token,
+                                      "cohort": next_cohort - 1, "f2_clock_id": CLOCK_ID,
+                                      "release_monotonic_ns": clock_ns()}
+                    save_new(barrier / f"stream-release-{next_cohort - 1}.json", stream_release)
+                    summary["phase"]["releases"].append({
+                        "cohort": next_cohort, "release_monotonic_ns": later["release_monotonic_ns"],
+                        "trigger_first_stream_ready": trigger,
+                        "stream_release_monotonic_ns": stream_release["release_monotonic_ns"],
+                        "prefill_headstart_ns": headstart})
                     next_cohort += 1
             time.sleep(0.05)
         if native is not None and native.closing is not None:  # every agent finished: native closing facts

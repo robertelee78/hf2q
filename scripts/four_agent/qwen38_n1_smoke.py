@@ -405,17 +405,22 @@ def main():
                            max_calls=max_tools(args.repair_turns))
         protocol = Workflow(args.repair_turns) if args.repair_turns else None
         seen = set()
-        phase_trigger = []
+        first_stream_gate = []
         if n4:
-            from qwen_n4_live_smoke import first_stream_send_marker, phase_cohorts, wait_barrier
+            from qwen_n4_live_smoke import (
+                first_stream_ready_marker, phase_cohorts, wait_barrier, wait_stream_release,
+            )
             save(output / "summary.json", summary)
             summary["barrier"] = wait_barrier(args.barrier_dir, args.agent_id, args.run_id,
                                                args.server_pid, args.barrier_token, output,
                                                initial_hash, args.approval_sha256, args.instance, phase)
             if phase is not None and phase["cohort"] < len(phase_cohorts(phase["plan"])):
-                # Release the later cohort once every member has sent its first streamed request.
-                phase_trigger.append(lambda ns: first_stream_send_marker(
-                    args.barrier_dir, args.agent_id, args.run_id, args.barrier_token, ns))
+                def gate(turn0):
+                    first_stream_ready_marker(args.barrier_dir, args.agent_id, args.run_id,
+                                              args.barrier_token, turn0)
+                    wait_stream_release(args.barrier_dir, phase["cohort"], args.run_id,
+                                        args.barrier_token, args.server_pid)
+                first_stream_gate.append(gate)
         started = time.monotonic()
         for turn in range(max_tools(args.repair_turns) + 1):
             require(not INTERRUPTED and time.monotonic() - started < 7200, "whole client deadline")
@@ -424,8 +429,8 @@ def main():
                                     args.request_setup)
             turn_output = output / f"turn-{turn}"
             turn_output.mkdir(mode=0o700)
-            if phase_trigger and request["stream"]:
-                phase_trigger.pop()(clock_ns())
+            if first_stream_gate and request["stream"]:
+                first_stream_gate.pop()(summary["turns"][0])
             message, call, receipt = exchange(args.base_url, request, turn_output, turn, seen,
                                                deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind, family=args.family,
                                                setup=args.request_setup,

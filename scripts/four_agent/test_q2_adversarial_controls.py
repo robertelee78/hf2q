@@ -308,18 +308,20 @@ class AuditControls(unittest.TestCase):
         self.assertRegex(self.reason(client, summary), "agent set differs from the phase plan")
         client, summary = self.run_dir("3+1")
         self.assertRegex(self.reason(client, summary), "aggregate phase cohort")
-        late = max(summary["agents"][a]["task_completed_monotonic_ns"] for a in ("agent-0", "agent-1", "agent-2")) + 1
-        summary["phase"]["releases"][1]["release_monotonic_ns"] = late
+        release = summary["phase"]["releases"][1]
+        summary["agents"]["agent-0"]["task_completed_monotonic_ns"] = release["stream_release_monotonic_ns"]
         self.assertRegex(self.reason(client, summary, plan="3+1"), "population never mixed")
         client, summary = self.run_dir("2+2")
-        trigger = summary["phase"]["releases"][1]["trigger_first_stream_send_monotonic_ns"]
+        trigger = summary["phase"]["releases"][1]["trigger_first_stream_ready"]
         agent = next(iter(trigger))
-        trigger[agent] = summary["agents"][agent]["turns"][1]["send_monotonic_ns"] - 1_000_000_001
-        self.assertRegex(self.reason(client, summary, plan="2+2"), "first-stream-send trigger outside")
+        trigger[agent]["first_stream_ready_monotonic_ns"] = trigger[agent]["turn0_terminal_monotonic_ns"] - 1
+        self.assertRegex(self.reason(client, summary, plan="2+2"), "first-stream-ready trigger outside")
         client, summary = self.run_dir("1+3")
         release = summary["phase"]["releases"][1]
-        release["release_monotonic_ns"] = max(release["trigger_first_stream_send_monotonic_ns"].values()) - 1
-        self.assertRegex(self.reason(client, summary, plan="1+3"), "cohort released before its trigger")
+        release["stream_release_monotonic_ns"] = (
+            release["release_monotonic_ns"] + release["prefill_headstart_ns"] - 1
+        )
+        self.assertRegex(self.reason(client, summary, plan="1+3"), "mixed-phase prefill head start")
         client, summary = self.run_dir()
         summary["phase"] = {"plan": "3+1", "cohorts": [["agent-0", "agent-1", "agent-2"], ["agent-3"]], "releases": []}
         self.assertRegex(self.reason(client, summary), "canonical run carries a phase record")
@@ -327,7 +329,7 @@ class AuditControls(unittest.TestCase):
         del summary["phase"]["releases"][1]
         self.assertRegex(self.reason(client, summary, plan="3+1"), "missing cohort release")
         client, summary = self.run_dir("2+2")
-        del summary["phase"]["releases"][1]["trigger_first_stream_send_monotonic_ns"]["agent-1"]
+        del summary["phase"]["releases"][1]["trigger_first_stream_ready"]["agent-1"]
         self.assertRegex(self.reason(client, summary, plan="2+2"), "cohort trigger membership")
 
 

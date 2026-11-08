@@ -13,6 +13,7 @@ import atexit
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -450,7 +451,7 @@ class StubTools:
 
 
 def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", family="qwen", instance=None,
-                phase=None, release_ns=None, on_first_stream_send=None, server_pid=SERVER_PID, acks=None, variant=None,
+                phase=None, release_ns=None, on_first_stream_ready=None, server_pid=SERVER_PID, acks=None, variant=None,
                 repair_turns=0):
     """The agent child's turn loop with stub tools; raises the actual client rejection on a bad response.
 
@@ -492,8 +493,8 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
         request = build_request(model, messages, schemas, turn, family, engine_kind)
         turn_out = out / f"turn-{turn}"
         turn_out.mkdir()
-        if turn == 1 and on_first_stream_send is not None:
-            on_first_stream_send(clock_ns())
+        if turn == 1 and on_first_stream_ready is not None:
+            on_first_stream_ready(summary["turns"][0])
         callback = None
         if acks is not None:
             callback = acknowledging(first_progress_ack(acks, agent, turn))
@@ -520,7 +521,7 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
 
 
 def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="hf2q", family="qwen", instance=None,
-             cleanup=None, run=RUN, server_pid=SERVER_PID, variant=None, repair_turns=0):
+             cleanup=None, run=RUN, server_pid=SERVER_PID, variant=None, repair_turns=0, stream_releases=None):
     """Coordinator summary over `results`; its status is the actual coordinator aggregate."""
     agents = coordinator.active_agents(phase_plan)
     cleanup = cleanup or {agent: copy.deepcopy(CLEAN) for agent in agents}
@@ -541,10 +542,25 @@ def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="h
     if repair_turns:
         summary["repair_turns"] = repair_turns
     if phase_plan is not None:
-        summary["phase"] = {"plan": phase_plan, "cohorts": [list(c) for c in coordinator.phase_cohorts(phase_plan)],
-                            "releases": [{"cohort": i + 1, "release_monotonic_ns": at,
-                                          "trigger_first_stream_send_monotonic_ns": t}
-                                         for i, (at, t) in enumerate(zip(releases, triggers))]}
+        cohorts = coordinator.phase_cohorts(phase_plan)
+        phase_releases = []
+        for index, (at, trigger) in enumerate(zip(releases, triggers)):
+            if index == 0:
+                phase_releases.append({"cohort": 1, "release_monotonic_ns": at,
+                                       "trigger_first_stream_ready": None,
+                                       "stream_release_monotonic_ns": None, "prefill_headstart_ns": None})
+                continue
+            durations = [record["turn0_terminal_monotonic_ns"] - record["turn0_send_monotonic_ns"]
+                         for record in trigger.values()]
+            headstart = max(coordinator.PHASE_MIN_HEADSTART_NS, min(durations) // 2)
+            stream_at = (stream_releases[index] if stream_releases is not None
+                         else at + headstart)
+            phase_releases.append({"cohort": index + 1, "release_monotonic_ns": at,
+                                   "trigger_first_stream_ready": trigger,
+                                   "stream_release_monotonic_ns": stream_at,
+                                   "prefill_headstart_ns": headstart})
+        summary["phase"] = {"plan": phase_plan, "cohorts": [list(c) for c in cohorts],
+                            "releases": phase_releases}
     summary["status"] = coordinator.aggregate(results, exits, {a: cleanup[a]["verified"] for a in agents}, server_pid, run,
                                               engine_kind, family, record, phase_plan, variant_record,
                                               repair_turns=repair_turns)
@@ -558,7 +574,7 @@ def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="h
 
 
 def retime(results, phase_plan, makespan_s, slots=None, origin=10 ** 12):
-    """Deterministic lockstep clocks over real receipts; returns (releases, triggers).
+    """Deterministic lockstep clocks over real receipts; returns (releases, ready-marker triggers).
 
     `slots=N` (canonical plan only) runs the agents N at a time, each group after the previous one
     finished, as a server capped at N slots would; `slots=1` is a serialized service. A later
@@ -577,9 +593,16 @@ def retime(results, phase_plan, makespan_s, slots=None, origin=10 ** 12):
     releases, triggers, start = [origin], [None], {}
     for index, cohort in enumerate(cohorts):
         if index:
-            trigger = {a: start[a] + duration + agents.index(a) * (gap // 8)
-                       for a in cohorts[index - 1]}
-            releases.append(max(trigger.values()) + 1)
+            trigger = {}
+            for agent in cohorts[index - 1]:
+                marker_send = start[agent] + agents.index(agent) * (gap // 8)
+                terminal = marker_send + duration // 2
+                trigger[agent] = {
+                    "first_stream_ready_monotonic_ns": terminal,
+                    "turn0_send_monotonic_ns": marker_send,
+                    "turn0_terminal_monotonic_ns": terminal,
+                }
+            releases.append(max(value["first_stream_ready_monotonic_ns"] for value in trigger.values()) + 1)
             triggers.append(trigger)
         for agent in cohort:
             group = 0 if slots is None else agents.index(agent) // slots
@@ -691,7 +714,7 @@ def run_live(service, client_dir, phase_plan=None, engine_kind="hf2q", family="q
         while not all((barrier / f"{a}.ready").exists() for a in processes):
             assert time.monotonic() < until and all(p.poll() is None for p in processes.values()), "agents not ready"
             time.sleep(0.005)
-        releases, triggers = [clock_ns()], [None]
+        releases, triggers, stream_releases = [clock_ns()], [None], [None]
         write_json(barrier / "release-1.json", {"release_monotonic_ns": releases[0]})
         while any(p.poll() is None for p in processes.values()):
             assert time.monotonic() < until, "live agents exceeded the deadline"
@@ -701,7 +724,16 @@ def run_live(service, client_dir, phase_plan=None, engine_kind="hf2q", family="q
                     releases.append(clock_ns())
                     triggers.append(trigger)
                     write_json(barrier / f"release-{len(releases)}.json", {"release_monotonic_ns": releases[-1]})
-            time.sleep(0.002)
+                    durations = [value["turn0_terminal_monotonic_ns"] - value["turn0_send_monotonic_ns"]
+                                 for value in trigger.values()]
+                    target = releases[-1] + max(coordinator.PHASE_MIN_HEADSTART_NS, min(durations) // 2)
+                    while clock_ns() < target:
+                        time.sleep(0.001)
+                    stream_releases.append(clock_ns())
+                    write_json(barrier / f"stream-release-{len(releases) - 1}.json", {
+                        "schema": coordinator.STREAM_RELEASE_SCHEMA, "run_id": RUN, "barrier_token": TOKEN,
+                        "cohort": len(releases) - 1, "f2_clock_id": CLOCK_ID,
+                        "release_monotonic_ns": stream_releases[-1]})
     finally:
         cleanup = {agent: child.stop_group(process, {}) for agent, process in processes.items()}
     errors = {}
@@ -711,7 +743,8 @@ def run_live(service, client_dir, phase_plan=None, engine_kind="hf2q", family="q
                 errors[agent] = process.stderr.read().decode()
     assert not errors, errors
     results = {a: json.loads((client_dir / a / "summary.json").read_text()) for a in processes}
-    return assemble(client_dir, results, releases, triggers, phase_plan, engine_kind, family, cleanup=cleanup)
+    return assemble(client_dir, results, releases, triggers, phase_plan, engine_kind, family, cleanup=cleanup,
+                    stream_releases=stream_releases)
 
 
 def agent_main(config):
@@ -725,12 +758,13 @@ def agent_main(config):
         time.sleep(0.001)
     time.sleep(0.001)
     release_ns = json.loads(release.read_text())["release_monotonic_ns"]
-    marker = None
+    gate = None
     if phase is not None and cohort < len(coordinator.phase_cohorts(plan)):
-        def marker(ns):
-            coordinator.first_stream_send_marker(barrier, agent, RUN, TOKEN, ns)
+        def gate(turn0):
+            coordinator.first_stream_ready_marker(barrier, agent, RUN, TOKEN, turn0)
+            coordinator.wait_stream_release(barrier, cohort, RUN, TOKEN, os.getppid())
     drive_agent(config["base"], config["out"], agent, engine_kind=config["engine_kind"], family=config["family"],
-                phase=phase, release_ns=release_ns, on_first_stream_send=marker, acks=config["acks"])
+                phase=phase, release_ns=release_ns, on_first_stream_ready=gate, acks=config["acks"])
     return 0
 
 
