@@ -334,3 +334,17 @@ matmuls keep their routes. `/hf2q/v1/runtime` publishes the resolved kernel (`St
 `RowExact` or `ColumnInvariantMma`) as
 `measurement_snapshot.active_controls.gemma_decode_dense_kernel`; Gemma Q1
 endpoint and localizer packets declare it as `decode_dense_kernel`.
+
+### Native Q5_0 tensor matmul (default off)
+
+`HF2Q_Q5_0_TENSOR_MM` is read by mlx-native (0.18.0 and later), not by hf2q.
+Only the exact value `1` routes Q5_0 dense and expert matrix multiplications
+through the tensor pipeline; unset or any other value keeps the simdgroup
+route. It exists for the Gemma combined-candidate quality campaign; the
+tensor route is not yet qualified as a default. The first Gemma 4 model load
+of a process logs one line `Gemma4 native routing: q5_0_tensor_mm=<true|false>
+mm_id_schedule=<grid|compact>`, and
+`/hf2q/v1/runtime` publishes the resolved value as
+`measurement_snapshot.active_controls.q5_0_tensor_mm` (`true`/`false`) beside
+`mm_id_schedule`. The Gemma launcher forwards it from `Q5_0_TENSOR_MM=1`
+and the Q5 case from `HF2Q_Q5_Q5_0_TENSOR_MM=1`.
