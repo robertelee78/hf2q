@@ -27,10 +27,12 @@ MODULES = ("qwen38_n1_smoke.py", "qwen38_n1_tools.py", "qwen38_n1_verdict.py",
            "family_peer.py", "test_family_peer.py", "f2_semantic.py")
 INTERRUPTED = False
 # ADR-063 Q3 controls (--phase-plan): agents in release cohorts on the same four-slot server.
-# "1" is the one-agent control; "K+M" releases K agents, then the remaining M once every one of
-# the first K is ready to send its first streamed request. The first cohort waits half of its
-# shortest unary-turn duration while the later cohort starts prefill, then starts streaming.
-# Absent, all four start together (pure phase), byte-identical to runs before phase plans existed.
+# A phase plan divides the canonical four agents into K+M cohorts. After turn 0,
+# both cohorts wait immediately before their first streamed request. The later
+# cohort is released only after the first cohort is ready; once the later cohort
+# is also ready, one bound clock releases every cohort into streaming together.
+# Absent, all four start together (pure phase), byte-identical to runs before
+# phase plans existed.
 PHASE_PLANS = {"1": (1,), "3+1": (3, 1), "2+2": (2, 2), "1+3": (1, 3)}
 FIRST_STREAM_READY_SCHEMA = "hf2q.n4-first-stream-ready.v1"
 STREAM_RELEASE_SCHEMA = "hf2q.n4-stream-release.v1"
@@ -237,7 +239,7 @@ def first_stream_ready_marker(directory, agent, run, token, turn0):
 
 
 def phase_trigger(directory, agents, run, token):
-    """Every first-cohort agent's ready and unary-turn clocks, or None until all are present."""
+    """Every requested agent's ready and unary-turn clocks, or None until all are present."""
     found = {}
     for agent in agents:
         path = Path(directory) / f"{agent}.first-stream-ready.json"
@@ -530,6 +532,7 @@ def main():
         if args.phase_plan is not None:
             summary["phase"]["releases"].append({"cohort": 1, "release_monotonic_ns": release["release_monotonic_ns"],
                                                  "trigger_first_stream_ready": None,
+                                                 "later_first_stream_ready": None,
                                                  "stream_release_monotonic_ns": None, "prefill_headstart_ns": None})
         next_cohort = 2
         while any(process.poll() is None for process in processes.values()):
@@ -548,24 +551,34 @@ def main():
                 else:
                     later = {**release, "cohort": next_cohort, "release_monotonic_ns": clock_ns()}
                     save_new(barrier / release_name(next_cohort), later)
-                    durations = [value["turn0_terminal_monotonic_ns"] - value["turn0_send_monotonic_ns"]
-                                 for value in trigger.values()]
-                    headstart = max(PHASE_MIN_HEADSTART_NS, min(durations) // 2)
-                    target = later["release_monotonic_ns"] + headstart
+                    later_trigger = None
+                    while later_trigger is None:
+                        require(not INTERRUPTED and all(process.poll() is None for process in processes.values()),
+                                "agent exited before all-cohort first-stream readiness")
+                        os.kill(args.server_pid, 0)
+                        later_trigger = phase_trigger(barrier, cohorts[next_cohort - 1], run, token)
+                        if later_trigger is None:
+                            time.sleep(0.02)
+                    target = max(later["release_monotonic_ns"] + PHASE_MIN_HEADSTART_NS,
+                                 max(value["first_stream_ready_monotonic_ns"]
+                                     for value in later_trigger.values()))
                     while clock_ns() < target:
                         require(not INTERRUPTED and all(process.poll() is None for process in processes.values()),
                                 "agent exited during mixed-phase prefill head start")
                         os.kill(args.server_pid, 0)
                         time.sleep(0.02)
-                    stream_release = {"schema": STREAM_RELEASE_SCHEMA, "run_id": run, "barrier_token": token,
-                                      "cohort": next_cohort - 1, "f2_clock_id": CLOCK_ID,
-                                      "release_monotonic_ns": clock_ns()}
-                    save_new(barrier / f"stream-release-{next_cohort - 1}.json", stream_release)
+                    stream_at = clock_ns()
+                    for cohort in range(1, next_cohort + 1):
+                        stream_release = {"schema": STREAM_RELEASE_SCHEMA, "run_id": run, "barrier_token": token,
+                                          "cohort": cohort, "f2_clock_id": CLOCK_ID,
+                                          "release_monotonic_ns": stream_at}
+                        save_new(barrier / f"stream-release-{cohort}.json", stream_release)
                     summary["phase"]["releases"].append({
                         "cohort": next_cohort, "release_monotonic_ns": later["release_monotonic_ns"],
                         "trigger_first_stream_ready": trigger,
-                        "stream_release_monotonic_ns": stream_release["release_monotonic_ns"],
-                        "prefill_headstart_ns": headstart})
+                        "later_first_stream_ready": later_trigger,
+                        "stream_release_monotonic_ns": stream_at,
+                        "prefill_headstart_ns": stream_at - later["release_monotonic_ns"]})
                     next_cohort += 1
             time.sleep(0.05)
         if native is not None and native.closing is not None:  # every agent finished: native closing facts

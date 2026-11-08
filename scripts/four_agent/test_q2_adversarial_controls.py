@@ -318,10 +318,12 @@ class AuditControls(unittest.TestCase):
         self.assertRegex(self.reason(client, summary, plan="2+2"), "first-stream-ready trigger outside")
         client, summary = self.run_dir("1+3")
         release = summary["phase"]["releases"][1]
-        release["stream_release_monotonic_ns"] = (
-            release["release_monotonic_ns"] + release["prefill_headstart_ns"] - 1
-        )
-        self.assertRegex(self.reason(client, summary, plan="1+3"), "mixed-phase prefill head start")
+        release["prefill_headstart_ns"] -= 1
+        self.assertRegex(self.reason(client, summary, plan="1+3"), "mixed-phase all-cohort stream release")
+        client, summary = self.run_dir("3+1")
+        later = summary["phase"]["releases"][1]["later_first_stream_ready"]["agent-3"]
+        later["first_stream_ready_monotonic_ns"] = later["turn0_terminal_monotonic_ns"] - 1
+        self.assertRegex(self.reason(client, summary, plan="3+1"), "later first-stream-ready trigger outside")
         client, summary = self.run_dir()
         summary["phase"] = {"plan": "3+1", "cohorts": [["agent-0", "agent-1", "agent-2"], ["agent-3"]], "releases": []}
         self.assertRegex(self.reason(client, summary), "canonical run carries a phase record")

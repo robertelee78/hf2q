@@ -146,6 +146,13 @@ python3 -B scripts/four_agent/adr065_campaign.py analyze <dir> --ceilings "$B1/b
 
 After an independent review of this file, the campaign file and the baseline receipts, the reviewed `ceilings.json` of each family is published with the B1 receipts on main.
 
+## Execution correction: all-cohort stream release
+
+The first full Qwen3.8 baseline campaign at `$B1/baseline-v2/qwen38` is retained as `Invalid`. At measured `3+1` block 5, Q5 passed and four HTTP requests overlapped, but the independent Q2 audit observed only three concurrently progressing streamed requests. The campaign correctly halted and is never pooled or resumed.
+
+That recurrence invalidated the fixed half-turn-0 head-start trigger that had passed one hardware smoke. Mixed phase plans now gate every cohort immediately before its first streamed request: first-cohort readiness releases the later cohort into turn-0 prefill, later-cohort readiness proves that prefill completed, and one bound clock then releases both cohorts into streaming. The audit binds both marker sets to raw turn-0 receipts and still requires width 4. A fresh campaign and fresh ceilings are required after the corrected protocol passes its focused suite and hardware smoke.
+
+
 ## Draft ADR-065 amendment (for the root to land)
 
 The fairness rule above departs from the current text of ADR-065 ("Measurement and acceptance rules", third paragraph, and the B1 acceptance bullet). The ADR text needs this amendment before any candidate is judged by it.

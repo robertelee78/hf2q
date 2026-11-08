@@ -414,7 +414,7 @@ def main():
             summary["barrier"] = wait_barrier(args.barrier_dir, args.agent_id, args.run_id,
                                                args.server_pid, args.barrier_token, output,
                                                initial_hash, args.approval_sha256, args.instance, phase)
-            if phase is not None and phase["cohort"] < len(phase_cohorts(phase["plan"])):
+            if phase is not None and len(phase_cohorts(phase["plan"])) > 1:
                 def gate(turn0):
                     first_stream_ready_marker(args.barrier_dir, args.agent_id, args.run_id,
                                               args.barrier_token, turn0)

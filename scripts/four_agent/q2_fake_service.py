@@ -78,13 +78,12 @@ WAIT_TIMEOUT = 20.0
 def rendezvous_groups(phase_plan):
     """Streamed (agent, turn) sets a genuinely concurrent service holds open together.
 
-    n4: every agent's first streamed turn. K+M: the earlier cohort's second streamed turn (turn 3)
-    with the later cohort's first (turn 1); the later cohort is released during the earlier
-    cohort's turn 1, so both are reached without either waiting on the other. "1": none."""
-    cohorts = coordinator.phase_cohorts(phase_plan)
-    if len(cohorts) == 1:
-        return [] if len(cohorts[0]) == 1 else [{(agent, 1) for agent in cohorts[0]}]
-    return [{(agent, 3) for agent in cohorts[0]} | {(agent, 1) for agent in cohorts[1]}]
+    n4 and K+M: every active agent's first streamed turn. Mixed plans release both
+    cohorts from the same bound clock after the later cohort completes turn 0.
+    "1": none.
+    """
+    agents = coordinator.active_agents(phase_plan)
+    return [] if len(agents) == 1 else [{(agent, 1) for agent in agents}]
 
 
 def first_progress_ack(directory, agent, turn):
@@ -548,17 +547,27 @@ def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="h
             if index == 0:
                 phase_releases.append({"cohort": 1, "release_monotonic_ns": at,
                                        "trigger_first_stream_ready": None,
+                                       "later_first_stream_ready": None,
                                        "stream_release_monotonic_ns": None, "prefill_headstart_ns": None})
                 continue
-            durations = [record["turn0_terminal_monotonic_ns"] - record["turn0_send_monotonic_ns"]
-                         for record in trigger.values()]
-            headstart = max(coordinator.PHASE_MIN_HEADSTART_NS, min(durations) // 2)
-            stream_at = (stream_releases[index] if stream_releases is not None
-                         else at + headstart)
+            later_trigger = {}
+            for agent in cohorts[index]:
+                turn0 = results[agent]["turns"][0]
+                terminal = turn0["validated_terminal_monotonic_ns"]
+                later_trigger[agent] = {
+                    "first_stream_ready_monotonic_ns": terminal,
+                    "turn0_send_monotonic_ns": turn0["send_monotonic_ns"],
+                    "turn0_terminal_monotonic_ns": terminal,
+                }
+            target = max(at + coordinator.PHASE_MIN_HEADSTART_NS,
+                         max(record["first_stream_ready_monotonic_ns"]
+                             for record in later_trigger.values()))
+            stream_at = stream_releases[index] if stream_releases is not None else target
             phase_releases.append({"cohort": index + 1, "release_monotonic_ns": at,
                                    "trigger_first_stream_ready": trigger,
+                                   "later_first_stream_ready": later_trigger,
                                    "stream_release_monotonic_ns": stream_at,
-                                   "prefill_headstart_ns": headstart})
+                                   "prefill_headstart_ns": stream_at - at})
         summary["phase"] = {"plan": phase_plan, "cohorts": [list(c) for c in cohorts],
                             "releases": phase_releases}
     summary["status"] = coordinator.aggregate(results, exits, {a: cleanup[a]["verified"] for a in agents}, server_pid, run,
@@ -577,11 +586,11 @@ def retime(results, phase_plan, makespan_s, slots=None, origin=10 ** 12):
     """Deterministic lockstep clocks over real receipts; returns (releases, ready-marker triggers).
 
     `slots=N` (canonical plan only) runs the agents N at a time, each group after the previous one
-    finished, as a server capped at N slots would; `slots=1` is a serialized service. A later
-    cohort's streamed turns line up with the earlier cohort's (its turn t with their turn t+2), so
-    a genuine mixed population reaches all four co-active agents. Event counts stay those of the
-    raw frames. Semantic events are the last frames of each stream, as the fake service sends them,
-    and every v3 timing record is recomputed with the actual function."""
+    finished, as a server capped at N slots would; `slots=1` is a serialized service. In a mixed
+    plan, the later cohort completes turn 0 before every cohort begins turn 1 from one shared
+    stream-release clock, so a genuine mixed population reaches all four co-active agents. Event
+    counts stay those of the raw frames. Semantic events are the last frames of each stream, as
+    the fake service sends them, and every v3 timing record is recomputed with the actual function."""
     cohorts = coordinator.phase_cohorts(phase_plan)
     agents = coordinator.active_agents(phase_plan)
     assert slots is None or len(cohorts) == 1, "slot-capped retiming is for single-release plans"
@@ -607,14 +616,19 @@ def retime(results, phase_plan, makespan_s, slots=None, origin=10 ** 12):
         for agent in cohort:
             group = 0 if slots is None else agents.index(agent) // slots
             start[agent] = releases[index] + 1 + group * steps * duration
+    stream_start = None
+    if len(cohorts) > 1:
+        later_ready = [start[agent] + agents.index(agent) * (gap // 8) + duration // 2
+                       for agent in cohorts[1]]
+        stream_start = max(releases[1] + coordinator.PHASE_MIN_HEADSTART_NS, max(later_ready))
     for agent in agents:
         lane = agents.index(agent) * (gap // 8)
         cohort = [agent in c for c in cohorts].index(True)
         result = results[agent]
         result["barrier"]["release_monotonic_ns"] = releases[cohort]
         for turn, receipt in enumerate(result["turns"]):
-            if cohort and turn:
-                send = start[cohorts[0][0]] + (turn + 2 * cohort) * duration + lane
+            if stream_start is not None and turn:
+                send = stream_start + (turn - 1) * duration + lane
             else:
                 send = start[agent] + turn * duration + lane
             count, semantic = len(receipt["progress_event_monotonic_ns"]), len(receipt["semantic_event_monotonic_ns"])
@@ -724,16 +738,24 @@ def run_live(service, client_dir, phase_plan=None, engine_kind="hf2q", family="q
                     releases.append(clock_ns())
                     triggers.append(trigger)
                     write_json(barrier / f"release-{len(releases)}.json", {"release_monotonic_ns": releases[-1]})
-                    durations = [value["turn0_terminal_monotonic_ns"] - value["turn0_send_monotonic_ns"]
-                                 for value in trigger.values()]
-                    target = releases[-1] + max(coordinator.PHASE_MIN_HEADSTART_NS, min(durations) // 2)
+                    later_trigger = None
+                    while later_trigger is None:
+                        assert time.monotonic() < until, "later cohort did not reach first-stream readiness"
+                        later_trigger = coordinator.phase_trigger(barrier, cohorts[len(releases) - 1], RUN, TOKEN)
+                        if later_trigger is None:
+                            time.sleep(0.001)
+                    target = max(releases[-1] + coordinator.PHASE_MIN_HEADSTART_NS,
+                                 max(value["first_stream_ready_monotonic_ns"]
+                                     for value in later_trigger.values()))
                     while clock_ns() < target:
                         time.sleep(0.001)
-                    stream_releases.append(clock_ns())
-                    write_json(barrier / f"stream-release-{len(releases) - 1}.json", {
-                        "schema": coordinator.STREAM_RELEASE_SCHEMA, "run_id": RUN, "barrier_token": TOKEN,
-                        "cohort": len(releases) - 1, "f2_clock_id": CLOCK_ID,
-                        "release_monotonic_ns": stream_releases[-1]})
+                    stream_at = clock_ns()
+                    stream_releases.append(stream_at)
+                    for cohort in range(1, len(releases) + 1):
+                        write_json(barrier / f"stream-release-{cohort}.json", {
+                            "schema": coordinator.STREAM_RELEASE_SCHEMA, "run_id": RUN,
+                            "barrier_token": TOKEN, "cohort": cohort, "f2_clock_id": CLOCK_ID,
+                            "release_monotonic_ns": stream_at})
     finally:
         cleanup = {agent: child.stop_group(process, {}) for agent, process in processes.items()}
     errors = {}
@@ -759,7 +781,7 @@ def agent_main(config):
     time.sleep(0.001)
     release_ns = json.loads(release.read_text())["release_monotonic_ns"]
     gate = None
-    if phase is not None and cohort < len(coordinator.phase_cohorts(plan)):
+    if phase is not None and len(coordinator.phase_cohorts(plan)) > 1:
         def gate(turn0):
             coordinator.first_stream_ready_marker(barrier, agent, RUN, TOKEN, turn0)
             coordinator.wait_stream_release(barrier, cohort, RUN, TOKEN, os.getppid())
