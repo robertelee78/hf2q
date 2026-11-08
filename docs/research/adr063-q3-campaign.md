@@ -78,6 +78,8 @@ The server is always the frozen four-slot C262144 configuration; only the client
 
 Three retained 2026-11-08 `3+1` attempts established the phase trigger boundary. `$E/v0130/b1-503/baseline/qwen38` waited for every first decoded token; `$E/v0130/b1-503/phase-trigger-smoke-8f674a1c` released on the first decoded token; `$E/v0130/b1-503/phase-trigger-smoke-e19c226d` released when every first streamed request was sent. All completed the tasks and reached four overlapping HTTP requests, but Q2 correctly rejected decode co-progress width 3: the later cohort's unary prefill consumed nearly the first cohort's entire streamed turn. None is pooled. The ready/head-start protocol removes that measured scheduling ambiguity without weakening the width-4 gate.
 
+The replacement smoke at `$E/v0130/b1-503/phase-trigger-smoke-82af777e` passed Q5 and cleanup, reached HTTP overlap 4, and passed Q2 at decode co-progress width 4. The witness spans turn 1 of all agents for 3.847 seconds, with 61/62/62/40 progress frames and overlap fraction 0.5005.
+
 `--phase-plan` cannot be combined with `--instance` or `--benchmark-profile`. Each agent result records its `{plan, cohort}`, and aggregation refuses a mismatch. A canonical result that carries a phase is also refused.
 
 ## Design
