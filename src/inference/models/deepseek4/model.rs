@@ -70,10 +70,12 @@ impl Deepseek4Model {
     /// verifier catalog and belong in their own artifact.
     pub fn load_from_gguf(gguf: &GgufFile) -> Result<Self> {
         let cfg = Deepseek4Config::from_gguf(gguf).context("Deepseek4Config::from_gguf")?;
+        let matvec = super::residency::MatvecKernels::from_env()?;
         let ctx = GpuContext::new()
             .map_err(|source| anyhow::anyhow!("DeepSeek-V4 Metal initialization: {source}"))?;
-        let weights = Deepseek4Weights::load_from_gguf(gguf, &cfg, ctx.device().clone())
+        let mut weights = Deepseek4Weights::load_from_gguf(gguf, &cfg, ctx.device().clone())
             .context("Deepseek4Weights::load_from_gguf")?;
+        weights.set_matvec_kernels(matvec);
         let joint_route_unproven = super::joint_decode_routes::unproven_joint_route(&cfg, &weights);
         Ok(Self {
             cfg,

@@ -4,7 +4,35 @@ use anyhow::{ensure,Context,Result};
 use serde::Deserialize;
 use serde_json::{json,Value};
 use std::{fs::{File,OpenOptions},io::{Read,Write},os::unix::fs::{OpenOptionsExt,PermissionsExt},path::{Path,PathBuf}};
-const MODEL_SHA:&str="50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6";
+/// Embedded `tokenizer.chat_template` a selected GGUF must carry. This is a check of
+/// the file's content only: hf2q serves the compiled-in DEEPSEEK_V4_FLASH_0731
+/// template on every DeepSeek-V4 file (engine_deepseek4.rs
+/// `Deepseek4LoadedModel::serving_chat_template`), so every workload is rendered
+/// with that template whichever file is selected.
+#[derive(Debug,PartialEq)]
+enum GgufTemplate {Compiled0731,Sha256(&'static str)}
+/// Closed set of DeepSeek-V4 files a Q1 prepare may select (ADR-063 Q1-DS4, #549).
+#[derive(Debug)]
+struct SelectedModel {sha256:&'static str,label:&'static str,gguf_template:GgufTemplate}
+const SELECTED_MODELS:[SelectedModel;2]=[
+    SelectedModel {sha256:"50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6",
+        label:"hf2q DeepSeek-V4-Flash-0731 deepseek4-agentic-q2 artifact",gguf_template:GgufTemplate::Compiled0731},
+    // ds4's 0731 file embeds its own template (5016 bytes); hf2q does not serve it.
+    SelectedModel {sha256:"ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0",
+        label:"ds4 DeepSeek-V4-Flash IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8 chat-v2 imatrix 0731 file",
+        gguf_template:GgufTemplate::Sha256("872492071c22c8d2025238120309ffbddddb666b49f4433f55c19b69bf51af27")},
+];
+const SERVED_TEMPLATE:&str="compiled-in DEEPSEEK_V4_FLASH_0731 (engine_deepseek4.rs Deepseek4LoadedModel::serving_chat_template) on every selected file; the GGUF-embedded template is checked as file content only and is never served";
+fn selected_model(sha256:&str)->Result<&'static SelectedModel> {
+    SELECTED_MODELS.iter().find(|m|m.sha256==sha256).context("model outside the closed selected DeepSeek-V4 set")
+}
+fn check_gguf_template(model:&SelectedModel,embedded:Option<&str>)->Result<()> {
+    let embedded=embedded.context("selected DS GGUF has no embedded chat template")?;
+    ensure!(match model.gguf_template {
+        GgufTemplate::Compiled0731=>embedded==crate::core::chat_templates::DEEPSEEK_V4_FLASH_0731,
+        GgufTemplate::Sha256(sha)=>hash(embedded.as_bytes())==sha,
+    },"selected DS GGUF embedded template differs from its closed identity");Ok(())
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Model {path:PathBuf,retained_full_sha256:String,file_identity:FileIdentity}
@@ -44,14 +72,15 @@ fn run()->Result<()> {
     ensure!(raw.len()<=1024*1024,"bounded config");let c:Config=serde_json::from_slice(&raw)?;preflight(&c.output)?;
     let source=c.expected_exporter_source_commit.as_deref().context("pending source binding")?;
     let binary=c.expected_exporter_binary_sha256.as_deref().context("pending binary binding")?;
+    let selected=selected_model(&c.model.retained_full_sha256)?;
     ensure!(hex(source,40)&&hex(binary,64)&&option_env!("HF2Q_BUILD_GIT_SHA")==Some(source)
-        &&acquisition::executable_digest()?==binary&&c.model.retained_full_sha256==MODEL_SHA,"actual prep source/binary/selected DS identity");
+        &&acquisition::executable_digest()?==binary,"actual prep source/binary/selected DS identity");
     let mut retained:Vec<(&FileBinding,u64,Vec<u8>)>=Vec::new();
     for (b,cap) in [(&c.full_content_receipt,16*1024*1024),(&c.tokenizer,64*1024*1024),
         (&c.template,1024*1024),(&c.producer_execution,2*1024*1024),(&c.producer_helper_binding,2*1024*1024)] {
         retained.push((b,cap,acquisition::checked_file(b,cap)?));
     }
-    acquisition::full_content_receipt_has_model(&retained[0].2,MODEL_SHA)?;
+    acquisition::full_content_receipt_has_model(&retained[0].2,selected.sha256)?;
     let tokenizer=tokenizers::Tokenizer::from_bytes(&retained[1].2).map_err(|e|anyhow::anyhow!("tokenizer: {e}"))?;
     ensure!(tokenizer.get_truncation().is_none(),"no tokenizer truncation");
     let template=std::str::from_utf8(&retained[2].2)?.to_owned();
@@ -88,8 +117,9 @@ fn run()->Result<()> {
     ensure!(c.model.path.is_absolute(),"absolute selected model");let fd=File::open(&c.model.path)?;
     let before=FileIdentity::observed(&fd)?;ensure!(before==c.model.file_identity,"current exact descriptor/stat");
     let gguf=mlx_native::gguf::GgufFile::from_file(fd.try_clone()?)?;
-    ensure!(gguf.tensor_data_offset()<=32*1024*1024&&gguf.metadata_string("general.architecture")==Some("deepseek4")
-        &&gguf.metadata_string("tokenizer.chat_template")==Some(template.as_str()),"bounded actual DS header/native template");
+    let embedded=gguf.metadata_string("tokenizer.chat_template");
+    ensure!(gguf.tensor_data_offset()<=32*1024*1024&&gguf.metadata_string("general.architecture")==Some("deepseek4"),"bounded actual DS header");
+    check_gguf_template(selected,embedded)?;
     let cfg=crate::inference::models::deepseek4::Deepseek4Config::from_gguf(&gguf)?;
     let workload=derive(&ids,cfg.vocab_size)?;let recipe=super::deepseek_actual::recipe(&cfg);
     let expected=super::deepseek_actual::expected(&cfg,Trajectory::T1Resume64)?;
@@ -102,7 +132,9 @@ fn run()->Result<()> {
         "simultaneously_executing_lanes":1,"ordinary_ownership":"four retained caches, serial logical trajectories; not physical B4",
         "tokens_per_lane":144,"token_vectors_sha256":acquisition::tokens_digest(&workload)?,"workload_file_sha256":hash(&workload_bytes),
         "config_input_sha256":hash(&raw),"model_path":c.model.path,"model_file_identity":before,
-        "model_full_sha256_retained":MODEL_SHA,"model_payload_rehashed":false,"header_data_offset":gguf.tensor_data_offset(),
+        "model_full_sha256_retained":selected.sha256,"selected_model":selected.label,
+        "gguf_chat_template_sha256":hash(embedded.unwrap_or_default().as_bytes()),"served_chat_template":SERVED_TEMPLATE,
+        "model_payload_rehashed":false,"header_data_offset":gguf.tensor_data_offset(),
         "full_content_receipt_path":c.full_content_receipt.path,"full_content_receipt_sha256":c.full_content_receipt.sha256,
         "tokenizer_file_sha256":c.tokenizer.sha256,"template_file_sha256":c.template.sha256,"template_source":"NativeEncoding { name: \"DEEPSEEK_V4_FLASH_0731\" }",
         "actual_deepseek_config_debug":format!("{cfg:?}"),"actual_deepseek_config_debug_sha256":recipe.actual_model_config_sha256,

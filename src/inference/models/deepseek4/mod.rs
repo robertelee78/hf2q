@@ -61,7 +61,13 @@ mod cache_tests;
 #[cfg(test)]
 mod cooperative_fault;
 #[cfg(test)]
+mod ds4_attn_microbench_tests;
+#[cfg(test)]
+mod ds4_bench_support;
+#[cfg(test)]
 mod ds4_file_kernel_parity_tests;
+#[cfg(test)]
+mod ds4_op_microbench_tests;
 #[cfg(test)]
 mod ds4_file_parity_tests;
 #[cfg(test)]
@@ -86,6 +92,8 @@ mod real_artifact_tests;
 mod residency_tests;
 #[cfg(test)]
 mod row_matmul_tests;
+#[cfg(test)]
+mod row_exact_matvec_tests;
 
 pub const ARCH_DEEPSEEK4: &str = "deepseek4";
 
