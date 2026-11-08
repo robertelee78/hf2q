@@ -234,10 +234,14 @@ thread_local! {
 /// Qwen3.6 prefill P1). The schedule depends only on the `[seq_len, top_k]`
 /// expert ids, so the outputs are bitwise those of three self-scheduling
 /// calls. Requires the `mm_id` route at the stock threshold for both calls
-/// (`top_k` in {1, 6, 8}, K ≥ 32; an operator threshold override keeps the
-/// per-call route), block-quantized GGML stacks with identical gate/up
-/// geometry, and no imatrix collector (its intercept commits and rotates the
-/// command buffer between the calls).
+/// (`top_k` in {1, 6, 8}, K ≥ 32), block-quantized GGML stacks with
+/// identical gate/up geometry, and no imatrix collector (its intercept
+/// commits and rotates the command buffer between the calls). Any
+/// `HF2Q_MM_ID_ROUTING_THRESHOLD` value, even the stock one, keeps the
+/// per-call route. The check mirrors the production (environment) routing
+/// policy; a registry carrying a custom `expert_mm_threshold` above the
+/// stock value would make the pair call refuse chunks between the two
+/// thresholds with an error rather than fall back.
 fn moe_prefill_shares_expert_schedule(
     seq_len: u32,
     shape: MoeFfnShape,
@@ -5043,6 +5047,24 @@ mod tests {
         };
         assert!(!moe_prefill_shares_expert_schedule(
             512, odd_top_k, &weights, false
+        ));
+        struct NullCollector;
+        impl crate::quantize::imatrix::ImatrixCollector for NullCollector {
+            fn record(&mut self, _tensor_name: &str, _input_row: &[f32]) {}
+            fn record_moe(
+                &mut self,
+                _tensor_name: &str,
+                _expert_id: usize,
+                _input_row: &[f32],
+            ) {}
+        }
+        crate::quantize::imatrix::with_collector(NullCollector, || {
+            assert!(!moe_prefill_shares_expert_schedule(
+                512, shape, &weights, false
+            ));
+        });
+        assert!(moe_prefill_shares_expert_schedule(
+            512, shape, &weights, false
         ));
         let drifted = MoeFfnWeightsGpuQ {
             expert_up_stride: 288,
