@@ -10,7 +10,7 @@ This document and the campaign file [`scripts/four_agent/adr065/campaign-b1.json
 
 **Operator decision (2026-11-05).** Rust 1.99.1 from here forward. The host's stable toolchain was updated at 07:14Z, and `38eea839` no longer builds on it. The baseline is therefore rebuilt with stable rustc 1.99.1 (commit `58cf8f9c35b355199727627d07ae34a4e2846d67`) from the newest main, once the Rust 1.99 fix merges. It remains "fixed main".
 
-The campaign file holds that build's identity in `baseline`. While a field is `null` (a placeholder), the driver refuses to launch a baseline.
+The campaign file holds the finalized build identity in `baseline`. The driver refuses to launch if any identity differs.
 
 **Superseded build (2026-11-04), kept as evidence only and never the baseline:**
 
@@ -21,10 +21,10 @@ The campaign file holds that build's identity in `baseline`. While a field is `n
 
 | Item | Value |
 | --- | --- |
-| Binary | `$B1/main-build/hf2q`. It is built from a clean checkout of `source_commit` with `RUSTC_WRAPPER= CARGO_INCREMENTAL=0 GIT_COMMIT_SHA=<source_commit> CARGO_TARGET_DIR=/Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool cargo build --release --locked`, using the stable 1.99.1 toolchain, then copied out of the target directory. The campaign file records its sha256 and bytes. |
-| Source commit | The newest hf2q main commit after the Rust 1.99 fix (the `source_commit` field). |
-| Build receipt | `$B1/main-build/build-receipt.json` (`hf2q.adr065.build-receipt.v1`, written by `adr065_campaign.py build-receipt`), bound by sha256. It records:<br>• source commit, and binary sha256 and bytes;<br>• mlx-native version and checksum, read from `Cargo.lock` at that commit;<br>• `rustc -vV` output (release and commit hash), run in the checkout so a `rust-toolchain` file applies;<br>• the mlx-native versions and rustc commits embedded in the binary;<br>• the build command. |
-| Native | mlx-native `=0.15.18`, with its crates.io checksum from `Cargo.lock` at `source_commit` (`native.checksum`). If main's pin has moved by then, `native.version` moves with it and the change is reviewed. |
+| Binary | `$B1/main-build/hf2q`, sha256 `154c79c64142d7669595eb4f450bf9f07e56fb96aa051d35669a437a8d282cbe`, 58,425,672 bytes. It was built from a clean checkout with `RUSTC_WRAPPER= CARGO_INCREMENTAL=0 GIT_COMMIT_SHA=<source_commit> CARGO_TARGET_DIR=/Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool cargo build --release --locked`, using the stable 1.99.1 toolchain, then copied out of the target directory. |
+| Source commit | `4bfb04362fbe258cf2b23b8167082f18b71653fd`, the first merged main containing the Rust 1.99 compatibility fix while retaining mlx-native 0.15.18. |
+| Build receipt | `$B1/main-build/build-receipt.json` (`hf2q.adr065.build-receipt.v1`), sha256 `bb2c27e0ff9ecb7574be9126f7a5569a78809cbfef134442c730c2b8bdb7a68f`. It records:<br>• source commit, and binary sha256 and bytes;<br>• mlx-native version and checksum, read from `Cargo.lock` at that commit;<br>• `rustc -vV` output (release and commit hash), run in the checkout so a `rust-toolchain` file applies;<br>• the mlx-native versions and rustc commits embedded in the binary;<br>• the build command. |
+| Native | mlx-native `=0.15.18`, crates.io checksum `9d10f97e0e25a00c1b4706a0ea9a838b2524b3fc2b999d05f21cd2580c524bee`. |
 | Toolchain | rustc 1.99.1, commit `58cf8f9c35b355199727627d07ae34a4e2846d67` (`toolchain` in the campaign file). |
 
 Before launch, the driver checks five things against the campaign file:

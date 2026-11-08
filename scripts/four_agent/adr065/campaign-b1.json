@@ -11,11 +11,11 @@
     "label": "hf2q main (newest, Rust 1.99.1 build) with mlx-native 0.15.18 (RoPE partial-rotary fix; phase-1 default)",
     "kind": "main-build",
     "binary": {
-      "source_commit": null,
-      "sha256": null,
-      "bytes": null,
+      "source_commit": "4bfb04362fbe258cf2b23b8167082f18b71653fd",
+      "sha256": "154c79c64142d7669595eb4f450bf9f07e56fb96aa051d35669a437a8d282cbe",
+      "bytes": 58425672,
       "path": "{B1}/main-build/hf2q",
-      "build_receipt": {"path": "{B1}/main-build/build-receipt.json", "sha256": null},
+      "build_receipt": {"path": "{B1}/main-build/build-receipt.json", "sha256": "bb2c27e0ff9ecb7574be9126f7a5569a78809cbfef134442c730c2b8bdb7a68f"},
       "build": {
         "source_checkout": "/opt/hf2q-worktrees/b1-main-build (detached at source_commit, clean)",
         "cargo_target_dir": "/Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool",
@@ -24,13 +24,13 @@
         "copy": "target/release/hf2q -> {B1}/main-build/hf2q"
       }
     },
-    "native": {"crate": "mlx-native", "version": "0.15.18", "checksum": null},
+    "native": {"crate": "mlx-native", "version": "0.15.18", "checksum": "9d10f97e0e25a00c1b4706a0ea9a838b2524b3fc2b999d05f21cd2580c524bee"},
     "toolchain": {"rustc_release": "1.99.1", "rustc_commit_hash": "58cf8f9c35b355199727627d07ae34a4e2846d67",
                   "rustup_toolchain": "stable-aarch64-apple-darwin"},
     "notes": [
       "Operator decision 2026-11-04: B1 baselines the fixed engine, hf2q main once mlx-native 0.15.18 (RoPE partial-rotary fix in rope_multi.metal, affecting Qwen3.6/3.8) is published and pinned on main; never the v0.1.29 release.",
       "Operator decision 2026-11-05: Rust 1.99.1 from here forward (host stable updated 07:14Z; 38eea839 no longer builds on it). The baseline is rebuilt with stable 1.99.1 from the newest main once the Rust 1.99 fix merges. The superseded 38eea839 build (627d152a, built with rustc 4a4ef493) is kept as evidence in {B1}/main-build-38eea839/ and is never the baseline.",
-      "Null fields are placeholders until that commit is built; the driver refuses to launch a baseline while any is null. If main's mlx-native pin is no longer 0.15.18 at that commit, native.version changes with it and ReviewB1 re-checks.",
+      "Finalized after the operator unblocked speed campaigns on 2026-11-08: source commit 4bfb04362fbe258cf2b23b8167082f18b71653fd is the first merged main containing the Rust 1.99 compatibility fix while retaining mlx-native 0.15.18.",
       "Before launch the driver checks the binary's sha256 and size; the build receipt (bound by sha256: source commit, binary sha256 and size, native version and checksum, rustc release and commit hash); the mlx-native pin in Cargo.lock at source_commit; and that the binary embeds exactly one mlx-native version (native.version) and exactly one rustc commit (toolchain.rustc_commit_hash)."
     ]
   },
