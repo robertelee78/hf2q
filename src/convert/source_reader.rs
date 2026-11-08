@@ -46,7 +46,7 @@ use memmap2::Mmap;
 use safetensors::{tensor::Dtype, SafeTensors};
 
 use crate::convert::source_dtype::{fp8, mxfp4};
-use crate::core::mlx_safetensors_loader::{discover_shards, read_floats_to_f32};
+use crate::core::safetensors_source::{discover_shards, read_floats_to_f32};
 use crate::quantize::ggml_quants::SourceDtype;
 
 /// One safetensors-side tensor, dequantized to F32 row-major.

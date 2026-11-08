@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use safetensors::{tensor::Dtype, SafeTensors};
 use sha2::{Digest, Sha256};
 
-use crate::core::mlx_safetensors_loader::read_floats_to_f32;
+use crate::core::safetensors_source::read_floats_to_f32;
 use crate::input::integrity::{verify_conversion_manifest, VerifiedSourceManifest};
 use crate::quantize::ggml_quants::SourceDtype;
 

@@ -1,7 +1,7 @@
 //! Source-dtype dequantizers — load-side conversion of safetensors-on-
 //! disk dtypes to the F32 buffer the convert orchestrator expects.
 //!
-//! `F32 / F16 / BF16` live in `core::mlx_safetensors_loader::read_floats_to_f32`
+//! `F32 / F16 / BF16` live in `core::safetensors_source::read_floats_to_f32`
 //! (they're elementwise and shared with the runtime loader). This
 //! module hosts the per-format dequantizers that the runtime path does
 //! NOT need: today, just `float8_e4m3fn` for MiniMax-M2.7 / DeepSeek-V3

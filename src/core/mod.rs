@@ -55,6 +55,7 @@ pub mod hardware;
 pub mod integrity;
 pub mod kernel_parity;
 pub mod mlx_safetensors_loader;
+pub mod safetensors_source;
 pub mod model_arch;
 pub(crate) mod paired_artifact;
 pub mod provenance;
