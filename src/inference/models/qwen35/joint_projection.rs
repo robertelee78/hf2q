@@ -27,9 +27,9 @@ use mlx_native::{
 
 use super::joint_decode_routes::JointRouteMode;
 
-/// Switch for [`JointProjectionKernel::ColumnInvariantMma`]: `1`/`on`/`true`
-/// selects it in the padded mode; unset, blank or `0`/`off`/`false` keeps
-/// `mul_mv_ext`.
+/// Diagnostic override for [`JointProjectionKernel::ColumnInvariantMma`]:
+/// `1`/`on`/`true` selects it in padded mode and `0`/`off`/`false` disables
+/// it. Unset or blank follows the joint-MTP candidate switch.
 pub(crate) const QWEN_JOINT_MMA_ENV: &str = "HF2Q_QWEN_JOINT_MMA";
 
 /// K step of the MMA kernel's generic (Q4_K / Q6_K) kind.

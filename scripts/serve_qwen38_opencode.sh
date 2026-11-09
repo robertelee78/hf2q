@@ -35,10 +35,12 @@ fi
 # per model at load from the Qwen3.8 identity (#729), so the launcher does not
 # export HF2Q_DECODE_MVN / HF2Q_DECODE_MV_EXT: an exported value is a
 # process-wide operator override that applies to every model in the process.
-# HF2Q_QWEN_JOINT_MMA=1 (default off, experimental) runs the padded joint
-# step's Q4_K/Q6_K layer products on mlx-native's column-invariant few-row
-# MMA kernel instead of mul_mv_ext (Q1 Class B against the mul_mv_ext route;
-# rows stay cohort-invariant). The output head stays on mul_mv_ext.
+# HF2Q_QWEN_JOINT_MTP=1 (default off, experimental) selects joint MTP verify
+# and, in padded mode, the column-invariant few-row MMA kernel for Q4_K/Q6_K
+# layer products. HF2Q_QWEN_JOINT_MMA=0 disables only the MMA half for
+# diagnostics; an explicit 1 enables MMA without MTP. The kernel is Q1 Class B
+# against mul_mv_ext, rows stay cohort-invariant, and the output head is
+# unchanged.
 
 case "${QWEN38_SPECULATION:-}" in
     ''|off|auto) ;;

@@ -29,7 +29,8 @@ use crate::inference::models::qwen35::joint_projection::{
     select_joint_projection_kernel, JointProjectionKernel, QWEN_JOINT_MMA_ENV,
 };
 use crate::inference::models::qwen35::joint_step_options::{
-    switch_from_process, JointStepOptions, QWEN_JOINT_MTP_ENV, QWEN_JOINT_POOLED_OUTPUTS_ENV,
+    parse_switch, switch_from_process, JointStepOptions, QWEN_JOINT_MTP_ENV,
+    QWEN_JOINT_POOLED_OUTPUTS_ENV,
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::serve::api::engine_qwen35::{
@@ -88,7 +89,9 @@ pub(super) struct Qwen35JointDecodeConfig {
     pub step: JointStepOptions,
     /// `HF2Q_QWEN_JOINT_MTP`: speculating lanes verify their MTP drafts as
     /// windows of a joint step (`forward_gpu_joint_verify`) instead of the
-    /// serial K3 round. Default off.
+    /// serial K3 round. In padded mode the same candidate switch selects the
+    /// column-invariant projection unless its diagnostic override is explicit.
+    /// Default off.
     pub joint_mtp: bool,
 }
 
@@ -132,6 +135,16 @@ fn parse_qwen_joint_solo(raw: Option<&str>) -> Result<bool, String> {
             "{QWEN_JOINT_SOLO_ENV} must be 1/on/true or 0/off/false, got {raw:?}"
         )),
     }
+}
+
+/// Joint MTP and the column-invariant projection form one measured candidate.
+/// An explicit MMA value remains a diagnostic override; otherwise MTP selects
+/// MMA in padded mode and the route selector keeps exact mode canonical.
+fn parse_qwen_joint_mma(raw: Option<&str>, joint_mtp: bool) -> Result<bool, String> {
+    if raw.map(str::trim).filter(|raw| !raw.is_empty()).is_none() {
+        return Ok(joint_mtp);
+    }
+    parse_switch(QWEN_JOINT_MMA_ENV, raw)
 }
 
 /// `solo` applies only to the padded mode on a worker with at least two
@@ -226,15 +239,24 @@ pub(super) fn qwen35_joint_decode_config(
             false
         })
     };
+    let joint_mtp = switch(QWEN_JOINT_MTP_ENV, "MTP verify");
+    let raw_mma = std::env::var(QWEN_JOINT_MMA_ENV).ok();
+    let mma = parse_qwen_joint_mma(raw_mma.as_deref(), joint_mtp).unwrap_or_else(|error| {
+        tracing::warn!(
+            error,
+            fallback = joint_mtp,
+            "invalid Qwen joint MMA switch"
+        );
+        joint_mtp
+    });
     let requested_step = JointStepOptions {
-        projection: if switch(QWEN_JOINT_MMA_ENV, "MMA") {
+        projection: if mma {
             JointProjectionKernel::ColumnInvariantMma
         } else {
             JointProjectionKernel::Canonical
         },
         pooled_outputs: switch(QWEN_JOINT_POOLED_OUTPUTS_ENV, "pooled outputs"),
     };
-    let joint_mtp = switch(QWEN_JOINT_MTP_ENV, "MTP verify");
     let selected = select_qwen_joint_decode(
         requested,
         max_rows,
@@ -879,6 +901,17 @@ mod tests {
             assert_eq!(parse_qwen_joint_solo(Some(raw)), Ok(false));
         }
         assert!(parse_qwen_joint_solo(Some("solo")).is_err());
+    }
+
+    #[test]
+    fn joint_mtp_selects_mma_unless_explicitly_overridden() {
+        assert_eq!(parse_qwen_joint_mma(None, false), Ok(false));
+        assert_eq!(parse_qwen_joint_mma(Some(" "), false), Ok(false));
+        assert_eq!(parse_qwen_joint_mma(None, true), Ok(true));
+        assert_eq!(parse_qwen_joint_mma(Some(" "), true), Ok(true));
+        assert_eq!(parse_qwen_joint_mma(Some("0"), true), Ok(false));
+        assert_eq!(parse_qwen_joint_mma(Some("1"), false), Ok(true));
+        assert!(parse_qwen_joint_mma(Some("mma"), true).is_err());
     }
 
     #[test]
