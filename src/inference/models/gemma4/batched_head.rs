@@ -210,18 +210,27 @@ impl MlxModelWeights {
         }
         use crate::inference::models::gemma4::batched_body::host_phases;
         let _hp = std::time::Instant::now();
-        s.finish()
-            .map_err(|e| anyhow::anyhow!("lm_head_batched session finish: {e}"))?;
+        if crate::inference::stage_profile::enabled() {
+            let ns = s
+                .finish_with_gpu_time()
+                .map_err(|e| anyhow::anyhow!("profile lm_head_batched session: {e}"))?;
+            mlx_native::kernel_profile::record("adr065.head", ns);
+        } else {
+            s.finish()
+                .map_err(|e| anyhow::anyhow!("lm_head_batched session finish: {e}"))?;
+        }
         host_phases::add(
             host_phases::Phase::LmheadWait,
             _hp.elapsed().as_nanos() as u64,
         );
 
+        let readback = crate::inference::stage_profile::CpuSpan::begin("logit_readback");
         let _hp = std::time::Instant::now();
         let logits: Vec<f32> = logits_b
             .as_slice::<f32>()
             .map_err(|e| anyhow::anyhow!("lm_head_batched read logits: {e}"))?
             .to_vec();
+        drop(readback);
         host_phases::add(
             host_phases::Phase::LmheadReadback,
             _hp.elapsed().as_nanos() as u64,

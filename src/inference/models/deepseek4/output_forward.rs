@@ -195,9 +195,16 @@ impl Deepseek4Model {
             hidden,
             "vocabulary projection",
         )?;
-        session
-            .finish()
-            .context("execute DeepSeek-V4 output head")?;
+        if crate::inference::stage_profile::enabled() {
+            let ns = session
+                .finish_with_gpu_time()
+                .context("execute profiled DeepSeek-V4 output head")?;
+            mlx_native::kernel_profile::record("adr065.head", ns);
+        } else {
+            session
+                .finish()
+                .context("execute DeepSeek-V4 output head")?;
+        }
         Ok(logits)
     }
 

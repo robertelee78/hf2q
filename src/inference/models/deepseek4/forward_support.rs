@@ -54,6 +54,10 @@ thread_local! {
     static PREFILL_SUBMISSION_INPUTS_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static DECODE_POOL: RefCell<MlxBufferPool> = RefCell::new(MlxBufferPool::new());
     static TRANSIENT_POOL_PHASE: Cell<TransientPoolPhase> = const { Cell::new(TransientPoolPhase::Inactive) };
+    /// Set only when serving clears a non-empty decode arena. The first
+    /// successful decode allocation after that release is one reallocation
+    /// event for E1, independent of the number of buffers in the new arena.
+    static DECODE_POOL_WAS_RELEASED: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(super) fn begin_prefill_pool_layer() {
@@ -190,7 +194,12 @@ pub(crate) fn release_decode_scratch() -> TransientScratchStats {
         TransientPoolPhase::Inactive,
         "cannot release DeepSeek-V4 decode scratch during a graph"
     );
-    DECODE_POOL.with(release_pool)
+    let stats = DECODE_POOL.with(release_pool);
+    if stats.free_buffers > 0 {
+        DECODE_POOL_WAS_RELEASED.with(|released| released.set(true));
+        crate::inference::stage_profile::scratch_release();
+    }
+    stats
 }
 
 pub(super) fn alloc(
@@ -219,12 +228,17 @@ pub(super) fn alloc(
                     .alloc_uninitialized(device, bytes, dtype, shape)
             })
             .with_context(|| format!("allocate pooled DeepSeek-V4 prefill {label}")),
-        TransientPoolPhase::Decode => DECODE_POOL
-            .with(|pool| {
+        TransientPoolPhase::Decode => {
+            let allocation = DECODE_POOL.with(|pool| {
                 pool.borrow_mut()
                     .alloc_uninitialized(device, bytes, dtype, shape)
-            })
-            .with_context(|| format!("allocate pooled DeepSeek-V4 decode {label}")),
+            });
+            if allocation.is_ok() && DECODE_POOL_WAS_RELEASED.with(|released| released.replace(false))
+            {
+                crate::inference::stage_profile::scratch_reallocation();
+            }
+            allocation.with_context(|| format!("allocate pooled DeepSeek-V4 decode {label}"))
+        }
         TransientPoolPhase::Inactive => device
             .alloc_buffer(bytes, dtype, shape)
             .with_context(|| format!("allocate DeepSeek-V4 {label}")),

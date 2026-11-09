@@ -454,6 +454,28 @@ class ArgvAndCases(unittest.TestCase):
             sources = case['client']['approval']['set']['sources']['sha256_of']
             self.assertEqual({Path(s).name for s in sources}, set(MODULES), family)
 
+    def test_stage_profile_controls_are_explicit_and_independent(self):
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        for family in ('qwen38', 'gemma4', 'deepseek4'):
+            case = q5_case.loads((HERE / 'q5_cases' / f'{family}.json').read_bytes())
+            stock = q5_case.build_plan(case, builtins, self.required())
+            self.assertEqual(stock['serve']['env']['HF2Q_ADR065_STAGE_PROFILE'], '', family)
+            self.assertEqual(stock['serve']['env']['MLX_PROFILE_CB'], '', family)
+            profiled = q5_case.build_plan(case, builtins, {
+                **self.required(),
+                'HF2Q_Q5_ADR065_STAGE_PROFILE': '1',
+                'HF2Q_Q5_NATIVE_PROFILE_CB': '1',
+            })
+            self.assertEqual(profiled['serve']['env']['HF2Q_ADR065_STAGE_PROFILE'], '1', family)
+            self.assertEqual(profiled['serve']['env']['MLX_PROFILE_CB'], '1', family)
+            if family == 'gemma4':
+                self.assertEqual(stock['serve']['env']['HF2Q_FUSE_LMHEAD'], '')
+                gemma_profile = q5_case.build_plan(case, builtins, {
+                    **self.required(), 'HF2Q_Q5_FUSE_LMHEAD': '0'})
+                self.assertEqual(gemma_profile['serve']['env']['HF2Q_FUSE_LMHEAD'], '0')
+            else:
+                self.assertNotIn('HF2Q_FUSE_LMHEAD', stock['serve']['env'])
+
     def test_deepseek_case_uses_scoped_compressor_override(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'deepseek4.json').read_bytes())
         env = case['serve']['env']

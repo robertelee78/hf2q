@@ -116,10 +116,14 @@ pub(super) fn sample(
             })
             .map(|token| (token, None));
     }
+    let readback = crate::inference::stage_profile::CpuSpan::begin("logit_readback");
     let mut values = logits
         .as_slice::<f32>()
         .context("read DeepSeek-V4 logits")?
         .to_vec();
+    drop(readback);
+    let host_selection =
+        crate::inference::stage_profile::CpuSpan::begin("host_selection");
     for (&token, &bias) in &params.logit_bias {
         if let Some(logit) = values.get_mut(token as usize) {
             *logit += bias;
@@ -139,6 +143,7 @@ pub(super) fn sample(
         &loaded.eos_token_ids,
         token,
     )?;
+    drop(host_selection);
     Ok((token, logprob))
 }
 

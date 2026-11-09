@@ -320,7 +320,12 @@ pub fn append_kv_to_cache_without_attention(
         slot_id,
     )
     .context("MTP KV-only canonical cache write")?;
-    enc.commit_labeled("mtp.kv_only_append");
+    if crate::inference::stage_profile::enabled() {
+        enc.commit_and_wait_labeled("adr065.mtp_catchup.kv_write")
+            .context("profile MTP KV-only append")?;
+    } else {
+        enc.commit_labeled("mtp.kv_only_append");
+    }
     slot.current_len[slot_idx] = new_len;
     Ok(())
 }
@@ -7903,6 +7908,8 @@ pub(crate) fn apply_tq_sdpa_rows_gated_into(
         device,
     )
     .context("row-batched TQ K/V encode")?;
+    crate::inference::stage_profile::boundary(enc, "adr065.kv_write")
+        .context("profile Qwen joint KV write")?;
     mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
         enc,
         registry,

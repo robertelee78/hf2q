@@ -34,7 +34,7 @@ pub(super) static ENCODER_STAGES: LazyLock<bool> =
     LazyLock::new(|| std::env::var("HF2Q_DEEPSEEK_ENCODER_STAGES").as_deref() == Ok("1"));
 
 fn split_profile_stage(session: &mut GraphSession<'_>, label: &str) -> Result<()> {
-    if *ENCODER_STAGES {
+    if *ENCODER_STAGES || crate::inference::stage_profile::enabled() {
         session
             .encoder_mut()
             .profile_stage_boundary(label)

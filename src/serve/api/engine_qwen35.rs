@@ -5902,6 +5902,8 @@ impl Qwen35DecodeState {
         kv_cache: &mut HybridKvCache,
         supervisor: &EngineSupervisor,
     ) -> Result<Qwen35TickOutcome> {
+        let _stage_round =
+            crate::inference::stage_profile::Round::begin("qwen35", "solo_k3", 1);
         let round_started = Instant::now();
         let phase_profile = std::env::var("HF2Q_MTP_PHASE_PROFILE").as_deref() == Ok("1");
         let entry = self.k3_entry(kv_cache)?;

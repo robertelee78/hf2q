@@ -11,6 +11,7 @@
 pub mod models;
 pub(crate) mod native_observation;
 pub mod spec_decode;
+pub(crate) mod stage_profile;
 pub mod vision;
 
 /// ADR-053 — GLP (GGUF Layer Projection) runtime steering.

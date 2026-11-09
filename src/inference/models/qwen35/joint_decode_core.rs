@@ -412,6 +412,8 @@ pub(crate) fn encode_joint_delta_net_layer(
         "ssm_beta",
     )?;
     enc.memory_barrier();
+    crate::inference::stage_profile::boundary(enc, "adr065.projections")
+        .context("profile Qwen joint DeltaNet projections")?;
 
     // ---- Per slot: causal conv against the slot's ping-pong parity ----
     let qkv_conv = pooled_f32(device, vec![width, qkv_ch], "DeltaNet conv output")?;
@@ -467,6 +469,8 @@ pub(crate) fn encode_joint_delta_net_layer(
         }
     }
     enc.memory_barrier();
+    crate::inference::stage_profile::boundary(enc, "adr065.delta_conv")
+        .context("profile Qwen joint DeltaNet convolution")?;
 
     // ---- Per slot: L2 norms of Q and K ----
     let mut q_l2 = Vec::with_capacity(rows.real());
@@ -574,6 +578,8 @@ pub(crate) fn encode_joint_delta_net_layer(
         .with_context(|| format!("Qwen joint gated delta net layer {layer_idx} row {row}"))?;
     }
     enc.memory_barrier();
+    crate::inference::stage_profile::boundary(enc, "adr065.delta_gdn")
+        .context("profile Qwen joint gated DeltaNet")?;
     if rows.width > rows.real() {
         fill_padding_rows(enc, registry, device, &attn_out, rows, v_elems)?;
         enc.memory_barrier();
@@ -631,6 +637,8 @@ pub(crate) fn encode_joint_delta_net_layer(
         },
     )
     .and_then(|outputs| single(outputs, "ssm_out"))?;
+    crate::inference::stage_profile::boundary(enc, "adr065.projections")
+        .context("profile Qwen joint DeltaNet output projection")?;
 
     // Same CPU-side parity flip the serial path performs after encoding.
     let slot = &mut kv_cache.linear_attn[rank];
@@ -804,6 +812,8 @@ pub(crate) fn encode_joint_full_attn_layer(
         shape.mrope_section,
     )?;
     enc.memory_barrier();
+    crate::inference::stage_profile::boundary(enc, "adr065.projections")
+        .context("profile Qwen joint full-attention projections")?;
 
     // ---- KV write at each slot's cursor + attention over each slot + gate ----
     let max_seq_len = kv_cache.max_seq_len;
@@ -886,12 +896,14 @@ pub(crate) fn encode_joint_full_attn_layer(
         )?
     };
     enc.memory_barrier();
+    crate::inference::stage_profile::boundary(enc, "adr065.attention")
+        .context("profile Qwen joint attention")?;
 
     // ---- Packed: output projection ----
     let gated = gated
         .with_shape(vec![width, q_total])
         .map_err(|e| anyhow!("shape Qwen joint gated attention: {e}"))?;
-    project_rows(
+    let output = project_rows(
         enc,
         registry,
         device,
@@ -914,5 +926,8 @@ pub(crate) fn encode_joint_full_attn_layer(
             .map(|output| vec![output])
         },
     )
-    .and_then(|outputs| single(outputs, "attn_output"))
+    .and_then(|outputs| single(outputs, "attn_output"))?;
+    crate::inference::stage_profile::boundary(enc, "adr065.projections")
+        .context("profile Qwen joint attention output projection")?;
+    Ok(output)
 }

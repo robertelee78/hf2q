@@ -16202,6 +16202,8 @@ fn decode_batch_gemma4(
     kv_bytes_per_token: u64,
     supervisor: &EngineSupervisor,
 ) -> Option<SlotAwareGpuFatal> {
+    let _stage_round =
+        crate::inference::stage_profile::Round::begin("gemma4", "joint", handles.len());
     // First-max argmax (matches dispatch_argmax_f32's `>` tie-break). Only the
     // VALUE (== logits max) feeds the rerank threshold; the index is a cosmetic
     // seed that finalize_token_from_logits never lets affect the result (the max
@@ -16272,6 +16274,8 @@ fn decode_batch_gemma4(
     let mut fused_head_out: Option<crate::inference::models::gemma4::batched_head::BatchedHeadOut> =
         None;
     if use_batched_body {
+        let arena_setup =
+            crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
         let mut tokens: Vec<u32> = Vec::new();
         let mut sids: Vec<SlotId> = Vec::new();
         let mut positions: Vec<usize> = Vec::new();
@@ -16364,6 +16368,7 @@ fn decode_batch_gemma4(
             crate::inference::models::gemma4::batched_body::host_phases::Phase::GatherMisc,
             _hp_gather.elapsed().as_nanos() as u64,
         );
+        drop(arena_setup);
         let _catsplit_g0 = std::time::Instant::now();
         // ADR-040 M-SPEED-LC Stage 2 (codex CHANGES-REQUIRED fix) — regime
         // selection is gated on `INVESTIGATION_ENV.hybrid_kv` (the SAME
@@ -16702,6 +16707,8 @@ fn decode_batch_gemma4(
         let logits_row = &head.logits[i * vocab..(i + 1) * vocab];
         // Select directly from the artifact-native head logits. No transformed
         // head or host embedding copy participates in token selection.
+        let host_selection =
+            crate::inference::stage_profile::CpuSpan::begin("host_selection");
         let _hp_am = std::time::Instant::now();
         let (greedy_token, _) = argmax_f32(logits_row);
         crate::inference::models::gemma4::batched_body::host_phases::add(
@@ -16736,6 +16743,7 @@ fn decode_batch_gemma4(
                 continue;
             }
         };
+        drop(host_selection);
         crate::inference::models::gemma4::batched_body::host_phases::add(
             crate::inference::models::gemma4::batched_body::host_phases::Phase::DecodeTick,
             _hp_dt.elapsed().as_nanos() as u64,

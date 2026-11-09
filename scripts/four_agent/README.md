@@ -863,6 +863,12 @@ The traced-run witness manifest lists `qwen35.joint_decode.actual_slot_rows` bes
 
 Design: [docs/research/adr063-q4-trace-design.md](../../docs/research/adr063-q4-trace-design.md). Tests: `test_f2_native_trace_joint.py`, `test_q4_trace_overhead.py`, `test_q4_trace_attribution.py`.
 
+### ADR-065 E1 stage attribution (`adr065_stage_profile.py`)
+
+Run each family twice with the same source-stamped binary and Q5 case: `HF2Q_ADR065_STAGE_PROFILE=wall` for the normal graph's complete-round wall control, then `HF2Q_ADR065_STAGE_PROFILE=1 MLX_PROFILE_CB=1` for diagnostic stage splits. Wall records stay in memory until HTTP work drains at graceful shutdown, so receipt output cannot change cohort formation or request decisions. Profile mode deliberately commits and waits at category boundaries. The server emits one `[ADR065_STAGE_PROFILE_JSON]` closed-schema record per complete Qwen3.8, DeepSeek-V4 or Gemma 4 round. GPU categories are projections, DeltaNet conv/GDN, KV write, attention, FFN/MoE, head, MTP draft/catch-up and Unknown. CPU categories are logit readback, host selection, rollback, per-row arena setup and host gap. DeepSeek records scratch release/reallocation events. Unknown labels are retained and excluded from decisions. Unset changes neither command-buffer topology nor output.
+
+`adr065_stage_profile.py --pair FAMILY CONTROL PROFILE PREVIOUS_DEFAULT [--pair ...] [--output REPORT.json]` requires passing Q5 receipts with proven cleanup, the same artifact and same control/profile binary, exact arm environments, and ExactTranscripts between the wall control and previous-default run. It reports category totals by route and width, known/Unknown GPU shares, profile/control complete-round median distortion and Q5 makespan distortion.
+
 ### ADR-065 E3 shadow acceptance (`adr065_shadow_acceptance.py`)
 
 Set `HF2Q_ADR065_SHADOW_DRAFT=1` with `HF2Q_QWEN_SPECULATION=off` for the diagnostic arm of a Qwen3.8 four-agent run. Only lanes in an actual joint group propose. Request-history lookup and MTP K3 run counterfactually; MTP draft cache rows are discarded and capture is disarmed before the ordinary target forward. The server emits one `[ADR065_SHADOW_DRAFT_JSON]` record when a proposal mismatches, reaches its full depth or is censored by request completion.

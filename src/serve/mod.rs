@@ -5998,6 +5998,7 @@ pub fn cmd_serve(
             },
         };
         let http_failure = http_result.err();
+        crate::inference::stage_profile::flush_wall();
         state_for_warmup.preparations.cancel_all();
         if let Err(error) = state_for_warmup
             .preparations
