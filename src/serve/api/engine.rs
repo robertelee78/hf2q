@@ -20718,6 +20718,11 @@ fn decode_batch_qwen35(
             continue;
         }
 
+        let _critical_path_span = super::engine_qwen35::critical_path::Span::decode(
+            "solo",
+            std::iter::once((handle.slot_id, state.joint_verify_eligibility())),
+        );
+
         // The tick's single route decision (planned before the joint partition
         // under the repeatable route, here otherwise), witnessed for the
         // repeatability gates.
