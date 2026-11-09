@@ -152,7 +152,35 @@ The first full Qwen3.8 baseline campaign at `$B1/baseline-v2/qwen38` is retained
 
 That recurrence invalidated the fixed half-turn-0 head-start trigger that had passed one hardware smoke. Mixed phase plans now gate every cohort immediately before its first streamed request: first-cohort readiness releases the later cohort into turn-0 prefill, later-cohort readiness proves that prefill completed, and one bound clock then releases both cohorts into streaming. The audit binds both marker sets to raw turn-0 receipts and still requires width 4.
 
-The correction at `6da49c254f6ebb01b54d4ee042f5f9303d98611c` passed 106 focused protocol/campaign tests and 137 campaign/calibration/peer integration tests. The Qwen3.8 `3+1` hardware smoke at `$B1/phase-trigger-smoke-6da49c25-r2` then passed Q5 with cleanup proven. Its independent Q2 audit observed HTTP overlap 4 and decode co-progress width 4 on every agent's turn 1, with a 1.0 overlap fraction and 131/132/129/121 frames in the common window. A fresh campaign and fresh ceilings remain required.
+The correction at `6da49c254f6ebb01b54d4ee042f5f9303d98611c` passed 106 focused protocol/campaign tests and 137 campaign/calibration/peer integration tests. The Qwen3.8 `3+1` hardware smoke at `$B1/phase-trigger-smoke-6da49c25-r2` then passed Q5 with cleanup proven. Its independent Q2 audit observed HTTP overlap 4 and decode co-progress width 4 on every agent's turn 1, with a 1.0 overlap fraction and 131/132/129/121 frames in the common window.
+
+## Baseline result
+
+Qwen3.8 and DeepSeek-V4 completed at `$B1/baseline-v3`; Gemma 4 completed at `$B1/baseline-v4/gemma4`. Every family completed the predeclared 20 `n4` blocks and six blocks for each control. Gemma's retained v3 warm-up did not start because the frozen baseline binary predates `--lcp-resume-budget`; `75b36399e70a29b02e5c1246bc2958fd4b99814e` made the canonical launcher feature-detect that versioned flag, preserved current-binary behavior, and passed 68 launcher/Q5 tests before the fresh v4 campaign.
+
+The published absolute ceilings are:
+
+| Family | Workload | Eligible / measured | TTFT p95 ceiling (s) | SSE-gap max ceiling (s) |
+| --- | --- | ---: | ---: | ---: |
+| Qwen3.8 | `n4` | 20 / 20 | 18.120170 | 4.080577 |
+| Qwen3.8 | `n1` | 6 / 6 | 8.976879 | 0.901963 |
+| Qwen3.8 | `3+1` | 6 / 6 | 18.244073 | 3.022313 |
+| Qwen3.8 | `2+2` | 6 / 6 | 19.132330 | 4.402711 |
+| Qwen3.8 | `1+3` | 6 / 6 | 17.164283 | 5.347750 |
+| DeepSeek-V4 | `n4` | 18 / 20 | 14.157026 | — |
+| DeepSeek-V4 | `n1` | 6 / 6 | 2.502978 | — |
+| DeepSeek-V4 | `3+1` | 6 / 6 | 13.812220 | — |
+| DeepSeek-V4 | `2+2` | 6 / 6 | 13.963687 | — |
+| DeepSeek-V4 | `1+3` | 5 / 6 | 13.131643 | — |
+| Gemma 4 | `n4` | 20 / 20 | 0.878426 | 0.058451 |
+| Gemma 4 | `n1` | 6 / 6 | 0.358489 | 0.029294 |
+| Gemma 4 | `3+1` | 6 / 6 | 0.881714 | 0.058618 |
+| Gemma 4 | `2+2` | 6 / 6 | 0.875029 | 0.057321 |
+| Gemma 4 | `1+3` | 6 / 6 | 0.878650 | 0.058657 |
+
+DeepSeek-V4 retained and excluded two `n4` task failures and one `1+3` task failure. Its passing streams emitted one semantic event per streamed turn, so SSE gap was not measurable and does not gate under the predeclared rule. Qwen3.8 and Gemma 4 had no excluded measured run.
+
+`$B1/baseline-independent-review.json` independently re-derived every stage's eligible count and extrema from `campaign.json`, verified each campaign and campaign-file hash, and matched all three `ceilings.json` files. Their sha256 values are Qwen3.8 `5eac8b1dd7fe96571e02b0165c93850e42b58230a2fdd5f6935756345e6f98ad`, DeepSeek-V4 `9be17867a885b432132f77013732756600cb64d336c3d70561b15b30586877f5`, and Gemma 4 `65a1e22dc7643526ee1d84c7fa8812bd8e563ff0fe6cc2aa3868f4d762785f18`.
 
 ## Draft ADR-065 amendment (for the root to land)
 
