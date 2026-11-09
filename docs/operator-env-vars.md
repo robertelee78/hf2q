@@ -337,6 +337,9 @@ matmuls keep their routes. `/hf2q/v1/runtime` publishes the resolved kernel (`St
 `RowExact` or `ColumnInvariantMma`) as
 `measurement_snapshot.active_controls.gemma_decode_dense_kernel`; Gemma Q1
 endpoint and localizer packets declare it as `decode_dense_kernel`.
+The Gemma launcher forwards `DECODE_DENSE=stock|row_exact|mma`; the Q5 case
+maps `HF2Q_Q5_GEMMA_DECODE_DENSE` to that launcher variable. Leaving it unset
+keeps the stock route.
 
 ### Native Q5_0 tensor matmul (default off)
 

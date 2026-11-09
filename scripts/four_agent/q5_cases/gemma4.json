@@ -12,6 +12,7 @@
     "Gemma combined-candidate Q5_0 tensor-MM opt-in (mlx-native #99): HF2Q_Q5_Q5_0_TENSOR_MM=1 is forwarded by the launcher as HF2Q_Q5_0_TENSOR_MM=1 (Q5_0 dense and expert matmuls take the tensor pipeline); the empty default leaves the native default (off), and the launcher rejects any other value. The arm is recorded in /hf2q/v1/runtime active_controls.q5_0_tensor_mm. Use a distinct --output per arm.",
     "V2 decode-workload diagnostic (ADR-063 Q4-GEMMA-DECODE §7.4): HF2Q_Q5_GEMMA_ROUTING_OVERLAP=1 is forwarded by the launcher as HF2Q_GEMMA_ROUTING_OVERLAP=1 and prints [ROUTING_OVERLAP] histograms at worker exit; the empty default leaves it off. Untimed runs only.",
     "A/B of the Gemma decode attention head split (ADR-063 gap program): HF2Q_Q5_GEMMA_DECODE_ATTN_NE=4 is forwarded by the launcher as HF2Q_GEMMA_DECODE_ATTN_NE=4 (NE head split of every d256 decode attention dispatch); the empty default leaves stock decode attention. The arm is recorded in /hf2q/v1/runtime active_controls.gemma_decode_attn_ne (Stock, Ne2 or Ne4).",
+    "A/B of the Gemma decode dense kernel (ADR-063 Q4-GEMMA-DECODE): HF2Q_Q5_GEMMA_DECODE_DENSE=stock|row_exact|mma is forwarded by the launcher as HF2Q_GEMMA_DECODE_DENSE; the empty default leaves the stock route. The resolved arm is recorded in /hf2q/v1/runtime active_controls.gemma_decode_dense_kernel.",
     "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv.",
     "Text-only: a nonexistent MMPROJ makes the launcher omit --mmproj (it would otherwise default to a repo projector path), and hf2q serve then auto-loads the sibling gemma-4-26B-A4B-it-hf2q-q4_k_m-mmproj.gguf (observed in the 2026-10-30 calibration). artifact.text_only_locator serves a hard link of the same file from a private {OUT}/text-model/ directory, and readiness requires vision_projector == false."
   ],
@@ -42,6 +43,7 @@
     "GEMMA_WARM_ATTENTION_KERNEL": "",
     "GEMMA_ROUTING_OVERLAP": "",
     "GEMMA_DECODE_ATTN_NE": "",
+    "GEMMA_DECODE_DENSE": "",
     "ADR065_STAGE_PROFILE": "",
     "NATIVE_PROFILE_CB": "",
     "FUSE_LMHEAD": ""
@@ -77,6 +79,7 @@
       "Q5_0_TENSOR_MM": "{Q5_0_TENSOR_MM}",
       "ROUTING_OVERLAP": "{GEMMA_ROUTING_OVERLAP}",
       "DECODE_ATTN_NE": "{GEMMA_DECODE_ATTN_NE}",
+      "DECODE_DENSE": "{GEMMA_DECODE_DENSE}",
       "HF2Q_ADR065_STAGE_PROFILE": "{ADR065_STAGE_PROFILE}",
       "MLX_PROFILE_CB": "{NATIVE_PROFILE_CB}",
       "HF2Q_FUSE_LMHEAD": "{FUSE_LMHEAD}"
