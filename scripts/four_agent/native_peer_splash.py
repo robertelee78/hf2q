@@ -242,6 +242,29 @@ def _model(model):
             ', '.join(sorted(MODEL_IDS.values())) + ')')
 
 
+def _wire_tools(tools):
+    """Omit the semantic `strict:false` default Splash renders but hf2q does not."""
+    require(isinstance(tools, list) and tools, 'canonical Splash tools required')
+    result = copy.deepcopy(tools)
+    for tool in result:
+        function = tool.get('function') if isinstance(tool, dict) else None
+        require(isinstance(function, dict) and function.get('strict') is False,
+                'canonical Splash function strict:false required')
+        function.pop('strict')
+    return result
+
+
+def _canonical_tools(tools):
+    require(isinstance(tools, list) and tools, 'Splash wire tools required')
+    result = copy.deepcopy(tools)
+    for tool in result:
+        function = tool.get('function') if isinstance(tool, dict) else None
+        require(isinstance(function, dict) and 'strict' not in function,
+                'Splash wire function must omit strict:false')
+        function['strict'] = False
+    return result
+
+
 def request_controls(request, family):
     """Canonical hf2q request -> exact Splash request; any other field refuses."""
     _family(family)
@@ -256,7 +279,8 @@ def request_controls(request, family):
             and type(request['stream']) is bool, 'canonical tool/transport controls required')
     budget = qwen_n4_peer.request_controls(request)['reasoning_budget_tokens']  # also checks roles/overflow
     require(budget == thinking_budget(request['messages']), 'Qwen thinking ceiling rule drift')
-    native = {k: v for k, v in request.items() if k != 'hf2q_overflow_policy'}
+    native = {k: copy.deepcopy(v) for k, v in request.items() if k != 'hf2q_overflow_policy'}
+    native['tools'] = _wire_tools(native['tools'])
     return {**native, **copy.deepcopy(NATIVE), 'thinking_token_budget': budget}
 
 
@@ -270,13 +294,15 @@ def canonical(request, family):
     require(type(request.get('thinking_token_budget')) is int
             and request['thinking_token_budget'] == thinking_budget(request.get('messages')),
             'Splash thinking budget drift')
-    stripped = {k: v for k, v in request.items() if k not in NATIVE and k != 'thinking_token_budget'}
+    stripped = {k: copy.deepcopy(v) for k, v in request.items()
+                if k not in NATIVE and k != 'thinking_token_budget'}
     stream = stripped.get('stream') is True
     require(set(stripped) - {'stream_options'} == SHARED_KEYS - {'hf2q_overflow_policy'}
             and ('stream_options' in stripped) == stream
             and (not stream or same(stripped['stream_options'], {'include_usage': True})),
             'Splash request carries a field outside the closed envelope')
     _model(stripped['model'])
+    stripped['tools'] = _canonical_tools(stripped['tools'])
     return {**stripped, 'hf2q_overflow_policy': 'reject'}
 
 

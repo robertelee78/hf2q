@@ -317,7 +317,7 @@ assembly, and requires every `model.json` field other than paths and times to ma
 
 | Canonical hf2q field / behaviour | Splash request | Note |
 |---|---|---|
-| model, messages, tools, `tool_choice auto`, `stream`, `stream_options.include_usage`, `logprobs false` | as is | `logprobs:true` and `n≠1` would 400 |
+| model, messages, tools, `tool_choice auto`, `stream`, `stream_options.include_usage`, `logprobs false` | as is, except each function's semantic default `strict:false` is omitted from the Splash wire and restored by the inverse | Splash renders an explicit `strict:false` into the prompt while hf2q omits it; removing the default is semantically equal and is required for prompt-byte parity. `logprobs:true` and `n≠1` would 400 |
 | `max_completion_tokens 8192` | as is | |
 | `hf2q_overflow_policy reject` | dropped | Splash lowers the limit to the context instead. The client refuses a turn whose prompt+8192 > 262144 (as for oMLX) |
 | greedy | `temperature 0, top_p 1, top_k 0, min_p 0, presence 0, frequency 0` | `temperature == 0.0` is accepted as argmax (`protocol.py:718`) |
@@ -372,6 +372,22 @@ request it:
 
 Splash's later-system patch is kept only when ordinary conversations render byte-identically to the original
 template, so a byte mismatch means a real rendering difference.
+
+Post-sweep correction (2026-11-09): a parity-specific replay of the failed
+Qwen3.8 S0 run found the first byte mismatch at offset 532. Splash rendered
+`\"strict\": false` once per function definition; hf2q omitted that semantic
+default, making Splash's turn-0 prompt 51 bytes longer (3,135 vs 3,084).
+`native_peer_splash.request_controls` now omits only this false default on the
+Splash wire, while `canonical` restores it for the canonical request and
+refuses any other wire shape. The sweep predating this correction remains
+invalid and is never relabelled.
+
+A corrected Q5 replay then passed the byte post-oracle on all 20 completed
+turns. The run remained `ClientFailed`: two agents emitted and tested the
+correct `std::num::ParseIntError` edit and two retained `std::fmt::Error`,
+below the 0.75 task floor. The correction therefore closes prompt rendering
+for that run without converting the frozen sweep or corrected Q5 into valid
+Splash evidence.
 
 ### 6.5 Q5 cases (to be added with the adapter, not before)
 
