@@ -81,6 +81,36 @@ impl Qwen35DecodeState {
         self.mtp.is_none() && self.history_lookup.is_none()
     }
 
+    /// Counterfactual joint-verify eligibility for the E4 interval observer.
+    /// Transform blockers are definitive. Proposer availability is evaluated
+    /// from request-local state only and does not advance any live ledger.
+    pub(in crate::serve::api) fn joint_verify_eligibility(&self) -> &'static str {
+        if !super::shadow_draft::verify_transforms_clear(self) {
+            return "blocked_transform";
+        }
+        let remaining = self.max_tokens.saturating_sub(self.generated_tokens.len());
+        if self.mtp.is_some() && remaining >= super::K3_VERIFY_ROWS {
+            return "eligible";
+        }
+        let history = self.history_lookup.as_ref().is_some_and(|live| {
+            let mut lookup = live.clone();
+            let expected = self.prompt_tokens.len() + self.generated_tokens.len();
+            if lookup.verified_len() < expected {
+                let Some(cursor) = lookup.verified_len().checked_sub(self.prompt_tokens.len())
+                else {
+                    return false;
+                };
+                lookup.extend_verified(&self.generated_tokens[cursor..]);
+            }
+            lookup.verified_len() == expected && !lookup.propose().is_empty()
+        });
+        if history {
+            "eligible"
+        } else {
+            "no_draft"
+        }
+    }
+
     /// Joint-partition class of a joint-ready lane: `Some(ordinary)` lets it
     /// join, `None` keeps it on the serial loop.
     /// - Repeatable route: only a lane whose planned tick is `Ordinary` joins,

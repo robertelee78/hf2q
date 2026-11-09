@@ -4146,6 +4146,12 @@ impl Qwen35PrefillState {
                     prefill_positions_from(self.graft_len + self.next_token_index, chunk.len())
                 });
             let chunk_started = Instant::now();
+            let _critical_path_span = critical_path::Span::prefill(
+                self.slot_id,
+                self.prompt_tokens.len(),
+                chunk_start,
+                end,
+            );
             let lease =
                 supervisor.arm("Qwen35 bounded prefill", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
             // ADR-059: a bound graft skips the catch-up because the MTP
@@ -4523,6 +4529,8 @@ pub(in crate::serve::api) struct Qwen35CoherentTarget {
     started: Instant,
 }
 
+#[path = "engine_qwen35/critical_path.rs"]
+pub(in crate::serve::api) mod critical_path;
 #[path = "engine_qwen35/joint_decode.rs"]
 mod joint_decode;
 pub(in crate::serve::api) use joint_decode::Qwen35JointLane;

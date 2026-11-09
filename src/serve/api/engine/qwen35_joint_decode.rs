@@ -26,7 +26,7 @@ use crate::inference::models::qwen35::joint_step_options::{
     switch_from_process, JointStepOptions, QWEN_JOINT_POOLED_OUTPUTS_ENV,
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
-use crate::serve::api::engine_qwen35::{Qwen35JointLane, Qwen35TickOutcome};
+use crate::serve::api::engine_qwen35::{critical_path, Qwen35JointLane, Qwen35TickOutcome};
 use crate::serve::api::qwen35_speculation::QwenSpeculationRoute;
 use crate::serve::api::registry::ModelRegistration;
 
@@ -507,6 +507,17 @@ fn run_qwen35_joint_group(
             }
         }
     }
+
+    let _critical_path_span = if critical_path::enabled() {
+        critical_path::Span::decode(
+            "joint",
+            lanes
+                .iter()
+                .map(|lane| (lane.handle.slot_id, lane.state.joint_verify_eligibility())),
+        )
+    } else {
+        None
+    };
 
     for lane in &mut lanes {
         // The joint row serves the lane's ordinary tick; drop its plan.

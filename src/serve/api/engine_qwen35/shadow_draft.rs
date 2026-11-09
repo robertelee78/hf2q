@@ -63,6 +63,10 @@ impl TransformFlags {
     }
 }
 
+pub(super) fn verify_transforms_clear(state: &Qwen35DecodeState) -> bool {
+    TransformFlags::from_request(state).all_clear()
+}
+
 #[derive(Clone, Copy)]
 enum Proposer {
     History,

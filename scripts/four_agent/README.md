@@ -869,6 +869,12 @@ Set `HF2Q_ADR065_SHADOW_DRAFT=1` with `HF2Q_QWEN_SPECULATION=off` for the diagno
 
 `adr065_shadow_acceptance.py SERVER_LOG... [--output REPORT.json]` validates the closed records and reports accepted-prefix histograms (0–3) by proposer, slot, cold/warm turn type and context bucket, plus the share with no grammar/repetition/forced-thinking/tool-trigger transform and proposal wall cost. Censored proposals are counted but excluded from histograms. Qualification compares the diagnostic arm's served transcripts with an otherwise identical off arm.
 
+### ADR-065 E4 critical path (`adr065_critical_path.py`)
+
+Set `HF2Q_ADR065_CRITICAL_PATH=1` for retained Qwen3.8 Q5 runs. The server emits one `[ADR065_CRITICAL_PATH_JSON]` interval for every prefill slice and joint or solo decode turn on `CLOCK_MONOTONIC`; decode records carry every lane's slot and counterfactual verify eligibility. The observer is exact-value opt-in and otherwise does no timestamp call or allocation.
+
+`adr065_critical_path.py Q5_RUN... [--output REPORT.json]` joins those server intervals to the coordinator's per-turn monotonic timestamps and prompt/cache token counts. It validates passing Q5 receipts and cleanup, derives aggregate queue-depth intervals and every per-agent idle/tool gap, partitions baseline makespan with the precedence engine work → queue → tool gap → idle/unattributed, reports joint widths, and computes $f$ as joint duration weighted by the eligible-lane fraction divided by baseline makespan. Requests with the same prompt/cache signature remain one queue cohort rather than receiving an invented agent-to-slot assignment. Its 95% interval treats each retained run as one independent cluster.
+
 ### ADR-065 E5 DeepSeek expert union (`adr065_deepseek_expert_union.py`)
 
 Set `HF2Q_ADR065_EXPERT_UNION=1` for a DeepSeek-V4 four-agent diagnostic run. Width-2 through width-4 joint steps blit-copy each layer's sanitized routed ids into one per-step buffer and read it after the existing pipeline drain. The observer emits one `[ADR065_EXPERT_UNION_JSON]` record per step with hash/score routing class, unique-expert counts and exact routed weight-byte counterfactuals; it adds no synchronization.
