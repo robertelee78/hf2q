@@ -38,9 +38,11 @@
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::DType;
 
-/// Widest joint step the graph accepts; it stays on the `m <= 8` matvec
-/// routes. Serving caps the default lower (see the scheduler's row cap).
+/// Widest serving joint-decode pack. Production callers stay within this
+/// bound.
 pub(crate) const MAX_JOINT_DECODE_ROWS: usize = 8;
+/// Widest diagnostic joint-verify pack: four slots × four rows.
+pub(crate) const MAX_JOINT_VERIFY_ROWS: usize = 16;
 
 /// The only packed width of the `mul_mv_ext` mode, and its row cap.
 pub(crate) const PADDED_MV_EXT_WIDTH: usize = 4;
@@ -138,19 +140,16 @@ pub(crate) fn joint_mode_max_rows(mode: JointRouteMode, requested: usize) -> usi
     }
 }
 
-/// Packed width of a joint MTP verify step with `rows` real rows (the lane
-/// windows, `1..=`[`MAX_JOINT_DECODE_ROWS`]). Exact steps pack only real
-/// rows: their products are bitwise one-row at every admitted width. The
-/// padded mode packs 4 rows up to 4 real rows and 8 above. At `m = 4` and
-/// `m = 8` the canonical `mul_mv_ext` products and the output head use the
-/// same tile (`r1ptg` 4, `nxpsg` 8) as the spec-off width-4 step, whose rows
-/// they must reproduce; `m = 5, 6, 7` would select other tiles or a partial
-/// tile. The column-invariant MMA products are invariant at any `m <= 8`.
+/// Packed width of a diagnostic joint-MTP verify step with `rows` real rows
+/// (the lane windows, `1..=`[`MAX_JOINT_VERIFY_ROWS`]). Exact steps pack only
+/// real rows. The padded mode uses the production width-four tile for a
+/// 4×1 round and a full width-sixteen pack for larger prototype rounds. The
+/// latter is diagnostic-only and has no serving caller.
 pub(crate) fn joint_verify_padded_width(mode: JointRouteMode, rows: usize) -> usize {
     match mode {
         JointRouteMode::Exact => rows,
         JointRouteMode::PaddedMvExt if rows <= PADDED_MV_EXT_WIDTH => PADDED_MV_EXT_WIDTH,
-        JointRouteMode::PaddedMvExt => MAX_JOINT_DECODE_ROWS,
+        JointRouteMode::PaddedMvExt => MAX_JOINT_VERIFY_ROWS,
     }
 }
 
@@ -320,15 +319,12 @@ mod tests {
     }
 
     #[test]
-    fn verify_width_keeps_the_spec_off_tile() {
-        for rows in 1..=MAX_JOINT_DECODE_ROWS {
-            assert_eq!(
-                joint_verify_padded_width(JointRouteMode::Exact, rows),
-                rows
-            );
+    fn verify_width_covers_the_diagnostic_grid() {
+        for rows in 1..=MAX_JOINT_VERIFY_ROWS {
+            assert_eq!(joint_verify_padded_width(JointRouteMode::Exact, rows), rows);
             let padded = joint_verify_padded_width(JointRouteMode::PaddedMvExt, rows);
             assert!(padded >= rows);
-            assert_eq!(padded, if rows <= 4 { 4 } else { 8 });
+            assert_eq!(padded, if rows <= 4 { 4 } else { 16 });
         }
     }
 
@@ -336,9 +332,15 @@ mod tests {
     fn joint_policy_reads_only_the_model_policy() {
         let mut ggml = mlx_native::GgmlRoutingPolicy::default();
         ggml.dense_decode_mv_ext = false;
-        assert_eq!(JointRoutingPolicy::from_ggml(&ggml), JointRoutingPolicy { mv_ext: false });
+        assert_eq!(
+            JointRoutingPolicy::from_ggml(&ggml),
+            JointRoutingPolicy { mv_ext: false }
+        );
         ggml.dense_decode_mv_ext = true;
-        assert_eq!(JointRoutingPolicy::from_ggml(&ggml), JointRoutingPolicy { mv_ext: true });
+        assert_eq!(
+            JointRoutingPolicy::from_ggml(&ggml),
+            JointRoutingPolicy { mv_ext: true }
+        );
     }
 
     #[test]

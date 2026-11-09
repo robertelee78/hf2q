@@ -47,10 +47,10 @@ use crate::inference::models::qwen35::joint_decode_core::{
     DeltaNetRoutes, FullAttnRoutes, JointRows, JointWindow,
 };
 use crate::inference::models::qwen35::joint_decode_routes::{
-    check_dense_ffn_route, check_mode_policy, dense_ffn_route,
-    joint_decode_env_unavailable_reason, joint_mode_max_rows, joint_padded_width, projection_route,
-    select_joint_route_mode, JointDenseFfnRoute, JointProductRoute, JointRouteMode,
-    JointRoutingPolicy, MAX_JOINT_DECODE_ROWS,
+    check_dense_ffn_route, check_mode_policy, dense_ffn_route, joint_decode_env_unavailable_reason,
+    joint_mode_max_rows, joint_padded_width, projection_route, select_joint_route_mode,
+    JointDenseFfnRoute, JointProductRoute, JointRouteMode, JointRoutingPolicy,
+    MAX_JOINT_DECODE_ROWS, MAX_JOINT_VERIFY_ROWS,
 };
 use crate::inference::models::qwen35::joint_projection::{
     JointProjectionKernel, JointProjectionScope,
@@ -347,21 +347,24 @@ impl Qwen35Model {
             windows: &windows,
             width: joint_padded_width(mode, rows.len()),
         };
-        self.with_joint_forward(mode, |device, registry, layer_weights, output_head, plan| {
-            self.encode_joint_decode(
-                device,
-                registry,
-                layer_weights,
-                output_head,
-                plan,
-                &packing,
-                kv_cache,
-                dense_ffn,
-                options,
-                None,
-            )
-            .map(|(outputs, _normed)| outputs)
-        })
+        self.with_joint_forward(
+            mode,
+            |device, registry, layer_weights, output_head, plan| {
+                self.encode_joint_decode(
+                    device,
+                    registry,
+                    layer_weights,
+                    output_head,
+                    plan,
+                    &packing,
+                    kv_cache,
+                    dense_ffn,
+                    options,
+                    None,
+                )
+                .map(|(outputs, _normed)| outputs)
+            },
+        )
     }
 
     /// Admission shared by every joint forward, before any cache write: no
@@ -390,8 +393,11 @@ impl Qwen35Model {
             self.glp.is_none(),
             "Qwen joint decode unavailable: GLP steering requires the serial graph"
         );
-        check_mode_policy(mode, JointRoutingPolicy::from_ggml(&self.ggml_routing_policy))
-            .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
+        check_mode_policy(
+            mode,
+            JointRoutingPolicy::from_ggml(&self.ggml_routing_policy),
+        )
+        .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
         check_dense_ffn_route(mode, dense_ffn)
             .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
         ensure!(
@@ -472,7 +478,7 @@ impl Qwen35Model {
         let rows = packing.rows;
         let width = packing.width;
         ensure!(
-            (1..=width).contains(&rows.len()) && width <= MAX_JOINT_DECODE_ROWS,
+            (1..=width).contains(&rows.len()) && width <= MAX_JOINT_VERIFY_ROWS,
             "Qwen joint forward packs {} rows at width {width}",
             rows.len()
         );
