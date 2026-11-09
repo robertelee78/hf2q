@@ -869,6 +869,12 @@ Set `HF2Q_ADR065_SHADOW_DRAFT=1` with `HF2Q_QWEN_SPECULATION=off` for the diagno
 
 `adr065_shadow_acceptance.py SERVER_LOG... [--output REPORT.json]` validates the closed records and reports accepted-prefix histograms (0–3) by proposer, slot, cold/warm turn type and context bucket, plus the share with no grammar/repetition/forced-thinking/tool-trigger transform and proposal wall cost. Censored proposals are counted but excluded from histograms. Qualification compares the diagnostic arm's served transcripts with an otherwise identical off arm.
 
+### ADR-065 E5 DeepSeek expert union (`adr065_deepseek_expert_union.py`)
+
+Set `HF2Q_ADR065_EXPERT_UNION=1` for a DeepSeek-V4 four-agent diagnostic run. Width-2 through width-4 joint steps blit-copy each layer's sanitized routed ids into one per-step buffer and read it after the existing pipeline drain. The observer emits one `[ADR065_EXPERT_UNION_JSON]` record per step with hash/score routing class, unique-expert counts and exact routed weight-byte counterfactuals; it adds no synchronization.
+
+`adr065_deepseek_expert_union.py SERVER_LOG... --require-width 2 --require-width 3 --require-width 4 [--output REPORT.json]` validates the closed schema and byte arithmetic, then reports per-width/per-layer unique-expert histograms and naive-versus-unique routed-byte reductions separately for hash and score layers.
+
 ## F2 scoreboard rendering
 
 `f2_scoreboard_render.py` renders [docs/research/adr063-f2-scoreboard.md](../../docs/research/adr063-f2-scoreboard.md) from the checked-in rows manifest `docs/research/adr063-f2-scoreboard-rows.json` (schema `hf2q.f2.scoreboard-rows.v1`) plus any `f2_scoreboard_cli.py` outputs. Only those fixed-six outputs can produce Qualified F2 primary results; manifest rows are Descriptive, NegativeResult or Failure receipts and cite `$E/...` receipt paths and extraction keys, never absolute local paths. `--verify` re-reads every Verified row from its receipt and refuses drift:

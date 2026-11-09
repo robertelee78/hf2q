@@ -816,6 +816,7 @@ impl Deepseek4Model {
                         // calibration capture (capture is single-sequence,
                         // fresh-cache-per-prompt by contract).
                         None,
+                        None,
                         RowMatmul::Matrix,
                     )?;
                     session.finish().with_context(|| {
@@ -1248,6 +1249,7 @@ impl Deepseek4Model {
             Some(output_state),
             id_mm_scratch,
             writer_capture,
+            None,
             RowMatmul::Matrix,
         )
         .with_context(|| format!("encode DeepSeek-V4 prefill layer-{layer} FFN"))
