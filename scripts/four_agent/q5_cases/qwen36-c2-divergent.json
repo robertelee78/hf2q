@@ -2,17 +2,19 @@
   "schema": "hf2q.q5.calibration-case.v1",
   "family": "qwen36",
   "notes": [
-    "Derived from: Qwen3.6 runner: current-hf normal baseline and largest-tool-result supervisors; launcher text-only, 48 GiB shared KV budget.",
+    "hf2q divergent C2 arm of the Qwen3.6 repair-turn workload. Derived from qwen36-c2.json; every field not named here is unchanged.",
+    "Repair-turn workload (ADR-063 Q4-QWEN36, operator decision 2026-11-03): the client runs --repair-turns 1 and the approval binds repair_turns 1.",
+    "Derived from: Qwen3.6 repair-turn runner; launcher text-only, 48 GiB shared KV budget.",
     "Override any variable with HF2Q_Q5_<NAME>; null variables are required. See scripts/four_agent/README.md.",
-    "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv.",
+    "The client is the checked-in declared Qwen3.6 repair-turn workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv.",
     "ADR-063 C2 K=4 reservation: 337640960 bytes per slot includes four committed anchors plus one pending; speculation is off for this case.",
     "Derived by coding_divergent_edit.py: request turns 3 and 5 truncate the turn t-2 tool-result message to 16 lines plus the pinned elision marker."
   ],
   "workload": {
-    "id": "adr063-q5-qwen36-n4-coding-ctx262144-c2-k4-divergent-edit-v1",
+    "id": "adr063-q5-qwen36-repair1-n4-coding-ctx262144-c2-k4-divergent-edit-v1",
     "slots": 4,
     "context_per_slot": 262144,
-    "client": "scripts/four_agent/qwen_n4_live_smoke.py --family qwen --workload divergent-edit-v1",
+    "client": "scripts/four_agent/qwen_n4_live_smoke.py --family qwen --repair-turns 1 --workload divergent-edit-v1",
     "anchors_per_slot": 4,
     "anchor_bytes_per_slot_max": 337640960,
     "speculation_capture_bytes": 0
@@ -20,7 +22,7 @@
   "variables": {
     "HF2Q_BIN": "{REPO}/target/release/hf2q",
     "MODEL": "{REPO}/models/qwen36-stock-adr063/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf",
-    "MODEL_SHA256": "",
+    "MODEL_SHA256": "815a22cab21649948352c0eea6e9be0d9d15606e2024d86e7bdb71fb9df08220",
     "MODEL_ID": "Qwen3.6 35B A3B",
     "PORT": "18236",
     "CARGO": null,
@@ -120,6 +122,8 @@
       "qwen",
       "--engine-kind",
       "hf2q",
+      "--repair-turns",
+      "1",
       "--workload",
       "divergent-edit-v1"
     ],
@@ -154,6 +158,7 @@
             "{REPO}/scripts/four_agent/test_coding_divergent_edit.py"
           ]
         },
+        "repair_turns": 1,
         "workload_variant": "divergent-edit-v1",
         "workload_fixture_sha256": {
           "sha256_of": "{REPO}/scripts/four_agent/fixtures/divergent-edit-v1.txt"

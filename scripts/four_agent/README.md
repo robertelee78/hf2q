@@ -701,8 +701,9 @@ messages, live fixture files, tools, scoring, and all other turns are unchanged.
   24-instance C2 quality campaign derives instances from a divergent C2 case.
 - `q5_cases/qwen38-c2.json` and `qwen36-c2.json` declare four committed anchors,
   the per-slot reservation for four committed images plus one pending image,
-  and the speculation-capture reservation. Their `-divergent` derivatives
-  carry the variant binding and calibrate separately.
+  and the speculation-capture reservation. The Qwen3.6 case uses its declared
+  one-repair-turn workload. Their `-divergent` derivatives preserve that
+  workload, carry the variant binding, and calibrate separately.
 
 ## Task-quality campaign (ADR-063 Q1 §3.5)
 

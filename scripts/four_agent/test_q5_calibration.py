@@ -320,6 +320,15 @@ class ArgvAndCases(unittest.TestCase):
             with self.assertRaises(q5_case.CaseError, msg=change):
                 q5_case.validate(self.case(**change))
 
+    def test_qwen36_c2_requires_declared_repair_workload(self):
+        case = q5_case.loads((HERE / 'q5_cases' / 'qwen36-c2.json').read_bytes())
+        self.assertEqual(q5_case.repair_turns(case), 1)
+        broken = json.loads(json.dumps(case))
+        broken['client']['argv'] = broken['client']['argv'][:-2]
+        del broken['client']['approval']['set']['repair_turns']
+        with self.assertRaisesRegex(q5_case.CaseError, 'declared repair-turn workload'):
+            q5_case.validate(broken)
+
     def test_duplicate_keys_and_cycles_refuse(self):
         with self.assertRaises(q5_case.CaseError):
             q5_case.loads(b'{"a": 1, "a": 2}')
