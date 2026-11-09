@@ -20,6 +20,7 @@ pub mod compressor;
 mod compressor_tail;
 pub mod config;
 mod decode_cohort;
+mod expert_union;
 mod ffn_forward;
 pub mod forward;
 mod forward_support;

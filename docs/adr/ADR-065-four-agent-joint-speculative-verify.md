@@ -279,6 +279,17 @@ Priority: Medium.
 
 Delivery boundary: Receipts merged to main.
 
+Result (2026-11-09): Complete. The retained DeepSeek-V4 four-agent run reached
+`CalibrationPass`, proved cleanup and captured 1,148 joint steps: 330 at width
+2, 169 at width 3 and 649 at width 4. Mean unique experts in hash/score layers
+were 11.338/10.642, 17.134/15.559 and 19.809/17.617 at those widths. Counting
+each selected expert's gate/up/down matrices once per layer and step reduced
+the routed-weight counterfactual from 8,843,998,396,416 to
+6,936,750,653,440 bytes (21.565%). The observer adds a blit per layer but reads
+only after the existing pipeline drain. Identities, exact per-layer
+histograms, commands and retained hashes are in
+[the E5 evidence record](../research/adr065-e5-deepseek-expert-union.md).
+
 ### E6. Probe existing primitives for verify-window equality
 
 Outcome: Which existing kernels can serve verify windows bitwise is known.
