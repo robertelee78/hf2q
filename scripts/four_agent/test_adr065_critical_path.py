@@ -99,8 +99,8 @@ class CriticalPathTests(unittest.TestCase):
         self.assertEqual(run["critical_path_ns"]["solo"], 50)
         self.assertEqual(len(run["queue_intervals"]), 4)
         self.assertEqual(run["queue_intervals"][0], {
-            "kind": "queue", "agent": "agent-0", "turn": 0, "slot": 0,
-            "begin_ns": 110, "end_ns": 150,
+            "kind": "queue", "prompt_tokens": 100, "cached_tokens": 0,
+            "pending_requests": 1, "begin_ns": 110, "end_ns": 150,
         })
         self.assertEqual(
             {interval["kind"] for interval in run["client_gap_intervals"]},
@@ -113,7 +113,34 @@ class CriticalPathTests(unittest.TestCase):
         self.assertEqual(eligibility["eligible_lane_weighted_ns"], 50)
         self.assertEqual(eligibility["eligible_lane_ns"], 200)
         self.assertEqual(eligibility["total_lane_ns"], 400)
+        self.assertEqual(eligibility["lane_status_counts"], {
+            "blocked_transform": 1, "eligible": 2, "no_draft": 1, "unknown": 0,
+        })
+        self.assertEqual(eligibility["lane_status_time_ns"], {
+            "blocked_transform": 100, "eligible": 200, "no_draft": 100, "unknown": 0,
+        })
         self.assertAlmostEqual(eligibility["f"], 1 / 18)
+
+    def test_shared_prompt_signature_uses_queue_depth_without_arbitrary_slot_join(self):
+        records = [
+            prefill(slot, 100, 150 + slot * 20, 170 + slot * 20)
+            for slot in range(4)
+        ]
+        records += [
+            decode("joint", [(slot, "blocked_transform") for slot in range(4)], 250, 350),
+        ]
+        run_dir = self.make_run(records=records)
+        summary_path = run_dir / "client" / "summary.json"
+        summary = json.loads(summary_path.read_text())
+        for agent in summary["agents"].values():
+            agent["turns"][0]["usage"]["prompt_tokens"] = 100
+        summary_path.write_text(json.dumps(summary))
+
+        report = subject.summarize_run(run_dir)
+        self.assertEqual(max(row["pending_requests"] for row in report["queue_intervals"]), 4)
+        self.assertEqual(report["critical_path_ns"]["queue"], 40)
+        self.assertTrue(all("agent" not in row and "slot" not in row
+                            for row in report["queue_intervals"]))
 
     def test_run_cluster_interval_uses_independent_run_values(self):
         report = subject.summarize([self.make_run("run-a"), self.make_run("run-b")])

@@ -5,7 +5,7 @@ import argparse
 import json
 import math
 import statistics
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 PREFIX = "[ADR065_CRITICAL_PATH_JSON] "
@@ -163,26 +163,52 @@ def client_intervals(summary, summary_path):
 
 
 def queue_intervals(requests, engine, source):
-    first_prefills = [record for record in engine
-                      if record["kind"] == "prefill"]
-    used = set()
+    request_groups = defaultdict(list)
+    for request in requests:
+        request_groups[(request["prompt_tokens"], request["cached_tokens"])].append(request)
+    prefill_groups = defaultdict(list)
+    for span in engine:
+        if span["kind"] == "prefill":
+            signature = (span["prompt_tokens"], span["chunk_start"])
+            if signature in request_groups:
+                prefill_groups[signature].append(span)
+
     queues = []
-    for request in sorted(requests, key=lambda row: row["begin_ns"]):
-        candidates = [
-            (index, span) for index, span in enumerate(first_prefills)
-            if index not in used
-            and span["prompt_tokens"] == request["prompt_tokens"]
-            and span["chunk_start"] == request["cached_tokens"]
-            and request["begin_ns"] <= span["begin_ns"] < request["end_ns"]
-        ]
-        require(len(candidates) == 1,
-                f"{source}: request {request['agent']} turn {request['turn']} matched "
-                f"{len(candidates)} initial prefill slices")
-        index, span = candidates[0]
-        used.add(index)
-        queues.append({"kind": "queue", "agent": request["agent"],
-                       "turn": request["turn"], "slot": span["slot"],
-                       "begin_ns": request["begin_ns"], "end_ns": span["begin_ns"]})
+    require(set(prefill_groups) == set(request_groups),
+            f"{source}: initial-prefill signatures disagree with client requests")
+    for signature, group_requests in sorted(request_groups.items()):
+        prefills = sorted(prefill_groups[signature], key=lambda span: span["begin_ns"])
+        require(len(prefills) == len(group_requests),
+                f"{source}: signature {signature} has {len(group_requests)} requests "
+                f"but {len(prefills)} initial prefill slices")
+        events = defaultdict(lambda: {"arrivals": 0, "starts": 0})
+        for request in group_requests:
+            events[request["begin_ns"]]["arrivals"] += 1
+        for span in prefills:
+            require(any(request["begin_ns"] <= span["begin_ns"] < request["end_ns"]
+                        for request in group_requests),
+                    f"{source}: signature {signature} prefill is outside every request")
+            events[span["begin_ns"]]["starts"] += 1
+
+        pending = 0
+        previous = None
+        for timestamp in sorted(events):
+            if previous is not None and previous < timestamp and pending > 0:
+                queues.append({
+                    "kind": "queue",
+                    "prompt_tokens": signature[0],
+                    "cached_tokens": signature[1],
+                    "pending_requests": pending,
+                    "begin_ns": previous,
+                    "end_ns": timestamp,
+                })
+            event = events[timestamp]
+            pending += event["arrivals"]
+            require(event["starts"] <= pending,
+                    f"{source}: signature {signature} prefills before request arrival")
+            pending -= event["starts"]
+            previous = timestamp
+        require(pending == 0, f"{source}: signature {signature} queue did not drain")
     return queues
 
 
@@ -234,6 +260,8 @@ def summarize_run(run_dir):
     eligible_weighted_ns = 0.0
     eligible_lane_ns = 0
     total_lane_ns = 0
+    lane_status_counts = Counter()
+    lane_status_time_ns = Counter()
     for span in joint:
         duration = span["end_ns"] - span["begin_ns"]
         eligible = sum(lane["verify_eligibility"] == "eligible" for lane in span["lanes"])
@@ -241,6 +269,10 @@ def summarize_run(run_dir):
         eligible_weighted_ns += duration * eligible / span["width"]
         eligible_lane_ns += duration * eligible
         total_lane_ns += duration * span["width"]
+        for lane in span["lanes"]:
+            status = lane["verify_eligibility"]
+            lane_status_counts[status] += 1
+            lane_status_time_ns[status] += duration
     makespan_ns = end - start
     return {
         "run": run_dir.name,
@@ -251,7 +283,10 @@ def summarize_run(run_dir):
         "interval_counts": {"engine": len(engine), "requests": len(requests),
                             "queue": len(queues), "tool_or_idle": len(gaps)},
         "queue_intervals": sorted(
-            queues, key=lambda interval: (interval["begin_ns"], interval["agent"])
+            queues,
+            key=lambda interval: (
+                interval["begin_ns"], interval["prompt_tokens"], interval["cached_tokens"]
+            ),
         ),
         "client_gap_intervals": sorted(
             gaps, key=lambda interval: (interval["begin_ns"], interval["agent"])
@@ -267,6 +302,12 @@ def summarize_run(run_dir):
             "eligible_lane_ns": eligible_lane_ns,
             "total_lane_ns": total_lane_ns,
             "lane_time_share": eligible_lane_ns / total_lane_ns if total_lane_ns else None,
+            "lane_status_counts": {
+                status: lane_status_counts[status] for status in sorted(ELIGIBILITY)
+            },
+            "lane_status_time_ns": {
+                status: lane_status_time_ns[status] for status in sorted(ELIGIBILITY)
+            },
             "f": eligible_weighted_ns / makespan_ns,
         },
     }
