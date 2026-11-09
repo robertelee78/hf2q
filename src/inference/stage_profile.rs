@@ -257,6 +257,10 @@ pub fn flush_wall() {
         eprintln!("[ADR065_STAGE_PROFILE_JSON] {value}");
     }
 }
+/// True while E1 owns the native profile table for a complete round.
+pub fn owns_native_profile_tables() -> bool {
+    enabled()
+}
 
 /// CPU stage timer. It is inert and timestamp-free when E1 is disabled or no
 /// complete-round guard owns the current worker thread.
@@ -332,7 +336,10 @@ fn classify_label(label: &str) -> &'static str {
         "projections"
     } else if label.starts_with("adr065.delta_conv") {
         "delta_conv"
-    } else if label.starts_with("adr065.delta_gdn") || label.contains("delta_net.ops") {
+    } else if label.starts_with("adr065.delta_gdn")
+        || label.contains("delta_net.ops")
+        || label.contains("gdn.ops5-9")
+    {
         "delta_gdn"
     } else if label.starts_with("adr065.kv_write") || label.contains("kv_cache_write") {
         "kv_write"
@@ -368,6 +375,7 @@ mod tests {
             ("adr065.projections", "projections"),
             ("adr065.delta_conv", "delta_conv"),
             ("adr065.delta_gdn", "delta_gdn"),
+            ("layer.gdn.ops5-9", "delta_gdn"),
             ("adr065.kv_write", "kv_write"),
             ("adr065.attention", "attention"),
             ("adr065.ffn_moe", "ffn_moe"),

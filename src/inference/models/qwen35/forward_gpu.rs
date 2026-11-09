@@ -124,7 +124,9 @@ fn dump_layer_activations_prefix() -> Option<String> {
 }
 
 fn print_and_reset_cb_profile(label: &str) {
-    if std::env::var("MLX_PROFILE_CB").is_err() {
+    if std::env::var("MLX_PROFILE_CB").is_err()
+        || crate::inference::stage_profile::owns_native_profile_tables()
+    {
         return;
     }
 
