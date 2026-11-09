@@ -20,8 +20,9 @@
 #                           `--lcp-resume-budget` flag, whose built-in
 #                           default is a host-independent 8GiB (this
 #                           launcher's qualified capacity). The launcher
-#                           passes it explicitly; set LCP_RESUME_BUDGET= to
-#                           override.
+#                           passes it explicitly when the selected binary
+#                           supports it and otherwise preserves that binary's
+#                           previous default.
 #   Cross-slot admission   Built-in Gemma 4 default: an idle slot group waits
 #                           up to 25 ms for peer agent requests so their
 #                           appended suffixes share one transformer-body pass
@@ -165,6 +166,15 @@ KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-51539607552}" # 48 GiB shared
 
 [[ -f "$MODEL" ]] || { echo "model not found: $MODEL" >&2; exit 3; }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not found: $HF2Q_BIN (cargo build --release)" >&2; exit 3; }
+SERVE_HELP=$("$HF2Q_BIN" serve --help 2>&1) || {
+    echo "failed to inspect serve options from: $HF2Q_BIN" >&2
+    exit 3
+}
+if [[ "$SERVE_HELP" == *"--lcp-resume-budget"* ]]; then
+    LCP_RESUME_BUDGET_SUPPORTED=1
+else
+    LCP_RESUME_BUDGET_SUPPORTED=0
+fi
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
     echo "PORT must be an integer from 1 through 65535 (got: $PORT)" >&2
     exit 3
@@ -298,54 +308,36 @@ case "${DECODE_ATTN_NE:-}" in
         ;;
 esac
 
-# macOS bash 3.2 + `set -u`: expanding an EMPTY array via "${MMARGS[@]}"
-# is an unbound-variable error (this killed the no-mmproj boot
-# 2026-08-03). Branch the exec instead of relying on the expansion.
+# Build argv through positional parameters. This is safe on macOS bash 3.2
+# when the optional projector or versioned LCP budget flag is absent.
+set -- \
+    --model "$MODEL" \
+    --host "$HOST" \
+    --port "$PORT" \
+    --overflow-policy reject \
+    --scheduler inflight-batched \
+    --max-slots "$MAX_SLOTS" \
+    --kv-cache-budget "$KV_CACHE_BUDGET_BYTES"
 if [[ -f "$MMPROJ" ]]; then
-    exec env \
-        ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
-        ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
-        ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
-        ${JOINT_COLD_ENV:+HF2Q_GEMMA_JOINT_COLD_PREFILL="$JOINT_COLD_ENV"} \
-        ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
-        ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
-        ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
-        ${Q5_0_TENSOR_MM_ENV:+HF2Q_Q5_0_TENSOR_MM="$Q5_0_TENSOR_MM_ENV"} \
-        ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
-        ${DECODE_ATTN_NE_ENV:+HF2Q_GEMMA_DECODE_ATTN_NE="$DECODE_ATTN_NE_ENV"} \
-        ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
-        "$HF2Q_BIN" -v serve \
-            --model "$MODEL" \
-            --mmproj "$MMPROJ" \
-            --host "$HOST" \
-            --port "$PORT" \
-            --overflow-policy reject \
-            --scheduler inflight-batched \
-            --max-slots "$MAX_SLOTS" \
-            --kv-cache-budget "$KV_CACHE_BUDGET_BYTES" \
-            --lcp-resume-budget "$LCP_RESUME_BUDGET" \
-            --default-repetition-penalty "${REP_PENALTY:-1.05}"
-else
-    exec env \
-        ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
-        ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
-        ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
-        ${JOINT_COLD_ENV:+HF2Q_GEMMA_JOINT_COLD_PREFILL="$JOINT_COLD_ENV"} \
-        ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
-        ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
-        ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
-        ${Q5_0_TENSOR_MM_ENV:+HF2Q_Q5_0_TENSOR_MM="$Q5_0_TENSOR_MM_ENV"} \
-        ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
-        ${DECODE_ATTN_NE_ENV:+HF2Q_GEMMA_DECODE_ATTN_NE="$DECODE_ATTN_NE_ENV"} \
-        ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
-        "$HF2Q_BIN" -v serve \
-            --model "$MODEL" \
-            --host "$HOST" \
-            --port "$PORT" \
-            --overflow-policy reject \
-            --scheduler inflight-batched \
-            --max-slots "$MAX_SLOTS" \
-            --kv-cache-budget "$KV_CACHE_BUDGET_BYTES" \
-            --lcp-resume-budget "$LCP_RESUME_BUDGET" \
-            --default-repetition-penalty "${REP_PENALTY:-1.05}"
+    set -- "$@" --mmproj "$MMPROJ"
 fi
+if [[ "$LCP_RESUME_BUDGET_SUPPORTED" == 1 ]]; then
+    set -- "$@" --lcp-resume-budget "$LCP_RESUME_BUDGET"
+else
+    echo "selected hf2q binary predates --lcp-resume-budget; preserving its built-in LCP behavior" >&2
+fi
+set -- "$@" --default-repetition-penalty "${REP_PENALTY:-1.05}"
+
+exec env \
+    ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
+    ${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"} \
+    ${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"} \
+    ${JOINT_COLD_ENV:+HF2Q_GEMMA_JOINT_COLD_PREFILL="$JOINT_COLD_ENV"} \
+    ${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"} \
+    ${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"} \
+    ${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"} \
+    ${Q5_0_TENSOR_MM_ENV:+HF2Q_Q5_0_TENSOR_MM="$Q5_0_TENSOR_MM_ENV"} \
+    ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
+    ${DECODE_ATTN_NE_ENV:+HF2Q_GEMMA_DECODE_ATTN_NE="$DECODE_ATTN_NE_ENV"} \
+    ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
+    "$HF2Q_BIN" -v serve "$@"

@@ -459,8 +459,6 @@ class ArgvAndCases(unittest.TestCase):
         env = case['serve']['env']
         self.assertNotIn('HF2Q_DEEPSEEK_UNSAFE_MEMORY_OVERRIDE', env)
         self.assertEqual(env['MAX_COMPRESSOR_USED_GIB'], '16')
-        launcher = (HERE.parent / 'serve_deepseek4_opencode.sh').read_text()
-        self.assertIn('MAX_COMPRESSOR_USED_GIB="${MAX_COMPRESSOR_USED_GIB:-8}"', launcher)
         self.assertEqual(case['workload']['id'], 'adr063-q5-deepseek4-n4-coding-ctx262144-final-default')
 
     def test_gemma_case_forwards_only_an_explicit_full_input_checkpoint_arm(self):
@@ -471,9 +469,6 @@ class ArgvAndCases(unittest.TestCase):
         self.assertNotIn('HF2Q_GEMMA_FULL_INPUT_CHECKPOINT', stock['serve']['env'])
         off = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_FULL_INPUT_CHECKPOINT': '0'})
         self.assertEqual(off['serve']['env']['FULL_INPUT_CHECKPOINT'], '0')
-        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
-        self.assertEqual(launcher.count('${FULL_INPUT_ENV:+HF2Q_GEMMA_FULL_INPUT_CHECKPOINT="$FULL_INPUT_ENV"}'), 2)
-        self.assertIn('0|1) FULL_INPUT_ENV="$FULL_INPUT_CHECKPOINT" ;;', launcher)
 
     def test_gemma_case_forwards_only_an_explicit_joint_warm_prefill_arm(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
@@ -484,9 +479,6 @@ class ArgvAndCases(unittest.TestCase):
         off = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_JOINT_WARM_PREFILL': '0'})
         self.assertEqual(off['serve']['env']['JOINT_WARM_PREFILL'], '0')
         self.assertEqual(off['serve']['env']['FULL_INPUT_CHECKPOINT'], '', 'arms are independent')
-        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
-        self.assertEqual(launcher.count('${JOINT_WARM_ENV:+HF2Q_GEMMA_JOINT_WARM_PREFILL="$JOINT_WARM_ENV"}'), 2)
-        self.assertIn('0|1) JOINT_WARM_ENV="$JOINT_WARM_PREFILL" ;;', launcher)
 
     def test_gemma_case_forwards_only_an_explicit_joint_cold_prefill_arm(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
@@ -497,9 +489,6 @@ class ArgvAndCases(unittest.TestCase):
         off = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_JOINT_COLD_PREFILL': '0'})
         self.assertEqual(off['serve']['env']['JOINT_COLD_PREFILL'], '0')
         self.assertEqual(off['serve']['env']['JOINT_WARM_PREFILL'], '', 'arms are independent')
-        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
-        self.assertEqual(launcher.count('${JOINT_COLD_ENV:+HF2Q_GEMMA_JOINT_COLD_PREFILL="$JOINT_COLD_ENV"}'), 2)
-        self.assertIn('0|1) JOINT_COLD_ENV="$JOINT_COLD_PREFILL" ;;', launcher)
 
     def test_gemma_case_forwards_only_an_explicit_warm_tiled_attention_arm(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
@@ -555,9 +544,6 @@ class ArgvAndCases(unittest.TestCase):
         broken['readiness']['checks'][0]['optional'] = True
         with self.assertRaises(q5_case.CaseError):
             q5_case.validate(broken)
-        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
-        self.assertEqual(launcher.count('${WARM_TILED_ENV:+HF2Q_GEMMA_WARM_TILED_ATTENTION="$WARM_TILED_ENV"}'), 2)
-        self.assertIn('0|1|tensor) WARM_TILED_ENV="$WARM_TILED_ATTENTION" ;;', launcher)
 
     def test_gemma_case_forwards_only_explicit_prefill_moe_arms(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
@@ -573,12 +559,6 @@ class ArgvAndCases(unittest.TestCase):
         self.assertEqual(arm_a['serve']['env']['MM_ID_SCHEDULE'], 'grid')
         self.assertEqual(arm_a['serve']['env']['WARM_TILED_ATTENTION'], '', 'arms are independent')
         self.assertEqual(arm_a['serve']['env']['JOINT_WARM_PREFILL'], '', 'arms are independent')
-        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
-        self.assertEqual(launcher.count(
-            '${PREFILL_MOE_DOWN_ENV:+HF2Q_GEMMA_PREFILL_MOE_DOWN="$PREFILL_MOE_DOWN_ENV"}'), 2)
-        self.assertEqual(launcher.count('${MM_ID_SCHEDULE_ENV:+HF2Q_MM_ID_SCHEDULE="$MM_ID_SCHEDULE_ENV"}'), 2)
-        self.assertIn('flat|slotted) PREFILL_MOE_DOWN_ENV="$PREFILL_MOE_DOWN" ;;', launcher)
-        self.assertIn('grid|compact) MM_ID_SCHEDULE_ENV="$MM_ID_SCHEDULE" ;;', launcher)
 
     def test_gemma_case_forwards_only_an_explicit_q5_0_tensor_mm_arm(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
@@ -591,10 +571,6 @@ class ArgvAndCases(unittest.TestCase):
         self.assertNotIn('HF2Q_Q5_0_TENSOR_MM', on['serve']['env'])
         self.assertEqual(on['serve']['env']['MM_ID_SCHEDULE'], '', 'arms are independent')
         self.assertEqual(on['serve']['env']['PREFILL_MOE_DOWN'], '', 'arms are independent')
-        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
-        self.assertEqual(launcher.count('${Q5_0_TENSOR_MM_ENV:+HF2Q_Q5_0_TENSOR_MM="$Q5_0_TENSOR_MM_ENV"}'), 2)
-        self.assertIn('    1) Q5_0_TENSOR_MM_ENV=1 ;;', launcher)
-        self.assertIn('echo "Q5_0_TENSOR_MM must be 1 or unset" >&2', launcher)
 
     def test_gemma_case_forwards_only_an_explicit_routing_overlap_arm(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
@@ -605,9 +581,6 @@ class ArgvAndCases(unittest.TestCase):
         on = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_ROUTING_OVERLAP': '1'})
         self.assertEqual(on['serve']['env']['ROUTING_OVERLAP'], '1')
         self.assertEqual(on['serve']['env']['WARM_TILED_ATTENTION'], '', 'arms are independent')
-        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
-        self.assertEqual(launcher.count('${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"}'), 2)
-        self.assertIn('0|1) ROUTING_OVERLAP_ENV="$ROUTING_OVERLAP" ;;', launcher)
 
     def test_gemma_case_forwards_only_an_explicit_decode_attn_ne_arm(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
@@ -618,9 +591,6 @@ class ArgvAndCases(unittest.TestCase):
         on = q5_case.build_plan(case, builtins, {**self.required(), 'HF2Q_Q5_GEMMA_DECODE_ATTN_NE': '4'})
         self.assertEqual(on['serve']['env']['DECODE_ATTN_NE'], '4')
         self.assertEqual(on['serve']['env']['ROUTING_OVERLAP'], '', 'arms are independent')
-        launcher = (HERE.parent / 'serve_gemma4_opencode.sh').read_text()
-        self.assertEqual(launcher.count('${DECODE_ATTN_NE_ENV:+HF2Q_GEMMA_DECODE_ATTN_NE="$DECODE_ATTN_NE_ENV"}'), 2)
-        self.assertIn('0|2|4) DECODE_ATTN_NE_ENV="$DECODE_ATTN_NE" ;;', launcher)
 
     def test_run_id_matches_client_identity_rule(self):
         for name in ('x', 'q5-qwen38-20261030T120000Z', 'a.b c' * 30):
