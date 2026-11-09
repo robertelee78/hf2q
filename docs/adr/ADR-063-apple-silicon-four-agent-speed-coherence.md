@@ -1685,6 +1685,25 @@ amended by its independent review).
 
 This decision establishes no speed win.
 
+Research update (2026-11-09): the frozen Qwen3.8 Splash sweep produced no
+valid configuration. All 16 runs (eight one-factor points, two runs each)
+failed the canonical task gate; no run reached `CalibrationPass`, a passing
+audit and the prompt-parity post-oracle. This remains a `Failed` Splash arm
+under the decision above and establishes no Q4 verdict.
+
+The raw decode lead is nevertheless measured and source-attributed. Across
+S0's 17 completed responses before its task failure, Splash accepted 61.48%
+of 4,746 DFlash2 proposals and produced 5.329 completion tokens per cycle at
+a median 60.05 tok/s per request. The pinned implementation combines a
+five-layer, seven-proposal DFlash2 drafter and coherent rank-256 path selector;
+confidence/cost-priced 1--8-row verification; three command stages that
+overlap CPU grammar simulation with target forward; and decode-debt
+scheduling. hf2q's ordinary four-lane target step is weight-streaming-bound
+at a traced median 89.08 ms, while its first production joint-MTP pilot can
+only draft one token per lane at width four. The source and receipt analysis,
+including validity limits and the required successor architecture, is
+[the Qwen3.8 Splash gap record](../research/adr063-qwen38-splash-gap.md).
+
 ### F2 closure scope: option B (operator decision 2026-10-31/11-01)
 
 The operator approved option B of the F2 intent review
