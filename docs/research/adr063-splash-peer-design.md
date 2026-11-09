@@ -382,6 +382,13 @@ Splash wire, while `canonical` restores it for the canonical request and
 refuses any other wire shape. The sweep predating this correction remains
 invalid and is never relabelled.
 
+A corrected Q5 replay then passed the byte post-oracle on all 20 completed
+turns. The run remained `ClientFailed`: two agents emitted and tested the
+correct `std::num::ParseIntError` edit and two retained `std::fmt::Error`,
+below the 0.75 task floor. The correction therefore closes prompt rendering
+for that run without converting the frozen sweep or corrected Q5 into valid
+Splash evidence.
+
 ### 6.5 Q5 cases (to be added with the adapter, not before)
 
 `q5_cases/splash-qwen38.json` and `splash-qwen36.json`. Schema as `native-omlx-qwen36.json`, with these values:

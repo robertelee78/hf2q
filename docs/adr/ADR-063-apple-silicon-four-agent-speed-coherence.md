@@ -1691,6 +1691,16 @@ failed the canonical task gate; no run reached `CalibrationPass`, a passing
 audit and the prompt-parity post-oracle. This remains a `Failed` Splash arm
 under the decision above and establishes no Q4 verdict.
 
+Follow-up parity correction (2026-11-09): a replay exposed one request adapter
+difference. Splash rendered each tool's semantic default `"strict": false`
+while hf2q omitted it. The corrected adapter omits only that false default on
+the Splash wire and restores it for the canonical request. All 20 completed
+prompts in a corrected Q5 replay passed the byte post-oracle. The corrected
+Q5 still failed the task gate: two agents produced and tested the correct
+`std::num::ParseIntError` edit and two retained `std::fmt::Error`, below the
+0.75 task floor. This closes request rendering as the remaining cause in that
+run; it neither validates nor relabels the frozen sweep.
+
 The raw decode lead is nevertheless measured and source-attributed. Across
 S0's 17 completed responses before its task failure, Splash accepted 61.48%
 of 4,746 DFlash2 proposals and produced 5.329 completion tokens per cycle at
