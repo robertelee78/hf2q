@@ -143,6 +143,7 @@ impl HybridKvCache {
         self.la_restore_route = route;
     }
 
+    #[cfg(test)]
     pub(crate) fn la_restore_route(&self) -> LaRestoreRoute {
         self.la_restore_route
     }
