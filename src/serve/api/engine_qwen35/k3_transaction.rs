@@ -540,13 +540,14 @@ impl Qwen35DecodeState {
         Ok(committed)
     }
 
-    /// The solo commit: cursors, the host DeltaNet restore and settlement
-    /// inside one fail-closed scope (any error clears capture and resets the
-    /// slot), then the ledger.
+    /// The solo commit: cursors, the configured DeltaNet restore and
+    /// settlement inside one fail-closed scope (any error clears capture and
+    /// resets the slot), then the ledger.
     pub(in crate::serve::api) fn k3_commit_solo(
         &mut self,
         qwen: &Qwen35LoadedModel,
         kv_cache: &mut HybridKvCache,
+        supervisor: &EngineSupervisor,
         plan: K3Plan,
     ) -> Result<K3SoloCommit> {
         let state_started = Instant::now();
@@ -554,9 +555,14 @@ impl Qwen35DecodeState {
         let state_result = (|| -> Result<()> {
             if let Some(restore) = self.k3_commit_cursors(kv_cache, &plan)? {
                 let rollback_started = Instant::now();
-                kv_cache
-                    .rollback_la_to(restore.slot, restore.capture_row)
-                    .context("Qwen SlotAware MTP K3 recurrent rollback")?;
+                let lease = supervisor.arm(
+                    "Qwen35 SlotAware MTP K3 restore",
+                    QWEN35_WORKER_TRANSACTION_TIMEOUT,
+                )?;
+                let restored = kv_cache
+                    .rollback_la(restore.slot, restore.capture_row)
+                    .context("Qwen SlotAware MTP K3 recurrent rollback");
+                lease.finish().and(restored)?;
                 rollback_elapsed = rollback_started.elapsed();
             }
             self.k3_commit_settle(kv_cache, &plan)
