@@ -123,21 +123,20 @@ This is relevant to TTFT and SSE cadence, but it does not explain the 5.3 tok/cy
 
 The first pilot exposed a real serving bug: a stable prompt anchor retained an MTP hidden-row view whose owner covered a larger transient multi-row allocation. The anchor store correctly refused it, so no stable checkpoint was published and prefix reuse failed. The fix materializes only the retained row into a right-sized owner. Its focused regression passed, and the repeated real Q5 passed with no checkpoint refusal or missing-checkpoint warning.
 
-The passing pilot and previous-default Q5 runs used the same artifact, case, host and candidate binary:
+The four-point factorial pilot used one binary, artifact, case and host. All four runs reached `CalibrationPass`, completed 28 turns, reused the full eligible prompt prefixes and produced the same final source-hash multiset:
 
-| Metric | Previous default | Joint MTP + column-invariant MMA | Ratio/change |
-|---|---:|---:|---:|
-| Client makespan | 137.458 s | 94.188 s | 0.685; 31.5% sooner |
-| Completion tokens | 6,310 | 6,388 | 1.012 |
-| Aggregate completion rate | 45.905 tok/s | 67.822 tok/s | 1.477× |
-| Median request decode rate | 13.042 tok/s | 21.046 tok/s | 1.614× |
-| Workflow turns | 28 | 28 | equal |
-| Final source-hash multiset | four expected hashes | same four hashes | equal |
-| Q5 | `CalibrationPass` | `CalibrationPass` | both pass |
+| Path | Client makespan | Completion tokens | Aggregate completion rate | Median request decode |
+|---|---:|---:|---:|---:|
+| Previous default | 137.458 s | 6,310 | 45.905 tok/s | 13.042 tok/s |
+| Column-invariant MMA only | 124.568 s | 6,388 | 51.281 tok/s | 14.615 tok/s |
+| Joint MTP only | 130.161 s | 6,310 | 48.478 tok/s | 13.674 tok/s |
+| Joint MTP + column-invariant MMA | 94.188 s | 6,388 | 67.822 tok/s | 21.046 tok/s |
 
-The pilot executed 857 global joint-MTP cycles and 3,172 lane-cycles. The fixed allocator issued an estimated 3,556 drafts. Subtracting one prefill seed per request and one target decision per lane-cycle from the 6,388 completions gives 3,188 accepted drafts: about 89.65% acceptance and 2.01 output tokens per lane-cycle. This estimate assumes the production seed/settle accounting; terminal rows can distort it slightly.
+MMA alone is 9.38% sooner and joint MTP alone 5.31% sooner than the previous default. Together they are 31.48% sooner. Joint MTP is 24.39% sooner when added to MMA; MMA is 27.64% sooner when added to joint MTP. The log-scale interaction ratio is 0.799, so treating these as independent improvements would miss a further 20.15% reduction. This matches the mechanism: joint MTP creates wider temporal products, and the column-invariant few-row kernel prevents those products from paying the canonical width growth.
 
-This overturns the practical premise behind ADR-065 E8's `f=0`: the production integration can make joint-window eligibility nonzero on the canonical grammar/tool workload and delivers a large one-run effect. It does not by itself overturn the decision. ADR-065 requires a fixed-count one-switch A/B, fairness, quality and independent review before J4/J5 can be reopened or a default changed.
+The combined pilot executed 857 global joint-MTP cycles and 3,172 lane-cycles. The fixed allocator issued an estimated 3,556 drafts. Subtracting one prefill seed per request and one target decision per lane-cycle from the 6,388 completions gives 3,188 accepted drafts: about 89.65% acceptance and 2.01 output tokens per lane-cycle. This estimate assumes the production seed/settle accounting; terminal rows can distort it slightly.
+
+This overturns the practical premise behind ADR-065 E8's `f=0`: the production integration can make joint-window eligibility nonzero on the canonical grammar/tool workload and delivers a large factorial-pilot effect. It does not by itself overturn the decision. ADR-065 requires a fixed-count one-switch A/B, fairness, quality and independent review before J4/J5 can be reopened or a default changed.
 
 It also does not match Splash's raw cycle productivity:
 
@@ -150,8 +149,8 @@ It also does not match Splash's raw cycle productivity:
 ## Decision
 
 1. Do not claim that hf2q has beaten Splash. Splash has no valid point, while hf2q has not matched its raw decode architecture.
-2. Preserve the joint-MTP work as a candidate, not a default. Its single paired-shape pilot is strong enough to justify reopening the measurement decision, not strong enough to ship on by assertion.
-3. Run the required one-factor pilot and fixed-count A/B to separate column-invariant MMA from joint MTP. The production switch must represent one coherent candidate configuration.
+2. Preserve joint MTP plus column-invariant MMA as one candidate treatment, not a default. The factorial pilot shows that neither component represents the combined effect.
+3. Give the combined treatment one production kill switch, then run ADR-065's fixed-count A/B, fairness and quality gates. A single successful run is not qualification.
 4. Keep every target token target-verified and every tool/grammar path enabled. No quality waiver converts raw speed into a Q4 result.
 
 ## Required successor to match raw Splash
@@ -170,7 +169,7 @@ ADR-065 currently forbids new drafter architectures and tree drafting. A DFlash2
 
 ## Next checks
 
-- Complete the four-point factorial pilot: default, MMA only, joint MTP only, and joint MTP plus MMA.
-- If one coherent candidate remains, run ADR-065's fixed-count ABBA campaign against the previous default and the current Q4 peer campaign on the same release candidate.
+- Bind joint MTP plus column-invariant MMA to one candidate switch and run ADR-065's fixed-count ABBA campaign against the previous default.
+- Run the current Q4 peer campaign on the same release candidate if the A/B passes.
 - Run the Splash prompt-parity post-oracle. Until one Splash point passes Q5, audits and the 0.75 task floor, its Q4 comparison remains failed rather than a speed denominator.
 - If raw Splash parity remains a product requirement after v0.1.30, approve the successor drafter/verifier scope explicitly and measure it against the 5.304 tok/cycle target above.
