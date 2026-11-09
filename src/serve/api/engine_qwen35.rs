@@ -4323,13 +4323,15 @@ impl Qwen35PrefillState {
             let advanced = end - self.next_token_index;
             self.next_token_index = end;
             let checkpoint = if self.stable_prompt_prefix_tokens == Some(end) {
-                let spec =
-                    self.mtp_pending_hidden
-                        .as_ref()
-                        .map(|hidden| Qwen35SpecPrefixBoundary {
-                            token_count: end,
-                            pending_target_hidden: hidden.clone(),
-                        });
+                let spec = self
+                    .mtp_pending_hidden
+                    .as_ref()
+                    .map(|hidden| {
+                        qwen.model.with_gpu_cache_mut(|device, _registry| {
+                            anchor_store::owned_spec_boundary(device, end, hidden)
+                        })
+                    })
+                    .transpose()?;
                 let hidden_bytes = spec
                     .as_ref()
                     .map_or(0, |boundary| boundary.pending_target_hidden.data_byte_len());
