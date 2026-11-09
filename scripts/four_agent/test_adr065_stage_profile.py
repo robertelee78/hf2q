@@ -54,6 +54,14 @@ class StageProfileTests(unittest.TestCase):
         (run / "client").mkdir(parents=True)
         client = run / "client" / "summary.json"
         client.write_text(json.dumps(summary(seconds, response)))
+        turn = run / "client" / "agent-0" / "turn-0"
+        turn.mkdir(parents=True)
+        (turn / "request.json").write_text(json.dumps({
+            "messages": [{"role": "user", "content": "same request"}],
+        }))
+        (turn / "assembled-assistant.json").write_text(json.dumps({
+            "role": "assistant", "content": response,
+        }))
         env = {"HF2Q_ADR065_STAGE_PROFILE": mode}
         if mode == "1":
             env["MLX_PROFILE_CB"] = "1"
@@ -98,7 +106,10 @@ class StageProfileTests(unittest.TestCase):
             self.assertEqual(attribution["gpu_ns"]["unknown"], 20)
             self.assertAlmostEqual(attribution["unknown_gpu_share"], 20 / 420)
             self.assertAlmostEqual(attribution["known_share"], 400 / 420)
-            self.assertTrue(result["exact_transcripts_vs_previous_default"])
+            self.assertEqual(
+                result["exact_transcripts_vs_previous_default"]["classification"],
+                "ExactTranscripts",
+            )
 
     def test_transcript_mismatch_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

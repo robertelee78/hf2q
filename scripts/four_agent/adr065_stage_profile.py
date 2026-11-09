@@ -5,7 +5,11 @@ import argparse
 import hashlib
 import json
 import statistics
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from q1_decision_policy import transcripts
 
 PREFIX = "[ADR065_STAGE_PROFILE_JSON] "
 SCHEMA = "hf2q.adr065.stage-profile-round.v1"
@@ -97,13 +101,6 @@ def parse_records(path):
     return records
 
 
-def transcript(summary):
-    rows = []
-    for agent, value in sorted(summary["agents"].items()):
-        for turn in value["turns"]:
-            rows.append((agent, turn["turn"], turn["request_sha256"], turn["response_sha256"]))
-        rows.append((agent, "source", value["final_source_sha256"], value["observed_final_source_sha256"]))
-    return rows
 
 
 def groups(records):
@@ -149,7 +146,8 @@ def analyze_pair(family, control_dir, profile_dir, reference_dir):
         raise ValueError(f"{family}: artifact identities differ")
     if c_binary != p_binary:
         raise ValueError(f"{family}: control/profile binaries differ")
-    if transcript(c_summary) != transcript(r_summary):
+    exactness = transcripts([c_run, r_run])
+    if exactness["classification"] != "ExactTranscripts":
         raise ValueError(f"{family}: wall-control transcript differs from previous default")
     c_env = c_receipt.get("serve_env", {})
     p_env = p_receipt.get("serve_env", {})
@@ -182,7 +180,7 @@ def analyze_pair(family, control_dir, profile_dir, reference_dir):
     return {
         "artifact_sha256": c_artifact,
         "binary_sha256": c_binary,
-        "exact_transcripts_vs_previous_default": True,
+        "exact_transcripts_vs_previous_default": exactness,
         "control_makespan_seconds": c_summary["own_output_four_task_makespan_seconds"],
         "profile_makespan_seconds": p_summary["own_output_four_task_makespan_seconds"],
         "profile_makespan_over_control": (
