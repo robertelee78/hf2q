@@ -23,9 +23,10 @@ impl LaRestoreRoute {
                 "HF2Q_QWEN_LA_GPU_RESTORE must be 0 or 1 (got {value:?})"
             )),
             None => match variant {
-                // P4b starts default-off. Its matched A/B decides whether the
-                // dense default flips; the MoE default remains host-only.
-                Qwen35Variant::Dense | Qwen35Variant::Moe => Ok(Self::Host),
+                // The matched P4b A/B was a Win with every promotion gate
+                // passing. Qwen3.6 remains host-only without an override.
+                Qwen35Variant::Dense => Ok(Self::Gpu),
+                Qwen35Variant::Moe => Ok(Self::Host),
             },
         }
     }
@@ -481,7 +482,7 @@ mod tests {
     fn route_resolution_is_explicit_and_moe_defaults_to_host() {
         assert_eq!(
             LaRestoreRoute::resolve(None, Qwen35Variant::Dense).unwrap(),
-            LaRestoreRoute::Host
+            LaRestoreRoute::Gpu
         );
         assert_eq!(
             LaRestoreRoute::resolve(None, Qwen35Variant::Moe).unwrap(),
