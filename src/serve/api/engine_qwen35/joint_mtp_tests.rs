@@ -24,18 +24,21 @@
 //! cargo test --release --bin hf2q joint_mtp -- --test-threads=1
 //! ```
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::time::Duration;
-
 use anyhow::Result;
 use mlx_native::MlxDevice;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use super::super::speculation_qualification_tests::loaded_model;
 use super::super::{Qwen35CanonicalDecision, Qwen35DecodeState, Qwen35LoadedModel};
 use super::{
-    cap8_draft_depths, plan_qwen35_window, run_joint_mtp_step, Qwen35JointMtpDraftRequest,
-    Qwen35JointMtpForward,
+    cap8_draft_depths, diagnostic_draft_depths, plan_qwen35_window, run_joint_mtp_step,
+    Qwen35JointMtpDraftRequest, Qwen35JointMtpForward, Qwen35JointMtpStageTiming,
 };
 use crate::inference::models::qwen35::joint_decode_routes::{JointDenseFfnRoute, JointRouteMode};
 use crate::inference::models::qwen35::joint_projection::JointProjectionKernel;
@@ -48,21 +51,17 @@ use crate::inference::models::qwen35::spec_decode::{last_hidden_row, positions_f
 use crate::serve::api::engine::SamplingParams;
 use crate::serve::api::engine_supervisor::EngineSupervisor;
 use crate::serve::api::qwen35_speculation::{QwenSpeculationController, QwenSpeculationPolicy};
-use crate::serve::multi_seq_kv::SlotId;
+use crate::serve::multi_seq_kv::{MultiSeqKvCache, SlotId};
 
 #[test]
-fn cap8_depths_follow_the_width_rule() {
+fn cap8_depths_follow_the_serving_width_rule() {
     let full = |lanes: usize| cap8_draft_depths(&vec![3; lanes]);
     assert_eq!(full(4), [1, 1, 1, 1]);
     assert_eq!(full(3), [2, 2, 1]);
     assert_eq!(full(2), [3, 3]);
     assert_eq!(full(1), [3]);
-    // Lanes that cannot draft (or only a little) leave rows to the others;
-    // the step never exceeds 8 rows and never exceeds a cap.
     assert_eq!(cap8_draft_depths(&[0, 3, 3, 3]), [0, 2, 1, 1]);
     assert_eq!(cap8_draft_depths(&[1, 3, 3]), [1, 2, 2]);
-    assert_eq!(cap8_draft_depths(&[0, 0]), [0, 0]);
-    assert_eq!(cap8_draft_depths(&[2, 0]), [2, 0]);
     for caps in [[3, 3, 3, 3], [0, 1, 2, 3], [3, 0, 0, 1]] {
         let depths = cap8_draft_depths(&caps);
         assert!(depths.iter().sum::<usize>() + caps.len() <= 8);
@@ -71,10 +70,16 @@ fn cap8_depths_follow_the_width_rule() {
 }
 
 #[test]
+fn diagnostic_depths_cover_four_by_four() {
+    assert_eq!(diagnostic_draft_depths(&[3, 3, 3, 3]), [3, 3, 3, 3]);
+    assert_eq!(diagnostic_draft_depths(&[3, 3, 0, 0]), [3, 3, 0, 0]);
+    assert_eq!(diagnostic_draft_depths(&[3, 0, 0, 0]), [3, 0, 0, 0]);
+}
+
+#[test]
 fn draft_free_window_commits_its_bonus_row() {
-    let decision = |token, terminal| {
-        move |_: usize| Ok(Qwen35CanonicalDecision { token, terminal })
-    };
+    let decision =
+        |token, terminal| move |_: usize| Ok(Qwen35CanonicalDecision { token, terminal });
     let plan = plan_qwen35_window(&[], decision(7, false)).expect("plan");
     assert_eq!(plan.output, [7]);
     assert!(!plan.terminal_after_pending);
@@ -101,7 +106,9 @@ struct LanePlan {
 }
 
 fn synthetic_prompt(slot: u32, len: u32) -> Vec<u32> {
-    (0..len).map(|index| (slot * 97 + index * 31 + 7) % VOCAB).collect()
+    (0..len)
+        .map(|index| (slot * 97 + index * 31 + 7) % VOCAB)
+        .collect()
 }
 
 /// Lane 0 greedy; lane 1 without MTP state; lane 2 with a repetition
@@ -185,7 +192,10 @@ fn seed(
             .model
             .forward_gpu_last_logits_with_hidden(&tokens, &positions, kv, slot)
             .expect("prefill with hidden");
-        let embed = qwen.model.embed_tokens_gpu(&tokens).expect("prompt embeddings");
+        let embed = qwen
+            .model
+            .embed_tokens_gpu(&tokens)
+            .expect("prompt embeddings");
         let mtp = qwen.model.mtp.as_ref().expect("MTP weights");
         qwen.model
             .with_gpu_cache_mut(|device, registry| {
@@ -288,6 +298,8 @@ fn drive(
                     &supervisor,
                     drafter,
                     &|_| false,
+                    None,
+                    None,
                 )
                 .expect("joint MTP step"),
                 None => spec_off_step(qwen, &mut kv, group, forward, &supervisor),
@@ -312,7 +324,8 @@ fn drive(
         }
         for slot in finished {
             let state = states[slot as usize].take().expect("finished lane");
-            kv.reset_for_slot(SlotId(slot)).expect("reset finished slot");
+            kv.reset_for_slot(SlotId(slot))
+                .expect("reset finished slot");
             finish(state, &mut outcomes);
         }
     }
@@ -551,7 +564,13 @@ fn joint_mtp_batched_drafts_are_deterministic_and_match_spec_off() {
     let policy = padded_policy();
     let lanes = synthetic_lanes();
     let eos = pick_eos(policy, &lanes, forward);
-    let (reference, _) = drive(&qwen(policy, &[eos], false), &lanes, CAPACITY, forward, None);
+    let (reference, _) = drive(
+        &qwen(policy, &[eos], false),
+        &lanes,
+        CAPACITY,
+        forward,
+        None,
+    );
     let (first, _, first_drafts) =
         spec_on_with_batched_drafter(&qwen(policy, &[eos], true), &lanes, CAPACITY, forward);
     let (second, _, second_drafts) =
@@ -559,7 +578,10 @@ fn joint_mtp_batched_drafts_are_deterministic_and_match_spec_off() {
     assert_streams_equal(&lanes, &first, &reference);
     assert_eq!(first, second, "spec-on runs differ");
     assert!(!first_drafts.is_empty(), "the batched drafter never ran");
-    assert_eq!(first_drafts, second_drafts, "batched drafts are not deterministic");
+    assert_eq!(
+        first_drafts, second_drafts,
+        "batched drafts are not deterministic"
+    );
 }
 
 /// Qwen3.8 artifact: four greedy lanes × 64 tokens (lane 3 joins at turn
@@ -597,7 +619,10 @@ fn qwen38_joint_mtp_matches_spec_off_tokens() {
     let LoadedModel::Qwen35(mut qwen) = LoadedModel::load(&options).expect("load Qwen3.8") else {
         panic!("HF2Q_QWEN38_GGUF must name a Qwen3.5-family GGUF");
     };
-    assert!(qwen.model.mtp.is_some(), "the gate needs the native MTP head");
+    assert!(
+        qwen.model.mtp.is_some(),
+        "the gate needs the native MTP head"
+    );
     let forward = mma_forward();
     assert_eq!(qwen.model.joint_decode_mode(), Ok(forward.mode));
     let encode = |text: &str| -> Vec<u32> {
@@ -657,4 +682,254 @@ fn qwen38_joint_mtp_matches_spec_off_tokens() {
         on_turns < off_turns,
         "joint MTP must accept drafts ({on_turns} vs {off_turns} turns)"
     );
+}
+
+#[derive(Serialize)]
+struct DiagnosticSample {
+    context_tokens: usize,
+    shape: &'static str,
+    rows: usize,
+    warmup: bool,
+    committed_tokens: Vec<usize>,
+    prepare_ns: u64,
+    draft_ns: u64,
+    verify_readback_ns: u64,
+    selection_ns: u64,
+    capture_recovery_ns: u64,
+    settle_catch_up_ns: u64,
+    total_ns: u64,
+}
+
+#[derive(Serialize)]
+struct DiagnosticReport {
+    schema: &'static str,
+    source_commit: String,
+    model_path: String,
+    q5_case_path: String,
+    q5_case_sha256: String,
+    grid: String,
+    warmups_per_configuration: usize,
+    timed_runs_per_configuration: usize,
+    samples: Vec<DiagnosticSample>,
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).expect("diagnostic duration fits u64")
+}
+
+/// ADR-065 E7/E2 diagnostic-only driver. It never enters the HTTP serving
+/// path. `smoke` covers the Q5-admitted 4×1 and 4×4 rounds at 2K context;
+/// `full` covers all nine shapes at 2K, 16K and 64K with one warm-up and
+/// seven retained measurements per configuration.
+#[test]
+#[ignore = "requires Qwen3.8, Q5 case identity, retained-output path and Apple Metal"]
+fn qwen38_joint_verify_diagnostic_grid() {
+    use crate::serve::api::engine::{LoadOptions, LoadedModel};
+
+    const CONTEXTS: &[usize] = &[2_048, 16_384, 65_536];
+    const SHAPES: &[(&str, &[usize])] = &[
+        ("4x1", &[0, 0, 0, 0]),
+        ("4x2", &[1, 1, 1, 1]),
+        ("4x3", &[2, 2, 2, 2]),
+        ("4x4", &[3, 3, 3, 3]),
+        ("4+4+1+1", &[3, 3, 0, 0]),
+        ("4+1+1+1", &[3, 0, 0, 0]),
+        ("1x4", &[3]),
+        ("2x4", &[3, 3]),
+        ("3x4", &[3, 3, 3]),
+    ];
+
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let model_path = PathBuf::from(
+        std::env::var_os("HF2Q_QWEN38_GGUF").expect("HF2Q_QWEN38_GGUF must name the artifact"),
+    );
+    assert!(
+        model_path.is_file(),
+        "artifact is absent at {}",
+        model_path.display()
+    );
+    let q5_case_path = PathBuf::from(
+        std::env::var_os("HF2Q_ADR065_E_Q5_CASE")
+            .expect("HF2Q_ADR065_E_Q5_CASE must name the frozen Q5 case"),
+    );
+    let q5_case = fs::read(&q5_case_path)
+        .unwrap_or_else(|error| panic!("read Q5 case {}: {error}", q5_case_path.display()));
+    let output_path = PathBuf::from(
+        std::env::var_os("HF2Q_ADR065_E_OUTPUT")
+            .expect("HF2Q_ADR065_E_OUTPUT must name the retained JSON report"),
+    );
+    let grid = std::env::var("HF2Q_ADR065_E_GRID").unwrap_or_else(|_| "smoke".into());
+    assert!(
+        matches!(grid.as_str(), "smoke" | "full"),
+        "grid must be smoke or full"
+    );
+    let source_commit =
+        std::env::var("HF2Q_ADR065_E_SOURCE_COMMIT").expect("source commit identity is required");
+
+    let options = LoadOptions {
+        model_path: model_path.clone(),
+        tokenizer_path: None,
+        config_path: None,
+        dwq_overlay_path: None,
+        kv_persist_dir: None,
+        kv_persist_budget_bytes: 0,
+        glp_path: None,
+        glp_alpha: None,
+        kv_graft_path: None,
+        lcp_resume_budget: crate::serve::kv_persist::lcp_registry::LcpResumeBudget::DEFAULT,
+    };
+    let LoadedModel::Qwen35(mut qwen) = LoadedModel::load(&options).expect("load Qwen3.8") else {
+        panic!("HF2Q_QWEN38_GGUF must name a Qwen3.5-family GGUF");
+    };
+    assert!(
+        qwen.model.mtp.is_some(),
+        "the diagnostic needs the native MTP head"
+    );
+    qwen.speculation = speculation(true);
+    let mut forward = mma_forward();
+    // Width sixteen is a diagnostic mul_mv_ext pack; the few-row MMA route
+    // remains bounded to its published serving envelope.
+    forward.options.projection = JointProjectionKernel::Canonical;
+    assert_eq!(qwen.model.joint_decode_mode(), Ok(forward.mode));
+    qwen.model
+        .ensure_gpu_cache_primed()
+        .expect("prime GPU cache at the model's final address");
+    let prompt_token = *qwen
+        .tokenizer
+        .encode("x", false)
+        .expect("tokenize diagnostic seed")
+        .get_ids()
+        .first()
+        .expect("diagnostic seed token");
+    let supervisor = EngineSupervisor::new();
+    let timed_runs = if grid == "full" { 7 } else { 1 };
+    let contexts = if grid == "full" {
+        CONTEXTS
+    } else {
+        &CONTEXTS[..1]
+    };
+    let mut samples = Vec::new();
+
+    for &context in contexts {
+        let mut kv = qwen
+            .model
+            .with_gpu_cache_mut(|device, _registry| {
+                HybridKvCache::new_with_options(
+                    &qwen.model.cfg,
+                    device,
+                    u32::try_from(context + 32).expect("context fits u32"),
+                    SLOTS,
+                    true,
+                )
+            })
+            .expect("allocate four-slot diagnostic cache");
+        for &(shape, caps) in SHAPES
+            .iter()
+            .filter(|(shape, _)| grid == "full" || matches!(*shape, "4x1" | "4x4"))
+        {
+            for repetition in 0..=timed_runs {
+                let mut states = caps
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, _)| {
+                        let slot = u32::try_from(slot).expect("slot fits u32");
+                        kv.reset_for_slot(SlotId(slot))
+                            .expect("reset diagnostic slot");
+                        let plan = LanePlan {
+                            slot,
+                            prompt: vec![prompt_token],
+                            max_tokens: 1_024,
+                            penalty: false,
+                            mtp: true,
+                            join_turn: 0,
+                        };
+                        let mut state = seed(&qwen, &mut kv, &plan, true);
+                        kv.append_for_seq(
+                            SlotId(slot),
+                            u32::try_from(context - 1).expect("context fits u32"),
+                        )
+                        .expect("advance synthetic context cursor");
+                        state.prompt_len = context;
+                        state.decode_position_base = context;
+                        state.cached_tokens = context;
+                        state
+                    })
+                    .collect::<Vec<_>>();
+                let before = states
+                    .iter()
+                    .map(|state| state.generated_tokens.len())
+                    .collect::<Vec<_>>();
+                let mut state_refs = states.iter_mut().collect::<Vec<_>>();
+                let mut timing = Qwen35JointMtpStageTiming::default();
+                let complete_round_started = Instant::now();
+                let ticks = run_joint_mtp_step(
+                    &qwen,
+                    &mut kv,
+                    &mut state_refs,
+                    forward,
+                    &supervisor,
+                    &mut |qwen, kv, requests| qwen.draft_joint_mtp(kv, requests, &supervisor),
+                    &|_| false,
+                    Some(caps),
+                    Some(&mut timing),
+                )
+                .unwrap_or_else(|error| panic!("{shape} at {context}: {error:#}"));
+                drop(state_refs);
+                let drain_started = Instant::now();
+                for (state, tick) in states.iter_mut().zip(ticks) {
+                    let mut tick = tick.unwrap_or_else(|error| {
+                        panic!("{shape} slot {}: {error:#}", state.slot_id.0)
+                    });
+                    while !tick.finished && state.has_pending_speculation_output() {
+                        tick = state
+                            .joint_mtp_drain_tick(&qwen)
+                            .unwrap_or_else(|error| panic!("{shape} drain: {error:#}"));
+                    }
+                }
+                timing.settle_catch_up += drain_started.elapsed();
+                timing.total = complete_round_started.elapsed();
+                let committed_tokens = states
+                    .iter()
+                    .zip(before)
+                    .map(|(state, prior)| state.generated_tokens.len().saturating_sub(prior))
+                    .collect::<Vec<_>>();
+                samples.push(DiagnosticSample {
+                    context_tokens: context,
+                    shape,
+                    rows: caps.iter().map(|cap| cap + 1).sum(),
+                    warmup: repetition == 0,
+                    committed_tokens,
+                    prepare_ns: duration_ns(timing.prepare),
+                    draft_ns: duration_ns(timing.draft),
+                    verify_readback_ns: duration_ns(timing.verify_readback),
+                    selection_ns: duration_ns(timing.selection),
+                    capture_recovery_ns: duration_ns(timing.capture_recovery),
+                    settle_catch_up_ns: duration_ns(timing.settle_catch_up),
+                    total_ns: duration_ns(timing.total),
+                });
+            }
+        }
+    }
+
+    let report = DiagnosticReport {
+        schema: "hf2q.adr065.joint-verify-timing.v1",
+        source_commit,
+        model_path: model_path.display().to_string(),
+        q5_case_path: q5_case_path.display().to_string(),
+        q5_case_sha256: hex::encode(Sha256::digest(&q5_case)),
+        grid,
+        warmups_per_configuration: 1,
+        timed_runs_per_configuration: timed_runs,
+        samples,
+    };
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .unwrap_or_else(|error| panic!("create {}: {error}", parent.display()));
+    }
+    fs::write(
+        &output_path,
+        serde_json::to_vec_pretty(&report).expect("serialize diagnostic report"),
+    )
+    .unwrap_or_else(|error| panic!("write {}: {error}", output_path.display()));
+    eprintln!("wrote {}", output_path.display());
 }

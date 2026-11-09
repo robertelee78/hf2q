@@ -41,7 +41,7 @@ use crate::inference::models::qwen35::joint_decode_core::{
     encode_delta_net_replay, rows_view, DeltaNetReplay, JointWindow,
 };
 use crate::inference::models::qwen35::joint_decode_routes::{
-    joint_verify_padded_width, JointDenseFfnRoute, JointRouteMode, MAX_JOINT_DECODE_ROWS,
+    joint_verify_padded_width, JointDenseFfnRoute, JointRouteMode, MAX_JOINT_VERIFY_ROWS,
 };
 use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
@@ -98,7 +98,7 @@ impl Qwen35JointVerifyPending {
 
 impl Qwen35Model {
     /// Run one joint verify step over `lanes` (distinct slots, `1 + k_i`
-    /// rows each, at most [`MAX_JOINT_DECODE_ROWS`] rows in total). Every
+    /// rows each, at most [`MAX_JOINT_VERIFY_ROWS`] rows in total). Every
     /// row's logits, hidden and argmax are bitwise those of the joint
     /// decode step under the same `mode`, `dense_ffn` and `options` for that
     /// slot at that position with the same preceding tokens. Refusal
@@ -115,8 +115,8 @@ impl Qwen35Model {
         ensure!(!lanes.is_empty(), "Qwen joint verify requires a lane");
         let total = lanes.iter().map(|lane| lane.tokens.len()).sum::<usize>();
         ensure!(
-            (1..=MAX_JOINT_DECODE_ROWS).contains(&total),
-            "Qwen joint verify requires 1..={MAX_JOINT_DECODE_ROWS} rows, got {total}"
+            (1..=MAX_JOINT_VERIFY_ROWS).contains(&total),
+            "Qwen joint verify requires 1..={MAX_JOINT_VERIFY_ROWS} rows, got {total}"
         );
         let mut rows = Vec::with_capacity(total);
         let mut windows = Vec::with_capacity(lanes.len());
@@ -186,13 +186,8 @@ impl Qwen35Model {
         let (outputs, normed, replay) = self.with_joint_forward(
             mode,
             |device, registry, layer_weights, output_head, plan| {
-                let mut replay = DeltaNetReplay::new(
-                    device,
-                    &self.cfg,
-                    &windows,
-                    packing.width,
-                    linear_layers,
-                )?;
+                let mut replay =
+                    DeltaNetReplay::new(device, &self.cfg, &windows, packing.width, linear_layers)?;
                 let (outputs, normed) = self.encode_joint_decode(
                     device,
                     registry,
@@ -293,13 +288,7 @@ impl Qwen35Model {
                     .command_encoder()
                     .map_err(|e| anyhow!("Qwen joint verify replay encoder: {e}"))?;
                 encode_delta_net_replay(
-                    &mut enc,
-                    device,
-                    registry,
-                    cache,
-                    replay,
-                    &partial,
-                    &self.cfg,
+                    &mut enc, device, registry, cache, replay, &partial, &self.cfg,
                 )?;
                 enc.commit_and_wait_labeled("qwen35.joint_verify.replay")
                     .map_err(|e| anyhow!("Qwen joint verify replay command buffer: {e}"))

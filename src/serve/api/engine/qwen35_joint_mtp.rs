@@ -18,9 +18,9 @@ use crate::serve::api::registry::ModelRegistration;
 
 use super::{
     is_fatal_command_buffer_error, reinstall_lanes, settle_qwen35_decode_lane, take_joint_lanes,
-    EngineSupervisor, InflightBatchedScheduler, PromptCache, Qwen35FatalFailure,
-    Qwen35FatalReply, Qwen35JointDecodeConfig, Qwen35KvGuard, Qwen35PromptAnchor,
-    Qwen35RetainedPrefix, Qwen35Slot, Qwen35SlotWork, Qwen35WorkerFatalKind, SlotHandle,
+    EngineSupervisor, InflightBatchedScheduler, PromptCache, Qwen35FatalFailure, Qwen35FatalReply,
+    Qwen35JointDecodeConfig, Qwen35KvGuard, Qwen35PromptAnchor, Qwen35RetainedPrefix, Qwen35Slot,
+    Qwen35SlotWork, Qwen35WorkerFatalKind, SlotHandle,
 };
 
 /// One joint MTP step over `group`, then settle and drain every lane.
@@ -72,7 +72,10 @@ pub(super) fn run_qwen35_joint_mtp_group(
             "joint_mtp_step",
             &lanes.iter().map(|lane| lane.handle).collect::<Vec<_>>(),
         );
-        let mut states = lanes.iter_mut().map(|lane| &mut lane.state).collect::<Vec<_>>();
+        let mut states = lanes
+            .iter_mut()
+            .map(|lane| &mut lane.state)
+            .collect::<Vec<_>>();
         run_joint_mtp_step(
             guard.model,
             guard.kv.as_mut().expect("kv Some during loop"),
@@ -85,6 +88,8 @@ pub(super) fn run_qwen35_joint_mtp_group(
             supervisor,
             &mut |qwen, kv, requests| qwen.draft_joint_mtp(kv, requests, supervisor),
             &|error| !supervisor.is_healthy() || is_fatal_command_buffer_error(error),
+            None,
+            None,
         )
     };
     let ticks = match step {

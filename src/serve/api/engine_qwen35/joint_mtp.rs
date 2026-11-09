@@ -32,10 +32,11 @@
 
 use anyhow::{Context, Result};
 use mlx_native::MlxBuffer;
+use std::time::{Duration, Instant};
 
 use crate::inference::models::qwen35::joint_decode_core::rows_view;
 use crate::inference::models::qwen35::joint_decode_routes::{
-    JointDenseFfnRoute, JointRouteMode, MAX_JOINT_DECODE_ROWS,
+    JointDenseFfnRoute, JointRouteMode, MAX_JOINT_DECODE_ROWS, MAX_JOINT_VERIFY_ROWS,
 };
 use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
@@ -56,21 +57,14 @@ use super::{
     QWEN35_WORKER_TRANSACTION_TIMEOUT,
 };
 
-/// Row budget of one joint MTP step (cap8): every projection pass stays on
-/// the `m <= 8` route.
+/// Row budget of one serving joint-MTP step.
 pub(in crate::serve::api) const JOINT_MTP_MAX_ROWS: usize = MAX_JOINT_DECODE_ROWS;
 /// Deepest window: the pending token plus three drafts.
 pub(in crate::serve::api) const JOINT_MTP_MAX_DRAFTS: usize = 3;
 
-/// The cap8 draft depths of one step. `caps[i]` is lane `i`'s largest
-/// admissible draft count (0 for a lane that cannot draft). Every lane
-/// holds one row; the remaining budget of [`JOINT_MTP_MAX_ROWS`] rows is
-/// granted one draft at a time, round-robin in lane order, up to each cap.
-/// With every lane able to draft three: 4 lanes → 1 each, 3 → 2/2/1,
-/// 2 → 3/3, 1 → 3.
-pub(in crate::serve::api) fn cap8_draft_depths(caps: &[usize]) -> Vec<usize> {
+fn bounded_draft_depths(caps: &[usize], max_rows: usize) -> Vec<usize> {
     let mut depths = vec![0; caps.len()];
-    let mut budget = JOINT_MTP_MAX_ROWS.saturating_sub(caps.len());
+    let mut budget = max_rows.saturating_sub(caps.len());
     while budget > 0 {
         let mut granted = false;
         for (depth, &cap) in depths.iter_mut().zip(caps) {
@@ -85,6 +79,16 @@ pub(in crate::serve::api) fn cap8_draft_depths(caps: &[usize]) -> Vec<usize> {
         }
     }
     depths
+}
+
+/// Serving cap-eight depth assignment.
+pub(in crate::serve::api) fn cap8_draft_depths(caps: &[usize]) -> Vec<usize> {
+    bounded_draft_depths(caps, JOINT_MTP_MAX_ROWS)
+}
+
+/// Diagnostic four-slot × four-row assignment. No serving caller uses it.
+fn diagnostic_draft_depths(caps: &[usize]) -> Vec<usize> {
+    bounded_draft_depths(caps, MAX_JOINT_VERIFY_ROWS)
 }
 
 /// Accept walk over one window: [`plan_qwen35_verified_block`], plus the
@@ -210,7 +214,9 @@ impl Qwen35DecodeState {
         kv_cache: &HybridKvCache,
     ) -> Result<Qwen35JointMtpRole> {
         let Some(mtp) = self.mtp.as_ref() else {
-            return Ok(Qwen35JointMtpRole::Ordinary(self.prepare_joint_tick(kv_cache)?));
+            return Ok(Qwen35JointMtpRole::Ordinary(
+                self.prepare_joint_tick(kv_cache)?,
+            ));
         };
         let pending_token = *self
             .generated_tokens
@@ -413,7 +419,10 @@ impl Qwen35LoadedModel {
                 let active = (0..lanes.len())
                     .filter(|&index| lanes[index].depth > depth)
                     .collect::<Vec<_>>();
-                let active_tokens = active.iter().map(|&index| tokens[index]).collect::<Vec<_>>();
+                let active_tokens = active
+                    .iter()
+                    .map(|&index| tokens[index])
+                    .collect::<Vec<_>>();
                 let shared_embed =
                     self.model
                         .embed_tokens_gpu_in_context(&active_tokens, device, registry)?;
@@ -508,6 +517,20 @@ pub(in crate::serve::api) struct Qwen35JointMtpForward {
     pub options: JointStepOptions,
 }
 
+/// Wall-time split for one complete diagnostic joint-verify round. GPU
+/// synchronization and output readback are included in `verify_readback`;
+/// MTP catch-up is included in `settle_catch_up`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::serve::api) struct Qwen35JointMtpStageTiming {
+    pub prepare: Duration,
+    pub draft: Duration,
+    pub verify_readback: Duration,
+    pub selection: Duration,
+    pub capture_recovery: Duration,
+    pub settle_catch_up: Duration,
+    pub total: Duration,
+}
+
 /// The drafter of a joint MTP step: production calls
 /// [`Qwen35LoadedModel::draft_joint_mtp`]; tests force draft outcomes.
 pub(in crate::serve::api) type Qwen35JointMtpDrafter<'a> = dyn FnMut(
@@ -528,17 +551,20 @@ enum Verified {
 }
 
 /// One joint MTP step over `states` (distinct slots, at most
-/// [`JOINT_MTP_MAX_ROWS`] lanes): roles, cap8 depths, batched drafting,
-/// one joint verify forward, the accept walks, the shared commit and each
-/// lane's settlement. Returns every lane's tick (a window lane's first
-/// verified token; the rest stay queued for
-/// [`Qwen35DecodeState::joint_mtp_drain_tick`]).
+/// [`JOINT_MTP_MAX_ROWS`] lanes): roles, bounded batched drafting, one joint
+/// verify forward, accept walks, shared recovery commit and lane settlement.
+/// Returns every lane's tick (a window lane's first verified token; the rest
+/// stay queued for [`Qwen35DecodeState::joint_mtp_drain_tick`]).
+///
+/// `diagnostic_draft_caps` and `diagnostic_timing` exist only for the bounded
+/// ADR-065 E7/E2 experiment. Serving passes `None` for both.
 ///
 /// Lane-local failures (preparation, accept walk, catch-up) fail only that
 /// lane; a failed draft fails the drafting lanes; a failed verify or commit
 /// fails every lane that submitted it. A failure `is_fatal` accepts (an
 /// unhealthy supervisor, a fatal command buffer) is returned as `Err`: the
 /// worker fail-stops.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::serve::api) fn run_joint_mtp_step(
     qwen: &Qwen35LoadedModel,
     kv_cache: &mut HybridKvCache,
@@ -547,8 +573,20 @@ pub(in crate::serve::api) fn run_joint_mtp_step(
     supervisor: &EngineSupervisor,
     drafter: &mut Qwen35JointMtpDrafter<'_>,
     is_fatal: &dyn Fn(&anyhow::Error) -> bool,
+    diagnostic_draft_caps: Option<&[usize]>,
+    diagnostic_timing: Option<&mut Qwen35JointMtpStageTiming>,
 ) -> Result<Vec<Result<Qwen35TickOutcome>>> {
     let lanes = states.len();
+    if let Some(caps) = diagnostic_draft_caps {
+        anyhow::ensure!(
+            caps.len() == lanes,
+            "diagnostic draft caps have {} lanes, expected {lanes}",
+            caps.len()
+        );
+    }
+    let round_started = Instant::now();
+    let mut observed = Qwen35JointMtpStageTiming::default();
+    let stage_started = Instant::now();
     let mut ticks: Vec<Option<Result<Qwen35TickOutcome>>> = (0..lanes).map(|_| None).collect();
     let fail_all = |ticks: &mut Vec<Option<Result<Qwen35TickOutcome>>>,
                     indices: &[usize],
@@ -573,13 +611,23 @@ pub(in crate::serve::api) fn run_joint_mtp_step(
             }
         }
     }
+    observed.prepare = stage_started.elapsed();
 
-    // 2. cap8 depths and batched drafting.
+    // 2. Bounded depths and batched drafting.
+    let stage_started = Instant::now();
     let caps = roles
         .iter()
-        .map(|role| role.as_ref().map_or(0, Qwen35JointMtpRole::draft_cap))
+        .enumerate()
+        .map(|(index, role)| {
+            let cap = role.as_ref().map_or(0, Qwen35JointMtpRole::draft_cap);
+            diagnostic_draft_caps.map_or(cap, |limits| cap.min(limits[index]))
+        })
         .collect::<Vec<_>>();
-    let depths = cap8_draft_depths(&caps);
+    let depths = if diagnostic_draft_caps.is_some() {
+        diagnostic_draft_depths(&caps)
+    } else {
+        cap8_draft_depths(&caps)
+    };
     let mut drafts = vec![Vec::new(); lanes];
     let drafting = (0..lanes)
         .filter(|&index| depths[index] > 0)
@@ -621,12 +669,14 @@ pub(in crate::serve::api) fn run_joint_mtp_step(
             }
         }
     }
+    observed.draft = stage_started.elapsed();
 
     // 3. One joint verify forward over every window.
     let verifying = (0..lanes)
         .filter(|&index| roles[index].is_some())
         .collect::<Vec<_>>();
     if !verifying.is_empty() {
+        let stage_started = Instant::now();
         let tokens = verifying
             .iter()
             .map(|&index| match roles[index].as_ref() {
@@ -675,6 +725,8 @@ pub(in crate::serve::api) fn run_joint_mtp_step(
                 return Ok(finish_ticks(ticks));
             }
         };
+        observed.verify_readback = stage_started.elapsed();
+        let stage_started = Instant::now();
 
         // 4. Accept walks with spec-off's decision function.
         let mut accepted = Vec::with_capacity(verifying.len());
@@ -709,20 +761,32 @@ pub(in crate::serve::api) fn run_joint_mtp_step(
             });
             verified.push(step);
         }
+        observed.selection = stage_started.elapsed();
 
-        // 5. Shared commit, then each lane's settlement.
-        match qwen.commit_joint_verify(kv_cache, pending, &accepted, supervisor) {
+        // 5. Shared capture/recovery commit, then per-lane MTP catch-up and
+        // settlement.
+        let stage_started = Instant::now();
+        let committed = qwen.commit_joint_verify(kv_cache, pending, &accepted, supervisor);
+        observed.capture_recovery = stage_started.elapsed();
+        match committed {
             Ok(()) => {
+                let stage_started = Instant::now();
                 for ((&index, step), hidden_rows) in verifying.iter().zip(verified).zip(&hidden) {
                     let role = roles[index].take().expect("verifying lanes hold a role");
                     let state = &mut *states[index];
                     ticks[index] = Some(match (role, step) {
-                        (Qwen35JointMtpRole::Ordinary(lane), Verified::Ordinary(output)) => state
-                            .finish_joint_tick(qwen, kv_cache, supervisor, lane.target, output),
+                        (Qwen35JointMtpRole::Ordinary(lane), Verified::Ordinary(output)) => {
+                            state.finish_joint_tick(qwen, kv_cache, supervisor, lane.target, output)
+                        }
                         (Qwen35JointMtpRole::Window(window), Verified::Window { plan, tokens }) => {
                             state
                                 .settle_joint_mtp_window(
-                                    qwen, kv_cache, supervisor, window, &tokens, hidden_rows,
+                                    qwen,
+                                    kv_cache,
+                                    supervisor,
+                                    window,
+                                    &tokens,
+                                    hidden_rows,
                                     plan,
                                 )
                                 .and_then(|()| state.joint_mtp_drain_tick(qwen))
@@ -731,20 +795,25 @@ pub(in crate::serve::api) fn run_joint_mtp_step(
                         _ => Err(anyhow::anyhow!("Qwen joint MTP lane role changed")),
                     });
                 }
+                observed.settle_catch_up = stage_started.elapsed();
             }
             Err(error) if is_fatal(&error) => return Err(error),
             Err(error) => fail_all(&mut ticks, &verifying, error),
         }
     }
+    observed.total = round_started.elapsed();
+    if let Some(timing) = diagnostic_timing {
+        *timing = observed;
+    }
     Ok(finish_ticks(ticks))
 }
 
-fn finish_ticks(
-    ticks: Vec<Option<Result<Qwen35TickOutcome>>>,
-) -> Vec<Result<Qwen35TickOutcome>> {
+fn finish_ticks(ticks: Vec<Option<Result<Qwen35TickOutcome>>>) -> Vec<Result<Qwen35TickOutcome>> {
     ticks
         .into_iter()
-        .map(|tick| tick.unwrap_or_else(|| Err(anyhow::anyhow!("Qwen joint MTP lane produced no tick"))))
+        .map(|tick| {
+            tick.unwrap_or_else(|| Err(anyhow::anyhow!("Qwen joint MTP lane produced no tick")))
+        })
         .collect()
 }
 
