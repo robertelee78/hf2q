@@ -207,6 +207,17 @@ impl Deepseek4Model {
             let layers_per_command_buffer = decode_layers_per_command_buffer(layers)?;
             let device = self.ctx.device().clone();
             let executor = GraphExecutor::new(device.clone());
+            let mut expert_union_capture = (order == RowCaches::Independent)
+                .then(|| {
+                    super::expert_union::Capture::for_joint_step(
+                        &device,
+                        layers,
+                        token_ids.len(),
+                        self.cfg.num_experts_per_tok as usize,
+                    )
+                })
+                .transpose()?
+                .flatten();
             let frequencies = JointRopeFrequencies::new(&device, &self.cfg)?;
             let mut positions = alloc_host_input(
                 &device,
@@ -260,6 +271,7 @@ impl Deepseek4Model {
                                 None,
                                 None,
                                 None,
+                                expert_union_capture.as_mut(),
                                 RowMatmul::IndependentRows,
                             )
                             .with_context(|| {
@@ -278,7 +290,12 @@ impl Deepseek4Model {
             let drained = drain(&in_flight).context("drain DeepSeek-V4 joint decode pipeline");
             drop(in_flight);
             match (encode_result, drained) {
-                (Ok(()), Ok(())) => state.context("DeepSeek-V4 joint decode produced no state"),
+                (Ok(()), Ok(())) => {
+                    if let Some(capture) = expert_union_capture {
+                        capture.emit_after_drain(self.cfg.hash_layer_count as usize)?;
+                    }
+                    state.context("DeepSeek-V4 joint decode produced no state")
+                }
                 (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
                 (Err(error), Err(drain_error)) => Err(error).context(format!(
                     "joint decode pipeline drain also failed: {drain_error:#}"

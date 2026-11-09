@@ -2,7 +2,7 @@
 
 use std::sync::{LazyLock, Once};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use mlx_native::graph::GraphSession;
 use mlx_native::ops::deepseek_hyper_connection::{
     dispatch_hc_post, dispatch_hc_pre, dispatch_hc_split_sinkhorn,
@@ -90,6 +90,7 @@ impl Deepseek4Model {
             None,
             None,
             None,
+            None,
             RowMatmul::Matrix,
         )
     }
@@ -120,6 +121,7 @@ impl Deepseek4Model {
         reusable_output_state: Option<MlxBuffer>,
         mut id_mm_scratch: Option<&mut [IdMmScratch; 2]>,
         writer_capture: Option<&mut Option<MlxBuffer>>,
+        mut expert_union_capture: Option<&mut super::expert_union::Capture>,
         matmul: RowMatmul,
     ) -> Result<MlxBuffer> {
         if layer >= self.cfg.num_hidden_layers as usize {
@@ -197,6 +199,19 @@ impl Deepseek4Model {
         let down_experts = self
             .weights
             .raw_matrix_ref(&format!("{prefix}.ffn_down_exps.weight"))?;
+        let expert_bytes = expert_union_capture.as_ref().map(|_| -> Result<u64> {
+            let total = gate_experts
+                .buffer
+                .data_byte_len()
+                .checked_add(up_experts.buffer.data_byte_len())
+                .and_then(|value| value.checked_add(down_experts.buffer.data_byte_len()))
+                .context("DeepSeek-V4 routed expert byte count overflow")?;
+            ensure!(
+                total % experts == 0,
+                "DeepSeek-V4 routed expert bytes {total} are not divisible by {experts} experts"
+            );
+            u64::try_from(total / experts).context("DeepSeek-V4 per-expert bytes exceed u64")
+        }).transpose()?;
         let gate_shared = self
             .weights
             .raw_matrix_ref(&format!("{prefix}.ffn_gate_shexp.weight"))?;
@@ -412,6 +427,11 @@ impl Deepseek4Model {
                 &invalid_status,
                 rows,
             )?;
+            if let (Some(capture), Some(expert_bytes)) =
+                (expert_union_capture.as_deref_mut(), expert_bytes)
+            {
+                capture.encode_layer(session, layer, &safe_indices, expert_bytes)?;
+            }
             #[cfg(test)]
             {
                 use crate::adr063_invariance::{family, receipt::{Family, Stage}};
