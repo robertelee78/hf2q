@@ -60,7 +60,7 @@ At campaign start the driver freezes the binary, model, cases, argv input files,
 
 ## Design (every later two-arm A/B)
 
-- **Arms.** A is the previous default: the family case. B is the candidate: the same binary, with a case that differs from A's only in `serve.env`, the kill switch. The driver refuses any other difference and records the changed variables.
+- **Arms.** A is the previous default and B is the candidate. By default A is the family case; `--a-case` may derive it only through `serve.env` when both arms need a shared campaign parameter, such as enabling a path that the phase-1 default leaves off. B must differ from A only through `serve.env`, the kill switch. The driver refuses every other difference and records both the A derivation and the A-to-B changes.
 - **Blocks.** One block is one paired A and B run. Odd blocks run A then B, even blocks B then A, so each pair of consecutive blocks forms ABBA. This is the two-arm Williams design (`q3_stats.block_order`). Each stage begins with one discarded warmup per arm per driver session, in the next block's order.
 - **Block count.** Fixed before qualification: 6 by default for every family (`ab_blocks`). The alternatives are 8, 12, 16 or 20, chosen from a separately labelled `pilot` campaign that is named with `--pilot-of` and bound by sha256. Pilot runs are never pooled, and a pilot has no verdict. There is no sequential peeking: a stage stops only at its fixed count.
 - **Stages.** `n4` is primary. The controls follow in this order: `n1`, then `3+1`, `2+2` and `1+3`, using the same client phase plans as Q3.
@@ -138,9 +138,10 @@ python3 -B scripts/four_agent/adr065_campaign.py baseline --family qwen38 \
 python3 -B scripts/four_agent/adr065_campaign.py ceilings "$B1/baseline/qwen38"
 # ... the same for deepseek4, then gemma4.
 
-# A later A/B (story S): B's case is the family case plus the kill switch in serve.env.
+# A later A/B (story S). --a-case is optional; both derived cases may change only serve.env,
+# and only the kill switch may differ between them.
 python3 -B scripts/four_agent/adr065_campaign.py ab --family qwen38 --binary <bin> --commit <40-hex> \
-  --b-case <B case> --qe-identity "<named session/host>" --output <dir>
+  --a-case <A case> --b-case <B case> --qe-identity "<named session/host>" --output <dir>
 python3 -B scripts/four_agent/adr065_campaign.py analyze <dir> --ceilings "$B1/baseline/qwen38/ceilings.json"
 ```
 

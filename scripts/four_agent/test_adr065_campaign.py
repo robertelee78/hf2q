@@ -97,7 +97,7 @@ def fake_ids(plan, binary_sha=BIN_SHA, artifact_sha=MODEL_SHA, dirty=(), inputs=
 class Args:
     def __init__(self, mode, **kw):
         self.mode, self.family, self.qe_identity, self.workloads = mode, "qwen38", "qe-test", None
-        self.baseline_bin = self.binary = self.b_case = self.blocks = self.pilot_of = None
+        self.baseline_bin = self.binary = self.a_case = self.b_case = self.blocks = self.pilot_of = None
         self.commit, self.label, self.n1_engages = "2" * 40, "candidate", False
         self.__dict__.update(kw)
 
@@ -211,6 +211,24 @@ class Plan(Harness):
         self.assertEqual((plan["design"]["blocks"], plan["n1_control"]), (6, "required"))
         self.assertEqual(ac.schedule(plan)["n4"]["blocks"][:4], [["A", "B"], ["B", "A"], ["A", "B"], ["B", "A"]])
         self.assertEqual(plan["budget"]["planned_runs"], 5 * (2 + 12))
+        a_case = self.b_case(lambda c: c["serve"]["env"].update(
+            HF2Q_QWEN_SPECULATION="auto", HF2Q_QWEN_LA_GPU_RESTORE="0"))
+        b_case = self.b_case(lambda c: c["serve"]["env"].update(
+            HF2Q_QWEN_SPECULATION="auto", HF2Q_QWEN_LA_GPU_RESTORE="1"))
+        derived, derived_cases = self.plan("ab", a_case=a_case, b_case=b_case, n1_engages=True)
+        self.assertEqual(derived["arms"]["A"]["derived_env"], {
+            "HF2Q_QWEN_LA_GPU_RESTORE": [None, "0"],
+            "HF2Q_QWEN_SPECULATION": [None, "auto"],
+        })
+        self.assertEqual(derived["arms"]["B"]["kill_switch"], {
+            "HF2Q_QWEN_LA_GPU_RESTORE": ["0", "1"],
+        })
+        self.assertEqual(derived_cases["A"]["serve"]["env"]["HF2Q_QWEN_SPECULATION"], "auto")
+        self.assertEqual(derived["n1_control"], "reported")
+        with self.assertRaisesRegex(q3.qc.CampaignError, "derived A case changes no serve.env"):
+            self.plan("ab", a_case=str(self.case))
+        with self.assertRaisesRegex(q3.qc.CampaignError, "derived A case.*except serve.env"):
+            self.plan("ab", a_case=self.b_case(lambda c: c["serve"]["argv"].append("--x")))
         with self.assertRaisesRegex(q3.qc.CampaignError, "no kill switch"):
             self.plan("ab", b_case=str(self.case))
         with self.assertRaisesRegex(q3.qc.CampaignError, "except serve.env"):

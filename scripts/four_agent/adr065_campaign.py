@@ -7,9 +7,10 @@ scripts/four_agent/adr065/campaign-b1.json; docs/research/adr065-b1-campaign.md 
 
   baseline  the predeclared phase-1 baseline: arm A only, the released default binary, a fixed number
             of measured runs per workload after one discarded warmup. Feeds `ceilings`.
-  ab        a two-arm A/B on one binary: A the previous default (the family case), B a case that differs
-            only in serve.env (the kill switch). Fixed block count (6, or 8/12/16/20 chosen from --pilot-of);
-            odd blocks A then B, even blocks B then A (ABBA over each pair of blocks).
+  ab        a two-arm A/B on one binary: A the previous default and B the candidate. Each may derive
+            the family case only through serve.env; between A and B, only the kill switch differs.
+            Fixed block count (6, or 8/12/16/20 chosen from --pilot-of); odd blocks A then B, even
+            blocks B then A (ABBA over each pair of blocks).
   pilot     a separately labelled A/B whose runs are never pooled and which never has a verdict.
   ceilings  BASELINE_DIR/ceilings.json: per-run per-slot p95 semantic TTFT and maximum semantic SSE gap
             of every baseline run, and the largest value per workload (the frozen fairness ceilings).
@@ -90,16 +91,22 @@ def hours(runs, seconds, cooldown):
     return [round(runs * (s + cooldown) / 3600, 1) for s in seconds]
 
 
-def kill_switch(a_case, b_case):
-    """The B case may differ from the A case only in serve.env (and notes): the changed variables."""
+def env_changes(a_case, b_case, subject):
+    """Changed serve.env values, refusing every other difference between two cases."""
     def rest(case):
         out = json.loads(json.dumps(case))
         out.pop("notes", None)
         out["serve"].pop("env", None)
         return out
-    qc.require(rest(a_case) == rest(b_case), "the B case must equal the family case except serve.env (and notes)")
+    qc.require(rest(a_case) == rest(b_case), f"{subject} must equal its base case except serve.env (and notes)")
     env_a, env_b = a_case["serve"].get("env", {}), b_case["serve"].get("env", {})
-    changed = {k: [env_a.get(k), env_b.get(k)] for k in sorted(set(env_a) | set(env_b)) if env_a.get(k) != env_b.get(k)}
+    return {k: [env_a.get(k), env_b.get(k)] for k in sorted(set(env_a) | set(env_b))
+            if env_a.get(k) != env_b.get(k)}
+
+
+def kill_switch(a_case, b_case):
+    """The B case may differ from the A case only in serve.env (and notes): the changed variables."""
+    changed = env_changes(a_case, b_case, "the B case")
     qc.require(changed, "the B case changes no serve.env variable (no kill switch)")
     return changed
 
@@ -131,10 +138,17 @@ def build_plan(args, campaign, source):
               "CARGO": env["CARGO"], "TOOLCHAIN": env["TOOLCHAIN"],
               "SANDBOX_PROOF": expand(env["sandbox_proof"]["path"], roots),
               "SANDBOX_PROOF_SHA256": env["sandbox_proof"]["sha256"]}
-    overrides = qc.overrides(case, [f"{k}={v}" for k, v in values.items()], {})
-    arms = {"A": {"case": str(case_path), "case_sha256": fam["q5_case"]["sha256"], "engine_kind": "hf2q",
+    a_path, a_case, common = case_path, case, None
+    if args.mode != "baseline" and args.a_case is not None:
+        a_path, a_case = read_case(args.a_case)
+        common = env_changes(case, a_case, "the derived A case")
+        qc.require(common, "the derived A case changes no serve.env variable")
+    overrides = qc.overrides(a_case, [f"{k}={v}" for k, v in values.items()], {})
+    arms = {"A": {"case": str(a_path), "case_sha256": q5_artifacts.sha256(a_path), "engine_kind": "hf2q",
                   "role": ROLES["A"], "overrides": overrides}}
-    cases = {"A": case}
+    if common is not None:
+        arms["A"]["derived_env"] = common
+    cases = {"A": a_case}
     workloads = q3.parse_workloads(args.workloads or ",".join(campaign["workloads"]["order"]))
     plan = {"schema": SCHEMA, "mode": args.mode, "family": family, "primary": adr065_stats.PRIMARY,
             "workloads": workloads, "campaign_file": source, "peer_unavailable_evidence": [],
@@ -162,7 +176,7 @@ def build_plan(args, campaign, source):
         fixed = None
     else:
         b_path, b_case = read_case(args.b_case)
-        switch = kill_switch(case, b_case)
+        switch = kill_switch(a_case, b_case)
         arms["B"] = {"case": str(b_path), "case_sha256": q5_artifacts.sha256(b_path), "engine_kind": "hf2q",
                      "role": ROLES["B"], "overrides": qc.overrides(b_case, [f"{k}={v}" for k, v in values.items()], {}),
                      "kill_switch": switch}
@@ -397,7 +411,8 @@ def parse_args(argv):
             p.add_argument("--binary", required=True, help="the one binary both arms run")
             p.add_argument("--commit", required=True, help="40-hex source commit of --binary")
             p.add_argument("--label", default="candidate")
-            p.add_argument("--b-case", required=True, help="B's Q5 case: the family case with the kill switch in serve.env")
+            p.add_argument("--a-case", help="optional A Q5 case derived from the family case only through serve.env")
+            p.add_argument("--b-case", required=True, help="B's Q5 case: A with only the kill switch changed in serve.env")
             p.add_argument("--blocks", type=int, help="fixed block count (default the family's ab_blocks)")
             p.add_argument("--n1-engages", action="store_true",
                            help="the change engages with one agent: the n1 control is reported, not required")
