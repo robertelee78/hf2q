@@ -131,7 +131,9 @@ def validate(case):
         require(name not in RUNTIME, f'{{{name}}} is known only after launch; use it in the client section')
     for name in referenced(case):
         require(name in BUILTINS + RUNTIME + DERIVED or name in variables, f'undeclared placeholder {{{name}}}')
-    repair_turns(case)
+    repairs = repair_turns(case)
+    if declared_anchor_fields and case['family'] == 'qwen36':
+        require(repairs == 1, 'Qwen3.6 C2 workloads use the declared repair-turn workload')
     request_setup(case)
     return case
 
