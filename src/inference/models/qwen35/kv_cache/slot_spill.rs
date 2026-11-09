@@ -191,8 +191,8 @@ fn validate_attention(
         buffers.len()
     );
     for (index, (buffer, rows)) in buffers.into_iter().zip(&spilled.rows).enumerate() {
-        let expected = SlotRows::of(buffer, n_seqs, name)?
-            .spilled_len(spilled.cursor as usize, name)?;
+        let expected =
+            SlotRows::of(buffer, n_seqs, name)?.spilled_len(spilled.cursor as usize, name)?;
         anyhow::ensure!(
             rows.len() == expected,
             "slot spill ({name} buffer {index}): spilled {} bytes, cache geometry needs {expected}",
@@ -249,7 +249,8 @@ impl HybridKvCache {
         let n_seqs = self.n_seqs as usize;
         let mut total = 0usize;
         for (layer, block) in self.full_attn.iter().enumerate() {
-            total += attention_spill_bytes(block, slot_idx, n_seqs, &format!("full_attn[{layer}]"))?;
+            total +=
+                attention_spill_bytes(block, slot_idx, n_seqs, &format!("full_attn[{layer}]"))?;
         }
         if let Some(mtp) = &self.mtp_slot {
             total += attention_spill_bytes(mtp, slot_idx, n_seqs, "mtp")?;
@@ -347,14 +348,23 @@ impl HybridKvCache {
             self.linear_attn.len()
         );
         for (layer, (block, spilled)) in self.full_attn.iter().zip(&spill.full_attn).enumerate() {
-            validate_attention(block, spilled, slot_idx, n_seqs, &format!("full_attn[{layer}]"))?;
+            validate_attention(
+                block,
+                spilled,
+                slot_idx,
+                n_seqs,
+                &format!("full_attn[{layer}]"),
+            )?;
         }
         match (self.mtp_slot.as_ref(), spill.mtp.as_ref()) {
-            (Some(mtp), Some(spilled)) => validate_attention(mtp, spilled, slot_idx, n_seqs, "mtp")?,
+            (Some(mtp), Some(spilled)) => {
+                validate_attention(mtp, spilled, slot_idx, n_seqs, "mtp")?
+            }
             (None, None) => {}
             _ => anyhow::bail!("restore_slot_spill: MTP presence differs between spill and cache"),
         }
-        for (layer, (linear, spilled)) in self.linear_attn.iter().zip(&spill.linear_attn).enumerate()
+        for (layer, (linear, spilled)) in
+            self.linear_attn.iter().zip(&spill.linear_attn).enumerate()
         {
             anyhow::ensure!(
                 slot_idx < linear.pp_flipped.len(),
@@ -383,13 +393,15 @@ impl HybridKvCache {
             "restore_slot_spill: graft length missing for slot {slot_idx}"
         );
 
-        for (layer, (block, spilled)) in self
-            .full_attn
-            .iter_mut()
-            .zip(&spill.full_attn)
-            .enumerate()
+        for (layer, (block, spilled)) in self.full_attn.iter_mut().zip(&spill.full_attn).enumerate()
         {
-            restore_attention(block, spilled, slot_idx, n_seqs, &format!("full_attn[{layer}]"))?;
+            restore_attention(
+                block,
+                spilled,
+                slot_idx,
+                n_seqs,
+                &format!("full_attn[{layer}]"),
+            )?;
         }
         if let (Some(mtp), Some(spilled)) = (self.mtp_slot.as_mut(), spill.mtp.as_ref()) {
             restore_attention(mtp, spilled, slot_idx, n_seqs, "mtp")?;

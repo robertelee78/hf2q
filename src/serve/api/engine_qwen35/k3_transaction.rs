@@ -425,8 +425,7 @@ impl Qwen35DecodeState {
             }
         };
         drop(readback);
-        let host_selection =
-            crate::inference::stage_profile::CpuSpan::begin("host_selection");
+        let host_selection = crate::inference::stage_profile::CpuSpan::begin("host_selection");
         let semantic_started = Instant::now();
         let mut semantic = Qwen35SpecSemanticState::from_decode(self);
         let plan = match plan_qwen35_verified_block(&draft.drafts, |row| {
@@ -559,8 +558,7 @@ impl Qwen35DecodeState {
         let mut rollback_elapsed = Duration::ZERO;
         let state_result = (|| -> Result<()> {
             let restore = {
-                let _rollback_cpu =
-                    crate::inference::stage_profile::CpuSpan::begin("rollback");
+                let _rollback_cpu = crate::inference::stage_profile::CpuSpan::begin("rollback");
                 self.k3_commit_cursors(kv_cache, &plan)?
             };
             if let Some(restore) = restore {

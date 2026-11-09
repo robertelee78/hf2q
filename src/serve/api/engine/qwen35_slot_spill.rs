@@ -35,11 +35,14 @@ use anyhow::Context;
 
 use super::slot_spill::{plan_reclaim, ResumePreference, SlotSpillStore, SpillInsert, VictimSpill};
 use super::{
-    qwen35_anchor_vision_compatible, qwen35_slot_affinity, Qwen35PromptAnchor, Qwen35RetainedPrefix,
+    qwen35_anchor_vision_compatible, qwen35_slot_affinity, Qwen35RetainedPrefix,
     Qwen35SlotPreference, SlotId,
 };
 use crate::inference::models::qwen35::kv_cache::{HybridKvCache, HybridKvSlotSpill};
-use crate::serve::api::engine_qwen35::Qwen35SpecPrefixBoundary;
+use crate::serve::api::engine_qwen35::{
+    anchor_store::{Qwen35Anchor as Qwen35PromptAnchor, Qwen35AnchorStore},
+    Qwen35SpecPrefixBoundary,
+};
 
 const LOG_TARGET: &str = "hf2q::serve::api::engine_qwen35::slot_spill";
 
@@ -58,7 +61,7 @@ pub(super) struct Qwen35SlotSpill {
     source_slot: u32,
     kv: HybridKvSlotSpill,
     retained: Qwen35RetainedPrefix,
-    anchor: Option<Qwen35PromptAnchor>,
+    anchor: Qwen35AnchorStore,
 }
 
 pub(super) type Qwen35SlotSpillStore = SlotSpillStore<Qwen35SlotSpill>;
@@ -124,9 +127,14 @@ fn best_spill_match(
     }
     qwen35_best_ledger_match(
         store.newest_first().map(|(index, entry)| {
+            let anchor = entry.payload.anchor.deepest_prefix_of(
+                prompt_tokens,
+                request_vision_fingerprint,
+                text_anchor_reuse_limit,
+            );
             let (retained, anchor) = qwen35_resume_candidate(
                 &entry.payload.retained,
-                entry.payload.anchor.as_ref(),
+                anchor,
                 request_vision_fingerprint,
                 text_anchor_reuse_limit,
             );
@@ -136,28 +144,29 @@ fn best_spill_match(
     )
 }
 
-fn ledger_tokens(retained: &Qwen35RetainedPrefix, anchor: Option<&Qwen35PromptAnchor>) -> usize {
-    retained
-        .len()
-        .max(anchor.map_or(0, |anchor| anchor.prompt_tokens.len()))
+fn ledger_tokens(retained: &Qwen35RetainedPrefix, anchors: &Qwen35AnchorStore) -> usize {
+    retained.len().max(
+        anchors
+            .committed()
+            .iter()
+            .map(|anchor| anchor.prompt_tokens.len())
+            .max()
+            .unwrap_or(0),
+    )
 }
 
 /// Host-side bytes of a ledger, charged to the spill budget with the cache
 /// copy so the store bound covers everything an entry keeps alive.
-fn ledger_bytes(retained: &Qwen35RetainedPrefix, anchor: Option<&Qwen35PromptAnchor>) -> usize {
+fn ledger_bytes(retained: &Qwen35RetainedPrefix, anchors: &Qwen35AnchorStore) -> usize {
     let spec = |spec: &Option<Qwen35SpecPrefixBoundary>| {
         spec.as_ref()
             .map_or(0, |spec| spec.pending_target_hidden.byte_len())
     };
-    let token = std::mem::size_of::<u32>();
-    retained.len() * token
-        + spec(&retained.spec)
-        + anchor.map_or(0, |anchor| {
-            anchor.prompt_tokens.len() * token
-                + anchor.kv.total_bytes()
-                + anchor.prefill_logits.len() * std::mem::size_of::<f32>()
-                + spec(&anchor.spec)
-        })
+    retained
+        .len()
+        .saturating_mul(std::mem::size_of::<u32>())
+        .saturating_add(spec(&retained.spec))
+        .saturating_add(anchors.owned_bytes())
 }
 
 /// Spill the conversation that held `slot` (see [`VictimSpill`]). A spill
@@ -168,13 +177,13 @@ fn spill_qwen35_victim(
     store: &mut Qwen35SlotSpillStore,
     slot: SlotId,
     retained: &mut Qwen35RetainedPrefix,
-    anchor: &mut Option<Qwen35PromptAnchor>,
+    anchor: &mut Qwen35AnchorStore,
     mode: VictimSpill,
 ) {
     if mode == VictimSpill::Keep {
         return;
     }
-    let tokens = ledger_tokens(retained, anchor.as_ref());
+    let tokens = ledger_tokens(retained, anchor);
     let kv_bytes = match kv.slot_spill_bytes(slot) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -182,7 +191,7 @@ fn spill_qwen35_victim(
             return;
         }
     };
-    let bytes = u64::try_from(kv_bytes + ledger_bytes(retained, anchor.as_ref())).unwrap_or(u64::MAX);
+    let bytes = u64::try_from(kv_bytes + ledger_bytes(retained, anchor)).unwrap_or(u64::MAX);
     if !store.admits(bytes) {
         tracing::debug!(
             target: LOG_TARGET,
@@ -201,7 +210,10 @@ fn spill_qwen35_victim(
         }
     };
     let (retained, anchor) = match mode {
-        VictimSpill::Move => (std::mem::take(retained), anchor.take()),
+        VictimSpill::Move => {
+            let empty = anchor.empty_like();
+            (std::mem::take(retained), std::mem::replace(anchor, empty))
+        }
         VictimSpill::Copy => (retained.clone(), anchor.clone()),
         VictimSpill::Keep => unreachable!("Keep returned above"),
     };
@@ -218,7 +230,7 @@ fn spill_qwen35_victim(
                     target: LOG_TARGET,
                     slot = entry.payload.source_slot,
                     stamp = entry.stamp,
-                    tokens = ledger_tokens(&entry.payload.retained, entry.payload.anchor.as_ref()),
+                    tokens = ledger_tokens(&entry.payload.retained, &entry.payload.anchor),
                     bytes = entry.bytes,
                     "Qwen35 slot spill evicted (oldest stamp)"
                 );
@@ -245,9 +257,9 @@ pub(super) fn spill_reclaimed_qwen35_slot(
     store: &mut Qwen35SlotSpillStore,
     slot: SlotId,
     retained: &mut Qwen35RetainedPrefix,
-    anchor: &mut Option<Qwen35PromptAnchor>,
+    anchor: &mut Qwen35AnchorStore,
 ) {
-    if !retained.is_empty() || anchor.is_some() {
+    if !retained.is_empty() || !anchor.is_empty() {
         spill_qwen35_victim(kv, store, slot, retained, anchor, VictimSpill::Move);
     }
 }
@@ -266,7 +278,7 @@ pub(super) fn reclaim_qwen35_slot(
     store: &mut Qwen35SlotSpillStore,
     slot: SlotId,
     retained: &mut Qwen35RetainedPrefix,
-    anchor: &mut Option<Qwen35PromptAnchor>,
+    anchor: &mut Qwen35AnchorStore,
     in_place: Option<Qwen35SlotPreference>,
     prompt_tokens: &[u32],
     request_vision_fingerprint: Option<[u8; 32]>,
@@ -283,7 +295,7 @@ pub(super) fn reclaim_qwen35_slot(
         spill_match,
         prompt_tokens,
         retained.as_slice(),
-        !retained.is_empty() || anchor.is_some(),
+        !retained.is_empty() || !anchor.is_empty(),
     );
     // Take the matched entry before spilling the victim so the victim's
     // insertion can never evict it.
@@ -294,7 +306,7 @@ pub(super) fn reclaim_qwen35_slot(
     let Some((entry, preference)) = restore else {
         return Ok(in_place);
     };
-    let tokens = ledger_tokens(&entry.payload.retained, entry.payload.anchor.as_ref());
+    let tokens = ledger_tokens(&entry.payload.retained, &entry.payload.anchor);
     kv.restore_slot_spill(slot, &entry.payload.kv)
         .with_context(|| {
             format!(
@@ -304,6 +316,7 @@ pub(super) fn reclaim_qwen35_slot(
         })?;
     *retained = entry.payload.retained;
     *anchor = entry.payload.anchor;
+    anchor.rebind_slot(slot.0 as usize);
     tracing::debug!(
         target: LOG_TARGET,
         slot = slot.0,

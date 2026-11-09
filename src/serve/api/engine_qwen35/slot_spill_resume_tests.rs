@@ -18,7 +18,7 @@
 //!    is admitted through `Qwen35PrefillState::begin` the way admission
 //!    resumes it:
 //!    - **anchor:** the follow-up shares only the turn-1 prompt; the slot is
-//!      rewound with `restore_slot_anchor`;
+//!      rewound with atomic anchor plan/apply;
 //!    - **live tail:** the follow-up extends the retained prefix, carrying
 //!      its speculative boundary (the pending verifier hidden row).
 //!
@@ -294,7 +294,7 @@ fn serve_follow_up(
     .unwrap_or_else(|error| panic!("{label}: follow-up admission: {error:#}"));
     let (mut target, prefill_logits) = loop {
         match pending
-            .advance(qwen, None, kv, PREFILL_CHUNK, supervisor)
+            .advance(qwen, None, kv, PREFILL_CHUNK, supervisor, None)
             .unwrap_or_else(|error| panic!("{label}: follow-up prefill: {error:#}"))
         {
             Qwen35PrefillAdvance::Pending { state, .. } => pending = state,
@@ -359,7 +359,10 @@ fn run_follow_up(
 
     let (prompt, cached_tokens, candidate) = match form {
         FollowUp::Anchor => {
-            kv.restore_slot_anchor(slot, &ledger.anchor)
+            let plan = kv
+                .plan_slot_anchor_restore(slot, &ledger.anchor)
+                .unwrap_or_else(|error| panic!("{label}: anchor preflight: {error:#}"));
+            kv.apply_slot_anchor_restore(plan)
                 .unwrap_or_else(|error| panic!("{label}: anchor restore: {error:#}"));
             let prompt: Vec<u32> = first_turn.iter().chain(suffix).copied().collect();
             assert!(

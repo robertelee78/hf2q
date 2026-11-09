@@ -95,12 +95,19 @@ fn reset_and_check(
     }
     Ok(elements)
 }
-fn total_payload(mode: Mode,tail_bytes:u64,snapshot_bytes:u64)->Result<u64> {
-    let snapshots=match mode {
-        Mode::ColdBaseline=>0,Mode::ColdChunkMatched64=>1,Mode::CancelledThenRecovered=>2,
+fn total_payload(mode: Mode, tail_bytes: u64, snapshot_bytes: u64) -> Result<u64> {
+    let snapshots = match mode {
+        Mode::ColdBaseline => 0,
+        Mode::ColdChunkMatched64 => 1,
+        Mode::CancelledThenRecovered => 2,
     };
-    tail_bytes.checked_add(snapshot_bytes.checked_mul(snapshots)
-        .context("snapshot quota overflow")?).context("total quota overflow")
+    tail_bytes
+        .checked_add(
+            snapshot_bytes
+                .checked_mul(snapshots)
+                .context("snapshot quota overflow")?,
+        )
+        .context("total quota overflow")
 }
 
 fn target_tail(
@@ -313,7 +320,7 @@ fn run() -> Result<()> {
     let snapshot = tail::checkpoint_expected(&model.model.cfg, packet.configured_context)?;
     let tail_bytes = tail::payload(&expected)?;
     let snapshot_bytes = tail::payload(&snapshot)?;
-    let total = total_payload(packet.mode,tail_bytes,snapshot_bytes)?;
+    let total = total_payload(packet.mode, tail_bytes, snapshot_bytes)?;
     anyhow::ensure!(
         total <= 4 * 1024 * 1024 * 1024
             && tail_bytes <= packet.continuation_payload_limit
@@ -363,14 +370,25 @@ fn run() -> Result<()> {
         None
     };
     let mut matched_prefix = if packet.mode == Mode::ColdChunkMatched64 {
-        let root=packet.output.join("prefix64");
-        let mut store=Store::new(&root,packet.identity.clone(),
-            "T0ChunkMatchedCheckpoint64".into(),snapshot.clone(),
-            packet.snapshot_payload_limit,snapshot.len()).map_err(anyhow::Error::msg)?;
-        let mut binding=observed.clone();binding.output_root=root;
-        store.bind_acquisition(binding).map_err(anyhow::Error::msg)?;
+        let root = packet.output.join("prefix64");
+        let mut store = Store::new(
+            &root,
+            packet.identity.clone(),
+            "T0ChunkMatchedCheckpoint64".into(),
+            snapshot.clone(),
+            packet.snapshot_payload_limit,
+            snapshot.len(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut binding = observed.clone();
+        binding.output_root = root;
+        store
+            .bind_acquisition(binding)
+            .map_err(anyhow::Error::msg)?;
         Some(store)
-    } else { None };
+    } else {
+        None
+    };
     let mut prefix_preparation = Vec::new();
     let mut recovery = Vec::new();
     let mut calls = Vec::new();
@@ -379,14 +397,27 @@ fn run() -> Result<()> {
         for lane in 0..4 {
             zero_elements.push(reset_and_check(&mut model)?);
             if let Some(prefix) = matched_prefix.as_mut() {
-                prefix_preparation.push(run_loaded_prefix64(&mut model,
-                    &packet.workload.lanes[lane][..128],SamplingParams {
-                        max_tokens:8192,..SamplingParams::default()
-                    },|phase,cache| {
-                        anyhow::ensure!(matches!(phase,Phase::Checkpoint64),"prefix-only phase drift");
-                        qwen_cache::after_checked_terminal(prefix,cache,model_layers(&header_cfg),
-                            &format!("agent-{lane}"),64)
-                    })?);
+                prefix_preparation.push(run_loaded_prefix64(
+                    &mut model,
+                    &packet.workload.lanes[lane][..128],
+                    SamplingParams {
+                        max_tokens: 8192,
+                        ..SamplingParams::default()
+                    },
+                    |phase, cache| {
+                        anyhow::ensure!(
+                            matches!(phase, Phase::Checkpoint64),
+                            "prefix-only phase drift"
+                        );
+                        qwen_cache::after_checked_terminal(
+                            prefix,
+                            cache,
+                            model_layers(&header_cfg),
+                            &format!("agent-{lane}"),
+                            64,
+                        )
+                    },
+                )?);
             }
             if let Some((before, after)) = checkpoints.as_mut() {
                 recovery.push(run_loaded(
@@ -432,16 +463,19 @@ fn run() -> Result<()> {
             let _ = a.finish();
             let _ = b.finish();
         }
-        if let Some(mut prefix)=matched_prefix {
+        if let Some(mut prefix) = matched_prefix {
             prefix.fail("matched prefix continuation failed");
-            let _=prefix.finish();
+            let _ = prefix.finish();
         }
         return Err(error);
     }
     scope.check_unchanged()?;
-    if let Some(prefix)=matched_prefix {
-        let trace=prefix.finish().map_err(anyhow::Error::msg)?;
-        anyhow::ensure!(trace.coverage.errors.is_empty(),"baseline64 coverage incomplete");
+    if let Some(prefix) = matched_prefix {
+        let trace = prefix.finish().map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            trace.coverage.errors.is_empty(),
+            "baseline64 coverage incomplete"
+        );
     }
     let trace = store.finish().map_err(anyhow::Error::msg)?;
     anyhow::ensure!(trace.coverage.errors.is_empty(), "tail coverage incomplete");
@@ -471,8 +505,10 @@ fn run() -> Result<()> {
     };
     let mut evidence = serde_json::json!({"schema":"hf2q.q1.qwen-recovery-continuation.v1","mode":packet.mode,"packet_sha256":hash(&raw),"ordinary_policy":format!("{:?}",model.speculation.policy()),"calls":calls,"recovery":recovery,"recovery_proof":recovery_proof,"zero_state_elements_checked_per_lane":zero_elements,"captured_rows_per_lane":80,"endpoint_scope":[64,144],"first64_logits_captured":false,"active_cache_boundaries":[128,144],"planned_tensor_payload":total,"trace_records":trace.coverage.captured.len(),"physical_target_input_rows_per_lane":if packet.mode==Mode::CancelledThenRecovered{208}else{144},"cancelled_unpublished_rows_per_lane":if packet.mode==Mode::CancelledThenRecovered{64}else{0},"full_144_token_trajectory_processed":true,"full_144_logit_coverage":false,"whole_q1_qualified":false,"task_quality_claim":false});
     if packet.mode == Mode::ColdChunkMatched64 {
-        evidence["prefix_preparation"]=serde_json::to_value(prefix_preparation)?;
-        evidence["prefix_checkpoint_scope"]=serde_json::json!("full active64; require exact common-state comparison before rollback attribution");
+        evidence["prefix_preparation"] = serde_json::to_value(prefix_preparation)?;
+        evidence["prefix_checkpoint_scope"] = serde_json::json!(
+            "full active64; require exact common-state comparison before rollback attribution"
+        );
     }
     let mut file = std::fs::OpenOptions::new()
         .create_new(true)
@@ -532,20 +568,46 @@ fn q1_continuation_output_preflight_rejects_repo_and_existing_before_load() {
 
 #[test]
 fn chunk_matched_mode_has_distinct_scope_and_one_extra_full_checkpoint() {
-    let tail=1_609_203_712;let checkpoint=636_092_416;
-    assert_eq!(total_payload(Mode::ColdBaseline,tail,checkpoint).unwrap(),tail);
-    assert_eq!(total_payload(Mode::ColdChunkMatched64,tail,checkpoint).unwrap(),2_245_296_128);
-    assert_eq!(total_payload(Mode::CancelledThenRecovered,tail,checkpoint).unwrap(),2_881_388_544);
-    assert!(total_payload(Mode::ColdChunkMatched64,u64::MAX,checkpoint).is_err());
-    let recovered_calls=(0..4).flat_map(|lane|std::iter::once(Call {
-        lane,before:64,input_rows:64,after:128,output_rows:64
-    }).chain((128..144).map(move |before|Call {
-        lane,before,input_rows:1,after:before+1,output_rows:1
-    }))).collect::<Vec<_>>();
-    assert!(require_calls(Mode::ColdChunkMatched64,&recovered_calls).is_ok());
-    assert!(require_calls(Mode::ColdBaseline,&recovered_calls).is_err());
-    let mut missing=recovered_calls;missing.remove(0);
-    assert!(require_calls(Mode::ColdChunkMatched64,&missing).is_err());
-    assert_ne!(serde_json::to_string(&Mode::ColdChunkMatched64).unwrap(),
-        serde_json::to_string(&Mode::ColdBaseline).unwrap());
+    let tail = 1_609_203_712;
+    let checkpoint = 636_092_416;
+    assert_eq!(
+        total_payload(Mode::ColdBaseline, tail, checkpoint).unwrap(),
+        tail
+    );
+    assert_eq!(
+        total_payload(Mode::ColdChunkMatched64, tail, checkpoint).unwrap(),
+        2_245_296_128
+    );
+    assert_eq!(
+        total_payload(Mode::CancelledThenRecovered, tail, checkpoint).unwrap(),
+        2_881_388_544
+    );
+    assert!(total_payload(Mode::ColdChunkMatched64, u64::MAX, checkpoint).is_err());
+    let recovered_calls = (0..4)
+        .flat_map(|lane| {
+            std::iter::once(Call {
+                lane,
+                before: 64,
+                input_rows: 64,
+                after: 128,
+                output_rows: 64,
+            })
+            .chain((128..144).map(move |before| Call {
+                lane,
+                before,
+                input_rows: 1,
+                after: before + 1,
+                output_rows: 1,
+            }))
+        })
+        .collect::<Vec<_>>();
+    assert!(require_calls(Mode::ColdChunkMatched64, &recovered_calls).is_ok());
+    assert!(require_calls(Mode::ColdBaseline, &recovered_calls).is_err());
+    let mut missing = recovered_calls;
+    missing.remove(0);
+    assert!(require_calls(Mode::ColdChunkMatched64, &missing).is_err());
+    assert_ne!(
+        serde_json::to_string(&Mode::ColdChunkMatched64).unwrap(),
+        serde_json::to_string(&Mode::ColdBaseline).unwrap()
+    );
 }

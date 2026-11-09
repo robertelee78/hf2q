@@ -612,11 +612,17 @@ fn gpu_restore_transaction_cases_match_host() {
         assert_eq!(digest(&gpu_kv, SLOT), digest(&host_kv, SLOT), "{name}");
         assert_eq!(peer_digests(&gpu_kv), peer_digests(&host_kv), "{name}");
         assert_eq!(
-            gpu.pending_speculation_output,
-            host.pending_speculation_output,
+            gpu.pending_speculation_output, host.pending_speculation_output,
             "{name}"
         );
-        assert_eq!(gpu.terminal_after_pending, host.terminal_after_pending, "{name}");
-        assert_eq!(verifier_hidden_bits(&gpu), verifier_hidden_bits(&host), "{name}");
+        assert_eq!(
+            gpu.terminal_after_pending, host.terminal_after_pending,
+            "{name}"
+        );
+        assert_eq!(
+            verifier_hidden_bits(&gpu),
+            verifier_hidden_bits(&host),
+            "{name}"
+        );
     }
 }

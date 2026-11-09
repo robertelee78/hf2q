@@ -93,7 +93,7 @@ def task_instance(packet, instance):
 
 
 def workload_variant(packet, name):
-    """Explicit workload variant (coding_long_context.py) bound by the approval, or None for the canonical task."""
+    """Explicit pinned workload variant, or None for the canonical task."""
     if name is None:
         require("workload_variant" not in packet and "workload_fixture_sha256" not in packet,
                 "canonical workload approval carries a workload variant")
@@ -371,7 +371,7 @@ def main():
                         help="quality-campaign task instance (row of fixtures/coding-instances.json); "
                              "omit for the canonical parse_port workload")
     parser.add_argument("--workload",
-                        help="workload variant of the canonical task (coding_long_context.py: long-context-v1); "
+                        help="workload variant (long-context-v1 or divergent-edit-v1); "
                              "omit for the canonical files")
     parser.add_argument("--phase-plan", choices=sorted(PHASE_PLANS),
                         help="ADR-063 Q3 control: '1' runs agent-0 alone; 'K+M' releases K agents, then the "
@@ -429,10 +429,10 @@ def main():
             summary["instance"] = workload.record()
         variant = workload_variant(packet, args.workload)
         if variant is not None:
-            require(args.benchmark_profile is None and workload is None,
-                    "a workload variant runs the canonical task, without a benchmark profile or task instance")
-            from coding_long_context import MODULES as VARIANT_MODULES
-            names += VARIANT_MODULES
+            require(args.benchmark_profile is None and
+                    (workload is None or variant.composes_with_instance),
+                    "this workload variant does not compose with a task instance")
+            names += variant.modules
             summary["workload_variant"] = variant.record()
         require(args.phase_plan is None or (workload is None and args.benchmark_profile is None),
                 "phase plans are controls of the canonical workload")

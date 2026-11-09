@@ -662,8 +662,8 @@ D2's acceptance includes long contexts, and the canonical client tops out near 2
 - **Unchanged.** The prompts and identity line are the canonical ones, so the turn-0 and turn-1 requests are byte-identical to the canonical workload. So are the six-step workflow and its sha256, the tools, the transport matrix, `src/`, the test counts (two per target), grading, the prefix-reuse checks, the 256 KiB wire bound, and the 64 KiB bounds on writes and test output. Only `read_file` gets a 192 KiB bound (`Tools(read_limit=…)`), and only under this variant.
 - **Determinism.** `coding_long_context.render()` builds the fixture from its `SCHEMA` table. `FIXTURE_SHA256` pins the committed bytes, and the client refuses drift. To change the fixture, define a new variant id; never re-pin `long-context-v1`.
 - **Binding.** The coordinator approval must carry `workload_variant` (equal to `--workload`) and `workload_fixture_sha256`. Its `sources` must also cover `coding_long_context.py` and `test_coding_long_context.py`. A canonical approval that carries either key is refused. The coordinator and every agent summary record `workload_variant: {id, fixture_sha256}`. Aggregation, and therefore `q2_run_audit.py`, refuses an agent from another workload, and the D2 record prints `workload: {id, variant}`.
-- **Composition.** `--workload` is N4-only and cannot be combined with `--instance` or `--benchmark-profile`. `--phase-plan` is allowed, so `q3_campaign.py` can derive its controls from a long-context case.
-- **Campaigns.** `q3_campaign.py` refuses a plan unless every arm's client `--workload` equals that arm's approval `workload_variant` and all arms select the same variant (or all run the canonical files). `quality_campaign.py` refuses a case that already selects a variant. `native_peer_tensorfold_audit.py` refuses D2 runs with different `workload.variant`.
+- **Composition.** `long-context-v1` is N4-only and cannot be combined with `--instance` or `--benchmark-profile`. `--phase-plan` is allowed, so `q3_campaign.py` can derive its controls from a long-context case.
+- **Campaigns.** `q3_campaign.py` refuses a plan unless every arm's client `--workload` equals that arm's approval `workload_variant` and all arms select the same variant (or all run the canonical files). `quality_campaign.py` accepts only the separately defined `divergent-edit-v1` variant with instances; it refuses `long-context-v1`. `native_peer_tensorfold_audit.py` refuses D2 runs with different `workload.variant`.
 - **Scope.** The fixture covers D2's *long contexts* only. It is generated from one template per setting, so it is deliberately repetitive code: it is not evidence for D2's *nonrepetitive code* item, which needs its own workload.
 - **Prompt growth.** `python3 coding_long_context.py estimate` builds the seven actual requests of one agent offline: the real file contents, a canonical fix and about 1 KiB of reasoning per reply. It reports wire bytes / 4 per turn:
 
@@ -684,6 +684,25 @@ D2's acceptance includes long contexts, and the canonical client tops out near 2
   ```
 
   Then run them exactly like T0 and T2 above. Keep the derived files outside `q5_cases/`: the campaign tests require ports 18252 and 18253 to appear once each there. Other canonical N4 cases derive the same way; the estimate above is for the Qwen request shape.
+
+## Divergent-edit workload (ADR-063 C2, #360)
+
+`qwen_n4_live_smoke.py --workload divergent-edit-v1` edits request history
+immediately before request turns 3 and 5. It replaces the tool-result message
+from turn `t-2` with its first 16 lines and the marker pinned in
+[`fixtures/divergent-edit-v1.txt`](fixtures/divergent-edit-v1.txt). Earlier
+messages, live fixture files, tools, scoring, and all other turns are unchanged.
+
+- `coding_divergent_edit.py estimate` reports every turn's wire bytes and the
+  exact target turn, original bytes, edited bytes, and retained line count.
+- Approval binds `workload_variant` and `workload_fixture_sha256`; the frozen
+  sources include the dispatcher, implementation, and test.
+- Unlike `long-context-v1`, this variant composes with `--instance`; the paired
+  24-instance C2 quality campaign derives instances from a divergent C2 case.
+- `q5_cases/qwen38-c2.json` and `qwen36-c2.json` declare four committed anchors,
+  the per-slot reservation for four committed images plus one pending image,
+  and the speculation-capture reservation. Their `-divergent` derivatives
+  carry the variant binding and calibrate separately.
 
 ## Task-quality campaign (ADR-063 Q1 §3.5)
 

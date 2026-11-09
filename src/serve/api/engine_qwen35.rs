@@ -44,7 +44,8 @@ use super::engine::{
 use super::engine_error::EngineRequestError;
 use super::engine_supervisor::EngineSupervisor;
 
-const QWEN35_WORKER_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(in crate::serve::api) const QWEN35_WORKER_TRANSACTION_TIMEOUT: Duration =
+    Duration::from_secs(30);
 
 /// Canonical Qwen3 chat-template stop tokens.
 ///
@@ -417,12 +418,9 @@ impl Qwen35LoadedModel {
                  proves out); refusing to start with both --kv-graft and \
                  --kv-persist"
             );
-            let (bank, compatibility) = crate::inference::graft::validate_graft_for_model(
-                graft_path,
-                model_path,
-                &gguf,
-            )
-            .with_context(|| format!("KV graft bind: {}", graft_path.display()))?;
+            let (bank, compatibility) =
+                crate::inference::graft::validate_graft_for_model(graft_path, model_path, &gguf)
+                    .with_context(|| format!("KV graft bind: {}", graft_path.display()))?;
             if compatibility != crate::inference::glp::Compatibility::Checkpoint {
                 tracing::warn!(
                     ?compatibility,
@@ -993,9 +991,9 @@ impl Qwen35LoadedModel {
         let restore_value = restore_value
             .as_deref()
             .map(|value| {
-                value.to_str().ok_or_else(|| {
-                    anyhow::anyhow!("HF2Q_QWEN_LA_GPU_RESTORE must be valid UTF-8")
-                })
+                value
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("HF2Q_QWEN_LA_GPU_RESTORE must be valid UTF-8"))
             })
             .transpose()?;
         let restore_route = LaRestoreRoute::resolve(restore_value, self.model.cfg.variant)
@@ -2297,9 +2295,7 @@ fn generate_qwen35_once_ordinary(
                     .context("qwen35 lcp_registry restore_partial")?;
                 // A capacity-growth replacement cache lost its region
                 // tag; the restored rows re-establish it.
-                if graft_len > 0
-                    && kv_cache.graft_region_for_slot(SlotId(0)).unwrap_or(0) == 0
-                {
+                if graft_len > 0 && kv_cache.graft_region_for_slot(SlotId(0)).unwrap_or(0) == 0 {
                     kv_cache
                         .mark_graft_region_for_slot(SlotId(0), graft_len as u32)
                         .context("re-mark graft region after LCP restore")?;
@@ -2465,7 +2461,8 @@ fn generate_qwen35_once_ordinary(
             let mut suffix_positions = vec![0i32; 4 * suffix_len];
             for axis in 0..4 {
                 for token in 0..suffix_len {
-                    suffix_positions[axis * suffix_len + token] = (graft_len + lcp_resume_start + token) as i32;
+                    suffix_positions[axis * suffix_len + token] =
+                        (graft_len + lcp_resume_start + token) as i32;
                 }
             }
             let position_build_ms = position_build_start.elapsed().as_secs_f64() * 1000.0;
@@ -2520,7 +2517,8 @@ fn generate_qwen35_once_ordinary(
             let mut prefix_positions = vec![0i32; 4 * prefix_len];
             for axis in 0..4 {
                 for token in 0..prefix_len {
-                    prefix_positions[axis * prefix_len + token] = (graft_len + lcp_resume_start + token) as i32;
+                    prefix_positions[axis * prefix_len + token] =
+                        (graft_len + lcp_resume_start + token) as i32;
                 }
             }
             supervised_gpu_call(supervisor, "qwen35_serial_prefill", || {
@@ -2549,7 +2547,8 @@ fn generate_qwen35_once_ordinary(
             let mut tail_positions = vec![0i32; 4 * tail_len];
             for axis in 0..4 {
                 for token in 0..tail_len {
-                    tail_positions[axis * tail_len + token] = (graft_len + recovery_anchor + token) as i32;
+                    tail_positions[axis * tail_len + token] =
+                        (graft_len + recovery_anchor + token) as i32;
                 }
             }
             eprintln!(
@@ -2612,7 +2611,8 @@ fn generate_qwen35_once_ordinary(
                 let mut chunk_positions = vec![0i32; 4 * chunk_seq_len];
                 for axis in 0..4 {
                     for t in 0..chunk_seq_len {
-                        chunk_positions[axis * chunk_seq_len + t] = (graft_len + k_start + t) as i32;
+                        chunk_positions[axis * chunk_seq_len + t] =
+                            (graft_len + k_start + t) as i32;
                     }
                 }
                 let logits = supervised_gpu_call(
@@ -2732,7 +2732,8 @@ fn generate_qwen35_once_ordinary(
                 let mut tail_positions = vec![0i32; 4 * tail_len];
                 for axis in 0..4 {
                     for token in 0..tail_len {
-                        tail_positions[axis * tail_len + token] = (graft_len + recovery_anchor + token) as i32;
+                        tail_positions[axis * tail_len + token] =
+                            (graft_len + recovery_anchor + token) as i32;
                     }
                 }
                 eprintln!(
@@ -2769,7 +2770,8 @@ fn generate_qwen35_once_ordinary(
             let mut suffix_positions = vec![0i32; 4 * suffix_len];
             for axis in 0..4 {
                 for t in 0..suffix_len {
-                    suffix_positions[axis * suffix_len + t] = (graft_len + lcp_resume_start + t) as i32;
+                    suffix_positions[axis * suffix_len + t] =
+                        (graft_len + lcp_resume_start + t) as i32;
                 }
             }
             eprintln!(
@@ -4097,6 +4099,7 @@ impl Qwen35PrefillState {
         kv_cache: &mut HybridKvCache,
         max_chunk_tokens: usize,
         supervisor: &EngineSupervisor,
+        anchor_quota_headroom: Option<usize>,
     ) -> Result<Qwen35PrefillAdvance> {
         let (prefill_logits, mtp_hidden, advanced_tokens, checkpoint) = if let Some(logits) =
             self.cached_prefill_logits.take()
@@ -4327,19 +4330,61 @@ impl Qwen35PrefillState {
                             token_count: end,
                             pending_target_hidden: hidden.clone(),
                         });
-                Some(Qwen35StablePromptCheckpoint {
-                    prompt_tokens: self.prompt_tokens[..end].to_vec(),
-                    // ADR-059: the anchor's boundary is the PHYSICAL cursor
-                    // (graft rows + prompt rows). `restore_slot_anchor`
-                    // rewinds to exactly this cursor and the graft rows
-                    // below it are intact by the append-only contract.
-                    kv: kv_cache
-                        .snapshot_slot_anchor(self.slot_id, self.graft_len + end)
-                        .context("capture Qwen35 stable prompt boundary")?,
-                    prefill_logits: logits.clone(),
-                    vision_fingerprint: self.params.vision_fingerprint,
-                    spec,
-                })
+                let hidden_bytes = spec
+                    .as_ref()
+                    .map_or(0, |boundary| boundary.pending_target_hidden.data_byte_len());
+                let non_payload_bytes =
+                    anchor_store::anchor_non_payload_bytes(end, logits.len(), hidden_bytes)?;
+                let payload_bytes = kv_cache.slot_anchor_image_bytes()?;
+                let capture_bytes = payload_bytes
+                    .checked_add(non_payload_bytes)
+                    .context("Qwen anchor capture-byte estimate overflow")?;
+                if anchor_quota_headroom.is_some_and(|headroom| capture_bytes > headroom) {
+                    anchor_store::record_anchor_capture_skipped_quota();
+                    tracing::warn!(
+                        slot = self.slot_id.0,
+                        capture_bytes,
+                        anchor_quota_headroom,
+                        "Qwen35 stable prompt checkpoint capture skipped before allocation: quota"
+                    );
+                    None
+                } else {
+                    let snapshot_started = Instant::now();
+                    let snapshot = (|| -> Result<_> {
+                        let lease = supervisor
+                            .arm("Qwen35 anchor snapshot", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
+                        let kv = kv_cache.snapshot_slot_anchor(self.slot_id, self.graft_len + end);
+                        lease.finish()?;
+                        kv
+                    })();
+                    anchor_store::record_anchor_snapshot(snapshot_started.elapsed());
+                    match snapshot {
+                        Ok(kv) => Some(Qwen35StablePromptCheckpoint {
+                            prompt_tokens: self.prompt_tokens[..end].to_vec(),
+                            // ADR-059: the anchor's boundary is the physical cursor;
+                            // plan/apply rewinds to it and the graft rows below it
+                            // remain intact under the append-only contract.
+                            kv,
+                            prefill_logits: logits.clone(),
+                            vision_fingerprint: self.params.vision_fingerprint,
+                            spec,
+                        }),
+                        Err(error)
+                            if !supervisor.is_healthy()
+                                || super::engine::is_fatal_command_buffer_error(&error) =>
+                        {
+                            return Err(error.context("capture Qwen35 stable prompt boundary"));
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                slot = self.slot_id.0,
+                                error = %error,
+                                "Qwen35 stable prompt checkpoint capture skipped"
+                            );
+                            None
+                        }
+                    }
+                }
             } else {
                 None
             };
@@ -4402,10 +4447,13 @@ impl Qwen35PrefillState {
 
 /// Branch predicate used by the metadata accessor and source-only controls.
 /// The actual decode_tick first checks the output limit, then its pending queue.
-pub(super) fn f2_qwen_decode_buffer_state(step: usize, max_tokens: usize,
-    pending_tokens: usize) -> (bool, bool) {
+pub(super) fn f2_qwen_decode_buffer_state(
+    step: usize,
+    max_tokens: usize,
+    pending_tokens: usize,
+) -> (bool, bool) {
     let live = step < max_tokens;
-    (live && pending_tokens == 0,live && pending_tokens != 0)
+    (live && pending_tokens == 0, live && pending_tokens != 0)
 }
 
 /// Hoisted per-slot decode state for a Qwen35 SlotAware request — the
@@ -4529,28 +4577,30 @@ pub(in crate::serve::api) struct Qwen35CoherentTarget {
     started: Instant,
 }
 
+#[path = "engine_qwen35/anchor_store.rs"]
+pub(in crate::serve::api) mod anchor_store;
 #[path = "engine_qwen35/critical_path.rs"]
 pub(in crate::serve::api) mod critical_path;
 #[path = "engine_qwen35/joint_decode.rs"]
 mod joint_decode;
-pub(in crate::serve::api) use joint_decode::Qwen35JointLane;
+pub(in crate::serve::api) use joint_decode::{Qwen35JointLane, Qwen35LaneRefusal};
 #[path = "engine_qwen35/k3_transaction.rs"]
 mod k3_transaction;
 use k3_transaction::K3_VERIFY_ROWS;
+#[cfg(test)]
+#[path = "engine_qwen35/round_slot_independence_tests.rs"]
+mod round_slot_independence_tests;
 #[path = "engine_qwen35/shadow_draft.rs"]
 mod shadow_draft;
+#[cfg(test)]
+#[path = "engine_qwen35/slot_spill_resume_tests.rs"]
+mod slot_spill_resume_tests;
 #[cfg(test)]
 #[path = "engine_qwen35/speculation_qualification_tests.rs"]
 mod speculation_qualification_tests;
 #[cfg(test)]
 #[path = "engine_qwen35/speculation_real_artifact_tests.rs"]
 mod speculation_real_artifact_tests;
-#[cfg(test)]
-#[path = "engine_qwen35/round_slot_independence_tests.rs"]
-mod round_slot_independence_tests;
-#[cfg(test)]
-#[path = "engine_qwen35/slot_spill_resume_tests.rs"]
-mod slot_spill_resume_tests;
 #[cfg(test)]
 #[path = "engine_qwen35/text_decode_tests.rs"]
 mod text_decode_tests;
@@ -5208,8 +5258,11 @@ impl Qwen35DecodeState {
     /// Same branch order as decode_tick: pending verified outputs require no
     /// forward. The second fact is pending token data, NOT semantic readiness.
     pub(crate) fn f2_work_readiness(&self) -> (bool, bool) {
-        f2_qwen_decode_buffer_state(self.step,self.max_tokens,
-            self.pending_speculation_output.len())
+        f2_qwen_decode_buffer_state(
+            self.step,
+            self.max_tokens,
+            self.pending_speculation_output.len(),
+        )
     }
 
     /// The decoded first-token text to stream when the slot finishes at
@@ -5796,14 +5849,9 @@ impl Qwen35DecodeState {
                 kv_cache.truncate_mtp_to_for_slot(self.slot_id, committed_cursor)?;
             }
             if plan.valid_input_tokens < verify_rows {
-                let lease = supervisor.arm(
-                    "Qwen35 history restore",
-                    QWEN35_WORKER_TRANSACTION_TIMEOUT,
-                )?;
-                let restored = kv_cache.rollback_la(
-                    self.slot_id,
-                    plan.carry_hidden_row as u32,
-                );
+                let lease =
+                    supervisor.arm("Qwen35 history restore", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
+                let restored = kv_cache.rollback_la(self.slot_id, plan.carry_hidden_row as u32);
                 lease.finish().and(restored)?;
             }
             kv_cache.clear_la_capture();
@@ -5902,8 +5950,7 @@ impl Qwen35DecodeState {
         kv_cache: &mut HybridKvCache,
         supervisor: &EngineSupervisor,
     ) -> Result<Qwen35TickOutcome> {
-        let _stage_round =
-            crate::inference::stage_profile::Round::begin("qwen35", "solo_k3", 1);
+        let _stage_round = crate::inference::stage_profile::Round::begin("qwen35", "solo_k3", 1);
         let round_started = Instant::now();
         let phase_profile = std::env::var("HF2Q_MTP_PHASE_PROFILE").as_deref() == Ok("1");
         let entry = self.k3_entry(kv_cache)?;
@@ -8047,11 +8094,8 @@ pub(super) fn generate_stream_qwen35_once_extended(
                 if let Err(e) = kv_cache.restore_partial(snapshot, graft_len + prefix.k) {
                     return Err(e).context("Qwen35 SerialFifo streaming LCP checkpoint restore");
                 }
-                if graft_len > 0
-                    && kv_cache.graft_region_for_slot(SlotId(0)).unwrap_or(0) == 0
-                {
-                    if let Err(e) =
-                        kv_cache.mark_graft_region_for_slot(SlotId(0), graft_len as u32)
+                if graft_len > 0 && kv_cache.graft_region_for_slot(SlotId(0)).unwrap_or(0) == 0 {
+                    if let Err(e) = kv_cache.mark_graft_region_for_slot(SlotId(0), graft_len as u32)
                     {
                         return Err(e).context("re-mark graft region after streaming LCP restore");
                     }
@@ -8190,7 +8234,8 @@ pub(super) fn generate_stream_qwen35_once_extended(
             let mut suffix_positions = vec![0i32; 4 * suffix_len];
             for axis in 0..4 {
                 for token in 0..suffix_len {
-                    suffix_positions[axis * suffix_len + token] = (graft_len + lcp_resume_start + token) as i32;
+                    suffix_positions[axis * suffix_len + token] =
+                        (graft_len + lcp_resume_start + token) as i32;
                 }
             }
             match supervised_gpu_call(supervisor, "qwen35_serial_stream_prefill", || {
@@ -8228,7 +8273,8 @@ pub(super) fn generate_stream_qwen35_once_extended(
             let mut prefix_positions = vec![0i32; 4 * prefix_len];
             for axis in 0..4 {
                 for token in 0..prefix_len {
-                    prefix_positions[axis * prefix_len + token] = (graft_len + lcp_resume_start + token) as i32;
+                    prefix_positions[axis * prefix_len + token] =
+                        (graft_len + lcp_resume_start + token) as i32;
                 }
             }
             if let Err(error) =
@@ -8259,7 +8305,8 @@ pub(super) fn generate_stream_qwen35_once_extended(
             let mut tail_positions = vec![0i32; 4 * tail_len];
             for axis in 0..4 {
                 for token in 0..tail_len {
-                    tail_positions[axis * tail_len + token] = (graft_len + recovery_anchor + token) as i32;
+                    tail_positions[axis * tail_len + token] =
+                        (graft_len + recovery_anchor + token) as i32;
                 }
             }
             eprintln!(
@@ -8300,7 +8347,8 @@ pub(super) fn generate_stream_qwen35_once_extended(
                 let mut chunk_positions = vec![0i32; 4 * chunk_seq_len];
                 for axis in 0..4 {
                     for t in 0..chunk_seq_len {
-                        chunk_positions[axis * chunk_seq_len + t] = (graft_len + k_start + t) as i32;
+                        chunk_positions[axis * chunk_seq_len + t] =
+                            (graft_len + k_start + t) as i32;
                     }
                 }
                 let res =
@@ -8407,7 +8455,8 @@ pub(super) fn generate_stream_qwen35_once_extended(
                 let mut tail_positions = vec![0i32; 4 * tail_len];
                 for axis in 0..4 {
                     for token in 0..tail_len {
-                        tail_positions[axis * tail_len + token] = (graft_len + recovery_anchor + token) as i32;
+                        tail_positions[axis * tail_len + token] =
+                            (graft_len + recovery_anchor + token) as i32;
                     }
                 }
                 eprintln!(
@@ -8433,7 +8482,8 @@ pub(super) fn generate_stream_qwen35_once_extended(
             let mut suffix_positions = vec![0i32; 4 * suffix_len];
             for axis in 0..4 {
                 for t in 0..suffix_len {
-                    suffix_positions[axis * suffix_len + t] = (graft_len + lcp_resume_start + t) as i32;
+                    suffix_positions[axis * suffix_len + t] =
+                        (graft_len + lcp_resume_start + t) as i32;
                 }
             }
             eprintln!(
@@ -11662,7 +11712,12 @@ mod glp_cache_identity_tests {
     use crate::inference::glp::reader::{GlpHookPoint, GlpMode, GlpVector};
     use std::collections::BTreeMap;
 
-    fn bound(hook: GlpHookPoint, mode: GlpMode, alpha: f32, layers: BTreeMap<u32, Vec<f32>>) -> BoundGlp {
+    fn bound(
+        hook: GlpHookPoint,
+        mode: GlpMode,
+        alpha: f32,
+        layers: BTreeMap<u32, Vec<f32>>,
+    ) -> BoundGlp {
         BoundGlp {
             vector: GlpVector {
                 mode,
@@ -11739,7 +11794,10 @@ mod glp_cache_identity_tests {
             1.0,
             layers.clone(),
         );
-        assert_ne!(glp_steering_params_hash(Some(&a)), glp_steering_params_hash(Some(&add)));
+        assert_ne!(
+            glp_steering_params_hash(Some(&a)),
+            glp_steering_params_hash(Some(&add))
+        );
 
         // Unsteered is stable and distinct from any steered config.
         let none = glp_steering_params_hash(None);

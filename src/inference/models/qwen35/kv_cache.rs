@@ -50,17 +50,18 @@ pub use mlx_native::ops::gated_delta_net::cpu_reference_f32 as gated_delta_net_c
 use super::gqa_q2_policy::use_gqa_q2_tq_sdpa;
 use super::{Qwen35Config, Qwen35LayerKind};
 
-mod source_teacher;
 mod allocation_plan;
+mod la_restore;
 #[cfg(test)]
 pub(crate) mod q1_capture_layout;
 mod slot_spill;
-mod la_restore;
-pub(crate) use la_restore::LaRestoreRoute;
-pub use slot_spill::HybridKvSlotSpill;
+mod source_teacher;
 use allocation_plan::{
-    ensure_capture_with, CaptureAllocationPlan, CaptureRole, ExistingCapture, HybridCacheAllocationPlan,
+    ensure_capture_with, CaptureAllocationPlan, CaptureRole, ExistingCapture,
+    HybridCacheAllocationPlan,
 };
+pub(crate) use la_restore::{LaAnchorImage, LaAnchorRestorePlan, LaRestoreRoute};
+pub use slot_spill::HybridKvSlotSpill;
 
 pub(super) use source_teacher::{
     plan_qwen35_base_text_cache, prepare_qwen35_base_text_cache, PreparedQwen35BaseTextCacheV1,
@@ -1145,6 +1146,9 @@ pub struct HybridKvCache {
     /// It is never conversational history — the engine excludes it from
     /// `retained_prefix` and transcript reconstruction.
     pub graft_len: Vec<u32>,
+    /// Monotonic identity of each slot's physical cache lineage. Append-only
+    /// writes preserve it; reset, graft replacement, drop and fork advance it.
+    slot_state_generation: Vec<u64>,
 }
 
 /// Resolved slot index for a given model layer.
@@ -1227,24 +1231,35 @@ pub struct HybridKvCacheSnapshot {
 #[derive(Clone)]
 pub struct HybridKvSlotAnchor {
     prompt_len: usize,
+    state_generation: u64,
+    graft_len: u32,
     full_attn_current_len: Vec<u32>,
     mtp_current_len: Option<u32>,
-    linear_conv: Vec<Vec<u8>>,
-    linear_recurrent: Vec<Vec<u8>>,
+    linear_image: Option<LaAnchorImage>,
 }
 
 impl HybridKvSlotAnchor {
     /// Physical bytes retained outside the live cache for this checkpoint.
     pub fn total_bytes(&self) -> usize {
-        self.linear_conv
-            .iter()
-            .chain(self.linear_recurrent.iter())
-            .map(Vec::len)
-            .sum()
+        self.linear_image
+            .as_ref()
+            .map_or(0, LaAnchorImage::total_bytes)
     }
 
     pub fn prompt_len(&self) -> usize {
         self.prompt_len
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_stub(prompt_len: usize) -> Self {
+        Self {
+            prompt_len,
+            state_generation: 0,
+            graft_len: 0,
+            full_attn_current_len: Vec::new(),
+            mtp_current_len: None,
+            linear_image: None,
+        }
     }
 }
 
@@ -1682,6 +1697,22 @@ impl HybridKvCache {
         crate::serve::multi_seq_kv::MultiSeqKvCache::seq_len(self, slot)
     }
 
+    pub(crate) fn slot_state_generation(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<u64> {
+        self.slot_state_generation
+            .get(slot.0 as usize)
+            .copied()
+            .ok_or_else(|| anyhow!("slot state generation missing for slot {}", slot.0))
+    }
+
+    fn advance_slot_state_generation(&mut self, slot_idx: usize) {
+        self.slot_state_generation[slot_idx] = self.slot_state_generation[slot_idx]
+            .checked_add(1)
+            .expect("Qwen slot state generation overflow");
+    }
+
     /// Verify that every verifier full-attention layer has committed the same
     /// request-local cursor before the serving driver publishes a resumable
     /// prefill boundary.
@@ -1761,10 +1792,11 @@ impl HybridKvCache {
         Ok(())
     }
 
-    /// Capture the prompt boundary for one physical agent slot without
-    /// duplicating its append-only full-attention K/V rows.
+    /// Capture one slot's prompt boundary without duplicating append-only
+    /// full-attention K/V rows. The recurrent payload is one right-sized
+    /// shared-storage image, produced through the configured P4b route.
     pub(crate) fn snapshot_slot_anchor(
-        &self,
+        &mut self,
         slot: crate::serve::multi_seq_kv::SlotId,
         prompt_len: usize,
     ) -> Result<HybridKvSlotAnchor> {
@@ -1781,7 +1813,6 @@ impl HybridKvCache {
             "snapshot_slot_anchor: prompt_len={prompt_len} outside 1..={}",
             self.max_seq_len
         );
-
         let mut full_attn_current_len = Vec::with_capacity(self.full_attn.len());
         for (layer_idx, full) in self.full_attn.iter().enumerate() {
             let cursor = *full.current_len.get(slot_idx).ok_or_else(|| {
@@ -1798,134 +1829,63 @@ impl HybridKvCache {
             .mtp_slot
             .as_ref()
             .map(|mtp| {
-                let cursor = mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
+                mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
                     anyhow!(
                         "snapshot_slot_anchor: MTP cursor missing for slot {}",
                         slot.0
                     )
-                })?;
-                Ok::<u32, anyhow::Error>(cursor)
+                })
             })
             .transpose()?;
-
-        let mut linear_conv = Vec::with_capacity(self.linear_attn.len());
-        let mut linear_recurrent = Vec::with_capacity(self.linear_attn.len());
-        for (layer_idx, linear) in self.linear_attn.iter().enumerate() {
-            let (conv, _) = linear.conv_bufs_for_slot(slot);
-            let (recurrent, _) = linear.recurrent_bufs_for_slot(slot);
-            linear_conv.push(copy_slot_region_out(
-                conv,
-                slot_idx,
-                n_seqs,
-                &format!("linear_attn[{layer_idx}].conv"),
-            )?);
-            linear_recurrent.push(copy_slot_region_out(
-                recurrent,
-                slot_idx,
-                n_seqs,
-                &format!("linear_attn[{layer_idx}].recurrent"),
-            )?);
-        }
-
+        let linear_image = self.snapshot_la_anchor(slot)?;
         Ok(HybridKvSlotAnchor {
             prompt_len,
+            state_generation: self.slot_state_generation(slot)?,
+            graft_len: self.graft_len[slot_idx],
             full_attn_current_len,
             mtp_current_len,
-            linear_conv,
-            linear_recurrent,
+            linear_image: Some(linear_image),
         })
     }
 
-    /// Rewind one physical agent slot to a previously captured prompt
-    /// boundary. Peer cursors, peer DeltaNet state, and all full-attention
-    /// K/V bytes remain untouched.
-    pub(crate) fn restore_slot_anchor(
-        &mut self,
+    /// Preflight every cursor, image extent and destination before restore.
+    /// The returned plan owns all bounded views and can be applied once.
+    pub(crate) fn plan_slot_anchor_restore(
+        &self,
         slot: crate::serve::multi_seq_kv::SlotId,
         anchor: &HybridKvSlotAnchor,
-    ) -> Result<()> {
+    ) -> Result<LaAnchorRestorePlan> {
         let slot_idx = slot.0 as usize;
-        let n_seqs = self.n_seqs as usize;
         anyhow::ensure!(
-            slot_idx < n_seqs,
-            "restore_slot_anchor: slot {} outside n_seqs={}",
-            slot.0,
-            self.n_seqs
+            self.slot_state_generation.get(slot_idx) == Some(&anchor.state_generation),
+            "plan_slot_anchor_restore: slot lineage changed"
+        );
+        anyhow::ensure!(
+            self.graft_len.get(slot_idx) == Some(&anchor.graft_len),
+            "plan_slot_anchor_restore: graft identity changed"
         );
         anyhow::ensure!(
             anchor.prompt_len <= self.max_seq_len as usize,
-            "restore_slot_anchor: prompt_len={} exceeds max_seq_len={}",
+            "plan_slot_anchor_restore: prompt_len={} exceeds max_seq_len={}",
             anchor.prompt_len,
             self.max_seq_len
         );
-        anyhow::ensure!(
-            anchor.full_attn_current_len.len() == self.full_attn.len(),
-            "restore_slot_anchor: full-attn layer count mismatch"
-        );
-        anyhow::ensure!(
-            anchor.linear_conv.len() == self.linear_attn.len()
-                && anchor.linear_recurrent.len() == self.linear_attn.len(),
-            "restore_slot_anchor: linear-attn layer count mismatch"
-        );
+        let image = anchor
+            .linear_image
+            .as_ref()
+            .context("plan_slot_anchor_restore: recurrent image missing")?;
+        self.plan_anchor_restore(
+            slot,
+            image,
+            &anchor.full_attn_current_len,
+            anchor.mtp_current_len,
+        )
+    }
 
-        // The anchor intentionally owns no full-attention K/V copy. Refuse
-        // the rewind unless the live append-only cursor proves those rows
-        // are still populated in this same slot.
-        for (layer_idx, (full, &saved_cursor)) in self
-            .full_attn
-            .iter_mut()
-            .zip(anchor.full_attn_current_len.iter())
-            .enumerate()
-        {
-            let live_cursor = full.current_len.get_mut(slot_idx).ok_or_else(|| {
-                anyhow!("restore_slot_anchor: full_attn[{layer_idx}] cursor missing")
-            })?;
-            anyhow::ensure!(
-                *live_cursor >= saved_cursor,
-                "restore_slot_anchor: full_attn[{layer_idx}] live cursor {} is behind saved cursor {saved_cursor}; prompt K/V cannot be proven intact",
-                *live_cursor
-            );
-            *live_cursor = saved_cursor;
-        }
-        match (self.mtp_slot.as_mut(), anchor.mtp_current_len) {
-            (Some(mtp), Some(saved_cursor)) => {
-                let live_cursor = mtp.current_len.get_mut(slot_idx).ok_or_else(|| {
-                    anyhow!(
-                        "restore_slot_anchor: MTP cursor missing for slot {}",
-                        slot.0
-                    )
-                })?;
-                anyhow::ensure!(
-                    *live_cursor >= saved_cursor,
-                    "restore_slot_anchor: MTP live cursor {} is behind saved cursor {saved_cursor}",
-                    *live_cursor
-                );
-                *live_cursor = saved_cursor;
-            }
-            (None, None) => {}
-            _ => anyhow::bail!("restore_slot_anchor: MTP presence mismatch"),
-        }
-
-        for (layer_idx, linear) in self.linear_attn.iter_mut().enumerate() {
-            copy_slot_region_in(
-                &anchor.linear_conv[layer_idx],
-                &mut linear.conv_state,
-                slot_idx,
-                n_seqs,
-                &format!("linear_attn[{layer_idx}].conv"),
-            )?;
-            copy_slot_region_in(
-                &anchor.linear_recurrent[layer_idx],
-                &mut linear.recurrent,
-                slot_idx,
-                n_seqs,
-                &format!("linear_attn[{layer_idx}].recurrent"),
-            )?;
-            // The named buffers now hold the restored current state for this
-            // slot. Peer parity remains exactly as it was.
-            linear.pp_flipped[slot_idx] = false;
-        }
-        Ok(())
+    /// Apply a fully preflighted slot restore atomically with respect to
+    /// observable cursors: bytes complete before any cursor or parity changes.
+    pub(crate) fn apply_slot_anchor_restore(&mut self, plan: LaAnchorRestorePlan) -> Result<()> {
+        self.apply_anchor_restore(plan)
     }
 
     /// Allocate the full hybrid cache for a Qwen3.5 (dense or MoE) model.
@@ -2078,6 +2038,7 @@ impl HybridKvCache {
             la_restore_registry: None,
             la_capture_active_tokens: None,
             graft_len: vec![0; n_seqs as usize],
+            slot_state_generation: vec![0; n_seqs as usize],
         })
     }
 
@@ -2292,10 +2253,7 @@ impl HybridKvCache {
     /// Staged primitive per the `multi_seq_kv.rs` iter-1 pattern: tested
     /// here, glued into the live serve path by the `--kv-graft` engine
     /// wiring increment.
-    pub fn graft_region_for_slot(
-        &self,
-        slot: crate::serve::multi_seq_kv::SlotId,
-    ) -> Result<u32> {
+    pub fn graft_region_for_slot(&self, slot: crate::serve::multi_seq_kv::SlotId) -> Result<u32> {
         let slot_idx = slot.0 as usize;
         anyhow::ensure!(
             slot_idx < self.n_seqs as usize,
@@ -2324,10 +2282,9 @@ impl HybridKvCache {
             self.n_seqs
         );
         for (rank, full) in self.full_attn.iter_mut().enumerate() {
-            let cursor = full
-                .current_len
-                .get_mut(slot_idx)
-                .ok_or_else(|| anyhow!("advance_cursors_for_test: full_attn[{rank}] cursor missing"))?;
+            let cursor = full.current_len.get_mut(slot_idx).ok_or_else(|| {
+                anyhow!("advance_cursors_for_test: full_attn[{rank}] cursor missing")
+            })?;
             *cursor = cursor
                 .checked_add(rows)
                 .ok_or_else(|| anyhow!("advance_cursors_for_test: cursor overflow"))?;
@@ -2478,6 +2435,7 @@ impl HybridKvCache {
             }
         }
         self.graft_len[slot_idx] = n_slots;
+        self.advance_slot_state_generation(slot_idx);
         Ok(n_slots)
     }
 
@@ -2524,7 +2482,8 @@ impl HybridKvCache {
         let mut registry = mlx_native::KernelRegistry::new();
         let mut encoder = self
             .device
-            .command_encoder().map(crate::inference::native_observation::encoder)
+            .command_encoder()
+            .map(crate::inference::native_observation::encoder)
             .context("graft TQ splice: command encoder")?;
         for (graph_layer, slot_of) in self.per_layer_slot.iter().enumerate() {
             let LayerSlot::Full(rank) = slot_of else {
@@ -2544,9 +2503,7 @@ impl HybridKvCache {
                 layer_kv.k.len(),
                 layer_kv.v.len()
             );
-            let upload = |values: &[f32],
-                          label: &'static str|
-             -> Result<mlx_native::MlxBuffer> {
+            let upload = |values: &[f32], label: &'static str| -> Result<mlx_native::MlxBuffer> {
                 let mut buf = self
                     .device
                     .alloc_buffer(
@@ -2644,7 +2601,10 @@ impl HybridKvCache {
             slot.0,
             self.n_seqs
         );
-        anyhow::ensure!(n_slots > 0, "extract_full_attn_rows_for_graft: n_slots must be > 0");
+        anyhow::ensure!(
+            n_slots > 0,
+            "extract_full_attn_rows_for_graft: n_slots must be > 0"
+        );
         anyhow::ensure!(
             !self.tq_kv_active,
             "extract_full_attn_rows_for_graft: TQ-active caches refuse derivation \
@@ -2692,11 +2652,11 @@ impl HybridKvCache {
                  not cover n_slots={n_slots}; the donor prefill was too short",
                 full.current_len[slot_idx]
             );
-            let extract = |buf: &MlxBuffer,
-                           side: &'static str|
-             -> Result<Vec<f32>> {
+            let extract = |buf: &MlxBuffer, side: &'static str| -> Result<Vec<f32>> {
                 let src = buf.as_slice::<f32>().with_context(|| {
-                    format!("extract_full_attn_rows_for_graft: {side} readback (layer {graph_layer})")
+                    format!(
+                        "extract_full_attn_rows_for_graft: {side} readback (layer {graph_layer})"
+                    )
                 })?;
                 let mut rows = vec![0f32; n_slots as usize * heads * head_dim];
                 for position in 0..n_slots as usize {
@@ -2704,8 +2664,7 @@ impl HybridKvCache {
                         // Cache layout [n_seqs, heads, max_seq_len,
                         // head_dim]; bank layout [n_slots, heads,
                         // head_dim] (position-major).
-                        let src_base =
-                            ((slot_idx * heads + head) * max_len + position) * head_dim;
+                        let src_base = ((slot_idx * heads + head) * max_len + position) * head_dim;
                         let dst_base = (position * heads + head) * head_dim;
                         rows[dst_base..dst_base + head_dim]
                             .copy_from_slice(&src[src_base..src_base + head_dim]);
@@ -2725,11 +2684,7 @@ impl HybridKvCache {
                      missing (F32 control path required)"
                 )
             })?;
-            out.push((
-                graph_layer as u32,
-                extract(k, "K")?,
-                extract(v, "V")?,
-            ));
+            out.push((graph_layer as u32, extract(k, "K")?, extract(v, "V")?));
         }
         anyhow::ensure!(
             !out.is_empty(),
@@ -2756,7 +2711,10 @@ impl HybridKvCache {
             slot.0,
             self.n_seqs
         );
-        anyhow::ensure!(n_slots > 0, "mark_graft_region_for_slot: n_slots must be > 0");
+        anyhow::ensure!(
+            n_slots > 0,
+            "mark_graft_region_for_slot: n_slots must be > 0"
+        );
         anyhow::ensure!(
             self.graft_len[slot_idx] == 0,
             "mark_graft_region_for_slot: slot {} already carries a graft region",
@@ -3460,6 +3418,7 @@ impl HybridKvCache {
             // slot → parity back to canonical (named fields = current).
             la.pp_flipped[slot_idx] = false;
         }
+        self.advance_slot_state_generation(slot_idx);
         Ok(())
     }
 
@@ -3508,6 +3467,11 @@ impl HybridKvCache {
             for f in slot.pp_flipped.iter_mut() {
                 *f = false;
             }
+        }
+        for generation in &mut self.slot_state_generation {
+            *generation = generation
+                .checked_add(1)
+                .expect("Qwen slot state generation overflow");
         }
     }
 
@@ -3711,7 +3675,10 @@ impl HybridKvCache {
                 current_len: match prefix_tokens {
                     Some(n_tokens) => {
                         let boundary = u32::try_from(n_tokens).unwrap_or(u32::MAX);
-                        slot.current_len.iter().map(|&cursor| cursor.min(boundary)).collect()
+                        slot.current_len
+                            .iter()
+                            .map(|&cursor| cursor.min(boundary))
+                            .collect()
                     }
                     None => slot.current_len.clone(),
                 },
@@ -4809,6 +4776,7 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         // ADR-059: dropping a slot releases its graft region — the next
         // request on this slot is ungrafted until an explicit re-splice.
         self.graft_len[slot.0 as usize] = 0;
+        self.advance_slot_state_generation(slot.0 as usize);
         Ok(())
     }
 
@@ -5122,6 +5090,7 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
             slot.pp_flipped[dst_idx] = slot.pp_flipped[src_idx];
         }
 
+        self.advance_slot_state_generation(dst_idx);
         Ok(())
     }
 }
@@ -12618,8 +12587,11 @@ mod tests {
             linear.pp_flipped[target.0 as usize] = false;
         }
 
+        let plan = cache
+            .plan_slot_anchor_restore(target, &anchor)
+            .expect("slot-local restore preflight");
         cache
-            .restore_slot_anchor(target, &anchor)
+            .apply_slot_anchor_restore(plan)
             .expect("slot-local restore");
         assert_eq!(cache.seq_len(target).unwrap(), 9);
         assert_eq!(cache.seq_len(peer).unwrap(), 7, "peer cursor changed");
@@ -12656,6 +12628,46 @@ mod tests {
                     .all(|&byte| byte == 14)
             );
             assert!(linear.pp_flipped[peer.0 as usize], "peer parity changed");
+        }
+    }
+
+    #[test]
+    fn slot_anchor_preflight_refuses_replaced_slot_lineage_without_mutation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("alloc");
+        let slot = SlotId(1);
+        cache.append_for_seq(slot, 9).expect("prompt cursor");
+        let anchor = cache
+            .snapshot_slot_anchor(slot, 9)
+            .expect("slot-local anchor");
+        let captured_generation = cache.slot_state_generation(slot).unwrap();
+
+        cache.reset_for_slot(slot).expect("replace slot lineage");
+        let replaced_generation = cache.slot_state_generation(slot).unwrap();
+        assert_eq!(replaced_generation, captured_generation + 1);
+        assert_eq!(cache.seq_len(slot).unwrap(), 0);
+        let before: Vec<_> = cache
+            .linear_attn
+            .iter()
+            .map(|linear| {
+                (
+                    linear.conv_state.as_slice::<u32>().unwrap().to_vec(),
+                    linear.recurrent.as_slice::<u32>().unwrap().to_vec(),
+                )
+            })
+            .collect();
+
+        let error = cache
+            .plan_slot_anchor_restore(slot, &anchor)
+            .err()
+            .expect("replaced lineage must refuse the old anchor");
+        assert!(format!("{error:#}").contains("slot lineage changed"));
+        assert_eq!(cache.seq_len(slot).unwrap(), 0);
+        for (linear, (conv, recurrent)) in cache.linear_attn.iter().zip(before) {
+            assert_eq!(linear.conv_state.as_slice::<u32>().unwrap(), conv);
+            assert_eq!(linear.recurrent.as_slice::<u32>().unwrap(), recurrent);
         }
     }
 
@@ -12789,10 +12801,7 @@ mod tests {
             let mut cache =
                 HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
             let canary = bank(0, 2, 8, &[3, 7]);
-            assert_eq!(
-                cache.splice_graft_for_slot(SlotId(0), &canary).unwrap(),
-                0
-            );
+            assert_eq!(cache.splice_graft_for_slot(SlotId(0), &canary).unwrap(), 0);
             assert_eq!(cache.graft_region_for_slot(SlotId(0)).unwrap(), 0);
             for full in cache.full_attn.iter() {
                 assert_eq!(full.current_len[0], 0);
@@ -12808,9 +12817,7 @@ mod tests {
                 HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
             let graft = bank(3, 2, 8, &[3, 7]);
             cache.splice_graft_for_slot(SlotId(0), &graft).unwrap();
-            let err = cache
-                .splice_graft_for_slot(SlotId(0), &graft)
-                .unwrap_err();
+            let err = cache.splice_graft_for_slot(SlotId(0), &graft).unwrap_err();
             assert!(err.to_string().contains("already carries a graft"));
         }
 
@@ -12823,9 +12830,7 @@ mod tests {
                 HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
             cache.append_for_seq(SlotId(0), 4).unwrap();
             let graft = bank(3, 2, 8, &[3, 7]);
-            let err = cache
-                .splice_graft_for_slot(SlotId(0), &graft)
-                .unwrap_err();
+            let err = cache.splice_graft_for_slot(SlotId(0), &graft).unwrap_err();
             assert!(err.to_string().contains("not fresh"));
         }
 
@@ -12874,20 +12879,49 @@ mod tests {
             let mut encoder = device.command_encoder().expect("encoder");
             let slot = &mut reference.full_attn[0];
             slot.encode_seq_tokens_to_tq_for_slot(
-                &k_buf, true, 3, 2, 256, 16, 0, 0, false, 1.0, 8, SlotId(1),
-                &mut encoder, &mut registry, &device,
+                &k_buf,
+                true,
+                3,
+                2,
+                256,
+                16,
+                0,
+                0,
+                false,
+                1.0,
+                8,
+                SlotId(1),
+                &mut encoder,
+                &mut registry,
+                &device,
             )
             .expect("reference K encode");
             slot.encode_seq_tokens_to_tq_for_slot(
-                &v_buf, false, 3, 2, 256, 16, 0, 0, false, 1.0, 8, SlotId(1),
-                &mut encoder, &mut registry, &device,
+                &v_buf,
+                false,
+                3,
+                2,
+                256,
+                16,
+                0,
+                0,
+                false,
+                1.0,
+                8,
+                SlotId(1),
+                &mut encoder,
+                &mut registry,
+                &device,
             )
             .expect("reference V encode");
             encoder.commit_and_wait().expect("reference commit");
 
             // Byte-identical packed + norm bytes on the grafted layer.
             let grafted = cache.full_attn[0].tq.as_ref().expect("grafted TQ buffers");
-            let expect = reference.full_attn[0].tq.as_ref().expect("reference TQ buffers");
+            let expect = reference.full_attn[0]
+                .tq
+                .as_ref()
+                .expect("reference TQ buffers");
             let per_slot_packed = 2usize * 16 * 256;
             for (label, got, want) in [
                 (
@@ -12941,9 +12975,7 @@ mod tests {
             let mut cache =
                 HybridKvCache::new_with_options(&cfg, &device, 16, 2, true).expect("kv");
             let graft = bank(3, 2, 8, &[3, 7]);
-            let err = cache
-                .splice_graft_for_slot(SlotId(0), &graft)
-                .unwrap_err();
+            let err = cache.splice_graft_for_slot(SlotId(0), &graft).unwrap_err();
             assert!(err.to_string().contains("head_dim 256 or 512"));
         }
 
@@ -12981,9 +13013,7 @@ mod tests {
                 HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
             // Bank claims 3 KV heads; the cache holds 2.
             let graft = bank(3, 3, 8, &[3, 7]);
-            let err = cache
-                .splice_graft_for_slot(SlotId(0), &graft)
-                .unwrap_err();
+            let err = cache.splice_graft_for_slot(SlotId(0), &graft).unwrap_err();
             assert!(err.to_string().contains("geometry mismatch"));
         }
 
@@ -12996,10 +13026,10 @@ mod tests {
                 HybridKvCache::new_with_options(&cfg, &device, 16, 2, false).expect("kv");
             // Covers layer 3 only; the cache's full-attn set is {3, 7}.
             let graft = bank(3, 2, 8, &[3]);
-            let err = cache
-                .splice_graft_for_slot(SlotId(0), &graft)
-                .unwrap_err();
-            assert!(err.to_string().contains("does not cover full-attention layer 7"));
+            let err = cache.splice_graft_for_slot(SlotId(0), &graft).unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("does not cover full-attention layer 7"));
         }
 
         #[test]
@@ -13107,7 +13137,9 @@ mod tests {
             // bank rows at positions 0..3 WITHOUT the graft machinery
             // (no tag), then a cursor advance makes them readable.
             for (graph_layer, slot_of) in cache.per_layer_slot.iter().enumerate() {
-                let LayerSlot::Full(rank) = slot_of else { continue };
+                let LayerSlot::Full(rank) = slot_of else {
+                    continue;
+                };
                 let layer_kv = &graft.layers[&(graph_layer as u32)];
                 let full = &mut cache.full_attn[*rank as usize];
                 super::splice_rows_into_buffer(
@@ -13154,7 +13186,9 @@ mod tests {
             let err = cache
                 .extract_full_attn_rows_for_graft(SlotId(0), 3)
                 .unwrap_err();
-            assert!(err.to_string().contains("never derive from a grafted cache"));
+            assert!(err
+                .to_string()
+                .contains("never derive from a grafted cache"));
 
             // A cursor that does not cover n_slots refuses by name.
             cache.reset_for_slot(SlotId(0)).unwrap();
@@ -13165,8 +13199,7 @@ mod tests {
             assert!(err.to_string().contains("donor prefill was too short"));
 
             // A TQ-active cache refuses derivation by name.
-            let mut tq =
-                HybridKvCache::new_with_options(&cfg, &device, 16, 2, true).expect("kv");
+            let mut tq = HybridKvCache::new_with_options(&cfg, &device, 16, 2, true).expect("kv");
             tq.advance_cursors_for_test(SlotId(0), 5).unwrap();
             let err = tq
                 .extract_full_attn_rows_for_graft(SlotId(0), 3)
@@ -13176,7 +13209,7 @@ mod tests {
 
         /// ADR-059 SlotAware anchor semantics: `snapshot_slot_anchor`
         /// captures the PHYSICAL boundary (graft rows + prompt rows) and
-        /// `restore_slot_anchor` rewinds to it without copying bytes — the
+        /// `plan_slot_anchor_restore` / `apply_slot_anchor_restore` rewinds to it
         /// graft rows below the boundary survive by the append-only
         /// contract and the region tag stays marked (only a reset clears
         /// it, and a reset clears the anchor too).
@@ -13200,8 +13233,11 @@ mod tests {
             // rewinds to the anchor.
             cache.append_for_seq(SlotId(0), 3).unwrap();
             assert_eq!(cache.sequence_len_for_slot(SlotId(0)).unwrap(), 11);
+            let plan = cache
+                .plan_slot_anchor_restore(SlotId(0), &anchor)
+                .expect("graft-aware anchor preflight");
             cache
-                .restore_slot_anchor(SlotId(0), &anchor)
+                .apply_slot_anchor_restore(plan)
                 .expect("graft-aware anchor restore");
             assert_eq!(
                 cache.sequence_len_for_slot(SlotId(0)).unwrap(),

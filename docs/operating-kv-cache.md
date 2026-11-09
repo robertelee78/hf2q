@@ -28,6 +28,30 @@
 > generic hot-swap spiller substrate. The rest of this runbook remains accurate
 > for the Gemma-4 spiller substrate it was written against.
 
+## Qwen SlotAware multi-depth anchors (v0.1.30)
+
+`HF2Q_QWEN_ANCHOR_DEPTH` bounds committed anchors per physical slot to 1–8.
+The shipped default is `1`; use `4` only with the C2 Q5 reservation and
+qualification receipt for the exact artifact and workload. Captures remain
+pending until successful decode completion. Cancellation and errors discard
+pending state. Restore selects the deepest committed exact prefix, preflights
+all cursor/image ranges, prunes descendants before writes, and then restores
+through the configured `HF2Q_QWEN_LA_GPU_RESTORE` route.
+
+`HF2Q_QWEN_ANCHOR_BYTES_PER_SLOT_MAX=<bytes>` is an optional positive decimal
+quota for committed plus pending anchor-owned storage. Over-quota and
+oversized-owner captures are skipped, not published. Unset means no runtime
+quota; Q5 admission remains mandatory.
+
+Observe:
+
+- `hf2q_qwen_anchor_owned_bytes{slot,class,state}` and
+  `hf2q_qwen_anchor_committed{slot}`;
+- restore rank, equality-hit, refusal, tombstone, eviction, capture-skip, and
+  snapshot/restore timing counters under `hf2q_qwen_anchor_*`;
+- `hf2q_qwen_joint_not_eligible_turns_total{reason="anchor_capture"}` and
+  `{reason="anchor_restore"}`. Both must remain zero in a C2 campaign.
+
 > **State of truth (2026-05-01, preserved for provenance).** This runbook documents only what is implemented in the
 > tree at the commit above. Phase D is ship-gated but the substrate is fully
 > wired (cmd_serve flag + recovery scan + spiller + writer + factory). The
