@@ -532,11 +532,28 @@ fn run_qwen35_joint_group(
         );
     });
 
+    // E3 diagnostic: draft only after the scheduler has formed a real joint
+    // group, then discard proposer state before the ordinary target forward.
+    if lanes.len() >= 2 {
+        for lane in &mut lanes {
+            if let Err(error) = lane.state.shadow_draft_before_joint(
+                guard.model,
+                guard.kv.as_mut().expect("kv Some during loop"),
+                supervisor,
+            ) {
+                lane.tick = Some(Err(error));
+            }
+        }
+    }
+
     // Prepare each lane exactly as its serial tick would before the forward.
     let mut prepared: Vec<(usize, Qwen35JointLane)> = Vec::with_capacity(lanes.len());
     {
         let kv = guard.kv.as_ref().expect("kv Some during loop");
         for (index, lane) in lanes.iter_mut().enumerate() {
+            if lane.tick.is_some() {
+                continue;
+            }
             match lane.state.prepare_joint_tick(kv) {
                 Ok(joint_lane) => prepared.push((index, joint_lane)),
                 Err(error) => lane.tick = Some(Err(error)),

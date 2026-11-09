@@ -226,6 +226,16 @@ Priority: High.
 
 Delivery boundary: Receipts and diagnostic merged to main.
 
+Result (2026-11-09): Complete. The retained Qwen3.8 four-agent runs both reached
+`CalibrationPass`; enabling the shadow drafter preserved `ExactTranscripts`
+across 28 agent/turn positions. The diagnostic recorded 1,918 complete
+proposals. History accepted prefixes `0/1/2/3` in `257/197/81/774` records;
+MTP K3 did so in `27/49/50/483`. Every measured row carried the workload's
+automatic tool-trigger grammar, so the no-transform share was 0%. This is
+below E8's 50% prerequisite for the host-selection optimization. Identities,
+per-slot and cold/warm histograms, costs, commands and retained receipt hashes
+are in [the E3 evidence record](../research/adr065-e3-shadow-acceptance.md).
+
 ### E4. Measure makespan composition and eligibility
 
 Outcome: The share of makespan that joint verify could change is known.

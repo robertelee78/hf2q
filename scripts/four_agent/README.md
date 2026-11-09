@@ -863,6 +863,12 @@ The traced-run witness manifest lists `qwen35.joint_decode.actual_slot_rows` bes
 
 Design: [docs/research/adr063-q4-trace-design.md](../../docs/research/adr063-q4-trace-design.md). Tests: `test_f2_native_trace_joint.py`, `test_q4_trace_overhead.py`, `test_q4_trace_attribution.py`.
 
+### ADR-065 E3 shadow acceptance (`adr065_shadow_acceptance.py`)
+
+Set `HF2Q_ADR065_SHADOW_DRAFT=1` with `HF2Q_QWEN_SPECULATION=off` for the diagnostic arm of a Qwen3.8 four-agent run. Only lanes in an actual joint group propose. Request-history lookup and MTP K3 run counterfactually; MTP draft cache rows are discarded and capture is disarmed before the ordinary target forward. The server emits one `[ADR065_SHADOW_DRAFT_JSON]` record when a proposal mismatches, reaches its full depth or is censored by request completion.
+
+`adr065_shadow_acceptance.py SERVER_LOG... [--output REPORT.json]` validates the closed records and reports accepted-prefix histograms (0–3) by proposer, slot, cold/warm turn type and context bucket, plus the share with no grammar/repetition/forced-thinking/tool-trigger transform and proposal wall cost. Censored proposals are counted but excluded from histograms. Qualification compares the diagnostic arm's served transcripts with an otherwise identical off arm.
+
 ## F2 scoreboard rendering
 
 `f2_scoreboard_render.py` renders [docs/research/adr063-f2-scoreboard.md](../../docs/research/adr063-f2-scoreboard.md) from the checked-in rows manifest `docs/research/adr063-f2-scoreboard-rows.json` (schema `hf2q.f2.scoreboard-rows.v1`) plus any `f2_scoreboard_cli.py` outputs. Only those fixed-six outputs can produce Qualified F2 primary results; manifest rows are Descriptive, NegativeResult or Failure receipts and cite `$E/...` receipt paths and extraction keys, never absolute local paths. `--verify` re-reads every Verified row from its receipt and refuses drift:

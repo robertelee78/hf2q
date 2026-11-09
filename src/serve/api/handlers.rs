@@ -1737,14 +1737,14 @@ mod qwen_thinking_budget_tests {
 /// capability is the stock-client default (ADR-062 D5 keeps this the one
 /// composition point — the caller probes the template once and shares the
 /// result with the reasoning-channel resolution).
-fn resolve_api_enable_thinking(
+pub(crate) fn resolve_api_enable_thinking(
     request_override: Option<bool>,
     template_supports_thinking: bool,
 ) -> bool {
     request_override.unwrap_or(template_supports_thinking)
 }
 
-fn resolve_api_template_kwargs(
+pub(crate) fn resolve_api_template_kwargs(
     registration: Option<&registry::ModelRegistration>,
     request_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
     deepseek_reasoning_effort: Option<&'static str>,
