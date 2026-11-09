@@ -181,6 +181,8 @@ Priority: High.
 
 Delivery boundary: Diagnostic merged to main with receipts.
 
+Result (2026-11-09): Complete. The exact-value opt-in E1 observer now attributes complete joint and solo K3 rounds with closed GPU/CPU stage classes, fail-closed Unknown handling and per-completion DeepSeek scratch counters. Retained official-artifact Q5 controls measured profile/wall makespan ratios of 1.8752× for Qwen3.8, 2.3001× for DeepSeek-V4 and 4.8830× for Gemma 4; every wall control was `ExactTranscripts` against the previous-default binary across 28 turn positions. The official Qwen K3 gate retained 151 complete solo rounds with both accepted and rejected drafts and separate MTP draft/catch-up attribution. See [the E1 evidence record](../research/adr065-e1-stage-attribution.md).
+
 ### E2. Measure complete-round cost for valid window configurations
 
 Outcome: Complete-round wall and GPU time is known for the configurations joint verify would run.

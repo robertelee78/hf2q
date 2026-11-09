@@ -111,6 +111,33 @@ class StageProfileTests(unittest.TestCase):
                 "ExactTranscripts",
             )
 
+    def test_solo_profile_reduces_complete_k3_rounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "k3.log"
+            values = [
+                record(
+                    "profile",
+                    200,
+                    {
+                        "mtp_draft": {"count": 3, "gpu_ns": 40},
+                        "mtp_catchup": {"count": 1, "gpu_ns": 10},
+                    },
+                    {
+                        "rollback": {"count": 1, "cpu_ns": 2},
+                        "host_gap": {"count": 1, "cpu_ns": 148},
+                    },
+                    width=1,
+                    route="solo_k3",
+                ),
+                record("profile", 50, {"head": {"count": 1, "gpu_ns": 20}},
+                       {"host_gap": {"count": 1, "cpu_ns": 30}}),
+            ]
+            path.write_text("".join(stage.PREFIX + json.dumps(value) + "\n" for value in values))
+            result = stage.analyze_solo_profile("qwen38", path)
+            self.assertEqual(result["attribution"]["rounds"], 1)
+            self.assertEqual(result["attribution"]["gpu_ns"]["mtp_draft"], 40)
+            self.assertEqual(result["attribution"]["cpu_ns"]["rollback"], 2)
+
     def test_transcript_mismatch_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

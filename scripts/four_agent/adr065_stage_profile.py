@@ -199,6 +199,25 @@ def analyze_pair(family, control_dir, profile_dir, reference_dir):
             "reference_summary_sha256": sha256(r_summary_path),
         },
     }
+def analyze_solo_profile(family, profile_log):
+    records = parse_records(profile_log)
+    record_family = "qwen35" if family == "qwen38" else family
+    solo = [
+        record for record in records
+        if record["mode"] == "profile"
+        and record["family"] == record_family
+        and record["route"] == "solo_k3"
+    ]
+    if not solo:
+        raise ValueError(f"{family}: no solo_k3 profile records in {profile_log}")
+    return {
+        "route": "solo_k3",
+        "width": 1,
+        "attribution": reduce_group(solo),
+        "profile_log_sha256": sha256(profile_log),
+    }
+
+
 
 
 def main(argv=None):
@@ -207,6 +226,10 @@ def main(argv=None):
         "--pair", action="append", nargs=4, metavar=("FAMILY", "CONTROL", "PROFILE", "REFERENCE"),
         required=True,
     )
+    parser.add_argument(
+        "--solo-profile", action="append", nargs=2, metavar=("FAMILY", "LOG"),
+        default=[],
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     report = {
@@ -214,6 +237,10 @@ def main(argv=None):
         "families": {
             family: analyze_pair(family, control, profile, reference)
             for family, control, profile, reference in args.pair
+        },
+        "solo_profiles": {
+            family: analyze_solo_profile(family, profile_log)
+            for family, profile_log in args.solo_profile
         },
         "decision_rule": "Unknown GPU time is reported and excluded from all stage decisions.",
     }
