@@ -21,7 +21,7 @@ use mlx_native::MlxBuffer;
 use tokenizers::Tokenizer;
 
 use crate::inference::models::qwen35::kv_cache::{
-    HybridKvCache, HybridKvCacheSnapshot, HybridKvSlotAnchor,
+    HybridKvCache, HybridKvCacheSnapshot, HybridKvSlotAnchor, LaRestoreRoute,
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::inference::spec_decode::cost_controller::SpeculationCostController;
@@ -987,7 +987,18 @@ impl Qwen35LoadedModel {
         // allocator reserves full-attention storage lazily, while scheduler
         // admission governs aggregate physical high-water use.
         let max_seq_len = self.model.cfg.max_position_embeddings;
-        let cache = HybridKvCache::new_with_options(
+        let restore_value = std::env::var_os("HF2Q_QWEN_LA_GPU_RESTORE");
+        let restore_value = restore_value
+            .as_deref()
+            .map(|value| {
+                value.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("HF2Q_QWEN_LA_GPU_RESTORE must be valid UTF-8")
+                })
+            })
+            .transpose()?;
+        let restore_route = LaRestoreRoute::resolve(restore_value, self.model.cfg.variant)
+            .context("resolve HF2Q_QWEN_LA_GPU_RESTORE")?;
+        let mut cache = HybridKvCache::new_with_options(
             &self.model.cfg,
             &device,
             max_seq_len,
@@ -1001,6 +1012,13 @@ impl Qwen35LoadedModel {
                 max_seq_len, max_slots, self.tq_kv_active
             )
         })?;
+        cache.set_la_restore_route(restore_route);
+        tracing::info!(
+            target: "hf2q::serve::api::engine_qwen35::progress",
+            la_restore = restore_route.label(),
+            variant = ?self.model.cfg.variant,
+            "Qwen DeltaNet capture restore policy"
+        );
         self.persistent_kv_cache = Some(cache);
         Ok(())
     }
@@ -5739,7 +5757,15 @@ impl Qwen35DecodeState {
                 kv_cache.truncate_mtp_to_for_slot(self.slot_id, committed_cursor)?;
             }
             if plan.valid_input_tokens < verify_rows {
-                kv_cache.rollback_la_to(self.slot_id, plan.carry_hidden_row as u32)?;
+                let lease = supervisor.arm(
+                    "Qwen35 history restore",
+                    QWEN35_WORKER_TRANSACTION_TIMEOUT,
+                )?;
+                let restored = kv_cache.rollback_la(
+                    self.slot_id,
+                    plan.carry_hidden_row as u32,
+                );
+                lease.finish().and(restored)?;
             }
             kv_cache.clear_la_capture();
             if prior_mtp_len.is_some() {
@@ -5845,7 +5871,7 @@ impl Qwen35DecodeState {
         let rows = self.k3_verify_solo(qwen, kv_cache, supervisor, &draft)?;
         let plan = self.k3_verify_to_plan(qwen, kv_cache, supervisor, draft, rows)?;
         let timing = plan.timing;
-        let commit = self.k3_commit_solo(qwen, kv_cache, plan)?;
+        let commit = self.k3_commit_solo(qwen, kv_cache, supervisor, plan)?;
         let equivalent_decisions = equivalent_target_decisions(
             &self.pending_speculation_output,
             self.terminal_after_pending,

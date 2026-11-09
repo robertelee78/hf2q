@@ -55,6 +55,8 @@ mod allocation_plan;
 #[cfg(test)]
 pub(crate) mod q1_capture_layout;
 mod slot_spill;
+mod la_restore;
+pub(crate) use la_restore::LaRestoreRoute;
 pub use slot_spill::HybridKvSlotSpill;
 use allocation_plan::{
     ensure_capture_with, CaptureAllocationPlan, CaptureRole, ExistingCapture, HybridCacheAllocationPlan,
@@ -128,9 +130,10 @@ pub struct LinearAttnStateSlot {
     /// runner routes `build_delta_net_layer` through
     /// `dispatch_gated_delta_net_decode_with_capture`, which writes
     /// per-position state into `capture_states` each token. On partial-
-    /// reject of K drafts, the runner copies
-    /// `capture_states[..., accepted_idx, ...]` → the slot's CURRENT
-    /// recurrent buffer (parity-aware, ADR-040 M-QWEN) via
+    /// reject of K drafts, a slot-aware worker restores
+    /// `capture_states[..., accepted_idx, ...]` into the slot's CURRENT
+    /// recurrent buffer (parity-aware, ADR-040 M-QWEN) through
+    /// [`HybridKvCache::rollback_la`]. Host-only callers use
     /// [`HybridKvCache::rollback_la_to`].
     ///
     /// Memory cost (Qwen 3.5/3.6 D_k=D_v=128, n_v_heads=8, n_seqs=1,
@@ -153,11 +156,11 @@ pub struct LinearAttnStateSlot {
     /// `Some(buf)` when [`HybridKvCache::ensure_la_capture`] has been
     /// called. The K=N spec runner routes `build_delta_net_layer`
     /// through the capture variant, which writes per-position conv state.
-    /// On partial-reject of K drafts, the runner copies
-    /// `conv_capture_states[..., accepted_idx, ...]` → the slot's CURRENT
-    /// conv buffer (parity-aware, ADR-040 M-QWEN) via
-    /// [`HybridKvCache::rollback_la_to`] — paired with the
-    /// recurrent capture rollback to fully restore DeltaNet state.
+    /// On partial-reject of K drafts, a slot-aware worker restores
+    /// `conv_capture_states[..., accepted_idx, ...]` into the slot's CURRENT
+    /// conv buffer through [`HybridKvCache::rollback_la`] — paired with the
+    /// recurrent capture rollback to fully restore DeltaNet state. Host-only
+    /// callers use [`HybridKvCache::rollback_la_to`].
     ///
     /// Memory cost (Qwen 3.5/3.6 conv_channels=8192, K-1=3, n_seqs=1,
     /// n_tokens_max=4): 384 KB per LA layer. ~12 MB total per forward
@@ -1122,6 +1125,12 @@ pub struct HybridKvCache {
     /// caller-supplied device — the TQ graft splice's encode pass — can
     /// do so; every buffer here is already on this device.
     pub device: MlxDevice,
+    /// Capture-to-state restore route. Constructors default to the host path;
+    /// only the SlotAware Qwen worker resolves the production override.
+    la_restore_route: LaRestoreRoute,
+    /// Lazily initialized because host restores and non-SlotAware caches never
+    /// compile or use the strided-copy pipeline.
+    la_restore_registry: Option<mlx_native::KernelRegistry>,
     /// Capture storage may remain allocated between agentic turns, but the
     /// capture kernels must run only while this flag is set. Keeping activity
     /// separate from allocation avoids re-creating hundreds of megabytes of
@@ -2065,6 +2074,8 @@ impl HybridKvCache {
             per_layer_slot,
             tq_kv_active,
             device: device.clone(),
+            la_restore_route: LaRestoreRoute::Host,
+            la_restore_registry: None,
             la_capture_active_tokens: None,
             graft_len: vec![0; n_seqs as usize],
         })

@@ -18,9 +18,10 @@ use super::super::{
     Qwen35VerifiedBlockPlan,
 };
 use super::{K3Draft, K3Entry, K3LaRestore, K3Plan, K3PlanTiming, K3_VERIFY_ROWS};
-use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+use crate::inference::models::qwen35::kv_cache::{HybridKvCache, LaRestoreRoute};
 use crate::inference::models::qwen35::Qwen35Config;
 use crate::serve::api::engine::SamplingParams;
+use crate::serve::api::engine_supervisor::EngineSupervisor;
 use crate::serve::api::qwen35_speculation::QwenSpeculationPolicy;
 use crate::serve::multi_seq_kv::{MultiSeqKvCache, SlotId};
 
@@ -392,6 +393,7 @@ fn solo_commit_validation_failure_clears_capture_resets_slot_and_installs_no_led
     kv.truncate_mtp_to_for_slot(SLOT, PRIOR)
         .expect("MTP behind the target");
     let mut state = decode_state(&qwen, &device);
+    let supervisor = EngineSupervisor::new();
     let generated = state.generated_tokens.clone();
     let hidden_before = verifier_hidden_bits(&state);
     let peers = peer_digests(&kv);
@@ -400,7 +402,7 @@ fn solo_commit_validation_failure_clears_capture_resets_slot_and_installs_no_led
         hidden_rows(&device, K3_VERIFY_ROWS, qwen.hidden_size),
     );
 
-    let error = match state.k3_commit_solo(&qwen, &mut kv, plan) {
+    let error = match state.k3_commit_solo(&qwen, &mut kv, &supervisor, plan) {
         Ok(_) => panic!("validation must fail with the MTP cursor behind"),
         Err(error) => format!("{error:#}"),
     };
@@ -430,13 +432,14 @@ fn solo_commit_carry_hidden_failure_resets_slot_after_settlement() {
     let cfg = cache_cfg(&qwen);
     let mut kv = verified_cache(&cfg, &device);
     let mut state = decode_state(&qwen, &device);
+    let supervisor = EngineSupervisor::new();
     let generated = state.generated_tokens.clone();
     let hidden_before = verifier_hidden_bits(&state);
     let peers = peer_digests(&kv);
     // One hidden row: the partial plan's carry row 1 is out of range.
     let plan = k3_plan(PARTIAL, hidden_rows(&device, 1, qwen.hidden_size));
 
-    let error = match state.k3_commit_solo(&qwen, &mut kv, plan) {
+    let error = match state.k3_commit_solo(&qwen, &mut kv, &supervisor, plan) {
         Ok(_) => panic!("carry hidden must fail with one verifier row"),
         Err(error) => format!("{error:#}"),
     };
@@ -475,6 +478,7 @@ fn unit_commit_sequence_matches_solo_commit_and_mutates_only_its_slot() {
         let mut unit_kv = verified_cache(&cfg, &device);
         let mut solo = decode_state(&qwen, &device);
         let mut unit = decode_state(&qwen, &device);
+        let supervisor = EngineSupervisor::new();
         let peers = peer_digests(&solo_kv);
         assert_eq!(peer_digests(&unit_kv), peers, "{name}: twin caches");
         let entry_state = digest(&solo_kv, SLOT);
@@ -496,7 +500,7 @@ fn unit_commit_sequence_matches_solo_commit_and_mutates_only_its_slot() {
             .collect();
 
         let solo_commit = solo
-            .k3_commit_solo(&qwen, &mut solo_kv, solo_plan)
+            .k3_commit_solo(&qwen, &mut solo_kv, &supervisor, solo_plan)
             .unwrap_or_else(|error| panic!("{name}: solo commit: {error:#}"));
         let owed = unit
             .k3_commit_cursors(&mut unit_kv, &unit_plan)
@@ -569,5 +573,50 @@ fn unit_commit_sequence_matches_solo_commit_and_mutates_only_its_slot() {
                 "{name}: carry hidden"
             );
         }
+    }
+}
+
+/// T-P4b-5: full, partial and zero acceptance through the production solo
+/// commit are byte-identical with the GPU restore switch on and off.
+#[test]
+fn gpu_restore_transaction_cases_match_host() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().expect("Metal device");
+    let qwen = loaded_model(QwenSpeculationPolicy::Auto);
+    let cfg = cache_cfg(&qwen);
+    let supervisor = EngineSupervisor::new();
+
+    for (name, decisions) in [("full", FULL), ("partial", PARTIAL), ("zero", ZERO)] {
+        let mut host_kv = verified_cache(&cfg, &device);
+        let mut gpu_kv = verified_cache(&cfg, &device);
+        gpu_kv.set_la_restore_route(LaRestoreRoute::Gpu);
+        let mut host = decode_state(&qwen, &device);
+        let mut gpu = decode_state(&qwen, &device);
+        let host_plan = k3_plan(
+            decisions,
+            hidden_rows(&device, K3_VERIFY_ROWS, qwen.hidden_size),
+        );
+        let gpu_plan = k3_plan(
+            decisions,
+            hidden_rows(&device, K3_VERIFY_ROWS, qwen.hidden_size),
+        );
+
+        let host_commit = host
+            .k3_commit_solo(&qwen, &mut host_kv, &supervisor, host_plan)
+            .unwrap_or_else(|error| panic!("{name}: host commit: {error:#}"));
+        let gpu_commit = gpu
+            .k3_commit_solo(&qwen, &mut gpu_kv, &supervisor, gpu_plan)
+            .unwrap_or_else(|error| panic!("{name}: GPU commit: {error:#}"));
+
+        assert_eq!(gpu_commit.committed, host_commit.committed, "{name}");
+        assert_eq!(digest(&gpu_kv, SLOT), digest(&host_kv, SLOT), "{name}");
+        assert_eq!(peer_digests(&gpu_kv), peer_digests(&host_kv), "{name}");
+        assert_eq!(
+            gpu.pending_speculation_output,
+            host.pending_speculation_output,
+            "{name}"
+        );
+        assert_eq!(gpu.terminal_after_pending, host.terminal_after_pending, "{name}");
+        assert_eq!(verifier_hidden_bits(&gpu), verifier_hidden_bits(&host), "{name}");
     }
 }
