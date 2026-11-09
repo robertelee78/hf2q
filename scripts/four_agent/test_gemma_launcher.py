@@ -12,7 +12,7 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "serve_gemma4_opencode.sh"
 
 
 class GemmaLauncher(unittest.TestCase):
-    def run_launcher(self, supports_budget: bool):
+    def run_launcher(self, supports_budget: bool, decode_dense: str | None = None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = root / "model.gguf"
@@ -27,6 +27,7 @@ class GemmaLauncher(unittest.TestCase):
                 "fi\n"
                 "printf '%s\\n' \"$@\" > \"$CAPTURE\"\n"
                 "printf '%s\\n' \"${HF2Q_GEMMA_FULL_INPUT_CHECKPOINT-}\" > \"$CAPTURE.env\"\n"
+                "printf '%s\\n' \"${HF2Q_GEMMA_DECODE_DENSE-}\" > \"$CAPTURE.dense\"\n"
             )
             binary.chmod(0o755)
             capture = root / "argv"
@@ -45,23 +46,36 @@ class GemmaLauncher(unittest.TestCase):
                 "MODEL": str(model),
                 "PORT": str(port),
             }
+            if decode_dense is not None:
+                env["DECODE_DENSE"] = decode_dense
             result = subprocess.run([str(LAUNCHER)], env=env, text=True, capture_output=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
-            return capture.read_text().splitlines(), (root / "argv.env").read_text().strip(), result.stderr
+            return (
+                capture.read_text().splitlines(),
+                (root / "argv.env").read_text().strip(),
+                (root / "argv.dense").read_text().strip(),
+                result.stderr,
+            )
 
     def test_versioned_budget_flag_and_environment_forwarding(self):
-        current, forwarded, current_stderr = self.run_launcher(True)
+        current, forwarded, dense, current_stderr = self.run_launcher(True)
         self.assertEqual(forwarded, "0")
+        self.assertEqual(dense, "")
         position = current.index("--lcp-resume-budget")
         self.assertEqual(current[position + 1], "8GiB")
         self.assertNotIn("predates --lcp-resume-budget", current_stderr)
 
-        previous, forwarded, previous_stderr = self.run_launcher(False)
+        previous, forwarded, dense, previous_stderr = self.run_launcher(False)
         self.assertEqual(forwarded, "0")
+        self.assertEqual(dense, "")
         self.assertNotIn("--lcp-resume-budget", previous)
         self.assertIn("predates --lcp-resume-budget", previous_stderr)
         self.assertIn("--kv-cache-budget", previous)
         self.assertIn("--default-repetition-penalty", previous)
+
+    def test_decode_dense_is_forwarded_only_when_explicit(self):
+        _, _, dense, _ = self.run_launcher(True, decode_dense="row_exact")
+        self.assertEqual(dense, "row_exact")
 
 
 if __name__ == "__main__":

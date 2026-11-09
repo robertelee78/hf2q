@@ -126,6 +126,10 @@
 #                                    the stock decode attention. 4 is the
 #                                    gap-program NE head split of d256
 #                                    decode attention (Class B A/B arm).
+#     DECODE_DENSE=stock|row_exact|mma
+#                                    (this script) forwards
+#                                    HF2Q_GEMMA_DECODE_DENSE; unset keeps the
+#                                    stock decode dense route.
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):
 #   * Disk persistence of the LCP registry for gemma (ADR-017 spiller
@@ -307,6 +311,15 @@ case "${DECODE_ATTN_NE:-}" in
         exit 2
         ;;
 esac
+DECODE_DENSE_ENV=""
+case "${DECODE_DENSE:-}" in
+    "") ;;
+    stock|row_exact|mma) DECODE_DENSE_ENV="$DECODE_DENSE" ;;
+    *)
+        echo "DECODE_DENSE must be stock, row_exact, mma or unset" >&2
+        exit 2
+        ;;
+esac
 
 # Build argv through positional parameters. This is safe on macOS bash 3.2
 # when the optional projector or versioned LCP budget flag is absent.
@@ -339,5 +352,6 @@ exec env \
     ${Q5_0_TENSOR_MM_ENV:+HF2Q_Q5_0_TENSOR_MM="$Q5_0_TENSOR_MM_ENV"} \
     ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
     ${DECODE_ATTN_NE_ENV:+HF2Q_GEMMA_DECODE_ATTN_NE="$DECODE_ATTN_NE_ENV"} \
+    ${DECODE_DENSE_ENV:+HF2Q_GEMMA_DECODE_DENSE="$DECODE_DENSE_ENV"} \
     ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
     "$HF2Q_BIN" -v serve "$@"
