@@ -223,7 +223,8 @@ impl MtpWeights {
             device,
             registry,
             &mut output,
-            #[cfg(test)] None,
+            #[cfg(test)]
+            None,
         )
         .context("MTP dedicated native embedding gather")?;
         Ok(output)
@@ -405,7 +406,14 @@ impl MtpWeights {
         }
         let pos_buf = upload_i32(&positions, device).context("MTP upload batched positions")?;
         let rows_u32 = u32::try_from(rows).context("MTP batched draft rows exceed u32")?;
-        let projected = self.project_embedding_and_hidden(&embed, &prev, rows_u32, device, registry)?;
+        let projected = self.project_embedding_and_hidden(
+            &embed,
+            &prev,
+            rows_u32,
+            device,
+            registry,
+            "adr065.mtp_draft",
+        )?;
         let slots = lanes.iter().map(|lane| lane.slot_id).collect::<Vec<_>>();
         let attn_out = self.forward_full_attention_rows(
             &projected, &pos_buf, kv_cache, &slots, device, registry, cfg,
@@ -443,8 +451,11 @@ impl MtpWeights {
         let h = self.hidden_size;
         let rows = slots.len();
         let rows_u32 = rows as u32;
-        let (n_heads, n_kv_heads, head_dim) =
-            (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
+        let (n_heads, n_kv_heads, head_dim) = (
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        );
         ensure!(
             head_dim % 32 == 0,
             "MTP batched draft attention requires head_dim % 32 == 0, got {head_dim}"
@@ -475,7 +486,15 @@ impl MtpWeights {
         let (q_flat, gate_flat) = match &attn.q_gate {
             MtpQGateWeightsGpu::Ungated { wq, wq_ggml_type } => (
                 apply_linear_projection_f32_with_ggml_type(
-                    &mut enc, registry, device, &x_norm, wq, *wq_ggml_type, rows_u32, h, q_total,
+                    &mut enc,
+                    registry,
+                    device,
+                    &x_norm,
+                    wq,
+                    *wq_ggml_type,
+                    rows_u32,
+                    h,
+                    q_total,
                 )?,
                 None,
             ),
@@ -717,7 +736,10 @@ impl MtpWeights {
         )?;
         if mtp_substep_profile {
             // Force GPU sync to measure sub-step time accurately.
-            let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("MTP profile sync 1")?;
+            let mut enc = device
+                .command_encoder()
+                .map(crate::inference::native_observation::encoder)
+                .context("MTP profile sync 1")?;
             enc.commit_and_wait().ok();
         }
         let t_proj = t0.elapsed().as_secs_f64() * 1000.0;
@@ -727,7 +749,10 @@ impl MtpWeights {
             &projected, &pos_buf, kv_cache, slot_id, 1, device, registry, cfg,
         )?;
         if mtp_substep_profile {
-            let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("MTP profile sync 2")?;
+            let mut enc = device
+                .command_encoder()
+                .map(crate::inference::native_observation::encoder)
+                .context("MTP profile sync 2")?;
             enc.commit_and_wait().ok();
         }
         let t_attn = t1.elapsed().as_secs_f64() * 1000.0;
@@ -735,7 +760,10 @@ impl MtpWeights {
         let t2 = std::time::Instant::now();
         let hidden = self.forward_ffn_residual(&projected, &attn_out, device, registry, cfg)?;
         if mtp_substep_profile {
-            let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("MTP profile sync 3")?;
+            let mut enc = device
+                .command_encoder()
+                .map(crate::inference::native_observation::encoder)
+                .context("MTP profile sync 3")?;
             enc.commit_and_wait().ok();
         }
         let t_ffn = t2.elapsed().as_secs_f64() * 1000.0;
@@ -836,7 +864,8 @@ impl MtpWeights {
             .map_err(|e| anyhow!("MTP alloc shifted target nextn: {e}"))?;
         let plan = shifted_nextn_copy_plan(seq_len, hidden_size, pending_target_hidden.is_some())?;
         let mut enc = device
-            .command_encoder().map(crate::inference::native_observation::encoder)
+            .command_encoder()
+            .map(crate::inference::native_observation::encoder)
             .context("MTP enc shifted target nextn")?;
         if let (Some(pending), Some(copy)) = (pending_target_hidden, plan.pending) {
             dispatch_copy_f32(
@@ -901,7 +930,8 @@ impl MtpWeights {
         // before its temporary buffers drop; the MTP cursor and valid prefix
         // are transactional on return.
         let mut drain = device
-            .command_encoder().map(crate::inference::native_observation::encoder)
+            .command_encoder()
+            .map(crate::inference::native_observation::encoder)
             .context("MTP target-batch cache drain")?;
         drain
             .commit_and_wait_labeled("mtp.process_target_batch")
@@ -926,7 +956,8 @@ impl MtpWeights {
         let attn = &self.attn;
         let (k_rope, v_flat) = {
             let mut enc = device
-                .command_encoder().map(crate::inference::native_observation::encoder)
+                .command_encoder()
+                .map(crate::inference::native_observation::encoder)
                 .context("MTP enc KV-only projections")?;
             let x_norm = rms_norm_with_weight(
                 &mut enc,
@@ -1026,7 +1057,10 @@ impl MtpWeights {
         profile_label: &'static str,
     ) -> Result<MlxBuffer> {
         let h = self.hidden_size;
-        let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("MTP enc eh_proj")?;
+        let mut enc = device
+            .command_encoder()
+            .map(crate::inference::native_observation::encoder)
+            .context("MTP enc eh_proj")?;
         let embed_norm = rms_norm_with_weight(
             &mut enc,
             registry,
@@ -1118,7 +1152,10 @@ impl MtpWeights {
         let attn = &self.attn;
 
         let (q_rope, k_rope, v_flat, gate_flat) = {
-            let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("MTP enc attn qkv")?;
+            let mut enc = device
+                .command_encoder()
+                .map(crate::inference::native_observation::encoder)
+                .context("MTP enc attn qkv")?;
             let x_norm = rms_norm_with_weight(
                 &mut enc,
                 registry,
@@ -1262,7 +1299,10 @@ impl MtpWeights {
         )
         .context("MTP SDPA")?;
 
-        let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("MTP enc attn output")?;
+        let mut enc = device
+            .command_encoder()
+            .map(crate::inference::native_observation::encoder)
+            .context("MTP enc attn output")?;
         let gated_or_attn = if let Some(gate) = gate_flat.as_ref() {
             let gated = apply_sigmoid_gate_multiply(
                 &mut enc,
@@ -1325,7 +1365,10 @@ impl MtpWeights {
         let ffn_residual = device
             .alloc_buffer(rows * hs * 4, DType::F32, vec![rows, hs])
             .map_err(|e| anyhow!("MTP alloc ffn_residual: {e}"))?;
-        let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("MTP enc residual norm")?;
+        let mut enc = device
+            .command_encoder()
+            .map(crate::inference::native_observation::encoder)
+            .context("MTP enc residual norm")?;
         dispatch_fused_residual_norm_f32(
             &mut enc,
             registry,
@@ -1383,7 +1426,10 @@ impl MtpWeights {
                 // The legacy wrapper `build_moe_ffn_layer_gpu_q` hardcodes
                 // `layer_idx=0` (gpu_ffn.rs:2263); using it from production
                 // would silently mis-tag MTP expert records.
-                let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("MTP enc moe_ffn_q")?;
+                let mut enc = device
+                    .command_encoder()
+                    .map(crate::inference::native_observation::encoder)
+                    .context("MTP enc moe_ffn_q")?;
                 let out = if rows == 1 {
                     build_moe_ffn_layer_gpu_q_into(
                         &mut enc,
@@ -1463,7 +1509,10 @@ impl MtpWeights {
         // command buffer with a memory_barrier between RAW dependents.
         // Saves ~1ms per draft step on Apple Metal at decode shape.
         let h = self.hidden_size;
-        let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("MTP enc shared head")?;
+        let mut enc = device
+            .command_encoder()
+            .map(crate::inference::native_observation::encoder)
+            .context("MTP enc shared head")?;
         let normed = rms_norm_with_weight(
             &mut enc,
             registry,
@@ -1519,7 +1568,8 @@ impl MtpWeights {
         let rows = hidden.element_count() / hs;
         let vocab = self.vocab_size as usize;
         let mut enc = device
-            .command_encoder().map(crate::inference::native_observation::encoder)
+            .command_encoder()
+            .map(crate::inference::native_observation::encoder)
             .context("MTP enc fused shared head argmax")?;
         let normed = rms_norm_with_weight(
             &mut enc,

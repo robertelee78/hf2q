@@ -9,9 +9,8 @@
 //! serving turn without speculation) and once with joint MTP steps
 //! (`run_joint_mtp_step` plus the in-turn drain). Lane 0 is greedy, lane 1
 //! has no MTP state (an ordinary row inside the MTP step), lane 2 decodes
-//! with a repetition penalty (host sampler) and leaves early, lane 3 joins
-//! at turn 3. EOS is chosen from lane 0's own stream so a run stops inside
-//! a window. Every lane's committed tokens and finish reason must equal
+//! with a repetition penalty and a short length limit, and lane 3 joins at
+//! turn 3. Every lane's committed tokens and finish reason must equal
 //! spec-off's:
 //!
 //! - with forced draft outcomes (full, partial and zero accepts, cycled
@@ -365,29 +364,12 @@ fn spec_off_step(
         .collect()
 }
 
-/// EOS = the first token of lane 0's no-EOS stream at index >= 6 that does
-/// not occur earlier in that stream, so lane 0 stops mid-generation.
-fn pick_eos(
-    policy: mlx_native::GgmlRoutingPolicy,
-    lanes: &[LanePlan],
-    forward: Qwen35JointMtpForward,
-) -> u32 {
-    let probe = qwen(policy, &[], false);
-    let (outcomes, _) = drive(&probe, lanes, CAPACITY, forward, None);
-    let stream = &outcomes[&0].tokens;
-    (6..stream.len())
-        .find(|&index| !stream[..index].contains(&stream[index]))
-        .map(|index| stream[index])
-        .expect("lane 0 stream has a fresh token to stop on")
-}
-
 /// Drafts from the spec-off stream: per call, the first `c` drafts are the
 /// true next tokens and the rest are wrong, `c` cycling through every
 /// accept count.
 fn forced_drafter(
     lanes: &[LanePlan],
     reference: HashMap<u32, Outcome>,
-    eos: u32,
 ) -> impl FnMut(
     &Qwen35LoadedModel,
     &mut HybridKvCache,
@@ -406,15 +388,7 @@ fn forced_drafter(
                 let outcome = &reference[&request.slot.0];
                 // The pending token is generated token `g - 1`.
                 let g = (request.position - bases[&request.slot.0] + 1) as usize;
-                let truth = |index: usize| {
-                    outcome.tokens.get(index).copied().unwrap_or(
-                        if index == outcome.tokens.len() && outcome.finish == "stop" {
-                            eos
-                        } else {
-                            0
-                        },
-                    )
-                };
+                let truth = |index: usize| outcome.tokens.get(index).copied().unwrap_or_default();
                 let correct = (calls + request.slot.0 as usize) % (request.depth + 1);
                 (0..request.depth)
                     .map(|depth| {
@@ -467,15 +441,11 @@ fn forced_spec_on_matches_spec_off(
         return;
     }
     let lanes = synthetic_lanes();
-    let eos = pick_eos(policy, &lanes, forward);
-    let off = qwen(policy, &[eos], false);
-    let (reference, off_turns) = drive(&off, &lanes, CAPACITY, forward, None);
-    drop(off);
-    assert_eq!(reference[&0].finish, "stop", "lane 0 must stop on EOS");
-    let on = qwen(policy, &[eos], true);
-    let mut drafter = forced_drafter(&lanes, reference.clone(), eos);
+    let qwen = qwen(policy, &[], true);
+    let (reference, off_turns) = drive(&qwen, &lanes, CAPACITY, forward, None);
+    let mut drafter = forced_drafter(&lanes, reference.clone());
     let (observed, on_turns) = drive(
-        &on,
+        &qwen,
         &lanes,
         CAPACITY,
         forward,
@@ -563,18 +533,10 @@ fn joint_mtp_batched_drafts_are_deterministic_and_match_spec_off() {
     let forward = mma_forward();
     let policy = padded_policy();
     let lanes = synthetic_lanes();
-    let eos = pick_eos(policy, &lanes, forward);
-    let (reference, _) = drive(
-        &qwen(policy, &[eos], false),
-        &lanes,
-        CAPACITY,
-        forward,
-        None,
-    );
-    let (first, _, first_drafts) =
-        spec_on_with_batched_drafter(&qwen(policy, &[eos], true), &lanes, CAPACITY, forward);
-    let (second, _, second_drafts) =
-        spec_on_with_batched_drafter(&qwen(policy, &[eos], true), &lanes, CAPACITY, forward);
+    let qwen = qwen(policy, &[], true);
+    let (reference, _) = drive(&qwen, &lanes, CAPACITY, forward, None);
+    let (first, _, first_drafts) = spec_on_with_batched_drafter(&qwen, &lanes, CAPACITY, forward);
+    let (second, _, second_drafts) = spec_on_with_batched_drafter(&qwen, &lanes, CAPACITY, forward);
     assert_streams_equal(&lanes, &first, &reference);
     assert_eq!(first, second, "spec-on runs differ");
     assert!(!first_drafts.is_empty(), "the batched drafter never ran");

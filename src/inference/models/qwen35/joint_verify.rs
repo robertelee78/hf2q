@@ -8,11 +8,10 @@
 //! so every op a row sees is the op the spec-off joint step runs for the
 //! same slot at the same position:
 //!
-//! - packed products at the verify width ([`joint_verify_padded_width`]),
-//!   which keeps the spec-off kernel per row (column-invariant MMA at any
-//!   `m <= 8`, the `mul_mv_ext` width-4 tile at `m` = 4 and 8, the one-row
-//!   dispatch on per-row routes); the output head runs inside the same
-//!   width, the canonical spec-off kernel;
+//! - packed products at the verify width: column-invariant MMA uses the
+//!   exact real-row count at `m <= 8`; canonical products use
+//!   [`joint_verify_padded_width`]. The output head stays inside that width,
+//!   preserving the spec-off kernel for every row;
 //! - DeltaNet: one `ssm_conv` and one gated delta net dispatch per lane
 //!   with `n_tokens` = the window's rows, reading the current parity and
 //!   writing the opposite one (bitwise the sequential one-token steps);
@@ -41,8 +40,10 @@ use crate::inference::models::qwen35::joint_decode_core::{
     encode_delta_net_replay, rows_view, DeltaNetReplay, JointWindow,
 };
 use crate::inference::models::qwen35::joint_decode_routes::{
-    joint_verify_padded_width, JointDenseFfnRoute, JointRouteMode, MAX_JOINT_VERIFY_ROWS,
+    joint_verify_padded_width, JointDenseFfnRoute, JointRouteMode, MAX_JOINT_DECODE_ROWS,
+    MAX_JOINT_VERIFY_ROWS,
 };
+use crate::inference::models::qwen35::joint_projection::JointProjectionKernel;
 use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
 use crate::inference::models::qwen35::model::Qwen35Model;
@@ -177,10 +178,20 @@ impl Qwen35Model {
             }
         }
         self.check_joint_step_admission(kv_cache, mode, dense_ffn, options)?;
+        let width = if options.projection == JointProjectionKernel::ColumnInvariantMma {
+            ensure!(
+                total <= MAX_JOINT_DECODE_ROWS,
+                "Qwen joint verify column-invariant MMA supports at most \
+                 {MAX_JOINT_DECODE_ROWS} rows, got {total}"
+            );
+            total
+        } else {
+            joint_verify_padded_width(mode, total)
+        };
         let packing = super::joint_decode::JointPacking {
             rows: &rows,
             windows: &windows,
-            width: joint_verify_padded_width(mode, total),
+            width,
         };
         let linear_layers = kv_cache.linear_attn.len();
         let (outputs, normed, replay) = self.with_joint_forward(

@@ -140,15 +140,15 @@ pub(crate) fn joint_mode_max_rows(mode: JointRouteMode, requested: usize) -> usi
     }
 }
 
-/// Packed width of a diagnostic joint-MTP verify step with `rows` real rows
-/// (the lane windows, `1..=`[`MAX_JOINT_VERIFY_ROWS`]). Exact steps pack only
-/// real rows. The padded mode uses the production width-four tile for a
-/// 4×1 round and a full width-sixteen pack for larger prototype rounds. The
-/// latter is diagnostic-only and has no serving caller.
+/// Packed width of a joint-MTP verify step with `rows` real rows (the lane
+/// windows, `1..=`[`MAX_JOINT_VERIFY_ROWS`]). Exact steps pack only real
+/// rows. The padded mode uses the smallest proven tile that covers the
+/// step: width four, width eight, or the diagnostic-only width sixteen.
 pub(crate) fn joint_verify_padded_width(mode: JointRouteMode, rows: usize) -> usize {
     match mode {
         JointRouteMode::Exact => rows,
         JointRouteMode::PaddedMvExt if rows <= PADDED_MV_EXT_WIDTH => PADDED_MV_EXT_WIDTH,
+        JointRouteMode::PaddedMvExt if rows <= MAX_JOINT_DECODE_ROWS => MAX_JOINT_DECODE_ROWS,
         JointRouteMode::PaddedMvExt => MAX_JOINT_VERIFY_ROWS,
     }
 }
@@ -324,7 +324,14 @@ mod tests {
             assert_eq!(joint_verify_padded_width(JointRouteMode::Exact, rows), rows);
             let padded = joint_verify_padded_width(JointRouteMode::PaddedMvExt, rows);
             assert!(padded >= rows);
-            assert_eq!(padded, if rows <= 4 { 4 } else { 16 });
+            let expected = if rows <= 4 {
+                4
+            } else if rows <= 8 {
+                8
+            } else {
+                16
+            };
+            assert_eq!(padded, expected);
         }
     }
 

@@ -13,14 +13,16 @@
 
 use std::sync::Once;
 
-use crate::serve::api::engine_qwen35::{run_joint_mtp_step, Qwen35JointMtpForward};
+use crate::serve::api::engine_qwen35::{
+    anchor_store::Qwen35AnchorStore, run_joint_mtp_step, Qwen35JointMtpForward,
+};
 use crate::serve::api::registry::ModelRegistration;
 
 use super::{
     is_fatal_command_buffer_error, reinstall_lanes, settle_qwen35_decode_lane, take_joint_lanes,
     EngineSupervisor, InflightBatchedScheduler, PromptCache, Qwen35FatalFailure, Qwen35FatalReply,
-    Qwen35JointDecodeConfig, Qwen35KvGuard, Qwen35PromptAnchor, Qwen35RetainedPrefix, Qwen35Slot,
-    Qwen35SlotWork, Qwen35WorkerFatalKind, SlotHandle,
+    Qwen35JointDecodeConfig, Qwen35KvGuard, Qwen35RetainedPrefix, Qwen35Slot, Qwen35SlotWork,
+    Qwen35WorkerFatalKind, SlotHandle,
 };
 
 /// One joint MTP step over `group`, then settle and drain every lane.
@@ -31,7 +33,7 @@ pub(super) fn run_qwen35_joint_mtp_group(
     slots: &mut [Option<Qwen35Slot>],
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     registration: Option<&ModelRegistration>,
     group: Vec<SlotHandle>,
     serial_lanes: usize,
