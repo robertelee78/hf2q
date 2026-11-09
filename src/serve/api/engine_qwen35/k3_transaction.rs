@@ -413,6 +413,7 @@ impl Qwen35DecodeState {
 
         #[cfg(test)]
         q1_speculation::verified_buffers(next_pos, &verify_logits, &verify_hidden)?;
+        let readback = crate::inference::stage_profile::CpuSpan::begin("logit_readback");
         let verify_logits = match verify_logits.as_mut_slice::<f32>() {
             Ok(logits) => logits,
             Err(error) => {
@@ -423,6 +424,9 @@ impl Qwen35DecodeState {
                 return Err(anyhow::anyhow!("{error}").context("Qwen SlotAware MTP K3 logits view"));
             }
         };
+        drop(readback);
+        let host_selection =
+            crate::inference::stage_profile::CpuSpan::begin("host_selection");
         let semantic_started = Instant::now();
         let mut semantic = Qwen35SpecSemanticState::from_decode(self);
         let plan = match plan_qwen35_verified_block(&draft.drafts, |row| {
@@ -446,6 +450,7 @@ impl Qwen35DecodeState {
             }
         };
         let semantic_elapsed = semantic_started.elapsed();
+        drop(host_selection);
 
         Ok(K3Plan::new(
             draft,
@@ -553,7 +558,12 @@ impl Qwen35DecodeState {
         let state_started = Instant::now();
         let mut rollback_elapsed = Duration::ZERO;
         let state_result = (|| -> Result<()> {
-            if let Some(restore) = self.k3_commit_cursors(kv_cache, &plan)? {
+            let restore = {
+                let _rollback_cpu =
+                    crate::inference::stage_profile::CpuSpan::begin("rollback");
+                self.k3_commit_cursors(kv_cache, &plan)?
+            };
+            if let Some(restore) = restore {
                 let rollback_started = Instant::now();
                 let lease = supervisor.arm(
                     "Qwen35 SlotAware MTP K3 restore",

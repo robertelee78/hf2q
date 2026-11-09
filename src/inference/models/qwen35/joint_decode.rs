@@ -381,6 +381,8 @@ impl Qwen35Model {
         dense_ffn: JointDenseFfnRoute,
         options: JointStepOptions,
     ) -> Result<Vec<Qwen35JointRowOutput>> {
+        let arena_setup =
+            crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
         let cfg = &self.cfg;
         let hidden_size = cfg.hidden_size;
         let h = hidden_size as usize;
@@ -430,6 +432,7 @@ impl Qwen35Model {
         )
         .context("Qwen joint embedding gather")?;
 
+        drop(arena_setup);
         let chain_n = joint_chain_n(cfg, layer_weights);
         let n_layers = layer_weights.len();
         ensure!(
@@ -624,6 +627,8 @@ impl Qwen35Model {
                     bail!("Qwen joint layer {layer_idx} has no admitted FFN arm")
                 }
             };
+            crate::inference::stage_profile::boundary(enc, "adr065.ffn_moe")
+                .with_context(|| format!("profile Qwen joint FFN layer {layer_idx}"))?;
             if closes_chain(layer_idx, chain_n, n_layers) {
                 chain
                     .take()
@@ -732,14 +737,21 @@ impl Qwen35Model {
             .with_context(|| format!("Qwen joint argmax row {row}"))?;
             argmax.push(Some((index, value)));
         }
-        enc.commit_and_wait_labeled("qwen35.joint_decode.output_head")
+        let head_label = if crate::inference::stage_profile::enabled() {
+            "adr065.head"
+        } else {
+            "qwen35.joint_decode.output_head"
+        };
+        enc.commit_and_wait_labeled(head_label)
             .map_err(|e| anyhow!("Qwen joint decode command buffer: {e}"))?;
         drop(retained);
 
+        let readback = crate::inference::stage_profile::CpuSpan::begin("logit_readback");
         let all_logits = logits
             .as_slice::<f32>()
             .map_err(|e| anyhow!("read Qwen joint logits: {e}"))?;
-        rows.iter()
+        let outputs = rows
+            .iter()
             .enumerate()
             .zip(argmax)
             .map(|((row, input), argmax)| -> Result<Qwen35JointRowOutput> {
@@ -762,7 +774,9 @@ impl Qwen35Model {
                     nextn_hidden,
                 })
             })
-            .collect()
+            .collect();
+        drop(readback);
+        outputs
     }
 }
 

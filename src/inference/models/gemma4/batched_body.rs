@@ -226,13 +226,35 @@ pub(crate) mod catsplit {
         DenseV = 4,
         DenseO = 5,
         AttnPre = 6,
-        AttnFlash = 7,
-        DenseFfn = 8,
-        MoeGateUp = 9,
-        MoeDown = 10,
-        MoeOther = 11,
+        KvWrite = 7,
+        AttnFlash = 8,
+        AttnUnknown = 9,
+        DenseFfn = 10,
+        MoeGateUp = 11,
+        MoeDown = 12,
+        MoeOther = 13,
     }
-    pub const LEN: usize = 12;
+
+    impl Cat {
+        pub fn stage_label(self) -> &'static str {
+            match self {
+                Self::Embed
+                | Self::RmsNorm
+                | Self::DenseQ
+                | Self::DenseK
+                | Self::DenseV
+                | Self::DenseO
+                | Self::AttnPre => "adr065.projections",
+                Self::KvWrite => "adr065.kv_write",
+                Self::AttnFlash => "adr065.attention",
+                Self::AttnUnknown => "adr065.unknown",
+                Self::DenseFfn | Self::MoeGateUp | Self::MoeDown | Self::MoeOther => {
+                    "adr065.ffn_moe"
+                }
+            }
+        }
+    }
+    pub const LEN: usize = 14;
     // Consumed only by the engine.rs bench/profiling tests (cfg(test));
     // dead in the production bin build by design.
     #[allow(dead_code)]
@@ -244,7 +266,9 @@ pub(crate) mod catsplit {
         "dense_v_proj",
         "dense_o_proj",
         "attn_pre(qkv_norm_rope+vnorm+fwht)",
-        "attention(kv_enc+flash)",
+        "kv_write",
+        "attention(flash+fwht_undo)",
+        "unknown(kv_write+attention)",
         "dense_ffn(gate+up+down+router)",
         "moe_gate_up(mv_id)",
         "moe_down(mv_id)",
@@ -258,6 +282,7 @@ pub(crate) mod catsplit {
                 AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
                 AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
                 AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0),
             ];)*
         };
     }
@@ -266,8 +291,10 @@ pub(crate) mod catsplit {
     /// Running dispatch_count() at the last boundary, for per-category deltas.
     static LAST_DISP: AtomicU64 = AtomicU64::new(0);
 
-    pub static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("HF2Q_DECODE_CATSPLIT").as_deref() == Ok("1"));
+    pub static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("HF2Q_DECODE_CATSPLIT").as_deref() == Ok("1")
+            || crate::inference::stage_profile::enabled()
+    });
 
     /// Add `ns` GPU-busy time (and one CB) to category `c`, plus the
     /// dispatch_count() delta since the previous boundary (the dispatches just
@@ -432,6 +459,9 @@ fn cat_boundary<'a>(
         .finish_with_gpu_time()
         .map_err(|e| anyhow::anyhow!("catsplit finish: {e}"))?;
     catsplit::add(c, ns);
+    if crate::inference::stage_profile::enabled() {
+        mlx_native::kernel_profile::record(c.stage_label(), ns);
+    }
     Ok(())
 }
 
@@ -860,6 +890,7 @@ impl MlxModelWeights {
         // skeleton, byte-packed 5/6/8-bit TQ-HB K+V (mlx-native
         // `flash_attn_vec_tq_hb_batched`, ADR-040 M-SPEED-LC Stage 1) instead
         // of hybrid's F16-K + TQ-HB-V.
+        let mut kv_split = false;
         match regime {
             BatchedKvRegime::Hybrid(multi_seq_kv_hybrid) => {
                 // ADR-040 M4 — OPT-IN batched multi-seq flash (HF2Q_BATCHED_FLASH=1):
@@ -1039,6 +1070,8 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("bf FWHT-V L{layer_idx} s{i}: {e}"))?;
                         }
                     }
+                    cat_boundary(session, exec, catsplit::Cat::KvWrite)?;
+                    kv_split = true;
                     // PHASE 2 — ONE batched flash over all N queries (per-query KV via
                     // slot_id_buf + positions_buf, derived in-kernel).
                     let p_hyb = mlx_native::ops::flash_attn_vec_hybrid::FlashAttnVecTqHbParams {
@@ -1585,6 +1618,8 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("tq HB-V L{layer_idx} s{i}: {e}"))?;
                         }
                     }
+                    cat_boundary(session, exec, catsplit::Cat::KvWrite)?;
+                    kv_split = true;
                     // PHASE 2 — ONE `flash_attn_vec_tq_hb_batched` dispatch over all N
                     // queries. The dispatcher OWNS undo semantics (fused reduce+undo at
                     // nwg>1 / standalone fwht_sign_undo at nwg==1 — mlx-native
@@ -1806,9 +1841,17 @@ impl MlxModelWeights {
             } // end BatchedKvRegime::FullTq
         }
 
-        // catsplit: KV-encode + flash attention + FWHT-undo (the whole
-        // per-slot/batched attention block above, either regime).
-        cat_boundary(session, exec, catsplit::Cat::AttnFlash)?;
+        // Batched same-bucket routes separate KV writes from attention. The
+        // per-slot fallback interleaves them and therefore remains Unknown.
+        cat_boundary(
+            session,
+            exec,
+            if kv_split {
+                catsplit::Cat::AttnFlash
+            } else {
+                catsplit::Cat::AttnUnknown
+            },
+        )?;
         #[cfg(test)]
         crate::adr063_invariance::gemma_stage::capture_batched(
             session, exec, layer_idx, slot_ids, seq_positions, &[

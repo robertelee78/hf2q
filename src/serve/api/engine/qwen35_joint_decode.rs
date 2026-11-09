@@ -508,6 +508,8 @@ fn run_qwen35_joint_group(
         }
     }
 
+    let _stage_round =
+        crate::inference::stage_profile::Round::begin("qwen35", "joint", lanes.len());
     let _critical_path_span = if critical_path::enabled() {
         critical_path::Span::decode(
             "joint",

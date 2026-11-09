@@ -327,6 +327,8 @@ pub(super) fn encode_window_layer(
         steps,
         inputs.kv_rope,
     )?;
+    crate::inference::stage_profile::boundary(session.encoder_mut(), "adr065.kv_write")
+        .context("profile DeepSeek-V4 window KV write")?;
     plan.encode_attention(session, registry, device, cfg, layer_caches, sinks, inputs)
 }
 
@@ -930,6 +932,8 @@ impl JointCompressedLayer {
                 inputs,
             )?;
         }
+        crate::inference::stage_profile::boundary(session.encoder_mut(), "adr065.kv_write")
+            .context("profile DeepSeek-V4 compressed cache writes")?;
         self.encode_attention(
             session,
             registry,

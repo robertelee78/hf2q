@@ -391,8 +391,14 @@ impl MtpWeights {
         let pos_buf = upload_i32(position_ids, device).context("MTP upload positions")?;
 
         let t0 = std::time::Instant::now();
-        let projected =
-            self.project_embedding_and_hidden(embed_t, prev_hidden, 1, device, registry)?;
+        let projected = self.project_embedding_and_hidden(
+            embed_t,
+            prev_hidden,
+            1,
+            device,
+            registry,
+            "adr065.mtp_draft",
+        )?;
         if mtp_substep_profile {
             // Force GPU sync to measure sub-step time accurately.
             let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("MTP profile sync 1")?;
@@ -542,7 +548,12 @@ impl MtpWeights {
             )
             .context("MTP shift target nextn prefix")?;
         }
-        enc.commit();
+        if crate::inference::stage_profile::enabled() {
+            enc.commit_and_wait_labeled("adr065.mtp_catchup.shifted_copy")
+                .context("profile MTP shifted target copy")?;
+        } else {
+            enc.commit();
+        }
         // Release the submitted copy now: the native observer retains a
         // command for its checked drain only once the encoder drops, so an
         // encoder held past the drain below stays unchecked until some later
@@ -557,6 +568,7 @@ impl MtpWeights {
             seq_len_u32,
             device,
             registry,
+            "adr065.mtp_catchup",
         )?;
         self.append_attention_kv(
             &projected,
@@ -659,7 +671,12 @@ impl MtpWeights {
                 cfg.rope_theta as f32,
                 cfg.mrope_section,
             )?;
-            enc.commit_labeled("mtp.kv_only_projections");
+            if crate::inference::stage_profile::enabled() {
+                enc.commit_and_wait_labeled("adr065.mtp_catchup.kv_projections")
+                    .context("profile MTP catch-up KV projections")?;
+            } else {
+                enc.commit_labeled("mtp.kv_only_projections");
+            }
             (k_rope, v_flat)
         };
 
@@ -690,6 +707,7 @@ impl MtpWeights {
         seq_len: u32,
         device: &MlxDevice,
         registry: &mut KernelRegistry,
+        profile_label: &'static str,
     ) -> Result<MlxBuffer> {
         let h = self.hidden_size;
         let mut enc = device.command_encoder().map(crate::inference::native_observation::encoder).context("MTP enc eh_proj")?;
@@ -758,7 +776,12 @@ impl MtpWeights {
             2 * h,
             h,
         )?;
-        enc.commit();
+        if crate::inference::stage_profile::enabled() {
+            enc.commit_and_wait_labeled(profile_label)
+                .context("profile MTP embedding and hidden projection")?;
+        } else {
+            enc.commit();
+        }
         Ok(out)
     }
 
@@ -893,7 +916,12 @@ impl MtpWeights {
                 cfg.rope_theta as f32,
                 cfg.mrope_section,
             )?;
-            enc.commit();
+            if crate::inference::stage_profile::enabled() {
+                enc.commit_and_wait_labeled("adr065.mtp_draft.attention_projections")
+                    .context("profile MTP draft attention projections")?;
+            } else {
+                enc.commit();
+            }
             (q_rope, k_rope, v_flat, gate_flat)
         };
 
@@ -948,7 +976,12 @@ impl MtpWeights {
             q_total,
             h,
         )?;
-        enc.commit();
+        if crate::inference::stage_profile::enabled() {
+            enc.commit_and_wait_labeled("adr065.mtp_draft.attention_output")
+                .context("profile MTP draft attention output")?;
+        } else {
+            enc.commit();
+        }
         Ok(out)
     }
 
@@ -982,7 +1015,12 @@ impl MtpWeights {
             cfg.rms_norm_eps,
         )
         .context("MTP fused residual norm")?;
-        enc.commit();
+        if crate::inference::stage_profile::enabled() {
+            enc.commit_and_wait_labeled("adr065.mtp_draft.residual_norm")
+                .context("profile MTP draft residual norm")?;
+        } else {
+            enc.commit();
+        }
         // Release before the FFN, whose teacher-scope route may wait.
         drop(enc);
 
@@ -1035,7 +1073,12 @@ impl MtpWeights {
                 // Match the legacy wrapper's commit policy: seq=1 (the only
                 // MTP draft shape) uses non-blocking commit so the next
                 // command buffer pipelines across the boundary on Metal.
-                enc.commit();
+                if crate::inference::stage_profile::enabled() {
+                    enc.commit_and_wait_labeled("adr065.mtp_draft.moe")
+                        .context("profile MTP draft MoE")?;
+                } else {
+                    enc.commit();
+                }
                 Ok(out)
             }
         }
@@ -1080,7 +1123,12 @@ impl MtpWeights {
             self.vocab_size,
         )
         .context("MTP shared head projection")?;
-        enc.commit_and_wait().context("MTP commit logits")?;
+        if crate::inference::stage_profile::enabled() {
+            enc.commit_and_wait_labeled("adr065.mtp_draft.shared_head")
+                .context("profile MTP commit logits")?;
+        } else {
+            enc.commit_and_wait().context("MTP commit logits")?;
+        }
         Ok((logits, normed))
     }
 

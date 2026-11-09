@@ -41,7 +41,10 @@
     "Q5_0_TENSOR_MM": "",
     "GEMMA_WARM_ATTENTION_KERNEL": "",
     "GEMMA_ROUTING_OVERLAP": "",
-    "GEMMA_DECODE_ATTN_NE": ""
+    "GEMMA_DECODE_ATTN_NE": "",
+    "ADR065_STAGE_PROFILE": "",
+    "NATIVE_PROFILE_CB": "",
+    "FUSE_LMHEAD": ""
   },
   "binary": "{HF2Q_BIN}",
   "artifact": {
@@ -73,7 +76,10 @@
       "MM_ID_SCHEDULE": "{MM_ID_SCHEDULE}",
       "Q5_0_TENSOR_MM": "{Q5_0_TENSOR_MM}",
       "ROUTING_OVERLAP": "{GEMMA_ROUTING_OVERLAP}",
-      "DECODE_ATTN_NE": "{GEMMA_DECODE_ATTN_NE}"
+      "DECODE_ATTN_NE": "{GEMMA_DECODE_ATTN_NE}",
+      "HF2Q_ADR065_STAGE_PROFILE": "{ADR065_STAGE_PROFILE}",
+      "MLX_PROFILE_CB": "{NATIVE_PROFILE_CB}",
+      "HF2Q_FUSE_LMHEAD": "{FUSE_LMHEAD}"
     }
   },
   "readiness": {

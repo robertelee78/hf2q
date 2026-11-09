@@ -322,6 +322,9 @@ pub(super) fn run_deepseek4_joint_decode(
             }
         }
 
+        let active_lanes = lanes.iter().filter(|lane| lane.active()).count();
+        let _stage_round =
+            crate::inference::stage_profile::Round::begin("deepseek4", "joint", active_lanes);
         let mut pending = Vec::with_capacity(lanes.len());
         for (index, lane) in lanes.iter_mut().enumerate() {
             if !lane.active() {

@@ -202,6 +202,8 @@ impl Deepseek4Model {
     ) -> (Result<MlxBuffer>, bool) {
         let mut submitted_any = false;
         let result = (|| -> Result<MlxBuffer> {
+            let arena_setup =
+                crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
             let layers = self.cfg.num_hidden_layers as usize;
             ensure!(layers > 0, "DeepSeek-V4 joint decode encoded zero layers");
             let layers_per_command_buffer = decode_layers_per_command_buffer(layers)?;
@@ -236,6 +238,7 @@ impl Deepseek4Model {
             let mut state: Option<MlxBuffer> = None;
             let mut in_flight =
                 SubmissionChain::with_capacity(layers.div_ceil(layers_per_command_buffer));
+            drop(arena_setup);
             let encode_result = (|| -> Result<()> {
                 for start in (0..layers).step_by(layers_per_command_buffer) {
                     let end = (start + layers_per_command_buffer).min(layers);
@@ -541,6 +544,11 @@ impl Deepseek4Model {
                 block_size: 64,
             },
         )?;
+        crate::inference::stage_profile::boundary(
+            session.encoder_mut(),
+            "adr065.projections",
+        )
+        .context("profile DeepSeek-V4 attention projections")?;
 
         let batch_inputs = JointBatchInputs {
             q_rope: &q_rope,
@@ -594,6 +602,8 @@ impl Deepseek4Model {
                 )
                 .with_context(|| format!("encode DeepSeek-V4 joint layer-{layer} row cores"))?,
         }
+        crate::inference::stage_profile::boundary(session.encoder_mut(), "adr065.attention")
+            .context("profile DeepSeek-V4 sparse attention")?;
 
         encode_compressed_attention_epilogue(
             session,
@@ -609,6 +619,11 @@ impl Deepseek4Model {
             rows,
             RowMatmul::IndependentRows,
         )?;
+        crate::inference::stage_profile::boundary(
+            session.encoder_mut(),
+            "adr065.projections",
+        )
+        .context("profile DeepSeek-V4 attention output projection")?;
         Ok(core.output_state)
     }
 }
