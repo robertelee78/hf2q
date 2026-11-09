@@ -141,7 +141,8 @@ impl ServingRenderer {
             .metadata_string("general.architecture")
             .context("GGUF general.architecture")?
             .to_string();
-        let (tokenizer, _) = crate::serve::api::engine_qwen35::build_qwen35_serving_tokenizer(&gguf)?;
+        let (tokenizer, _) =
+            crate::serve::api::engine_qwen35::build_qwen35_serving_tokenizer(&gguf)?;
         let template = gguf
             .metadata_string("tokenizer.chat_template")
             .context("the probe needs the artifact's embedded chat template")?
@@ -269,7 +270,8 @@ fn reconstruct_agent(renderer: &ServingRenderer, agent_dir: &Path) -> Result<Age
             );
         }
         ensure!(
-            raw.get("tool_choice").is_none_or(|choice| *choice == "auto"),
+            raw.get("tool_choice")
+                .is_none_or(|choice| *choice == "auto"),
             "{agent} turn {index}: only tool_choice auto is reconstructed"
         );
         let request: ChatCompletionRequest = serde_json::from_slice(&request_bytes)?;
@@ -277,7 +279,10 @@ fn reconstruct_agent(renderer: &ServingRenderer, agent_dir: &Path) -> Result<Age
         let prompt_tokens = usage_field(record, "/usage/prompt_tokens")?;
         let completion_tokens = usage_field(record, "/usage/completion_tokens")?;
         let cached_tokens = usage_field(record, "/usage/prompt_tokens_details/cached_tokens")?;
-        ensure!(completion_tokens > 0, "{agent} turn {index}: empty completion");
+        ensure!(
+            completion_tokens > 0,
+            "{agent} turn {index}: empty completion"
+        );
 
         let prompt = renderer.tokens(&request.messages, tools, true)?;
         ensure!(
@@ -324,7 +329,10 @@ fn reconstruct_agent(renderer: &ServingRenderer, agent_dir: &Path) -> Result<Age
                 "{agent} turn {index}: echoed assistant message differs from turn {previous}'s assembled reply"
             );
         } else {
-            ensure!(cached_tokens == 0, "{agent} turn 0: unexpected cached prefix");
+            ensure!(
+                cached_tokens == 0,
+                "{agent} turn 0: unexpected cached prefix"
+            );
         }
 
         turns.push(TurnSpan {
@@ -384,14 +392,22 @@ fn reconstruct_run(renderer: &ServingRenderer, run: &Path) -> Result<Vec<AgentTr
         })
         .collect::<Vec<_>>();
     agent_dirs.sort();
-    ensure!(!agent_dirs.is_empty(), "no agent-* directory under {}", client.display());
+    ensure!(
+        !agent_dirs.is_empty(),
+        "no agent-* directory under {}",
+        client.display()
+    );
     agent_dirs
         .iter()
         .map(|dir| reconstruct_agent(renderer, dir))
         .collect()
 }
 
-fn transcript_evidence(renderer: &ServingRenderer, run: &Path, agents: &[AgentTranscript]) -> Value {
+fn transcript_evidence(
+    renderer: &ServingRenderer,
+    run: &Path,
+    agents: &[AgentTranscript],
+) -> Value {
     let receipt_identity = std::fs::read(run.join("receipt.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -546,7 +562,9 @@ fn load_serving_model(path: &Path) -> Result<Qwen35Model> {
         .map_err(|error| anyhow!("open GGUF {}: {error}", path.display()))?;
     let mut progress = LoadProgress::new(false, 1, 0);
     let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress)?;
-    model.bind_ggml_routing_policy(super::routing_policy::resolve_qwen_ggml_routing_policy(path));
+    model.bind_ggml_routing_policy(super::routing_policy::resolve_qwen_ggml_routing_policy(
+        path,
+    ));
     Ok(model)
 }
 
@@ -573,7 +591,10 @@ fn mtp_catch_up(
     target_nextn: &MlxBuffer,
 ) -> Result<()> {
     let mtp = model.mtp.as_ref().context("artifact has no MTP block")?;
-    ensure!(mtp_cursor(cache, slot)? == start, "MTP cursor is not at {start}");
+    ensure!(
+        mtp_cursor(cache, slot)? == start,
+        "MTP cursor is not at {start}"
+    );
     let positions = positions_for_range(start as i32, tokens.len());
     let shared_embed_rows = model.embed_tokens_gpu(tokens)?;
     model.with_gpu_cache_mut(|device, registry| {
@@ -604,13 +625,17 @@ fn draft_chain(
     verifier_hidden: &MlxBuffer,
 ) -> Result<Vec<u32>> {
     let mtp = model.mtp.as_ref().context("artifact has no MTP block")?;
-    ensure!(mtp_cursor(cache, slot)? == s, "MTP cursor is not at {s} before drafting");
+    ensure!(
+        mtp_cursor(cache, slot)? == s,
+        "MTP cursor is not at {s} before drafting"
+    );
     let drafted = model.with_gpu_cache_mut(|device, registry| {
         let mut drafts = Vec::with_capacity(depth_cap);
         let mut chain_hidden: Option<MlxBuffer> = None;
         let mut chain_token = sequence[s];
         for depth in 0..depth_cap {
-            let shared_embed = model.embed_tokens_gpu_in_context(&[chain_token], device, registry)?;
+            let shared_embed =
+                model.embed_tokens_gpu_in_context(&[chain_token], device, registry)?;
             let previous = chain_hidden.as_ref().unwrap_or(verifier_hidden);
             let (token, next_hidden) = mtp.forward_draft_greedy_for_token(
                 previous,
@@ -669,14 +694,26 @@ fn probe_agent(
             argmax_agree: 0,
         };
         // Prompt segment: the server's prefill call and prompt catch-up.
-        ensure!(cursor < span.prompt_len, "turn {} has no new prompt tokens", span.turn);
+        ensure!(
+            cursor < span.prompt_len,
+            "turn {} has no new prompt tokens",
+            span.turn
+        );
         while cursor < span.prompt_len {
             let end = (cursor + PROMPT_CHUNK).min(span.prompt_len);
             let tokens = &sequence[cursor..end];
             let positions = positions_for_range(cursor as i32, tokens.len());
             let (logits, hidden) =
                 model.forward_gpu_last_logits_with_hidden(tokens, &positions, &mut cache, slot)?;
-            mtp_catch_up(model, &mut cache, slot, tokens, cursor, pending.as_ref(), &hidden)?;
+            mtp_catch_up(
+                model,
+                &mut cache,
+                slot,
+                tokens,
+                cursor,
+                pending.as_ref(),
+                &hidden,
+            )?;
             pending = Some(last_hidden_row(&hidden, hidden_size)?);
             if end == span.prompt_len {
                 probe.argmax_rows += 1;
@@ -751,7 +788,10 @@ fn run_probe() -> Result<Value> {
         .map(|value| value.parse::<usize>())
         .transpose()?
         .unwrap_or(DEFAULT_COMPLETION_CHUNK);
-    ensure!(completion_chunk > 0, "{COMPLETION_CHUNK_ENV} must be positive");
+    ensure!(
+        completion_chunk > 0,
+        "{COMPLETION_CHUNK_ENV} must be positive"
+    );
 
     let renderer = ServingRenderer::from_gguf(&gguf)?;
     let transcripts = reconstruct_run(&renderer, &run)?;
@@ -772,7 +812,10 @@ fn run_probe() -> Result<Value> {
         let started = Instant::now();
         let probes = probe_agent(&model, agent, completion_chunk)
             .with_context(|| format!("probe {}", agent.agent))?;
-        let agent_runs = probes.iter().map(|probe| probe.runs.clone()).collect::<Vec<_>>();
+        let agent_runs = probes
+            .iter()
+            .map(|probe| probe.runs.clone())
+            .collect::<Vec<_>>();
         eprintln!(
             "mtp-probe {}: {} turns, {:.1}s, {}",
             agent.agent,

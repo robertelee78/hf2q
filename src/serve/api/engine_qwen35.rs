@@ -4150,15 +4150,21 @@ impl Qwen35PrefillState {
                 supervisor.arm("Qwen35 bounded prefill", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
             // ADR-059: a bound graft skips the catch-up because the MTP
             // arena never receives the graft (see `classify_slot_request`).
+            let mtp_runtime = qwen.model.mtp.is_some() && kv_cache.mtp_slot.is_some();
+            let graft_bound = qwen.model.kv_graft.is_some();
             let mtp_prefill = (self.cached_tokens == 0 || self.mtp_pending_hidden.is_some())
                 && !self.speculation_unavailable
-                && super::qwen35_speculation::prefill_mtp_catchup_allowed(
+                && (super::qwen35_speculation::prefill_mtp_catchup_allowed(
                     qwen.speculation.policy(),
                     is_qwen_server_speculation_exact_eligible(&self.params),
                     self.vision.is_none(),
-                    qwen.model.mtp.is_some() && kv_cache.mtp_slot.is_some(),
-                    qwen.model.kv_graft.is_some(),
-                );
+                    mtp_runtime,
+                    graft_bound,
+                ) || shadow_draft::prefill_mtp_allowed(
+                    self.vision.is_none(),
+                    mtp_runtime,
+                    graft_bound,
+                ));
             let (forward, mtp_hidden) = if let Some(vision) = vision_chunk.as_ref() {
                 let soft_tokens: Vec<_> = vision
                     .soft_tokens
@@ -4453,6 +4459,9 @@ pub(crate) struct Qwen35DecodeState {
     /// Per-request lookup state. It is initialized from prompt + target seed
     /// and is synchronized only from the committed output ledger.
     history_lookup: Option<HistoryLookupIndex>,
+    /// Counterfactual proposals awaiting comparison with committed target
+    /// decisions. Present only under the ADR-065 E3 diagnostic.
+    shadow_draft: Option<shadow_draft::ShadowDraftState>,
     /// A verified draft+bonus may span worker ticks. This queue is shared by
     /// all proposers so no new proposal can overtake an already verified SSE
     /// token.
@@ -4520,6 +4529,8 @@ pub(in crate::serve::api) use joint_decode::Qwen35JointLane;
 #[path = "engine_qwen35/k3_transaction.rs"]
 mod k3_transaction;
 use k3_transaction::K3_VERIFY_ROWS;
+#[path = "engine_qwen35/shadow_draft.rs"]
+mod shadow_draft;
 #[cfg(test)]
 #[path = "engine_qwen35/speculation_qualification_tests.rs"]
 mod speculation_qualification_tests;
@@ -5133,6 +5144,12 @@ impl Qwen35DecodeState {
         };
         // Repeatable route: fixed-cost proposer gates; adaptive: wall time.
         let cost_model = qwen.speculation.cost_model();
+        let shadow_draft = shadow_draft::state_for_request(
+            qwen.speculation.policy(),
+            &prompt_tokens,
+            &generated_tokens,
+            cached_tokens,
+        )?;
 
         Ok(Self {
             slot_id,
@@ -5161,6 +5178,7 @@ impl Qwen35DecodeState {
             decode_start: Instant::now(),
             mtp: mtp_hidden.map(|verifier_hidden| Qwen35SlotMtpState { verifier_hidden }),
             history_lookup,
+            shadow_draft,
             pending_speculation_output: VecDeque::new(),
             terminal_after_pending: false,
             mtp_cost: cost_model.map_or_else(SpeculationCostController::new, |model| {
@@ -5362,7 +5380,11 @@ impl Qwen35DecodeState {
                 }
             }
         }
-        if self.mtp.is_some() && remaining >= K3_VERIFY_ROWS && self.mtp_cost.may_speculate() {
+        if self.shadow_draft.is_none()
+            && self.mtp.is_some()
+            && remaining >= K3_VERIFY_ROWS
+            && self.mtp_cost.may_speculate()
+        {
             return Ok(Qwen35TickKind::K3);
         }
         Ok(Qwen35TickKind::Ordinary)
@@ -5512,6 +5534,7 @@ impl Qwen35DecodeState {
         tok: u32,
         ordinary_target_elapsed: Duration,
     ) -> Result<Qwen35TickOutcome> {
+        self.shadow_observe_committed(tok);
         self.mtp_cost
             .observe_ordinary_target(ordinary_target_elapsed);
         self.history_cost
@@ -5524,6 +5547,7 @@ impl Qwen35DecodeState {
         )?;
         if qwen.eos_token_ids.contains(&tok) {
             self.finish_reason = "stop";
+            self.shadow_flush_censored();
             return Ok(Qwen35TickOutcome {
                 fragment: String::new(),
                 is_reasoning: false,
@@ -5532,6 +5556,7 @@ impl Qwen35DecodeState {
         }
         if qwen35_grammar_terminal_token(self.grammar_runtime.as_ref(), &self.params, tok) {
             self.finish_reason = "stop";
+            self.shadow_flush_censored();
             return Ok(Qwen35TickOutcome {
                 fragment: String::new(),
                 is_reasoning: false,
@@ -5560,6 +5585,7 @@ impl Qwen35DecodeState {
         if qwen35_hit_stop_string(&self.decoded_text, &self.stop_strings) {
             qwen35_strip_trailing_stop(&mut self.decoded_text, &self.stop_strings);
             self.text_decoder.discard();
+            self.shadow_flush_censored();
             self.finish_reason = "stop";
             return Ok(Qwen35TickOutcome {
                 fragment: frag,
@@ -5569,6 +5595,9 @@ impl Qwen35DecodeState {
         }
         self.step += 1;
         let finished = self.step >= self.max_tokens;
+        if finished {
+            self.shadow_flush_censored();
+        }
         Ok(Qwen35TickOutcome {
             fragment: frag,
             is_reasoning: false,
@@ -6193,8 +6222,10 @@ impl Qwen35DecodeState {
         qwen: &Qwen35LoadedModel,
         token: u32,
     ) -> Result<Qwen35TickOutcome> {
+        self.shadow_observe_committed(token);
         if qwen.eos_token_ids.contains(&token) {
             self.finish_reason = "stop";
+            self.shadow_flush_censored();
             return Ok(Qwen35TickOutcome {
                 fragment: String::new(),
                 is_reasoning: false,
@@ -6224,6 +6255,7 @@ impl Qwen35DecodeState {
         )?;
         if qwen35_grammar_terminal_token(self.grammar_runtime.as_ref(), &self.params, token) {
             self.finish_reason = "stop";
+            self.shadow_flush_censored();
             return Ok(Qwen35TickOutcome {
                 fragment: String::new(),
                 is_reasoning: false,
@@ -6255,10 +6287,14 @@ impl Qwen35DecodeState {
         if terminal {
             self.finish_reason = "stop";
         }
+        let finished = terminal || self.generated_tokens.len() >= self.max_tokens;
+        if finished {
+            self.shadow_flush_censored();
+        }
         Ok(Qwen35TickOutcome {
             fragment,
             is_reasoning: false,
-            finished: terminal || self.generated_tokens.len() >= self.max_tokens,
+            finished,
         })
     }
 
