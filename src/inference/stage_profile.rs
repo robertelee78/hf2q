@@ -47,6 +47,8 @@ static NATIVE_ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var("MLX_PROFILE_CB").as_deref() == Ok("1"));
 static SCRATCH_RELEASES: AtomicU64 = AtomicU64::new(0);
 static SCRATCH_REALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static PENDING_SCRATCH_RELEASES: AtomicU64 = AtomicU64::new(0);
+static PENDING_SCRATCH_REALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct CountTime {
@@ -61,8 +63,6 @@ struct State {
     mode: Mode,
     started: Instant,
     cpu: BTreeMap<&'static str, CountTime>,
-    scratch_releases_at_start: u64,
-    scratch_reallocations_at_start: u64,
 }
 
 struct WallRecord {
@@ -122,8 +122,6 @@ impl Round {
                 mode: *MODE,
                 started: Instant::now(),
                 cpu: BTreeMap::new(),
-                scratch_releases_at_start: SCRATCH_RELEASES.load(Ordering::Relaxed),
-                scratch_reallocations_at_start: SCRATCH_REALLOCATIONS.load(Ordering::Relaxed),
             });
             true
         });
@@ -146,10 +144,8 @@ impl Round {
                     route: state.route,
                     width: state.width,
                     wall_ns,
-                    scratch_releases: scratch_releases_total
-                        .saturating_sub(state.scratch_releases_at_start),
-                    scratch_reallocations: scratch_reallocations_total
-                        .saturating_sub(state.scratch_reallocations_at_start),
+                    scratch_releases: PENDING_SCRATCH_RELEASES.swap(0, Ordering::Relaxed),
+                    scratch_reallocations: PENDING_SCRATCH_REALLOCATIONS.swap(0, Ordering::Relaxed),
                     scratch_releases_total,
                     scratch_reallocations_total,
                 });
@@ -210,12 +206,9 @@ impl Round {
             "cpu": cpu,
             "unknown_labels": raw_unknown,
             "deepseek_decode_scratch": {
-                "release_events": SCRATCH_RELEASES
-                    .load(Ordering::Relaxed)
-                    .saturating_sub(state.scratch_releases_at_start),
-                "reallocation_events": SCRATCH_REALLOCATIONS
-                    .load(Ordering::Relaxed)
-                    .saturating_sub(state.scratch_reallocations_at_start),
+                "release_events": PENDING_SCRATCH_RELEASES.swap(0, Ordering::Relaxed),
+                "reallocation_events": PENDING_SCRATCH_REALLOCATIONS
+                    .swap(0, Ordering::Relaxed),
                 "release_events_total": SCRATCH_RELEASES.load(Ordering::Relaxed),
                 "reallocation_events_total": SCRATCH_REALLOCATIONS.load(Ordering::Relaxed),
             },
@@ -319,12 +312,14 @@ pub fn boundary(
 pub fn scratch_release() {
     if enabled() {
         SCRATCH_RELEASES.fetch_add(1, Ordering::Relaxed);
+        PENDING_SCRATCH_RELEASES.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 pub fn scratch_reallocation() {
     if enabled() {
         SCRATCH_REALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        PENDING_SCRATCH_REALLOCATIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -348,7 +343,9 @@ fn classify_label(label: &str) -> &'static str {
         "attention"
     } else if label.starts_with("adr065.ffn_moe")
         || label.contains("ffn")
+        || label.contains("FFN")
         || label.contains("expert")
+        || label.contains("MoE")
     {
         "ffn_moe"
     } else if label.starts_with("adr065.head")
@@ -374,6 +371,7 @@ mod tests {
             ("adr065.kv_write", "kv_write"),
             ("adr065.attention", "attention"),
             ("adr065.ffn_moe", "ffn_moe"),
+            ("DeepSeek-V4 FFN gate/up projections", "ffn_moe"),
             ("adr065.head", "head"),
             ("mtp.shared_head_argmax", "mtp_draft"),
             ("mtp.process_target_batch", "mtp_catchup"),
