@@ -405,17 +405,22 @@ def main():
                            max_calls=max_tools(args.repair_turns))
         protocol = Workflow(args.repair_turns) if args.repair_turns else None
         seen = set()
-        first_decode = []
+        first_stream_gate = []
         if n4:
-            from qwen_n4_live_smoke import first_decode_marker, phase_cohorts, wait_barrier
+            from qwen_n4_live_smoke import (
+                first_stream_ready_marker, phase_cohorts, wait_barrier, wait_stream_release,
+            )
             save(output / "summary.json", summary)
             summary["barrier"] = wait_barrier(args.barrier_dir, args.agent_id, args.run_id,
                                                args.server_pid, args.barrier_token, output,
                                                initial_hash, args.approval_sha256, args.instance, phase)
-            if phase is not None and phase["cohort"] < len(phase_cohorts(phase["plan"])):
-                # A later cohort is released once this cohort has decoded its first token.
-                first_decode.append(lambda ns: first_decode_marker(args.barrier_dir, args.agent_id, args.run_id,
-                                                                   args.barrier_token, ns))
+            if phase is not None and len(phase_cohorts(phase["plan"])) > 1:
+                def gate(turn0):
+                    first_stream_ready_marker(args.barrier_dir, args.agent_id, args.run_id,
+                                              args.barrier_token, turn0)
+                    wait_stream_release(args.barrier_dir, phase["cohort"], args.run_id,
+                                        args.barrier_token, args.server_pid)
+                first_stream_gate.append(gate)
         started = time.monotonic()
         for turn in range(max_tools(args.repair_turns) + 1):
             require(not INTERRUPTED and time.monotonic() - started < 7200, "whole client deadline")
@@ -424,10 +429,11 @@ def main():
                                     args.request_setup)
             turn_output = output / f"turn-{turn}"
             turn_output.mkdir(mode=0o700)
-            on_first_token = first_decode.pop() if first_decode and request["stream"] else None
+            if first_stream_gate and request["stream"]:
+                first_stream_gate.pop()(summary["turns"][0])
             message, call, receipt = exchange(args.base_url, request, turn_output, turn, seen,
                                                deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind, family=args.family,
-                                               on_first_token=on_first_token, setup=args.request_setup,
+                                               setup=args.request_setup,
                                                assistant_policy=None if protocol is None else protocol.policy)
             summary["turns"].append(receipt)
             messages.append(message)
