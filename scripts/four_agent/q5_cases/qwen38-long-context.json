@@ -26,7 +26,9 @@
     "SANDBOX_PROOF": null,
     "SANDBOX_PROOF_SHA256": null,
     "CLIENT_APPROVAL_TEMPLATE": null,
-    "LOG_FILTER": ""
+    "LOG_FILTER": "",
+    "ADR065_STAGE_PROFILE": "",
+    "NATIVE_PROFILE_CB": ""
   },
   "binary": "{HF2Q_BIN}",
   "artifact": {
@@ -48,7 +50,9 @@
       "HOST": "127.0.0.1",
       "PORT": "{PORT}",
       "HF2Q_BIN": "{HF2Q_BIN}",
-      "LOG_FILTER": "{LOG_FILTER}"
+      "LOG_FILTER": "{LOG_FILTER}",
+      "HF2Q_ADR065_STAGE_PROFILE": "{ADR065_STAGE_PROFILE}",
+      "MLX_PROFILE_CB": "{NATIVE_PROFILE_CB}"
     }
   },
   "readiness": {
