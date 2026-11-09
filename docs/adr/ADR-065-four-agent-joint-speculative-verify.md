@@ -258,6 +258,18 @@ Priority: High.
 
 Delivery boundary: Receipts merged to main.
 
+Result (2026-11-09): Complete. Three retained Qwen3.8 four-agent runs reached
+`CalibrationPass`, proved cleanup and partitioned baseline makespan exactly.
+Joint-reference decode occupied 85.303–85.471% of makespan and prefill
+14.195–14.362%; queue, tool gaps and idle/unattributed time occupied the
+remainder. The observer classified all 6,310 lane-turns per run as
+`blocked_transform` under the automatic tool trigger, so each run had
+$f=0$ and the three-run clustered 95% interval was $[0,0]$. Width-one through
+width-four joint turns were all present; no serial-solo turn occurred.
+Identities, estimator, interval precedence, per-run width distributions,
+commands and retained hashes are in
+[the E4 evidence record](../research/adr065-e4-critical-path.md).
+
 ### E5. Trace DeepSeek expert union per joint step
 
 Outcome: The real routed-expert overlap across DeepSeek joint rows is known.
