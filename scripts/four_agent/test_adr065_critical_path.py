@@ -97,6 +97,15 @@ class CriticalPathTests(unittest.TestCase):
         self.assertEqual(run["critical_path_ns"]["prefill"], 80)
         self.assertEqual(run["critical_path_ns"]["joint"], 100)
         self.assertEqual(run["critical_path_ns"]["solo"], 50)
+        self.assertEqual(len(run["queue_intervals"]), 4)
+        self.assertEqual(run["queue_intervals"][0], {
+            "kind": "queue", "agent": "agent-0", "turn": 0, "slot": 0,
+            "begin_ns": 110, "end_ns": 150,
+        })
+        self.assertEqual(
+            {interval["kind"] for interval in run["client_gap_intervals"]},
+            {"idle", "tool_gap"},
+        )
         self.assertEqual(run["joint_width_distribution"], {
             "4": {"turns": 1, "duration_ns": 100},
         })

@@ -250,6 +250,12 @@ def summarize_run(run_dir):
         "makespan": {"begin_ns": start, "end_ns": end, "duration_ns": makespan_ns},
         "interval_counts": {"engine": len(engine), "requests": len(requests),
                             "queue": len(queues), "tool_or_idle": len(gaps)},
+        "queue_intervals": sorted(
+            queues, key=lambda interval: (interval["begin_ns"], interval["agent"])
+        ),
+        "client_gap_intervals": sorted(
+            gaps, key=lambda interval: (interval["begin_ns"], interval["agent"])
+        ),
         "critical_path_ns": partition,
         "joint_width_distribution": {
             str(width): {"turns": widths[width], "duration_ns": width_time[width]}

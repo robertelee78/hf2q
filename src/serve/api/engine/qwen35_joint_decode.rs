@@ -508,12 +508,16 @@ fn run_qwen35_joint_group(
         }
     }
 
-    let _critical_path_span = critical_path::Span::decode(
-        "joint",
-        lanes
-            .iter()
-            .map(|lane| (lane.handle.slot_id, lane.state.joint_verify_eligibility())),
-    );
+    let _critical_path_span = if critical_path::enabled() {
+        critical_path::Span::decode(
+            "joint",
+            lanes
+                .iter()
+                .map(|lane| (lane.handle.slot_id, lane.state.joint_verify_eligibility())),
+        )
+    } else {
+        None
+    };
 
     for lane in &mut lanes {
         // The joint row serves the lane's ordinary tick; drop its plan.

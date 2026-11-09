@@ -16,7 +16,7 @@ const PREFIX: &str = "[ADR065_CRITICAL_PATH_JSON] ";
 
 static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var(ENV).as_deref() == Ok("1"));
 
-pub(super) fn enabled() -> bool {
+pub(in crate::serve::api) fn enabled() -> bool {
     *ENABLED
 }
 
