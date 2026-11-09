@@ -206,6 +206,14 @@ Priority: High.
 
 Delivery boundary: Receipts merged to main.
 
+Result (2026-11-09): Complete. The diagnostic-only Qwen3.8 prototype ran all
+27 shape/context configurations with one warm-up and seven timed repetitions
+each. Median complete-round time ranged from 56.153 ms (4×1 near 2k) to
+354.661 ms (4×4 near 64k); verify and readback dominated, while host selection
+remained 3.9–8.9 µs. The report retains drafting, verify/readback, selection,
+capture/recovery and catch-up/settlement splits for every repetition. See
+[the E2 evidence record](../research/adr065-e2-complete-round-cost.md).
+
 ### E3. Measure counterfactual draft acceptance on joint-ready states
 
 Outcome: The acceptance that joint verify would see on the four-agent workload is known.
@@ -350,6 +358,14 @@ Priority: High.
 
 Delivery boundary: Receipts merged to main; prototype code not on any default path.
 
+Result (2026-11-09): Complete. A published experiment commit, never merged to
+the default path, runs the complete graph directly without opening the HTTP
+server. The Q5-bound smoke completed 4×1 and 4×4 rounds at near-2k context in
+56.061 ms and 219.055 ms after warm-up, including draft, grouped target graph,
+readback, host selection, rejection recovery, synchronization and MTP
+catch-up. See
+[the E7 evidence record](../research/adr065-e7-joint-verify-prototype.md).
+
 ### E8. Record the G0 gate decision
 
 Outcome: A recorded decision says whether joint verify proceeds.
@@ -373,6 +389,14 @@ Predecessors: E1, E2, E3, E4, E7.
 Priority: High.
 
 Delivery boundary: Decision record merged to main.
+
+Result (2026-11-09): `NoGo`. The pre-registered 100,000-replicate
+run-clustered bootstrap gives $s=1.9093$ (95% interval
+$[1.7742,2.0364]$), but E4 gives $f=0$ and therefore $S=1$ with interval
+$[1,1]$. The isolated operation clears its local speed threshold but cannot
+change the canonical workload's makespan. J4, J5, J6, A1, A2, P3a and P3b are
+not pursued; every other story retains its own acceptance. See
+[the E8 decision record](../research/adr065-e8-g0-decision.md).
 
 ## J. Joint temporal verify for Qwen3.8
 
