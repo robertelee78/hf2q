@@ -39,6 +39,12 @@ def schemas():
     return [{'type': 'function', 'function': {'name': name, 'strict': False,
              'parameters': {'type': 'object', 'properties': {}}}} for name in ('read_file', 'write_file', 'run_tests')]
 
+def splash_schemas():
+    result = schemas()
+    for tool in result:
+        tool['function'].pop('strict')
+    return result
+
 
 def chain():
     return [{'role': 'system', 'content': 'unchanged'}, {'role': 'user', 'content': 'same coding task'},
@@ -112,7 +118,7 @@ class Translation(unittest.TestCase):
                     with self.subTest(model=model, turn=turn, budget=budget):
                         hf = build_request(model, messages, schemas(), turn, 'qwen')
                         request = native(turn, model, messages)
-                        expected = {'model': model, 'messages': messages, 'tools': schemas(), 'tool_choice': 'auto',
+                        expected = {'model': model, 'messages': messages, 'tools': splash_schemas(), 'tool_choice': 'auto',
                                     'max_completion_tokens': 8192, 'logprobs': False, 'stream': turn % 2 == 1,
                                     'temperature': 0, 'top_p': 1.0, 'top_k': 0, 'min_p': 0.0, 'presence_penalty': 0.0,
                                     'frequency_penalty': 0.0, 'chat_template_kwargs': {'enable_thinking': True},
@@ -129,6 +135,14 @@ class Translation(unittest.TestCase):
             canonical = sp.canonical(native(turn), 'qwen')
             self.assertEqual(canonical, build_request(M, chain(), schemas(), turn, 'qwen'))
             wire(canonical, 'qwen')
+        explicit_wire_default = native(0)
+        explicit_wire_default['tools'] = schemas()
+        with self.assertRaises(Invalid):
+            sp.canonical(explicit_wire_default, 'qwen')
+        strict_canonical = build_request(M, chain(), schemas(), 0, 'qwen')
+        strict_canonical['tools'][0]['function']['strict'] = True
+        with self.assertRaises(Invalid):
+            sp.request_controls(strict_canonical, 'qwen')
         request = native(1)
         drift = [('temperature', 0.6), ('top_p', 0.95), ('top_k', 20), ('min_p', 0.05), ('repetition_penalty', 1.05),
                  ('presence_penalty', 0.5), ('chat_template_kwargs', {'enable_thinking': False}),
