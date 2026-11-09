@@ -1,0 +1,134 @@
+{
+  "schema": "hf2q.adr065.campaign.v1",
+  "story": "ADR-065 B1 (#503): freeze the phase-1 baseline and fairness ceilings",
+  "doc": "docs/research/adr065-b1-campaign.md",
+  "roots": {
+    "E": "/Users/robert/.local/state/hf2q/campaigns/adr063-preflight-20261023",
+    "MODELS": "/Users/robert/.local/share/hf2q/models",
+    "B1": "/Users/robert/.local/state/hf2q/v0130/b1-503"
+  },
+  "baseline": {
+    "label": "hf2q main (newest, Rust 1.99.1 build) with mlx-native 0.15.18 (RoPE partial-rotary fix; phase-1 default)",
+    "kind": "main-build",
+    "binary": {
+      "source_commit": "4bfb04362fbe258cf2b23b8167082f18b71653fd",
+      "sha256": "154c79c64142d7669595eb4f450bf9f07e56fb96aa051d35669a437a8d282cbe",
+      "bytes": 58425672,
+      "path": "{B1}/main-build/hf2q",
+      "build_receipt": {"path": "{B1}/main-build/build-receipt.json", "sha256": "bb2c27e0ff9ecb7574be9126f7a5569a78809cbfef134442c730c2b8bdb7a68f"},
+      "build": {
+        "source_checkout": "/opt/hf2q-worktrees/b1-main-build (detached at source_commit, clean)",
+        "cargo_target_dir": "/Users/robert/.local/state/hf2q/ext/cargo-targets/B1Tool",
+        "environment": "RUSTC_WRAPPER= CARGO_INCREMENTAL=0 GIT_COMMIT_SHA=<source_commit>",
+        "command": "cargo build --release --locked",
+        "copy": "target/release/hf2q -> {B1}/main-build/hf2q"
+      }
+    },
+    "native": {"crate": "mlx-native", "version": "0.15.18", "checksum": "9d10f97e0e25a00c1b4706a0ea9a838b2524b3fc2b999d05f21cd2580c524bee"},
+    "toolchain": {"rustc_release": "1.99.1", "rustc_commit_hash": "58cf8f9c35b355199727627d07ae34a4e2846d67",
+                  "rustup_toolchain": "stable-aarch64-apple-darwin"},
+    "notes": [
+      "Operator decision 2026-11-04: B1 baselines the fixed engine, hf2q main once mlx-native 0.15.18 (RoPE partial-rotary fix in rope_multi.metal, affecting Qwen3.6/3.8) is published and pinned on main; never the v0.1.29 release.",
+      "Operator decision 2026-11-05: Rust 1.99.1 from here forward (host stable updated 07:14Z; 38eea839 no longer builds on it). The baseline is rebuilt with stable 1.99.1 from the newest main once the Rust 1.99 fix merges. The superseded 38eea839 build (627d152a, built with rustc 4a4ef493) is kept as evidence in {B1}/main-build-38eea839/ and is never the baseline.",
+      "Finalized after the operator unblocked speed campaigns on 2026-11-08: source commit 4bfb04362fbe258cf2b23b8167082f18b71653fd is the first merged main containing the Rust 1.99 compatibility fix while retaining mlx-native 0.15.18.",
+      "Before launch the driver checks the binary's sha256 and size; the build receipt (bound by sha256: source commit, binary sha256 and size, native version and checksum, rustc release and commit hash); the mlx-native pin in Cargo.lock at source_commit; and that the binary embeds exactly one mlx-native version (native.version) and exactly one rustc commit (toolchain.rustc_commit_hash)."
+    ]
+  },
+  "environment": {
+    "CARGO": "/Users/robert/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+    "cargo_sha256": "6d576d8058f8ca643e8fce55b64ee3c614ba64c9da2e536bae843e6a2e1f3951",
+    "TOOLCHAIN": "stable-aarch64-apple-darwin",
+    "sandbox_proof": {"path": "{E}/owned-cleanup-sandbox-capability-20261105-cargo199/proof.json",
+                      "sha256": "4b2bea7715c6244e7636d6d07b4e33bd41b7c525313488dcca0f107cc79d486e"},
+    "negative_control_receipt": {"path": "{E}/q5-negative-control-20261030T041437Z/receipt.json",
+                                 "sha256": "b3c1db0bbd3df2ff8783ea1df447b2c94799763cf1255fe3623b1155eaea1e3b"}
+  },
+  "run_order": ["qwen38", "deepseek4", "gemma4"],
+  "families": {
+    "qwen38": {
+      "title": "Qwen3.8 27B",
+      "artifact": {"path": "{MODELS}/qwen38-stock/Qwen3.8-27B-vanilla.gguf",
+                   "sha256": "cf0eb0103c1ffe7b3702670aa794a669bafbe328b95e892268305dd87c2c30d7",
+                   "bytes": 16810714976,
+                   "conversion_receipt_sha256": "8a370d80c6f06a5f7111abe1dad46ae9cc1dbf66034e6fa2abe90276b0f13b23"},
+      "q5_case": {"path": "scripts/four_agent/q5_cases/qwen38.json",
+                  "sha256": "4358e4c3c94c55fb737284e33d22a340a3e12edcbfa3abcaf19d98f1aae25633"},
+      "client_approval_template": {"path": "{E}/approval-templates-proof-4b2bea77-cargo199/qwen38-client-approval.json",
+                                   "sha256": "facc7afa42cb76330b207292979dcbc846cd2bad0433c81450be0b6cd7d46776"},
+      "ab_blocks": 6,
+      "run_seconds_estimate": [95, 135]
+    },
+    "deepseek4": {
+      "title": "DeepSeek-V4 Flash",
+      "artifact": {"path": "{MODELS}/deepseek4/DeepSeek-V4-Flash-0731-hf2q-deepseek4-agentic-q2.gguf",
+                   "sha256": "50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6",
+                   "bytes": 107431343264,
+                   "conversion_receipt_sha256": "9c5dc7ea21411e44ced343352f510a59039f16c11bdb19e7e4f3a10bfa88e03b"},
+      "q5_case": {"path": "scripts/four_agent/q5_cases/deepseek4.json",
+                  "sha256": "d362f00ea484facd8e4422affbdefc77364f3aceb89dbc660f0212895d9e1004"},
+      "client_approval_template": {"path": "{E}/approval-templates-proof-4b2bea77-cargo199/deepseek4-client-approval.json",
+                                   "sha256": "b9da836100f52741cd2d586914701d2d8a5a6aceb0eb4922b6b2fe7d44654393"},
+      "ab_blocks": 6,
+      "run_seconds_estimate": [111, 160]
+    },
+    "gemma4": {
+      "title": "Gemma 4 26B-A4B",
+      "artifact": {"path": "{MODELS}/gemma4-google/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf",
+                   "sha256": "bf65b7e163216885790442d0324839101ba4b5b49f7be4ec0cf3d7c5c538ef53",
+                   "bytes": 16796018144,
+                   "conversion_receipt_sha256": "299aa501a10546a26d85ca1e5600c6d6e5873e2fc2d35a4b0337409771677caf"},
+      "q5_case": {"path": "scripts/four_agent/q5_cases/gemma4.json",
+                  "sha256": "1d0ff664b827adb1b12ed17dfd2a442b22b2439eab3856d514b21992c720d6ef"},
+      "client_approval_template": {"path": "{E}/approval-templates-proof-4b2bea77-cargo199/gemma4-client-approval.json",
+                                   "sha256": "895093735222afa592f3444c6feb6e6d3626a0afd237583e9389a68bd8d19490"},
+      "ab_blocks": 6,
+      "run_seconds_estimate": [29, 35]
+    }
+  },
+  "workloads": {
+    "order": ["n4", "n1", "3+1", "2+2", "1+3"],
+    "primary": "n4",
+    "n1_control": "for a change that should not engage with one agent, the n1 interval must lie within +-2.5 points",
+    "mixed_controls": "3+1, 2+2 and 1+3 effects are reported"
+  },
+  "design": {
+    "arms": {"A": "the previous default", "B": "the candidate: the same binary with one kill switch changed"},
+    "block": "one block is one paired A and B run; odd blocks run A then B and even blocks B then A, so each pair of consecutive blocks forms ABBA",
+    "warmup": "one discarded run per arm per stage per driver session, in the next block's order",
+    "ab_block_count": {"default": 6, "allowed": [6, 8, 12, 16, 20],
+                       "rule": "a count other than 6 is chosen from a separately labelled pilot campaign before qualification; pilot runs are never pooled; no sequential peeking"},
+    "primary_metric": "client summary own_output_four_task_makespan_seconds",
+    "effect": "paired log-makespan Student-t 95% interval over quality-eligible blocks (both runs Pass), as a percentage-point reduction of B against A",
+    "verdict_order": ["Loss", "Win", "Equivalent", "Inconclusive"],
+    "margin_points": 2.5,
+    "failed_runs": "task, tool, protocol, isolation or truncation failures make a run quality-ineligible; every run is retained in the receipt",
+    "fairness": {
+      "paired_regression": "per workload, Q3's paired fairness test: block-paired ln(B/A) of the run's worst-slot p95 semantic TTFT and of its worst-slot maximum semantic SSE gap (Student-t 95% interval); a candidate fails if the ratio interval's lower bound exceeds neutral_ratio (reliably worse beyond the band). A measurable metric without an interval is Unverifiable and fails; a metric no passing run measured (one semantic event per streamed turn) does not gate.",
+      "neutral_ratio": 1.025,
+      "safety_cap": "every measured candidate run and slot: p95 semantic TTFT, and the run's maximum semantic SSE gap, at or below cap_factor x the frozen baseline ceiling of its family and workload",
+      "cap_factor": 1.5,
+      "decision": "operator decision 2026-11-03 (ReviewB1 finding 3); ADR-065 amendment drafted in docs/research/adr065-b1-campaign.md"
+    }
+  },
+  "baseline_campaign": {
+    "arms": ["A"],
+    "runs_per_stage": {"n4": 20, "n1": 6, "3+1": 6, "2+2": 6, "1+3": 6},
+    "ceiling": "the largest value over the stage's eligible measured runs (outcome Pass, Q5 verdict CalibrationPass, no serious or critical thermal state) and their slots; warmups never count; excluded runs are listed; a stage without an eligible run has no ceiling and is refused"
+  },
+  "execution": {
+    "cooldown_seconds": 60,
+    "retry_allowance_attempts": 6,
+    "budget": {
+      "rule": "a campaign halts for good once its attempts reach planned runs + retry_allowance_attempts; hours = runs x (run_seconds_estimate + cooldown_seconds)",
+      "baseline_per_family": {"planned_runs": 49, "max_attempts": 55,
+                              "hours": {"qwen38": [2.1, 2.7], "deepseek4": [2.3, 3.0], "gemma4": [1.2, 1.3]}},
+      "baseline_total_hours": [5.6, 6.9],
+      "ab_per_family_at_6_blocks": {"planned_runs": 70, "max_attempts": 76,
+                                    "hours": {"qwen38": [3.0, 3.8], "deepseek4": [3.3, 4.3], "gemma4": [1.7, 1.8]}}
+    },
+    "host": "reserved exclusively under HOST-LOCK; no peer or other hf2q process loaded; one engine at a time",
+    "q5": "every run is one q5_calibration.py supervised runtime and must reach CalibrationPass",
+    "thermal": "a serious or critical thermal state invalidates the run for acceptance",
+    "identities": "binary, model, case, harness, Python and host are frozen at campaign start and re-checked before every run; drift halts the campaign for good"
+  }
+}

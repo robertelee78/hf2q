@@ -347,10 +347,17 @@ class Halt(Exception):
 
 
 class Driver:
+    """Q3 campaign driver. ADR-065 campaigns (adr065_campaign.py) subclass it: `schema`, `launch_problems`,
+    `finished` and `step` are the hooks they override."""
+    schema = SCHEMA
+
     def __init__(self, plan, cases, out, environ, runner, thermal, identify):
         self.plan, self.cases, self.out, self.environ = plan, cases, out, environ
         self.runner, self.thermal, self.identify = runner, thermal, identify
         self.manifest = None
+
+    def launch_problems(self, frozen):
+        return q3_identity.launch_problems(self.plan, frozen, self.out)
 
     def save(self):
         save(self.out / "campaign.json", self.manifest)
@@ -392,7 +399,7 @@ class Driver:
             qc.require(not self.out.exists(), "campaign output must be a new directory")
             qc.require(not any((p / ".git").exists() for p in (self.out.parent.resolve(), *self.out.parent.resolve().parents)),
                        "campaign output must be outside any Git tree")
-            problems = q3_identity.launch_problems(self.plan, frozen, self.out)
+            problems = self.launch_problems(frozen)
             qc.require(not problems, "not launchable: " + "; ".join(problems))
             self.out.mkdir(mode=0o700)
             for name in ("cases", "runs", "logs"):
@@ -403,7 +410,7 @@ class Driver:
             if self.plan.get("splash_unavailable_evidence"):
                 unavailable["splash"] = {"reason": "declared from prior evidence",
                                          "evidence": self.plan["splash_unavailable_evidence"]}
-            self.manifest = {"schema": SCHEMA, "plan": self.plan, "plan_sha256": digest, "identities": frozen,
+            self.manifest = {"schema": self.schema, "plan": self.plan, "plan_sha256": digest, "identities": frozen,
                              "identities_sha256": qc.plan_sha256(frozen), "created_utc": now(), "status": "Running",
                              "halted": None, "sessions": [], "next_seq": 0, "unavailable": unavailable,
                              "independent_review_required": True,

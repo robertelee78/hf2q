@@ -141,6 +141,19 @@ def controls_identity(plan, ids):
             "host": ids["host"], "python_sha256": ids["python"]["sha256"], "arms": arms}
 
 
+def arm_problems(ids):
+    """Per-arm launch problems shared with the ADR-065 driver: unset variables, missing files and binaries."""
+    problems = [f"{name}: missing variables {','.join(i['missing_variables'])}" for name, i in ids["arms"].items()
+                if i["missing_variables"]]
+    problems += [f"{name}: {what} not found" for name, i in ids["arms"].items() for what, ok in i["file_checks"].items() if not ok]
+    return problems + [f"{name}: binary {i['binary']['path']} not found" for name, i in ids["arms"].items()
+                       if not i["binary"]["exists"]]
+
+
+def harness_clean(ids):
+    return ids["harness"]["git_commit"] is not None and not ids["harness"]["git_dirty"]
+
+
 def launch_problems(plan, ids, output=None):
     """Everything that keeps a campaign from starting; empty when launchable. output: the campaign directory, which
     same-artifact arms check (Splash run directories must be on APFS). Without a stock arm (--no-stock-arm) only the
@@ -148,10 +161,7 @@ def launch_problems(plan, ids, output=None):
     campaign's experiment binary."""
     hf2q = [name for name in ("stock", "experiment") if name in plan["arms"]]
     problems = [f"--{name}-bin is required" for name in hf2q if not plan["declared"][name]["binary"]]
-    problems += [f"{name}: missing variables {','.join(i['missing_variables'])}" for name, i in ids["arms"].items()
-                 if i["missing_variables"]]
-    problems += [f"{name}: {what} not found" for name, i in ids["arms"].items() for what, ok in i["file_checks"].items() if not ok]
-    problems += [f"{name}: binary {i['binary']['path']} not found" for name, i in ids["arms"].items() if not i["binary"]["exists"]]
+    problems += arm_problems(ids)
     native = native_arms(plan)
     if not same_model(ids, native):
         problems.append("every arm must serve the same model artifact (sha256, or path and size)")
@@ -187,7 +197,7 @@ def launch_problems(plan, ids, output=None):
         if changed:
             problems.append(f"the stock record {' and '.join(bound[n]['path'] for n in changed)} changed since the "
                             "campaign bound it (freeze the record read-only before binding)")
-    if ids["harness"]["git_commit"] is None or ids["harness"]["git_dirty"]:
+    if not harness_clean(ids):
         problems.append("the harness checkout must be a clean Git commit (scripts/ has uncommitted changes)")
     if not plan["declared"]["qe_identity"]:
         problems.append("--qe-identity (the named QE session/host executing Q3) is required")
