@@ -330,7 +330,7 @@ pub(super) fn prefill(
     .unwrap_or_else(|error| panic!("slot {} prefill admission: {error:#}", slot.0));
     loop {
         match pending
-            .advance(qwen, None, kv, PREFILL_CHUNK, supervisor)
+            .advance(qwen, None, kv, PREFILL_CHUNK, supervisor, None)
             .unwrap_or_else(|error| panic!("slot {} prefill: {error:#}", slot.0))
         {
             Qwen35PrefillAdvance::Pending { state, .. } => pending = state,

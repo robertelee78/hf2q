@@ -311,7 +311,9 @@ fn spill_and_restore_refuse_an_active_capture_transaction() {
     let device = MlxDevice::new().expect("Metal device");
     let mut cache = cache(&device, true, true);
     arrange(&mut cache);
-    let spill = cache.spill_slot(SlotId(1)).expect("spill between transactions");
+    let spill = cache
+        .spill_slot(SlotId(1))
+        .expect("spill between transactions");
     cache
         .ensure_la_capture(&cfg(true), &device, 2)
         .expect("arm capture");

@@ -83,32 +83,42 @@ pub(crate) struct Prefix64Evidence {
     pub scheduler_in_flight_after: u32,
     pub cancellation_performed: bool,
 }
-enum BoundaryOutcome { Prefix(Prefix64Evidence), Recovered(Evidence) }
+enum BoundaryOutcome {
+    Prefix(Prefix64Evidence),
+    Recovered(Evidence),
+}
 
 pub(crate) fn run_loaded(
     model: &mut super::super::engine_qwen35::Qwen35LoadedModel,
-    prompt: &[u32], params: SamplingParams,
-    observe: impl FnMut(Phase,&crate::inference::models::qwen35::kv_cache::HybridKvCache)->Result<()>,
+    prompt: &[u32],
+    params: SamplingParams,
+    observe: impl FnMut(Phase, &crate::inference::models::qwen35::kv_cache::HybridKvCache) -> Result<()>,
 ) -> Result<Evidence> {
-    match run_loaded_boundary(model,prompt,params,false,observe)? {
+    match run_loaded_boundary(model, prompt, params, false, observe)? {
         BoundaryOutcome::Recovered(value) => Ok(value),
         BoundaryOutcome::Prefix(_) => anyhow::bail!("unexpected prefix-only outcome"),
     }
 }
 pub(crate) fn run_loaded_prefix64(
     model: &mut super::super::engine_qwen35::Qwen35LoadedModel,
-    prompt: &[u32], params: SamplingParams,
-    observe: impl FnMut(Phase,&crate::inference::models::qwen35::kv_cache::HybridKvCache)->Result<()>,
+    prompt: &[u32],
+    params: SamplingParams,
+    observe: impl FnMut(Phase, &crate::inference::models::qwen35::kv_cache::HybridKvCache) -> Result<()>,
 ) -> Result<Prefix64Evidence> {
-    match run_loaded_boundary(model,prompt,params,true,observe)? {
+    match run_loaded_boundary(model, prompt, params, true, observe)? {
         BoundaryOutcome::Prefix(value) => Ok(value),
         BoundaryOutcome::Recovered(_) => anyhow::bail!("unexpected cancellation outcome"),
     }
 }
 fn run_loaded_boundary(
     model: &mut super::super::engine_qwen35::Qwen35LoadedModel,
-    prompt: &[u32], mut params: SamplingParams, keep_prefix64: bool,
-    mut observe: impl FnMut(Phase,&crate::inference::models::qwen35::kv_cache::HybridKvCache)->Result<()>,
+    prompt: &[u32],
+    mut params: SamplingParams,
+    keep_prefix64: bool,
+    mut observe: impl FnMut(
+        Phase,
+        &crate::inference::models::qwen35::kv_cache::HybridKvCache,
+    ) -> Result<()>,
 ) -> Result<BoundaryOutcome> {
     anyhow::ensure!(
         prompt.len() == 128,
@@ -172,7 +182,7 @@ fn run_loaded_boundary(
     ))];
     let mut retained = vec![Qwen35RetainedPrefix::default()];
     let mut caches = vec![PromptCache::new()];
-    let mut anchors = vec![None];
+    let mut anchors = vec![Qwen35AnchorStore::new(1).expect("test anchor depth")];
     let stats = Arc::new(Mutex::new(scheduler.stats()));
     let supervisor = EngineSupervisor::new();
     let first = advance_qwen35_prefill(
@@ -198,7 +208,7 @@ fn run_loaded_boundary(
     );
     anyhow::ensure!(
         anchors[0]
-            .as_ref()
+            .pending()
             .is_some_and(|a| a.prompt_tokens == prompt[..64]),
         "real stable checkpoint64 missing"
     );
@@ -217,14 +227,22 @@ fn run_loaded_boundary(
         // second forward, receiver cancellation injection or cache rollback.
         drop(slots[0].take());
         scheduler.release(handle);
-        let retained_cursor=guard.kv.as_ref().unwrap().sequence_len_for_slot(handle.slot_id)? as usize;
-        let in_flight=scheduler.stats().in_flight_slots;
-        anyhow::ensure!(retained_cursor==64 && in_flight==0 && supervisor.is_healthy(),
-            "prefix-only detach changed checked cache or reservation");
+        let retained_cursor = guard
+            .kv
+            .as_ref()
+            .unwrap()
+            .sequence_len_for_slot(handle.slot_id)? as usize;
+        let in_flight = scheduler.stats().in_flight_slots;
+        anyhow::ensure!(
+            retained_cursor == 64 && in_flight == 0 && supervisor.is_healthy(),
+            "prefix-only detach changed checked cache or reservation"
+        );
         return Ok(BoundaryOutcome::Prefix(Prefix64Evidence {
-            source_route:"shared actual advance_qwen35_prefill first Pending64; no cancellation",
-            checked_prefix:64,retained_cursor,scheduler_in_flight_after:in_flight,
-            cancellation_performed:false,
+            source_route: "shared actual advance_qwen35_prefill first Pending64; no cancellation",
+            checked_prefix: 64,
+            retained_cursor,
+            scheduler_in_flight_after: in_flight,
+            cancellation_performed: false,
         }));
     }
 

@@ -16,7 +16,10 @@
 //! on which tenants share its turns; only a lone lane that would speculate
 //! stays serial.
 
-use std::sync::Once;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Once,
+};
 
 use crate::inference::models::qwen35::joint_decode_routes::{
     joint_decode_env_unavailable_reason, joint_ffn_shared_from_process, joint_mode_max_rows,
@@ -26,15 +29,17 @@ use crate::inference::models::qwen35::joint_step_options::{
     switch_from_process, JointStepOptions, QWEN_JOINT_POOLED_OUTPUTS_ENV,
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
-use crate::serve::api::engine_qwen35::{critical_path, Qwen35JointLane, Qwen35TickOutcome};
+use crate::serve::api::engine_qwen35::{
+    anchor_store::Qwen35AnchorStore, critical_path, Qwen35JointLane, Qwen35LaneRefusal,
+    Qwen35TickOutcome,
+};
 use crate::serve::api::qwen35_speculation::QwenSpeculationRoute;
 use crate::serve::api::registry::ModelRegistration;
 
 use super::{
     is_fatal_command_buffer_error, settle_qwen35_decode_lane, EngineSupervisor,
     InflightBatchedScheduler, PromptCache, Qwen35FatalFailure, Qwen35FatalReply, Qwen35KvGuard,
-    Qwen35PromptAnchor, Qwen35RetainedPrefix, Qwen35Slot, Qwen35SlotWork, Qwen35WorkerFatalKind,
-    SlotHandle,
+    Qwen35RetainedPrefix, Qwen35Slot, Qwen35SlotWork, Qwen35WorkerFatalKind, SlotHandle,
 };
 
 /// Kill switch for A/B measurement: `1`/`on`/`true` selects joint decode,
@@ -345,9 +350,88 @@ fn distribute_step_error<T>(
     (0..rows).map(move |_| Err(first.take().unwrap_or_else(|| anyhow::anyhow!("{message}"))))
 }
 
+pub(in crate::serve::api) struct Qwen35JointTelemetry {
+    pub capture_active: AtomicU64,
+    pub duplicate_slots: AtomicU64,
+    pub max_rows: AtomicU64,
+    pub too_few_ready: AtomicU64,
+    pub lane_step_bound: AtomicU64,
+    pub lane_pending_speculation_output: AtomicU64,
+    pub lane_no_seed: AtomicU64,
+    pub lane_target_cursor: AtomicU64,
+    pub lane_mtp_cursor: AtomicU64,
+    pub lane_speculation_route: AtomicU64,
+    pub lane_client_closed: AtomicU64,
+    pub lane_handle_mismatch: AtomicU64,
+}
+
+pub(in crate::serve::api) static JOINT_TELEMETRY: Qwen35JointTelemetry = Qwen35JointTelemetry {
+    capture_active: AtomicU64::new(0),
+    duplicate_slots: AtomicU64::new(0),
+    max_rows: AtomicU64::new(0),
+    too_few_ready: AtomicU64::new(0),
+    lane_step_bound: AtomicU64::new(0),
+    lane_pending_speculation_output: AtomicU64::new(0),
+    lane_no_seed: AtomicU64::new(0),
+    lane_target_cursor: AtomicU64::new(0),
+    lane_mtp_cursor: AtomicU64::new(0),
+    lane_speculation_route: AtomicU64::new(0),
+    lane_client_closed: AtomicU64::new(0),
+    lane_handle_mismatch: AtomicU64::new(0),
+};
+
+pub(in crate::serve::api) fn record_joint_ineligible(reason: &Qwen35JointIneligible) {
+    let counter = match reason {
+        Qwen35JointIneligible::CaptureActive => &JOINT_TELEMETRY.capture_active,
+        Qwen35JointIneligible::DuplicateSlots => &JOINT_TELEMETRY.duplicate_slots,
+        Qwen35JointIneligible::MaxRowsBelowTwo => &JOINT_TELEMETRY.max_rows,
+        Qwen35JointIneligible::TooFewReady { refusals, .. } => {
+            for refusal in refusals {
+                let lane = match refusal {
+                    Qwen35LaneRefusal::StepBound => &JOINT_TELEMETRY.lane_step_bound,
+                    Qwen35LaneRefusal::PendingSpeculationOutput => {
+                        &JOINT_TELEMETRY.lane_pending_speculation_output
+                    }
+                    Qwen35LaneRefusal::NoSeed => &JOINT_TELEMETRY.lane_no_seed,
+                    Qwen35LaneRefusal::TargetCursor => &JOINT_TELEMETRY.lane_target_cursor,
+                    Qwen35LaneRefusal::MtpCursor => &JOINT_TELEMETRY.lane_mtp_cursor,
+                    Qwen35LaneRefusal::SpeculationRoute => &JOINT_TELEMETRY.lane_speculation_route,
+                    Qwen35LaneRefusal::ClientClosed => &JOINT_TELEMETRY.lane_client_closed,
+                    Qwen35LaneRefusal::HandleMismatch => &JOINT_TELEMETRY.lane_handle_mismatch,
+                };
+                lane.fetch_add(1, Ordering::Relaxed);
+            }
+            &JOINT_TELEMETRY.too_few_ready
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::serve::api) enum Qwen35JointIneligible {
+    CaptureActive,
+    DuplicateSlots,
+    MaxRowsBelowTwo,
+    TooFewReady {
+        ready: usize,
+        refusals: Vec<Qwen35LaneRefusal>,
+    },
+}
+
+impl Qwen35JointIneligible {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::CaptureActive => "capture_active",
+            Self::DuplicateSlots => "duplicate_slots",
+            Self::MaxRowsBelowTwo => "max_rows",
+            Self::TooFewReady { .. } => "too_few_ready",
+        }
+    }
+}
+
 pub(super) enum Qwen35JointRun {
     /// No joint group forms; the caller runs the whole turn serially.
-    NotEligible,
+    NotEligible(Qwen35JointIneligible),
     /// Joint lanes are settled; `serial` handles still need the serial loop.
     Ran {
         serial: Vec<SlotHandle>,
@@ -380,7 +464,7 @@ pub(super) fn run_qwen35_joint_decode(
     slots: &mut [Option<Qwen35Slot>],
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     registration: Option<&ModelRegistration>,
     handles: &[SlotHandle],
     kv_bytes_per_token: u64,
@@ -395,7 +479,17 @@ pub(super) fn run_qwen35_joint_decode(
     {
         // An active DeltaNet capture would make the joint transaction refuse
         // after lanes were prepared; keep such a turn serial up front.
-        return Qwen35JointRun::NotEligible;
+        return Qwen35JointRun::NotEligible(Qwen35JointIneligible::CaptureActive);
+    }
+    if config.max_rows < 2 {
+        return Qwen35JointRun::NotEligible(Qwen35JointIneligible::MaxRowsBelowTwo);
+    }
+    if handles.iter().enumerate().any(|(index, handle)| {
+        handles[..index]
+            .iter()
+            .any(|earlier| earlier.slot_id == handle.slot_id)
+    }) {
+        return Qwen35JointRun::NotEligible(Qwen35JointIneligible::DuplicateSlots);
     }
     // Repeatable route: plan every lane's tick from its own state before the
     // partition, so a lane that speculates or drains verified output never
@@ -411,23 +505,40 @@ pub(super) fn run_qwen35_joint_decode(
             }
         }
     }
+    let mut refusals = Vec::new();
+    let mut ready = 0usize;
     let Some(JointPartition { groups, mut serial }) = ({
         let kv = guard.kv.as_ref().expect("kv Some during loop");
-        partition_qwen35_joint_lanes(handles, config.max_rows, config.solo, |handle| match slots
-            .get(handle.slot_id.0 as usize)
-            .and_then(Option::as_ref)
-        {
-            Some((Qwen35SlotWork::Decode(state), reply, installed))
-                if *installed == handle
-                    && !reply.client_closed()
-                    && state.joint_decode_ready(kv) =>
-            {
-                state.joint_lane_class()
+        partition_qwen35_joint_lanes(handles, config.max_rows, config.solo, |handle| {
+            let Some((Qwen35SlotWork::Decode(state), reply, installed)) = slots
+                .get(handle.slot_id.0 as usize)
+                .and_then(Option::as_ref)
+            else {
+                refusals.push(Qwen35LaneRefusal::HandleMismatch);
+                return None;
+            };
+            if *installed != handle {
+                refusals.push(Qwen35LaneRefusal::HandleMismatch);
+                return None;
             }
-            _ => None,
+            if reply.client_closed() {
+                refusals.push(Qwen35LaneRefusal::ClientClosed);
+                return None;
+            }
+            if let Err(reason) = state.joint_decode_readiness(kv) {
+                refusals.push(reason);
+                return None;
+            }
+            let class = state.joint_lane_class();
+            if class.is_some() {
+                ready += 1;
+            } else {
+                refusals.push(Qwen35LaneRefusal::SpeculationRoute);
+            }
+            class
         })
     }) else {
-        return Qwen35JointRun::NotEligible;
+        return Qwen35JointRun::NotEligible(Qwen35JointIneligible::TooFewReady { ready, refusals });
     };
 
     let mut groups = groups.into_iter();
@@ -474,7 +585,7 @@ fn run_qwen35_joint_group(
     slots: &mut [Option<Qwen35Slot>],
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     registration: Option<&ModelRegistration>,
     group: Vec<SlotHandle>,
     serial_lanes: usize,

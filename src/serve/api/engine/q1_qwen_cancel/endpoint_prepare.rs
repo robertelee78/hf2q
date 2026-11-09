@@ -94,8 +94,14 @@ pub(super) fn plan(
         ) && header_cfg.vocab_size == work.vocab_size,
         "explicit Qwen vocabulary/family/variant"
     );
-    ensure!((144..=262144).contains(&capacity), "endpoint capacity 144..=262144");
-    ensure!(payload_limit <= qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX, "endpoint payload limit <= 4 GiB");
+    ensure!(
+        (144..=262144).contains(&capacity),
+        "endpoint capacity 144..=262144"
+    );
+    ensure!(
+        payload_limit <= qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX,
+        "endpoint payload limit <= 4 GiB"
+    );
     let recipe = qwen_checkpoint::endpoint_recipe(work.family, capacity, header_cfg);
     let mut packets = Vec::with_capacity(TRAJECTORIES.len());
     for trajectory in TRAJECTORIES {
@@ -106,7 +112,10 @@ pub(super) fn plan(
             capacity,
             mtp_positions,
         )?;
-        ensure!(!cache.is_empty(), "complete active-cache manifest is mandatory");
+        ensure!(
+            !cache.is_empty(),
+            "complete active-cache manifest is mandatory"
+        );
         let planned = qwen_checkpoint::planned_payload(
             &cache,
             header_cfg.vocab_size as usize,
@@ -132,14 +141,22 @@ fn localizer_plan(
     capacity: u32,
     l: &LocalizerConfig,
 ) -> Result<LocalizerPlan> {
-    ensure!((144..=262144).contains(&capacity), "localizer capacity 144..=262144");
-    ensure!(!l.routes.is_empty() && l.routes.len() <= 8, "one to eight localizer routes");
+    ensure!(
+        (144..=262144).contains(&capacity),
+        "localizer capacity 144..=262144"
+    );
+    ensure!(
+        !l.routes.is_empty() && l.routes.len() <= 8,
+        "one to eight localizer routes"
+    );
     let mut routes: Vec<(String, Vec<usize>, qwen_localizer::Manifest)> = Vec::new();
     for r in &l.routes {
         ensure!(
             !r.rerun_id.is_empty()
                 && r.rerun_id.len() <= 64
-                && r.rerun_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+                && r.rerun_id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
                 && routes.iter().all(|(id, _, _)| *id != r.rerun_id),
             "distinct file-safe localizer rerun ids"
         );
@@ -246,7 +263,10 @@ fn localizer_files(
         "whole_q1_qualified": false,
     });
     let encoded = serde_json::to_vec_pretty(&value)?;
-    ensure!(encoded.len() <= 2 * 1024 * 1024, "bounded localizer metadata");
+    ensure!(
+        encoded.len() <= 2 * 1024 * 1024,
+        "bounded localizer metadata"
+    );
     files.insert(0, ("localizer-prepared.json".into(), encoded));
     Ok(files)
 }
@@ -320,8 +340,10 @@ fn run() -> Result<()> {
             "mtp_positions": config.mtp_positions,
         });
         let encoded = serde_json::to_vec_pretty(&packet)?;
-        ensure!(encoded.len() + 65536 <= qwen_checkpoint::ENDPOINT_PACKET_READ_LIMIT,
-            "packet must fit the qwen_actual packet read limit");
+        ensure!(
+            encoded.len() + 65536 <= qwen_checkpoint::ENDPOINT_PACKET_READ_LIMIT,
+            "packet must fit the qwen_actual packet read limit"
+        );
         files.push((format!("packet-{}.json", trajectory.label()), encoded));
     }
     let value = serde_json::json!({
@@ -373,9 +395,15 @@ fn run() -> Result<()> {
     let encoded = serde_json::to_vec_pretty(&value)?;
     ensure!(encoded.len() <= 2 * 1024 * 1024, "metadata output bound");
     let localizer_out = match &localizer {
-        Some((l, lp)) => {
-            localizer_files(&b, common, &raw, config.configured_capacity, &identity, l, lp)?
-        }
+        Some((l, lp)) => localizer_files(
+            &b,
+            common,
+            &raw,
+            config.configured_capacity,
+            &identity,
+            l,
+            lp,
+        )?,
         None => Vec::new(),
     };
     if let Some((binding, _)) = &derivation {
@@ -386,8 +414,16 @@ fn run() -> Result<()> {
         ("prepared.json", encoded.as_slice()),
         ("workload.json", b.vectors.as_slice()),
     ];
-    out.extend(files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())));
-    out.extend(localizer_out.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())));
+    out.extend(
+        files
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+    );
+    out.extend(
+        localizer_out
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+    );
     b.recheck_and_write(common, &out)?;
     if let Some((l, lp)) = &localizer {
         println!(
@@ -410,7 +446,8 @@ fn run() -> Result<()> {
 
 const SUFFIX_SCHEMA: &str = "hf2q.q1.qwen36-tool-round-suffix144-workload.v1";
 const SUFFIX_LABEL: &str = "Qwen36ToolRoundSuffix144";
-const SUFFIX_DECISION: &str = "D1 PENDING: operator/reviewer must accept the last-144-token windows \
+const SUFFIX_DECISION: &str =
+    "D1 PENDING: operator/reviewer must accept the last-144-token windows \
 of the four reviewed tool_round prompts as real agent prompts for Class B; otherwise Qwen3.6 (c) \
 is diagnostic-only. Class A comparisons are valid either way.";
 
@@ -422,7 +459,10 @@ pub(super) fn suffix144_workload(rounds: &[Vec<u32>], vocab_size: u32) -> Result
     let lanes = rounds
         .iter()
         .map(|tokens| {
-            let start = tokens.len().checked_sub(144).context("tool_round prompt shorter than 144")?;
+            let start = tokens
+                .len()
+                .checked_sub(144)
+                .context("tool_round prompt shorter than 144")?;
             Ok(tokens[start..].to_vec())
         })
         .collect::<Result<Vec<_>>>()?;
@@ -480,12 +520,18 @@ fn suffix_run() -> Result<()> {
         "model_loaded": false,
     }))?;
     for (binding, old) in config.rounds.iter().zip(&bound) {
-        ensure!(acquisition::checked_file(binding, 4 * 1024 * 1024)? == *old, "round changed");
+        ensure!(
+            acquisition::checked_file(binding, 4 * 1024 * 1024)? == *old,
+            "round changed"
+        );
     }
     prepare::output_preflight(&config.output)?;
     std::fs::create_dir(&config.output)?;
     std::fs::set_permissions(&config.output, std::fs::Permissions::from_mode(0o700))?;
-    for (name, bytes) in [("workload.json", &workload), ("derivation.json", &derivation)] {
+    for (name, bytes) in [
+        ("workload.json", &workload),
+        ("derivation.json", &derivation),
+    ] {
         std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)

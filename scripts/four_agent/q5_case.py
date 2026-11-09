@@ -62,6 +62,26 @@ def validate(case):
     require(workload.get('slots') == 4, 'Q5 calibrates the four-slot configuration (workload.slots == 4)')
     require(type(workload.get('context_per_slot')) is int and workload['context_per_slot'] > 0,
             'workload.context_per_slot must be a positive integer')
+    anchor_fields = {'anchors_per_slot', 'anchor_bytes_per_slot_max',
+                     'speculation_capture_bytes'}
+    declared_anchor_fields = anchor_fields & set(workload)
+    require(not declared_anchor_fields or declared_anchor_fields == anchor_fields,
+            'C2 workloads declare anchors_per_slot, anchor_bytes_per_slot_max and speculation_capture_bytes together')
+    if declared_anchor_fields:
+        require(type(workload['anchors_per_slot']) is int and 1 <= workload['anchors_per_slot'] <= 8,
+                'workload.anchors_per_slot must be an integer in 1..=8')
+        require(type(workload['anchor_bytes_per_slot_max']) is int and
+                workload['anchor_bytes_per_slot_max'] > 0,
+                'workload.anchor_bytes_per_slot_max must be positive')
+        require(type(workload['speculation_capture_bytes']) is int and
+                workload['speculation_capture_bytes'] >= 0,
+                'workload.speculation_capture_bytes must be non-negative')
+        serve_env = (case.get('serve') or {}).get('env', {})
+        require(serve_env.get('HF2Q_QWEN_ANCHOR_DEPTH') == str(workload['anchors_per_slot']),
+                'serve anchor depth must equal workload.anchors_per_slot')
+        require(serve_env.get('HF2Q_QWEN_ANCHOR_BYTES_PER_SLOT_MAX') ==
+                str(workload['anchor_bytes_per_slot_max']),
+                'serve anchor quota must equal workload.anchor_bytes_per_slot_max')
     variables = case.get('variables', {})
     require(isinstance(variables, dict), 'variables must be an object')
     for name, value in variables.items():

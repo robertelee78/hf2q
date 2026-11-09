@@ -200,7 +200,8 @@ impl Bound {
     /// output directory and write each file exclusively.
     pub(super) fn recheck_and_write(&self, config: &Config, files: &[(&str, &[u8])]) -> Result<()> {
         ensure!(
-            acquisition::checked_file(&config.full_content_receipt, 16 * 1024 * 1024)? == self.full_receipt,
+            acquisition::checked_file(&config.full_content_receipt, 16 * 1024 * 1024)?
+                == self.full_receipt,
             "receipt changed"
         );
         ensure!(

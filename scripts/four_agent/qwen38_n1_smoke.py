@@ -123,8 +123,7 @@ def approval(args):
                 "task instances use the canonical scorer, not a benchmark profile")
         source_paths += [Path(__file__).with_name(n) for n in INSTANCE_MODULES]
     if variant is not None:
-        from coding_long_context import MODULES as VARIANT_MODULES
-        source_paths += [Path(__file__).with_name(n) for n in VARIANT_MODULES]
+        source_paths += [Path(__file__).with_name(n) for n in variant.modules]
     require(packet.get("sources") == {p.name: child.digest(p) for p in source_paths}, "client source drift")
     require(packet.get("approved") is True, "explicit internal operating approval absent")
     proof = child.validate_proof(args.sandbox_proof, args.sandbox_proof_sha256)
@@ -326,7 +325,7 @@ def main():
     parser.add_argument("--engine-kind", choices=family_contract.ENGINE_KINDS, default="hf2q")
     parser.add_argument("--benchmark-profile", choices=("gemma-matched-v1",))
     parser.add_argument("--instance", type=int, help="N4 quality-campaign task instance (coding_instances.py)")
-    parser.add_argument("--workload", help="N4 workload variant of the canonical task (coding_long_context.py)")
+    parser.add_argument("--workload", help="N4 workload variant (long-context-v1 or divergent-edit-v1)")
     parser.add_argument("--phase-plan", help="Q3 phase plan from the four-agent coordinator (qwen_n4_live_smoke.py)")
     parser.add_argument("--phase-cohort", type=int, help="this agent's release cohort under --phase-plan")
     parser.add_argument("--request-setup", choices=("qwen36-vendor-coding-v1",),
@@ -399,8 +398,9 @@ def main():
             tool_class = BenchmarkTools
             summary["benchmark_profile"] = args.benchmark_profile
         files = {} if workload is None else {"immutable": workload.immutable, "initial": workload.initial}
-        if variant is not None:
-            files = {"immutable": variant.immutable, "initial": variant.initial, "read_limit": variant.read_limit}
+        if variant is not None and workload is None and hasattr(variant, "immutable"):
+            files = {"immutable": variant.immutable, "initial": variant.initial,
+                     "read_limit": variant.read_limit}
         tools = tool_class(output / "tools", args.cargo, args.sandbox_exec, packet["sdk_root"], **files,
                            max_calls=max_tools(args.repair_turns))
         protocol = Workflow(args.repair_turns) if args.repair_turns else None
@@ -422,9 +422,15 @@ def main():
                                         args.barrier_token, args.server_pid)
                 first_stream_gate.append(gate)
         started = time.monotonic()
+        variant_edits = []
         for turn in range(max_tools(args.repair_turns) + 1):
             require(not INTERRUPTED and time.monotonic() - started < 7200, "whole client deadline")
             os.kill(args.server_pid, 0)
+            if variant is not None:
+                edit = variant.before_request(messages, turn)
+                if edit is not None:
+                    variant_edits.append(edit)
+                    summary["workload_variant_edits"] = variant_edits
             request = build_request(args.model, messages, schemas, turn, args.family, args.engine_kind,
                                     args.request_setup)
             turn_output = output / f"turn-{turn}"

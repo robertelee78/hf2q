@@ -650,8 +650,8 @@ fn verified_block_at_the_length_boundary_finishes_like_greedy() {
 /// A client that disconnects while verified output is still queued leaves
 /// the slot's GPU state ahead of its streamed ledger. The decode state must
 /// refuse to publish a speculative boundary there, and cancellation recovery
-/// (`restore_slot_anchor`) must rewind both the target and the MTP cursor to
-/// the verified prompt boundary without touching a peer slot.
+/// atomic plan/apply restore must rewind both target and MTP cursors to the
+/// verified prompt boundary without touching a peer slot.
 #[test]
 fn cancellation_mid_verified_drain_publishes_nothing_and_anchor_rewinds_target_and_mtp() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
@@ -714,7 +714,10 @@ fn cancellation_mid_verified_drain_publishes_nothing_and_anchor_rewinds_target_a
     kv.validate_speculative_cursors_for_slot(slot, cursor)
         .expect("mid-drain cursors");
 
-    kv.restore_slot_anchor(slot, &anchor)
+    let plan = kv
+        .plan_slot_anchor_restore(slot, &anchor)
+        .expect("cancellation anchor preflight");
+    kv.apply_slot_anchor_restore(plan)
         .expect("cancellation anchor restore");
     kv.validate_speculative_cursors_for_slot(slot, PROMPT.len())
         .expect("target and MTP cursors must return to the prompt boundary");

@@ -35,14 +35,14 @@
 pub(crate) mod gemma_full_input;
 
 #[cfg(test)]
-#[path = "engine/q1_qwen_cancel.rs"]
-pub(crate) mod q1_qwen_cancel;
+#[path = "engine/q1_gemma_cancel.rs"]
+pub(crate) mod q1_gemma_cancel;
 #[cfg(test)]
 #[path = "engine/q1_gemma_cohort.rs"]
 pub(crate) mod q1_gemma_cohort;
 #[cfg(test)]
-#[path = "engine/q1_gemma_cancel.rs"]
-pub(crate) mod q1_gemma_cancel;
+#[path = "engine/q1_qwen_cancel.rs"]
+pub(crate) mod q1_qwen_cancel;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -55,6 +55,12 @@ use tokenizers::Tokenizer;
 use tokio::sync::{mpsc, oneshot};
 
 use super::engine_error::EngineRequestError;
+use super::engine_qwen35::anchor_store::{
+    anchor_non_payload_bytes, configured_anchor_depth, configured_anchor_quota,
+    record_anchor_capture_skipped_quota, record_anchor_equality_hit, record_anchor_restore,
+    record_anchor_restore_refused, record_anchor_snapshot, Qwen35Anchor as Qwen35PromptAnchor,
+    Qwen35AnchorStore,
+};
 use super::engine_supervisor::{spawn_supervised_worker, EngineSupervisor};
 
 const SLOT_AWARE_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -71,7 +77,9 @@ const GEMMA4_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(120);
 const QWEN35_GPU_WARMUP_TIMEOUT: Duration = Duration::from_secs(240);
 const ENGINE_SYNC_CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 
-use crate::inference::models::gemma4::{MlxModelWeights, MultiSeqPrefillOutput, ProfileAccumulator};
+use crate::inference::models::gemma4::{
+    MlxModelWeights, MultiSeqPrefillOutput, ProfileAccumulator,
+};
 use crate::serve::config::Gemma4Config;
 use crate::serve::forward_prefill::SoftTokenInjection;
 use crate::serve::gpu::GpuContext;
@@ -1979,7 +1987,7 @@ mod f2_work_state;
 mod deepseek4_joint_decode;
 
 #[path = "engine/qwen35_joint_decode.rs"]
-mod qwen35_joint_decode;
+pub(in crate::serve::api) mod qwen35_joint_decode;
 
 #[path = "engine/slot_spill.rs"]
 mod slot_spill;
@@ -3832,7 +3840,8 @@ impl GemmaLoadedModel {
             // the respective env-gate is engaged at process start.
             multi_seq_kv_dense: None,
             multi_seq_kv_mlx: None,
-            slot_spill_budget_bytes: crate::serve::operator_settings::DEFAULT_SLOT_SPILL_BUDGET_BYTES,
+            slot_spill_budget_bytes:
+                crate::serve::operator_settings::DEFAULT_SLOT_SPILL_BUDGET_BYTES,
         })
     }
 
@@ -8945,16 +8954,18 @@ fn deepseek4_prefill_lane_views(
     fifo: &[SlotHandle],
 ) -> Vec<Deepseek4PrefillLaneView> {
     fifo.iter()
-        .filter_map(|&handle| match slots.get(handle.slot_id.0 as usize)?.as_ref()? {
-            (Deepseek4SlotWork::Prefill(state), _, installed) if *installed == handle => {
-                Some(Deepseek4PrefillLaneView {
-                    handle,
-                    cold_wave: state.is_cold_wave(),
-                    recovery_tail: state.is_recovery_tail(),
-                })
-            }
-            _ => None,
-        })
+        .filter_map(
+            |&handle| match slots.get(handle.slot_id.0 as usize)?.as_ref()? {
+                (Deepseek4SlotWork::Prefill(state), _, installed) if *installed == handle => {
+                    Some(Deepseek4PrefillLaneView {
+                        handle,
+                        cold_wave: state.is_cold_wave(),
+                        recovery_tail: state.is_recovery_tail(),
+                    })
+                }
+                _ => None,
+            },
+        )
         .collect()
 }
 
@@ -10230,22 +10241,24 @@ fn plan_deepseek4_prefill_cohort(
         }
         _ => None,
     };
-    let lanes: Vec<(Deepseek4CohortLane, &super::engine_deepseek4::Deepseek4PrefillState)> =
-        std::iter::once(primary)
-            .chain(handles.iter().copied().filter(|handle| *handle != primary))
-            .filter_map(|handle| {
-                prefilling(handle).map(|(state, reply)| {
-                    (
-                        Deepseek4CohortLane {
-                            handle,
-                            cold_wave: state.is_cold_wave(),
-                            reply_class: deepseek4_reply_class(reply),
-                        },
-                        state,
-                    )
-                })
+    let lanes: Vec<(
+        Deepseek4CohortLane,
+        &super::engine_deepseek4::Deepseek4PrefillState,
+    )> = std::iter::once(primary)
+        .chain(handles.iter().copied().filter(|handle| *handle != primary))
+        .filter_map(|handle| {
+            prefilling(handle).map(|(state, reply)| {
+                (
+                    Deepseek4CohortLane {
+                        handle,
+                        cold_wave: state.is_cold_wave(),
+                        reply_class: deepseek4_reply_class(reply),
+                    },
+                    state,
+                )
             })
-            .collect();
+        })
+        .collect();
     if lanes.first().map(|(lane, _)| lane.handle) != Some(primary) {
         return Ok(None);
     }
@@ -14709,10 +14722,18 @@ fn advance_gemma4_prefill(
         .max(1) as usize;
     let advance = state.advance(guard, registration, max_chunk_tokens, supervisor);
     #[cfg(test)]
-    if let Err(error) = q1_gemma_cancel::after_actual_advance(advance.is_ok(),handle,
-        validate_gemma4_slot_cursor(guard,handle.slot_id,gemma4_live_slot_tokens(guard,handle.slot_id))
-            .ok().map(|_|gemma4_live_slot_tokens(guard,handle.slot_id))) {
-        return Some(SlotAwareGpuFatal::invariant_slot(handle,reply,error));
+    if let Err(error) = q1_gemma_cancel::after_actual_advance(
+        advance.is_ok(),
+        handle,
+        validate_gemma4_slot_cursor(
+            guard,
+            handle.slot_id,
+            gemma4_live_slot_tokens(guard, handle.slot_id),
+        )
+        .ok()
+        .map(|_| gemma4_live_slot_tokens(guard, handle.slot_id)),
+    ) {
+        return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
     }
     match advance {
         Ok(advance) => {
@@ -16274,8 +16295,7 @@ fn decode_batch_gemma4(
     let mut fused_head_out: Option<crate::inference::models::gemma4::batched_head::BatchedHeadOut> =
         None;
     if use_batched_body {
-        let arena_setup =
-            crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
+        let arena_setup = crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
         let mut tokens: Vec<u32> = Vec::new();
         let mut sids: Vec<SlotId> = Vec::new();
         let mut positions: Vec<usize> = Vec::new();
@@ -16707,8 +16727,7 @@ fn decode_batch_gemma4(
         let logits_row = &head.logits[i * vocab..(i + 1) * vocab];
         // Select directly from the artifact-native head logits. No transformed
         // head or host embedding copy participates in token selection.
-        let host_selection =
-            crate::inference::stage_profile::CpuSpan::begin("host_selection");
+        let host_selection = crate::inference::stage_profile::CpuSpan::begin("host_selection");
         let _hp_am = std::time::Instant::now();
         let (greedy_token, _) = argmax_f32(logits_row);
         crate::inference::models::gemma4::batched_body::host_phases::add(
@@ -17351,7 +17370,8 @@ fn recover_qwen35_slot_after_cancellation(
     handle: SlotHandle,
     kv_bytes_per_token: u64,
     retained_tokens: &mut Qwen35RetainedPrefix,
-    prompt_anchor: &mut Option<Qwen35PromptAnchor>,
+    prompt_anchor: &mut Qwen35AnchorStore,
+    supervisor: &EngineSupervisor,
     preserve_unmodified_live_prefix: bool,
 ) -> Result<()> {
     let kv = guard.kv.as_mut().expect("kv Some during loop");
@@ -17359,6 +17379,7 @@ fn recover_qwen35_slot_after_cancellation(
         kv.sequence_len_for_slot(handle.slot_id)
             .context("read Qwen35 live cursor before cancellation recovery")? as usize;
     record_retained_slot_kv(scheduler, handle, live_tokens, kv_bytes_per_token);
+    prompt_anchor.discard_pending(qwen35_operator_request_id(handle));
 
     if preserve_unmodified_live_prefix
         && !retained_tokens.is_empty()
@@ -17385,10 +17406,29 @@ fn recover_qwen35_slot_after_cancellation(
         return Ok(());
     }
 
-    if let Some(anchor) = prompt_anchor.as_ref() {
+    if let Some(anchor) = prompt_anchor
+        .committed()
+        .iter()
+        .rev()
+        .find(|anchor| anchor.kv.prompt_len() <= live_tokens)
+        .cloned()
+    {
         let anchor_tokens = anchor.prompt_tokens.len();
         if anchor_tokens > 0 {
-            match kv.restore_slot_anchor(handle.slot_id, &anchor.kv) {
+            let restore_started = Instant::now();
+            let restore = (|| -> Result<()> {
+                let plan = kv.plan_slot_anchor_restore(handle.slot_id, &anchor.kv)?;
+                prompt_anchor.on_cursor_set(anchor_tokens);
+                let lease = supervisor.arm(
+                    "Qwen35 anchor restore",
+                    super::engine_qwen35::QWEN35_WORKER_TRANSACTION_TIMEOUT,
+                )?;
+                let result = kv.apply_slot_anchor_restore(plan);
+                lease.finish()?;
+                result
+            })();
+            record_anchor_restore(restore_started.elapsed());
+            match restore {
                 Ok(()) => {
                     let restored = kv
                         .sequence_len_for_slot(handle.slot_id)
@@ -17434,6 +17474,11 @@ fn recover_qwen35_slot_after_cancellation(
                     return Ok(());
                 }
                 Err(error) => {
+                    if !supervisor.is_healthy() || is_fatal_command_buffer_error(&error) {
+                        return Err(error.context("Qwen35 cancellation checkpoint restore"));
+                    }
+                    record_anchor_restore_refused();
+                    prompt_anchor.poison_and_clear();
                     tracing::warn!(
                         slot = handle.slot_id.0,
                         error = %error,
@@ -17447,7 +17492,7 @@ fn recover_qwen35_slot_after_cancellation(
     kv.reset_for_slot(handle.slot_id)
         .context("reset Qwen35 slot after cancellation rollback miss")?;
     retained_tokens.clear_all();
-    *prompt_anchor = None;
+    prompt_anchor.reset();
     Ok(())
 }
 
@@ -17457,23 +17502,37 @@ fn recover_qwen35_slot_after_cancellation_for_reply(
     handle: SlotHandle,
     kv_bytes_per_token: u64,
     retained_tokens: &mut Qwen35RetainedPrefix,
-    prompt_anchor: &mut Option<Qwen35PromptAnchor>,
+    prompt_anchor: &mut Qwen35AnchorStore,
     preserve_unmodified_live_prefix: bool,
+    supervisor: &EngineSupervisor,
     reply: SlotReply,
 ) -> std::result::Result<SlotReply, Qwen35FatalFailure> {
-    qwen35_reset_result_for_reply(
+    let recovery = recover_qwen35_slot_after_cancellation(
+        guard,
+        scheduler,
         handle,
-        reply,
-        recover_qwen35_slot_after_cancellation(
-            guard,
-            scheduler,
-            handle,
-            kv_bytes_per_token,
-            retained_tokens,
-            prompt_anchor,
-            preserve_unmodified_live_prefix,
-        ),
-    )
+        kv_bytes_per_token,
+        retained_tokens,
+        prompt_anchor,
+        supervisor,
+        preserve_unmodified_live_prefix,
+    );
+    match recovery {
+        Ok(()) => Ok(reply),
+        Err(error) => {
+            let kind = if !supervisor.is_healthy() || is_fatal_command_buffer_error(&error) {
+                Qwen35WorkerFatalKind::Gpu
+            } else {
+                Qwen35WorkerFatalKind::Invariant
+            };
+            Err(Qwen35FatalFailure {
+                handle: Some(handle),
+                reply: Qwen35FatalReply::Slot(reply),
+                error,
+                kind,
+            })
+        }
+    }
 }
 
 fn qwen35_reset_result_for_reply(
@@ -17960,15 +18019,6 @@ fn validate_qwen35_generation_request(
     })
 }
 
-#[derive(Clone)]
-struct Qwen35PromptAnchor {
-    prompt_tokens: Vec<u32>,
-    kv: crate::inference::models::qwen35::kv_cache::HybridKvSlotAnchor,
-    prefill_logits: Vec<f32>,
-    vision_fingerprint: Option<[u8; 32]>,
-    spec: Option<super::engine_qwen35::Qwen35SpecPrefixBoundary>,
-}
-
 #[derive(Clone, Default)]
 struct Qwen35RetainedPrefix {
     tokens: Vec<u32>,
@@ -18012,7 +18062,7 @@ fn qwen35_cached_spec_for_decision<T>(
 
 fn install_qwen35_stable_prompt_checkpoint(
     handle: SlotHandle,
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     checkpoint: super::engine_qwen35::Qwen35StablePromptCheckpoint,
 ) {
     tracing::info!(
@@ -18021,13 +18071,24 @@ fn install_qwen35_stable_prompt_checkpoint(
         checkpoint_bytes = checkpoint.kv.total_bytes(),
         "Qwen35 slot-local stable prompt boundary captured"
     );
-    prompt_anchors[handle.slot_id.0 as usize] = Some(Qwen35PromptAnchor {
-        prompt_tokens: checkpoint.prompt_tokens,
-        kv: checkpoint.kv,
-        prefill_logits: checkpoint.prefill_logits,
-        vision_fingerprint: checkpoint.vision_fingerprint,
-        spec: checkpoint.spec,
-    });
+    if let Err(error) = prompt_anchors[handle.slot_id.0 as usize].stage(
+        qwen35_operator_request_id(handle),
+        Qwen35PromptAnchor {
+            id: 0,
+            request: 0,
+            prompt_tokens: checkpoint.prompt_tokens,
+            kv: checkpoint.kv,
+            prefill_logits: checkpoint.prefill_logits,
+            vision_fingerprint: checkpoint.vision_fingerprint,
+            spec: checkpoint.spec,
+        },
+    ) {
+        tracing::warn!(
+            slot = handle.slot_id.0,
+            error = %error,
+            "Qwen35 stable prompt checkpoint staging refused"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18441,7 +18502,7 @@ fn qwen35_pending_request_is_ready(
     request: &Request,
     prompt_caches: &[PromptCache],
     retained_tokens: &[Qwen35RetainedPrefix],
-    prompt_anchors: &[Option<Qwen35PromptAnchor>],
+    prompt_anchors: &[Qwen35AnchorStore],
     slots: &[Option<Qwen35Slot>],
 ) -> bool {
     let response_cache_hit = qwen35_request_has_response_cache_hit(request, prompt_caches);
@@ -18506,7 +18567,7 @@ fn deepseek4_pending_request_is_ready(
 
 fn active_qwen35_slot_affinity(
     retained_tokens: &[Qwen35RetainedPrefix],
-    prompt_anchors: &[Option<Qwen35PromptAnchor>],
+    prompt_anchors: &[Qwen35AnchorStore],
     slots: &[Option<Qwen35Slot>],
     prompt_tokens: &[u32],
     vision_fingerprint: Option<[u8; 32]>,
@@ -18518,9 +18579,8 @@ fn active_qwen35_slot_affinity(
             .zip(slots.iter())
             .enumerate()
             .map(|(index, ((retained, anchor), active))| {
-                let anchor_matches = anchor
-                    .as_ref()
-                    .is_some_and(|anchor| anchor.vision_fingerprint == vision_fingerprint);
+                let anchor = anchor.deepest_prefix_of(prompt_tokens, vision_fingerprint, None);
+                let anchor_matches = anchor.is_some();
                 let active_matches = active
                     .as_ref()
                     .is_some_and(|(work, _, _)| work.vision_fingerprint() == vision_fingerprint);
@@ -18531,10 +18591,7 @@ fn active_qwen35_slot_affinity(
                     } else {
                         &[]
                     },
-                    anchor
-                        .as_ref()
-                        .filter(|_| anchor_matches)
-                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    anchor.map(|anchor| anchor.prompt_tokens.as_slice()),
                     active
                         .as_ref()
                         .filter(|_| active_matches)
@@ -18958,7 +19015,31 @@ fn run_slot_aware_qwen35(
         .map(|_| Qwen35RetainedPrefix::default())
         .collect();
     let mut prompt_caches: Vec<PromptCache> = (0..n_slots).map(|_| PromptCache::new()).collect();
-    let mut prompt_anchors: Vec<Option<Qwen35PromptAnchor>> = (0..n_slots).map(|_| None).collect();
+    let anchor_depth = match configured_anchor_depth() {
+        Ok(depth) => depth,
+        Err(error) => {
+            drain_with_startup_error(rx, &format!("Qwen anchor depth: {error}"));
+            return;
+        }
+    };
+    let anchor_quota = match configured_anchor_quota() {
+        Ok(quota) => quota,
+        Err(error) => {
+            drain_with_startup_error(rx, &format!("Qwen anchor quota: {error}"));
+            return;
+        }
+    };
+    let mut prompt_anchors: Vec<Qwen35AnchorStore> = (0..n_slots)
+        .map(|slot| {
+            Qwen35AnchorStore::new_for_slot(anchor_depth, anchor_quota, slot)
+                .expect("validated Qwen anchor configuration")
+        })
+        .collect();
+    tracing::info!(
+        anchor_depth,
+        anchor_bytes_per_slot_max = ?anchor_quota,
+        "Qwen35 multi-depth anchor store configured"
+    );
     // #727: conversations whose slot is reclaimed by another request are
     // spilled here and restored on their return (`qwen35_slot_spill`).
     let mut slot_spills = qwen35_slot_spill::Qwen35SlotSpillStore::new(
@@ -19532,7 +19613,7 @@ fn admit_qwen35_slot(
     slots: &mut [Option<Qwen35Slot>],
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     slot_spills: &mut qwen35_slot_spill::Qwen35SlotSpillStore,
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
@@ -19551,12 +19632,18 @@ fn admit_qwen35_slot(
         .max_seq_len as usize;
     // ADR-059: the bound graft (if any) shifts every physical position and
     // adds graft_len rows per covered full-attention layer.
-    let graft = guard.model.model.kv_graft.as_ref();
-    let graft_len = graft.map(|bound| bound.bank.n_slots as usize).unwrap_or(0);
+    let graft_bound = guard.model.model.kv_graft.is_some();
+    let graft_len = guard
+        .model
+        .model
+        .kv_graft
+        .as_ref()
+        .map(|bound| bound.bank.n_slots as usize)
+        .unwrap_or(0);
     // ADR-059 fail-closed: extension (vision soft-token / deepstack)
     // prefill is not graft-wired. Refuse by name before validation or
     // scheduling — never serve ungrafted under a graft flag.
-    if graft.is_some() && vision.is_some() {
+    if graft_bound && vision.is_some() {
         slot_fire_done(
             reply,
             Err(anyhow::anyhow!(
@@ -19608,9 +19695,14 @@ fn admit_qwen35_slot(
             .zip(slots.iter())
             .enumerate()
             .map(|(index, ((retained, anchor), active))| {
+                let deepest = anchor.deepest_prefix_of(
+                    &prompt_tokens,
+                    request_vision_fingerprint,
+                    text_anchor_reuse_limit,
+                );
                 let (retained, anchor) = qwen35_slot_spill::qwen35_resume_candidate(
                     retained,
-                    anchor.as_ref(),
+                    deepest,
                     request_vision_fingerprint,
                     text_anchor_reuse_limit,
                 );
@@ -19752,7 +19844,7 @@ fn admit_qwen35_slot(
                 Err(fatal) => return Some(fatal),
             };
             retained_tokens[handle.slot_id.0 as usize].clear_all();
-            prompt_anchors[handle.slot_id.0 as usize] = None;
+            prompt_anchors[handle.slot_id.0 as usize].reset();
             scheduler.release(handle);
             finish_qwen35_operator_request(handle, "failed");
             slot_fire_done(reply, Err(error), false);
@@ -19760,7 +19852,7 @@ fn admit_qwen35_slot(
         }
     };
     let anchor_hit = selected_preference.is_some_and(|preference| preference.restore_prompt_anchor);
-    let cached_tokens = selected_preference
+    let mut cached_tokens = selected_preference
         .map(|preference| preference.cached_tokens)
         .unwrap_or(0);
     crate::serve::operator_ui::prefill_planned(
@@ -19771,132 +19863,178 @@ fn admit_qwen35_slot(
     );
     if cached_tokens == 0 {
         retained_tokens[handle.slot_id.0 as usize].clear_all();
-        prompt_anchors[handle.slot_id.0 as usize] = None;
+        prompt_anchors[handle.slot_id.0 as usize].reset();
     }
 
     let (cached_prefill_logits, cached_spec_candidate) = if anchor_hit {
-        let slot_idx = handle.slot_id.0 as usize;
-        let anchor = prompt_anchors[slot_idx]
-            .as_ref()
-            .expect("anchor_preferred matched an existing Qwen prompt anchor");
-        if let Err(e) = guard
-            .kv
-            .as_mut()
-            .expect("kv Some during loop")
-            .restore_slot_anchor(handle.slot_id, &anchor.kv)
-        {
-            reply = match reset_qwen35_slot_for_reply(
-                guard,
-                scheduler,
-                handle,
-                kv_bytes_per_token,
-                reply,
-            ) {
-                Ok(reply) => reply,
-                Err(fatal) => return Some(fatal),
-            };
-            retained_tokens[slot_idx].clear_all();
-            prompt_anchors[slot_idx] = None;
-            scheduler.release(handle);
-            finish_qwen35_operator_request(handle, "failed");
-            slot_fire_done(
-                reply,
-                Err(e.context("Qwen35 slot-local prompt-boundary restore")),
-                false,
-            );
-            return None;
-        }
-        tracing::info!(
-            slot = handle.slot_id.0,
-            prompt_tokens = prompt_tokens.len(),
-            cached_tokens,
-            suffix_tokens = prompt_tokens.len().saturating_sub(cached_tokens),
-            checkpoint_bytes = anchor.kv.total_bytes(),
-            "Qwen35 slot-local prompt-boundary cache hit"
-        );
-        // ADR-059: the anchor's boundary is the physical cursor
-        // (graft rows + prompt rows). After the rewind the graft rows sit
-        // intact below it (append-only contract); the region tag can only
-        // be absent if a reset happened, and a reset clears the anchor —
-        // so a missing tag here is an invariant failure. Fail closed
-        // rather than serving ungrafted.
-        if graft_len > 0 {
-            match guard
-                .kv
-                .as_ref()
-                .expect("kv Some after Qwen anchor restore")
-                .graft_region_for_slot(handle.slot_id)
-            {
-                Ok(marked) if marked as usize == graft_len => {}
-                other => {
-                    let _ = other;
-                    reply = match reset_qwen35_slot_for_reply(
-                        guard,
-                        scheduler,
-                        handle,
-                        kv_bytes_per_token,
-                        reply,
-                    ) {
-                        Ok(reply) => reply,
-                        Err(fatal) => return Some(fatal),
-                    };
-                    retained_tokens[slot_idx].clear_all();
-                    prompt_anchors[slot_idx] = None;
-                    scheduler.release(handle);
-                    finish_qwen35_operator_request(handle, "failed");
-                    slot_fire_done(
-                        reply,
-                        Err(anyhow::anyhow!(
-                            "Qwen35 anchor restore for slot {} left the graft region \
-                             unmarked (expected {graft_len}); refusing rather than \
-                             serving ungrafted",
-                            handle.slot_id.0
-                        )),
-                        false,
-                    );
-                    return None;
+        'anchor_restore: {
+            let slot_idx = handle.slot_id.0 as usize;
+            let anchor = prompt_anchors[slot_idx]
+                .deepest_prefix_of(
+                    &prompt_tokens,
+                    request_vision_fingerprint,
+                    text_anchor_reuse_limit,
+                )
+                .cloned()
+                .expect("anchor preference matched a committed Qwen prompt anchor");
+            let restore_started = Instant::now();
+            let restore = (|| -> Result<()> {
+                anyhow::ensure!(
+                    anchor.prompt_tokens.len() == cached_tokens,
+                    "Qwen anchor selection changed between affinity and admission"
+                );
+                let ticket = prompt_anchors[slot_idx].ticket(anchor.id)?;
+                let plan = guard
+                    .kv
+                    .as_ref()
+                    .expect("kv Some during loop")
+                    .plan_slot_anchor_restore(handle.slot_id, &anchor.kv)?;
+                prompt_anchors[slot_idx].before_restore(ticket)?;
+                let lease = supervisor.arm(
+                    "Qwen35 anchor restore",
+                    super::engine_qwen35::QWEN35_WORKER_TRANSACTION_TIMEOUT,
+                )?;
+                let result = guard
+                    .kv
+                    .as_mut()
+                    .expect("kv Some during loop")
+                    .apply_slot_anchor_restore(plan);
+                lease.finish()?;
+                result
+            })();
+            record_anchor_restore(restore_started.elapsed());
+            if let Err(e) = restore {
+                if !supervisor.is_healthy() || is_fatal_command_buffer_error(&e) {
+                    return Some(Qwen35FatalFailure {
+                        handle: Some(handle),
+                        reply: Qwen35FatalReply::Slot(reply),
+                        error: e.context("Qwen35 slot-local prompt-boundary restore"),
+                        kind: Qwen35WorkerFatalKind::Gpu,
+                    });
                 }
+                record_anchor_restore_refused();
+                prompt_anchors[slot_idx].poison_and_clear();
+                reply = match reset_qwen35_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[slot_idx].clear_all();
+                prompt_anchors[slot_idx].reset();
+                cached_tokens = 0;
+                crate::serve::operator_ui::prefill_planned(
+                    "qwen35",
+                    operator_request_id,
+                    0,
+                    prompt_tokens.len(),
+                );
+                tracing::warn!(
+                    slot = handle.slot_id.0,
+                    error = %e,
+                    "Qwen anchor restore refused; continuing from a cold slot"
+                );
+                break 'anchor_restore (None, None);
             }
-        }
-        // ADR-059: speculative prefix boundaries carry MTP state that never
-        // saw the graft; suppress reuse under a bound graft.
-        let spec_candidate = if graft.is_none() {
-            anchor.spec.clone()
-        } else {
-            None
-        };
-        let cached_spec = spec_candidate.clone().filter(|spec| {
-            spec.token_count == cached_tokens
-                && guard
+            tracing::info!(
+                slot = handle.slot_id.0,
+                prompt_tokens = prompt_tokens.len(),
+                cached_tokens,
+                suffix_tokens = prompt_tokens.len().saturating_sub(cached_tokens),
+                checkpoint_bytes = anchor.kv.total_bytes(),
+                "Qwen35 slot-local prompt-boundary cache hit"
+            );
+            // ADR-059: the anchor's boundary is the physical cursor
+            // (graft rows + prompt rows). After the rewind the graft rows sit
+            // intact below it (append-only contract); the region tag can only
+            // be absent if a reset happened, and a reset clears the anchor —
+            // so a missing tag here is an invariant failure. Fail closed
+            // rather than serving ungrafted.
+            if graft_len > 0 {
+                match guard
                     .kv
                     .as_ref()
                     .expect("kv Some after Qwen anchor restore")
-                    .validate_speculative_cursors_for_slot(handle.slot_id, spec.token_count)
-                    .is_ok()
-        });
-        let cached_logits = selected_preference
-            .filter(|preference| preference.use_prefill_logits)
-            .map(|_| anchor.prefill_logits.clone());
-        if spec_candidate.is_some() && cached_spec.is_none() {
-            tracing::warn!(
-                slot = handle.slot_id.0,
-                cached_tokens,
-                "invalid Qwen anchor speculative metadata discarded"
-            );
-            super::qwen35_speculation::record_fallback(
-                super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable,
-            );
-            prompt_anchors[slot_idx]
-                .as_mut()
-                .expect("Qwen anchor exists after restore")
-                .spec = None;
+                    .graft_region_for_slot(handle.slot_id)
+                {
+                    Ok(marked) if marked as usize == graft_len => {}
+                    other => {
+                        let _ = other;
+                        reply = match reset_qwen35_slot_for_reply(
+                            guard,
+                            scheduler,
+                            handle,
+                            kv_bytes_per_token,
+                            reply,
+                        ) {
+                            Ok(reply) => reply,
+                            Err(fatal) => return Some(fatal),
+                        };
+                        retained_tokens[slot_idx].clear_all();
+                        prompt_anchors[slot_idx].reset();
+                        scheduler.release(handle);
+                        finish_qwen35_operator_request(handle, "failed");
+                        slot_fire_done(
+                            reply,
+                            Err(anyhow::anyhow!(
+                                "Qwen35 anchor restore for slot {} left the graft region \
+                             unmarked (expected {graft_len}); refusing rather than \
+                             serving ungrafted",
+                                handle.slot_id.0
+                            )),
+                            false,
+                        );
+                        return None;
+                    }
+                }
+            }
+            // ADR-059: speculative prefix boundaries carry MTP state that never
+            // saw the graft; suppress reuse under a bound graft.
+            let spec_candidate = if !graft_bound {
+                anchor.spec.clone()
+            } else {
+                None
+            };
+            let cached_spec = spec_candidate.clone().filter(|spec| {
+                spec.token_count == cached_tokens
+                    && guard
+                        .kv
+                        .as_ref()
+                        .expect("kv Some after Qwen anchor restore")
+                        .validate_speculative_cursors_for_slot(handle.slot_id, spec.token_count)
+                        .is_ok()
+            });
+            let cached_logits = selected_preference
+                .filter(|preference| preference.use_prefill_logits)
+                .map(|_| anchor.prefill_logits.clone());
+            if cached_logits.is_some() {
+                record_anchor_equality_hit();
+            }
+            if spec_candidate.is_some() && cached_spec.is_none() {
+                tracing::warn!(
+                    slot = handle.slot_id.0,
+                    cached_tokens,
+                    "invalid Qwen anchor speculative metadata discarded"
+                );
+                super::qwen35_speculation::record_fallback(
+                    super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable,
+                );
+                prompt_anchors[slot_idx]
+                    .anchor_mut(anchor.id)
+                    .expect("Qwen anchor exists after restore")
+                    .spec = None;
+            }
+            (cached_logits, cached_spec)
         }
-        (cached_logits, cached_spec)
     } else {
         let slot_idx = handle.slot_id.0 as usize;
         // ADR-059: speculative prefix boundaries carry MTP state that never
         // saw the graft; suppress reuse under a bound graft.
-        let spec_candidate = if graft.is_none() {
+        let spec_candidate = if !graft_bound {
             retained_tokens[slot_idx].spec.clone()
         } else {
             None
@@ -19933,9 +20071,9 @@ fn admit_qwen35_slot(
         guard.model.speculation.policy(),
         super::engine_qwen35::is_qwen_server_speculation_exact_eligible(&params),
         cached_tokens == prompt_tokens.len() && cached_spec_candidate.is_none(),
-        graft.is_some(),
+        graft_bound,
     );
-    if graft.is_some()
+    if graft_bound
         && slot_mtp_decision
             == super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable
     {
@@ -19970,7 +20108,7 @@ fn admit_qwen35_slot(
         cached_spec,
         vision,
         guard.model.hidden_size,
-        graft,
+        guard.model.model.kv_graft.as_ref(),
     ) {
         Ok(state) => state,
         Err(error) => {
@@ -19985,7 +20123,7 @@ fn admit_qwen35_slot(
                 Err(fatal) => return Some(fatal),
             };
             retained_tokens[handle.slot_id.0 as usize].clear_all();
-            prompt_anchors[handle.slot_id.0 as usize] = None;
+            prompt_anchors[handle.slot_id.0 as usize].reset();
             scheduler.release(handle);
             if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
                 *snapshot = scheduler.stats();
@@ -20033,7 +20171,7 @@ fn advance_qwen35_prefill(
     slots: &mut [Option<Qwen35Slot>],
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     handle: SlotHandle,
@@ -20092,6 +20230,7 @@ fn advance_qwen35_prefill(
             &mut retained_tokens[slot_idx],
             &mut prompt_anchors[slot_idx],
             true,
+            supervisor,
             reply,
         ) {
             Ok(reply) => reply,
@@ -20115,10 +20254,17 @@ fn advance_qwen35_prefill(
         guard.kv.as_mut().expect("kv Some during loop"),
         max_chunk_tokens,
         supervisor,
+        prompt_anchors[slot_idx].quota_headroom(),
     );
     #[cfg(test)]
-    q1_qwen_cancel::after_actual_advance(advance.is_ok(), guard.kv.as_ref()
-        .and_then(|kv| kv.sequence_len_for_slot(handle.slot_id).ok()).map(|n| n as usize));
+    q1_qwen_cancel::after_actual_advance(
+        advance.is_ok(),
+        guard
+            .kv
+            .as_ref()
+            .and_then(|kv| kv.sequence_len_for_slot(handle.slot_id).ok())
+            .map(|n| n as usize),
+    );
     match advance {
         Ok(super::engine_qwen35::Qwen35PrefillAdvance::Pending {
             state,
@@ -20147,6 +20293,7 @@ fn advance_qwen35_prefill(
                     &mut retained_tokens[slot_idx],
                     &mut prompt_anchors[slot_idx],
                     false,
+                    supervisor,
                     reply,
                 ) {
                     Ok(reply) => reply,
@@ -20192,6 +20339,7 @@ fn advance_qwen35_prefill(
                     &mut retained_tokens[slot_idx],
                     &mut prompt_anchors[slot_idx],
                     false,
+                    supervisor,
                     reply,
                 ) {
                     Ok(reply) => reply,
@@ -20219,6 +20367,7 @@ fn advance_qwen35_prefill(
                 prefill_logits,
                 reply,
                 kv_bytes_per_token,
+                supervisor,
             ) {
                 return Some(fatal);
             }
@@ -20254,7 +20403,7 @@ fn advance_qwen35_prefill(
                 Err(fatal) => return Some(fatal),
             };
             retained_tokens[slot_idx].clear_all();
-            prompt_anchors[slot_idx] = None;
+            prompt_anchors[slot_idx].reset();
             scheduler.release(handle);
             finish_qwen35_operator_request(handle, "failed");
             slot_fire_done(reply, Err(error), false);
@@ -20301,13 +20450,14 @@ fn finish_qwen35_prefill(
     slots: &mut [Option<Qwen35Slot>],
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     handle: SlotHandle,
     mut state: super::engine_qwen35::Qwen35DecodeState,
     prefill_logits: Vec<f32>,
     mut reply: SlotReply,
     kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
 ) -> Option<Qwen35FatalFailure> {
     let slot_idx = handle.slot_id.0 as usize;
     let (prompt_tokens, params) = {
@@ -20337,10 +20487,14 @@ fn finish_qwen35_prefill(
     let desired_anchor_tokens = stable_boundary
         .map(|boundary| &prompt_tokens[..boundary])
         .unwrap_or(prompt_tokens.as_slice());
-    let already_anchored = prompt_anchors[slot_idx].as_ref().is_some_and(|anchor| {
-        anchor.prompt_tokens == desired_anchor_tokens
-            && anchor.vision_fingerprint == params.vision_fingerprint
-    });
+    let already_anchored = prompt_anchors[slot_idx]
+        .pending()
+        .into_iter()
+        .chain(prompt_anchors[slot_idx].committed())
+        .any(|anchor| {
+            anchor.prompt_tokens == desired_anchor_tokens
+                && anchor.vision_fingerprint == params.vision_fingerprint
+        });
     if stable_boundary.is_some() && !already_anchored {
         // This is safe for generation—the full prompt has committed—but the
         // request must not publish an unusable post-cue checkpoint. The
@@ -20351,60 +20505,124 @@ fn finish_qwen35_prefill(
             stable_boundary,
             "Qwen35 stable prompt checkpoint missing after bounded prefill"
         );
-        prompt_anchors[slot_idx] = None;
+        prompt_anchors[slot_idx].discard_pending(qwen35_operator_request_id(handle));
     } else if !already_anchored {
-        let spec = state
-            .spec_prefix_candidate(prompt_tokens.len())
-            .filter(|spec| {
-                guard
-                    .kv
-                    .as_ref()
-                    .expect("kv Some during Qwen prompt anchor capture")
-                    .validate_speculative_cursors_for_slot(handle.slot_id, spec.token_count)
-                    .is_ok()
-            });
-        let anchor = guard
-            .kv
-            .as_ref()
-            .expect("kv Some during loop")
-            .snapshot_slot_anchor(handle.slot_id, prompt_tokens.len());
-        match anchor {
-            Ok(kv) => {
-                tracing::info!(
-                    slot = handle.slot_id.0,
-                    prompt_tokens = prompt_tokens.len(),
-                    checkpoint_bytes = kv.total_bytes(),
-                    "Qwen35 slot-local prompt boundary captured"
-                );
-                prompt_anchors[slot_idx] = Some(Qwen35PromptAnchor {
-                    prompt_tokens: prompt_tokens.clone(),
-                    kv,
-                    prefill_logits,
-                    vision_fingerprint: params.vision_fingerprint,
-                    spec,
+        'prompt_anchor_capture: {
+            let spec = state
+                .spec_prefix_candidate(prompt_tokens.len())
+                .filter(|spec| {
+                    guard
+                        .kv
+                        .as_ref()
+                        .expect("kv Some during Qwen prompt anchor capture")
+                        .validate_speculative_cursors_for_slot(handle.slot_id, spec.token_count)
+                        .is_ok()
                 });
-            }
-            Err(error) => {
-                reply = match reset_qwen35_slot_for_reply(
-                    guard,
-                    scheduler,
-                    handle,
-                    kv_bytes_per_token,
-                    reply,
-                ) {
-                    Ok(reply) => reply,
-                    Err(fatal) => return Some(fatal),
-                };
-                retained_tokens[slot_idx].clear_all();
-                prompt_anchors[slot_idx] = None;
-                scheduler.release(handle);
-                finish_qwen35_operator_request(handle, "failed");
-                slot_fire_done(
-                    reply,
-                    Err(error.context("Qwen35 slot-local prompt-boundary capture")),
-                    false,
+            let hidden_bytes = spec
+                .as_ref()
+                .map_or(0, |boundary| boundary.pending_target_hidden.data_byte_len());
+            let non_payload_bytes = match anchor_non_payload_bytes(
+                prompt_tokens.len(),
+                prefill_logits.len(),
+                hidden_bytes,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(
+                        slot = handle.slot_id.0,
+                        error = %error,
+                        "Qwen35 prompt checkpoint capture skipped before allocation"
+                    );
+                    break 'prompt_anchor_capture;
+                }
+            };
+            let payload_bytes = match guard
+                .kv
+                .as_ref()
+                .expect("kv Some during Qwen prompt anchor capture")
+                .slot_anchor_image_bytes()
+            {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(
+                        slot = handle.slot_id.0,
+                        error = %error,
+                        "Qwen35 prompt checkpoint image sizing failed"
+                    );
+                    break 'prompt_anchor_capture;
+                }
+            };
+            let capture_bytes = payload_bytes.checked_add(non_payload_bytes);
+            if prompt_anchors[slot_idx]
+                .quota_headroom()
+                .is_some_and(|headroom| capture_bytes.is_none_or(|bytes| bytes > headroom))
+            {
+                record_anchor_capture_skipped_quota();
+                tracing::warn!(
+                    slot = handle.slot_id.0,
+                    capture_bytes,
+                    "Qwen35 prompt checkpoint capture skipped before allocation: quota"
                 );
-                return None;
+                break 'prompt_anchor_capture;
+            }
+            let snapshot_started = Instant::now();
+            let anchor = (|| -> anyhow::Result<_> {
+                let lease = supervisor.arm(
+                    "Qwen35 anchor snapshot",
+                    super::engine_qwen35::QWEN35_WORKER_TRANSACTION_TIMEOUT,
+                )?;
+                let anchor = guard
+                    .kv
+                    .as_mut()
+                    .expect("kv Some during loop")
+                    .snapshot_slot_anchor(handle.slot_id, prompt_tokens.len());
+                lease.finish()?;
+                anchor
+            })();
+            record_anchor_snapshot(snapshot_started.elapsed());
+            match anchor {
+                Ok(kv) => {
+                    tracing::info!(
+                        slot = handle.slot_id.0,
+                        prompt_tokens = prompt_tokens.len(),
+                        checkpoint_bytes = kv.total_bytes(),
+                        "Qwen35 slot-local prompt boundary captured"
+                    );
+                    if let Err(error) = prompt_anchors[slot_idx].stage(
+                        qwen35_operator_request_id(handle),
+                        Qwen35PromptAnchor {
+                            id: 0,
+                            request: 0,
+                            prompt_tokens: prompt_tokens.clone(),
+                            kv,
+                            prefill_logits,
+                            vision_fingerprint: params.vision_fingerprint,
+                            spec,
+                        },
+                    ) {
+                        tracing::warn!(
+                            slot = handle.slot_id.0,
+                            error = %error,
+                            "Qwen35 prompt checkpoint staging refused"
+                        );
+                    }
+                }
+                Err(error) => {
+                    if !supervisor.is_healthy() || is_fatal_command_buffer_error(&error) {
+                        return Some(Qwen35FatalFailure {
+                            handle: Some(handle),
+                            reply: Qwen35FatalReply::Slot(reply),
+                            error: error.context("Qwen35 slot-local prompt-boundary capture"),
+                            kind: Qwen35WorkerFatalKind::Gpu,
+                        });
+                    }
+                    tracing::warn!(
+                        slot = handle.slot_id.0,
+                        error = %error,
+                        "Qwen35 prompt checkpoint capture skipped"
+                    );
+                    prompt_anchors[slot_idx].discard_pending(qwen35_operator_request_id(handle));
+                }
             }
         }
     }
@@ -20446,6 +20664,7 @@ fn finish_qwen35_prefill(
             &mut retained_tokens[slot_idx],
             &mut prompt_anchors[slot_idx],
             false,
+            supervisor,
             reply,
         ) {
             Ok(reply) => reply,
@@ -20524,7 +20743,7 @@ fn embed_qwen35_inline(
     guard: &mut Qwen35KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
     retained_tokens: &mut [Qwen35RetainedPrefix],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     slot_spills: &mut qwen35_slot_spill::Qwen35SlotSpillStore,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -20578,7 +20797,7 @@ fn embed_qwen35_inline(
         &mut prompt_anchors[slot_idx],
     );
     retained_tokens[slot_idx].clear_all();
-    prompt_anchors[slot_idx] = None;
+    prompt_anchors[slot_idx].reset();
     let result = supervised_gpu_call(supervisor, "qwen35_slot_embed", || {
         super::engine_qwen35::embed_qwen35_slot_aware(
             guard.model,
@@ -20627,7 +20846,7 @@ fn decode_batch_qwen35(
     slots: &mut [Option<Qwen35Slot>],
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     handles: &[SlotHandle],
     kv_bytes_per_token: u64,
@@ -20648,7 +20867,15 @@ fn decode_batch_qwen35(
             config,
             supervisor,
         ) {
-            qwen35_joint_decode::Qwen35JointRun::NotEligible => None,
+            qwen35_joint_decode::Qwen35JointRun::NotEligible(reason) => {
+                qwen35_joint_decode::record_joint_ineligible(&reason);
+                tracing::debug!(
+                    target: "hf2q::serve::api::engine_qwen35::progress",
+                    reason = reason.label(),
+                    "Qwen joint decode turn"
+                );
+                None
+            }
             qwen35_joint_decode::Qwen35JointRun::Ran { serial } => Some(serial),
             qwen35_joint_decode::Qwen35JointRun::Fatal(fatal) => return Some(fatal),
         },
@@ -20709,6 +20936,7 @@ fn decode_batch_qwen35(
                 &mut retained_tokens[slot_idx],
                 &mut prompt_anchors[slot_idx],
                 false,
+                supervisor,
                 reply,
             ) {
                 Ok(reply) => reply,
@@ -20790,7 +21018,7 @@ fn settle_qwen35_decode_lane(
     slots: &mut [Option<Qwen35Slot>],
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     handle: SlotHandle,
     mut reply: SlotReply,
@@ -20830,7 +21058,7 @@ fn settle_qwen35_decode_lane(
                 Err(fatal) => return Some(fatal),
             };
             retained_tokens[slot_idx].clear_all();
-            prompt_anchors[slot_idx] = None;
+            prompt_anchors[slot_idx].reset();
             scheduler.release(handle);
             slot_fire_done(reply, Err(e), false);
             return None;
@@ -20921,6 +21149,7 @@ fn settle_qwen35_decode_lane(
                 &mut retained_tokens[slot_idx],
                 &mut prompt_anchors[slot_idx],
                 false,
+                supervisor,
                 reply,
             ) {
                 Ok(reply) => reply,
@@ -20933,6 +21162,19 @@ fn settle_qwen35_decode_lane(
             (prompt.to_vec(), params.clone())
         };
         let gr = state.finish(guard.model, registration);
+        if !client_dropped && gr.is_ok() {
+            if let Err(error) = prompt_anchors[slot_idx].commit(qwen35_operator_request_id(handle))
+            {
+                return Some(Qwen35FatalFailure {
+                    handle: Some(handle),
+                    reply: Qwen35FatalReply::Slot(reply),
+                    error: error.context("commit Qwen prompt anchor"),
+                    kind: Qwen35WorkerFatalKind::Invariant,
+                });
+            }
+        } else {
+            prompt_anchors[slot_idx].discard_pending(qwen35_operator_request_id(handle));
+        }
         super::engine_supervisor::qwen_pool_request_observation(
             handle.slot_id.0 as usize,
             handle.generation,
@@ -31922,7 +32164,11 @@ mod tests {
         assert_eq!(deepseek4_cohort_lane_rows(4, 0, None), 0);
     }
 
-    fn cohort_lane(slot: u32, cold_wave: bool, reply_class: Deepseek4ReplyClass) -> Deepseek4CohortLane {
+    fn cohort_lane(
+        slot: u32,
+        cold_wave: bool,
+        reply_class: Deepseek4ReplyClass,
+    ) -> Deepseek4CohortLane {
         Deepseek4CohortLane {
             handle: SlotHandle {
                 slot_id: SlotId(slot),
@@ -31935,7 +32181,11 @@ mod tests {
 
     /// `(start, rows)` of a lane's own plan under a per-lane cap: each lane
     /// has its own cursor and remaining rows; `None` is token-wise work.
-    fn lane_plan(cursor: usize, remaining: Option<usize>, cap: usize) -> Option<((usize, usize), usize)> {
+    fn lane_plan(
+        cursor: usize,
+        remaining: Option<usize>,
+        cap: usize,
+    ) -> Option<((usize, usize), usize)> {
         remaining.map(|remaining| {
             let rows = remaining.min(cap);
             ((cursor, rows), rows)
@@ -31967,9 +32217,17 @@ mod tests {
         .expect("four unequal matrix plans form one cohort");
         assert_eq!(
             members,
-            vec![(0, (0, 512)), (1, (300, 333)), (2, (1_111, 129)), (3, (2_111, 512))]
+            vec![
+                (0, (0, 512)),
+                (1, (300, 333)),
+                (2, (1_111, 129)),
+                (3, (2_111, 512))
+            ]
         );
-        assert!(caps.iter().all(|&(_, cap)| cap == 512), "every lane planned at the width-4 cap");
+        assert!(
+            caps.iter().all(|&(_, cap)| cap == 512),
+            "every lane planned at the width-4 cap"
+        );
         let aggregate: usize = members.iter().map(|(_, (_, rows))| rows).sum();
         assert!(aggregate <= crate::inference::models::deepseek4::MAX_COOPERATIVE_PREFILL_ROWS);
     }
@@ -32001,7 +32259,10 @@ mod tests {
         )
         .unwrap()
         .expect("primary and lane 4 are compatible matrix lanes");
-        assert_eq!(members.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(), vec![0, 4]);
+        assert_eq!(
+            members.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(),
+            vec![0, 4]
+        );
         // A token-wise companion (its recovery tail) is never a member.
         let members = select_deepseek4_prefill_cohort(
             &lanes,
@@ -32011,7 +32272,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(members.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(), vec![0, 4]);
+        assert_eq!(
+            members.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(),
+            vec![0, 4]
+        );
         // An ineligible primary (sub-33 or token-wise) runs serially.
         for primary in [Some(32), None] {
             assert!(select_deepseek4_prefill_cohort(
@@ -32053,12 +32317,17 @@ mod tests {
         let members = select_deepseek4_prefill_cohort(
             &lanes,
             widths,
-            |width| deepseek4_cohort_lane_rows(width, 128, Some(DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS)),
+            |width| {
+                deepseek4_cohort_lane_rows(width, 128, Some(DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS))
+            },
             |lane, cap| Ok(lane_plan(lane, remaining[lane], cap)),
         )
         .unwrap()
         .expect("two matrix lanes form a Mixed cohort");
-        assert_eq!(members.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(
+            members.iter().map(|(lane, _)| *lane).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
         assert!(members.len() <= DEEPSEEK4_MIXED_COHORT_WIDTH);
         assert!(members.iter().map(|(_, (_, rows))| rows).sum::<usize>() <= budget);
         // A selected lane in its tail is never cohorted: the Mixed slice
@@ -32067,7 +32336,11 @@ mod tests {
         assert!(select_deepseek4_prefill_cohort(
             &lanes,
             2..=2,
-            |width| deepseek4_cohort_lane_rows(width, 128, Some(DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS)),
+            |width| deepseek4_cohort_lane_rows(
+                width,
+                128,
+                Some(DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS)
+            ),
             |lane, cap| Ok(lane_plan(lane, tail_first[lane], cap)),
         )
         .unwrap()
@@ -32105,8 +32378,14 @@ mod tests {
             other => panic!("expected a Mixed step, got {other:?}"),
         }
         // No runnable decoder (only parked completions): no Mixed budget.
-        assert_eq!(deepseek4_mixed_work_budget(8, false, true).max_prefill_windows, None);
-        assert_eq!(scheduler.prefill_handles_fifo(), vec![handles[2], handles[3]]);
+        assert_eq!(
+            deepseek4_mixed_work_budget(8, false, true).max_prefill_windows,
+            None
+        );
+        assert_eq!(
+            scheduler.prefill_handles_fifo(),
+            vec![handles[2], handles[3]]
+        );
         // Stragglers 2 (cursor 0) and 3 (cursor 512) prefill the cold wave.
         let cursors = [0, 0, 0, 512];
         let mut receivers = Vec::new();
@@ -32130,19 +32409,26 @@ mod tests {
         let cursor_of = |slot: usize| (cursors[slot], cursors[slot]);
         // The round-robin Mixed primary is lane 3, behind lane 2 in FIFO.
         let primary = handles[3];
-        let cohort = plan_deepseek4_prefill_cohort(128, cursor_of, &slots, &scheduler, primary, None, false)
-            .expect("a Mixed step never raises the pure-prefill FIFO invariant")
-            .expect("both stragglers have matrix chunks");
+        let cohort =
+            plan_deepseek4_prefill_cohort(128, cursor_of, &slots, &scheduler, primary, None, false)
+                .expect("a Mixed step never raises the pure-prefill FIFO invariant")
+                .expect("both stragglers have matrix chunks");
         let members: Vec<(SlotHandle, usize, usize)> = cohort
             .iter()
-            .map(|candidate| (candidate.handle, candidate.plan.start(), candidate.plan.token_count()))
+            .map(|candidate| {
+                (
+                    candidate.handle,
+                    candidate.plan.start(),
+                    candidate.plan.token_count(),
+                )
+            })
             .collect();
         assert_eq!(members, vec![(handles[3], 512, 237), (handles[2], 0, 749)]);
         // The pure-prefill step keeps the invariant.
-        assert!(
-            plan_deepseek4_prefill_cohort(128, cursor_of, &slots, &scheduler, primary, None, true)
-                .is_err()
-        );
+        assert!(plan_deepseek4_prefill_cohort(
+            128, cursor_of, &slots, &scheduler, primary, None, true
+        )
+        .is_err());
         drop(receivers);
     }
 
@@ -32201,7 +32487,10 @@ mod tests {
         let slots = slots_at(cursors);
         let views = deepseek4_prefill_lane_views(&slots, &fifo);
         assert_eq!(
-            views.iter().map(|lane| lane.recovery_tail).collect::<Vec<_>>(),
+            views
+                .iter()
+                .map(|lane| lane.recovery_tail)
+                .collect::<Vec<_>>(),
             vec![true, true, false, false]
         );
         let primary = deepseek4_cold_wave_matrix_primary(&views);
@@ -32220,7 +32509,11 @@ mod tests {
         assert_eq!(
             cohort
                 .iter()
-                .map(|candidate| (candidate.handle, candidate.plan.start(), candidate.plan.token_count()))
+                .map(|candidate| (
+                    candidate.handle,
+                    candidate.plan.start(),
+                    candidate.plan.token_count()
+                ))
                 .collect::<Vec<_>>(),
             vec![(handles[2], 0, 749), (handles[3], 0, 749)]
         );
@@ -32272,18 +32565,60 @@ mod tests {
         let start = Instant::now();
         let mut barrier = Idle;
         // A lone request: nothing else in flight, no wait.
-        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, true, true, 0));
+        assert!(!deepseek4_admission_barrier_wait(
+            &mut barrier,
+            start,
+            true,
+            true,
+            true,
+            0
+        ));
         assert_eq!(barrier, Idle);
         // Decoders runnable, no free slot or admission closed: never armed.
-        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, true, false, 3));
-        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, false, true, 3));
-        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, false, true, true, 3));
+        assert!(!deepseek4_admission_barrier_wait(
+            &mut barrier,
+            start,
+            true,
+            true,
+            false,
+            3
+        ));
+        assert!(!deepseek4_admission_barrier_wait(
+            &mut barrier,
+            start,
+            true,
+            false,
+            true,
+            3
+        ));
+        assert!(!deepseek4_admission_barrier_wait(
+            &mut barrier,
+            start,
+            false,
+            true,
+            true,
+            3
+        ));
         assert_eq!(barrier, Idle);
         // Another request in flight: wait, bounded by the constant.
-        assert!(deepseek4_admission_barrier_wait(&mut barrier, start, true, true, true, 2));
+        assert!(deepseek4_admission_barrier_wait(
+            &mut barrier,
+            start,
+            true,
+            true,
+            true,
+            2
+        ));
         assert_eq!(barrier, Armed(start));
         let almost = start + DEEPSEEK4_ADMISSION_BARRIER - Duration::from_micros(1);
-        assert!(deepseek4_admission_barrier_wait(&mut barrier, almost, true, true, true, 1));
+        assert!(deepseek4_admission_barrier_wait(
+            &mut barrier,
+            almost,
+            true,
+            true,
+            true,
+            1
+        ));
         assert!(!deepseek4_admission_barrier_wait(
             &mut barrier,
             start + DEEPSEEK4_ADMISSION_BARRIER,
@@ -32294,14 +32629,42 @@ mod tests {
         ));
         assert_eq!(barrier, Spent);
         // At most once per prefill transaction.
-        assert!(!deepseek4_admission_barrier_wait(&mut barrier, almost, true, true, true, 1));
+        assert!(!deepseek4_admission_barrier_wait(
+            &mut barrier,
+            almost,
+            true,
+            true,
+            true,
+            1
+        ));
         // Ends as soon as nothing is in flight (or the slots fill).
         let mut barrier = Idle;
-        assert!(deepseek4_admission_barrier_wait(&mut barrier, start, true, true, true, 1));
-        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, true, true, 0));
+        assert!(deepseek4_admission_barrier_wait(
+            &mut barrier,
+            start,
+            true,
+            true,
+            true,
+            1
+        ));
+        assert!(!deepseek4_admission_barrier_wait(
+            &mut barrier,
+            start,
+            true,
+            true,
+            true,
+            0
+        ));
         assert_eq!(barrier, Spent);
         let mut barrier = Armed(start);
-        assert!(!deepseek4_admission_barrier_wait(&mut barrier, start, true, false, true, 1));
+        assert!(!deepseek4_admission_barrier_wait(
+            &mut barrier,
+            start,
+            true,
+            false,
+            true,
+            1
+        ));
         assert_eq!(barrier, Spent);
     }
 
@@ -32311,7 +32674,8 @@ mod tests {
         // The barrier expired with two cold lanes seeded; two more cold
         // requests arrive while they prefill. Admission stays open for them
         // and they join the same wave.
-        let filling = deepseek4_reconcile_cold_cohort(Filling, false, false, true, 2, 2, true, true);
+        let filling =
+            deepseek4_reconcile_cold_cohort(Filling, false, false, true, 2, 2, true, true);
         assert_eq!((filling.phase, filling.admission_open), (Filling, true));
         assert!(filling.rerun_admission);
         let full = deepseek4_reconcile_cold_cohort(Filling, true, false, false, 4, 4, false, false);

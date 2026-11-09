@@ -49,29 +49,61 @@ pub(in crate::serve::api) struct Qwen35JointLane {
     pub(in crate::serve::api) target: Qwen35JointTarget,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::serve::api) enum Qwen35LaneRefusal {
+    StepBound,
+    PendingSpeculationOutput,
+    NoSeed,
+    TargetCursor,
+    MtpCursor,
+    SpeculationRoute,
+    ClientClosed,
+    HandleMismatch,
+}
+
+impl Qwen35LaneRefusal {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::StepBound => "step_bound",
+            Self::PendingSpeculationOutput => "pending_speculation_output",
+            Self::NoSeed => "no_seed",
+            Self::TargetCursor => "target_cursor",
+            Self::MtpCursor => "mtp_cursor",
+            Self::SpeculationRoute => "speculation_route",
+            Self::ClientClosed => "client_closed",
+            Self::HandleMismatch => "handle_mismatch",
+        }
+    }
+}
+
 impl Qwen35DecodeState {
-    /// Whether this slot's next tick is a target forward that a joint step
-    /// can serve: no CPU-only verified output is queued, the step bound is
-    /// not reached, and the cache cursor (and MTP cursor, when MTP state is
-    /// held) equals the committed ledger minus the unfed newest token.
-    pub(in crate::serve::api) fn joint_decode_ready(&self, kv_cache: &HybridKvCache) -> bool {
-        if self.step >= self.max_tokens
-            || !self.pending_speculation_output.is_empty()
-            || self.generated_tokens.is_empty()
-        {
-            return false;
+    /// Classify whether this slot's next tick can join a target forward.
+    pub(in crate::serve::api) fn joint_decode_readiness(
+        &self,
+        kv_cache: &HybridKvCache,
+    ) -> std::result::Result<(), Qwen35LaneRefusal> {
+        if self.step >= self.max_tokens {
+            return Err(Qwen35LaneRefusal::StepBound);
+        }
+        if !self.pending_speculation_output.is_empty() {
+            return Err(Qwen35LaneRefusal::PendingSpeculationOutput);
+        }
+        if self.generated_tokens.is_empty() {
+            return Err(Qwen35LaneRefusal::NoSeed);
         }
         let fed = self.prompt_tokens.len() + self.generated_tokens.len() - 1;
-        let Ok(cursor) = kv_cache.sequence_len_for_slot(self.slot_id) else {
-            return false;
-        };
+        let cursor = kv_cache
+            .sequence_len_for_slot(self.slot_id)
+            .map_err(|_| Qwen35LaneRefusal::TargetCursor)?;
         if cursor as usize != fed {
-            return false;
+            return Err(Qwen35LaneRefusal::TargetCursor);
         }
-        match self.mtp {
-            Some(_) => mtp_cursor_for_slot(kv_cache, self.slot_id).is_ok_and(|mtp| mtp == cursor),
-            None => true,
+        if self.mtp.is_some()
+            && !mtp_cursor_for_slot(kv_cache, self.slot_id).is_ok_and(|mtp| mtp == cursor)
+        {
+            return Err(Qwen35LaneRefusal::MtpCursor);
         }
+        Ok(())
     }
 
     /// Whether this slot's serial tick is the ordinary target forward: no

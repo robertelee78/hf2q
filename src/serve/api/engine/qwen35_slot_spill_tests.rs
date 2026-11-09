@@ -13,6 +13,7 @@ use super::{
 };
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
 use crate::inference::models::qwen35::{default_layer_types, Qwen35Config, Qwen35Variant};
+use crate::serve::api::engine_qwen35::anchor_store::Qwen35AnchorStore;
 
 fn preference(cached_tokens: usize, anchor: bool) -> Qwen35SlotPreference {
     Qwen35SlotPreference {
@@ -100,14 +101,15 @@ fn ledger_match_is_longest_prefix_then_newest() {
         (0, &prompt[..12], Some(&prompt[..4])),
     ];
     let (index, best) = qwen35_best_ledger_match(candidates, &prompt).expect("match");
-    assert_eq!((index, best.cached_tokens), (1, 12), "longest, newest on ties");
+    assert_eq!(
+        (index, best.cached_tokens),
+        (1, 12),
+        "longest, newest on ties"
+    );
     assert!(!best.restore_prompt_anchor);
 
     // A full-prompt anchor beats a shorter live tail and reuses its logits.
-    let candidates = [
-        (0, &prompt[..15], None),
-        (1, &other[..], Some(&prompt[..])),
-    ];
+    let candidates = [(0, &prompt[..15], None), (1, &other[..], Some(&prompt[..]))];
     let (index, best) = qwen35_best_ledger_match(candidates, &prompt).expect("match");
     assert_eq!((index, best.cached_tokens), (1, 20));
     assert!(best.restore_prompt_anchor && best.use_prefill_logits);
@@ -201,26 +203,34 @@ fn seat_conversation(
     tokens: &[u32],
     anchor_len: usize,
     seed: usize,
-) -> (Qwen35RetainedPrefix, Option<Qwen35PromptAnchor>) {
+) -> (Qwen35RetainedPrefix, Qwen35AnchorStore) {
     plant(cache, slot, seed);
     set_cursor(cache, slot, anchor_len as u32);
     let kv = cache
         .snapshot_slot_anchor(slot, anchor_len)
         .expect("anchor checkpoint");
     set_cursor(cache, slot, tokens.len() as u32);
-    (
-        Qwen35RetainedPrefix {
-            tokens: tokens.to_vec(),
-            spec: None,
-        },
-        Some(Qwen35PromptAnchor {
-            prompt_tokens: tokens[..anchor_len].to_vec(),
-            kv,
-            prefill_logits: vec![0.25; 8],
-            vision_fingerprint: None,
-            spec: None,
-        }),
-    )
+    let retained = Qwen35RetainedPrefix {
+        tokens: tokens.to_vec(),
+        spec: None,
+    };
+    let mut anchors = Qwen35AnchorStore::new(4).expect("test anchor store");
+    anchors
+        .stage(
+            seed as u64,
+            Qwen35PromptAnchor {
+                id: 0,
+                request: 0,
+                prompt_tokens: tokens[..anchor_len].to_vec(),
+                kv,
+                prefill_logits: vec![0.25; 8],
+                vision_fingerprint: None,
+                spec: None,
+            },
+        )
+        .expect("stage anchor");
+    anchors.commit(seed as u64).expect("commit anchor");
+    (retained, anchors)
 }
 
 #[test]
@@ -231,7 +241,9 @@ fn reclaimed_conversation_is_spilled_then_restored_bitwise_into_its_granted_slot
         .expect("three-slot cache");
     let mut retained: Vec<Qwen35RetainedPrefix> =
         (0..3).map(|_| Qwen35RetainedPrefix::default()).collect();
-    let mut anchors: Vec<Option<Qwen35PromptAnchor>> = (0..3).map(|_| None).collect();
+    let mut anchors: Vec<Qwen35AnchorStore> = (0..3)
+        .map(|_| Qwen35AnchorStore::new(4).expect("test anchor store"))
+        .collect();
     let mut store: Qwen35SlotSpillStore = SlotSpillStore::new(1 << 30, 8);
 
     let a: Vec<u32> = (1..=10).collect();
@@ -254,7 +266,7 @@ fn reclaimed_conversation_is_spilled_then_restored_bitwise_into_its_granted_slot
     .expect("cold reclaim");
     assert_eq!(granted, None, "C stays cold");
     assert_eq!(store.len(), 1);
-    assert!(retained[0].is_empty() && anchors[0].is_none());
+    assert!(retained[0].is_empty() && anchors[0].is_empty());
 
     // C runs in slot 0 and overwrites it.
     cache.reset_for_slot(SlotId(0)).expect("cold reset");
@@ -290,7 +302,9 @@ fn reclaimed_conversation_is_spilled_then_restored_bitwise_into_its_granted_slot
     assert!(store.is_empty(), "a restored spill leaves the store");
     assert_eq!(retained[2].tokens, a);
     assert_eq!(
-        anchors[2].as_ref().map(|anchor| anchor.prompt_tokens.as_slice()),
+        anchors[2]
+            .deepest()
+            .map(|anchor| anchor.prompt_tokens.as_slice()),
         Some(&a[..6])
     );
     assert!(
@@ -324,7 +338,7 @@ fn reclaimed_conversation_is_spilled_then_restored_bitwise_into_its_granted_slot
     assert_eq!(granted, in_place);
     assert_eq!(store.len(), 1);
     assert_eq!(retained[2].tokens, a, "the slot ledger is unchanged");
-    assert!(anchors[2].is_some());
+    assert!(!anchors[2].is_empty());
 
     // A's own next turn also rewinds slot 2 to the anchor, but it shares the
     // tokens after it (the assistant header): no copy is taken.
@@ -372,15 +386,15 @@ fn reclaimed_conversation_is_spilled_then_restored_bitwise_into_its_granted_slot
         &mut anchors[1],
     );
     assert_eq!(store.len(), 1);
-    assert!(retained[1].is_empty() && anchors[1].is_none());
+    assert!(retained[1].is_empty() && anchors[1].is_empty());
 }
 
 #[test]
 fn a_spill_above_the_budget_is_not_stored_and_the_victim_goes_cold() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let device = MlxDevice::new().expect("Metal device");
-    let mut cache = HybridKvCache::new_with_options(&tiny_cfg(), &device, 32, 2, true)
-        .expect("two-slot cache");
+    let mut cache =
+        HybridKvCache::new_with_options(&tiny_cfg(), &device, 32, 2, true).expect("two-slot cache");
     let a: Vec<u32> = (1..=10).collect();
     let (mut retained, mut anchor) = seat_conversation(&mut cache, SlotId(0), &a, 6, 1);
     let mut store: Qwen35SlotSpillStore = SlotSpillStore::new(1024, 8);

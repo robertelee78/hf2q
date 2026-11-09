@@ -57,7 +57,11 @@ pub(super) fn run_lane(
     run_lane_until(model, mode, prefix, lane, 144)
 }
 pub(super) fn run_lane_until(
-    model: &mut Qwen35LoadedModel, mode: Mode, prefix: &[u32], lane: usize, end: usize,
+    model: &mut Qwen35LoadedModel,
+    mode: Mode,
+    prefix: &[u32],
+    lane: usize,
+    end: usize,
 ) -> Result<usize> {
     anyhow::ensure!(end == 131 || end == 144, "explicit diagnostic end");
     anyhow::ensure!(
@@ -104,6 +108,7 @@ pub(super) fn run_lane_until(
         lease.cache.as_mut().unwrap(),
         128,
         &supervisor,
+        None,
     )?;
     let Qwen35PrefillAdvance::Ready { mut state, .. } = advance else {
         anyhow::bail!("one128-row prefill didn't reach actual Ready");
@@ -131,11 +136,8 @@ pub(super) fn run_lane_until(
                 "real ordinary baseline not measured; no cost override"
             );
             let before = state.generated_tokens.len();
-            let outcome = state.mtp_k3_round(
-                lease.model,
-                lease.cache.as_mut().unwrap(),
-                &supervisor,
-            )?;
+            let outcome =
+                state.mtp_k3_round(lease.model, lease.cache.as_mut().unwrap(), &supervisor)?;
             anyhow::ensure!(
                 !outcome.finished && state.generated_tokens.len() == before + 1,
                 "actual K3 first output missing/terminal"

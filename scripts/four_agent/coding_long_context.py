@@ -27,7 +27,7 @@ from qwen38_n1_tools import IMMUTABLE, INITIAL
 from qwen38_n1_verdict import EXPECTED, WIRE_LIMIT, require
 
 ID = "long-context-v1"
-WORKLOADS = (ID,)
+WORKLOADS = (ID, "divergent-edit-v1")
 FIXTURE = Path(__file__).with_name("fixtures") / f"{ID}.rs"
 FIXTURE_REPO_PATH = f"{{REPO}}/scripts/four_agent/fixtures/{ID}.rs"
 FIXTURE_SHA256 = "cfa2a052035de194fd16965a6493601b2383c9ede219235c061d98fbe10ad96b"
@@ -361,6 +361,8 @@ class Variant:
         self.immutable = {**IMMUTABLE, "tests/ports.rs": IMMUTABLE["tests/ports.rs"] + fixture_text}
         self.initial = INITIAL
         self.read_limit = READ_LIMIT
+        self.composes_with_instance = False
+        self.modules = MODULES
         require(len(self.immutable["tests/ports.rs"].encode()) <= READ_LIMIT, "long-context tests exceed the read limit")
 
     def binding(self):
@@ -371,10 +373,17 @@ class Variant:
         """Client summary record."""
         return {"id": self.id, "fixture_sha256": self.fixture_sha256}
 
+    def before_request(self, _messages, _turn):
+        return None
 
-def select(name, path=FIXTURE):
-    require(name in WORKLOADS, f"unknown workload variant {name!r} (known: {', '.join(WORKLOADS)})")
-    raw = Path(path).read_bytes()
+
+def select(name, path=None):
+    if name == "divergent-edit-v1":
+        from coding_divergent_edit import select as select_divergent
+        return select_divergent(name)
+    require(name == ID, f"unknown workload variant {name!r} (known: {', '.join(WORKLOADS)})")
+    fixture = FIXTURE if path is None else Path(path)
+    raw = fixture.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
     require(digest == FIXTURE_SHA256, "long-context fixture drift (regenerate and re-pin FIXTURE_SHA256)")
     return Variant(name, raw.decode("utf8", "strict"), digest)

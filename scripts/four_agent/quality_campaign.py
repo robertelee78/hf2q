@@ -116,22 +116,34 @@ def engine_kind(case):
 
 
 def derive_case(case, instance):
-    """The arm's Q5 case with the client pinned to one task instance and its sources frozen."""
+    """The arm's Q5 case pinned to one task instance, optionally on divergent-edit-v1."""
     q5_case.validate(case)
     derived = json.loads(json.dumps(case))
     client = derived["client"]
-    require(CLIENT in client["argv"] and not coding_long_context.FOREIGN_OPTIONS & set(client["argv"]),
-            "case client must be the canonical four-agent coding client without --instance, --workload, "
-            "--phase-plan or --benchmark-profile")
+    argv = client["argv"]
+    require(CLIENT in argv and "--instance" not in argv and
+            "--phase-plan" not in argv and "--benchmark-profile" not in argv,
+            "case client must be the four-agent coding client without instance, phase or profile")
+    workload = argv[argv.index("--workload") + 1] if "--workload" in argv[:-1] else None
+    require(workload in (None, "divergent-edit-v1"),
+            "quality instances compose only with the canonical or divergent-edit-v1 workload")
     require(set(q5_case.PLACEHOLDER.findall(client.get("summary", ""))) == {"OUT"},
             "client.summary must be a path under {OUT}")
     approval = client.get("approval")
-    require(approval is not None and not coding_long_context.FOREIGN_KEYS & set(approval["set"]),
-            "case approval must not already set a task instance or workload variant")
+    require(approval is not None and
+            not {"instance", "instance_table_sha256", "benchmark_profile"} & set(approval["set"]),
+            "case approval must not already set a task instance")
+    if workload is None:
+        require(not coding_long_context.FOREIGN_KEYS & set(approval["set"]),
+                "canonical case approval must not select a workload variant")
+    else:
+        require(approval["set"].get("workload_variant") == workload and
+                "workload_fixture_sha256" in approval["set"],
+                "divergent workload approval binding missing")
     sources = approval["set"].get("sources")
     require(isinstance(sources, dict) and set(sources) == {"sha256_of"} and isinstance(sources["sha256_of"], list),
             "case approval must freeze client sources with sha256_of")
-    client["argv"] = client["argv"] + ["--instance", str(instance)]
+    client["argv"] = argv + ["--instance", str(instance)]
     approval["set"]["instance"] = instance
     approval["set"]["instance_table_sha256"] = {"sha256_of": TABLE}
     sources["sha256_of"] = sources["sha256_of"] + [f"{{REPO}}/scripts/four_agent/{name}"

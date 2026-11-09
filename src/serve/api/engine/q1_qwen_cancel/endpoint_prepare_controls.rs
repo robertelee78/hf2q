@@ -18,7 +18,14 @@ fn q1_qwen_endpoint_prepare_matches_actual_recipe_and_cache() {
     for (q38, family) in [(true, Family::Qwen38), (false, Family::Qwen36)] {
         let cfg = selected_header_fixture(q38);
         let work = work(family, cfg.vocab_size);
-        let plan = plan(&cfg, &work, 262144, qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX, [0, 0]).unwrap();
+        let plan = plan(
+            &cfg,
+            &work,
+            262144,
+            qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX,
+            [0, 0],
+        )
+        .unwrap();
         // The literal recipe `qwen_actual` checked before this cutover.
         let literal = acquisition::ConfigRecipe {
             family,
@@ -29,10 +36,16 @@ fn q1_qwen_endpoint_prepare_matches_actual_recipe_and_cache() {
             route: "endpoint",
             actual_model_config_sha256: hash(format!("{:?}", &cfg).as_bytes()),
         };
-        assert_eq!(plan.config_sha256, acquisition::config_digest(&literal).unwrap());
+        assert_eq!(
+            plan.config_sha256,
+            acquisition::config_digest(&literal).unwrap()
+        );
         assert_eq!(plan.config_debug_sha256, literal.actual_model_config_sha256);
         assert_eq!(plan.recipe, serde_json::to_value(&literal).unwrap());
-        assert_eq!(plan.token_vectors_sha256, acquisition::tokens_digest(&work).unwrap());
+        assert_eq!(
+            plan.token_vectors_sha256,
+            acquisition::tokens_digest(&work).unwrap()
+        );
         assert_eq!(plan.packets.len(), TRAJECTORIES.len());
         for (trajectory, cache, planned) in &plan.packets {
             let actual =
@@ -40,8 +53,12 @@ fn q1_qwen_endpoint_prepare_matches_actual_recipe_and_cache() {
             assert_eq!(cache, &actual);
             assert_eq!(
                 *planned,
-                qwen_checkpoint::planned_payload(&actual, cfg.vocab_size as usize, qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX)
-                    .unwrap()
+                qwen_checkpoint::planned_payload(
+                    &actual,
+                    cfg.vocab_size as usize,
+                    qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX
+                )
+                .unwrap()
             );
         }
     }
@@ -50,23 +67,85 @@ fn q1_qwen_endpoint_prepare_matches_actual_recipe_and_cache() {
 #[test]
 fn q1_qwen_endpoint_prepare_negative_controls() {
     let cfg = selected_header_fixture(false);
-    let base = plan(&cfg, &work(Family::Qwen36, cfg.vocab_size), 262144, 2 << 30, [0, 0]).unwrap();
+    let base = plan(
+        &cfg,
+        &work(Family::Qwen36, cfg.vocab_size),
+        262144,
+        2 << 30,
+        [0, 0],
+    )
+    .unwrap();
     // A context-overridden header (the continuation tool's recipe input) must
     // not reproduce the endpoint identity digest.
     let mut overridden = cfg.clone();
     overridden.max_position_embeddings = overridden.max_position_embeddings.wrapping_add(1);
-    let other = plan(&overridden, &work(Family::Qwen36, cfg.vocab_size), 262144, 2 << 30, [0, 0]).unwrap();
+    let other = plan(
+        &overridden,
+        &work(Family::Qwen36, cfg.vocab_size),
+        262144,
+        2 << 30,
+        [0, 0],
+    )
+    .unwrap();
     assert_ne!(other.config_sha256, base.config_sha256);
     // Wrong family/variant, vocabulary, capacity, Q36 MTP cursors, quota.
-    assert!(plan(&cfg, &work(Family::Qwen38, cfg.vocab_size), 262144, 2 << 30, [0, 0]).is_err());
-    assert!(plan(&cfg, &work(Family::Qwen36, cfg.vocab_size - 1), 262144, 2 << 30, [0, 0]).is_err());
-    assert!(plan(&cfg, &work(Family::Qwen36, cfg.vocab_size), 143, 2 << 30, [0, 0]).is_err());
-    assert!(plan(&cfg, &work(Family::Qwen36, cfg.vocab_size), 262144, 2 << 30, [64, 64]).is_err());
-    assert!(plan(&cfg, &work(Family::Qwen36, cfg.vocab_size), 262144, 1, [0, 0]).is_err());
-    assert!(plan(&cfg, &work(Family::Qwen36, cfg.vocab_size), 262144,
-        qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX + 1, [0, 0]).is_err());
+    assert!(plan(
+        &cfg,
+        &work(Family::Qwen38, cfg.vocab_size),
+        262144,
+        2 << 30,
+        [0, 0]
+    )
+    .is_err());
+    assert!(plan(
+        &cfg,
+        &work(Family::Qwen36, cfg.vocab_size - 1),
+        262144,
+        2 << 30,
+        [0, 0]
+    )
+    .is_err());
+    assert!(plan(
+        &cfg,
+        &work(Family::Qwen36, cfg.vocab_size),
+        143,
+        2 << 30,
+        [0, 0]
+    )
+    .is_err());
+    assert!(plan(
+        &cfg,
+        &work(Family::Qwen36, cfg.vocab_size),
+        262144,
+        2 << 30,
+        [64, 64]
+    )
+    .is_err());
+    assert!(plan(
+        &cfg,
+        &work(Family::Qwen36, cfg.vocab_size),
+        262144,
+        1,
+        [0, 0]
+    )
+    .is_err());
+    assert!(plan(
+        &cfg,
+        &work(Family::Qwen36, cfg.vocab_size),
+        262144,
+        qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX + 1,
+        [0, 0]
+    )
+    .is_err());
     let q38 = selected_header_fixture(true);
-    assert!(plan(&q38, &work(Family::Qwen38, q38.vocab_size), 262144, qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX, [64, 64]).is_err());
+    assert!(plan(
+        &q38,
+        &work(Family::Qwen38, q38.vocab_size),
+        262144,
+        qwen_checkpoint::ENDPOINT_PAYLOAD_LIMIT_MAX,
+        [64, 64]
+    )
+    .is_err());
 }
 
 #[test]
@@ -131,7 +210,10 @@ fn q1_qwen_localizer_recipe_pins_todays_stage_localizer_literal() {
         );
         let work = work(family, cfg.vocab_size);
         let plan = localizer_plan(&cfg, &work, 262144, &localizer(t0_t3_routes())).unwrap();
-        assert_eq!(plan.config_sha256, acquisition::config_digest(&recipe).unwrap());
+        assert_eq!(
+            plan.config_sha256,
+            acquisition::config_digest(&recipe).unwrap()
+        );
         assert_eq!(plan.recipe, serde_json::to_value(&recipe).unwrap());
     }
 }
@@ -141,9 +223,13 @@ fn q1_qwen_localizer_routes_freeze_identical_coordinates_within_cap() {
     for (q38, family) in [(true, Family::Qwen38), (false, Family::Qwen36)] {
         let cfg = selected_header_fixture(q38);
         let hidden = cfg.hidden_size as usize;
-        let plan =
-            localizer_plan(&cfg, &work(family, cfg.vocab_size), 262144, &localizer(t0_t3_routes()))
-                .unwrap();
+        let plan = localizer_plan(
+            &cfg,
+            &work(family, cfg.vocab_size),
+            262144,
+            &localizer(t0_t3_routes()),
+        )
+        .unwrap();
         assert_eq!(plan.routes.len(), 2);
         let (_, _, (t128, e128, b128)) = &plan.routes[0];
         let (_, chunks, (t64, e64, b64)) = &plan.routes[1];
@@ -158,10 +244,15 @@ fn q1_qwen_localizer_routes_freeze_identical_coordinates_within_cap() {
             e128.iter().map(|e| e.at.clone()).collect();
         assert_eq!(coordinates.len(), e128.len());
         assert_eq!(e128[0].at.layer, u32::MAX);
-        assert_eq!(e128[0].at.stage, crate::adr063_invariance::receipt::Stage::Input);
+        assert_eq!(
+            e128[0].at.stage,
+            crate::adr063_invariance::receipt::Stage::Input
+        );
         assert_eq!(e128[0].shape, vec![1, hidden]);
         assert_eq!(e128[128].at.layer, 3);
-        assert!(e128.iter().all(|e| e.at.agent == "agent-1" && e.at.logical_step == 0));
+        assert!(e128
+            .iter()
+            .all(|e| e.at.agent == "agent-1" && e.at.logical_step == 0));
         assert_eq!(t128.len(), 7);
         assert_eq!(t64.len(), 14);
         for target in t128.iter().chain(t64.iter()) {
@@ -191,11 +282,17 @@ fn q1_qwen_localizer_plan_refuses_unbound_scope() {
     let mut v = base.clone();
     v["routes"] = serde_json::json!([{"rerun_id": "a", "prefill_chunks": [128]},
         {"rerun_id": "b", "prefill_chunks": [64]}]);
-    assert!(refused(v), "64- and 128-token routes cannot share expected coordinates");
+    assert!(
+        refused(v),
+        "64- and 128-token routes cannot share expected coordinates"
+    );
     let mut v = base.clone();
     v["normalize_rows"] = serde_json::json!(false);
     v["routes"] = t0_t3_routes();
-    assert!(refused(v), "unnormalized per-chunk captures differ across routes");
+    assert!(
+        refused(v),
+        "unnormalized per-chunk captures differ across routes"
+    );
     let mut v = base.clone();
     v["routes"] = serde_json::json!([{"rerun_id": "a", "prefill_chunks": [128]},
         {"rerun_id": "a", "prefill_chunks": [64, 64]}]);
@@ -215,7 +312,10 @@ fn q1_qwen_localizer_plan_refuses_unbound_scope() {
         (serde_json::json!([]), serde_json::json!(["layer_out"])),
         (serde_json::json!([3]), serde_json::json!(["embed"])),
         (serde_json::json!([3]), serde_json::json!(["fa_q_rope"])),
-        (serde_json::json!([3]), serde_json::json!(["layer_out", "layer_out"])),
+        (
+            serde_json::json!([3]),
+            serde_json::json!(["layer_out", "layer_out"]),
+        ),
         (serde_json::json!([3]), serde_json::json!([])),
     ] {
         let mut v = base.clone();

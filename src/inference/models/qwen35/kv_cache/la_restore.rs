@@ -45,6 +45,39 @@ pub(crate) struct LaRestoreItem {
     pub capture_row: u32,
 }
 
+#[derive(Clone)]
+pub(crate) struct LaAnchorImage {
+    storage: MlxBuffer,
+    layers: Vec<LaAnchorLayer>,
+}
+
+#[derive(Clone, Copy)]
+struct LaAnchorLayer {
+    recurrent_offset: usize,
+    recurrent_elements: usize,
+    conv_offset: usize,
+    conv_elements: usize,
+    channels: usize,
+    k_minus_one: usize,
+}
+
+impl LaAnchorImage {
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.storage.data_byte_len()
+    }
+
+    pub(crate) fn is_right_sized(&self) -> bool {
+        self.storage.byte_len() == self.storage.data_byte_len()
+    }
+}
+
+pub(crate) struct LaAnchorRestorePlan {
+    slot: SlotId,
+    cursors: Vec<u32>,
+    mtp_cursor: Option<u32>,
+    copies: LaRestorePlan,
+}
+
 struct ConvCopy {
     source: MlxBuffer,
     destination: MlxBuffer,
@@ -61,6 +94,16 @@ struct RecurrentCopy {
 struct RestoreCopy {
     conv: ConvCopy,
     recurrent: RecurrentCopy,
+}
+
+struct SnapshotCopy {
+    conv_source: MlxBuffer,
+    conv_destination: MlxBuffer,
+    recurrent_source: MlxBuffer,
+    recurrent_destination: MlxBuffer,
+    recurrent_bytes: u64,
+    channels: u32,
+    k_minus_one: u32,
 }
 
 /// Fully validated capture-to-state restore. Every view is bounded before an
@@ -139,6 +182,47 @@ fn views_overlap(left: &MlxBuffer, right: &MlxBuffer) -> Result<bool> {
     Ok(left.byte_offset() < right_end && right.byte_offset() < left_end)
 }
 
+fn anchor_layout(cache: &HybridKvCache) -> Result<(Vec<LaAnchorLayer>, usize)> {
+    let n_seqs = cache.n_seqs as usize;
+    anyhow::ensure!(n_seqs > 0, "anchor image: n_seqs is zero");
+    let mut offset = 0usize;
+    let mut layers = Vec::with_capacity(cache.linear_attn.len());
+    for (index, layer) in cache.linear_attn.iter().enumerate() {
+        anyhow::ensure!(
+            layer.recurrent.element_count() % n_seqs == 0,
+            "anchor image: recurrent layer {index} is not slot-aligned"
+        );
+        let recurrent_elements = layer.recurrent.element_count() / n_seqs;
+        let shape = layer.conv_state.shape();
+        anyhow::ensure!(
+            shape.len() == 3 && shape[2] == n_seqs,
+            "anchor image: conv layer {index} shape {shape:?} is not [channels, K-1, n_seqs]"
+        );
+        let channels = shape[0];
+        let k_minus_one = shape[1];
+        let conv_elements = channels
+            .checked_mul(k_minus_one)
+            .ok_or_else(|| anyhow!("anchor image: conv element overflow"))?;
+        let recurrent_offset = offset;
+        offset = offset
+            .checked_add(recurrent_elements)
+            .ok_or_else(|| anyhow!("anchor image: recurrent offset overflow"))?;
+        let conv_offset = offset;
+        offset = offset
+            .checked_add(conv_elements)
+            .ok_or_else(|| anyhow!("anchor image: conv offset overflow"))?;
+        layers.push(LaAnchorLayer {
+            recurrent_offset,
+            recurrent_elements,
+            conv_offset,
+            conv_elements,
+            channels,
+            k_minus_one,
+        });
+    }
+    Ok((layers, offset))
+}
+
 impl HybridKvCache {
     pub(crate) fn set_la_restore_route(&mut self, route: LaRestoreRoute) {
         self.la_restore_route = route;
@@ -147,6 +231,350 @@ impl HybridKvCache {
     #[cfg(test)]
     pub(crate) fn la_restore_route(&self) -> LaRestoreRoute {
         self.la_restore_route
+    }
+
+    pub(crate) fn slot_anchor_image_bytes(&self) -> Result<usize> {
+        let (_, elements) = anchor_layout(self)?;
+        elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| anyhow!("anchor image byte length overflow"))
+    }
+
+    pub(crate) fn snapshot_la_anchor(&mut self, slot: SlotId) -> Result<LaAnchorImage> {
+        let slot_index = slot.0 as usize;
+        let n_seqs = self.n_seqs as usize;
+        anyhow::ensure!(
+            slot_index < n_seqs,
+            "snapshot_la_anchor: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        let (layers, elements) = anchor_layout(self)?;
+        let bytes = elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| anyhow!("snapshot_la_anchor: image byte length overflow"))?;
+        let mut image = LaAnchorImage {
+            storage: self
+                .device
+                .alloc_buffer(bytes, DType::F32, vec![elements])
+                .map_err(|error| anyhow!("snapshot_la_anchor: allocate image: {error}"))?,
+            layers,
+        };
+        anyhow::ensure!(
+            image.is_right_sized(),
+            "snapshot_la_anchor: image owner is not right-sized"
+        );
+
+        match self.la_restore_route {
+            LaRestoreRoute::Host => {
+                let destination = image
+                    .storage
+                    .as_mut_slice::<u32>()
+                    .context("snapshot_la_anchor: map image")?;
+                for (layer, layout) in self.linear_attn.iter().zip(&image.layers) {
+                    let recurrent_per_slot = layout.recurrent_elements;
+                    let recurrent_start = slot_index
+                        .checked_mul(recurrent_per_slot)
+                        .ok_or_else(|| anyhow!("snapshot_la_anchor: recurrent slot overflow"))?;
+                    let recurrent = current_recurrent(layer, slot_index)
+                        .as_slice::<u32>()
+                        .context("snapshot_la_anchor: map recurrent state")?;
+                    destination
+                        [layout.recurrent_offset..layout.recurrent_offset + recurrent_per_slot]
+                        .copy_from_slice(
+                            &recurrent[recurrent_start..recurrent_start + recurrent_per_slot],
+                        );
+
+                    let conv_start = slot_index
+                        .checked_mul(layout.conv_elements)
+                        .ok_or_else(|| anyhow!("snapshot_la_anchor: conv slot overflow"))?;
+                    let conv = current_conv(layer, slot_index)
+                        .as_slice::<u32>()
+                        .context("snapshot_la_anchor: map conv state")?;
+                    let output = &mut destination
+                        [layout.conv_offset..layout.conv_offset + layout.conv_elements];
+                    for k in 0..layout.k_minus_one {
+                        for channel in 0..layout.channels {
+                            output[k * layout.channels + channel] =
+                                conv[conv_start + channel * layout.k_minus_one + k];
+                        }
+                    }
+                }
+            }
+            LaRestoreRoute::Gpu => {
+                let mut copies = Vec::with_capacity(self.linear_attn.len());
+                for (layer, layout) in self.linear_attn.iter().zip(&image.layers) {
+                    let recurrent_source = f32_view(
+                        current_recurrent(layer, slot_index),
+                        slot_index
+                            .checked_mul(layout.recurrent_elements)
+                            .ok_or_else(|| {
+                                anyhow!("snapshot_la_anchor: recurrent source overflow")
+                            })?,
+                        layout.recurrent_elements,
+                        "snapshot_la_anchor recurrent source",
+                    )?;
+                    let recurrent_destination = f32_view(
+                        &image.storage,
+                        layout.recurrent_offset,
+                        layout.recurrent_elements,
+                        "snapshot_la_anchor recurrent destination",
+                    )?;
+                    let conv_source = f32_view(
+                        current_conv(layer, slot_index),
+                        slot_index
+                            .checked_mul(layout.conv_elements)
+                            .ok_or_else(|| anyhow!("snapshot_la_anchor: conv source overflow"))?,
+                        layout.conv_elements,
+                        "snapshot_la_anchor conv source",
+                    )?;
+                    let conv_destination = f32_view(
+                        &image.storage,
+                        layout.conv_offset,
+                        layout.conv_elements,
+                        "snapshot_la_anchor conv destination",
+                    )?;
+                    copies.push(SnapshotCopy {
+                        conv_source,
+                        conv_destination,
+                        recurrent_source,
+                        recurrent_destination,
+                        recurrent_bytes: u64::try_from(
+                            layout.recurrent_elements * std::mem::size_of::<f32>(),
+                        )
+                        .context("snapshot_la_anchor: recurrent bytes do not fit u64")?,
+                        channels: u32::try_from(layout.channels)
+                            .context("snapshot_la_anchor: channels do not fit u32")?,
+                        k_minus_one: u32::try_from(layout.k_minus_one)
+                            .context("snapshot_la_anchor: K-1 does not fit u32")?,
+                    });
+                }
+                let mut encoder = self
+                    .device
+                    .command_encoder()
+                    .context("snapshot_la_anchor: create command encoder")?;
+                let registry = self
+                    .la_restore_registry
+                    .get_or_insert_with(KernelRegistry::new);
+                for copy in &copies {
+                    dispatch_strided_copy_f32(
+                        &mut encoder,
+                        registry,
+                        self.device.metal_device(),
+                        &copy.conv_source,
+                        &copy.conv_destination,
+                        &StridedCopyParams {
+                            rows: copy.k_minus_one,
+                            cols: copy.channels,
+                            stride_row: 1,
+                            stride_col: copy.k_minus_one,
+                        },
+                    )
+                    .context("snapshot_la_anchor: conv strided copy")?;
+                }
+                for copy in &copies {
+                    encoder
+                        .blit_copy_bytes(
+                            &copy.recurrent_source,
+                            0,
+                            &copy.recurrent_destination,
+                            0,
+                            copy.recurrent_bytes,
+                        )
+                        .context("snapshot_la_anchor: recurrent blit")?;
+                }
+                encoder
+                    .commit_and_wait_labeled("qwen35.anchor_snapshot")
+                    .context("snapshot_la_anchor: GPU snapshot")?;
+            }
+        }
+        Ok(image)
+    }
+
+    pub(crate) fn plan_anchor_restore(
+        &self,
+        slot: SlotId,
+        image: &LaAnchorImage,
+        cursors: &[u32],
+        mtp_cursor: Option<u32>,
+    ) -> Result<LaAnchorRestorePlan> {
+        let slot_index = slot.0 as usize;
+        anyhow::ensure!(
+            slot_index < self.n_seqs as usize,
+            "plan_anchor_restore: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(
+            cursors.len() == self.full_attn.len(),
+            "plan_anchor_restore: full-attention layer count mismatch"
+        );
+        anyhow::ensure!(
+            image.layers.len() == self.linear_attn.len(),
+            "plan_anchor_restore: linear-attention layer count mismatch"
+        );
+        let (expected_layers, expected_elements) = anchor_layout(self)?;
+        anyhow::ensure!(
+            image.storage.element_count() == expected_elements
+                && image
+                    .layers
+                    .iter()
+                    .zip(&expected_layers)
+                    .all(|(actual, expected)| {
+                        actual.recurrent_offset == expected.recurrent_offset
+                            && actual.recurrent_elements == expected.recurrent_elements
+                            && actual.conv_offset == expected.conv_offset
+                            && actual.conv_elements == expected.conv_elements
+                            && actual.channels == expected.channels
+                            && actual.k_minus_one == expected.k_minus_one
+                    }),
+            "plan_anchor_restore: anchor image geometry mismatch"
+        );
+        for (index, (layer, &saved)) in self.full_attn.iter().zip(cursors).enumerate() {
+            let live = *layer
+                .current_len
+                .get(slot_index)
+                .ok_or_else(|| anyhow!("plan_anchor_restore: cursor missing at layer {index}"))?;
+            anyhow::ensure!(
+                live >= saved,
+                "plan_anchor_restore: live cursor {live} behind saved cursor {saved} at layer {index}"
+            );
+        }
+        match (&self.mtp_slot, mtp_cursor) {
+            (Some(mtp), Some(saved)) => {
+                let live = *mtp.current_len.get(slot_index).ok_or_else(|| {
+                    anyhow!(
+                        "plan_anchor_restore: MTP cursor missing for slot {}",
+                        slot.0
+                    )
+                })?;
+                anyhow::ensure!(
+                    live >= saved,
+                    "plan_anchor_restore: live MTP cursor {live} behind saved {saved}"
+                );
+            }
+            (None, None) => {}
+            _ => anyhow::bail!("plan_anchor_restore: MTP presence mismatch"),
+        }
+
+        let mut copies = Vec::with_capacity(self.linear_attn.len());
+        for (layer, layout) in self.linear_attn.iter().zip(&image.layers) {
+            let recurrent_source = f32_view(
+                &image.storage,
+                layout.recurrent_offset,
+                layout.recurrent_elements,
+                "plan_anchor_restore recurrent source",
+            )?;
+            let recurrent_destination = f32_view(
+                &layer.recurrent,
+                slot_index
+                    .checked_mul(layout.recurrent_elements)
+                    .ok_or_else(|| {
+                        anyhow!("plan_anchor_restore: recurrent destination overflow")
+                    })?,
+                layout.recurrent_elements,
+                "plan_anchor_restore recurrent destination",
+            )?;
+            let conv_source = f32_view(
+                &image.storage,
+                layout.conv_offset,
+                layout.conv_elements,
+                "plan_anchor_restore conv source",
+            )?;
+            let conv_destination = f32_view(
+                &layer.conv_state,
+                slot_index
+                    .checked_mul(layout.conv_elements)
+                    .ok_or_else(|| anyhow!("plan_anchor_restore: conv destination overflow"))?,
+                layout.conv_elements,
+                "plan_anchor_restore conv destination",
+            )?;
+            anyhow::ensure!(
+                !views_overlap(&recurrent_source, &recurrent_destination)?
+                    && !views_overlap(&conv_source, &conv_destination)?,
+                "plan_anchor_restore: source overlaps destination"
+            );
+            copies.push(RestoreCopy {
+                conv: ConvCopy {
+                    source: conv_source,
+                    destination: conv_destination,
+                    channels: u32::try_from(layout.channels)
+                        .context("plan_anchor_restore: channels do not fit u32")?,
+                    k_minus_one: u32::try_from(layout.k_minus_one)
+                        .context("plan_anchor_restore: K-1 does not fit u32")?,
+                },
+                recurrent: RecurrentCopy {
+                    source: recurrent_source,
+                    destination: recurrent_destination,
+                    bytes: u64::try_from(layout.recurrent_elements * std::mem::size_of::<f32>())
+                        .context("plan_anchor_restore: recurrent bytes do not fit u64")?,
+                },
+            });
+        }
+        Ok(LaAnchorRestorePlan {
+            slot,
+            cursors: cursors.to_vec(),
+            mtp_cursor,
+            copies: LaRestorePlan { copies },
+        })
+    }
+
+    pub(crate) fn apply_anchor_restore(&mut self, mut plan: LaAnchorRestorePlan) -> Result<()> {
+        match self.la_restore_route {
+            LaRestoreRoute::Host => {
+                for copy in &mut plan.copies.copies {
+                    let source = copy
+                        .conv
+                        .source
+                        .as_slice::<u32>()
+                        .context("apply_anchor_restore: map conv source")?;
+                    let destination = copy
+                        .conv
+                        .destination
+                        .as_mut_slice::<u32>()
+                        .context("apply_anchor_restore: map conv destination")?;
+                    let channels = copy.conv.channels as usize;
+                    let k_minus_one = copy.conv.k_minus_one as usize;
+                    for channel in 0..channels {
+                        for k in 0..k_minus_one {
+                            destination[channel * k_minus_one + k] = source[k * channels + channel];
+                        }
+                    }
+                    let source = copy
+                        .recurrent
+                        .source
+                        .as_slice::<u8>()
+                        .context("apply_anchor_restore: map recurrent source")?;
+                    let destination = copy
+                        .recurrent
+                        .destination
+                        .as_mut_slice::<u8>()
+                        .context("apply_anchor_restore: map recurrent destination")?;
+                    destination.copy_from_slice(source);
+                }
+            }
+            LaRestoreRoute::Gpu => {
+                let mut encoder = self
+                    .device
+                    .command_encoder()
+                    .context("apply_anchor_restore: create command encoder")?;
+                self.encode_la_restore(&mut encoder, &plan.copies)?;
+                encoder
+                    .commit_and_wait_labeled("qwen35.anchor_restore")
+                    .context("apply_anchor_restore: GPU restore")?;
+            }
+        }
+        let slot_index = plan.slot.0 as usize;
+        for (layer, saved) in self.full_attn.iter_mut().zip(plan.cursors) {
+            layer.current_len[slot_index] = saved;
+        }
+        if let (Some(mtp), Some(saved)) = (self.mtp_slot.as_mut(), plan.mtp_cursor) {
+            mtp.current_len[slot_index] = saved;
+        }
+        for layer in &mut self.linear_attn {
+            layer.pp_flipped[slot_index] = false;
+        }
+        Ok(())
     }
 
     /// Validate every layer and destination before any GPU command is encoded.
@@ -499,6 +927,105 @@ mod tests {
             );
             assert!(LaRestoreRoute::resolve(Some("gpu"), variant).is_err());
             assert!(LaRestoreRoute::resolve(Some(""), variant).is_err());
+        }
+    }
+
+    fn active_slot_state(cache: &HybridKvCache, slot: usize) -> Vec<[Vec<u32>; 2]> {
+        let n_seqs = cache.n_seqs as usize;
+        cache
+            .linear_attn
+            .iter()
+            .map(|layer| {
+                let recurrent = current_recurrent(layer, slot)
+                    .as_slice::<u32>()
+                    .expect("mapped recurrent");
+                let recurrent_per_slot = recurrent.len() / n_seqs;
+                let recurrent_start = slot * recurrent_per_slot;
+                let conv = current_conv(layer, slot)
+                    .as_slice::<u32>()
+                    .expect("mapped conv");
+                let conv_per_slot = conv.len() / n_seqs;
+                let conv_start = slot * conv_per_slot;
+                [
+                    recurrent[recurrent_start..recurrent_start + recurrent_per_slot].to_vec(),
+                    conv[conv_start..conv_start + conv_per_slot].to_vec(),
+                ]
+            })
+            .collect()
+    }
+
+    fn perturb(cache: &mut HybridKvCache, target: usize) {
+        for layer in &mut cache.linear_attn {
+            for buffer in [
+                &mut layer.recurrent,
+                &mut layer.recurrent_scratch,
+                &mut layer.conv_state,
+                &mut layer.conv_state_scratch,
+            ] {
+                for value in buffer.as_mut_slice::<u32>().expect("mapped state") {
+                    *value = value.wrapping_add(0x0101_0101);
+                }
+            }
+            layer.pp_flipped[target] = !layer.pp_flipped[target];
+        }
+    }
+
+    #[test]
+    fn anchor_image_round_trips_every_slot_parity_and_route_without_touching_peers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = mlx_native::MlxDevice::new().expect("Metal device");
+        let cfg = config(Qwen35Variant::Dense);
+        for snapshot_route in [LaRestoreRoute::Host, LaRestoreRoute::Gpu] {
+            for restore_route in [LaRestoreRoute::Host, LaRestoreRoute::Gpu] {
+                for flipped in [false, true] {
+                    for slot in 0..4 {
+                        let mut cache =
+                            HybridKvCache::new(&cfg, &device, 64, 4).expect("anchor cache");
+                        cache.ensure_la_capture(&cfg, &device, 4).unwrap();
+                        plant(&mut cache);
+                        for layer in &mut cache.linear_attn {
+                            layer.pp_flipped[slot] = flipped;
+                        }
+                        let expected = active_slot_state(&cache, slot);
+                        cache.set_la_restore_route(snapshot_route);
+                        let image = cache
+                            .snapshot_la_anchor(SlotId(slot as u32))
+                            .expect("anchor snapshot");
+                        let expected_bytes = cache
+                            .linear_attn
+                            .iter()
+                            .map(|layer| {
+                                (layer.recurrent.data_byte_len() + layer.conv_state.data_byte_len())
+                                    / cache.n_seqs as usize
+                            })
+                            .sum::<usize>();
+                        assert_eq!(image.total_bytes(), expected_bytes);
+                        assert!(image.is_right_sized());
+
+                        perturb(&mut cache, slot);
+                        let peers_before: Vec<_> = (0..4)
+                            .filter(|&peer| peer != slot)
+                            .map(|peer| (peer, active_slot_state(&cache, peer)))
+                            .collect();
+                        let cursors = vec![0; cache.full_attn.len()];
+                        cache.set_la_restore_route(restore_route);
+                        let plan = cache
+                            .plan_anchor_restore(SlotId(slot as u32), &image, &cursors, None)
+                            .expect("anchor restore preflight");
+                        cache
+                            .apply_anchor_restore(plan)
+                            .expect("anchor restore apply");
+                        assert_eq!(active_slot_state(&cache, slot), expected);
+                        for (peer, before) in peers_before {
+                            assert_eq!(
+                                active_slot_state(&cache, peer),
+                                before,
+                                "peer slot {peer} changed"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

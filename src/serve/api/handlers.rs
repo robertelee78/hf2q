@@ -17,6 +17,7 @@
 //! scaffolding here (AppState threading, error envelope, JSON responses) is
 //! what every future handler is built on.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use axum::extract::{Extension, Path as AxPath, State};
@@ -486,8 +487,7 @@ pub async fn chat_completions(
                 || request.structured_outputs.is_some()
                 || request.json_schema.is_some();
             if constrained && !request.extra.is_empty() {
-                let mut keys: Vec<&str> =
-                    request.extra.keys().map(String::as_str).collect();
+                let mut keys: Vec<&str> = request.extra.keys().map(String::as_str).collect();
                 keys.sort_unstable();
                 state
                     .metrics
@@ -505,7 +505,7 @@ pub async fn chat_completions(
                 .into_response();
             }
             request
-        },
+        }
         Err(rejection) => {
             state
                 .metrics
@@ -825,40 +825,44 @@ async fn chat_completions_with_prepared(
         return resp;
     }
 
-    let (message_content, message_tool_calls, effective_finish_reason) =
-        if extracted.tool_calls.is_empty() && length_cut && tool_call_policy.enforces_body_grammar() {
-            // Cut before any call completed: keep the text that preceded it.
-            (
-                tool_turn_message_content(extracted.content),
-                None,
-                "length".to_string(),
-            )
-        } else if extracted.tool_calls.is_empty() {
-            // No tool calls: preserve original text and finish_reason.
-            (
-                Some(MessageContent::Text(result.text)),
-                None,
-                result.finish_reason.to_string(),
-            )
-        } else if length_cut {
-            // Calls completed before the cut: return them, reporting the cut.
-            (
-                tool_turn_message_content(extracted.content),
-                Some(extracted.tool_calls),
-                "length".to_string(),
-            )
-        } else {
-            // Tool calls found: content is whatever remained outside the markers
-            // (may be empty when the model emitted only tool-call spans).
-            let content = tool_turn_message_content(extracted.content);
-            // OpenAI spec: finish_reason == "tool_calls" whenever at least one
-            // structured tool call was emitted.
-            (
-                content,
-                Some(extracted.tool_calls),
-                "tool_calls".to_string(),
-            )
-        };
+    let (message_content, message_tool_calls, effective_finish_reason) = if extracted
+        .tool_calls
+        .is_empty()
+        && length_cut
+        && tool_call_policy.enforces_body_grammar()
+    {
+        // Cut before any call completed: keep the text that preceded it.
+        (
+            tool_turn_message_content(extracted.content),
+            None,
+            "length".to_string(),
+        )
+    } else if extracted.tool_calls.is_empty() {
+        // No tool calls: preserve original text and finish_reason.
+        (
+            Some(MessageContent::Text(result.text)),
+            None,
+            result.finish_reason.to_string(),
+        )
+    } else if length_cut {
+        // Calls completed before the cut: return them, reporting the cut.
+        (
+            tool_turn_message_content(extracted.content),
+            Some(extracted.tool_calls),
+            "length".to_string(),
+        )
+    } else {
+        // Tool calls found: content is whatever remained outside the markers
+        // (may be empty when the model emitted only tool-call spans).
+        let content = tool_turn_message_content(extracted.content);
+        // OpenAI spec: finish_reason == "tool_calls" whenever at least one
+        // structured tool call was emitted.
+        (
+            content,
+            Some(extracted.tool_calls),
+            "tool_calls".to_string(),
+        )
+    };
     tracing::info!(
         model = %req.model,
         finish_reason = %effective_finish_reason,
@@ -6374,7 +6378,9 @@ mod compile_tool_grammar_precondition_tests {
             .chain(one_scalar_tool("grep"))
             .collect();
         let call = |name: &str, q: &str| {
-            format!("\n<function={name}>\n<parameter=q>\n{q}\n</parameter>\n</function>\n</tool_call>")
+            format!(
+                "\n<function={name}>\n<parameter=q>\n{q}\n</parameter>\n</function>\n</tool_call>"
+            )
         };
         for model in ["qwen3.6-35b-a3b", "Qwen3.8-27B"] {
             for parallel in [false, true] {
@@ -6384,15 +6390,18 @@ mod compile_tool_grammar_precondition_tests {
                     .expect("Auto grammar");
                 let root = g.rule_id("root").expect("root");
                 let fresh = || {
-                    let mut rt = grammar::sampler::GrammarRuntime::new(g.clone(), root)
-                        .expect("runtime");
+                    let mut rt =
+                        grammar::sampler::GrammarRuntime::new(g.clone(), root).expect("runtime");
                     rt.set_lazy_trigger(b"<tool_call>");
                     rt
                 };
 
                 let mut rt = fresh();
                 let first = format!("Looking.\n\n<tool_call>{}", call("grep", "fn main"));
-                assert!(rt.accept_bytes(first.as_bytes()), "{model} parallel={parallel}");
+                assert!(
+                    rt.accept_bytes(first.as_bytes()),
+                    "{model} parallel={parallel}"
+                );
                 assert!(rt.is_accepted(), "{model} parallel={parallel}: first call");
                 if parallel {
                     let second = format!("\n<tool_call>{}", call("read_file", "src/main.rs"));
@@ -6405,7 +6414,10 @@ mod compile_tool_grammar_precondition_tests {
                         call("grep", "x"),
                         call("read_file", "y")
                     );
-                    assert!(!doubled.accept_bytes(bytes.as_bytes()), "{model}: doubled newline");
+                    assert!(
+                        !doubled.accept_bytes(bytes.as_bytes()),
+                        "{model}: doubled newline"
+                    );
                 }
 
                 let mut compact = fresh();
@@ -7910,7 +7922,9 @@ fn common_engine_error_response(
     if msg.contains("invalid_request:") {
         return Some(ApiError::invalid_request(msg.to_string(), None).into_response());
     }
-    if let Some((_, detail)) = msg.split_once(&format!("{}: ", engine::SERIAL_PROMPT_LIMIT_SENTINEL)) {
+    if let Some((_, detail)) =
+        msg.split_once(&format!("{}: ", engine::SERIAL_PROMPT_LIMIT_SENTINEL))
+    {
         return Some(ApiError::prompt_exceeds_server_limit(detail.to_string()).into_response());
     }
     if msg.contains("capability_unsupported:") {
@@ -8857,6 +8871,149 @@ hf2q_qwen_history_lookup_no_match_total {}\n",
         qwen_mtp.history_lookup_no_match.load(Ordering::Relaxed),
     );
 
+    let qwen_anchors = {
+        let mut output = String::from(
+            "# HELP hf2q_qwen_anchor_owned_bytes Bytes owned by Qwen anchors by slot, class and publication state.\n\
+# TYPE hf2q_qwen_anchor_owned_bytes gauge\n\
+# HELP hf2q_qwen_anchor_committed Number of committed Qwen anchors by slot.\n\
+# TYPE hf2q_qwen_anchor_committed gauge\n",
+        );
+        for gauge in super::engine_qwen35::anchor_store::anchor_gauges() {
+            writeln!(
+                output,
+                "hf2q_qwen_anchor_committed{{slot=\"{}\"}} {}",
+                gauge.slot, gauge.committed_count
+            )
+            .expect("write Qwen anchor metric");
+            for (state, owned) in [("committed", gauge.committed), ("pending", gauge.pending)] {
+                for (class, bytes) in [
+                    ("payload_image", owned.payload_image),
+                    ("logits", owned.logits),
+                    ("hidden", owned.hidden),
+                    ("tokens", owned.tokens),
+                    ("metadata", owned.metadata),
+                ] {
+                    writeln!(
+                        output,
+                        "hf2q_qwen_anchor_owned_bytes{{slot=\"{}\",class=\"{}\",state=\"{}\"}} {}",
+                        gauge.slot, class, state, bytes
+                    )
+                    .expect("write Qwen anchor metric");
+                }
+            }
+        }
+        let telemetry = &super::engine_qwen35::anchor_store::ANCHOR_TELEMETRY;
+        output.push_str(
+            "# HELP hf2q_qwen_anchor_restores_total Successful Qwen anchor restores by rank, where zero is deepest.\n\
+# TYPE hf2q_qwen_anchor_restores_total counter\n",
+        );
+        for (rank, counter) in telemetry.restores_by_rank.iter().enumerate() {
+            writeln!(
+                output,
+                "hf2q_qwen_anchor_restores_total{{rank=\"{rank}\"}} {}",
+                counter.load(Ordering::Relaxed)
+            )
+            .expect("write Qwen anchor restore rank metric");
+        }
+        writeln!(
+            output,
+            "# HELP hf2q_qwen_anchor_equality_hits_total Anchor restores that skipped prefill using saved logits.\n\
+# TYPE hf2q_qwen_anchor_equality_hits_total counter\n\
+hf2q_qwen_anchor_equality_hits_total {}\n\
+# HELP hf2q_qwen_anchor_restore_refused_total Anchor restore refusals before a safe completed restore.\n\
+# TYPE hf2q_qwen_anchor_restore_refused_total counter\n\
+hf2q_qwen_anchor_restore_refused_total{{reason=\"validation\"}} {}\n\
+# HELP hf2q_qwen_anchor_tombstoned_total Anchors removed before a cursor rewind or divergent write.\n\
+# TYPE hf2q_qwen_anchor_tombstoned_total counter\n\
+hf2q_qwen_anchor_tombstoned_total{{cause=\"cursor\"}} {}\n\
+# HELP hf2q_qwen_anchor_evicted_total Committed anchors evicted by the configured depth bound.\n\
+# TYPE hf2q_qwen_anchor_evicted_total counter\n\
+hf2q_qwen_anchor_evicted_total {}\n\
+# HELP hf2q_qwen_anchor_capture_skipped_total Anchor captures skipped by closed reason.\n\
+# TYPE hf2q_qwen_anchor_capture_skipped_total counter\n\
+hf2q_qwen_anchor_capture_skipped_total{{reason=\"oversized_owner\"}} {}\n\
+hf2q_qwen_anchor_capture_skipped_total{{reason=\"quota\"}} {}\n\
+# HELP hf2q_qwen_anchor_snapshot_milliseconds_sum Total supervised anchor snapshot time in milliseconds.\n\
+# TYPE hf2q_qwen_anchor_snapshot_milliseconds_sum counter\n\
+hf2q_qwen_anchor_snapshot_milliseconds_sum {:.6}\n\
+# HELP hf2q_qwen_anchor_snapshot_milliseconds_count Supervised anchor snapshot attempts.\n\
+# TYPE hf2q_qwen_anchor_snapshot_milliseconds_count counter\n\
+hf2q_qwen_anchor_snapshot_milliseconds_count {}\n\
+# HELP hf2q_qwen_anchor_restore_milliseconds_sum Total supervised anchor restore time in milliseconds.\n\
+# TYPE hf2q_qwen_anchor_restore_milliseconds_sum counter\n\
+hf2q_qwen_anchor_restore_milliseconds_sum {:.6}\n\
+# HELP hf2q_qwen_anchor_restore_milliseconds_count Supervised anchor restore attempts.\n\
+# TYPE hf2q_qwen_anchor_restore_milliseconds_count counter\n\
+hf2q_qwen_anchor_restore_milliseconds_count {}",
+            telemetry.equality_hits.load(Ordering::Relaxed),
+            telemetry.restore_refused.load(Ordering::Relaxed),
+            telemetry.tombstoned_cursor.load(Ordering::Relaxed),
+            telemetry.evicted.load(Ordering::Relaxed),
+            telemetry
+                .capture_skipped_oversized_owner
+                .load(Ordering::Relaxed),
+            telemetry.capture_skipped_quota.load(Ordering::Relaxed),
+            telemetry.snapshot_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            telemetry.snapshot_count.load(Ordering::Relaxed),
+            telemetry.restore_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            telemetry.restore_count.load(Ordering::Relaxed),
+        )
+        .expect("write Qwen anchor telemetry");
+        writeln!(
+            output,
+            "# HELP hf2q_qwen_anchor_captures_staged_total Anchor snapshots staged as pending.\n\
+# TYPE hf2q_qwen_anchor_captures_staged_total counter\n\
+hf2q_qwen_anchor_captures_staged_total {}\n\
+# HELP hf2q_qwen_anchor_commits_total Pending anchors published after successful decode completion.\n\
+# TYPE hf2q_qwen_anchor_commits_total counter\n\
+hf2q_qwen_anchor_commits_total {}",
+            telemetry.captures_staged.load(Ordering::Relaxed),
+            telemetry.committed.load(Ordering::Relaxed),
+        )
+        .expect("write Qwen anchor publication telemetry");
+        output
+    };
+
+    let qwen_joint = {
+        let joint = &super::engine::qwen35_joint_decode::JOINT_TELEMETRY;
+        format!(
+            "# HELP hf2q_qwen_joint_not_eligible_turns_total Qwen joint turns routed serially by closed reason.\n\
+# TYPE hf2q_qwen_joint_not_eligible_turns_total counter\n\
+hf2q_qwen_joint_not_eligible_turns_total{{reason=\"capture_active\"}} {}\n\
+hf2q_qwen_joint_not_eligible_turns_total{{reason=\"too_few_ready\"}} {}\n\
+hf2q_qwen_joint_not_eligible_turns_total{{reason=\"duplicate_slots\"}} {}\n\
+hf2q_qwen_joint_not_eligible_turns_total{{reason=\"max_rows\"}} {}\n\
+hf2q_qwen_joint_not_eligible_turns_total{{reason=\"anchor_capture\"}} 0\n\
+hf2q_qwen_joint_not_eligible_turns_total{{reason=\"anchor_restore\"}} 0\n\
+# HELP hf2q_qwen_joint_lane_refusals_total Qwen lane refusals by closed reason.\n\
+# TYPE hf2q_qwen_joint_lane_refusals_total counter\n\
+hf2q_qwen_joint_lane_refusals_total{{reason=\"step_bound\"}} {}\n\
+hf2q_qwen_joint_lane_refusals_total{{reason=\"pending_speculation_output\"}} {}\n\
+hf2q_qwen_joint_lane_refusals_total{{reason=\"no_seed\"}} {}\n\
+hf2q_qwen_joint_lane_refusals_total{{reason=\"target_cursor\"}} {}\n\
+hf2q_qwen_joint_lane_refusals_total{{reason=\"mtp_cursor\"}} {}\n\
+hf2q_qwen_joint_lane_refusals_total{{reason=\"speculation_route\"}} {}\n\
+hf2q_qwen_joint_lane_refusals_total{{reason=\"client_closed\"}} {}\n\
+hf2q_qwen_joint_lane_refusals_total{{reason=\"handle_mismatch\"}} {}\n\
+hf2q_qwen_joint_lane_refusals_total{{reason=\"anchor_capture\"}} 0\n\
+hf2q_qwen_joint_lane_refusals_total{{reason=\"anchor_restore\"}} 0\n",
+            joint.capture_active.load(Ordering::Relaxed),
+            joint.too_few_ready.load(Ordering::Relaxed),
+            joint.duplicate_slots.load(Ordering::Relaxed),
+            joint.max_rows.load(Ordering::Relaxed),
+            joint.lane_step_bound.load(Ordering::Relaxed),
+            joint
+                .lane_pending_speculation_output
+                .load(Ordering::Relaxed),
+            joint.lane_no_seed.load(Ordering::Relaxed),
+            joint.lane_target_cursor.load(Ordering::Relaxed),
+            joint.lane_mtp_cursor.load(Ordering::Relaxed),
+            joint.lane_speculation_route.load(Ordering::Relaxed),
+            joint.lane_client_closed.load(Ordering::Relaxed),
+            joint.lane_handle_mismatch.load(Ordering::Relaxed),
+        )
+    };
+
     let body = format!(
         "\
 # HELP hf2q_uptime_seconds Process uptime in seconds since bind.\n\
@@ -8945,6 +9102,8 @@ hf2q_qwen_mtp_fallback_requests_total {qwen_mtp_fallbacks}\n\
 # TYPE hf2q_qwen_mtp_conversation_resets_total counter\n\
 hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
 {qwen_speculation_proposers}\
+{qwen_anchors}\
+{qwen_joint}\
 ",
         uptime = state.uptime_seconds(),
         ready = ready,
@@ -8977,6 +9136,8 @@ hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
         qwen_mtp_fallback_reasons = qwen_mtp_fallback_reasons,
         qwen_mtp_resets = qwen_mtp.conversation_resets.load(Ordering::Relaxed),
         qwen_speculation_proposers = qwen_speculation_proposers,
+        qwen_anchors = qwen_anchors,
+        qwen_joint = qwen_joint,
     );
     // Prometheus exposition format: text/plain with a versioned content-type.
     let mut resp = (StatusCode::OK, body).into_response();
@@ -13338,8 +13499,8 @@ mod gcd_schema_tests {
         let schema_text = include_str!("../../../examples/recon-opportunities.schema.json");
         let schema: serde_json::Value =
             serde_json::from_str(schema_text).expect("example schema is valid JSON");
-        let gbnf = grammar::json_schema::schema_to_gbnf(&schema)
-            .expect("example schema compiles to GBNF");
+        let gbnf =
+            grammar::json_schema::schema_to_gbnf(&schema).expect("example schema compiles to GBNF");
         let grammar = grammar::parser::parse(&gbnf).expect("compiled GBNF parses");
         let root_id = grammar.rule_id("root").expect("compiled grammar has root");
         (grammar, root_id)
@@ -13354,8 +13515,8 @@ mod gcd_schema_tests {
             b"My safety guidelines prohibit me from generating that.".as_slice(),
             b"Here is the technical breakdown.".as_slice(),
         ] {
-            let mut rt = grammar::sampler::GrammarRuntime::new(grammar.clone(), root_id)
-                .expect("runtime");
+            let mut rt =
+                grammar::sampler::GrammarRuntime::new(grammar.clone(), root_id).expect("runtime");
             let alive = rt.accept_bytes(refusal);
             assert!(
                 !alive || rt.is_dead(),
@@ -13371,7 +13532,10 @@ mod gcd_schema_tests {
         let valid = br#"{"opportunities":[{"summary":"Exposed debug endpoint allows unauthenticated config reads.","attack_context":"Staging API on 10.0.4.8 exposes /debug/config without authn; reachable from the eng VPN.","tool_context":{"tool":"nuclei","invocation":"nuclei -u http://10.0.4.8 -t exposed-debug.yaml","evidence":"HTTP 200 on /debug/config with JSON config body"},"next_steps":["Confirm write methods on the same endpoint","Check whether session secrets are present in the body"]}]}"#;
         let mut rt = grammar::sampler::GrammarRuntime::new(grammar, root_id).expect("runtime");
         let alive = rt.accept_bytes(valid);
-        assert!(alive && !rt.is_dead(), "valid object must survive the grammar");
+        assert!(
+            alive && !rt.is_dead(),
+            "valid object must survive the grammar"
+        );
         assert!(
             rt.is_terminally_accepted(),
             "valid object reaches terminal acceptance"
@@ -13425,8 +13589,8 @@ mod gcd_schema_tests {
         let root_id = grammar.rule_id("root").expect("compiled grammar has root");
 
         let vacuous = br#"{"opportunities":[]}"#;
-        let mut rt = grammar::sampler::GrammarRuntime::new(grammar.clone(), root_id)
-            .expect("runtime");
+        let mut rt =
+            grammar::sampler::GrammarRuntime::new(grammar.clone(), root_id).expect("runtime");
         let alive = rt.accept_bytes(vacuous);
         assert!(
             !alive || rt.is_dead(),
@@ -13452,11 +13616,11 @@ mod tool_bounds_tests;
 mod four_agent_input_capture;
 
 #[cfg(test)]
-#[path = "handlers_prefix_post_oracle_tests.rs"]
-mod prefix_post_oracle_tests;
-#[cfg(test)]
 #[path = "handlers_deepseek_prefix_post_oracle_tests.rs"]
 mod deepseek_prefix_post_oracle_tests;
+#[cfg(test)]
+#[path = "handlers_prefix_post_oracle_tests.rs"]
+mod prefix_post_oracle_tests;
 
 #[cfg(test)]
 #[path = "handlers_deepseek_dsml_boundary_tests.rs"]
@@ -13491,7 +13655,7 @@ mod qwen38_largest_prompt_tests;
 mod tool_result_capacity_tokens_tests;
 
 #[cfg(test)]
-#[path="handlers_q1_deepseek_prepare.rs"]
+#[path = "handlers_q1_deepseek_prepare.rs"]
 pub(crate) mod q1_deepseek_prepare;
 
 #[cfg(test)]
