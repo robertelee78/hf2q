@@ -8,9 +8,12 @@ import statistics
 
 MIN_BLOCKS = 5
 MAX_BLOCKS = 20
-HALF_WIDTH_PP = 2.5    # target 95% half-width, percentage points of the arm ratio
-PEER_MARGIN = 0.95     # Q4: at least 5% lower four-agent makespan than the peer
-NEUTRAL_RATIO = 1.025  # fairness regression band (the F2 2.5-point neutral band)
+HALF_WIDTH_PP = 2.5          # target 95% half-width, percentage points of the arm ratio
+LEGACY_STOCK_MARGIN = 1.0    # Q3: any demonstrated gain over v0.1.28 stock
+LEGACY_PEER_MARGIN = 0.95    # original Q4: at least 5% lower makespan than the peer
+STOCK_MARGIN = 0.95          # v0.1.30: at least 5% lower makespan than v0.1.29
+PEER_PARITY = 1.0            # v0.1.30: statistically no slower than every valid peer
+NEUTRAL_RATIO = 1.025        # fairness regression band (the F2 2.5-point neutral band)
 # Stop reason of a no-stock stage (--no-stock-arm) whose only contrast (the peer) became unavailable or failed.
 NO_CONTRAST = "no_contrast"
 # Two-sided 95% Student t quantiles, df = complete blocks - 1 (blocks <= 20).
@@ -94,13 +97,15 @@ def family_verdict(state):
     `state` keys: experiment_failures, peer_unavailable (dict or None), peer_failures, quality
     ({"status": "pass"|"loss"|"unresolved"|"none", ...}), complete (bool), vs_stock, vs_peer,
     fairness ({name: effect} of lower-is-better experiment-vs-stock effects), thermal_valid
-    (False only when a serious/critical state was observed), memory_valid (bool). Optional (ADR-063 "Splash
-    peer of record for the Qwen families"): splash_required (bool), splash_unavailable (dict or None),
-    splash_failures (list), vs_splash (effect). Where Splash is required, a missing, unavailable or failed Splash
-    arm never yields a Win and the vs-Splash ratio must meet the same PEER_MARGIN as the peer's. Optional (ADR-063
-    Q4-DS4-RACE decision D1, a --stock-record campaign without a stock arm): stock_source ({"record", "sha256",
-    "status", "reason"}) names the bound same-artifact record that vs_stock and fairness come from; every vs-stock
-    reason names it, and a missing or non-Complete record yields Pending with its reason.
+    (False only when a serious/critical state was observed), memory_valid (bool). Optional:
+    stock_margin_ratio and peer_margin_ratio select the source-bound release contract; new v0.1.30
+    campaigns use STOCK_MARGIN and PEER_PARITY. ADR-063 "Splash peer of record for the Qwen families"
+    adds splash_required (bool), splash_unavailable (dict or None), splash_failures (list), and
+    vs_splash (effect). Where Splash is required, a missing, unavailable or failed Splash arm never
+    yields a Win and the vs-Splash ratio must meet the same peer margin. ADR-063 Q4-DS4-RACE decision
+    D1 optionally adds stock_source ({"record", "sha256", "status", "reason"}), naming the bound
+    same-artifact record that supplies vs_stock and fairness; every vs-stock reason names it, and a
+    missing or non-Complete record yields Pending with its reason.
     """
     splash = bool(state.get("splash_required"))
     source = state.get("stock_source")
@@ -126,6 +131,8 @@ def family_verdict(state):
         return "Pending", ["primary workload has not reached its stopping rule"]
     vs_stock, vs_peer = state["vs_stock"], state["vs_peer"]
     vs_splash = state["vs_splash"] if splash else None
+    stock_margin = state.get("stock_margin_ratio", STOCK_MARGIN)
+    peer_margin = state.get("peer_margin_ratio", PEER_PARITY)
     if vs_peer["ratio_ci95"] is not None and vs_peer["ratio_ci95"][0] > 1:
         return "Loss", ["experiment makespan is longer than the peer's (95% CI of the ratio above 1)"]
     if splash and vs_splash["ratio_ci95"] is not None and vs_splash["ratio_ci95"][0] > 1:
@@ -135,12 +142,15 @@ def family_verdict(state):
         reasons.append(f"precision not reached: 95% half-width must be <= {HALF_WIDTH_PP} points for "
                        + ("every contrast (stock, peer, Splash)" if splash else "both contrasts")
                        + ("" if precise(vs_stock) else named))
-    if vs_stock["ratio_ci95"] is None or vs_stock["ratio_ci95"][1] >= 1:
-        reasons.append("no demonstrated makespan gain over stock (95% CI of the ratio reaches 1)" + named)
-    if vs_peer["ratio_ci95"] is None or vs_peer["ratio_ci95"][1] > PEER_MARGIN:
-        reasons.append("peer margin not demonstrated (95% CI upper bound of the ratio above 0.95)")
-    if splash and (vs_splash["ratio_ci95"] is None or vs_splash["ratio_ci95"][1] > PEER_MARGIN):
-        reasons.append("Splash margin not demonstrated (95% CI upper bound of the ratio above 0.95)")
+    if vs_stock["ratio_ci95"] is None or vs_stock["ratio_ci95"][1] > stock_margin:
+        reasons.append(f"stock margin not demonstrated (95% CI upper bound of the ratio above "
+                       f"{stock_margin:.2f})" + named)
+    if vs_peer["ratio_ci95"] is None or vs_peer["ratio_ci95"][1] > peer_margin:
+        reasons.append(f"peer parity not demonstrated (95% CI upper bound of the ratio above "
+                       f"{peer_margin:.2f})")
+    if splash and (vs_splash["ratio_ci95"] is None or vs_splash["ratio_ci95"][1] > peer_margin):
+        reasons.append(f"Splash parity not demonstrated (95% CI upper bound of the ratio above "
+                       f"{peer_margin:.2f})")
     for name, effect in sorted(state["fairness"].items()):
         if regression(effect):
             reasons.append(f"fairness regression vs stock: {name}" + named)

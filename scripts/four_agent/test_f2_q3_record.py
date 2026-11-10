@@ -279,7 +279,7 @@ class StockRecordRows(base.StockRecordHarness):
         r.validate_manifest(document)
         self.assertEqual(r.verify_rows(document, self.root), [x["id"] for x in rows["rows"]])
         # --verify re-derives the stock_record field: an edited or deleted one is drift
-        for change in ({"stock_label": "v0.1.29 release"}, None):
+        for change in ({"stock_label": "v0.1.28 release"}, None):
             with self.subTest(change=change):
                 edited = json.loads(json.dumps(document))
                 rec = edited["groups"]["qwen38-q3-record"]["q3_record"]

@@ -4,6 +4,23 @@ Status: harness and predeclared rules (2026-10-30). This document records no new
 
 Sources: ADR-063 Q3 and Q4 (`docs/adr/ADR-063-apple-silicon-four-agent-speed-coherence.md`), the operator update "Per-family closure and release scope (2026-10-30)" (per-family win/loss/unavailable/failed verdicts; only wins count; F2 and Q1 do not gate), issue #369.
 
+## v0.1.30 release-gate amendment (operator decision 2026-11-10)
+
+New v0.1.30 campaigns use the published v0.1.29 release, source
+`c40fbf37bc2bc24cebd2c57faa60891debd1179a`, as `stock`. A release-pass
+`Win` requires the candidate/stock 95% CI upper ratio bound to be at most
+0.95 and every candidate/valid-peer upper bound to be at most 1.00. Thus the
+5% minimum is against the immediately prior hf2q release; peers are
+non-inferiority gates. `campaign.json` records both thresholds as
+`design.stock_margin_ratio` and `design.peer_margin_ratio`.
+
+Historical campaigns remain reproducible: `q3_report.py` reads margins from
+the campaign plan, and plans made before this amendment retain the former
+stock-gain/peer-0.95 rules. Qwen3.6 still requires a valid Splash contrast.
+Qwen3.8's corrected Splash arm is not a valid performance denominator, so its
+separate ADR-067 mechanism gate applies as specified by ADR-063.
+
+
 ## Arms
 
 Every arm runs the same GGUF, the canonical four-agent coding client (`qwen_n4_live_smoke.py`), 4 slots and 262144 tokens per slot, through the Q5 supervisor (`q5_calibration.py`), one runtime at a time.
@@ -130,11 +147,11 @@ Rules apply in this order:
 6. `Pending`: the primary stage has not reached its stopping rule.
 7. `Loss`: the experiment-vs-peer makespan ratio CI lies above 1, so the experiment is slower than the peer. This holds at any precision, because a longer makespan with an interval excluding a tie is a measured loss.
 8. `Loss` (Qwen families): the experiment-vs-Splash makespan ratio CI lies above 1.
-9. `Win`: every one of the following holds.
-   - Every required contrast (stock, peer, and Splash for Qwen families) reached the precision target. The stopping
-     rule waits for vs-Splash while Splash is available and has not failed.
-   - Against stock, the CI upper bound is below 1.
-   - Against the peer, the CI upper bound is ≤ 0.95. This is Q4's "at least 5% lower makespan … with paired uncertainty excluding a tie": the whole interval must clear the margin. For Qwen3.8 and Qwen3.6, the vs-Splash CI upper bound must also be ≤ 0.95.
+9. `Win`: every one of the following holds under the thresholds frozen in the campaign plan.
+   - Every required contrast (stock, peer, and Splash where required) reached the precision target. The stopping
+     rule waits for vs-Splash while a required Splash arm is available and has not failed.
+   - Against v0.1.29 stock, the CI upper bound is ≤ 0.95.
+   - Against the peer, the CI upper bound is ≤ 1.00. For Qwen3.6, the vs-Splash CI upper bound must also be ≤ 1.00.
    - Neither fairness effect against stock (worst-slot p95 TTFT, worst-slot max SSE gap) has a CI lower bound above the 2.5-point neutral band (ratio 1.025).
    - Quality is not unresolved.
    - No run observed a serious or critical thermal state.
@@ -218,7 +235,7 @@ Design: `docs/research/adr066-iq2xxs-subset-design.md` §7.4 and §8. v0.1.28 an
   - has no vs-stock effect or no hf2q artifact sha256.
 - **Launch and every run.** `launch_problems` refuses when the record's experiment binary sha256 differs from this campaign's `--experiment-bin`, or when either bound file changed since binding. The frozen identities carry the experiment binary sha256 and the bound files' current sha256 (`identities.stock_record`), which are re-checked before every run, so a rebuilt binary or a changed record halts the campaign with `IdentityDrift`. `plan.stock_record` is part of the plan a `--resume` must reproduce. **Operating rule:** freeze the record read-only (`chmod a-w`) before binding, as for `--controls-of`.
 - **Stopping rule.** It waits on `vs_stock` only when the plan has a stock arm. A stock-record or no-stock native-comparison campaign waits on `vs_peer`. When the peer becomes unavailable or fails, such a stage has no contrast left: it stops at once with reason `no_contrast` (`q3_stats.NO_CONTRAST`), and so does every later stage, instead of running experiment-only blocks to the maximum.
-- **Verdict.** `verdict.json` `stock_record` re-binds the record by sha256 and carries its primary `vs_stock` makespan effect and the `vs_stock` fairness secondaries, its stock and experiment failures, and its thermal and memory validity. The family verdict uses them as its `vs_stock` and `fairness`. `stock_failures` and `experiment_failures` are the union of both campaigns, each record entry tagged `(stock record <path>)`. `thermal_valid` and `memory_valid` are the conjunction of both. `q3_stats.family_verdict` takes `stock_source` (the record's path, sha256 and status): every vs-stock reason names it, and a record that is missing, changed since binding or not `Complete` gives `Pending` with that reason, never a silent skip. The decision rules are unchanged, so a Win still needs the 95% CI of the vs-stock ratio below 1, precision and the fairness band, all from the record.
+- **Verdict.** `verdict.json` `stock_record` re-binds the record by sha256 and carries its primary `vs_stock` makespan effect and the `vs_stock` fairness secondaries, its stock and experiment failures, and its thermal and memory validity. The family verdict uses them as its `vs_stock` and `fairness`. `stock_failures` and `experiment_failures` are the union of both campaigns, each record entry tagged `(stock record <path>)`. `thermal_valid` and `memory_valid` are the conjunction of both. `q3_stats.family_verdict` takes `stock_source` (the record's path, sha256 and status): every vs-stock reason names it, and a record that is missing, changed since binding or not `Complete` gives `Pending` with that reason, never a silent skip. The release decision rules are unchanged, so a v0.1.30 Win still needs the bound candidate/v0.1.29 ratio's 95% CI upper bound ≤ 0.95, precision and the fairness band, all from the record.
 - **No-stock native comparison.** Without a record (`--no-stock-arm --native-comparison`), `vs_stock` is the empty effect and `fairness` is `{}`. The native branch makes the verdict `Unavailable` with the comparison reason, as for any native comparison.
 - **Rows.** The workload text reads "stock `<label>` on hf2q's artifact, from record `<$E ref>`" (or "no stock arm" without a record). The vs-stock rows read `verdict.json` `stock_record.effects.vs_stock` (and `stock_record.secondary.<metric>.vs_stock` under `--of-record`), carry the record's hf2q artifact sha256, and note "baseline stock `<label>`, from the same-artifact record `<$E ref>` on hf2q's artifact". `--of-record` accepts a stock-record campaign. Its `q3_record` carries `stock_record` (the record's `$E/` verdict ref, hf2q artifact sha256 and stock label), and the tier labels the stock cell and the fairness cell "vs stock (hf2q artifact record)". The quality-gate references stay `stock-hf2q` and `peer`: the `stock-hf2q` gate must run the record's stock binary with the record's (equal) experiment binary as subject, every run on the record's hf2q artifact, and the `peer` gate must run this campaign's peer binary on the peer arm's artifact (ds4's file).
 - **Same-file ds4 arm (D2).** `q5_cases/native-ds4-deepseek4-samefile.json` declares `artifact_relation: same_as_hf2q` in its approval `native_ds4` block, a closed field (`different` by default; not a case variable, bound by `case_sha256` and the ds4 `campaign_identity`). The plan labels the arm `ds4 c97964b (same ds4 file)` and its F2 baseline is `ds4_samefile`. It runs only with `--native-comparison` (`--peer-unavailable-evidence` refuses: the same-file peer runs), and the different-artifact case only with `--peer-unavailable-evidence`. Launch needs the native and the hf2q artifact sha256 both present and equal; the `MODEL_FILE` name check stays. TensorFold and oMLX refuse a `same_as_hf2q` case. `native_peer`, row notes and the scoreboard say "same file", task makespan only, and the scoreboard renders same-file rows in their own "Native-engine comparisons (same file as the hf2q arm, task makespan only)" section. The weights are the same bytes, but prompts are not byte-identical (ds4 renders tool schemas first, and its Think Max prefix differs).

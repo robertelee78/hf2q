@@ -111,10 +111,18 @@ def state(**changes):
 
 
 class Verdicts(unittest.TestCase):
-    def test_win_needs_stock_gain_and_peer_margin(self):
+    def test_win_needs_five_percent_stock_gain_and_peer_parity(self):
         self.assertEqual(q3_stats.family_verdict(state())[0], "Win")
-        self.assertEqual(q3_stats.family_verdict(state(vs_peer=effect_of([0.97] * 5)))[0], "Inconclusive")
-        self.assertEqual(q3_stats.family_verdict(state(vs_stock=effect_of([1.0] * 5)))[0], "Inconclusive")
+        self.assertEqual(q3_stats.family_verdict(state(vs_peer=effect_of([0.97] * 5)))[0], "Win")
+        self.assertEqual(q3_stats.family_verdict(state(vs_stock=effect_of([0.97] * 5)))[0], "Inconclusive")
+
+    def test_legacy_plan_margins_remain_recomputable(self):
+        legacy = state(stock_margin_ratio=q3_stats.LEGACY_STOCK_MARGIN,
+                       peer_margin_ratio=q3_stats.LEGACY_PEER_MARGIN,
+                       vs_stock=effect_of([0.99] * 5), vs_peer=effect_of([0.97] * 5))
+        verdict, reasons = q3_stats.family_verdict(legacy)
+        self.assertEqual(verdict, "Inconclusive")
+        self.assertIn("peer parity not demonstrated (95% CI upper bound of the ratio above 0.95)", reasons)
 
     def test_imprecise_faster_is_inconclusive_but_slower_than_peer_is_a_loss(self):
         wide = effect_of([0.5, 0.9, 0.6, 0.95, 0.7])
@@ -1036,9 +1044,11 @@ class StockRecord(StockRecordHarness):
                 q3.build_plan(args, {}, "qwen38")
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             q3.parse_args(["--dry-run", "--no-stock-arm", "--stock-record", record])  # exactly one --family
-        default, _ = q3.build_plan(self.args(), {}, "qwen38")  # the default campaign is unchanged
+        default, _ = q3.build_plan(self.args(), {}, "qwen38")
         self.assertEqual((default["measured_arms"], default["declared"]["stock"]["label"]),
-                         (["stock", "experiment", "peer"], "v0.1.28 release"))
+                         (["stock", "experiment", "peer"], "v0.1.29 release"))
+        self.assertEqual((default["design"]["stock_margin_ratio"], default["design"]["peer_margin_ratio"]),
+                         (0.95, 1.0))
         self.assertNotIn("stock_record", default)
 
     def test_the_record_must_be_a_complete_same_artifact_stock_primary(self):
@@ -1093,7 +1103,7 @@ class StockRecord(StockRecordHarness):
                           {"path": str(record.parent / "campaign.json"), "sha256": q3.sha256(record.parent / "campaign.json")}))
         self.assertEqual((bound["family"], bound["primary_status"], bound["stock_binary_sha256"],
                           bound["experiment_binary_sha256"], bound["artifact_sha256"], bound["stock"]["label"]),
-                         ("qwen38", "Complete", STOCK_SHA, EXP_SHA, MODEL_SHA, "v0.1.28 release"))
+                         ("qwen38", "Complete", STOCK_SHA, EXP_SHA, MODEL_SHA, "v0.1.29 release"))
         self.assertEqual(q3_identity.launch_problems(plan, self.ids(plan)), [])  # no --stock-bin/--stock-commit needed
         manifest = driver.run()
         self.assertEqual((manifest["status"], manifest["stages"][0]["stop"]), ("Complete", {"reason": "precision", "blocks": 5}))
@@ -1202,7 +1212,7 @@ class StockRecord(StockRecordHarness):
         verdict, reasons = q3_stats.family_verdict(state(stock_source=source, vs_stock=effect_of([1.0] * 5),
                                                          fairness={"worst_slot_ttft_p95_s": effect_of([1.2] * 5)}))
         self.assertEqual(verdict, "Inconclusive")
-        self.assertIn("no demonstrated makespan gain over stock (95% CI of the ratio reaches 1)" + named, reasons)
+        self.assertIn("stock margin not demonstrated (95% CI upper bound of the ratio above 0.95)" + named, reasons)
         self.assertIn("fairness regression vs stock: worst_slot_ttft_p95_s" + named, reasons)
         wide = effect_of([0.5, 0.9, 0.6, 0.95, 0.7])
         self.assertTrue(q3_stats.family_verdict(state(stock_source=source, vs_stock=wide))[1][0].endswith(named))
@@ -1221,7 +1231,7 @@ class StockRecord(StockRecordHarness):
             with self.subTest(of_record=of_record):
                 rows = q3_report.rows(self.out, self.root, of_record)  # --of-record is accepted for this mode
                 [group] = rows["groups"].values()
-                self.assertIn(f"4 slots; stock v0.1.28 release on hf2q's artifact, from record {record_ref}; experiment "
+                self.assertIn(f"4 slots; stock v0.1.29 release on hf2q's artifact, from record {record_ref}; experiment "
                               "hf2q 22222222 vs the peer, Williams blocks.", group["workload"])
                 stock = [r for r in rows["rows"] if r.get("baseline_arm") == "v0128_stock"]
                 self.assertEqual({r["metric"] for r in stock},
@@ -1230,7 +1240,7 @@ class StockRecord(StockRecordHarness):
                 self.assertEqual(ms["verification"]["key"], "verdict.json stock_record.effects.vs_stock.improvement_percent")
                 self.assertEqual((ms["artifact_sha256"], ms["receipt"]),
                                  (MODEL_SHA, f"$E/evidence/q3-qwen38-ds4file/verdict.json"))
-                self.assertIn(f"(baseline stock v0.1.28 release, from the same-artifact record {record_ref} on hf2q's "
+                self.assertIn(f"(baseline stock v0.1.29 release, from the same-artifact record {record_ref} on hf2q's "
                               "artifact)", ms["note"])
                 peer = next(r for r in rows["rows"] if r.get("baseline_arm") == "peer" and r["metric"] == "makespan_s")
                 self.assertEqual(peer["artifact_sha256"], DS4_ART)
@@ -1241,7 +1251,7 @@ class StockRecord(StockRecordHarness):
                 self.assertEqual(f2.verify_rows(board, self.root), [r["id"] for r in rows["rows"]])
                 if of_record:
                     self.assertEqual(group["q3_record"]["stock_record"],
-                                     {"verdict_ref": record_ref, "artifact_sha256": MODEL_SHA, "stock_label": "v0.1.28 release"})
+                                     {"verdict_ref": record_ref, "artifact_sha256": MODEL_SHA, "stock_label": "v0.1.29 release"})
                     line = next(l for l in f2.render(board, [], "0" * 64).splitlines() if l.startswith("| Qwen3.8 27B | "))
                     self.assertIn("sooner than v0.1.28 stock (hf2q artifact record) (95% CI", line)
                     self.assertIn("| vs stock (hf2q artifact record): TTFT p95 ", line)

@@ -487,11 +487,11 @@ class Verdict(unittest.TestCase):
                 'splash_unavailable': None, 'splash_failures': [], 'vs_splash': self.effect(0.88, 0.93)}
         return {**base, **changes}
 
-    def test_win_needs_both_peers(self):
+    def test_win_needs_parity_with_both_peers(self):
         self.assertEqual(q3_stats.family_verdict(self.state())[0], 'Win')
-        verdict, reasons = q3_stats.family_verdict(self.state(vs_splash=self.effect(0.9, 0.97)))
+        verdict, reasons = q3_stats.family_verdict(self.state(vs_splash=self.effect(0.99, 1.01)))
         self.assertEqual(verdict, 'Inconclusive')
-        self.assertIn('Splash margin not demonstrated (95% CI upper bound of the ratio above 0.95)', reasons)
+        self.assertIn('Splash parity not demonstrated (95% CI upper bound of the ratio above 1.00)', reasons)
         self.assertEqual(q3_stats.family_verdict(self.state(vs_splash=self.effect(1.02, 1.1)))[0], 'Loss')
         self.assertEqual(q3_stats.family_verdict(self.state(splash_failures=['x']))[0], 'Failed')
         unavailable = q3_stats.family_verdict(self.state(splash_unavailable={'reason': 'no Splash arm'}))
