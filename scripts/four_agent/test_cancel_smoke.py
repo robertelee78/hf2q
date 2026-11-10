@@ -285,6 +285,11 @@ class Parsing(unittest.TestCase):
         with self.assertRaises(cs.Invalid):
             cs.joint_turns(self.lines(' DEBUG x: Qwen joint decode turn lanes=4 serial=0\n'), 'qwen38')
 
+    def test_qwen_mtp_width_is_lanes(self):
+        lines = self.lines(' DEBUG hf2q::serve::api::engine_qwen35::progress: Qwen joint MTP turn lanes=4 serial=0 turn_lanes=4\n')
+        turn = cs.joint_turns(lines, 'qwen38')[0]
+        self.assertEqual((turn['kind'], turn['width']), ('MTP', 4))
+
     def test_log_lines_keep_only_complete_lines_in_range(self):
         with tempfile.NamedTemporaryFile('wb', delete=False) as handle:
             handle.write(b'a\nb\npartial')

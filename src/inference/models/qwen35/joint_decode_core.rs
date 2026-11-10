@@ -20,13 +20,21 @@
 //! rows: their per-row arithmetic does not depend on the row count. The
 //! serial bodies are unchanged; this module repeats their dispatch order.
 //!
+//! A slot's rows form one [`JointWindow`] of consecutive positions: one row
+//! in a decode step, the pending token plus its MTP drafts in a verify step
+//! (`joint_verify`). DeltaNet runs one conv and one gated delta net dispatch
+//! per window (`n_tokens` = its rows; window ≡ sequential one-token steps);
+//! full attention runs each row's own write + SDPA in order, as decode does.
+//! [`DeltaNetReplay`] retains a multi-row window's inputs for the verify
+//! commit's replay ([`encode_delta_net_replay`]).
+//!
 //! Packed rows beyond the real rows (`mul_mv_ext` width-4 padding) carry copies
 //! of row 0's core outputs so every packed kernel reads finite data; their
 //! results are discarded and they never touch a cache.
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use mlx_native::ops::compute_g_beta::dispatch_compute_g_beta;
-use mlx_native::ops::copy::dispatch_copy_f32;
+use mlx_native::ops::copy::{dispatch_copy_f32, dispatch_strided_copy_f32, StridedCopyParams};
 use mlx_native::ops::elementwise::scalar_mul_f32;
 use mlx_native::ops::gated_delta_net::GatedDeltaNetParams;
 use mlx_native::ops::gated_delta_net_decode::dispatch_gated_delta_net_decode;
@@ -39,8 +47,8 @@ use super::decode_pool::pooled_alloc_buffer;
 use super::delta_net::DeltaNetLayerShape;
 use super::full_attn::FullAttnShape;
 use super::gpu_delta_net::{
-    apply_l2_norm_per_head, apply_pre_norm, apply_proj_with_ggml_type, narrow_la_ping_pong_to_slot,
-    DeltaNetWeightsGpu, FORWARD_DISPATCH_N_SEQS,
+    apply_l2_norm_per_head, apply_l2_norm_per_head_into, apply_pre_norm, apply_proj_with_ggml_type,
+    narrow_la_ping_pong_to_slot, DeltaNetWeightsGpu, FORWARD_DISPATCH_N_SEQS,
 };
 use super::gpu_full_attn::{
     apply_imrope, apply_linear_projection_f32_pooled_with_ggml_type, apply_pre_attn_rms_norm,
@@ -55,10 +63,40 @@ use super::Qwen35Config;
 use crate::serve::multi_seq_kv::SlotId;
 
 /// The packed rows of one joint step: the real rows' slots in packed order,
-/// plus the packed width (`>= slots.len()`; larger only when padded).
+/// their lane windows, plus the packed width (`>= slots.len()`; larger only
+/// when padded).
 pub(crate) struct JointRows<'a> {
     pub slots: &'a [SlotId],
+    /// Consecutive real rows of one slot, in packed order, covering every
+    /// real row once. A decode step has one single-row window per slot; an
+    /// MTP verify step has one window per lane (its pending token and
+    /// drafts at consecutive positions).
+    pub windows: &'a [JointWindow],
     pub width: usize,
+}
+
+/// One lane's rows of a joint step: packed rows `start..start + rows`, all
+/// of `slot`, at consecutive positions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JointWindow {
+    pub slot: SlotId,
+    pub start: usize,
+    pub rows: usize,
+}
+
+impl JointWindow {
+    /// One single-row window per slot: the decode step's layout.
+    pub(crate) fn per_row(slots: &[SlotId]) -> Vec<Self> {
+        slots
+            .iter()
+            .enumerate()
+            .map(|(start, &slot)| Self {
+                slot,
+                start,
+                rows: 1,
+            })
+            .collect()
+    }
 }
 
 impl JointRows<'_> {
@@ -69,6 +107,34 @@ impl JointRows<'_> {
     fn width_u32(&self) -> u32 {
         self.width as u32
     }
+}
+
+/// Zero-copy view of rows `start..start + rows` of a row-major buffer with
+/// `row_width` elements per row, shaped `[rows, row_width]`.
+pub(crate) fn rows_view(
+    buffer: &MlxBuffer,
+    start: usize,
+    rows: usize,
+    row_width: usize,
+) -> Result<MlxBuffer> {
+    let elements = rows
+        .checked_mul(row_width)
+        .context("Qwen joint rows view overflow")?;
+    let first = start
+        .checked_mul(row_width)
+        .context("Qwen joint rows view offset overflow")?;
+    ensure!(
+        first + elements <= buffer.element_count(),
+        "Qwen joint rows {start}..{} of {row_width} elements exceed buffer {:?}",
+        start + rows,
+        buffer.shape()
+    );
+    let byte_offset = u64::try_from(first * buffer.dtype().size_of())
+        .context("Qwen joint rows view byte offset overflow")?;
+    buffer
+        .slice_view(byte_offset, elements)
+        .with_shape(vec![rows, row_width])
+        .map_err(|e| anyhow!("reshape Qwen joint rows view: {e}"))
 }
 
 /// Zero-copy view of row `row` of a row-major buffer, reshaped to `shape`.
@@ -291,13 +357,361 @@ fn check_slots(kv_cache: &HybridKvCache, rows: &JointRows<'_>) -> Result<()> {
             kv_cache.n_seqs
         );
     }
+    let mut next = 0;
+    for (index, window) in rows.windows.iter().enumerate() {
+        let end = window.start + window.rows;
+        ensure!(
+            window.rows > 0 && window.start == next && end <= rows.real(),
+            "Qwen joint windows must cover the real rows in packed order"
+        );
+        ensure!(
+            rows.slots[window.start..end]
+                .iter()
+                .all(|&slot| slot == window.slot),
+            "Qwen joint window rows belong to slot {}",
+            window.slot.0
+        );
+        ensure!(
+            rows.windows[..index]
+                .iter()
+                .all(|earlier| earlier.slot != window.slot),
+            "Qwen joint slot {} appears in two windows",
+            window.slot.0
+        );
+        next = end;
+    }
+    ensure!(
+        next == rows.real() && rows.width >= next,
+        "Qwen joint windows cover {next} of {} real rows (width {})",
+        rows.real(),
+        rows.width
+    );
+    Ok(())
+}
+
+/// Elements per [`DeltaNetReplay`] allocation: 16-byte aligned so every
+/// view starts on the alignment the MMA and copy kernels expect.
+fn replay_elements(elements: usize) -> usize {
+    elements.next_multiple_of(4)
+}
+
+/// What a verify step's DeltaNet layers retain for the replay commit
+/// ([`encode_delta_net_replay`]), in one durable allocation that outlives
+/// the decode pool: per DeltaNet layer the packed `g`/`beta` rows and, per
+/// multi-row window, the scaled Q, L2-normed K, V and raw conv input rows
+/// plus a replay output scratch. Single-row windows retain nothing: their
+/// commit is a fast path (keep, or discard by a parity flip).
+pub(crate) struct DeltaNetReplay {
+    arena: MlxBuffer,
+    used: usize,
+    layers: Vec<DeltaNetReplayLayer>,
+}
+
+struct DeltaNetReplayLayer {
+    rank: usize,
+    lanes: Vec<DeltaNetReplayLane>,
+}
+
+/// One multi-row window's replay inputs in one DeltaNet layer.
+struct DeltaNetReplayLane {
+    slot: SlotId,
+    rows: usize,
+    /// `[rows, n_k_heads * d_k]`, already scaled.
+    q: MlxBuffer,
+    /// `[rows, n_k_heads * d_k]`, L2-normed.
+    k: MlxBuffer,
+    /// `[rows, n_v_heads * d_v]`.
+    v: MlxBuffer,
+    /// `[rows, n_v_heads]` views of the layer's packed `g` and `beta`.
+    g: MlxBuffer,
+    beta: MlxBuffer,
+    /// `[K-1 + rows, channels]`: K-1 staging rows the commit fills with the
+    /// original conv state, then the window's raw conv inputs.
+    conv_rows: MlxBuffer,
+    /// `[rows, n_v_heads * d_v]` replay output scratch (discarded).
+    output: MlxBuffer,
+}
+
+/// Per-layer buffers a multi-row window stages during the verify forward.
+struct WindowStage {
+    q: MlxBuffer,
+    k: MlxBuffer,
+    v: MlxBuffer,
+    conv_rows: MlxBuffer,
+    output: MlxBuffer,
+}
+
+impl DeltaNetReplay {
+    /// Storage for `linear_layers` DeltaNet layers of a step with `windows`
+    /// at packed `width`; `None` when no window has more than one row.
+    pub(crate) fn new(
+        device: &MlxDevice,
+        cfg: &Qwen35Config,
+        windows: &[JointWindow],
+        width: usize,
+        linear_layers: usize,
+    ) -> Result<Option<Self>> {
+        if windows.iter().all(|window| window.rows == 1) {
+            return Ok(None);
+        }
+        let shape = DeltaNetLayerShape::from_config(cfg);
+        let q_span = (shape.n_k_heads * shape.d_k) as usize;
+        let v_elems = (shape.n_v_heads * shape.d_v) as usize;
+        let channels = 2 * q_span + v_elems;
+        let k_minus_one = shape.conv_kernel as usize - 1;
+        let nv = shape.n_v_heads as usize;
+        let per_layer = 2 * replay_elements(width * nv)
+            + windows
+                .iter()
+                .filter(|window| window.rows > 1)
+                .map(|window| {
+                    let n = window.rows;
+                    replay_elements((k_minus_one + n) * channels)
+                        + 2 * replay_elements(n * q_span)
+                        + 2 * replay_elements(n * v_elems)
+                })
+                .sum::<usize>();
+        let elements = per_layer
+            .checked_mul(linear_layers)
+            .context("Qwen joint verify replay storage overflow")?;
+        let arena = device
+            .alloc_buffer(elements * 4, DType::F32, vec![elements])
+            .map_err(|e| anyhow!("allocate Qwen joint verify replay storage: {e}"))?;
+        Ok(Some(Self {
+            arena,
+            used: 0,
+            layers: Vec::with_capacity(linear_layers),
+        }))
+    }
+
+    fn take(&mut self, elements: usize) -> Result<MlxBuffer> {
+        let end = self.used + replay_elements(elements);
+        ensure!(
+            end <= self.arena.element_count(),
+            "Qwen joint verify replay storage exhausted ({end} of {} elements)",
+            self.arena.element_count()
+        );
+        let view = self
+            .arena
+            .slice_view((self.used * 4) as u64, elements)
+            .with_shape(vec![elements])
+            .map_err(|e| anyhow!("shape Qwen joint verify replay view: {e}"))?;
+        self.used = end;
+        Ok(view)
+    }
+}
+
+fn ssm_conv_params_buffer(device: &MlxDevice, params: SsmConvParams) -> Result<MlxBuffer> {
+    let mut buffer = pooled_alloc_buffer(device, 16, DType::U32, vec![4])
+        .map_err(|e| anyhow!("allocate Qwen joint ssm params: {e}"))?;
+    buffer
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("{e}"))?
+        .copy_from_slice(&[
+            params.channels,
+            params.n_tokens,
+            params.n_seqs,
+            params.k_width,
+        ]);
+    Ok(buffer)
+}
+
+fn write_gdn_params(buffer: &mut MlxBuffer, params: GatedDeltaNetParams) -> Result<()> {
+    buffer
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("{e}"))?
+        .copy_from_slice(&[
+            params.d_k,
+            params.d_v,
+            params.n_k_heads,
+            params.n_v_heads,
+            params.n_tokens,
+            params.n_seqs,
+            0,
+            0,
+            0,
+        ]);
+    Ok(())
+}
+
+/// Kernel parameter buffers of one layer, one per window length.
+struct WindowParams(Vec<(usize, MlxBuffer)>);
+
+impl WindowParams {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn get(
+        &mut self,
+        rows: usize,
+        make: impl FnOnce() -> Result<MlxBuffer>,
+    ) -> Result<&MlxBuffer> {
+        let index = match self.0.iter().position(|(len, _)| *len == rows) {
+            Some(index) => index,
+            None => {
+                self.0.push((rows, make()?));
+                self.0.len() - 1
+            }
+        };
+        Ok(&self.0[index].1)
+    }
+}
+
+fn gdn_params(shape: &DeltaNetLayerShape, rows: usize) -> GatedDeltaNetParams {
+    GatedDeltaNetParams {
+        d_k: shape.d_k,
+        d_v: shape.d_v,
+        n_k_heads: shape.n_k_heads,
+        n_v_heads: shape.n_v_heads,
+        n_tokens: rows as u32,
+        n_seqs: FORWARD_DISPATCH_N_SEQS,
+    }
+}
+
+/// Encode the replay commit of a verify step's DeltaNet state. For every
+/// lane window with `accepted` rows in `1..rows` (`accepted` lists
+/// `(slot, accepted rows)`; other lanes are skipped) and every DeltaNet
+/// layer, rebuild the slot's current state as the state after its first
+/// `accepted` rows:
+///
+/// - recurrent: one `gated_delta_net_decode` over those rows from the
+///   untouched pre-window state (the verify flipped the parity, so it is
+///   the slot's scratch role now) into the current role;
+/// - conv: byte copies only, `new_state(i, c) = [old ‖ rows](accepted + i, c)`
+///   (the `ssm_conv` state rule): the old state is staged transposed in
+///   front of the retained raw rows, then the window starting at
+///   `accepted` is copied back in the state layout.
+///
+/// No parity changes. The caller commits `enc`.
+pub(crate) fn encode_delta_net_replay(
+    enc: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    kv_cache: &HybridKvCache,
+    replay: &DeltaNetReplay,
+    accepted: &[(SlotId, usize)],
+    cfg: &Qwen35Config,
+) -> Result<()> {
+    let shape = DeltaNetLayerShape::from_config(cfg);
+    let (d_k, d_v, n_v_heads) = (shape.d_k, shape.d_v, shape.n_v_heads);
+    let q_span = (shape.n_k_heads * d_k) as usize;
+    let v_elems = (n_v_heads * d_v) as usize;
+    let channels = 2 * q_span + v_elems;
+    let k_minus_one = shape.conv_kernel - 1;
+    let km1 = k_minus_one as usize;
+    let nv = n_v_heads as usize;
+    let partial = |lane: &DeltaNetReplayLane| {
+        accepted
+            .iter()
+            .find(|(slot, _)| *slot == lane.slot)
+            .map(|&(_, rows)| rows)
+            .filter(|&rows| (1..lane.rows).contains(&rows))
+    };
+    // (pre-window state, current state) views of one lane's slot.
+    let views = |rank: usize, slot: SlotId| -> Result<_> {
+        let la = kv_cache
+            .linear_attn
+            .get(rank)
+            .context("Qwen joint verify replay layer outside the cache")?;
+        let (conv_cur, conv_prior) = la.conv_bufs_for_slot(slot);
+        let (rec_cur, rec_prior) = la.recurrent_bufs_for_slot(slot);
+        Ok(narrow_la_ping_pong_to_slot(
+            conv_prior,
+            conv_cur,
+            rec_prior,
+            rec_cur,
+            slot,
+            d_k,
+            d_v,
+            n_v_heads,
+            channels as u32,
+            k_minus_one,
+        ))
+    };
+    for layer in &replay.layers {
+        for lane in &layer.lanes {
+            if partial(lane).is_none() {
+                continue;
+            }
+            let view = views(layer.rank, lane.slot)?;
+            dispatch_strided_copy_f32(
+                enc,
+                registry,
+                device.metal_device(),
+                &view.conv_state_in,
+                &rows_view(&lane.conv_rows, 0, km1, channels)?,
+                &StridedCopyParams {
+                    rows: k_minus_one,
+                    cols: channels as u32,
+                    stride_row: 1,
+                    stride_col: k_minus_one,
+                },
+            )
+            .with_context(|| format!("stage Qwen joint verify conv state slot {}", lane.slot.0))?;
+        }
+    }
+    enc.memory_barrier();
+    let mut params = WindowParams::new();
+    for layer in &replay.layers {
+        for lane in &layer.lanes {
+            let Some(rows) = partial(lane) else {
+                continue;
+            };
+            let view = views(layer.rank, lane.slot)?;
+            dispatch_strided_copy_f32(
+                enc,
+                registry,
+                device.metal_device(),
+                &rows_view(&lane.conv_rows, rows, km1, channels)?,
+                &view.conv_state_out,
+                &StridedCopyParams {
+                    rows: channels as u32,
+                    cols: k_minus_one,
+                    stride_row: 1,
+                    stride_col: channels as u32,
+                },
+            )
+            .with_context(|| {
+                format!("rebuild Qwen joint verify conv state slot {}", lane.slot.0)
+            })?;
+            let p = gdn_params(&shape, rows);
+            let params_buf = params.get(rows, || {
+                let mut buffer = device
+                    .alloc_buffer(9 * 4, DType::U32, vec![9])
+                    .map_err(|e| anyhow!("allocate Qwen joint replay GDN params: {e}"))?;
+                write_gdn_params(&mut buffer, p)?;
+                Ok(buffer)
+            })?;
+            dispatch_gated_delta_net_decode(
+                enc,
+                registry,
+                device.metal_device(),
+                &rows_view(&lane.q, 0, rows, q_span)?,
+                &rows_view(&lane.k, 0, rows, q_span)?,
+                &rows_view(&lane.v, 0, rows, v_elems)?,
+                &rows_view(&lane.g, 0, rows, nv)?,
+                &rows_view(&lane.beta, 0, rows, nv)?,
+                &view.recurrent_in,
+                &rows_view(&lane.output, 0, rows, v_elems)?,
+                &view.recurrent_out,
+                params_buf,
+                p,
+            )
+            .with_context(|| format!("replay Qwen joint verify GDN slot {}", lane.slot.0))?;
+        }
+    }
     Ok(())
 }
 
 /// Encode one DeltaNet layer for every joint row into `enc` (no commit) and
-/// flip each row's ping-pong parity, exactly as the serial single-token path
-/// does after encoding its layer. Returns the packed `[width, hidden]`
-/// attention output.
+/// flip each window's ping-pong parity once, exactly as the serial
+/// single-token path does after encoding its layer. Each window runs one
+/// `ssm_conv` and one gated delta net dispatch over its rows (`n_tokens` =
+/// its row count), reading the slot's current state and writing its
+/// opposite parity. Multi-row windows (MTP verify) need `replay`, which
+/// retains their inputs for [`encode_delta_net_replay`]. Returns the packed
+/// `[width, hidden]` attention output.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_joint_delta_net_layer(
     enc: &mut CommandEncoder,
@@ -310,6 +724,7 @@ pub(crate) fn encode_joint_delta_net_layer(
     layer_idx: usize,
     rows: &JointRows<'_>,
     cfg: &Qwen35Config,
+    mut replay: Option<&mut DeltaNetReplay>,
 ) -> Result<MlxBuffer> {
     check_slots(kv_cache, rows)?;
     let shape = DeltaNetLayerShape::from_config(cfg);
@@ -415,98 +830,170 @@ pub(crate) fn encode_joint_delta_net_layer(
     crate::inference::stage_profile::boundary(enc, "adr065.projections")
         .context("profile Qwen joint DeltaNet projections")?;
 
-    // ---- Per slot: causal conv against the slot's ping-pong parity ----
+    // ---- Per window: causal conv against the slot's ping-pong parity ----
     let qkv_conv = pooled_f32(device, vec![width, qkv_ch], "DeltaNet conv output")?;
-    let mut ssm_params_buf = pooled_alloc_buffer(device, 16, DType::U32, vec![4])
-        .map_err(|e| anyhow!("allocate Qwen joint ssm params: {e}"))?;
-    {
-        let s = ssm_params_buf
-            .as_mut_slice::<u32>()
-            .map_err(|e| anyhow!("{e}"))?;
-        s[0] = qkv_channels;
-        s[1] = 1;
-        s[2] = FORWARD_DISPATCH_N_SEQS;
-        s[3] = k_width;
-    }
-    let ssm_conv_params = SsmConvParams {
-        channels: qkv_channels,
-        n_tokens: 1,
-        n_seqs: FORWARD_DISPATCH_N_SEQS,
-        k_width,
-    };
-    let mut views = Vec::with_capacity(rows.real());
+    let k_minus_one = (k_width - 1) as usize;
+    let mut ssm_params = WindowParams::new();
+    let mut lanes = Vec::with_capacity(rows.windows.len());
     {
         let slot = &kv_cache.linear_attn[rank];
-        for (row, &slot_id) in rows.slots.iter().enumerate() {
-            let (conv_cur, conv_scratch) = slot.conv_bufs_for_slot(slot_id);
-            let (rec_cur, rec_scratch) = slot.recurrent_bufs_for_slot(slot_id);
+        for window in rows.windows {
+            let n = window.rows;
+            let (conv_cur, conv_scratch) = slot.conv_bufs_for_slot(window.slot);
+            let (rec_cur, rec_scratch) = slot.recurrent_bufs_for_slot(window.slot);
             let view = narrow_la_ping_pong_to_slot(
                 conv_cur,
                 conv_scratch,
                 rec_cur,
                 rec_scratch,
-                slot_id,
+                window.slot,
                 d_k,
                 d_v,
                 n_v_heads,
                 qkv_channels,
                 k_width - 1,
             );
+            let conv_params = SsmConvParams {
+                channels: qkv_channels,
+                n_tokens: n as u32,
+                n_seqs: FORWARD_DISPATCH_N_SEQS,
+                k_width,
+            };
             dispatch_ssm_conv(
                 enc,
                 registry,
                 device.metal_device(),
-                &row_view(&qkv_raw, row, vec![1, qkv_ch])?,
+                &rows_view(&qkv_raw, window.start, n, qkv_ch)?,
                 &weights.ssm_conv1d,
                 &view.conv_state_in,
                 &view.conv_state_out,
-                &row_view(&qkv_conv, row, vec![1, qkv_ch])?,
-                &ssm_params_buf,
-                ssm_conv_params,
+                &rows_view(&qkv_conv, window.start, n, qkv_ch)?,
+                ssm_params.get(n, || ssm_conv_params_buffer(device, conv_params))?,
+                conv_params,
             )
-            .with_context(|| format!("Qwen joint ssm_conv layer {layer_idx} row {row}"))?;
-            views.push(view);
+            .with_context(|| {
+                format!(
+                    "Qwen joint ssm_conv layer {layer_idx} rows {}..{}",
+                    window.start,
+                    window.start + n
+                )
+            })?;
+            let stage = if n > 1 {
+                let replay = replay
+                    .as_deref_mut()
+                    .context("Qwen joint multi-row window requires replay storage")?;
+                let conv_rows = replay.take((k_minus_one + n) * qkv_ch)?;
+                dispatch_copy_f32(
+                    enc,
+                    registry,
+                    device.metal_device(),
+                    &qkv_raw,
+                    &conv_rows,
+                    window.start * qkv_ch,
+                    k_minus_one * qkv_ch,
+                    n * qkv_ch,
+                )
+                .map_err(|e| anyhow!("retain Qwen joint conv rows layer {layer_idx}: {e}"))?;
+                Some(WindowStage {
+                    conv_rows,
+                    q: replay.take(n * q_span)?,
+                    k: replay.take(n * k_span)?,
+                    v: replay.take(n * v_elems)?,
+                    output: replay.take(n * v_elems)?,
+                })
+            } else {
+                None
+            };
+            lanes.push((view, stage));
         }
     }
     enc.memory_barrier();
     crate::inference::stage_profile::boundary(enc, "adr065.delta_conv")
         .context("profile Qwen joint DeltaNet convolution")?;
 
-    // ---- Per slot: L2 norms of Q and K ----
+    // ---- Per row: L2 norms of Q and K; a multi-row window gathers its
+    // ---- K and V rows contiguously for the window dispatch ----
     let mut q_l2 = Vec::with_capacity(rows.real());
-    let mut k_l2 = Vec::with_capacity(rows.real());
-    for row in 0..rows.real() {
-        let base = row * qkv_ch;
-        let q_view = qkv_conv.slice_view((base * 4) as u64, q_span);
-        let k_view = qkv_conv.slice_view(((base + q_span) * 4) as u64, k_span);
-        q_l2.push(apply_l2_norm_per_head(
-            enc, registry, device, &q_view, 1, n_k_heads, d_k, eps,
-        )?);
-        k_l2.push(apply_l2_norm_per_head(
-            enc, registry, device, &k_view, 1, n_k_heads, d_k, eps,
-        )?);
+    let mut window_k = Vec::with_capacity(rows.windows.len());
+    for (window, (_, stage)) in rows.windows.iter().zip(&lanes) {
+        let mut single_k = None;
+        for r in 0..window.rows {
+            let base = (window.start + r) * qkv_ch;
+            let q_view = qkv_conv.slice_view((base * 4) as u64, q_span);
+            let k_view = qkv_conv.slice_view(((base + q_span) * 4) as u64, k_span);
+            q_l2.push(apply_l2_norm_per_head(
+                enc, registry, device, &q_view, 1, n_k_heads, d_k, eps,
+            )?);
+            match stage {
+                None => {
+                    single_k = Some(apply_l2_norm_per_head(
+                        enc, registry, device, &k_view, 1, n_k_heads, d_k, eps,
+                    )?);
+                }
+                Some(stage) => {
+                    let mut l2_params = pooled_alloc_buffer(device, 8, DType::F32, vec![2])
+                        .map_err(|e| anyhow!("allocate Qwen joint l2 params: {e}"))?;
+                    apply_l2_norm_per_head_into(
+                        enc,
+                        registry,
+                        device,
+                        &k_view,
+                        &stage.k.slice_view((r * k_span * 4) as u64, k_span),
+                        &mut l2_params,
+                        1,
+                        n_k_heads,
+                        d_k,
+                        eps,
+                    )?;
+                    dispatch_copy_f32(
+                        enc,
+                        registry,
+                        device.metal_device(),
+                        &qkv_conv,
+                        &stage.v,
+                        base + q_span + k_span,
+                        r * v_elems,
+                        v_elems,
+                    )
+                    .map_err(|e| anyhow!("gather Qwen joint window V row {r}: {e}"))?;
+                }
+            }
+        }
+        window_k.push(single_k);
     }
     enc.memory_barrier();
 
-    // ---- Per slot q scale; packed g/beta ----
+    // ---- Per row q scale; packed g/beta ----
     let q_scale = 1.0_f32 / (d_k as f32).sqrt();
-    let mut q_scaled = Vec::with_capacity(rows.real());
-    for q in &q_l2 {
-        let scaled = pooled_f32(device, vec![q_span], "scaled query")?;
-        scalar_mul_f32(
-            enc,
-            registry,
-            device.metal_device(),
-            q,
-            &scaled,
-            q_span,
-            q_scale,
-        )
-        .context("Qwen joint q scale")?;
-        q_scaled.push(scaled);
+    let mut window_q = Vec::with_capacity(rows.windows.len());
+    let mut q_rows = q_l2.iter();
+    for (window, (_, stage)) in rows.windows.iter().zip(&lanes) {
+        let scaled = match stage {
+            None => pooled_f32(device, vec![q_span], "scaled query")?,
+            Some(stage) => stage.q.clone(),
+        };
+        for r in 0..window.rows {
+            let q = q_rows.next().context("Qwen joint q rows")?;
+            scalar_mul_f32(
+                enc,
+                registry,
+                device.metal_device(),
+                q,
+                &scaled.slice_view((r * q_span * 4) as u64, q_span),
+                q_span,
+                q_scale,
+            )
+            .context("Qwen joint q scale")?;
+        }
+        window_q.push(scaled);
     }
-    let g_buf = pooled_f32(device, vec![width * nv], "DeltaNet g")?;
-    let beta_buf = pooled_f32(device, vec![width * nv], "DeltaNet beta")?;
+    let (g_buf, beta_buf) = match replay.as_deref_mut() {
+        Some(replay) => (replay.take(width * nv)?, replay.take(width * nv)?),
+        None => (
+            pooled_f32(device, vec![width * nv], "DeltaNet g")?,
+            pooled_f32(device, vec![width * nv], "DeltaNet beta")?,
+        ),
+    };
     let mut g_params = pooled_alloc_buffer(device, 8, DType::U32, vec![2])
         .map_err(|e| anyhow!("allocate Qwen joint g params: {e}"))?;
     {
@@ -531,51 +1018,52 @@ pub(crate) fn encode_joint_delta_net_layer(
     .context("Qwen joint compute_g_beta")?;
     enc.memory_barrier();
 
-    // ---- Per slot: gated delta net against the slot's recurrent state ----
-    let gdn_params = GatedDeltaNetParams {
-        d_k,
-        d_v,
-        n_k_heads,
-        n_v_heads,
-        n_tokens: 1,
-        n_seqs: FORWARD_DISPATCH_N_SEQS,
-    };
-    let mut gdn_params_buf = pooled_alloc_buffer(device, 9 * 4, DType::U32, vec![9])
-        .map_err(|e| anyhow!("allocate Qwen joint GDN params: {e}"))?;
-    {
-        let s = gdn_params_buf
-            .as_mut_slice::<u32>()
-            .map_err(|e| anyhow!("{e}"))?;
-        s[0] = gdn_params.d_k;
-        s[1] = gdn_params.d_v;
-        s[2] = gdn_params.n_k_heads;
-        s[3] = gdn_params.n_v_heads;
-        s[4] = gdn_params.n_tokens;
-        s[5] = gdn_params.n_seqs;
-        s[6] = 0;
-        s[7] = 0;
-        s[8] = 0;
-    }
+    // ---- Per window: gated delta net against the slot's recurrent state ----
+    let mut gdn_params_bufs = WindowParams::new();
     let attn_out = pooled_f32(device, vec![width * v_elems], "DeltaNet core output")?;
-    for (row, view) in views.iter().enumerate() {
-        let base = row * qkv_ch;
-        let v_view = qkv_conv.slice_view(((base + q_span + k_span) * 4) as u64, v_elems);
+    for (index, (window, (view, stage))) in rows.windows.iter().zip(&lanes).enumerate() {
+        let n = window.rows;
+        let p = gdn_params(&shape, n);
+        let (k, v) = match stage {
+            None => (
+                window_k[index]
+                    .clone()
+                    .context("Qwen joint single-row K")?,
+                qkv_conv.slice_view(
+                    ((window.start * qkv_ch + q_span + k_span) * 4) as u64,
+                    v_elems,
+                ),
+            ),
+            Some(stage) => (stage.k.clone(), stage.v.clone()),
+        };
+        let params_buf = gdn_params_bufs.get(n, || {
+            let mut buffer = pooled_alloc_buffer(device, 9 * 4, DType::U32, vec![9])
+                .map_err(|e| anyhow!("allocate Qwen joint GDN params: {e}"))?;
+            write_gdn_params(&mut buffer, p)?;
+            Ok(buffer)
+        })?;
         dispatch_gated_delta_net_decode(
             enc,
             registry,
             device.metal_device(),
-            &q_scaled[row],
-            &k_l2[row],
-            &v_view,
-            &g_buf.slice_view((row * nv * 4) as u64, nv),
-            &beta_buf.slice_view((row * nv * 4) as u64, nv),
+            &window_q[index],
+            &k,
+            &v,
+            &g_buf.slice_view((window.start * nv * 4) as u64, n * nv),
+            &beta_buf.slice_view((window.start * nv * 4) as u64, n * nv),
             &view.recurrent_in,
-            &attn_out.slice_view((row * v_elems * 4) as u64, v_elems),
+            &attn_out.slice_view((window.start * v_elems * 4) as u64, n * v_elems),
             &view.recurrent_out,
-            &gdn_params_buf,
-            gdn_params,
+            params_buf,
+            p,
         )
-        .with_context(|| format!("Qwen joint gated delta net layer {layer_idx} row {row}"))?;
+        .with_context(|| {
+            format!(
+                "Qwen joint gated delta net layer {layer_idx} rows {}..{}",
+                window.start,
+                window.start + n
+            )
+        })?;
     }
     enc.memory_barrier();
     crate::inference::stage_profile::boundary(enc, "adr065.delta_gdn")
@@ -640,10 +1128,37 @@ pub(crate) fn encode_joint_delta_net_layer(
     crate::inference::stage_profile::boundary(enc, "adr065.projections")
         .context("profile Qwen joint DeltaNet output projection")?;
 
-    // Same CPU-side parity flip the serial path performs after encoding.
+    // Same CPU-side parity flip the serial path performs after encoding,
+    // once per window: a window's dispatches read the current parity and
+    // wrote the opposite one.
     let slot = &mut kv_cache.linear_attn[rank];
-    for &slot_id in rows.slots {
-        slot.swap_for_slot(slot_id);
+    for window in rows.windows {
+        slot.swap_for_slot(window.slot);
+    }
+    if let Some(replay) = replay {
+        let lanes = rows
+            .windows
+            .iter()
+            .zip(lanes)
+            .filter_map(|(window, (_, stage))| {
+                stage.map(|stage| {
+                    let rows_nv = window.rows * nv;
+                    let offset = (window.start * nv * 4) as u64;
+                    DeltaNetReplayLane {
+                        slot: window.slot,
+                        rows: window.rows,
+                        q: stage.q,
+                        k: stage.k,
+                        v: stage.v,
+                        g: g_buf.slice_view(offset, rows_nv),
+                        beta: beta_buf.slice_view(offset, rows_nv),
+                        conv_rows: stage.conv_rows,
+                        output: stage.output,
+                    }
+                })
+            })
+            .collect();
+        replay.layers.push(DeltaNetReplayLayer { rank, lanes });
     }
     Ok(output)
 }

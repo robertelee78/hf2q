@@ -580,6 +580,31 @@ class Sweep(unittest.TestCase):
             self.assertEqual(turn['splash_apply_template']['sha256'],
                              hashlib.sha256(b'{"prompt":"<|im_start|>system"}').hexdigest())
 
+    def test_parity_config_uses_embedded_agent_receipts_after_client_failure(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            run = root / 'run'
+            turn = run / 'client' / 'agent-0' / 'turn-0'
+            turn.mkdir(parents=True)
+            raw = json.dumps(native(0), separators=(',', ':')).encode()
+            (turn / 'request.json').write_bytes(raw)
+            (turn / 'splash-apply-template.raw').write_bytes(b'{"prompt":"rendered"}')
+            agent = {'turns': [{'turn': 0, 'request_sha256': hashlib.sha256(raw).hexdigest()}]}
+            (run / 'client' / 'summary.json').write_text(json.dumps({
+                'engine_kind': 'splash',
+                'native_readiness': {'q3_family': 'qwen38'},
+                'status': 'Failed',
+                'agents': {'agent-0': agent},
+            }))
+            template = root / 'qwen38.template.jinja'
+            template.write_text('reviewed')
+            with mock.patch.dict(sp.ARTIFACTS['qwen38'], {
+                'template_sha256': hashlib.sha256(template.read_bytes()).hexdigest(),
+            }):
+                config = json.loads(splash_sweep.parity_config(run, template, root / 'parity').read_text())
+            self.assertEqual([(item['agent'], item['turn']) for item in config['turns']], [('agent-0', 0)])
+
 
 class Registry(unittest.TestCase):
     def test_splash_is_a_same_artifact_adapter_kind(self):

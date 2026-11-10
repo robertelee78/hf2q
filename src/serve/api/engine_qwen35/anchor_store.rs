@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use mlx_native::{MlxBuffer, MlxDevice};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     LazyLock, Mutex,
@@ -43,6 +44,41 @@ impl Qwen35Anchor {
     pub fn owned_bytes(&self) -> usize {
         self.owned().total()
     }
+}
+
+/// Copy a speculative hidden-row view into a right-sized owner before an
+/// anchor retains it. MTP prefill and verify return row views into multi-row
+/// outputs; retaining such a view would pin the whole transient allocation
+/// and make the anchor's byte accounting false.
+pub(in crate::serve::api) fn owned_spec_boundary(
+    device: &MlxDevice,
+    token_count: usize,
+    hidden: &MlxBuffer,
+) -> Result<Qwen35SpecPrefixBoundary> {
+    let pending_target_hidden = if hidden.byte_len() == hidden.data_byte_len() {
+        hidden.clone()
+    } else {
+        let mut owned = device
+            .alloc_buffer(
+                hidden.data_byte_len(),
+                hidden.dtype(),
+                hidden.shape().to_vec(),
+            )
+            .map_err(|error| anyhow!("allocate Qwen anchor speculative hidden: {error}"))?;
+        owned
+            .as_mut_slice::<u8>()
+            .map_err(|error| anyhow!("map Qwen anchor speculative hidden destination: {error}"))?
+            .copy_from_slice(
+                hidden.as_slice::<u8>().map_err(|error| {
+                    anyhow!("map Qwen anchor speculative hidden source: {error}")
+                })?,
+            );
+        owned
+    };
+    Ok(Qwen35SpecPrefixBoundary {
+        token_count,
+        pending_target_hidden,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -642,5 +678,36 @@ mod tests {
         assert!(format!("{error:#}").contains("exceeds slot quota"));
         assert!(store.is_empty());
         assert_eq!(store.owned_bytes(), 0);
+    }
+
+    #[test]
+    fn speculative_boundary_materializes_a_right_sized_hidden_row() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().unwrap();
+        let mut parent = device
+            .alloc_buffer(
+                8 * std::mem::size_of::<f32>(),
+                mlx_native::DType::F32,
+                vec![8],
+            )
+            .unwrap();
+        parent
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let row = parent.slice_view(4 * std::mem::size_of::<f32>() as u64, 4);
+        assert_ne!(row.byte_len(), row.data_byte_len());
+
+        let boundary = owned_spec_boundary(&device, 17, &row).unwrap();
+
+        assert_eq!(boundary.token_count, 17);
+        assert_eq!(
+            boundary.pending_target_hidden.byte_len(),
+            boundary.pending_target_hidden.data_byte_len()
+        );
+        assert_eq!(
+            boundary.pending_target_hidden.as_slice::<f32>().unwrap(),
+            &[5.0, 6.0, 7.0, 8.0]
+        );
     }
 }

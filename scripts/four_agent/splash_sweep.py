@@ -144,10 +144,20 @@ def parity_config(run_dir, template, output_dir=None):
     require(not any((p / '.git').exists() for p in (out.parent, *out.parent.parents)), 'output must be outside Git')
     out.mkdir(mode=0o700)
     turns = []
-    for agent_summary in sorted((run / 'client').glob('agent-*/summary.json')):
-        agent = agent_summary.parent.name
-        for receipt in json.loads(agent_summary.read_text())['turns']:
-            directory = agent_summary.parent / f"turn-{receipt['turn']}"
+    agent_receipts = [
+        (agent_summary.parent.name, json.loads(agent_summary.read_text())['turns'])
+        for agent_summary in sorted((run / 'client').glob('agent-*/summary.json'))
+    ]
+    if not agent_receipts:
+        agents = summary.get('agents') or {}
+        require(isinstance(agents, dict), f'{run} client summary has no agent receipts')
+        agent_receipts = [
+            (agent, receipt['turns'])
+            for agent, receipt in sorted(agents.items())
+        ]
+    for agent, receipts in agent_receipts:
+        for receipt in receipts:
+            directory = run / 'client' / agent / f"turn-{receipt['turn']}"
             raw = (directory / 'request.json').read_bytes()
             require(digest(raw) == receipt['request_sha256'], f'{agent} turn {receipt["turn"]}: request archive changed')
             canonical = sp.canonical(json.loads(raw), 'qwen')

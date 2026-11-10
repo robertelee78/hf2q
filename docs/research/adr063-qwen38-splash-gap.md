@@ -25,29 +25,50 @@ The result has two distinct parts:
 
 Primary receipts:
 
-- Splash S0: `~/.local/state/hf2q/v0130/q4-qwen38/splash-s0-final-51a3923f-v2/`
-- Splash sweep: `~/.local/state/hf2q/v0130/q4-qwen38/splash-sweep-v1/selection.json`
+- Splash corrected sweep: `~/.local/state/hf2q/v0130/q4-qwen38/splash-sweep-strict-parity-v2/selection.json`
+- Splash source-attribution S0: `~/.local/state/hf2q/v0130/q4-qwen38/splash-s0-final-51a3923f-v2/`
 - hf2q previous default: `~/.local/state/hf2q/v0130/q4-qwen38/hf2q-default-09961830-v1/`
 - hf2q joint-MTP pilot: `~/.local/state/hf2q/v0130/q4-qwen38/hf2q-joint-mtp-mma-09961830-v2/`
+- hf2q fixed campaign: `~/.local/state/hf2q/campaigns/adr065-qwen38-joint-mtp-cdb180d5-v1/`
 - hf2q command timing: `~/.local/state/hf2q/v0130/q4-trace-gpu-timing/`
 - ADR-065 E7: `~/.local/state/hf2q/v0130/e7-510/smoke/report.json`
 
-These are local evidence paths, not published release receipts. The pilot is not a release verdict.
+These are local evidence paths, not published release receipts.
 
 ## Check 1: Splash has no valid Q4 point
 
-The frozen one-factor sweep contains eight configurations and two runs per configuration. None is valid:
+The corrected one-factor sweep contains eight configurations and two runs per
+configuration. Its request normalization removes only Splash's semantically
+false `strict` tool default and restores that default in the canonical inverse.
+All 320 archived turns pass the hf2q byte post-oracle. Prompt rendering is
+therefore no longer a validity blocker.
 
-- every configuration has `valid: false`;
-- seven configurations have task pass fraction `0.0`;
-- the ANE-off configuration has task pass fraction `0.125`;
-- every run lacks `CalibrationPass`, a passing run audit, and the required prompt-parity post-oracle.
+No configuration passes the quality gate:
 
-S0 itself ended `ClientFailed`. All four agents produced the same invalid Rust edit, annotating `u16::parse` with `std::fmt::Error`; compilation failed with E0271. The supervisor then cancelled the remaining agents. This is a quality failure, not a speed win.
+| Configurations | Task pass fraction |
+|---|---:|
+| S0, KV BF16, ANE off, matched | 0.000 |
+| state BF16, decode share 0.25 | 0.125 |
+| cache disk off, decode share 1.0 | 0.250 |
 
-The frozen sweep is not prompt-equivalent. A parity-specific replay of S0 found its first mismatch at byte 532: Splash rendered `"strict": false` for each of the three tool functions while hf2q omitted that semantic default, adding 51 prompt bytes. The adapter now omits only this false default from Splash's wire request and restores it for the canonical hf2q request. A replay of every completed turn from a corrected Q5 run passed the hf2q byte post-oracle: 20 of 20 rendered prompts were identical.
+The required floor is 0.75. Every one of the 16 runs lacks `CalibrationPass`
+and a passing run audit. In every run at least one lane annotates `u16::parse`
+with `std::fmt::Error`, fails compilation with E0271, and stops after the
+fourth step rather than completing the required six-step workflow. The
+supervisor then cancels unfinished lanes. A few lanes complete the task before
+that stop, but the best two-run configuration reaches only two of eight tasks.
 
-That corrected Q5 still ended `ClientFailed`. Two agents emitted `std::num::ParseIntError` and passed both requested test targets; two retained the invalid `std::fmt::Error` annotation. The resulting two-of-four success is below the 0.75 task floor, and one agent stopped after the failed fourth tool step instead of completing the required six-step sequence. One corrected run cannot attribute the output change to the schema fix, but it rules out prompt rendering as the remaining failure in that run. Splash also cannot reproduce hf2q's 1.05/64 repetition-penalty semantics and therefore sends no penalty, as frozen by the Splash design. The original sweep remains invalid and is never relabelled.
+Failed clients do not execute Splash's normal closing render proof, so the
+parity replay re-rendered their archived requests through the same pinned
+model/template endpoint after the runs. The swept knobs affect KV/state
+precision, ANE, verification, scheduling and cache placement, not chat
+rendering. `splash_sweep.py parity-config` now accepts the authoritative
+per-agent receipts embedded in a failed client summary instead of requiring
+the success-only per-agent summary files.
+
+The corrected selection record has SHA-256
+`74568385b4cb7c913fbf4e2603b199c45b3a54a508398dd98f2e3f0fd1564064`.
+The original non-parity sweep remains historical evidence only.
 
 Per ADR-063, a failed or absent Splash arm cannot be turned into a Win against nothing. The raw measurements below are architecture evidence only.
 
@@ -138,7 +159,15 @@ MMA alone is 9.38% sooner and joint MTP alone 5.31% sooner than the previous def
 
 The combined pilot executed 857 global joint-MTP cycles and 3,172 lane-cycles. The fixed allocator issued an estimated 3,556 drafts. Subtracting one prefill seed per request and one target decision per lane-cycle from the 6,388 completions gives 3,188 accepted drafts: about 89.65% acceptance and 2.01 output tokens per lane-cycle. This estimate assumes the production seed/settle accounting; terminal rows can distort it slightly.
 
-This overturns the practical premise behind ADR-065 E8's `f=0`: the production integration can make joint-window eligibility nonzero on the canonical grammar/tool workload and delivers a large factorial-pilot effect. It does not by itself overturn the decision. ADR-065 requires a fixed-count one-switch A/B, fairness, quality and independent review before J4/J5 can be reopened or a default changed.
+The fixed-count one-switch campaign subsequently confirmed that the practical
+premise behind ADR-065 E8's `f=0` does not describe the production integration.
+Across six fixed n4 blocks the combined candidate reduces makespan by 34.600%
+(95% CI 33.738–35.452%). All 70 A/B runs pass Q5, task quality, thermal and
+fairness gates; cancellation recovery passes with byte-exact survivors. The
+official analysis is `Win`, SHA-256
+`0f1a077bc5484cb190257ac5c46dd22a8d71f990dd6424dc157fd6841882f05c`.
+The operator superseded E8 for this measured J4/J5 design and promoted it as
+the dense-MTP default, with `HF2Q_QWEN_JOINT_MTP=0` as the kill switch.
 
 It also does not match Splash's raw cycle productivity:
 
@@ -150,10 +179,16 @@ It also does not match Splash's raw cycle productivity:
 
 ## Decision
 
-1. Do not claim that hf2q has beaten Splash. Splash has no valid point, while hf2q has not matched its raw decode architecture.
-2. Preserve joint MTP plus column-invariant MMA as one candidate treatment, not a default. The factorial pilot shows that neither component represents the combined effect.
-3. Give the combined treatment one production kill switch, then run ADR-065's fixed-count A/B, fairness and quality gates. A single successful run is not qualification.
-4. Keep every target token target-verified and every tool/grammar path enabled. No quality waiver converts raw speed into a Q4 result.
+1. Do not claim a matched speed Win against Splash. The fully prompt-equivalent
+   sweep has no valid Splash point, so policy provides no competitor speed
+   denominator.
+2. Ship joint MTP plus column-invariant MMA as one default candidate treatment
+   on dense artifacts with an MTP head. The fixed campaign, not the factorial
+   pilot, is the promotion evidence.
+3. Keep every target token target-verified and every tool/grammar path enabled.
+   No quality waiver converts Splash's raw speed into a Q4 result.
+4. Treat Splash's 5.304 accepted/bonus outputs per lane-cycle as the
+   architectural target for a successor, not as a v0.1.30 comparison result.
 
 ## Required successor to match raw Splash
 
@@ -171,7 +206,11 @@ ADR-065 currently forbids new drafter architectures and tree drafting. A DFlash2
 
 ## Next checks
 
-- Bind joint MTP plus column-invariant MMA to one candidate switch and run ADR-065's fixed-count ABBA campaign against the previous default.
-- Run the current Q4 peer campaign on the same release candidate if the A/B passes.
-- Run the Splash prompt-parity post-oracle. Until one Splash point passes Q5, audits and the 0.75 task floor, its Q4 comparison remains failed rather than a speed denominator.
-- If raw Splash parity remains a product requirement after v0.1.30, approve the successor drafter/verifier scope explicitly and measure it against the 5.304 tok/cycle target above.
+- Promoted source `6adfbcde` passes Q5 with the switch unset in 92.792 s.
+  Its startup record has `explicit=false`, `joint_mtp=true` and
+  `column_invariant_mma=true`; cleanup is proven.
+- Complete the remaining v0.1.30 family gates; do not rerun or select a Splash
+  point from this frozen sweep.
+- If raw Splash parity remains a product requirement after v0.1.30, approve
+  the successor drafter/verifier scope explicitly and measure it against the
+  5.304 tok/cycle target above.

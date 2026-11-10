@@ -6,16 +6,26 @@
 //! takes the options explicitly, so one process can run several (the Q1
 //! trace).
 
+use super::joint_projection::JointProjectionKernel;
+
 /// Switch for [`JointStepOptions::pooled_outputs`]: `1`/`on`/`true` takes the
 /// joint layer chain's multi-row outputs from the decode pool
 /// ([`super::decode_pool::StepPooledOutputs`]); unset, blank or
 /// `0`/`off`/`false` keeps fresh device allocations. Either mode.
 pub(crate) const QWEN_JOINT_POOLED_OUTPUTS_ENV: &str = "HF2Q_QWEN_JOINT_POOLED_OUTPUTS";
 
+/// Production kill switch for the combined joint MTP candidate. Dense Qwen
+/// artifacts with an MTP head default to joint MTP verify and, in padded
+/// mode, the column-invariant projection. `0`/`off`/`false` restores serial
+/// K3 and the canonical projection. MoE and artifacts without MTP stay off by
+/// default. The worker reads it once at start with the other joint switches.
+pub(crate) const QWEN_JOINT_MTP_ENV: &str = "HF2Q_QWEN_JOINT_MTP";
+
 /// Per-step execution choices of a joint step that its route mode does not
 /// fix. The default turns every choice off.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct JointStepOptions {
+    pub projection: JointProjectionKernel,
     /// Multi-row layer outputs from the decode pool (Class A).
     pub pooled_outputs: bool,
 }

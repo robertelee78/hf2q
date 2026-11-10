@@ -390,13 +390,23 @@ Priority: High.
 
 Delivery boundary: Decision record merged to main.
 
-Result (2026-11-09): `NoGo`. The pre-registered 100,000-replicate
+Original result (2026-11-09): `NoGo`. The pre-registered 100,000-replicate
 run-clustered bootstrap gives $s=1.9093$ (95% interval
 $[1.7742,2.0364]$), but E4 gives $f=0$ and therefore $S=1$ with interval
-$[1,1]$. The isolated operation clears its local speed threshold but cannot
-change the canonical workload's makespan. J4, J5, J6, A1, A2, P3a and P3b are
-not pursued; every other story retains its own acceptance. See
+$[1,1]$. The isolated diagnostic operation cleared its local speed threshold
+but could not enter the phase-1 scheduler, so the original stop set was
+correct for that prototype. See
 [the E8 decision record](../research/adr065-e8-g0-decision.md).
+
+Superseding decision (2026-11-10): `Go` for J4/J5. The production candidate
+changes the scheduler eligibility that made E4's counterfactual $f=0$: every
+eligible dense-MTP lane contributes a joint verify window. Its predeclared
+six-block campaign is an official `Win`, reducing n4 makespan by 34.600%
+(95% CI 33.738–35.452%) with all 70 runs quality-eligible, Q5-passing and
+thermally valid, no fairness failures, and a passing cancellation gate. The
+operator explicitly superseded the E8 stop for this measured candidate and
+approved default promotion. Other stories in the original stop set remain
+separate designs, not implied work.
 
 ## J. Joint temporal verify for Qwen3.8
 
@@ -474,7 +484,7 @@ Requirement: The program MUST build joint verify windows under the numerical and
 Acceptance:
 
 - Joint rows become windows; projections use fixed padded groups of the width E6 proves; per-slot DeltaNet and attention run on windows with per-slot capture.
-- Joint admission accepts capture-active lanes only when `HF2Q_QWEN_JOINT_VERIFY=1`; unset or `0`, admission and served output equal phase 1 (`ExactTranscripts`).
+- Joint admission accepts capture-active lanes only when `HF2Q_QWEN_JOINT_MTP=1`; unset or `0`, admission and served output equal phase 1 (`ExactTranscripts`) during J4 qualification.
 - Grafted lanes and lanes outside phase-1 joint eligibility keep their existing fallback; phase-1-eligible lanes that cannot verify contribute REF(1) rows.
 - Class A cohort invariance, the Class B envelope, transaction cases (full, partial and zero acceptance mixed across lanes; EOS as accepted draft, first draft, bonus and replacement; grammar end; forced thinking close; tool trigger; length boundary; queue-drain cancellation; eight later ordinary decisions per lane) and the three failure classes pass on the official artifact with the switch on.
 
@@ -486,7 +496,11 @@ Predecessors: E8, J1, J2, J3.
 
 Priority: High.
 
-Delivery boundary: Merged to main with the switch defaulting to off.
+Qualification boundary: candidate commit recorded with the switch defaulting to off; final merge follows J5's verdict.
+
+Result (2026-11-10): complete. The default-off candidate at
+`cdb180d523bae933359f7e5f5484701ad698ba9d` passed the numerical,
+transaction, official-artifact Q5 and focused test gates. J5 owns its default.
 
 ### J5. Qualify joint verify on the four-agent workload
 
@@ -510,6 +524,15 @@ Predecessors: B1, J4.
 Priority: High.
 
 Delivery boundary: Merged to main with the default set by the A/B verdict.
+
+Result (2026-11-10): `Win`; promote. The fixed six-block n4 effect is a
+34.600% makespan reduction with 95% CI [33.738%, 35.452%]. All 70 measured
+runs pass Q5, quality, thermal and fairness gates. The cancellation smoke
+narrows an active four-lane MTP cohort to three lanes, leaves all survivors
+byte-exact against control, keeps the server ready and proves cleanup.
+Dense artifacts with an MTP head therefore enable the route by default;
+`HF2Q_QWEN_JOINT_MTP=0` is the production kill switch. MoE and no-MTP
+artifacts remain off by default.
 
 ### J6. Decide whether solo K3 runs through the joint reference route
 

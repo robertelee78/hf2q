@@ -250,9 +250,24 @@ Both routes are inside the 0.25 nat route bound, which closes Q-C2b for the earl
 |---|---|---|---:|---:|---:|---:|
 | joint, shared-weight FFN | serial | `RouteSensitive` | 0.2835 nat | 0.1040 nat | 576/576 | 0 |
 | joint, per-row fused FFN | serial | `WithinDecisionEnvelope` | 0.1538 nat | 0.0763 nat | 576/576 | 0 |
+| joint, shared-weight FFN, column-invariant MMA | serial | `RouteSensitive` | 0.2594 nat | 0.1026 nat | 576/576 | 0 |
+| joint, shared-weight FFN, column-invariant MMA | joint, shared-weight FFN (`mul_mv_ext`) | `WithinDecisionEnvelope` | 0.0759 nat | 0.0141 nat | 576/576 | 0 |
 | joint, shared-weight FFN, pooled outputs | joint, shared-weight FFN | `ExactEqual` | 0 | 0 | 576/576 | 0 |
 
 The shared-weight FFN route has 3 rows over τ, all at absolute row 1160 (agents 0, 1 and 3). Each keeps its top-1, with margins of 0.95–1.04 nat. The cause is the production route itself, not pooling: the pooled arm is `ExactEqual` to it. Root decision of 2026-11-07 (`/Users/robert/.local/state/hf2q/v0130/q38-opparity/q1/RESULT-f1.md`, "Root decision"): this is recorded as an updated Class B measurement of the production padded route, with no localization required. The 32-step table above stays as the earlier record.
+
+The column-invariant MMA route (`HF2Q_QWEN_JOINT_MMA=1`) has 1 row over τ, at row 1160 (agent-1, which keeps its top-1 with a margin of 1.04 nat).
+
+**Admission.** Root admitted the MMA route (F1) on 2026-11-07. The rule: it is at least as close to serial as the shipped production padded route on p95, max, rows over τ and KL max, and it is `WithinDecisionEnvelope` against that route.
+
+| Statistic | MMA | Production |
+|---|---:|---:|
+| p95 | 0.1026 | 0.1040 |
+| max | 0.259 | 0.283 |
+| rows over τ | 1 | 3 |
+| KL max | 6.7e-3 | 8.1e-3 |
+
+p50 is equal within 1.3e-4 (0.02508 vs 0.02495). GAP-PROGRAM applies the same rule to MoE families. The combined Qwen3.8 candidate's quality campaign decides. The route needs mlx-native ≥ 0.18.0 (`quantized_matmul_ggml_column_invariant_mma`).
 
 `qwen38_joint_decode_q1_envelope_trace` takes 2–4 real agent prompts (`HF2Q_QWEN_JOINT_Q1_PROMPTS`) and requires the padded mode:
 - **Input format.** A JSON array where each entry is either the exact rendered chat prompt as token IDs, or the rendered prompt text tokenized with the serving `tokenizer.json` at `HF2Q_QWEN35_TOKENIZER`.
@@ -261,6 +276,7 @@ The shared-weight FFN route has 3 rows over τ, all at absolute row 1160 (agents
   - `$OUT/serial/trace.json`: the serial one-token `forward_gpu_last_logits` (stock M1 target route);
   - `$OUT/joint_shared_ffn/trace.json`: `forward_gpu_decode_joint` over all agents with the shared-weight FFN (production default);
   - `$OUT/joint_serial_ffn/trace.json`: the same with the per-row fused FFN (`HF2Q_QWEN_JOINT_FFN_SHARED=0`).
+  - `$OUT/joint_shared_ffn_mma/trace.json`: the production FFN route with the packed layer products on the column-invariant MMA kernel (`HF2Q_QWEN_JOINT_MMA=1`).
   - `$OUT/joint_shared_ffn_pooled/trace.json`: the production route with pooled layer outputs (`HF2Q_QWEN_JOINT_POOLED_OUTPUTS=1`, Class A). The test asserts its logits bitwise equal to `joint_shared_ffn` at every step.
 
 **Prepared input.** `/tmp/adr063-qwen38-q1-prompts.json` holds four token-ID prompts, entry N = agent-N. They are the recorded turn-2 requests of `E/qwen-joint-ffn-ab-v1/q38-1-ffn1-20261031T034127Z/client/agent-{0,1,2,3}/turn-2/request.json`; agent-1 and agent-3 turn-2 are the turns that forked in the S3 A/B.

@@ -71,8 +71,14 @@ mod joint_decode_ffn_tests;
 pub(crate) mod joint_decode_routes;
 #[cfg(test)]
 pub(crate) mod joint_decode_test_support;
+pub(crate) mod joint_projection;
 pub(crate) mod joint_step_options;
-pub(crate) use forward_gpu::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput};
+#[cfg(test)]
+pub(crate) mod joint_verify_tests;
+pub(crate) use forward_gpu::{
+    Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput, Qwen35JointVerify,
+    Qwen35JointVerifyLane, Qwen35JointVerifyPending,
+};
 #[cfg(test)]
 mod real_artifact_joint_decode_tests;
 #[cfg(test)]
@@ -83,6 +89,8 @@ mod real_artifact_joint_decode_q1_tests;
 mod real_artifact_joint_decode_witness_tests;
 #[cfg(test)]
 mod real_artifact_joint_decode_gpu_timing_tests;
+#[cfg(test)]
+mod real_artifact_joint_verify_tests;
 #[cfg(test)]
 mod real_artifact_resume_attn_fast_tests;
 #[cfg(test)]

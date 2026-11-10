@@ -38,9 +38,11 @@
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::DType;
 
-/// Widest joint step the graph accepts; it stays on the `m <= 8` matvec
-/// routes. Serving caps the default lower (see the scheduler's row cap).
+/// Widest serving joint-decode pack. Production callers stay within this
+/// bound.
 pub(crate) const MAX_JOINT_DECODE_ROWS: usize = 8;
+/// Widest diagnostic joint-verify pack: four slots × four rows.
+pub(crate) const MAX_JOINT_VERIFY_ROWS: usize = 16;
 
 /// The only packed width of the `mul_mv_ext` mode, and its row cap.
 pub(crate) const PADDED_MV_EXT_WIDTH: usize = 4;
@@ -135,6 +137,19 @@ pub(crate) fn joint_mode_max_rows(mode: JointRouteMode, requested: usize) -> usi
     match mode {
         JointRouteMode::Exact => requested,
         JointRouteMode::PaddedMvExt => requested.min(PADDED_MV_EXT_WIDTH),
+    }
+}
+
+/// Packed width of a joint-MTP verify step with `rows` real rows (the lane
+/// windows, `1..=`[`MAX_JOINT_VERIFY_ROWS`]). Exact steps pack only real
+/// rows. The padded mode uses the smallest proven tile that covers the
+/// step: width four, width eight, or the diagnostic-only width sixteen.
+pub(crate) fn joint_verify_padded_width(mode: JointRouteMode, rows: usize) -> usize {
+    match mode {
+        JointRouteMode::Exact => rows,
+        JointRouteMode::PaddedMvExt if rows <= PADDED_MV_EXT_WIDTH => PADDED_MV_EXT_WIDTH,
+        JointRouteMode::PaddedMvExt if rows <= MAX_JOINT_DECODE_ROWS => MAX_JOINT_DECODE_ROWS,
+        JointRouteMode::PaddedMvExt => MAX_JOINT_VERIFY_ROWS,
     }
 }
 
@@ -304,12 +319,35 @@ mod tests {
     }
 
     #[test]
+    fn verify_width_covers_the_diagnostic_grid() {
+        for rows in 1..=MAX_JOINT_VERIFY_ROWS {
+            assert_eq!(joint_verify_padded_width(JointRouteMode::Exact, rows), rows);
+            let padded = joint_verify_padded_width(JointRouteMode::PaddedMvExt, rows);
+            assert!(padded >= rows);
+            let expected = if rows <= 4 {
+                4
+            } else if rows <= 8 {
+                8
+            } else {
+                16
+            };
+            assert_eq!(padded, expected);
+        }
+    }
+
+    #[test]
     fn joint_policy_reads_only_the_model_policy() {
         let mut ggml = mlx_native::GgmlRoutingPolicy::default();
         ggml.dense_decode_mv_ext = false;
-        assert_eq!(JointRoutingPolicy::from_ggml(&ggml), JointRoutingPolicy { mv_ext: false });
+        assert_eq!(
+            JointRoutingPolicy::from_ggml(&ggml),
+            JointRoutingPolicy { mv_ext: false }
+        );
         ggml.dense_decode_mv_ext = true;
-        assert_eq!(JointRoutingPolicy::from_ggml(&ggml), JointRoutingPolicy { mv_ext: true });
+        assert_eq!(
+            JointRoutingPolicy::from_ggml(&ggml),
+            JointRoutingPolicy { mv_ext: true }
+        );
     }
 
     #[test]

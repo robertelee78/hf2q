@@ -43,14 +43,17 @@ use crate::inference::models::qwen35::gpu_ffn::{
 };
 use crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_into_with_ggml_type;
 use crate::inference::models::qwen35::joint_decode_core::{
-    encode_joint_delta_net_layer, encode_joint_full_attn_layer, row_view, DeltaNetRoutes,
-    FullAttnRoutes, JointRows,
+    encode_joint_delta_net_layer, encode_joint_full_attn_layer, row_view, DeltaNetReplay,
+    DeltaNetRoutes, FullAttnRoutes, JointRows, JointWindow,
 };
 use crate::inference::models::qwen35::joint_decode_routes::{
-    check_dense_ffn_route, check_mode_policy, dense_ffn_route,
-    joint_decode_env_unavailable_reason, joint_mode_max_rows, joint_padded_width, projection_route,
-    select_joint_route_mode, JointDenseFfnRoute, JointProductRoute, JointRouteMode,
-    JointRoutingPolicy, MAX_JOINT_DECODE_ROWS,
+    check_dense_ffn_route, check_mode_policy, dense_ffn_route, joint_decode_env_unavailable_reason,
+    joint_mode_max_rows, joint_padded_width, projection_route, select_joint_route_mode,
+    JointDenseFfnRoute, JointProductRoute, JointRouteMode, JointRoutingPolicy,
+    MAX_JOINT_DECODE_ROWS, MAX_JOINT_VERIFY_ROWS,
+};
+use crate::inference::models::qwen35::joint_projection::{
+    JointProjectionKernel, JointProjectionScope,
 };
 use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
@@ -69,6 +72,22 @@ pub(crate) enum Qwen35JointOutput {
     Logits,
     /// Full logits plus the post-output-norm hidden row MTP consumes.
     LogitsAndHidden,
+    /// GPU argmax plus the post-output-norm hidden row (a greedy MTP lane).
+    GreedyTokenAndHidden,
+}
+
+impl Qwen35JointOutput {
+    fn wants_argmax(self) -> bool {
+        matches!(self, Self::GreedyToken | Self::GreedyTokenAndHidden)
+    }
+
+    fn wants_logits(self) -> bool {
+        matches!(self, Self::Logits | Self::LogitsAndHidden)
+    }
+
+    fn wants_hidden(self) -> bool {
+        matches!(self, Self::LogitsAndHidden | Self::GreedyTokenAndHidden)
+    }
 }
 
 /// One slot's input to a joint step.
@@ -94,9 +113,20 @@ enum LayerRoutes {
     Linear(DeltaNetRoutes),
 }
 
-struct JointPlan {
+/// Admitted product routes of every layer and the output head.
+pub(super) struct JointPlan {
     layers: Vec<LayerRoutes>,
     head: JointProductRoute,
+}
+
+/// The packed rows of one joint forward.
+pub(super) struct JointPacking<'a> {
+    /// Real rows in packed order.
+    pub rows: &'a [Qwen35JointRow],
+    /// Lane windows over `rows` (single rows for a decode step).
+    pub windows: &'a [JointWindow],
+    /// Packed width, at least `rows.len()`; padding rows copy row 0.
+    pub width: usize,
 }
 
 fn plan_joint_routes(
@@ -272,8 +302,9 @@ impl Qwen35Model {
     /// bitwise those of its serial one-token forward. `dense_ffn` must be
     /// admitted for `mode` ([`check_dense_ffn_route`]). `options` are
     /// resolved by the caller (the serving worker reads their switches once
-    /// at start; the Q1 trace runs several in one process). Refusal
-    /// (admission, shape, slot range) happens before any cache write.
+    /// at start; the Q1 trace runs several in one process); the
+    /// column-invariant MMA kernel is admitted only in the padded mode.
+    /// Refusal (admission, shape, slot range) happens before any cache write.
     pub(crate) fn forward_gpu_decode_joint_with_options(
         &self,
         rows: &[Qwen35JointRow],
@@ -308,6 +339,45 @@ impl Qwen35Model {
                 "Qwen joint position must be non-negative"
             );
         }
+        self.check_joint_step_admission(kv_cache, mode, dense_ffn, options)?;
+        let slots = rows.iter().map(|row| row.slot_id).collect::<Vec<_>>();
+        let windows = JointWindow::per_row(&slots);
+        let packing = JointPacking {
+            rows,
+            windows: &windows,
+            width: joint_padded_width(mode, rows.len()),
+        };
+        self.with_joint_forward(
+            mode,
+            |device, registry, layer_weights, output_head, plan| {
+                self.encode_joint_decode(
+                    device,
+                    registry,
+                    layer_weights,
+                    output_head,
+                    plan,
+                    &packing,
+                    kv_cache,
+                    dense_ffn,
+                    options,
+                    None,
+                )
+                .map(|(outputs, _normed)| outputs)
+            },
+        )
+    }
+
+    /// Admission shared by every joint forward, before any cache write: no
+    /// DeltaNet capture, no serial-only diagnostics or steering, the mode
+    /// and dense FFN route admitted by the model's routing policy, and the
+    /// MMA projections only in the padded mode.
+    pub(super) fn check_joint_step_admission(
+        &self,
+        kv_cache: &HybridKvCache,
+        mode: JointRouteMode,
+        dense_ffn: JointDenseFfnRoute,
+        options: JointStepOptions,
+    ) -> Result<()> {
         ensure!(
             !kv_cache.la_capture_active(),
             "Qwen joint decode cannot run while a DeltaNet capture is active"
@@ -323,14 +393,38 @@ impl Qwen35Model {
             self.glp.is_none(),
             "Qwen joint decode unavailable: GLP steering requires the serial graph"
         );
-        check_mode_policy(mode, JointRoutingPolicy::from_ggml(&self.ggml_routing_policy))
-            .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
+        check_mode_policy(
+            mode,
+            JointRoutingPolicy::from_ggml(&self.ggml_routing_policy),
+        )
+        .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
         check_dense_ffn_route(mode, dense_ffn)
             .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
-        self.ensure_gpu_cache_primed()?;
+        ensure!(
+            options.projection == JointProjectionKernel::Canonical
+                || mode == JointRouteMode::PaddedMvExt,
+            "Qwen joint decode unavailable: the column-invariant MMA projections are \
+             admitted only in the padded mode"
+        );
+        Ok(())
+    }
 
+    /// Run `encode` inside one joint forward: the primed GPU cache of this
+    /// model, its admitted route plan and a freshly reset decode pool.
+    pub(super) fn with_joint_forward<R>(
+        &self,
+        mode: JointRouteMode,
+        encode: impl FnOnce(
+            &MlxDevice,
+            &mut KernelRegistry,
+            &[LayerWeightsGpu],
+            &OutputHeadGpu,
+            &JointPlan,
+        ) -> Result<R>,
+    ) -> Result<R> {
+        self.ensure_gpu_cache_primed()?;
         let pool_operation = decode_pool::profile::Operation::enter(self as *const _ as usize)?;
-        let result = GPU_CACHE.with(|cell| -> Result<Vec<Qwen35JointRowOutput>> {
+        let result = GPU_CACHE.with(|cell| -> Result<R> {
             let mut guard = cell.borrow_mut();
             let cache = guard
                 .as_mut()
@@ -350,37 +444,30 @@ impl Qwen35Model {
                 .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
             decode_pool::checked_reset_decode_pool()
                 .map_err(|e| anyhow!("Qwen joint decode pool reset: {e}"))?;
-            self.encode_joint_decode(
-                device,
-                registry,
-                layer_weights,
-                output_head,
-                &plan,
-                rows,
-                kv_cache,
-                mode,
-                dense_ffn,
-                options,
-            )
+            encode(device, registry, layer_weights, output_head, &plan)
         });
         pool_operation.complete()?;
         result
     }
 
+    /// Encode and run one joint forward over `packing`. `replay` (MTP
+    /// verify only) retains the multi-row windows' DeltaNet inputs. Returns
+    /// the real rows' outputs and the packed `[width, hidden]`
+    /// post-output-norm rows (a durable allocation).
     #[allow(clippy::too_many_arguments)]
-    fn encode_joint_decode(
+    pub(super) fn encode_joint_decode(
         &self,
         device: &MlxDevice,
         registry: &mut KernelRegistry,
         layer_weights: &[LayerWeightsGpu],
         output_head: &OutputHeadGpu,
         plan: &JointPlan,
-        rows: &[Qwen35JointRow],
+        packing: &JointPacking<'_>,
         kv_cache: &mut HybridKvCache,
-        mode: JointRouteMode,
         dense_ffn: JointDenseFfnRoute,
         options: JointStepOptions,
-    ) -> Result<Vec<Qwen35JointRowOutput>> {
+        mut replay: Option<&mut DeltaNetReplay>,
+    ) -> Result<(Vec<Qwen35JointRowOutput>, MlxBuffer)> {
         let arena_setup =
             crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
         let cfg = &self.cfg;
@@ -388,11 +475,18 @@ impl Qwen35Model {
         let h = hidden_size as usize;
         let eps = cfg.rms_norm_eps;
         let vocab = cfg.vocab_size as usize;
-        let width = joint_padded_width(mode, rows.len());
+        let rows = packing.rows;
+        let width = packing.width;
+        ensure!(
+            (1..=width).contains(&rows.len()) && width <= MAX_JOINT_VERIFY_ROWS,
+            "Qwen joint forward packs {} rows at width {width}",
+            rows.len()
+        );
         let width_u32 = width as u32;
         let slots = rows.iter().map(|row| row.slot_id).collect::<Vec<_>>();
         let joint_rows = JointRows {
             slots: &slots,
+            windows: packing.windows,
             width,
         };
         // Padding rows replay row 0's token and position; their outputs are
@@ -408,13 +502,16 @@ impl Qwen35Model {
             }
         }
         let positions = host_buffer(device, DType::I32, positions.as_slice(), "positions")?;
-        // The forward's actual input manifest (trace on only): one row per
-        // packed slot in matrix order, padding rows owner-less. Its drop at
-        // return closes the forward before the caller's per-lane settle work.
-        let _native_input = crate::inference::native_observation::joint_decode_input(
-            rows.iter().map(|row| (row.slot_id.0, row.position)),
-            width,
-        );
+        // The decode forward's actual input manifest (trace on only): one
+        // row per packed slot in matrix order, padding rows owner-less. Its
+        // drop at return closes the forward before the caller's per-lane
+        // settle work. A verify window has no joint trace role yet.
+        let _native_input = replay.is_none().then(|| {
+            crate::inference::native_observation::joint_decode_input(
+                rows.iter().map(|row| (row.slot_id.0, row.position)),
+                width,
+            )
+        });
         let mut embedded = device
             .alloc_buffer(width * h * 4, DType::F32, vec![width, h])
             .map_err(|e| anyhow!("allocate Qwen joint embeddings: {e}"))?;
@@ -456,8 +553,9 @@ impl Qwen35Model {
         let mut hidden = embedded;
         let mut retained = Vec::with_capacity(n_layers);
         let mut chain: Option<CommandEncoder> = None;
-        // Layer chains only; the output head allocates its outputs as
-        // before.
+        // Layer chains only; the output head stays canonical and allocates
+        // its outputs as before.
+        let projection_scope = JointProjectionScope::enter(options.projection, width_u32);
         let pooled_scope = decode_pool::StepPooledOutputs::enter(options.pooled_outputs);
         for (layer_idx, (weights, routes)) in layer_weights.iter().zip(&plan.layers).enumerate() {
             if let Some(enc) = chain.as_mut() {
@@ -503,6 +601,7 @@ impl Qwen35Model {
                         layer_idx,
                         &joint_rows,
                         cfg,
+                        replay.as_deref_mut(),
                     )
                     .with_context(|| format!("Qwen joint DeltaNet layer {layer_idx}"))?,
                     &attn.post_attn_norm,
@@ -641,6 +740,7 @@ impl Qwen35Model {
             enc.commit_labeled("qwen35.joint_decode.layers.flush");
         }
         drop(pooled_scope);
+        drop(projection_scope);
 
         // ---- Output head: final norm, lm_head, per-row argmax ----
         let mut enc = device
@@ -716,7 +816,7 @@ impl Qwen35Model {
         let argmax_params = host_buffer(device, DType::U32, &[cfg.vocab_size], "argmax params")?;
         let mut argmax = Vec::with_capacity(rows.len());
         for (row, input) in rows.iter().enumerate() {
-            if input.output != Qwen35JointOutput::GreedyToken {
+            if !input.output.wants_argmax() {
                 argmax.push(None);
                 continue;
             }
@@ -763,9 +863,13 @@ impl Qwen35Model {
                             .map_err(|e| anyhow!("read Qwen joint argmax row {row}: {e}"))
                     })
                     .transpose()?;
-                let logits = (input.output != Qwen35JointOutput::GreedyToken)
+                let logits = input
+                    .output
+                    .wants_logits()
                     .then(|| all_logits[row * vocab..(row + 1) * vocab].to_vec());
-                let nextn_hidden = (input.output == Qwen35JointOutput::LogitsAndHidden)
+                let nextn_hidden = input
+                    .output
+                    .wants_hidden()
                     .then(|| nth_hidden_row(&normed, hidden_size, row as u64))
                     .transpose()?;
                 Ok(Qwen35JointRowOutput {
@@ -774,9 +878,9 @@ impl Qwen35Model {
                     nextn_hidden,
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>();
         drop(readback);
-        outputs
+        outputs.map(|outputs| (outputs, normed))
     }
 }
 
@@ -940,6 +1044,190 @@ mod tests {
                         "{gate_up:?}/{down:?} packed m={m} row {row} differs from m=1"
                     );
                 }
+            }
+        }
+    }
+
+    /// Packed width-4 products inside an MMA [`JointProjectionScope`]: each
+    /// row is bitwise the MMA kernel's own result, equals the same row in a
+    /// padded 1-real-row step (row copies in the other slots) and the
+    /// width-1 dispatch, and repeats bitwise. Qwen3.8 K values included.
+    #[test]
+    fn mma_scope_rows_are_cohort_invariant_and_deterministic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let width = 4_usize;
+        let mut seed = 0x51A7_0003_u32;
+        for (ggml_type, n, k) in [
+            (GgmlType::Q4_K, 256_u32, 5120_u32),
+            (GgmlType::Q6_K, 256, 5120),
+            (GgmlType::Q4_K, 128, 17408),
+            (GgmlType::Q6_K, 128, 17408),
+            (GgmlType::Q4_K, 48, 6144),
+        ] {
+            let (nn, kk) = (n as usize, k as usize);
+            let weight = synthetic_blocks(&device, ggml_type, n, k, &mut seed);
+            let rows = random_f32(&mut seed, width * kk);
+            let packed_input = upload_f32(&rows, &device).expect("upload rows");
+            // Padded step for row r: row r first, copies of it after.
+            let padded_inputs: Vec<MlxBuffer> = (0..width)
+                .map(|r| {
+                    let row = &rows[r * kk..(r + 1) * kk];
+                    upload_f32(&row.repeat(width), &device).expect("upload padded")
+                })
+                .collect();
+            let mut enc = device.command_encoder().expect("encoder");
+            let project = |enc: &mut CommandEncoder,
+                           registry: &mut KernelRegistry,
+                           input: &MlxBuffer,
+                           seq: u32| {
+                apply_proj_with_ggml_type(
+                    enc, registry, &device, input, &weight, ggml_type, seq, k, n,
+                )
+                .expect("scoped projection")
+            };
+            let (packed, repeat, padded, singles) = {
+                let _scope =
+                    JointProjectionScope::enter(JointProjectionKernel::ColumnInvariantMma, 4);
+                let packed = project(&mut enc, &mut registry, &packed_input, 4);
+                let repeat = project(&mut enc, &mut registry, &packed_input, 4);
+                let padded: Vec<MlxBuffer> = padded_inputs
+                    .iter()
+                    .map(|input| project(&mut enc, &mut registry, input, 4))
+                    .collect();
+                let _single_scope =
+                    JointProjectionScope::enter(JointProjectionKernel::ColumnInvariantMma, 1);
+                let singles: Vec<MlxBuffer> = (0..width)
+                    .map(|r| {
+                        let input = row_view(&packed_input, r, vec![1, kk]).expect("row view");
+                        project(&mut enc, &mut registry, &input, 1)
+                    })
+                    .collect();
+                (packed, repeat, padded, singles)
+            };
+            let direct = device
+                .alloc_buffer(width * nn * 4, DType::F32, vec![width, nn])
+                .expect("direct output");
+            mlx_native::quantized_matmul_ggml_column_invariant_mma(
+                &mut enc,
+                &mut registry,
+                &device,
+                &packed_input,
+                &weight,
+                &direct,
+                &mlx_native::ops::quantized_matmul_ggml::GgmlQuantizedMatmulParams {
+                    m: 4,
+                    n,
+                    k,
+                    ggml_type,
+                },
+            )
+            .expect("direct MMA");
+            enc.commit_and_wait_labeled("test.qwen.joint.mma_scope")
+                .expect("complete scoped projections");
+            let label = format!("{ggml_type:?} {n}x{k}");
+            let packed = bits(&packed, width * nn);
+            assert_eq!(
+                packed,
+                bits(&direct, width * nn),
+                "{label}: scope did not route to MMA"
+            );
+            assert_eq!(packed, bits(&repeat, width * nn), "{label}: repeat differs");
+            for r in 0..width {
+                let row = &packed[r * nn..(r + 1) * nn];
+                assert_eq!(
+                    row,
+                    &bits(&padded[r], nn)[..],
+                    "{label}: row {r} differs when padded"
+                );
+                assert_eq!(
+                    row,
+                    &bits(&singles[r], nn)[..],
+                    "{label}: row {r} differs from m=1"
+                );
+            }
+        }
+    }
+
+    /// The shared-weights dense FFN inside an MMA scope: every packed row is
+    /// bitwise the 1-row FFN of that row (joint ≡ per-slot by construction).
+    #[test]
+    fn mma_scope_shared_dense_ffn_matches_per_row_bitwise() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (hidden, intermediate) = (512_u32, 1024_u32);
+        let h = hidden as usize;
+        let m = 4_usize;
+        let mut seed = 0x51A7_0004_u32;
+        for down in [GgmlType::Q4_K, GgmlType::Q6_K] {
+            let weights = DenseFfnWeightsGpuQ {
+                gate_q: synthetic_blocks(&device, GgmlType::Q4_K, intermediate, hidden, &mut seed),
+                up_q: synthetic_blocks(&device, GgmlType::Q4_K, intermediate, hidden, &mut seed),
+                down_q: synthetic_blocks(&device, down, hidden, intermediate, &mut seed),
+                ggml_type_gate_up: GgmlType::Q4_K,
+                ggml_type_down: down,
+                intermediate_size: intermediate,
+                hidden_size: hidden,
+            };
+            let x = upload_f32(&random_f32(&mut seed, m * h), &device)
+                .expect("upload x")
+                .with_shape(vec![m, h])
+                .expect("shape x");
+            let residual = upload_f32(&random_f32(&mut seed, m * h), &device)
+                .expect("upload residual")
+                .with_shape(vec![m, h])
+                .expect("shape residual");
+            let mut enc = device.command_encoder().expect("encoder");
+            let packed = {
+                let _scope =
+                    JointProjectionScope::enter(JointProjectionKernel::ColumnInvariantMma, 4);
+                build_dense_ffn_layer_gpu_q_into_with_gate_up(
+                    &mut enc,
+                    &device,
+                    &mut registry,
+                    &x,
+                    &weights,
+                    Some(&residual),
+                    DenseGateUpDispatch::Separate,
+                )
+                .expect("packed dense FFN")
+            };
+            let per_row: Vec<MlxBuffer> = {
+                let _scope =
+                    JointProjectionScope::enter(JointProjectionKernel::ColumnInvariantMma, 1);
+                (0..m)
+                    .map(|row| {
+                        enc.memory_barrier();
+                        build_dense_ffn_layer_gpu_q_into_with_gate_up(
+                            &mut enc,
+                            &device,
+                            &mut registry,
+                            &row_view(&x, row, vec![1, h]).expect("x row"),
+                            &weights,
+                            Some(&row_view(&residual, row, vec![1, h]).expect("residual row")),
+                            DenseGateUpDispatch::Separate,
+                        )
+                        .expect("per-row dense FFN")
+                    })
+                    .collect()
+            };
+            enc.commit_and_wait_labeled("test.qwen.joint.mma_dense_ffn")
+                .expect("complete dense FFN");
+            let packed = bits(&packed, m * h);
+            for (row, output) in per_row.iter().enumerate() {
+                assert_eq!(
+                    &packed[row * h..(row + 1) * h],
+                    bits(output, h).as_slice(),
+                    "Q4_K/{down:?} MMA packed row {row} differs from m=1"
+                );
             }
         }
     }

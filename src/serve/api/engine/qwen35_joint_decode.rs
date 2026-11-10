@@ -25,8 +25,12 @@ use crate::inference::models::qwen35::joint_decode_routes::{
     joint_decode_env_unavailable_reason, joint_ffn_shared_from_process, joint_mode_max_rows,
     select_dense_ffn_route, JointDenseFfnRoute, JointRouteMode, MAX_JOINT_DECODE_ROWS,
 };
+use crate::inference::models::qwen35::joint_projection::{
+    select_joint_projection_kernel, JointProjectionKernel, QWEN_JOINT_MMA_ENV,
+};
 use crate::inference::models::qwen35::joint_step_options::{
-    switch_from_process, JointStepOptions, QWEN_JOINT_POOLED_OUTPUTS_ENV,
+    parse_switch, switch_from_process, JointStepOptions, QWEN_JOINT_MTP_ENV,
+    QWEN_JOINT_POOLED_OUTPUTS_ENV,
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::serve::api::engine_qwen35::{
@@ -41,6 +45,10 @@ use super::{
     InflightBatchedScheduler, PromptCache, Qwen35FatalFailure, Qwen35FatalReply, Qwen35KvGuard,
     Qwen35RetainedPrefix, Qwen35Slot, Qwen35SlotWork, Qwen35WorkerFatalKind, SlotHandle,
 };
+
+/// The joint MTP verify turn (`HF2Q_QWEN_JOINT_MTP`).
+#[path = "qwen35_joint_mtp.rs"]
+mod joint_mtp;
 
 /// Kill switch for A/B measurement: `1`/`on`/`true` selects joint decode,
 /// `0`/`off`/`false` keeps the serial per-slot turn. Unset selects joint
@@ -79,6 +87,13 @@ pub(super) struct Qwen35JointDecodeConfig {
     pub solo: bool,
     /// Per-step options; their switches are read here, once.
     pub step: JointStepOptions,
+    /// `HF2Q_QWEN_JOINT_MTP`: speculating lanes verify their MTP drafts as
+    /// windows of a joint step (`forward_gpu_joint_verify`) instead of the
+    /// serial K3 round. In padded mode the same switch selects the
+    /// column-invariant projection unless its diagnostic override is explicit.
+    /// Default on for dense artifacts with an MTP head; explicit false is the
+    /// kill switch. MoE and artifacts without MTP remain off by default.
+    pub joint_mtp: bool,
 }
 
 /// `Ok(None)` when unset, so the caller applies the default (on).
@@ -123,9 +138,33 @@ fn parse_qwen_joint_solo(raw: Option<&str>) -> Result<bool, String> {
     }
 }
 
+/// The measured joint MTP+MMA candidate is the dense-MTP default. An explicit
+/// value remains the production kill switch.
+fn parse_qwen_joint_mtp(raw: Option<&str>, default: bool) -> Result<bool, String> {
+    if raw.map(str::trim).filter(|raw| !raw.is_empty()).is_none() {
+        return Ok(default);
+    }
+    parse_switch(QWEN_JOINT_MTP_ENV, raw)
+}
+
+/// Joint MTP and the column-invariant projection form one measured candidate.
+/// An explicit MMA value remains a diagnostic override; otherwise MTP selects
+/// MMA in padded mode and the route selector keeps exact mode canonical.
+fn parse_qwen_joint_mma(raw: Option<&str>, joint_mtp: bool) -> Result<bool, String> {
+    if raw.map(str::trim).filter(|raw| !raw.is_empty()).is_none() {
+        return Ok(joint_mtp);
+    }
+    parse_switch(QWEN_JOINT_MMA_ENV, raw)
+}
+
 /// `solo` applies only to the padded mode on a worker with at least two
 /// slots: exact-mode joint rows equal serial rows bitwise, and a one-slot
-/// worker (N1) never shares a turn.
+/// worker (N1) never shares a turn. `requested_step` holds the switches;
+/// the column-invariant MMA projection applies only to the padded mode.
+/// `joint_mtp` needs a lone lane to be able to run as a one-lane joint step
+/// whose row equals the spec-off row: exact mode (joint ≡ serial), or the
+/// padded mode with the solo route.
+#[allow(clippy::too_many_arguments)]
 fn select_qwen_joint_decode(
     requested: bool,
     max_rows: usize,
@@ -133,16 +172,27 @@ fn select_qwen_joint_decode(
     ffn_shared: bool,
     solo_requested: bool,
     n_slots: usize,
-    pooled_outputs: bool,
+    requested_step: JointStepOptions,
+    joint_mtp: bool,
 ) -> Option<Qwen35JointDecodeConfig> {
     match (requested, mode) {
-        (true, Ok(mode)) => Some(Qwen35JointDecodeConfig {
-            max_rows: joint_mode_max_rows(mode, max_rows),
-            mode,
-            dense_ffn: select_dense_ffn_route(mode, ffn_shared),
-            solo: solo_requested && mode == JointRouteMode::PaddedMvExt && n_slots >= 2,
-            step: JointStepOptions { pooled_outputs },
-        }),
+        (true, Ok(mode)) => {
+            let solo = solo_requested && mode == JointRouteMode::PaddedMvExt && n_slots >= 2;
+            Some(Qwen35JointDecodeConfig {
+                max_rows: joint_mode_max_rows(mode, max_rows),
+                mode,
+                dense_ffn: select_dense_ffn_route(mode, ffn_shared),
+                solo,
+                step: JointStepOptions {
+                    projection: select_joint_projection_kernel(
+                        mode,
+                        requested_step.projection == JointProjectionKernel::ColumnInvariantMma,
+                    ),
+                    pooled_outputs: requested_step.pooled_outputs,
+                },
+                joint_mtp: joint_mtp && (mode == JointRouteMode::Exact || solo),
+            })
+        }
         _ => None,
     }
 }
@@ -193,15 +243,36 @@ pub(super) fn qwen35_joint_decode_config(
         tracing::warn!(error, fallback = true, "invalid Qwen joint solo switch");
         true
     });
-    let pooled_outputs =
-        switch_from_process(QWEN_JOINT_POOLED_OUTPUTS_ENV).unwrap_or_else(|error| {
+    let switch = |name: &str, label: &str| {
+        switch_from_process(name).unwrap_or_else(|error| {
+            tracing::warn!(error, fallback = false, "invalid Qwen joint {label} switch");
+            false
+        })
+    };
+    let joint_mtp_default = !moe && model.mtp.is_some();
+    let raw_mtp = std::env::var(QWEN_JOINT_MTP_ENV).ok();
+    let joint_mtp =
+        parse_qwen_joint_mtp(raw_mtp.as_deref(), joint_mtp_default).unwrap_or_else(|error| {
             tracing::warn!(
                 error,
-                fallback = false,
-                "invalid Qwen joint pooled outputs switch"
+                fallback = joint_mtp_default,
+                "invalid Qwen joint MTP verify switch"
             );
-            false
+            joint_mtp_default
         });
+    let raw_mma = std::env::var(QWEN_JOINT_MMA_ENV).ok();
+    let mma = parse_qwen_joint_mma(raw_mma.as_deref(), joint_mtp).unwrap_or_else(|error| {
+        tracing::warn!(error, fallback = joint_mtp, "invalid Qwen joint MMA switch");
+        joint_mtp
+    });
+    let requested_step = JointStepOptions {
+        projection: if mma {
+            JointProjectionKernel::ColumnInvariantMma
+        } else {
+            JointProjectionKernel::Canonical
+        },
+        pooled_outputs: switch(QWEN_JOINT_POOLED_OUTPUTS_ENV, "pooled outputs"),
+    };
     let selected = select_qwen_joint_decode(
         requested,
         max_rows,
@@ -209,7 +280,8 @@ pub(super) fn qwen35_joint_decode_config(
         ffn_shared,
         solo_requested,
         n_slots,
-        pooled_outputs,
+        requested_step,
+        joint_mtp,
     );
     tracing::info!(
         target: "hf2q::serve::api::engine_qwen35::progress",
@@ -224,7 +296,11 @@ pub(super) fn qwen35_joint_decode_config(
         mode = selected.map_or("serial", |config| config.mode.label()),
         dense_ffn = selected.map_or("serial", |config| config.dense_ffn.label()),
         solo = selected.is_some_and(|config| config.solo),
+        column_invariant_mma = selected.is_some_and(|config| {
+            config.step.projection == JointProjectionKernel::ColumnInvariantMma
+        }),
         pooled_outputs = selected.is_some_and(|config| config.step.pooled_outputs),
+        joint_mtp = selected.is_some_and(|config| config.joint_mtp),
         unavailable = unavailable.as_deref().unwrap_or("none"),
         "Qwen joint decode configuration"
     );
@@ -509,7 +585,11 @@ pub(super) fn run_qwen35_joint_decode(
     let mut ready = 0usize;
     let Some(JointPartition { groups, mut serial }) = ({
         let kv = guard.kv.as_ref().expect("kv Some during loop");
-        partition_qwen35_joint_lanes(handles, config.max_rows, config.solo, |handle| {
+        // Joint MTP: every joint-ready lane joins (a speculating lane as a
+        // window), a lone one included, so no request ever runs a serial
+        // speculation round.
+        let solo = config.solo || config.joint_mtp;
+        partition_qwen35_joint_lanes(handles, config.max_rows, solo, |handle| {
             let Some((Qwen35SlotWork::Decode(state), reply, installed)) = slots
                 .get(handle.slot_id.0 as usize)
                 .and_then(Option::as_ref)
@@ -529,7 +609,11 @@ pub(super) fn run_qwen35_joint_decode(
                 refusals.push(reason);
                 return None;
             }
-            let class = state.joint_lane_class();
+            let class = if config.joint_mtp {
+                Some(true)
+            } else {
+                state.joint_lane_class()
+            };
             if class.is_some() {
                 ready += 1;
             } else {
@@ -555,7 +639,12 @@ pub(super) fn run_qwen35_joint_decode(
             serial.extend(groups.by_ref().flatten());
             break;
         }
-        if let Some(fatal) = run_qwen35_joint_group(
+        let run = if config.joint_mtp {
+            joint_mtp::run_qwen35_joint_mtp_group
+        } else {
+            run_qwen35_joint_group
+        };
+        if let Some(fatal) = run(
             guard,
             scheduler,
             slots,
@@ -576,6 +665,39 @@ pub(super) fn run_qwen35_joint_decode(
     Qwen35JointRun::Ran { serial }
 }
 
+/// Take `group`'s decode lanes out of `slots` (every lane installed with its
+/// scheduled handle), or put everything back and fail.
+fn take_joint_lanes(
+    slots: &mut [Option<Qwen35Slot>],
+    group: Vec<SlotHandle>,
+) -> Result<Vec<JointLane>, Box<Qwen35FatalFailure>> {
+    let mut lanes = Vec::with_capacity(group.len());
+    for handle in group {
+        let index = handle.slot_id.0 as usize;
+        match slots[index].take() {
+            Some((Qwen35SlotWork::Decode(state), reply, installed)) if installed == handle => {
+                lanes.push(JointLane {
+                    handle,
+                    reply,
+                    state,
+                    tick: None,
+                });
+            }
+            other => {
+                slots[index] = other;
+                reinstall_lanes(slots, lanes);
+                return Err(Box::new(Qwen35FatalFailure {
+                    handle: Some(handle),
+                    reply: Qwen35FatalReply::None,
+                    error: anyhow::anyhow!("Qwen joint decode lane changed before execution"),
+                    kind: Qwen35WorkerFatalKind::Invariant,
+                }));
+            }
+        }
+    }
+    Ok(lanes)
+}
+
 /// One joint step over `group` (sorted by slot, 1..=`max_rows` lanes), then
 /// settle each lane with the serial path's slot semantics.
 #[allow(clippy::too_many_arguments)]
@@ -594,30 +716,10 @@ fn run_qwen35_joint_group(
     config: Qwen35JointDecodeConfig,
     supervisor: &EngineSupervisor,
 ) -> Option<Qwen35FatalFailure> {
-    let mut lanes = Vec::with_capacity(group.len());
-    for handle in group {
-        let index = handle.slot_id.0 as usize;
-        match slots[index].take() {
-            Some((Qwen35SlotWork::Decode(state), reply, installed)) if installed == handle => {
-                lanes.push(JointLane {
-                    handle,
-                    reply,
-                    state,
-                    tick: None,
-                });
-            }
-            other => {
-                slots[index] = other;
-                reinstall_lanes(slots, lanes);
-                return Some(Qwen35FatalFailure {
-                    handle: Some(handle),
-                    reply: Qwen35FatalReply::None,
-                    error: anyhow::anyhow!("Qwen joint decode lane changed before execution"),
-                    kind: Qwen35WorkerFatalKind::Invariant,
-                });
-            }
-        }
-    }
+    let mut lanes = match take_joint_lanes(slots, group) {
+        Ok(lanes) => lanes,
+        Err(fatal) => return Some(*fatal),
+    };
 
     let _stage_round =
         crate::inference::stage_profile::Round::begin("qwen35", "joint", lanes.len());
@@ -818,6 +920,27 @@ mod tests {
     }
 
     #[test]
+    fn joint_mtp_defaults_only_for_eligible_dense_models() {
+        assert_eq!(parse_qwen_joint_mtp(None, true), Ok(true));
+        assert_eq!(parse_qwen_joint_mtp(Some(" "), true), Ok(true));
+        assert_eq!(parse_qwen_joint_mtp(None, false), Ok(false));
+        assert_eq!(parse_qwen_joint_mtp(Some("0"), true), Ok(false));
+        assert_eq!(parse_qwen_joint_mtp(Some("1"), false), Ok(true));
+        assert!(parse_qwen_joint_mtp(Some("mtp"), true).is_err());
+    }
+
+    #[test]
+    fn joint_mtp_selects_mma_unless_explicitly_overridden() {
+        assert_eq!(parse_qwen_joint_mma(None, false), Ok(false));
+        assert_eq!(parse_qwen_joint_mma(Some(" "), false), Ok(false));
+        assert_eq!(parse_qwen_joint_mma(None, true), Ok(true));
+        assert_eq!(parse_qwen_joint_mma(Some(" "), true), Ok(true));
+        assert_eq!(parse_qwen_joint_mma(Some("0"), true), Ok(false));
+        assert_eq!(parse_qwen_joint_mma(Some("1"), false), Ok(true));
+        assert!(parse_qwen_joint_mma(Some("mma"), true).is_err());
+    }
+
+    #[test]
     fn joint_width_defaults_to_four_and_accepts_two_through_eight() {
         assert_eq!(parse_qwen_joint_decode_max_rows(None), Ok(4));
         assert_eq!(parse_qwen_joint_decode_max_rows(Some(" ")), Ok(4));
@@ -834,16 +957,28 @@ mod tests {
 
     #[test]
     fn refused_artifacts_and_disabled_switch_keep_serial_decode() {
+        let pooled = JointStepOptions {
+            pooled_outputs: true,
+            ..JointStepOptions::default()
+        };
         assert_eq!(
-            select_qwen_joint_decode(true, 4, Ok(JointRouteMode::Exact), true, true, 4, true),
+            select_qwen_joint_decode(
+                true,
+                4,
+                Ok(JointRouteMode::Exact),
+                true,
+                true,
+                4,
+                pooled,
+                true
+            ),
             Some(Qwen35JointDecodeConfig {
                 max_rows: 4,
                 mode: JointRouteMode::Exact,
                 dense_ffn: JointDenseFfnRoute::SerialBuilder,
                 solo: false,
-                step: JointStepOptions {
-                    pooled_outputs: true
-                },
+                step: pooled,
+                joint_mtp: true,
             })
         );
         assert_eq!(
@@ -854,7 +989,8 @@ mod tests {
                 true,
                 true,
                 4,
-                false
+                JointStepOptions::default(),
+                true
             ),
             None
         );
@@ -866,9 +1002,32 @@ mod tests {
                 true,
                 true,
                 4,
-                false
+                JointStepOptions::default(),
+                true
             ),
             None
+        );
+    }
+
+    #[test]
+    fn mma_projection_is_padded_mode_only() {
+        let mma = JointStepOptions {
+            projection: JointProjectionKernel::ColumnInvariantMma,
+            ..JointStepOptions::default()
+        };
+        let projection = |mode| {
+            select_qwen_joint_decode(true, 4, Ok(mode), true, true, 4, mma, false)
+                .expect("admitted mode")
+                .step
+                .projection
+        };
+        assert_eq!(
+            projection(JointRouteMode::PaddedMvExt),
+            JointProjectionKernel::ColumnInvariantMma
+        );
+        assert_eq!(
+            projection(JointRouteMode::Exact),
+            JointProjectionKernel::Canonical
         );
     }
 
@@ -882,6 +1041,7 @@ mod tests {
                 true,
                 true,
                 4,
+                JointStepOptions::default(),
                 false,
             )
             .expect("admitted padded mode");
@@ -893,6 +1053,7 @@ mod tests {
                 true,
                 true,
                 4,
+                JointStepOptions::default(),
                 false,
             )
             .expect("admitted exact mode");
@@ -900,12 +1061,47 @@ mod tests {
         }
     }
 
+    /// The joint MTP route needs a lone lane to run as a joint step: exact
+    /// mode, or the padded mode with the solo route.
+    #[test]
+    fn joint_mtp_requires_a_lone_lane_joint_route() {
+        let joint_mtp = |mode, solo_requested, n_slots, requested| {
+            select_qwen_joint_decode(
+                true,
+                4,
+                Ok(mode),
+                true,
+                solo_requested,
+                n_slots,
+                JointStepOptions::default(),
+                requested,
+            )
+            .expect("admitted mode")
+            .joint_mtp
+        };
+        assert!(joint_mtp(JointRouteMode::PaddedMvExt, true, 4, true));
+        assert!(joint_mtp(JointRouteMode::Exact, false, 4, true));
+        assert!(!joint_mtp(JointRouteMode::PaddedMvExt, false, 4, true));
+        assert!(!joint_mtp(JointRouteMode::PaddedMvExt, true, 1, true));
+        assert!(!joint_mtp(JointRouteMode::PaddedMvExt, true, 4, false));
+        assert!(!joint_mtp(JointRouteMode::Exact, true, 4, false));
+    }
+
     #[test]
     fn solo_route_is_padded_mode_on_multi_slot_workers_only() {
         let solo = |mode, solo_requested, n_slots| {
-            select_qwen_joint_decode(true, 4, Ok(mode), true, solo_requested, n_slots, false)
-                .expect("admitted mode")
-                .solo
+            select_qwen_joint_decode(
+                true,
+                4,
+                Ok(mode),
+                true,
+                solo_requested,
+                n_slots,
+                JointStepOptions::default(),
+                false,
+            )
+            .expect("admitted mode")
+            .solo
         };
         for n_slots in 2..=8 {
             assert!(solo(JointRouteMode::PaddedMvExt, true, n_slots));
