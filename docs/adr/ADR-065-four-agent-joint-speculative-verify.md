@@ -1,8 +1,9 @@
 # ADR-065: Four-agent joint speculative verify and multi-slot decode
 
-- **Status:** Accepted
+- **Status:** Accepted; amended by ADR-067 for the family-neutral DFlash2 successor
 - **Date:** 2026-10-31
 - **Updated:** 2026-11-03 (later) — operator design approvals for J1 (#512), P4a (#526) and P4b (#527): P4a delivers through existing primitives (path A, no release); P4b defaults on only for dense Qwen3.8 on a Win or Equivalent with the stated conditions, Qwen3.6 unchanged; J1/P4b runtime-metallib evidence depends on the runtime-registry fix `4e32003`, released alone in mlx-native 0.15.17 (see "Design approvals"). Earlier 2026-11-03 — operator decision on B1 fairness (B1 review finding 3): fairness is ADR-063 Q3's block-paired regression test (fail only if the lower bound of the B/A interval, as a ratio, exceeds 1.025 on worst-slot p95 semantic TTFT or worst-slot maximum semantic SSE gap); the frozen worst-ever baseline ceilings survive only as a 1.5× per-run, per-slot safety cap, set from `CalibrationPass`, thermal-valid baseline runs; campaign completeness and the `n1` control are explicit acceptance gates (see "Measurement and acceptance rules"). Earlier 2026-11-01 — accepted by the owner; execution waits for the ADR-063 v0.1.28 milestone to complete.
+- **Amended:** 2026-11-10 — ADR-067 is the explicit exception to this ADR's bounded no-new-drafter scope. It may add the family-neutral DFlash2 runtime, per-family adapters, published native primitives and source-bound checkpoint training/export work under its D0-D6 gates. J1-J5 and every result already recorded here remain unchanged controls.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speculation, joint-decode, speed
 - **Depends on:** ADR-063
@@ -61,9 +62,9 @@ TensorFold also records losses this program will not repeat (`docs/recipes/addin
 
 ### Global acceptance and exclusions
 
-The program MUST keep exact-transaction speculation inside the four-agent joint step for Qwen3.8-27B and make per-slot work multi-slot where measurement shows it pays, improving four-agent makespan over the phase-1 default without per-slot quality or fairness regression. DeepSeek-V4 and Gemma 4 receive only work their own traces justify, under the numeric decision rules of their stories.
+The original program MUST keep exact-transaction speculation inside the four-agent joint step for Qwen3.8-27B and make per-slot work multi-slot where measurement shows it pays, improving four-agent makespan over the phase-1 default without per-slot quality or fairness regression. DeepSeek-V4 and Gemma 4 receive only work their own traces justify under this ADR. ADR-067 separately owns the cross-family DFlash2 successor and consumes this joint verifier as Qwen's semantic control.
 
-The program MUST preserve every ADR-063 global acceptance rule and exclusion: Rust-owned inference, OpenAI unary/SSE and native tool semantics, conversation isolation, Q5 per-family calibrated admission, one hf2q process at a time with peers unloaded, distinct candidate authors and independent reviewers, and the native publication rule. It MUST NOT introduce approximate recurrent or non-prefix reuse, ANE offload, distributed Macs, custom training, Python or vendor production paths, new drafter architectures, tree drafting, grafted-lane joint verify, or Qwen3.6 default changes.
+The program MUST preserve every ADR-063 global acceptance rule and exclusion: Rust-owned inference, OpenAI unary/SSE and native tool semantics, conversation isolation, Q5 per-family calibrated admission, one hf2q process at a time with peers unloaded, distinct candidate authors and independent reviewers, and the native publication rule. It MUST NOT introduce approximate recurrent or non-prefix reuse, ANE offload, distributed Macs, Python or vendor production paths, grafted-lane joint verify, or unrelated Qwen3.6 default changes. New drafter architecture, checkpoint training/export and family adapters are allowed only through ADR-067's explicit provenance, exactness and D0-D6 contract; this does not reopen tree drafting or any other excluded J4 mechanism.
 
 A negative or inconclusive measurement is recorded evidence, never a shipped feature. No TensorFold figure is an acceptance receipt.
 
