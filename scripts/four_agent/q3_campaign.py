@@ -15,9 +15,10 @@ re-checked before every run; any change halts the campaign for good.
 
 Each workload stage (n4 primary pure-phase, then the n1 and 3+1/2+2/1+3 controls) runs
 one discarded warmup per arm per driver session, then Williams-ordered blocks: at least 5,
-at most 20, stopping once the 95% half-width of every required experiment contrast is
-<= 2.5 points. Writes campaign.json and verdict.json. Design, estimator, verdict rules
-and root commands: docs/research/adr063-q3-campaign.md.
+at most 20 by default or 40 when the campaign predeclares the approved precision extension,
+stopping once the 95% half-width of every required experiment contrast is <= 2.5 points.
+Writes campaign.json and verdict.json. Design, estimator, verdict rules and root commands:
+docs/research/adr063-q3-campaign.md.
 --controls-of runs control stages only, as controls of a primary verdict of record (#369
 amendment): its family and arm identities must match that campaign's frozen ones.
 --no-stock-arm runs without the stock arm (ADR-063 Q4-DS4-RACE decision D1): either with --stock-record, binding a
@@ -297,7 +298,7 @@ def build_plan(args, environ, family):
             "design": {"metric": "client summary own_output_four_task_makespan_seconds",
                        "estimator": "mean of per-block ln(experiment/reference), 95% t interval over complete blocks",
                        "blocks": "Williams sequences over the measured arms", "min_blocks": q3_stats.MIN_BLOCKS,
-                       "max_blocks": q3_stats.MAX_BLOCKS, "half_width_pp": q3_stats.HALF_WIDTH_PP,
+                       "max_blocks": args.max_blocks, "half_width_pp": q3_stats.HALF_WIDTH_PP,
                        "stock_margin_ratio": q3_stats.STOCK_MARGIN,
                        "peer_margin_ratio": q3_stats.PEER_PARITY,
                        "fairness_neutral_ratio": q3_stats.NEUTRAL_RATIO,
@@ -325,11 +326,12 @@ def build_plan(args, environ, family):
 
 
 def schedule_preview(plan):
+    max_blocks = plan["design"]["max_blocks"]
     return {key: {"phase_plan": WORKLOADS[key], "warmup_order": q3_stats.block_order(q3_report.stage_arms(plan, key), 1),
                   "blocks": [{"block": b, "order": q3_stats.block_order(q3_report.stage_arms(plan, key), b)}
-                             for b in range(1, q3_stats.MAX_BLOCKS + 1)],
+                             for b in range(1, max_blocks + 1)],
                   "stop": f"after block >= {q3_stats.MIN_BLOCKS} when every required contrast has 95% half-width "
-                          f"<= {q3_stats.HALF_WIDTH_PP} points; inconclusive at {q3_stats.MAX_BLOCKS}"}
+                          f"<= {q3_stats.HALF_WIDTH_PP} points; inconclusive at {max_blocks}"}
             for key in plan["workloads"]}
 
 
@@ -462,7 +464,8 @@ class Driver:
         elif not stage["blocks"] or not q3_report.block_complete(stage["blocks"][-1]):
             return False
         else:
-            reason = q3_stats.stop_decision(len(stage["blocks"]), required)
+            reason = q3_stats.stop_decision(
+                len(stage["blocks"]), required, max_blocks=self.plan["design"]["max_blocks"])
         if reason is not None:
             stage.update(status="Complete", stop={"reason": reason, "blocks": len(stage["blocks"])})
             self.save()
@@ -641,6 +644,10 @@ def parse_args(argv):
                             help=f"HF2Q_Q5_<NAME> override for the {arm} arm only (repeatable)")
     parser.add_argument("--workloads", default=",".join(WORKLOADS),
                         help="stages in order; n4 (primary) first, or control keys only with --controls-of")
+    parser.add_argument("--max-blocks", type=int, choices=(q3_stats.MAX_BLOCKS, q3_stats.MAX_SUPPORTED_BLOCKS),
+                        default=q3_stats.MAX_BLOCKS,
+                        help="predeclared sequential precision cap: 20 by default; 40 uses the approved fresh-campaign "
+                             "precision extension and is frozen in campaign.json")
     parser.add_argument("--controls-of", type=Path, metavar="PRIMARY_VERDICT_JSON",
                         help="controls-only campaign (#369 amendment): run control stages only, as controls of this "
                              "Q3 verdict.json of record; family and arm identities must match its campaign")

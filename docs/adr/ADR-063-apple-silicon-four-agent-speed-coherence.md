@@ -106,7 +106,7 @@ Acceptance:
 
 - Report semantic TTFT p50/p95/max per slot, maximum semantic SSE gap, four-agent makespan, successful-task goodput, new/cached tokens, prefill/decode rates, queue/restore/draft/verify time, peak RSS and thermal state.
 
-- Use warmup and at least five balanced paired blocks, then a predeclared 95% confidence-interval half-width target of 2.5 percentage points for the primary effect, with a maximum of 20 blocks per primary comparison; unresolved results are inconclusive, never a win.
+- Use warmup and at least five balanced paired blocks, then a predeclared 95% confidence-interval half-width target of 2.5 percentage points for the primary effect, with a default maximum of 20 blocks per primary comparison. A fresh campaign may predeclare the approved 40-block precision extension in Q4 after an earlier 20-block campaign exhausted its cap solely on precision; unresolved results are inconclusive, never a win.
 
 - Measure mixed prefill/decode populations 3+1, 2+2 and 1+3, plus pure four-prefill and four-decode controls; trace active/runnable slots and actual physical cohort membership. Overlapping queued HTTP requests alone do not prove concurrency.
 
@@ -496,7 +496,7 @@ Acceptance:
 
 - Freeze three primary arms at run start: current unmodified hf2q, experimental hf2q based on that exact baseline, and latest upstream peer; retain immutable source/binary identities for all runs.
 
-- Use balanced interleaved three-arm crossover blocks, warmup and stock controls; target a predeclared 95% effect-interval half-width <=2.5 percentage points, minimum five and maximum twenty blocks. An unresolved interval means inconclusive, not faster.
+- Use balanced interleaved three-arm crossover blocks, warmup and stock controls; target a predeclared 95% effect-interval half-width <=2.5 percentage points, minimum five and maximum twenty blocks by default. A fresh campaign may predeclare the Q4 40-block precision extension; it never pools an exhausted campaign. An unresolved interval means inconclusive, not faster.
 
 - Report experiment-versus-stock and experiment-versus-latest-peer effects separately for one-slot controls and primary four-slot agentic workloads, including mixed 3+1/2+2/1+3 and pure-phase controls.
 
@@ -527,7 +527,9 @@ Requirement: The program MUST explain, per family, where hf2q loses time against
 
 Acceptance:
 
-- Q4 release pass = `scripts/four_agent/q3_stats.py` `family_verdict` == `Win` under the v0.1.30 thresholds: the candidate/v0.1.29 four-agent makespan ratio has a 95% CI upper bound ≤ 0.95 (`STOCK_MARGIN`), and the candidate/peer ratio, peer in its best valid configuration, has a 95% CI upper bound ≤ 1.00 (`PEER_PARITY`), under the Q3 Williams-block design (5–20 blocks). The stock arm is the published v0.1.29 commit `c40fbf37bc2bc24cebd2c57faa60891debd1179a`; an older baseline cannot satisfy the release gate. Qwen3.6's candidate/Splash ratio must also have a CI upper bound ≤ 1.00. Qwen3.8 requires peer parity plus ADR-067 D0-D6 and at least 5.304 accepted-plus-bonus tokens per lane-cycle on the matched quality-passing workload; the harness must render this operator-rescoped verdict without treating failed Splash output as a denominator. `Win` remains the receipt-schema label, but for v0.1.30 it means 5% faster than prior hf2q plus peer non-inferiority, not 5% faster than a peer.
+- Q4 release pass = `scripts/four_agent/q3_stats.py` `family_verdict` == `Win` under the v0.1.30 thresholds: the candidate/v0.1.29 four-agent makespan ratio has a 95% CI upper bound ≤ 0.95 (`STOCK_MARGIN`), and the candidate/peer ratio, peer in its best valid configuration, has a 95% CI upper bound ≤ 1.00 (`PEER_PARITY`), under the Q3 Williams-block design (5–20 blocks by default, or 5–40 when a fresh campaign predeclares the precision extension below). The stock arm is the published v0.1.29 commit `c40fbf37bc2bc24cebd2c57faa60891debd1179a`; an older baseline cannot satisfy the release gate. Qwen3.6's candidate/Splash ratio must also have a CI upper bound ≤ 1.00. Qwen3.8 requires peer parity plus ADR-067 D0-D6 and at least 5.304 accepted-plus-bonus tokens per lane-cycle on the matched quality-passing workload; the harness must render this operator-rescoped verdict without treating failed Splash output as a denominator. `Win` remains the receipt-schema label, but for v0.1.30 it means 5% faster than prior hf2q plus peer non-inferiority, not 5% faster than a peer.
+
+- Precision-cap amendment (execution decision, 2026-11-10): `--max-blocks 40` is allowed only when frozen in a new campaign plan after a completed 20-block campaign exhausted its cap solely because a required contrast missed the unchanged 2.5-point half-width. The new campaign uses new immutable receipts and never pools the exhausted campaign; Williams ordering, the minimum, estimator, thresholds and all non-performance gates remain unchanged. The trigger was `q4-gemma-release-gate-27a9ddc4-v2`: candidate/peer ratio 0.9153, 95% CI [0.8864, 0.9450], but half-width 3.254 points at block 20, so that campaign remains `Inconclusive`.
 
 - The paired task-quality gates on the exact candidate binary pass against v0.1.29 and against the peer (against the native ds4 arm where the same-GGUF peer is unavailable), and for Qwen3.6 also against Splash, and all deterministic task/tool/isolation gates pass. Qwen3.8's failed Splash outputs remain a quality finding, not a candidate quality comparator.
 

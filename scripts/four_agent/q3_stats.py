@@ -8,6 +8,7 @@ import statistics
 
 MIN_BLOCKS = 5
 MAX_BLOCKS = 20
+MAX_SUPPORTED_BLOCKS = 40
 HALF_WIDTH_PP = 2.5          # target 95% half-width, percentage points of the arm ratio
 LEGACY_STOCK_MARGIN = 1.0    # Q3: any demonstrated gain over v0.1.28 stock
 LEGACY_PEER_MARGIN = 0.95    # original Q4: at least 5% lower makespan than the peer
@@ -16,10 +17,13 @@ PEER_PARITY = 1.0            # v0.1.30: statistically no slower than every valid
 NEUTRAL_RATIO = 1.025        # fairness regression band (the F2 2.5-point neutral band)
 # Stop reason of a no-stock stage (--no-stock-arm) whose only contrast (the peer) became unavailable or failed.
 NO_CONTRAST = "no_contrast"
-# Two-sided 95% Student t quantiles, df = complete blocks - 1 (blocks <= 20).
+# Two-sided 95% Student t quantiles, df = complete blocks - 1.
 T975 = {1: 12.7062, 2: 4.3027, 3: 3.1824, 4: 2.7764, 5: 2.5706, 6: 2.4469, 7: 2.3646, 8: 2.3060,
         9: 2.2622, 10: 2.2281, 11: 2.2010, 12: 2.1788, 13: 2.1604, 14: 2.1448, 15: 2.1314,
-        16: 2.1199, 17: 2.1098, 18: 2.1009, 19: 2.0930}
+        16: 2.1199, 17: 2.1098, 18: 2.1009, 19: 2.0930, 20: 2.0860, 21: 2.0796, 22: 2.0739,
+        23: 2.0687, 24: 2.0639, 25: 2.0595, 26: 2.0555, 27: 2.0518, 28: 2.0484, 29: 2.0452,
+        30: 2.0423, 31: 2.0395, 32: 2.0369, 33: 2.0345, 34: 2.0322, 35: 2.0301, 36: 2.0281,
+        37: 2.0262, 38: 2.0244, 39: 2.0227}
 
 
 def williams(t):
@@ -77,11 +81,13 @@ def precise(effect):
             and effect["half_width_pp"] <= HALF_WIDTH_PP)
 
 
-def stop_decision(completed_blocks, required):
+def stop_decision(completed_blocks, required, max_blocks=MAX_BLOCKS):
     """None to continue; else the stop reason. `required` maps contrast name -> effect."""
+    if max_blocks not in (MAX_BLOCKS, MAX_SUPPORTED_BLOCKS):
+        raise ValueError("max_blocks must be the predeclared 20 or 40 block cap")
     if completed_blocks >= MIN_BLOCKS and required and all(precise(e) for e in required.values()):
         return "precision"
-    if completed_blocks >= MAX_BLOCKS:
+    if completed_blocks >= max_blocks:
         return "max_blocks"
     return None
 
