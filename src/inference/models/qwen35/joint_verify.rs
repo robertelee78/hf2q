@@ -102,7 +102,8 @@ impl Qwen35JointVerifyPending {
 enum VerifyLayout {
     /// Existing MTP diagnostic: preserve the caller's joint-decode route.
     JointMtp,
-    /// DFlash2 target: always fill one four-lane, eight-row temporal tile.
+    /// DFlash2 target: dense targets fill the width-32 tile; MoE targets use
+    /// the smallest admitted tile so padding does not trigger expert work.
     DFlash2,
 }
 
@@ -119,6 +120,14 @@ impl VerifyLayout {
             Self::JointMtp => "joint MTP",
             Self::DFlash2 => "DFlash2",
         }
+    }
+}
+
+fn dflash2_verify_width(is_moe: bool, total: usize) -> usize {
+    if is_moe {
+        total.next_power_of_two().clamp(4, DFLASH2_VERIFY_WIDTH)
+    } else {
+        DFLASH2_VERIFY_WIDTH
     }
 }
 
@@ -157,7 +166,10 @@ impl Qwen35Model {
     /// route and stream each dense target weight once. This is a Q1 Class B
     /// alternate route against one-token decode: its decision envelope and
     /// argmax equality are qualification gates, not assumptions.
-    #[allow(dead_code, reason = "DFlash2 scheduler wiring follows the target-capture gate")]
+    #[allow(
+        dead_code,
+        reason = "DFlash2 scheduler wiring follows the target-capture gate"
+    )]
     pub(crate) fn forward_gpu_dflash2_verify(
         &self,
         lanes: &[Qwen35JointVerifyLane<'_>],
@@ -289,16 +301,16 @@ impl Qwen35Model {
         }
         self.check_joint_step_admission(kv_cache, mode, dense_ffn, options)?;
         let width = match layout {
-            VerifyLayout::DFlash2 => DFLASH2_VERIFY_WIDTH,
+            VerifyLayout::DFlash2 => dflash2_verify_width(self.cfg.moe.is_some(), total),
             VerifyLayout::JointMtp
                 if options.projection == JointProjectionKernel::ColumnInvariantMma =>
             {
-            ensure!(
-                total <= MAX_JOINT_DECODE_ROWS,
-                "Qwen joint verify column-invariant MMA supports at most \
-                 {MAX_JOINT_DECODE_ROWS} rows, got {total}"
-            );
-            total
+                ensure!(
+                    total <= MAX_JOINT_DECODE_ROWS,
+                    "Qwen joint verify column-invariant MMA supports at most \
+                     {MAX_JOINT_DECODE_ROWS} rows, got {total}"
+                );
+                total
             }
             VerifyLayout::JointMtp => joint_verify_padded_width(mode, total),
         };
@@ -436,5 +448,19 @@ impl Qwen35Model {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dflash2_moe_width_avoids_unverified_padding_expert_work() {
+        for (rows, width) in [(1, 4), (4, 4), (5, 8), (8, 8), (9, 16), (17, 32)] {
+            assert_eq!(dflash2_verify_width(true, rows), width);
+        }
+        assert_eq!(dflash2_verify_width(false, 1), DFLASH2_VERIFY_WIDTH);
+        assert_eq!(dflash2_verify_width(false, 17), DFLASH2_VERIFY_WIDTH);
     }
 }

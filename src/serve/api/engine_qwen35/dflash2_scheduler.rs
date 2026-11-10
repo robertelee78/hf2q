@@ -16,7 +16,9 @@ use crate::inference::models::qwen35::kv_cache::HybridKvCache;
 use crate::inference::models::qwen35::{
     Qwen35JointOutput, Qwen35JointRowOutput, Qwen35JointVerify, Qwen35JointVerifyLane,
 };
-use crate::inference::spec_decode::dflash2::adapters::QwenDFlash2Adapter;
+use crate::inference::spec_decode::dflash2::{
+    adapters::QwenDFlash2Adapter, verify_budget::VerifyBudgetLane,
+};
 use crate::serve::api::engine_supervisor::EngineSupervisor;
 
 use super::{
@@ -298,8 +300,15 @@ impl Qwen35LoadedModel {
             distribute_error(&mut ticks, &active, error);
             return Ok(finish_ticks(ticks));
         }
-        let proposals = runtime.proposals()?.to_vec();
-        let verify_rows = runtime.verify_rows()?.to_vec();
+        if self.model.cfg.moe.is_some() {
+            let mut active_lanes = [0; 4];
+            for (lane, &index) in active.iter().enumerate() {
+                active_lanes[lane] = states[index].slot_id.0 as usize;
+            }
+            runtime.select_verify_rows(&active_lanes[..active.len()], &maximum_rows)?;
+        }
+        let proposals = runtime.proposals()?;
+        let verify_rows = runtime.verify_rows()?;
         let mut tokens: Vec<Option<Vec<u32>>> = (0..lanes).map(|_| None).collect();
         for &index in &active {
             let slot = states[index].slot_id.0 as usize;
@@ -338,10 +347,16 @@ impl Qwen35LoadedModel {
                 }
             })
             .collect::<Vec<_>>();
+        let selected_rows = trace_timing.then(|| {
+            verify_lanes
+                .iter()
+                .map(|lane| lane.tokens.len())
+                .sum::<usize>()
+        });
         let adapter_config = runtime.config.clone();
         let adapter = QwenDFlash2Adapter::new(&self.model, &adapter_config)?;
         let capture = runtime.qwen_target_capture(&adapter, &lane_indices)?;
-        let verify_started = trace_timing.then(Instant::now);
+        let verify_started = Instant::now();
         let lease = supervisor.arm("Qwen35 DFlash2 verify", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
         let verify = self.model.forward_gpu_dflash2_verify(
             &verify_lanes,
@@ -352,7 +367,8 @@ impl Qwen35LoadedModel {
             Some(capture),
         );
         let verify = lease.finish().and(verify);
-        let verify_micros = verify_started.map(|started| started.elapsed().as_micros());
+        let verify_elapsed = verify_started.elapsed();
+        let verify_micros = trace_timing.then(|| verify_elapsed.as_micros());
         let Qwen35JointVerify {
             rows,
             hidden: _,
@@ -422,14 +438,40 @@ impl Qwen35LoadedModel {
             runtime.commit_target_context(device, registry, &retained)
         });
         let context_committed = lease.finish().and(context_committed);
-        let draft_commit_micros =
-            draft_commit_started.map(|started| started.elapsed().as_micros());
+        let draft_commit_micros = draft_commit_started.map(|started| started.elapsed().as_micros());
         if let Err(error) = context_committed {
             if is_fatal(&error) {
                 return Err(error);
             }
             distribute_error(&mut ticks, &verifying, error);
             return Ok(finish_ticks(ticks));
+        }
+        if self.model.cfg.moe.is_some() {
+            let mut observations = [VerifyBudgetLane::default(); 4];
+            let mut observed = 0;
+            for (&index, step) in verifying.iter().zip(&verified) {
+                if let Verified::Window { plan, tokens } = step {
+                    observations[observed] = VerifyBudgetLane {
+                        lane_index: states[index].slot_id.0 as usize,
+                        verify_rows: tokens.len(),
+                        accepted: plan.plan.matched_drafts,
+                        labels: true,
+                    };
+                    observed += 1;
+                }
+            }
+            if observed == verifying.len() {
+                if let Err(error) = runtime.observe_verify_budget(
+                    &observations[..observed],
+                    verify_elapsed.as_secs_f64() * 1000.0,
+                ) {
+                    tracing::warn!(
+                        target: "hf2q::serve::api::engine_qwen35::progress",
+                        error = %error,
+                        "Qwen DFlash2 verify-budget observation discarded"
+                    );
+                }
+            }
         }
         for ((&index, step), &count) in verifying.iter().zip(&verified).zip(&accepted) {
             if let Verified::Window { tokens, .. } = step {
@@ -443,7 +485,8 @@ impl Qwen35LoadedModel {
             tracing::debug!(
                 target: "hf2q::serve::api::engine_qwen35::progress",
                 active_lanes = verifying.len(),
-                verify_rows = accepted.iter().sum::<usize>(),
+                selected_rows = selected_rows.unwrap_or_default(),
+                accepted_rows = accepted.iter().sum::<usize>(),
                 draft_us = draft_micros.unwrap_or_default(),
                 target_verify_us = verify_micros.unwrap_or_default(),
                 host_plan_us = plan_micros.unwrap_or_default(),
@@ -658,6 +701,4 @@ mod tests {
         );
         assert_eq!(plan.plan.valid_input_tokens, 3);
     }
-
-
 }

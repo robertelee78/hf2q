@@ -489,6 +489,67 @@ kernel path requires a complete prepared-weight BF16/fusion execution model
 that wins end to end, not another raw-block row tile, K-order, split-K, or
 partial activation-staging change.
 
+#### Splash MoE verification differential
+
+The exact Qwen3.6 DFlash2 campaign falsified the assumption that the dense
+width-32 route transfers unchanged to MoE. Before an external interruption
+invalidated the campaign, 18 complete four-agent blocks measured the candidate
+at 37.542 seconds median: 33.66% faster than v0.1.29, but 5.55% slower than the
+valid peer and 2.316 times Splash's 16.420-second median. All 18 candidate
+quality outcomes passed. The point estimate is too far from either comparator
+to justify rerunning the unchanged route.
+
+Pinned Splash source identifies the missing mechanism. MoE uses
+`--verify-rows auto`, while dense targets verify every row. For each draft
+position it maps selector confidence to acceptance probability with
+`logit(p) = 0.7 * logit(confidence) + intercept[position]`; the seven prior
+intercepts are `0, -0.35, -0.8, -0.75, -0.75, -0.85, -0.45`. It ranks each
+lane's cumulative survival probabilities and chooses the prefix count that
+maximizes expected accepted-plus-bonus tokens divided by cycle cost. The
+initial cost shapes at one, two, four and eight rows per lane are
+`[0.60, 0.69, 0.85, 1]`, `[0.50, 0.58, 0.74, 1]`,
+`[0.45, 0.52, 0.70, 1]`, and `[0.40, 0.47, 0.67, 1]` for one through four
+lanes respectively. Splash later refits acceptance from the latest 4,096
+labels every 64 cycles and cycle cost with exponential decay `0.97`; every
+32nd cycle verifies all rows for exploration.
+
+The target-side saving is not a host-only truncation. Splash's MoE router marks
+rows beyond each lane's selected prefix invalid, so they do not count toward
+expert groups, trigger streamed expert loads, or execute expert tiles. hf2q's
+prior Qwen3.6 route selected and executed all 32 rows. The bounded successor
+ports Splash's online 4,096-label acceptance fit, 64-cycle refit, decayed cost
+fit and 32-cycle exploration schedule for identity-matched Qwen MoE targets.
+It routes only selected rows and uses the smallest covering 4/8/16/32 output
+tile; dense Qwen3.8 keeps its qualified fixed width-32 route.
+
+The successive four-agent calibration smokes all passed task quality and
+cleanup. Online budgeting reduced makespan from 36.129 to 35.203 seconds;
+excluding padding rows from expert work reduced it to 30.947 seconds. At that
+point the four-lane median selected 18 of 32 rows and accepted 15, while target
+verification still cost 46.488 ms of a 58.538 ms transaction. Generic
+`mm_id` grouping does not close that residual gap: the allocation-owning
+32-row route regressed to 36.162 seconds, and pooling one compact gate/up
+schedule and reusing it for down still measured 33.781 seconds. A separate
+five-route live-expert scalar tile reused each native Q4_K/Q6_K weight row
+across grouped routes and passed bitwise operator parity plus full-layer
+quality, but regressed the four-agent smoke to 44.440 seconds. Its diagnostic
+four-lane step spent 94.366 ms in target verification at 19 selected rows,
+versus 46.488 ms for the exact matvec route at 18. These grouped routes are
+rejected on end-to-end performance.
+
+Splash's remaining advantage is therefore kernel-specific, not an omitted
+selector constant or grouping alone. Its verified grouping feeds custom
+eight-row Table16 expert tiles; those tiles keep activations in BF16, use
+register matrix operations, launch only live expert tiles through indirect
+grids, and combine the shared and routed experts in one grouped representation.
+hf2q's available generic grouped path uses 32-row F32 tiles, while the scalar
+live-expert spike loses output-column occupancy and has too little route reuse
+at the observed 10–19 selected rows. Both pay more scheduling, staging, or
+weight-decode cost than the Q4_K route matvecs. Matching Splash requires a
+family-neutral prepared-weight eight-row BF16 register-matrix expert tile over
+every admitted GGUF expert format, not another raw-block scalar tile or generic
+`mm_id` threshold override.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,

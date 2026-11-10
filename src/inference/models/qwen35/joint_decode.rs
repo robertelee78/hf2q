@@ -706,6 +706,14 @@ impl Qwen35Model {
                             vec![width, h],
                         )
                         .map_err(|e| anyhow!("allocate Qwen joint MoE output: {e}"))?;
+                        // DFlash2 pads recurrent and dense projections to an
+                        // admitted tile, but its MoE work is row-local. Route
+                        // only selected rows; later padding outputs are ignored.
+                        let moe_rows = if capture.is_some() {
+                            rows.len() as u32
+                        } else {
+                            width_u32
+                        };
                         build_moe_ffn_layer_gpu_batched_into(
                             enc,
                             device,
@@ -715,7 +723,7 @@ impl Qwen35Model {
                             shape,
                             Some(&ffn_residual),
                             &mut output,
-                            width_u32,
+                            moe_rows,
                             layer_idx,
                         )
                         .with_context(|| format!("Qwen joint batched MoE FFN layer {layer_idx}"))?;

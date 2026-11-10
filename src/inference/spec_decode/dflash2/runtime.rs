@@ -17,6 +17,7 @@ use super::{
     schema::DFlash2CheckpointDescriptor,
     selector::dispatch_dflash2_selection,
     tensors::DFlash2ModelTensors,
+    verify_budget::{DFlash2VerifyBudget, VerifyBudgetLane},
     weights::DFlash2WeightsFile,
     workspace::DFlash2Workspace,
 };
@@ -94,6 +95,7 @@ pub struct DFlash2Runtime {
     pub workspace: DFlash2Workspace,
     lane_lengths: Vec<usize>,
     lane_bindings: Vec<DFlash2LaneBinding>,
+    verify_budget: DFlash2VerifyBudget,
 }
 
 impl DFlash2Runtime {
@@ -135,6 +137,7 @@ impl DFlash2Runtime {
             lane_bindings: (0..lanes)
                 .map(|_| DFlash2LaneBinding::new(rewind_limit))
                 .collect(),
+            verify_budget: DFlash2VerifyBudget::default(),
         })
     }
 
@@ -229,6 +232,30 @@ impl DFlash2Runtime {
 
     pub fn verify_rows(&self) -> Result<&[u32]> {
         Ok(self.workspace.verify_rows.as_slice::<u32>()?)
+    }
+
+    pub(crate) fn select_verify_rows(
+        &mut self,
+        lane_indices: &[usize],
+        maximum_rows: &[u32],
+    ) -> Result<()> {
+        let rows = self
+            .verify_budget
+            .select_rows(&self.workspace, lane_indices, maximum_rows)?;
+        let selected = self.workspace.verify_rows.as_mut_slice::<u32>()?;
+        for (&lane, rows) in lane_indices.iter().zip(rows) {
+            selected[lane] = u32::try_from(rows)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe_verify_budget(
+        &mut self,
+        lanes: &[VerifyBudgetLane],
+        milliseconds: f64,
+    ) -> Result<()> {
+        self.verify_budget
+            .observe(&self.workspace, lanes, milliseconds)
     }
     pub fn lane_lengths(&self) -> &[usize] {
         &self.lane_lengths
