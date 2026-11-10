@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 #[cfg(test)]
 use super::forward::dispatch_layer;
 use super::{
@@ -25,6 +27,65 @@ use crate::inference::{
 use anyhow::{ensure, Context, Result};
 use mlx_native::{KernelRegistry, MlxDevice};
 
+struct DFlash2LaneBinding {
+    hasher: Sha256,
+    tokens: usize,
+    rewind_tokens: Option<Vec<u32>>,
+}
+
+impl DFlash2LaneBinding {
+    fn new(rewind_limit: usize) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"hf2q-dflash2-lane-v1");
+        Self {
+            hasher,
+            tokens: 0,
+            rewind_tokens: Some(Vec::with_capacity(rewind_limit)),
+        }
+    }
+
+    fn append(&mut self, tokens: &[u32], rewind_limit: usize) {
+        for token in tokens {
+            self.hasher.update(token.to_le_bytes());
+        }
+        self.tokens += tokens.len();
+        if let Some(prefix) = self.rewind_tokens.as_mut() {
+            if self.tokens <= rewind_limit {
+                prefix.extend_from_slice(tokens);
+            } else {
+                self.rewind_tokens = None;
+            }
+        }
+    }
+
+    fn matches(&self, tokens: &[u32]) -> bool {
+        if self.tokens != tokens.len() {
+            return false;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"hf2q-dflash2-lane-v1");
+        for token in tokens {
+            hasher.update(token.to_le_bytes());
+        }
+        self.hasher.clone().finalize() == hasher.finalize()
+    }
+
+    fn rewind(&mut self, tokens: &[u32], rewind_limit: usize) -> bool {
+        if self.matches(tokens) {
+            return true;
+        }
+        let Some(prefix) = self.rewind_tokens.as_ref() else {
+            return false;
+        };
+        if tokens.len() >= self.tokens || prefix.get(..tokens.len()) != Some(tokens) {
+            return false;
+        }
+        *self = Self::new(rewind_limit);
+        self.append(tokens, rewind_limit);
+        true
+    }
+}
+
 /// GPU-resident DFlash2 checkpoint and persistent per-slot draft rings.
 pub struct DFlash2Runtime {
     pub descriptor: &'static DFlash2CheckpointDescriptor,
@@ -32,6 +93,7 @@ pub struct DFlash2Runtime {
     pub tensors: DFlash2ModelTensors,
     pub workspace: DFlash2Workspace,
     lane_lengths: Vec<usize>,
+    lane_bindings: Vec<DFlash2LaneBinding>,
 }
 
 impl DFlash2Runtime {
@@ -63,12 +125,16 @@ impl DFlash2Runtime {
             .context("upload DFlash2 tensors")?;
         let workspace =
             DFlash2Workspace::new(device, &config, lanes).context("allocate DFlash2 workspace")?;
+        let rewind_limit = config.sliding_window;
         Ok(Self {
             descriptor,
             config,
             tensors,
             workspace,
             lane_lengths: vec![0; lanes],
+            lane_bindings: (0..lanes)
+                .map(|_| DFlash2LaneBinding::new(rewind_limit))
+                .collect(),
         })
     }
 
@@ -166,6 +232,48 @@ impl DFlash2Runtime {
     }
     pub fn lane_lengths(&self) -> &[usize] {
         &self.lane_lengths
+    }
+
+    /// Align a resident draft ring with the exact target token prefix restored
+    /// into this slot. Rewind is safe only before the first ring wrap; after
+    /// that, overwritten older rows make an earlier prefix unrecoverable.
+    pub fn align_lane_prefix(&mut self, lane: usize, tokens: &[u32]) -> bool {
+        let Some(length) = self.lane_lengths.get_mut(lane) else {
+            return false;
+        };
+        let Some(binding) = self.lane_bindings.get_mut(lane) else {
+            return false;
+        };
+        if binding.tokens != *length || !binding.rewind(tokens, self.config.sliding_window) {
+            return false;
+        }
+        *length = tokens.len();
+        true
+    }
+
+    /// Bind a successfully committed hidden-state suffix to its exact target
+    /// token IDs. The ring and token identity must advance in lockstep.
+    pub fn record_lane_tokens(&mut self, lane: usize, tokens: &[u32]) -> Result<()> {
+        let lane_length = *self
+            .lane_lengths
+            .get(lane)
+            .context("DFlash2 token-binding lane is out of range")?;
+        let binding = self
+            .lane_bindings
+            .get_mut(lane)
+            .context("DFlash2 token-binding lane is out of range")?;
+        let bound_length = binding
+            .tokens
+            .checked_add(tokens.len())
+            .context("DFlash2 token-binding length overflow")?;
+        ensure!(
+            bound_length == lane_length,
+            "DFlash2 lane {lane} token binding {} + {} != ring length {lane_length}",
+            binding.tokens,
+            tokens.len()
+        );
+        binding.append(tokens, self.config.sliding_window);
+        Ok(())
     }
 
     /// Append a target prefill capture to one physical draft-ring lane.
@@ -310,6 +418,7 @@ impl DFlash2Runtime {
             values[lane * lane_elements..(lane + 1) * lane_elements].fill(0);
         }
         self.lane_lengths[lane] = 0;
+        self.lane_bindings[lane] = DFlash2LaneBinding::new(self.config.sliding_window);
         Ok(())
     }
 }
@@ -323,6 +432,20 @@ mod tests {
     use half::bf16;
     use safetensors::{tensor::TensorView, Dtype, SafeTensors};
     use std::path::PathBuf;
+
+    #[test]
+    fn lane_binding_rewinds_exact_unwrapped_prefix_only() {
+        let mut binding = DFlash2LaneBinding::new(8);
+        assert!(binding.matches(&[]));
+        binding.append(&[7, 11, 13], 8);
+        assert!(binding.matches(&[7, 11, 13]));
+        assert!(!binding.matches(&[7, 11, 17]));
+        assert!(binding.rewind(&[7, 11], 8));
+        assert!(binding.matches(&[7, 11]));
+
+        binding.append(&[13, 17], 3);
+        assert!(!binding.rewind(&[7, 11, 13], 3));
+    }
 
     fn float_values(view: TensorView<'_>) -> Vec<f32> {
         match view.dtype() {

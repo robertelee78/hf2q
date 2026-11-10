@@ -412,6 +412,14 @@ impl Qwen35LoadedModel {
             distribute_error(&mut ticks, &verifying, error);
             return Ok(finish_ticks(ticks));
         }
+        for ((&index, step), &count) in verifying.iter().zip(&verified).zip(&accepted) {
+            if let Verified::Window { tokens, .. } = step {
+                let slot = states[index].slot_id.0 as usize;
+                runtime
+                    .record_lane_tokens(slot, &tokens[..count])
+                    .with_context(|| format!("bind DFlash2 slot {slot} retained token prefix"))?;
+            }
+        }
 
         for (&index, step) in verifying.iter().zip(verified) {
             ticks[index] = Some(match step {

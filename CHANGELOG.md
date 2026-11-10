@@ -48,6 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- DFlash2 Qwen lanes now bind resident draft rings to the exact committed token prefix. Exact cached follow-ups preserve or safely rewind an unwrapped ring and continue DFlash2 after suffix prefill; incompatible, same-length-different, or post-wrap restored prefixes clear the ring and fail closed to the established route. Inactive physical lanes use the selector's minimum valid one-row bound without participating in verification.
+
 - Splash four-agent request parity now omits the semantic default `strict:false` from each function definition on the Splash wire, matching hf2q's rendered tool schema byte for byte; the audit inverse restores the canonical client shape and refuses drift.
 
 - Gemma 4 prefill V unit norm (joint stream and cold multi-sequence lanes) now uses mlx-native 0.18.0's `dispatch_rms_norm_no_scale_f32_dual_perm`, which packs two (token, head) rows per threadgroup, instead of hf2q's own one-row-per-threadgroup encode of the same kernel, which is removed. The kernel runs one simdgroup per row at any 1-D dispatch geometry, so the f32 and permuted BF16 outputs are bitwise identical (Class A; model-free unit test at the Gemma 4 26B sliding and global shapes).
