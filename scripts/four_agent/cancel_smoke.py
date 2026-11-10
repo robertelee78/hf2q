@@ -44,6 +44,7 @@ FINISHES = ('stop', 'tool_calls', 'length')
 RAW_LIMIT = 32 * 1024 * 1024
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 JOINT = re.compile(r'\b(?P<engine>DeepSeek-V4|Qwen) joint (?P<kind>decode|MTP) turn(?P<fields>(?:\s+[a-z_]+=\S+)*)')
+DFLASH = re.compile(r'\bQwen DFlash2 stage timing(?P<fields>(?:\s+[a-z_]+=\S+)*)')
 FIELD = re.compile(r'([a-z_]+)=(\S+)')
 ERROR_LINE = re.compile(r'^\s*ERROR\s')
 # A poison event, not a `cache_poisoned=false` field on an INFO progress line.
@@ -259,13 +260,22 @@ def joint_turns(lines, family):
     engine = FAMILIES[family]
     turns = []
     for end, line in lines:
+        dflash = DFLASH.search(line) if family == 'qwen38' else None
+        if dflash is not None:
+            fields = parse_integer_fields(dflash.group('fields'), 'DFlash2 stage')
+            require('active_lanes' in fields, f'DFlash2 stage line lacks active_lanes: {line}')
+            turns.append({
+                'end_offset': end,
+                'kind': 'DFlash2',
+                'width': fields['active_lanes'],
+                'serial': 0,
+                **fields,
+            })
+            continue
         match = JOINT.search(line)
         if match is None or match.group('engine') != engine:
             continue
-        fields = {}
-        for key, value in FIELD.findall(match.group('fields')):
-            require(value.isdecimal(), f'non-integer joint turn field {key}={value}')
-            fields[key] = int(value)
+        fields = parse_integer_fields(match.group('fields'), 'joint turn')
         if family == 'deepseek4' or match.group('kind') == 'MTP':
             width_key = 'lanes'
         else:
@@ -273,6 +283,14 @@ def joint_turns(lines, family):
         require(width_key in fields and 'serial' in fields, f'joint turn line lacks {width_key}/serial: {line}')
         turns.append({'end_offset': end, 'kind': match.group('kind'), 'width': fields[width_key], **fields})
     return turns
+
+
+def parse_integer_fields(raw, context):
+    fields = {}
+    for key, value in FIELD.findall(raw):
+        require(value.isdecimal(), f'non-integer {context} field {key}={value}')
+        fields[key] = int(value)
+    return fields
 
 
 def histogram(turns, family):

@@ -540,6 +540,16 @@ mod tests {
         }
     }
 
+    fn logits(token: usize, vocab: usize) -> Qwen35JointRowOutput {
+        let mut values = vec![-10.0_f32; vocab];
+        values[token] = 10.0;
+        Qwen35JointRowOutput {
+            greedy_token: None,
+            logits: Some(values),
+            nextn_hidden: None,
+        }
+    }
+
     #[test]
     fn target_rejection_commits_matching_prefix_and_canonical_replacement() {
         let qwen = loaded_model(QwenSpeculationPolicy::Off);
@@ -593,4 +603,61 @@ mod tests {
         assert_eq!(plan.plan.rejected_drafts, 0);
         assert_eq!(plan.plan.valid_input_tokens, 4);
     }
+    #[test]
+    fn terminal_draft_is_not_streamed_or_retained() {
+        let qwen = loaded_model(QwenSpeculationPolicy::Off);
+        let state = decode_state(&qwen, 8);
+        let window = Qwen35DFlash2Window {
+            pending_token: 8,
+            position: 4,
+            greedy: true,
+            maximum_rows: 4,
+        };
+        let plan = state
+            .plan_dflash2_window(
+                &qwen,
+                &window,
+                &[9, 63, 11],
+                vec![greedy(9), greedy(63), greedy(11), greedy(12)],
+            )
+            .expect("plan DFlash2 terminal draft");
+        assert_eq!(plan.plan.output.into_iter().collect::<Vec<_>>(), [9]);
+        assert_eq!(plan.plan.matched_drafts, 2);
+        assert_eq!(plan.plan.rejected_drafts, 0);
+        assert_eq!(plan.plan.valid_input_tokens, 2);
+        assert!(plan.plan.terminal_after_pending);
+    }
+
+    #[test]
+    fn logprob_request_uses_full_logits_for_each_canonical_decision() {
+        let qwen = loaded_model(QwenSpeculationPolicy::Off);
+        let mut state = decode_state(&qwen, 8);
+        state.want_logprobs = true;
+        let window = Qwen35DFlash2Window {
+            pending_token: 8,
+            position: 4,
+            greedy: false,
+            maximum_rows: 4,
+        };
+        let plan = state
+            .plan_dflash2_window(
+                &qwen,
+                &window,
+                &[9, 10, 55],
+                vec![
+                    logits(9, qwen.vocab_size),
+                    logits(10, qwen.vocab_size),
+                    logits(11, qwen.vocab_size),
+                    logits(12, qwen.vocab_size),
+                ],
+            )
+            .expect("plan DFlash2 logprob rejection");
+        assert_eq!(
+            plan.plan.output.into_iter().collect::<Vec<_>>(),
+            [9, 10, 11]
+        );
+        assert_eq!(plan.plan.valid_input_tokens, 3);
+    }
+
+
 }

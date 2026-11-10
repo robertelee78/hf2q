@@ -348,13 +348,14 @@ without a pinned identity match are likewise unavailable. Gemma has a schema
 and target-weight adapter but no serving transaction yet; DeepSeek has no
 compatible trained checkpoint and remains explicitly unavailable.
 
-This is implementation evidence, not gate closure. The candidate still performs
-the cold-prefill capture conversion through host memory, uses deterministic
-greedy proposals rather than the reference sampled selector policy, and does not
-overlap grammar simulation with target verification. D2 needs real-target
-width-32 parity and scaling receipts; D3 needs the full semantic, rollback,
-cancellation and multi-turn matrix; D4 needs synchronization removal and measured
-overlap. D5 and D6 remain unopened until those gates pass.
+This is implementation evidence, not full gate closure. The candidate still
+performs the cold-prefill capture conversion through host memory and does not
+overlap grammar simulation with target verification. Real-target width-32
+parity, exact-prefix continuation, inactive-lane handling, EOS suppression,
+logprobs canonical decisions, cancellation recovery and the fixed performance
+campaign now have evidence below. Grammar rejection, sampled-policy parity,
+post-wrap rollback and the complete multi-turn serving matrix remain open.
+D5's same-artifact peer threshold and D6 promotion also remain open.
 
 One exact-target runtime smoke used an hf2q Q5_K_M conversion of
 `Qwen/Qwen3.6-35B-A3B@995ad96eacd98c81ed38be0c5b274b04031597b0`
@@ -407,6 +408,57 @@ change and below the accepted joint-MTP campaign's 87.704486–94.153340-second
 range. The smoke is performance evidence, not D5 closure: it is one run, used a
 local native checkout rather than the release-candidate published pin, and does
 not supply a confidence interval.
+
+The fixed six-block ABBA campaign on the published `mlx-native` 0.21.0 pin
+(`8baa89fb…` package SHA256) compared the prior joint-MTP route with DFlash2.
+All measured runs were quality eligible, thermally valid `CalibrationPass`
+runs. DFlash2's makespan ratio was `0.894442` with 95% CI
+`[0.882325, 0.906726]`, a 10.556% improvement with 95% CI
+`[9.327%, 11.768%]`; TTFT and SSE-gap upper bounds also showed no regression.
+The retained campaign artifact
+`adr067-qwen38-dflash2-148e0e3f-v1-run/analysis.json` has SHA256
+`a3fb5214…`. Trace reduction measured 3,710 accepted-plus-bonus
+outputs over 699 lane-cycles, or `5.307582` outputs per lane-cycle, clearing
+the preregistered absolute `5.304` mechanism floor.
+
+The cancellation rerun taught the harness the DFlash2 physical-width record
+instead of relabelling it as the older joint route. It observed widths one
+through four during the cancellation pass, returned byte-exact survivor
+payloads, kept the victim payload as a strict prefix of its control, preserved
+server readiness, and proved owned cleanup. The retained cancellation artifact
+`qwen38-cancel-148e0e3f-v2/receipt.json` has SHA256 `ac2541d2…`; the client
+summary SHA256 is `2b3f4187…`. Scheduler
+regressions additionally prove that a terminal EOS proposal is neither
+streamed nor retained and that logprobs requests keep full-logit canonical
+decisions.
+
+This closes neither D5 nor D6. The historical valid same-artifact peer median
+is about 79.7 seconds; the fixed DFlash2 campaign's median is about 80.47
+seconds, so it does not meet the required 0.95 upper-ratio bound. DFlash2
+therefore remains explicit opt-in and the global `HF2Q_DFLASH2=0` control
+continues to restore the prior route.
+
+#### Splash dense-kernel differential
+
+The pinned Splash source explains why matching only the 32-row tile did not
+close the remaining target cost. Splash repacks native GGUF blocks at load into
+its `MDGG0001` code, optional high-bit and predecoded metadata planes. Its
+32-row kernel then reads coalesced code/meta vectors, double-buffers half-weight
+stages, overlaps the next payload and metadata loads with the current
+`matmul2d`, and keeps activations in BF16. hf2q's production tensor-v1 kernel
+still streams native GGUF block layouts and repeatedly decodes irregular
+Q4_K/Q6_K metadata from those blocks. Splash's own source notes about an 8%
+cost for dynamic Q4_K scale-byte indexing support this attribution.
+
+Two bounded experiments falsified shortcuts. Routing the fixed width through
+the generic tensor-v2 64x32 short tile raised target-verify medians to roughly
+161 ms; restricting that route to Q6_K still measured roughly 155 ms. A
+load-once Q4_K/Q6_K code/meta repack with a dedicated 32-row tensor kernel
+passed model-free numerical parity and real-model Q5, but improved the matched
+target-verify median only from 151.038 ms to 149.288 ms and did not approach
+the peer threshold. Neither experiment is promoted. The remaining credible
+path is the complete prepared-weight plus BF16/fusion execution model, not
+another raw-block row-tile switch.
 
 ### D5: performance qualification
 
