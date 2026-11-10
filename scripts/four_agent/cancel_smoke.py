@@ -8,14 +8,14 @@ deltas) while the other three are still decoding. It then checks that:
 - the three survivors end with valid SSE: one choice, a stop/tool_calls/length
   finish_reason, usage, [DONE], well-formed tool calls and no error frames;
 - /metrics hf2q_sse_cancellations rose by exactly one;
-- the server log shows a joint decode turn of width >= 2 before the close;
+- the server log shows a joint decode/MTP turn of width >= 2 before the close;
 - the server log has no ERROR or poison lines during the run, and /readyz stays ready.
 An optional control pass replays the same four requests without a cancel. Its
 completion shows that the cancelled slot was released. It also compares the
 survivors' outputs with the cancel pass (exact equality is expected on bitwise
 routes; reported, not gated).
 
-`widths` histograms the per-turn "joint decode turn" debug lines of any server
+`widths` histograms the per-turn joint decode/MTP debug lines of any server
 log (S-C2). The server must run with the debug target enabled, e.g. launcher
 LOG_FILTER (see README "S3 cancel smoke").
 
@@ -43,7 +43,7 @@ FAMILIES = {'deepseek4': 'DeepSeek-V4', 'qwen38': 'Qwen'}
 FINISHES = ('stop', 'tool_calls', 'length')
 RAW_LIMIT = 32 * 1024 * 1024
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
-JOINT = re.compile(r'\b(?P<engine>DeepSeek-V4|Qwen) joint decode turn(?P<fields>(?:\s+[a-z_]+=\S+)*)')
+JOINT = re.compile(r'\b(?P<engine>DeepSeek-V4|Qwen) joint (?P<kind>decode|MTP) turn(?P<fields>(?:\s+[a-z_]+=\S+)*)')
 FIELD = re.compile(r'([a-z_]+)=(\S+)')
 ERROR_LINE = re.compile(r'^\s*ERROR\s')
 # A poison event, not a `cache_poisoned=false` field on an INFO progress line.
@@ -266,9 +266,12 @@ def joint_turns(lines, family):
         for key, value in FIELD.findall(match.group('fields')):
             require(value.isdecimal(), f'non-integer joint turn field {key}={value}')
             fields[key] = int(value)
-        width_key = 'lanes' if family == 'deepseek4' else 'rows'
+        if family == 'deepseek4' or match.group('kind') == 'MTP':
+            width_key = 'lanes'
+        else:
+            width_key = 'rows'
         require(width_key in fields and 'serial' in fields, f'joint turn line lacks {width_key}/serial: {line}')
-        turns.append({'end_offset': end, 'width': fields[width_key], **fields})
+        turns.append({'end_offset': end, 'kind': match.group('kind'), 'width': fields[width_key], **fields})
     return turns
 
 
