@@ -1985,6 +1985,8 @@ mod f2_work_state;
 
 #[path = "engine/deepseek4_joint_decode.rs"]
 mod deepseek4_joint_decode;
+#[path = "engine/qwen35_dflash2.rs"]
+mod qwen35_dflash2;
 
 #[path = "engine/qwen35_joint_decode.rs"]
 pub(in crate::serve::api) mod qwen35_joint_decode;
@@ -20862,6 +20864,27 @@ fn decode_batch_qwen35(
     joint_decode: Option<qwen35_joint_decode::Qwen35JointDecodeConfig>,
     supervisor: &EngineSupervisor,
 ) -> Option<Qwen35FatalFailure> {
+    let dflash_serial = match qwen35_dflash2::run_qwen35_dflash2(
+        guard,
+        scheduler,
+        slots,
+        retained_tokens,
+        prompt_caches,
+        prompt_anchors,
+        registration,
+        handles,
+        kv_bytes_per_token,
+        joint_decode,
+        supervisor,
+    ) {
+        qwen35_dflash2::Qwen35DFlash2Run::NotEligible => None,
+        qwen35_dflash2::Qwen35DFlash2Run::Ran { serial } => Some(serial),
+        qwen35_dflash2::Qwen35DFlash2Run::Fatal(fatal) => return Some(fatal),
+    };
+    let handles = dflash_serial.as_deref().unwrap_or(handles);
+    if handles.is_empty() {
+        return None;
+    }
     let serial_handles = match qwen35_joint_decode::qwen35_joint_decode_turn_config(joint_decode) {
         Some(config) => match qwen35_joint_decode::run_qwen35_joint_decode(
             guard,
@@ -36396,6 +36419,7 @@ assistant:
             // scope; iter-2a always constructs it as `None` (per the
             // production `Qwen35LoadedModel::load` site).
             persistent_kv_cache: None,
+            dflash2: None,
             speculation: super::super::qwen35_speculation::QwenSpeculationController::new(
                 super::super::qwen35_speculation::QwenSpeculationPolicy::Off,
             ),

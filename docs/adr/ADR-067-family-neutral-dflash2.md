@@ -315,6 +315,59 @@ acceptance gate are complete; these measurements do not promote the route.
 - Add decode-debt scheduling only as a separately attributed experiment after
   D1-D3 pass. It must not obscure drafter/verifier attribution.
 
+#### D2-D4 implementation-candidate status
+
+The first production-shaped candidate is deliberately default-off. It provisions
+only when `HF2Q_DFLASH2=1` and both `HF2Q_DFLASH2_CONFIG` and
+`HF2Q_DFLASH2_WEIGHTS` match a pinned descriptor and the loaded target exactly.
+Target binding is the hf2q source-bundle receipt, not architecture dimensions or
+the operator's filename. The pinned exact-source identities are
+`73ded708c49c2d0a47c790ce1d6181e848ac7591dab741de83dbb57218cc6873`
+for Qwen3.8 and
+`851811f43867ae177636f0c536bb98c33731d992ce357831809a1eda5eb974ca`
+for Qwen3.6. External GGUFs, a different source receipt and descriptors without a
+qualified target receipt are rejected before draft weights upload. A startup
+smoke with the release-gate `qwen36-abliterix-t63-APEX` GGUF exercised this
+boundary and was rejected as intended; matching dimensions did not admit the
+fine-tuned target.
+
+The Qwen SlotAware path captures cold-prefill target layers, keeps one persistent
+draft ring per physical slot, drafts all provisioned slots in one graph, verifies
+one to eight rows per live lane in the fixed width-32 target route, applies the
+existing spec-off semantic decision function, commits only accepted target and
+draft prefixes, and drains accepted output through the existing ordered SSE
+settlement path.
+
+Slot reassignment clears the draft ring before the request's first prefill
+advance. A request that starts from a restored or otherwise cached prefix has a
+non-zero target cursor and a zero draft cursor, so it remains on the promoted
+route instead of reusing context from a different conversation. Qwen3.5 and any
+target without a pinned identity match are likewise unavailable. Gemma has a
+schema and target-weight adapter but no serving transaction yet; DeepSeek has no
+compatible trained checkpoint and remains explicitly unavailable.
+
+This is implementation evidence, not gate closure. The candidate still performs
+the cold-prefill capture conversion through host memory, uses deterministic
+greedy proposals rather than the reference sampled selector policy, and does not
+overlap grammar simulation with target verification. D2 needs real-target
+width-32 parity and scaling receipts; D3 needs the full semantic, rollback,
+cancellation and multi-turn matrix; D4 needs synchronization removal and measured
+overlap. D5 and D6 remain unopened until those gates pass.
+
+One exact-target runtime smoke used an hf2q Q5_K_M conversion of
+`Qwen/Qwen3.6-35B-A3B@995ad96eacd98c81ed38be0c5b274b04031597b0`
+(source receipt `851811f4…`), the pinned 1,052,513,456-byte Qwen3.6
+DFlash2 checkpoint (`d1f16c0…`), one SlotAware lane, temperature 0 and cold
+prompts. Provisioning succeeded. A 16-token unary request completed two DFlash2
+cycles whose retained target-row counts were 8 and 7, at 123.55 output tok/s.
+An SSE request emitted a valid forced `echo` tool call with incremental
+`{"text":"hi"}` arguments and `finish_reason:"tool_calls"`; a following
+tool-result request completed normally. The tool-call run exercised retained
+counts from 1 through 8 and forced-thinking closure. The mismatched
+`qwen36-abliterix-t63-APEX` startup refusal above was run against the same draft
+artifact. These are end-to-end smoke observations, not D2-D6 qualification:
+they are single-lane, unmatched to spec-off, and not the Q4 workload.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,

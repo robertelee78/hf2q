@@ -25,6 +25,11 @@ use crate::inference::models::qwen35::kv_cache::{
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::inference::spec_decode::cost_controller::SpeculationCostController;
+use crate::inference::spec_decode::dflash2::{
+    adapters::QwenDFlash2Adapter,
+    runtime::DFlash2Runtime,
+    schema::{DFlash2CheckpointDescriptor, DFlash2FamilyAdapter, KNOWN_DFLASH2_CHECKPOINTS},
+};
 use crate::inference::spec_decode::ngram_proposer::{HistoryLookupConfig, HistoryLookupIndex};
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape, TokenizerSource,
@@ -243,6 +248,9 @@ pub struct Qwen35LoadedModel {
     /// preserves type information on the decode hot path and avoids a
     /// virtual cache interface in `EngineInner`.
     pub persistent_kv_cache: Option<HybridKvCache>,
+    /// Default-off DFlash2 runtime. Present only after exact checkpoint,
+    /// target-family and slot-width validation at worker provisioning.
+    pub dflash2: Option<DFlash2Runtime>,
     /// Server-side MTP policy and per-conversation profitability state. The
     /// native runner owns no persistent speculative KV yet, so this state
     /// deliberately contains no cache tensors.
@@ -252,6 +260,75 @@ pub struct Qwen35LoadedModel {
     /// `load_engine` applies the operator's resolved value. `0` disables
     /// spilling.
     pub slot_spill_budget_bytes: u64,
+}
+
+fn validate_dflash2_target_source(
+    descriptor: &DFlash2CheckpointDescriptor,
+    provenance: &Provenance,
+) -> Result<()> {
+    let expected = descriptor.target_source_sha256.with_context(|| {
+        format!(
+            "DFlash2 checkpoint {} has no qualified target source identity",
+            descriptor.id
+        )
+    })?;
+    let actual = match provenance {
+        Provenance::Hf2q { source_sha256, .. } => source_sha256.as_str(),
+        Provenance::External => {
+            anyhow::bail!(
+                "DFlash2 checkpoint {} requires an hf2q target with source identity {}",
+                descriptor.id,
+                expected
+            )
+        }
+    };
+    anyhow::ensure!(
+        actual == expected,
+        "DFlash2 checkpoint {} targets source {}, loaded GGUF source is {}",
+        descriptor.id,
+        expected,
+        actual
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod dflash2_target_identity_tests {
+    use super::*;
+    use crate::inference::spec_decode::dflash2::schema::{GEMMA4_E2B_DFLASH2, QWEN36_DFLASH2};
+
+    #[test]
+    fn exact_source_receipt_is_required_for_activation() {
+        let expected = QWEN36_DFLASH2
+            .target_source_sha256
+            .expect("Qwen3.6 descriptor source identity");
+        let exact = Provenance::Hf2q {
+            producer_version: "hf2q test".into(),
+            source_sha256: expected.into(),
+            mmproj_sha256: None,
+        };
+        validate_dflash2_target_source(&QWEN36_DFLASH2, &exact)
+            .expect("exact target source must activate");
+
+        let wrong = Provenance::Hf2q {
+            producer_version: "hf2q test".into(),
+            source_sha256: "f".repeat(64),
+            mmproj_sha256: None,
+        };
+        assert!(validate_dflash2_target_source(&QWEN36_DFLASH2, &wrong).is_err());
+        assert!(validate_dflash2_target_source(&QWEN36_DFLASH2, &Provenance::External).is_err());
+    }
+
+    #[test]
+    fn descriptor_without_qualified_target_remains_unavailable() {
+        assert!(GEMMA4_E2B_DFLASH2.target_source_sha256.is_none());
+        let provenance = Provenance::Hf2q {
+            producer_version: "hf2q test".into(),
+            source_sha256: "a".repeat(64),
+            mmproj_sha256: None,
+        };
+        assert!(validate_dflash2_target_source(&GEMMA4_E2B_DFLASH2, &provenance).is_err());
+    }
 }
 
 impl Qwen35LoadedModel {
@@ -679,6 +756,7 @@ impl Qwen35LoadedModel {
             // populates this lazily via `HybridKvCache::new_with_options
             // (... n_seqs = max_slots, ...)`.
             persistent_kv_cache: None,
+            dflash2: None,
             // ADR-044 (2026-08-21) / ADR-063 D1: an unset
             // HF2Q_QWEN_SPECULATION is `auto` here (one slot); a SlotAware
             // worker re-resolves it at start, to `off` when it selected joint
@@ -1020,7 +1098,126 @@ impl Qwen35LoadedModel {
             "Qwen DeltaNet capture restore policy"
         );
         self.persistent_kv_cache = Some(cache);
+        self.provision_dflash2(max_slots as usize)?;
         Ok(())
+    }
+
+    fn provision_dflash2(&mut self, max_slots: usize) -> anyhow::Result<()> {
+        let enabled = match std::env::var("HF2Q_DFLASH2").ok().as_deref() {
+            None | Some("") | Some("0" | "off" | "false") => false,
+            Some("1" | "on" | "true") => true,
+            Some(value) => {
+                anyhow::bail!("HF2Q_DFLASH2 must be 1/on/true or 0/off/false, got {value:?}")
+            }
+        };
+        if !enabled {
+            self.dflash2 = None;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            (1..=4).contains(&max_slots),
+            "DFlash2 supports 1..=4 physical slots, got {max_slots}"
+        );
+        let config_path = PathBuf::from(
+            std::env::var_os("HF2Q_DFLASH2_CONFIG")
+                .context("HF2Q_DFLASH2=1 requires HF2Q_DFLASH2_CONFIG")?,
+        );
+        let weights_path = PathBuf::from(
+            std::env::var_os("HF2Q_DFLASH2_WEIGHTS")
+                .context("HF2Q_DFLASH2=1 requires HF2Q_DFLASH2_WEIGHTS")?,
+        );
+        let config_bytes = std::fs::read(&config_path)
+            .with_context(|| format!("read DFlash2 config {}", config_path.display()))?;
+        let (descriptor, config) = KNOWN_DFLASH2_CHECKPOINTS
+            .iter()
+            .filter(|descriptor| {
+                matches!(
+                    descriptor.family_adapter,
+                    DFlash2FamilyAdapter::QwenDense | DFlash2FamilyAdapter::QwenMoe
+                )
+            })
+            .find_map(|descriptor| {
+                descriptor
+                    .parse_config(&config_bytes)
+                    .ok()
+                    .map(|config| (descriptor, config))
+            })
+            .context("DFlash2 config does not match a pinned Qwen checkpoint")?;
+        validate_dflash2_target_source(descriptor, &self.provenance)?;
+        self.model.ensure_gpu_cache_primed()?;
+        let runtime = self.model.with_gpu_cache_mut(|device, _registry| {
+            let adapter = QwenDFlash2Adapter::new(&self.model, &config)?;
+            DFlash2Runtime::load_verified(
+                device,
+                descriptor,
+                &config_path,
+                &weights_path,
+                &adapter,
+                max_slots,
+            )
+        })?;
+        tracing::info!(
+            checkpoint = descriptor.id,
+            lanes = max_slots,
+            "Qwen DFlash2 runtime provisioned"
+        );
+        self.dflash2 = Some(runtime);
+        Ok(())
+    }
+    fn dflash2_lane_matches(&self, slot_id: SlotId, logical_position: usize) -> bool {
+        self.dflash2
+            .as_ref()
+            .and_then(|runtime| runtime.lane_lengths().get(slot_id.0 as usize))
+            .is_some_and(|length| *length == logical_position)
+    }
+
+    fn clear_dflash2_lane(&mut self, slot_id: SlotId) -> Result<()> {
+        if let Some(runtime) = self.dflash2.as_mut() {
+            runtime.clear_lane(slot_id.0 as usize)?;
+        }
+        Ok(())
+    }
+
+    fn forward_dflash2_prefill_chunk(
+        &mut self,
+        tokens: &[u32],
+        positions: &[i32],
+        kv_cache: &mut HybridKvCache,
+        slot_id: SlotId,
+        logical_start: usize,
+    ) -> Result<Vec<f32>> {
+        let mut runtime = self
+            .dflash2
+            .take()
+            .context("DFlash2 prefill requested without a provisioned runtime")?;
+        let result = (|| {
+            let mut capture =
+                crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession::new(
+                    runtime.config.target_layer_ids.clone(),
+                    tokens.len(),
+                    self.model.cfg.hidden_size as usize,
+                    false,
+                );
+            let (logits, _hidden) = self.model.forward_gpu_last_logits_with_hidden_dflash(
+                tokens,
+                positions,
+                kv_cache,
+                Some(&mut capture),
+                slot_id,
+            )?;
+            self.model.with_gpu_cache_mut(|device, registry| {
+                runtime.ingest_qwen_capture(
+                    device,
+                    registry,
+                    &capture,
+                    slot_id.0 as usize,
+                    logical_start,
+                )
+            })?;
+            Ok(logits)
+        })();
+        self.dflash2 = Some(runtime);
+        result
     }
 }
 
@@ -4101,6 +4298,13 @@ impl Qwen35PrefillState {
         supervisor: &EngineSupervisor,
         anchor_quota_headroom: Option<usize>,
     ) -> Result<Qwen35PrefillAdvance> {
+        // A physical scheduler slot may now belong to a different
+        // conversation. Clear its draft ring once before the request's first
+        // prefill advance; cached-prefix requests then fail closed because
+        // their target cursor is non-zero while the draft cursor is zero.
+        if self.next_token_index == self.cached_tokens {
+            qwen.clear_dflash2_lane(self.slot_id)?;
+        }
         let (prefill_logits, mtp_hidden, advanced_tokens, checkpoint) = if let Some(logits) =
             self.cached_prefill_logits.take()
         {
@@ -4161,6 +4365,9 @@ impl Qwen35PrefillState {
             // arena never receives the graft (see `classify_slot_request`).
             let mtp_runtime = qwen.model.mtp.is_some() && kv_cache.mtp_slot.is_some();
             let graft_bound = qwen.model.kv_graft.is_some();
+            let dflash2_prefill = self.vision.is_none()
+                && self.graft_len == 0
+                && qwen.dflash2_lane_matches(self.slot_id, self.next_token_index);
             let mtp_prefill = (self.cached_tokens == 0 || self.mtp_pending_hidden.is_some())
                 && !self.speculation_unavailable
                 && (super::qwen35_speculation::prefill_mtp_catchup_allowed(
@@ -4201,6 +4408,17 @@ impl Qwen35PrefillState {
                             kv_cache,
                             self.slot_id,
                         ),
+                    None,
+                )
+            } else if dflash2_prefill {
+                (
+                    qwen.forward_dflash2_prefill_chunk(
+                        chunk,
+                        &positions,
+                        kv_cache,
+                        self.slot_id,
+                        self.next_token_index,
+                    ),
                     None,
                 )
             } else if mtp_prefill {
@@ -4587,6 +4805,9 @@ pub(in crate::serve::api) struct Qwen35CoherentTarget {
 pub(in crate::serve::api) mod anchor_store;
 #[path = "engine_qwen35/critical_path.rs"]
 pub(in crate::serve::api) mod critical_path;
+#[path = "engine_qwen35/dflash2_scheduler.rs"]
+mod dflash2_scheduler;
+pub(in crate::serve::api) use dflash2_scheduler::Qwen35DFlash2Forward;
 #[path = "engine_qwen35/joint_decode.rs"]
 mod joint_decode;
 pub(in crate::serve::api) use joint_decode::{Qwen35JointLane, Qwen35LaneRefusal};
@@ -11678,6 +11899,7 @@ mod tests {
             // ADR-040 C2b scaffold — test fixture mirrors production
             // construction shape; iter-2a always leaves this `None`.
             persistent_kv_cache: None,
+            dflash2: None,
             speculation: crate::serve::api::qwen35_speculation::QwenSpeculationController::new(
                 crate::serve::api::qwen35_speculation::QwenSpeculationPolicy::Off,
             ),
