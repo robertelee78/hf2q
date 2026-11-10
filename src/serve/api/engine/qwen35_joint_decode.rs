@@ -89,9 +89,10 @@ pub(super) struct Qwen35JointDecodeConfig {
     pub step: JointStepOptions,
     /// `HF2Q_QWEN_JOINT_MTP`: speculating lanes verify their MTP drafts as
     /// windows of a joint step (`forward_gpu_joint_verify`) instead of the
-    /// serial K3 round. In padded mode the same candidate switch selects the
+    /// serial K3 round. In padded mode the same switch selects the
     /// column-invariant projection unless its diagnostic override is explicit.
-    /// Default off.
+    /// Default on for dense artifacts with an MTP head; explicit false is the
+    /// kill switch. MoE and artifacts without MTP remain off by default.
     pub joint_mtp: bool,
 }
 
@@ -135,6 +136,15 @@ fn parse_qwen_joint_solo(raw: Option<&str>) -> Result<bool, String> {
             "{QWEN_JOINT_SOLO_ENV} must be 1/on/true or 0/off/false, got {raw:?}"
         )),
     }
+}
+
+/// The measured joint MTP+MMA candidate is the dense-MTP default. An explicit
+/// value remains the production kill switch.
+fn parse_qwen_joint_mtp(raw: Option<&str>, default: bool) -> Result<bool, String> {
+    if raw.map(str::trim).filter(|raw| !raw.is_empty()).is_none() {
+        return Ok(default);
+    }
+    parse_switch(QWEN_JOINT_MTP_ENV, raw)
 }
 
 /// Joint MTP and the column-invariant projection form one measured candidate.
@@ -239,14 +249,20 @@ pub(super) fn qwen35_joint_decode_config(
             false
         })
     };
-    let joint_mtp = switch(QWEN_JOINT_MTP_ENV, "MTP verify");
+    let joint_mtp_default = !moe && model.mtp.is_some();
+    let raw_mtp = std::env::var(QWEN_JOINT_MTP_ENV).ok();
+    let joint_mtp =
+        parse_qwen_joint_mtp(raw_mtp.as_deref(), joint_mtp_default).unwrap_or_else(|error| {
+            tracing::warn!(
+                error,
+                fallback = joint_mtp_default,
+                "invalid Qwen joint MTP verify switch"
+            );
+            joint_mtp_default
+        });
     let raw_mma = std::env::var(QWEN_JOINT_MMA_ENV).ok();
     let mma = parse_qwen_joint_mma(raw_mma.as_deref(), joint_mtp).unwrap_or_else(|error| {
-        tracing::warn!(
-            error,
-            fallback = joint_mtp,
-            "invalid Qwen joint MMA switch"
-        );
+        tracing::warn!(error, fallback = joint_mtp, "invalid Qwen joint MMA switch");
         joint_mtp
     });
     let requested_step = JointStepOptions {
@@ -901,6 +917,16 @@ mod tests {
             assert_eq!(parse_qwen_joint_solo(Some(raw)), Ok(false));
         }
         assert!(parse_qwen_joint_solo(Some("solo")).is_err());
+    }
+
+    #[test]
+    fn joint_mtp_defaults_only_for_eligible_dense_models() {
+        assert_eq!(parse_qwen_joint_mtp(None, true), Ok(true));
+        assert_eq!(parse_qwen_joint_mtp(Some(" "), true), Ok(true));
+        assert_eq!(parse_qwen_joint_mtp(None, false), Ok(false));
+        assert_eq!(parse_qwen_joint_mtp(Some("0"), true), Ok(false));
+        assert_eq!(parse_qwen_joint_mtp(Some("1"), false), Ok(true));
+        assert!(parse_qwen_joint_mtp(Some("mtp"), true).is_err());
     }
 
     #[test]

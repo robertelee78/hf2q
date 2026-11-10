@@ -14,12 +14,11 @@ use super::joint_projection::JointProjectionKernel;
 /// `0`/`off`/`false` keeps fresh device allocations. Either mode.
 pub(crate) const QWEN_JOINT_POOLED_OUTPUTS_ENV: &str = "HF2Q_QWEN_JOINT_POOLED_OUTPUTS";
 
-/// Switch for the joint MTP candidate: `1`/`on`/`true` lets speculating lanes
-/// verify their MTP drafts as windows of one joint step (each verify row
-/// bitwise the spec-off row; see `forward_gpu_joint_verify`) and selects the
-/// column-invariant projection in padded mode. Unset, blank or
-/// `0`/`off`/`false` keeps the serial K3 round and canonical projection. The
-/// worker reads it once at start, with the other joint switches.
+/// Production kill switch for the combined joint MTP candidate. Dense Qwen
+/// artifacts with an MTP head default to joint MTP verify and, in padded
+/// mode, the column-invariant projection. `0`/`off`/`false` restores serial
+/// K3 and the canonical projection. MoE and artifacts without MTP stay off by
+/// default. The worker reads it once at start with the other joint switches.
 pub(crate) const QWEN_JOINT_MTP_ENV: &str = "HF2Q_QWEN_JOINT_MTP";
 
 /// Per-step execution choices of a joint step that its route mode does not
