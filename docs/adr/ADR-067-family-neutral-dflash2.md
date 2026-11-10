@@ -1,9 +1,9 @@
-# Qwen3.8 DFlash2 successor design
+# ADR-067: Family-neutral DFlash2 speculative decoding
 
 Date: 2026-11-10
-Status: Proposed; implementation requires the operator amendment in
-[Decision required](#decision-required)
-Scope: Qwen3.8-27B dense decode only
+Status: Accepted; implementation authorized for the v0.1.30 program
+Decider: Robert E. Lee (product owner), 2026-11-10
+Scope: every enabled hf2q text-generation architecture; Qwen3.8 is the first qualified checkpoint
 
 ## Problem
 
@@ -72,6 +72,39 @@ across MT-Bench, code, and math tasks on H200. The local pinned Splash run's 5.3
 accepted-plus-bonus tokens per lane-cycle is consistent with that mechanism;
 the H200 throughput numbers are not transferable to Apple Silicon.
 
+## Family scope and checkpoint availability
+
+The runtime architecture is family-neutral. `dflash2` is not a Qwen namespace
+and must not encode Qwen target state in its core interfaces. Every enabled
+text-generation architecture is in scope through an explicit adapter:
+
+| hf2q generation architecture | DFlash2 target adapter | Published compatible checkpoint at decision time |
+|---|---|---|
+| `qwen35` dense, including Qwen3.8 | dense recurrent/attention capture and verify | Yes for Qwen3.8-27B |
+| `qwen35moe`, including Qwen3.5/3.6 | MoE recurrent/attention capture, routing and confidence-priced verify | No official DFlash2 checkpoint; official DFlash v1 checkpoints exist |
+| `gemma4` dense and MoE | Gemma hybrid-cache capture, verify and rollback | No official DFlash2 checkpoint; official DFlash v1 checkpoints exist |
+| `deepseek4` | DeepSeek recurrent/attention capture, MoE verify and rollback | No official DFlash2 checkpoint |
+
+Embedding-only architectures do not decode and are excluded. Conversion-only
+architectures enter this table when their generation surface is enabled; they
+must not be routed through an approximately compatible adapter.
+
+The official `z-lab/dflash-2` collection contains Qwen3.8-27B and
+Muse-Glimmer-30B; Muse is not an hf2q generation architecture. The pinned
+DFlash repository publishes no training/export contract, and its training-code
+request issue #19 remains open. Therefore a family without compatible trained
+weights can receive the shared runtime and explicit adapter, but hf2q must report
+DFlash2 as unavailable for that target until source-bound weights and their
+training/export provenance exist. Synthetic or cross-family weights cannot
+qualify a production path.
+
+The implementation order follows available evidence, not family preference:
+the shared checkpoint/runtime/selector/transaction layer first; Qwen3.8
+end-to-end because its weights exist; then Qwen MoE, Gemma and DeepSeek adapters
+as compatible weights and family-specific parity fixtures become available.
+This is one cross-family program, not a Qwen implementation followed by
+uncommitted ports.
+
 ## Prior hf2q work: reusable and rejected
 
 `src/inference/spec_decode/dflash/` implements the older 58-tensor DFlash format.
@@ -93,20 +126,23 @@ than reintroducing ADR-034's verifier semantics.
 
 ## Decision
 
-Implement a new `dflash2` path with explicit types and a default-off feature
-switch until all gates pass. Keep the old DFlash module unchanged until the new
-path is qualified; then delete only the Qwen-specific old path made obsolete by
-the cutover. Gemma and Qwen3-VL behavior are out of scope.
+Implement a new family-neutral `dflash2` subsystem with explicit core and
+per-family types and a default-off feature switch until that family's gates pass.
+Keep the old DFlash module unchanged until each corresponding adapter is
+qualified; then delete only code made obsolete by that adapter's clean cutover.
+Qwen3-VL remains outside the enabled generation surface and must stay fail-closed.
 
 Production remains Rust plus `mlx-native`. It must not shell out to Python,
 Splash, SGLang, vLLM, or another engine. External programs are allowed only in
-the pinned parity harness.
+the pinned parity or checkpoint-provenance harness.
 
 ### Ownership split
 
 hf2q owns:
 
 - exact checkpoint/config validation and model-family binding;
+- a family-neutral checkpoint descriptor and explicit target-adapter trait;
+- per-family hidden-capture, verifier-state and rollback implementations;
 - draft and target cache lifetimes;
 - lane scheduling, grammar state, sampling policy, acceptance, cancellation,
   prefix reuse, and state rollback;
@@ -128,17 +164,22 @@ local patch cannot qualify the result.
 
 ### Runtime contract
 
-One decode cycle performs:
+One decode cycle performs the same transaction for every family. Block size,
+target capture layers, hidden width, selector dimensions and verify limits come
+from a validated family/checkpoint descriptor and use bounded preallocated
+storage. Qwen3.8's descriptor is eight rows and seven proposals; a different
+shape is never inferred from a nearby model.
 
-1. Gather each lane's anchor, target hidden captures, draft KV ring, output
-   budget, and sampling/grammar state.
-2. Run one batched five-layer DFlash2 graph for eight rows per active lane.
-3. Run the coherent-path selector and emit seven proposals plus confidence per
-   lane.
+1. Gather each lane's anchor, declared target hidden captures, draft KV ring,
+   output budget, and sampling/grammar state through the family adapter.
+2. Run one batched DFlash2 graph for the descriptor's rows per active lane.
+3. Run the coherent-path selector and emit the descriptor's proposals plus
+   confidence per lane.
 4. Begin CPU grammar simulation for each lane's anchor plus proposals while the
    target graph starts.
-5. Run one target joint verify over the active lane windows, up to 32 rows,
-   preserving each row's serial spec-off state and logits.
+5. Run one family target joint verify over the active lane windows, preserving
+   each row's serial spec-off recurrent, attention, routing and logits state.
+   Qwen3.8 requires up to 32 rows for four lanes.
 6. Apply forced-thinking, greedy, sampled, logprob, and grammar decisions against
    the same predecessor state as spec-off; accept only the matching prefix and
    one canonical mismatch or bonus token.
@@ -161,13 +202,14 @@ production code.
 
 ### D0: checkpoint and source contract
 
-- Validate every required config field and all 81 tensor names, dtypes, shapes,
-  and byte ranges.
-- Reject wrong target architecture, target layer list, vocabulary, hidden size,
-  block size, selector dimensions, convolution dimensions, or checkpoint
-  revision.
-- Record checkpoint, target GGUF, Splash source, hf2q source, and native
-  dependency hashes in every campaign.
+- Validate every required config field and every tensor name, dtype, shape, and
+  byte range against a versioned checkpoint schema. The Qwen3.8 schema has 81
+  tensors; another family or DFlash2 revision gets its own explicit schema.
+- Reject wrong target architecture, target checkpoint identity, target layer
+  list, vocabulary, hidden size, block size, selector dimensions, convolution
+  dimensions, or draft revision.
+- Record draft checkpoint and provenance, target GGUF, reference source, hf2q
+  source, family adapter and native dependency hashes in every campaign.
 
 ### D1: drafter parity
 
@@ -225,25 +267,29 @@ for:
 - cached-token counts, prefill/decode rates, TTFT, SSE cadence, completion rate,
   and exact quality verdicts.
 
-The mechanism gate is at least 5.304 accepted-plus-bonus tokens per lane-cycle
-on the matched workload without a quality or task regression. The end-to-end Q4
-Win remains the campaign contract: a valid external comparator and 95% CI upper
-bound at or below 0.95. Raw Splash timing is architectural evidence, not a Win.
+Qwen3.8's mechanism gate is at least 5.304 accepted-plus-bonus tokens per
+lane-cycle on the matched workload without a quality or task regression. The
+operator replaced its unavailable valid-Splash denominator with this
+source-bound absolute gate on 2026-11-10; failed Splash output remains evidence,
+not a Win. Qwen3.8 must still beat its valid same-artifact peer under Q4's 95%
+CI rule.
 
-If no valid Splash comparator exists, the operator must explicitly replace that
-Q4 denominator before the release can close. The replacement should retain the
-quality floor and use a source-bound absolute target or a valid published
-competitor; it must not relabel failed Splash output as a pass.
+Every additional family preregisters its own mechanism and end-to-end gates
+against spec-off, stock and valid peers before seeing candidate results. It
+must establish a net gain; merely loading a drafter or accepting one token does
+not qualify the adapter.
 
 ### D6: promotion
 
 - Run the realistic multi-turn coding, tool-call, tool-result, unary/SSE, prefix
   reuse, cancellation, and clean-shutdown gate required by the serving contract.
-- Run Q5 on the release-candidate commit with `HF2Q_QWEN_DFLASH2` unset and prove
-  the startup audit selects DFlash2.
-- Run the kill-switch control with `HF2Q_QWEN_DFLASH2=0` and prove the promoted
-  joint-MTP route remains correct.
-- Remove superseded Qwen-only DFlash code and temporary fixtures before landing.
+- Run Q5 on the release-candidate commit with the family-neutral DFlash2 policy
+  unset and prove the startup audit selects DFlash2 only for a qualified,
+  identity-matched target/draft pair.
+- Run the global kill-switch control with `HF2Q_DFLASH2=0` and prove each
+  family's prior promoted route remains correct.
+- Remove superseded family-specific DFlash code and temporary fixtures only
+  after that family's cutover.
 
 ## Risks
 
@@ -258,21 +304,29 @@ competitor; it must not relabel failed Splash output as a pass.
   correctness requirement, not an optimization.
 - **Sampling and grammar:** the reference selector's sampled policy and host/GPU
   overlap cannot be approximated by greedy-only qualification.
-- **Comparator validity:** implementing DFlash2 does not make the current failed
-  Splash campaign valid. Release accounting still requires an explicit contract
-  decision.
+- **Checkpoint availability:** Qwen3.8 is the only enabled generation family
+  with an official DFlash2 checkpoint at this decision. Other families cannot
+  advertise support until compatible weights and provenance exist.
+- **Comparator validity:** the failed Qwen3.8 Splash campaign remains invalid.
+  The operator-approved absolute mechanism gate does not relabel it.
 
-## Decision required
+## Operator decision
 
-ADR-063 and ADR-065 currently place this successor after v0.1.30 and forbid it
-inside J4. Before implementation, the operator must choose one explicit contract:
+The operator decided on 2026-11-10 to:
 
-1. Amend both ADRs to include DFlash2 in v0.1.30, and replace the unavailable
-   valid-Splash denominator with a quality-preserving source-bound mechanism and
-   absolute performance gate until a valid external comparator exists.
-2. Keep v0.1.30 bounded to the promoted joint-MTP route, explicitly rescope the
-   Qwen3.8 Splash requirement, and execute this successor under v0.1.31.
-3. Hold v0.1.30 until an unchanged valid Splash configuration exists, retaining
-   the original external-comparator requirement and deferring DFlash2.
+1. expand v0.1.30 with the DFlash2 successor and amend ADR-063/ADR-065 rather
+   than defer the architecture;
+2. replace Qwen3.8's unavailable valid-Splash denominator with the
+   quality-preserving 5.304 accepted-plus-bonus token/lane-cycle mechanism gate,
+   while retaining its valid same-artifact peer Win and every Q5, quality,
+   fairness and serving gate;
+3. make the subsystem family-neutral for every enabled text-generation
+   architecture, not a Qwen-only path;
+4. qualify Qwen3.8 first because a compatible source-bound checkpoint exists,
+   and require explicit adapters, compatible trained weights and independent
+   D0-D6 qualification before activation on Qwen MoE, Gemma or DeepSeek.
 
-No implementation should begin under an implicit interpretation of those ADRs.
+The implementation may begin under this amended contract. Missing family
+weights are an explicit unavailable prerequisite, never permission for an
+approximate adapter, fabricated checkpoint, quality waiver or external
+production fallback.

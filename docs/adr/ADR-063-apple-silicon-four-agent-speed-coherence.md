@@ -1,8 +1,9 @@
 # ADR-063: Apple Silicon four-agent GGUF speed and coherence
 
-- **Status:** Accepted program scope, F1/F3 execution entry, the separately reviewed F2/Q1/Q2/C1 source implementation entry and the 2026-11-03 measurement-only entry (see "Speed program, Q1 successors and release mapping"); other implementation designs require separate approval.
+- **Status:** Accepted program scope, including the 2026-11-10 ADR-067 family-neutral DFlash2 implementation and Qwen3.8 comparator amendment; other implementation designs require separate approval.
 - **Date:** 2026-10-22
 - **Updated:** 2026-11-05 (Q4-QWEN36 workload) — the operator's repair-turn workload (2026-11-03) is adopted for Qwen3.6: on fixed main (mlx-native 0.15.18 `rope_multi` partial-rotary pairing, #686 tool-call newline) the paired task campaign is hf2q 21/24 vs peer 20/24, `Pass`, so Qwen3.6 has a declared workload and its Q4 speed race runs on it (Q4-QWEN36). Earlier: 2026-11-05 (Q4-GEMMA-LMHEAD-MMA opened) — the operator opened a Class B few-row MMA lm-head story under Q4-GEMMA-DECODE design §13 decision 2(b) (`docs/research/adr063-q4-gemma-lmhead-mma-design.md`); it is a predecessor of the Gemma closing campaign. Earlier: 2026-11-05 (Q4-GEMMA-ATTN-EXACT outcome) — S0 parity passed on both metallib paths. The best exact configuration (G = 2, R = 1) has a chain ratio of 0.761 against the frozen 0.70 go bar, so the story as designed stops. The operator adopted the narrowed follow-up Q4-GEMMA-ATTN-EXACT-G2 (`docs/research/adr063-q4-gemma-attn-exact-design.md` §12–§13). Earlier: 2026-11-04 (Gemma 4 gap stories) — operator decision adding Q4-GEMMA-COLD, Q4-GEMMA-PREFILL-MOE, Q4-GEMMA-DECODE and Q4-GEMMA-SPEC-SERVE, with their designs approved (`docs/research/adr063-q4-gemma-{cold,prefill-moe,decode,spec-serve}-design.md`) and their recorded decisions; decode attention is lever A of Q4-GEMMA-DECODE (root decision); the four are predecessors of Q4-GEMMA-ATTN's closing combined candidate; the revised Gemma lever budget is an estimate of about 2.2–4.0 s against the 3.0 s a Win needs; the mlx-native `rope_multi` partial-rotary defect (fix mlx-native PR #86, merged as `dc236dc1`, release 0.15.18 not yet published): all Qwen GPU validation, the ADR-065 B1 baseline run on main and the Q1 spec b6 run wait until 0.15.18 is published and pinned `=0.15.18`, ADR-065's J1/P4b pin moves to 0.15.18, and Q1-QWEN38-RERUN's delivered result stands (see "Gemma 4 gap stories and the rope_multi pin"). Earlier 2026-11-04 (Splash peer) — for Qwen3.8 and Qwen3.6 a Q4 Win requires hf2q to finish the four-agent task at least 5% sooner than both the peer and Splash, each in its best valid configuration; Splash `031a25a6` joins as a second same-artifact peer of record on the hf2q GGUFs (see "Splash peer of record for the Qwen families"; design `docs/research/adr063-splash-peer-design.md`, decisions D1–D10). Earlier 2026-11-03 (design approvals) — operator approval of the designs for Q4-GEMMA-KERNEL/Q4-GEMMA-ATTN (`docs/research/adr063-gemma-tiled-attn-design.md`), Q4-TRACE (`docs/research/adr063-q4-trace-design.md`, with its three §7 answers), Q1-QWEN36-SPEC/Q1-GEMMA-SPEC (`docs/research/adr063-q1-spec-design.md`; the unlocalized-`RouteSensitive` exception is rejected, Gemma results must be localized and #665 includes the verifier-route localizer) and Q4-DS4-RACE with ADR-066 N-IQ2XXS (`docs/research/adr066-iq2xxs-subset-design.md`); Q4-QWEN36: the conversion audit found no defect, and the first third-party check is unsloth UD-Q4_K_M under the canonical setup on both engines (see "Design approvals and Qwen3.6 decisions"). Earlier 2026-11-03 (C2 sign-offs) — owner sign-off of C2 (#360) decisions D1–D5 (`docs/research/adr063-c2-design.md` §10): divergent turns are judged by the Q1 decision envelope on every teacher-forced row of each divergent turn, `RouteSensitive` blocks; append-only turns keep `ExactTranscripts` plus the bitwise same-route twin; "≤ 1.025" limits are 95% CI upper bounds at Q3's sequential precision stop; campaigns use that stop instead of fixed blocks; anchor identity omits C1's `conversation` field; cancellation discards the request's own pending anchor. Earlier 2026-11-03 (later) — Q4-DS4 result Fit (six of seven peer runs valid; best configuration provisional); Q4-DS4-RACE now consumes ADR-066 N-IQ2XXS (the IQ2_XXS subset as its own story) instead of N1/N3/N4; Q4-DS4-RACE decision D1: on the ds4 file the race is judged against the peer only, and the vs-stock makespan contrast, fairness band and stock quality gate come from a same-artifact candidate-vs-v0.1.28 record on hf2q's own DeepSeek-V4 artifact with the same candidate binary; Q4-DS4-RACE decision D2: ds4 runs on the same file in a declared same-artifact native-comparison campaign (design `docs/research/adr066-iq2xxs-subset-design.md`). Earlier 2026-11-03 — operator decisions for the v0.1.30 speed program (see "Speed program, Q1 successors and release mapping"): Q4 rewritten as the "clearly faster than the peer" umbrella, closed by the new per-family stories Q4-QWEN38, Q4-GEMMA with Q4-GEMMA-ATTN, Q4-DS4 with Q4-DS4-RACE, and Q4-QWEN36, with Q4-GEMMA-KERNEL (mlx-native) and Q4-TRACE; the measurement tracks Q4-GEMMA (profiling) and Q4-DS4 (fit) are split from their implementation tracks and their designs are operator-approved; Q4-DS4-RACE consumes the IQ2_XXS subset of ADR-066 N1/N3/N4 pulled ahead of ADR-066 B2; Q1 successors Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC and Q1-GEMMA-SPEC added; C2 amended (built regardless of measured demand, on ADR-065 P4a/P4b with J1 joining v0.1.30, frozen limits, delivery v0.1.30); remaining verification leftovers recorded as tracked successor scope, v0.1.31. 2026-11-01 — F2 closes on option B (per-family Q3 verdicts of record with controls, quality gate and fairness; see "F2 closure scope"). 2026-10-30 — Q5 rewritten as per-family calibrated admission with live out-of-memory stops; F2 and Q1 are no longer closure gates, so stories close on per-family, independently reviewed evidence; Q3/Q4 accept per-family peer wins where a peer arm exists; C2 moves to v0.1.29. Earlier 2026-10-27 parallel-source update unchanged.
+- **Amended:** 2026-11-10 — the operator selected ADR-067 option 1: DFlash2 joins v0.1.30 as a family-neutral subsystem for every enabled text-generation architecture, Qwen3.8 qualifies first because compatible weights exist, and Qwen3.8's invalid Splash denominator is replaced by the source-bound 5.304 accepted-plus-bonus token/lane-cycle mechanism gate while its valid same-artifact peer Win and all quality, fairness, memory and serving gates remain required. Families without compatible trained weights remain explicitly unavailable until their own adapter and D0-D6 qualification; they are not approximated through Qwen.
 - **Deciders:** Robert E. Lee (product owner)
 - **Tags:** apple-silicon, m5-max, gguf, four-slot, speed, coherence, qe, v0.1.28, v0.1.30
 - Stable source ID: ADR-063
@@ -520,15 +521,15 @@ Delivery boundary: Measured evidence or qualified implementation merged to main 
 
 ### Q4. Accept and release a faster coherent four-agent Apple configuration
 
-Outcome: The program understands why hf2q is slower than the peer on the same Mac and becomes clearly faster: per family, the published hf2q finishes the canonical four-agent coding task at least 5% sooner than the peer in its best valid configuration, with quality gates passing. For Qwen3.8 and Qwen3.6 it must also finish at least 5% sooner than Splash in its best valid configuration (see "Splash peer of record for the Qwen families").
+Outcome: The program understands why hf2q is slower than the peer on the same Mac and becomes clearly faster: per family, the published hf2q finishes the canonical four-agent coding task at least 5% sooner than the peer in its best valid configuration, with quality gates passing. Qwen3.6 must also finish at least 5% sooner than Splash in its best valid configuration. Qwen3.8 instead satisfies ADR-067's absolute 5.304 accepted-plus-bonus token/lane-cycle mechanism gate because the corrected Splash arm has no valid configuration.
 
 Requirement: The program MUST explain, per family, where hf2q loses time against the peer on the M5 Max 128 GB and MUST deliver, for each of Qwen3.8, DeepSeek-V4, Qwen3.6 and Gemma 4, a configuration whose Q4 verdict is Win, with the declared quality, fairness and memory gates intact. Q4 is the umbrella story; it closes through the per-family stories Q4-QWEN38, Q4-GEMMA with Q4-GEMMA-ATTN, Q4-DS4 with Q4-DS4-RACE, and Q4-QWEN36.
 
 Acceptance:
 
-- Q4 win = `scripts/four_agent/q3_stats.py` `family_verdict` == Win: the hf2q/peer four-agent makespan ratio, peer in its best valid configuration, has a 95% CI upper bound ≤ 0.95 (`PEER_MARGIN`), under the Q3 Williams-block design (5–20 blocks). For Qwen3.8 and Qwen3.6, the hf2q/Splash ratio, Splash in its best valid configuration, must meet the same bound in the same campaign. The F2-tier "Win" label, which is against v0.1.28 stock only, is not a Q4 win.
+- Q4 win = `scripts/four_agent/q3_stats.py` `family_verdict` == Win: the hf2q/peer four-agent makespan ratio, peer in its best valid configuration, has a 95% CI upper bound ≤ 0.95 (`PEER_MARGIN`), under the Q3 Williams-block design (5–20 blocks). Qwen3.6's hf2q/Splash ratio must meet the same bound. Qwen3.8 requires the peer Win plus ADR-067 D0-D6 and at least 5.304 accepted-plus-bonus tokens per lane-cycle on the matched quality-passing workload; the harness must render this operator-rescoped verdict without treating failed Splash output as a denominator. The F2-tier "Win" label, which is against v0.1.28 stock only, is not a Q4 win.
 
-- The paired task-quality gates on the exact candidate binary pass against v0.1.28 and against the peer (against the native ds4 arm where the same-GGUF peer is unavailable), and for Qwen3.8 and Qwen3.6 also against Splash, and all deterministic task/tool/isolation gates pass.
+- The paired task-quality gates on the exact candidate binary pass against v0.1.28 and against the peer (against the native ds4 arm where the same-GGUF peer is unavailable), and for Qwen3.6 also against Splash, and all deterministic task/tool/isolation gates pass. Qwen3.8's failed Splash outputs remain a quality finding, not a candidate quality comparator.
 
 - Fairness: worst-slot TTFT p95 and SSE-gap max ratios against v0.1.28 stock stay within the stock fairness band 1.025 (`NEUTRAL_RATIO`). Vs-peer TTFT ratios are disclosed, not gated; SSE gaps against the peer are shown as not comparable.
 
@@ -546,7 +547,7 @@ Acceptance:
 
 - The Q1 successors (Q1-DS4, Q1-GEMMA-T2LOC, Q1-QWEN38-RERUN, Q1-QWEN36-SPEC, Q1-GEMMA-SPEC) do not gate Q4. DeepSeek-V4 quality for Q4 is the paired task-quality gate plus the S3 bitwise joint == serial check.
 
-- Q4 cannot close until every family is Win or the operator records a re-scope of that family in this ADR. A family's Win is measured in its closing story: Q4-QWEN38, Q4-GEMMA-ATTN (after the Q4-GEMMA profile), Q4-DS4-RACE (after the Q4-DS4 fit result) and Q4-QWEN36. A family that cannot reach Win keeps its verdict of record (Loss, Unavailable or Failed) with evidence; a Q4-DS4 no-fit or a Q4-QWEN36 BelowFloor result goes to the operator as `needs_decision`.
+- Q4 cannot close until every family is Win or the operator records a re-scope of that family in this ADR. The 2026-11-10 Qwen3.8 re-scope replaces only the unavailable valid-Splash denominator with ADR-067's absolute mechanism gate; it does not waive the peer Win or another gate. A family's verdict is measured in its closing story: Q4-QWEN38, Q4-GEMMA-ATTN (after the Q4-GEMMA profile), Q4-DS4-RACE (after the Q4-DS4 fit result) and Q4-QWEN36. A family that cannot reach Win keeps its verdict of record (Loss, Unavailable or Failed) with evidence; a Q4-DS4 no-fit or a Q4-QWEN36 BelowFloor result goes to the operator as `needs_decision`.
 
 Repository ownership: The integration owner coordinates two release chains: merge/publish/verify mlx-native updates first, pin and clean-build hf2q, then qualify and publish the hf2q crate plus signed standalone artifacts. Record both package versions/checksums, immutable source commits, native PRs and all four independent model verdicts.
 
@@ -593,9 +594,9 @@ Delivery boundary: Measured evidence or qualified implementation merged to main 
 
 ### Q4-QWEN38. Diagnose and close the Qwen3.8 gap to the peer
 
-Outcome: hf2q finishes the canonical Qwen3.8-27B four-agent coding task at least 5% sooner than the peer in its best valid configuration (with its own MTP head) and than Splash in its best valid configuration, and the measured cause of today's gap is recorded.
+Outcome: hf2q finishes the canonical Qwen3.8-27B four-agent coding task at least 5% sooner than the peer in its best valid configuration and its qualified DFlash2 route reaches at least 5.304 accepted-plus-bonus tokens per lane-cycle, while the measured cause of the Splash raw decode lead is recorded.
 
-Requirement: The program MUST attribute the Qwen3.8 hf2q-versus-peer gap by stage and MUST deliver a Qwen3.8 configuration whose Q4 verdict is Win.
+Requirement: The program MUST attribute the Qwen3.8 hf2q-versus-peer and raw Splash mechanism gaps by stage and MUST deliver a Qwen3.8 configuration whose amended Q4 verdict is Win.
 
 Acceptance:
 
@@ -605,15 +606,15 @@ Acceptance:
 
 - The 2.6× worst-slot TTFT gap is decomposed into queueing, admission, prefill and first-token stages, and each stage is closed or disclosed with evidence.
 
-- Speculation at four slots is decided from measurement (dense Qwen speculation defaults to off at four slots since #493; the peer uses its MTP head): the chosen setting is the one in the measured winning configuration, and its exactness follows the ADR-065 numerical and transaction contract.
+- Speculation at four slots is decided from measurement. The accepted ADR-067 DFlash2 route is qualified against serial spec-off, the promoted joint-MTP route and its global kill switch; the chosen setting defaults on only after D0-D6 pass.
 
-- The family verdict meets the Q4 win definition and every Q4 quality, fairness (stock band 1.025) and fresh-Q5 gate on the release candidate.
+- The family verdict meets the amended Q4 definition, including the peer Win, ADR-067 5.304 mechanism floor, every Q4 quality and fairness gate (stock band 1.025), and fresh Q5 on the release candidate.
 
 Repository ownership: hf2q owns attribution wiring, scheduling, speculation policy and the campaign. Every Metal kernel, dispatcher and primitive parity test belongs in mlx-native and is consumed at a published, exactly pinned revision.
 
 Validation: Independent review of the per-stage attribution and of the Q3-design hf2q-versus-peer campaign from raw receipts.
 
-Predecessors: ADR-065 E8 (#511, G0 gate decision), Q4-TRACE, Q5, the Splash Qwen3.8 fit and best-configuration record. Consumes ADR-065 P4a (#526), P4b (#527) and any ADR-065 build story admitted after the E8 gate.
+Predecessors: ADR-067 D0-D6, ADR-065 E8 (#511, G0 gate decision), Q4-TRACE, Q5 and the valid same-artifact peer record. Consumes ADR-065 P4a (#526), P4b (#527), the promoted joint-MTP control and any published native build required by ADR-067.
 
 Priority: High. Core scope (first-tier family).
 
@@ -1714,6 +1715,21 @@ only draft one token per lane at width four. The source and receipt analysis,
 including validity limits and the required successor architecture, is
 [the Qwen3.8 Splash gap record](../research/adr063-qwen38-splash-gap.md).
 
+Operator amendment (2026-11-10): the invalid Qwen3.8 Splash arm is no longer
+a required performance denominator. Q4-QWEN38 instead requires a valid
+same-artifact peer Win plus ADR-067's source-bound floor of 5.304
+accepted-plus-bonus tokens per lane-cycle, with every existing task, tool,
+fairness, memory, cancellation, prefix-reuse and Q5 gate intact. This does not
+convert the failed Splash campaign into a Win.
+
+The approved implementation is family-neutral across every enabled generation
+architecture (`qwen35`, `qwen35moe`, `gemma4`, `deepseek4`). Qwen3.8 is the
+first qualified adapter because it is the only one with an official compatible
+DFlash2 checkpoint at this decision. Qwen MoE, Gemma and DeepSeek require their
+own compatible trained weights, explicit target-state adapters and independent
+ADR-067 D0-D6 receipts before activation. Missing weights are recorded as
+Unavailable; no family may use an approximately compatible Qwen path.
+
 ### F2 closure scope: option B (operator decision 2026-10-31/11-01)
 
 The operator approved option B of the F2 intent review
@@ -2188,7 +2204,7 @@ Both actual Rust config validation and strict Python artifact validation must re
 
 ## Successor watchlist and tracked successor scope
 
-Production mixed-prefill policy after S1; queue-aware locality after traces; a native DFlash2/DSpark port after D2; lattice trees at a global four-slot row budget; NAX attention; scratch-lifetime synchronization removal; output/LSE shared-segment attention. Each needs its own measured deciding result, memory budget and approved design. ANE conversion/offload, approximate recurrent/nonprefix replay and custom-training-first plans remain excluded.
+Production mixed-prefill policy after S1; queue-aware locality after traces; lattice trees at a global four-slot row budget; NAX attention; scratch-lifetime synchronization removal; output/LSE shared-segment attention. Each needs its own measured deciding result, memory budget and approved design. The former native DFlash2 successor is now active v0.1.30 scope under ADR-067. ANE conversion/offload and approximate recurrent/nonprefix replay remain excluded; checkpoint training/export work is allowed only under ADR-067's explicit provenance and family-qualification contract.
 
 Tracked successor scope, v0.1.31 (operator-confirmed 2026-11-03; the last two items are carried from the planning reviews; not v0.1.30 speed-program scope):
 
