@@ -20,6 +20,26 @@ stock-gain/peer-0.95 rules. Qwen3.6 still requires a valid Splash contrast.
 Qwen3.8's corrected Splash arm is not a valid performance denominator, so its
 separate ADR-067 mechanism gate applies as specified by ADR-063.
 
+## v0.1.30 precision-cap amendment (execution decision 2026-11-10)
+
+The default sequential cap remains 20 blocks. A fresh campaign may predeclare
+`--max-blocks 40` when a completed 20-block campaign exhausted its cap solely
+because a required contrast missed the unchanged 2.5-point precision target.
+The extended campaign starts from new immutable identities and receipts; it
+does not pool the exhausted campaign. The Williams order, minimum five blocks,
+precision stop, estimator, release thresholds and every quality/fairness gate
+remain unchanged. `campaign.json` freezes the selected cap, and resume requires
+the identical plan.
+
+This extension responds to
+`q4-gemma-release-gate-27a9ddc4-v2`: all runs were valid and both release
+thresholds were demonstrated, but the candidate/peer half-width was 3.254
+points at block 20 (ratio 0.9153, 95% CI [0.8864, 0.9450]). The campaign is
+still `Inconclusive`; its observed effect is not accepted or pooled. The
+extension changes only the maximum opportunity to reach the already declared
+precision target in a new campaign.
+
+
 
 ## Arms
 
@@ -103,7 +123,7 @@ The replacement smoke at `$E/v0130/b1-503/phase-trigger-smoke-82af777e` passed Q
 
 - **Blocks.** Williams sequences over the measured arms. With three arms there are six sequences: all permutations, each arm twice in every position, and each ordered adjacent pair twice. Two arms alternate AB/BA. Four arms use one 4×4 square in which every ordered pair is adjacent once. Block `b` uses sequence `(b-1) mod len`. An arm that becomes unavailable is left out of later blocks; the remaining arms keep their relative order.
 - **Warmup.** In each driver session, before a stage's next block, one run per active arm in the order of that next block. Warmup runs are discarded for timing and kept as receipts. Their task outcomes still count, so an experiment warmup failure is an experiment failure. A warmup left unfinished by an interrupted session is marked `Abandoned`, and the resumed session runs fresh warmups.
-- **Blocks per stage.** At least 5 and at most 20. After each complete block from block 5 onward, the stage stops when every required contrast has a 95% half-width ≤ 2.5 percentage points. Required contrasts are experiment-vs-stock, plus experiment-vs-peer while the peer is available and has not failed. At 20 blocks without that precision the stage stops as `max_blocks`, which is inconclusive. The rule stops on precision, never on the size of the effect.
+- **Blocks per stage.** At least 5 and at most 20 by default. A fresh campaign may predeclare the approved 40-block precision extension above. After each complete block from block 5 onward, the stage stops when every required contrast has a 95% half-width ≤ 2.5 percentage points. Required contrasts are experiment-vs-stock, plus experiment-vs-peer while the peer is available and has not failed. At the plan's 20- or 40-block cap without that precision the stage stops as `max_blocks`, which is inconclusive. The rule stops on precision, never on the size of the effect.
 - **Run outcomes** (from `receipt.json`, `client/summary.json` and `server.stderr`):
   - `Pass`: the client reports `FourAgentProtocolCompleteAwaitingIndependentReview` with exit 0 and no supervisor stop, and the Q2 run audit (`q2_run_audit.py`) re-derives that claim from the raw client evidence: archived request/response hashes, a parser replay of every turn, lineage, v3 timing, makespan arithmetic, cohort membership, verified cleanup, and a client-observed co-progress width (streamed requests active together over a sustained common window) of 4 for `n4` and for every `K+M` plan, and exactly agent-0 for `n1`. A serialized or slot-capped service fails it. See [adr063-q2-adversarial-controls.md](adr063-q2-adversarial-controls.md).
   - `Fail`: after the four-agent release, a failed client, `server_exited` or `client_timeout` (task failure), or a Q5 memory stop (`memory_stop`). A Metal out-of-memory marker in `server.stderr` (`kIOGPUCommandBufferCallbackErrorOutOfMemory`, `Insufficient Memory`) makes the kind `out_of_memory`.
@@ -119,7 +139,7 @@ For a contrast of the experiment against reference arm R, over the complete bloc
 
 $$d_b = \ln M_{E,b} - \ln M_{R,b}, \qquad \bar d = \tfrac1n\sum_b d_b, \qquad h = t_{0.975,\,n-1}\, \frac{s_d}{\sqrt n}$$
 
-$M$ is the client's `own_output_four_task_makespan_seconds`, measured from the barrier release to the last validated task completion; model load is excluded. Each block is one cluster: one independent run per arm, each a whole cohort of conversations. Tokens and turns are never units. The reported ratio is $e^{\bar d}$ with 95% CI $[e^{\bar d-h}, e^{\bar d+h}]$, the improvement is $100(1-e^{\bar d})$ percent with its CI mapped the same way, and the half-width is $100(e^{h}-1)$ percentage points. The t quantiles for df 1–19 are tabulated in `q3_stats.T975`.
+$M$ is the client's `own_output_four_task_makespan_seconds`, measured from the barrier release to the last validated task completion; model load is excluded. Each block is one cluster: one independent run per arm, each a whole cohort of conversations. Tokens and turns are never units. The reported ratio is $e^{\bar d}$ with 95% CI $[e^{\bar d-h}, e^{\bar d+h}]$, the improvement is $100(1-e^{\bar d})$ percent with its CI mapped the same way, and the half-width is $100(e^{h}-1)$ percentage points. The t quantiles for df 1–39 are tabulated in `q3_stats.T975`.
 
 Secondary block-paired effects use the same estimator on: successful-task goodput (higher is better), client elapsed, worst-slot p95 and max semantic TTFT, and worst-slot p95 and max SSE gap.
 

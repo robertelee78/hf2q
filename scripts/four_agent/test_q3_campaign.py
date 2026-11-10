@@ -96,6 +96,12 @@ class Estimator(unittest.TestCase):
         self.assertEqual(q3_stats.stop_decision(5, {"vs_stock": precise, "vs_peer": precise}), "precision")
         self.assertIsNone(q3_stats.stop_decision(5, {"vs_stock": precise, "vs_peer": wide}))
         self.assertEqual(q3_stats.stop_decision(20, {"vs_stock": precise, "vs_peer": wide}), "max_blocks")
+        self.assertIsNone(q3_stats.stop_decision(20, {"vs_stock": precise, "vs_peer": wide}, max_blocks=40))
+        self.assertEqual(q3_stats.stop_decision(40, {"vs_stock": precise, "vs_peer": wide}, max_blocks=40),
+                         "max_blocks")
+        with self.assertRaisesRegex(ValueError, "predeclared 20 or 40"):
+            q3_stats.stop_decision(20, {"vs_stock": wide}, max_blocks=30)
+        self.assertEqual(effect_of([0.9] * 40)["blocks"], 40)
         # 2.5 points is the boundary: a 2.6-point half-width keeps running
         self.assertTrue(q3_stats.precise(effect_of([0.9, 0.9 * 1.021, 0.9, 0.9 * 1.021, 0.9, 0.9 * 1.021])))
         self.assertFalse(q3_stats.precise(effect_of([0.9, 0.96, 0.9, 0.96, 0.9])))
@@ -290,6 +296,16 @@ class Driver(Harness):
         verdict = self.verdict(manifest)
         self.assertEqual(verdict["verdict"], "Inconclusive")
         self.assertTrue(any("precision" in r for r in verdict["reasons"]))
+
+    def test_noisy_campaign_honors_predeclared_forty_block_cap(self):
+        driver, runner = self.driver(
+            lambda arm, w, call: {"makespan": noisy(100, call // 3, 0.4) * (0.9 if arm == "experiment" else 1)},
+            "--max-blocks", "40")
+        manifest = driver.run()
+        self.assertEqual(manifest["plan"]["design"]["max_blocks"], 40)
+        self.assertEqual(manifest["stages"][0]["stop"], {"reason": "max_blocks", "blocks": 40})
+        self.assertEqual(len(runner.calls), 123)
+        self.assertEqual(self.verdict(manifest)["verdict"], "Inconclusive")
 
     def test_slower_than_peer_is_a_loss(self):
         driver, _ = self.driver(lambda arm, w, call: {"makespan": noisy({"peer": 60}.get(arm, 100), call, 0.002)})
