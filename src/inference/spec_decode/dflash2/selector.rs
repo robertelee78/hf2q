@@ -10,7 +10,7 @@ use mlx_native::ops::dflash2_selector::{
 use mlx_native::{CommandEncoder, KernelRegistry, MlxDevice};
 
 /// Encode top-16 candidate extraction, predecessor/successor edge scoring,
-/// coherent-path selection, and the correctness-first all-row verify plan.
+/// coherent-path selection, and either all-row or confidence-budgeted verify.
 pub fn dispatch_dflash2_selection(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -72,8 +72,10 @@ pub fn dispatch_dflash2_selection(
     )?;
     encoder.memory_barrier();
 
-    // D3 starts from every proposal row. The empirical cost/acceptance model
-    // is enabled only after real-model qualification records its coefficients.
+    // The draft graph emits the correctness-first all-row plan. MoE serving
+    // replaces it from the same confidence readback with its online host
+    // budget before target verification; dense targets retain this plan.
+    let cost = [1.0; DFLASH2_VERIFY_COSTS - 1];
     dispatch_dflash2_verify_rows(
         encoder,
         registry,
@@ -83,7 +85,7 @@ pub fn dispatch_dflash2_selection(
         DFlash2VerifyRowsParams {
             slope: 0.0,
             intercept: [0.0; DFLASH2_MAX_POSITIONS],
-            cost: [1.0; DFLASH2_VERIFY_COSTS - 1],
+            cost,
             cost_64: 1.0,
             lanes: lanes as u32,
             rows_per_lane: config.block_size as u32,

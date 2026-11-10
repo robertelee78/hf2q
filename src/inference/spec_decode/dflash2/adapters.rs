@@ -25,6 +25,13 @@ pub trait DFlash2TargetFamily {
     fn embedding(&self) -> Result<&MlxQWeight>;
     fn vocabulary_head(&self) -> Result<&MlxQWeight>;
     fn embedding_scale(&self) -> f32;
+    /// Whether target verification should budget rows from selector confidence.
+    ///
+    /// Dense targets keep every row because reducing their packed width did
+    /// not qualify. MoE targets benefit because fewer rows avoid expert work.
+    fn adaptive_verify_budget(&self) -> bool {
+        false
+    }
 
     fn validate(&self, config: &DFlash2Config) -> Result<()> {
         config
@@ -56,8 +63,7 @@ impl<'a> QwenDFlash2Adapter<'a> {
             workspace.rows_per_lane == self.config.block_size
                 && workspace.max_lanes <= 4
                 && self.config.fc_input_dim()
-                    == self.config.target_layer_ids.len()
-                        * self.model.cfg.hidden_size as usize,
+                    == self.config.target_layer_ids.len() * self.model.cfg.hidden_size as usize,
             "Qwen DFlash2 target capture geometry does not match its workspace"
         );
         Ok(DFlash2JointCapture {
@@ -101,6 +107,10 @@ impl DFlash2TargetFamily for QwenDFlash2Adapter<'_> {
 
     fn embedding_scale(&self) -> f32 {
         1.0
+    }
+
+    fn adaptive_verify_budget(&self) -> bool {
+        self.model.cfg.moe.is_some()
     }
 }
 

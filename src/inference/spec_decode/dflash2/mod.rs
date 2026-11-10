@@ -7,9 +7,10 @@
 pub mod adapters;
 pub mod config;
 pub mod forward;
-pub mod schema;
 pub mod runtime;
+pub mod schema;
 pub mod selector;
 pub mod tensors;
+pub(crate) mod verify_budget;
 pub mod weights;
 pub mod workspace;

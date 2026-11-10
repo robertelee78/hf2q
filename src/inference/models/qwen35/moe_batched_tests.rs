@@ -501,6 +501,50 @@ fn batched_rows_equal_single_row_route_bitwise_down_q4_k() {
     batched_equals_serial(GgmlType::Q4_K, 0x36_04);
 }
 
+#[test]
+fn batched_selected_rows_ignore_larger_output_tile() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let layer = Layer::random(GgmlType::Q6_K, 0x36_17);
+    let weights = layer.gpu(&device, true, &layer.gpu_experts(&device));
+    let (x, residual) = rows(17, 0x17_32);
+    let selected = (0..17).collect::<Vec<_>>();
+    let expected = run_batched(&device, &mut registry, &weights, &x, &residual, &selected);
+
+    decode_pool::checked_reset_decode_pool().expect("reset decode pool");
+    let xin = packed(&x, &selected, &device);
+    let res = packed(&residual, &selected, &device);
+    let mut out = device.alloc_buffer(32 * H * 4, DType::F32, vec![32, H]).expect("alloc out");
+    let mut enc = device.command_encoder().expect("encoder");
+    let routing = build_moe_ffn_layer_gpu_batched_into(
+        &mut enc,
+        &device,
+        &mut registry,
+        &xin,
+        &weights,
+        shape(),
+        Some(&res),
+        &mut out,
+        17,
+        0,
+    )
+    .expect("batched MoE layer");
+    enc.commit_and_wait_labeled("test.qwen.moe_batched.padded_output").expect("commit");
+    let out = out.as_slice::<f32>().expect("read output");
+    let ids = routing.ids.as_slice::<u32>().expect("read ids");
+    let routing_weights = routing.weights.as_slice::<f32>().expect("read weights");
+    for (row, expected) in expected.iter().enumerate() {
+        assert_eq!(&out[row * H..(row + 1) * H], expected.out, "row {row} output");
+        assert_eq!(&ids[row * TOP_K..(row + 1) * TOP_K], expected.ids, "row {row} ids");
+        assert_eq!(
+            &routing_weights[row * TOP_K..(row + 1) * TOP_K],
+            expected.weights,
+            "row {row} weights"
+        );
+    }
+}
+
 const REFERENCE_ROWS: usize = 32;
 /// Rows whose F64 logit gap among the top 9 is below this are near a tie:
 /// their selection or order may legitimately differ under F32 rounding.
