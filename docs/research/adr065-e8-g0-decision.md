@@ -98,6 +98,7 @@ for A and B and changes only `HF2Q_QWEN_JOINT_MTP` from absent to `1`.
 | Case-bound fairness ceilings | Qwen3.8 baseline-v4 | `464fabf04e6efc87f1deebc82feea4ffc946c244e321fbee8f6f05f5cebca0a0` |
 | Independent analysis | `Win`; no gate failures | `0f1a077bc5484cb190257ac5c46dd22a8d71f990dd6424dc157fd6841882f05c` |
 | Candidate Q5 | `CalibrationPass` | `bfe99a65cc7d6379e3d22971d16e0c8ce3c715e5c252727313d9b3cacda1f89a` |
+| Promoted unset-switch Q5 (`6adfbcde`) | `CalibrationPass`; joint MTP/MMA active; cleanup proven | `d2b61412de248476e0536ac746af3777c9dac2e77e43a2b5f2fb8b383b72cef0` |
 | Cancellation Q5 | `CalibrationPass`; cleanup proven | `6514df591735d0d37e4aed5b14d604981f3ff5bafe4a142cae731678b54431d3` |
 | Cancellation client | `CancelSmokePass` | `7dbd24d73b95ff633dc1d216c4ba81d46b6a9186599e80ca0a7434a221e44e4d` |
 
