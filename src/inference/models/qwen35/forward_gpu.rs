@@ -3271,7 +3271,7 @@ impl Qwen35Model {
     ///
     /// When `dflash_capture` is `None`, behavior is byte-identical to
     /// [`Self::forward_gpu_with_hidden`].
-    pub fn forward_gpu_with_hidden_dflash(
+    fn forward_gpu_with_hidden_dflash_mode(
         &self,
         tokens: &[u32],
         positions_flat: &[i32],
@@ -3287,12 +3287,21 @@ impl Qwen35Model {
         // slice_view discipline.  Bounds-checked at `forward_gpu_impl`
         // entry per B4a's `slot_id.0 < n_seqs` contract.
         slot_id: SlotId,
+        output_mode: OutputHeadMode,
     ) -> Result<(Vec<f32>, MlxBuffer)> {
         let Some(session) = dflash_capture else {
-            // ADR-040 Phase B4d (2026-05-30): dflash variant now
-            // routes `slot_id` verbatim through the dflash-None
-            // fallthrough (was hard-coded SlotId(0) per B4a deferral).
-            return self.forward_gpu_with_hidden(tokens, positions_flat, kv_cache, slot_id);
+            return match output_mode {
+                OutputHeadMode::All => {
+                    self.forward_gpu_with_hidden(tokens, positions_flat, kv_cache, slot_id)
+                }
+                OutputHeadMode::Last => self.forward_gpu_last_logits_with_hidden(
+                    tokens,
+                    positions_flat,
+                    kv_cache,
+                    slot_id,
+                ),
+                _ => unreachable!("DFlash capture supports All or Last output heads"),
+            };
         };
         // Validate session layout matches this forward call before
         // running the (expensive) forward — fail fast.
@@ -3344,7 +3353,7 @@ impl Qwen35Model {
             kv_cache,
             Some(&mut acts),
             Some(&mut hidden_out),
-            OutputHeadMode::All,
+            output_mode,
             &[],
             None,
             None,
@@ -3384,6 +3393,48 @@ impl Qwen35Model {
             session.write_layer_slab(capture_idx, slab)?;
         }
         Ok((logits, hidden))
+    }
+
+    /// Target forward with selected layer captures and only the last logits row.
+    pub fn forward_gpu_last_logits_with_hidden_dflash(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        dflash_capture: Option<
+            &mut crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession,
+        >,
+        slot_id: SlotId,
+    ) -> Result<(Vec<f32>, MlxBuffer)> {
+        self.forward_gpu_with_hidden_dflash_mode(
+            tokens,
+            positions_flat,
+            kv_cache,
+            dflash_capture,
+            slot_id,
+            OutputHeadMode::Last,
+        )
+    }
+
+    /// Target forward with selected layer captures and every logits row.
+    pub fn forward_gpu_with_hidden_dflash(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        dflash_capture: Option<
+            &mut crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession,
+        >,
+        slot_id: SlotId,
+    ) -> Result<(Vec<f32>, MlxBuffer)> {
+        self.forward_gpu_with_hidden_dflash_mode(
+            tokens,
+            positions_flat,
+            kv_cache,
+            dflash_capture,
+            slot_id,
+            OutputHeadMode::All,
+        )
     }
 
     /// ADR-034 task #78 Step 3c.A.2 (2026-05-21) — embed tokens to a
