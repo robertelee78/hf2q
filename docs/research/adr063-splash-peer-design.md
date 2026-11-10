@@ -8,6 +8,14 @@ configuration. This document gives the Splash facts that decision needs, the har
 budget and the ADR-063 amendment text. `$V` = `/Users/robert/.local/state/hf2q/v0130`; Splash source paths are
 relative to the pinned checkout.
 
+Operator amendment (2026-11-10): v0.1.30's 5% minimum now applies against
+published hf2q v0.1.29; every valid peer, including Splash, is a non-inferiority
+gate with a 95% CI upper ratio bound of 1.00. Qwen3.8's corrected Splash task
+arm is not a valid performance denominator and is replaced by ADR-067's 5.304
+accepted-plus-bonus token/lane-cycle mechanism gate. The original decision
+above remains the historical input to this design; this amendment governs new
+release campaigns.
+
 ## 1. Findings
 
 | Question | Answer (source) |
@@ -439,8 +447,8 @@ because only hf2q has a server phase trace. Code changes:
   7. not complete → `Pending`;
   8. vs-peer ratio CI above 1 → `Loss`;
   9. vs-Splash ratio CI above 1 → `Loss` ("experiment makespan is longer than Splash's");
-  10. the Win conditions, where `vs_splash` must be precise with a CI upper bound ≤ `PEER_MARGIN 0.95`, beside
-      `vs_stock` and `vs_peer`.
+  10. the Win conditions, where new v0.1.30 plans require `vs_splash` to be precise with a CI upper bound ≤
+      `PEER_PARITY 1.00`, beside `vs_stock` and `vs_peer`; historical plans retain their frozen 0.95 threshold.
 - **Stopping rule.** `q3_report.required_effects` adds `vs_splash` while Splash is available and has not failed.
   `CONTRASTS` gains `("vs_splash", "splash")`.
 - **Report.** `verdict.json` gains a `splash` block (unavailable, failures, label). Rows render

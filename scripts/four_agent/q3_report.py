@@ -253,10 +253,13 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
     thermal = [e["metrics"]["thermal"]["valid"] for e in measured]
     stock_record = None if "stock_record" not in plan else bound_stock_record(plan["stock_record"])
     tagged = lambda items: [f"{f} (stock record {stock_record['path']})" for f in items]
+    design = plan["design"]
     state = {"experiment_failures": failures(manifest, "experiment")
                                     + (tagged(stock_record["experiment_failures"]) if stock_record else []),
              "peer_unavailable": manifest["unavailable"].get("peer"),
              "peer_failures": failures(manifest, "peer"), "quality": quality,
+             "stock_margin_ratio": design.get("stock_margin_ratio", q3_stats.LEGACY_STOCK_MARGIN),
+             "peer_margin_ratio": design.get("peer_margin_ratio", q3_stats.LEGACY_PEER_MARGIN),
              "thermal_valid": False if False in thermal else (True if thermal and None not in thermal else None),
              "memory_valid": all(e["metrics"]["memory"]["q5_pass"] for e in measured
                                  if e["arm"] == "experiment" and e["outcome"] == "Pass")}

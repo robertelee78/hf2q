@@ -202,7 +202,7 @@ def splash_arm(args, family, record):
     return not args.splash_unavailable_evidence
 
 
-STOCK_LABEL = "v0.1.28 release"
+STOCK_LABEL = "v0.1.29 release"
 
 
 def no_stock_refusal(args):
@@ -298,7 +298,9 @@ def build_plan(args, environ, family):
                        "estimator": "mean of per-block ln(experiment/reference), 95% t interval over complete blocks",
                        "blocks": "Williams sequences over the measured arms", "min_blocks": q3_stats.MIN_BLOCKS,
                        "max_blocks": q3_stats.MAX_BLOCKS, "half_width_pp": q3_stats.HALF_WIDTH_PP,
-                       "peer_margin_ratio": q3_stats.PEER_MARGIN, "fairness_neutral_ratio": q3_stats.NEUTRAL_RATIO,
+                       "stock_margin_ratio": q3_stats.STOCK_MARGIN,
+                       "peer_margin_ratio": q3_stats.PEER_PARITY,
+                       "fairness_neutral_ratio": q3_stats.NEUTRAL_RATIO,
                        "warmup": "one discarded run per measured arm per stage per driver session"},
             "declared": {"stock": None if args.no_stock_arm else {"label": args.stock_label or STOCK_LABEL,
                                                                   "commit": args.stock_commit, "binary": args.stock_bin},
@@ -606,7 +608,7 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--family", action="append", choices=q5_case.FAMILIES,
                         help="model family (repeatable with --dry-run; default every family in --dry-run)")
-    parser.add_argument("--stock-bin", help="stock hf2q binary (the released v0.1.28 standalone binary)")
+    parser.add_argument("--stock-bin", help="stock hf2q binary (the released v0.1.29 standalone binary)")
     parser.add_argument("--stock-commit", help="40-hex source commit of the stock binary")
     parser.add_argument("--stock-label", help=f"stock arm label (default {STOCK_LABEL!r})")
     parser.add_argument("--no-stock-arm", action="store_true",
