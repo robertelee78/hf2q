@@ -535,6 +535,7 @@ def main():
                                                  "later_first_stream_ready": None,
                                                  "stream_release_monotonic_ns": None, "prefill_headstart_ns": None})
         next_cohort = 2
+        canonical_stream_released = False
         while any(process.poll() is None for process in processes.values()):
             require(not INTERRUPTED and time.monotonic() - started < 7320, "N4 deadline/interruption")
             os.kill(args.server_pid, 0)
@@ -542,6 +543,23 @@ def main():
             for agent, process in processes.items():
                 descendants(rows, process.pid, known[agent])
                 require(process.poll() in (None, 0), "one agent failed; no partial success")
+            if args.phase_plan is None and not canonical_stream_released:
+                trigger = phase_trigger(barrier, agents, run, token)
+                if trigger is None:
+                    require(all(processes[a].poll() is None for a in agents),
+                            "canonical agent exited before first-stream readiness")
+                else:
+                    stream_at = clock_ns()
+                    save_new(barrier / "stream-release-1.json",
+                             {"schema": STREAM_RELEASE_SCHEMA, "run_id": run,
+                              "barrier_token": token, "cohort": 1,
+                              "f2_clock_id": CLOCK_ID,
+                              "release_monotonic_ns": stream_at})
+                    summary["stream_release"] = {
+                        "trigger_first_stream_ready": trigger,
+                        "release_monotonic_ns": stream_at,
+                    }
+                    canonical_stream_released = True
             if next_cohort <= len(cohorts):
                 waiting_on = cohorts[next_cohort - 2]
                 trigger = phase_trigger(barrier, waiting_on, run, token)
