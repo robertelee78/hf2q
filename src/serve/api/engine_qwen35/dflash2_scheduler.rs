@@ -6,6 +6,8 @@
 //! in-turn drain used by joint MTP. DFlash2 is optional and fail-closed: a lane
 //! joins only when its target cursor and persistent draft-ring cursor agree.
 
+use std::time::Instant;
+
 use anyhow::{Context, Result};
 
 use crate::inference::models::qwen35::joint_decode_routes::{JointDenseFfnRoute, JointRouteMode};
@@ -243,6 +245,11 @@ impl Qwen35LoadedModel {
         if active.is_empty() {
             return Ok(finish_ticks(ticks));
         }
+        let trace_timing = tracing::enabled!(
+            target: "hf2q::serve::api::engine_qwen35::progress",
+            tracing::Level::DEBUG
+        );
+        let cycle_started = trace_timing.then(Instant::now);
 
         let physical_lanes = runtime.workspace.max_lanes;
         let mut anchors = vec![0_u32; physical_lanes];
@@ -267,6 +274,7 @@ impl Qwen35LoadedModel {
         let uniforms = vec![0.5_f32; physical_lanes * DFLASH2_PROPOSALS_PER_LANE];
         let adapter_config = runtime.config.clone();
         let adapter = QwenDFlash2Adapter::new(&self.model, &adapter_config)?;
+        let draft_started = trace_timing.then(Instant::now);
         let lease = supervisor.arm("Qwen35 DFlash2 draft", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
         let drafted = self.model.with_gpu_cache_mut(|device, registry| {
             runtime.run_draft(
@@ -282,6 +290,7 @@ impl Qwen35LoadedModel {
             )
         });
         let drafted = lease.finish().and(drafted);
+        let draft_micros = draft_started.map(|started| started.elapsed().as_micros());
         if let Err(error) = drafted {
             if is_fatal(&error) {
                 return Err(error);
@@ -332,6 +341,7 @@ impl Qwen35LoadedModel {
         let adapter_config = runtime.config.clone();
         let adapter = QwenDFlash2Adapter::new(&self.model, &adapter_config)?;
         let capture = runtime.qwen_target_capture(&adapter, &lane_indices)?;
+        let verify_started = trace_timing.then(Instant::now);
         let lease = supervisor.arm("Qwen35 DFlash2 verify", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
         let verify = self.model.forward_gpu_dflash2_verify(
             &verify_lanes,
@@ -342,6 +352,7 @@ impl Qwen35LoadedModel {
             Some(capture),
         );
         let verify = lease.finish().and(verify);
+        let verify_micros = verify_started.map(|started| started.elapsed().as_micros());
         let Qwen35JointVerify {
             rows,
             hidden: _,
@@ -355,6 +366,7 @@ impl Qwen35LoadedModel {
             }
         };
         drop(verify_lanes);
+        let plan_started = trace_timing.then(Instant::now);
 
         let mut accepted = Vec::with_capacity(verifying.len());
         let mut verified = Vec::with_capacity(verifying.len());
@@ -382,10 +394,14 @@ impl Qwen35LoadedModel {
             });
             verified.push(step);
         }
+        let plan_micros = plan_started.map(|started| started.elapsed().as_micros());
 
+        let target_commit_started = trace_timing.then(Instant::now);
         let lease = supervisor.arm("Qwen35 DFlash2 commit", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
         let committed = self.model.commit_joint_verify(kv_cache, pending, &accepted);
         let committed = lease.finish().and(committed);
+        let target_commit_micros =
+            target_commit_started.map(|started| started.elapsed().as_micros());
         if let Err(error) = committed {
             if is_fatal(&error) {
                 return Err(error);
@@ -397,6 +413,7 @@ impl Qwen35LoadedModel {
         for (&index, &count) in verifying.iter().zip(&accepted) {
             retained[states[index].slot_id.0 as usize] = u32::try_from(count)?;
         }
+        let draft_commit_started = trace_timing.then(Instant::now);
         let lease = supervisor.arm(
             "Qwen35 DFlash2 target-context commit",
             QWEN35_WORKER_TRANSACTION_TIMEOUT,
@@ -405,6 +422,8 @@ impl Qwen35LoadedModel {
             runtime.commit_target_context(device, registry, &retained)
         });
         let context_committed = lease.finish().and(context_committed);
+        let draft_commit_micros =
+            draft_commit_started.map(|started| started.elapsed().as_micros());
         if let Err(error) = context_committed {
             if is_fatal(&error) {
                 return Err(error);
@@ -419,6 +438,20 @@ impl Qwen35LoadedModel {
                     .record_lane_tokens(slot, &tokens[..count])
                     .with_context(|| format!("bind DFlash2 slot {slot} retained token prefix"))?;
             }
+        }
+        if let Some(started) = cycle_started {
+            tracing::debug!(
+                target: "hf2q::serve::api::engine_qwen35::progress",
+                active_lanes = verifying.len(),
+                verify_rows = accepted.iter().sum::<usize>(),
+                draft_us = draft_micros.unwrap_or_default(),
+                target_verify_us = verify_micros.unwrap_or_default(),
+                host_plan_us = plan_micros.unwrap_or_default(),
+                target_commit_us = target_commit_micros.unwrap_or_default(),
+                draft_commit_us = draft_commit_micros.unwrap_or_default(),
+                total_us = started.elapsed().as_micros(),
+                "Qwen DFlash2 stage timing"
+            );
         }
 
         for (&index, step) in verifying.iter().zip(verified) {

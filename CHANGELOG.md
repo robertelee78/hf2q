@@ -49,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - DFlash2 Qwen lanes now bind resident draft rings to the exact committed token prefix. Exact cached follow-ups preserve or safely rewind an unwrapped ring and continue DFlash2 after suffix prefill; incompatible, same-length-different, or post-wrap restored prefixes clear the ring and fail closed to the established route. Inactive physical lanes use the selector's minimum valid one-row bound without participating in verification.
+- DFlash2's fixed 32-row target verifier uses mlx-native's matching tensor-v1 tile instead of the 128-row tensor-v2 tile; every other dense MM shape retains its previous route. On the exact Qwen3.8 four-lane smoke, target verification fell from a 215.494 ms median to 123.537 ms and the full coding protocol from 103.141573 s to 74.388081 s with all clients successful. The DFlash progress DEBUG target now attributes draft, target verify, host planning, target commit, draft-context commit and total transaction wall time; normal INFO serving does not sample the timers.
 
 - Splash four-agent request parity now omits the semantic default `strict:false` from each function definition on the Splash wire, matching hf2q's rendered tool schema byte for byte; the audit inverse restores the canonical client shape and refuses drift.
 
