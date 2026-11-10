@@ -41,8 +41,10 @@ use mlx_native::DType;
 /// Widest serving joint-decode pack. Production callers stay within this
 /// bound.
 pub(crate) const MAX_JOINT_DECODE_ROWS: usize = 8;
-/// Widest diagnostic joint-verify pack: four slots × four rows.
+/// Widest diagnostic joint-MTP verify pack: four slots × four rows.
 pub(crate) const MAX_JOINT_VERIFY_ROWS: usize = 16;
+/// Fixed DFlash2 target width: four lanes × eight rows.
+pub(crate) const DFLASH2_VERIFY_WIDTH: usize = 32;
 
 /// The only packed width of the `mul_mv_ext` mode, and its row cap.
 pub(crate) const PADDED_MV_EXT_WIDTH: usize = 4;
@@ -333,6 +335,7 @@ mod tests {
             };
             assert_eq!(padded, expected);
         }
+        assert_eq!(DFLASH2_VERIFY_WIDTH, 4 * 8);
     }
 
     #[test]

@@ -36,12 +36,13 @@ use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::MlxBuffer;
 
 use super::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput};
+use crate::inference::models::qwen35::forward_gpu::joint_decode::DFlash2JointCapture;
 use crate::inference::models::qwen35::joint_decode_core::{
     encode_delta_net_replay, rows_view, DeltaNetReplay, JointWindow,
 };
 use crate::inference::models::qwen35::joint_decode_routes::{
-    joint_verify_padded_width, JointDenseFfnRoute, JointRouteMode, MAX_JOINT_DECODE_ROWS,
-    MAX_JOINT_VERIFY_ROWS,
+    joint_verify_padded_width, JointDenseFfnRoute, JointRouteMode, DFLASH2_VERIFY_WIDTH,
+    MAX_JOINT_DECODE_ROWS, MAX_JOINT_VERIFY_ROWS,
 };
 use crate::inference::models::qwen35::joint_projection::JointProjectionKernel;
 use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
@@ -97,8 +98,32 @@ impl Qwen35JointVerifyPending {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VerifyLayout {
+    /// Existing MTP diagnostic: preserve the caller's joint-decode route.
+    JointMtp,
+    /// DFlash2 target: always fill one four-lane, eight-row temporal tile.
+    DFlash2,
+}
+
+impl VerifyLayout {
+    fn max_rows(self) -> usize {
+        match self {
+            Self::JointMtp => MAX_JOINT_VERIFY_ROWS,
+            Self::DFlash2 => DFLASH2_VERIFY_WIDTH,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::JointMtp => "joint MTP",
+            Self::DFlash2 => "DFlash2",
+        }
+    }
+}
+
 impl Qwen35Model {
-    /// Run one joint verify step over `lanes` (distinct slots, `1 + k_i`
+    /// Run one joint MTP verify step over `lanes` (distinct slots, `1 + k_i`
     /// rows each, at most [`MAX_JOINT_VERIFY_ROWS`] rows in total). Every
     /// row's logits, hidden and argmax are bitwise those of the joint
     /// decode step under the same `mode`, `dense_ffn` and `options` for that
@@ -113,11 +138,79 @@ impl Qwen35Model {
         dense_ffn: JointDenseFfnRoute,
         options: JointStepOptions,
     ) -> Result<Qwen35JointVerify> {
-        ensure!(!lanes.is_empty(), "Qwen joint verify requires a lane");
-        let total = lanes.iter().map(|lane| lane.tokens.len()).sum::<usize>();
+        self.forward_gpu_joint_verify_layout(
+            lanes,
+            kv_cache,
+            mode,
+            dense_ffn,
+            options,
+            VerifyLayout::JointMtp,
+            None,
+        )
+    }
+
+    /// Run the DFlash2 target verify as one fixed-width temporal tile.
+    ///
+    /// The tile is always [`DFLASH2_VERIFY_WIDTH`] rows, so a lane's bytes
+    /// do not depend on the number or lengths of its cohort's windows.
+    /// Quantized projections at this width use the canonical matrix-matrix
+    /// route and stream each dense target weight once. This is a Q1 Class B
+    /// alternate route against one-token decode: its decision envelope and
+    /// argmax equality are qualification gates, not assumptions.
+    #[allow(dead_code, reason = "DFlash2 scheduler wiring follows the target-capture gate")]
+    pub(crate) fn forward_gpu_dflash2_verify(
+        &self,
+        lanes: &[Qwen35JointVerifyLane<'_>],
+        kv_cache: &mut HybridKvCache,
+        mode: JointRouteMode,
+        dense_ffn: JointDenseFfnRoute,
+        options: JointStepOptions,
+        capture: Option<DFlash2JointCapture<'_>>,
+    ) -> Result<Qwen35JointVerify> {
+        self.forward_gpu_joint_verify_layout(
+            lanes,
+            kv_cache,
+            mode,
+            dense_ffn,
+            options,
+            VerifyLayout::DFlash2,
+            capture,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_gpu_joint_verify_layout(
+        &self,
+        lanes: &[Qwen35JointVerifyLane<'_>],
+        kv_cache: &mut HybridKvCache,
+        mode: JointRouteMode,
+        dense_ffn: JointDenseFfnRoute,
+        options: JointStepOptions,
+        layout: VerifyLayout,
+        capture: Option<DFlash2JointCapture<'_>>,
+    ) -> Result<Qwen35JointVerify> {
         ensure!(
-            (1..=MAX_JOINT_VERIFY_ROWS).contains(&total),
-            "Qwen joint verify requires 1..={MAX_JOINT_VERIFY_ROWS} rows, got {total}"
+            !lanes.is_empty(),
+            "Qwen {} verify requires a lane",
+            layout.label()
+        );
+        if layout == VerifyLayout::DFlash2 {
+            ensure!(
+                lanes.len() <= 4,
+                "Qwen DFlash2 verify accepts at most four lanes, got {}",
+                lanes.len()
+            );
+            ensure!(
+                options.projection == JointProjectionKernel::Canonical,
+                "Qwen DFlash2 verify requires the canonical width-32 projection route"
+            );
+        }
+        let total = lanes.iter().map(|lane| lane.tokens.len()).sum::<usize>();
+        let max_rows = layout.max_rows();
+        ensure!(
+            (1..=max_rows).contains(&total),
+            "Qwen {} verify requires 1..={max_rows} rows, got {total}",
+            layout.label()
         );
         let mut rows = Vec::with_capacity(total);
         let mut windows = Vec::with_capacity(lanes.len());
@@ -126,33 +219,50 @@ impl Qwen35Model {
             let slot = lane.slot_id;
             ensure!(
                 slot.0 < kv_cache.n_seqs,
-                "Qwen joint verify slot {} outside n_seqs={}",
+                "Qwen {} verify slot {} outside n_seqs={}",
+                layout.label(),
                 slot.0,
                 kv_cache.n_seqs
             );
             ensure!(
                 lanes[..index].iter().all(|earlier| earlier.slot_id != slot),
-                "Qwen joint verify slot {} appears twice",
+                "Qwen {} verify slot {} appears twice",
+                layout.label(),
                 slot.0
             );
             ensure!(
                 !lane.tokens.is_empty(),
-                "Qwen joint verify lane {} has no rows",
+                "Qwen {} verify lane {} has no rows",
+                layout.label(),
                 slot.0
             );
-            let position = u32::try_from(lane.position)
-                .context("Qwen joint verify position must be non-negative")?;
+            if layout == VerifyLayout::DFlash2 {
+                ensure!(
+                    lane.tokens.len() <= 8,
+                    "Qwen DFlash2 verify lane {} has {} rows; maximum is eight",
+                    slot.0,
+                    lane.tokens.len()
+                );
+            }
+            let position = u32::try_from(lane.position).with_context(|| {
+                format!(
+                    "Qwen {} verify position must be non-negative",
+                    layout.label()
+                )
+            })?;
             kv_cache
                 .validate_sequence_len_for_slot(slot, position as usize)
                 .with_context(|| {
                     format!(
-                        "Qwen joint verify lane {} must start at its committed cursor",
+                        "Qwen {} verify lane {} must start at its committed cursor",
+                        layout.label(),
                         slot.0
                     )
                 })?;
             ensure!(
                 position as usize + lane.tokens.len() <= kv_cache.max_seq_len as usize,
-                "Qwen joint verify lane {} window {}..{} exceeds max_seq_len {}",
+                "Qwen {} verify lane {} window {}..{} exceeds max_seq_len {}",
+                layout.label(),
                 slot.0,
                 position,
                 position as usize + lane.tokens.len(),
@@ -178,15 +288,19 @@ impl Qwen35Model {
             }
         }
         self.check_joint_step_admission(kv_cache, mode, dense_ffn, options)?;
-        let width = if options.projection == JointProjectionKernel::ColumnInvariantMma {
+        let width = match layout {
+            VerifyLayout::DFlash2 => DFLASH2_VERIFY_WIDTH,
+            VerifyLayout::JointMtp
+                if options.projection == JointProjectionKernel::ColumnInvariantMma =>
+            {
             ensure!(
                 total <= MAX_JOINT_DECODE_ROWS,
                 "Qwen joint verify column-invariant MMA supports at most \
                  {MAX_JOINT_DECODE_ROWS} rows, got {total}"
             );
             total
-        } else {
-            joint_verify_padded_width(mode, total)
+            }
+            VerifyLayout::JointMtp => joint_verify_padded_width(mode, total),
         };
         let packing = super::joint_decode::JointPacking {
             rows: &rows,
@@ -210,6 +324,7 @@ impl Qwen35Model {
                     dense_ffn,
                     options,
                     replay.as_mut(),
+                    capture,
                 )?;
                 Ok((outputs, normed, replay))
             },
@@ -223,7 +338,8 @@ impl Qwen35Model {
             rows.iter()
                 .zip(&windows)
                 .all(|(lane, window)| lane.len() == window.rows),
-            "Qwen joint verify returned fewer rows than it packed"
+            "Qwen {} verify returned fewer rows than it packed",
+            layout.label()
         );
         let hidden_size = self.cfg.hidden_size as usize;
         let hidden = windows

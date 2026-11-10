@@ -80,30 +80,51 @@ text-generation architecture is in scope through an explicit adapter:
 
 | hf2q generation architecture | DFlash2 target adapter | Published compatible checkpoint at decision time |
 |---|---|---|
-| `qwen35` dense, including Qwen3.8 | dense recurrent/attention capture and verify | Yes for Qwen3.8-27B |
-| `qwen35moe`, including Qwen3.5/3.6 | MoE recurrent/attention capture, routing and confidence-priced verify | No official DFlash2 checkpoint; official DFlash v1 checkpoints exist |
-| `gemma4` dense and MoE | Gemma hybrid-cache capture, verify and rollback | No official DFlash2 checkpoint; official DFlash v1 checkpoints exist |
-| `deepseek4` | DeepSeek recurrent/attention capture, MoE verify and rollback | No official DFlash2 checkpoint |
+| `qwen35` dense, including Qwen3.8 | dense recurrent/attention capture and verify | Yes: `z-lab/Qwen3.8-27B-DFlash2@50307d4c4cde6860d4eee73e2547cd786fe8e8a4` |
+| `qwen35moe`, including Qwen3.5/3.6 | MoE recurrent/attention capture, routing and confidence-priced verify | Yes for Qwen3.6: `incoai/Qwen3.6-35B-A3B-DFlash2@51ef7b6923ad6c14cb1bb41c37a9041446496ab6`; no compatible Qwen3.5 checkpoint found |
+| `gemma4` dense and MoE | Gemma hybrid-cache capture, verify and rollback | Yes for `google/gemma-4-E2B-it` and `google/gemma-4-31B-it`; no checkpoint matching the release-gate `gemma-4-26B-A4B-it` artifact found |
+| `deepseek4` | DeepSeek recurrent/attention capture, MoE verify and rollback | No compatible DeepSeek-V4 checkpoint found |
 
 Embedding-only architectures do not decode and are excluded. Conversion-only
 architectures enter this table when their generation surface is enabled; they
 must not be routed through an approximately compatible adapter.
 
-The official `z-lab/dflash-2` collection contains Qwen3.8-27B and
-Muse-Glimmer-30B; Muse is not an hf2q generation architecture. The pinned
-DFlash repository publishes no training/export contract, and its training-code
-request issue #19 remains open. Therefore a family without compatible trained
-weights can receive the shared runtime and explicit adapter, but hf2q must report
-DFlash2 as unavailable for that target until source-bound weights and their
+The initial collection search understated availability. The operator harness
+already pins the Apache-2.0 Qwen3.6 checkpoint above: its 1,052,513,456-byte
+BF16 safetensors file has SHA256
+`d1f16c0ff85afbe6166fabfae998af3ec16fa11da87da4391b5e0e0a7c796a4d`,
+and its config SHA256 is
+`86d2e8e57e7c70bb867240708d00c0535ae9ed3c828dbdcb21584471c7bbce59`.
+It uses six draft layers and target captures after layers
+`[1, 6, 11, 16, 22, 27, 32, 37]`. Qwen3.6 is therefore an available second
+qualification path, not an unavailable-family placeholder.
+
+Two Apache-2.0 Gemma checkpoints also establish that the shared format is not
+Qwen-only. `rasyosef/gemma-4-E2B-it-dflash2@6eb3ade2e4ae841974d692e9edc177dcaa7e20ff`
+publishes its training command, state and validation metrics; the latter reports
+3.6595 accepted draft tokens and 4.4580 expected accepted length. Its
+646,093,904-byte weights have SHA256
+`842a33bc4f38cc054dc5df0784ee332b49b2a824956d60795d8e94f269024fee`.
+`RedHatAI/gemma-4-31B-it-speculator.dflash2@b0cd01b4918aae6b6388272950c4f9851734674b`
+publishes the same 81-tensor names as the Qwen3.8 checkpoint with Gemma-bound
+dimensions; its 5,494,652,680-byte weights have SHA256
+`3e82ec115f31020a81a69c6145aee727996ea9d83664f6285728e6bff0dd6b0f`.
+Both use the nested `speculators` config envelope, which requires a separate
+versioned config schema even though the tensor naming convention is shared.
+
+The search found no DFlash2 checkpoint compatible with DeepSeek-V4 and none for
+the release-gate Gemma 4 26B-A4B target. A family or target without compatible
+trained weights can receive the shared runtime and explicit adapter, but hf2q
+must report DFlash2 as unavailable until source-bound weights and their
 training/export provenance exist. Synthetic or cross-family weights cannot
 qualify a production path.
 
 The implementation order follows available evidence, not family preference:
-the shared checkpoint/runtime/selector/transaction layer first; Qwen3.8
-end-to-end because its weights exist; then Qwen MoE, Gemma and DeepSeek adapters
-as compatible weights and family-specific parity fixtures become available.
-This is one cross-family program, not a Qwen implementation followed by
-uncommitted ports.
+the shared checkpoint/runtime/selector/transaction layer first; Qwen3.8 and
+Qwen3.6 end-to-end because their exact weights and target artifacts exist;
+Gemma adapters against an exact supported target/checkpoint pair next; and
+DeepSeek when compatible weights exist. This is one cross-family program, not a
+Qwen implementation followed by uncommitted ports.
 
 ## Prior hf2q work: reusable and rejected
 
@@ -223,13 +244,54 @@ production code.
 - Reject the path if proposal acceptance on the Q4 workload does not materially
   exceed the promoted one-token MTP route.
 
+#### D1 reference-oracle correction and measured status
+
+The first fixture spike used the checkpoint's end-to-end BF16 PyTorch graph as
+the numeric oracle. It was rejected before qualification: hf2q's existing
+`mlx-native` contract keeps draft activations in F32, packs attention Q/K/V and
+the sliding KV ring in BF16, and executes the target GGUF vocabulary head with
+its native quantized kernel. The BF16-only oracle therefore tested a different
+precision contract. Adding F32-to-BF16 round trips after every operation made
+both numeric and candidate parity worse and added avoidable per-layer kernels;
+that failed spike was removed.
+
+Fixture schema `hf2q.dflash2-reference-fixture.v2` instead runs the pinned
+reference with F32 draft activations and BF16 packed attention/cache. The
+isolated second-lane case is the numeric calibration case and is excluded from
+the holdout claim. Its frozen limits are: input max-absolute `0.03`, layer
+relative max-absolute `0.05`, final-hidden max-absolute `2.5`, logit
+max-absolute `2.0`, selector-hidden max-absolute `1.1`, at least 10 common
+members in each top-16 candidate set, and at least four matching positions in
+each seven-token path. The short, 2,048-token wrap, two-lane and restore cases
+are the holdouts. Their frozen fixture SHA256 values are, respectively,
+`44ff640455fae488cde9fd70e8861296575326596eaee5148c61c595eb2e5002`,
+`597020bfafc62647dbf0f653b554bf8c2aa004c3dbb51c0365632a4f6a1ab8d2`,
+`00682c8dd2cbd9b3f1e28f5476993ad867812a60d2f34ccd2181bf9fd009a06c`,
+and `9d041ae20e9f4a39368e6953ad54cf7dbdb5368a8524c1edb45ff4667f636595`.
+
+The v2 holdouts pass those frozen limits. Short, wrap and restore match all
+seven selected path positions; the two-lane case matches `7/7` and `4/7`.
+Candidate overlap is at least `10/16` at every position. This proves bounded
+operational-precision parity for the forward, ring and coherent selector. D1
+remains open until aligned edge/confidence comparison and the Q4-workload
+acceptance gate are complete; these measurements do not promote the route.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
-  32 rows total.
-- Prove every row's hidden, logits, and argmax against serial spec-off, including
-  DeltaNet sequential state, full-attention KV positions, and mixed lane
-  lengths.
+  32 rows total. DFlash2 always executes a fixed width-32 tile; inactive rows
+  remain masked and cannot change a live lane's bytes.
+- Freeze width-32 verification as a Q1 Class B route against serial spec-off
+  before collecting parity data. For every target-logit row, require
+  `max_abs_delta <= 0.25` and exact argmax equality. Record hidden-state
+  max-absolute, mean-absolute and cosine metrics, but do not create an
+  elementwise hidden gate that the governing Q1 policy does not define.
+- Require bitwise cohort invariance for each live lane across solo, mixed-length,
+  full four-lane and lane-permuted width-32 tiles. For MoE targets, also record
+  selected expert IDs and router margins per row.
+- Prove DeltaNet sequential state, full-attention KV positions, and mixed lane
+  lengths, then prove exact retained-prefix cache state after accepting zero
+  through seven proposals.
 - Keep the promoted route available behind `HF2Q_QWEN_DFLASH2=0` until the new
   default passes Q5.
 - Stop if a 32-row target forward scales approximately with rows instead of
@@ -304,9 +366,12 @@ not qualify the adapter.
   correctness requirement, not an optimization.
 - **Sampling and grammar:** the reference selector's sampled policy and host/GPU
   overlap cannot be approximated by greedy-only qualification.
-- **Checkpoint availability:** Qwen3.8 is the only enabled generation family
-  with an official DFlash2 checkpoint at this decision. Other families cannot
-  advertise support until compatible weights and provenance exist.
+- **Checkpoint availability:** compatible checkpoints exist for Qwen3.8,
+  Qwen3.6, Gemma4 E2B and Gemma4 31B. No compatible checkpoint was found for
+  Qwen3.5, the release-gate Gemma4 26B-A4B artifact, or DeepSeek-V4. Those
+  target families must fail closed until identity-matched weights with
+  reproducible provenance exist; support cannot be inferred from a nearby
+  model.
 - **Comparator validity:** the failed Qwen3.8 Splash campaign remains invalid.
   The operator-approved absolute mechanism gate does not relabel it.
 
