@@ -371,6 +371,18 @@ counts from 1 through 8 and forced-thinking closure. The mismatched
 artifact. These are end-to-end smoke observations, not D2-D6 qualification:
 they are single-lane, unmatched to spec-off, and not the Q4 workload.
 
+The first four-lane Qwen3.6 run exposed a separate target-shape boundary: its
+native-storage batched MoE layer admitted only the ordinary joint-decode width
+of eight rows, while DFlash2 always supplies 32 target rows. The route now
+admits 32. Rows one through eight retain their bitwise single-row invariant;
+the F32 router and shared-gate logits at width 32 use dense MM and are instead
+qualified against the whole-layer F64 reference. Q4_K and Q6_K model-free
+tests matched expert IDs outside declared near ties and stayed within the
+`8 * (hidden + moe_i) * 2^-24 * S` error envelope. The exact checkpoint then
+completed a four-lane repair-turn Q5 calibration in 35.619491 seconds with all
+clients successful and cleanup proven. This closes the runtime shape defect;
+it is not a matched D5 campaign result.
+
 An exact-target Qwen3.8 Q4_K_M follow-up smoke on 2026-11-10 exercised that
 prefix binding. The cold unary turn used 64 prompt tokens, produced 36 completion
 tokens through DFlash2, and returned `ALPHA`. The next rendered prompt had 120
@@ -451,18 +463,31 @@ still streams native GGUF block layouts and repeatedly decodes irregular
 Q4_K/Q6_K metadata from those blocks. Splash's own source notes about an 8%
 cost for dynamic Q4_K scale-byte indexing support this attribution.
 
-Two bounded experiments falsified shortcuts. Routing the fixed width through
-the generic tensor-v2 64x32 short tile raised target-verify medians to roughly
-161 ms; restricting that route to Q6_K still measured roughly 155 ms. A
-load-once Q4_K/Q6_K code/meta repack with a dedicated 32-row tensor kernel
-passed model-free numerical parity and real-model Q5, but improved the matched
-target-verify median only from 151.038 ms to 149.288 ms. That was insufficient
-under the original 0.95 peer-superiority contract. The later parity amendment
-makes the prepared-weight route eligible for a new matched campaign; it does
-not turn the old unmatched observations into acceptance evidence. Neither
-experiment is promoted. The remaining credible path is the complete
-prepared-weight plus BF16/fusion execution model, not another raw-block
-row-tile switch.
+Bounded experiments falsified the available shortcuts. Generic tensor-v2
+64x32 routing raised target-verify medians to roughly 161 ms; restricting that
+route to Q6_K still measured roughly 155 ms. A dedicated load-once Q4_K/Q6_K
+code/meta repack passed model-free numerical parity and every real-model Q5
+quality and cleanup gate, but none of its measured schedules beat the promoted
+route end to end:
+
+| candidate | four-task makespan (s) | target-verify median (ms) | transaction median (ms) |
+|---|---:|---:|---:|
+| golden-ratio K walk | 119.305 | 233.553 | 261.045 |
+| sequential prepared planes | 83.802 | 152.115 | 178.083 |
+| selected projection split-K | 82.591 | 152.900 | 178.249 |
+| all transformer projections split-K | 82.747 | 152.591 | 178.367 |
+| staged half activations | 83.167 | 150.212 | 175.863 |
+| pipelined staged half activations | 84.316 | 150.355 | 175.719 |
+
+The prepared route also retains a second model-sized weight representation.
+Its small kernel-stage gain does not justify that memory cost without an
+end-to-end win. A separate smallest-covering 4/8/16/32 verifier-width spike
+regressed to 87.782 seconds because the narrower stock kernels cost more than
+the fixed width-32 pass; the fixed dense width remains intentional. All seven
+spikes are rejected, not production fallbacks. The remaining credible dense
+kernel path requires a complete prepared-weight BF16/fusion execution model
+that wins end to end, not another raw-block row tile, K-order, split-K, or
+partial activation-staging change.
 
 ### D5: performance qualification
 

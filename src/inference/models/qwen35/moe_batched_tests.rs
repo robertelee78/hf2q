@@ -5,10 +5,11 @@
 //! layouts (expert and shared gate/up Q4_K; down Q6_K or Q4_K; router and
 //! shared gate logit F32), with finite f16 scales.
 //!
-//! * batched == serial: every row of a `rows = 2..8` layer, in any row
+//! * batched == serial: every row of a `rows = 2..8` decode layer, in any row
 //!   order and next to any other rows, is bitwise the `rows = 1` layer of that
 //!   row, including expert ids and routing weights; the serial decode builder
-//!   (`build_moe_ffn_layer_gpu_q_into` at one row) runs exactly that route.
+//!   (`build_moe_ffn_layer_gpu_q_into` at one row) runs exactly that route;
+//! * one width-32 DFlash2 target layer stays within the F64 reference envelope.
 //! * F64 reference of the whole layer (routing on F64 router logits, ties to
 //!   the lower expert): identical expert ids, output within
 //!   `8 * (hidden + moe_i) * 2^-24 * S` where `S` is the F64 magnitude of the
@@ -516,29 +517,28 @@ fn matches_f64_reference(down_t: GgmlType, seed: u64) {
     let unit = 2f64.powi(-24);
     let factor = 8.0 * (H + MI) as f64 * unit;
     let (mut worst_ratio, mut max_abs, mut sum_abs, mut near_ties) = (0.0f64, 0.0f64, 0.0f64, 0);
-    for chunk in (0..REFERENCE_ROWS).collect::<Vec<_>>().chunks(4) {
-        let gpu = run_batched(&device, &mut registry, &weights, &x, &residual, chunk);
-        for (slot, &row) in chunk.iter().enumerate() {
-            let reference = cache.reference(&x[row], &residual[row]);
-            if reference.gap < TIE_GAP {
-                near_ties += 1;
-            } else {
-                let ids: Vec<usize> = gpu[slot].ids.iter().map(|&id| id as usize).collect();
-                assert_eq!(ids, reference.ids, "{down_t:?} row {row}: expert ids differ from F64");
-            }
-            for i in 0..H {
-                let err = (gpu[slot].out[i] as f64 - reference.out[i]).abs();
-                let bound = factor * reference.magnitude[i];
-                assert!(
-                    err <= bound,
-                    "{down_t:?} row {row} [{i}]: |{} - {}| = {err:e} > {bound:e}",
-                    gpu[slot].out[i],
-                    reference.out[i]
-                );
-                worst_ratio = worst_ratio.max(err / reference.magnitude[i]);
-                max_abs = max_abs.max(err);
-                sum_abs += err;
-            }
+    let all_rows = (0..REFERENCE_ROWS).collect::<Vec<_>>();
+    let gpu = run_batched(&device, &mut registry, &weights, &x, &residual, &all_rows);
+    for row in 0..REFERENCE_ROWS {
+        let reference = cache.reference(&x[row], &residual[row]);
+        if reference.gap < TIE_GAP {
+            near_ties += 1;
+        } else {
+            let ids: Vec<usize> = gpu[row].ids.iter().map(|&id| id as usize).collect();
+            assert_eq!(ids, reference.ids, "{down_t:?} row {row}: expert ids differ from F64");
+        }
+        for i in 0..H {
+            let err = (gpu[row].out[i] as f64 - reference.out[i]).abs();
+            let bound = factor * reference.magnitude[i];
+            assert!(
+                err <= bound,
+                "{down_t:?} row {row} [{i}]: |{} - {}| = {err:e} > {bound:e}",
+                gpu[row].out[i],
+                reference.out[i]
+            );
+            worst_ratio = worst_ratio.max(err / reference.magnitude[i]);
+            max_abs = max_abs.max(err);
+            sum_abs += err;
         }
     }
     eprintln!(

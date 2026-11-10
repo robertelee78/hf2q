@@ -1,7 +1,7 @@
 //! Batched MoE FFN decode route (`HF2Q_QWEN_MOE_BATCHED=1`).
 //!
-//! One MoE FFN layer over `rows = 1..=8` decode rows in one encoder segment,
-//! with the router and shared expert read in their GGUF storage types:
+//! One MoE FFN layer over `rows = 1..=32` decode or DFlash2 target rows in one
+//! encoder segment, with the router and shared expert read in their GGUF storage types:
 //!
 //! | phase | dispatch | kernel |
 //! |---|---|---|
@@ -16,10 +16,10 @@
 //! | E | expert down over `rows * top_k` pairs | `kernel_mul_mv_id_q4_K_f32_nr2` (Q4_K) or `kernel_mul_mv_id_<q>_f32[_nr2]` (forced matvec route) |
 //! | F | weighted reduce + sigmoid(shared gate) * shared + residual | `moe_weighted_reduce_f32` |
 //!
-//! Every kernel computes a row (or a `(row, expert)` pair) with arithmetic
-//! that does not depend on how many rows share the dispatch, so a row's
-//! output is bitwise the same at `rows = 1` (serial decode) and inside a
-//! joint step of 2..8 rows. The serial decode builder
+//! Decode dispatches of one to eight rows preserve the established bitwise
+//! single-row invariant. The DFlash2 verifier's width-32 pass uses dense MM
+//! for the F32 router and shared-gate logits and is qualified against the F64
+//! whole-layer reference instead. The serial decode builder
 //! ([`super::gpu_ffn::build_moe_ffn_layer_gpu_q_into`] at one row) and the
 //! joint step both run this route whenever the layer's weights were loaded
 //! in native storage, so the switch is decided once at load.
@@ -49,8 +49,8 @@ use super::gpu_ffn::MoeFfnWeightsGpuQ;
 /// Switch for the batched native-storage MoE decode route. Default off.
 pub(crate) const QWEN_MOE_BATCHED_ENV: &str = "HF2Q_QWEN_MOE_BATCHED";
 
-/// Widest row count one batched MoE layer accepts (the joint width cap).
-pub(crate) const MOE_BATCHED_MAX_ROWS: usize = DENSE_MATVEC_F32_ROWS_MAX_ROWS as usize;
+/// Widest row count one batched MoE layer accepts: the DFlash2 target width.
+pub(crate) const MOE_BATCHED_MAX_ROWS: usize = 32;
 
 /// Parse [`QWEN_MOE_BATCHED_ENV`]; unset or blank means off.
 pub(crate) fn parse_qwen_moe_batched(raw: Option<&str>) -> Result<bool, String> {
@@ -79,9 +79,8 @@ pub(crate) fn qwen_moe_batched_requested() -> bool {
     *REQUESTED
 }
 
-/// Shared-expert storage types the batched route admits. Their
-/// `quantized_matmul_ggml` routes at `m = 1..=8` (matvec at one row, the
-/// exact column-amortizing `mN` tiles above) are row-exact.
+/// Shared-expert storage types the batched route admits. Their GGML matmul
+/// routes support the full `m = 1..=32` interval.
 pub(crate) fn native_shared_types_supported(gate_up: GgmlType, down: GgmlType) -> bool {
     let exact = |t: GgmlType| matches!(t, GgmlType::Q4_K | GgmlType::Q6_K);
     exact(gate_up) && exact(down)
