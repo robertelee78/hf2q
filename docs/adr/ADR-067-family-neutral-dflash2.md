@@ -434,9 +434,10 @@ decisions.
 
 This closes neither D5 nor D6. The historical valid same-artifact peer median
 is about 79.7 seconds; the fixed DFlash2 campaign's median is about 80.47
-seconds, so it does not meet the required 0.95 upper-ratio bound. DFlash2
-therefore remains explicit opt-in and the global `HF2Q_DFLASH2=0` control
-continues to restore the prior route.
+seconds. Those unmatched medians provide no confidence interval for the amended
+candidate/peer upper-ratio bound of 1.00. DFlash2 therefore remains explicit
+opt-in and the global `HF2Q_DFLASH2=0` control continues to restore the prior
+route.
 
 #### Splash dense-kernel differential
 
@@ -455,10 +456,13 @@ the generic tensor-v2 64x32 short tile raised target-verify medians to roughly
 161 ms; restricting that route to Q6_K still measured roughly 155 ms. A
 load-once Q4_K/Q6_K code/meta repack with a dedicated 32-row tensor kernel
 passed model-free numerical parity and real-model Q5, but improved the matched
-target-verify median only from 151.038 ms to 149.288 ms and did not approach
-the peer threshold. Neither experiment is promoted. The remaining credible
-path is the complete prepared-weight plus BF16/fusion execution model, not
-another raw-block row-tile switch.
+target-verify median only from 151.038 ms to 149.288 ms. That was insufficient
+under the original 0.95 peer-superiority contract. The later parity amendment
+makes the prepared-weight route eligible for a new matched campaign; it does
+not turn the old unmatched observations into acceptance evidence. Neither
+experiment is promoted. The remaining credible path is the complete
+prepared-weight plus BF16/fusion execution model, not another raw-block
+row-tile switch.
 
 ### D5: performance qualification
 
@@ -478,8 +482,10 @@ Qwen3.8's mechanism gate is at least 5.304 accepted-plus-bonus tokens per
 lane-cycle on the matched workload without a quality or task regression. The
 operator replaced its unavailable valid-Splash denominator with this
 source-bound absolute gate on 2026-11-10; failed Splash output remains evidence,
-not a Win. Qwen3.8 must still beat its valid same-artifact peer under Q4's 95%
-CI rule.
+not a Win. Qwen3.8 must also finish at least 5% sooner than v0.1.29, with the
+candidate/stock 95% CI upper ratio at most 0.95, and reach statistical parity
+with every valid same-artifact peer, with each candidate/peer upper ratio at
+most 1.00.
 
 Every additional family preregisters its own mechanism and end-to-end gates
 against spec-off, stock and valid peers before seeing candidate results. It
@@ -528,13 +534,19 @@ The operator decided on 2026-11-10 to:
    than defer the architecture;
 2. replace Qwen3.8's unavailable valid-Splash denominator with the
    quality-preserving 5.304 accepted-plus-bonus token/lane-cycle mechanism gate,
-   while retaining its valid same-artifact peer Win and every Q5, quality,
+   while retaining its valid same-artifact peer parity and every Q5, quality,
    fairness and serving gate;
 3. make the subsystem family-neutral for every enabled text-generation
    architecture, not a Qwen-only path;
 4. qualify Qwen3.8 first because a compatible source-bound checkpoint exists,
    and require explicit adapters, compatible trained weights and independent
    D0-D6 qualification before activation on Qwen MoE, Gemma or DeepSeek.
+
+Later on 2026-11-10, the operator amended the cross-family Q4 speed contract:
+each candidate must finish at least 5% sooner than v0.1.29 and reach statistical
+parity with every valid peer. ADR-067 inherits the exact 95% CI bounds above;
+the amendment changes no checkpoint, mechanism, quality, memory or serving
+gate.
 
 The implementation may begin under this amended contract. Missing family
 weights are an explicit unavailable prerequisite, never permission for an
