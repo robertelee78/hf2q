@@ -290,6 +290,16 @@ class Parsing(unittest.TestCase):
         turn = cs.joint_turns(lines, 'qwen38')[0]
         self.assertEqual((turn['kind'], turn['width']), ('MTP', 4))
 
+    def test_qwen_dflash_width_is_active_lanes(self):
+        lines = self.lines(
+            ' DEBUG hf2q::serve::api::engine_qwen35::progress: Qwen DFlash2 stage timing '
+            'active_lanes=3 verify_rows=17 draft_us=20106 target_verify_us=117961 '
+            'host_plan_us=321 target_commit_us=2175 draft_commit_us=2251 total_us=142823\n'
+        )
+        turn = cs.joint_turns(lines, 'qwen38')[0]
+        self.assertEqual((turn['kind'], turn['width'], turn['serial']), ('DFlash2', 3, 0))
+        self.assertEqual(turn['verify_rows'], 17)
+
     def test_log_lines_keep_only_complete_lines_in_range(self):
         with tempfile.NamedTemporaryFile('wb', delete=False) as handle:
             handle.write(b'a\nb\npartial')
