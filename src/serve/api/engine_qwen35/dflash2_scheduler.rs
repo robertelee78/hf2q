@@ -247,7 +247,10 @@ impl Qwen35LoadedModel {
         let physical_lanes = runtime.workspace.max_lanes;
         let mut anchors = vec![0_u32; physical_lanes];
         let mut temperatures = vec![0.0_f32; physical_lanes];
-        let mut maximum_rows = vec![0_u32; physical_lanes];
+        // The native selector validates every physical lane before dispatch,
+        // including lanes omitted from this scheduler step. Give inactive
+        // lanes the smallest valid bound; their draft/verify output is ignored.
+        let mut maximum_rows = vec![1_u32; physical_lanes];
         for &index in &active {
             let state = &states[index];
             let slot = state.slot_id.0 as usize;
