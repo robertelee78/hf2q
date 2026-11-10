@@ -1171,6 +1171,12 @@ impl Qwen35LoadedModel {
             .is_some_and(|length| *length == logical_position)
     }
 
+    fn align_dflash2_lane_prefix(&mut self, slot_id: SlotId, tokens: &[u32]) -> bool {
+        self.dflash2
+            .as_mut()
+            .is_some_and(|runtime| runtime.align_lane_prefix(slot_id.0 as usize, tokens))
+    }
+
     fn clear_dflash2_lane(&mut self, slot_id: SlotId) -> Result<()> {
         if let Some(runtime) = self.dflash2.as_mut() {
             runtime.clear_lane(slot_id.0 as usize)?;
@@ -1214,6 +1220,7 @@ impl Qwen35LoadedModel {
                     logical_start,
                 )
             })?;
+            runtime.record_lane_tokens(slot_id.0 as usize, tokens)?;
             Ok(logits)
         })();
         self.dflash2 = Some(runtime);
@@ -4298,11 +4305,17 @@ impl Qwen35PrefillState {
         supervisor: &EngineSupervisor,
         anchor_quota_headroom: Option<usize>,
     ) -> Result<Qwen35PrefillAdvance> {
-        // A physical scheduler slot may now belong to a different
-        // conversation. Clear its draft ring once before the request's first
-        // prefill advance; cached-prefix requests then fail closed because
-        // their target cursor is non-zero while the draft cursor is zero.
-        if self.next_token_index == self.cached_tokens {
+        // Preserve or safely rewind a resident draft ring only when its exact
+        // committed token prefix matches the target cache restored into this
+        // physical slot. Length alone is insufficient: a same-length
+        // conversation may have replaced the target cache while leaving
+        // unrelated draft state.
+        if self.next_token_index == self.cached_tokens
+            && !qwen.align_dflash2_lane_prefix(
+                self.slot_id,
+                &self.prompt_tokens[..self.cached_tokens],
+            )
+        {
             qwen.clear_dflash2_lane(self.slot_id)?;
         }
         let (prefill_logits, mtp_hidden, advanced_tokens, checkpoint) = if let Some(logits) =

@@ -338,12 +338,14 @@ existing spec-off semantic decision function, commits only accepted target and
 draft prefixes, and drains accepted output through the existing ordered SSE
 settlement path.
 
-Slot reassignment clears the draft ring before the request's first prefill
-advance. A request that starts from a restored or otherwise cached prefix has a
-non-zero target cursor and a zero draft cursor, so it remains on the promoted
-route instead of reusing context from a different conversation. Qwen3.5 and any
-target without a pinned identity match are likewise unavailable. Gemma has a
-schema and target-weight adapter but no serving transaction yet; DeepSeek has no
+Each resident draft ring is bound to the exact committed target-token prefix,
+not just the target cursor length. Slot reassignment or a different same-length
+conversation therefore clears the draft ring. Before the ring's first
+sliding-window wrap, an exact earlier prefix may safely rewind the logical cursor
+because all required rows remain resident; after the first wrap, an earlier
+restore fails closed to the established baseline route. Qwen3.5 and any target
+without a pinned identity match are likewise unavailable. Gemma has a schema
+and target-weight adapter but no serving transaction yet; DeepSeek has no
 compatible trained checkpoint and remains explicitly unavailable.
 
 This is implementation evidence, not gate closure. The candidate still performs
@@ -367,6 +369,18 @@ counts from 1 through 8 and forced-thinking closure. The mismatched
 `qwen36-abliterix-t63-APEX` startup refusal above was run against the same draft
 artifact. These are end-to-end smoke observations, not D2-D6 qualification:
 they are single-lane, unmatched to spec-off, and not the Q4 workload.
+
+An exact-target Qwen3.8 Q4_K_M follow-up smoke on 2026-11-10 exercised that
+prefix binding. The cold unary turn used 64 prompt tokens, produced 36 completion
+tokens through DFlash2, and returned `ALPHA`. The next rendered prompt had 120
+tokens; target admission reused exactly 100 cached tokens, prefilled only
+positions 100 through 119, then ran eight DFlash2 verify windows with retained
+counts `2,1,3,3,2,8,8,2` and returned `BETA`. A four-lane regression discovered
+and fixed the native selector boundary for inactive physical lanes: inactive
+lanes now carry the smallest valid one-row bound while remaining excluded from
+verification and settlement. These observations prove exact-prefix warm
+continuation and inactive-lane safety for the candidate, not the D3 cancellation,
+tool/SSE and long-context rollback matrix or D6 qualification.
 
 ### D5: performance qualification
 
