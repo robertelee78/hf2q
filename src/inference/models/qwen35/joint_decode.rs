@@ -50,7 +50,7 @@ use crate::inference::models::qwen35::joint_decode_routes::{
     check_dense_ffn_route, check_mode_policy, dense_ffn_route, joint_decode_env_unavailable_reason,
     joint_mode_max_rows, joint_padded_width, projection_route, select_joint_route_mode,
     JointDenseFfnRoute, JointProductRoute, JointRouteMode, JointRoutingPolicy,
-    MAX_JOINT_DECODE_ROWS, MAX_JOINT_VERIFY_ROWS,
+    DFLASH2_VERIFY_WIDTH, MAX_JOINT_DECODE_ROWS,
 };
 use crate::inference::models::qwen35::joint_projection::{
     JointProjectionKernel, JointProjectionScope,
@@ -127,6 +127,17 @@ pub(super) struct JointPacking<'a> {
     pub windows: &'a [JointWindow],
     /// Packed width, at least `rows.len()`; padding rows copy row 0.
     pub width: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct DFlash2JointCapture<'a> {
+    pub layer_ids: &'a [usize],
+    pub output: &'a MlxBuffer,
+    /// Physical draft-ring lane for each packed target window.
+    pub lane_indices: &'a [usize],
+    pub lanes: usize,
+    pub rows_per_lane: usize,
+    pub feature_width: usize,
 }
 
 fn plan_joint_routes(
@@ -361,6 +372,7 @@ impl Qwen35Model {
                     dense_ffn,
                     options,
                     None,
+                    None,
                 )
                 .map(|(outputs, _normed)| outputs)
             },
@@ -467,9 +479,9 @@ impl Qwen35Model {
         dense_ffn: JointDenseFfnRoute,
         options: JointStepOptions,
         mut replay: Option<&mut DeltaNetReplay>,
+        capture: Option<DFlash2JointCapture<'_>>,
     ) -> Result<(Vec<Qwen35JointRowOutput>, MlxBuffer)> {
-        let arena_setup =
-            crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
+        let arena_setup = crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
         let cfg = &self.cfg;
         let hidden_size = cfg.hidden_size;
         let h = hidden_size as usize;
@@ -478,10 +490,39 @@ impl Qwen35Model {
         let rows = packing.rows;
         let width = packing.width;
         ensure!(
-            (1..=width).contains(&rows.len()) && width <= MAX_JOINT_VERIFY_ROWS,
+            (1..=width).contains(&rows.len()) && width <= DFLASH2_VERIFY_WIDTH,
             "Qwen joint forward packs {} rows at width {width}",
             rows.len()
         );
+        if let Some(capture) = capture {
+            ensure!(
+                capture.lane_indices.len() == packing.windows.len()
+                    && capture
+                        .lane_indices
+                        .iter()
+                        .enumerate()
+                        .all(|(index, lane)| {
+                            *lane < capture.lanes
+                                && !capture.lane_indices[..index].contains(lane)
+                        })
+                    && capture.rows_per_lane == 8
+                    && !capture.layer_ids.is_empty()
+                    && capture.feature_width == h * capture.layer_ids.len()
+                    && capture.output.dtype() == DType::F32
+                    && capture.output.element_count()
+                        == capture.lanes * capture.rows_per_lane * capture.feature_width
+                    && capture.layer_ids.windows(2).all(|pair| pair[0] < pair[1])
+                    && capture
+                        .layer_ids
+                        .iter()
+                        .all(|layer| *layer < layer_weights.len())
+                    && packing
+                        .windows
+                        .iter()
+                        .all(|window| window.rows <= capture.rows_per_lane),
+                "invalid Qwen DFlash2 target capture geometry"
+            );
+        }
         let width_u32 = width as u32;
         let slots = rows.iter().map(|row| row.slot_id).collect::<Vec<_>>();
         let joint_rows = JointRows {
@@ -726,6 +767,39 @@ impl Qwen35Model {
                     bail!("Qwen joint layer {layer_idx} has no admitted FFN arm")
                 }
             };
+            if let Some(capture) = capture {
+                if let Some(capture_index) = capture
+                    .layer_ids
+                    .iter()
+                    .position(|captured| *captured == layer_idx)
+                {
+                    enc.memory_barrier();
+                    for (&lane, window) in
+                        capture.lane_indices.iter().zip(packing.windows)
+                    {
+                        let source =
+                            output.slice_view((window.start * h * 4) as u64, window.rows * h);
+                        let destination = capture.output.slice_view(
+                            (lane * capture.rows_per_lane * capture.feature_width * 4) as u64,
+                            window.rows * capture.feature_width,
+                        );
+                        mlx_native::ops::feature_concat::dispatch_feature_concat_f32(
+                            enc,
+                            registry,
+                            device.metal_device(),
+                            &source,
+                            &destination,
+                            window.rows as u32,
+                            hidden_size,
+                            (capture_index * h) as u32,
+                            capture.feature_width as u32,
+                        )
+                        .with_context(|| {
+                            format!("capture Qwen DFlash2 layer {layer_idx} lane {lane}")
+                        })?;
+                    }
+                }
+            }
             crate::inference::stage_profile::boundary(enc, "adr065.ffn_moe")
                 .with_context(|| format!("profile Qwen joint FFN layer {layer_idx}"))?;
             if closes_chain(layer_idx, chain_n, n_layers) {

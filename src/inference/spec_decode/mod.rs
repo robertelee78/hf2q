@@ -18,6 +18,7 @@
 
 pub mod cost_controller;
 pub mod dflash;
+pub mod dflash2;
 pub mod eagle3;
 pub mod eagle3_orchestrator;
 pub mod ngram_orchestrator;

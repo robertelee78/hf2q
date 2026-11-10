@@ -1,0 +1,748 @@
+//! Verified checkpoint ownership and bounded DFlash2 cycle execution.
+
+use std::path::Path;
+
+#[cfg(test)]
+use super::forward::dispatch_layer;
+use super::{
+    adapters::{
+        dispatch_dflash2_input, target_vocabulary_head, DFlash2TargetFamily, QwenDFlash2Adapter,
+    },
+    config::DFlash2Config,
+    forward::{
+        dispatch_dflash2_context_commit, dispatch_dflash2_forward, prepare_decode_positions,
+    },
+    schema::DFlash2CheckpointDescriptor,
+    selector::dispatch_dflash2_selection,
+    tensors::DFlash2ModelTensors,
+    weights::DFlash2WeightsFile,
+    workspace::DFlash2Workspace,
+};
+use crate::inference::{
+    models::qwen35::DFlash2JointCapture,
+    spec_decode::dflash::hidden_capture::{extract_drafter_concat, DFlashCaptureSession},
+};
+use anyhow::{ensure, Context, Result};
+use mlx_native::{KernelRegistry, MlxDevice};
+
+/// GPU-resident DFlash2 checkpoint and persistent per-slot draft rings.
+pub struct DFlash2Runtime {
+    pub descriptor: &'static DFlash2CheckpointDescriptor,
+    pub config: DFlash2Config,
+    pub tensors: DFlash2ModelTensors,
+    pub workspace: DFlash2Workspace,
+    lane_lengths: Vec<usize>,
+}
+
+impl DFlash2Runtime {
+    /// Verify the immutable checkpoint identity before uploading any tensor.
+    pub fn load_verified<T: DFlash2TargetFamily>(
+        device: &MlxDevice,
+        descriptor: &'static DFlash2CheckpointDescriptor,
+        config_path: impl AsRef<Path>,
+        weights_path: impl AsRef<Path>,
+        target: &T,
+        lanes: usize,
+    ) -> Result<Self> {
+        let config_bytes = std::fs::read(config_path.as_ref())
+            .with_context(|| format!("read DFlash2 config {}", config_path.as_ref().display()))?;
+        let config = descriptor
+            .parse_config(&config_bytes)
+            .context("validate DFlash2 config identity")?;
+        target
+            .validate(&config)
+            .context("bind DFlash2 checkpoint to target")?;
+        let weights_file = DFlash2WeightsFile::open_verified(weights_path.as_ref(), descriptor)
+            .with_context(|| {
+                format!("verify DFlash2 weights {}", weights_path.as_ref().display())
+            })?;
+        let weights = weights_file
+            .load_verified(&config, descriptor)
+            .context("validate DFlash2 tensor manifest")?;
+        let tensors = DFlash2ModelTensors::upload(device, &config, &weights)
+            .context("upload DFlash2 tensors")?;
+        let workspace =
+            DFlash2Workspace::new(device, &config, lanes).context("allocate DFlash2 workspace")?;
+        Ok(Self {
+            descriptor,
+            config,
+            tensors,
+            workspace,
+            lane_lengths: vec![0; lanes],
+        })
+    }
+
+    pub fn qwen_target_capture<'a>(
+        &'a self,
+        adapter: &'a QwenDFlash2Adapter<'a>,
+        lane_indices: &'a [usize],
+    ) -> Result<DFlash2JointCapture<'a>> {
+        adapter.target_capture(&self.workspace, lane_indices)
+    }
+
+    /// Execute one physical anchor-plus-seven-proposal graph for every slot.
+    /// Inactive slots use a retained count of zero at commit; their rings do not
+    /// change. The caller owns the small proposal readback and target verify.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_draft<T: DFlash2TargetFamily>(
+        &mut self,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        target: &T,
+        anchors: &[u32],
+        logical_positions: &[u32],
+        temperatures: &[f32],
+        sampling_mask: u32,
+        maximum_verify_rows: &[u32],
+        uniforms: &[f32],
+    ) -> Result<()> {
+        let lanes = self.workspace.max_lanes;
+        let proposals = self.config.proposal_tokens();
+        ensure!(
+            uniforms.len() == lanes * proposals,
+            "DFlash2 uniform count {} != lanes {lanes} * proposals {proposals}",
+            uniforms.len()
+        );
+        ensure!(
+            logical_positions
+                .iter()
+                .zip(&self.lane_lengths)
+                .all(|(position, length)| usize::try_from(*position) == Ok(*length)),
+            "DFlash2 draft positions {logical_positions:?} do not match lane contexts {:?}",
+            self.lane_lengths
+        );
+        self.workspace
+            .uniforms
+            .as_mut_slice::<f32>()?
+            .copy_from_slice(uniforms);
+        prepare_decode_positions(&mut self.workspace, &self.config, logical_positions)?;
+        let mut encoder = device
+            .command_encoder()
+            .context("create DFlash2 draft encoder")?;
+        dispatch_dflash2_input(
+            &self.tensors,
+            &mut encoder,
+            registry,
+            device,
+            &self.config,
+            target,
+            anchors,
+            &mut self.workspace,
+        )?;
+        let vocabulary_head = target_vocabulary_head(target)?;
+        dispatch_dflash2_forward(
+            &mut encoder,
+            registry,
+            device,
+            &self.config,
+            &self.tensors,
+            vocabulary_head,
+            &mut self.workspace,
+        )?;
+        dispatch_dflash2_selection(
+            &mut encoder,
+            registry,
+            device,
+            &self.config,
+            &self.tensors,
+            &self.workspace,
+            anchors,
+            temperatures,
+            sampling_mask,
+            maximum_verify_rows,
+        )?;
+        encoder
+            .commit_and_wait()
+            .context("execute DFlash2 draft cycle")?;
+        Ok(())
+    }
+
+    pub fn proposals(&self) -> Result<&[u32]> {
+        Ok(self.workspace.proposed_tokens.as_slice::<u32>()?)
+    }
+
+    pub fn verify_rows(&self) -> Result<&[u32]> {
+        Ok(self.workspace.verify_rows.as_slice::<u32>()?)
+    }
+    pub fn lane_lengths(&self) -> &[usize] {
+        &self.lane_lengths
+    }
+
+    /// Append a target prefill capture to one physical draft-ring lane.
+    ///
+    /// The legacy capture is CPU layer-major. This method performs the one
+    /// layout conversion, then projects and commits bounded eight-row chunks
+    /// through the same transaction used after target verification.
+    pub fn ingest_qwen_capture(
+        &mut self,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        capture: &DFlashCaptureSession,
+        lane: usize,
+        logical_start: usize,
+    ) -> Result<()> {
+        ensure!(
+            lane < self.workspace.max_lanes,
+            "DFlash2 capture lane {lane} is out of range"
+        );
+        ensure!(
+            capture.target_layer_ids == self.config.target_layer_ids,
+            "DFlash2 capture layers {:?} != checkpoint layers {:?}",
+            capture.target_layer_ids,
+            self.config.target_layer_ids
+        );
+        ensure!(
+            logical_start == self.lane_lengths[lane],
+            "DFlash2 capture starts at {logical_start}, lane {lane} is at {}",
+            self.lane_lengths[lane]
+        );
+        let concatenated = extract_drafter_concat(
+            &capture.hidden_output,
+            &capture.target_layer_ids,
+            &self.config.target_layer_ids,
+            capture.seq_len,
+            capture.hidden_size,
+        )
+        .context("convert Qwen target capture to DFlash2 concat layout")?;
+        let feature_width = self.config.fc_input_dim();
+        ensure!(
+            concatenated.len() == capture.seq_len * feature_width,
+            "DFlash2 concatenated capture has {} values, expected {}",
+            concatenated.len(),
+            capture.seq_len * feature_width
+        );
+        for (chunk_index, chunk) in concatenated
+            .chunks(self.config.block_size * feature_width)
+            .enumerate()
+        {
+            let rows = chunk.len() / feature_width;
+            let lane_start = lane * self.config.block_size * feature_width;
+            let destination = self
+                .workspace
+                .captured_target_hidden
+                .as_mut_slice::<f32>()?;
+            destination[lane_start..lane_start + self.config.block_size * feature_width].fill(0.0);
+            destination[lane_start..lane_start + chunk.len()].copy_from_slice(chunk);
+
+            let positions = self
+                .lane_lengths
+                .iter()
+                .map(|length| {
+                    u32::try_from(*length).context("DFlash2 context position exceeds u32")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            prepare_decode_positions(&mut self.workspace, &self.config, &positions)
+                .with_context(|| format!("prepare DFlash2 capture chunk {chunk_index}"))?;
+            let mut retained = vec![0_u32; self.workspace.max_lanes];
+            retained[lane] = u32::try_from(rows)?;
+            self.commit_target_context(device, registry, &retained)
+                .with_context(|| format!("commit DFlash2 capture chunk {chunk_index}"))?;
+        }
+        Ok(())
+    }
+
+    /// Project retained target hidden rows and append only those rows to each
+    /// physical slot's draft rings.
+    pub fn commit_target_context(
+        &mut self,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        retained_counts: &[u32],
+    ) -> Result<()> {
+        ensure!(
+            retained_counts.len() == self.workspace.max_lanes,
+            "DFlash2 retained-count length {} != workspace lanes {}",
+            retained_counts.len(),
+            self.workspace.max_lanes
+        );
+        ensure!(
+            retained_counts
+                .iter()
+                .all(|count| (*count as usize) <= self.config.block_size),
+            "DFlash2 retained counts {retained_counts:?} exceed block size {}",
+            self.config.block_size
+        );
+        self.workspace
+            .verify_rows
+            .as_mut_slice::<u32>()?
+            .copy_from_slice(retained_counts);
+        let mut encoder = device
+            .command_encoder()
+            .context("create DFlash2 context encoder")?;
+        dispatch_dflash2_context_commit(
+            &mut encoder,
+            registry,
+            device,
+            &self.config,
+            &self.tensors,
+            &self.workspace.verify_rows,
+            &self.workspace,
+        )?;
+        encoder
+            .commit_and_wait()
+            .context("commit DFlash2 target context")?;
+        for (length, retained) in self.lane_lengths.iter_mut().zip(retained_counts) {
+            *length = length
+                .checked_add(*retained as usize)
+                .context("DFlash2 lane length overflow")?;
+        }
+        Ok(())
+    }
+
+    /// Reset one scheduler slot before reassignment or incompatible prefix
+    /// restore. Other slots remain byte-identical.
+    pub fn clear_lane(&mut self, lane: usize) -> Result<()> {
+        ensure!(
+            lane < self.workspace.max_lanes,
+            "DFlash2 lane {lane} is out of range"
+        );
+        let heads = self.config.num_key_value_heads;
+        let width = self.config.sliding_window;
+        let dim = self.config.head_dim;
+        let lane_elements = heads * width * dim;
+        for ring in self
+            .workspace
+            .ring_keys
+            .iter_mut()
+            .chain(self.workspace.ring_values.iter_mut())
+        {
+            let values = ring.as_mut_slice::<u16>()?;
+            values[lane * lane_elements..(lane + 1) * lane_elements].fill(0);
+        }
+        self.lane_lengths[lane] = 0;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inference::models::qwen35::model::Qwen35Model;
+    use crate::inference::spec_decode::dflash2::schema::QWEN36_DFLASH2;
+    use crate::serve::header::LoadProgress;
+    use half::bf16;
+    use safetensors::{tensor::TensorView, Dtype, SafeTensors};
+    use std::path::PathBuf;
+
+    fn float_values(view: TensorView<'_>) -> Vec<f32> {
+        match view.dtype() {
+            Dtype::BF16 => view
+                .data()
+                .chunks_exact(2)
+                .map(|bytes| bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32())
+                .collect(),
+            Dtype::F32 => f32_values(view),
+            dtype => panic!("unsupported fixture floating-point dtype {dtype:?}"),
+        }
+    }
+
+    fn f32_values(view: TensorView<'_>) -> Vec<f32> {
+        view.data()
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
+    }
+
+    fn i64_values(view: TensorView<'_>) -> Vec<i64> {
+        view.data()
+            .chunks_exact(8)
+            .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
+    }
+
+    fn max_abs(actual: &[f32], expected: &[f32]) -> f32 {
+        assert_eq!(actual.len(), expected.len());
+        actual
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    #[ignore = "requires HF2Q_QWEN36_GGUF, HF2Q_QWEN36_DFLASH2_CONFIG, HF2Q_QWEN36_DFLASH2_WEIGHTS and Apple Metal"]
+    fn qwen36_verified_checkpoint_runs_one_real_draft_cycle() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let gguf_path =
+            PathBuf::from(std::env::var_os("HF2Q_QWEN36_GGUF").expect("HF2Q_QWEN36_GGUF"));
+        let config_path = PathBuf::from(
+            std::env::var_os("HF2Q_QWEN36_DFLASH2_CONFIG").expect("HF2Q_QWEN36_DFLASH2_CONFIG"),
+        );
+        let weights_path = PathBuf::from(
+            std::env::var_os("HF2Q_QWEN36_DFLASH2_WEIGHTS").expect("HF2Q_QWEN36_DFLASH2_WEIGHTS"),
+        );
+        let gguf = mlx_native::gguf::GgufFile::open(&gguf_path).expect("open Qwen3.6 GGUF");
+        let mut progress = LoadProgress::new(false, 1, 0);
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen3.6");
+        model
+            .ensure_gpu_cache_primed()
+            .expect("prime Qwen3.6 GPU cache");
+        model
+            .with_gpu_cache_mut(|device, registry| {
+                let config_bytes = std::fs::read(&config_path)?;
+                let config = QWEN36_DFLASH2.parse_config(&config_bytes)?;
+                let adapter = QwenDFlash2Adapter::new(&model, &config)?;
+                let mut runtime = DFlash2Runtime::load_verified(
+                    device,
+                    &QWEN36_DFLASH2,
+                    &config_path,
+                    &weights_path,
+                    &adapter,
+                    1,
+                )?;
+                runtime
+                    .workspace
+                    .captured_target_hidden
+                    .as_mut_slice::<f32>()?
+                    .fill(0.0);
+                runtime.run_draft(
+                    device,
+                    registry,
+                    &adapter,
+                    &[1],
+                    &[0],
+                    &[0.0],
+                    0,
+                    &[8],
+                    &[0.5; 7],
+                )?;
+                ensure!(
+                    runtime
+                        .proposals()?
+                        .iter()
+                        .all(|token| (*token as usize) < runtime.config.vocab_size),
+                    "real DFlash2 proposal exceeds target vocabulary"
+                );
+                ensure!(
+                    runtime.verify_rows()? == [8],
+                    "real DFlash2 did not verify all rows"
+                );
+                Ok(())
+            })
+            .expect("run real Qwen3.6 DFlash2 cycle");
+    }
+
+    fn capture_lane(
+        values: &[f32],
+        lane: usize,
+        rows: usize,
+        hidden: usize,
+        layer_ids: &[usize],
+    ) -> DFlashCaptureSession {
+        let layers = layer_ids.len();
+        let mut capture = DFlashCaptureSession::new(layer_ids.to_vec(), rows, hidden, false);
+        for row in 0..rows {
+            for layer in 0..layers {
+                let source = ((lane * rows + row) * layers + layer) * hidden;
+                let destination = (layer * rows + row) * hidden;
+                capture.hidden_output[destination..destination + hidden]
+                    .copy_from_slice(&values[source..source + hidden]);
+            }
+        }
+        capture
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Qwen3.6 GGUF/checkpoint, HF2Q_DFLASH2_REFERENCE_FIXTURES and Apple Metal"]
+    fn qwen36_fixture_suite_matches_pinned_reference() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let gguf_path =
+            PathBuf::from(std::env::var_os("HF2Q_QWEN36_GGUF").expect("HF2Q_QWEN36_GGUF"));
+        let config_path = PathBuf::from(
+            std::env::var_os("HF2Q_QWEN36_DFLASH2_CONFIG").expect("HF2Q_QWEN36_DFLASH2_CONFIG"),
+        );
+        let weights_path = PathBuf::from(
+            std::env::var_os("HF2Q_QWEN36_DFLASH2_WEIGHTS").expect("HF2Q_QWEN36_DFLASH2_WEIGHTS"),
+        );
+        let fixture_directory = PathBuf::from(
+            std::env::var_os("HF2Q_DFLASH2_REFERENCE_FIXTURES")
+                .expect("HF2Q_DFLASH2_REFERENCE_FIXTURES"),
+        );
+
+        let gguf = mlx_native::gguf::GgufFile::open(&gguf_path).expect("open Qwen3.6 GGUF");
+        let mut progress = LoadProgress::new(false, 1, 0);
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen3.6");
+        model
+            .ensure_gpu_cache_primed()
+            .expect("prime Qwen3.6 GPU cache");
+        model
+            .with_gpu_cache_mut(|device, registry| {
+                let config_bytes = std::fs::read(&config_path)?;
+                let config = QWEN36_DFLASH2.parse_config(&config_bytes)?;
+                let adapter = QwenDFlash2Adapter::new(&model, &config)?;
+                let target_hidden = model.cfg.hidden_size as usize;
+
+                for (case, file_name) in [
+                    ("short", "qwen36-short-f32.safetensors"),
+                    ("wrap", "qwen36-wrap-f32.safetensors"),
+                    ("single", "qwen36-single1-f32.safetensors"),
+                    ("multi", "qwen36-multi-f32.safetensors"),
+                    ("restore", "qwen36-restore-f32.safetensors"),
+                ] {
+                    let fixture_path = fixture_directory.join(file_name);
+                    let fixture_bytes = std::fs::read(&fixture_path)
+                        .with_context(|| format!("read {case} reference fixture"))?;
+                    let (_, metadata) = SafeTensors::read_metadata(&fixture_bytes)
+                        .with_context(|| format!("read {case} reference metadata"))?;
+                    let metadata = metadata
+                        .metadata()
+                        .as_ref()
+                        .context("reference metadata is missing")?;
+                    ensure!(
+                        metadata.get("schema").map(String::as_str)
+                            == Some("hf2q.dflash2-reference-fixture.v2"),
+                        "{case} fixture schema differs"
+                    );
+                    ensure!(
+                        metadata.get("reference_commit").map(String::as_str)
+                            == Some("95c8aeca5e4b4c4f9c0c967c05ab89fa3ed24f4c"),
+                        "{case} fixture reference commit differs"
+                    );
+                    ensure!(
+                        metadata.get("compute_dtype").map(String::as_str) == Some("float32"),
+                        "{case} fixture must match hf2q's float32 activations"
+                    );
+                    ensure!(
+                        metadata.get("case").map(String::as_str) == Some(case),
+                        "{case} fixture metadata differs"
+                    );
+                    ensure!(
+                        metadata.get("attention_precision").map(String::as_str)
+                            == Some("bfloat16"),
+                        "{case} fixture must match hf2q's packed attention precision"
+                    );
+                    let context_start = metadata
+                        .get("context_start")
+                        .context("context_start metadata is missing")?
+                        .parse::<usize>()?;
+                    let context_rows = metadata
+                        .get("context_rows")
+                        .context("context_rows metadata is missing")?
+                        .parse::<usize>()?;
+                    let fixture = SafeTensors::deserialize(&fixture_bytes)
+                        .with_context(|| format!("parse {case} fixture"))?;
+
+                    let target_view = fixture.tensor("input.target_hidden")?;
+                    let target_shape = target_view.shape();
+                    ensure!(
+                        target_shape.len() == 3
+                            && target_shape[1] == context_rows
+                            && target_shape[2] == config.fc_input_dim(),
+                        "{case} target input shape {target_shape:?} differs"
+                    );
+                    let lanes = target_shape[0];
+                    let target = float_values(target_view);
+                    let mut runtime = DFlash2Runtime::load_verified(
+                        device,
+                        &QWEN36_DFLASH2,
+                        &config_path,
+                        &weights_path,
+                        &adapter,
+                        lanes,
+                    )?;
+
+                    if case == "restore" {
+                        let initial_view = fixture.tensor("input.initial_target_hidden")?;
+                        let initial_shape = initial_view.shape();
+                        ensure!(
+                            initial_shape.len() == 3
+                                && initial_shape[0] == lanes
+                                && initial_shape[2] == config.fc_input_dim(),
+                            "restore initial target shape {initial_shape:?} differs"
+                        );
+                        let initial_rows = initial_shape[1];
+                        let initial = float_values(initial_view);
+                        for lane in 0..lanes {
+                            let capture = capture_lane(
+                                &initial,
+                                lane,
+                                initial_rows,
+                                target_hidden,
+                                &config.target_layer_ids,
+                            );
+                            runtime.ingest_qwen_capture(device, registry, &capture, lane, 0)?;
+                        }
+                    }
+                    for lane in 0..lanes {
+                        let capture = capture_lane(
+                            &target,
+                            lane,
+                            context_rows,
+                            target_hidden,
+                            &config.target_layer_ids,
+                        );
+                        runtime.ingest_qwen_capture(
+                            device,
+                            registry,
+                            &capture,
+                            lane,
+                            context_start,
+                        )?;
+                    }
+                    ensure!(
+                        runtime
+                            .lane_lengths()
+                            .iter()
+                            .all(|length| *length == context_start + context_rows),
+                        "{case} context lengths {:?} differ",
+                        runtime.lane_lengths()
+                    );
+
+                    let anchors = i64_values(fixture.tensor("input.anchor")?)
+                        .into_iter()
+                        .map(|value| value as u32)
+                        .collect::<Vec<_>>();
+                    let positions = runtime
+                        .lane_lengths()
+                        .iter()
+                        .map(|length| u32::try_from(*length))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    prepare_decode_positions(&mut runtime.workspace, &config, &positions)?;
+                    let mut encoder = device.command_encoder()?;
+                    dispatch_dflash2_input(
+                        &runtime.tensors,
+                        &mut encoder,
+                        registry,
+                        device,
+                        &config,
+                        &adapter,
+                        &anchors,
+                        &mut runtime.workspace,
+                    )?;
+                    encoder.commit_and_wait()?;
+                    let expected_noise = float_values(fixture.tensor("input.noise_embedding")?);
+                    let noise_delta = max_abs(
+                        runtime.workspace.hidden[0].as_slice::<f32>()?,
+                        &expected_noise,
+                    );
+                    ensure!(
+                        noise_delta <= 0.03,
+                        "{case} input embedding max_abs={noise_delta} exceeds 0.03"
+                    );
+                    for layer in 0..config.num_hidden_layers {
+                        let mut encoder = device.command_encoder()?;
+                        dispatch_layer(
+                            &mut encoder,
+                            registry,
+                            device,
+                            &config,
+                            &runtime.tensors.layers[layer],
+                            &runtime.workspace,
+                            layer,
+                        )?;
+                        encoder.commit_and_wait()?;
+                        let expected =
+                            float_values(fixture.tensor(&format!("output.layer.{layer}.output"))?);
+                        let delta = max_abs(
+                            runtime.workspace.hidden[(layer + 1) & 1].as_slice::<f32>()?,
+                            &expected,
+                        );
+                        let expected_abs_max = expected
+                            .iter()
+                            .fold(0.0_f32, |maximum, value| maximum.max(value.abs()));
+                        ensure!(
+                            delta / expected_abs_max <= 0.05,
+                            "{case} layer {layer} relative max_abs={} exceeds 0.05",
+                            delta / expected_abs_max
+                        );
+                    }
+
+                    runtime.run_draft(
+                        device,
+                        registry,
+                        &adapter,
+                        &anchors,
+                        &positions,
+                        &vec![0.0; lanes],
+                        0,
+                        &vec![8; lanes],
+                        &vec![0.5; lanes * config.proposal_tokens()],
+                    )?;
+
+                    let expected_hidden = float_values(fixture.tensor("output.final_hidden")?);
+                    let hidden_delta = max_abs(
+                        runtime.workspace.final_hidden.as_slice::<f32>()?,
+                        &expected_hidden,
+                    );
+                    ensure!(
+                        hidden_delta <= 2.5,
+                        "{case} final hidden max_abs={hidden_delta} exceeds 2.5"
+                    );
+
+                    let vocabulary = config.vocab_size;
+                    let all_logits = runtime.workspace.logits.as_slice::<f32>()?;
+                    let mut actual_logits =
+                        Vec::with_capacity(lanes * config.proposal_tokens() * vocabulary);
+                    for lane in 0..lanes {
+                        let start = (lane * config.block_size + 1) * vocabulary;
+                        actual_logits.extend_from_slice(
+                            &all_logits[start..start + config.proposal_tokens() * vocabulary],
+                        );
+                    }
+                    let expected_logits = float_values(fixture.tensor("output.logits")?);
+                    let logits_delta = max_abs(&actual_logits, &expected_logits);
+                    ensure!(
+                        logits_delta <= 2.0,
+                        "{case} logits max_abs={logits_delta} exceeds 2.0"
+                    );
+
+                    let all_selector = runtime.workspace.selector_hidden_bf16.as_slice::<u16>()?;
+                    let mut actual_selector =
+                        Vec::with_capacity(lanes * config.proposal_tokens() * config.selector_rank);
+                    for lane in 0..lanes {
+                        let start = (lane * config.block_size + 1) * config.selector_rank;
+                        actual_selector.extend(
+                            all_selector
+                                [start..start + config.proposal_tokens() * config.selector_rank]
+                                .iter()
+                                .map(|bits| bf16::from_bits(*bits).to_f32()),
+                        );
+                    }
+                    let expected_selector = float_values(fixture.tensor("output.selector_hidden")?);
+                    let selector_delta = max_abs(&actual_selector, &expected_selector);
+                    ensure!(
+                        selector_delta <= 1.1,
+                        "{case} selector hidden max_abs={selector_delta} exceeds 1.1"
+                    );
+
+                    let expected_candidates = i64_values(fixture.tensor("output.candidates")?)
+                        .into_iter()
+                        .map(|value| value as u32)
+                        .collect::<Vec<_>>();
+                    let candidate_overlaps = runtime
+                        .workspace
+                        .candidates
+                        .as_slice::<u32>()?
+                        .chunks_exact(config.selector_top_k)
+                        .zip(expected_candidates.chunks_exact(config.selector_top_k))
+                        .map(|(actual, expected)| {
+                            actual.iter().filter(|token| expected.contains(token)).count()
+                        })
+                        .collect::<Vec<_>>();
+                    ensure!(
+                        candidate_overlaps.iter().all(|overlap| *overlap >= 10),
+                        "{case} candidate overlaps {candidate_overlaps:?} fall below 10/16"
+                    );
+                    let expected_path = i64_values(fixture.tensor("output.path")?)
+                        .into_iter()
+                        .map(|value| value as u32)
+                        .collect::<Vec<_>>();
+                    let path_agreements = runtime
+                        .proposals()?
+                        .chunks_exact(config.proposal_tokens())
+                        .zip(expected_path.chunks_exact(config.proposal_tokens()))
+                        .map(|(actual, expected)| {
+                            actual.iter().zip(expected).filter(|(a, e)| a == e).count()
+                        })
+                        .collect::<Vec<_>>();
+                    ensure!(
+                        path_agreements.iter().all(|agreement| *agreement >= 4),
+                        "{case} path agreements {path_agreements:?} fall below 4/7: actual={:?} expected={expected_path:?}",
+                        runtime.proposals()?
+                    );
+                }
+                Ok(())
+            })
+            .expect("compare Qwen3.6 DFlash2 fixture suite");
+    }
+}

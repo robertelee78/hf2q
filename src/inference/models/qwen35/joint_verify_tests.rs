@@ -1,28 +1,26 @@
-//! Model-free gates for the joint MTP verify window (H1) and its replay
-//! commit (H2), plus the harness the Qwen3.8 artifact gate reuses.
+//! Model-free gates for joint MTP verify/commit (H1/H2) and the DFlash2
+//! fixed-width target verifier, plus the harness reused by the Qwen3.8
+//! artifact gate.
 //!
 //! A synthetic Qwen3.5-family model (8 layers: 6 DeltaNet, 2 gated full
 //! attention with head_dim 256 on a TQ cache; Q4_K/Q6_K projections, dense
 //! FFN and output head, like Qwen3.8) runs the spec-off joint decode step
-//! sequentially with the true tokens: that is the reference for every
-//! position. Each case then runs one verify step over lane windows in the
-//! cap8 layouts (4×2, 3+3+2, 2×4, 1×4) in several packing orders, with the
-//! first wrong draft forced at a chosen depth, and commits a forced accept
-//! count per lane (full, partial, pending row only, and none). It checks,
-//! bitwise:
+//! sequentially with the true tokens.
 //!
-//! - every verify row whose inputs are all true tokens equals the spec-off
-//!   row at that position (logits and post-norm hidden);
-//! - after the commit, each lane's state digest (attention cursors, TQ
-//!   codes and norms below the cursor, current conv and recurrent state)
-//!   equals the spec-off digest after the same number of tokens, and slots
-//!   outside the step are untouched;
-//! - two further spec-off steps from the committed state equal the
-//!   reference rows.
+//! The MTP cases exercise cap-8 layouts (4×2, 3+3+2, 2×4, 1×4) in several
+//! packing orders, force a first wrong draft at a chosen depth, and commit
+//! full, partial, pending-only and empty prefixes. They require bitwise row
+//! and cache identity against spec-off.
 //!
-//! The invariance gate runs one lane's window alone and beside different
-//! windows and orders, and requires identical bytes. All tests need Apple
-//! Metal (`hf2q_gpu_test_lock`) and skip without a device:
+//! The DFlash2 case exercises a full four-lane × eight-row tile, a lane alone
+//! in the same fixed width-32 tile, and a lane permutation. It applies the
+//! frozen Q1 Class B logit envelope and argmax gate against spec-off, records
+//! exact row/cache/target-hidden cohort invariance.
+//!
+//!
+//! Both routes check retained-prefix commit, attention cursors, TQ codes and
+//! norms, recurrent state, untouched slots, and continuation after commit.
+//! All tests need Apple Metal (`hf2q_gpu_test_lock`) and skip without a device:
 //!
 //! ```text
 //! cargo test --release --bin hf2q joint_verify_tests
@@ -33,7 +31,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
-use super::forward_gpu::Qwen35JointVerifyLane;
+use super::forward_gpu::{DFlash2JointCapture, Qwen35JointVerifyLane};
 use super::gpu_delta_net::DeltaNetWeightsGpu;
 use super::gpu_ffn::DenseFfnWeightsGpuQ;
 use super::gpu_full_attn::{upload_f32, FullAttnQGateWeightsGpu, FullAttnWeightsGpu};
@@ -255,7 +253,11 @@ pub(super) fn run_case(fixture: &Fixture<'_>, lanes: &[LaneCase], label: &str) -
     let start = |slot: u32| fixture.start[slot as usize];
     let mut slots = lanes.iter().map(|lane| lane.slot).collect::<Vec<_>>();
     slots.sort_unstable();
-    let max_rows = lanes.iter().map(|lane| lane.drafts + 1).max().expect("a lane");
+    let max_rows = lanes
+        .iter()
+        .map(|lane| lane.drafts + 1)
+        .max()
+        .expect("a lane");
 
     // Spec-off reference: the case's slots advance together with the true
     // tokens; rows per position and digests after every step.
@@ -307,11 +309,22 @@ pub(super) fn run_case(fixture: &Fixture<'_>, lanes: &[LaneCase], label: &str) -
         .collect::<Vec<_>>();
     let arm = fixture.arm;
     let verify = model
-        .forward_gpu_joint_verify(&verify_lanes, &mut cache, arm.mode, arm.dense_ffn, arm.options)
+        .forward_gpu_joint_verify(
+            &verify_lanes,
+            &mut cache,
+            arm.mode,
+            arm.dense_ffn,
+            arm.options,
+        )
         .unwrap_or_else(|error| panic!("{label}: verify: {error:#}"));
     let mut traced = Vec::with_capacity(lanes.len());
     for (lane, rows) in lanes.iter().zip(&verify.rows) {
-        assert_eq!(rows.len(), lane.drafts + 1, "{label}: lane {} rows", lane.slot);
+        assert_eq!(
+            rows.len(),
+            lane.drafts + 1,
+            "{label}: lane {} rows",
+            lane.slot
+        );
         let mut bits = Vec::with_capacity(rows.len());
         for (row, output) in rows.iter().enumerate() {
             let observed = row_bits(model, output);
@@ -391,8 +404,7 @@ pub(super) fn run_case(fixture: &Fixture<'_>, lanes: &[LaneCase], label: &str) -
     for lane in lanes {
         let advanced = lane.accepted + CONTINUE;
         assert!(
-            lane_digest(&cache, &model.cfg, lane.slot)
-                == ref_digests[lane.slot as usize][advanced],
+            lane_digest(&cache, &model.cfg, lane.slot) == ref_digests[lane.slot as usize][advanced],
             "{label}: lane {} state after continuing differs from spec-off",
             lane.slot
         );
@@ -454,10 +466,7 @@ pub(super) fn check_invariance(fixture: &Fixture<'_>, label: &str) {
             .iter()
             .position(|lane| lane.slot == 2)
             .expect("target lane");
-        (
-            trace.rows[index].clone(),
-            trace.committed[index].clone(),
-        )
+        (trace.rows[index].clone(), trace.committed[index].clone())
     };
     let alone = run_case(fixture, INVARIANCE_CASES[0], &format!("{label} alone"));
     let (rows, committed) = target(INVARIANCE_CASES[0], &alone);
@@ -792,7 +801,11 @@ fn with_synthetic_fixture(
         return;
     };
     let model = synthetic_model(&device, policy, false);
-    assert_eq!(model.joint_decode_mode(), Ok(arm.mode), "joint mode admitted");
+    assert_eq!(
+        model.joint_decode_mode(),
+        Ok(arm.mode),
+        "joint mode admitted"
+    );
     let new_cache = || synthetic_cache(&model, arm);
     let token = |slot, position| synthetic_token(slot, position);
     run(&Fixture {
@@ -801,6 +814,230 @@ fn with_synthetic_fixture(
         new_cache: &new_cache,
         start: PREFIX,
         token: &token,
+    });
+}
+
+fn dflash_arm() -> Arm {
+    Arm {
+        mode: JointRouteMode::PaddedMvExt,
+        dense_ffn: JointDenseFfnRoute::SharedWeights,
+        options: JointStepOptions {
+            projection: JointProjectionKernel::Canonical,
+            pooled_outputs: true,
+        },
+    }
+}
+
+struct DFlashCaseTrace {
+    rows: Vec<Vec<RowBits>>,
+    committed: Vec<LaneDigest>,
+    captured: Vec<Vec<u32>>,
+}
+
+fn run_dflash_case(fixture: &Fixture<'_>, lanes: &[LaneCase], label: &str) -> DFlashCaseTrace {
+    let mut cache = (fixture.new_cache)();
+    let token_rows = lanes
+        .iter()
+        .map(|lane| {
+            (0..=lane.drafts)
+                .map(|row| {
+                    (fixture.token)(lane.slot, fixture.start[lane.slot as usize] + row as i32)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let verify_lanes = lanes
+        .iter()
+        .zip(&token_rows)
+        .map(|(lane, tokens)| Qwen35JointVerifyLane {
+            slot_id: SlotId(lane.slot),
+            position: fixture.start[lane.slot as usize],
+            tokens,
+            output: Qwen35JointOutput::LogitsAndHidden,
+        })
+        .collect::<Vec<_>>();
+    let capture_layers = [0, fixture.model.cfg.num_hidden_layers as usize - 1];
+    let feature_width = fixture.model.cfg.hidden_size as usize * capture_layers.len();
+    let captured = fixture
+        .model
+        .with_gpu_cache_mut(|device, _registry| {
+            Ok(device.alloc_buffer(
+                SLOTS as usize * 8 * feature_width * 4,
+                DType::F32,
+                vec![SLOTS as usize * 8, feature_width],
+            )?)
+        })
+        .unwrap_or_else(|error| panic!("{label}: allocate DFlash2 capture: {error:#}"));
+    let capture_lanes = lanes
+        .iter()
+        .map(|lane| lane.slot as usize)
+        .collect::<Vec<_>>();
+    let capture = DFlash2JointCapture {
+        layer_ids: &capture_layers,
+        output: &captured,
+        lane_indices: &capture_lanes,
+        lanes: SLOTS as usize,
+        rows_per_lane: 8,
+        feature_width,
+    };
+    let arm = fixture.arm;
+    let verify = fixture
+        .model
+        .forward_gpu_dflash2_verify(
+            &verify_lanes,
+            &mut cache,
+            arm.mode,
+            arm.dense_ffn,
+            arm.options,
+            Some(capture),
+        )
+        .unwrap_or_else(|error| panic!("{label}: DFlash2 verify: {error:#}"));
+    let rows = verify
+        .rows
+        .iter()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| row_bits(fixture.model, row))
+                .collect()
+        })
+        .collect();
+    let captured_values = captured
+        .as_slice::<f32>()
+        .unwrap_or_else(|error| panic!("{label}: read DFlash2 capture: {error}"));
+    let captured = lanes
+        .iter()
+        .map(|lane| {
+            let start = lane.slot as usize * 8 * feature_width;
+            captured_values[start..start + (lane.drafts + 1) * feature_width]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect()
+        })
+        .collect();
+    fixture
+        .model
+        .commit_joint_verify(
+            &mut cache,
+            verify.pending,
+            &lanes.iter().map(|lane| lane.accepted).collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|error| panic!("{label}: DFlash2 commit: {error:#}"));
+    DFlashCaseTrace {
+        rows,
+        committed: lanes
+            .iter()
+            .map(|lane| lane_digest(&cache, &fixture.model.cfg, lane.slot))
+            .collect(),
+        captured,
+    }
+}
+
+fn argmax_bits(logits: &[u32]) -> usize {
+    let mut selected = 0;
+    for index in 1..logits.len() {
+        if f32::from_bits(logits[index]) > f32::from_bits(logits[selected]) {
+            selected = index;
+        }
+    }
+    selected
+}
+
+#[test]
+fn dflash2_width32_meets_q1_and_is_cohort_invariant() {
+    with_synthetic_fixture(padded_policy(), dflash_arm(), |fixture| {
+        let full = [lane(0, 7, 0), lane(1, 7, 2), lane(2, 7, 5), lane(3, 7, 8)];
+
+        let mut reference_cache = (fixture.new_cache)();
+        let mut reference: [Vec<RowBits>; SLOTS as usize] = std::array::from_fn(|_| Vec::new());
+        for step in 0..8 {
+            let slots = [0, 1, 2, 3];
+            let positions = slots.map(|slot| fixture.start[slot as usize] + step);
+            for (slot, row) in slots.into_iter().zip(spec_off_step(
+                fixture,
+                &mut reference_cache,
+                &slots,
+                &positions,
+            )) {
+                reference[slot as usize].push(row);
+            }
+        }
+
+        let observed = run_dflash_case(fixture, &full, "width32 full");
+        for (lane_index, lane) in full.iter().enumerate() {
+            for row in 0..=lane.drafts {
+                let actual = &observed.rows[lane_index][row];
+                let expected = &reference[lane.slot as usize][row];
+                assert_eq!(
+                    argmax_bits(&actual.0),
+                    argmax_bits(&expected.0),
+                    "lane {} row {row}: width32 argmax differs from spec-off",
+                    lane.slot
+                );
+                let max_logit_delta = actual
+                    .0
+                    .iter()
+                    .zip(&expected.0)
+                    .map(|(&left, &right)| (f32::from_bits(left) - f32::from_bits(right)).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    max_logit_delta <= 0.25,
+                    "lane {} row {row}: width32 max logit delta {max_logit_delta} exceeds Q1",
+                    lane.slot
+                );
+
+                let hidden_metrics = actual.1.iter().zip(&expected.1).fold(
+                    (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32),
+                    |metrics, (&left, &right)| {
+                        let left = f32::from_bits(left);
+                        let right = f32::from_bits(right);
+                        (
+                            metrics.0.max((left - right).abs()),
+                            metrics.1 + (left - right).abs(),
+                            metrics.2 + left * left,
+                            metrics.3 + right * right,
+                        )
+                    },
+                );
+                assert!(
+                    hidden_metrics.0.is_finite()
+                        && hidden_metrics.1.is_finite()
+                        && hidden_metrics.2.is_finite()
+                        && hidden_metrics.3.is_finite(),
+                    "lane {} row {row}: hidden metrics are non-finite",
+                    lane.slot
+                );
+            }
+        }
+
+        let alone_case = [lane(2, 7, 5)];
+        let alone = run_dflash_case(fixture, &alone_case, "width32 alone");
+        assert_eq!(
+            alone.rows[0], observed.rows[2],
+            "lane 2 rows changed by cohort"
+        );
+        assert_eq!(
+            alone.committed[0], observed.committed[2],
+            "lane 2 retained cache changed by cohort"
+        );
+        assert_eq!(
+            alone.captured[0], observed.captured[2],
+            "lane 2 target captures changed by cohort"
+        );
+
+        let permuted_case = [lane(3, 7, 8), lane(2, 7, 5), lane(1, 7, 2), lane(0, 7, 0)];
+        let permuted = run_dflash_case(fixture, &permuted_case, "width32 permuted");
+        assert_eq!(
+            permuted.rows[1], observed.rows[2],
+            "lane 2 rows changed by packing order"
+        );
+        assert_eq!(
+            permuted.committed[1], observed.committed[2],
+            "lane 2 retained cache changed by packing order"
+        );
+        assert_eq!(
+            permuted.captured[1], observed.captured[2],
+            "lane 2 target captures changed by packing order"
+        );
     });
 }
 
@@ -916,7 +1153,10 @@ fn verify_refuses_bad_windows_before_writing() {
                 .forward_gpu_joint_verify(lanes, &mut cache, arm.mode, arm.dense_ffn, arm.options)
                 .is_err());
         }
-        assert!(digests(fixture, &cache) == before, "refusal wrote the cache");
+        assert!(
+            digests(fixture, &cache) == before,
+            "refusal wrote the cache"
+        );
         let verify = model
             .forward_gpu_joint_verify(
                 &[Qwen35JointVerifyLane {
@@ -932,10 +1172,7 @@ fn verify_refuses_bad_windows_before_writing() {
             )
             .expect("valid window");
         assert!(verify.rows[0].iter().all(|row| row.greedy_token.is_some()));
-        assert_eq!(
-            verify.pending.lanes().collect::<Vec<_>>(),
-            [(SlotId(2), 4)]
-        );
+        assert_eq!(verify.pending.lanes().collect::<Vec<_>>(), [(SlotId(2), 4)]);
         // A commit needs one accept count per lane, each within the window.
         assert!(model
             .commit_joint_verify(&mut (fixture.new_cache)(), verify.pending, &[5])
