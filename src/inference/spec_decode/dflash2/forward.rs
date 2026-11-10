@@ -937,16 +937,17 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_forward_selection_and_commit_run_on_metal() {
+    fn synthetic_forward_selection_and_commit_run_on_metal_with_inactive_lanes() {
         let device = MlxDevice::new().unwrap();
         let mut registry = KernelRegistry::new();
         let cfg = config();
         let tensors = tensors(&device, &cfg);
         let head = buffer(&device, DType::BF16, &[cfg.vocab_size, cfg.hidden_size]).unwrap();
-        let mut workspace = DFlash2Workspace::new(&device, &cfg, 1).unwrap();
-        prepare_decode_positions(&mut workspace, &cfg, &[0]).unwrap();
+        let mut workspace = DFlash2Workspace::new(&device, &cfg, 4).unwrap();
+        prepare_decode_positions(&mut workspace, &cfg, &[0; 4]).unwrap();
         workspace.uniforms.as_mut_slice::<f32>().unwrap().fill(0.5);
-        let mut retained = buffer(&device, DType::U32, &[1]).unwrap();
+        let mut retained = buffer(&device, DType::U32, &[4]).unwrap();
+        retained.as_mut_slice::<u32>().unwrap().fill(0);
         retained.as_mut_slice::<u32>().unwrap()[0] = 1;
 
         let mut encoder = device.command_encoder().unwrap();
@@ -967,10 +968,10 @@ mod tests {
             &cfg,
             &tensors,
             &workspace,
-            &[0],
-            &[1.0],
+            &[0; 4],
+            &[1.0; 4],
             0,
-            &[8],
+            &[8, 1, 1, 1],
         )
         .unwrap();
         dispatch_dflash2_context_commit(
@@ -993,7 +994,7 @@ mod tests {
             .all(|value| value.is_finite()));
         assert_eq!(
             workspace.proposed_tokens.as_slice::<u32>().unwrap(),
-            &[0; 7]
+            &[0; 4 * 7]
         );
         assert_eq!(workspace.ring_keys[0].as_slice::<u16>().unwrap()[0], 0);
     }
