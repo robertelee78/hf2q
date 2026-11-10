@@ -382,6 +382,32 @@ verification and settlement. These observations prove exact-prefix warm
 continuation and inactive-lane safety for the candidate, not the D3 cancellation,
 tool/SSE and long-context rollback matrix or D6 qualification.
 
+The first D4 stage trace found that acceptance was not the remaining wall-time
+problem. On the exact Qwen3.8 target, the default mlx-native tensor-v2 route
+spent a median 215.494 ms in the fixed 32-row target verify and 243.857 ms in
+the physical transaction. Tensor-v2 uses a 128-row output tile, so this shape
+left three quarters of its row tile empty. The same four-lane, 256-token smoke
+with tensor-v1's matching 32-row tile reduced those medians to 123.537 ms and
+149.179 ms and produced byte-identical assistant payloads. Disabling tensor MM
+entirely was neutral to slower, which isolates the result to the tensor-v1
+versus tensor-v2 shape route rather than tensor execution generally.
+
+The scheduler retains this observer behind the existing DFlash progress DEBUG
+target. Enabled traces emit draft, target verify, host planning, target commit,
+draft-context commit and total wall time for each physical transaction; normal
+INFO serving does not create `Instant` samples or emit a record.
+
+mlx-native therefore routes exactly 32-row dense GGML MM through tensor-v1 and
+retains every other shape's previous route. Its production route and resolved
+trace tests cover the decision, while the existing Q5 tensor numerical gate
+covers row/position invariance. A local exact-source integration smoke completed
+the full four-agent coding protocol in 74.388081 seconds with all four clients
+successful and cleanup proven, down from 103.141573 seconds before the route
+change and below the accepted joint-MTP campaign's 87.704486–94.153340-second
+range. The smoke is performance evidence, not D5 closure: it is one run, used a
+local native checkout rather than the release-candidate published pin, and does
+not supply a confidence interval.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,
