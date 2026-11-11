@@ -8145,13 +8145,13 @@ impl Qwen35Model {
         let qkv_channels = (2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
             + cfg.linear_num_value_heads * cfg.linear_value_head_dim)
             as usize;
-        let mut grouped_m8_preparation =
-            if super::moe_batched::qwen_moe_grouped_native_m8_requested()? {
+        let mut staged_m8_preparation =
+            if super::moe_batched::qwen_moe_staged_m8_requested()? {
                 Some((
                     KernelRegistry::new(),
                     device
                         .command_encoder()
-                        .context("create grouped M8 preparation encoder")?,
+                        .context("create staged M8 preparation encoder")?,
                 ))
             } else {
                 None
@@ -8198,7 +8198,7 @@ impl Qwen35Model {
                             w.expert_down_affine.as_ref(),
                         )
                         .with_context(|| format!("moe_ffn_q layer {i} affine overlay"))?;
-                    if let Some((registry, encoder)) = grouped_m8_preparation.as_mut() {
+                    if let Some((registry, encoder)) = staged_m8_preparation.as_mut() {
                         moe_gpu
                             .prepare_grouped_m8(
                                 encoder,
@@ -8207,7 +8207,7 @@ impl Qwen35Model {
                                 cfg.hidden_size,
                                 moe_cfg.moe_intermediate_size,
                             )
-                            .with_context(|| format!("prepare moe_ffn_q layer {i} grouped M8"))?;
+                            .with_context(|| format!("prepare moe_ffn_q layer {i} staged M8"))?;
                     }
                     FfnWeightsGpu::MoeQ(moe_gpu)
                 }
@@ -8234,10 +8234,10 @@ impl Qwen35Model {
             };
             out.push(layer_gpu);
         }
-        if let Some((_, mut encoder)) = grouped_m8_preparation {
+        if let Some((_, mut encoder)) = staged_m8_preparation {
             encoder
-                .commit_and_wait_labeled("qwen.prepare_grouped_m8")
-                .context("commit grouped M8 expert preparation")?;
+                .commit_and_wait_labeled("qwen.prepare_staged_m8")
+                .context("commit staged M8 expert preparation")?;
         }
         Ok(out)
     }

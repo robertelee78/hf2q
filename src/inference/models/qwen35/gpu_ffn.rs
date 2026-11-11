@@ -499,8 +499,8 @@ pub struct MoeFfnWeightsGpuQ {
     pub expert_gate_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
     pub expert_up_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
     pub expert_down_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
-    /// Converter-style code/meta planes for the exact eight-row DFlash2
-    /// expert tile. Present only under its explicit experimental switch.
+    /// Prepared quantized planes for the staged-M8 DFlash2 expert route.
+    /// Present only under its explicit experimental switch.
     pub(crate) prepared_m8: Option<PreparedMoeExpertsM8>,
 }
 
@@ -643,7 +643,7 @@ impl MoeFfnWeightsGpuQ {
                 && self.expert_gate_affine.is_none()
                 && self.expert_up_affine.is_none()
                 && self.expert_down_affine.is_none(),
-            "prepared grouped M8 requires native expert stacks without affine overlays"
+            "staged M8 preparation requires native expert stacks without affine overlays"
         );
         let gate_params = GgmlQuantizedMatmulIdParams {
             n_tokens: 1,
