@@ -38,9 +38,10 @@ use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk_simd;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    quantized_matmul_id_ggml_mv, quantized_matmul_id_ggml_mv_masked,
-    quantized_matmul_id_ggml_mv_q4_k_nr2, quantized_matmul_id_ggml_mv_q4_k_nr2_masked,
-    GgmlQuantizedMatmulIdParams,
+    quantized_matmul_id_ggml_grouped_m8_epilogue, quantized_matmul_id_ggml_mv,
+    quantized_matmul_id_ggml_mv_masked, quantized_matmul_id_ggml_mv_q4_k_nr2,
+    quantized_matmul_id_ggml_mv_q4_k_nr2_masked, GgmlQuantizedMatmulIdParams,
+    GroupedM8Epilogue, GroupedM8Input,
 };
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -52,6 +53,32 @@ use super::gpu_ffn::MoeFfnWeightsGpuQ;
 
 /// Switch for the batched native-storage MoE decode route. Default off.
 pub(crate) const QWEN_MOE_BATCHED_ENV: &str = "HF2Q_QWEN_MOE_BATCHED";
+/// Experimental native-layout eight-row Metal tensor tile for Q4_K/Q6_K
+/// expert stacks. This is independent of the batched-route admission switch.
+pub(crate) const QWEN_MOE_GROUPED_NATIVE_M8_ENV: &str = "HF2Q_QWEN_MOE_GROUPED_NATIVE_M8";
+
+pub(crate) fn qwen_moe_grouped_native_m8_requested() -> Result<bool> {
+    static REQUESTED: LazyLock<Result<bool, String>> = LazyLock::new(|| {
+        let Some(raw) = std::env::var(QWEN_MOE_GROUPED_NATIVE_M8_ENV)
+            .ok()
+            .map(|raw| raw.trim().to_ascii_lowercase())
+            .filter(|raw| !raw.is_empty())
+        else {
+            return Ok(false);
+        };
+        match raw.as_str() {
+            "1" | "on" | "true" => Ok(true),
+            "0" | "off" | "false" => Ok(false),
+            _ => Err(format!(
+                "{QWEN_MOE_GROUPED_NATIVE_M8_ENV} must be 1/on/true or 0/off/false, got {raw:?}"
+            )),
+        }
+    });
+    match &*REQUESTED {
+        Ok(requested) => Ok(*requested),
+        Err(error) => bail!("{error}"),
+    }
+}
 
 /// Widest row count one batched MoE layer accepts: the DFlash2 target width.
 pub(crate) const MOE_BATCHED_MAX_ROWS: usize = 32;
@@ -74,11 +101,12 @@ pub(crate) fn parse_qwen_moe_batched(raw: Option<&str>) -> Result<bool, String> 
 /// load). Invalid values warn and keep the default (off).
 pub(crate) fn qwen_moe_batched_requested() -> bool {
     static REQUESTED: LazyLock<bool> = LazyLock::new(|| {
-        parse_qwen_moe_batched(std::env::var(QWEN_MOE_BATCHED_ENV).ok().as_deref())
-            .unwrap_or_else(|error| {
+        parse_qwen_moe_batched(std::env::var(QWEN_MOE_BATCHED_ENV).ok().as_deref()).unwrap_or_else(
+            |error| {
                 tracing::warn!(error, fallback = false, "invalid Qwen MoE batched switch");
                 false
-            })
+            },
+        )
     });
     *REQUESTED
 }
@@ -247,7 +275,9 @@ fn dispatch_expert_mv(
         params.k as usize,
         || {
             if let Err(e) = enc.commit_wait_and_rotate() {
-                eprintln!("[hf2q imatrix moe intercept ({tag})] commit_wait_and_rotate failed: {e}");
+                eprintln!(
+                    "[hf2q imatrix moe intercept ({tag})] commit_wait_and_rotate failed: {e}"
+                );
                 return None;
             }
             input.as_slice::<f32>().ok().map(|sl| sl.to_vec())
@@ -325,6 +355,29 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
             && weights.expert_down_affine.is_none(),
         "batched MoE layer {layer_idx} does not support DWQ affine expert overlays"
     );
+    let grouped_native_m8 = qwen_moe_grouped_native_m8_requested()?;
+    if grouped_native_m8 {
+        ensure!(
+            matches!(shape.num_experts_per_tok, 1 | 6 | 8)
+                && shape.hidden_size % 64 == 0
+                && shape.moe_intermediate_size % 64 == 0
+                && matches!(weights.ggml_type_gate_up, GgmlType::Q4_K | GgmlType::Q6_K)
+                && matches!(weights.ggml_type_down, GgmlType::Q4_K | GgmlType::Q6_K)
+                && !crate::quantize::imatrix::is_active(),
+            "{QWEN_MOE_GROUPED_NATIVE_M8_ENV}=1 requires top-k 1/6/8, \
+             64-column-aligned Q4_K/Q6_K native expert stacks and no imatrix collector"
+        );
+    }
+    let prepared_m8 = if grouped_native_m8 {
+        Some(
+            weights
+                .prepared_m8
+                .as_ref()
+                .context("grouped M8 expert planes were not prepared at model upload")?,
+        )
+    } else {
+        None
+    };
     let r = rows as usize;
     let h = shape.hidden_size as usize;
     let top_k = shape.num_experts_per_tok as usize;
@@ -338,7 +391,13 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     );
     let pairs = r * top_k;
 
-    let logits = pooled(device, r * ne as usize, DType::F32, vec![r, ne as usize], "router logits")?;
+    let logits = pooled(
+        device,
+        r * ne as usize,
+        DType::F32,
+        vec![r, ne as usize],
+        "router logits",
+    )?;
     let sh_logit = pooled(device, r, DType::F32, vec![r, 1], "shared gate logit")?;
     let a_s = pooled(device, r * m_sh, DType::F32, vec![r, m_sh], "shared gate")?;
     let b_s = pooled(device, r * m_sh, DType::F32, vec![r, m_sh], "shared up")?;
@@ -346,10 +405,49 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     let y_s = pooled(device, r * h, DType::F32, vec![r, h], "shared down")?;
     let ids = pooled(device, pairs, DType::U32, vec![pairs], "expert ids")?;
     let routing_weights = pooled(device, pairs, DType::F32, vec![pairs], "routing weights")?;
-    let gate_all = pooled(device, pairs * m_moe, DType::F32, vec![pairs, m_moe], "expert gate")?;
-    let up_all = pooled(device, pairs * m_moe, DType::F32, vec![pairs, m_moe], "expert up")?;
-    let h_all = pooled(device, pairs * m_moe, DType::F32, vec![pairs, m_moe], "expert swiglu")?;
+    let expert_storage = if grouped_native_m8 {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    let gate_all = pooled(
+        device,
+        pairs * m_moe,
+        expert_storage,
+        vec![pairs, m_moe],
+        "expert gate",
+    )?;
+    let up_all = pooled(
+        device,
+        if grouped_native_m8 { 1 } else { pairs * m_moe },
+        DType::F32,
+        if grouped_native_m8 {
+            vec![1]
+        } else {
+            vec![pairs, m_moe]
+        },
+        "expert up",
+    )?;
+    let h_all = pooled(
+        device,
+        pairs * m_moe,
+        expert_storage,
+        vec![pairs, m_moe],
+        "expert swiglu",
+    )?;
     let y_all = pooled(device, pairs * h, DType::F32, vec![pairs, h], "expert down")?;
+    let gathered_m8 = grouped_native_m8
+        .then(|| {
+            let width = h.max(m_moe);
+            pooled(
+                device,
+                (ne as usize + pairs + 7) * width,
+                DType::BF16,
+                vec![ne as usize + pairs + 7, width],
+                "grouped M8 gathered input",
+            )
+        })
+        .transpose()?;
     let mut silu_sh_params = pooled(device, 1, DType::U32, vec![1], "shared swiglu params")?;
     let mut silu_params = pooled(device, 1, DType::U32, vec![1], "expert swiglu params")?;
     let n_h_s = (r * m_sh) as u32;
@@ -379,7 +477,16 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         (MoeDenseRole::SharedUp, &b_s, m_sh32),
     ] {
         encode_native_dense_proj(
-            enc, registry, device, x, weights, role, output, rows, h32, out_features,
+            enc,
+            registry,
+            device,
+            x,
+            weights,
+            role,
+            output,
+            rows,
+            h32,
+            out_features,
         )
         .with_context(|| format!("batched MoE layer {layer_idx}"))?;
     }
@@ -446,14 +553,80 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         expert_stride: weights.expert_up_stride,
         ..gate_params
     };
-    dispatch_expert_mv(
-        enc, registry, device, x, &weights.expert_gate_q, &ids, &gate_all, &gate_params,
-        "ffn_gate_exps", layer_idx, route_mask.is_some(),
-    )?;
-    dispatch_expert_mv(
-        enc, registry, device, x, &weights.expert_up_q, &ids, &up_all, &up_params,
-        "ffn_up_exps", layer_idx, route_mask.is_some(),
-    )?;
+    if grouped_native_m8 {
+        super::decode_pool::with_id_mm_scratch(
+            super::decode_pool::MmIdSlot::Gate,
+            device,
+            ne,
+            rows * shape.num_experts_per_tok,
+            |scratch| {
+                quantized_matmul_id_ggml_grouped_m8_epilogue(
+                    enc,
+                    registry,
+                    device,
+                    x,
+                    gathered_m8.as_ref().expect("allocated grouped M8 input"),
+                    &prepared_m8.expect("validated prepared M8").gate,
+                    &ids,
+                    &gate_all,
+                    None,
+                    scratch,
+                    &gate_params,
+                    false,
+                    false,
+                    false,
+                    GroupedM8Input::F32,
+                    GroupedM8Epilogue::Bf16,
+                )?;
+                quantized_matmul_id_ggml_grouped_m8_epilogue(
+                    enc,
+                    registry,
+                    device,
+                    x,
+                    gathered_m8.as_ref().expect("allocated grouped M8 input"),
+                    &prepared_m8.expect("validated prepared M8").up,
+                    &ids,
+                    &h_all,
+                    Some(&gate_all),
+                    scratch,
+                    &up_params,
+                    false,
+                    true,
+                    true,
+                    GroupedM8Input::F32,
+                    GroupedM8Epilogue::SiluMulBf16,
+                )
+            },
+        )
+        .map_err(|e| anyhow!("batched MoE layer {layer_idx} grouped native M8 gate/up: {e}"))?;
+    } else {
+        dispatch_expert_mv(
+            enc,
+            registry,
+            device,
+            x,
+            &weights.expert_gate_q,
+            &ids,
+            &gate_all,
+            &gate_params,
+            "ffn_gate_exps",
+            layer_idx,
+            route_mask.is_some(),
+        )?;
+        dispatch_expert_mv(
+            enc,
+            registry,
+            device,
+            x,
+            &weights.expert_up_q,
+            &ids,
+            &up_all,
+            &up_params,
+            "ffn_up_exps",
+            layer_idx,
+            route_mask.is_some(),
+        )?;
+    }
     encode_native_dense_proj(
         enc,
         registry,
@@ -469,19 +642,21 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     .with_context(|| format!("batched MoE layer {layer_idx}"))?;
     enc.memory_barrier();
 
-    // ---- D: expert SwiGLU ----
-    dispatch_silu_mul(
-        enc,
-        registry,
-        device.metal_device(),
-        &gate_all,
-        &up_all,
-        &h_all,
-        &silu_params,
-        n_h_all,
-    )
-    .map_err(|e| anyhow!("batched MoE layer {layer_idx} expert swiglu: {e}"))?;
-    enc.memory_barrier();
+    // ---- D: expert SwiGLU (the grouped M8 up epilogue already produced it) ----
+    if !grouped_native_m8 {
+        dispatch_silu_mul(
+            enc,
+            registry,
+            device.metal_device(),
+            &gate_all,
+            &up_all,
+            &h_all,
+            &silu_params,
+            n_h_all,
+        )
+        .map_err(|e| anyhow!("batched MoE layer {layer_idx} expert swiglu: {e}"))?;
+        enc.memory_barrier();
+    }
 
     // ---- E: expert down, one pair per input row ----
     let down_params = GgmlQuantizedMatmulIdParams {
@@ -493,10 +668,54 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         expert_stride: weights.expert_down_stride,
         ggml_type: weights.ggml_type_down,
     };
-    dispatch_expert_mv(
-        enc, registry, device, &h_all, &weights.expert_down_q, &ids, &y_all, &down_params,
-        "ffn_down_exps", layer_idx, route_mask.is_some(),
-    )?;
+    if grouped_native_m8 {
+        let slotted_down_params = GgmlQuantizedMatmulIdParams {
+            n_tokens: rows,
+            top_k: shape.num_experts_per_tok,
+            ..down_params
+        };
+        super::decode_pool::with_id_mm_scratch(
+            super::decode_pool::MmIdSlot::Gate,
+            device,
+            ne,
+            rows * shape.num_experts_per_tok,
+            |scratch| {
+                quantized_matmul_id_ggml_grouped_m8_epilogue(
+                    enc,
+                    registry,
+                    device,
+                    &h_all,
+                    gathered_m8.as_ref().expect("allocated grouped M8 input"),
+                    &prepared_m8.expect("validated prepared M8").down,
+                    &ids,
+                    &y_all,
+                    None,
+                    scratch,
+                    &slotted_down_params,
+                    true,
+                    true,
+                    false,
+                    GroupedM8Input::Bf16,
+                    GroupedM8Epilogue::F32,
+                )
+            },
+        )
+        .map_err(|e| anyhow!("batched MoE layer {layer_idx} grouped native M8 down: {e}"))?;
+    } else {
+        dispatch_expert_mv(
+            enc,
+            registry,
+            device,
+            &h_all,
+            &weights.expert_down_q,
+            &ids,
+            &y_all,
+            &down_params,
+            "ffn_down_exps",
+            layer_idx,
+            route_mask.is_some(),
+        )?;
+    }
     enc.memory_barrier();
 
     // ---- F: weighted reduce + sigmoid(shared gate) * shared + residual ----
@@ -519,8 +738,12 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
 
     #[cfg(test)]
     {
-        crate::adr063_invariance::qwen::retain_current("moe_router_logits", &logits, vec![r, ne as usize])
-            .map_err(anyhow::Error::msg)?;
+        crate::adr063_invariance::qwen::retain_current(
+            "moe_router_logits",
+            &logits,
+            vec![r, ne as usize],
+        )
+        .map_err(anyhow::Error::msg)?;
         crate::adr063_invariance::qwen::retain_current("moe_router_ids", &ids, vec![r, top_k])
             .map_err(anyhow::Error::msg)?;
         crate::adr063_invariance::qwen::retain_current(

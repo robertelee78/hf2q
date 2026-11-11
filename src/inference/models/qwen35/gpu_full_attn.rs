@@ -14074,6 +14074,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            prepared_m8: None,
             dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
         };
 
@@ -14492,6 +14493,7 @@ mod tests {
                 expert_gate_affine: None,
                 expert_up_affine: None,
                 expert_down_affine: None,
+                prepared_m8: None,
                 dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
             }
         };
@@ -15242,6 +15244,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            prepared_m8: None,
             dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
         };
 
@@ -15347,6 +15350,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            prepared_m8: None,
             dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
         };
         let hidden_in_a = upload_f32(&hidden_data, &device).unwrap();
@@ -15391,6 +15395,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            prepared_m8: None,
             dense_storage: super::super::gpu_ffn::MoeDenseStorage::Bf16,
         };
         let hidden_in_b = upload_f32(&hidden_data, &device).unwrap();
