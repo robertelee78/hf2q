@@ -398,6 +398,14 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         shape.num_experts_per_tok,
     )
     .map_err(|e| anyhow!("batched MoE layer {layer_idx} top-k: {e}"))?;
+    // The route mask reads and rewrites the top-k outputs. Without this
+    // explicit RAW barrier, its dispatch can race the selector and expose
+    // partially written expert IDs or weights to the masked expert kernels.
+    // The failure is scheduling-dependent and corrupts otherwise-live rows,
+    // so it appears as intermittent greedy token and tool-argument drift.
+    if route_mask.is_some() {
+        enc.memory_barrier();
+    }
     if let Some(mask) = route_mask {
         dispatch_dflash2_mask_moe_routes(
             enc,
