@@ -547,17 +547,35 @@ versus 46.488 ms for the exact matvec route at 18. These grouped routes are
 rejected on end-to-end performance.
 
 Splash's remaining advantage is therefore kernel-specific, not an omitted
-selector constant or grouping alone. Its verified grouping feeds custom
-eight-row Table16 expert tiles; those tiles keep activations in BF16, use
-register matrix operations, launch only live expert tiles through indirect
-grids, and combine the shared and routed experts in one grouped representation.
-hf2q's available generic grouped path uses 32-row F32 tiles, while the scalar
+selector constant or grouping alone. A complete device-policy trace corrects
+an earlier inference from the presence of its Table16 register kernel.
+`ExecutionPlans::moeConfig` calls `moeGgufTile`; `MoE.hpp` selects the register
+tile only for Apple9 GPUs with more than ten cores, while the release M5 Max is
+Apple10 and therefore always selects `MoeGgufTile::Staged`. The valid Splash
+comparator consequently does **not** run the Table16/register expert path. It
+runs eight-row staged tiles over BF16 grouped activations and outputs, launches
+only the indirect grid of live tiles, switches one- or two-row expert tiles to
+a dedicated column-dot kernel, and executes gate and up together with one
+simdgroup per projection and a fused BF16 SiLU epilogue. Shared-expert slices
+are inserted into the same grouped representation.
+
+The retained status from valid Splash run `n4-070-b17-splash-a0` confirms that
+policy on the comparison host: `apple_gpu_family=10`, 40 GPU cores, 21.213 GB
+of target weights and 480 MB of draft weights. Across 606 mixed-width decode
+batches (183 B1, 95 B2, 145 B3 and 183 B4), target forward consumed
+10,866.091 ms, or 17.93 ms per batch, while complete model GPU decode consumed
+12,721.392 ms, or 20.99 ms per batch. Its final B1 sample reported 13.156 ms
+target forward and 15.276 ms complete GPU decode. Against hf2q's steady B4
+50.4-55.9 ms target verify, this localizes the remaining deficit inside the
+target kernels and activation graph rather than the host transaction tail.
+
+hf2q's generic grouped path instead uses 32-row F32 tiles, while the scalar
 live-expert spike loses output-column occupancy and has too little route reuse
 at the observed 10–19 selected rows. Both pay more scheduling, staging, or
-weight-decode cost than the Q4_K route matvecs. Matching Splash requires a
-family-neutral prepared-weight eight-row BF16 register-matrix expert tile over
-every admitted GGUF expert format, not another raw-block scalar tile or generic
-`mm_id` threshold override.
+weight-decode cost than the Q4_K route matvecs. The M5-class successor must
+therefore implement the staged M8 design, including the one/two-row column
+tile and one-pass gate/up, over every admitted GGUF expert format. A Table16
+register copy targets Splash's Apple9 policy and cannot establish M5 parity.
 
 The converter-style prepared-plane M8 spike then passed Q4_K/Q6_K operator
 parity and reduced the best exact four-agent smoke to 28.641453 seconds. A
@@ -696,11 +714,11 @@ seconds; these unpaired, output-dependent samples do not establish an
 end-to-end win. The route therefore remains isolated until a matched quality
 and performance campaign can qualify it.
 
-The exact Splash-style Table16/register-matrix follow-up did not rescue that
-target route. The spike consumed the same prepared Q4_K/Q6_K planes directly,
-gathered eight BF16 rows into Splash's transposed 64-input table, retained its
-F32 seed/sum correction, and passed shared/slotted F32, BF16 gate/up epilogue
-and BF16-input down-projection parity at the existing 0.3% kernel envelope. A
+The Table16/register-matrix follow-up did not rescue that target route. The
+spike consumed the same prepared Q4_K/Q6_K planes directly, gathered eight
+BF16 rows into Splash's transposed 64-input table, retained its F32 seed/sum
+correction, and passed shared/slotted F32, BF16 gate/up epilogue and
+BF16-input down-projection parity at the existing 0.3% kernel envelope. A
 first implementation exposed an hf2q-specific compact-schedule hazard:
 per-expert route slices have one guard entry, not eight-row padding, so padded
 Table16 writes overlapped the next expert. Reserving seven additional rows per
@@ -708,10 +726,27 @@ expert removed that race. Narrow per-lane payload loads then reduced the
 register result from 1.207 to 1.187 ms per projection, but the matched
 100-dispatch Qwen3.6 gate probe still measured 1.134 ms for the scalar route,
 0.862 ms for the prepared Metal-tensor route and 1.187 ms for the register
-route. The exact register route is 37.7% slower than the already insufficient
-prepared route and remains a rejected experiment. This strengthens the
-single-transaction requirement: copying Splash's expert arithmetic in
-isolation does not close hf2q's command-boundary and target-state costs.
+route. The register route is 37.7% slower than the already insufficient
+prepared route and remains a rejected experiment. Source policy now shows
+that this result measures Splash's Apple9 arithmetic, not the Apple10 staged
+M8 path used by the valid M5 Max comparator; it cannot reject or validate the
+required staged successor.
+
+The next staged-M8 spike fused gate and up in the Apple10 shape: one
+simdgroup per projection over the same 32 output columns, gate retained in
+threadgroup memory, and a `BF16(up) * SiLU(BF16(gate))` epilogue. Q4_K and
+Q6_K focused parity passed. The production-shape 100-pair probe improved from
+1.943 to 1.286 ms per gate/up pair (33.8%). That microkernel result did not
+transfer to the complete model. Two realistic four-agent Q5 runs passed task
+quality and cleanup at 38.783 and 37.500 seconds, versus 37.137 and 36.384
+seconds for the preceding separate-pass prepared route. These output-dependent
+smokes are not a paired performance campaign, but their 38.142-second median
+is 3.76% slower than the separate route's 36.760-second median and supplies no
+basis to promote the fusion. The spike is preserved on the isolated experiment
+branches `mlx-native/perf/dflash2-expert-m8@1b72ed6` and
+`hf2q/perf/dflash2-expert-m8@f442ff66`. The next target change must measure
+whole-layer BF16 activation flow and accepted-token yield, not infer an
+end-to-end win from dispatch timing.
 
 An unprofiled four-request diagnostic on the exact Qwen3.6 Q4_K_M target then
 separated transaction boundaries from target work without the stage profiler's
