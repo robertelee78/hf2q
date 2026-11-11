@@ -8206,6 +8206,7 @@ impl Qwen35Model {
                                 device,
                                 cfg.hidden_size,
                                 moe_cfg.moe_intermediate_size,
+                                moe_cfg.shared_expert_intermediate_size,
                             )
                             .with_context(|| format!("prepare moe_ffn_q layer {i} staged M8"))?;
                     }

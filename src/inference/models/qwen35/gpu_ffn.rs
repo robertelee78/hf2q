@@ -68,8 +68,8 @@ use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    prepare_quantized_matmul_id_ggml_grouped_m8, quantized_matmul_id_ggml_pooled,
-    quantized_matmul_id_ggml_pooled_pair,
+    prepare_quantized_matmul_id_ggml_grouped_m8_with_tail,
+    quantized_matmul_id_ggml_pooled, quantized_matmul_id_ggml_pooled_pair,
     quantized_matmul_id_ggml_pooled_slotted_reusing_schedule, GgmlQuantizedMatmulIdParams,
     PreparedGroupedM8Experts, MM_ID_ROUTING_THRESHOLD,
 };
@@ -637,6 +637,7 @@ impl MoeFfnWeightsGpuQ {
         device: &MlxDevice,
         hidden_size: u32,
         moe_intermediate_size: u32,
+        shared_intermediate_size: u32,
     ) -> Result<()> {
         anyhow::ensure!(
             self.dense_storage.is_native()
@@ -644,6 +645,27 @@ impl MoeFfnWeightsGpuQ {
                 && self.expert_up_affine.is_none()
                 && self.expert_down_affine.is_none(),
             "staged M8 preparation requires native expert stacks without affine overlays"
+        );
+        let MoeDenseStorage::Native {
+            shared_gate_up,
+            shared_down,
+        } = self.dense_storage
+        else {
+            unreachable!("validated native storage");
+        };
+        anyhow::ensure!(
+            shared_intermediate_size == moe_intermediate_size,
+            "staged M8 combined shared route requires shared intermediate {} to equal routed intermediate {}",
+            shared_intermediate_size,
+            moe_intermediate_size
+        );
+        anyhow::ensure!(
+            shared_gate_up == self.ggml_type_gate_up && shared_down == self.ggml_type_down,
+            "staged M8 combined shared route requires matching quant types: routed gate/up {:?}, shared gate/up {:?}, routed down {:?}, shared down {:?}",
+            self.ggml_type_gate_up,
+            shared_gate_up,
+            self.ggml_type_down,
+            shared_down
         );
         let gate_params = GgmlQuantizedMatmulIdParams {
             n_tokens: 1,
@@ -658,6 +680,24 @@ impl MoeFfnWeightsGpuQ {
             expert_stride: self.expert_up_stride,
             ..gate_params
         };
+        let shared_gate_up_stride = ggml_type_stride(
+            shared_gate_up,
+            shared_intermediate_size as usize,
+            hidden_size as usize,
+        )
+        .context("shared gate/up stride")?;
+        let shared_down_stride = ggml_type_stride(
+            shared_down,
+            hidden_size as usize,
+            shared_intermediate_size as usize,
+        )
+        .context("shared down stride")?;
+        let shared_gate_params = GgmlQuantizedMatmulIdParams {
+            n_experts: 1,
+            expert_stride: shared_gate_up_stride,
+            ..gate_params
+        };
+        let shared_up_params = shared_gate_params;
         let down_params = GgmlQuantizedMatmulIdParams {
             n: hidden_size,
             k: moe_intermediate_size,
@@ -665,31 +705,42 @@ impl MoeFfnWeightsGpuQ {
             ggml_type: self.ggml_type_down,
             ..gate_params
         };
+        let shared_down_params = GgmlQuantizedMatmulIdParams {
+            n_experts: 1,
+            expert_stride: shared_down_stride,
+            ..down_params
+        };
         self.prepared_m8 = Some(PreparedMoeExpertsM8 {
-            gate: prepare_quantized_matmul_id_ggml_grouped_m8(
+            gate: prepare_quantized_matmul_id_ggml_grouped_m8_with_tail(
                 encoder,
                 registry,
                 device,
                 &self.expert_gate_q,
                 &gate_params,
+                &self.shared_gate,
+                &shared_gate_params,
             )
-            .context("prepare gate expert M8 planes")?,
-            up: prepare_quantized_matmul_id_ggml_grouped_m8(
+            .context("prepare routed/shared gate M8 planes")?,
+            up: prepare_quantized_matmul_id_ggml_grouped_m8_with_tail(
                 encoder,
                 registry,
                 device,
                 &self.expert_up_q,
                 &up_params,
+                &self.shared_up,
+                &shared_up_params,
             )
-            .context("prepare up expert M8 planes")?,
-            down: prepare_quantized_matmul_id_ggml_grouped_m8(
+            .context("prepare routed/shared up M8 planes")?,
+            down: prepare_quantized_matmul_id_ggml_grouped_m8_with_tail(
                 encoder,
                 registry,
                 device,
                 &self.expert_down_q,
                 &down_params,
+                &self.shared_down,
+                &shared_down_params,
             )
-            .context("prepare down expert M8 planes")?,
+            .context("prepare routed/shared down M8 planes")?,
         });
         Ok(())
     }

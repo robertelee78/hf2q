@@ -38,8 +38,12 @@ use mlx_native::ops::dense_matvec_f32_rows::{
     dispatch_dense_matvec_f32_rows, DENSE_MATVEC_F32_ROWS_MAX_ROWS,
 };
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
-use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk_simd;
-use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
+use mlx_native::ops::moe_softmax_topk::{
+    dispatch_moe_softmax_topk_simd, dispatch_moe_softmax_topk_simd_with_shared,
+};
+use mlx_native::ops::moe_weighted_reduce::{
+    dispatch_moe_weighted_reduce, dispatch_moe_weighted_reduce_shared_last,
+};
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
     quantized_matmul_id_ggml_grouped_m8_epilogue,
@@ -368,14 +372,15 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     let staged_m8 = qwen_moe_staged_m8_requested()?;
     if staged_m8 {
         ensure!(
-            matches!(shape.num_experts_per_tok, 1 | 6 | 8)
+            shape.num_experts_per_tok == 8
+                && shape.shared_intermediate_size == shape.moe_intermediate_size
                 && shape.hidden_size % 64 == 0
                 && shape.moe_intermediate_size % 64 == 0
                 && matches!(weights.ggml_type_gate_up, GgmlType::Q4_K | GgmlType::Q6_K)
                 && matches!(weights.ggml_type_down, GgmlType::Q4_K | GgmlType::Q6_K)
                 && !crate::quantize::imatrix::is_active(),
-            "{QWEN_MOE_STAGED_M8_ENV}=1 requires top-k 1/6/8, \
-             64-column-aligned Q4_K/Q6_K native expert stacks and no imatrix collector"
+            "{QWEN_MOE_STAGED_M8_ENV}=1 requires top-k 8, equal routed/shared intermediate \
+             widths, 64-column-aligned Q4_K/Q6_K native expert stacks and no imatrix collector"
         );
     }
     let prepared_m8 = if staged_m8 {
@@ -391,15 +396,18 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     let r = rows as usize;
     let h = shape.hidden_size as usize;
     let top_k = shape.num_experts_per_tok as usize;
+    let route_top_k = top_k + usize::from(staged_m8);
     let m_moe = shape.moe_intermediate_size as usize;
     let m_sh = shape.shared_intermediate_size as usize;
     let ne = shape.num_experts;
+    let route_experts = ne + u32::from(staged_m8);
     ensure!(
         x.element_count() >= r * h,
         "batched MoE layer {layer_idx}: input has {} values, need {rows} x {h}",
         x.element_count()
     );
     let pairs = r * top_k;
+    let route_pairs = r * route_top_k;
 
     let logits = pooled(
         device,
@@ -409,12 +417,15 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         "router logits",
     )?;
     let sh_logit = pooled(device, r, DType::F32, vec![r, 1], "shared gate logit")?;
-    let a_s = pooled(device, r * m_sh, DType::F32, vec![r, m_sh], "shared gate")?;
-    let b_s = pooled(device, r * m_sh, DType::F32, vec![r, m_sh], "shared up")?;
-    let h_s = pooled(device, r * m_sh, DType::F32, vec![r, m_sh], "shared swiglu")?;
-    let y_s = pooled(device, r * h, DType::F32, vec![r, h], "shared down")?;
-    let ids = pooled(device, pairs, DType::U32, vec![pairs], "expert ids")?;
-    let routing_weights = pooled(device, pairs, DType::F32, vec![pairs], "routing weights")?;
+    let shared_elements = if staged_m8 { 1 } else { r * m_sh };
+    let a_s = pooled(device, shared_elements, DType::F32, vec![shared_elements], "shared gate")?;
+    let b_s = pooled(device, shared_elements, DType::F32, vec![shared_elements], "shared up")?;
+    let h_s = pooled(device, shared_elements, DType::F32, vec![shared_elements], "shared swiglu")?;
+    let y_s_elements = if staged_m8 { 1 } else { r * h };
+    let y_s = pooled(device, y_s_elements, DType::F32, vec![y_s_elements], "shared down")?;
+    let ids = pooled(device, route_pairs, DType::U32, vec![route_pairs], "expert ids")?;
+    let routing_weights =
+        pooled(device, route_pairs, DType::F32, vec![route_pairs], "routing weights")?;
     let expert_storage = if staged_m8 { DType::BF16 } else { DType::F32 };
     let gate_all = pooled(
         device,
@@ -440,20 +451,26 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     )?;
     let h_all = pooled(
         device,
-        pairs * m_moe,
+        route_pairs * m_moe,
         expert_storage,
-        vec![pairs, m_moe],
+        vec![route_pairs, m_moe],
         "expert swiglu",
     )?;
-    let y_all = pooled(device, pairs * h, DType::F32, vec![pairs, h], "expert down")?;
+    let y_all = pooled(
+        device,
+        route_pairs * h,
+        DType::F32,
+        vec![route_pairs, h],
+        "expert down",
+    )?;
     let gathered_m8 = staged_m8
         .then(|| {
             let width = h.max(m_moe);
             pooled(
                 device,
-                (ne as usize + pairs) * width,
+                (route_experts as usize + route_pairs) * width,
                 DType::BF16,
-                vec![ne as usize + pairs, width],
+                vec![route_experts as usize + route_pairs, width],
                 "staged M8 gathered input",
             )
         })
@@ -461,7 +478,7 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     let mut silu_sh_params = pooled(device, 1, DType::U32, vec![1], "shared swiglu params")?;
     let mut silu_params = pooled(device, 1, DType::U32, vec![1], "expert swiglu params")?;
     let n_h_s = (r * m_sh) as u32;
-    let n_h_all = (pairs * m_moe) as u32;
+    let n_h_all = (route_pairs * m_moe) as u32;
     silu_sh_params
         .as_mut_slice::<u32>()
         .map_err(|e| anyhow!("batched MoE shared swiglu params: {e}"))?[0] = n_h_s;
@@ -479,12 +496,10 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
 
     let h32 = shape.hidden_size;
     let m_sh32 = shape.shared_intermediate_size;
-    // ---- A: router, shared gate logit, shared gate/up (all read x) ----
+    // ---- A: router and shared gate logit; legacy path also projects shared gate/up ----
     for (role, output, out_features) in [
         (MoeDenseRole::Router, &logits, ne),
         (MoeDenseRole::SharedGateLogit, &sh_logit, 1),
-        (MoeDenseRole::SharedGate, &a_s, m_sh32),
-        (MoeDenseRole::SharedUp, &b_s, m_sh32),
     ] {
         encode_native_dense_proj(
             enc,
@@ -500,30 +515,58 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         )
         .with_context(|| format!("batched MoE layer {layer_idx}"))?;
     }
+    if !staged_m8 {
+        for (role, output) in [
+            (MoeDenseRole::SharedGate, &a_s),
+            (MoeDenseRole::SharedUp, &b_s),
+        ] {
+            encode_native_dense_proj(
+                enc, registry, device, x, weights, role, output, rows, h32, m_sh32,
+            )
+            .with_context(|| format!("batched MoE layer {layer_idx}"))?;
+        }
+    }
     enc.memory_barrier();
 
-    // ---- B: routing over every row, shared SwiGLU ----
-    dispatch_moe_softmax_topk_simd(
-        enc,
-        registry,
-        device,
-        &logits,
-        &ids,
-        &routing_weights,
-        rows,
-        ne,
-        shape.num_experts_per_tok,
-    )
-    .map_err(|e| anyhow!("batched MoE layer {layer_idx} top-k: {e}"))?;
+    // ---- B: routing over every row; staged path appends the shared expert ----
+    let route_result = if staged_m8 {
+        dispatch_moe_softmax_topk_simd_with_shared(
+            enc,
+            registry,
+            device,
+            &logits,
+            &ids,
+            &routing_weights,
+            rows,
+            ne,
+            shape.num_experts_per_tok,
+        )
+    } else {
+        dispatch_moe_softmax_topk_simd(
+            enc,
+            registry,
+            device,
+            &logits,
+            &ids,
+            &routing_weights,
+            rows,
+            ne,
+            shape.num_experts_per_tok,
+        )
+    };
+    route_result.map_err(|e| anyhow!("batched MoE layer {layer_idx} top-k: {e}"))?;
     // The route mask reads and rewrites the top-k outputs. Without this
     // explicit RAW barrier, its dispatch can race the selector and expose
     // partially written expert IDs or weights to the masked expert kernels.
-    // The failure is scheduling-dependent and corrupts otherwise-live rows,
-    // so it appears as intermittent greedy token and tool-argument drift.
     if route_mask.is_some() {
         enc.memory_barrier();
     }
     if let Some(mask) = route_mask {
+        let mut mask_params = mask.params;
+        if staged_m8 {
+            mask_params.top_k = route_top_k as u32;
+            mask_params.n_experts = route_experts;
+        }
         dispatch_dflash2_mask_moe_routes(
             enc,
             registry,
@@ -531,31 +574,33 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
             mask.verify_rows,
             &ids,
             &routing_weights,
-            mask.params,
+            mask_params,
         )
         .map_err(|e| anyhow!("batched MoE layer {layer_idx} DFlash2 route mask: {e}"))?;
     }
-    dispatch_silu_mul(
-        enc,
-        registry,
-        device.metal_device(),
-        &a_s,
-        &b_s,
-        &h_s,
-        &silu_sh_params,
-        n_h_s,
-    )
-    .map_err(|e| anyhow!("batched MoE layer {layer_idx} shared swiglu: {e}"))?;
+    if !staged_m8 {
+        dispatch_silu_mul(
+            enc,
+            registry,
+            device.metal_device(),
+            &a_s,
+            &b_s,
+            &h_s,
+            &silu_sh_params,
+            n_h_s,
+        )
+        .map_err(|e| anyhow!("batched MoE layer {layer_idx} shared swiglu: {e}"))?;
+    }
     enc.memory_barrier();
 
     // ---- C: expert gate/up over rows * top_k pairs (row t feeds pairs
     // t * top_k ..), shared down ----
     let gate_params = GgmlQuantizedMatmulIdParams {
         n_tokens: rows,
-        top_k: shape.num_experts_per_tok,
+        top_k: route_top_k as u32,
         n: shape.moe_intermediate_size,
         k: h32,
-        n_experts: ne,
+        n_experts: route_experts,
         expert_stride: weights.expert_gate_stride,
         ggml_type: weights.ggml_type_gate_up,
     };
@@ -567,8 +612,8 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         super::decode_pool::with_id_mm_scratch(
             super::decode_pool::MmIdSlot::Gate,
             device,
-            ne,
-            rows * shape.num_experts_per_tok,
+            route_experts,
+            route_pairs as u32,
             |scratch| {
                 quantized_matmul_id_ggml_grouped_m8_gate_up(
                     enc,
@@ -615,19 +660,21 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
             route_mask.is_some(),
         )?;
     }
-    encode_native_dense_proj(
-        enc,
-        registry,
-        device,
-        &h_s,
-        weights,
-        MoeDenseRole::SharedDown,
-        &y_s,
-        rows,
-        m_sh32,
-        h32,
-    )
-    .with_context(|| format!("batched MoE layer {layer_idx}"))?;
+    if !staged_m8 {
+        encode_native_dense_proj(
+            enc,
+            registry,
+            device,
+            &h_s,
+            weights,
+            MoeDenseRole::SharedDown,
+            &y_s,
+            rows,
+            m_sh32,
+            h32,
+        )
+        .with_context(|| format!("batched MoE layer {layer_idx}"))?;
+    }
     enc.memory_barrier();
 
     // ---- D: expert SwiGLU (the staged M8 gate/up kernel already produced it) ----
@@ -652,21 +699,21 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         top_k: 1,
         n: h32,
         k: shape.moe_intermediate_size,
-        n_experts: ne,
+        n_experts: route_experts,
         expert_stride: weights.expert_down_stride,
         ggml_type: weights.ggml_type_down,
     };
     if staged_m8 {
         let slotted_down_params = GgmlQuantizedMatmulIdParams {
             n_tokens: rows,
-            top_k: shape.num_experts_per_tok,
+            top_k: route_top_k as u32,
             ..down_params
         };
         super::decode_pool::with_id_mm_scratch(
             super::decode_pool::MmIdSlot::Gate,
             device,
-            ne,
-            rows * shape.num_experts_per_tok,
+            route_experts,
+            route_pairs as u32,
             |scratch| {
                 quantized_matmul_id_ggml_grouped_m8_epilogue(
                     enc,
@@ -707,22 +754,39 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     enc.memory_barrier();
 
     // ---- F: weighted reduce + sigmoid(shared gate) * shared + residual ----
-    dispatch_moe_weighted_reduce(
-        enc,
-        registry,
-        device,
-        &routing_weights,
-        &y_all,
-        &sh_logit,
-        &y_s,
-        residual_ref,
-        out,
-        rows,
-        shape.num_experts_per_tok,
-        h32,
-        residual.is_some(),
-    )
-    .map_err(|e| anyhow!("batched MoE layer {layer_idx} weighted reduce: {e}"))?;
+    let reduce_result = if staged_m8 {
+        dispatch_moe_weighted_reduce_shared_last(
+            enc,
+            registry,
+            device,
+            &routing_weights,
+            &y_all,
+            &sh_logit,
+            residual_ref,
+            out,
+            rows,
+            shape.num_experts_per_tok,
+            h32,
+            residual.is_some(),
+        )
+    } else {
+        dispatch_moe_weighted_reduce(
+            enc,
+            registry,
+            device,
+            &routing_weights,
+            &y_all,
+            &sh_logit,
+            &y_s,
+            residual_ref,
+            out,
+            rows,
+            shape.num_experts_per_tok,
+            h32,
+            residual.is_some(),
+        )
+    };
+    reduce_result.map_err(|e| anyhow!("batched MoE layer {layer_idx} weighted reduce: {e}"))?;
 
     #[cfg(test)]
     {
