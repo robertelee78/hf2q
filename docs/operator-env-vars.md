@@ -93,6 +93,20 @@ architecture.
 | `HF2Q_QWEN_ATTN_ROWS` | on | `0`/`off`/`false`, `1`/`on`/`true` | Qwen TQ full-attention decode. On: joint decode and the greedy single-command-buffer serial layer run every row's K/V encode, Q rotation, attention and output gate in one pass (no per-row barriers or row copies), and `HF2Q_QWEN_GQA_Q2=auto` uses the measured Qwen3.6 (16/2 heads) crossovers. `0` restores the per-row chain and the single 8,192 crossover. Both give the same bits. Read once. Invalid values warn and use on. |
 | `HF2Q_QWEN_GQA_Q2` | `auto` | `auto`, `off`/`0`/`false`, `on`/`1`/`true` | Qwen3.8 TQ-HB decode shares each KV-head load/dequantization across two query heads when the exact D=256/GQA/no-mask geometry is supported. `auto` selects it at KV length ≥8,192 (Qwen3.6's 16/2-head geometry with `HF2Q_QWEN_ATTN_ROWS` on: ≥4,096 for one row, ≥1,024 when several rows share the pass); `off` is the production escape hatch; `on` forces the candidate only where its hard geometry checks pass. Invalid values fail safe to `off`. Release requires the exact-output, thermally supervised short/long receipt in the shipping contract. |
 
+## DFlash2
+
+DFlash2 remains opt-in and requires an identity-matched target/drafter pair.
+Unknown revisions, source identities, tensor manifests and family adapters
+fail before serving.
+
+| Var | Default | Values | Effect |
+|---|---|---|---|
+| `HF2Q_DFLASH2` | off | `1` | Provisions the pinned DFlash2 checkpoint selected by the loaded target. Both checkpoint path variables below are required. |
+| `HF2Q_DFLASH2_CONFIG` | unset | path | Exact checkpoint configuration. Its SHA-256, schema and target binding must match a compiled descriptor. |
+| `HF2Q_DFLASH2_WEIGHTS` | unset | path | Exact safetensors checkpoint. Its SHA-256, byte length and tensor manifest must match the same descriptor. |
+| `HF2Q_DFLASH2_DRAFT_AF4_G64` | off | `1` | Uses source-bound group-64 affine four-bit draft projections (36 bytes per 64 weights) instead of BF16. Qwen3.8 and Qwen3.6 Q5 have passed; the route remains opt-in until every activated family is qualified. |
+| `HF2Q_DFLASH2_GPU_TARGET_TOKENS` | on for the pinned dense Qwen3.8 descriptor; off otherwise | `0`/`off`/`false`, `1`/`on`/`true` | Keeps selected proposals on the GPU through target embedding, removing the draft-to-target host wait and token packing. `0` restores staged host handoff. Explicit `1` on Qwen MoE or Gemma fails checkpoint load: their dynamic verification-row and target-state transaction is not yet qualified. Invalid values fail load. |
+
 ## Qwen joint decode
 
 With two or more Qwen agents decoding at once, eligible slots can advance through one shared target forward per scheduler turn instead of one forward per slot. Joint rows run ordinary target decode: MTP drafting and history proposals are suppressed for them (slots with MTP state still run their MTP catch-up, so a later solo turn resumes K3). In exact mode, a turn with fewer than two eligible slots is serial, including MTP K3 and history speculation, and slots beyond the joint width stay serial that turn. In the padded mode (below), every eligible slot runs in consecutive joint steps of at most the joint width. That includes a lone slot whose next tick is ordinary target decode, so an ordinary request's arithmetic does not depend on which tenants share its turns (#717). A lone slot with MTP or history speculation state keeps its serial speculative round.

@@ -62,6 +62,8 @@ pub struct DFlash2Workspace {
     pub unary: MlxBuffer,
     pub edges: MlxBuffer,
     pub proposed_tokens: MlxBuffer,
+    /// Fixed-width target token tile composed on GPU from anchors and proposals.
+    pub target_tokens: MlxBuffer,
     pub proposal_probabilities: MlxBuffer,
     pub confidence: MlxBuffer,
     pub verify_rows: MlxBuffer,
@@ -335,6 +337,7 @@ impl DFlash2Workspace {
             &[lanes, positions],
             &mut allocated_bytes,
         )?;
+        let target_tokens = allocate(device, DType::U32, &[lanes * block], &mut allocated_bytes)?;
         let proposal_probabilities = allocate(
             device,
             DType::F32,
@@ -400,6 +403,7 @@ impl DFlash2Workspace {
             unary,
             edges,
             proposed_tokens,
+            target_tokens,
             proposal_probabilities,
             confidence,
             verify_rows,

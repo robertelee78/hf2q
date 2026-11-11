@@ -1071,6 +1071,7 @@ mod tests {
             &[1.0; 4],
             0,
             &[8, 1, 1, 1],
+            &[0],
         )
         .unwrap();
         dispatch_dflash2_context_commit(

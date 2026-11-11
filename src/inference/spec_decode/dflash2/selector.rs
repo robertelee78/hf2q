@@ -3,9 +3,9 @@
 use super::{config::DFlash2Config, tensors::DFlash2ModelTensors, workspace::DFlash2Workspace};
 use anyhow::{anyhow, Result};
 use mlx_native::ops::dflash2_selector::{
-    dispatch_dflash2_selector, dispatch_dflash2_verify_rows, DFlash2SelectorBuffers,
-    DFlash2SelectorParams, DFlash2VerifyRowsParams, DFLASH2_MAX_LANES, DFLASH2_MAX_POSITIONS,
-    DFLASH2_VERIFY_COSTS,
+    dispatch_dflash2_compose_verify_input, dispatch_dflash2_selector, dispatch_dflash2_verify_rows,
+    DFlash2ComposeVerifyInputParams, DFlash2SelectorBuffers, DFlash2SelectorParams,
+    DFlash2VerifyRowsParams, DFLASH2_MAX_LANES, DFLASH2_MAX_POSITIONS, DFLASH2_VERIFY_COSTS,
 };
 use mlx_native::{CommandEncoder, KernelRegistry, MlxDevice};
 
@@ -22,6 +22,7 @@ pub fn dispatch_dflash2_selection(
     temperatures: &[f32],
     sampling_mask: u32,
     maximum_verify_rows: &[u32],
+    target_lane_order: &[u32],
 ) -> Result<()> {
     let lanes = workspace.max_lanes;
     for (name, len) in [
@@ -34,6 +35,26 @@ pub fn dispatch_dflash2_selection(
                 "DFlash2 {name} count {len} != workspace lanes {lanes}"
             ));
         }
+    }
+    if target_lane_order.is_empty() || target_lane_order.len() > lanes {
+        return Err(anyhow!(
+            "DFlash2 target lane count {} must be in 1..={lanes}",
+            target_lane_order.len()
+        ));
+    }
+    let mut target_anchor = [0; DFLASH2_MAX_LANES];
+    let mut target_physical_lane = [0; DFLASH2_MAX_LANES];
+    let mut target_rows = [0; DFLASH2_MAX_LANES];
+    for (logical, &physical_u32) in target_lane_order.iter().enumerate() {
+        let physical = physical_u32 as usize;
+        if physical >= lanes || target_lane_order[..logical].contains(&physical_u32) {
+            return Err(anyhow!(
+                "DFlash2 target logical lane {logical} names invalid physical lane {physical}"
+            ));
+        }
+        target_anchor[logical] = anchors[physical];
+        target_physical_lane[logical] = physical_u32;
+        target_rows[logical] = maximum_verify_rows[physical];
     }
     let mut anchor = [0; DFLASH2_MAX_LANES];
     let mut temperature = [1.0; DFLASH2_MAX_LANES];
@@ -91,6 +112,23 @@ pub fn dispatch_dflash2_selection(
             rows_per_lane: config.block_size as u32,
             every_row: 1,
             maximum,
+        },
+    )?;
+    encoder.memory_barrier();
+    dispatch_dflash2_compose_verify_input(
+        encoder,
+        registry,
+        device,
+        &workspace.proposed_tokens,
+        &workspace.target_tokens,
+        DFlash2ComposeVerifyInputParams {
+            anchor: target_anchor,
+            physical_lane: target_physical_lane,
+            rows: target_rows,
+            physical_lanes: lanes as u32,
+            lanes: target_lane_order.len() as u32,
+            rows_per_lane: config.block_size as u32,
+            width: (workspace.max_lanes * workspace.rows_per_lane) as u32,
         },
     )?;
     encoder.memory_barrier();

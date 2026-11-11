@@ -12,7 +12,7 @@ use super::{
     forward::{
         dispatch_dflash2_context_commit, dispatch_dflash2_forward, prepare_decode_positions,
     },
-    schema::DFlash2CheckpointDescriptor,
+    schema::{DFlash2CheckpointDescriptor, DFlash2FamilyAdapter},
     selector::dispatch_dflash2_selection,
     tensors::DFlash2ModelTensors,
     verify_budget::{DFlash2VerifyBudget, VerifyBudgetLane},
@@ -22,8 +22,29 @@ use super::{
 use crate::inference::spec_decode::dflash::hidden_capture::{
     extract_drafter_concat, DFlashCaptureSession,
 };
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use mlx_native::{KernelRegistry, MlxDevice};
+
+const GPU_TARGET_TOKENS_ENV: &str = "HF2Q_DFLASH2_GPU_TARGET_TOKENS";
+
+fn resolve_gpu_target_tokens(
+    descriptor: &DFlash2CheckpointDescriptor,
+    raw: Option<&str>,
+) -> Result<bool> {
+    let supported = descriptor.family_adapter == DFlash2FamilyAdapter::QwenDense;
+    match raw {
+        None => Ok(supported),
+        Some("0" | "off" | "false") => Ok(false),
+        Some("1" | "on" | "true") if supported => Ok(true),
+        Some("1" | "on" | "true") => bail!(
+            "{GPU_TARGET_TOKENS_ENV}=1 is not qualified for DFlash2 adapter {:?}",
+            descriptor.family_adapter
+        ),
+        Some(value) => bail!(
+            "{GPU_TARGET_TOKENS_ENV} must be one of 0/off/false/1/on/true, got {value:?}"
+        ),
+    }
+}
 
 struct DFlash2LaneBinding {
     hasher: Sha256,
@@ -93,6 +114,7 @@ pub struct DFlash2Runtime {
     lane_lengths: Vec<usize>,
     lane_bindings: Vec<DFlash2LaneBinding>,
     verify_budget: DFlash2VerifyBudget,
+    gpu_target_tokens: bool,
 }
 
 impl DFlash2Runtime {
@@ -124,6 +146,15 @@ impl DFlash2Runtime {
             .context("upload DFlash2 tensors")?;
         let workspace =
             DFlash2Workspace::new(device, &config, lanes).context("allocate DFlash2 workspace")?;
+        let gpu_target_tokens = resolve_gpu_target_tokens(
+            descriptor,
+            std::env::var(GPU_TARGET_TOKENS_ENV).ok().as_deref(),
+        )?;
+        tracing::info!(
+            checkpoint = descriptor.id,
+            gpu_target_tokens,
+            "DFlash2 transaction policy resolved"
+        );
         let rewind_limit = config.sliding_window;
         Ok(Self {
             descriptor,
@@ -135,12 +166,16 @@ impl DFlash2Runtime {
                 .map(|_| DFlash2LaneBinding::new(rewind_limit))
                 .collect(),
             verify_budget: DFlash2VerifyBudget::default(),
+            gpu_target_tokens,
         })
     }
 
-    /// Execute one physical anchor-plus-seven-proposal graph for every slot.
-    /// Inactive slots use a retained count of zero at commit; their rings do not
-    /// change. The caller owns the small proposal readback and target verify.
+    pub(crate) fn gpu_target_tokens(&self) -> bool {
+        self.gpu_target_tokens
+    }
+
+    /// Execute one physical anchor-plus-seven-proposal graph for every slot
+    /// and wait until host proposal readback is safe.
     #[allow(clippy::too_many_arguments)]
     pub fn run_draft<T: DFlash2TargetFamily>(
         &mut self,
@@ -153,6 +188,70 @@ impl DFlash2Runtime {
         sampling_mask: u32,
         maximum_verify_rows: &[u32],
         uniforms: &[f32],
+    ) -> Result<()> {
+        let target_lane_order = (0..self.workspace.max_lanes as u32).collect::<Vec<_>>();
+        self.run_draft_inner(
+            device,
+            registry,
+            target,
+            anchors,
+            logical_positions,
+            temperatures,
+            sampling_mask,
+            maximum_verify_rows,
+            &target_lane_order,
+            uniforms,
+            true,
+        )
+    }
+
+    /// Submit the draft graph without a host wait. The graph also composes
+    /// `workspace.target_tokens`; a same-queue target embedding may consume it
+    /// immediately, while host proposal access remains invalid until that
+    /// target command reaches its completion boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_draft_for_gpu_target<T: DFlash2TargetFamily>(
+        &mut self,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        target: &T,
+        anchors: &[u32],
+        logical_positions: &[u32],
+        temperatures: &[f32],
+        sampling_mask: u32,
+        maximum_verify_rows: &[u32],
+        target_lane_order: &[u32],
+        uniforms: &[f32],
+    ) -> Result<()> {
+        self.run_draft_inner(
+            device,
+            registry,
+            target,
+            anchors,
+            logical_positions,
+            temperatures,
+            sampling_mask,
+            maximum_verify_rows,
+            target_lane_order,
+            uniforms,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_draft_inner<T: DFlash2TargetFamily>(
+        &mut self,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        target: &T,
+        anchors: &[u32],
+        logical_positions: &[u32],
+        temperatures: &[f32],
+        sampling_mask: u32,
+        maximum_verify_rows: &[u32],
+        target_lane_order: &[u32],
+        uniforms: &[f32],
+        wait: bool,
     ) -> Result<()> {
         let lanes = self.workspace.max_lanes;
         let proposals = self.config.proposal_tokens();
@@ -208,10 +307,15 @@ impl DFlash2Runtime {
             temperatures,
             sampling_mask,
             maximum_verify_rows,
+            target_lane_order,
         )?;
-        encoder
-            .commit_and_wait_labeled("adr067.dflash2_draft")
-            .context("execute DFlash2 draft cycle")?;
+        if wait {
+            encoder
+                .commit_and_wait_labeled("adr067.dflash2_draft")
+                .context("execute DFlash2 draft cycle")?;
+        } else {
+            encoder.commit_labeled("adr067.dflash2_draft");
+        }
         Ok(())
     }
 
@@ -444,7 +548,7 @@ mod tests {
     use super::*;
     use crate::inference::models::qwen35::model::Qwen35Model;
     use crate::inference::spec_decode::dflash2::adapters::QwenDFlash2Adapter;
-    use crate::inference::spec_decode::dflash2::schema::QWEN36_DFLASH2;
+    use crate::inference::spec_decode::dflash2::schema::{QWEN36_DFLASH2, QWEN38_DFLASH2};
     use crate::serve::header::LoadProgress;
     use half::bf16;
     use safetensors::{tensor::TensorView, Dtype, SafeTensors};
@@ -462,6 +566,15 @@ mod tests {
 
         binding.append(&[13, 17], 3);
         assert!(!binding.rewind(&[7, 11, 13], 3));
+    }
+
+    #[test]
+    fn gpu_target_token_policy_defaults_only_for_qualified_dense_qwen() {
+        assert!(resolve_gpu_target_tokens(&QWEN38_DFLASH2, None).unwrap());
+        assert!(!resolve_gpu_target_tokens(&QWEN36_DFLASH2, None).unwrap());
+        assert!(!resolve_gpu_target_tokens(&QWEN38_DFLASH2, Some("0")).unwrap());
+        assert!(resolve_gpu_target_tokens(&QWEN36_DFLASH2, Some("1")).is_err());
+        assert!(resolve_gpu_target_tokens(&QWEN38_DFLASH2, Some("invalid")).is_err());
     }
 
     fn float_values(view: TensorView<'_>) -> Vec<f32> {
@@ -556,6 +669,12 @@ mod tests {
                 ensure!(
                     runtime.verify_rows()? == [8],
                     "real DFlash2 did not verify all rows"
+                );
+                let mut expected_target_tokens = vec![1_u32];
+                expected_target_tokens.extend_from_slice(runtime.proposals()?);
+                ensure!(
+                    runtime.workspace.target_tokens.as_slice::<u32>()? == expected_target_tokens,
+                    "real DFlash2 GPU target tile did not contain anchor plus proposals"
                 );
                 Ok(())
             })

@@ -31,8 +31,9 @@ use mlx_native::ops::rms_norm;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::{
-    default_chain_n, dump_layer_n, embed_tokens_gpu_into, gpu_cache_matches_model, FfnWeightsGpu,
-    ForwardGpuCache, LayerWeightsGpu, OutputHeadGpu, GPU_CACHE,
+    default_chain_n, dump_layer_n, embed_token_ids_gpu_into, embed_tokens_gpu_into,
+    gpu_cache_matches_model, FfnWeightsGpu, ForwardGpuCache, LayerWeightsGpu, OutputHeadGpu,
+    GPU_CACHE,
 };
 use crate::inference::models::qwen35::decode_pool;
 use crate::inference::models::qwen35::dump_bisect;
@@ -129,7 +130,6 @@ pub(super) struct JointPacking<'a> {
     /// Packed width, at least `rows.len()`; padding rows copy row 0.
     pub width: usize,
 }
-
 
 fn plan_joint_routes(
     mode: JointRouteMode,
@@ -364,6 +364,7 @@ impl Qwen35Model {
                     options,
                     None,
                     None,
+                    None,
                 )
                 .map(|(outputs, _normed)| outputs)
             },
@@ -469,6 +470,7 @@ impl Qwen35Model {
         kv_cache: &mut HybridKvCache,
         dense_ffn: JointDenseFfnRoute,
         options: JointStepOptions,
+        gpu_token_ids: Option<&MlxBuffer>,
         mut replay: Option<&mut DeltaNetReplay>,
         capture: Option<DFlash2TargetCapture<'_>>,
     ) -> Result<(Vec<Qwen35JointRowOutput>, MlxBuffer)> {
@@ -493,8 +495,7 @@ impl Qwen35Model {
                         .iter()
                         .enumerate()
                         .all(|(index, lane)| {
-                            *lane < capture.lanes
-                                && !capture.lane_indices[..index].contains(lane)
+                            *lane < capture.lanes && !capture.lane_indices[..index].contains(lane)
                         })
                     && capture.rows_per_lane == 8
                     && !capture.layer_ids.is_empty()
@@ -547,19 +548,44 @@ impl Qwen35Model {
         let mut embedded = device
             .alloc_buffer(width * h * 4, DType::F32, vec![width, h])
             .map_err(|e| anyhow!("allocate Qwen joint embeddings: {e}"))?;
-        embed_tokens_gpu_into(
-            &tokens,
-            &self.token_embd,
-            self.token_embd_native.as_ref(),
-            cfg.vocab_size,
-            hidden_size,
-            device,
-            registry,
-            &mut embedded,
-            #[cfg(test)]
-            None,
-        )
-        .context("Qwen joint embedding gather")?;
+        if let Some(token_ids) = gpu_token_ids {
+            ensure!(
+                token_ids.dtype() == DType::U32 && token_ids.element_count() >= width,
+                "Qwen GPU target token tile has {:?} with {} rows, expected at least {width} U32 rows",
+                token_ids.dtype(),
+                token_ids.element_count()
+            );
+            let narrowed;
+            let token_ids = if token_ids.element_count() == width {
+                token_ids
+            } else {
+                narrowed = token_ids.slice_view(0, width);
+                &narrowed
+            };
+            embed_token_ids_gpu_into(
+                token_ids,
+                self.token_embd_native.as_ref(),
+                hidden_size,
+                device,
+                registry,
+                &mut embedded,
+            )
+            .context("Qwen joint GPU-token embedding gather")?;
+        } else {
+            embed_tokens_gpu_into(
+                &tokens,
+                &self.token_embd,
+                self.token_embd_native.as_ref(),
+                cfg.vocab_size,
+                hidden_size,
+                device,
+                registry,
+                &mut embedded,
+                #[cfg(test)]
+                None,
+            )
+            .context("Qwen joint embedding gather")?;
+        }
 
         drop(arena_setup);
         let chain_n = joint_chain_n(cfg, layer_weights);
@@ -773,9 +799,7 @@ impl Qwen35Model {
                     .position(|captured| *captured == layer_idx)
                 {
                     enc.memory_barrier();
-                    for (&lane, window) in
-                        capture.lane_indices.iter().zip(packing.windows)
-                    {
+                    for (&lane, window) in capture.lane_indices.iter().zip(packing.windows) {
                         let source =
                             output.slice_view((window.start * h * 4) as u64, window.rows * h);
                         let destination = capture.output.slice_view(
