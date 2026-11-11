@@ -664,6 +664,27 @@ release promotion. The profile waits distort topology, and the remaining
 target, host-readback and multi-command costs still require the single
 GPU-resident transaction and the binding end-to-end Splash gate.
 
+The next isolated spike fused the AF4G64 gate and up dot products in one
+register kernel and applied `SiLU(gate) * up` before the output write. It
+removed the separate gate/up output, deinterleave and SiLU dispatches. The
+partial-row Metal reference test passed, and the exact Qwen3.6 Q5 smoke passed
+with cleanup proven in `qwen36-dflash2-af4g64-silu-profile-v11`. The complete
+draft command nevertheless regressed at every observed width:
+
+| Width | Prepared AF4G64 (ms) | Fused SiLU epilogue (ms) | Change |
+|---:|---:|---:|---:|
+| 1 | 7.908 | 7.957 | +0.62% |
+| 2 | 7.904 | 7.933 | +0.37% |
+| 3 | 7.903 | 8.006 | +1.31% |
+| 4 | 7.878 | 7.920 | +0.53% |
+
+The dual accumulator path's removed dispatches do not repay its larger
+register working set. The fused epilogue remains on isolated experiment
+branches `mlx-native/perf/af4g64-silu-epilogue@978699b` and
+`hf2q/perf/dflash2-af4-silu@c72e2dd3`; it must not land. This falsifies that
+specific fusion shape, not the source-backed AF4G64 store or the required
+single GPU-resident decode transaction.
+
 The prepared target-MoE spike repacked Q4_K/Q6_K expert rows into Metal
 tensor planes and gathered target activations as BF16. Its production-shape
 microbenchmark reduced one Qwen3.6 gate projection from 1.086 ms to 0.875 ms
