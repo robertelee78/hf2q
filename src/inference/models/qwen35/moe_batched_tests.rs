@@ -264,6 +264,7 @@ fn run_batched(
         &mut out,
         r as u32,
         0,
+        None,
     )
     .expect("batched MoE layer");
     enc.commit_and_wait_labeled("test.qwen.moe_batched").expect("commit");
@@ -528,6 +529,7 @@ fn batched_selected_rows_ignore_larger_output_tile() {
         &mut out,
         17,
         0,
+        None,
     )
     .expect("batched MoE layer");
     enc.commit_and_wait_labeled("test.qwen.moe_batched.padded_output").expect("commit");

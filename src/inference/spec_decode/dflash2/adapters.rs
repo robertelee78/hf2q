@@ -23,6 +23,8 @@ pub struct DFlash2TargetCapture<'a> {
     pub output: &'a MlxBuffer,
     /// Physical draft-ring lane for each packed target window.
     pub lane_indices: &'a [usize],
+    /// GPU-selected live prefix length for every physical draft-ring lane.
+    pub verify_rows: &'a MlxBuffer,
     pub lanes: usize,
     pub rows_per_lane: usize,
     pub feature_width: usize,
@@ -60,6 +62,7 @@ pub trait DFlash2TargetFamily {
             layer_ids: &config.target_layer_ids,
             output: &workspace.captured_target_hidden,
             lane_indices,
+            verify_rows: &workspace.verify_rows,
             lanes: workspace.max_lanes,
             rows_per_lane: workspace.rows_per_lane,
             feature_width: config.fc_input_dim(),

@@ -59,7 +59,9 @@ use crate::inference::models::qwen35::joint_projection::{
 use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
 use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35Model};
-use crate::inference::models::qwen35::moe_batched::build_moe_ffn_layer_gpu_batched_into;
+use crate::inference::models::qwen35::moe_batched::{
+    build_moe_ffn_layer_gpu_batched_into, DFlash2MoeRouteMask,
+};
 use crate::inference::models::qwen35::spec_decode::nth_hidden_row;
 use crate::inference::models::qwen35::Qwen35Config;
 use crate::inference::spec_decode::dflash2::adapters::DFlash2TargetCapture;
@@ -723,13 +725,33 @@ impl Qwen35Model {
                             vec![width, h],
                         )
                         .map_err(|e| anyhow!("allocate Qwen joint MoE output: {e}"))?;
-                        // DFlash2 pads recurrent and dense projections to an
-                        // admitted tile, but its MoE work is row-local. Route
-                        // only selected rows; later padding outputs are ignored.
                         let moe_rows = if capture.is_some() {
                             rows.len() as u32
                         } else {
                             width_u32
+                        };
+                        let route_mask = if gpu_token_ids.is_some() {
+                            let capture = capture.context(
+                                "Qwen GPU-target MoE verification requires DFlash2 capture",
+                            )?;
+                            let mut physical_lane = [0_u32; 4];
+                            for (logical, &physical) in capture.lane_indices.iter().enumerate() {
+                                physical_lane[logical] = u32::try_from(physical)
+                                    .context("Qwen DFlash2 physical lane overflow")?;
+                            }
+                            Some(DFlash2MoeRouteMask {
+                                verify_rows: capture.verify_rows,
+                                params: mlx_native::ops::dflash2_attention_pack::DFlash2MoeRouteMaskParams {
+                                    physical_lane,
+                                    lanes: capture.lane_indices.len() as u32,
+                                    rows_per_lane: capture.rows_per_lane as u32,
+                                    top_k: shape.num_experts_per_tok,
+                                    n_experts: shape.num_experts,
+                                    width: moe_rows,
+                                },
+                            })
+                        } else {
+                            None
                         };
                         build_moe_ffn_layer_gpu_batched_into(
                             enc,
@@ -742,6 +764,7 @@ impl Qwen35Model {
                             &mut output,
                             moe_rows,
                             layer_idx,
+                            route_mask,
                         )
                         .with_context(|| format!("Qwen joint batched MoE FFN layer {layer_idx}"))?;
                         output

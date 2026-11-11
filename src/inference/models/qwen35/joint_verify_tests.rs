@@ -859,14 +859,17 @@ fn run_dflash_case(fixture: &Fixture<'_>, lanes: &[LaneCase], label: &str) -> DF
         .collect::<Vec<_>>();
     let capture_layers = [0, fixture.model.cfg.num_hidden_layers as usize - 1];
     let feature_width = fixture.model.cfg.hidden_size as usize * capture_layers.len();
-    let captured = fixture
+    let (captured, verify_rows) = fixture
         .model
         .with_gpu_cache_mut(|device, _registry| {
-            Ok(device.alloc_buffer(
-                SLOTS as usize * 8 * feature_width * 4,
-                DType::F32,
-                vec![SLOTS as usize * 8, feature_width],
-            )?)
+            Ok((
+                device.alloc_buffer(
+                    SLOTS as usize * 8 * feature_width * 4,
+                    DType::F32,
+                    vec![SLOTS as usize * 8, feature_width],
+                )?,
+                device.alloc_buffer(SLOTS as usize * 4, DType::U32, vec![SLOTS as usize])?,
+            ))
         })
         .unwrap_or_else(|error| panic!("{label}: allocate DFlash2 capture: {error:#}"));
     let capture_lanes = lanes
@@ -877,6 +880,7 @@ fn run_dflash_case(fixture: &Fixture<'_>, lanes: &[LaneCase], label: &str) -> DF
         layer_ids: &capture_layers,
         output: &captured,
         lane_indices: &capture_lanes,
+        verify_rows: &verify_rows,
         lanes: SLOTS as usize,
         rows_per_lane: 8,
         feature_width,

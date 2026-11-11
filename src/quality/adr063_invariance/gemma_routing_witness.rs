@@ -74,7 +74,11 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// `q5_0_tensor_mm` (default off) and their kernel registrations.
 /// `src/ops/routing_selection_witness.rs` and the routing and routing-witness
 /// shaders are unchanged, so the route label is kept.
-pub const WITNESS_NATIVE_VERSION: &str = "0.18.0";
+/// Re-reviewed 0.18.0 -> 0.21.3 (`82bcb3a` -> `3b1a15e`, tag `v0.21.3`):
+/// the routing-witness op and routing shaders are unchanged. The intervening
+/// releases add opt-in decode, DFlash2, expert-matmul, cache and observation
+/// kernels without changing this witness route, so the route label is kept.
+pub const WITNESS_NATIVE_VERSION: &str = "0.21.3";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {

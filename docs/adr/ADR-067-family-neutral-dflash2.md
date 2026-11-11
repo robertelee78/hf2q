@@ -727,13 +727,39 @@ both arms.
 
 This promotes the GPU handoff for the identity-matched dense Qwen3.8
 descriptor, with `HF2Q_DFLASH2_GPU_TARGET_TOKENS=0` as its escape hatch. The
-equivalent Qwen3.6 MoE all-row attempt failed Q5 task quality: one lane did not
-complete the required initial six-step workflow. MoE therefore retains its
-adaptive staged handoff, and forcing the dense route on a MoE or Gemma adapter
-fails at checkpoint load. This is not the complete Splash transaction:
-Qwen3.8 remains 4.918 times Splash's 16.420-second median, and target output
-readback, host acceptance, target-state settlement and draft-context commit
-remain separate boundaries.
+first Qwen3.6 MoE attempt failed task quality because host acceptance consumed
+all eight target output rows after the GPU selected a shorter verify prefix.
+Those unverified outputs could therefore be accepted and committed. The
+corrected transaction reads the selected counts only after target completion,
+excludes unselected outputs from acceptance, masks their routed expert IDs on
+the GPU, and makes quantized expert kernels return zero before any sentinel
+expert weight address or read.
+
+The corrected exact Qwen3.6 candidate passed the four-agent Q5 workflow,
+tool-result continuation, unary/SSE response and cleanup gates in
+`qwen36-dflash2-moe-adaptive-v3`; its own-output makespan was 31.981 seconds
+versus 48.534 seconds for the published-package staged control
+`qwen36-dflash2-af4g64-registry-final-v1`, 34.11% lower. An override-free
+default-on repetition then failed task quality in
+`qwen36-dflash2-moe-default-v4`: one lane produced the same Rust
+type-inference error in both its initial edit and allowed repair. The next
+override-free repetition passed in `qwen36-dflash2-moe-default-v5` at 31.192
+seconds, 35.73% below the staged control. A clean release build against the
+published `mlx-native 0.21.3` crate then exercised the same GPU route, valid
+unary/SSE responses, tool-result continuation and prefix reuse in
+`qwen36-dflash2-moe-published-v6`, but one lane wrote an unterminated Rust
+string and did not issue the required repair call, so that run correctly
+failed task quality. All runs proved cleanup and resolved the GPU route at
+startup.
+
+The mixed quality result does not qualify a default. Qwen3.6 MoE therefore
+supports the complete GPU adaptive-row route when
+`HF2Q_DFLASH2_GPU_TARGET_TOKENS=1`, but remains staged by default pending a
+repeatable fixed-count quality campaign. Gemma remains fail-closed because no
+exact release-gate target/checkpoint pair exists. This is not the complete
+Splash transaction: Qwen3.8 remains 4.918 times Splash's 16.420-second median,
+and target output readback, host acceptance, target-state settlement and
+draft-context commit remain separate boundaries.
 
 ### D5: performance qualification
 

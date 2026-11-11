@@ -27,6 +27,9 @@
 use std::sync::LazyLock;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
+use mlx_native::ops::dflash2_attention_pack::{
+    dispatch_dflash2_mask_moe_routes, DFlash2MoeRouteMaskParams,
+};
 use mlx_native::ops::dense_matvec_f32_rows::{
     dispatch_dense_matvec_f32_rows, DENSE_MATVEC_F32_ROWS_MAX_ROWS,
 };
@@ -35,7 +38,8 @@ use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk_simd;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    quantized_matmul_id_ggml_mv, quantized_matmul_id_ggml_mv_q4_k_nr2,
+    quantized_matmul_id_ggml_mv, quantized_matmul_id_ggml_mv_masked,
+    quantized_matmul_id_ggml_mv_q4_k_nr2, quantized_matmul_id_ggml_mv_q4_k_nr2_masked,
     GgmlQuantizedMatmulIdParams,
 };
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
@@ -234,6 +238,7 @@ fn dispatch_expert_mv(
     params: &GgmlQuantizedMatmulIdParams,
     tag: &'static str,
     layer: usize,
+    masked: bool,
 ) -> Result<()> {
     crate::quantize::imatrix::intercept_qmatmul_id_with_hint(
         crate::quantize::imatrix::ImatrixHint::Layered { tag, layer },
@@ -250,10 +255,19 @@ fn dispatch_expert_mv(
         || ids.as_slice::<u32>().ok().map(|sl| sl.to_vec()),
     )
     .map_err(|e| anyhow!("imatrix moe intercept ({tag}): {e}"))?;
-    let dispatched = if params.ggml_type == GgmlType::Q4_K {
-        quantized_matmul_id_ggml_mv_q4_k_nr2(enc, registry, device, input, weight, ids, output, params)
-    } else {
-        quantized_matmul_id_ggml_mv(enc, registry, device, input, weight, ids, output, params)
+    let dispatched = match (params.ggml_type, masked) {
+        (GgmlType::Q4_K, false) => quantized_matmul_id_ggml_mv_q4_k_nr2(
+            enc, registry, device, input, weight, ids, output, params,
+        ),
+        (GgmlType::Q4_K, true) => quantized_matmul_id_ggml_mv_q4_k_nr2_masked(
+            enc, registry, device, input, weight, ids, output, params,
+        ),
+        (_, false) => {
+            quantized_matmul_id_ggml_mv(enc, registry, device, input, weight, ids, output, params)
+        }
+        (_, true) => quantized_matmul_id_ggml_mv_masked(
+            enc, registry, device, input, weight, ids, output, params,
+        ),
     };
     dispatched.map_err(|e| anyhow!("{tag} mul_mv_id: {e}"))
 }
@@ -266,6 +280,12 @@ fn dispatch_expert_mv(
 pub(crate) struct MoeBatchedRouting {
     pub ids: MlxBuffer,
     pub weights: MlxBuffer,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DFlash2MoeRouteMask<'a> {
+    pub verify_rows: &'a MlxBuffer,
+    pub params: DFlash2MoeRouteMaskParams,
 }
 
 fn pooled(device: &MlxDevice, elements: usize, dtype: DType, shape: Vec<usize>, label: &str) -> Result<MlxBuffer> {
@@ -289,6 +309,7 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     out: &mut MlxBuffer,
     rows: u32,
     layer_idx: usize,
+    route_mask: Option<DFlash2MoeRouteMask<'_>>,
 ) -> Result<MoeBatchedRouting> {
     ensure!(
         (1..=MOE_BATCHED_MAX_ROWS).contains(&(rows as usize)),
@@ -377,6 +398,18 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         shape.num_experts_per_tok,
     )
     .map_err(|e| anyhow!("batched MoE layer {layer_idx} top-k: {e}"))?;
+    if let Some(mask) = route_mask {
+        dispatch_dflash2_mask_moe_routes(
+            enc,
+            registry,
+            device,
+            mask.verify_rows,
+            &ids,
+            &routing_weights,
+            mask.params,
+        )
+        .map_err(|e| anyhow!("batched MoE layer {layer_idx} DFlash2 route mask: {e}"))?;
+    }
     dispatch_silu_mul(
         enc,
         registry,
@@ -407,11 +440,11 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     };
     dispatch_expert_mv(
         enc, registry, device, x, &weights.expert_gate_q, &ids, &gate_all, &gate_params,
-        "ffn_gate_exps", layer_idx,
+        "ffn_gate_exps", layer_idx, route_mask.is_some(),
     )?;
     dispatch_expert_mv(
         enc, registry, device, x, &weights.expert_up_q, &ids, &up_all, &up_params,
-        "ffn_up_exps", layer_idx,
+        "ffn_up_exps", layer_idx, route_mask.is_some(),
     )?;
     encode_native_dense_proj(
         enc,
@@ -454,7 +487,7 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     };
     dispatch_expert_mv(
         enc, registry, device, &h_all, &weights.expert_down_q, &ids, &y_all, &down_params,
-        "ffn_down_exps", layer_idx,
+        "ffn_down_exps", layer_idx, route_mask.is_some(),
     )?;
     enc.memory_barrier();
 

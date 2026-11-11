@@ -30,7 +30,7 @@ Qwen solo K3 performs multiple target forwards in one round. While the E1 guard 
 | Qwen3.8 GGUF | sha256 `cf0eb0103c1ffe7b3702670aa794a669bafbe328b95e892268305dd87c2c30d7` |
 | DeepSeek-V4 GGUF | sha256 `50df7e3dfe06321613c78075df4111b14985a0db31087992d7438f2895a3aad6` |
 | Gemma 4 GGUF | sha256 `bf65b7e163216885790442d0324839101ba4b5b49f7be4ec0cf3d7c5c538ef53` |
-| Qwen / DeepSeek / Gemma Q5 cases | `37ab3e832f06e15b6465757feaec6d7d337bb4d477cb819bf50dad1f20caee6f` / `b78360154fe140275a91de1d5b2928862ebe6b3d1a88f031e3951c17e2783c82` / `6f2bea3c84338e3652c0aa74ba7353949104937f0d6bbe06ee1df1676929c245` |
+| Qwen / DeepSeek / Gemma Q5 cases | `37ab3e832f06e15b6465757feaec6d7d337bb4d477cb819bf50dad1f20caee6f` / `b78360154fe140275a91de1d5b2928862ebe6b3d1a88f031e3951c17e2783c82` / `9da75fe32fb87a41bfa857b035ca131765d1700652f63cb42c1fe24e1ebc63e7` |
 | Sandbox proof | sha256 `4b2bea7715c6244e7636d6d07b4e33bd41b7c525313488dcca0f107cc79d486e` |
 | Toolchain | `stable-aarch64-apple-darwin`, rustc/cargo 1.99.1, locked dependencies |
 
