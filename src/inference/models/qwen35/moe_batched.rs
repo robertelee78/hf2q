@@ -17,8 +17,9 @@
 //! | F | weighted reduce + sigmoid(shared gate) * shared + residual | `moe_weighted_reduce_f32` |
 //!
 //! With `HF2Q_QWEN_MOE_STAGED_M8=1`, phases C–E instead use prepared
-//! Q4_K/Q6_K planes: one staged-M8 gate/up dispatch writes the BF16 SwiGLU
-//! intermediate, and staged-M8 down consumes it while reusing the route schedule.
+//! Q4_K/Q6_K planes. Gate and up remain separate F32 projections so the
+//! established F32 SwiGLU and down-projection input preserve task quality;
+//! both projections reuse one compact route schedule and gathered input.
 //!
 //! Decode dispatches of one to eight rows preserve the established bitwise
 //! single-row invariant. The DFlash2 verifier's width-32 pass uses dense MM
@@ -42,11 +43,10 @@ use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk_simd;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    quantized_matmul_id_ggml_grouped_m8_epilogue,
-    quantized_matmul_id_ggml_grouped_m8_gate_up, quantized_matmul_id_ggml_mv,
+    quantized_matmul_id_ggml_grouped_m8_epilogue, quantized_matmul_id_ggml_mv,
     quantized_matmul_id_ggml_mv_masked, quantized_matmul_id_ggml_mv_q4_k_nr2,
-    quantized_matmul_id_ggml_mv_q4_k_nr2_masked, GgmlQuantizedMatmulIdParams,
-    GroupedM8Epilogue, GroupedM8Input,
+    quantized_matmul_id_ggml_mv_q4_k_nr2_masked, GgmlQuantizedMatmulIdParams, GroupedM8Epilogue,
+    GroupedM8Input,
 };
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -415,33 +415,24 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     let y_s = pooled(device, r * h, DType::F32, vec![r, h], "shared down")?;
     let ids = pooled(device, pairs, DType::U32, vec![pairs], "expert ids")?;
     let routing_weights = pooled(device, pairs, DType::F32, vec![pairs], "routing weights")?;
-    let expert_storage = if staged_m8 { DType::BF16 } else { DType::F32 };
     let gate_all = pooled(
         device,
-        if staged_m8 { 1 } else { pairs * m_moe },
-        expert_storage,
-        if staged_m8 {
-            vec![1]
-        } else {
-            vec![pairs, m_moe]
-        },
+        pairs * m_moe,
+        DType::F32,
+        vec![pairs, m_moe],
         "expert gate",
     )?;
     let up_all = pooled(
         device,
-        if staged_m8 { 1 } else { pairs * m_moe },
+        pairs * m_moe,
         DType::F32,
-        if staged_m8 {
-            vec![1]
-        } else {
-            vec![pairs, m_moe]
-        },
+        vec![pairs, m_moe],
         "expert up",
     )?;
     let h_all = pooled(
         device,
         pairs * m_moe,
-        expert_storage,
+        DType::F32,
         vec![pairs, m_moe],
         "expert swiglu",
     )?;
@@ -570,19 +561,42 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
             ne,
             rows * shape.num_experts_per_tok,
             |scratch| {
-                quantized_matmul_id_ggml_grouped_m8_gate_up(
+                let prepared = prepared_m8.expect("validated prepared M8");
+                quantized_matmul_id_ggml_grouped_m8_epilogue(
                     enc,
                     registry,
                     device,
                     x,
                     gathered_m8.as_ref().expect("allocated staged M8 input"),
-                    &prepared_m8.expect("validated prepared M8").gate,
-                    &prepared_m8.expect("validated prepared M8").up,
+                    &prepared.gate,
                     &ids,
-                    &h_all,
+                    &gate_all,
+                    None,
                     scratch,
                     &gate_params,
+                    false,
+                    false,
+                    false,
                     GroupedM8Input::F32,
+                    GroupedM8Epilogue::F32,
+                )?;
+                quantized_matmul_id_ggml_grouped_m8_epilogue(
+                    enc,
+                    registry,
+                    device,
+                    x,
+                    gathered_m8.as_ref().expect("allocated staged M8 input"),
+                    &prepared.up,
+                    &ids,
+                    &up_all,
+                    None,
+                    scratch,
+                    &up_params,
+                    false,
+                    true,
+                    true,
+                    GroupedM8Input::F32,
+                    GroupedM8Epilogue::F32,
                 )
             },
         )
@@ -630,21 +644,19 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     .with_context(|| format!("batched MoE layer {layer_idx}"))?;
     enc.memory_barrier();
 
-    // ---- D: expert SwiGLU (the staged M8 gate/up kernel already produced it) ----
-    if !staged_m8 {
-        dispatch_silu_mul(
-            enc,
-            registry,
-            device.metal_device(),
-            &gate_all,
-            &up_all,
-            &h_all,
-            &silu_params,
-            n_h_all,
-        )
-        .map_err(|e| anyhow!("batched MoE layer {layer_idx} expert swiglu: {e}"))?;
-        enc.memory_barrier();
-    }
+    // ---- D: expert SwiGLU in the established F32 activation domain ----
+    dispatch_silu_mul(
+        enc,
+        registry,
+        device.metal_device(),
+        &gate_all,
+        &up_all,
+        &h_all,
+        &silu_params,
+        n_h_all,
+    )
+    .map_err(|e| anyhow!("batched MoE layer {layer_idx} expert swiglu: {e}"))?;
+    enc.memory_barrier();
 
     // ---- E: expert down, one pair per input row ----
     let down_params = GgmlQuantizedMatmulIdParams {
@@ -683,7 +695,7 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
                     true,
                     true,
                     false,
-                    GroupedM8Input::Bf16,
+                    GroupedM8Input::F32,
                     GroupedM8Epilogue::F32,
                 )
             },

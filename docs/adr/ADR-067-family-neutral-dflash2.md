@@ -784,6 +784,30 @@ Splash-parity promotion: its four-lane target median was 43.796 ms versus
 Splash's 17.93 ms target-forward average. Shared-expert grouping, indirect
 live grids and broader BF16 target activation flow remain open.
 
+The original fused-BF16 arithmetic did not pass the repeatability requirement.
+A later exact repair-turn Q5 run produced the same uncompilable Rust repair in
+two lanes while its same-binary native-MoE control passed all four lanes. This
+is a task-quality failure, regardless of the fused route's 44.212 ms
+four-lane target median, so the BF16 intermediate is no longer offered by the
+switch.
+
+The quality successor keeps the prepared expert planes and compact grouping,
+but runs gate and up as separate F32-output staged-M8 projections over one
+reused schedule and gathered input. The established F32 SwiGLU feeds the
+prepared down projection as F32. Two initial consecutive exact four-agent Q5
+runs passed task, tool and cleanup gates.
+
+A separately predeclared six-block balanced campaign at
+`$E/qwen36-m8-d5-v1` compared that successor with same-binary native batched
+MoE. All 12 exact task/tool/cleanup gates passed. The staged route reduced the
+four-lane target-verification median by 9.740% (95% log-ratio CI
+8.407–11.053%, half-width 1.323 points): its per-run median was 44.589 ms
+versus 49.387 ms for the control. Client makespan reduced by 6.904%, but the
+95% CI was -2.976–15.836% (half-width 9.406 points), so the end-to-end effect
+is inconclusive. This replaces the fused-BF16 implementation behind
+`HF2Q_QWEN_MOE_STAGED_M8=1`; the route remains opt-in pending an end-to-end
+precision pass and still does not establish Splash parity.
+
 Preparing the shared expert as a separate one-expert staged-M8 stack did not
 reproduce Splash's grouping. The first exact run exposed another untracked
 buffer hazard: replacing the compact schedule and gathered rows before the
