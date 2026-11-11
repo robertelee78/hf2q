@@ -78,7 +78,7 @@
                    "bytes": 16796018144,
                    "conversion_receipt_sha256": "299aa501a10546a26d85ca1e5600c6d6e5873e2fc2d35a4b0337409771677caf"},
       "q5_case": {"path": "scripts/four_agent/q5_cases/gemma4.json",
-                  "sha256": "6f2bea3c84338e3652c0aa74ba7353949104937f0d6bbe06ee1df1676929c245"},
+                  "sha256": "9da75fe32fb87a41bfa857b035ca131765d1700652f63cb42c1fe24e1ebc63e7"},
       "client_approval_template": {"path": "{E}/approval-templates-proof-4b2bea77-cargo199/gemma4-client-approval.json",
                                    "sha256": "895093735222afa592f3444c6feb6e6d3626a0afd237583e9389a68bd8d19490"},
       "ab_blocks": 6,
