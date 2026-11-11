@@ -625,6 +625,17 @@ Splash's valid 16.420344-second median. The next spike must combine packed
 prepared planes with fused Q/K/V and gate/up execution; payload density alone
 is insufficient.
 
+The follow-on fused Q4_K spike concatenated Q/K/V and gate/up projection rows,
+used one quantized matmul for each fused projection, split Q/K/V on GPU, and
+viewed the K/V suffix without duplicating weight storage for context commits.
+Twenty-five focused DFlash2 tests and the realistic profiled Q5 run passed
+with cleanup proven. The width-four draft-command median was 8.133 ms versus
+8.118 ms for the unfused Q4_K route: fusion through the generic GGML kernel
+and follow-up split did not improve the draft command. It remains isolated.
+The next draft projection route must use the source-bound AF4G64-style
+group-64 packed affine format and fuse gate/up activation into the linear
+epilogue rather than adding a split pass.
+
 The prepared target-MoE spike repacked Q4_K/Q6_K expert rows into Metal
 tensor planes and gathered target activations as BF16. Its production-shape
 microbenchmark reduced one Qwen3.6 gate projection from 1.086 ms to 0.875 ms
