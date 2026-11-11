@@ -277,22 +277,42 @@ impl Qwen35LoadedModel {
             .map(|&position| u32::try_from(position).context("Qwen DFlash2 position exceeds u32"))
             .collect::<Result<Vec<_>>>()?;
         let uniforms = vec![0.5_f32; physical_lanes * DFLASH2_PROPOSALS_PER_LANE];
+        let gpu_target_tokens = runtime.gpu_target_tokens();
+        let target_lane_order = active
+            .iter()
+            .map(|&index| states[index].slot_id.0)
+            .collect::<Vec<_>>();
         let adapter_config = runtime.config.clone();
         let adapter = QwenDFlash2Adapter::new(&self.model, &adapter_config)?;
         let draft_started = trace_timing.then(Instant::now);
         let lease = supervisor.arm("Qwen35 DFlash2 draft", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
         let drafted = self.model.with_gpu_cache_mut(|device, registry| {
-            runtime.run_draft(
-                device,
-                registry,
-                &adapter,
-                &anchors,
-                &positions,
-                &temperatures,
-                0,
-                &maximum_rows,
-                &uniforms,
-            )
+            if gpu_target_tokens {
+                runtime.run_draft_for_gpu_target(
+                    device,
+                    registry,
+                    &adapter,
+                    &anchors,
+                    &positions,
+                    &temperatures,
+                    0,
+                    &maximum_rows,
+                    &target_lane_order,
+                    &uniforms,
+                )
+            } else {
+                runtime.run_draft(
+                    device,
+                    registry,
+                    &adapter,
+                    &anchors,
+                    &positions,
+                    &temperatures,
+                    0,
+                    &maximum_rows,
+                    &uniforms,
+                )
+            }
         });
         let drafted = lease.finish().and(drafted);
         let draft_micros = draft_started.map(|started| started.elapsed().as_micros());
@@ -303,26 +323,33 @@ impl Qwen35LoadedModel {
             distribute_error(&mut ticks, &active, error);
             return Ok(finish_ticks(ticks));
         }
-        if self.model.cfg.moe.is_some() {
+        if !gpu_target_tokens {
             let mut active_lanes = [0; 4];
             for (lane, &index) in active.iter().enumerate() {
                 active_lanes[lane] = states[index].slot_id.0 as usize;
             }
             runtime.select_verify_rows(&active_lanes[..active.len()], &maximum_rows)?;
         }
-        let proposals = runtime.proposals()?;
-        let verify_rows = runtime.verify_rows()?;
         let mut tokens: Vec<Option<Vec<u32>>> = (0..lanes).map(|_| None).collect();
-        for &index in &active {
-            let slot = states[index].slot_id.0 as usize;
-            let proposal_start = slot * DFLASH2_PROPOSALS_PER_LANE;
-            let proposal_end = proposal_start + DFLASH2_PROPOSALS_PER_LANE;
-            match windows[index].as_ref().expect("active window").tokens(
-                &proposals[proposal_start..proposal_end],
-                verify_rows[slot] as usize,
-            ) {
-                Ok(lane_tokens) => tokens[index] = Some(lane_tokens),
-                Err(error) => ticks[index] = Some(Err(error)),
+        if gpu_target_tokens {
+            for &index in &active {
+                let window = windows[index].as_ref().expect("active window");
+                tokens[index] = Some(vec![window.pending_token; window.maximum_rows]);
+            }
+        } else {
+            let proposals = runtime.proposals()?;
+            let verify_rows = runtime.verify_rows()?;
+            for &index in &active {
+                let slot = states[index].slot_id.0 as usize;
+                let proposal_start = slot * DFLASH2_PROPOSALS_PER_LANE;
+                let proposal_end = proposal_start + DFLASH2_PROPOSALS_PER_LANE;
+                match windows[index].as_ref().expect("active window").tokens(
+                    &proposals[proposal_start..proposal_end],
+                    verify_rows[slot] as usize,
+                ) {
+                    Ok(lane_tokens) => tokens[index] = Some(lane_tokens),
+                    Err(error) => ticks[index] = Some(Err(error)),
+                }
             }
         }
         let verifying = active
@@ -357,18 +384,29 @@ impl Qwen35LoadedModel {
                 .sum::<usize>()
         });
         let adapter = QwenDFlash2Adapter::new(&self.model, &runtime.config)?;
-        let capture =
-            adapter.target_capture(&runtime.config, &runtime.workspace, &lane_indices)?;
+        let capture = adapter.target_capture(&runtime.config, &runtime.workspace, &lane_indices)?;
         let verify_started = Instant::now();
         let lease = supervisor.arm("Qwen35 DFlash2 verify", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
-        let verify = self.model.forward_gpu_dflash2_verify(
-            &verify_lanes,
-            kv_cache,
-            forward.mode,
-            forward.dense_ffn,
-            forward.options,
-            Some(capture),
-        );
+        let verify = if gpu_target_tokens {
+            self.model.forward_gpu_dflash2_verify_from_gpu_tokens(
+                &verify_lanes,
+                &runtime.workspace.target_tokens,
+                kv_cache,
+                forward.mode,
+                forward.dense_ffn,
+                forward.options,
+                Some(capture),
+            )
+        } else {
+            self.model.forward_gpu_dflash2_verify(
+                &verify_lanes,
+                kv_cache,
+                forward.mode,
+                forward.dense_ffn,
+                forward.options,
+                Some(capture),
+            )
+        };
         let verify = lease.finish().and(verify);
         let verify_elapsed = verify_started.elapsed();
         let verify_micros = trace_timing.then(|| verify_elapsed.as_micros());
@@ -385,6 +423,25 @@ impl Qwen35LoadedModel {
             }
         };
         drop(verify_lanes);
+        if gpu_target_tokens {
+            let proposals = runtime.proposals()?;
+            for &index in &verifying {
+                let slot = states[index].slot_id.0 as usize;
+                let proposal_start = slot * DFLASH2_PROPOSALS_PER_LANE;
+                let proposal_end = proposal_start + DFLASH2_PROPOSALS_PER_LANE;
+                let window = windows[index].as_ref().expect("verified window");
+                tokens[index] = Some(
+                    window
+                        .tokens(
+                            &proposals[proposal_start..proposal_end],
+                            window.maximum_rows,
+                        )
+                        .with_context(|| {
+                            format!("bind GPU-produced DFlash2 target tokens for slot {slot}")
+                        })?,
+                );
+            }
+        }
         let plan_started = trace_timing.then(Instant::now);
 
         let mut accepted = Vec::with_capacity(verifying.len());

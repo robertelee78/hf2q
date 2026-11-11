@@ -155,6 +155,7 @@ impl Qwen35Model {
             options,
             VerifyLayout::JointMtp,
             None,
+            None,
         )
     }
 
@@ -186,6 +187,33 @@ impl Qwen35Model {
             dense_ffn,
             options,
             VerifyLayout::DFlash2,
+            None,
+            capture,
+        )
+    }
+
+    /// Run DFlash2 verification from the GPU-composed fixed-width token tile.
+    /// Host lane metadata still owns positions and cache windows; token values
+    /// remain on the command queue until verification completes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_gpu_dflash2_verify_from_gpu_tokens(
+        &self,
+        lanes: &[Qwen35JointVerifyLane<'_>],
+        target_tokens: &MlxBuffer,
+        kv_cache: &mut HybridKvCache,
+        mode: JointRouteMode,
+        dense_ffn: JointDenseFfnRoute,
+        options: JointStepOptions,
+        capture: Option<DFlash2TargetCapture<'_>>,
+    ) -> Result<Qwen35JointVerify> {
+        self.forward_gpu_joint_verify_layout(
+            lanes,
+            kv_cache,
+            mode,
+            dense_ffn,
+            options,
+            VerifyLayout::DFlash2,
+            Some(target_tokens),
             capture,
         )
     }
@@ -199,6 +227,7 @@ impl Qwen35Model {
         dense_ffn: JointDenseFfnRoute,
         options: JointStepOptions,
         layout: VerifyLayout,
+        gpu_token_ids: Option<&MlxBuffer>,
         capture: Option<DFlash2TargetCapture<'_>>,
     ) -> Result<Qwen35JointVerify> {
         ensure!(
@@ -335,6 +364,7 @@ impl Qwen35Model {
                     kv_cache,
                     dense_ffn,
                     options,
+                    gpu_token_ids,
                     replay.as_mut(),
                     capture,
                 )?;

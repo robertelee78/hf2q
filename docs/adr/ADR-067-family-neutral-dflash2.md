@@ -707,6 +707,34 @@ qualifying end-to-end result. Asynchronous tail submission alone is rejected;
 the accepted design still requires GPU-resident proposals, target verify,
 acceptance, and both commits in one transaction.
 
+The next accepted dense-target slice keeps draft proposals on the GPU through
+target verification. A bounded Metal composition kernel packs each logical
+lane's anchor plus selected proposal prefix into the fixed target tile. The
+draft command submits without a host wait; the target's native embedding
+gather consumes that tile on the same queue. Proposal readback occurs only
+after the target output-head completion boundary, when host acceptance still
+needs the token identities.
+
+The matched Qwen3.8 Q5 candidate and control used the same binary, target,
+checkpoint, prompts and AF4G64 draft projections. Both passed calibration and
+cleanup. Every agent produced the same workflow and final-source hashes in
+both arms.
+
+| Qwen3.8 arm | Four-agent makespan (s) | Relative to staged control |
+|---|---:|---:|
+| Staged host proposal handoff | 86.397 | baseline |
+| GPU proposal-to-target handoff | 80.758 | 6.53% faster |
+
+This promotes the GPU handoff for the identity-matched dense Qwen3.8
+descriptor, with `HF2Q_DFLASH2_GPU_TARGET_TOKENS=0` as its escape hatch. The
+equivalent Qwen3.6 MoE all-row attempt failed Q5 task quality: one lane did not
+complete the required initial six-step workflow. MoE therefore retains its
+adaptive staged handoff, and forcing the dense route on a MoE or Gemma adapter
+fails at checkpoint load. This is not the complete Splash transaction:
+Qwen3.8 remains 4.918 times Splash's 16.420-second median, and target output
+readback, host acceptance, target-state settlement and draft-context commit
+remain separate boundaries.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,

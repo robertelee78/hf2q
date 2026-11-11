@@ -1048,6 +1048,129 @@ pub(super) fn embed_tokens_gpu_into(
     upload_f32_into(&cpu, output).context("upload synthetic F32 embedding rows")
 }
 
+/// Gather a fixed-width target tile from GPU-produced token IDs. The caller
+/// retains `token_ids` through the consuming target command; queue order is
+/// the dependency boundary, so this path performs no host wait or readback.
+pub(super) fn embed_token_ids_gpu_into(
+    token_ids: &MlxBuffer,
+    token_embd_native: Option<&MlxQWeight>,
+    hidden_size: u32,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    output: &mut MlxBuffer,
+) -> Result<()> {
+    let native = token_embd_native
+        .context("GPU-produced Qwen token IDs require an exact native embedding table")?;
+    let tokens = token_ids.element_count();
+    let hidden = hidden_size as usize;
+    ensure!(
+        tokens > 0 && token_ids.dtype() == DType::U32,
+        "GPU-produced embedding token IDs must be a non-empty U32 buffer"
+    );
+    ensure!(
+        output.dtype() == DType::F32 && output.element_count() == tokens * hidden,
+        "GPU-produced embedding output must be exact F32 [{tokens}, {hidden}]"
+    );
+    ensure!(
+        native.affine.is_none() && native.info.cols == hidden,
+        "GPU-produced embedding requires an exact native table with {hidden} columns"
+    );
+    let route = NativeEmbeddingRoute::for_type(native.info.ggml_dtype)?;
+    ensure!(
+        route != NativeEmbeddingRoute::F32,
+        "GPU-produced token IDs require a quantized native Qwen embedding table"
+    );
+    let mut enc = device
+        .command_encoder()
+        .map(crate::inference::native_observation::encoder)
+        .context("GPU-produced Qwen token embedding encoder")?;
+    match route {
+        NativeEmbeddingRoute::Q2K => {
+            mlx_native::ops::embedding_q2_k::register(registry);
+            mlx_native::embedding_gather_q2_k(
+                &mut enc,
+                registry,
+                device,
+                &native.buffer,
+                token_ids,
+                output,
+                &mlx_native::EmbeddingQ2KParams {
+                    vocab_size: native.info.rows,
+                    embed_dim: hidden,
+                    n_tokens: tokens,
+                },
+            )?;
+        }
+        NativeEmbeddingRoute::Q4K => {
+            mlx_native::ops::embedding_q4_k::register(registry);
+            mlx_native::embedding_gather_q4_k(
+                &mut enc,
+                registry,
+                device,
+                &native.buffer,
+                token_ids,
+                output,
+                &mlx_native::EmbeddingQ4KParams {
+                    vocab_size: native.info.rows,
+                    embed_dim: hidden,
+                    n_tokens: tokens,
+                },
+            )?;
+        }
+        NativeEmbeddingRoute::Q5K => {
+            mlx_native::ops::embedding_kquant::register(registry);
+            mlx_native::embedding_gather_q5_k(
+                &mut enc,
+                registry,
+                device,
+                &native.buffer,
+                token_ids,
+                output,
+                &mlx_native::EmbeddingQ5KParams {
+                    vocab_size: native.info.rows,
+                    embed_dim: hidden,
+                    n_tokens: tokens,
+                },
+            )?;
+        }
+        NativeEmbeddingRoute::Q6K => {
+            mlx_native::ops::embedding_kquant::register(registry);
+            mlx_native::embedding_gather_q6_k(
+                &mut enc,
+                registry,
+                device,
+                &native.buffer,
+                token_ids,
+                output,
+                &mlx_native::EmbeddingQ6KParams {
+                    vocab_size: native.info.rows,
+                    embed_dim: hidden,
+                    n_tokens: tokens,
+                },
+            )?;
+        }
+        NativeEmbeddingRoute::Q8_0 => {
+            mlx_native::ops::embedding_q8_0::register(registry);
+            mlx_native::embedding_gather_q8_0(
+                &mut enc,
+                registry,
+                device,
+                &native.buffer,
+                token_ids,
+                output,
+                &mlx_native::EmbeddingQ8_0Params {
+                    vocab_size: native.info.rows,
+                    embed_dim: hidden,
+                    n_tokens: tokens,
+                },
+            )?;
+        }
+        NativeEmbeddingRoute::F32 => unreachable!("rejected above"),
+    }
+    enc.commit_labeled("qwen35.embedding.gpu_token_ids");
+    Ok(())
+}
+
 /// Gather token embeddings to a fresh `[seq_len, hidden_size]` F32 buffer.
 #[allow(clippy::too_many_arguments)]
 fn embed_tokens_gpu(
