@@ -577,6 +577,27 @@ therefore implement the staged M8 design, including the one/two-row column
 tile and one-pass gate/up, over every admitted GGUF expert format. A Table16
 register copy targets Splash's Apple9 policy and cannot establish M5 parity.
 
+The source-bound register route is more specific than an eight-row threshold.
+`MoE.cpp:225-283` first applies the GPU verify-row counts while grouping routes,
+writes a compact live-tile count plus indirect gate/up and down grids, and
+launches no inactive expert tile. `moe_gather_table16` then transposes each live
+eight-row tile from BF16 into a 64-input-span Table16 image and accumulates its
+row sums; one 256-thread group handles one tile and 256 input columns.
+`moe_expert_gguf_sg_*` launches one threadgroup per 64 output columns and live
+expert tile, selects the expert's prepared GGUF planes at runtime, and performs
+no K split. Gate and up are separate register passes with the up pass applying
+`SiLU(gate) * up`; the intermediate remains BF16, is prepared into another
+Table16 tile, and feeds down. Splash's own source reports the Table16 gather at
+8 microseconds for one lane and 14 microseconds for four lanes on an M3 Max.
+
+Therefore the next hf2q MoE candidate must be one coherent route: BF16 target
+residuals, verify-row-aware compact tile grouping, producer-written Table16
+input, prepared Q4_K/Q6_K expert planes, an M8 register projection, BF16
+intermediate/output, indirect live-tile grids, and grouped reduction. Testing
+any one item while retaining the current F32 pair matrices or fixed-grid
+matvec launch does not reproduce Splash's mechanism and cannot support a
+promotion claim.
+
 The converter-style prepared-plane M8 spike then passed Q4_K/Q6_K operator
 parity and reduced the best exact four-agent smoke to 28.641453 seconds. A
 dedicated one/two-route register column tile and a one-time F32-to-F16 input
@@ -828,6 +849,34 @@ exact release-gate target/checkpoint pair exists. This is not the complete
 Splash transaction: Qwen3.8 remains 4.918 times Splash's 16.420-second median,
 and target output readback, host acceptance, target-state settlement and
 draft-context commit remain separate boundaries.
+
+The next bounded transaction slice adds mlx-native's
+`dispatch_dflash2_accept_greedy` operation. On transform-free exact-greedy
+requests, the target output-head command now computes retained and accepted
+counts in physical-lane order and consumes the retained counts in the draft
+context commit before submission. The canonical host acceptance walk still
+runs after readback and must match both GPU counts exactly; any mismatch or
+post-submit error fail-stops the worker. Requests with repetition penalty,
+forced-thinking transitions, grammar state, lazy tool triggers, stop strings,
+sampling, or logprobs remain on the prior host acceptance path because their
+semantic token is not the raw target argmax.
+
+The realistic Qwen3.8 four-agent coding calibration passed with unary/SSE tool
+semantics, tool-result continuation, prefix reuse and cleanup proven; its
+production transforms correctly kept `gpu_acceptance=false`. A separate
+one-slot Qwen3.8 smoke disabled thinking and repetition transforms, returned the
+requested token sequence, and recorded `gpu_acceptance=true`, four retained
+rows, `draft_commit_us=0`, and a 1.398 ms target replay. The one-slot smoke also
+found and fixed the GPU target tile allocation: target verification now always
+receives the canonical 32-row tile, with unused logical lanes padded by lane
+zero's anchor, even when the worker owns fewer than four physical lanes.
+
+This still is not Splash's single transaction. Partial acceptance requires
+`commit_joint_verify` to replay retained Qwen DeltaNet rows in a later target
+command. Splash instead leaves verified GDN rows pending on a tape and folds
+the retained prefix into the next graph. The next state-transaction slice must
+therefore add deferred retained-row state or an equivalent dynamic GPU commit;
+moving another host wait without removing that replay cannot close the gap.
 
 ### D5: performance qualification
 

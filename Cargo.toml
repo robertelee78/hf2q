@@ -171,7 +171,7 @@ thiserror = "2"
 # direct packed Q5_K/Q6_K embedding gathers and deterministic lowest-index
 # argmax tie handling, native BF16 GGUF/dense/expert execution, and sticky
 # expert-ID validation and optional deduplicated pool checkpoints use the
-# published mlx-native 0.21.3 contract (optional measurement observers default off;
+# published mlx-native 0.21.4 contract (optional measurement observers default off;
 # compact expert-matmul tile schedule with schedule reuse, ADR-063 Q4-GEMMA-PREFILL-MOE;
 # tile-fastest mm_id, grouped GeGLU decode and GQA vec-hybrid attention, opt-in SIMD MoE top-k;
 # row-exact few-row mat-vecs, DeepSeek rows kernels, tensor prefill flash attention,
@@ -179,9 +179,10 @@ thiserror = "2"
 # and coherent path selection, exact sliding-ring attention packing, transactional
 # context commit, checkpoint mask rows, BF16 D128 draft attention, the exact
 # 32-row tensor-v1 dense-MM route, prepared AF4G64 register-tile projection,
-# GPU-resident DFlash2 target-token composition, adaptive verify rows, and padded expert masking).
+# GPU-resident DFlash2 target-token composition, adaptive verify rows, padded expert
+# masking, and GPU greedy acceptance with EOS-aware retained-prefix accounting).
 # Bounded same-file metadata diagnostics share its production mapping planner.
-mlx-native = "=0.21.3"
+mlx-native = "=0.21.4"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
