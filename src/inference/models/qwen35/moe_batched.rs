@@ -38,7 +38,8 @@ use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk_simd;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    quantized_matmul_id_ggml_grouped_m8_epilogue, quantized_matmul_id_ggml_mv,
+    quantized_matmul_id_ggml_grouped_m8_epilogue,
+    quantized_matmul_id_ggml_grouped_m8_gate_up, quantized_matmul_id_ggml_mv,
     quantized_matmul_id_ggml_mv_masked, quantized_matmul_id_ggml_mv_q4_k_nr2,
     quantized_matmul_id_ggml_mv_q4_k_nr2_masked, GgmlQuantizedMatmulIdParams,
     GroupedM8Epilogue, GroupedM8Input,
@@ -560,41 +561,19 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
             ne,
             rows * shape.num_experts_per_tok,
             |scratch| {
-                quantized_matmul_id_ggml_grouped_m8_epilogue(
+                quantized_matmul_id_ggml_grouped_m8_gate_up(
                     enc,
                     registry,
                     device,
                     x,
                     gathered_m8.as_ref().expect("allocated grouped M8 input"),
                     &prepared_m8.expect("validated prepared M8").gate,
-                    &ids,
-                    &gate_all,
-                    None,
-                    scratch,
-                    &gate_params,
-                    false,
-                    false,
-                    false,
-                    GroupedM8Input::F32,
-                    GroupedM8Epilogue::Bf16,
-                )?;
-                quantized_matmul_id_ggml_grouped_m8_epilogue(
-                    enc,
-                    registry,
-                    device,
-                    x,
-                    gathered_m8.as_ref().expect("allocated grouped M8 input"),
                     &prepared_m8.expect("validated prepared M8").up,
                     &ids,
                     &h_all,
-                    Some(&gate_all),
                     scratch,
-                    &up_params,
-                    false,
-                    true,
-                    true,
+                    &gate_params,
                     GroupedM8Input::F32,
-                    GroupedM8Epilogue::SiluMulBf16,
                 )
             },
         )
