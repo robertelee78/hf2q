@@ -1,17 +1,23 @@
 //! Coherent DFlash2 proposal selection over the reusable decode workspace.
 
-use super::{config::DFlash2Config, tensors::DFlash2ModelTensors, workspace::DFlash2Workspace};
+use super::{
+    config::DFlash2Config,
+    tensors::DFlash2ModelTensors,
+    verify_budget::VerifyRowsModel,
+    workspace::DFlash2Workspace,
+};
 use anyhow::{anyhow, Result};
 use mlx_native::ops::dflash2_selector::{
-    dispatch_dflash2_compose_verify_input, dispatch_dflash2_selector, dispatch_dflash2_verify_rows,
-    DFlash2ComposeVerifyInputParams, DFlash2SelectorBuffers, DFlash2SelectorParams,
-    DFlash2VerifyRowsParams, DFLASH2_MAX_LANES, DFLASH2_MAX_POSITIONS, DFLASH2_VERIFY_COSTS,
+    dispatch_dflash2_compose_fixed_verify_input, dispatch_dflash2_compose_verify_input,
+    dispatch_dflash2_selector, dispatch_dflash2_verify_rows, DFlash2ComposeVerifyInputParams,
+    DFlash2SelectorBuffers, DFlash2SelectorParams, DFlash2VerifyRowsParams, DFLASH2_MAX_LANES,
+    DFLASH2_MAX_POSITIONS, DFLASH2_VERIFY_COSTS,
 };
 use mlx_native::{CommandEncoder, KernelRegistry, MlxDevice};
 
 /// Encode top-16 candidate extraction, predecessor/successor edge scoring,
 /// coherent-path selection, and either all-row or confidence-budgeted verify.
-pub fn dispatch_dflash2_selection(
+pub(crate) fn dispatch_dflash2_selection(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
@@ -23,6 +29,7 @@ pub fn dispatch_dflash2_selection(
     sampling_mask: u32,
     maximum_verify_rows: &[u32],
     target_lane_order: &[u32],
+    verify_model: Option<VerifyRowsModel>,
 ) -> Result<()> {
     let lanes = workspace.max_lanes;
     for (name, len) in [
@@ -93,10 +100,18 @@ pub fn dispatch_dflash2_selection(
     )?;
     encoder.memory_barrier();
 
-    // The draft graph emits the correctness-first all-row plan. MoE serving
-    // replaces it from the same confidence readback with its online host
-    // budget before target verification; dense targets retain this plan.
-    let cost = [1.0; DFLASH2_VERIFY_COSTS - 1];
+    let mut cost = [1.0; DFLASH2_VERIFY_COSTS - 1];
+    let mut cost_64 = 1.0;
+    let mut intercept = [0.0; DFLASH2_MAX_POSITIONS];
+    let mut slope = 0.0;
+    let mut every_row = true;
+    if let Some(model) = verify_model.as_ref() {
+        slope = model.slope;
+        intercept = model.intercept;
+        cost.copy_from_slice(&model.costs[..DFLASH2_VERIFY_COSTS - 1]);
+        cost_64 = model.costs[DFLASH2_VERIFY_COSTS - 1];
+        every_row = model.every_row;
+    }
     dispatch_dflash2_verify_rows(
         encoder,
         registry,
@@ -104,33 +119,48 @@ pub fn dispatch_dflash2_selection(
         &workspace.confidence,
         &workspace.verify_rows,
         DFlash2VerifyRowsParams {
-            slope: 0.0,
-            intercept: [0.0; DFLASH2_MAX_POSITIONS],
+            slope,
+            intercept,
             cost,
-            cost_64: 1.0,
-            lanes: lanes as u32,
-            rows_per_lane: config.block_size as u32,
-            every_row: 1,
-            maximum,
-        },
-    )?;
-    encoder.memory_barrier();
-    dispatch_dflash2_compose_verify_input(
-        encoder,
-        registry,
-        device,
-        &workspace.proposed_tokens,
-        &workspace.target_tokens,
-        DFlash2ComposeVerifyInputParams {
-            anchor: target_anchor,
+            cost_64,
             physical_lane: target_physical_lane,
-            rows: target_rows,
+            maximum: target_rows,
             physical_lanes: lanes as u32,
             lanes: target_lane_order.len() as u32,
             rows_per_lane: config.block_size as u32,
-            width: (workspace.max_lanes * workspace.rows_per_lane) as u32,
+            every_row: u32::from(every_row),
         },
     )?;
+    encoder.memory_barrier();
+    let compose = DFlash2ComposeVerifyInputParams {
+        anchor: target_anchor,
+        physical_lane: target_physical_lane,
+        rows: target_rows,
+        physical_lanes: lanes as u32,
+        lanes: target_lane_order.len() as u32,
+        rows_per_lane: config.block_size as u32,
+        width: (workspace.max_lanes * workspace.rows_per_lane) as u32,
+    };
+    if verify_model.is_some() {
+        dispatch_dflash2_compose_fixed_verify_input(
+            encoder,
+            registry,
+            device,
+            &workspace.proposed_tokens,
+            &workspace.verify_rows,
+            &workspace.target_tokens,
+            compose,
+        )?;
+    } else {
+        dispatch_dflash2_compose_verify_input(
+            encoder,
+            registry,
+            device,
+            &workspace.proposed_tokens,
+            &workspace.target_tokens,
+            compose,
+        )?;
+    }
     encoder.memory_barrier();
     Ok(())
 }

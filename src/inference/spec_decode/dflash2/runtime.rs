@@ -31,9 +31,13 @@ fn resolve_gpu_target_tokens(
     descriptor: &DFlash2CheckpointDescriptor,
     raw: Option<&str>,
 ) -> Result<bool> {
-    let supported = descriptor.family_adapter == DFlash2FamilyAdapter::QwenDense;
+    let qualified = descriptor.family_adapter == DFlash2FamilyAdapter::QwenDense;
+    let supported = matches!(
+        descriptor.family_adapter,
+        DFlash2FamilyAdapter::QwenDense | DFlash2FamilyAdapter::QwenMoe
+    );
     match raw {
-        None => Ok(supported),
+        None => Ok(qualified),
         Some("0" | "off" | "false") => Ok(false),
         Some("1" | "on" | "true") if supported => Ok(true),
         Some("1" | "on" | "true") => bail!(
@@ -296,6 +300,11 @@ impl DFlash2Runtime {
             vocabulary_head,
             &mut self.workspace,
         )?;
+        let verify_model = if !wait && target.adaptive_verify_budget() {
+            Some(self.verify_budget.model(target_lane_order.len())?)
+        } else {
+            None
+        };
         dispatch_dflash2_selection(
             &mut encoder,
             registry,
@@ -308,6 +317,7 @@ impl DFlash2Runtime {
             sampling_mask,
             maximum_verify_rows,
             target_lane_order,
+            verify_model,
         )?;
         if wait {
             encoder
@@ -569,11 +579,11 @@ mod tests {
     }
 
     #[test]
-    fn gpu_target_token_policy_defaults_only_for_qualified_dense_qwen() {
+    fn gpu_target_token_policy_defaults_for_qualified_dense_qwen() {
         assert!(resolve_gpu_target_tokens(&QWEN38_DFLASH2, None).unwrap());
         assert!(!resolve_gpu_target_tokens(&QWEN36_DFLASH2, None).unwrap());
         assert!(!resolve_gpu_target_tokens(&QWEN38_DFLASH2, Some("0")).unwrap());
-        assert!(resolve_gpu_target_tokens(&QWEN36_DFLASH2, Some("1")).is_err());
+        assert!(resolve_gpu_target_tokens(&QWEN36_DFLASH2, Some("1")).unwrap());
         assert!(resolve_gpu_target_tokens(&QWEN38_DFLASH2, Some("invalid")).is_err());
     }
 

@@ -171,6 +171,18 @@ impl Qwen35DecodeState {
         Ok(Qwen35DFlash2Plan { plan })
     }
 
+    fn plan_selected_dflash2_window(
+        &self,
+        qwen: &Qwen35LoadedModel,
+        window: &Qwen35DFlash2Window,
+        tokens: &[u32],
+        mut rows: Vec<Qwen35JointRowOutput>,
+    ) -> Result<Qwen35DFlash2Plan> {
+        anyhow::ensure!(!tokens.is_empty(), "Qwen DFlash2 selected no target rows");
+        rows.truncate(tokens.len());
+        self.plan_dflash2_window(qwen, window, &tokens[1..], rows)
+    }
+
     fn settle_dflash2_window(&mut self, plan: Qwen35DFlash2Plan) {
         let Qwen35DFlash2Plan { plan } = plan;
         self.mtp = None;
@@ -277,7 +289,10 @@ impl Qwen35LoadedModel {
             .map(|&position| u32::try_from(position).context("Qwen DFlash2 position exceeds u32"))
             .collect::<Result<Vec<_>>>()?;
         let uniforms = vec![0.5_f32; physical_lanes * DFLASH2_PROPOSALS_PER_LANE];
-        let gpu_target_tokens = runtime.gpu_target_tokens();
+        let gpu_target_tokens = runtime.gpu_target_tokens()
+            && active
+                .iter()
+                .all(|&index| maximum_rows[states[index].slot_id.0 as usize] == 8);
         let target_lane_order = active
             .iter()
             .map(|&index| states[index].slot_id.0)
@@ -425,6 +440,7 @@ impl Qwen35LoadedModel {
         drop(verify_lanes);
         if gpu_target_tokens {
             let proposals = runtime.proposals()?;
+            let verify_rows = runtime.verify_rows()?;
             for &index in &verifying {
                 let slot = states[index].slot_id.0 as usize;
                 let proposal_start = slot * DFLASH2_PROPOSALS_PER_LANE;
@@ -434,7 +450,7 @@ impl Qwen35LoadedModel {
                     window
                         .tokens(
                             &proposals[proposal_start..proposal_end],
-                            window.maximum_rows,
+                            verify_rows[slot] as usize,
                         )
                         .with_context(|| {
                             format!("bind GPU-produced DFlash2 target tokens for slot {slot}")
@@ -451,12 +467,11 @@ impl Qwen35LoadedModel {
                 .iter()
                 .map(|&index| tokens[index].take().expect("verified tokens")),
         ) {
-            let drafts = &lane_tokens[1..];
             let step = states[index]
-                .plan_dflash2_window(
+                .plan_selected_dflash2_window(
                     self,
                     windows[index].as_ref().expect("verified window"),
-                    drafts,
+                    &lane_tokens,
                     rows,
                 )
                 .map(|plan| Verified::Window {
@@ -706,6 +721,40 @@ mod tests {
         assert_eq!(plan.plan.rejected_drafts, 0);
         assert_eq!(plan.plan.valid_input_tokens, 4);
     }
+    #[test]
+    fn selected_gpu_budget_excludes_unverified_target_rows() {
+        let qwen = loaded_model(QwenSpeculationPolicy::Off);
+        let state = decode_state(&qwen, 8);
+        let window = Qwen35DFlash2Window {
+            pending_token: 8,
+            position: 4,
+            greedy: true,
+            maximum_rows: 8,
+        };
+        let plan = state
+            .plan_selected_dflash2_window(
+                &qwen,
+                &window,
+                &[8, 9, 10],
+                vec![
+                    greedy(9),
+                    greedy(10),
+                    greedy(11),
+                    greedy(99),
+                    greedy(99),
+                    greedy(99),
+                    greedy(99),
+                    greedy(99),
+                ],
+            )
+            .expect("plan selected GPU DFlash2 rows");
+        assert_eq!(
+            plan.plan.output.into_iter().collect::<Vec<_>>(),
+            [9, 10, 11]
+        );
+        assert_eq!(plan.plan.valid_input_tokens, 3);
+    }
+
     #[test]
     fn terminal_draft_is_not_streamed_or_retained() {
         let qwen = loaded_model(QwenSpeculationPolicy::Off);

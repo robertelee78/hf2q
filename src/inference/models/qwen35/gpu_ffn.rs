@@ -2771,6 +2771,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             &mut out,
             1,
             layer_idx,
+            None,
         )?;
         return Ok(out);
     }
