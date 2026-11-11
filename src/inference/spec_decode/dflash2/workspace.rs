@@ -18,9 +18,12 @@ pub struct DFlash2Workspace {
     pub captured_target_hidden: MlxBuffer,
     pub hidden: [MlxBuffer; 2],
     pub normalized: MlxBuffer,
+    pub af4_table: MlxBuffer,
+    pub af4_sums: MlxBuffer,
     pub dynamic: MlxBuffer,
     pub convolved: MlxBuffer,
     pub residual: MlxBuffer,
+    pub qkv: MlxBuffer,
     pub query: MlxBuffer,
     pub key: MlxBuffer,
     pub value: MlxBuffer,
@@ -44,6 +47,7 @@ pub struct DFlash2Workspace {
     pub softcap_params: MlxBuffer,
     pub head_meta: MlxBuffer,
     pub projected: MlxBuffer,
+    pub gate_up: MlxBuffer,
     pub gate: MlxBuffer,
     pub up: MlxBuffer,
     pub intermediate: MlxBuffer,
@@ -109,6 +113,11 @@ impl DFlash2Workspace {
         let key_value = config.num_key_value_heads * config.head_dim;
         let intermediate = config.intermediate_size;
         let packed = config.sliding_window - 1 + block;
+        let max_projection_input = config
+            .fc_input_dim()
+            .max(hidden)
+            .max(query)
+            .max(intermediate);
         let mut allocated_bytes = 0usize;
 
         let row_tokens = allocate(device, DType::U32, &[lanes, block], &mut allocated_bytes)?;
@@ -121,6 +130,18 @@ impl DFlash2Workspace {
         let hidden_a = allocate(device, DType::F32, &[rows, hidden], &mut allocated_bytes)?;
         let hidden_b = allocate(device, DType::F32, &[rows, hidden], &mut allocated_bytes)?;
         let normalized = allocate(device, DType::F32, &[rows, hidden], &mut allocated_bytes)?;
+        let af4_table = allocate(
+            device,
+            DType::BF16,
+            &[rows.div_ceil(8), 8, max_projection_input],
+            &mut allocated_bytes,
+        )?;
+        let af4_sums = allocate(
+            device,
+            DType::F32,
+            &[rows.div_ceil(8), max_projection_input / 64, 8],
+            &mut allocated_bytes,
+        )?;
         let dynamic = allocate(
             device,
             DType::F32,
@@ -129,6 +150,12 @@ impl DFlash2Workspace {
         )?;
         let convolved = allocate(device, DType::F32, &[rows, hidden], &mut allocated_bytes)?;
         let residual = allocate(device, DType::F32, &[rows, hidden], &mut allocated_bytes)?;
+        let qkv = allocate(
+            device,
+            DType::F32,
+            &[rows, query + 2 * key_value],
+            &mut allocated_bytes,
+        )?;
         let query_buffer = allocate(device, DType::F32, &[rows, query], &mut allocated_bytes)?;
         let key = allocate(device, DType::F32, &[rows, key_value], &mut allocated_bytes)?;
         let value = allocate(device, DType::F32, &[rows, key_value], &mut allocated_bytes)?;
@@ -223,6 +250,12 @@ impl DFlash2Workspace {
         ]);
         let head_meta = allocate(device, DType::U32, &[4], &mut allocated_bytes)?;
         let projected = allocate(device, DType::F32, &[rows, hidden], &mut allocated_bytes)?;
+        let gate_up = allocate(
+            device,
+            DType::F32,
+            &[rows, 2 * intermediate],
+            &mut allocated_bytes,
+        )?;
         let gate = allocate(
             device,
             DType::F32,
@@ -323,9 +356,12 @@ impl DFlash2Workspace {
             captured_target_hidden,
             hidden: [hidden_a, hidden_b],
             normalized,
+            af4_table,
+            af4_sums,
             dynamic,
             convolved,
             residual,
+            qkv,
             query: query_buffer,
             key,
             value,
@@ -333,6 +369,7 @@ impl DFlash2Workspace {
             key_normalized,
             attention,
             projected,
+            gate_up,
             gate,
             up,
             packed_query,

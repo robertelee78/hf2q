@@ -1159,6 +1159,7 @@ impl Qwen35LoadedModel {
         tracing::info!(
             checkpoint = descriptor.id,
             lanes = max_slots,
+            draft_projection = runtime.tensors.context_projection.format_label(),
             "Qwen DFlash2 runtime provisioned"
         );
         self.dflash2 = Some(runtime);
