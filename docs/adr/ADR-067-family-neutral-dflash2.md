@@ -577,6 +577,7 @@ K, V, gate and up projections. AF4G64's nominal four-bit values use about
 one-quarter of the projection payload before group metadata, making projection
 bandwidth and dispatch shape the primary draft differential rather than only an
 activation-precision difference.
+
 The exact Qwen3.6 checkpoint is 1,052,513,456 bytes: 797,966,336 bytes
 are projection tensors and 254,536,704 bytes are retained BF16 tensors.
 At 36 bytes per 64 values, an equivalent packed projection payload is
@@ -609,6 +610,20 @@ not performance claims. The result confirms both independent work fronts:
 quantized/fused draft projections must attack the fixed 9.3 ms command, while
 prepared target kernels, BF16 target activations and the single transaction
 must close the wider target and synchronization gap.
+
+The first isolated packed-projection spike used hf2q's owned Q4_K quantizer
+behind `HF2Q_DFLASH2_DRAFT_Q4_K=1`. Startup confirmed Q4_K activation, all
+focused tests and six paired realistic Q5 runs passed, and cleanup was proven.
+At width four, Q4_K reduced the profiled draft command from 9.318 ms to
+8.118 ms (12.88%). Three Williams-ordered paired blocks produced BF16 elapsed
+times of 38.285, 41.871 and 40.584 seconds and Q4_K times of 41.626, 39.659
+and 34.414 seconds. The medians were 40.584 and 39.659 seconds respectively;
+the paired ratio estimate was 0.95583 with a non-qualifying 95% CI of
+[0.70149, 1.30238]. Generic Q4_K dispatch therefore remains an isolated failed
+experiment: payload compression helps the draft command, but does not approach
+Splash's valid 16.420344-second median. The next spike must combine packed
+prepared planes with fused Q/K/V and gate/up execution; payload density alone
+is insufficient.
 
 ### D5: performance qualification
 
