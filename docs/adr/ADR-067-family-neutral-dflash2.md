@@ -636,6 +636,34 @@ The next draft projection route must use the source-bound AF4G64-style
 group-64 packed affine format and fuse gate/up activation into the linear
 epilogue rather than adding a split pass.
 
+The source-bound AF4G64 successor then quantized each 64-weight group to
+64 four-bit affine codes plus BF16 scale and bias, packed the codes into
+projection-major planes, and reused one preallocated BF16 Table16/F32-sum
+scratch pair across every draft projection. Q/K/V and gate/up weights remain
+concatenated at upload, so each group is read once per fused projection. The
+exact Qwen3.6 Q5 calibration passed and cleanup was proven first in
+`qwen36-dflash2-af4g64-fused-profile-v10`, then from the published
+`mlx-native 0.21.1` registry package in
+`qwen36-dflash2-af4g64-registry-final-v1`.
+
+| Isolated width-four draft route | Median draft GPU command (ms) | Decision |
+|---|---:|---|
+| BF16 production baseline | 9.318 | baseline |
+| generic Q4_K | 8.118 | rejected; generic kernel |
+| row-major AF4G64 | 15.868 | rejected |
+| prepared AF4G64, direct BF16 dequantization | 10.984 | rejected |
+| prepared AF4G64, exact F32 affine epilogue | 9.387 | rejected |
+| prepared AF4G64, activation Table16 | 7.878 | accepted primitive |
+
+The accepted primitive is 15.45% faster than the BF16 draft command and 2.96%
+faster than the generic Q4_K spike. Widths one through three measured
+7.908, 7.904 and 7.903 ms, so the gain is not a width-four-only schedule
+artifact. This authorizes the exact packed projection primitive and fused
+weight layout behind `HF2Q_DFLASH2_DRAFT_AF4_G64=1`; it does not authorize
+release promotion. The profile waits distort topology, and the remaining
+target, host-readback and multi-command costs still require the single
+GPU-resident transaction and the binding end-to-end Splash gate.
+
 The prepared target-MoE spike repacked Q4_K/Q6_K expert rows into Metal
 tensor planes and gathered target activations as BF16. Its production-shape
 microbenchmark reduced one Qwen3.6 gate projection from 1.086 ms to 0.875 ms
