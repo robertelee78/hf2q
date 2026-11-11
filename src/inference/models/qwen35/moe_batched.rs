@@ -31,22 +31,21 @@
 use std::sync::LazyLock;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
-use mlx_native::ops::dflash2_attention_pack::{
-    dispatch_dflash2_mask_moe_routes, DFlash2MoeRouteMaskParams,
-};
 use mlx_native::ops::dense_matvec_f32_rows::{
     dispatch_dense_matvec_f32_rows, DENSE_MATVEC_F32_ROWS_MAX_ROWS,
 };
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
+use mlx_native::ops::dflash2_attention_pack::{
+    dispatch_dflash2_mask_moe_routes, DFlash2MoeRouteMaskParams,
+};
 use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk_simd;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    quantized_matmul_id_ggml_grouped_m8_epilogue,
-    quantized_matmul_id_ggml_grouped_m8_gate_up, quantized_matmul_id_ggml_mv,
-    quantized_matmul_id_ggml_mv_masked, quantized_matmul_id_ggml_mv_q4_k_nr2,
-    quantized_matmul_id_ggml_mv_q4_k_nr2_masked, GgmlQuantizedMatmulIdParams,
-    GroupedM8Epilogue, GroupedM8Input,
+    quantized_matmul_id_ggml_grouped_m8_epilogue, quantized_matmul_id_ggml_grouped_m8_gate_up,
+    quantized_matmul_id_ggml_mv, quantized_matmul_id_ggml_mv_masked,
+    quantized_matmul_id_ggml_mv_q4_k_nr2, quantized_matmul_id_ggml_mv_q4_k_nr2_masked,
+    GgmlQuantizedMatmulIdParams, GroupedM8Epilogue, GroupedM8Input,
 };
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -328,7 +327,13 @@ pub(crate) struct DFlash2MoeRouteMask<'a> {
     pub params: DFlash2MoeRouteMaskParams,
 }
 
-fn pooled(device: &MlxDevice, elements: usize, dtype: DType, shape: Vec<usize>, label: &str) -> Result<MlxBuffer> {
+fn pooled(
+    device: &MlxDevice,
+    elements: usize,
+    dtype: DType,
+    shape: Vec<usize>,
+    label: &str,
+) -> Result<MlxBuffer> {
     pooled_alloc_buffer(device, elements * dtype.size_of(), dtype, shape)
         .map_err(|e| anyhow!("allocate batched MoE {label}: {e}"))
 }
@@ -373,9 +378,16 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
                 && shape.moe_intermediate_size % 64 == 0
                 && matches!(weights.ggml_type_gate_up, GgmlType::Q4_K | GgmlType::Q6_K)
                 && matches!(weights.ggml_type_down, GgmlType::Q4_K | GgmlType::Q6_K)
+                && matches!(
+                    weights.dense_storage,
+                    MoeDenseStorage::Native {
+                        shared_gate_up: GgmlType::Q4_K | GgmlType::Q6_K,
+                        shared_down: GgmlType::Q4_K | GgmlType::Q6_K,
+                    }
+                )
                 && !crate::quantize::imatrix::is_active(),
             "{QWEN_MOE_STAGED_M8_ENV}=1 requires top-k 1/6/8, \
-             64-column-aligned Q4_K/Q6_K native expert stacks and no imatrix collector"
+             64-column-aligned Q4_K/Q6_K native routed and shared experts and no imatrix collector"
         );
     }
     let prepared_m8 = if staged_m8 {
@@ -409,13 +421,40 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         "router logits",
     )?;
     let sh_logit = pooled(device, r, DType::F32, vec![r, 1], "shared gate logit")?;
-    let a_s = pooled(device, r * m_sh, DType::F32, vec![r, m_sh], "shared gate")?;
-    let b_s = pooled(device, r * m_sh, DType::F32, vec![r, m_sh], "shared up")?;
-    let h_s = pooled(device, r * m_sh, DType::F32, vec![r, m_sh], "shared swiglu")?;
+    let expert_storage = if staged_m8 { DType::BF16 } else { DType::F32 };
+    let a_s = pooled(
+        device,
+        if staged_m8 { 1 } else { r * m_sh },
+        DType::F32,
+        if staged_m8 { vec![1] } else { vec![r, m_sh] },
+        "shared gate",
+    )?;
+    let b_s = pooled(
+        device,
+        if staged_m8 { 1 } else { r * m_sh },
+        DType::F32,
+        if staged_m8 { vec![1] } else { vec![r, m_sh] },
+        "shared up",
+    )?;
+    let h_s = pooled(
+        device,
+        r * m_sh,
+        expert_storage,
+        vec![r, m_sh],
+        "shared swiglu",
+    )?;
     let y_s = pooled(device, r * h, DType::F32, vec![r, h], "shared down")?;
     let ids = pooled(device, pairs, DType::U32, vec![pairs], "expert ids")?;
     let routing_weights = pooled(device, pairs, DType::F32, vec![pairs], "routing weights")?;
-    let expert_storage = if staged_m8 { DType::BF16 } else { DType::F32 };
+    let mut shared_ids = staged_m8
+        .then(|| pooled(device, r, DType::U32, vec![r], "shared expert ids"))
+        .transpose()?;
+    if let Some(shared_ids) = shared_ids.as_mut() {
+        shared_ids
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow!("initialize shared expert ids: {e}"))?
+            .fill(0);
+    }
     let gate_all = pooled(
         device,
         if staged_m8 { 1 } else { pairs * m_moe },
@@ -479,12 +518,11 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
 
     let h32 = shape.hidden_size;
     let m_sh32 = shape.shared_intermediate_size;
-    // ---- A: router, shared gate logit, shared gate/up (all read x) ----
+    // ---- A: router and shared gate logit always read x. The staged route
+    // prepares and fuses the shared expert gate/up separately below.
     for (role, output, out_features) in [
         (MoeDenseRole::Router, &logits, ne),
         (MoeDenseRole::SharedGateLogit, &sh_logit, 1),
-        (MoeDenseRole::SharedGate, &a_s, m_sh32),
-        (MoeDenseRole::SharedUp, &b_s, m_sh32),
     ] {
         encode_native_dense_proj(
             enc,
@@ -499,6 +537,17 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
             out_features,
         )
         .with_context(|| format!("batched MoE layer {layer_idx}"))?;
+    }
+    if !staged_m8 {
+        for (role, output) in [
+            (MoeDenseRole::SharedGate, &a_s),
+            (MoeDenseRole::SharedUp, &b_s),
+        ] {
+            encode_native_dense_proj(
+                enc, registry, device, x, weights, role, output, rows, h32, m_sh32,
+            )
+            .with_context(|| format!("batched MoE layer {layer_idx}"))?;
+        }
     }
     enc.memory_barrier();
 
@@ -535,21 +584,46 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         )
         .map_err(|e| anyhow!("batched MoE layer {layer_idx} DFlash2 route mask: {e}"))?;
     }
-    dispatch_silu_mul(
-        enc,
-        registry,
-        device.metal_device(),
-        &a_s,
-        &b_s,
-        &h_s,
-        &silu_sh_params,
-        n_h_s,
-    )
-    .map_err(|e| anyhow!("batched MoE layer {layer_idx} shared swiglu: {e}"))?;
+    if !staged_m8 {
+        dispatch_silu_mul(
+            enc,
+            registry,
+            device.metal_device(),
+            &a_s,
+            &b_s,
+            &h_s,
+            &silu_sh_params,
+            n_h_s,
+        )
+        .map_err(|e| anyhow!("batched MoE layer {layer_idx} shared swiglu: {e}"))?;
+    }
     enc.memory_barrier();
 
-    // ---- C: expert gate/up over rows * top_k pairs (row t feeds pairs
-    // t * top_k ..), shared down ----
+    // ---- C: shared and routed expert gate/up. The staged shared projection
+    // runs first so the routed compact schedule remains available to down.
+    let (shared_gate_up_type, shared_down_type) = match weights.dense_storage {
+        MoeDenseStorage::Native {
+            shared_gate_up,
+            shared_down,
+        } => (shared_gate_up, shared_down),
+        MoeDenseStorage::Bf16 => unreachable!("native storage checked above"),
+    };
+    let shared_gate_params = GgmlQuantizedMatmulIdParams {
+        n_tokens: rows,
+        top_k: 1,
+        n: m_sh32,
+        k: h32,
+        n_experts: 1,
+        expert_stride: weights.shared_gate.data_byte_len() as u64,
+        ggml_type: shared_gate_up_type,
+    };
+    let shared_down_params = GgmlQuantizedMatmulIdParams {
+        n: h32,
+        k: m_sh32,
+        expert_stride: weights.shared_down.data_byte_len() as u64,
+        ggml_type: shared_down_type,
+        ..shared_gate_params
+    };
     let gate_params = GgmlQuantizedMatmulIdParams {
         n_tokens: rows,
         top_k: shape.num_experts_per_tok,
@@ -570,14 +644,33 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
             ne,
             rows * shape.num_experts_per_tok,
             |scratch| {
+                let prepared = prepared_m8.expect("validated prepared M8");
                 quantized_matmul_id_ggml_grouped_m8_gate_up(
                     enc,
                     registry,
                     device,
                     x,
                     gathered_m8.as_ref().expect("allocated staged M8 input"),
-                    &prepared_m8.expect("validated prepared M8").gate,
-                    &prepared_m8.expect("validated prepared M8").up,
+                    &prepared.shared_gate,
+                    &prepared.shared_up,
+                    shared_ids.as_ref().expect("allocated shared expert ids"),
+                    &h_s,
+                    scratch,
+                    &shared_gate_params,
+                    GroupedM8Input::F32,
+                )?;
+                // Both calls reuse the compact schedule and gathered-input
+                // buffers. Their untracked Metal hazards require an explicit
+                // read-before-overwrite boundary.
+                enc.memory_barrier();
+                quantized_matmul_id_ggml_grouped_m8_gate_up(
+                    enc,
+                    registry,
+                    device,
+                    x,
+                    gathered_m8.as_ref().expect("allocated staged M8 input"),
+                    &prepared.gate,
+                    &prepared.up,
                     &ids,
                     &h_all,
                     scratch,
@@ -615,19 +708,21 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
             route_mask.is_some(),
         )?;
     }
-    encode_native_dense_proj(
-        enc,
-        registry,
-        device,
-        &h_s,
-        weights,
-        MoeDenseRole::SharedDown,
-        &y_s,
-        rows,
-        m_sh32,
-        h32,
-    )
-    .with_context(|| format!("batched MoE layer {layer_idx}"))?;
+    if !staged_m8 {
+        encode_native_dense_proj(
+            enc,
+            registry,
+            device,
+            &h_s,
+            weights,
+            MoeDenseRole::SharedDown,
+            &y_s,
+            rows,
+            m_sh32,
+            h32,
+        )
+        .with_context(|| format!("batched MoE layer {layer_idx}"))?;
+    }
     enc.memory_barrier();
 
     // ---- D: expert SwiGLU (the staged M8 gate/up kernel already produced it) ----
@@ -646,7 +741,8 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         enc.memory_barrier();
     }
 
-    // ---- E: expert down, one pair per input row ----
+    // ---- E: routed down reuses its gate/up schedule; shared down then
+    // rebuilds the one-expert schedule over the BF16 shared intermediate. ----
     let down_params = GgmlQuantizedMatmulIdParams {
         n_tokens: pairs as u32,
         top_k: 1,
@@ -668,13 +764,14 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
             ne,
             rows * shape.num_experts_per_tok,
             |scratch| {
+                let prepared = prepared_m8.expect("validated prepared M8");
                 quantized_matmul_id_ggml_grouped_m8_epilogue(
                     enc,
                     registry,
                     device,
                     &h_all,
                     gathered_m8.as_ref().expect("allocated staged M8 input"),
-                    &prepared_m8.expect("validated prepared M8").down,
+                    &prepared.down,
                     &ids,
                     &y_all,
                     None,
@@ -682,6 +779,27 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
                     &slotted_down_params,
                     true,
                     true,
+                    false,
+                    GroupedM8Input::Bf16,
+                    GroupedM8Epilogue::F32,
+                )?;
+                // The shared projection replaces the routed schedule and
+                // gathered rows in place; finish routed reads first.
+                enc.memory_barrier();
+                quantized_matmul_id_ggml_grouped_m8_epilogue(
+                    enc,
+                    registry,
+                    device,
+                    &h_s,
+                    gathered_m8.as_ref().expect("allocated staged M8 input"),
+                    &prepared.shared_down,
+                    shared_ids.as_ref().expect("allocated shared expert ids"),
+                    &y_s,
+                    None,
+                    scratch,
+                    &shared_down_params,
+                    false,
+                    false,
                     false,
                     GroupedM8Input::Bf16,
                     GroupedM8Epilogue::F32,
