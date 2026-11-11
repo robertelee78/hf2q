@@ -784,6 +784,19 @@ Splash-parity promotion: its four-lane target median was 43.796 ms versus
 Splash's 17.93 ms target-forward average. Shared-expert grouping, indirect
 live grids and broader BF16 target activation flow remain open.
 
+Preparing the shared expert as a separate one-expert staged-M8 stack did not
+reproduce Splash's grouping. The first exact run exposed another untracked
+buffer hazard: replacing the compact schedule and gathered rows before the
+prior projection finished corrupted all four responses. Explicit barriers
+restored task and tool quality, and the exact repair-turn Q5 passed with
+cleanup proven, but every populated matched four-lane bin regressed. Target
+verification rose by 7.19% to 13.37% across 12 to 32 selected rows; its
+run-wide median rose from 45.283 ms to 49.774 ms (9.92%). The experiment is
+preserved at `6b5e3793` and rejected. Splash's shared-expert slices must join
+the routed experts in one compact schedule and one gate/up/down dispatch
+sequence; adding a second schedule, gathered-buffer overwrite and barriers is
+the opposite mechanism.
+
 An unprofiled four-request diagnostic on the exact Qwen3.6 Q4_K_M target then
 separated transaction boundaries from target work without the stage profiler's
 forced waits. With GPU proposal handoff and AF4G64 draft projections active,
