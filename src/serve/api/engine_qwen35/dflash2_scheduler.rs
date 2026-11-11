@@ -17,7 +17,8 @@ use crate::inference::models::qwen35::{
     Qwen35JointOutput, Qwen35JointRowOutput, Qwen35JointVerify, Qwen35JointVerifyLane,
 };
 use crate::inference::spec_decode::dflash2::{
-    adapters::QwenDFlash2Adapter, verify_budget::VerifyBudgetLane,
+    adapters::{DFlash2TargetFamily, QwenDFlash2Adapter},
+    verify_budget::VerifyBudgetLane,
 };
 use crate::serve::api::engine_supervisor::EngineSupervisor;
 
@@ -222,6 +223,8 @@ impl Qwen35LoadedModel {
             states.len(),
             runtime.workspace.max_lanes
         );
+        let _stage_round =
+            crate::inference::stage_profile::Round::begin("qwen35", "dflash2", states.len());
         let lanes = states.len();
         let mut ticks: Vec<Option<Result<Qwen35TickOutcome>>> = (0..lanes).map(|_| None).collect();
         let mut windows: Vec<Option<Qwen35DFlash2Window>> = Vec::with_capacity(lanes);
@@ -353,9 +356,9 @@ impl Qwen35LoadedModel {
                 .map(|lane| lane.tokens.len())
                 .sum::<usize>()
         });
-        let adapter_config = runtime.config.clone();
-        let adapter = QwenDFlash2Adapter::new(&self.model, &adapter_config)?;
-        let capture = runtime.qwen_target_capture(&adapter, &lane_indices)?;
+        let adapter = QwenDFlash2Adapter::new(&self.model, &runtime.config)?;
+        let capture =
+            adapter.target_capture(&runtime.config, &runtime.workspace, &lane_indices)?;
         let verify_started = Instant::now();
         let lease = supervisor.arm("Qwen35 DFlash2 verify", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
         let verify = self.model.forward_gpu_dflash2_verify(

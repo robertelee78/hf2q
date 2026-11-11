@@ -31,7 +31,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
-use super::forward_gpu::{DFlash2JointCapture, Qwen35JointVerifyLane};
+use super::forward_gpu::Qwen35JointVerifyLane;
 use super::gpu_delta_net::DeltaNetWeightsGpu;
 use super::gpu_ffn::DenseFfnWeightsGpuQ;
 use super::gpu_full_attn::{upload_f32, FullAttnQGateWeightsGpu, FullAttnWeightsGpu};
@@ -47,6 +47,7 @@ use super::{
     default_layer_types, Qwen35Config, Qwen35JointOutput, Qwen35JointRow, Qwen35LayerKind,
     Qwen35Variant,
 };
+use crate::inference::spec_decode::dflash2::adapters::DFlash2TargetCapture;
 use crate::serve::forward_mlx_shared::MlxQWeight;
 use crate::serve::gpu::QuantWeightInfo;
 use crate::serve::multi_seq_kv::SlotId;
@@ -872,7 +873,7 @@ fn run_dflash_case(fixture: &Fixture<'_>, lanes: &[LaneCase], label: &str) -> DF
         .iter()
         .map(|lane| lane.slot as usize)
         .collect::<Vec<_>>();
-    let capture = DFlash2JointCapture {
+    let capture = DFlash2TargetCapture {
         layer_ids: &capture_layers,
         output: &captured,
         lane_indices: &capture_lanes,

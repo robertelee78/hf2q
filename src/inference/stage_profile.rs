@@ -328,7 +328,9 @@ pub fn scratch_reallocation() {
 }
 
 fn classify_label(label: &str) -> &'static str {
-    if label.starts_with("adr065.mtp_catchup") || label.contains("process_target_batch") {
+    if label.starts_with("adr067.dflash2_draft") {
+        "dflash2_draft"
+    } else if label.starts_with("adr065.mtp_catchup") || label.contains("process_target_batch") {
         "mtp_catchup"
     } else if label.starts_with("adr065.mtp_draft") || label.starts_with("mtp.") {
         "mtp_draft"
@@ -373,6 +375,7 @@ mod tests {
     fn classifies_closed_stage_labels_and_fails_unknown() {
         for (label, expected) in [
             ("adr065.projections", "projections"),
+            ("adr067.dflash2_draft", "dflash2_draft"),
             ("adr065.delta_conv", "delta_conv"),
             ("adr065.delta_gdn", "delta_gdn"),
             ("layer.gdn.ops5-9", "delta_gdn"),
