@@ -2867,6 +2867,7 @@ mod g4_cfa3_tests {
             affine: None,
             f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
+            repacked_gguf_m32: std::sync::OnceLock::new(),
         }
     }
 
@@ -2965,6 +2966,7 @@ mod g4_cfa3_tests {
             affine: None,
             f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
+            repacked_gguf_m32: std::sync::OnceLock::new(),
         };
 
         // final_norm: [hidden] F32 ones.
@@ -3340,6 +3342,7 @@ embed_weight,
             affine: None,
             f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
+            repacked_gguf_m32: std::sync::OnceLock::new(),
         };
         let final_norm = alloc_f32_g4(&vec![1.0f32; hidden], &device);
 

@@ -110,6 +110,7 @@ fn native_matrix_embedding_dispatches_every_admitted_codec() {
             affine: None,
             f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
+            repacked_gguf_m32: std::sync::OnceLock::new(),
         };
         let output = device
             .alloc_buffer(
@@ -255,6 +256,7 @@ fn native_matrix_projection_dispatches_every_admitted_codec_and_width() {
             affine: None,
             f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
+            repacked_gguf_m32: std::sync::OnceLock::new(),
         };
         assert_eq!(
             supports_native_perm021(&weight, 9, 256),

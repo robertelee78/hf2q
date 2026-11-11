@@ -154,7 +154,6 @@ pub(crate) fn joint_verify_padded_width(mode: JointRouteMode, rows: usize) -> us
         JointRouteMode::PaddedMvExt => MAX_JOINT_VERIFY_ROWS,
     }
 }
-
 /// Block storage whose packed route is proven (or, for `PaddedMvExt`,
 /// width-consistent) on the default matvec family.
 fn packed_block_type(ggml_type: GgmlType) -> bool {

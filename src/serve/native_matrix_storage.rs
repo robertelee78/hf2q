@@ -82,6 +82,7 @@ impl MlxQWeight {
             affine: None,
             f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
+            repacked_gguf_m32: std::sync::OnceLock::new(),
         })
     }
 }

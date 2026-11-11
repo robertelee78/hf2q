@@ -80,6 +80,11 @@ pub struct MlxQWeight {
     /// F16 shadow) keep using the legacy dispatch path until additional
     /// bake helpers land in later substeps.
     pub decode_record_q6k_m1: std::sync::OnceLock<Option<mlx_native::DispatchRecord>>,
+    /// Model-owned load-once Q4_K/Q6_K planes for the fixed width-32
+    /// verifier route. Clones start empty because this is an execution cache,
+    /// not matrix identity.
+    pub repacked_gguf_m32:
+        std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
 }
 
 impl Clone for MlxQWeight {
@@ -93,6 +98,7 @@ impl Clone for MlxQWeight {
             // A cloned model-local handle lazily bakes its own record while
             // retaining the same underlying artifact-backed buffer owner.
             decode_record_q6k_m1: std::sync::OnceLock::new(),
+            repacked_gguf_m32: std::sync::OnceLock::new(),
         }
     }
 }
@@ -220,6 +226,7 @@ impl MlxQWeight {
             }),
             f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
+            repacked_gguf_m32: std::sync::OnceLock::new(),
         })
     }
 }
@@ -296,6 +303,7 @@ pub(crate) fn load_gguf_qweight(
         affine: None,
         f16_shadow: None,
         decode_record_q6k_m1: std::sync::OnceLock::new(),
+        repacked_gguf_m32: std::sync::OnceLock::new(),
     })
 }
 
@@ -514,6 +522,55 @@ pub fn dispatch_qmatmul(
             k,
         )
         .map_err(|e| anyhow::anyhow!("dispatch_mm_v2_f16 (native F16) failed: {e}"));
+    }
+
+    let n = weight.info.rows as u32;
+    let k = weight.info.cols as u32;
+    if m == 32
+        && n % 64 == 0
+        && k % 256 == 0
+        && matches!(
+            weight.info.ggml_dtype,
+            mlx_native::GgmlType::Q4_K | mlx_native::GgmlType::Q6_K
+        )
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            std::env::var("HF2Q_REPACKED_GGUF_M32")
+                .map(|value| value == "1")
+                .unwrap_or(false)
+        });
+        if enabled {
+            if weight.repacked_gguf_m32.get().is_none() {
+                let params = weight.matmul_params(m)?;
+                let prepared =
+                    mlx_native::ops::repacked_gguf_mm::prepare_repacked_gguf_weight(
+                        session.encoder_mut(),
+                        registry,
+                        device,
+                        &weight.buffer,
+                        &params,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!("prepare_repacked_gguf_weight failed: {error}")
+                    })?;
+                let _ = weight.repacked_gguf_m32.set(prepared);
+            }
+            let prepared = weight.repacked_gguf_m32.get().ok_or_else(|| {
+                anyhow::anyhow!("prepared GGUF weight was not retained by its model owner")
+            })?;
+            let params = weight.matmul_params(m)?;
+            return mlx_native::ops::repacked_gguf_mm::dispatch_repacked_gguf_mm(
+                session.encoder_mut(),
+                registry,
+                device,
+                input,
+                prepared,
+                output,
+                &params,
+            )
+            .map_err(|error| anyhow::anyhow!("dispatch_repacked_gguf_mm failed: {error}"));
+        }
     }
 
     // ADR-029 iter-175 Step 1d — Q6_K NR2 decode-m=1 fast path via
@@ -1095,6 +1152,7 @@ mod dispatch_qmatmul_f32_router_test {
             affine: None,
             f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
+            repacked_gguf_m32: std::sync::OnceLock::new(),
         };
 
         // Run through GraphSession (mirrors production dispatch path).
@@ -1166,6 +1224,7 @@ mod dispatch_qmatmul_bf16_test {
             affine: None,
             f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
+            repacked_gguf_m32: std::sync::OnceLock::new(),
         };
         let stored_before = qweight.buffer.as_slice::<u16>().unwrap().to_vec();
         let input_values: Vec<f32> = (0..m)

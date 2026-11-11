@@ -605,6 +605,7 @@ pub(crate) fn synthetic_model(
         affine: None,
         f16_shadow: None,
         decode_record_q6k_m1: std::sync::OnceLock::new(),
+        repacked_gguf_m32: std::sync::OnceLock::new(),
     });
     let layers = std::mem::take(&mut model.layers);
     for (index, layer) in layers.into_iter().enumerate() {
@@ -941,7 +942,6 @@ fn argmax_bits(logits: &[u32]) -> usize {
     }
     selected
 }
-
 #[test]
 fn dflash2_width32_meets_q1_and_is_cohort_invariant() {
     with_synthetic_fixture(padded_policy(), dflash_arm(), |fixture| {

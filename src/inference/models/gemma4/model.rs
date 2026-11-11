@@ -213,6 +213,7 @@ impl MlxMoeWeights {
                 affine: None,
                 f16_shadow: None,
                 decode_record_q6k_m1: std::sync::OnceLock::new(),
+                repacked_gguf_m32: std::sync::OnceLock::new(),
             },
             per_expert_scale: alloc_one_f32_placeholder(mlx_device, "per_expert_scale")?,
             gate_up_ggml_dtype: mlx_native::GgmlType::F32,
