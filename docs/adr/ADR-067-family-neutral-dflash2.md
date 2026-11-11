@@ -696,6 +696,39 @@ seconds; these unpaired, output-dependent samples do not establish an
 end-to-end win. The route therefore remains isolated until a matched quality
 and performance campaign can qualify it.
 
+The exact Splash-style Table16/register-matrix follow-up did not rescue that
+target route. The spike consumed the same prepared Q4_K/Q6_K planes directly,
+gathered eight BF16 rows into Splash's transposed 64-input table, retained its
+F32 seed/sum correction, and passed shared/slotted F32, BF16 gate/up epilogue
+and BF16-input down-projection parity at the existing 0.3% kernel envelope. A
+first implementation exposed an hf2q-specific compact-schedule hazard:
+per-expert route slices have one guard entry, not eight-row padding, so padded
+Table16 writes overlapped the next expert. Reserving seven additional rows per
+expert removed that race. Narrow per-lane payload loads then reduced the
+register result from 1.207 to 1.187 ms per projection, but the matched
+100-dispatch Qwen3.6 gate probe still measured 1.134 ms for the scalar route,
+0.862 ms for the prepared Metal-tensor route and 1.187 ms for the register
+route. The exact register route is 37.7% slower than the already insufficient
+prepared route and remains a rejected experiment. This strengthens the
+single-transaction requirement: copying Splash's expert arithmetic in
+isolation does not close hf2q's command-boundary and target-state costs.
+
+An unprofiled four-request diagnostic on the exact Qwen3.6 Q4_K_M target then
+separated transaction boundaries from target work without the stage profiler's
+forced waits. With GPU proposal handoff and AF4G64 draft projections active,
+steady four-lane cycles spent about 50.4-55.9 ms in target verification and
+52.9-58.5 ms in the whole transaction. Host planning was normally below
+0.5 ms, target settlement about 0.9-1.7 ms and draft-context settlement about
+0.7-0.8 ms. The four requests each generated 160 tokens at 58.1-64.2 output
+tokens/s and server cleanup was proven. The trace also showed the adaptive MoE
+mask often accepting only 8-18 rows across four lanes while the fixed target
+tile still admitted 32 rows; only routed-expert work was masked. A single
+command graph remains required for Splash parity and state correctness, but
+these measurements reject command boundaries as the dominant remaining
+throughput gap. The next target slice must reduce the fixed target graph's
+weight/dequantization traffic and execute only the selected MoE rows; deleting
+the roughly 2-3 ms host/settlement tail alone cannot close a roughly 2x gap.
+
 A separate checked asynchronous target-context submission spike retained the
 in-flight command encoder, observed its error at the next same-queue draft
 wait, and drained it before capture overwrite, lane clear, or runtime drop.
