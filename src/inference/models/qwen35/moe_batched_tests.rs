@@ -209,6 +209,7 @@ impl Layer {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            prepared_m8: None,
         }
     }
 }

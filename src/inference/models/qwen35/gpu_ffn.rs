@@ -68,12 +68,13 @@ use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    quantized_matmul_id_ggml_pooled, quantized_matmul_id_ggml_pooled_pair,
+    prepare_quantized_matmul_id_ggml_grouped_m8, quantized_matmul_id_ggml_pooled,
+    quantized_matmul_id_ggml_pooled_pair,
     quantized_matmul_id_ggml_pooled_slotted_reusing_schedule, GgmlQuantizedMatmulIdParams,
-    MM_ID_ROUTING_THRESHOLD,
+    PreparedGroupedM8Experts, MM_ID_ROUTING_THRESHOLD,
 };
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
-use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use crate::serve::forward_mlx_shared::MlxAffineMoeStack;
 
@@ -454,6 +455,12 @@ impl MoeFfnWeightsGpu {
 /// BF16; with [`MoeDenseStorage::Native`] (`HF2Q_QWEN_MOE_BATCHED=1`) they
 /// keep their GGUF storage (router and shared gate logit F32, shared
 /// gate/up/down raw GGML blocks) and decode runs the batched route.
+pub(crate) struct PreparedMoeExpertsM8 {
+    pub gate: PreparedGroupedM8Experts,
+    pub up: PreparedGroupedM8Experts,
+    pub down: PreparedGroupedM8Experts,
+}
+
 pub struct MoeFfnWeightsGpuQ {
     /// Router projection: `[num_experts, hidden_size]` (BF16 or native F32).
     pub router: MlxBuffer,
@@ -492,6 +499,9 @@ pub struct MoeFfnWeightsGpuQ {
     pub expert_gate_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
     pub expert_up_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
     pub expert_down_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
+    /// Prepared quantized planes for the staged-M8 DFlash2 expert route.
+    /// Present only under its explicit experimental switch.
+    pub(crate) prepared_m8: Option<PreparedMoeExpertsM8>,
 }
 
 fn ggml_type_stride(t: GgmlType, rows: usize, cols: usize) -> Result<u64> {
@@ -590,6 +600,7 @@ impl MoeFfnWeightsGpuQ {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            prepared_m8: None,
         })
     }
 
@@ -616,6 +627,70 @@ impl MoeFfnWeightsGpuQ {
         self.expert_gate_affine = gate.cloned();
         self.expert_up_affine = up.cloned();
         self.expert_down_affine = down.cloned();
+        Ok(())
+    }
+
+    pub(crate) fn prepare_grouped_m8(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        hidden_size: u32,
+        moe_intermediate_size: u32,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.dense_storage.is_native()
+                && self.expert_gate_affine.is_none()
+                && self.expert_up_affine.is_none()
+                && self.expert_down_affine.is_none(),
+            "staged M8 preparation requires native expert stacks without affine overlays"
+        );
+        let gate_params = GgmlQuantizedMatmulIdParams {
+            n_tokens: 1,
+            top_k: 1,
+            n: moe_intermediate_size,
+            k: hidden_size,
+            n_experts: self.num_experts,
+            expert_stride: self.expert_gate_stride,
+            ggml_type: self.ggml_type_gate_up,
+        };
+        let up_params = GgmlQuantizedMatmulIdParams {
+            expert_stride: self.expert_up_stride,
+            ..gate_params
+        };
+        let down_params = GgmlQuantizedMatmulIdParams {
+            n: hidden_size,
+            k: moe_intermediate_size,
+            expert_stride: self.expert_down_stride,
+            ggml_type: self.ggml_type_down,
+            ..gate_params
+        };
+        self.prepared_m8 = Some(PreparedMoeExpertsM8 {
+            gate: prepare_quantized_matmul_id_ggml_grouped_m8(
+                encoder,
+                registry,
+                device,
+                &self.expert_gate_q,
+                &gate_params,
+            )
+            .context("prepare gate expert M8 planes")?,
+            up: prepare_quantized_matmul_id_ggml_grouped_m8(
+                encoder,
+                registry,
+                device,
+                &self.expert_up_q,
+                &up_params,
+            )
+            .context("prepare up expert M8 planes")?,
+            down: prepare_quantized_matmul_id_ggml_grouped_m8(
+                encoder,
+                registry,
+                device,
+                &self.expert_down_q,
+                &down_params,
+            )
+            .context("prepare down expert M8 planes")?,
+        });
         Ok(())
     }
 }
@@ -3554,7 +3629,6 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             expert_stride: weights.expert_up_stride,
             ..gate_params
         };
-
         // ADR-033 §Pi Task #20 iter 6 — fused MoE gate+up+silu_mul mm_id
         // (Q6_K only, prefill arena variant). See bare-`_into` variant
         // above for full rationale.
@@ -4745,6 +4819,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            prepared_m8: None,
         };
 
         let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
@@ -4945,6 +5020,7 @@ mod tests {
                 expert_gate_affine: None,
                 expert_up_affine: None,
                 expert_down_affine: None,
+                prepared_m8: None,
             };
             for seq in [33usize, 85, 157, 512] {
                 for collapsed in [false, true] {
@@ -5059,6 +5135,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            prepared_m8: None,
         };
         let threshold = MM_ID_ROUTING_THRESHOLD;
         assert!(moe_prefill_shares_expert_schedule(
@@ -5194,6 +5271,7 @@ mod tests {
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
+            prepared_m8: None,
         };
         const REPS: usize = 15;
         for seq in [85usize, 157, 271, 512, 682] {

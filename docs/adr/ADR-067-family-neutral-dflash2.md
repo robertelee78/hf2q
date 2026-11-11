@@ -590,13 +590,13 @@ no K split. Gate and up are separate register passes with the up pass applying
 Table16 tile, and feeds down. Splash's own source reports the Table16 gather at
 8 microseconds for one lane and 14 microseconds for four lanes on an M3 Max.
 
-Therefore the next hf2q MoE candidate must be one coherent route: BF16 target
-residuals, verify-row-aware compact tile grouping, producer-written Table16
-input, prepared Q4_K/Q6_K expert planes, an M8 register projection, BF16
-intermediate/output, indirect live-tile grids, and grouped reduction. Testing
-any one item while retaining the current F32 pair matrices or fixed-grid
-matvec launch does not reproduce Splash's mechanism and cannot support a
-promotion claim.
+Therefore the next hf2q MoE candidate must be one coherent Apple10 route:
+BF16 target/expert activations, verify-row-aware compact tile grouping,
+prepared Q4_K/Q6_K planes, staged M8 with the dedicated one/two-row column
+path, one-pass gate/up with a BF16 intermediate, indirect live-tile grids,
+shared-expert slices in the grouped representation, and grouped reduction.
+Testing one item while retaining F32 pair matrices or fixed-grid matvec
+launches does not reproduce Splash's mechanism and cannot support promotion.
 
 The converter-style prepared-plane M8 spike then passed Q4_K/Q6_K operator
 parity and reduced the best exact four-agent smoke to 28.641453 seconds. A
@@ -753,21 +753,36 @@ that this result measures Splash's Apple9 arithmetic, not the Apple10 staged
 M8 path used by the valid M5 Max comparator; it cannot reject or validate the
 required staged successor.
 
-The next staged-M8 spike fused gate and up in the Apple10 shape: one
-simdgroup per projection over the same 32 output columns, gate retained in
-threadgroup memory, and a `BF16(up) * SiLU(BF16(gate))` epilogue. Q4_K and
-Q6_K focused parity passed. The production-shape 100-pair probe improved from
-1.943 to 1.286 ms per gate/up pair (33.8%). That microkernel result did not
-transfer to the complete model. Two realistic four-agent Q5 runs passed task
-quality and cleanup at 38.783 and 37.500 seconds, versus 37.137 and 36.384
-seconds for the preceding separate-pass prepared route. These output-dependent
-smokes are not a paired performance campaign, but their 38.142-second median
-is 3.76% slower than the separate route's 36.760-second median and supplies no
-basis to promote the fusion. The spike is preserved on the isolated experiment
-branches `mlx-native/perf/dflash2-expert-m8@1b72ed6` and
-`hf2q/perf/dflash2-expert-m8@f442ff66`. The next target change must measure
-whole-layer BF16 activation flow and accepted-token yield, not infer an
-end-to-end win from dispatch timing.
+The next staged-M8 spike implemented the Apple10 arithmetic shape: prepared
+Q4_K/Q6_K expert planes, BF16 gathered activations and intermediate, a
+dedicated one/two-row column path, and one gate/up dispatch with one simdgroup
+per projection over the same 32 output columns. Gate remains in threadgroup
+memory and the up side writes `BF16(up) * SiLU(BF16(gate))`; down consumes that
+BF16 intermediate and returns F32. Focused Q4_K/Q6_K gate/up/down parity passed.
+
+The first exact downstream run exposed a compact-map storage boundary that the
+focused kernel case had not enforced: map0c inserts one guard entry before each
+expert route list, so a gathered buffer sized for routed rows alone can be
+overrun and stall the command buffer. mlx-native 0.21.5 now rejects that
+undersized extent, and hf2q reserves `routed_rows + experts`; the boundary
+regression passed. The registry-pinned release build then completed the exact
+four-agent repair-turn Q5 with tool calls and cleanup proven.
+
+The original microbenchmark conclusion was invalid because it used
+`K=5120`, `N=1536`, 128 experts rather than Qwen3.6's actual `K=2048`,
+`N=512`, 256 experts. The corrected 18-row probe measured 0.184 ms for one
+prepared projection and 0.255 ms for the one-pass gate/up pair. More
+importantly, matched exact-model traces compare equal selected-row bins rather
+than output-dependent request makespans. Both the staged-M8 and native-control
+four-agent Q5 runs passed all task/tool/cleanup gates (605 and 479
+transactions). Across four-lane bins from 13 through 24 selected rows,
+staged-M8 reduced target verification by 1.27% to 9.42%; at exactly 32 rows it
+reduced 59.464 ms to 52.095 ms (12.39%), and the matched-bin weighted median
+improvement was 4.52%. The route therefore lands opt-in as
+`HF2Q_QWEN_MOE_STAGED_M8=1`, requiring `HF2Q_QWEN_MOE_BATCHED=1`. It is not a
+Splash-parity promotion: its four-lane target median was 43.796 ms versus
+Splash's 17.93 ms target-forward average. Shared-expert grouping, indirect
+live grids and broader BF16 target activation flow remain open.
 
 An unprofiled four-request diagnostic on the exact Qwen3.6 Q4_K_M target then
 separated transaction boundaries from target work without the stage profiler's
