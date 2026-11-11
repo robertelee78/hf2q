@@ -25,7 +25,9 @@ use mlx_native::ops::{
     q_gate_deinterleave::{dispatch_q_gate_deinterleave_f32, QGateDeinterleaveParams},
     qkv_split::{dispatch_qkv_split_f32, QkvSplitParams},
     qmm_affine::{
-        dispatch_qmm_affine_t_packed_simd4_b4, dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16,
+        dispatch_qmm_affine_t_packed_simd4_b4,
+        dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16,
+        dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_silu_mul,
     },
     quantized_matmul_ggml::{dispatch_mm_v2_f16, quantized_matmul_ggml},
     rms_norm::dispatch_rms_norm,
@@ -508,53 +510,73 @@ pub(super) fn dispatch_layer(
         DFlash2ConvolutionStage::Prepare,
     )?;
     encoder.memory_barrier();
-    project(
-        encoder,
-        registry,
-        device,
-        workspace,
-        &tensors.gate_up_projection,
-        &workspace.convolved,
-        &workspace.gate_up,
-        rows,
-        hidden,
-        2 * config.intermediate_size,
-    )?;
-    encoder.memory_barrier();
-    let fused_gate_up =
-        workspace
-            .gate_up
-            .with_shape(vec![rows, 1, 2 * config.intermediate_size])?;
-    let gate = workspace
-        .gate
-        .with_shape(vec![rows, 1, config.intermediate_size])?;
-    let up = workspace
-        .up
-        .with_shape(vec![rows, 1, config.intermediate_size])?;
-    dispatch_q_gate_deinterleave_f32(
-        encoder,
-        registry,
-        device,
-        &fused_gate_up,
-        &gate,
-        &up,
-        QGateDeinterleaveParams {
-            m: u32::try_from(rows)?,
-            n_heads: 1,
-            head_dim: u32::try_from(config.intermediate_size)?,
-        },
-    )?;
-    encoder.memory_barrier();
-    dispatch_silu_mul(
-        encoder,
-        registry,
-        device.metal_device(),
-        &workspace.gate,
-        &workspace.up,
-        &workspace.intermediate,
-        &workspace.silu_params,
-        (rows * config.intermediate_size) as u32,
-    )?;
+    match &tensors.gate_up_projection {
+        DFlash2Projection::Af4G64 { weights, metadata } => {
+            dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_silu_mul(
+                encoder,
+                registry,
+                device.metal_device(),
+                &workspace.convolved,
+                &workspace.af4_table,
+                &workspace.af4_sums,
+                weights,
+                metadata,
+                &workspace.intermediate,
+                u32::try_from(rows)?,
+                u32::try_from(config.intermediate_size)?,
+                u32::try_from(hidden)?,
+            )?;
+        }
+        DFlash2Projection::Dense { .. } => {
+            project(
+                encoder,
+                registry,
+                device,
+                workspace,
+                &tensors.gate_up_projection,
+                &workspace.convolved,
+                &workspace.gate_up,
+                rows,
+                hidden,
+                2 * config.intermediate_size,
+            )?;
+            encoder.memory_barrier();
+            let fused_gate_up =
+                workspace
+                    .gate_up
+                    .with_shape(vec![rows, 1, 2 * config.intermediate_size])?;
+            let gate = workspace
+                .gate
+                .with_shape(vec![rows, 1, config.intermediate_size])?;
+            let up = workspace
+                .up
+                .with_shape(vec![rows, 1, config.intermediate_size])?;
+            dispatch_q_gate_deinterleave_f32(
+                encoder,
+                registry,
+                device,
+                &fused_gate_up,
+                &gate,
+                &up,
+                QGateDeinterleaveParams {
+                    m: u32::try_from(rows)?,
+                    n_heads: 1,
+                    head_dim: u32::try_from(config.intermediate_size)?,
+                },
+            )?;
+            encoder.memory_barrier();
+            dispatch_silu_mul(
+                encoder,
+                registry,
+                device.metal_device(),
+                &workspace.gate,
+                &workspace.up,
+                &workspace.intermediate,
+                &workspace.silu_params,
+                u32::try_from(rows * config.intermediate_size)?,
+            )?;
+        }
+    }
     encoder.memory_barrier();
     project(
         encoder,
