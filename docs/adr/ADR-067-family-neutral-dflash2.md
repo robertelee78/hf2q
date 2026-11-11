@@ -797,6 +797,30 @@ the routed experts in one compact schedule and one gate/up/down dispatch
 sequence; adding a second schedule, gathered-buffer overwrite and barriers is
 the opposite mechanism.
 
+The exact single-schedule variant also failed the performance gate. mlx-native
+experiment `4d2dca2` prepared 256 routed experts plus the shared expert into
+one 257-expert allocation without a model-sized concatenation, appended the
+shared expert as route nine, built one compact schedule, ran one gate/up/down
+dispatch sequence and reduced the final route with the sigmoid shared gate.
+hf2q experiment `143feea4` applied the DFlash2 route mask to all nine routes
+and removed the separate shared projections. Q4_K/Q6_K prepared-tail parity,
+SIMD routing, shared-last reduction, the native all-target check and seven
+focused hf2q MoE tests passed. Two exact four-agent repair-turn Q5 runs also
+passed task, tool and cleanup gates.
+
+Repeated timing did not justify promotion. The two registry/clean staged-M8
+baselines contained 617 four-lane samples with a 45.295 ms aggregate target
+median; the two combined-route runs contained 600 samples with a 45.3565 ms
+median, a 0.136% regression. The median of run medians was effectively flat
+(45.2895 versus 45.3005 ms), while equal-selected-row bins had a 1.41%
+weighted-median regression. Rows 21, 22, 25, 26, 27 and 32 regressed by 2.62%
+to 6.97%. The implementation is preserved on its experiment branches and
+rejected. Splash's shared representation is not an isolated speed lever:
+adding a ninth grouped route trades away the efficient dense shared projection
+at the wider verifier rows. The next target slice must compact the fixed target
+graph to live rows and reduce target weight/dequantization traffic rather than
+rearranging the same shared-expert work.
+
 An unprofiled four-request diagnostic on the exact Qwen3.6 Q4_K_M target then
 separated transaction boundaries from target work without the stage profiler's
 forced waits. With GPU proposal handoff and AF4G64 draft projections active,
