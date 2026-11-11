@@ -348,6 +348,15 @@ without a pinned identity match are likewise unavailable. Gemma has a schema
 and target-weight adapter but no serving transaction yet; DeepSeek has no
 compatible trained checkpoint and remains explicitly unavailable.
 
+The shared runtime and capture descriptor are family-neutral: the runtime has
+no production dependency on Qwen types, and `DFlash2TargetFamily` constructs
+the bounded capture geometry consumed by an explicit family verifier. Qwen is
+the first consumer; the same contract is available to the existing Gemma
+adapter without routing Gemma through Qwen state. The opt-in ADR-065 stage
+profiler also owns a complete DFlash2 cycle and labels the draft command
+separately, so draft, target categories and host gap can be measured without
+changing the default graph.
+
 This is implementation evidence, not full gate closure. The candidate still
 performs the cold-prefill capture conversion through host memory and does not
 overlap grammar simulation with target verification. Real-target width-32
@@ -550,6 +559,57 @@ family-neutral prepared-weight eight-row BF16 register-matrix expert tile over
 every admitted GGUF expert format, not another raw-block scalar tile or generic
 `mm_id` threshold override.
 
+The converter-style prepared-plane M8 spike then passed Q4_K/Q6_K operator
+parity and reduced the best exact four-agent smoke to 28.641453 seconds. A
+dedicated one/two-route register column tile and a one-time F32-to-F16 input
+gather also passed their kernel gates, but the gathered variant completed the
+same smoke in 32.553126 seconds. Both remain rejected: even the best prepared
+result is 1.744x Splash's 16.420344-second median, and the gathered route
+regresses that prepared baseline.
+
+A complete audit of pinned Splash found two orthogonal graph differences.
+`DraftCheckpoint.cpp:28-41,58-93` repacks every draft projection from source
+BF16 into `GGUF_FMT_AF4G64` planes; norms, convolution kernels and selector
+codebooks alone remain BF16. It also concatenates Q/K/V rows into one projection
+and executes gate/up through a fused epilogue. hf2q currently uploads every
+draft projection as BF16, retaining a 3.85 GB drafter and issuing separate Q,
+K, V, gate and up projections. AF4G64's nominal four-bit values use about
+one-quarter of the projection payload before group metadata, making projection
+bandwidth and dispatch shape the primary draft differential rather than only an
+activation-precision difference.
+The exact Qwen3.6 checkpoint is 1,052,513,456 bytes: 797,966,336 bytes
+are projection tensors and 254,536,704 bytes are retained BF16 tensors.
+At 36 bytes per 64 values, an equivalent packed projection payload is
+224,428,032 bytes and the complete tensor payload is about 479 MB.
+
+`Runtime.cpp:3037-3092` also encodes the draft forward, GPU proposal and
+verify-row selection, target input embedding, target verify, acceptance, target
+commit and draft commit into one Metal command graph and submits it once. hf2q
+currently waits for the draft, reads proposals and row counts on the host,
+submits target verify, plans acceptance on the host, commits target state, then
+submits the draft-context commit. Splash keeps target activations and MoE
+outputs in BF16; hf2q's Qwen target graph is predominantly F32. Representative
+hf2q prepared-plane traces spend about 9.5 ms in the draft and 20.8-24.8 ms in
+one-lane target verify, or 39-49 ms in four-lane target verify. The next spike
+must therefore quantify the draft projection categories, then replace the BF16
+draft projection path with a source-bound quantized fused-QKV/fused-gate-up
+path before attempting the larger GPU-resident cycle transaction. Another
+expert threshold, scalar tile or activation-gather change cannot qualify from
+the measured evidence.
+
+The opt-in stage profiler then passed the realistic Qwen3.6 four-agent Q5
+smoke with cleanup proven
+(`qwen36-dflash2-stage-profile-v1/receipt.json`). Across complete decode
+rounds, the median draft GPU command was stable at 9.318-9.359 ms for widths
+one through four. Median classified target GPU time was about 19.0 ms at width
+one and 42.8 ms at width four; width-four MoE alone was 22.769 ms. The
+profile-only category waits inflate median wall time to 67.845 ms at width one
+and 97.876 ms at width four, so those wall values are attribution evidence,
+not performance claims. The result confirms both independent work fronts:
+quantized/fused draft projections must attack the fixed 9.3 ms command, while
+prepared target kernels, BF16 target activations and the single transaction
+must close the wider target and synchronization gap.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,
@@ -566,12 +626,15 @@ for:
 
 Qwen3.8's mechanism gate is at least 5.304 accepted-plus-bonus tokens per
 lane-cycle on the matched workload without a quality or task regression. The
-operator replaced its unavailable valid-Splash denominator with this
-source-bound absolute gate on 2026-11-10; failed Splash output remains evidence,
-not a Win. Qwen3.8 must also finish at least 5% sooner than v0.1.29, with the
-candidate/stock 95% CI upper ratio at most 0.95, and reach statistical parity
-with every valid same-artifact peer, with each candidate/peer upper ratio at
-most 1.00.
+17 completed Splash runs form an independently valid arm despite the separate
+peer arm's failure: Splash's median is 16.420344 seconds, with no Splash-arm
+failure. Promotion therefore requires candidate/Splash statistical parity,
+with the candidate/Splash 95% CI upper ratio at most 1.00. Qwen3.8 must also
+finish at least 5% sooner than v0.1.29, with the candidate/stock 95% CI upper
+ratio at most 0.95, and reach statistical parity with every other valid
+same-artifact peer, with each candidate/peer upper ratio at most 1.00. The
+absolute mechanism gate remains necessary but cannot substitute for the valid
+Splash arm.
 
 Every additional family preregisters its own mechanism and end-to-end gates
 against spec-off, stock and valid peers before seeing candidate results. It
@@ -609,8 +672,10 @@ not qualify the adapter.
   target families must fail closed until identity-matched weights with
   reproducible provenance exist; support cannot be inferred from a nearby
   model.
-- **Comparator validity:** the failed Qwen3.8 Splash campaign remains invalid.
-  The operator-approved absolute mechanism gate does not relabel it.
+- **Comparator validity:** the overall Qwen3.8 campaign is invalid because its
+  separate peer arm failed, but the 17/17 completed Splash arm is independently
+  valid and binding. Neither the absolute mechanism gate nor another peer can
+  waive candidate/Splash parity.
 
 ## Operator decision
 
@@ -638,3 +703,19 @@ The implementation may begin under this amended contract. Missing family
 weights are an explicit unavailable prerequisite, never permission for an
 approximate adapter, fabricated checkpoint, quality waiver or external
 production fallback.
+
+On 2026-11-11 the operator approved adopting the source-backed Splash-class
+execution strategy rather than continuing threshold tuning: a packed
+four-bit-class draft projection store, fused Q/K/V, fused gate/up, BF16 target
+activations where parity permits, and one GPU-resident draft-to-commit
+transaction. The first isolated candidate uses hf2q's owned Q4_K quantizer
+because its 4.5-bit payload density matches AF4G64 and its kernels already have
+width-32 coverage. Each step remains default-off until its own exact checkpoint,
+quality, acceptance, memory and end-to-end peer gates pass. Cross-family support
+still requires an exact family adapter and compatible trained checkpoint; this
+decision does not authorize routing another architecture through Qwen state.
+
+The operator further clarified on 2026-11-11 that a DFlash2 candidate slower
+than the valid Splash arm must not be promoted. This supersedes the temporary
+unavailable-Splash substitution in item 2 above now that a valid Splash arm
+exists; it does not relax the absolute mechanism, stock or other peer gates.

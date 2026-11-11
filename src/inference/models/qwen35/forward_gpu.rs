@@ -84,9 +84,7 @@ use mlx_native::ops::rms_norm;
 /// Joint B-row decode shares this module's thread-local weight cache.
 #[path = "joint_decode.rs"]
 mod joint_decode;
-pub(crate) use joint_decode::{
-    DFlash2JointCapture, Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput,
-};
+pub(crate) use joint_decode::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput};
 
 /// Joint MTP verify windows and their replay commit run the joint graph.
 #[path = "joint_verify.rs"]

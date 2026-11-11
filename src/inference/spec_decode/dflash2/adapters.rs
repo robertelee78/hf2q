@@ -7,17 +7,26 @@ use super::{
     workspace::DFlash2Workspace,
 };
 use crate::{
-    inference::models::{
-        gemma4::model::MlxModelWeights,
-        qwen35::{model::Qwen35Model, DFlash2JointCapture},
-    },
+    inference::models::{gemma4::model::MlxModelWeights, qwen35::model::Qwen35Model},
     serve::forward_mlx_shared::MlxQWeight,
 };
 use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::dflash2_attention_pack::{
     dispatch_dflash2_mask_rows_f32, DFlash2MaskRowsParams,
 };
-use mlx_native::{CommandEncoder, GgmlType, KernelRegistry, MlxDevice};
+use mlx_native::{CommandEncoder, GgmlType, KernelRegistry, MlxBuffer, MlxDevice};
+
+/// Family-neutral target hidden-capture destination for one packed verify.
+#[derive(Clone, Copy)]
+pub struct DFlash2TargetCapture<'a> {
+    pub layer_ids: &'a [usize],
+    pub output: &'a MlxBuffer,
+    /// Physical draft-ring lane for each packed target window.
+    pub lane_indices: &'a [usize],
+    pub lanes: usize,
+    pub rows_per_lane: usize,
+    pub feature_width: usize,
+}
 
 pub trait DFlash2TargetFamily {
     fn family_name(&self) -> &'static str;
@@ -33,6 +42,30 @@ pub trait DFlash2TargetFamily {
         false
     }
 
+    fn target_capture<'a>(
+        &self,
+        config: &'a DFlash2Config,
+        workspace: &'a DFlash2Workspace,
+        lane_indices: &'a [usize],
+    ) -> Result<DFlash2TargetCapture<'a>> {
+        ensure!(
+            workspace.rows_per_lane == config.block_size
+                && workspace.max_lanes <= 4
+                && config.fc_input_dim()
+                    == config.target_layer_ids.len() * self.target_shape().hidden_size,
+            "DFlash2 {} target capture geometry does not match its workspace",
+            self.family_name()
+        );
+        Ok(DFlash2TargetCapture {
+            layer_ids: &config.target_layer_ids,
+            output: &workspace.captured_target_hidden,
+            lane_indices,
+            lanes: workspace.max_lanes,
+            rows_per_lane: workspace.rows_per_lane,
+            feature_width: config.fc_input_dim(),
+        })
+    }
+
     fn validate(&self, config: &DFlash2Config) -> Result<()> {
         config
             .validate_target(self.target_shape())
@@ -42,38 +75,15 @@ pub trait DFlash2TargetFamily {
 
 pub struct QwenDFlash2Adapter<'a> {
     model: &'a Qwen35Model,
-    config: &'a DFlash2Config,
 }
 
 impl<'a> QwenDFlash2Adapter<'a> {
-    pub fn new(model: &'a Qwen35Model, config: &'a DFlash2Config) -> Result<Self> {
-        let adapter = Self { model, config };
+    pub fn new(model: &'a Qwen35Model, config: &DFlash2Config) -> Result<Self> {
+        let adapter = Self { model };
         adapter.validate(config)?;
         adapter.embedding()?;
         adapter.vocabulary_head()?;
         Ok(adapter)
-    }
-
-    pub fn target_capture<'b>(
-        &'b self,
-        workspace: &'b DFlash2Workspace,
-        lane_indices: &'b [usize],
-    ) -> Result<DFlash2JointCapture<'b>> {
-        ensure!(
-            workspace.rows_per_lane == self.config.block_size
-                && workspace.max_lanes <= 4
-                && self.config.fc_input_dim()
-                    == self.config.target_layer_ids.len() * self.model.cfg.hidden_size as usize,
-            "Qwen DFlash2 target capture geometry does not match its workspace"
-        );
-        Ok(DFlash2JointCapture {
-            layer_ids: &self.config.target_layer_ids,
-            output: &workspace.captured_target_hidden,
-            lane_indices,
-            lanes: workspace.max_lanes,
-            rows_per_lane: workspace.rows_per_lane,
-            feature_width: self.config.fc_input_dim(),
-        })
     }
 }
 

@@ -61,6 +61,7 @@ use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35Model};
 use crate::inference::models::qwen35::moe_batched::build_moe_ffn_layer_gpu_batched_into;
 use crate::inference::models::qwen35::spec_decode::nth_hidden_row;
 use crate::inference::models::qwen35::Qwen35Config;
+use crate::inference::spec_decode::dflash2::adapters::DFlash2TargetCapture;
 use crate::serve::multi_seq_kv::SlotId;
 
 /// What the caller needs back for one joint row.
@@ -129,16 +130,6 @@ pub(super) struct JointPacking<'a> {
     pub width: usize,
 }
 
-#[derive(Clone, Copy)]
-pub struct DFlash2JointCapture<'a> {
-    pub layer_ids: &'a [usize],
-    pub output: &'a MlxBuffer,
-    /// Physical draft-ring lane for each packed target window.
-    pub lane_indices: &'a [usize],
-    pub lanes: usize,
-    pub rows_per_lane: usize,
-    pub feature_width: usize,
-}
 
 fn plan_joint_routes(
     mode: JointRouteMode,
@@ -479,7 +470,7 @@ impl Qwen35Model {
         dense_ffn: JointDenseFfnRoute,
         options: JointStepOptions,
         mut replay: Option<&mut DeltaNetReplay>,
-        capture: Option<DFlash2JointCapture<'_>>,
+        capture: Option<DFlash2TargetCapture<'_>>,
     ) -> Result<(Vec<Qwen35JointRowOutput>, MlxBuffer)> {
         let arena_setup = crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
         let cfg = &self.cfg;

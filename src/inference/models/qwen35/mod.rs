@@ -76,8 +76,8 @@ pub(crate) mod joint_step_options;
 #[cfg(test)]
 pub(crate) mod joint_verify_tests;
 pub(crate) use forward_gpu::{
-    DFlash2JointCapture, Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput,
-    Qwen35JointVerify, Qwen35JointVerifyLane, Qwen35JointVerifyPending,
+    Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput, Qwen35JointVerify,
+    Qwen35JointVerifyLane, Qwen35JointVerifyPending,
 };
 #[cfg(test)]
 mod real_artifact_joint_decode_tests;

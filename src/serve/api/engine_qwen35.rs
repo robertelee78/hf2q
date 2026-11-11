@@ -1212,7 +1212,7 @@ impl Qwen35LoadedModel {
                 slot_id,
             )?;
             self.model.with_gpu_cache_mut(|device, registry| {
-                runtime.ingest_qwen_capture(
+                runtime.ingest_target_capture(
                     device,
                     registry,
                     &capture,

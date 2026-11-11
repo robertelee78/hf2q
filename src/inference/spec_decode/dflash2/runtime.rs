@@ -7,9 +7,7 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use super::forward::dispatch_layer;
 use super::{
-    adapters::{
-        dispatch_dflash2_input, target_vocabulary_head, DFlash2TargetFamily, QwenDFlash2Adapter,
-    },
+    adapters::{dispatch_dflash2_input, target_vocabulary_head, DFlash2TargetFamily},
     config::DFlash2Config,
     forward::{
         dispatch_dflash2_context_commit, dispatch_dflash2_forward, prepare_decode_positions,
@@ -21,9 +19,8 @@ use super::{
     weights::DFlash2WeightsFile,
     workspace::DFlash2Workspace,
 };
-use crate::inference::{
-    models::qwen35::DFlash2JointCapture,
-    spec_decode::dflash::hidden_capture::{extract_drafter_concat, DFlashCaptureSession},
+use crate::inference::spec_decode::dflash::hidden_capture::{
+    extract_drafter_concat, DFlashCaptureSession,
 };
 use anyhow::{ensure, Context, Result};
 use mlx_native::{KernelRegistry, MlxDevice};
@@ -141,14 +138,6 @@ impl DFlash2Runtime {
         })
     }
 
-    pub fn qwen_target_capture<'a>(
-        &'a self,
-        adapter: &'a QwenDFlash2Adapter<'a>,
-        lane_indices: &'a [usize],
-    ) -> Result<DFlash2JointCapture<'a>> {
-        adapter.target_capture(&self.workspace, lane_indices)
-    }
-
     /// Execute one physical anchor-plus-seven-proposal graph for every slot.
     /// Inactive slots use a retained count of zero at commit; their rings do not
     /// change. The caller owns the small proposal readback and target verify.
@@ -221,7 +210,7 @@ impl DFlash2Runtime {
             maximum_verify_rows,
         )?;
         encoder
-            .commit_and_wait()
+            .commit_and_wait_labeled("adr067.dflash2_draft")
             .context("execute DFlash2 draft cycle")?;
         Ok(())
     }
@@ -308,7 +297,7 @@ impl DFlash2Runtime {
     /// The legacy capture is CPU layer-major. This method performs the one
     /// layout conversion, then projects and commits bounded eight-row chunks
     /// through the same transaction used after target verification.
-    pub fn ingest_qwen_capture(
+    pub fn ingest_target_capture(
         &mut self,
         device: &MlxDevice,
         registry: &mut KernelRegistry,
@@ -338,7 +327,7 @@ impl DFlash2Runtime {
             capture.seq_len,
             capture.hidden_size,
         )
-        .context("convert Qwen target capture to DFlash2 concat layout")?;
+        .context("convert target capture to DFlash2 concat layout")?;
         let feature_width = self.config.fc_input_dim();
         ensure!(
             concatenated.len() == capture.seq_len * feature_width,
@@ -454,6 +443,7 @@ impl DFlash2Runtime {
 mod tests {
     use super::*;
     use crate::inference::models::qwen35::model::Qwen35Model;
+    use crate::inference::spec_decode::dflash2::adapters::QwenDFlash2Adapter;
     use crate::inference::spec_decode::dflash2::schema::QWEN36_DFLASH2;
     use crate::serve::header::LoadProgress;
     use half::bf16;
@@ -710,7 +700,7 @@ mod tests {
                                 target_hidden,
                                 &config.target_layer_ids,
                             );
-                            runtime.ingest_qwen_capture(device, registry, &capture, lane, 0)?;
+                            runtime.ingest_target_capture(device, registry, &capture, lane, 0)?;
                         }
                     }
                     for lane in 0..lanes {
@@ -721,7 +711,7 @@ mod tests {
                             target_hidden,
                             &config.target_layer_ids,
                         );
-                        runtime.ingest_qwen_capture(
+                        runtime.ingest_target_capture(
                             device,
                             registry,
                             &capture,

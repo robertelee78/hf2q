@@ -36,7 +36,6 @@ use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::MlxBuffer;
 
 use super::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput};
-use crate::inference::models::qwen35::forward_gpu::joint_decode::DFlash2JointCapture;
 use crate::inference::models::qwen35::joint_decode_core::{
     encode_delta_net_replay, rows_view, DeltaNetReplay, JointWindow,
 };
@@ -48,6 +47,7 @@ use crate::inference::models::qwen35::joint_projection::JointProjectionKernel;
 use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
 use crate::inference::models::qwen35::model::Qwen35Model;
+use crate::inference::spec_decode::dflash2::adapters::DFlash2TargetCapture;
 use crate::serve::multi_seq_kv::SlotId;
 
 /// One lane of a joint verify step.
@@ -177,7 +177,7 @@ impl Qwen35Model {
         mode: JointRouteMode,
         dense_ffn: JointDenseFfnRoute,
         options: JointStepOptions,
-        capture: Option<DFlash2JointCapture<'_>>,
+        capture: Option<DFlash2TargetCapture<'_>>,
     ) -> Result<Qwen35JointVerify> {
         self.forward_gpu_joint_verify_layout(
             lanes,
@@ -199,7 +199,7 @@ impl Qwen35Model {
         dense_ffn: JointDenseFfnRoute,
         options: JointStepOptions,
         layout: VerifyLayout,
-        capture: Option<DFlash2JointCapture<'_>>,
+        capture: Option<DFlash2TargetCapture<'_>>,
     ) -> Result<Qwen35JointVerify> {
         ensure!(
             !lanes.is_empty(),
