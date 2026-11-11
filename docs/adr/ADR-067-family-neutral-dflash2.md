@@ -625,6 +625,28 @@ Splash's valid 16.420344-second median. The next spike must combine packed
 prepared planes with fused Q/K/V and gate/up execution; payload density alone
 is insufficient.
 
+The prepared target-MoE spike repacked Q4_K/Q6_K expert rows into Metal
+tensor planes and gathered target activations as BF16. Its production-shape
+microbenchmark reduced one Qwen3.6 gate projection from 1.086 ms to 0.875 ms
+(19.4%). The BF16 route passed a realistic four-agent Q5 run with cleanup
+proven, but changed numerical outputs relative to the F32 authority by
+0.17-0.22% relative RMSE in the focused kernel cases. Its standalone Q5
+makespan was 37.231 seconds and the combined packed-draft run was 40.826
+seconds; these unpaired, output-dependent samples do not establish an
+end-to-end win. The route therefore remains isolated until a matched quality
+and performance campaign can qualify it.
+
+A separate checked asynchronous target-context submission spike retained the
+in-flight command encoder, observed its error at the next same-queue draft
+wait, and drained it before capture overwrite, lane clear, or runtime drop.
+Twenty-five focused DFlash2 tests and realistic profiled and unprofiled Q5
+runs passed with cleanup proven. At width four, however, the topology-distorted
+profile median moved only from 97.876 ms to 97.460 ms, while median host gap
+moved from 44.518 ms to 43.784 ms. A 0.43% profile-wall change is not a
+qualifying end-to-end result. Asynchronous tail submission alone is rejected;
+the accepted design still requires GPU-resident proposals, target verify,
+acceptance, and both commits in one transaction.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,
