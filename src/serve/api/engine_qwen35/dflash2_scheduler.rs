@@ -119,6 +119,12 @@ impl Qwen35DecodeState {
         })
     }
 
+    fn gpu_greedy_acceptance_eligible(&self, window: &Qwen35DFlash2Window) -> bool {
+        window.greedy
+            && super::shadow_draft::verify_transforms_clear(self)
+            && super::is_qwen_server_speculation_exact_eligible(&self.params)
+    }
+
     fn plan_dflash2_window(
         &self,
         qwen: &Qwen35LoadedModel,
@@ -379,6 +385,12 @@ impl Qwen35LoadedModel {
             .iter()
             .map(|&index| states[index].slot_id.0 as usize)
             .collect::<Vec<_>>();
+        let gpu_acceptance = gpu_target_tokens
+            && verifying.iter().all(|&index| {
+                states[index].gpu_greedy_acceptance_eligible(
+                    windows[index].as_ref().expect("verified window"),
+                )
+            });
         let verify_lanes = verifying
             .iter()
             .map(|&index| {
@@ -403,6 +415,21 @@ impl Qwen35LoadedModel {
         let verify_started = Instant::now();
         let lease = supervisor.arm("Qwen35 DFlash2 verify", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
         let verify = if gpu_target_tokens {
+            let mut output_tail =
+                |encoder: &mut mlx_native::CommandEncoder,
+                 registry: &mut mlx_native::KernelRegistry,
+                 device: &mlx_native::MlxDevice,
+                 target_tokens: &mlx_native::MlxBuffer| {
+                    runtime.encode_gpu_acceptance_and_context(
+                        encoder,
+                        registry,
+                        device,
+                        target_tokens,
+                        &target_lane_order,
+                        &maximum_rows,
+                        &self.eos_token_ids,
+                    )
+                };
             self.model.forward_gpu_dflash2_verify_from_gpu_tokens(
                 &verify_lanes,
                 &runtime.workspace.target_tokens,
@@ -411,6 +438,7 @@ impl Qwen35LoadedModel {
                 forward.dense_ffn,
                 forward.options,
                 Some(capture),
+                gpu_acceptance.then_some(&mut output_tail),
             )
         } else {
             self.model.forward_gpu_dflash2_verify(
@@ -425,13 +453,16 @@ impl Qwen35LoadedModel {
         let verify = lease.finish().and(verify);
         let verify_elapsed = verify_started.elapsed();
         let verify_micros = trace_timing.then(|| verify_elapsed.as_micros());
+        // GPU acceptance has already committed the draft context when verify
+        // returns. Any later failure must stop the worker rather than continue
+        // with host and draft cursors that may differ.
         let Qwen35JointVerify {
             rows,
             hidden: _,
             pending,
         } = match verify {
             Ok(verify) => verify,
-            Err(error) if is_fatal(&error) => return Err(error),
+            Err(error) if gpu_acceptance || is_fatal(&error) => return Err(error),
             Err(error) => {
                 distribute_error(&mut ticks, &verifying, error);
                 return Ok(finish_ticks(ticks));
@@ -485,6 +516,24 @@ impl Qwen35LoadedModel {
             });
             verified.push(step);
         }
+        if gpu_acceptance {
+            let (gpu_retained, gpu_accepted) = runtime.gpu_acceptance_counts()?;
+            for (&index, step) in verifying.iter().zip(&verified) {
+                let slot = states[index].slot_id.0 as usize;
+                let (host_retained, host_accepted) = match step {
+                    Verified::Window { plan, .. } => (plan.accepted(), plan.plan.matched_drafts),
+                    Verified::Failed(_) => (0, 0),
+                };
+                anyhow::ensure!(
+                    gpu_retained[slot] as usize == host_retained
+                        && gpu_accepted[slot] as usize == host_accepted,
+                    "Qwen DFlash2 GPU acceptance mismatch for slot {slot}: \
+                     GPU retained/accepted={}/{}, host={host_retained}/{host_accepted}",
+                    gpu_retained[slot],
+                    gpu_accepted[slot]
+                );
+            }
+        }
         let plan_micros = plan_started.map(|started| started.elapsed().as_micros());
 
         let target_commit_started = trace_timing.then(Instant::now);
@@ -494,7 +543,7 @@ impl Qwen35LoadedModel {
         let target_commit_micros =
             target_commit_started.map(|started| started.elapsed().as_micros());
         if let Err(error) = committed {
-            if is_fatal(&error) {
+            if gpu_acceptance || is_fatal(&error) {
                 return Err(error);
             }
             distribute_error(&mut ticks, &verifying, error);
@@ -509,13 +558,17 @@ impl Qwen35LoadedModel {
             "Qwen35 DFlash2 target-context commit",
             QWEN35_WORKER_TRANSACTION_TIMEOUT,
         )?;
-        let context_committed = self.model.with_gpu_cache_mut(|device, registry| {
-            runtime.commit_target_context(device, registry, &retained)
-        });
+        let context_committed = if gpu_acceptance {
+            runtime.settle_gpu_context_lengths(&retained)
+        } else {
+            self.model.with_gpu_cache_mut(|device, registry| {
+                runtime.commit_target_context(device, registry, &retained)
+            })
+        };
         let context_committed = lease.finish().and(context_committed);
         let draft_commit_micros = draft_commit_started.map(|started| started.elapsed().as_micros());
         if let Err(error) = context_committed {
-            if is_fatal(&error) {
+            if gpu_acceptance || is_fatal(&error) {
                 return Err(error);
             }
             distribute_error(&mut ticks, &verifying, error);
@@ -562,6 +615,7 @@ impl Qwen35LoadedModel {
                 active_lanes = verifying.len(),
                 selected_rows = selected_rows.unwrap_or_default(),
                 accepted_rows = accepted.iter().sum::<usize>(),
+                gpu_acceptance,
                 draft_us = draft_micros.unwrap_or_default(),
                 target_verify_us = verify_micros.unwrap_or_default(),
                 host_plan_us = plan_micros.unwrap_or_default(),
@@ -753,6 +807,26 @@ mod tests {
             [9, 10, 11]
         );
         assert_eq!(plan.plan.valid_input_tokens, 3);
+    }
+
+    #[test]
+    fn gpu_acceptance_requires_transform_free_exact_greedy_semantics() {
+        let qwen = loaded_model(QwenSpeculationPolicy::Off);
+        let mut state = decode_state(&qwen, 8);
+        let window = Qwen35DFlash2Window {
+            pending_token: 8,
+            position: 4,
+            greedy: true,
+            maximum_rows: 8,
+        };
+        assert!(state.gpu_greedy_acceptance_eligible(&window));
+
+        state.params.repetition_penalty = 1.05;
+        assert!(!state.gpu_greedy_acceptance_eligible(&window));
+
+        state.params.repetition_penalty = 1.0;
+        state.params.stop_strings.push("stop".to_owned());
+        assert!(!state.gpu_greedy_acceptance_eligible(&window));
     }
 
     #[test]

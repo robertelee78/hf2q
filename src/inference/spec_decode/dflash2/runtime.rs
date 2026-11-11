@@ -23,7 +23,12 @@ use crate::inference::spec_decode::dflash::hidden_capture::{
     extract_drafter_concat, DFlashCaptureSession,
 };
 use anyhow::{bail, ensure, Context, Result};
-use mlx_native::{KernelRegistry, MlxDevice};
+use mlx_native::{
+    ops::dflash2_selector::{
+        dispatch_dflash2_accept_greedy, DFlash2GreedyAcceptanceParams, DFLASH2_MAX_LANES,
+    },
+    CommandEncoder, KernelRegistry, MlxBuffer, MlxDevice,
+};
 
 const GPU_TARGET_TOKENS_ENV: &str = "HF2Q_DFLASH2_GPU_TARGET_TOKENS";
 
@@ -44,9 +49,9 @@ fn resolve_gpu_target_tokens(
             "{GPU_TARGET_TOKENS_ENV}=1 is not qualified for DFlash2 adapter {:?}",
             descriptor.family_adapter
         ),
-        Some(value) => bail!(
-            "{GPU_TARGET_TOKENS_ENV} must be one of 0/off/false/1/on/true, got {value:?}"
-        ),
+        Some(value) => {
+            bail!("{GPU_TARGET_TOKENS_ENV} must be one of 0/off/false/1/on/true, got {value:?}")
+        }
     }
 }
 
@@ -501,7 +506,7 @@ impl DFlash2Runtime {
             self.config.block_size
         );
         self.workspace
-            .verify_rows
+            .retained_counts
             .as_mut_slice::<u32>()?
             .copy_from_slice(retained_counts);
         let mut encoder = device
@@ -513,12 +518,106 @@ impl DFlash2Runtime {
             device,
             &self.config,
             &self.tensors,
-            &self.workspace.verify_rows,
+            &self.workspace.retained_counts,
             &self.workspace,
         )?;
         encoder
             .commit_and_wait()
             .context("commit DFlash2 target context")?;
+        for (length, retained) in self.lane_lengths.iter_mut().zip(retained_counts) {
+            *length = length
+                .checked_add(*retained as usize)
+                .context("DFlash2 lane length overflow")?;
+        }
+        Ok(())
+    }
+
+    /// Append greedy acceptance and draft-context settlement to the target
+    /// output-head command. The caller owns the command's completion boundary
+    /// and must validate the GPU counts before committing host state.
+    pub(crate) fn encode_gpu_acceptance_and_context(
+        &self,
+        encoder: &mut CommandEncoder,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        target_tokens: &MlxBuffer,
+        target_lane_order: &[u32],
+        maximum_rows: &[u32],
+        eos_tokens: &[u32],
+    ) -> Result<()> {
+        ensure!(
+            !target_lane_order.is_empty()
+                && target_lane_order.len() <= DFLASH2_MAX_LANES
+                && maximum_rows.len() == self.workspace.max_lanes,
+            "invalid DFlash2 GPU acceptance lane geometry"
+        );
+        ensure!(
+            !eos_tokens.is_empty() && eos_tokens.len() <= 8,
+            "DFlash2 GPU acceptance requires 1..=8 EOS tokens"
+        );
+        let mut physical_lane = [0_u32; DFLASH2_MAX_LANES];
+        let mut maximum = [0_u32; DFLASH2_MAX_LANES];
+        for (logical, &physical) in target_lane_order.iter().enumerate() {
+            let physical_index = physical as usize;
+            ensure!(
+                physical_index < self.workspace.max_lanes
+                    && !physical_lane[..logical].contains(&physical),
+                "invalid DFlash2 GPU acceptance physical lane {physical}"
+            );
+            physical_lane[logical] = physical;
+            maximum[logical] = maximum_rows[physical_index];
+        }
+        let mut eos_token = [0_u32; 8];
+        eos_token[..eos_tokens.len()].copy_from_slice(eos_tokens);
+        dispatch_dflash2_accept_greedy(
+            encoder,
+            registry,
+            device,
+            &self.workspace.proposed_tokens,
+            target_tokens,
+            &self.workspace.verify_rows,
+            &self.workspace.retained_counts,
+            &self.workspace.accepted_counts,
+            DFlash2GreedyAcceptanceParams {
+                physical_lane,
+                maximum,
+                eos_token,
+                physical_lanes: self.workspace.max_lanes as u32,
+                lanes: target_lane_order.len() as u32,
+                rows_per_lane: self.config.block_size as u32,
+                width: target_tokens.element_count() as u32,
+                eos_count: eos_tokens.len() as u32,
+            },
+        )
+        .context("encode DFlash2 greedy GPU acceptance")?;
+        encoder.memory_barrier();
+        dispatch_dflash2_context_commit(
+            encoder,
+            registry,
+            device,
+            &self.config,
+            &self.tensors,
+            &self.workspace.retained_counts,
+            &self.workspace,
+        )
+        .context("encode DFlash2 GPU-resident target context commit")
+    }
+
+    pub(crate) fn gpu_acceptance_counts(&self) -> Result<(&[u32], &[u32])> {
+        Ok((
+            self.workspace.retained_counts.as_slice::<u32>()?,
+            self.workspace.accepted_counts.as_slice::<u32>()?,
+        ))
+    }
+
+    pub(crate) fn settle_gpu_context_lengths(&mut self, retained_counts: &[u32]) -> Result<()> {
+        ensure!(
+            retained_counts.len() == self.workspace.max_lanes
+                && retained_counts
+                    .iter()
+                    .all(|count| (*count as usize) <= self.config.block_size),
+            "invalid DFlash2 GPU retained counts {retained_counts:?}"
+        );
         for (length, retained) in self.lane_lengths.iter_mut().zip(retained_counts) {
             *length = length
                 .checked_add(*retained as usize)
@@ -683,7 +782,9 @@ mod tests {
                 let mut expected_target_tokens = vec![1_u32];
                 expected_target_tokens.extend_from_slice(runtime.proposals()?);
                 ensure!(
-                    runtime.workspace.target_tokens.as_slice::<u32>()? == expected_target_tokens,
+                    runtime.workspace.target_tokens.as_slice::<u32>()?
+                        [..expected_target_tokens.len()]
+                        == expected_target_tokens,
                     "real DFlash2 GPU target tile did not contain anchor plus proposals"
                 );
                 Ok(())

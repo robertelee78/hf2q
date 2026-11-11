@@ -35,6 +35,7 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::MlxBuffer;
 
+use super::joint_decode::JointOutputHeadTail;
 use super::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput};
 use crate::inference::models::qwen35::joint_decode_core::{
     encode_delta_net_replay, rows_view, DeltaNetReplay, JointWindow,
@@ -156,6 +157,7 @@ impl Qwen35Model {
             VerifyLayout::JointMtp,
             None,
             None,
+            None,
         )
     }
 
@@ -189,6 +191,7 @@ impl Qwen35Model {
             VerifyLayout::DFlash2,
             None,
             capture,
+            None,
         )
     }
 
@@ -205,6 +208,7 @@ impl Qwen35Model {
         dense_ffn: JointDenseFfnRoute,
         options: JointStepOptions,
         capture: Option<DFlash2TargetCapture<'_>>,
+        output_tail: Option<&mut JointOutputHeadTail<'_>>,
     ) -> Result<Qwen35JointVerify> {
         self.forward_gpu_joint_verify_layout(
             lanes,
@@ -215,6 +219,7 @@ impl Qwen35Model {
             VerifyLayout::DFlash2,
             Some(target_tokens),
             capture,
+            output_tail,
         )
     }
 
@@ -229,6 +234,7 @@ impl Qwen35Model {
         layout: VerifyLayout,
         gpu_token_ids: Option<&MlxBuffer>,
         capture: Option<DFlash2TargetCapture<'_>>,
+        output_tail: Option<&mut JointOutputHeadTail<'_>>,
     ) -> Result<Qwen35JointVerify> {
         ensure!(
             !lanes.is_empty(),
@@ -367,6 +373,7 @@ impl Qwen35Model {
                     gpu_token_ids,
                     replay.as_mut(),
                     capture,
+                    output_tail,
                 )?;
                 Ok((outputs, normed, replay))
             },

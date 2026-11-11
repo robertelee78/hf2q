@@ -112,6 +112,9 @@ pub(crate) struct Qwen35JointRowOutput {
     pub nextn_hidden: Option<MlxBuffer>,
 }
 
+pub(super) type JointOutputHeadTail<'a> =
+    dyn FnMut(&mut CommandEncoder, &mut KernelRegistry, &MlxDevice, &MlxBuffer) -> Result<()> + 'a;
+
 enum LayerRoutes {
     Full(FullAttnRoutes),
     Linear(DeltaNetRoutes),
@@ -367,6 +370,7 @@ impl Qwen35Model {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .map(|(outputs, _normed)| outputs)
             },
@@ -475,6 +479,7 @@ impl Qwen35Model {
         gpu_token_ids: Option<&MlxBuffer>,
         mut replay: Option<&mut DeltaNetReplay>,
         capture: Option<DFlash2TargetCapture<'_>>,
+        mut output_tail: Option<&mut JointOutputHeadTail<'_>>,
     ) -> Result<(Vec<Qwen35JointRowOutput>, MlxBuffer)> {
         let arena_setup = crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
         let cfg = &self.cfg;
@@ -933,29 +938,51 @@ impl Qwen35Model {
             }
         }
         enc.memory_barrier();
-        let argmax_params = host_buffer(device, DType::U32, &[cfg.vocab_size], "argmax params")?;
-        let mut argmax = Vec::with_capacity(rows.len());
-        for (row, input) in rows.iter().enumerate() {
-            if !input.output.wants_argmax() {
-                argmax.push(None);
-                continue;
-            }
-            let index = decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
-                .map_err(|e| anyhow!("allocate Qwen joint argmax index: {e}"))?;
-            let value = decode_pool::pooled_alloc_buffer(device, 4, DType::F32, vec![1])
-                .map_err(|e| anyhow!("allocate Qwen joint argmax value: {e}"))?;
-            dispatch_argmax_f32(
-                &mut enc,
-                registry,
-                device.metal_device(),
-                &row_view(&logits, row, vec![1, vocab])?,
-                &index,
-                &value,
-                &argmax_params,
-                cfg.vocab_size,
+        let argmax = if rows.iter().any(|row| row.output.wants_argmax()) {
+            let params = host_buffer(device, DType::U32, &[cfg.vocab_size], "argmax params")?;
+            let indices = decode_pool::pooled_alloc_buffer(
+                device,
+                rows.len() * DType::U32.size_of(),
+                DType::U32,
+                vec![rows.len()],
             )
-            .with_context(|| format!("Qwen joint argmax row {row}"))?;
-            argmax.push(Some((index, value)));
+            .map_err(|e| anyhow!("allocate Qwen joint argmax indices: {e}"))?;
+            let values = decode_pool::pooled_alloc_buffer(
+                device,
+                rows.len() * DType::F32.size_of(),
+                DType::F32,
+                vec![rows.len()],
+            )
+            .map_err(|e| anyhow!("allocate Qwen joint argmax values: {e}"))?;
+            for (row, input) in rows.iter().enumerate() {
+                if !input.output.wants_argmax() {
+                    continue;
+                }
+                dispatch_argmax_f32(
+                    &mut enc,
+                    registry,
+                    device.metal_device(),
+                    &row_view(&logits, row, vec![1, vocab])?,
+                    &indices.slice_view((row * DType::U32.size_of()) as u64, 1),
+                    &values.slice_view((row * DType::F32.size_of()) as u64, 1),
+                    &params,
+                    cfg.vocab_size,
+                )
+                .with_context(|| format!("Qwen joint argmax row {row}"))?;
+            }
+            Some((indices, values, params))
+        } else {
+            None
+        };
+        if let Some(tail) = output_tail.as_mut() {
+            ensure!(
+                rows.iter().all(|row| row.output.wants_argmax()),
+                "Qwen joint output-head tail requires greedy output for every row"
+            );
+            let (indices, _values, _params) =
+                argmax.as_ref().context("Qwen joint output-head argmax")?;
+            enc.memory_barrier();
+            tail(&mut enc, registry, device, indices).context("Qwen joint output-head tail")?;
         }
         let head_label = if crate::inference::stage_profile::enabled() {
             "adr065.head"
@@ -970,19 +997,20 @@ impl Qwen35Model {
         let all_logits = logits
             .as_slice::<f32>()
             .map_err(|e| anyhow!("read Qwen joint logits: {e}"))?;
+        let argmax_indices = argmax
+            .as_ref()
+            .map(|(indices, _values, _params)| indices.as_slice::<u32>())
+            .transpose()
+            .map_err(|e| anyhow!("read Qwen joint argmax indices: {e}"))?;
         let outputs = rows
             .iter()
             .enumerate()
-            .zip(argmax)
-            .map(|((row, input), argmax)| -> Result<Qwen35JointRowOutput> {
-                let greedy_token = argmax
-                    .map(|(index, _value)| {
-                        index
-                            .as_slice::<u32>()
-                            .map(|slice| slice[0])
-                            .map_err(|e| anyhow!("read Qwen joint argmax row {row}: {e}"))
-                    })
-                    .transpose()?;
+            .map(|(row, input)| -> Result<Qwen35JointRowOutput> {
+                let greedy_token = if input.output.wants_argmax() {
+                    Some(argmax_indices.context("missing Qwen joint argmax indices")?[row])
+                } else {
+                    None
+                };
                 let logits = input
                     .output
                     .wants_logits()

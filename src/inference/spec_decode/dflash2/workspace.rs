@@ -1,7 +1,7 @@
 //! Bounded, reusable DFlash2 decode workspace.
 
 use super::config::DFlash2Config;
-use mlx_native::{DType, MlxBuffer, MlxDevice, MlxError};
+use mlx_native::{ops::dflash2_selector::DFLASH2_MAX_LANES, DType, MlxBuffer, MlxDevice, MlxError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DFlash2WorkspaceError {
@@ -67,6 +67,8 @@ pub struct DFlash2Workspace {
     pub proposal_probabilities: MlxBuffer,
     pub confidence: MlxBuffer,
     pub verify_rows: MlxBuffer,
+    pub retained_counts: MlxBuffer,
+    pub accepted_counts: MlxBuffer,
     allocated_bytes: usize,
 }
 
@@ -337,7 +339,15 @@ impl DFlash2Workspace {
             &[lanes, positions],
             &mut allocated_bytes,
         )?;
-        let target_tokens = allocate(device, DType::U32, &[lanes * block], &mut allocated_bytes)?;
+        // Target verification always uses the canonical width-32 tile, even
+        // when the worker owns fewer than four physical draft lanes. The
+        // composition kernel pads unused logical lanes with lane 0's anchor.
+        let target_tokens = allocate(
+            device,
+            DType::U32,
+            &[DFLASH2_MAX_LANES * block],
+            &mut allocated_bytes,
+        )?;
         let proposal_probabilities = allocate(
             device,
             DType::F32,
@@ -351,6 +361,8 @@ impl DFlash2Workspace {
             &mut allocated_bytes,
         )?;
         let verify_rows = allocate(device, DType::U32, &[lanes], &mut allocated_bytes)?;
+        let retained_counts = allocate(device, DType::U32, &[lanes], &mut allocated_bytes)?;
+        let accepted_counts = allocate(device, DType::U32, &[lanes], &mut allocated_bytes)?;
 
         Ok(Self {
             max_lanes,
@@ -407,6 +419,8 @@ impl DFlash2Workspace {
             proposal_probabilities,
             confidence,
             verify_rows,
+            retained_counts,
+            accepted_counts,
             allocated_bytes,
         })
     }

@@ -1,9 +1,7 @@
 //! Coherent DFlash2 proposal selection over the reusable decode workspace.
 
 use super::{
-    config::DFlash2Config,
-    tensors::DFlash2ModelTensors,
-    verify_budget::VerifyRowsModel,
+    config::DFlash2Config, tensors::DFlash2ModelTensors, verify_budget::VerifyRowsModel,
     workspace::DFlash2Workspace,
 };
 use anyhow::{anyhow, Result};
@@ -132,7 +130,7 @@ pub(crate) fn dispatch_dflash2_selection(
         },
     )?;
     encoder.memory_barrier();
-    let compose = DFlash2ComposeVerifyInputParams {
+    let mut compose = DFlash2ComposeVerifyInputParams {
         anchor: target_anchor,
         physical_lane: target_physical_lane,
         rows: target_rows,
@@ -142,6 +140,10 @@ pub(crate) fn dispatch_dflash2_selection(
         width: (workspace.max_lanes * workspace.rows_per_lane) as u32,
     };
     if verify_model.is_some() {
+        // Qwen target verification is always the canonical width-32 route.
+        // Fill its padding lanes even when the worker owns fewer physical
+        // draft lanes.
+        compose.width = workspace.target_tokens.element_count() as u32;
         dispatch_dflash2_compose_fixed_verify_input(
             encoder,
             registry,
@@ -152,12 +154,15 @@ pub(crate) fn dispatch_dflash2_selection(
             compose,
         )?;
     } else {
+        let target_tokens = workspace
+            .target_tokens
+            .slice_view(0, compose.width as usize);
         dispatch_dflash2_compose_verify_input(
             encoder,
             registry,
             device,
             &workspace.proposed_tokens,
-            &workspace.target_tokens,
+            &target_tokens,
             compose,
         )?;
     }
