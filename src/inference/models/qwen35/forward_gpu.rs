@@ -104,6 +104,18 @@ fn effective_ffn_terminal_k_batch(seq_len: u32, configured: usize) -> usize {
     }
 }
 
+/// Block until every command buffer already committed on the device queue
+/// has run. The layer loop calls this before a host copy of the residual
+/// stream whose producer was committed without a wait.
+fn wait_for_committed_gpu_work(device: &MlxDevice) -> Result<()> {
+    device
+        .command_encoder()
+        .map(crate::inference::native_observation::encoder)
+        .context("host-read drain encoder")?
+        .commit_and_wait_labeled("qwen35.forward.host_read_drain")
+        .context("host-read drain")
+}
+
 // ================================================================
 // Debug dump helpers (HF2Q_DUMP_LAYER_N / HF2Q_DUMP_LAYER_ACTIVATIONS env gates)
 // ================================================================
@@ -5131,12 +5143,30 @@ impl Qwen35Model {
             let q1_layer_before = if q1_target_layers.is_some() {
                 Some(q1_layer_metadata::state(kv_cache,layer_idx,slot_id)?)
             } else {None};
+            // The residual entering this layer, kept for the activation
+            // capture at the layer tail. The layer never writes it: its
+            // output goes to the other ring slot or to a fresh buffer.
+            let captured_input = capture
+                .as_ref()
+                .is_some_and(|acts| acts.is_target_layer(layer_idx))
+                .then(|| hidden.clone());
             // K-boundary: last layer in the window OR final layer overall.
             // At K=1 every layer is a boundary (= current behaviour).
+            //
+            // A layer the host copies at its tail (the activation capture
+            // or the calibration residual capture) is a boundary too: its
+            // FFN terminal must wait, or the copy reads the two-slot output
+            // ring before the GPU has written this layer into it and
+            // returns an earlier layer's residual stream.
+            let host_reads_layer = captured_input.is_some()
+                || residual_capture
+                    .as_ref()
+                    .is_some_and(|cap| cap.layer == layer_idx);
             let is_k_boundary = seq_len == 1
                 || ffn_terminal_k_batch <= 1
                 || (layer_idx + 1) % ffn_terminal_k_batch == 0
-                || (layer_idx + 1) == n_layers;
+                || (layer_idx + 1) == n_layers
+                || host_reads_layer;
             let layer_cpu = &self.layers[layer_idx];
 
             // ADR-015 iter95 — push the per-layer `hidden` ARC clone into
@@ -5171,26 +5201,6 @@ impl Qwen35Model {
                     super::wave5b8_profile::SectionKind::LayerFullTotal
                 }
             });
-
-            // ADR-012 P9b GPU capture path: download residual entering this
-            // layer to CPU F32 if a capture target is bound. Cost: ~20 MB
-            // download per layer (seq_len × hidden × 4 bytes), single
-            // GPU→CPU transfer; well-amortized over the per-layer compute.
-            //
-            // ADR-034 task #78 Step 3c.A.4 (2026-05-21) — when
-            // `target_layer_filter` is set, only listed indices download
-            // hidden; others push an empty Vec to preserve the
-            // `layer_inputs[i]`/`layer_outputs[i]` invariant. Saves ~10×
-            // memory + GPU→CPU bandwidth for the DFlash capture use
-            // case (typically 4 of 64 layers).
-            if let Some(ref mut acts) = capture {
-                if acts.is_target_layer(layer_idx) {
-                    let f32_data = download_f32(&hidden).context("capture layer_input download")?;
-                    acts.layer_inputs.push(f32_data);
-                } else {
-                    acts.layer_inputs.push(Vec::new());
-                }
-            }
 
             // --- Attention ---
             let t_attn_start = if decode_profile {
@@ -6235,6 +6245,10 @@ impl Qwen35Model {
             // reference by test). Off unless a capture was threaded in.
             if let Some(cap) = residual_capture.as_mut() {
                 if cap.layer == layer_idx as usize {
+                    if seq_len == 1 {
+                        wait_for_committed_gpu_work(device)
+                            .context("calibration residual capture wait")?;
+                    }
                     let byte_offset = ((seq_len as u64 - 1) * h as u64) * 4;
                     let last_row = hidden.slice_view(byte_offset, h as usize);
                     let row = download_f32(&last_row).with_context(|| {
@@ -6314,20 +6328,35 @@ impl Qwen35Model {
             drop(_w5b22_dn_ffn_post_res);
             drop(_w5b22_dn_outer_total);
 
-            // ADR-012 P9b GPU capture path: download residual leaving this
-            // layer to CPU F32 if a capture target is bound. Pairs with the
-            // layer_input download at the start of the loop.
+            // ADR-012 P9b GPU capture path: download the residual entering
+            // and leaving this layer to CPU F32 if a capture target is
+            // bound (about 20 MB per layer and side at seq_len × hidden × 4
+            // bytes). Both are read here, after the boundary wait of this
+            // layer's FFN terminal; a one-row forward commits its layers
+            // without a wait, so it drains the queue first.
             //
-            // ADR-034 task #78 Step 3c.A.4 (2026-05-21) — filter to
-            // target_layer_filter when set; see the matching block at
-            // the start of the layer loop for rationale.
-            if let Some(ref mut acts) = capture {
-                if acts.is_target_layer(layer_idx) {
-                    let f32_data =
-                        download_f32(&hidden).context("capture layer_output download")?;
-                    acts.layer_outputs.push(f32_data);
-                } else {
-                    acts.layer_outputs.push(Vec::new());
+            // ADR-034 task #78 Step 3c.A.4 (2026-05-21) — when
+            // `target_layer_filter` is set, only listed indices download;
+            // others push an empty Vec to preserve the
+            // `layer_inputs[i]`/`layer_outputs[i]` invariant (the DFlash
+            // capture reads a few of the layers).
+            if let Some(acts) = capture.as_mut() {
+                match captured_input {
+                    Some(input) => {
+                        if seq_len == 1 {
+                            wait_for_committed_gpu_work(device)
+                                .context("activation capture wait")?;
+                        }
+                        acts.layer_inputs
+                            .push(download_f32(&input).context("capture layer_input download")?);
+                        acts.layer_outputs.push(
+                            download_f32(&hidden).context("capture layer_output download")?,
+                        );
+                    }
+                    None => {
+                        acts.layer_inputs.push(Vec::new());
+                        acts.layer_outputs.push(Vec::new());
+                    }
                 }
             }
 

@@ -74,6 +74,8 @@ pub(crate) mod joint_decode_test_support;
 pub(crate) mod joint_projection;
 pub(crate) mod joint_step_options;
 #[cfg(test)]
+mod capture_host_read_tests;
+#[cfg(test)]
 pub(crate) mod joint_verify_tests;
 pub(crate) use forward_gpu::{
     Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowOutput, Qwen35JointVerify,
