@@ -1468,6 +1468,128 @@ experts of more than eight routes, which this route runs as successive 8-row
 tiles in one threadgroup where Splash launches one threadgroup per tile. The
 route needs unpublished mlx-native kernels and is not quality-qualified.
 
+#### Splash attention-kernel differential
+
+The full-attention kernels (K/V cache write, attention, output gate; the
+Q/K/V and output projections are counted above) were then attributed model
+free. A DFlash2 verify step repeats each lane's slot eight times, so
+`tq_sdpa_rows_route` never admitted it and every full-attention layer ran the
+serial chain once per row behind barriers: two TQ encodes, the Q rotation,
+the split-K main and its reduce, the un-rotation and a row copy, 225
+dispatches in about 160 serialized stages per layer at four lanes, each row
+and query head scanning the slot's history on its own. mlx-native
+`bench_qwen_verify_attn` (one layer, served shapes, GPU at serving clocks,
+median of 20, `$V/splash-gap/attnverify/bench-qwen3{8,6}.log`) reads 1.03, 1.81
+and 3.59 ms per Qwen3.8 layer at four lanes over 512, 2,048 and 8,192 tokens
+of history (0.27, 0.46, 0.90 ms at one lane); Splash's three dispatches take
+0.073, 0.130 and 0.341 ms. Running the same per-row kernels row-batched
+behind two barriers (bitwise the serial chain) only reaches 0.36, 1.14 and
+2.31 ms: past a few hundred tokens the per-row kernel's own work dominates,
+because each of the 32 rows and 24 query heads dequantizes the history again.
+
+Splash computes a lane's eight rows and a KV head's query heads together, 48
+fused rows for Qwen3.8 and 64 for Qwen3.6, one threadgroup per KV head, lane
+and history split, with Metal tensor matmuls over 32-token pages, and
+combines the splits in a fixed order (`paged_attention_tile.h:279-387`,
+`:414-457`; split count from the lane's own history only,
+`PagedAttention.hpp:56-73`). `HF2Q_QWEN_VERIFY_ATTN_TILE=1` adopts that
+structure over hf2q's unchanged TQ-HB cache (mlx-native
+`tq_hb_verify_tile`): one batched K and one V encode for all rows, one query
+rotation and pack, one split, one reduce and one fused un-rotation and gate,
+six dispatches in four stages. The Lloyd-Max codebook is not linear, so a
+page's codes are dequantized to half centroids in threadgroup memory instead
+of being a matmul operand as Splash's INT8 pages are; that costs one more
+barrier per page and no change to the cache format, the prefill writer, the
+anchors or the spill path. Cache bytes and cursors are bitwise the serial
+chain's. The attention output is Class B: half matmul operands and a
+per-page online softmax. Its gates are an F64 reference with a K-scaled
+bound at both served geometries (largest observed error 0.43 of the bound),
+bitwise determinism, and bitwise independence of a row from the other lanes,
+the window's later rows, its packed row and the padding. Against the serial
+chain on hf2q's cache one layer's gated output moves by at most 1.0% of the
+row RMS in a deliberately peaked fixture, a relative RMS of 6.2e-4 to 7.9e-4
+per row, also across five steps with partial acceptance and cursor
+truncation; the test limits are 2% and 2e-3. The same token verified at
+another offset of another window can differ in its last bits (relative RMS
+about 4e-6), because the split partition follows the window's start; that
+alignment comes from the lane's own acceptance history, never from its
+cohort.
+
+An independent review measured the route's error against the exact F64
+attention at 3e-4 on flat and about 1e-3 on peaked attention, 1.1 to 2.5
+times the serial chain's on peaked attention; half the tile's error is the
+half query the serial chain also uses, the rest the half centroids. The
+probability operand of P·V is `p * norm / 16` in half: it saturates for value
+norms above 1,048,064, and a token that shares a split with a dominant one
+drops out once the operand is below 3e-8, which is invisible for norms from
+1 up, 1.7e-3 in the worst head at 0.25 and 2% at 0.02. The stored norms were
+therefore surveyed on the real caches: a diagnostic binary printed, every 50
+verify commits of one exact four-agent run per model, the norms of every
+committed token of the step's lanes (about 2,900 tokens per lane at the
+end, `$V/splash-gap/attnverify/runs/norm-table.txt`).
+
+| Stored value norm | min | 0.1% | 1% | 50% | 99% | 99.9% | max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Qwen3.8, lowest layer (rank 1) | 2.02 | 2.16 | 2.58 | 7.03 | 11.90 | 13.91 | 15.40 |
+| Qwen3.8, highest layer (rank 15) | 56.70 | 60.48 | 65.21 | 84.99 | 107.09 | 125.94 | 168.20 |
+| Qwen3.8, all 16 layers, all snapshots | 1.99 | | | | | | 168.20 |
+| Qwen3.6, lowest layer (rank 1) | 2.89 | 3.16 | 3.50 | 7.01 | 9.97 | 11.12 | 13.19 |
+| Qwen3.6, highest layer (rank 9) | 16.72 | 17.36 | 17.90 | 26.27 | 33.20 | 34.65 | 36.33 |
+| Qwen3.6, all 10 layers, all snapshots | 2.83 | | | | | | 36.33 |
+
+Key norms are 16.2 to 29.1. No layer is below 0.5 or above 1e5, so the
+operand needs no rescaling for these models; a model whose value norms left
+1 to 1e6 would need a per-row power-of-two operand scale first.
+
+The review also found that the split kernel's 26 to 29 KiB of static
+threadgroup memory doubled under Metal shader validation and aborted under
+the debug layer. That storage is now threadgroup memory bound by the host
+(same arithmetic, equal output digests plain, under either layer, under
+both, and from runtime-compiled source), and the route reports itself
+unavailable, so the step keeps the per-row chain, when a kernel's threads or
+threadgroup memory exceed the device's limits. A step the switch asked for
+and the route refused logs its reason once.
+
+Model free the route takes 0.051, 0.116 and 0.331 ms per Qwen3.8 layer at
+four lanes (0.033, 0.048, 0.103 ms at one) and 0.046, 0.083 and 0.195 ms per
+Qwen3.6 layer, including the K/V encodes and the gate: 0.70 to 0.97 times
+Splash's store, split and reduce at four lanes and 1.2 to 1.5 times at one
+lane, where six dispatches against three and the extra barrier decide.
+Splash's numbers are from its own tool and warm-up; they were not
+re-measured under this bench's filler protocol.
+
+In situ, same binary (sha256 `a57c958d…`: this change before its rebase
+onto `eea0fa1a` and before the review fixes above, which leave the
+arithmetic unchanged; prepared FFN and projections on), one exact Q5 run per
+cell, all `CalibrationPass` (`$V/splash-gap/attnverify/runs`):
+
+| Qwen3.8, per cycle | 1 lane | 2 lanes | 3 lanes | 4 lanes |
+|---|---:|---:|---:|---:|
+| Attention category off, GPU ms | 9.45 | 16.12 | 23.27 | 25.95 |
+| Attention plus KV write on, GPU ms | 1.14 | 1.24 | 2.10 | 2.02 |
+| Cycle total off, ms | 106.88 | 104.39 | 120.11 | 130.08 |
+| Cycle total on, ms (two runs) | 100.59, 89.52 | 102.55, 100.97 | 105.83, 103.35 | 109.87, 106.52 |
+| Dispatches off / on | 6,084 / 4,884 | 8,201 / 6,233 | 10,462 / 7,726 | 12,579 / 9,219 |
+
+| Qwen3.6, per cycle | 1 lane | 2 lanes | 3 lanes | 4 lanes |
+|---|---:|---:|---:|---:|
+| Attention category off, GPU ms | 4.42 | 8.27 | 10.54 | 11.48 |
+| Attention plus KV write on, GPU ms | 0.63 | 0.75 | 0.91 | 0.81 |
+| Cycle total off, ms | 36.74 | 58.75 | 51.63 | 58.23 |
+| Cycle total on, ms (two runs) | 34.58, 34.51 | 53.03, 52.59 | 42.91, 42.18 | 45.98, 45.79 |
+| Dispatches off / on | 3,324 / 2,814 | 4,751 / 3,681 | 7,079 / 5,369 | 8,407 / 6,217 |
+
+The category rows are explicit stage profiles (one profiled run per arm);
+the totals are unprofiled medians of the DEBUG stage timing. Splash's
+attention kernels take 1.71 ms per Qwen3.8 cycle at a 512-token history and
+2.68 ms at 2,048, and 0.72 ms per Qwen3.6 cycle. The Qwen3.8 arms emit
+different text (5,206 completion tokens in both runs with the switch, 5,237
+without; makespan 62.5 and 60.5 against 68.7 seconds), and the Qwen3.6 runs
+differ from run to run in both arms, so makespan is one draw per run and the
+per-cycle medians are the comparison. The switch is off by default pending
+the combined-candidate quality campaign. It needs an mlx-native release that
+contains `tq_hb_verify_tile`.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,

@@ -48,6 +48,7 @@ fn qwen38_joint_verify_matches_spec_off_bitwise() {
         options: JointStepOptions {
             projection: JointProjectionKernel::ColumnInvariantMma,
             pooled_outputs: true,
+            verify_attention_tile: false,
         },
     };
     assert_eq!(model.joint_decode_mode(), Ok(arm.mode));

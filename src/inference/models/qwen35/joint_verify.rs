@@ -251,6 +251,12 @@ impl Qwen35Model {
                 options.projection == JointProjectionKernel::Canonical,
                 "Qwen DFlash2 verify requires the canonical width-32 projection route"
             );
+        } else {
+            ensure!(
+                !options.verify_attention_tile,
+                "Qwen joint MTP verify rows are the joint decode step's; the tiled verify \
+                 attention is a DFlash2 route"
+            );
         }
         let total = lanes.iter().map(|lane| lane.tokens.len()).sum::<usize>();
         let max_rows = layout.max_rows();
@@ -353,6 +359,7 @@ impl Qwen35Model {
             rows: &rows,
             windows: &windows,
             width,
+            attention_tile: options.verify_attention_tile,
         };
         let linear_layers = kv_cache.linear_attn.len();
         let (outputs, normed, replay) = self.with_joint_forward(

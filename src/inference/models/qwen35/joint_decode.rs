@@ -64,6 +64,7 @@ use crate::inference::models::qwen35::moe_batched::{
 };
 use crate::inference::models::qwen35::prepared_projection;
 use crate::inference::models::qwen35::spec_decode::nth_hidden_row;
+use crate::inference::models::qwen35::verify_attn_tile::VerifyTileScratch;
 use crate::inference::models::qwen35::Qwen35Config;
 use crate::inference::spec_decode::dflash2::adapters::DFlash2TargetCapture;
 use crate::serve::multi_seq_kv::SlotId;
@@ -135,6 +136,8 @@ pub(super) struct JointPacking<'a> {
     pub windows: &'a [JointWindow],
     /// Packed width, at least `rows.len()`; padding rows copy row 0.
     pub width: usize,
+    /// DFlash2 verify with the tiled TQ full attention requested.
+    pub attention_tile: bool,
 }
 
 fn plan_joint_routes(
@@ -365,6 +368,7 @@ impl Qwen35Model {
             rows,
             windows: &windows,
             width: joint_padded_width(mode, rows.len()),
+            attention_tile: false,
         };
         self.with_joint_forward(
             mode,
@@ -536,10 +540,12 @@ impl Qwen35Model {
         }
         let width_u32 = width as u32;
         let slots = rows.iter().map(|row| row.slot_id).collect::<Vec<_>>();
+        let tile_scratch = VerifyTileScratch::default();
         let joint_rows = JointRows {
             slots: &slots,
             windows: packing.windows,
             width,
+            attention_tile: packing.attention_tile.then_some(&tile_scratch),
         };
         // Padding rows replay row 0's token and position; their outputs are
         // discarded and they never reach a cache.

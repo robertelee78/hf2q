@@ -4,6 +4,7 @@ use std::sync::Once;
 
 use crate::inference::models::qwen35::joint_projection::JointProjectionKernel;
 use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
+use crate::inference::models::qwen35::verify_attn_tile;
 use crate::serve::api::engine::qwen35_joint_decode::Qwen35JointDecodeConfig;
 use crate::serve::api::engine_qwen35::{
     anchor_store::Qwen35AnchorStore, Qwen35DFlash2Forward, Qwen35DecodeState,
@@ -153,6 +154,7 @@ pub(super) fn run_qwen35_dflash2(
                 options: JointStepOptions {
                     projection: JointProjectionKernel::Canonical,
                     pooled_outputs: config.step.pooled_outputs,
+                    verify_attention_tile: verify_attn_tile::enabled(),
                 },
             },
             supervisor,

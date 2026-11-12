@@ -123,6 +123,9 @@ pub(crate) mod resume_attn_fast;
 pub mod routing_policy;
 pub mod spec_decode;
 pub mod tokenizer;
+pub(crate) mod verify_attn_tile;
+#[cfg(test)]
+mod verify_attn_tile_tests;
 pub mod wave5b8_profile;
 pub mod weight_loader;
 pub mod weight_pool;

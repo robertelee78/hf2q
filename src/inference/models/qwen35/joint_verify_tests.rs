@@ -572,7 +572,17 @@ pub(crate) fn synthetic_model(
     policy: mlx_native::GgmlRoutingPolicy,
     mtp: bool,
 ) -> Qwen35Model {
-    let mut cfg = synthetic_cfg();
+    synthetic_model_with_cfg(device, policy, mtp, synthetic_cfg())
+}
+
+/// [`synthetic_model`] for another attention geometry of the synthetic
+/// config.
+fn synthetic_model_with_cfg(
+    device: &MlxDevice,
+    policy: mlx_native::GgmlRoutingPolicy,
+    mtp: bool,
+    mut cfg: Qwen35Config,
+) -> Qwen35Model {
     cfg.mtp_num_hidden_layers = u32::from(mtp);
     let mut model = Qwen35Model::empty_from_cfg(cfg.clone());
     let mut seed = 0x0A11_7E57_u32;
@@ -798,11 +808,20 @@ fn with_synthetic_fixture(
     arm: Arm,
     run: impl FnOnce(&Fixture<'_>),
 ) {
+    with_synthetic_fixture_cfg(policy, arm, synthetic_cfg(), run);
+}
+
+fn with_synthetic_fixture_cfg(
+    policy: mlx_native::GgmlRoutingPolicy,
+    arm: Arm,
+    cfg: Qwen35Config,
+    run: impl FnOnce(&Fixture<'_>),
+) {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let Ok(device) = MlxDevice::new() else {
         return;
     };
-    let model = synthetic_model(&device, policy, false);
+    let model = synthetic_model_with_cfg(&device, policy, false, cfg);
     assert_eq!(
         model.joint_decode_mode(),
         Ok(arm.mode),
@@ -826,6 +845,7 @@ fn dflash_arm() -> Arm {
         options: JointStepOptions {
             projection: JointProjectionKernel::Canonical,
             pooled_outputs: true,
+            verify_attention_tile: false,
         },
     }
 }
@@ -1047,6 +1067,168 @@ fn dflash2_width32_meets_q1_and_is_cohort_invariant() {
     });
 }
 
+/// The DFlash2 arm with the tiled TQ verify attention requested.
+fn dflash_tile_arm() -> Arm {
+    let mut arm = dflash_arm();
+    arm.options.verify_attention_tile = true;
+    arm
+}
+
+/// The synthetic config with eight query heads on its KV head: a geometry
+/// the tiled verify attention compiles (the default two do not).
+fn tile_cfg() -> Qwen35Config {
+    Qwen35Config {
+        num_attention_heads: 8,
+        ..synthetic_cfg()
+    }
+}
+
+/// The tiled verify attention inside the whole DFlash2 verify step, against
+/// the stock DFlash2 step of the same model and caches: the step takes the
+/// route (its two full-attention layers issue six dispatches each instead
+/// of the per-row chain's 225), retains the stock route's cache bytes and
+/// cursors through the commit, keeps every row's argmax inside the Q1 logit
+/// envelope, and a lane's rows, retained cache and captures do not depend on
+/// its cohort or packing order. The synthetic model's residual stream
+/// swamps its attention output, so the route's own numerics are gated at
+/// the layer (`verify_attn_tile_tests`) and kernel (mlx-native
+/// `test_tq_hb_verify_tile`) levels.
+#[test]
+fn dflash2_tiled_attention_meets_q1_and_is_cohort_invariant() {
+    let full = [lane(0, 7, 0), lane(1, 7, 2), lane(2, 7, 5), lane(3, 7, 8)];
+    with_synthetic_fixture_cfg(padded_policy(), dflash_tile_arm(), tile_cfg(), |fixture| {
+        // The same model and caches under the stock arm (a decode step, and
+        // so the cache prefix, never takes the tiled route).
+        let before = mlx_native::dispatch_count();
+        let stock = run_dflash_case(
+            &Fixture {
+                model: fixture.model,
+                arm: dflash_arm(),
+                new_cache: fixture.new_cache,
+                start: fixture.start,
+                token: fixture.token,
+            },
+            &full,
+            "stock width32",
+        );
+        let stock_dispatches = mlx_native::dispatch_count() - before;
+        let cache = (fixture.new_cache)();
+        let available = fixture
+            .model
+            .with_gpu_cache_mut(|device, registry| {
+                super::verify_attn_tile::tq_verify_tile_route(
+                    registry,
+                    device,
+                    &cache.full_attn[0],
+                    &[super::joint_decode_core::JointWindow {
+                        slot: SlotId(0),
+                        start: 0,
+                        rows: 8,
+                    }],
+                    32,
+                    fixture.model.cfg.num_attention_heads,
+                    fixture.model.cfg.num_key_value_heads,
+                    fixture.model.cfg.head_dim,
+                    CAPACITY,
+                )
+            })
+            .expect("probe tiled verify attention");
+        if !available {
+            eprintln!("RECORDED SKIP: tiled verify attention unavailable (no Metal tensor API)");
+            return;
+        }
+        let before = mlx_native::dispatch_count();
+        let tiled = run_dflash_case(fixture, &full, "tiled width32");
+        let tiled_dispatches = mlx_native::dispatch_count() - before;
+        // Per full-attention layer the per-row chain issues 225 dispatches
+        // for these 32 rows (six per row, 32 row copies, the gate) and the
+        // tiled route six; the model has two such layers.
+        assert!(
+            stock_dispatches >= tiled_dispatches + 400,
+            "the DFlash2 verify step did not take the tiled attention route: \
+             {stock_dispatches} stock and {tiled_dispatches} tiled dispatches"
+        );
+        assert_eq!(
+            tiled.committed, stock.committed,
+            "the tiled route retained other cache bytes than the stock route"
+        );
+        let mut worst = 0.0_f32;
+        for (lane_index, lane) in full.iter().enumerate() {
+            for row in 0..=lane.drafts {
+                let actual = &tiled.rows[lane_index][row];
+                let expected = &stock.rows[lane_index][row];
+                assert_eq!(
+                    argmax_bits(&actual.0),
+                    argmax_bits(&expected.0),
+                    "lane {} row {row}: tiled argmax differs from the stock route",
+                    lane.slot
+                );
+                let delta = actual
+                    .0
+                    .iter()
+                    .zip(&expected.0)
+                    .map(|(&left, &right)| (f32::from_bits(left) - f32::from_bits(right)).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    delta <= 0.25,
+                    "lane {} row {row}: tiled max logit delta {delta} exceeds Q1",
+                    lane.slot
+                );
+                worst = worst.max(delta);
+            }
+        }
+        eprintln!("tiled vs stock DFlash2 verify: max logit delta {worst:.3e}");
+
+        let alone = run_dflash_case(fixture, &[lane(2, 7, 5)], "tiled alone");
+        assert_eq!(
+            alone.rows[0], tiled.rows[2],
+            "lane 2 rows changed by cohort"
+        );
+        assert_eq!(
+            alone.committed[0], tiled.committed[2],
+            "lane 2 retained cache changed by cohort"
+        );
+        assert_eq!(
+            alone.captured[0], tiled.captured[2],
+            "lane 2 target captures changed by cohort"
+        );
+        let permuted_case = [lane(3, 7, 8), lane(2, 7, 5), lane(1, 7, 2), lane(0, 7, 0)];
+        let permuted = run_dflash_case(fixture, &permuted_case, "tiled permuted");
+        assert_eq!(
+            permuted.rows[1], tiled.rows[2],
+            "lane 2 rows changed by packing order"
+        );
+        assert_eq!(
+            permuted.committed[1], tiled.committed[2],
+            "lane 2 retained cache changed by packing order"
+        );
+        assert_eq!(
+            permuted.captured[1], tiled.captured[2],
+            "lane 2 target captures changed by packing order"
+        );
+
+        // MTP verify rows are the joint decode step's: it refuses the route.
+        let mut cache = (fixture.new_cache)();
+        let tokens = [(fixture.token)(0, fixture.start[0])];
+        let refused = fixture.model.forward_gpu_joint_verify(
+            &[Qwen35JointVerifyLane {
+                slot_id: SlotId(0),
+                position: fixture.start[0],
+                tokens: &tokens,
+                output: Qwen35JointOutput::LogitsAndHidden,
+            }],
+            &mut cache,
+            fixture.arm.mode,
+            fixture.arm.dense_ffn,
+            fixture.arm.options,
+        );
+        assert!(
+            refused.is_err(),
+            "MTP verify accepted the tiled verify attention"
+        );
+    });
+}
+
 /// Arm M: padded mode, shared-weights FFN, column-invariant MMA products.
 fn mma_arm() -> Arm {
     Arm {
@@ -1055,6 +1237,7 @@ fn mma_arm() -> Arm {
         options: JointStepOptions {
             projection: JointProjectionKernel::ColumnInvariantMma,
             pooled_outputs: true,
+            verify_attention_tile: false,
         },
     }
 }
