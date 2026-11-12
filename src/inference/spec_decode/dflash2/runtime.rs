@@ -10,7 +10,8 @@ use super::{
     adapters::{dispatch_dflash2_input, target_vocabulary_head, DFlash2TargetFamily},
     config::DFlash2Config,
     forward::{
-        dispatch_dflash2_context_commit, dispatch_dflash2_forward, prepare_decode_positions,
+        dispatch_dflash2_context_commit, dispatch_dflash2_forward, dispatch_dflash2_lane_ingest,
+        prepare_decode_positions,
     },
     schema::{DFlash2CheckpointDescriptor, DFlash2FamilyAdapter},
     selector::dispatch_dflash2_selection,
@@ -20,9 +21,7 @@ use super::{
     weights::DFlash2WeightsFile,
     workspace::DFlash2Workspace,
 };
-use crate::inference::spec_decode::dflash::hidden_capture::{
-    extract_drafter_concat, DFlashCaptureSession,
-};
+use crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession;
 use anyhow::{bail, ensure, Context, Result};
 use mlx_native::{
     ops::dflash2_selector::{
@@ -446,63 +445,53 @@ impl DFlash2Runtime {
         lane: usize,
         logical_start: usize,
     ) -> Result<()> {
+        self.ingest_target_capture_rows(
+            device,
+            registry,
+            capture,
+            lane,
+            logical_start,
+            0..capture.seq_len,
+        )
+    }
+
+    /// [`Self::ingest_target_capture`] for the capture rows `rows` only,
+    /// appended at `logical_start`. A prefill forward that crossed a prompt
+    /// boundary appends the rows before it and the rows after it as two
+    /// calls, as the two forwards would have.
+    pub fn ingest_target_capture_rows(
+        &mut self,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        capture: &DFlashCaptureSession,
+        lane: usize,
+        logical_start: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<()> {
         ensure!(
             lane < self.workspace.max_lanes,
             "DFlash2 capture lane {lane} is out of range"
-        );
-        ensure!(
-            capture.target_layer_ids == self.config.target_layer_ids,
-            "DFlash2 capture layers {:?} != checkpoint layers {:?}",
-            capture.target_layer_ids,
-            self.config.target_layer_ids
         );
         ensure!(
             logical_start == self.lane_lengths[lane],
             "DFlash2 capture starts at {logical_start}, lane {lane} is at {}",
             self.lane_lengths[lane]
         );
-        let concatenated = extract_drafter_concat(
-            &capture.hidden_output,
-            &capture.target_layer_ids,
-            &self.config.target_layer_ids,
-            capture.seq_len,
-            capture.hidden_size,
-        )
-        .context("convert target capture to DFlash2 concat layout")?;
-        let feature_width = self.config.fc_input_dim();
-        ensure!(
-            concatenated.len() == capture.seq_len * feature_width,
-            "DFlash2 concatenated capture has {} values, expected {}",
-            concatenated.len(),
-            capture.seq_len * feature_width
-        );
-        for (chunk_index, chunk) in concatenated
-            .chunks(self.config.block_size * feature_width)
-            .enumerate()
-        {
-            let rows = chunk.len() / feature_width;
-            let lane_start = lane * self.config.block_size * feature_width;
-            let destination = self
-                .workspace
-                .captured_target_hidden
-                .as_mut_slice::<f32>()?;
-            destination[lane_start..lane_start + self.config.block_size * feature_width].fill(0.0);
-            destination[lane_start..lane_start + chunk.len()].copy_from_slice(chunk);
-
-            let positions = self
-                .lane_lengths
-                .iter()
-                .map(|length| {
-                    u32::try_from(*length).context("DFlash2 context position exceeds u32")
-                })
-                .collect::<Result<Vec<_>>>()?;
-            prepare_decode_positions(&mut self.workspace, &self.config, &positions)
-                .with_context(|| format!("prepare DFlash2 capture chunk {chunk_index}"))?;
-            let mut retained = vec![0_u32; self.workspace.max_lanes];
-            retained[lane] = u32::try_from(rows)?;
-            self.commit_target_context(device, registry, &retained)
-                .with_context(|| format!("commit DFlash2 capture chunk {chunk_index}"))?;
-        }
+        let appended = rows.len();
+        ingest_capture_lane_passes(
+            device,
+            registry,
+            &self.config,
+            &self.tensors,
+            &self.workspace,
+            capture,
+            lane,
+            logical_start,
+            rows,
+        )?;
+        self.lane_lengths[lane] = logical_start
+            .checked_add(appended)
+            .context("DFlash2 lane length overflow")?;
         Ok(())
     }
 
@@ -783,6 +772,138 @@ impl DFlash2Runtime {
     }
 }
 
+/// Append capture rows `rows` to `lane`'s rings at `logical_start`.
+///
+/// A decode commit carries `block_size` rows of every lane, so appending a
+/// prefill capture through it projects `block_size` rows per pass over the
+/// draft's context weights. Here each pass carries the workspace's whole row
+/// capacity (`max_lanes * block_size` rows) of the one lane
+/// ([`dispatch_dflash2_lane_ingest`]), and the passes of a chunk share one
+/// command buffer: their inputs are staged in buffers of their own, so no
+/// pass waits for the host. The projections, norms and RoPE run over the
+/// same row count as a decode commit, and the ring bytes are those of
+/// `block_size`-row commits (`lane_passes_write_the_rings_of_block_commits`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ingest_capture_lane_passes(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    config: &DFlash2Config,
+    tensors: &DFlash2ModelTensors,
+    workspace: &DFlash2Workspace,
+    capture: &DFlashCaptureSession,
+    lane: usize,
+    logical_start: usize,
+    rows: std::ops::Range<usize>,
+) -> Result<()> {
+    ensure!(
+        capture.target_layer_ids == config.target_layer_ids,
+        "DFlash2 capture layers {:?} != checkpoint layers {:?}",
+        capture.target_layer_ids,
+        config.target_layer_ids
+    );
+    let layers = capture.target_layer_ids.len();
+    let hidden = capture.hidden_size;
+    let feature_width = config.fc_input_dim();
+    ensure!(
+        rows.start <= rows.end
+            && rows.end <= capture.seq_len
+            && layers * hidden == feature_width
+            && capture.hidden_output.len() == layers * capture.seq_len * hidden,
+        "DFlash2 capture rows {rows:?} of a {}-row, {layers}-layer, {hidden}-wide capture \
+         do not fit the checkpoint's {feature_width}-wide context",
+        capture.seq_len
+    );
+    let appended = rows.len();
+    if appended == 0 {
+        return Ok(());
+    }
+    let block = config.block_size;
+    let groups = workspace.max_lanes;
+    let pass_rows = groups * block;
+    let passes = appended.div_ceil(pass_rows);
+    let staged_rows = passes * pass_rows;
+    ensure!(
+        u32::try_from(logical_start + staged_rows).is_ok(),
+        "DFlash2 context position exceeds u32"
+    );
+
+    // The rows in the draft's `[row][layer][hidden]` layout; the capture is
+    // layer-major. Rows past the capture's end stay zero and are not committed.
+    let mut captured = device.alloc_buffer(
+        staged_rows * feature_width * std::mem::size_of::<f32>(),
+        mlx_native::DType::F32,
+        vec![staged_rows, feature_width],
+    )?;
+    {
+        let staged = captured.as_mut_slice::<f32>()?;
+        for (index, row) in rows.clone().enumerate() {
+            for layer in 0..layers {
+                let source = (layer * capture.seq_len + row) * hidden;
+                let destination = (index * layers + layer) * hidden;
+                staged[destination..destination + hidden]
+                    .copy_from_slice(&capture.hidden_output[source..source + hidden]);
+            }
+        }
+    }
+    let words = |values: &[u32]| -> Result<MlxBuffer> {
+        let mut buffer = device.alloc_buffer(
+            std::mem::size_of_val(values),
+            mlx_native::DType::U32,
+            vec![values.len()],
+        )?;
+        buffer.as_mut_slice::<u32>()?.copy_from_slice(values);
+        Ok(buffer)
+    };
+    let positions = words(
+        &(0..staged_rows)
+            .map(|index| (logical_start + index) as u32)
+            .collect::<Vec<_>>(),
+    )?;
+    // Group `g` of pass `p` holds rows `first..first + block`.
+    let group_firsts = (0..passes * groups).map(|group| group * block);
+    let write_positions = words(
+        &group_firsts
+            .clone()
+            .map(|first| ((logical_start + first) % config.sliding_window) as u32)
+            .collect::<Vec<_>>(),
+    )?;
+    let commit_counts = words(
+        &group_firsts
+            .map(|first| appended.saturating_sub(first).min(block) as u32)
+            .collect::<Vec<_>>(),
+    )?;
+
+    let mut encoder = device
+        .command_encoder()
+        .context("create DFlash2 capture ingest encoder")?;
+    let word = std::mem::size_of::<u32>();
+    for pass in 0..passes {
+        dispatch_dflash2_lane_ingest(
+            &mut encoder,
+            registry,
+            device,
+            config,
+            tensors,
+            workspace,
+            lane,
+            &captured
+                .slice_view(
+                    (pass * pass_rows * feature_width * std::mem::size_of::<f32>()) as u64,
+                    pass_rows * feature_width,
+                )
+                .with_shape(vec![pass_rows, feature_width])?,
+            &positions.slice_view((pass * pass_rows * word) as u64, pass_rows),
+            &write_positions.slice_view((pass * groups * word) as u64, groups),
+            &commit_counts.slice_view((pass * groups * word) as u64, groups),
+        )
+        .with_context(|| format!("encode DFlash2 capture pass {pass}"))?;
+    }
+    encoder
+        .commit_and_wait()
+        .context("commit DFlash2 capture ingest")?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "context_commit_tests.rs"]
 mod context_commit_tests;
@@ -925,6 +1046,220 @@ mod tests {
                 Ok(())
             })
             .expect("run real Qwen3.6 DFlash2 cycle");
+    }
+
+    /// The capture ingest the lane passes replaced: one decode-shaped commit
+    /// of `block_size` rows on the lane's own row group, one command buffer
+    /// each. Kept as the reference of the gate below.
+    fn ingest_block_commits(
+        runtime: &mut DFlash2Runtime,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        capture: &DFlashCaptureSession,
+        lane: usize,
+    ) -> Result<()> {
+        use crate::inference::spec_decode::dflash::hidden_capture::extract_drafter_concat;
+        let concatenated = extract_drafter_concat(
+            &capture.hidden_output,
+            &capture.target_layer_ids,
+            &runtime.config.target_layer_ids,
+            capture.seq_len,
+            capture.hidden_size,
+        )?;
+        let width = runtime.config.fc_input_dim();
+        let block = runtime.config.block_size;
+        for chunk in concatenated.chunks(block * width) {
+            let lane_start = lane * block * width;
+            let destination = runtime
+                .workspace
+                .captured_target_hidden
+                .as_mut_slice::<f32>()?;
+            destination[lane_start..lane_start + block * width].fill(0.0);
+            destination[lane_start..lane_start + chunk.len()].copy_from_slice(chunk);
+            let positions: Vec<u32> = runtime
+                .lane_lengths
+                .iter()
+                .map(|length| *length as u32)
+                .collect();
+            prepare_decode_positions(&mut runtime.workspace, &runtime.config, &positions)?;
+            let mut retained = vec![0_u32; runtime.workspace.max_lanes];
+            retained[lane] = (chunk.len() / width) as u32;
+            runtime.commit_target_context(device, registry, &retained)?;
+        }
+        Ok(())
+    }
+
+    /// Real-checkpoint gate for the lane-pass capture ingest, run explicitly
+    /// with the served draft switches on one model:
+    /// `HF2Q_QWEN38_GGUF=… HF2Q_DFLASH2_CONFIG=… HF2Q_DFLASH2_WEIGHTS=… HF2Q_DFLASH2_DRAFT_AF4_G64=1
+    /// HF2Q_DFLASH2_DRAFT_STAGED=1 <test binary> capture_ingest_matches_block_commits_on_the_real_checkpoint
+    /// --ignored --nocapture --test-threads=1` (or `HF2Q_QWEN36_GGUF=…`).
+    ///
+    /// At one to four lanes, every lane receives prefill chunks of 5, 31,
+    /// 157 and 720 rows (so chunks start off a block boundary and end in a
+    /// partial block) and then enough rows to wrap its ring, once through
+    /// the block commits and once through the lane passes. After every chunk
+    /// the rings of all lanes and the lane cursors must agree bit for bit,
+    /// and so must the logits, proposals and verify rows of a draft cycle
+    /// run on the context each route left.
+    #[test]
+    #[ignore = "requires HF2Q_QWEN38_GGUF or HF2Q_QWEN36_GGUF, HF2Q_DFLASH2_CONFIG, HF2Q_DFLASH2_WEIGHTS and Apple Metal; run alone"]
+    fn capture_ingest_matches_block_commits_on_the_real_checkpoint() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let (gguf_path, descriptor) = match (
+            std::env::var_os("HF2Q_QWEN38_GGUF"),
+            std::env::var_os("HF2Q_QWEN36_GGUF"),
+        ) {
+            (Some(path), None) => (PathBuf::from(path), &QWEN38_DFLASH2),
+            (None, Some(path)) => (PathBuf::from(path), &QWEN36_DFLASH2),
+            _ => panic!("set exactly one of HF2Q_QWEN38_GGUF and HF2Q_QWEN36_GGUF"),
+        };
+        let config_path =
+            PathBuf::from(std::env::var_os("HF2Q_DFLASH2_CONFIG").expect("HF2Q_DFLASH2_CONFIG"));
+        let weights_path =
+            PathBuf::from(std::env::var_os("HF2Q_DFLASH2_WEIGHTS").expect("HF2Q_DFLASH2_WEIGHTS"));
+        let gguf = mlx_native::gguf::GgufFile::open(&gguf_path).expect("open target GGUF");
+        let mut progress = LoadProgress::new(false, 1, 0);
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load target");
+        model.ensure_gpu_cache_primed().expect("prime GPU cache");
+
+        const CHUNKS: [usize; 4] = [5, 31, 157, 720];
+        fn random(state: &mut u64) -> f32 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*state >> 40) as f32 / (1_u64 << 24) as f32 - 0.5
+        }
+        fn rings(runtime: &DFlash2Runtime) -> Vec<u16> {
+            runtime
+                .workspace
+                .ring_keys
+                .iter()
+                .chain(&runtime.workspace.ring_values)
+                .flat_map(|ring| ring.as_slice::<u16>().expect("ring bits").to_vec())
+                .collect()
+        }
+
+        model
+            .with_gpu_cache_mut(|device, registry| {
+                let config_bytes = std::fs::read(&config_path)?;
+                let config = descriptor.parse_config(&config_bytes)?;
+                let adapter = QwenDFlash2Adapter::new(&model, &config)?;
+                let layers = config.target_layer_ids.len();
+                let hidden = config.fc_input_dim() / layers;
+                // The last chunk carries every lane past one ring wrap.
+                let prefix: usize = CHUNKS.iter().sum();
+                let mut chunks = CHUNKS.to_vec();
+                chunks.push(config.sliding_window + 13 - prefix.min(config.sliding_window));
+                for lanes in 1..=4_usize {
+                    let mut runtime = DFlash2Runtime::load_verified(
+                        device,
+                        descriptor,
+                        &config_path,
+                        &weights_path,
+                        &adapter,
+                        lanes,
+                    )?;
+                    let proposals = runtime.config.proposal_tokens();
+                    // One route's whole run: the rings and cursors after
+                    // every chunk, then a draft cycle's outputs.
+                    let run = |runtime: &mut DFlash2Runtime,
+                                   registry: &mut KernelRegistry,
+                                   lane_passes: bool|
+                     -> Result<(Vec<Vec<u16>>, Vec<usize>, Vec<u32>, Vec<u32>, Vec<u32>)> {
+                        for lane in 0..lanes {
+                            runtime.clear_lane(lane)?;
+                        }
+                        let mut after_chunks = Vec::new();
+                        let mut state = 0x5EED_u64;
+                        for &rows in &chunks {
+                            for lane in 0..lanes {
+                                let mut capture = DFlashCaptureSession::new(
+                                    runtime.config.target_layer_ids.clone(),
+                                    rows,
+                                    hidden,
+                                    false,
+                                );
+                                for value in &mut capture.hidden_output {
+                                    *value = 4.0 * random(&mut state);
+                                }
+                                let start = runtime.lane_lengths()[lane];
+                                if lane_passes {
+                                    runtime.ingest_target_capture(
+                                        device, registry, &capture, lane, start,
+                                    )?;
+                                } else {
+                                    ingest_block_commits(
+                                        runtime, device, registry, &capture, lane,
+                                    )?;
+                                }
+                                ensure!(
+                                    runtime.lane_lengths()[lane] == start + rows,
+                                    "lane {lane} cursor after a {rows}-row chunk"
+                                );
+                            }
+                            after_chunks.push(rings(runtime));
+                        }
+                        let lengths = runtime.lane_lengths().to_vec();
+                        let positions: Vec<u32> =
+                            lengths.iter().map(|length| *length as u32).collect();
+                        runtime.run_draft(
+                            device,
+                            registry,
+                            &adapter,
+                            &vec![1; lanes],
+                            &positions,
+                            &vec![0.0; lanes],
+                            0,
+                            &vec![8; lanes],
+                            &vec![0.5; lanes * proposals],
+                        )?;
+                        Ok((
+                            after_chunks,
+                            lengths,
+                            runtime.proposals()?.to_vec(),
+                            runtime.verify_rows()?.to_vec(),
+                            runtime
+                                .workspace
+                                .logits
+                                .as_slice::<u32>()?
+                                .to_vec(),
+                        ))
+                    };
+                    let started = std::time::Instant::now();
+                    let blocks = run(&mut runtime, registry, false)?;
+                    let blocks_ms = started.elapsed().as_secs_f64() * 1e3;
+                    let started = std::time::Instant::now();
+                    let passes = run(&mut runtime, registry, true)?;
+                    let passes_ms = started.elapsed().as_secs_f64() * 1e3;
+                    eprintln!(
+                        "[DFLASH2_INGEST] {} lanes={lanes}: {} rows per lane and one draft cycle: block commits {blocks_ms:.1} ms, lane passes {passes_ms:.1} ms",
+                        descriptor.id,
+                        chunks.iter().sum::<usize>()
+                    );
+                    for (index, (block, pass)) in blocks.0.iter().zip(&passes.0).enumerate() {
+                        ensure!(block.iter().any(|&bits| bits != 0), "nothing was appended");
+                        let differing = block.iter().zip(pass).filter(|(a, b)| a != b).count();
+                        ensure!(
+                            differing == 0,
+                            "{lanes} lanes, after the {}-row chunk: {differing} of {} ring values differ",
+                            chunks[index],
+                            block.len()
+                        );
+                    }
+                    ensure!(blocks.1 == passes.1, "{lanes} lanes: lane cursors differ");
+                    ensure!(blocks.2 == passes.2, "{lanes} lanes: draft proposals differ");
+                    ensure!(blocks.3 == passes.3, "{lanes} lanes: verify rows differ");
+                    ensure!(blocks.4 == passes.4, "{lanes} lanes: draft logits differ");
+                    eprintln!(
+                        "[DFLASH2_INGEST] {} lanes={lanes} chunks={chunks:?} staged={} rings, cursors and draft outputs identical",
+                        descriptor.id,
+                        runtime.workspace.staged.is_some()
+                    );
+                }
+                Ok(())
+            })
+            .expect("lane-pass ingest against block commits");
     }
 
     fn capture_lane(

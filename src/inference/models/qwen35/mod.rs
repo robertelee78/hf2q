@@ -121,6 +121,9 @@ mod moe_live_tiles_fused;
 mod moe_live_tiles_tests;
 pub mod mtp;
 pub mod mtp_weights_load;
+pub(crate) mod prefill_fold;
+#[cfg(test)]
+mod prefill_fold_tests;
 pub(crate) mod prefill_prepared;
 #[cfg(test)]
 mod prefill_prepared_tests;

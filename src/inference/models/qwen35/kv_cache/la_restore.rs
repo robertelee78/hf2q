@@ -69,6 +69,52 @@ impl LaAnchorImage {
     pub(crate) fn is_right_sized(&self) -> bool {
         self.storage.byte_len() == self.storage.data_byte_len()
     }
+
+    /// Linear-attention layers this image holds.
+    pub(crate) fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Layer `layer`'s regions of the image, for a forward that writes the
+    /// checkpoint itself (the cue fold): the recurrent state in the slot
+    /// layout, and the convolution state in the image's `[K-1, channels]`
+    /// layout.
+    pub(crate) fn boundary_views(&self, layer: usize) -> Result<LaBoundaryViews> {
+        let layout = self
+            .layers
+            .get(layer)
+            .ok_or_else(|| anyhow!("anchor image has no linear layer {layer}"))?;
+        Ok(LaBoundaryViews {
+            recurrent: f32_view(
+                &self.storage,
+                layout.recurrent_offset,
+                layout.recurrent_elements,
+                "anchor image boundary recurrent",
+            )?,
+            conv: f32_view(
+                &self.storage,
+                layout.conv_offset,
+                layout.conv_elements,
+                "anchor image boundary conv",
+            )?,
+        })
+    }
+
+    /// The image's words, for bitwise comparison in tests.
+    #[cfg(test)]
+    pub(crate) fn words(&self) -> Vec<u32> {
+        self.storage
+            .as_slice::<u32>()
+            .expect("map anchor image")
+            .to_vec()
+    }
+}
+
+/// One layer's destinations in a checkpoint image (see
+/// [`LaAnchorImage::boundary_views`]).
+pub(crate) struct LaBoundaryViews {
+    pub(crate) recurrent: MlxBuffer,
+    pub(crate) conv: MlxBuffer,
 }
 
 pub(crate) struct LaAnchorRestorePlan {
@@ -240,6 +286,34 @@ impl HybridKvCache {
             .ok_or_else(|| anyhow!("anchor image byte length overflow"))
     }
 
+    /// A zeroed, right-sized checkpoint image with this cache's layout.
+    fn allocate_anchor_image(&self) -> Result<LaAnchorImage> {
+        let (layers, elements) = anchor_layout(self)?;
+        let bytes = elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| anyhow!("anchor image byte length overflow"))?;
+        let image = LaAnchorImage {
+            storage: self
+                .device
+                .alloc_buffer(bytes, DType::F32, vec![elements])
+                .map_err(|error| anyhow!("allocate anchor image: {error}"))?,
+            layers,
+        };
+        anyhow::ensure!(
+            image.is_right_sized(),
+            "anchor image owner is not right-sized"
+        );
+        Ok(image)
+    }
+
+    /// An empty checkpoint image for a boundary that a forward crosses and
+    /// captures itself: its DeltaNet layers write their state at the
+    /// boundary into [`LaAnchorImage::boundary_views`], in the layout
+    /// [`Self::snapshot_la_anchor`] gives a snapshot taken there.
+    pub(crate) fn boundary_anchor_image(&self) -> Result<LaAnchorImage> {
+        self.allocate_anchor_image()
+    }
+
     pub(crate) fn snapshot_la_anchor(&mut self, slot: SlotId) -> Result<LaAnchorImage> {
         let slot_index = slot.0 as usize;
         let n_seqs = self.n_seqs as usize;
@@ -249,21 +323,7 @@ impl HybridKvCache {
             slot.0,
             self.n_seqs
         );
-        let (layers, elements) = anchor_layout(self)?;
-        let bytes = elements
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| anyhow!("snapshot_la_anchor: image byte length overflow"))?;
-        let mut image = LaAnchorImage {
-            storage: self
-                .device
-                .alloc_buffer(bytes, DType::F32, vec![elements])
-                .map_err(|error| anyhow!("snapshot_la_anchor: allocate image: {error}"))?,
-            layers,
-        };
-        anyhow::ensure!(
-            image.is_right_sized(),
-            "snapshot_la_anchor: image owner is not right-sized"
-        );
+        let mut image = self.allocate_anchor_image()?;
 
         match self.la_restore_route {
             LaRestoreRoute::Host => {
