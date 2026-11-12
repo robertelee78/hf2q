@@ -2853,6 +2853,90 @@ impl HybridKvCache {
         self.la_capture_active_tokens
     }
 
+    /// Bind every lazily reserved full-attention TQ buffer in one GPU write.
+    ///
+    /// The first command buffer that binds a reserved, never-used Metal
+    /// buffer waits in the driver before the GPU starts, for a time that
+    /// grows with the buffer's reserved size and not with the rows written
+    /// (M5 Max: about 16 ms per GiB, 34 ms per full-attention layer at a
+    /// four-slot, 262,144-token reservation). Unpaid, that wait lands in
+    /// the first prompt prefill. This writes row 0 of every sequence of
+    /// every layer once, on a cache no sequence has written yet: every
+    /// cursor is zero, so the row is unread and the first real write
+    /// replaces it. No served value changes.
+    ///
+    /// The MTP layer's storage is left alone: a server that never runs MTP
+    /// never binds it, and binding it here raised the peak footprint by
+    /// about 2 GiB at that reservation.
+    pub(crate) fn prewarm_tq_storage(
+        &mut self,
+        device: &MlxDevice,
+        registry: &mut mlx_native::KernelRegistry,
+    ) -> Result<()> {
+        let max_seq_len = self.max_seq_len;
+        let n_seqs = self.n_seqs;
+        let codebook_bits = match crate::debug::INVESTIGATION_ENV.tq_codebook_bits {
+            bits @ (5 | 6 | 8) => bits,
+            _ => 8,
+        };
+        for layer in self.full_attn.iter_mut() {
+            let Some(tq) = layer.tq.as_ref() else {
+                continue;
+            };
+            anyhow::ensure!(
+                layer.current_len.iter().all(|&len| len == 0),
+                "TQ prewarm needs an unused cache: a sequence already holds rows"
+            );
+            let shape = tq.k_packed.shape();
+            let (Some(&n_kv_heads), Some(&head_dim)) = (shape.get(1), shape.get(3)) else {
+                continue;
+            };
+            // The TQ encode kernel exists for these head widths only; other
+            // widths never write TQ rows.
+            if head_dim != 256 && head_dim != 512 {
+                continue;
+            }
+            let mut row = device
+                .alloc_buffer(
+                    n_kv_heads * head_dim * std::mem::size_of::<f32>(),
+                    DType::F32,
+                    vec![1, n_kv_heads, head_dim],
+                )
+                .map_err(|e| anyhow!("TQ prewarm row: {e}"))?;
+            row.as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("TQ prewarm row: {e}"))?
+                .fill(1.0);
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("TQ prewarm encoder: {e}"))?;
+            for seq in 0..n_seqs {
+                for is_k in [true, false] {
+                    layer.encode_seq_tokens_to_tq_for_slot(
+                        &row,
+                        is_k,
+                        1,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        max_seq_len,
+                        0,
+                        0,
+                        false,
+                        1.0,
+                        codebook_bits,
+                        crate::serve::multi_seq_kv::SlotId(seq),
+                        &mut encoder,
+                        registry,
+                        device,
+                    )?;
+                }
+            }
+            encoder
+                .commit_and_wait_labeled("qwen.kv_cache.tq_prewarm")
+                .map_err(|e| anyhow!("TQ prewarm commit: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// ADR-034 task #90 Step 2 (2026-05-21) + ADR-040 Phase A2b (2026-05-29) —
     /// roll back ONE sequence slot's linear-attention recurrent + conv state
     /// to `capture_states[..., accepted_idx, ...]` for that slot. Called on

@@ -1097,6 +1097,21 @@ impl Qwen35LoadedModel {
             variant = ?self.model.cfg.variant,
             "Qwen DeltaNet capture restore policy"
         );
+        // Pay the driver's first-bind wait for the reserved TQ storage here,
+        // before the listener reports ready, not in the first prompt prefill.
+        // The wait belongs to the buffer, not to a queue, so the allocating
+        // device and a registry of its own are enough.
+        if self.tq_kv_active {
+            let prewarm_started = Instant::now();
+            cache
+                .prewarm_tq_storage(&device, &mut mlx_native::KernelRegistry::new())
+                .context("prewarm Qwen35 full-attention TQ storage")?;
+            tracing::info!(
+                target: "hf2q::serve::api::engine_qwen35::progress",
+                elapsed_ms = prewarm_started.elapsed().as_millis() as u64,
+                "Qwen full-attention TQ storage prewarmed"
+            );
+        }
         self.persistent_kv_cache = Some(cache);
         self.provision_dflash2(max_slots as usize)?;
         Ok(())
