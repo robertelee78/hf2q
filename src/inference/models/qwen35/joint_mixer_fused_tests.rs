@@ -10,7 +10,7 @@
 //! twice to cover both projection routes under the fused stage:
 //! `cargo test --locked --bin hf2q joint_mixer_fused` and the same with
 //! `HF2Q_REPACKED_GGUF_M32=1 HF2Q_REPACKED_GGUF_M32_PROJ=1` (then the layer's
-//! prepared input products run as one wave).
+//! prepared input products run as one wave behind a norm that writes BF16).
 
 use super::joint_verify_tests::{
     dflash_arm, lane, padded_policy, run_dflash_case, with_synthetic_fixture, Arm, Fixture,

@@ -1,8 +1,8 @@
 //! Fused mixer stage of a Qwen DFlash2 target verify step
 //! (`HF2Q_QWEN_VERIFY_MIXER_FUSED=1`).
 //!
-//! A DeltaNet layer of a four-lane verify step is about 155 dispatches in
-//! ten serialized stages: its three prepared input products each as a
+//! A DeltaNet layer of a four-lane verify step is 159 dispatches in 14
+//! serialized stages: its three prepared input products each as a
 //! split-grid pass, a barrier and a reduce pass, and around the recurrence
 //! one dispatch per row for the Q norm, the K norm, the V gather and the
 //! query scale and one per window for the convolution, the raw-row copy and
@@ -10,7 +10,10 @@
 //!
 //! - the prepared input products of a layer (DeltaNet alpha/beta, qkv and z
 //!   gate; attention Q/gate, K and V) as one wave, one kernel pass each with
-//!   no barrier between them ([`super::prepared_projection::Pass::One`]), and
+//!   no barrier between them ([`super::prepared_projection::Pass::One`]),
+//! - the pre-mixer RMS norm straight into the BF16 rows those products read
+//!   when every product of the layer is prepared
+//!   ([`super::prepared_projection::normed_bf16_input`]), and
 //! - the DeltaNet core of every window (convolution, Q/K norms, query scale,
 //!   gates, recurrence, gated norm, the rows the replay commit retains) as
 //!   one dispatch that writes the BF16 rows the output projection reads
