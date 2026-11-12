@@ -8194,6 +8194,9 @@ impl Qwen35Model {
                 None
             };
 
+        // Layers the live-tile route runs on its fused expert stages, and
+        // layers it runs stage by stage.
+        let mut live_tile_layers = (0usize, 0usize);
         let mut out = Vec::with_capacity(self.layers.len());
         for (i, layer) in self.layers.iter().enumerate() {
             let ffn_gpu = match layer.ffn() {
@@ -8247,6 +8250,18 @@ impl Qwen35Model {
                             )
                             .with_context(|| format!("prepare moe_ffn_q layer {i} staged M8"))?;
                     }
+                    let shape = super::ffn::MoeFfnShape {
+                        hidden_size: cfg.hidden_size,
+                        num_experts: moe_cfg.num_experts,
+                        num_experts_per_tok: moe_cfg.num_experts_per_tok,
+                        moe_intermediate_size: moe_cfg.moe_intermediate_size,
+                        shared_intermediate_size: moe_cfg.shared_expert_intermediate_size,
+                    };
+                    match super::moe_live_tiles_fused::live_tile_layer_is_fused(&moe_gpu, shape) {
+                        Some(true) => live_tile_layers.0 += 1,
+                        Some(false) => live_tile_layers.1 += 1,
+                        None => {}
+                    }
                     FfnWeightsGpu::MoeQ(moe_gpu)
                 }
             };
@@ -8276,6 +8291,13 @@ impl Qwen35Model {
             encoder
                 .commit_and_wait_labeled("qwen.prepare_staged_m8")
                 .context("commit staged M8 expert preparation")?;
+        }
+        if moe_expert_route == super::moe_batched::MoeExpertRoute::LiveTiles {
+            tracing::info!(
+                fused_layers = live_tile_layers.0,
+                stage_layers = live_tile_layers.1,
+                "Qwen MoE live-tile layers: fused expert stages or stage by stage"
+            );
         }
         Ok(out)
     }

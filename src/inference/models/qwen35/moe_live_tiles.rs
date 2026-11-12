@@ -1,5 +1,8 @@
-//! Live-tile MoE FFN layer (`HF2Q_QWEN_MOE_LIVE_TILES=1`, on top of
-//! `HF2Q_QWEN_MOE_BATCHED=1` and `HF2Q_QWEN_MOE_STAGED_M8=1`).
+//! The live-tile MoE FFN layer (`HF2Q_QWEN_MOE_LIVE_TILES=1`, on top of
+//! `HF2Q_QWEN_MOE_BATCHED=1` and `HF2Q_QWEN_MOE_STAGED_M8=1`) stage by stage:
+//! the form [`super::moe_live_tiles_fused`] falls back to for a layer its
+//! fused expert stages do not admit, and the reference its bitwise tests
+//! compare it with.
 //!
 //! One MoE FFN layer over `rows = 1..=32` decode or DFlash2 target rows:
 //!
@@ -54,7 +57,7 @@ use super::moe_batched::{
 
 /// Rows of one router dispatch (the widest step of the row-exact kernel) and
 /// of one shared-expert tile.
-const BLOCK_ROWS: u32 = DENSE_MATVEC_F32_ROWS_MAX_ROWS;
+pub(super) const BLOCK_ROWS: u32 = DENSE_MATVEC_F32_ROWS_MAX_ROWS;
 
 /// One tile step's scratch from the decode pool.
 struct TileScratch {
@@ -91,7 +94,7 @@ impl TileScratch {
 }
 
 /// Rows `start..start + count` of a `[rows, width]` F32 buffer.
-fn row_block(buffer: &MlxBuffer, start: u32, count: u32, width: u32) -> MlxBuffer {
+pub(super) fn row_block(buffer: &MlxBuffer, start: u32, count: u32, width: u32) -> MlxBuffer {
     buffer.slice_view(
         u64::from(start) * u64::from(width) * DType::F32.size_of() as u64,
         count as usize * width as usize,
@@ -135,7 +138,7 @@ fn encode_row_exact_proj(
 /// (`[rows, hidden]`), adding `residual` when given. The caller validated
 /// the row count and the layer's native storage. Does not commit.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_moe_ffn_layer_live_tiles_into(
+pub(super) fn build_moe_ffn_layer_tile_stages_into(
     enc: &mut CommandEncoder,
     device: &MlxDevice,
     registry: &mut KernelRegistry,

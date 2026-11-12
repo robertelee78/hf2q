@@ -23,9 +23,10 @@
 //! Under a DFlash2 verify-row mask the schedule skips masked routes, so an
 //! unselected row costs no expert tile and phase F never reads its rows.
 //! With `HF2Q_QWEN_MOE_LIVE_TILES=1` as well, the layer runs
-//! [`super::moe_live_tiles`] instead: row-exact router logits at every width,
-//! one gate/up pass with a BF16 SwiGLU intermediate, and expert passes that
-//! launch the live tiles alone.
+//! [`super::moe_live_tiles_fused`] instead: row-exact router logits at every
+//! width, one schedule and one gate/up and down pass for the routed experts
+//! and the shared expert, a BF16 SwiGLU intermediate, and passes that launch
+//! the live tiles alone.
 //!
 //! Decode dispatches of one to eight rows preserve the established bitwise
 //! single-row invariant. The DFlash2 verifier's width-32 pass uses dense MM
@@ -72,7 +73,7 @@ pub(crate) const QWEN_MOE_BATCHED_ENV: &str = "HF2Q_QWEN_MOE_BATCHED";
 pub(crate) const QWEN_MOE_STAGED_M8_ENV: &str = "HF2Q_QWEN_MOE_STAGED_M8";
 
 /// Experimental live-tile expert route over the staged-M8 planes
-/// ([`super::moe_live_tiles`]). Requires [`QWEN_MOE_STAGED_M8_ENV`].
+/// ([`super::moe_live_tiles_fused`]). Requires [`QWEN_MOE_STAGED_M8_ENV`].
 pub(crate) const QWEN_MOE_LIVE_TILES_ENV: &str = "HF2Q_QWEN_MOE_LIVE_TILES";
 
 /// How one batched layer runs its routed experts.
@@ -459,7 +460,7 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_route_into(
         "batched MoE layer {layer_idx} does not support DWQ affine expert overlays"
     );
     if route == MoeExpertRoute::LiveTiles {
-        return super::moe_live_tiles::build_moe_ffn_layer_live_tiles_into(
+        return super::moe_live_tiles_fused::build_moe_ffn_layer_live_tiles_into(
             enc, device, registry, x, weights, shape, residual, out, rows, layer_idx, route_mask,
         );
     }

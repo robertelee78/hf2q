@@ -1609,6 +1609,57 @@ experts of more than eight routes, which this route runs as successive 8-row
 tiles in one threadgroup where Splash launches one threadgroup per tile. The
 route needs unpublished mlx-native kernels and is not quality-qualified.
 
+Second pass (wave 2). Measured inside the served cycle without the category
+profile (a diagnostic binary that gives every verify cycle one variant and
+reads each command buffer's GPU timestamps), the stage cost 15.5 ms of GPU
+time per four-lane cycle at the 20.3 rows the combined candidate verifies
+(8.7 ms plus 0.335 ms per verified row), not the profile's 17.6 to 21.5 ms:
+profiled cycles verify 24 to 25 rows because their waits flatten the verify
+budget's cost line, the category also holds the post-attention norm and the
+capture copy, and GPU time drifts inside a profiled process. The model-free
+0.375 ms came from one set of expert weights re-read sixteen times per
+command; with every layer on its own planes, as served, the layer took 0.323
+ms (Q4_K down) and 0.358 ms (Q6_K down) on the candidate's routes against
+Splash's 0.294 and 0.326 ms. The target of 13.6 ms was Splash on one weight
+set at 25 live rows; on the served routes and memory pattern it is 12.3 ms
+(medians of nine Q4_K-down and six Q6_K-down runs of 20 commands).
+
+The route now encodes its expert stages with `moe_tiles_fused` (Splash:
+`kernels/shared/moe.metal` grouping, `moe_expert_slab.h:63-100`): one
+schedule that applies the verify-row mask, emits tiles of at most eight
+routes (an expert of more routes is several threadgroups) and appends the
+shared expert's tiles; one gather; one gate/up and one down pass for routed
+and shared tiles together; and the router and shared-gate logits of all full
+blocks of eight rows in one dispatch each of the row-exact kernel. A layer
+is 8 dispatches and 6 barriers at 32 rows instead of 19 and 7. Every route
+keeps the tile arithmetic and register-path rule, so the layer is bitwise
+the stage-by-stage form (whole layers, masked and unmasked, widths 1 to 32,
+experts of up to 32 routes), which remains as the fallback for layers whose
+routed and shared planes differ in format or width. Model-free the layer
+takes 0.296 ms (Q4_K down) and 0.331 ms (Q6_K down), 12.5 ms for 40 layers
+against Splash's 12.3. In the served cycle, alternating the two forms per
+verify cycle in one process (506 four-lane cycles of two runs), the fused
+form uses 0.90 ± 0.13 ms less GPU time per cycle and its MoE stage takes
+14.8 instead of 15.7 ms at 20.6 verified rows. Four exact Q5 runs per form,
+interleaved on a host whose cycle time drifted between 34 and 43 ms, do not
+resolve that difference (median four-lane cycle 39.1 against 38.2 ms, three
+of four passes each); dispatches per cycle fall from 6,316 to 5,876. About
+1.5 ms of the stage in the server is not reproduced model-free: a GPU left
+idle before the command, as between cycles, accounts for 0.4 ms of it.
+
+The lower accepted-token count per lane-cycle of the combined candidate
+(4.00 against 4.17) follows the verify budget, not the tiles' arithmetic:
+the candidate removes fixed cycle cost (40.3 to 23.8 ms) while a verified
+row still costs 0.36 ms, so the budget verifies 4.29 instead of 4.73 draft
+rows per lane-cycle, and accepted tokens per second rise from 321 to 473.
+The first draft token matches equally often in every arm (0.815 to 0.823).
+On identical inputs (128 independent verify windows after a common prefill,
+teacher-forced), the staged-M8 route and the live tiles sit equally far from
+the FP32-expert route (relative logit error per window 3.2e-2 ± 0.25e-2 and
+3.1e-2 ± 0.18e-2, ten argmax differences in 1,024 rows each), and running
+the shared expert or the router on the staged-M8 route's FP32 kernels
+changes neither figure.
+
 #### Splash attention-kernel differential
 
 The full-attention kernels (K/V cache write, attention, output gate; the

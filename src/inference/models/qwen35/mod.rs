@@ -98,6 +98,8 @@ mod real_artifact_resume_attn_fast_tests;
 #[cfg(test)]
 mod real_artifact_moe_batched_q1_tests;
 #[cfg(test)]
+mod real_artifact_moe_route_replay_tests;
+#[cfg(test)]
 mod real_artifact_prefill_schedule_tests;
 #[cfg(test)]
 mod real_artifact_mtp_acceptance_probe_tests;
@@ -111,6 +113,7 @@ pub(crate) mod moe_batched;
 #[cfg(test)]
 mod moe_batched_tests;
 mod moe_live_tiles;
+mod moe_live_tiles_fused;
 #[cfg(test)]
 mod moe_live_tiles_tests;
 pub mod mtp;
