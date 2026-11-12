@@ -158,6 +158,7 @@ impl DFlash2Runtime {
             std::env::var(DFLASH2_DRAFT_STAGED_ENV).ok().as_deref(),
             &config,
             &tensors,
+            lanes,
         )?;
         let workspace = DFlash2Workspace::new(device, &config, lanes, staged)
             .context("allocate DFlash2 workspace")?;
@@ -337,6 +338,9 @@ impl DFlash2Runtime {
                 .context("execute DFlash2 draft cycle")?;
         } else {
             encoder.commit_labeled("adr067.dflash2_draft");
+        }
+        if let Some(staged) = self.workspace.staged.as_mut() {
+            staged.command_committed();
         }
         Ok(())
     }

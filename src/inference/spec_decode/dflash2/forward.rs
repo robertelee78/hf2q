@@ -860,7 +860,9 @@ fn dispatch_vocabulary_head(
 
 /// Encode the complete five/six-layer draft forward. The caller must populate
 /// `workspace.hidden[0]` with anchor + mask embeddings and call
-/// [`prepare_decode_positions`] first.
+/// [`prepare_decode_positions`] first. On the staged route the caller reports
+/// the command's commit with
+/// [`DFlash2StagedScratch::command_committed`](super::staged::DFlash2StagedScratch::command_committed).
 pub fn dispatch_dflash2_forward(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,

@@ -44,6 +44,10 @@ pub const STAGED_MIN_OUTPUTS: usize = 960;
 /// Rows the prepared target head tile takes.
 const PREPARED_HEAD_ROWS: usize = 32;
 
+/// Rows of the smallest staged tile; a command's rows are covered by 32-,
+/// 16- and 8-row tiles.
+const STAGED_TILE_ROWS: usize = 8;
+
 // The selector projection keeps the register tile and reads the F32 final
 // rows, so it may run beside the head, which reads their BF16 rounding.
 const _: () = assert!(mlx_native::DFLASH2_SELECTOR_RANK < STAGED_MIN_OUTPUTS);
@@ -52,8 +56,8 @@ pub(super) fn staged_tile_takes(output_width: usize) -> bool {
     output_width >= STAGED_MIN_OUTPUTS
 }
 
-/// Whether the checkpoint's shapes fit the staged route.
-fn supports(config: &DFlash2Config, tensors: &DFlash2ModelTensors) -> Result<()> {
+/// Whether the checkpoint's shapes at `lanes` lanes fit the staged route.
+fn supports(config: &DFlash2Config, tensors: &DFlash2ModelTensors, lanes: usize) -> Result<()> {
     ensure!(
         matches!(tensors.context_projection, DFlash2Projection::Af4G64 { .. }),
         "{DFLASH2_DRAFT_STAGED_ENV}=1 requires HF2Q_DFLASH2_DRAFT_AF4_G64=1"
@@ -71,6 +75,11 @@ fn supports(config: &DFlash2Config, tensors: &DFlash2ModelTensors) -> Result<()>
         "{DFLASH2_DRAFT_STAGED_ENV}=1 requires gate and up projections of whole 64-row tiles, got {} rows",
         config.intermediate_size
     );
+    ensure!(
+        (lanes * config.block_size) % STAGED_TILE_ROWS == 0,
+        "{DFLASH2_DRAFT_STAGED_ENV}=1 requires a multiple of {STAGED_TILE_ROWS} draft rows, got {lanes} lanes of {} rows",
+        config.block_size
+    );
     Ok(())
 }
 
@@ -79,10 +88,11 @@ pub(super) fn resolve_staged_draft(
     raw: Option<&str>,
     config: &DFlash2Config,
     tensors: &DFlash2ModelTensors,
+    lanes: usize,
 ) -> Result<bool> {
     match raw {
         None | Some("" | "0") => Ok(false),
-        Some("1") => supports(config, tensors).map(|()| true),
+        Some("1") => supports(config, tensors, lanes).map(|()| true),
         Some(value) => bail!("{DFLASH2_DRAFT_STAGED_ENV} must be 0 or 1, got {value:?}"),
     }
 }
@@ -111,9 +121,13 @@ pub struct DFlash2StagedScratch {
     /// `None` when the attention shape is not the one the ring kernels are
     /// compiled for; the draft then keeps the packed attention.
     pub attention: Option<DFlash2RingAttentionScratch>,
-    /// The target vocabulary head repacked for the staged tile by the first
-    /// draft command that projects through it.
+    /// The target vocabulary head repacked for the staged tile. It is
+    /// recorded by [`Self::command_committed`], once the command that repacks
+    /// it has been committed: a command abandoned while it is encoded leaves
+    /// no head whose planes were never written.
     pub head: Option<PreparedGgufWeight>,
+    /// The head the command being encoded repacks.
+    pending_head: Option<PreparedGgufWeight>,
 }
 
 impl DFlash2StagedScratch {
@@ -175,7 +189,7 @@ impl DFlash2StagedScratch {
                 partials: allocate(
                     device,
                     DType::F32,
-                    &[dflash2_ring_attention_partial_elements(lanes, kv_heads)],
+                    &[dflash2_ring_attention_partial_elements(lanes, kv_heads)?],
                     bytes,
                 )?,
                 output: allocate(device, DType::BF16, &[rows, query], bytes)?,
@@ -189,7 +203,15 @@ impl DFlash2StagedScratch {
             partials: allocate(device, DType::F32, &[partial_elements], bytes)?,
             attention,
             head: None,
+            pending_head: None,
         })
+    }
+
+    /// Record that the command encoded through this scratch was committed.
+    pub fn command_committed(&mut self) {
+        if let Some(head) = self.pending_head.take() {
+            self.head = Some(head);
+        }
     }
 
     /// Round F32 rows into `projection_input`.
@@ -325,7 +347,9 @@ pub(super) fn dispatch_ring_attention(
 
 /// Project `input` through the target's native head on the prepared tile.
 /// Returns `false`, encoding nothing, when the head or the row count is not
-/// one the tile takes.
+/// one the tile takes. The first command also repacks the head; the caller
+/// reports that command's commit with
+/// [`DFlash2StagedScratch::command_committed`].
 pub(super) fn dispatch_prepared_head(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -346,12 +370,17 @@ pub(super) fn dispatch_prepared_head(
     }
     let params = weight.matmul_params(u32::try_from(rows)?)?;
     if staged.head.is_none() {
-        staged.head = Some(
+        // Replaces a head that a command abandoned before its commit prepared.
+        staged.pending_head = Some(
             prepare_repacked_gguf_weight(encoder, registry, device, &weight.buffer, &params)
                 .context("prepare the DFlash2 vocabulary head")?,
         );
     }
-    let prepared = staged.head.as_ref().expect("prepared above");
+    let prepared = staged
+        .head
+        .as_ref()
+        .or(staged.pending_head.as_ref())
+        .expect("prepared above");
     staged.round_input(encoder, registry, device, input, rows, weight.info.cols)?;
     dispatch_repacked_gguf_mm_bf16_input(
         encoder,
@@ -375,6 +404,7 @@ mod tests {
             DFlash2VocabularyHead,
         },
     };
+    use crate::serve::gpu::QuantWeightInfo;
     use half::bf16;
 
     /// The smallest shape every staged kernel takes: 16 query heads over 4 KV
@@ -409,32 +439,48 @@ mod tests {
 
     #[test]
     fn the_switch_is_off_unless_exactly_one_and_fails_closed() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().unwrap();
         let cfg = config(1_024);
         let mut tensors = DFlash2ModelTensors::synthetic_af4_g64(&device, &cfg, 3);
         for off in [None, Some(""), Some("0")] {
-            assert!(!resolve_staged_draft(off, &cfg, &tensors).unwrap());
+            assert!(!resolve_staged_draft(off, &cfg, &tensors, 4).unwrap());
         }
-        assert!(resolve_staged_draft(Some("1"), &cfg, &tensors).unwrap());
+        for lanes in 1..=4 {
+            assert!(resolve_staged_draft(Some("1"), &cfg, &tensors, lanes).unwrap());
+        }
         for invalid in ["true", "on", " 1", "2"] {
-            let error = resolve_staged_draft(Some(invalid), &cfg, &tensors).unwrap_err();
+            let error = resolve_staged_draft(Some(invalid), &cfg, &tensors, 4).unwrap_err();
             assert!(error.to_string().contains("must be 0 or 1"), "{error}");
         }
 
+        // Rows the staged tiles cannot cover fail at load, not at the first
+        // encode.
+        let short_block = DFlash2Config {
+            block_size: 4,
+            ..cfg.clone()
+        };
+        assert!(resolve_staged_draft(Some("1"), &short_block, &tensors, 2).unwrap());
+        let error = resolve_staged_draft(Some("1"), &short_block, &tensors, 3).unwrap_err();
+        assert!(
+            error.to_string().contains("multiple of 8 draft rows"),
+            "{error}"
+        );
+
         let narrow = config(512);
         let narrow_tensors = DFlash2ModelTensors::synthetic_af4_g64(&device, &narrow, 3);
-        let error = resolve_staged_draft(Some("1"), &narrow, &narrow_tensors).unwrap_err();
+        let error = resolve_staged_draft(Some("1"), &narrow, &narrow_tensors, 4).unwrap_err();
         assert!(error.to_string().contains("hidden size"), "{error}");
-        assert!(!resolve_staged_draft(Some("0"), &narrow, &narrow_tensors).unwrap());
+        assert!(!resolve_staged_draft(Some("0"), &narrow, &narrow_tensors, 4).unwrap());
 
         tensors.layers[0].gate_up_halves = None;
-        let error = resolve_staged_draft(Some("1"), &cfg, &tensors).unwrap_err();
+        let error = resolve_staged_draft(Some("1"), &cfg, &tensors, 4).unwrap_err();
         assert!(error.to_string().contains("64-row tiles"), "{error}");
 
         tensors.context_projection = DFlash2Projection::Dense {
             weight: device.alloc_buffer(2, DType::BF16, vec![1, 1]).unwrap(),
         };
-        let error = resolve_staged_draft(Some("1"), &cfg, &tensors).unwrap_err();
+        let error = resolve_staged_draft(Some("1"), &cfg, &tensors, 4).unwrap_err();
         assert!(
             error.to_string().contains("HF2Q_DFLASH2_DRAFT_AF4_G64=1"),
             "{error}"
@@ -455,24 +501,23 @@ mod tests {
         rings: Vec<f32>,
     }
 
-    /// Fill the rings past one wrap, then run one draft forward.
-    fn run(lanes: usize, staged: bool) -> Outputs {
+    struct Fixture {
+        device: MlxDevice,
+        registry: KernelRegistry,
+        cfg: DFlash2Config,
+        tensors: DFlash2ModelTensors,
+        workspace: DFlash2Workspace,
+    }
+
+    /// A synthetic checkpoint whose rings are filled past one wrap and whose
+    /// draft input rows are set.
+    fn fixture(lanes: usize, staged: bool) -> Fixture {
         let device = MlxDevice::new().unwrap();
         let mut registry = KernelRegistry::new();
         let cfg = config(1_024);
         let tensors = DFlash2ModelTensors::synthetic_af4_g64(&device, &cfg, 5);
-        assert!(resolve_staged_draft(Some("1"), &cfg, &tensors).unwrap());
-        let mut head = device
-            .alloc_buffer(
-                cfg.vocab_size * cfg.hidden_size * 2,
-                DType::BF16,
-                vec![cfg.vocab_size, cfg.hidden_size],
-            )
-            .unwrap();
+        assert!(resolve_staged_draft(Some("1"), &cfg, &tensors, lanes).unwrap());
         let mut state = 17_u64;
-        for weight in head.as_mut_slice::<bf16>().unwrap() {
-            *weight = bf16::from_f32(0.05 * random(&mut state));
-        }
         let mut workspace = DFlash2Workspace::new(&device, &cfg, lanes, staged).unwrap();
         assert_eq!(workspace.staged.is_some(), staged);
         let retained_rows: Vec<u32> = [8_u32, 8, 3, 0][..lanes].to_vec();
@@ -512,6 +557,35 @@ mod tests {
         prepare_decode_positions(&mut workspace, &cfg, &lengths).unwrap();
         for value in workspace.hidden[0].as_mut_slice::<f32>().unwrap() {
             *value = 2.0 * random(&mut state);
+        }
+        Fixture {
+            device,
+            registry,
+            cfg,
+            tensors,
+            workspace,
+        }
+    }
+
+    /// One draft forward of [`fixture`] through a dense head.
+    fn run(lanes: usize, staged: bool) -> Outputs {
+        let Fixture {
+            device,
+            mut registry,
+            cfg,
+            tensors,
+            mut workspace,
+        } = fixture(lanes, staged);
+        let mut head = device
+            .alloc_buffer(
+                cfg.vocab_size * cfg.hidden_size * 2,
+                DType::BF16,
+                vec![cfg.vocab_size, cfg.hidden_size],
+            )
+            .unwrap();
+        let mut state = 29_u64;
+        for weight in head.as_mut_slice::<bf16>().unwrap() {
+            *weight = bf16::from_f32(0.05 * random(&mut state));
         }
         let mut encoder = device.command_encoder().unwrap();
         dispatch_dflash2_forward(
@@ -560,6 +634,7 @@ mod tests {
     /// lane count's row tiling.
     #[test]
     fn staged_route_matches_the_default_route_on_a_synthetic_checkpoint() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         for lanes in [1, 3, 4] {
             let default = run(lanes, false);
             let staged = run(lanes, true);
@@ -593,5 +668,106 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    /// A Q4_K head of `cfg`'s shape with small finite weights.
+    fn q4k_head(device: &MlxDevice, cfg: &DFlash2Config) -> MlxQWeight {
+        const BLOCK_BYTES: usize = 144;
+        let bytes = cfg.vocab_size * cfg.hidden_size / 256 * BLOCK_BYTES;
+        let mut buffer = device.alloc_buffer(bytes, DType::U8, vec![bytes]).unwrap();
+        for (block, bytes) in buffer
+            .as_mut_slice::<u8>()
+            .unwrap()
+            .chunks_exact_mut(BLOCK_BYTES)
+            .enumerate()
+        {
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = ((block * 31 + index * 13 + 7) & 255) as u8;
+            }
+            bytes[0..2].copy_from_slice(&half::f16::from_f32(0.015625).to_le_bytes());
+            bytes[2..4].copy_from_slice(&half::f16::from_f32(0.0078125).to_le_bytes());
+            for scale in &mut bytes[4..16] {
+                *scale &= 0x3f;
+            }
+        }
+        MlxQWeight {
+            buffer,
+            info: QuantWeightInfo {
+                ggml_dtype: GgmlType::Q4_K,
+                rows: cfg.vocab_size,
+                cols: cfg.hidden_size,
+            },
+            affine: None,
+            f16_shadow: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Encode one draft forward through a native head; commit it or abandon
+    /// it as a failed encode would.
+    fn forward_native(fixture: &mut Fixture, head: &MlxQWeight, commit: bool) -> Vec<f32> {
+        // A forward overwrites its input rows; every call starts from the same.
+        let mut state = 43_u64;
+        for value in fixture.workspace.hidden[0].as_mut_slice::<f32>().unwrap() {
+            *value = 2.0 * random(&mut state);
+        }
+        let mut encoder = fixture.device.command_encoder().unwrap();
+        dispatch_dflash2_forward(
+            &mut encoder,
+            &mut fixture.registry,
+            &fixture.device,
+            &fixture.cfg,
+            &fixture.tensors,
+            DFlash2VocabularyHead::Native(head),
+            &mut fixture.workspace,
+        )
+        .unwrap();
+        if commit {
+            encoder.commit_and_wait().unwrap();
+            if let Some(staged) = fixture.workspace.staged.as_mut() {
+                staged.command_committed();
+            }
+        }
+        fixture.workspace.logits.as_slice::<f32>().unwrap().to_vec()
+    }
+
+    #[test]
+    fn prepared_head_is_recorded_only_after_its_command_commits() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let prepared =
+            |fixture: &Fixture| fixture.workspace.staged.as_ref().unwrap().head.is_some();
+        let mut staged = fixture(4, true);
+        let head = q4k_head(&staged.device, &staged.cfg);
+
+        // A command abandoned after it encoded the repack never ran it.
+        forward_native(&mut staged, &head, false);
+        assert!(
+            !prepared(&staged),
+            "an uncommitted command recorded its head"
+        );
+        let logits = forward_native(&mut staged, &head, true);
+        assert!(prepared(&staged));
+        let again = forward_native(&mut staged, &head, true);
+        assert!(
+            logits
+                .iter()
+                .map(|v| v.to_bits())
+                .eq(again.iter().map(|v| v.to_bits())),
+            "the recorded head gives other logits than the command that prepared it"
+        );
+
+        // The prepared tile computes the stock head's product.
+        let mut default = fixture(4, false);
+        let stock = forward_native(&mut default, &head, true);
+        let error = relative_rms(&logits, &stock);
+        assert!(
+            error <= 5.0e-3,
+            "prepared head differs by relative RMS {error}"
+        );
+
+        // Fewer than four lanes keep the stock head.
+        let mut narrow = fixture(3, true);
+        forward_native(&mut narrow, &head, true);
+        assert!(!prepared(&narrow));
     }
 }
