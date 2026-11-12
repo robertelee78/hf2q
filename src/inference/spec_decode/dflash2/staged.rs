@@ -937,4 +937,130 @@ mod tests {
         forward_native(&mut narrow, &head, true);
         assert!(!prepared(&narrow));
     }
+
+    /// Every ring's bits after appending `rows` capture rows to `lane` at
+    /// `start`: by the decode-shaped commits of `block_size` rows on the
+    /// lane's own row group, one command buffer each, or by lane passes.
+    fn ingest_rings(
+        lanes: usize,
+        staged: bool,
+        lane: usize,
+        start: usize,
+        rows: usize,
+        lane_passes: bool,
+    ) -> Vec<u16> {
+        use crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession;
+        use crate::inference::spec_decode::dflash2::runtime::ingest_capture_lane_passes;
+
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let cfg = config(1_024);
+        let tensors = DFlash2ModelTensors::synthetic_af4_g64(&device, &cfg, 5);
+        let mut workspace = DFlash2Workspace::new(&device, &cfg, lanes, staged).unwrap();
+        assert_eq!(workspace.staged.is_some(), staged);
+        let width = cfg.fc_input_dim();
+        let mut state = 71_u64;
+        let capture = DFlashCaptureSession {
+            target_layer_ids: cfg.target_layer_ids.clone(),
+            hidden_output: (0..rows * width)
+                .map(|_| 2.0 * random(&mut state))
+                .collect(),
+            per_position_argmaxes: None,
+            seq_len: rows,
+            hidden_size: width / cfg.target_layer_ids.len(),
+        };
+        // The other lanes' rows hold whatever the last cycle left there.
+        for value in workspace
+            .captured_target_hidden
+            .as_mut_slice::<f32>()
+            .unwrap()
+        {
+            *value = 2.0 * random(&mut state);
+        }
+        if lane_passes {
+            ingest_capture_lane_passes(
+                &device,
+                &mut registry,
+                &cfg,
+                &tensors,
+                &workspace,
+                &capture,
+                lane,
+                start,
+                0..rows,
+            )
+            .unwrap();
+        } else {
+            let mut lengths: Vec<u32> = (0..lanes as u32).map(|other| 17 * other + 3).collect();
+            lengths[lane] = start as u32;
+            let mut retained = device
+                .alloc_buffer(lanes * 4, DType::U32, vec![lanes])
+                .unwrap();
+            let lane_rows = lane * cfg.block_size * width..(lane + 1) * cfg.block_size * width;
+            for chunk in capture.hidden_output.chunks(cfg.block_size * width) {
+                let destination = &mut workspace
+                    .captured_target_hidden
+                    .as_mut_slice::<f32>()
+                    .unwrap()[lane_rows.clone()];
+                destination.fill(0.0);
+                destination[..chunk.len()].copy_from_slice(chunk);
+                prepare_decode_positions(&mut workspace, &cfg, &lengths).unwrap();
+                let counts = retained.as_mut_slice::<u32>().unwrap();
+                counts.fill(0);
+                counts[lane] = (chunk.len() / width) as u32;
+                let mut encoder = device.command_encoder().unwrap();
+                dispatch_dflash2_context_commit(
+                    &mut encoder,
+                    &mut registry,
+                    &device,
+                    &cfg,
+                    &tensors,
+                    &retained,
+                    &workspace,
+                )
+                .unwrap();
+                encoder.commit_and_wait().unwrap();
+                lengths[lane] += (chunk.len() / width) as u32;
+            }
+        }
+        workspace
+            .ring_keys
+            .iter()
+            .chain(&workspace.ring_values)
+            .flat_map(|ring| ring.as_slice::<bf16>().unwrap())
+            .map(|value| value.to_bits())
+            .collect()
+    }
+
+    /// A prefill capture appended in passes of the workspace's whole row
+    /// capacity leaves, bit for bit, the rings that decode-shaped commits of
+    /// `block_size` rows leave: on both draft routes, at every lane count,
+    /// for a partial block, a chunk of several passes with a partial last
+    /// group, a chunk that wraps the ring, and one longer than the ring.
+    #[test]
+    fn lane_passes_write_the_rings_of_block_commits() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        for staged in [false, true] {
+            for lanes in [1, 3, 4] {
+                for (lane, start, rows) in
+                    [(0, 0, 5), (lanes - 1, 3, 61), (0, 250, 200), (lanes - 1, 10, 300)]
+                {
+                    let blocks = ingest_rings(lanes, staged, lane, start, rows, false);
+                    let passes = ingest_rings(lanes, staged, lane, start, rows, true);
+                    assert!(blocks.iter().any(|&bits| bits != 0), "nothing was appended");
+                    let differing = blocks
+                        .iter()
+                        .zip(&passes)
+                        .filter(|(block, pass)| block != pass)
+                        .count();
+                    assert!(
+                        differing == 0,
+                        "staged {staged}, {lanes} lanes, lane {lane}, {rows} rows at {start}: \
+                         {differing} of {} ring values differ",
+                        blocks.len()
+                    );
+                }
+            }
+        }
+    }
 }
