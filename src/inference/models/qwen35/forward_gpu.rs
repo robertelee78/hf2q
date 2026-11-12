@@ -303,6 +303,15 @@ enum OutputHeadMode {
     },
 }
 
+/// What [`Qwen35Model::forward_gpu_last_logits_folded`] returns: the logits
+/// of the chunk's last row, and the stable-boundary checkpoint taken inside
+/// the forward (its last-row logits and the slot state there).
+pub(crate) struct FoldedPrefill {
+    pub(crate) logits: Vec<f32>,
+    pub(crate) boundary_logits: Vec<f32>,
+    pub(crate) boundary: super::kv_cache::HybridKvSlotAnchor,
+}
+
 /// One ADR-054 per-family calibration capture request (#300): read the
 /// complete post-layer residual `hidden` (the exact tensor the
 /// `residual_stream_post_layer` steering mutates at the layer-loop tail)
@@ -3573,6 +3582,111 @@ impl Qwen35Model {
         )
     }
 
+    /// Whether the cue fold ([`super::prefill_fold`]) is exact for this
+    /// model in the open prefill scope: every product a folded forward runs
+    /// once over both segments takes the prepared row-tile MM, whose output
+    /// row depends on that input row alone. Full attention and the MoE FFN
+    /// are built per segment and need no such guarantee; an F32 FFN has none.
+    pub(crate) fn prefill_fold_exact(&self) -> Result<bool> {
+        self.ensure_gpu_cache_primed()?;
+        let shape = DeltaNetLayerShape::from_config(&self.cfg);
+        GPU_CACHE.with(|cell| -> Result<bool> {
+            let guard = cell.borrow();
+            let cache = guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("prefill_fold_exact: GPU_CACHE not initialized"))?;
+            ensure!(
+                gpu_cache_matches_model(cache, self),
+                "prefill_fold_exact: GPU_CACHE belongs to a different Qwen35Model"
+            );
+            Ok(cache.layer_weights.iter().all(|layer| {
+                let (ffn, linear) = match layer {
+                    LayerWeightsGpu::FullAttn { ffn, .. } => (ffn, None),
+                    LayerWeightsGpu::LinearAttn { attn, ffn } => (ffn, Some(attn)),
+                };
+                let ffn_exact = match ffn {
+                    FfnWeightsGpu::DenseQ(weights) => {
+                        super::gpu_ffn::dense_prefill_products_prepared(weights, 2)
+                    }
+                    FfnWeightsGpu::MoeQ(_) => true,
+                    FfnWeightsGpu::Dense(_) | FfnWeightsGpu::Moe(_) => false,
+                };
+                ffn_exact
+                    && linear.is_none_or(|weights| {
+                        shape.d_k % 32 == 0
+                            && shape.d_k <= 128
+                            && super::gpu_delta_net::prefill_products_prepared(
+                                weights,
+                                shape.hidden_size,
+                                shape.n_k_heads,
+                                shape.n_v_heads,
+                                shape.d_k,
+                                shape.d_v,
+                            )
+                    })
+            }))
+        })
+    }
+
+    /// One prompt-prefill forward over the last content chunk and the
+    /// generation cue behind it ([`super::prefill_fold`]). `prefix_rows`
+    /// content rows end at the stable prompt boundary, whose physical cursor
+    /// is `boundary_len`. Returns the last-row logits, the logits of the last
+    /// content row, and the slot checkpoint at the boundary: what a forward
+    /// over the content rows, [`HybridKvCache::snapshot_slot_anchor`], and a
+    /// forward over the cue rows produce, bit for bit. The caller opens the
+    /// prefill scope and has checked [`Self::prefill_fold_exact`].
+    pub(crate) fn forward_gpu_last_logits_folded(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        dflash_capture: Option<
+            &mut crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession,
+        >,
+        slot_id: SlotId,
+        prefix_rows: usize,
+        boundary_len: usize,
+    ) -> Result<FoldedPrefill> {
+        ensure!(
+            super::prefill_fold::rows_admitted(
+                prefix_rows,
+                tokens.len().saturating_sub(prefix_rows)
+            ),
+            "cue fold of {prefix_rows} + {} rows is outside the served shape",
+            tokens.len().saturating_sub(prefix_rows)
+        );
+        let image = kv_cache
+            .boundary_anchor_image()
+            .context("cue fold checkpoint image")?;
+        let request = super::prefill_fold::BoundaryFold {
+            prefix_rows: prefix_rows as u32,
+            image: image.clone(),
+        };
+        let (logits, boundary_logits) = super::prefill_fold::with_request(request, || {
+            match dflash_capture {
+                Some(capture) => self
+                    .forward_gpu_last_logits_with_hidden_dflash(
+                        tokens,
+                        positions_flat,
+                        kv_cache,
+                        Some(capture),
+                        slot_id,
+                    )
+                    .map(|(logits, _hidden)| logits),
+                None => self.forward_gpu_last_logits(tokens, positions_flat, kv_cache, slot_id),
+            }
+        })?;
+        let boundary = kv_cache
+            .slot_anchor_at_boundary(slot_id, boundary_len, image)
+            .context("cue fold checkpoint")?;
+        Ok(FoldedPrefill {
+            logits,
+            boundary_logits,
+            boundary,
+        })
+    }
+
     /// ADR-034 task #78 Step 3c.A.2 (2026-05-21) — embed tokens to a
     /// fresh GPU F32 buffer of shape `[tokens.len(), hidden_size]`.
     ///
@@ -4299,6 +4413,23 @@ impl Qwen35Model {
         // accesses; durable nextn parents/rings are direct, not pool-issued.
         super::decode_pool::checked_reset_decode_pool()?;
         let seq_len = tokens.len() as u32;
+        // Cue fold ([`super::prefill_fold`]): this forward crosses the stable
+        // prompt boundary at `prefix_rows` and captures the checkpoint there.
+        let fold = super::prefill_fold::take_request(seq_len)?;
+        if fold.is_some() {
+            ensure!(
+                matches!(output_head_mode, OutputHeadMode::Last)
+                    && soft_tokens.is_empty()
+                    && deepstack.is_none()
+                    && residual_capture.is_none()
+                    && nextn_hidden_out.is_none()
+                    && self.glp.is_none()
+                    && !kv_cache.la_capture_active()
+                    && !super::dump_bisect::is_enabled()
+                    && !super::execution_dispatch::dense_q_split_profile_enabled(),
+                "the cue fold serves the plain and the DFlash-capture prompt prefill only"
+            );
+        }
         // ---- ADR-019 Phase 2 iter91 Worker B (H2 production CB-count probe) ----
         //
         // When `HF2Q_DUMP_CB_COUNT=1` is set, capture the process-global
@@ -4517,7 +4648,10 @@ impl Qwen35Model {
         //
         // Skip when the model has no FullAttn layers: defensive — avoids a zero-
         // useful arena allocation when running DN-only models.
+        // A folded forward builds each full-attention layer per segment, on
+        // the segment scratch below, and has no use for chunk-sized scratch.
         let mut fa_arena: Option<super::FaPrefillArena> = if seq_len > 1
+            && fold.is_none()
             && layer_weights_gpu
                 .iter()
                 .any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
@@ -4561,6 +4695,7 @@ impl Qwen35Model {
         // Skip when the model has no FullAttn layers: defensive — avoids a
         // zero-useful arena allocation when running DN-only models.
         let mut fa_proj_arena: Option<super::FaProjectionsArena> = if seq_len > 1
+            && fold.is_none()
             && layer_weights_gpu
                 .iter()
                 .any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
@@ -4628,7 +4763,7 @@ impl Qwen35Model {
         // Memory footprint at 35B-A3B q4_0-flat pp4096 (h=5120, topk=8,
         // m_moe=512, m_sh=512): ~870 MB. Allocated once for the prefill;
         // M5 Max 128 GB unified memory keeps this well within budget.
-        let mut moe_ffn_arena: Option<super::MoeFfnArena> = if seq_len > 1 {
+        let mut moe_ffn_arena: Option<super::MoeFfnArena> = if seq_len > 1 && fold.is_none() {
             if let Some(moe) = cfg.moe.as_ref() {
                 Some(
                     super::MoeFfnArena::new(
@@ -4692,6 +4827,106 @@ impl Qwen35Model {
         } else {
             None
         };
+
+        // ---- Cue fold: per-segment scratch ----
+        //
+        // The two segments of a folded forward run their row-mixing layers
+        // as the two forwards would: full attention and the MoE FFN on
+        // scratch sized for the segment, DeltaNet with the boundary state
+        // and the parameter blocks of its two dispatches.
+        let fold_segments: Option<[(u32, u32); 2]> = fold.as_ref().map(|fold| {
+            [
+                (0, fold.prefix_rows),
+                (fold.prefix_rows, seq_len - fold.prefix_rows),
+            ]
+        });
+        let mut fold_fa: Vec<(super::FaPrefillArena, super::FaProjectionsArena, MlxBuffer)> =
+            Vec::new();
+        let mut fold_moe: Vec<super::MoeFfnArena> = Vec::new();
+        let mut fold_dn: Option<super::prefill_fold::DnBoundaryScratch> = None;
+        ensure!(
+            fold.is_none()
+                || layer_weights_gpu.iter().all(|layer| {
+                    matches!(
+                        layer,
+                        LayerWeightsGpu::FullAttn {
+                            ffn: FfnWeightsGpu::DenseQ(_) | FfnWeightsGpu::MoeQ(_),
+                            ..
+                        } | LayerWeightsGpu::LinearAttn {
+                            ffn: FfnWeightsGpu::DenseQ(_) | FfnWeightsGpu::MoeQ(_),
+                            ..
+                        }
+                    )
+                }),
+            "the cue fold needs quantized FFN layers"
+        );
+        if let Some(segments) = fold_segments {
+            let has_full = layer_weights_gpu
+                .iter()
+                .any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }));
+            let has_linear = layer_weights_gpu
+                .iter()
+                .any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }));
+            for (first, rows) in segments {
+                if has_full {
+                    let shape = FullAttnShape::from_config(cfg);
+                    fold_fa.push((
+                        super::FaPrefillArena::new(
+                            &device,
+                            rows,
+                            shape.n_head,
+                            shape.n_kv,
+                            shape.head_dim,
+                        )
+                        .context("alloc cue fold FaPrefillArena")?,
+                        super::FaProjectionsArena::new(
+                            &device,
+                            rows,
+                            shape.hidden_size,
+                            shape.n_head,
+                            shape.n_kv,
+                            shape.head_dim,
+                            shape.rms_norm_eps,
+                        )
+                        .context("alloc cue fold FaProjectionsArena")?,
+                        super::prefill_fold::segment_positions(
+                            &device,
+                            positions_flat,
+                            seq_len,
+                            first,
+                            rows,
+                        )?,
+                    ));
+                }
+                if let Some(moe) = cfg.moe.as_ref() {
+                    fold_moe.push(
+                        super::MoeFfnArena::new(
+                            &device,
+                            rows,
+                            h,
+                            moe.num_experts_per_tok,
+                            moe.moe_intermediate_size,
+                            moe.shared_expert_intermediate_size,
+                            moe.num_experts,
+                        )
+                        .context("alloc cue fold MoeFfnArena")?,
+                    );
+                }
+            }
+            if has_linear {
+                let dn_shape = DeltaNetLayerShape::from_config(cfg);
+                fold_dn = Some(super::prefill_fold::DnBoundaryScratch::new(
+                    &device,
+                    [segments[0].1, segments[1].1],
+                    dn_shape.n_k_heads,
+                    dn_shape.n_v_heads,
+                    dn_shape.d_k,
+                    dn_shape.d_v,
+                    dn_shape.conv_kernel,
+                    super::gpu_delta_net::FORWARD_DISPATCH_N_SEQS,
+                )?);
+            }
+        }
 
         // ---- ADR-019 Phase 2: FFN-output ring buffers (race closure) ----
         //
@@ -5210,6 +5445,94 @@ impl Qwen35Model {
                 None
             };
             let attn_out = match layer_gpu {
+                LayerWeightsGpu::FullAttn { attn, .. } if fold_segments.is_some() => {
+                    // Cue fold: the layer is built once per segment, with the
+                    // rows, cursor, positions and scratch that segment's own
+                    // forward has, and the two outputs are joined.
+                    let segments = fold_segments.unwrap_or_default();
+                    let shape = FullAttnShape::from_config(cfg);
+                    let full_attn_rank = match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                        Some(super::kv_cache::LayerSlot::Full(rank)) => rank as usize,
+                        other => {
+                            return Err(anyhow!(
+                                "layer {layer_idx}: expected FullAttn slot, got {:?}",
+                                other
+                            ))
+                        }
+                    };
+                    let max_seq = kv_cache.max_seq_len;
+                    let width = h as usize;
+                    let joined = super::decode_pool::pooled_alloc_buffer(
+                        &device,
+                        seq_len as usize * width * 4,
+                        DType::F32,
+                        vec![seq_len as usize, width],
+                    )
+                    .map_err(|e| anyhow!("alloc cue fold attention output: {e}"))?;
+                    let mut outputs = Vec::with_capacity(segments.len());
+                    for ((first, rows), (arena, projections, positions)) in
+                        segments.into_iter().zip(fold_fa.iter_mut())
+                    {
+                        let x = super::prefill_fold::row_view(&hidden, first, rows, width)
+                            .with_shape(vec![rows as usize, width])
+                            .map_err(|e| anyhow!("cue fold attention input rows: {e}"))?;
+                        let slot = &mut kv_cache.full_attn[full_attn_rank];
+                        outputs.push(
+                            build_gated_attn_layer(
+                                &device,
+                                &mut registry,
+                                &x,
+                                positions,
+                                attn,
+                                Some(slot),
+                                max_seq,
+                                rows,
+                                shape.hidden_size,
+                                shape.n_head,
+                                shape.n_kv,
+                                shape.head_dim,
+                                shape.rotary_dim,
+                                shape.rope_theta,
+                                shape.mrope_section,
+                                shape.rms_norm_eps,
+                                Some(arena),
+                                Some(projections),
+                                Some(&mut attn_out_holds),
+                                layer_session.as_mut(),
+                                slot_id,
+                            )
+                            .with_context(|| {
+                                format!("full_attn layer {layer_idx} rows {first}+{rows}")
+                            })?,
+                        );
+                    }
+                    ensure!(
+                        outputs.len() == segments.len(),
+                        "cue fold: full-attention segment scratch is missing"
+                    );
+                    let mut enc =
+                        LayerEncoder::from_session_or_plain(&device, layer_session.as_mut())
+                            .context("enc cue fold attention join")?;
+                    for ((first, rows), output) in segments.into_iter().zip(&outputs) {
+                        mlx_native::ops::copy::dispatch_strided_copy_f32(
+                            enc.encoder(),
+                            &mut registry,
+                            device.metal_device(),
+                            output,
+                            &super::prefill_fold::row_view(&joined, first, rows, width),
+                            &mlx_native::ops::copy::StridedCopyParams {
+                                rows,
+                                cols: h,
+                                stride_row: h,
+                                stride_col: 1,
+                            },
+                        )
+                        .with_context(|| format!("cue fold attention join layer {layer_idx}"))?;
+                    }
+                    enc.fence_or_commit("layer.full_attn.cue_fold_join")
+                        .context("commit cue fold attention join")?;
+                    joined
+                }
                 LayerWeightsGpu::FullAttn { attn, .. } => {
                     let shape = FullAttnShape::from_config(cfg);
                     // Resolve the persistent full-attn cache slot for this layer so
@@ -5353,6 +5676,33 @@ impl Qwen35Model {
                     };
                     let state_capture_ref = state_capture_view.as_ref();
                     let conv_capture_ref = conv_capture_view.as_ref();
+                    // Cue fold: this layer's convolution and recurrence split
+                    // at the boundary, writing the state there into the
+                    // checkpoint image.
+                    let dn_boundary = match (fold.as_ref(), fold_dn.as_ref()) {
+                        (Some(fold), Some(scratch)) if linear_slot_idx != usize::MAX => {
+                            let views = fold
+                                .image
+                                .boundary_views(linear_slot_idx)
+                                .with_context(|| format!("cue fold image layer {layer_idx}"))?;
+                            Some(super::prefill_fold::DnBoundarySplit {
+                                prefix_rows: fold.prefix_rows,
+                                scratch,
+                                recurrent: views.recurrent,
+                                conv_image: views.conv,
+                            })
+                        }
+                        (Some(_), _) => {
+                            return Err(anyhow!(
+                                "cue fold: layer {layer_idx} has no DeltaNet cache slot"
+                            ))
+                        }
+                        (None, _) => None,
+                    };
+                    ensure!(
+                        dn_boundary.is_none() || dn_prefill_arena.is_some(),
+                        "cue fold: DeltaNet layer {layer_idx} has no prefill arena"
+                    );
                     let out = if let Some(arena) = dn_prefill_arena.as_mut() {
                         build_delta_net_layer_with_arena(
                             &device,
@@ -5378,6 +5728,7 @@ impl Qwen35Model {
                             shape.rms_norm_eps,
                             state_capture_ref,
                             conv_capture_ref,
+                            dn_boundary.as_ref(),
                             // iter91: thread the borrowed session into the
                             // DN helper.  The DN helper has only one
                             // LayerEncoder site (stage_a) so it can
@@ -5996,8 +6347,58 @@ impl Qwen35Model {
                     // `out_slot` (sister of the DenseQ arm above).  Closes
                     // the iter91 race for the MoE path that fired at
                     // q4_0-flat layer-15 in the iter91 H4 run.
-                    let out = match (moe_ffn_arena.as_mut(), moe_ffn_output_ring.as_mut()) {
-                        (Some(arena), Some(ring)) => {
+                    let out = match (
+                        fold_segments,
+                        moe_ffn_arena.as_mut(),
+                        moe_ffn_output_ring.as_mut(),
+                    ) {
+                        (Some(segments), _, Some(ring)) => {
+                            // Cue fold: the MoE FFN picks its router and
+                            // shared-expert kernels by row count, so each
+                            // segment is built as its own forward builds it,
+                            // on its own scratch, into its rows of the ring.
+                            ensure!(
+                                fold_moe.len() == segments.len(),
+                                "cue fold: MoE segment scratch is missing"
+                            );
+                            let width = h as usize;
+                            for ((first, rows), arena) in
+                                segments.into_iter().zip(fold_moe.iter_mut())
+                            {
+                                let rows_of = |buffer: &MlxBuffer| {
+                                    super::prefill_fold::row_view(buffer, first, rows, width)
+                                        .with_shape(vec![rows as usize, width])
+                                        .map_err(|e| anyhow!("cue fold MoE rows: {e}"))
+                                };
+                                let x = rows_of(&ffn_input)?;
+                                let residual = fold_residual.map(rows_of).transpose()?;
+                                let mut out_rows = rows_of(ring.slot_mut(layer_idx as u32))?;
+                                build_moe_ffn_layer_gpu_q_into_with_arena(
+                                    enc.encoder(),
+                                    &device,
+                                    &mut registry,
+                                    &x,
+                                    w_gpu,
+                                    shape,
+                                    residual.as_ref(),
+                                    arena,
+                                    &mut out_rows,
+                                    layer_idx,
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "moe_ffn_q_into_with_arena layer {layer_idx} rows {first}+{rows}"
+                                    )
+                                })?;
+                            }
+                            ring.slot_clone(layer_idx as u32)
+                        }
+                        (Some(_), _, None) => {
+                            return Err(anyhow!(
+                                "cue fold: MoE output ring missing at layer {layer_idx}"
+                            ))
+                        }
+                        (None, Some(arena), Some(ring)) => {
                             let out_slot = ring.slot_mut(layer_idx as u32);
                             build_moe_ffn_layer_gpu_q_into_with_arena(
                                 enc.encoder(),
@@ -6701,6 +7102,24 @@ impl Qwen35Model {
                 Vec::new()
             }
         };
+        if let Some(fold) = fold.as_ref() {
+            // The checkpoint's logits: the head over the last prefix row, as
+            // the prefix's own forward projects it. The head above drained
+            // every layer, so `hidden` is settled.
+            let boundary_logits = apply_output_head_gpu_last(
+                None,
+                &device,
+                &mut registry,
+                &hidden,
+                &output_head,
+                fold.prefix_rows,
+                h,
+                cfg.vocab_size,
+                eps,
+            )
+            .context("cue fold boundary logits")?;
+            super::prefill_fold::publish_boundary_logits(boundary_logits);
+        }
         if let Some(t) = t_output_head {
             eprintln!(
                 "[DECODE_PROFILE] output_head={:.1}ms",
