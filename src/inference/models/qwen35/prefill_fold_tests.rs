@@ -17,12 +17,13 @@
 //! gate at the end repeats the comparison on a served model
 //! (`HF2Q_QWEN38_GGUF` or `HF2Q_QWEN36_GGUF`) and prints both walls.
 
-use mlx_native::MlxDevice;
-
-use super::joint_verify_tests::{padded_policy, synthetic_model};
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
 use super::prefill_prepared::PrefillScope;
+// The fixture rescaled so that every routed product of every layer reaches
+// the logits: the joint-verify fixture's own scale saturates the residual
+// stream after the first layer and would hide the attention the fold splits.
+use super::prefill_prepared_tests::with_synthetic_model;
 use super::spec_decode::positions_for_range;
 use crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession;
 use crate::serve::multi_seq_kv::SlotId;
@@ -55,20 +56,6 @@ fn cache(model: &Qwen35Model) -> HybridKvCache {
             HybridKvCache::new_with_options(&model.cfg, device, CAPACITY, SLOTS, true)
         })
         .expect("allocate TQ cache")
-}
-
-fn with_synthetic_model(run: impl FnOnce(&Qwen35Model)) {
-    let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let Ok(device) = MlxDevice::new() else {
-        return;
-    };
-    let model = synthetic_model(&device, padded_policy(), false);
-    // `synthetic_model` primed the thread's GPU cache for the model's
-    // address before the move out of it.
-    model
-        .ensure_gpu_cache_primed()
-        .expect("prime the GPU cache at the model's final address");
-    run(&model);
 }
 
 /// Everything a prefill over `[start, start + prefix + cue)` leaves behind.
