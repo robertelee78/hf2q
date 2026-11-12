@@ -429,8 +429,15 @@ fn qwen36_dflash2_fused_mixer_is_bitwise_the_stock_route_at_every_tile_width() {
             3,
         ),
     ];
+    let delta_layers = model
+        .cfg
+        .layer_types
+        .iter()
+        .filter(|kind| **kind == super::Qwen35LayerKind::LinearAttention)
+        .count() as u64;
     let mut failures = Vec::new();
     let mut compared = 0;
+    let mut saved_least = u64::MAX;
     for (routes, switches) in [
         ("stock projections", PreparedSwitches::OFF),
         ("prepared routes at 32 rows", PreparedSwitches::WIDTH_32),
@@ -440,9 +447,22 @@ fn qwen36_dflash2_fused_mixer_is_bitwise_the_stock_route_at_every_tile_width() {
         for tile in [false, true] {
             let attention = if tile { "tiled" } else { "per-row" };
             for (label, cohort, live, rows, accept) in cases {
-                let stock = verify_with(&model, cohort, tile, live, false, Some(accept));
-                let fused = verify_with(&model, cohort, tile, live, true, Some(accept));
                 let name = format!("{routes}, {attention} attention, {label}");
+                let before = mlx_native::dispatch_count();
+                let stock = verify_with(&model, cohort, tile, live, false, Some(accept));
+                let stock_dispatches = mlx_native::dispatch_count() - before;
+                let before = mlx_native::dispatch_count();
+                let fused = verify_with(&model, cohort, tile, live, true, Some(accept));
+                let fused_dispatches = mlx_native::dispatch_count() - before;
+                // The stock DeltaNet core of one single-row window is eight
+                // dispatches and the fused core one; the stock arm runs
+                // first, so plane preparation only raises its count.
+                assert!(
+                    stock_dispatches >= fused_dispatches + 7 * delta_layers,
+                    "{name}: the step did not take the fused core: {stock_dispatches} stock \
+                     and {fused_dispatches} fused dispatches"
+                );
+                saved_least = saved_least.min(stock_dispatches - fused_dispatches);
                 assert!(
                     stock.logits[..rows]
                         .iter()
@@ -472,7 +492,10 @@ fn qwen36_dflash2_fused_mixer_is_bitwise_the_stock_route_at_every_tile_width() {
             }
         }
     }
-    println!("fused mixer against the stock route: {compared} steps compared");
+    println!(
+        "fused mixer against the stock route: {compared} steps compared, at least {saved_least} \
+         dispatches saved per step over {delta_layers} DeltaNet layers"
+    );
     assert!(
         failures.is_empty(),
         "the fused mixer stage changed a DFlash2 verify step:\n{}",
