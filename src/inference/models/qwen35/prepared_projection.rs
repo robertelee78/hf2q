@@ -1,6 +1,7 @@
 //! Prepared Q4_K / Q6_K planes for the attention and DeltaNet projections of
-//! a width-32 Qwen joint target step (`HF2Q_REPACKED_GGUF_M32_PROJ=1`, on top
-//! of `HF2Q_REPACKED_GGUF_M32=1`).
+//! a Qwen joint target step (`HF2Q_REPACKED_GGUF_M32_PROJ=1`, on top of
+//! `HF2Q_REPACKED_GGUF_M32=1`): a 32-row step, or a DFlash2 target verify
+//! step of any width under `HF2Q_REPACKED_GGUF_ANY_WIDTH=1`.
 //!
 //! The stock 32-row GGML matmul has a latency floor of about 0.1 ms per
 //! serialized dispatch whatever the output width; the prepared BF16-input
@@ -46,6 +47,10 @@ pub(crate) struct FullAttnPlanes {
 }
 
 fn enabled() -> bool {
+    #[cfg(test)]
+    if let Some(switches) = super::prepared_switch_override::current() {
+        return switches.projections;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("HF2Q_REPACKED_GGUF_M32_PROJ")
@@ -55,6 +60,10 @@ fn enabled() -> bool {
 }
 
 fn head_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(switches) = super::prepared_switch_override::current() {
+        return switches.head;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("HF2Q_REPACKED_GGUF_M32_HEAD")
@@ -64,9 +73,12 @@ fn head_enabled() -> bool {
 }
 
 fn shared_head_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("HF2Q_REPACKED_GGUF_SHARED_HEAD").as_deref() == Ok("1")
-    });
+    #[cfg(test)]
+    if let Some(switches) = super::prepared_switch_override::current() {
+        return switches.shared_head;
+    }
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("HF2Q_REPACKED_GGUF_SHARED_HEAD").as_deref() == Ok("1"));
     *ENABLED
 }
 
@@ -97,6 +109,12 @@ impl SharedHead {
             && out_features % 64 == 0
             && in_features % 256 == 0
             && matches!(ggml_type, GgmlType::Q4_K | GgmlType::Q6_K)
+    }
+
+    /// Whether the planes have been prepared.
+    #[cfg(test)]
+    pub(crate) fn is_prepared(&self) -> bool {
+        self.prepared.get().is_some()
     }
 
     /// The planes of `weight`, preparing them on first use. Fails if the
@@ -139,6 +157,58 @@ impl SharedHead {
     }
 }
 
+/// One weight's planes cell and what prepares it.
+pub(crate) struct PlanesSource<'a> {
+    pub(crate) planes: &'a Planes,
+    /// Raw GGML blocks `[params.n, params.k]`; never the output of a
+    /// dispatch that is still being encoded.
+    pub(crate) weight: &'a MlxBuffer,
+    pub(crate) params: GgmlQuantizedMatmulParams,
+}
+
+/// Prepare the planes of every source whose cell is empty and publish them.
+///
+/// The repacks run in a command buffer of their own, and a cell is set only
+/// after that command buffer has completed. A cell therefore never holds
+/// planes that were encoded but not written: if the caller's encoder is
+/// dropped on a later error, or its command buffer fails, the planes it read
+/// are still valid for the life of the model; if the repack itself fails,
+/// the cells stay empty and the next use prepares again. (Published at
+/// encode time, the planes of an abandoned encoder stayed cached as zeros.)
+/// The wait is paid once per weight; sources prepared together share one.
+pub(crate) fn ensure_planes(
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    sources: &[PlanesSource<'_>],
+) -> Result<()> {
+    if sources.iter().all(|source| source.planes.get().is_some()) {
+        return Ok(());
+    }
+    let mut enc = device
+        .command_encoder()
+        .map_err(|error| anyhow!("prepared GGUF planes encoder: {error}"))?;
+    let mut prepared = Vec::with_capacity(sources.len());
+    for source in sources {
+        if source.planes.get().is_none() {
+            let planes = prepare_repacked_gguf_weight(
+                &mut enc,
+                registry,
+                device,
+                source.weight,
+                &source.params,
+            )
+            .context("prepare GGUF weight planes")?;
+            prepared.push((source.planes, planes));
+        }
+    }
+    enc.commit_and_wait_labeled("qwen35.prepared_planes.prepare")
+        .map_err(|error| anyhow!("prepare GGUF weight planes: {error}"))?;
+    for (cell, planes) in prepared {
+        let _ = cell.set(planes);
+    }
+    Ok(())
+}
+
 fn params(
     rows: u32,
     ggml_type: GgmlType,
@@ -155,7 +225,8 @@ fn params(
 
 /// Whether this product takes the prepared route: the switch is on, the
 /// weight is a raw GGML block matrix, and the dense prepared route admits its
-/// shape inside the open width-32 joint scope.
+/// shape inside the open joint scope (32 rows; any width up to 32 in a
+/// DFlash2 target verify step under `HF2Q_REPACKED_GGUF_ANY_WIDTH=1`).
 pub(crate) fn admits(
     rows: u32,
     weight: &MlxBuffer,
@@ -175,22 +246,22 @@ pub(crate) fn admits(
 
 /// Whether the output head of a `rows`-wide joint step takes the prepared
 /// route. The head runs after the layer chain's scope has closed, so the
-/// caller vouches for the joint width.
+/// caller vouches for the joint width and says whether the step is a DFlash2
+/// target verify: only such a step is admitted below 32 rows.
 pub(crate) fn admits_head(
     rows: u32,
     weight: &MlxBuffer,
     ggml_type: GgmlType,
     in_features: u32,
     out_features: u32,
+    dflash2_verify: bool,
 ) -> bool {
     head_enabled()
         && weight.dtype() == DType::U8
-        && super::gpu_ffn::repacked_dense_m32_shape_admits(&params(
-            rows,
-            ggml_type,
-            in_features,
-            out_features,
-        ))
+        && super::gpu_ffn::repacked_dense_m32_shape_admits(
+            &params(rows, ggml_type, in_features, out_features),
+            dflash2_verify,
+        )
 }
 
 /// Output rows of the fused alpha/beta weight for `heads` rows each.
@@ -447,13 +518,15 @@ pub(crate) fn project_into(
     out_features: u32,
 ) -> Result<()> {
     let params = params(rows, ggml_type, in_features, out_features);
-    if planes.get().is_none() {
-        let prepared = prepare_repacked_gguf_weight(enc, registry, device, weight, &params)
-            .context("prepare projection GGUF weight")?;
-        let _ = planes.set(prepared);
-        // The projection below reads the planes this repack writes.
-        enc.memory_barrier();
-    }
+    ensure_planes(
+        registry,
+        device,
+        &[PlanesSource {
+            planes,
+            weight,
+            params,
+        }],
+    )?;
     let prepared = planes
         .get()
         .context("prepared projection GGUF weight was not retained")?;

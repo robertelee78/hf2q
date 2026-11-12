@@ -138,6 +138,11 @@ pub(super) struct JointPacking<'a> {
     pub width: usize,
     /// DFlash2 verify with the tiled TQ full attention requested.
     pub attention_tile: bool,
+    /// A DFlash2 target verify step: its rows are a route of their own, not
+    /// held to the serial one-token forward's bits, so the prepared routes
+    /// may serve it at every width (`HF2Q_REPACKED_GGUF_ANY_WIDTH=1`). Plain
+    /// joint decode and joint MTP verify steps are not.
+    pub dflash2_verify: bool,
 }
 
 fn plan_joint_routes(
@@ -321,7 +326,9 @@ impl Qwen35Model {
     /// Advance `rows.len()` distinct slots by one token each in one
     /// layer-major transaction. Under [`JointRouteMode::Exact`] every row's
     /// logits, hidden, KV codes, recurrent state, cursor and parity are
-    /// bitwise those of its serial one-token forward. `dense_ffn` must be
+    /// bitwise those of its serial one-token forward, whatever the
+    /// prepared-route switches say: they change DFlash2 target verify steps
+    /// only (`JointPacking::dflash2_verify`). `dense_ffn` must be
     /// admitted for `mode` ([`check_dense_ffn_route`]). `options` are
     /// resolved by the caller (the serving worker reads their switches once
     /// at start; the Q1 trace runs several in one process); the
@@ -369,6 +376,7 @@ impl Qwen35Model {
             windows: &windows,
             width: joint_padded_width(mode, rows.len()),
             attention_tile: false,
+            dflash2_verify: false,
         };
         self.with_joint_forward(
             mode,
@@ -638,7 +646,8 @@ impl Qwen35Model {
         let mut chain: Option<CommandEncoder> = None;
         // Layer chains only; the output head stays canonical and allocates
         // its outputs as before.
-        let projection_scope = JointProjectionScope::enter(options.projection, width_u32);
+        let projection_scope =
+            JointProjectionScope::enter_step(options.projection, width_u32, packing.dflash2_verify);
         let pooled_scope = decode_pool::StepPooledOutputs::enter(options.pooled_outputs);
         for (layer_idx, (weights, routes)) in layer_weights.iter().zip(&plan.layers).enumerate() {
             if let Some(enc) = chain.as_mut() {
@@ -913,7 +922,8 @@ impl Qwen35Model {
         .context("Qwen joint output norm")?;
         enc.memory_barrier();
         // The width rule is the prepared route's own: 32 rows, or every
-        // joint width with `HF2Q_REPACKED_GGUF_ANY_WIDTH=1`.
+        // width of a DFlash2 target verify step with
+        // `HF2Q_REPACKED_GGUF_ANY_WIDTH=1`.
         let prepared_head = plan.head == JointProductRoute::Batched
             && prepared_projection::admits_head(
                 width_u32,
@@ -921,6 +931,7 @@ impl Qwen35Model {
                 output_head.lm_head_ggml_type,
                 hidden_size,
                 cfg.vocab_size,
+                packing.dflash2_verify,
             );
         // Pooled: the head writes every row and every result leaves this
         // function as an owned copy before the next forward resets the pool,

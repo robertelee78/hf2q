@@ -393,12 +393,23 @@ pub fn dispatch_dflash2_input<T: DFlash2TargetFamily>(
     Ok(())
 }
 
+/// The target's vocabulary head for one draft command.
+///
+/// `reads_prepared_head` says whether the command projects its vocabulary
+/// through prepared head planes
+/// ([`reads_prepared_head`](super::staged::reads_prepared_head)). Only then
+/// is the target asked for its shared planes: asking prepares them, and a
+/// command that runs the stock head would never read them.
 pub fn target_vocabulary_head<'a, T: DFlash2TargetFamily>(
     adapter: &'a T,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
+    reads_prepared_head: bool,
 ) -> Result<DFlash2VocabularyHead<'a>> {
     let weight = adapter.vocabulary_head()?;
+    if !reads_prepared_head {
+        return Ok(DFlash2VocabularyHead::Native(weight));
+    }
     Ok(
         match adapter.shared_prepared_vocabulary_head(registry, device)? {
             Some(prepared) => DFlash2VocabularyHead::SharedPrepared { weight, prepared },

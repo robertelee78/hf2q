@@ -14,7 +14,7 @@ use super::{
     },
     schema::{DFlash2CheckpointDescriptor, DFlash2FamilyAdapter},
     selector::dispatch_dflash2_selection,
-    staged::{resolve_staged_draft, DFLASH2_DRAFT_STAGED_ENV},
+    staged::{reads_prepared_head, resolve_staged_draft, DFLASH2_DRAFT_STAGED_ENV},
     tensors::DFlash2ModelTensors,
     verify_budget::{DFlash2VerifyBudget, VerifyBudgetLane},
     weights::DFlash2WeightsFile,
@@ -303,7 +303,12 @@ impl DFlash2Runtime {
             anchors,
             &mut self.workspace,
         )?;
-        let vocabulary_head = target_vocabulary_head(target, registry, device)?;
+        let vocabulary_head = target_vocabulary_head(
+            target,
+            registry,
+            device,
+            reads_prepared_head(&self.workspace, &self.config),
+        )?;
         dispatch_dflash2_forward(
             &mut encoder,
             registry,

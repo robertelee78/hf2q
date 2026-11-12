@@ -372,8 +372,9 @@ pub struct DenseFfnWeightsGpuQ {
     pub intermediate_size: u32,
     /// Model hidden size (input dim of gate/up, output dim of down).
     pub hidden_size: u32,
-    /// Width-32 load-once prepared planes. The owning layer drops them with the
-    /// source weights, so model replacement cannot retain stale GPU buffers.
+    /// Load-once prepared planes, shared by every row count. The owning layer
+    /// drops them with the source weights, so model replacement cannot retain
+    /// stale GPU buffers.
     pub(crate) repacked_m32: PreparedDenseFfnGguf,
 }
 
@@ -397,6 +398,10 @@ impl DenseFfnWeightsGpuQ {
 }
 
 fn repacked_dense_m32_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(switches) = super::prepared_switch_override::current() {
+        return switches.ffn;
+    }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("HF2Q_REPACKED_GGUF_M32")
@@ -405,12 +410,17 @@ fn repacked_dense_m32_enabled() -> bool {
     })
 }
 
-/// Whether the prepared route serves every joint width instead of only 32
-/// rows (`HF2Q_REPACKED_GGUF_ANY_WIDTH=1`). The prepared kernels cover any
-/// row count with 32-row tiles and a partial last tile, and a row's bits do
-/// not depend on the row count, so with the switch on a joint row is computed
-/// by one kernel family whatever the width of its step.
+/// Whether the prepared route serves a DFlash2 target verify step at every
+/// width instead of only at 32 rows (`HF2Q_REPACKED_GGUF_ANY_WIDTH=1`). The
+/// prepared kernels cover any row count with 32-row tiles and a partial last
+/// tile, and a row's bits do not depend on the row count, so with the switch
+/// on a verify row is computed by one kernel family whatever the width of
+/// its tile.
 fn repacked_any_width_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(switches) = super::prepared_switch_override::current() {
+        return switches.any_width;
+    }
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("HF2Q_REPACKED_GGUF_ANY_WIDTH").as_deref() == Ok("1")
     });
@@ -434,43 +444,82 @@ fn repacked_dense_shape_eligible(params: &GgmlQuantizedMatmulParams, any_width: 
         && matches!(params.ggml_type, GgmlType::Q4_K | GgmlType::Q6_K)
 }
 
-fn repacked_dense_m32_eligible(params: &GgmlQuantizedMatmulParams) -> bool {
-    repacked_dense_shape_eligible(params, repacked_any_width_enabled())
-}
-fn repacked_dense_m32_in_joint_scope(params: &GgmlQuantizedMatmulParams) -> bool {
-    super::joint_projection::active_width(params.m) && repacked_dense_m32_eligible(params)
+/// Whether a step may take the prepared route below 32 rows: the switch is
+/// on and the step is a DFlash2 target verify transaction. Plain joint
+/// decode and joint MTP verify steps keep their routes at those widths: in
+/// the exact mode their rows are held to the serial one-token forward's
+/// bits, and the serial forward never takes the prepared route.
+fn repacked_any_width_admitted(dflash2_verify: bool) -> bool {
+    dflash2_verify && repacked_any_width_enabled()
 }
 
-/// Whether the prepared width-32 route is on and admits this product in the
-/// open joint scope.
+fn repacked_dense_m32_in_joint_scope(params: &GgmlQuantizedMatmulParams) -> bool {
+    use super::joint_projection::{active_width, dflash2_verify_scope};
+    active_width(params.m)
+        && repacked_dense_shape_eligible(
+            params,
+            repacked_any_width_admitted(dflash2_verify_scope()),
+        )
+}
+
+/// Whether the prepared route is on and admits this product in the open
+/// joint scope: at 32 rows in any joint step, and at every width up to 32 in
+/// a DFlash2 target verify step under `HF2Q_REPACKED_GGUF_ANY_WIDTH=1`.
 pub(super) fn repacked_dense_m32_admits(params: &GgmlQuantizedMatmulParams) -> bool {
     repacked_dense_m32_enabled() && repacked_dense_m32_in_joint_scope(params)
 }
 
-/// Whether the prepared width-32 route is on and admits this product's
-/// shape, for a caller that itself guarantees the joint width (the output
-/// head, which runs after the layer chain's scope has closed).
-pub(super) fn repacked_dense_m32_shape_admits(params: &GgmlQuantizedMatmulParams) -> bool {
-    repacked_dense_m32_enabled() && repacked_dense_m32_eligible(params)
+/// Whether the prepared route is on and admits this product's shape, for a
+/// caller that itself guarantees the joint width and says whether the step
+/// is a DFlash2 target verify (the output head, which runs after the layer
+/// chain's scope has closed).
+pub(super) fn repacked_dense_m32_shape_admits(
+    params: &GgmlQuantizedMatmulParams,
+    dflash2_verify: bool,
+) -> bool {
+    repacked_dense_m32_enabled()
+        && repacked_dense_shape_eligible(params, repacked_any_width_admitted(dflash2_verify))
 }
 
-fn prepare_repacked_dense_weight<'a>(
-    cell: &'a std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
-    enc: &mut CommandEncoder,
+/// The gate, up and down planes of a dense FFN layer, prepared together on
+/// first use in a command buffer of their own and published only once it
+/// has completed ([`ensure_planes`](super::prepared_projection::ensure_planes)).
+fn prepared_dense_ffn_planes<'a>(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
-    weight: &MlxBuffer,
-    params: &GgmlQuantizedMatmulParams,
-) -> Result<&'a mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight> {
-    if cell.get().is_none() {
-        let prepared = mlx_native::ops::repacked_gguf_mm::prepare_repacked_gguf_weight(
-            enc, registry, device, weight, params,
-        )
-        .context("prepare dense FFN GGUF weight")?;
-        let _ = cell.set(prepared);
-    }
-    cell.get()
-        .context("prepared dense FFN GGUF weight was not retained")
+    weights: &'a DenseFfnWeightsGpuQ,
+    gate_up_params: &GgmlQuantizedMatmulParams,
+    down_params: &GgmlQuantizedMatmulParams,
+) -> Result<[&'a mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight; 3]> {
+    use super::prepared_projection::{ensure_planes, PlanesSource};
+    let cells = &weights.repacked_m32;
+    ensure_planes(
+        registry,
+        device,
+        &[
+            PlanesSource {
+                planes: &cells.gate,
+                weight: &weights.gate_q,
+                params: *gate_up_params,
+            },
+            PlanesSource {
+                planes: &cells.up,
+                weight: &weights.up_q,
+                params: *gate_up_params,
+            },
+            PlanesSource {
+                planes: &cells.down,
+                weight: &weights.down_q,
+                params: *down_params,
+            },
+        ],
+    )
+    .context("prepare dense FFN GGUF weights")?;
+    let planes = |cell: &'a std::sync::OnceLock<_>| {
+        cell.get()
+            .context("prepared dense FFN GGUF weight was not retained")
+    };
+    Ok([planes(&cells.gate)?, planes(&cells.up)?, planes(&cells.down)?])
 }
 
 /// GPU-side weight handles for a single Qwen3.5-MoE FFN layer.
@@ -1665,30 +1714,8 @@ pub(super) fn build_dense_ffn_layer_gpu_q_prepared_m32(
     let h = weights.hidden_size;
     let m = weights.intermediate_size;
     let n_out = (seq_len * h) as usize;
-    let gate = prepare_repacked_dense_weight(
-        &weights.repacked_m32.gate,
-        enc,
-        registry,
-        device,
-        &weights.gate_q,
-        gate_up_params,
-    )?;
-    let up = prepare_repacked_dense_weight(
-        &weights.repacked_m32.up,
-        enc,
-        registry,
-        device,
-        &weights.up_q,
-        gate_up_params,
-    )?;
-    let down = prepare_repacked_dense_weight(
-        &weights.repacked_m32.down,
-        enc,
-        registry,
-        device,
-        &weights.down_q,
-        down_params,
-    )?;
+    let [gate, up, down] =
+        prepared_dense_ffn_planes(registry, device, weights, gate_up_params, down_params)?;
     enc.memory_barrier();
 
     let x_bf16 = super::decode_pool::pooled_alloc_buffer(
@@ -5886,23 +5913,68 @@ mod tests {
         );
     }
 
+    /// The prepared dense route is admitted only inside a joint scope of the
+    /// product's width: at 32 rows in any joint step, and below 32 rows only
+    /// in a DFlash2 target verify step with the any-width switch on. Plain
+    /// joint decode and joint MTP steps keep the stock route below 32 rows
+    /// whatever the switches say.
     #[test]
-    fn prepared_dense_m32_is_confined_to_the_joint_width_32_scope() {
+    fn prepared_dense_route_is_confined_to_its_joint_scope_and_width_rule() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let params = GgmlQuantizedMatmulParams {
-            m: 32,
+        use super::super::joint_projection::{JointProjectionKernel, JointProjectionScope};
+        use super::super::prepared_switch_override::{Override, PreparedSwitches};
+        let params = |m| GgmlQuantizedMatmulParams {
+            m,
             n: 17_408,
             k: 5_120,
             ggml_type: GgmlType::Q4_K,
         };
-        assert!(!repacked_dense_m32_in_joint_scope(&params));
-        {
-            let _scope = super::super::joint_projection::JointProjectionScope::enter(
-                super::super::joint_projection::JointProjectionKernel::Canonical,
-                32,
-            );
-            assert!(repacked_dense_m32_in_joint_scope(&params));
+        let plain = |m| JointProjectionScope::enter(JointProjectionKernel::Canonical, m);
+        let verify =
+            |m| JointProjectionScope::enter_step(JointProjectionKernel::Canonical, m, true);
+        for (switches, below_32_in_verify) in [
+            (PreparedSwitches::WIDTH_32, false),
+            (PreparedSwitches::ALL, true),
+        ] {
+            let _switches = Override::set(switches);
+            for m in [1, 4, 8, 16, 24, 32] {
+                assert!(
+                    !repacked_dense_m32_admits(&params(m)),
+                    "{m} outside a scope"
+                );
+                {
+                    let _scope = plain(m);
+                    assert_eq!(repacked_dense_m32_admits(&params(m)), m == 32, "plain {m}");
+                    assert!(!repacked_dense_m32_admits(&params(m + 1)), "other width");
+                }
+                {
+                    let _scope = verify(m);
+                    assert_eq!(
+                        repacked_dense_m32_admits(&params(m)),
+                        m == 32 || below_32_in_verify,
+                        "DFlash2 verify {m}"
+                    );
+                }
+                assert_eq!(repacked_dense_m32_shape_admits(&params(m), false), m == 32);
+                assert_eq!(
+                    repacked_dense_m32_shape_admits(&params(m), true),
+                    m == 32 || below_32_in_verify
+                );
+                assert!(
+                    !repacked_dense_m32_admits(&params(m)),
+                    "{m} after the scope"
+                );
+            }
+            let _scope = verify(33);
+            assert!(!repacked_dense_m32_admits(&params(33)), "above 32 rows");
         }
-        assert!(!repacked_dense_m32_in_joint_scope(&params));
+        // The base switch gates everything.
+        let _off = Override::set(PreparedSwitches {
+            ffn: false,
+            ..PreparedSwitches::ALL
+        });
+        let _scope = verify(32);
+        assert!(!repacked_dense_m32_admits(&params(32)));
+        assert!(!repacked_dense_m32_shape_admits(&params(32), true));
     }
 }

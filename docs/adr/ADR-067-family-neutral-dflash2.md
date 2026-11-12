@@ -1398,9 +1398,11 @@ routes share one. The switch stays off by default.
 
 `HF2Q_REPACKED_GGUF_SHARED_HEAD=1` makes the model own one prepared output
 head (`Qwen35Model::prepared_output_head`, prepared in a command buffer of
-its own on first use); the staged draft takes it through
+its own when the first consumer that reads it asks); a staged draft command
+of 32 draft rows takes it through
 `DFlash2TargetFamily::shared_prepared_vocabulary_head` and the prepared
-target head reads the same planes. Logits are bitwise those of the separate
+target head reads the same planes. With neither consumer nothing is
+prepared. Logits are bitwise those of the separate
 copies (`staged::tests::shared_prepared_head_gives_the_bits_of_the_drafts_own_copy`,
 `prepared_width_tests`). On Qwen3.8 the prepared target head then costs no
 footprint: peak 75.80 / 75.69 GB with the shared planes against 75.81 /
@@ -1408,16 +1410,50 @@ footprint: peak 75.80 / 75.69 GB with the shared planes against 75.81 /
 prepared target head and a second copy.
 
 `HF2Q_REPACKED_GGUF_ANY_WIDTH=1` admits the prepared dense FFN, projections
-and head at every joint width from 1 to 32 rows (one rule,
-`gpu_ffn::repacked_rows_eligible`, behind `prepared_projection::admits*`).
-The Qwen3.6 verify tile is 4, 8, 16 or 32 rows; before, only 32 took the
-prepared kernels, so one- and two-lane cycles ran the stock ones and a row's
-bits depended on the tile width. Model-free gate (`prepared_width_tests`): a
-row of a prepared projection, of the fused alpha/beta product and of the
-whole dense FFN layer has the same bits at widths 1, 4, 8, 16, 24 and 32 in
-three cohorts each, repeated runs agree, and every product is inside an
-F64-referenced bound; the gate also passes under `MTL_SHADER_VALIDATION=1`
-with and without `MTL_DEBUG_LAYER=1`.
+and head at every tile width of a DFlash2 target verify step, 1 to 32 rows
+(one rule, `gpu_ffn::repacked_rows_eligible`, behind
+`prepared_projection::admits*`). The Qwen3.6 verify tile is 4, 8, 16 or 32
+rows; before, only 32 took the prepared kernels, so one- and two-lane cycles
+ran the stock ones and a row's bits depended on the tile width.
+
+The admission is confined to DFlash2 verify transactions
+(`JointPacking::dflash2_verify`, `joint_projection::dflash2_verify_scope`).
+Plain joint decode and joint MTP verify steps keep their routes under every
+switch, because in the exact mode their rows are held to the serial
+one-token forward's bits and the serial forward never takes a prepared
+kernel: the official-artifact gate
+`qwen36_joint_decode_matches_serial_decode_bitwise` passes with every switch
+on. The consequence is the one that already held at 32 rows: a token
+verified by DFlash2 and the same token decoded serially or in a plain joint
+step are computed by different routes (Class B), now at every tile width.
+Without the switch a one-lane Qwen3.6 verify (8 rows, stock kernels) was
+bitwise a plain joint or serial step; with it, it is not, so a lane that
+falls out of DFlash2 changes route.
+
+Gates. Model free (`prepared_width_tests`): a row of a prepared projection,
+of the fused alpha/beta product and of the whole dense FFN layer has the
+same bits at widths 1, 4, 8, 16, 24 and 32 in three cohorts each and beside
+padding rows of NaN, infinity, a half-overflowing value and a denormal;
+repeated runs agree; and each of the three is inside a derived bound of an
+F64 reference over the dequantized weights (the dense FFN's bound is
+dominated by the BF16 rounding of the hidden activation, 2^-8 relative).
+Whole step, synthetic model, switches set through a test-only override
+(`prepared_step_tests`): each family is wired to its switch; in the dense
+layout (32-row tile, 8 to 32 live rows) and the MoE layout (tiles of 4, 8,
+16 and 32 rows; quantized dense FFN layers stand in for the MoE layers) a
+lane's rows, committed cache and captures are bitwise the same in every
+cohort, packing order and padding, on the host-token and GPU-token paths
+(padding rows holding other tokens), with the per-row and the tiled verify
+attention, and equal the 32-row tile's rows without the switch; plain joint
+and joint MTP steps are bitwise unchanged by the switches and equal the
+serial forward in the exact mode. Real MoE layers:
+`qwen36_dflash2_verify_rows_have_one_value_at_every_tile_width` (ignored,
+official artifact). The model-free gate also passes under
+`MTL_SHADER_VALIDATION=1` with and without `MTL_DEBUG_LAYER=1`. The
+whole-step gate skips itself under shader validation: there a whole joint
+step of the synthetic model did not always repeat its bits (three of four
+validated runs failed, each in another comparison, stock steps included),
+which was not explained; the official-artifact gate was run plain only.
 
 Exact Q5 runs on the combined candidate (binary `455a172c`, every other
 candidate switch on; "on" is `_M32_HEAD`, `_SHARED_HEAD` and `_ANY_WIDTH`
@@ -1438,16 +1474,54 @@ to four lanes): head 4.55 / 4.27 / 1.95 / 1.65 off against 0.86 / 1.10 /
 0.94 / 1.02 on; projections 11.93 / 20.71 / 5.20 / 4.69 off against 4.45 /
 5.56 / 5.23 / 5.42 on.
 
+The review fixes (admission confined to DFlash2 verify steps, planes
+published after their own command buffer, shared head prepared on demand)
+were then run from a registry build (binary `a5aaae28`, crates.io mlx-native
+0.21.8, no path override), every switch on, all `CalibrationPass`:
+
+| Model (runs) | 1 lane ms | 2 lanes ms | 3 lanes ms | 4 lanes ms | accepted per lane-cycle (4 lanes) | dispatches (4 lanes) |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.6 (four) | 18.6 / 18.8 / 18.0 / 17.8 | 24.3 / 24.3 / 23.2 / 23.5 | 29.8 / 30.3 / 29.1 / 28.6 | 34.2 / 35.0 / 33.4 / 33.1 | 3.97 / 4.09 / 3.98 / 3.97 | 6,317 |
+| Qwen3.8 (two) | 71.8 / 60.2 | 61.3 / 61.2 | 71.6 / 65.7 | 72.4 / 72.0 | 5.23 / 5.26 | 9,064 |
+
+These runs were hours later on a busier host than the table above, so the
+two tables are not a comparison of the binaries; the Qwen3.8 transcript and
+the two Qwen3.6 transcripts are those of the earlier binary.
+
 Run-to-run text on Qwen3.6. With the switches off every pair of runs
 differs in every agent within its first five turns (three runs compared).
-With them on, three of four runs (two timing runs and the profiled run,
-whose cycle mix and timing are very different) produced the same transcript
-in all four agents and all turns; the fourth differs from them at one token
-of one agent's last turn and nowhere else. So the width-dependent
-projections and head were the main source of the variation but not the
-only one: something that depends on the cohort or the timing remains and
-was not identified. Four runs do not measure quality; the workflow-oracle
-pass rate needs root's long comparison.
+With them on, eight runs (seven timing runs of two binaries and one
+profiled run, whose cycle mix and timing are very different) produced two
+transcripts: six runs one, two runs the other, which differs from the
+first at one token of one agent's last turn and nowhere else (three of the
+four registry-build runs are identical; the fourth is the other
+transcript). So the width-dependent projections and head were the main
+source of the variation but not the only one. The independent review of
+this change located a remaining source in the tiled verify attention: its
+split length follows the window's start cursor, so the same token verified
+at another window offset can differ once the history crosses a split
+boundary (first at 1,536 tokens, then every 768), and the window
+boundaries follow a verify budget fed by wall-clock time. That belongs to
+the attention tile and the scheduler, not to this change, and was not
+fixed here. Eight runs do not measure quality; the workflow-oracle pass
+rate needs root's long comparison.
+
+Prepared planes are published only after the command buffer that writes
+them has completed (`prepared_projection::ensure_planes`; one buffer per
+projection weight, one per dense FFN layer for gate, up and down). Before,
+a cell was set when the repack was encoded into the caller's command
+buffer, so a forward abandoned between that encode and its commit left
+zero planes cached for the life of the model (an independent probe read
+640 of 640 outputs zero), and the prefill route shares those planes.
+`prepared_width_tests` covers the projection, fused alpha/beta and FFN
+cells: a failed preparation publishes nothing and the retry succeeds, and
+the planes an abandoned encoder published are the weight's. The price is
+one GPU wait per weight on first use, paid by the first prefill chunk
+after load (the prefill route prepares the planes the verify step then
+finds): 560-613 ms against 520-576 ms on Qwen3.6 (four runs against three)
+and 2.43-2.48 s against 2.05-2.07 s (two runs against four) on Qwen3.8; the first verify cycle, which prepares
+only the head, took 44.7-50.4 ms against 47.6-48.0 ms on Qwen3.6 and
+171.5-196.9 ms against 166.9-177.7 ms on Qwen3.8.
 
 A one-pass gate/up pair over the prepared planes with a BF16 SiLU epilogue,
 a residual folded into the down projection's reduce pass and a row-batched

@@ -728,7 +728,8 @@ struct OutputHeadGpu {
     /// GGML type recorded in the GGUF tensor directory.  Never inferred from
     /// `DType::U8`: all block quants share that Metal storage dtype.
     lm_head_ggml_type: GgmlType,
-    /// Width-32 load-once prepared planes of the head, dropped with it.
+    /// Load-once prepared planes of the head for the joint target step,
+    /// shared by every row count and dropped with it.
     prepared_m32: super::prepared_projection::Planes,
 }
 

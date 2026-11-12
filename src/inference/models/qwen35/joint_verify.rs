@@ -161,14 +161,19 @@ impl Qwen35Model {
         )
     }
 
-    /// Run the DFlash2 target verify as one fixed-width temporal tile.
+    /// Run the DFlash2 target verify as one temporal tile.
     ///
-    /// The tile is always [`DFLASH2_VERIFY_WIDTH`] rows, so a lane's bytes
-    /// do not depend on the number or lengths of its cohort's windows.
-    /// Quantized projections at this width use the canonical matrix-matrix
-    /// route and stream each dense target weight once. This is a Q1 Class B
-    /// alternate route against one-token decode: its decision envelope and
-    /// argmax equality are qualification gates, not assumptions.
+    /// A dense target's tile is always [`DFLASH2_VERIFY_WIDTH`] rows; a MoE
+    /// target's is the smallest power of two that holds its rows (at least
+    /// 4), so padding triggers no expert work. With the stock kernels a
+    /// lane's bytes therefore depend on the tile width on MoE targets; with
+    /// the prepared routes admitted at every width
+    /// (`HF2Q_REPACKED_GGUF_ANY_WIDTH=1`) the projections, dense FFN and
+    /// head of a row do not. This is a Q1 Class B alternate route against
+    /// one-token decode and against plain joint decode: its decision
+    /// envelope and argmax equality are qualification gates, not
+    /// assumptions, and a token verified here and the same token decoded
+    /// serially or in a plain joint step need not agree in bits.
     #[allow(
         dead_code,
         reason = "DFlash2 scheduler wiring follows the target-capture gate"
@@ -360,6 +365,7 @@ impl Qwen35Model {
             windows: &windows,
             width,
             attention_tile: options.verify_attention_tile,
+            dflash2_verify: layout == VerifyLayout::DFlash2,
         };
         let linear_layers = kv_cache.linear_attn.len();
         let (outputs, normed, replay) = self.with_joint_forward(

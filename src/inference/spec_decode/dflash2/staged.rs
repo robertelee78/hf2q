@@ -44,6 +44,13 @@ pub const STAGED_MIN_OUTPUTS: usize = 960;
 /// Rows the prepared target head tile takes.
 const PREPARED_HEAD_ROWS: usize = 32;
 
+/// Whether a draft command over `workspace` projects its vocabulary through
+/// prepared head planes: the staged route, at the prepared tile's row count.
+/// Only such a command reads a prepared head, its own or the target's.
+pub(super) fn reads_prepared_head(workspace: &DFlash2Workspace, config: &DFlash2Config) -> bool {
+    workspace.staged.is_some() && workspace.max_lanes * config.block_size == PREPARED_HEAD_ROWS
+}
+
 /// Rows of the smallest staged tile; a command's rows are covered by 32-,
 /// 16- and 8-row tiles.
 const STAGED_TILE_ROWS: usize = 8;
@@ -400,7 +407,8 @@ pub(super) fn dispatch_prepared_head(
 mod tests {
     use super::*;
     use crate::inference::spec_decode::dflash2::{
-        config::DFlash2LayerType,
+        adapters::{target_vocabulary_head, DFlash2TargetFamily},
+        config::{DFlash2LayerType, DFlash2TargetShape},
         forward::{
             dispatch_dflash2_context_commit, dispatch_dflash2_forward, prepare_decode_positions,
             DFlash2VocabularyHead,
@@ -787,6 +795,107 @@ mod tests {
             staged.head.is_none(),
             "the draft prepared a head beside the shared one"
         );
+    }
+
+    /// A target that counts how often it is asked for its shared head.
+    struct CountingTarget<'a> {
+        head: &'a MlxQWeight,
+        prepared: &'a PreparedGgufWeight,
+        asked: std::cell::Cell<usize>,
+    }
+
+    impl DFlash2TargetFamily for CountingTarget<'_> {
+        fn family_name(&self) -> &'static str {
+            "counting"
+        }
+
+        fn target_shape(&self) -> DFlash2TargetShape<'_> {
+            DFlash2TargetShape {
+                architecture: "counting",
+                hidden_size: self.head.info.cols,
+                vocab_size: self.head.info.rows,
+                num_hidden_layers: 1,
+            }
+        }
+
+        fn embedding(&self) -> Result<&MlxQWeight> {
+            Ok(self.head)
+        }
+
+        fn vocabulary_head(&self) -> Result<&MlxQWeight> {
+            Ok(self.head)
+        }
+
+        fn shared_prepared_vocabulary_head(
+            &self,
+            _registry: &mut KernelRegistry,
+            _device: &MlxDevice,
+        ) -> Result<Option<&PreparedGgufWeight>> {
+            self.asked.set(self.asked.get() + 1);
+            Ok(Some(self.prepared))
+        }
+
+        fn embedding_scale(&self) -> f32 {
+            1.0
+        }
+    }
+
+    /// The target is asked for its shared head (which prepares it) only by a
+    /// command that reads prepared planes: the staged route at 32 draft rows.
+    #[test]
+    fn the_shared_head_is_requested_only_by_a_command_that_reads_it() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        // (lanes, staged, reads the prepared head)
+        for (lanes, staged, reads) in [(4, true, true), (4, false, false), (2, true, false)] {
+            let mut fixture = fixture(lanes, staged);
+            assert_eq!(
+                reads_prepared_head(&fixture.workspace, &fixture.cfg),
+                reads,
+                "{lanes} lanes, staged {staged}"
+            );
+            let head = q4k_head(&fixture.device, &fixture.cfg);
+            let params = head.matmul_params(32).unwrap();
+            let mut encoder = fixture.device.command_encoder().unwrap();
+            let prepared = prepare_repacked_gguf_weight(
+                &mut encoder,
+                &mut fixture.registry,
+                &fixture.device,
+                &head.buffer,
+                &params,
+            )
+            .unwrap();
+            encoder.commit_and_wait().unwrap();
+            let target = CountingTarget {
+                head: &head,
+                prepared: &prepared,
+                asked: std::cell::Cell::new(0),
+            };
+            let vocabulary_head = target_vocabulary_head(
+                &target,
+                &mut fixture.registry,
+                &fixture.device,
+                reads_prepared_head(&fixture.workspace, &fixture.cfg),
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(
+                    vocabulary_head,
+                    DFlash2VocabularyHead::SharedPrepared { .. }
+                ),
+                reads,
+                "{lanes} lanes, staged {staged}"
+            );
+            assert_eq!(target.asked.get(), usize::from(reads));
+            // The command then runs the head it was handed.
+            let logits = forward_head(&mut fixture, vocabulary_head, true);
+            assert!(logits.iter().any(|value| *value != 0.0));
+            let own = fixture
+                .workspace
+                .staged
+                .as_ref()
+                .is_some_and(|staged| staged.head.is_some());
+            assert!(!own, "the draft prepared a head of its own");
+        }
     }
 
     #[test]
