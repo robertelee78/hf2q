@@ -992,26 +992,40 @@ matched stock 149.539 ms control. This rejects the earlier conclusion that
 prepared target weights were intrinsically noncompetitive; those spikes lacked
 direct BF16 input. It does not establish parity with Splash.
 
-A separate fixed six-block balanced campaign at
-`$E/qwen38-prepared-bf16-d5-v1` compared the prepared route with the stock
-GGUF kernels; both arms used the legacy four-layer command chains. All 12
-exact task/tool/cleanup gates passed. Prepared BF16 target FFNs reduced client
-makespan by 12.610% (95% paired-block log-ratio CI 11.243–13.955%,
-half-width 1.356 points). Per-run makespan medians were 70.898 seconds for the
-candidate and 80.979 seconds for the control. This qualifies the prepared
-weight mechanism against hf2q's stock target kernels. It does not satisfy the
-separate Splash-parity release gate.
+A fixed six-block balanced campaign at `$E/qwen38-prepared-bf16-d5-v1`
+compared the prepared route with the stock GGUF kernels; both arms used the
+legacy four-layer command chains. All 12 exact task/tool/cleanup gates passed
+and client makespan fell by 12.610% (95% paired-block log-ratio CI
+11.243–13.955%; medians 70.898 and 80.979 seconds). That campaign, and every
+Qwen3.8 diagnostic in this section, ran with mlx-native per-command-buffer
+profiling unintentionally enabled in both arms: the Q5 case exported
+`MLX_PROFILE_CB=""`, and mlx-native up to 0.21.6 treats any present value as
+on, which makes every labeled commit synchronous. Its absolute times are
+inflated and it is superseded by the campaign below. The per-stage numbers and
+the accept/reject decisions above and below that rest on them (single
+64-layer chain, BF16 gate/up epilogue, prepared DeltaNet and output-head
+projections, last-arriver reduction) were measured under the same condition
+and have not been re-measured.
 
-The campaign binary was built against a local mlx-native checkout. After
-mlx-native 0.21.6 was published (crate SHA256 `a4287522…6de0`, source
+After mlx-native 0.21.6 was published (crate SHA256 `a4287522…6de0`, source
 `a02890be`), hf2q was pinned to `=0.21.6` with no local patch; the locked
-all-target check, release build and full test suite passed. One exact
-four-agent Q5 on that registry-pinned release binary
-(`qwen38-prepared-bf16-registry0216-v1`) returned `CalibrationPass` with all
-four agents exiting zero, follow-up turns reusing 988-2,398 cached prompt
-tokens, cleanup proven and a 72.072-second own-output makespan. That single
-run confirms the published package serves the prepared route; the six-block
-campaign above remains the performance evidence.
+all-target check, release build and full test suite passed. With that
+registry-pinned release binary and identical output (16 requests, 5,361
+completion tokens), the same case measured 72.072 and 69.694 seconds with the
+empty variable exported and 61.145, 60.267 and 60.089 seconds without it.
+
+The predeclared replacement campaign
+`$E/qwen38-prepared-bf16-d5-unprofiled-v1` used that binary, the same fixed
+six-block alternating order and the Q5 supervisor that no longer exports empty
+case controls. All 12 runs returned `CalibrationPass` with cleanup proven and
+no profile dump. Prepared BF16 target FFNs reduced client makespan by 13.925%
+(95% paired-block log-ratio CI 12.527–15.300%); per-run medians were 59.944
+seconds for the candidate and 69.758 seconds for the control. The arms do not
+produce identical text: every candidate run generated 5,361 completion tokens
+and every control run 5,255, so the candidate finished sooner while emitting
+2.0% more tokens. This qualifies the prepared weight mechanism against hf2q's
+stock target kernels. It does not satisfy the separate Splash-parity release
+gate: the candidate median is 3.65 times Splash's 16.420-second median.
 
 The follow-up two-pass BF16 gate/up epilogue also passed model-free parity and
 the exact task/tool gate, but its 113.745 ms four-lane target median was flat
