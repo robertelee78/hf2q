@@ -476,17 +476,37 @@ pub(crate) fn bf16_input(
 }
 
 /// Whether [`normed_bf16_input`] serves activations of `in_features`
-/// columns: the stock RMS norm would run its float4 kernel on them, whose
-/// bits the BF16-output kernel reproduces.
-pub(crate) fn normed_bf16_available(in_features: u32) -> bool {
-    mlx_native::ops::rms_norm::rms_norm_f32_to_bf16_available(in_features)
+/// columns on this device: the stock RMS norm would run its float4 kernel on
+/// them, whose bits the BF16-output kernel reproduces, and the kernel's
+/// thread count and threadgroup memory are within the device's limits.
+pub(crate) fn normed_bf16_available(
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    in_features: u32,
+) -> Result<bool> {
+    mlx_native::ops::rms_norm::rms_norm_f32_to_bf16_supported(
+        registry,
+        device.metal_device(),
+        in_features,
+    )
+    .map_err(|error| anyhow!("probe the BF16-output RMS norm: {error}"))
+}
+
+/// Whether [`normed_bf16_input`] publishes the trace witness of its norm.
+/// It follows the stock norm it replaces: the DeltaNet pre-norm publishes
+/// one, the attention pre-norm does not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NormWitness {
+    Publish,
+    None,
 }
 
 /// Encode the RMS norm of the F32 `[rows, in_features]` activation straight
 /// into the BF16 rows the prepared projections read: bitwise the stock norm
 /// followed by [`bf16_input`], without the cast dispatch and its barrier.
-/// The caller checked [`normed_bf16_available`] and places the barrier
-/// before the projections.
+/// The caller checked [`normed_bf16_available`], says whether the norm it
+/// replaces publishes a trace witness, and places the barrier before the
+/// projections.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn normed_bf16_input(
     enc: &mut CommandEncoder,
@@ -497,6 +517,7 @@ pub(crate) fn normed_bf16_input(
     rows: u32,
     in_features: u32,
     eps: f32,
+    witness: NormWitness,
 ) -> Result<MlxBuffer> {
     let elements = rows as usize * in_features as usize;
     let output = pooled_alloc_buffer(
@@ -512,25 +533,29 @@ pub(crate) fn normed_bf16_input(
         .as_mut_slice::<f32>()
         .map_err(|error| anyhow!("write norm params: {error}"))?
         .copy_from_slice(&[eps, in_features as f32]);
-    crate::inference::native_observation::witness_command_rms_norm(
-        enc,
-        input,
-        rows as usize,
-        in_features as usize,
-        |enc| {
-            mlx_native::ops::rms_norm::dispatch_rms_norm_f32_to_bf16(
-                enc,
-                registry,
-                device.metal_device(),
-                input,
-                norm_weight,
-                &output,
-                &params,
-                rows,
-                in_features,
-            )
-        },
-    )
+    let mut dispatch = |enc: &mut CommandEncoder| {
+        mlx_native::ops::rms_norm::dispatch_rms_norm_f32_to_bf16(
+            enc,
+            registry,
+            device.metal_device(),
+            input,
+            norm_weight,
+            &output,
+            &params,
+            rows,
+            in_features,
+        )
+    };
+    match witness {
+        NormWitness::Publish => crate::inference::native_observation::witness_command_rms_norm(
+            enc,
+            input,
+            rows as usize,
+            in_features as usize,
+            dispatch,
+        ),
+        NormWitness::None => dispatch(enc),
+    }
     .context("RMS norm into the prepared projection input")?;
     Ok(output)
 }

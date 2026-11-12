@@ -818,8 +818,10 @@ pub(crate) fn encode_joint_delta_net_layer(
         && qkv_prepared
         && gate_prepared
         && alpha_beta_prepared
-        && prepared_projection::normed_bf16_available(hidden)
+        && prepared_projection::normed_bf16_available(registry, device, hidden)?
     {
+        // The stock DeltaNet pre-norm publishes a trace witness; so does
+        // this one.
         let direct = prepared_projection::normed_bf16_input(
             enc,
             registry,
@@ -829,6 +831,7 @@ pub(crate) fn encode_joint_delta_net_layer(
             width_u32,
             hidden,
             eps,
+            prepared_projection::NormWitness::Publish,
         )?;
         (None, Some(direct))
     } else {
@@ -1065,10 +1068,9 @@ pub(crate) fn encode_joint_delta_net_layer(
             rows,
             core.stages,
             replay,
-            &core.g,
-            &core.beta,
+            core.gates.as_ref().map(|(g, beta)| (g, beta)),
             nv,
-        );
+        )?;
         return Ok(output);
     }
     // Read by the recurrence's gate / beta kernel, which follows the conv
@@ -1357,7 +1359,15 @@ pub(crate) fn encode_joint_delta_net_layer(
     crate::inference::stage_profile::boundary(enc, "adr065.projections")
         .context("profile Qwen joint DeltaNet output projection")?;
     let stages = lanes.into_iter().map(|(_, stage)| stage).collect();
-    settle_delta_windows(kv_cache, rank, rows, stages, replay, &g_buf, &beta_buf, nv);
+    settle_delta_windows(
+        kv_cache,
+        rank,
+        rows,
+        stages,
+        replay,
+        Some((&g_buf, &beta_buf)),
+        nv,
+    )?;
     Ok(output)
 }
 
@@ -1455,23 +1465,24 @@ fn project_delta_output(
 /// Same CPU-side parity flip the serial path performs after encoding, once
 /// per window (a window's dispatches read the current parity and wrote the
 /// opposite one), and the hand-over of each multi-row window's retained rows
-/// to the replay commit.
-#[allow(clippy::too_many_arguments)]
+/// to the replay commit. `gates` are the layer's packed `g` and `beta` rows;
+/// a step with replay storage must pass them.
 fn settle_delta_windows(
     kv_cache: &mut HybridKvCache,
     rank: usize,
     rows: &JointRows<'_>,
     stages: Vec<Option<WindowStage>>,
     replay: Option<&mut DeltaNetReplay>,
-    g_buf: &MlxBuffer,
-    beta_buf: &MlxBuffer,
+    gates: Option<(&MlxBuffer, &MlxBuffer)>,
     nv: usize,
-) {
+) -> Result<()> {
     let slot = &mut kv_cache.linear_attn[rank];
     for window in rows.windows {
         slot.swap_for_slot(window.slot);
     }
     if let Some(replay) = replay {
+        let (g_buf, beta_buf) =
+            gates.context("Qwen joint verify replay storage without retained gate rows")?;
         let lanes = rows
             .windows
             .iter()
@@ -1496,6 +1507,7 @@ fn settle_delta_windows(
             .collect();
         replay.layers.push(DeltaNetReplayLayer { rank, lanes });
     }
+    Ok(())
 }
 
 /// Encode one gated full-attention layer for every joint row into `enc` (no
@@ -1558,8 +1570,10 @@ pub(crate) fn encode_joint_full_attn_layer(
         && fused_prepared.is_some()
         && k_prepared
         && v_prepared
-        && prepared_projection::normed_bf16_available(hidden)
+        && prepared_projection::normed_bf16_available(registry, device, hidden)?
     {
+        // The stock attention pre-norm publishes no trace witness; neither
+        // does this one.
         let direct = prepared_projection::normed_bf16_input(
             enc,
             registry,
@@ -1569,6 +1583,7 @@ pub(crate) fn encode_joint_full_attn_layer(
             width_u32,
             hidden,
             shape.rms_norm_eps,
+            prepared_projection::NormWitness::None,
         )?;
         (None, Some(direct))
     } else {

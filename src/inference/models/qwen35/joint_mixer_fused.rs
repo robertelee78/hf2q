@@ -22,9 +22,16 @@
 //! Class A: every output bit, the DeltaNet state and the retained rows are
 //! those of the stock route. Padding rows of the gated output are zero
 //! instead of row 0's core output under their own gate; no real row reads
-//! them.
+//! them. The fused core's equality with the stock chain is qualified by test
+//! on the Apple M5 Max; mlx-native `tests/test_gdn_window_fused.rs` is the
+//! gate for any other GPU family.
+//!
+//! The core serves DeltaNet head dimension 128, two to nine convolution taps
+//! and windows of at most eight rows, on a device whose limits admit its
+//! 256-thread pipeline; a layer that does not qualify keeps the stock chain
+//! behind the wave. The first use and the first refusal are logged.
 
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{LazyLock, Once, OnceLock};
 
 use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::gdn_window_fused::{
@@ -59,42 +66,79 @@ fn padding_lanes(real: usize, width: usize) -> usize {
     (width - real).div_ceil(WINDOW_ROWS as usize)
 }
 
-/// Whether the DeltaNet core of this step runs as one dispatch: the kernel
-/// serves the geometry, every window has at most [`WINDOW_ROWS`] rows, the
-/// lanes fit the kernel's table and the device runs its pipelines. Otherwise
-/// the step keeps the stock chain.
-pub(super) fn delta_core_admits(
-    registry: &mut KernelRegistry,
-    device: &MlxDevice,
-    shape: &DeltaNetLayerShape,
-    rows: &JointRows<'_>,
-) -> Result<bool> {
-    let geometry = shape.d_k == HEAD_DIM
-        && shape.d_v == HEAD_DIM
-        && shape.n_k_heads > 0
-        && shape.n_v_heads % shape.n_k_heads == 0
-        && (2..=WINDOW_ROWS + 1).contains(&shape.conv_kernel);
-    let lanes = rows
-        .windows
-        .iter()
-        .all(|window| (1..=WINDOW_ROWS as usize).contains(&window.rows))
-        && rows.windows.len() + padding_lanes(rows.real(), rows.width) <= MAX_LANES;
-    if !(geometry && lanes) {
-        return Ok(false);
-    }
+/// Whether this device runs the fused window pipelines (probed once).
+fn device_runs_core(registry: &mut KernelRegistry, device: &MlxDevice) -> Result<bool> {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     if let Some(available) = AVAILABLE.get() {
         return Ok(*available);
     }
     let available = gdn_window_fused_available(registry, device)
         .map_err(|error| anyhow!("probe the fused DeltaNet window kernel: {error}"))?;
-    if !available {
-        tracing::warn!(
-            "Qwen fused mixer: the fused DeltaNet window kernel exceeds this device's \
-             threadgroup limits; DeltaNet layers keep the stock chain"
-        );
-    }
     Ok(*AVAILABLE.get_or_init(|| available))
+}
+
+/// Why the fused core does not serve this geometry or these rows, whatever
+/// the device.
+pub(super) fn geometry_refusal(
+    shape: &DeltaNetLayerShape,
+    rows: &JointRows<'_>,
+) -> Option<&'static str> {
+    if shape.d_k != HEAD_DIM || shape.d_v != HEAD_DIM {
+        Some("the DeltaNet head dimension is not 128")
+    } else if shape.n_k_heads == 0 || shape.n_v_heads % shape.n_k_heads != 0 {
+        Some("the value heads are not a multiple of the key heads")
+    } else if !(2..=WINDOW_ROWS + 1).contains(&shape.conv_kernel) {
+        Some("the convolution has fewer than two or more than nine taps")
+    } else if !rows
+        .windows
+        .iter()
+        .all(|window| (1..=WINDOW_ROWS as usize).contains(&window.rows))
+    {
+        Some("a window has more than eight rows")
+    } else if rows.windows.len() + padding_lanes(rows.real(), rows.width) > MAX_LANES {
+        Some("the step has more lanes than the kernel's table")
+    } else {
+        None
+    }
+}
+
+/// Whether the DeltaNet core of this step runs as one dispatch: head
+/// dimension [`HEAD_DIM`], two to nine convolution taps, every window of at
+/// most [`WINDOW_ROWS`] rows, the lanes within the kernel's table, and a
+/// device whose thread and threadgroup-memory limits admit its pipelines.
+/// Otherwise the layer keeps the stock chain; the first refusal is logged
+/// with its reason.
+pub(super) fn delta_core_admits(
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    shape: &DeltaNetLayerShape,
+    rows: &JointRows<'_>,
+) -> Result<bool> {
+    let refusal = match geometry_refusal(shape, rows) {
+        Some(reason) => Some(reason),
+        None if !device_runs_core(registry, device)? => {
+            Some("the kernel exceeds this device's thread or threadgroup-memory limits")
+        }
+        None => None,
+    };
+    if let Some(reason) = refusal {
+        // The switch asked for the stage; say once why a layer keeps the
+        // stock chain.
+        static FIRST_REFUSAL: Once = Once::new();
+        FIRST_REFUSAL.call_once(|| {
+            tracing::info!(
+                reason,
+                key_head_dim = shape.d_k,
+                value_head_dim = shape.d_v,
+                num_key_heads = shape.n_k_heads,
+                num_value_heads = shape.n_v_heads,
+                conv_taps = shape.conv_kernel,
+                width = rows.width,
+                "Qwen DFlash2 verify keeps the stock DeltaNet chain: fused DeltaNet core refused"
+            );
+        });
+    }
+    Ok(refusal.is_none())
 }
 
 /// What the fused core of one layer produced.
@@ -103,10 +147,9 @@ pub(super) struct DeltaCore {
     pub(super) gated: MlxBuffer,
     /// Per window, the rows a multi-row window retains for the replay.
     pub(super) stages: Vec<Option<WindowStage>>,
-    /// Packed `g` and `beta` rows `[width, n_v_heads]` (replay storage when
-    /// the step has it; unwritten otherwise).
-    pub(super) g: MlxBuffer,
-    pub(super) beta: MlxBuffer,
+    /// Packed `g` and `beta` rows `[width, n_v_heads]` in the replay
+    /// storage; `None` for a step without it, which retains nothing.
+    pub(super) gates: Option<(MlxBuffer, MlxBuffer)>,
 }
 
 /// Encode the DeltaNet core of every window of a joint step as one dispatch
@@ -164,26 +207,22 @@ pub(super) fn encode_delta_core(
             None
         });
     }
-    let pooled = |label: &str| {
-        pooled_alloc_buffer(device, width * nv * 4, DType::F32, vec![width * nv])
-            .map_err(|error| anyhow!("allocate Qwen joint DeltaNet {label}: {error}"))
-    };
-    let (g, beta) = match replay.as_deref_mut() {
-        Some(replay) => (replay.take(width * nv)?, replay.take(width * nv)?),
-        None => (pooled("g")?, pooled("beta")?),
+    let gates = match replay.as_deref_mut() {
+        Some(replay) => Some((replay.take(width * nv)?, replay.take(width * nv)?)),
+        None => None,
     };
 
     let mut lanes = Vec::with_capacity(rows.windows.len() + padding_lanes(rows.real(), width));
     for (window, stage) in rows.windows.iter().zip(&stages) {
-        let tape = match (stage, replay.as_deref()) {
-            (Some(stage), Some(replay)) => Some(GdnWindowTape {
+        let tape = match (stage, replay.as_deref(), &gates) {
+            (Some(stage), Some(replay), Some((g, beta))) => Some(GdnWindowTape {
                 q: replay.offset_of(&stage.q)?,
                 k: replay.offset_of(&stage.k)?,
                 v: replay.offset_of(&stage.v)?,
                 conv_rows: replay.offset_of(&stage.conv_rows)?
                     + u32::try_from(k_minus_one * channels)?,
-                g: replay.offset_of(&g)? + u32::try_from(window.start * nv)?,
-                beta: replay.offset_of(&beta)? + u32::try_from(window.start * nv)?,
+                g: replay.offset_of(g)? + u32::try_from(window.start * nv)?,
+                beta: replay.offset_of(beta)? + u32::try_from(window.start * nv)?,
             }),
             _ => None,
         };
@@ -284,10 +323,21 @@ pub(super) fn encode_delta_core(
         &lanes,
     )
     .map_err(|error| anyhow!("dispatch fused DeltaNet window: {error}"))?;
+    static FIRST_USE: Once = Once::new();
+    FIRST_USE.call_once(|| {
+        tracing::info!(
+            rows = rows.real(),
+            width,
+            lanes = rows.windows.len(),
+            num_key_heads = shape.n_k_heads,
+            num_value_heads = shape.n_v_heads,
+            conv_taps = shape.conv_kernel,
+            "Qwen DFlash2 verify selected the fused DeltaNet core"
+        );
+    });
     Ok(DeltaCore {
         gated,
         stages,
-        g,
-        beta,
+        gates,
     })
 }
