@@ -27,7 +27,9 @@
 //!
 //! The fused stages need the routed and the shared expert's planes of each
 //! projection in one format and one expert width, and at most 256 experts
-//! and 256 routes a step. A layer outside that runs the stage-by-stage form.
+//! and 256 routes a step. A layer outside that runs the stage-by-stage form;
+//! model upload logs how many layers take each form
+//! ([`live_tile_layer_is_fused`]).
 
 use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::dense_matvec_f32_rows::{
@@ -46,11 +48,52 @@ use mlx_native::{
 };
 
 use super::ffn::MoeFfnShape;
-use super::gpu_ffn::MoeFfnWeightsGpuQ;
+use super::gpu_ffn::{MoeFfnWeightsGpuQ, PreparedMoeExpertsM8, PreparedMoeLiveTiles};
 use super::moe_batched::{
-    pooled, DFlash2MoeRouteMask, MoeBatchedRouting, MoeDenseRole, QWEN_MOE_LIVE_TILES_ENV,
+    pooled, DFlash2MoeRouteMask, MoeBatchedRouting, MoeDenseRole, MOE_BATCHED_MAX_ROWS,
+    QWEN_MOE_LIVE_TILES_ENV,
 };
 use super::moe_live_tiles::{build_moe_ffn_layer_tile_stages_into, row_block, BLOCK_ROWS};
+
+/// The planes and step shape the fused expert stages take for a layer.
+fn fused_step<'a>(
+    prepared: &'a PreparedMoeExpertsM8,
+    live: &'a PreparedMoeLiveTiles,
+    shape: MoeFfnShape,
+    rows: u32,
+) -> (MoeTilesFusedWeights<'a>, MoeTilesFusedParams) {
+    (
+        MoeTilesFusedWeights {
+            gate: &prepared.gate,
+            up: &prepared.up,
+            down: &prepared.down,
+            shared_gate: &live.shared[0],
+            shared_up: &live.shared[1],
+            shared_down: &live.shared[2],
+        },
+        MoeTilesFusedParams {
+            n_tokens: rows,
+            top_k: shape.num_experts_per_tok,
+            n_experts: shape.num_experts,
+            hidden: shape.hidden_size,
+            intermediate: shape.moe_intermediate_size,
+            column_tile: live.column_tile,
+        },
+    )
+}
+
+/// Whether the live-tile route runs this layer on the fused expert stages
+/// at the widest step (`false`: the stage-by-stage form). `None` when the
+/// layer has no live-tile planes.
+pub(super) fn live_tile_layer_is_fused(
+    weights: &MoeFfnWeightsGpuQ,
+    shape: MoeFfnShape,
+) -> Option<bool> {
+    let prepared = weights.prepared_m8.as_ref()?;
+    let live = prepared.live_tiles.as_ref()?;
+    let (planes, params) = fused_step(prepared, live, shape, MOE_BATCHED_MAX_ROWS as u32);
+    Some(moe_tiles_fused_admits(&planes, &params).is_ok())
+}
 
 /// Encode `output[rows, out] = input[rows, in] @ W^T` for the F32 weight of
 /// `role` on the row-exact kernel: the full blocks of [`BLOCK_ROWS`] rows in
@@ -146,22 +189,7 @@ pub(super) fn build_moe_ffn_layer_live_tiles_into(
         .live_tiles
         .as_ref()
         .context("the shared expert's live-tile planes were not prepared at model upload")?;
-    let params = MoeTilesFusedParams {
-        n_tokens: rows,
-        top_k: shape.num_experts_per_tok,
-        n_experts: shape.num_experts,
-        hidden: shape.hidden_size,
-        intermediate: shape.moe_intermediate_size,
-        column_tile: live.column_tile,
-    };
-    let planes = MoeTilesFusedWeights {
-        gate: &prepared.gate,
-        up: &prepared.up,
-        down: &prepared.down,
-        shared_gate: &live.shared[0],
-        shared_up: &live.shared[1],
-        shared_down: &live.shared[2],
-    };
+    let (planes, params) = fused_step(prepared, live, shape, rows);
     if moe_tiles_fused_admits(&planes, &params).is_err() {
         return build_moe_ffn_layer_tile_stages_into(
             enc, device, registry, x, weights, shape, residual, out, rows, layer_idx, route_mask,

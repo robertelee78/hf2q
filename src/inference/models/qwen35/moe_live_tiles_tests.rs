@@ -14,6 +14,9 @@
 //!   stage-by-stage form ([`super::moe_live_tiles`]): every output element,
 //!   expert id and routing weight of whole layers bitwise equal, masked and
 //!   unmasked, at widths 1 to 32, with experts of more than eight routes;
+//! * the fallback: a layer the fused stages refuse (routed and shared down
+//!   in different formats) runs the stage-by-stage form through the route's
+//!   entry point, bitwise and with that form's dispatches;
 //! * F64 reference of the whole layer with a K-scaled bound: BF16 expert
 //!   inputs and SwiGLU, half expert weights, FP32 sums, for the routed
 //!   experts and the shared expert.
@@ -27,7 +30,8 @@ use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 use super::decode_pool;
 use super::gpu_ffn::MoeFfnWeightsGpuQ;
 use super::moe_batched::{
-    build_moe_ffn_layer_gpu_batched_route_into, DFlash2MoeRouteMask, MoeExpertRoute,
+    build_moe_ffn_layer_gpu_batched_route_into, DFlash2MoeRouteMask, MoeDenseStorage,
+    MoeExpertRoute,
 };
 use super::moe_batched_tests::{
     bits, dequant_rows, packed, router_logits_f64, rows, shape, silu, top_k_f64, Layer, RowResult,
@@ -43,6 +47,16 @@ fn live_tile_weights(
     layer: &Layer,
 ) -> MoeFfnWeightsGpuQ {
     let mut weights = layer.gpu(device, true, &layer.gpu_experts(device));
+    prepare_live_tile_planes(device, registry, &mut weights);
+    weights
+}
+
+/// Prepare the expert planes and the shared expert's planes of `weights`.
+fn prepare_live_tile_planes(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    weights: &mut MoeFfnWeightsGpuQ,
+) {
     let mut enc = device.command_encoder().expect("prepare encoder");
     weights
         .prepare_grouped_m8(&mut enc, registry, device, H as u32, MI as u32, MSH as u32)
@@ -54,7 +68,6 @@ fn live_tile_weights(
     enc.commit_and_wait_labeled("test.qwen.moe_live_tiles.prepare")
         .expect("commit preparation");
     weights.prepared_m8.as_mut().expect("prepared").live_tiles = Some(live_tiles);
-    weights
 }
 
 /// One live-tile layer over the rows `select` (in that order). `verify_rows`
@@ -320,6 +333,147 @@ fn live_tile_route_equals_its_stage_form_bitwise_down_q6_k() {
 #[test]
 fn live_tile_route_equals_its_stage_form_bitwise_down_q4_k() {
     fused_stages_equal_tile_stages(GgmlType::Q4_K, 0x0f5e_d002);
+}
+
+/// `run` with the dispatches and barriers it encoded.
+fn counted<T>(run: impl FnOnce() -> T) -> (T, u64, u64) {
+    let (dispatches, barriers) = (mlx_native::dispatch_count(), mlx_native::barrier_count());
+    let result = run();
+    (
+        result,
+        mlx_native::dispatch_count() - dispatches,
+        mlx_native::barrier_count() - barriers,
+    )
+}
+
+/// A layer the fused stages refuse (routed down Q6_K beside a shared down
+/// Q4_K) through the route's entry point: the stage-by-stage form, bitwise,
+/// with that form's dispatches; and the load-time count sees it.
+#[test]
+fn live_tile_route_runs_a_refused_layer_stage_by_stage() {
+    const ROWS: usize = 32;
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let routed = Layer::random(GgmlType::Q6_K, 0x0fa1_1b06);
+    let other = Layer::random(GgmlType::Q4_K, 0x0fa1_1b04);
+    let mixed = Layer {
+        shared_down: other.shared_down,
+        ..routed
+    };
+    let mut weights = mixed.gpu(&device, true, &mixed.gpu_experts(&device));
+    weights.dense_storage = MoeDenseStorage::Native {
+        shared_gate_up: GgmlType::Q4_K,
+        shared_down: GgmlType::Q4_K,
+    };
+    prepare_live_tile_planes(&device, &mut registry, &mut weights);
+    assert_eq!(
+        super::moe_live_tiles_fused::live_tile_layer_is_fused(&weights, shape()),
+        Some(false),
+        "the mixed-format layer was admitted to the fused stages"
+    );
+    let admitted = live_tile_weights(
+        &device,
+        &mut registry,
+        &Layer::random(GgmlType::Q6_K, 0x0fa1_1b06),
+    );
+    assert_eq!(
+        super::moe_live_tiles_fused::live_tile_layer_is_fused(&admitted, shape()),
+        Some(true),
+        "a one-format layer was refused by the fused stages"
+    );
+    let unprepared = mixed.gpu(&device, true, &mixed.gpu_experts(&device));
+    assert_eq!(
+        super::moe_live_tiles_fused::live_tile_layer_is_fused(&unprepared, shape()),
+        None
+    );
+
+    let (x, residual) = rows(ROWS, 0x0fa1_1bff);
+    let all: Vec<usize> = (0..ROWS).collect();
+    let steps: Vec<(Vec<usize>, Option<Vec<u32>>)> = vec![
+        (all.clone(), None),
+        (all.clone(), Some(vec![5, 8, 1, 3])),
+        (all.clone(), Some(vec![0, 0, 0, 0])),
+        ((0..8).collect(), None),
+        ((8..24).collect(), Some(vec![3, 8])),
+        ((0..17).collect(), None),
+        (vec![9], None),
+        // Experts of more than eight routes.
+        ((0..ROWS).map(|row| row % 3).collect(), None),
+    ];
+    for (select, verify_rows) in &steps {
+        let label = format!("mixed formats, rows {select:?} mask {verify_rows:?}");
+        let (entry, entry_dispatches, entry_barriers) = counted(|| {
+            run_layer(
+                &device,
+                &mut registry,
+                &weights,
+                &x,
+                &residual,
+                select,
+                verify_rows.as_deref(),
+                Some(MoeExpertRoute::LiveTiles),
+            )
+        });
+        let (stages, stage_dispatches, stage_barriers) = counted(|| {
+            run_layer(
+                &device,
+                &mut registry,
+                &weights,
+                &x,
+                &residual,
+                select,
+                verify_rows.as_deref(),
+                None,
+            )
+        });
+        assert_eq!(
+            (entry_dispatches, entry_barriers),
+            (stage_dispatches, stage_barriers),
+            "{label}: the entry point did not encode the stage-by-stage form"
+        );
+        for (place, (entry, stages)) in entry.iter().zip(&stages).enumerate() {
+            let live = verify_rows.as_ref().map_or(true, |verify_rows| {
+                place % LANE_ROWS < verify_rows[place / LANE_ROWS] as usize
+            });
+            assert!(
+                !live || entry.out.iter().all(|value| value.is_finite()),
+                "{label}: place {place} is not finite"
+            );
+            assert_row(entry, stages, &format!("{label}: place {place}"));
+        }
+    }
+
+    // The same full-width steps on the admitted layer run the fused stages:
+    // eight dispatches, where the refused layer encodes the stage form's.
+    for verify_rows in [None, Some(vec![5u32, 8, 1, 3])] {
+        let mut dispatches = |weights: &MoeFfnWeightsGpuQ| {
+            counted(|| {
+                run_layer(
+                    &device,
+                    &mut registry,
+                    weights,
+                    &x,
+                    &residual,
+                    &all,
+                    verify_rows.as_deref(),
+                    Some(MoeExpertRoute::LiveTiles),
+                )
+            })
+            .1
+        };
+        let (fused, fallback) = (dispatches(&admitted), dispatches(&weights));
+        assert_eq!(fused, 8, "mask {verify_rows:?}: fused dispatches");
+        assert!(
+            fallback > 2 * fused,
+            "mask {verify_rows:?}: the refused layer encoded {fallback} dispatches"
+        );
+    }
+    eprintln!(
+        "moe_live_tiles: a refused layer runs the stage-by-stage form through the entry point, \
+         {} steps bitwise",
+        steps.len()
+    );
 }
 
 fn assert_row(actual: &RowResult, expected: &RowResult, label: &str) {

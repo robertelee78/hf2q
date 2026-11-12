@@ -134,7 +134,16 @@ fn qwen36_dflash2_verify_moe_route_replay() {
     model.bind_ggml_routing_policy(super::routing_policy::resolve_qwen_ggml_routing_policy(
         &gguf_path,
     ));
-    model.ensure_gpu_cache_primed().expect("prime GPU cache");
+    // The upload's INFO lines on stderr: the live-tile route logs how many
+    // layers run its fused expert stages and how many run stage by stage.
+    let load_log = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .without_time()
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .finish();
+    tracing::subscriber::with_default(load_log, || model.ensure_gpu_cache_primed())
+        .expect("prime GPU cache");
     let mode = model
         .joint_decode_mode()
         .unwrap_or_else(|reason| panic!("joint decode not admitted: {reason}"));
