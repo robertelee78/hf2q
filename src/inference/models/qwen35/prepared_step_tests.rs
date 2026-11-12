@@ -42,14 +42,14 @@ use crate::inference::spec_decode::dflash2::adapters::DFlash2TargetCapture;
 use crate::serve::multi_seq_kv::SlotId;
 
 /// The lane every case observes.
-const TARGET: u32 = 2;
+pub(super) const TARGET: u32 = 2;
 /// A valid token no lane's stream holds at the verified positions: what the
 /// GPU-token path's padding rows carry instead of a copy of row 0.
 const PADDING_TOKEN: u32 = 509;
 
 /// The MoE layout: the config that makes the DFlash2 tile follow its rows
 /// and selects the exact mode. FFN layers stay the synthetic dense ones.
-fn moe_layout_cfg(query_heads: u32) -> Qwen35Config {
+pub(super) fn moe_layout_cfg(query_heads: u32) -> Qwen35Config {
     Qwen35Config {
         num_attention_heads: query_heads,
         moe: Some(Qwen35MoeConfig {
@@ -63,7 +63,7 @@ fn moe_layout_cfg(query_heads: u32) -> Qwen35Config {
 }
 
 /// The exact mode as the Qwen3.6 DFlash2 target runs it.
-fn exact_arm(attention_tile: bool) -> Arm {
+pub(super) fn exact_arm(attention_tile: bool) -> Arm {
     Arm {
         mode: JointRouteMode::Exact,
         dense_ffn: JointDenseFfnRoute::SerialBuilder,
@@ -71,12 +71,13 @@ fn exact_arm(attention_tile: bool) -> Arm {
             projection: JointProjectionKernel::Canonical,
             pooled_outputs: true,
             verify_attention_tile: attention_tile,
+            verify_mixer_fused: false,
         },
     }
 }
 
 #[derive(Clone, Copy)]
-enum Tokens {
+pub(super) enum Tokens {
     /// Host tokens: padding rows replay row 0.
     Host,
     /// The GPU token tile, its padding rows holding [`PADDING_TOKEN`].
@@ -85,16 +86,20 @@ enum Tokens {
 
 /// The target lane's observable result of one DFlash2 verify step.
 #[derive(Clone, PartialEq)]
-struct LaneTrace {
-    rows: Vec<RowBits>,
-    committed: LaneDigest,
+pub(super) struct LaneTrace {
+    pub(super) rows: Vec<RowBits>,
+    pub(super) committed: LaneDigest,
     /// Captured layer outputs of the lane's rows.
-    captured: Vec<u32>,
+    pub(super) captured: Vec<u32>,
 }
 
 /// One DFlash2 target verify step over `cohort` (`(slot, rows)` in packed
 /// order), every lane accepted in full.
-fn dflash2_verify(fixture: &Fixture<'_>, cohort: &[(u32, usize)], tokens: Tokens) -> LaneTrace {
+pub(super) fn dflash2_verify(
+    fixture: &Fixture<'_>,
+    cohort: &[(u32, usize)],
+    tokens: Tokens,
+) -> LaneTrace {
     let model = fixture.model;
     let mut cache = (fixture.new_cache)();
     let lane_tokens = cohort
@@ -313,7 +318,7 @@ fn serial(fixture: &Fixture<'_>, steps: usize) -> (Vec<RowBits>, LaneDigest) {
 /// The kernels this gate is about are checked under validation where they
 /// can be isolated: `prepared_width_tests` and mlx-native's
 /// `repacked_gguf_mm` tests.
-fn whole_steps_repeat() -> bool {
+pub(super) fn whole_steps_repeat() -> bool {
     let repeat = std::env::var_os("MTL_SHADER_VALIDATION").is_none();
     if !repeat {
         eprintln!("skipped: whole joint steps do not repeat under Metal shader validation");
@@ -329,7 +334,7 @@ fn hidden_of(trace: &LaneTrace) -> Vec<&Vec<u32>> {
     trace.rows.iter().map(|row| &row.1).collect()
 }
 
-fn assert_same_lane(actual: &LaneTrace, expected: &LaneTrace, label: &str) {
+pub(super) fn assert_same_lane(actual: &LaneTrace, expected: &LaneTrace, label: &str) {
     assert!(
         actual.rows == expected.rows,
         "{label}: the lane's rows differ"
