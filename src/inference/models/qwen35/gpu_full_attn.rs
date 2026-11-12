@@ -12870,6 +12870,7 @@ mod tests {
             ggml_type_down: GgmlType::Q4_0,
             intermediate_size: intermediate_size as u32,
             hidden_size: hidden_size as u32,
+            repacked_m32: Default::default(),
         };
         (weights_q, gate_f32, up_f32, down_f32)
     }
@@ -13135,6 +13136,7 @@ mod tests {
                 ggml_type_down: GgmlType::Q4_0,
                 intermediate_size: m as u32,
                 hidden_size: h as u32,
+                repacked_m32: Default::default(),
             };
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
@@ -13181,6 +13183,7 @@ mod tests {
                 ggml_type_down: GgmlType::Q4_0,
                 intermediate_size: m as u32,
                 hidden_size: h as u32,
+                repacked_m32: Default::default(),
             };
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
@@ -13227,6 +13230,7 @@ mod tests {
                 ggml_type_down: GgmlType::Q4_0,
                 intermediate_size: m as u32,
                 hidden_size: h as u32,
+                repacked_m32: Default::default(),
             };
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
@@ -13334,6 +13338,7 @@ mod tests {
                 ggml_type_down: GgmlType::Q4_0,
                 intermediate_size: m as u32,
                 hidden_size: h as u32,
+                repacked_m32: Default::default(),
             };
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
@@ -13372,6 +13377,7 @@ mod tests {
                 ggml_type_down: GgmlType::Q4_0,
                 intermediate_size: m as u32,
                 hidden_size: h as u32 + 1, // mismatch
+                repacked_m32: Default::default(),
             };
             let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
             let enc = device.command_encoder().unwrap();
@@ -13471,6 +13477,7 @@ mod tests {
             ggml_type_down: GgmlType::Q4_0,
             intermediate_size: m as u32,
             hidden_size: h as u32,
+            repacked_m32: Default::default(),
         };
 
         // Input data.
@@ -13637,6 +13644,7 @@ mod tests {
             ggml_type_down: GgmlType::Q4_0,
             intermediate_size: m as u32,
             hidden_size: h as u32,
+            repacked_m32: Default::default(),
         };
 
         let hidden_in = upload_f32(&hidden_data, &device).unwrap();
@@ -13874,6 +13882,7 @@ mod tests {
             ggml_type_down: GgmlType::Q4_0,
             intermediate_size: m as u32,
             hidden_size: h as u32,
+            repacked_m32: Default::default(),
         };
         let full_shape_q = Qwen35TreeVerifyFullLayerShapeQ {
             attn: layer_shape(

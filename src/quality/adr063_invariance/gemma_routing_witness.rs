@@ -78,7 +78,10 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// the routing-witness op and routing shaders are unchanged. The intervening
 /// releases add opt-in decode, DFlash2, expert-matmul, cache and observation
 /// kernels without changing this witness route, so the route label is kept.
-pub const WITNESS_NATIVE_VERSION: &str = "0.21.3";
+/// Re-reviewed 0.21.3 -> 0.21.6 (`3b1a15e` -> `a02890b`): the witness op and
+/// all routing/routing-witness shaders are byte-identical. Registry additions
+/// for prepared dense and grouped expert kernels do not alter this route.
+pub const WITNESS_NATIVE_VERSION: &str = "0.21.6";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {

@@ -350,6 +350,13 @@ impl DenseFfnWeightsGpu {
 ///   BF16 path:  17408×5120×2×2 bytes = 357 MB per layer × 64 layers = 22 GB
 ///   Q4_0 path:  17408×5120×4/8×1.125 bytes ≈ 50 MB per layer × 64 layers = 3 GB
 ///   (Avoids the 129 GB OOM from the Q4_0→F32 round-trip in the old F32 path.)
+#[derive(Default)]
+pub(crate) struct PreparedDenseFfnGguf {
+    gate: std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
+    up: std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
+    down: std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
+}
+
 pub struct DenseFfnWeightsGpuQ {
     /// Gate projection raw GGML blocks: `[intermediate_size, hidden_size]`.
     pub gate_q: MlxBuffer,
@@ -365,6 +372,9 @@ pub struct DenseFfnWeightsGpuQ {
     pub intermediate_size: u32,
     /// Model hidden size (input dim of gate/up, output dim of down).
     pub hidden_size: u32,
+    /// Width-32 load-once prepared planes. The owning layer drops them with the
+    /// source weights, so model replacement cannot retain stale GPU buffers.
+    pub(crate) repacked_m32: PreparedDenseFfnGguf,
 }
 
 impl DenseFfnWeightsGpuQ {
@@ -381,8 +391,47 @@ impl DenseFfnWeightsGpuQ {
             ggml_type_down: w.ggml_type_down,
             intermediate_size: w.intermediate_size,
             hidden_size: w.hidden_size,
+            repacked_m32: PreparedDenseFfnGguf::default(),
         }
     }
+}
+
+fn repacked_dense_m32_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HF2Q_REPACKED_GGUF_M32")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    })
+}
+
+fn repacked_dense_m32_eligible(params: &GgmlQuantizedMatmulParams) -> bool {
+    params.m == 32
+        && params.n % 64 == 0
+        && params.k % 256 == 0
+        && matches!(params.ggml_type, GgmlType::Q4_K | GgmlType::Q6_K)
+}
+fn repacked_dense_m32_in_joint_scope(params: &GgmlQuantizedMatmulParams) -> bool {
+    super::joint_projection::active_width(params.m) && repacked_dense_m32_eligible(params)
+}
+
+fn prepare_repacked_dense_weight<'a>(
+    cell: &'a std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
+    enc: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weight: &MlxBuffer,
+    params: &GgmlQuantizedMatmulParams,
+) -> Result<&'a mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight> {
+    if cell.get().is_none() {
+        let prepared = mlx_native::ops::repacked_gguf_mm::prepare_repacked_gguf_weight(
+            enc, registry, device, weight, params,
+        )
+        .context("prepare dense FFN GGUF weight")?;
+        let _ = cell.set(prepared);
+    }
+    cell.get()
+        .context("prepared dense FFN GGUF weight was not retained")
 }
 
 /// GPU-side weight handles for a single Qwen3.5-MoE FFN layer.
@@ -1496,6 +1545,199 @@ pub(crate) fn build_dense_ffn_layer_gpu_q_into_with_gate_up(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn build_dense_ffn_layer_gpu_q_prepared_m32(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &DenseFfnWeightsGpuQ,
+    add_residual: Option<&MlxBuffer>,
+    gate_up_params: &GgmlQuantizedMatmulParams,
+    down_params: &GgmlQuantizedMatmulParams,
+) -> Result<MlxBuffer> {
+    let seq_len = gate_up_params.m;
+    let h = weights.hidden_size;
+    let m = weights.intermediate_size;
+    let n_out = (seq_len * h) as usize;
+    let gate = prepare_repacked_dense_weight(
+        &weights.repacked_m32.gate,
+        enc,
+        registry,
+        device,
+        &weights.gate_q,
+        gate_up_params,
+    )?;
+    let up = prepare_repacked_dense_weight(
+        &weights.repacked_m32.up,
+        enc,
+        registry,
+        device,
+        &weights.up_q,
+        gate_up_params,
+    )?;
+    let down = prepare_repacked_dense_weight(
+        &weights.repacked_m32.down,
+        enc,
+        registry,
+        device,
+        &weights.down_q,
+        down_params,
+    )?;
+    enc.memory_barrier();
+
+    let x_bf16 = super::decode_pool::pooled_alloc_buffer(
+        device,
+        seq_len as usize * h as usize * std::mem::size_of::<half::bf16>(),
+        DType::BF16,
+        vec![seq_len as usize, h as usize],
+    )
+    .map_err(|error| anyhow!("alloc dense_q prepared input: {error}"))?;
+    let gate_f32 = super::decode_pool::pooled_alloc_buffer(
+        device,
+        seq_len as usize * m as usize * std::mem::size_of::<f32>(),
+        DType::F32,
+        vec![seq_len as usize, m as usize],
+    )
+    .map_err(|error| anyhow!("alloc dense_q prepared gate: {error}"))?;
+    let up_f32 = super::decode_pool::pooled_alloc_buffer(
+        device,
+        seq_len as usize * m as usize * std::mem::size_of::<f32>(),
+        DType::F32,
+        vec![seq_len as usize, m as usize],
+    )
+    .map_err(|error| anyhow!("alloc dense_q prepared up: {error}"))?;
+    let hidden_f32 = super::decode_pool::pooled_alloc_buffer(
+        device,
+        seq_len as usize * m as usize * std::mem::size_of::<f32>(),
+        DType::F32,
+        vec![seq_len as usize, m as usize],
+    )
+    .map_err(|error| anyhow!("alloc dense_q prepared hidden: {error}"))?;
+    let hidden_bf16 = super::decode_pool::pooled_alloc_buffer(
+        device,
+        seq_len as usize * m as usize * std::mem::size_of::<half::bf16>(),
+        DType::BF16,
+        vec![seq_len as usize, m as usize],
+    )
+    .map_err(|error| anyhow!("alloc dense_q prepared BF16 hidden: {error}"))?;
+    let down_out = if super::decode_pool::step_pooled_outputs() {
+        super::decode_pool::pooled_alloc_buffer(
+            device,
+            n_out * std::mem::size_of::<f32>(),
+            DType::F32,
+            vec![seq_len as usize, h as usize],
+        )
+        .map_err(|error| anyhow!("alloc dense_q prepared down output: {error}"))?
+    } else {
+        device
+            .alloc_buffer(
+                n_out * std::mem::size_of::<f32>(),
+                DType::F32,
+                vec![seq_len as usize, h as usize],
+            )
+            .map_err(|error| anyhow!("alloc dense_q prepared down output: {error}"))?
+    };
+    let mut silu_params =
+        super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
+            .map_err(|error| anyhow!("alloc dense_q prepared SiLU params: {error}"))?;
+    silu_params
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("{error}"))?[0] = seq_len * m;
+
+    cast(
+        enc,
+        registry,
+        device.metal_device(),
+        x,
+        &x_bf16,
+        seq_len as usize * h as usize,
+        CastDirection::F32ToBF16,
+    )
+    .context("cast dense_q prepared input F32→BF16")?;
+    enc.memory_barrier();
+    mlx_native::ops::repacked_gguf_mm::dispatch_repacked_gguf_mm_bf16_input(
+        enc,
+        registry,
+        device,
+        &x_bf16,
+        gate,
+        &gate_f32,
+        gate_up_params,
+    )
+    .context("dense_q prepared gate projection")?;
+    mlx_native::ops::repacked_gguf_mm::dispatch_repacked_gguf_mm_bf16_input(
+        enc,
+        registry,
+        device,
+        &x_bf16,
+        up,
+        &up_f32,
+        gate_up_params,
+    )
+    .context("dense_q prepared up projection")?;
+    enc.memory_barrier();
+    dispatch_silu_mul(
+        enc,
+        registry,
+        device.metal_device(),
+        &gate_f32,
+        &up_f32,
+        &hidden_f32,
+        &silu_params,
+        seq_len * m,
+    )
+    .context("dense_q prepared silu_mul")?;
+    enc.memory_barrier();
+    cast(
+        enc,
+        registry,
+        device.metal_device(),
+        &hidden_f32,
+        &hidden_bf16,
+        seq_len as usize * m as usize,
+        CastDirection::F32ToBF16,
+    )
+    .context("cast dense_q prepared hidden F32→BF16")?;
+    enc.memory_barrier();
+    mlx_native::ops::repacked_gguf_mm::dispatch_repacked_gguf_mm_bf16_input(
+        enc,
+        registry,
+        device,
+        &hidden_bf16,
+        down,
+        &down_out,
+        down_params,
+    )
+    .context("dense_q prepared down projection")?;
+
+    if let Some(residual) = add_residual {
+        let sum = if super::decode_pool::step_pooled_outputs() {
+            super::decode_pool::pooled_alloc_buffer(device, n_out * 4, DType::F32, vec![n_out])
+                .map_err(|error| anyhow!("alloc dense_q prepared residual sum: {error}"))?
+        } else {
+            device
+                .alloc_buffer(n_out * 4, DType::F32, vec![n_out])
+                .map_err(|error| anyhow!("alloc dense_q prepared residual sum: {error}"))?
+        };
+        enc.memory_barrier();
+        elementwise_add(
+            enc,
+            registry,
+            device.metal_device(),
+            &down_out,
+            residual,
+            &sum,
+            n_out,
+            DType::F32,
+        )
+        .context("dense_q prepared residual add")?;
+        Ok(sum)
+    } else {
+        Ok(down_out)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_dense_ffn_layer_gpu_q_into_pooled(
     enc: &mut mlx_native::CommandEncoder,
     device: &MlxDevice,
@@ -1510,6 +1752,33 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     let seq_len = (x.element_count() / h as usize) as u32;
     let n_h = (seq_len * m) as u32;
     let n_out = (seq_len * h) as usize;
+    let gate_up_params = GgmlQuantizedMatmulParams {
+        m: seq_len,
+        n: m,
+        k: h,
+        ggml_type: weights.ggml_type_gate_up,
+    };
+    let down_params = GgmlQuantizedMatmulParams {
+        m: seq_len,
+        n: h,
+        k: m,
+        ggml_type: weights.ggml_type_down,
+    };
+    if repacked_dense_m32_enabled()
+        && repacked_dense_m32_in_joint_scope(&gate_up_params)
+        && repacked_dense_m32_in_joint_scope(&down_params)
+    {
+        return build_dense_ffn_layer_gpu_q_prepared_m32(
+            enc,
+            device,
+            registry,
+            x,
+            weights,
+            add_residual,
+            &gate_up_params,
+            &down_params,
+        );
+    }
 
     // ADR-012 §Optimize / Task #15 + W-5b.14/15: route the four large
     // INTERNAL scratches (gate, up, hidden, silu_params) through the
@@ -1579,19 +1848,6 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
         .as_mut_slice::<u32>()
         .map_err(|e| anyhow!("{e}"))?[0] = n_h;
     drop(_w5b_ffn_alloc);
-
-    let gate_up_params = GgmlQuantizedMatmulParams {
-        m: seq_len,
-        n: m,
-        k: h,
-        ggml_type: weights.ggml_type_gate_up,
-    };
-    let down_params = GgmlQuantizedMatmulParams {
-        m: seq_len,
-        n: h,
-        k: m,
-        ggml_type: weights.ggml_type_down,
-    };
 
     // ADR-034 task #93 (2026-05-21) — fused gate+up+silu_mul Q8_0 path.
     //
@@ -4421,6 +4677,7 @@ mod tests {
             ggml_type_down: ggml_type,
             intermediate_size,
             hidden_size,
+            repacked_m32: Default::default(),
         };
 
         let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
@@ -4549,6 +4806,7 @@ mod tests {
             ggml_type_down: GgmlType::Q4_0,
             intermediate_size,
             hidden_size,
+            repacked_m32: Default::default(),
         };
         let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
 
@@ -5449,5 +5707,25 @@ mod tests {
             total_bad, 0,
             "SIMD top-k is not bitwise equal to the legacy kernel"
         );
+    }
+
+    #[test]
+    fn prepared_dense_m32_is_confined_to_the_joint_width_32_scope() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let params = GgmlQuantizedMatmulParams {
+            m: 32,
+            n: 17_408,
+            k: 5_120,
+            ggml_type: GgmlType::Q4_K,
+        };
+        assert!(!repacked_dense_m32_in_joint_scope(&params));
+        {
+            let _scope = super::super::joint_projection::JointProjectionScope::enter(
+                super::super::joint_projection::JointProjectionKernel::Canonical,
+                32,
+            );
+            assert!(repacked_dense_m32_in_joint_scope(&params));
+        }
+        assert!(!repacked_dense_m32_in_joint_scope(&params));
     }
 }

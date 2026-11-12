@@ -1147,6 +1147,7 @@ mod tests {
                 ggml_type_down: down,
                 intermediate_size: intermediate,
                 hidden_size: hidden,
+                repacked_m32: Default::default(),
             };
             for m in 2..=4_usize {
                 let x = upload_f32(&random_f32(&mut seed, m * h), &device)
@@ -1324,6 +1325,7 @@ mod tests {
                 ggml_type_down: down,
                 intermediate_size: intermediate,
                 hidden_size: hidden,
+                repacked_m32: Default::default(),
             };
             let x = upload_f32(&random_f32(&mut seed, m * h), &device)
                 .expect("upload x")
@@ -1403,6 +1405,7 @@ mod tests {
             ggml_type_down: GgmlType::Q6_K,
             intermediate_size: intermediate,
             hidden_size: hidden,
+            repacked_m32: Default::default(),
         };
         let projection = synthetic_blocks(&device, GgmlType::Q4_K, 256, hidden, &mut seed);
         let x = upload_f32(&random_f32(&mut seed, m * h), &device)

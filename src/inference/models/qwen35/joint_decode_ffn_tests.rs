@@ -82,6 +82,7 @@ fn shared_gate_up_rows_are_cohort_invariant_and_track_the_serial_builder() {
                 ggml_type_down: down,
                 intermediate_size: intermediate,
                 hidden_size: hidden,
+                repacked_m32: Default::default(),
             };
             let x = (0..WIDTH)
                 .map(|_| random_f32(&mut seed, h))

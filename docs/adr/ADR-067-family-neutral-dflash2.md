@@ -954,6 +954,76 @@ the retained prefix into the next graph. The next state-transaction slice must
 therefore add deferred retained-row state or an equivalent dynamic GPU commit;
 moving another host wait without removing that replay cannot close the gap.
 
+#### Prepared BF16 target successor
+
+The source-complete Splash comparison then identified a stronger target
+differential than the rejected partial repacks above. Splash's prepared target
+kernel consumes BF16 activations directly, applies a golden-ratio stagger to
+the K walk on Apple10, chooses split-K with a wave/occupancy model, keeps
+ordinary projection outputs in BF16, and selects one- versus two-pass gate/up
+from that same model. Its Q4_K gate/up pair is intentionally two-pass on the
+40-core M5 Max; “fused gate/up” is not an unconditional one-pass rule.
+
+mlx-native's successor preparation retained the source GGUF allocation,
+generated the same code/high-bit/metadata plane classes once per persistent
+weight, and fed BF16 activations directly to MPP. On the exact Qwen3.8
+`M=32,N=17408,K=5120` Q4_K gate shape, the isolated median moved from
+0.186 ms for the stock kernel to 0.098 ms for the direct-BF16 prepared kernel,
+a 1.895x speedup. The golden-ratio walk reduced the prepared-BF16 point from
+0.118 ms to 0.098 ms in the paired development sequence. A one-pass
+32-column gate/up kernel measured 0.235 ms, slower than two 0.098 ms prepared
+passes, and was removed; this agrees with Splash's M5 Max policy rather than
+contradicting it.
+
+The exact Qwen3.8 four-agent diagnostics separate prepared weights from command
+chain length. The stock kernel measured 149.218 ms at four lanes with one
+64-layer command graph, effectively equal to the preceding 149.539 ms
+four-layer-chain control. Prepared BF16-input dense FFNs measured 117.001 ms
+over 227 four-lane samples with the legacy four-layer chains and 113.673 ms
+over 227 samples with one 64-layer chain. Their output-dependent client walls
+were 69.741 and 69.902 seconds respectively. The prepared route is therefore
+accepted; forcing one target-layer command graph is not. The latter did not
+improve the stock route or end-to-end wall and does not implement Splash's
+larger draft-through-commit transaction.
+
+The prepared dense-FFN change alone passes calibration, task/tool quality, and
+cleanup and reduces the binding four-lane target stage by 21.76% against the
+matched stock 149.539 ms control. This rejects the earlier conclusion that
+prepared target weights were intrinsically noncompetitive; those spikes lacked
+direct BF16 input. It does not establish parity with Splash.
+
+A separate fixed six-block balanced campaign at
+`$E/qwen38-prepared-bf16-d5-v1` compared the prepared route with the stock
+GGUF kernels; both arms used the legacy four-layer command chains. All 12
+exact task/tool/cleanup gates passed. Prepared BF16 target FFNs reduced client
+makespan by 12.610% (95% paired-block log-ratio CI 11.243–13.955%,
+half-width 1.356 points). Per-run makespan medians were 70.898 seconds for the
+candidate and 80.979 seconds for the control. This qualifies the prepared
+weight mechanism against hf2q's stock target kernels. It does not satisfy the
+separate Splash-parity release gate.
+
+The campaign binary was built against a local mlx-native checkout. After
+mlx-native 0.21.6 was published (crate SHA256 `a4287522…6de0`, source
+`a02890be`), hf2q was pinned to `=0.21.6` with no local patch; the locked
+all-target check, release build and full test suite passed. One exact
+four-agent Q5 on that registry-pinned release binary
+(`qwen38-prepared-bf16-registry0216-v1`) returned `CalibrationPass` with all
+four agents exiting zero, follow-up turns reusing 988-2,398 cached prompt
+tokens, cleanup proven and a 72.072-second own-output makespan. That single
+run confirms the published package serves the prepared route; the six-block
+campaign above remains the performance evidence.
+
+The follow-up two-pass BF16 gate/up epilogue also passed model-free parity and
+the exact task/tool gate, but its 113.745 ms four-lane target median was flat
+against the prepared F32-output route, so it remains rejected. Preparing the
+three large DeltaNet projections added about 3.55 GiB and regressed the
+four-lane median from 117.001 to 120.029 ms; preparing the output head added
+about 0.98 GiB and moved the same median only to 116.708 ms while worsening
+the output-dependent client wall. Both were removed. Finally, replacing the
+separate split reduction with a device-coherent last-arriver reduction
+regressed the exact four-lane target median from 116.708 to 127.588 ms despite
+an isolated microbenchmark gain, so the canonical separate reduction remains.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,

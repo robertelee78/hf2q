@@ -60,20 +60,25 @@ pub(crate) fn select_joint_projection_kernel(
 thread_local! {
     /// Packed width of the open MMA scope, if any.
     static MMA_SCOPE_WIDTH: Cell<Option<u32>> = const { Cell::new(None) };
+    /// Packed width of the open joint layer chain, independent of its kernel.
+    static JOINT_SCOPE_WIDTH: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
-/// Routes this thread's packed products to the MMA kernel until dropped.
+/// Marks this thread's packed joint products until dropped.
 pub(crate) struct JointProjectionScope {
     previous: Option<u32>,
+    previous_joint: Option<u32>,
 }
 
 impl JointProjectionScope {
-    /// Open a scope for products of exactly `width` rows. A
-    /// [`JointProjectionKernel::Canonical`] scope changes nothing.
+    /// Open a scope for products of exactly `width` rows. Only
+    /// [`JointProjectionKernel::ColumnInvariantMma`] changes MMA routing;
+    /// both kernels expose the joint width to other joint-only projections.
     pub(crate) fn enter(kernel: JointProjectionKernel, width: u32) -> Self {
         let scoped = (kernel == JointProjectionKernel::ColumnInvariantMma).then_some(width);
         Self {
             previous: MMA_SCOPE_WIDTH.with(|cell| cell.replace(scoped)),
+            previous_joint: JOINT_SCOPE_WIDTH.with(|cell| cell.replace(Some(width))),
         }
     }
 }
@@ -81,7 +86,13 @@ impl JointProjectionScope {
 impl Drop for JointProjectionScope {
     fn drop(&mut self) {
         MMA_SCOPE_WIDTH.with(|cell| cell.set(self.previous));
+        JOINT_SCOPE_WIDTH.with(|cell| cell.set(self.previous_joint));
     }
+}
+
+/// Whether this thread is encoding the layer chain for this packed width.
+pub(crate) fn active_width(width: u32) -> bool {
+    JOINT_SCOPE_WIDTH.with(Cell::get) == Some(width)
 }
 
 /// Whether the open scope takes this product: the packed width, a Q4_K /
@@ -160,9 +171,12 @@ mod tests {
             .alloc_buffer(4 * 5120 * 4, mlx_native::DType::F32, vec![4, 5120])
             .expect("input");
         assert!(!admits(&input, &params(4, GgmlType::Q4_K, 5120)));
+        assert!(!active_width(4));
         {
             let _scope = JointProjectionScope::enter(JointProjectionKernel::ColumnInvariantMma, 4);
             assert!(admits(&input, &params(4, GgmlType::Q4_K, 5120)));
+            assert!(active_width(4));
+            assert!(!active_width(8));
             assert!(admits(&input, &params(4, GgmlType::Q6_K, 17408)));
             assert!(!admits(&input, &params(1, GgmlType::Q4_K, 5120)));
             assert!(!admits(&input, &params(4, GgmlType::Q8_0, 5120)));
@@ -172,7 +186,9 @@ mod tests {
                 assert!(!admits(&input, &params(4, GgmlType::Q4_K, 5120)));
             }
             assert!(admits(&input, &params(4, GgmlType::Q4_K, 5120)));
+            assert!(active_width(4));
         }
         assert!(!admits(&input, &params(4, GgmlType::Q4_K, 5120)));
+        assert!(!active_width(4));
     }
 }
