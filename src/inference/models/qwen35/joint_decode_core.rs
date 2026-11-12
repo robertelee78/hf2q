@@ -791,9 +791,10 @@ pub(crate) fn encode_joint_delta_net_layer(
         )
         .and_then(|outputs| single(outputs, label))
     };
-    // Prepared route: the tiny alpha / beta projections run beside the BF16
-    // copy of the normalized rows, then the admitted large projections read
-    // that copy. The stock order is kept when nothing is admitted.
+    // Prepared route: one BF16 copy of the normalized rows feeds the admitted
+    // large projections and, as one fused product, the alpha and beta logit
+    // projections. Alpha / beta that stay stock run beside the copy. The stock
+    // order is kept when nothing is admitted.
     let admitted =
         |route: JointProductRoute, weight: &MlxBuffer, ggml_type: GgmlType, out_features: u32| {
             route == JointProductRoute::Batched
@@ -832,11 +833,48 @@ pub(crate) fn encode_joint_delta_net_layer(
         )?;
         Ok::<_, anyhow::Error>((alpha, beta))
     };
-    let (qkv_raw, z, alpha_logit, beta_logit) = if qkv_prepared || gate_prepared {
+    // Alpha and beta logits: projected separately, or one fused output that
+    // is split after the projections' barrier.
+    enum AlphaBeta {
+        Separate(MlxBuffer, MlxBuffer),
+        Fused(MlxBuffer),
+    }
+    let (qkv_raw, z, alpha_beta) = if qkv_prepared || gate_prepared {
         let x_norm_bf16 =
             prepared_projection::bf16_input(enc, registry, device, &x_norm, width_u32, hidden)?;
-        let (alpha_logit, beta_logit) = small_projections(enc, registry)?;
+        let alpha_beta_prepared = routes.alpha == JointProductRoute::Batched
+            && routes.beta == JointProductRoute::Batched
+            && prepared_projection::admits_alpha_beta(
+                width_u32,
+                &weights.ssm_alpha,
+                weights.ssm_alpha_ggml_type,
+                &weights.ssm_beta,
+                weights.ssm_beta_ggml_type,
+                hidden,
+                n_v_heads,
+            );
+        let separate = if alpha_beta_prepared {
+            None
+        } else {
+            Some(small_projections(enc, registry)?)
+        };
         enc.memory_barrier();
+        let alpha_beta = match separate {
+            Some((alpha, beta)) => AlphaBeta::Separate(alpha, beta),
+            None => AlphaBeta::Fused(prepared_projection::project_alpha_beta(
+                enc,
+                registry,
+                device,
+                &x_norm_bf16,
+                &weights.ssm_alpha,
+                &weights.ssm_beta,
+                weights.ssm_alpha_ggml_type,
+                &weights.prepared_m32,
+                width_u32,
+                hidden,
+                n_v_heads,
+            )?),
+        };
         let qkv_raw = if qkv_prepared {
             prepared_projection::project(
                 enc,
@@ -885,7 +923,7 @@ pub(crate) fn encode_joint_delta_net_layer(
                 "attn_gate",
             )?
         };
-        (qkv_raw, z, alpha_logit, beta_logit)
+        (qkv_raw, z, alpha_beta)
     } else {
         let qkv_raw = input_projection(
             enc,
@@ -906,11 +944,19 @@ pub(crate) fn encode_joint_delta_net_layer(
             "attn_gate",
         )?;
         let (alpha_logit, beta_logit) = small_projections(enc, registry)?;
-        (qkv_raw, z, alpha_logit, beta_logit)
+        (qkv_raw, z, AlphaBeta::Separate(alpha_logit, beta_logit))
     };
     enc.memory_barrier();
     crate::inference::stage_profile::boundary(enc, "adr065.projections")
         .context("profile Qwen joint DeltaNet projections")?;
+    // Read by the recurrence's gate / beta kernel, which follows the conv
+    // and norm barriers below.
+    let (alpha_logit, beta_logit) = match alpha_beta {
+        AlphaBeta::Separate(alpha, beta) => (alpha, beta),
+        AlphaBeta::Fused(fused) => prepared_projection::split_alpha_beta(
+            enc, registry, device, &fused, width_u32, n_v_heads,
+        )?,
+    };
 
     // ---- Per window: causal conv against the slot's ping-pong parity ----
     let qkv_conv = pooled_f32(device, vec![width, qkv_ch], "DeltaNet conv output")?;

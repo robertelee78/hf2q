@@ -716,6 +716,8 @@ struct OutputHeadGpu {
     /// GGML type recorded in the GGUF tensor directory.  Never inferred from
     /// `DType::U8`: all block quants share that Metal storage dtype.
     lm_head_ggml_type: GgmlType,
+    /// Width-32 load-once prepared planes of the head, dropped with it.
+    prepared_m32: super::prepared_projection::Planes,
 }
 
 // ================================================================
@@ -3827,6 +3829,7 @@ impl Qwen35Model {
                         .context("upload output_norm")?,
                     lm_head,
                     lm_head_ggml_type,
+                    prepared_m32: Default::default(),
                 };
 
                 // ADR-033 §Pi Task #20 iter 11 (2026-05-23) — prewarm hot
@@ -6819,6 +6822,7 @@ impl Qwen35Model {
                         .context("upload output_norm")?,
                     lm_head,
                     lm_head_ggml_type,
+                    prepared_m32: Default::default(),
                 };
                 #[cfg(test)]
                 let executed_catalog =

@@ -1266,6 +1266,37 @@ from 28.7 to 22.8 ms. One exact Qwen3.6 run with the switch passed with a
 withdraws the rejection of prepared DeltaNet projections recorded above. The
 route stays opt-in pending the combined-candidate campaign.
 
+Two follow-ups were then measured the same way, each against the preceding
+binary with otherwise identical settings.
+
+The alpha and beta logit projections (48 outputs each on Qwen3.8) were the
+last stock products of a DeltaNet layer's input wave, so that wave still paid
+the stock floor. They now run as one prepared product: alpha's rows, beta's
+rows and zero rows up to 128 outputs form one weight, and its output is split
+after the wave's barrier. This is Splash's fused alpha/beta segment. The
+six-block campaign (`$E/qwen38-proj-ab-d5-v2`) passed all 12 gates: four-lane
+target stage −5.29% (95% CI 0.51–9.84%; 102.93 against 107.25 ms), client
+makespan −3.48% (95% CI 0.55–6.32%; 58.44 against 60.17 seconds). It is part
+of `HF2Q_REPACKED_GGUF_M32_PROJ`.
+
+`HF2Q_REPACKED_GGUF_M32_HEAD=1` runs the 32-row output head through the
+prepared route. The six-block campaign (`$E/qwen38-proj-head-d5-v1`) passed
+all 12 gates and shortened the four-lane target stage by 3.27% (95% CI
+1.98–4.55%; 94.20 against 97.39 ms), but client makespan did not move (0.66%
+higher, 95% CI from 2.81% higher to 1.45% lower). The head's logits differ
+from the stock head's, so the text differs: this arm emitted 5,147 completion
+tokens against 5,237, ran 377.5 cycles against 354 because its lanes finished
+less evenly, and accepted 5.21 tokens per lane-cycle against 5.33. It adds
+0.94 GiB of footprint. The earlier rejection of a prepared head is withdrawn
+as a kernel result and stands as an end-to-end result on this workload; the
+switch is kept off by default for the combined-candidate campaign to decide.
+
+These campaigns repeat one deterministic conversation per arm, so their
+confidence intervals cover timing noise only. Two arms that emit different
+text are also running different workloads, and six repeats do not sample
+that. Stage time per cycle is the comparable quantity between such arms;
+makespan between them is one draw.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,

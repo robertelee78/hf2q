@@ -421,6 +421,13 @@ pub(super) fn repacked_dense_m32_admits(params: &GgmlQuantizedMatmulParams) -> b
     repacked_dense_m32_enabled() && repacked_dense_m32_in_joint_scope(params)
 }
 
+/// Whether the prepared width-32 route is on and admits this product's
+/// shape, for a caller that itself guarantees the joint width (the output
+/// head, which runs after the layer chain's scope has closed).
+pub(super) fn repacked_dense_m32_shape_admits(params: &GgmlQuantizedMatmulParams) -> bool {
+    repacked_dense_m32_enabled() && repacked_dense_m32_eligible(params)
+}
+
 fn prepare_repacked_dense_weight<'a>(
     cell: &'a std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
     enc: &mut CommandEncoder,
