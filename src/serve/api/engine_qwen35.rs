@@ -24,6 +24,7 @@ use crate::inference::models::qwen35::kv_cache::{
     HybridKvCache, HybridKvCacheSnapshot, HybridKvSlotAnchor, LaRestoreRoute,
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
+use crate::inference::models::qwen35::prefill_prepared::PrefillScope;
 use crate::inference::spec_decode::cost_controller::SpeculationCostController;
 use crate::inference::spec_decode::dflash2::{
     adapters::QwenDFlash2Adapter,
@@ -1205,13 +1206,16 @@ impl Qwen35LoadedModel {
                     self.model.cfg.hidden_size as usize,
                     false,
                 );
-            let (logits, _hidden) = self.model.forward_gpu_last_logits_with_hidden_dflash(
-                tokens,
-                positions,
-                kv_cache,
-                Some(&mut capture),
-                slot_id,
-            )?;
+            let (logits, _hidden) = {
+                let _prefill = PrefillScope::enter();
+                self.model.forward_gpu_last_logits_with_hidden_dflash(
+                    tokens,
+                    positions,
+                    kv_cache,
+                    Some(&mut capture),
+                    slot_id,
+                )?
+            };
             self.model.with_gpu_cache_mut(|device, registry| {
                 runtime.ingest_target_capture(
                     device,
@@ -4436,12 +4440,16 @@ impl Qwen35PrefillState {
                     None,
                 )
             } else if mtp_prefill {
-                match qwen.model.forward_gpu_last_logits_with_hidden(
-                    chunk,
-                    &positions,
-                    kv_cache,
-                    self.slot_id,
-                ) {
+                let target = {
+                    let _prefill = PrefillScope::enter();
+                    qwen.model.forward_gpu_last_logits_with_hidden(
+                        chunk,
+                        &positions,
+                        kv_cache,
+                        self.slot_id,
+                    )
+                };
+                match target {
                     // A failed target forward has not proven the completed
                     // ping-pong transition required by recurrent rollback.
                     // Surface the error; the scheduler fail-closes the slot.
@@ -4517,6 +4525,7 @@ impl Qwen35PrefillState {
                                 .context("Qwen SlotAware MTP prompt-catch-up bounded rollback")?;
                                 self.mtp_pending_hidden = None;
                                 self.speculation_unavailable = true;
+                                let _prefill = PrefillScope::enter();
                                 (
                                     qwen.model.forward_gpu_last_logits(
                                         chunk,
@@ -4531,6 +4540,7 @@ impl Qwen35PrefillState {
                     }
                 }
             } else {
+                let _prefill = PrefillScope::enter();
                 (
                     qwen.model
                         .forward_gpu_last_logits(chunk, &positions, kv_cache, self.slot_id),
