@@ -22,6 +22,10 @@
 //! both projections reuse one compact route schedule and gathered input.
 //! Under a DFlash2 verify-row mask the schedule skips masked routes, so an
 //! unselected row costs no expert tile and phase F never reads its rows.
+//! With `HF2Q_QWEN_MOE_LIVE_TILES=1` as well, the layer runs
+//! [`super::moe_live_tiles`] instead: row-exact router logits at every width,
+//! one gate/up pass with a BF16 SwiGLU intermediate, and expert passes that
+//! launch the live tiles alone.
 //!
 //! Decode dispatches of one to eight rows preserve the established bitwise
 //! single-row invariant. The DFlash2 verifier's width-32 pass uses dense MM
@@ -93,6 +97,49 @@ pub(crate) fn qwen_moe_staged_m8_requested() -> Result<bool> {
         "{QWEN_MOE_STAGED_M8_ENV}=1 requires {QWEN_MOE_BATCHED_ENV}=1"
     );
     Ok(requested)
+}
+
+/// Experimental live-tile expert route over the staged-M8 planes
+/// ([`super::moe_live_tiles`]). Requires [`QWEN_MOE_STAGED_M8_ENV`].
+pub(crate) const QWEN_MOE_LIVE_TILES_ENV: &str = "HF2Q_QWEN_MOE_LIVE_TILES";
+
+/// [`QWEN_MOE_LIVE_TILES_ENV`], read once per process; an invalid value or a
+/// missing prerequisite fails closed.
+pub(crate) fn qwen_moe_live_tiles_requested() -> Result<bool> {
+    static REQUESTED: LazyLock<Result<bool, String>> = LazyLock::new(|| {
+        super::joint_step_options::switch_from_process(QWEN_MOE_LIVE_TILES_ENV)
+    });
+    let requested = match &*REQUESTED {
+        Ok(requested) => *requested,
+        Err(error) => bail!("{error}"),
+    };
+    ensure!(
+        !requested || qwen_moe_staged_m8_requested()?,
+        "{QWEN_MOE_LIVE_TILES_ENV}=1 requires {QWEN_MOE_STAGED_M8_ENV}=1"
+    );
+    Ok(requested)
+}
+
+/// How one batched layer runs its routed experts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MoeExpertRoute {
+    /// Native-block expert matvecs.
+    Matvec,
+    /// [`QWEN_MOE_STAGED_M8_ENV`]: separate F32 gate and up tiles.
+    StagedM8,
+    /// [`QWEN_MOE_LIVE_TILES_ENV`].
+    LiveTiles,
+}
+
+/// The expert route the process switches select.
+pub(crate) fn qwen_moe_expert_route() -> Result<MoeExpertRoute> {
+    Ok(if qwen_moe_live_tiles_requested()? {
+        MoeExpertRoute::LiveTiles
+    } else if qwen_moe_staged_m8_requested()? {
+        MoeExpertRoute::StagedM8
+    } else {
+        MoeExpertRoute::Matvec
+    })
 }
 
 /// Widest row count one batched MoE layer accepts: the DFlash2 target width.
@@ -333,7 +380,7 @@ pub(crate) struct DFlash2MoeRouteMask<'a> {
     pub params: DFlash2MoeRouteMaskParams,
 }
 
-fn pooled(device: &MlxDevice, elements: usize, dtype: DType, shape: Vec<usize>, label: &str) -> Result<MlxBuffer> {
+pub(super) fn pooled(device: &MlxDevice, elements: usize, dtype: DType, shape: Vec<usize>, label: &str) -> Result<MlxBuffer> {
     pooled_alloc_buffer(device, elements * dtype.size_of(), dtype, shape)
         .map_err(|e| anyhow!("allocate batched MoE {label}: {e}"))
 }
@@ -356,6 +403,38 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     layer_idx: usize,
     route_mask: Option<DFlash2MoeRouteMask<'_>>,
 ) -> Result<MoeBatchedRouting> {
+    build_moe_ffn_layer_gpu_batched_route_into(
+        enc,
+        device,
+        registry,
+        x,
+        weights,
+        shape,
+        residual,
+        out,
+        rows,
+        layer_idx,
+        route_mask,
+        qwen_moe_expert_route()?,
+    )
+}
+
+/// [`build_moe_ffn_layer_gpu_batched_into`] on an explicit expert route.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_moe_ffn_layer_gpu_batched_route_into(
+    enc: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &MoeFfnWeightsGpuQ,
+    shape: MoeFfnShape,
+    residual: Option<&MlxBuffer>,
+    out: &mut MlxBuffer,
+    rows: u32,
+    layer_idx: usize,
+    route_mask: Option<DFlash2MoeRouteMask<'_>>,
+    route: MoeExpertRoute,
+) -> Result<MoeBatchedRouting> {
     ensure!(
         (1..=MOE_BATCHED_MAX_ROWS).contains(&(rows as usize)),
         "batched MoE layer {layer_idx} accepts 1..={MOE_BATCHED_MAX_ROWS} rows, got {rows}"
@@ -370,7 +449,12 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
             && weights.expert_down_affine.is_none(),
         "batched MoE layer {layer_idx} does not support DWQ affine expert overlays"
     );
-    let staged_m8 = qwen_moe_staged_m8_requested()?;
+    if route == MoeExpertRoute::LiveTiles {
+        return super::moe_live_tiles::build_moe_ffn_layer_live_tiles_into(
+            enc, device, registry, x, weights, shape, residual, out, rows, layer_idx, route_mask,
+        );
+    }
+    let staged_m8 = route == MoeExpertRoute::StagedM8;
     if staged_m8 {
         ensure!(
             matches!(shape.num_experts_per_tok, 1 | 6 | 8)
@@ -756,25 +840,27 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     .map_err(|e| anyhow!("batched MoE layer {layer_idx} weighted reduce: {e}"))?;
 
     #[cfg(test)]
-    {
-        crate::adr063_invariance::qwen::retain_current(
-            "moe_router_logits",
-            &logits,
-            vec![r, ne as usize],
-        )
-        .map_err(anyhow::Error::msg)?;
-        crate::adr063_invariance::qwen::retain_current("moe_router_ids", &ids, vec![r, top_k])
-            .map_err(anyhow::Error::msg)?;
-        crate::adr063_invariance::qwen::retain_current(
-            "moe_router_weights",
-            &routing_weights,
-            vec![r, top_k],
-        )
-        .map_err(anyhow::Error::msg)?;
-    }
+    retain_routing_for_tests(&logits, &ids, &routing_weights, r, ne as usize, top_k)?;
 
     Ok(MoeBatchedRouting {
         ids,
         weights: routing_weights,
     })
+}
+
+/// Retain a layer's routing for the ADR-063 invariance captures.
+#[cfg(test)]
+pub(super) fn retain_routing_for_tests(
+    logits: &MlxBuffer,
+    ids: &MlxBuffer,
+    routing_weights: &MlxBuffer,
+    rows: usize,
+    experts: usize,
+    top_k: usize,
+) -> Result<()> {
+    use crate::adr063_invariance::qwen::retain_current;
+    retain_current("moe_router_logits", logits, vec![rows, experts]).map_err(anyhow::Error::msg)?;
+    retain_current("moe_router_ids", ids, vec![rows, top_k]).map_err(anyhow::Error::msg)?;
+    retain_current("moe_router_weights", routing_weights, vec![rows, top_k])
+        .map_err(anyhow::Error::msg)
 }

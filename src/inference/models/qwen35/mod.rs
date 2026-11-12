@@ -108,6 +108,9 @@ pub mod moe;
 pub(crate) mod moe_batched;
 #[cfg(test)]
 mod moe_batched_tests;
+mod moe_live_tiles;
+#[cfg(test)]
+mod moe_live_tiles_tests;
 pub mod mtp;
 pub mod mtp_weights_load;
 pub(crate) mod prepared_projection;
