@@ -269,8 +269,15 @@ def validate_argv(argv, label):
 
 
 def child_env(environ, explicit):
+    """Ambient passthrough plus the case's explicit env; an empty value is not exported.
+
+    Cases leave optional controls at an empty default. A set-but-empty variable is
+    not "off" to every reader: mlx-native enabled per-command-buffer profiling for
+    any present `MLX_PROFILE_CB`, which forced synchronous labeled commits in every
+    Qwen3.8 run launched from a case that left it empty.
+    """
     env = {k: environ[k] for k in PASSTHROUGH if k in environ}
-    env.update(explicit)
+    env.update({k: v for k, v in explicit.items() if v != ''})
     return env
 
 

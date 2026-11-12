@@ -485,6 +485,21 @@ class ArgvAndCases(unittest.TestCase):
             else:
                 self.assertNotIn('HF2Q_FUSE_LMHEAD', stock['serve']['env'])
 
+    def test_empty_case_controls_never_reach_the_child_environment(self):
+        # mlx-native <= 0.21.6 (including the v0.1.29 stock arm) enables
+        # per-command-buffer profiling for any present MLX_PROFILE_CB.
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        ambient = {'PATH': '/usr/bin', 'MLX_PROFILE_CB': '1', 'UNLISTED': 'x'}
+        for family in ('qwen38', 'gemma4', 'deepseek4'):
+            case = q5_case.loads((HERE / 'q5_cases' / f'{family}.json').read_bytes())
+            stock = q5_case.child_env(ambient, q5_case.build_plan(case, builtins, self.required())['serve']['env'])
+            self.assertNotIn('MLX_PROFILE_CB', stock, family)
+            self.assertNotIn('', stock.values(), family)
+            self.assertEqual(stock['PATH'], '/usr/bin', family)
+            profiled = q5_case.child_env(ambient, q5_case.build_plan(case, builtins, {
+                **self.required(), 'HF2Q_Q5_NATIVE_PROFILE_CB': '1'})['serve']['env'])
+            self.assertEqual(profiled['MLX_PROFILE_CB'], '1', family)
+
     def test_deepseek_case_uses_scoped_compressor_override(self):
         case = q5_case.loads((HERE / 'q5_cases' / 'deepseek4.json').read_bytes())
         env = case['serve']['env']
