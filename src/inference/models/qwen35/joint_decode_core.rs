@@ -505,14 +505,14 @@ impl DeltaNetReplay {
 
     /// The storage every retained view is a range of.
     pub(super) fn storage(&self) -> &MlxBuffer {
-        &self.arena
+        self.arena.buffer()
     }
 
     /// Element offset of a [`Self::take`] view in [`Self::storage`].
     pub(super) fn offset_of(&self, view: &MlxBuffer) -> Result<u32> {
         let bytes = view
             .byte_offset()
-            .checked_sub(self.arena.byte_offset())
+            .checked_sub(self.arena.buffer().byte_offset())
             .context("Qwen joint verify replay view precedes its storage")?;
         u32::try_from(bytes / 4).context("Qwen joint verify replay offset exceeds u32")
     }
