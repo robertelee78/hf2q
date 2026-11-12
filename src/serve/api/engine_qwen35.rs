@@ -1065,6 +1065,8 @@ impl Qwen35LoadedModel {
         // Every agent slot receives the complete model context. The Qwen KV
         // allocator reserves full-attention storage lazily, while scheduler
         // admission governs aggregate physical high-water use.
+        crate::inference::models::qwen35::prefill_prepared::validate_at_worker_start()
+            .context("Qwen prompt prefill switches")?;
         let max_seq_len = self.model.cfg.max_position_embeddings;
         let restore_value = std::env::var_os("HF2Q_QWEN_LA_GPU_RESTORE");
         let restore_value = restore_value

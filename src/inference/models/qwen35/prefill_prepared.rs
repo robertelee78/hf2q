@@ -23,7 +23,7 @@ use std::sync::LazyLock;
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType, MlxBuffer};
 
-use super::joint_step_options::switch_from_process;
+use super::joint_step_options::{parse_switch, switch_from_process};
 
 /// Switch, default off: `1`/`on`/`true` routes prompt-prefill chunks through
 /// the prepared row-tile MM.
@@ -74,6 +74,63 @@ impl Drop for PrefillScope {
     }
 }
 
+/// The prompt-prefill switches of a SlotAware Qwen worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrefillSwitches {
+    pub(crate) prepared: bool,
+    pub(crate) fold_cue: bool,
+}
+
+/// The switches as an operator wrote them, read strictly: an invalid value
+/// is an error, not a fallback, and so are the two combinations that cannot
+/// keep their promise. With the chunk-scan DeltaNet investigation route on,
+/// alpha and beta would stay on the stock kernel beside prepared qkv, gate
+/// and output, and a row's bits would depend on whether its chunk is a
+/// multiple of 64 rows. The cue fold is exact only on the prepared kernels.
+pub(crate) fn resolve_switches(
+    prepared: Option<&str>,
+    fold_cue: Option<&str>,
+    chunk_scan_prefill: bool,
+) -> Result<PrefillSwitches, String> {
+    use super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV;
+    let switches = PrefillSwitches {
+        prepared: parse_switch(QWEN_PREFILL_PREPARED_ENV, prepared)?,
+        fold_cue: parse_switch(QWEN_PREFILL_FOLD_CUE_ENV, fold_cue)?,
+    };
+    if switches.prepared && chunk_scan_prefill {
+        return Err(format!(
+            "{QWEN_PREFILL_PREPARED_ENV} cannot be combined with the chunk-scan prefill \
+             investigation route: its alpha/beta projections keep the stock kernel"
+        ));
+    }
+    if switches.fold_cue && !switches.prepared {
+        return Err(format!(
+            "{QWEN_PREFILL_FOLD_CUE_ENV} requires {QWEN_PREFILL_PREPARED_ENV}"
+        ));
+    }
+    Ok(switches)
+}
+
+/// Validate the switches when a SlotAware worker provisions its slots, so a
+/// mistyped value stops the server instead of warning at the first prefill,
+/// and log what the worker will run.
+pub(crate) fn validate_at_worker_start() -> anyhow::Result<PrefillSwitches> {
+    let read = |name: &str| std::env::var(name).ok();
+    let switches = resolve_switches(
+        read(QWEN_PREFILL_PREPARED_ENV).as_deref(),
+        read(super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV).as_deref(),
+        crate::debug::INVESTIGATION_ENV.chunk_scan_prefill,
+    )
+    .map_err(anyhow::Error::msg)?;
+    tracing::info!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        prepared = switches.prepared,
+        fold_cue = switches.fold_cue,
+        "Qwen prompt prefill configuration"
+    );
+    Ok(switches)
+}
+
 /// Whether the prepared kernel serves this weight shape.
 fn shape_admitted(ggml_type: GgmlType, in_features: u32, out_features: u32) -> bool {
     matches!(ggml_type, GgmlType::Q4_K | GgmlType::Q6_K)
@@ -111,6 +168,36 @@ mod tests {
         assert_eq!(parse(Some("1")), Ok(true));
         assert_eq!(parse(Some("off")), Ok(false));
         assert!(parse(Some("rows")).is_err());
+    }
+
+    #[test]
+    fn worker_start_rejects_invalid_values_and_combinations_that_break_a_promise() {
+        let resolve =
+            |prepared, fold, chunk_scan| resolve_switches(prepared, fold, chunk_scan);
+        assert_eq!(
+            resolve(None, None, false),
+            Ok(PrefillSwitches {
+                prepared: false,
+                fold_cue: false
+            })
+        );
+        assert_eq!(
+            resolve(Some("1"), Some("on"), false),
+            Ok(PrefillSwitches {
+                prepared: true,
+                fold_cue: true
+            })
+        );
+        // The stock route may run beside the chunk-scan investigation route.
+        assert!(resolve(None, None, true).is_ok());
+        for (prepared, fold, chunk_scan, what) in [
+            (Some("yes"), None, false, "invalid prepared value"),
+            (Some("1"), Some("cue"), false, "invalid fold value"),
+            (Some("1"), None, true, "prepared beside chunk scan"),
+            (None, Some("1"), false, "fold without prepared"),
+        ] {
+            assert!(resolve(prepared, fold, chunk_scan).is_err(), "{what}");
+        }
     }
 
     #[test]
