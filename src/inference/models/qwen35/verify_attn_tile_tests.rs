@@ -27,7 +27,7 @@ use super::verify_attn_tile::{
 use super::{default_layer_types, Qwen35Config, Qwen35MoeConfig, Qwen35Variant};
 use crate::serve::multi_seq_kv::SlotId;
 
-const HD: u32 = 256;
+pub(super) const HD: u32 = 256;
 const CAPACITY: u32 = 2_112;
 const N_SEQS: u32 = 4;
 /// Cursor of each slot: one page, a split boundary region, an almost empty
@@ -35,24 +35,24 @@ const N_SEQS: u32 = 4;
 const CURSORS: [u32; 4] = [299, 2_040, 5, 799];
 
 #[derive(Clone, Copy)]
-struct Geometry {
-    nh: u32,
-    nkv: u32,
+pub(super) struct Geometry {
+    pub(super) nh: u32,
+    pub(super) nkv: u32,
 }
 
-const QWEN38: Geometry = Geometry { nh: 24, nkv: 4 };
-const QWEN36: Geometry = Geometry { nh: 16, nkv: 2 };
+pub(super) const QWEN38: Geometry = Geometry { nh: 24, nkv: 4 };
+pub(super) const QWEN36: Geometry = Geometry { nh: 16, nkv: 2 };
 
 impl Geometry {
-    fn q_total(self) -> usize {
+    pub(super) fn q_total(self) -> usize {
         (self.nh * HD) as usize
     }
 
-    fn kv_total(self) -> usize {
+    pub(super) fn kv_total(self) -> usize {
         (self.nkv * HD) as usize
     }
 
-    fn cfg(self) -> Qwen35Config {
+    pub(super) fn cfg(self) -> Qwen35Config {
         Qwen35Config {
             variant: Qwen35Variant::Moe,
             hidden_size: 2048,
@@ -182,11 +182,11 @@ fn f32_buffer(device: &MlxDevice, values: &[f32], shape: Vec<usize>) -> MlxBuffe
 
 /// One window row: IMROPE'd Q, K and V, and the attention gate.
 #[derive(Clone)]
-struct Row {
-    q: Vec<f32>,
-    k: Vec<f32>,
-    v: Vec<f32>,
-    gate: Vec<f32>,
+pub(super) struct Row {
+    pub(super) q: Vec<f32>,
+    pub(super) k: Vec<f32>,
+    pub(super) v: Vec<f32>,
+    pub(super) gate: Vec<f32>,
 }
 
 /// Eight rows for each slot.
@@ -280,15 +280,37 @@ fn tile_step(
     width: usize,
     scratch: &VerifyTileScratch,
 ) -> Vec<f32> {
+    let lanes: Vec<(u32, Vec<&Row>)> = step
+        .iter()
+        .map(|&(slot, rows)| (slot, inputs[slot as usize][..rows].iter().collect()))
+        .collect();
+    tile_step_rows(
+        device, registry, geometry, cache, &lanes, width, CAPACITY, scratch,
+    )
+}
+
+/// The tiled route for a step whose lanes are `(slot, window rows)` in packed
+/// order, on a cache of `capacity` tokens per slot: the gated packed rows.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn tile_step_rows(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    geometry: Geometry,
+    cache: &mut HybridKvCache,
+    lanes: &[(u32, Vec<&Row>)],
+    width: usize,
+    capacity: u32,
+    scratch: &VerifyTileScratch,
+) -> Vec<f32> {
     let mut windows = Vec::new();
     let mut packed: Vec<&Row> = Vec::new();
-    for &(slot, rows) in step {
+    for (slot, rows) in lanes {
         windows.push(JointWindow {
-            slot: SlotId(slot),
+            slot: SlotId(*slot),
             start: packed.len(),
-            rows,
+            rows: rows.len(),
         });
-        packed.extend(inputs[slot as usize][..rows].iter());
+        packed.extend(rows.iter().copied());
     }
     // Padding rows carry row 0's inputs, as the joint step packs them.
     while packed.len() < width {
@@ -314,7 +336,7 @@ fn tile_step(
         geometry.nh,
         geometry.nkv,
         HD,
-        CAPACITY
+        capacity
     )
     .expect("route probe"));
     let mut enc = device.command_encoder().expect("encoder");
@@ -333,18 +355,22 @@ fn tile_step(
         geometry.nh,
         geometry.nkv,
         HD,
-        CAPACITY,
+        capacity,
     )
     .expect("tiled verify attention");
     enc.commit_and_wait().expect("tiled verify completion");
     gated.as_slice::<f32>().unwrap()[..width * geometry.q_total()].to_vec()
 }
 
-fn bits(values: &[f32]) -> Vec<u32> {
+pub(super) fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|x| x.to_bits()).collect()
 }
 
-fn tile_available(device: &MlxDevice, registry: &mut KernelRegistry, geometry: Geometry) -> bool {
+pub(super) fn tile_available(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    geometry: Geometry,
+) -> bool {
     let cache =
         HybridKvCache::new_with_options(&geometry.cfg(), device, 64, 1, true).expect("cache");
     let window = [JointWindow {
@@ -669,45 +695,54 @@ fn same_committed(a: &HybridKvCache, b: &HybridKvCache, geometry: Geometry) -> b
         })
 }
 
-/// Five consecutive verify steps with partial acceptance, as the DFlash2
-/// commit truncates the cursors: after every step the tiled route's cache
-/// bytes and cursors are the serial chain's, its rows stay in the envelope,
-/// and a twin cache whose rejected and never-written tokens hold NaN,
-/// infinity or -1e30 norms and flipped codes gives the same output bits and
-/// writes the same windows, so no row reads a rejected or stale token.
-#[test]
-fn tiled_verify_attention_survives_rollbacks_and_ignores_rejected_tokens() {
+/// A lane's window and the rows it keeps, per step.
+type RollbackSteps<'a> = &'a [(Step<'a>, &'a [usize])];
+
+/// Consecutive verify steps with partial acceptance, as the DFlash2 commit
+/// truncates the cursors, from cursors `start`: after every step and after
+/// every truncation the tiled route's cache bytes and cursors are the serial
+/// chain's, its rows stay in the envelope, and a twin cache whose rejected
+/// and never-written tokens hold NaN, infinity or -1e30 norms and flipped
+/// codes gives the same output bits and writes the same windows, so no row
+/// reads a rejected or stale token. Returns the windows that were cut at
+/// 1,536 tokens (rows on both sides of the page boundary where the kernel's
+/// split length steps) per geometry.
+fn rollback_steps(start: [u32; N_SEQS as usize], seed: u32, steps: RollbackSteps<'_>) -> usize {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let device = match MlxDevice::new() {
         Ok(device) => device,
         Err(error) => {
             eprintln!("skipping: no Metal device: {error}");
-            return;
+            return usize::MAX;
         }
     };
     let mut registry = KernelRegistry::new();
-    // (lanes as (slot, window rows), rows each lane keeps)
-    let steps: [(Step<'_>, &[usize]); 5] = [
-        (&[(0, 8), (1, 8), (2, 3), (3, 1)], &[3, 0, 3, 1]),
-        (&[(0, 8), (1, 8), (2, 8), (3, 8)], &[8, 5, 0, 2]),
-        (&[(3, 2), (1, 8), (0, 5)], &[1, 8, 0]),
-        (&[(2, 8), (0, 1), (1, 4), (3, 7)], &[7, 1, 0, 6]),
-        (&[(1, 8)], &[2]),
-    ];
+    let mut fewest_cut = usize::MAX;
     for (name, geometry) in [("qwen38", QWEN38), ("qwen36", QWEN36)] {
         if !tile_available(&device, &mut registry, geometry) {
             eprintln!("RECORDED SKIP: tiled verify attention unavailable (no Metal tensor API)");
-            return;
+            return usize::MAX;
         }
         let q_total = geometry.q_total();
         let init = cache_init(geometry);
         let mut serial_cache = new_cache(&device, geometry, &init);
         let mut tile_cache = new_cache(&device, geometry, &init);
+        for cache in [&mut serial_cache, &mut tile_cache] {
+            cache.full_attn[0].current_len.copy_from_slice(&start);
+        }
+        let mut cut_windows = 0;
         for (index, (step, accepted)) in steps.iter().enumerate() {
-            let label = format!("{name} step {index}");
-            let inputs = rows_seeded(geometry, 0x5EED_0000 + index as u32);
+            let label = format!("{name} from {start:?} step {index}");
+            let inputs = rows_seeded(geometry, seed + index as u32);
             let before = tile_cache.full_attn[0].current_len.clone();
             assert_eq!(before, serial_cache.full_attn[0].current_len, "{label}");
+            cut_windows += step
+                .iter()
+                .filter(|&&(slot, rows)| {
+                    let cursor = before[slot as usize];
+                    cursor < 1_536 && cursor + rows as u32 > 1_536
+                })
+                .count();
             let mut serial = Vec::new();
             for &(slot, rows) in step.iter() {
                 for row in &inputs[slot as usize][..rows] {
@@ -773,6 +808,53 @@ fn tiled_verify_attention_survives_rollbacks_and_ignores_rejected_tokens() {
                         .expect("truncate to the accepted rows");
                 }
             }
+            assert!(
+                cache_state(&tile_cache) == cache_state(&serial_cache),
+                "{label}: cache bytes or cursors differ after the rollback"
+            );
         }
+        eprintln!(
+            "{name} from {start:?}: {} steps, {cut_windows} cut windows; final cursors {:?}",
+            steps.len(),
+            tile_cache.full_attn[0].current_len
+        );
+        fewest_cut = fewest_cut.min(cut_windows);
     }
+    fewest_cut
+}
+
+/// Five steps from the fixture's cursors (299, 2,040, 5, 799).
+#[test]
+fn tiled_verify_attention_survives_rollbacks_and_ignores_rejected_tokens() {
+    rollback_steps(
+        CURSORS,
+        0x5EED_0000,
+        &[
+            (&[(0, 8), (1, 8), (2, 3), (3, 1)], &[3, 0, 3, 1]),
+            (&[(0, 8), (1, 8), (2, 8), (3, 8)], &[8, 5, 0, 2]),
+            (&[(3, 2), (1, 8), (0, 5)], &[1, 8, 0]),
+            (&[(2, 8), (0, 1), (1, 4), (3, 7)], &[7, 1, 0, 6]),
+            (&[(1, 8)], &[2]),
+        ],
+    );
+}
+
+/// Seven steps from cursors just below 1,536 tokens, so most windows are cut
+/// there (two tiles per lane) and are verified again after a rollback.
+#[test]
+fn tiled_verify_attention_cut_windows_survive_rollbacks() {
+    let cut_windows = rollback_steps(
+        [1_531, 1_529, 1_533, 1_535],
+        0x5EED_1000,
+        &[
+            (&[(0, 8), (1, 8), (2, 8), (3, 8)], &[2, 0, 1, 0]),
+            (&[(0, 8), (1, 8), (2, 3), (3, 8)], &[1, 4, 3, 0]),
+            (&[(3, 2), (1, 8), (0, 5)], &[1, 2, 0]),
+            (&[(1, 8), (0, 8), (2, 4)], &[0, 1, 0]),
+            (&[(1, 8)], &[0]),
+            (&[(1, 2), (0, 8), (3, 8), (2, 8)], &[2, 8, 8, 8]),
+            (&[(1, 8), (0, 8), (3, 8), (2, 8)], &[8, 3, 0, 5]),
+        ],
+    );
+    assert!(cut_windows >= 10, "only {cut_windows} cut windows");
 }

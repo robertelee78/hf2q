@@ -1503,8 +1503,9 @@ at another window offset can differ once the history crosses a split
 boundary (first at 1,536 tokens, then every 768), and the window
 boundaries follow a verify budget fed by wall-clock time. That belongs to
 the attention tile and the scheduler, not to this change, and was not
-fixed here. Eight runs do not measure quality; the workflow-oracle pass
-rate needs root's long comparison.
+fixed here; mlx-native 0.21.9 removes it (see the attention-kernel
+differential below). Eight runs do not measure quality; the
+workflow-oracle pass rate needs root's long comparison.
 
 Prepared planes are published only after the command buffer that writes
 them has completed (`prepared_projection::ensure_planes`; one buffer per
@@ -1701,11 +1702,7 @@ the window's later rows, its packed row and the padding. Against the serial
 chain on hf2q's cache one layer's gated output moves by at most 1.0% of the
 row RMS in a deliberately peaked fixture, a relative RMS of 6.2e-4 to 7.9e-4
 per row, also across five steps with partial acceptance and cursor
-truncation; the test limits are 2% and 2e-3. The same token verified at
-another offset of another window can differ in its last bits (relative RMS
-about 4e-6), because the split partition follows the window's start; that
-alignment comes from the lane's own acceptance history, never from its
-cohort.
+truncation; the test limits are 2% and 2e-3.
 
 An independent review measured the route's error against the exact F64
 attention at 3e-4 on flat and about 1e-3 on peaked attention, 1.1 to 2.5
@@ -1741,6 +1738,61 @@ both, and from runtime-compiled source), and the route reports itself
 unavailable, so the step keeps the per-row chain, when a kernel's threads or
 threadgroup memory exceed the device's limits. A step the switch asked for
 and the route refused logs its reason once.
+
+A later review found that a token's bits depended on its verify window. As
+released in mlx-native 0.21.8 the tile cut a lane's history into splits by
+the pages of the whole window, so a window that crossed the page boundary
+where the split length steps (every 768 tokens of history from 1,536 on) gave
+its rows before the boundary another partition than the same tokens get in a
+window that ends there: at cursor 1,525 none of four tokens kept its bits and
+one logit moved by 0.85. Window starts follow the verify budget, which is fed
+by wall-clock time, so the served text could change from run to run. From
+mlx-native 0.21.9 a token's split length is a function of its own page count.
+Rows that ask for the same length share a tile as before, because a page or
+a split that holds none of a row's tokens leaves its bits alone, and a window
+whose rows ask for two lengths runs as two tiles on the lane's scratch. A
+token's output is now bitwise the same at every row index, window length,
+lane count and width. mlx-native verifies every position up to 9,152 tokens
+of history at every row index over every window start, and every window
+start within 48 tokens of each of the 43 such boundaries up to 33,824 tokens,
+at both geometries, plain, under Metal shader validation, under the debug
+layer and under both; with the cut disabled the first test fails on 70
+Qwen3.8 tokens. Its F64 reference, determinism, saturation, cohort and
+causal-end tests each include cut windows.
+`verify_attn_tile_window_tests` repeats the sweep on hf2q's cache: 24
+positions around every such boundary below 9,000 tokens, around plain page
+boundaries and at an empty slot, under eleven window plans including partial
+acceptance, in steps of one to four lanes at widths 8, 16 and 32, with equal
+cache bytes after every plan; and seven steps of partial acceptance and
+rollback from cursors just below 1,536 tokens keep the serial chain's cache
+bytes and cursors and ignore rejected tokens in cut windows. An independent
+review confirmed the independence for every window start up to 33,824
+tokens and that the only bits that differ from 0.21.8 are those of the rows
+before the boundary in a cut window. Everywhere else the partition and the bits are
+those of 0.21.8, and so is the cost: −2 to +1% at 512 to 32,768 tokens with
+one and four lanes (two passes of the median of 20,
+`$V/splash-gap/attnverify/align/batch1.log`). A cut window costs 0.142
+against 0.099 ms per Qwen3.8 layer at four lanes and is 7 of every 768 window
+starts. An absolute partition whose runs grow with their start page was
+built first and rejected: it gives the same independence but 53 to 105
+splits against 24 at 8,192 and 32,768 tokens, 3 to 36% slower there.
+
+In situ (hf2q `991abc2e` plus the window test, mlx-native `b76b42b`, binary
+`0a23d8a5`, every combined-candidate switch on, without the any-width
+switches of #825; `$V/splash-gap/attnverify/align/runs`): two Qwen3.8 runs,
+both `CalibrationPass`, have identical transcripts for all four agents
+(5,330 completion tokens); two of the four agents' transcripts differ from
+the 0.21.8 campaign's in their last message, as the changed bits of tokens
+in cut windows allow. Of six Qwen3.6 runs five are `CalibrationPass` and one
+is `ClientFailed` (an agent left the six-step workflow, as in two of the six
+0.21.8 candidate runs); no two of the five have the same transcripts. That
+variation is not the defect fixed here: it starts in the first assistant
+message, at 687 prompt tokens and under 200 generated ones, below the first
+page boundary where the split length steps, and the 0.21.8 control arm with
+the tile off shows it too (up to four variants of an agent's first message
+in six runs). The four-lane cycle medians, 80.5 and 81.5 ms for Qwen3.8 and
+32.9 to 37.6 ms for Qwen3.6, sit inside the spread of the 0.21.8 candidate
+runs (73.2 and 90.6; 35.5 and 36.9); no same-session control was run.
 
 Model free the route takes 0.051, 0.116 and 0.331 ms per Qwen3.8 layer at
 four lanes (0.033, 0.048, 0.103 ms at one) and 0.046, 0.083 and 0.195 ms per

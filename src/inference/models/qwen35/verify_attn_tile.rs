@@ -19,12 +19,14 @@
 //! TQ-HB cache format. The cache bytes and cursors are those of the serial
 //! chain; the attention output differs in bits (Class B): centroids enter the
 //! matmuls as half and the online softmax runs per page and history split.
-//! A row's output depends on its lane's cursor, its offset in the window, its
-//! query and the cache before its causal end only, never on the other lanes,
-//! the window's later rows, its packed row or the padding (mlx-native
-//! `test_tq_hb_verify_tile`, `verify_attn_tile_tests`). The same token
-//! verified at another offset of another window (another split partition)
-//! may differ in its last bits.
+//! A token's output depends on its position, its query and the cache before
+//! its causal end only: never on the window that verifies it (where the
+//! window starts, which of its rows the token is, how many rows it has), on
+//! the other lanes, its packed row or the padding (mlx-native
+//! `test_tq_hb_verify_tile`, `verify_attn_tile_tests`,
+//! `verify_attn_tile_window_tests`). Window boundaries follow the verify
+//! budget, which follows wall-clock time, so this is what keeps the served
+//! text independent of timing.
 //!
 //! The kernel carries probability times value norm in half, which is exact
 //! to half precision for stored value norms from about 1 to 1e6 (below 1,
