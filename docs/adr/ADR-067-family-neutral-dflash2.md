@@ -1211,6 +1211,61 @@ separate split reduction with a device-coherent last-arriver reduction
 regressed the exact four-lane target median from 116.708 to 127.588 ms despite
 an isolated microbenchmark gain, so the canonical separate reduction remains.
 
+#### Splash per-stage targets and prepared projections
+
+Splash's own developer tools were then built out of tree from the pinned
+commit and run on this host under the host lock
+(`$V/splash-kernel-bench/REPORT.md`: projection, MoE and attention
+microbenchmarks, and `decode-profile`, which loads the real target and draft
+without a server and attributes one DFlash cycle per dispatch). They replace
+the estimates above with measurements. One four-lane verify cycle, GPU ms:
+
+| Stage | Splash Qwen3.8 | hf2q Qwen3.8 | Splash Qwen3.6 | hf2q Qwen3.6 |
+|---|---:|---:|---:|---:|
+| Draft command | 5.98 | 16.2 | 3.36 | 8.1 |
+| Target FFN (dense, or the whole MoE layer) | 24.0 | 26.7 | 9.7 | 20.7 |
+| Target DeltaNet (projections and recurrence) | 12.8 | about 22 | 4.7 | about 9 |
+| Target full attention (projections and kernels) | 4.7 | about 24 | 1.8 | about 12 |
+| Target head | 1.95 | 4.3 | 0.86 | 1.3 |
+| Norms and other | 1.2 | 1.8 | 0.4 | 1.0 |
+| Whole cycle | 50.6 | 96 GPU, 110–118 wall | 20.8 | 54 GPU, 56–61 wall |
+| Dispatches per cycle | 626 | 12,147 | 655 | 8,107 |
+
+The hf2q columns are one explicit stage profile each (Qwen3.8 with prepared
+FFN and the prepared projections below; Qwen3.6 with staged M8 and GPU
+adaptive rows); "about" marks categories split by hand because hf2q's
+attention category includes the Q/K/V projections and its projection category
+includes the attention output projection. Splash prefills 512 Qwen3.8 rows in
+478–532 ms and 2,048 rows in 1,875 ms. hf2q is therefore 2.2–2.3 times
+Splash's cycle on Qwen3.8 and 2.7–2.9 times on Qwen3.6, and every stage has a
+measured target. Splash issues one fused dispatch for a DeltaNet layer's
+qkv, gate, alpha and beta projections and one for an attention layer's Q/gate,
+K and V; its attention kernels cost 0.11–0.17 ms per layer against about
+1.3 ms for hf2q's.
+
+A serialized-dispatch probe explains the earlier projection result: the stock
+32-row GGML matmul has a floor of about 0.1 ms per dispatch whatever its
+size (0.133, 0.113 and 0.101 ms for 8,192 by 5,120, 4,096 by 5,120 and 5,120
+by 4,096 Q4_K), while the prepared BF16 kernel takes 0.057, 0.031 and
+0.027 ms. Numbers taken
+with eight unbarriered dispatches per command overlap and hide that floor.
+
+`HF2Q_REPACKED_GGUF_M32_PROJ=1` (with `HF2Q_REPACKED_GGUF_M32=1`) therefore
+prepares the DeltaNet qkv, gate and output projections and the attention
+fused Q/gate, K, V and output projections on first use, and reads one BF16
+copy of each shared activation. A fixed six-block same-binary campaign
+(`$E/qwen38-prepared-proj-d5-v1`, DEBUG stage timing on both arms, run while
+other builds loaded the host) passed all 12 gates: the four-lane target
+stage fell by 7.07% (95% CI 4.78–9.30%; medians 117.66 against 127.02 ms) and
+client makespan by 4.32% (95% CI 0.39–8.08%; 66.02 against 68.76 seconds).
+The two arms emit different text (5,385 against 5,361 completion tokens per
+run), and the process footprint peaked at 69.95 GiB against 65.34 GiB. The
+explicit stage profile moved projections from 31.1 to 18.6 ms and attention
+from 28.7 to 22.8 ms. One exact Qwen3.6 run with the switch passed with a
+49.19 ms four-lane target median against 51.92 ms for its control. This
+withdraws the rejection of prepared DeltaNet projections recorded above. The
+route stays opt-in pending the combined-candidate campaign.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,

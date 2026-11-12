@@ -415,6 +415,12 @@ fn repacked_dense_m32_in_joint_scope(params: &GgmlQuantizedMatmulParams) -> bool
     super::joint_projection::active_width(params.m) && repacked_dense_m32_eligible(params)
 }
 
+/// Whether the prepared width-32 route is on and admits this product in the
+/// open joint scope.
+pub(super) fn repacked_dense_m32_admits(params: &GgmlQuantizedMatmulParams) -> bool {
+    repacked_dense_m32_enabled() && repacked_dense_m32_in_joint_scope(params)
+}
+
 fn prepare_repacked_dense_weight<'a>(
     cell: &'a std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
     enc: &mut CommandEncoder,

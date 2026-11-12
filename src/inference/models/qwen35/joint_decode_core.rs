@@ -54,11 +54,12 @@ use super::gpu_full_attn::{
     apply_imrope, apply_linear_projection_f32_pooled_with_ggml_type, apply_pre_attn_rms_norm,
     apply_q_gate_projection_f32, apply_q_or_k_per_head_rms_norm,
     apply_sdpa_with_kv_cache_decode_into, apply_sigmoid_gate_multiply,
-    apply_tq_sdpa_rows_gated_into, tq_sdpa_rows_route, FullAttnQGateWeightsGpu,
-    FullAttnWeightsGpu,
+    apply_tq_sdpa_rows_gated_into, deinterleave_q_gate_f32, tq_sdpa_rows_route,
+    FullAttnQGateWeightsGpu, FullAttnWeightsGpu,
 };
 use super::joint_decode_routes::{projection_route, JointProductRoute};
 use super::kv_cache::{HybridKvCache, LayerSlot};
+use super::prepared_projection;
 use super::Qwen35Config;
 use crate::serve::multi_seq_kv::SlotId;
 
@@ -790,42 +791,123 @@ pub(crate) fn encode_joint_delta_net_layer(
         )
         .and_then(|outputs| single(outputs, label))
     };
-    let qkv_raw = input_projection(
-        enc,
-        registry,
+    // Prepared route: the tiny alpha / beta projections run beside the BF16
+    // copy of the normalized rows, then the admitted large projections read
+    // that copy. The stock order is kept when nothing is admitted.
+    let admitted =
+        |route: JointProductRoute, weight: &MlxBuffer, ggml_type: GgmlType, out_features: u32| {
+            route == JointProductRoute::Batched
+                && prepared_projection::admits(width_u32, weight, ggml_type, hidden, out_features)
+        };
+    let qkv_prepared = admitted(
         routes.qkv,
         &weights.attn_qkv,
         weights.attn_qkv_ggml_type,
         qkv_channels,
-        "attn_qkv",
-    )?;
-    let z = input_projection(
-        enc,
-        registry,
+    );
+    let gate_prepared = admitted(
         routes.gate,
         &weights.attn_gate,
         weights.attn_gate_ggml_type,
         z_channels,
-        "attn_gate",
-    )?;
-    let alpha_logit = input_projection(
-        enc,
-        registry,
-        routes.alpha,
-        &weights.ssm_alpha,
-        weights.ssm_alpha_ggml_type,
-        n_v_heads,
-        "ssm_alpha",
-    )?;
-    let beta_logit = input_projection(
-        enc,
-        registry,
-        routes.beta,
-        &weights.ssm_beta,
-        weights.ssm_beta_ggml_type,
-        n_v_heads,
-        "ssm_beta",
-    )?;
+    );
+    let small_projections = |enc: &mut CommandEncoder, registry: &mut KernelRegistry| {
+        let alpha = input_projection(
+            enc,
+            registry,
+            routes.alpha,
+            &weights.ssm_alpha,
+            weights.ssm_alpha_ggml_type,
+            n_v_heads,
+            "ssm_alpha",
+        )?;
+        let beta = input_projection(
+            enc,
+            registry,
+            routes.beta,
+            &weights.ssm_beta,
+            weights.ssm_beta_ggml_type,
+            n_v_heads,
+            "ssm_beta",
+        )?;
+        Ok::<_, anyhow::Error>((alpha, beta))
+    };
+    let (qkv_raw, z, alpha_logit, beta_logit) = if qkv_prepared || gate_prepared {
+        let x_norm_bf16 =
+            prepared_projection::bf16_input(enc, registry, device, &x_norm, width_u32, hidden)?;
+        let (alpha_logit, beta_logit) = small_projections(enc, registry)?;
+        enc.memory_barrier();
+        let qkv_raw = if qkv_prepared {
+            prepared_projection::project(
+                enc,
+                registry,
+                device,
+                &x_norm_bf16,
+                &weights.attn_qkv,
+                weights.attn_qkv_ggml_type,
+                &weights.prepared_m32.qkv,
+                width_u32,
+                hidden,
+                qkv_channels,
+            )?
+        } else {
+            input_projection(
+                enc,
+                registry,
+                routes.qkv,
+                &weights.attn_qkv,
+                weights.attn_qkv_ggml_type,
+                qkv_channels,
+                "attn_qkv",
+            )?
+        };
+        let z = if gate_prepared {
+            prepared_projection::project(
+                enc,
+                registry,
+                device,
+                &x_norm_bf16,
+                &weights.attn_gate,
+                weights.attn_gate_ggml_type,
+                &weights.prepared_m32.gate,
+                width_u32,
+                hidden,
+                z_channels,
+            )?
+        } else {
+            input_projection(
+                enc,
+                registry,
+                routes.gate,
+                &weights.attn_gate,
+                weights.attn_gate_ggml_type,
+                z_channels,
+                "attn_gate",
+            )?
+        };
+        (qkv_raw, z, alpha_logit, beta_logit)
+    } else {
+        let qkv_raw = input_projection(
+            enc,
+            registry,
+            routes.qkv,
+            &weights.attn_qkv,
+            weights.attn_qkv_ggml_type,
+            qkv_channels,
+            "attn_qkv",
+        )?;
+        let z = input_projection(
+            enc,
+            registry,
+            routes.gate,
+            &weights.attn_gate,
+            weights.attn_gate_ggml_type,
+            z_channels,
+            "attn_gate",
+        )?;
+        let (alpha_logit, beta_logit) = small_projections(enc, registry)?;
+        (qkv_raw, z, alpha_logit, beta_logit)
+    };
     enc.memory_barrier();
     crate::inference::stage_profile::boundary(enc, "adr065.projections")
         .context("profile Qwen joint DeltaNet projections")?;
@@ -1101,30 +1183,55 @@ pub(crate) fn encode_joint_delta_net_layer(
     let gated = gated
         .with_shape(vec![width, z_channels as usize])
         .map_err(|e| anyhow!("shape Qwen joint gated output: {e}"))?;
-    let output = project_rows(
-        enc,
-        registry,
-        device,
-        routes.out,
-        &gated,
-        width,
-        z_channels as usize,
-        |enc, registry, input, seq| {
-            apply_proj_with_ggml_type(
-                enc,
-                registry,
-                device,
-                input,
-                &weights.ssm_out,
-                weights.ssm_out_ggml_type,
-                seq,
-                z_channels,
-                hidden,
-            )
-            .map(|output| vec![output])
-        },
-    )
-    .and_then(|outputs| single(outputs, "ssm_out"))?;
+    let output = if routes.out == JointProductRoute::Batched
+        && prepared_projection::admits(
+            width_u32,
+            &weights.ssm_out,
+            weights.ssm_out_ggml_type,
+            z_channels,
+            hidden,
+        ) {
+        let gated_bf16 =
+            prepared_projection::bf16_input(enc, registry, device, &gated, width_u32, z_channels)?;
+        enc.memory_barrier();
+        prepared_projection::project(
+            enc,
+            registry,
+            device,
+            &gated_bf16,
+            &weights.ssm_out,
+            weights.ssm_out_ggml_type,
+            &weights.prepared_m32.out,
+            width_u32,
+            z_channels,
+            hidden,
+        )?
+    } else {
+        project_rows(
+            enc,
+            registry,
+            device,
+            routes.out,
+            &gated,
+            width,
+            z_channels as usize,
+            |enc, registry, input, seq| {
+                apply_proj_with_ggml_type(
+                    enc,
+                    registry,
+                    device,
+                    input,
+                    &weights.ssm_out,
+                    weights.ssm_out_ggml_type,
+                    seq,
+                    z_channels,
+                    hidden,
+                )
+                .map(|output| vec![output])
+            },
+        )
+        .and_then(|outputs| single(outputs, "ssm_out"))?
+    };
     crate::inference::stage_profile::boundary(enc, "adr065.projections")
         .context("profile Qwen joint DeltaNet output projection")?;
 
@@ -1211,32 +1318,35 @@ pub(crate) fn encode_joint_full_attn_layer(
         shape.rms_norm_eps,
     )?;
     enc.memory_barrier();
-    let mut q_gate = project_rows(
-        enc,
-        registry,
-        device,
-        routes.q_gate,
-        &x_norm,
-        width,
-        hidden as usize,
-        |enc, registry, input, seq| {
-            let (q, gate) = apply_q_gate_projection_f32(
-                enc,
-                registry,
-                device,
-                input,
-                &weights.q_gate,
-                seq,
-                n_heads,
-                head_dim,
-                hidden,
-            )?;
-            Ok(vec![q, gate])
-        },
-    )?;
-    ensure!(q_gate.len() == 2, "Qwen joint Q/gate projection shape");
-    let gate_flat = q_gate.pop().expect("gate output checked above");
-    let q_flat = q_gate.pop().expect("query output checked above");
+    let stock_q_gate = |enc: &mut CommandEncoder, registry: &mut KernelRegistry| {
+        let mut q_gate = project_rows(
+            enc,
+            registry,
+            device,
+            routes.q_gate,
+            &x_norm,
+            width,
+            hidden as usize,
+            |enc, registry, input, seq| {
+                let (q, gate) = apply_q_gate_projection_f32(
+                    enc,
+                    registry,
+                    device,
+                    input,
+                    &weights.q_gate,
+                    seq,
+                    n_heads,
+                    head_dim,
+                    hidden,
+                )?;
+                Ok(vec![q, gate])
+            },
+        )?;
+        ensure!(q_gate.len() == 2, "Qwen joint Q/gate projection shape");
+        let gate = q_gate.pop().expect("gate output checked above");
+        let q = q_gate.pop().expect("query output checked above");
+        Ok::<_, anyhow::Error>((q, gate))
+    };
     let kv_projection = |enc: &mut CommandEncoder,
                          registry: &mut KernelRegistry,
                          route: JointProductRoute,
@@ -1260,22 +1370,116 @@ pub(crate) fn encode_joint_full_attn_layer(
         )
         .and_then(|outputs| single(outputs, label))
     };
-    let k_flat = kv_projection(
-        enc,
-        registry,
-        routes.k,
-        &weights.wk,
-        weights.wk_ggml_type,
-        "attn_k",
-    )?;
-    let v_flat = kv_projection(
-        enc,
-        registry,
-        routes.v,
-        &weights.wv,
-        weights.wv_ggml_type,
-        "attn_v",
-    )?;
+    // Prepared route: the fused Q/gate, K and V projections read one BF16
+    // copy of the normalized rows and overlap; the Q/gate split follows them.
+    let admitted =
+        |route: JointProductRoute, weight: &MlxBuffer, ggml_type: GgmlType, out_features: u32| {
+            route == JointProductRoute::Batched
+                && prepared_projection::admits(width_u32, weight, ggml_type, hidden, out_features)
+        };
+    let fused_prepared = match &weights.q_gate {
+        FullAttnQGateWeightsGpu::Fused { weight, ggml_type }
+            if admitted(routes.q_gate, weight, *ggml_type, 2 * q_total as u32) =>
+        {
+            Some((weight, *ggml_type))
+        }
+        _ => None,
+    };
+    let k_prepared = admitted(routes.k, &weights.wk, weights.wk_ggml_type, kv_total);
+    let v_prepared = admitted(routes.v, &weights.wv, weights.wv_ggml_type, kv_total);
+    let (q_flat, gate_flat, k_flat, v_flat) =
+        if fused_prepared.is_some() || k_prepared || v_prepared {
+            let x_norm_bf16 =
+                prepared_projection::bf16_input(enc, registry, device, &x_norm, width_u32, hidden)?;
+            enc.memory_barrier();
+            let fused = fused_prepared
+                .map(|(weight, ggml_type)| {
+                    prepared_projection::project(
+                        enc,
+                        registry,
+                        device,
+                        &x_norm_bf16,
+                        weight,
+                        ggml_type,
+                        &weights.prepared_m32.q_gate,
+                        width_u32,
+                        hidden,
+                        2 * q_total as u32,
+                    )
+                })
+                .transpose()?;
+            let kv = |enc: &mut CommandEncoder,
+                      registry: &mut KernelRegistry,
+                      prepared: bool,
+                      route: JointProductRoute,
+                      weight: &MlxBuffer,
+                      ggml_type: GgmlType,
+                      planes: &prepared_projection::Planes,
+                      label: &str| {
+                if prepared {
+                    prepared_projection::project(
+                        enc,
+                        registry,
+                        device,
+                        &x_norm_bf16,
+                        weight,
+                        ggml_type,
+                        planes,
+                        width_u32,
+                        hidden,
+                        kv_total,
+                    )
+                } else {
+                    kv_projection(enc, registry, route, weight, ggml_type, label)
+                }
+            };
+            let k_flat = kv(
+                enc,
+                registry,
+                k_prepared,
+                routes.k,
+                &weights.wk,
+                weights.wk_ggml_type,
+                &weights.prepared_m32.k,
+                "attn_k",
+            )?;
+            let v_flat = kv(
+                enc,
+                registry,
+                v_prepared,
+                routes.v,
+                &weights.wv,
+                weights.wv_ggml_type,
+                &weights.prepared_m32.v,
+                "attn_v",
+            )?;
+            let (q_flat, gate_flat) = match fused {
+                Some(fused) => deinterleave_q_gate_f32(
+                    enc, registry, device, fused, width_u32, n_heads, head_dim,
+                )?,
+                None => stock_q_gate(enc, registry)?,
+            };
+            (q_flat, gate_flat, k_flat, v_flat)
+        } else {
+            let (q_flat, gate_flat) = stock_q_gate(enc, registry)?;
+            let k_flat = kv_projection(
+                enc,
+                registry,
+                routes.k,
+                &weights.wk,
+                weights.wk_ggml_type,
+                "attn_k",
+            )?;
+            let v_flat = kv_projection(
+                enc,
+                registry,
+                routes.v,
+                &weights.wv,
+                weights.wv_ggml_type,
+                "attn_v",
+            )?;
+            (q_flat, gate_flat, k_flat, v_flat)
+        };
     enc.memory_barrier();
     let q_normed = apply_q_or_k_per_head_rms_norm(
         enc,
@@ -1418,30 +1622,61 @@ pub(crate) fn encode_joint_full_attn_layer(
     let gated = gated
         .with_shape(vec![width, q_total])
         .map_err(|e| anyhow!("shape Qwen joint gated attention: {e}"))?;
-    let output = project_rows(
-        enc,
-        registry,
-        device,
-        routes.o,
-        &gated,
-        width,
-        q_total,
-        |enc, registry, input, seq| {
-            apply_linear_projection_f32_pooled_with_ggml_type(
-                enc,
-                registry,
-                device,
-                input,
-                &weights.wo,
-                weights.wo_ggml_type,
-                seq,
-                q_total as u32,
-                hidden,
-            )
-            .map(|output| vec![output])
-        },
-    )
-    .and_then(|outputs| single(outputs, "attn_output"))?;
+    let output = if routes.o == JointProductRoute::Batched
+        && prepared_projection::admits(
+            width_u32,
+            &weights.wo,
+            weights.wo_ggml_type,
+            q_total as u32,
+            hidden,
+        ) {
+        let gated_bf16 = prepared_projection::bf16_input(
+            enc,
+            registry,
+            device,
+            &gated,
+            width_u32,
+            q_total as u32,
+        )?;
+        enc.memory_barrier();
+        prepared_projection::project(
+            enc,
+            registry,
+            device,
+            &gated_bf16,
+            &weights.wo,
+            weights.wo_ggml_type,
+            &weights.prepared_m32.out,
+            width_u32,
+            q_total as u32,
+            hidden,
+        )?
+    } else {
+        project_rows(
+            enc,
+            registry,
+            device,
+            routes.o,
+            &gated,
+            width,
+            q_total,
+            |enc, registry, input, seq| {
+                apply_linear_projection_f32_pooled_with_ggml_type(
+                    enc,
+                    registry,
+                    device,
+                    input,
+                    &weights.wo,
+                    weights.wo_ggml_type,
+                    seq,
+                    q_total as u32,
+                    hidden,
+                )
+                .map(|output| vec![output])
+            },
+        )
+        .and_then(|outputs| single(outputs, "attn_output"))?
+    };
     crate::inference::stage_profile::boundary(enc, "adr065.projections")
         .context("profile Qwen joint attention output projection")?;
     Ok(output)

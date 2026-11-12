@@ -108,6 +108,7 @@ pub(crate) mod moe_batched;
 mod moe_batched_tests;
 pub mod mtp;
 pub mod mtp_weights_load;
+pub(crate) mod prepared_projection;
 mod source_config;
 pub(crate) mod source_precision;
 pub(crate) mod resume_attn_fast;

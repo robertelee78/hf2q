@@ -102,6 +102,7 @@ pub(super) fn full_attention(
             Qwen35FutureDType::Bf16,
         )?,
         wo_ggml_type: GgmlType::F32,
+        prepared_m32: Default::default(),
     })
 }
 
@@ -214,6 +215,7 @@ pub(super) fn linear_attention(
         ssm_norm_cpu,
         ssm_out,
         ssm_out_ggml_type: GgmlType::F32,
+        prepared_m32: Default::default(),
     })
 }
 

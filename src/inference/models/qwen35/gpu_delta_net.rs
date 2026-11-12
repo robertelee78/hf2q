@@ -498,6 +498,10 @@ pub struct DeltaNetWeightsGpu {
     /// Output projection `[hidden_size, nv*dv]`.
     pub ssm_out: MlxBuffer,
     pub ssm_out_ggml_type: GgmlType,
+    /// Width-32 load-once prepared planes of the large projections. Shared by
+    /// clones and dropped with the last one, so model replacement cannot
+    /// retain stale GPU buffers.
+    pub(crate) prepared_m32: std::sync::Arc<super::prepared_projection::DeltaNetPlanes>,
 }
 
 impl DeltaNetWeightsGpu {
@@ -541,6 +545,7 @@ impl DeltaNetWeightsGpu {
             ssm_beta_ggml_type: GgmlType::Q4_0,
             ssm_out: upload_q4_0_from_f32(&weights.ssm_out, device)?,
             ssm_out_ggml_type: GgmlType::Q4_0,
+            prepared_m32: Default::default(),
         })
     }
 
@@ -585,6 +590,7 @@ impl DeltaNetWeightsGpu {
             ssm_beta_ggml_type: GgmlType::F32,
             ssm_out: upload_f32(&weights.ssm_out, device)?,
             ssm_out_ggml_type: GgmlType::F32,
+            prepared_m32: Default::default(),
         })
     }
 }
