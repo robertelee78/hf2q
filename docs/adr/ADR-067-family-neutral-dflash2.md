@@ -1841,9 +1841,16 @@ is prepared the pre-mixer norm writes their BF16 rows
 dispatch (`gdn_window_fused`) that writes the output projection's BF16 rows:
 0.068 ms per Qwen3.8 layer and 0.054 per Qwen3.6 layer at four lanes. Every
 kernel repeats the stock kernels' operations in their order, including the
-128-thread tree of the norm reductions, so the route is Class A: rows,
-captures, state and retained replay rows are bitwise the stock route's. A
-DeltaNet layer is 7 dispatches in five stages instead of 159 in 14.
+128-thread tree of the norm reductions, and the route is Class A: rows,
+captures, state and retained replay rows are bitwise the stock route's. That
+equality is qualified by test on the Apple M5 Max, not by the source alone:
+outside the pinned norm sums and scales the fused kernel's phases keep
+Metal's fast-math flags, as the stock kernels do, so mlx-native
+`tests/test_gdn_window_fused.rs` is the gate for any other GPU family. The
+core serves head dimension 128, two to nine convolution taps and windows of
+at most eight rows within the device's threadgroup limits; other layers keep
+the stock chain, and the first use and first refusal are logged. A DeltaNet
+layer is 7 dispatches in five stages instead of 159 in 14.
 
 Exact four-agent runs, every other switch of the combined candidate on, same
 binary with the switch on and off, all `CalibrationPass`
