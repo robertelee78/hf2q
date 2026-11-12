@@ -115,6 +115,12 @@ impl DFlash2LaneBinding {
     }
 }
 
+/// A draft-context commit the GPU is executing
+/// ([`DFlash2Runtime::submit_target_context`]).
+pub(crate) struct SubmittedContextCommit {
+    encoder: CommandEncoder,
+}
+
 /// GPU-resident DFlash2 checkpoint and persistent per-slot draft rings.
 pub struct DFlash2Runtime {
     pub descriptor: &'static DFlash2CheckpointDescriptor,
@@ -503,6 +509,55 @@ impl DFlash2Runtime {
         registry: &mut KernelRegistry,
         retained_counts: &[u32],
     ) -> Result<()> {
+        let mut encoder = self.encode_target_context(device, registry, retained_counts)?;
+        encoder
+            .commit_and_wait()
+            .context("commit DFlash2 target context")?;
+        self.advance_lane_lengths(retained_counts)
+    }
+
+    /// Encode the context commit of [`Self::commit_target_context`] and hand
+    /// it to the GPU without waiting. The rings are being written until
+    /// [`Self::finish_target_context`] returns: until then nothing may read
+    /// or write them on the host, and the lane lengths are unchanged.
+    /// Commands committed after this one on the same queue run after it.
+    pub(crate) fn submit_target_context(
+        &mut self,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        retained_counts: &[u32],
+    ) -> Result<SubmittedContextCommit> {
+        let mut encoder = self.encode_target_context(device, registry, retained_counts)?;
+        encoder.commit();
+        Ok(SubmittedContextCommit { encoder })
+    }
+
+    /// Wait for a submitted context commit. `advance` moves each lane's
+    /// length past the rows it retained; pass `false` when the step the
+    /// rows belong to failed after the submission, and then clear those
+    /// lanes: a ring that has wrapped lost its oldest rows to the commit.
+    pub(crate) fn finish_target_context(
+        &mut self,
+        submitted: SubmittedContextCommit,
+        retained_counts: &[u32],
+        advance: bool,
+    ) -> Result<()> {
+        submitted
+            .encoder
+            .wait_until_completed()
+            .context("commit DFlash2 target context")?;
+        if advance {
+            self.advance_lane_lengths(retained_counts)?;
+        }
+        Ok(())
+    }
+
+    fn encode_target_context(
+        &mut self,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        retained_counts: &[u32],
+    ) -> Result<CommandEncoder> {
         ensure!(
             retained_counts.len() == self.workspace.max_lanes,
             "DFlash2 retained-count length {} != workspace lanes {}",
@@ -532,9 +587,10 @@ impl DFlash2Runtime {
             &self.workspace.retained_counts,
             &self.workspace,
         )?;
-        encoder
-            .commit_and_wait()
-            .context("commit DFlash2 target context")?;
+        Ok(encoder)
+    }
+
+    fn advance_lane_lengths(&mut self, retained_counts: &[u32]) -> Result<()> {
         for (length, retained) in self.lane_lengths.iter_mut().zip(retained_counts) {
             *length = length
                 .checked_add(*retained as usize)
@@ -662,6 +718,10 @@ impl DFlash2Runtime {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "context_commit_tests.rs"]
+mod context_commit_tests;
 
 #[cfg(test)]
 mod tests {

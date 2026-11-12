@@ -6,6 +6,7 @@
 //! in-turn drain used by joint MTP. DFlash2 is optional and fail-closed: a lane
 //! joins only when its target cursor and persistent draft-ring cursor agree.
 
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -30,6 +31,20 @@ use super::{
 
 const DFLASH2_MAX_ROWS_PER_LANE: usize = 8;
 const DFLASH2_PROPOSALS_PER_LANE: usize = DFLASH2_MAX_ROWS_PER_LANE - 1;
+
+/// Opt-in switch of the context-first commit order; exact value `1`.
+pub(in crate::serve::api) const DFLASH2_CONTEXT_FIRST_ENV: &str = "HF2Q_DFLASH2_CONTEXT_FIRST";
+
+/// Whether a step submits its draft-context commit before it encodes the
+/// DeltaNet replay (read once).
+fn context_first() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var(DFLASH2_CONTEXT_FIRST_ENV)
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    });
+    *ENABLED
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::serve::api) struct Qwen35DFlash2Forward {
@@ -273,6 +288,9 @@ impl Qwen35LoadedModel {
             tracing::Level::DEBUG
         );
         let cycle_started = trace_timing.then(Instant::now);
+        let timeline = super::dflash2_timeline::Cycle::begin();
+        let timeline_on = timeline.is_some();
+        let timeline_mark = mlx_native::command_timeline::mark;
         // Native encode counters and this worker thread's CPU time at cycle
         // entry; the DEBUG record reports the dispatches, command buffers,
         // host waits, barriers and host CPU one cycle costs. CPU time close
@@ -330,6 +348,7 @@ impl Qwen35LoadedModel {
             .collect::<Vec<_>>();
         let adapter_config = runtime.config.clone();
         let adapter = QwenDFlash2Adapter::new(&self.model, &adapter_config)?;
+        timeline_mark("draft_begin");
         let draft_started = trace_timing.then(Instant::now);
         let lease = supervisor.arm("Qwen35 DFlash2 draft", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
         let drafted = self.model.with_gpu_cache_mut(|device, registry| {
@@ -362,6 +381,7 @@ impl Qwen35LoadedModel {
         });
         let drafted = lease.finish().and(drafted);
         let draft_micros = draft_started.map(|started| started.elapsed().as_micros());
+        timeline_mark("draft_end");
         if let Err(error) = drafted {
             if is_fatal(&error) {
                 return Err(error);
@@ -429,7 +449,7 @@ impl Qwen35LoadedModel {
                 }
             })
             .collect::<Vec<_>>();
-        let selected_rows = trace_timing.then(|| {
+        let selected_rows = (trace_timing || timeline_on).then(|| {
             verify_lanes
                 .iter()
                 .map(|lane| lane.tokens.len())
@@ -437,6 +457,7 @@ impl Qwen35LoadedModel {
         });
         let adapter = QwenDFlash2Adapter::new(&self.model, &runtime.config)?;
         let capture = adapter.target_capture(&runtime.config, &runtime.workspace, &lane_indices)?;
+        timeline_mark("verify_begin");
         let verify_started = Instant::now();
         let lease = supervisor.arm("Qwen35 DFlash2 verify", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
         let verify = if gpu_target_tokens {
@@ -478,6 +499,7 @@ impl Qwen35LoadedModel {
         let verify = lease.finish().and(verify);
         let verify_elapsed = verify_started.elapsed();
         let verify_micros = trace_timing.then(|| verify_elapsed.as_micros());
+        timeline_mark("verify_end");
         // GPU acceptance has already committed the draft context when verify
         // returns. Any later failure must stop the worker rather than continue
         // with host and draft cursors that may differ.
@@ -515,6 +537,7 @@ impl Qwen35LoadedModel {
             }
         }
         let plan_started = trace_timing.then(Instant::now);
+        timeline_mark("plan_begin");
 
         let mut accepted = Vec::with_capacity(verifying.len());
         let mut verified = Vec::with_capacity(verifying.len());
@@ -561,12 +584,59 @@ impl Qwen35LoadedModel {
         }
         let plan_micros = plan_started.map(|started| started.elapsed().as_micros());
 
+        let mut retained = vec![0_u32; physical_lanes];
+        for (&index, &count) in verifying.iter().zip(&accepted) {
+            retained[states[index].slot_id.0 as usize] = u32::try_from(count)?;
+        }
+        // Context first: the draft-context commit needs only the retained
+        // counts, so it goes to the GPU before the replay is encoded. The
+        // GPU, idle since the output head, starts it while the host encodes
+        // the replay behind it, and the replay's wait covers both commands.
+        // The commit's host checks run first, so only a failing replay
+        // command can leave a submitted context without its replay.
+        let context_first = !gpu_acceptance
+            && context_first()
+            && self
+                .model
+                .validate_joint_verify_commit(kv_cache, &pending, &accepted)
+                .is_ok();
+        timeline_mark("target_commit_begin");
         let target_commit_started = trace_timing.then(Instant::now);
         let lease = supervisor.arm("Qwen35 DFlash2 commit", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
-        let committed = self.model.commit_joint_verify(kv_cache, pending, &accepted);
+        let (committed, pipelined_context) = if context_first {
+            // No early return between the submission and its wait: nothing
+            // may touch the rings on the host while the command runs.
+            let submitted = self.model.with_gpu_cache_mut(|device, registry| {
+                runtime.submit_target_context(device, registry, &retained)
+            });
+            timeline_mark("context_submitted");
+            let committed = self.model.commit_joint_verify(kv_cache, pending, &accepted);
+            // The context sits before the replay on the queue: after the
+            // waited replay this returns at once.
+            let context = submitted.and_then(|submitted| {
+                let finished =
+                    runtime.finish_target_context(submitted, &retained, committed.is_ok());
+                if committed.is_err() {
+                    // The rings hold rows of a step that did not commit.
+                    for &index in &verifying {
+                        runtime.clear_lane(states[index].slot_id.0 as usize)?;
+                    }
+                }
+                finished
+            });
+            (committed, Some(context))
+        } else {
+            (
+                self.model.commit_joint_verify(kv_cache, pending, &accepted),
+                None,
+            )
+        };
         let committed = lease.finish().and(committed);
         let target_commit_micros =
             target_commit_started.map(|started| started.elapsed().as_micros());
+        timeline_mark("target_commit_end");
+        timeline_mark("draft_commit_begin");
+        let draft_commit_started = trace_timing.then(Instant::now);
         if let Err(error) = committed {
             if gpu_acceptance || is_fatal(&error) {
                 return Err(error);
@@ -574,24 +644,25 @@ impl Qwen35LoadedModel {
             distribute_error(&mut ticks, &verifying, error);
             return Ok(finish_ticks(ticks));
         }
-        let mut retained = vec![0_u32; physical_lanes];
-        for (&index, &count) in verifying.iter().zip(&accepted) {
-            retained[states[index].slot_id.0 as usize] = u32::try_from(count)?;
-        }
-        let draft_commit_started = trace_timing.then(Instant::now);
-        let lease = supervisor.arm(
-            "Qwen35 DFlash2 target-context commit",
-            QWEN35_WORKER_TRANSACTION_TIMEOUT,
-        )?;
-        let context_committed = if gpu_acceptance {
-            runtime.settle_gpu_context_lengths(&retained)
-        } else {
-            self.model.with_gpu_cache_mut(|device, registry| {
-                runtime.commit_target_context(device, registry, &retained)
-            })
+        let context_committed = match pipelined_context {
+            Some(result) => result,
+            None => {
+                let lease = supervisor.arm(
+                    "Qwen35 DFlash2 target-context commit",
+                    QWEN35_WORKER_TRANSACTION_TIMEOUT,
+                )?;
+                let context_committed = if gpu_acceptance {
+                    runtime.settle_gpu_context_lengths(&retained)
+                } else {
+                    self.model.with_gpu_cache_mut(|device, registry| {
+                        runtime.commit_target_context(device, registry, &retained)
+                    })
+                };
+                lease.finish().and(context_committed)
+            }
         };
-        let context_committed = lease.finish().and(context_committed);
         let draft_commit_micros = draft_commit_started.map(|started| started.elapsed().as_micros());
+        timeline_mark("draft_commit_end");
         if let Err(error) = context_committed {
             if gpu_acceptance || is_fatal(&error) {
                 return Err(error);
@@ -655,6 +726,14 @@ impl Qwen35LoadedModel {
                 host_cpu_us = now.4.wrapping_sub(entry.4),
                 "Qwen DFlash2 stage timing"
             );
+        }
+        if let Some(timeline) = timeline {
+            timeline.finish(super::dflash2_timeline::CycleSummary {
+                active_lanes: verifying.len(),
+                selected_rows: selected_rows.unwrap_or_default(),
+                accepted_rows: accepted.iter().sum::<usize>(),
+                gpu_acceptance,
+            });
         }
 
         for (&index, step) in verifying.iter().zip(verified) {

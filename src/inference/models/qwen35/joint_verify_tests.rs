@@ -803,7 +803,7 @@ fn synthetic_cache(model: &Qwen35Model, arm: Arm) -> HybridKvCache {
     cache
 }
 
-fn with_synthetic_fixture(
+pub(super) fn with_synthetic_fixture(
     policy: mlx_native::GgmlRoutingPolicy,
     arm: Arm,
     run: impl FnOnce(&Fixture<'_>),
@@ -838,7 +838,7 @@ fn with_synthetic_fixture_cfg(
     });
 }
 
-fn dflash_arm() -> Arm {
+pub(super) fn dflash_arm() -> Arm {
     Arm {
         mode: JointRouteMode::PaddedMvExt,
         dense_ffn: JointDenseFfnRoute::SharedWeights,
@@ -850,13 +850,18 @@ fn dflash_arm() -> Arm {
     }
 }
 
-struct DFlashCaseTrace {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct DFlashCaseTrace {
     rows: Vec<Vec<RowBits>>,
     committed: Vec<LaneDigest>,
     captured: Vec<Vec<u32>>,
 }
 
-fn run_dflash_case(fixture: &Fixture<'_>, lanes: &[LaneCase], label: &str) -> DFlashCaseTrace {
+pub(super) fn run_dflash_case(
+    fixture: &Fixture<'_>,
+    lanes: &[LaneCase],
+    label: &str,
+) -> DFlashCaseTrace {
     let mut cache = (fixture.new_cache)();
     let token_rows = lanes
         .iter()
@@ -1230,7 +1235,7 @@ fn dflash2_tiled_attention_meets_q1_and_is_cohort_invariant() {
 }
 
 /// Arm M: padded mode, shared-weights FFN, column-invariant MMA products.
-fn mma_arm() -> Arm {
+pub(super) fn mma_arm() -> Arm {
     Arm {
         mode: JointRouteMode::PaddedMvExt,
         dense_ffn: JointDenseFfnRoute::SharedWeights,

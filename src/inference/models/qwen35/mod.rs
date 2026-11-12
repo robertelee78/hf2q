@@ -117,6 +117,9 @@ pub(crate) mod prefill_prepared;
 #[cfg(test)]
 mod prefill_prepared_tests;
 pub(crate) mod prepared_projection;
+pub(crate) mod replay_arena;
+#[cfg(test)]
+mod replay_arena_tests;
 mod source_config;
 pub(crate) mod source_precision;
 pub(crate) mod resume_attn_fast;
