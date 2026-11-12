@@ -4831,7 +4831,11 @@ pub(in crate::serve::api) mod anchor_store;
 pub(in crate::serve::api) mod critical_path;
 #[path = "engine_qwen35/dflash2_scheduler.rs"]
 mod dflash2_scheduler;
-pub(in crate::serve::api) use dflash2_scheduler::Qwen35DFlash2Forward;
+pub(in crate::serve::api) use dflash2_scheduler::{
+    context_first as dflash2_context_first, Qwen35DFlash2Forward,
+};
+#[path = "engine_qwen35/dflash2_timeline.rs"]
+mod dflash2_timeline;
 #[path = "engine_qwen35/joint_decode.rs"]
 mod joint_decode;
 pub(in crate::serve::api) use joint_decode::{Qwen35JointLane, Qwen35LaneRefusal};

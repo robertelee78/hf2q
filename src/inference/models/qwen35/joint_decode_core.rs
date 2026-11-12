@@ -60,6 +60,7 @@ use super::gpu_full_attn::{
 use super::joint_decode_routes::{projection_route, JointProductRoute};
 use super::kv_cache::{HybridKvCache, LayerSlot};
 use super::prepared_projection;
+use super::replay_arena::ReplayArena;
 use super::verify_attn_tile::{
     apply_tq_verify_tile_gated_into, tq_verify_tile_route, VerifyTileScratch,
 };
@@ -409,7 +410,9 @@ fn replay_elements(elements: usize) -> usize {
 /// plus a replay output scratch. Single-row windows retain nothing: their
 /// commit is a fast path (keep, or discard by a parity flip).
 pub(crate) struct DeltaNetReplay {
-    arena: MlxBuffer,
+    arena: ReplayArena,
+    /// Elements this step may take; a retained arena can be larger.
+    capacity: usize,
     used: usize,
     layers: Vec<DeltaNetReplayLayer>,
 }
@@ -481,11 +484,9 @@ impl DeltaNetReplay {
         let elements = per_layer
             .checked_mul(linear_layers)
             .context("Qwen joint verify replay storage overflow")?;
-        let arena = device
-            .alloc_buffer(elements * 4, DType::F32, vec![elements])
-            .map_err(|e| anyhow!("allocate Qwen joint verify replay storage: {e}"))?;
         Ok(Some(Self {
-            arena,
+            arena: ReplayArena::acquire(device, elements)?,
+            capacity: elements,
             used: 0,
             layers: Vec::with_capacity(linear_layers),
         }))
@@ -494,12 +495,13 @@ impl DeltaNetReplay {
     fn take(&mut self, elements: usize) -> Result<MlxBuffer> {
         let end = self.used + replay_elements(elements);
         ensure!(
-            end <= self.arena.element_count(),
+            end <= self.capacity,
             "Qwen joint verify replay storage exhausted ({end} of {} elements)",
-            self.arena.element_count()
+            self.capacity
         );
         let view = self
             .arena
+            .buffer()
             .slice_view((self.used * 4) as u64, elements)
             .with_shape(vec![elements])
             .map_err(|e| anyhow!("shape Qwen joint verify replay view: {e}"))?;

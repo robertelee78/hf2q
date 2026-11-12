@@ -128,6 +128,9 @@ mod prepared_step_tests;
 pub(crate) mod prepared_switch_override;
 #[cfg(test)]
 mod prepared_width_tests;
+pub(crate) mod replay_arena;
+#[cfg(test)]
+mod replay_arena_tests;
 mod source_config;
 pub(crate) mod source_precision;
 pub(crate) mod resume_attn_fast;

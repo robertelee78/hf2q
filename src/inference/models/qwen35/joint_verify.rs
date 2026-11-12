@@ -373,6 +373,7 @@ impl Qwen35Model {
             |device, registry, layer_weights, output_head, plan| {
                 let mut replay =
                     DeltaNetReplay::new(device, &self.cfg, &windows, packing.width, linear_layers)?;
+                mlx_native::command_timeline::mark("verify.replay_storage");
                 let (outputs, normed) = self.encode_joint_decode(
                     device,
                     registry,
@@ -418,23 +419,13 @@ impl Qwen35Model {
         })
     }
 
-    /// Settle a verify step: lane `i` keeps its first `accepted[i]` rows
-    /// (`0..=rows`; `accepted` follows the verify step's lane order). The
-    /// lane's DeltaNet state and attention cursor become those of the
-    /// spec-off steps over exactly those rows:
-    ///
-    /// - all rows: nothing to do;
-    /// - none: the pre-window DeltaNet state is still intact in the scratch
-    ///   parity, so the parity flips back;
-    /// - a prefix: the DeltaNet state is replayed over the prefix from the
-    ///   pre-window state (one command buffer for every such lane).
-    ///
-    /// The attention cursor is truncated to `position + accepted`. On error
-    /// the caller must reset every lane of the step.
-    pub(crate) fn commit_joint_verify(
+    /// The host checks of [`Self::commit_joint_verify`], which runs them
+    /// first: the accept counts fit the verified windows and every lane's
+    /// cursor still sits where the verify step left it. Writes nothing.
+    pub(crate) fn validate_joint_verify_commit(
         &self,
-        kv_cache: &mut HybridKvCache,
-        pending: Qwen35JointVerifyPending,
+        kv_cache: &HybridKvCache,
+        pending: &Qwen35JointVerifyPending,
         accepted: &[usize],
     ) -> Result<()> {
         ensure!(
@@ -459,6 +450,29 @@ impl Qwen35Model {
                     )
                 })?;
         }
+        Ok(())
+    }
+
+    /// Settle a verify step: lane `i` keeps its first `accepted[i]` rows
+    /// (`0..=rows`; `accepted` follows the verify step's lane order). The
+    /// lane's DeltaNet state and attention cursor become those of the
+    /// spec-off steps over exactly those rows:
+    ///
+    /// - all rows: nothing to do;
+    /// - none: the pre-window DeltaNet state is still intact in the scratch
+    ///   parity, so the parity flips back;
+    /// - a prefix: the DeltaNet state is replayed over the prefix from the
+    ///   pre-window state (one command buffer for every such lane).
+    ///
+    /// The attention cursor is truncated to `position + accepted`. On error
+    /// the caller must reset every lane of the step.
+    pub(crate) fn commit_joint_verify(
+        &self,
+        kv_cache: &mut HybridKvCache,
+        pending: Qwen35JointVerifyPending,
+        accepted: &[usize],
+    ) -> Result<()> {
+        self.validate_joint_verify_commit(kv_cache, &pending, accepted)?;
         let partial = pending
             .lanes
             .iter()
@@ -483,6 +497,7 @@ impl Qwen35Model {
                     .map_err(|e| anyhow!("Qwen joint verify replay command buffer: {e}"))
             })?;
         }
+        mlx_native::command_timeline::mark("commit.replay_completed");
         for (lane, &rows) in pending.lanes.iter().zip(accepted) {
             if rows == 0 {
                 for layer in kv_cache.linear_attn.iter_mut() {
