@@ -28,6 +28,10 @@ pub(crate) struct JointStepOptions {
     pub projection: JointProjectionKernel,
     /// Multi-row layer outputs from the decode pool (Class A).
     pub pooled_outputs: bool,
+    /// DFlash2 verify steps only: tiled TQ full attention
+    /// ([`super::verify_attn_tile`], Class B). Decode steps never take it and
+    /// MTP verify rejects it.
+    pub verify_attention_tile: bool,
 }
 
 /// Parse an on/off switch named `name`; unset or blank means off.
