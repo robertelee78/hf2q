@@ -62,6 +62,7 @@ use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35Model};
 use crate::inference::models::qwen35::moe_batched::{
     build_moe_ffn_layer_gpu_batched_into, DFlash2MoeRouteMask,
 };
+use crate::inference::models::qwen35::prepared_projection;
 use crate::inference::models::qwen35::spec_decode::nth_hidden_row;
 use crate::inference::models::qwen35::Qwen35Config;
 use crate::inference::spec_decode::dflash2::adapters::DFlash2TargetCapture;
@@ -894,49 +895,84 @@ impl Qwen35Model {
         )
         .context("Qwen joint output norm")?;
         enc.memory_barrier();
+        let prepared_head = plan.head == JointProductRoute::Batched
+            && width == DFLASH2_VERIFY_WIDTH
+            && prepared_projection::admits_head(
+                width_u32,
+                &output_head.lm_head,
+                output_head.lm_head_ggml_type,
+                hidden_size,
+                cfg.vocab_size,
+            );
         // Pooled: the head writes every row and every result leaves this
         // function as an owned copy before the next forward resets the pool,
         // so a step pays no fresh `[width, vocab]` allocation and CPU zeroing.
-        let mut logits = decode_pool::pooled_alloc_buffer(
-            device,
-            width * vocab * 4,
-            DType::F32,
-            vec![width, vocab],
-        )
-        .map_err(|e| anyhow!("allocate Qwen joint logits: {e}"))?;
-        match plan.head {
-            JointProductRoute::Batched => apply_linear_projection_f32_into_with_ggml_type(
+        let logits = if prepared_head {
+            let normed_bf16 = prepared_projection::bf16_input(
                 &mut enc,
                 registry,
                 device,
                 &normed,
+                width_u32,
+                hidden_size,
+            )?;
+            enc.memory_barrier();
+            prepared_projection::project(
+                &mut enc,
+                registry,
+                device,
+                &normed_bf16,
                 &output_head.lm_head,
                 output_head.lm_head_ggml_type,
-                &mut logits,
+                &output_head.prepared_m32,
                 width_u32,
                 hidden_size,
                 cfg.vocab_size,
             )
-            .context("Qwen joint lm_head")?,
-            JointProductRoute::PerRow => {
-                for row in 0..rows.len() {
-                    let mut destination = row_view(&logits, row, vec![1, vocab])?;
-                    apply_linear_projection_f32_into_with_ggml_type(
-                        &mut enc,
-                        registry,
-                        device,
-                        &row_view(&normed, row, vec![1, h])?,
-                        &output_head.lm_head,
-                        output_head.lm_head_ggml_type,
-                        &mut destination,
-                        1,
-                        hidden_size,
-                        cfg.vocab_size,
-                    )
-                    .with_context(|| format!("Qwen joint lm_head row {row}"))?;
+            .context("Qwen joint prepared lm_head")?
+        } else {
+            let mut logits = decode_pool::pooled_alloc_buffer(
+                device,
+                width * vocab * 4,
+                DType::F32,
+                vec![width, vocab],
+            )
+            .map_err(|e| anyhow!("allocate Qwen joint logits: {e}"))?;
+            match plan.head {
+                JointProductRoute::Batched => apply_linear_projection_f32_into_with_ggml_type(
+                    &mut enc,
+                    registry,
+                    device,
+                    &normed,
+                    &output_head.lm_head,
+                    output_head.lm_head_ggml_type,
+                    &mut logits,
+                    width_u32,
+                    hidden_size,
+                    cfg.vocab_size,
+                )
+                .context("Qwen joint lm_head")?,
+                JointProductRoute::PerRow => {
+                    for row in 0..rows.len() {
+                        let mut destination = row_view(&logits, row, vec![1, vocab])?;
+                        apply_linear_projection_f32_into_with_ggml_type(
+                            &mut enc,
+                            registry,
+                            device,
+                            &row_view(&normed, row, vec![1, h])?,
+                            &output_head.lm_head,
+                            output_head.lm_head_ggml_type,
+                            &mut destination,
+                            1,
+                            hidden_size,
+                            cfg.vocab_size,
+                        )
+                        .with_context(|| format!("Qwen joint lm_head row {row}"))?;
+                    }
                 }
             }
-        }
+            logits
+        };
         enc.memory_barrier();
         let argmax = if rows.iter().any(|row| row.output.wants_argmax()) {
             let params = host_buffer(device, DType::U32, &[cfg.vocab_size], "argmax params")?;
