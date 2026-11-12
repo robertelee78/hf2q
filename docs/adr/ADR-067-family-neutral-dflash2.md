@@ -1876,7 +1876,13 @@ Left of the like-for-like distance (0.5 ms on Qwen3.8, 0.9 ms on Qwen3.6,
 profiled, with the profile's own command buffer per category boundary on the
 hf2q side): the attention layers' Q/gate de-interleave, head norms and rotary
 stages (0.3 against 0.15 ms), one cast stage per attention layer, and on
-Qwen3.6 the stock projections of 8- and 16-row steps. Outside these
+Qwen3.6 the stock projections of 8- and 16-row steps. (Those runs predate
+`HF2Q_REPACKED_GGUF_ANY_WIDTH`. With it the prepared routes serve every tile
+width of a DFlash2 verify step and the wave and the BF16 norm follow the
+same width rule; tests hold the step bitwise equal to the stock chain at
+widths 4, 8, 16 and 32 on the synthetic MoE layout and on the official
+Qwen3.6 artifact. Its effect on the Qwen3.6 cycle has not been measured.)
+Outside these
 categories the DeltaNet replay command of a partially accepted window still
 costs 2.1 ms GPU per Qwen3.8 cycle and 1.2 ms per Qwen3.6 cycle plus a host
 wait; Splash folds the retained rows into the state at the lane's next step
