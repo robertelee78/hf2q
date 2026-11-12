@@ -1873,7 +1873,7 @@ Qwen3.6 the stock projections of 8- and 16-row steps. Outside these
 categories the DeltaNet replay command of a partially accepted window still
 costs 2.1 ms GPU per Qwen3.8 cycle and 1.2 ms per Qwen3.6 cycle plus a host
 wait; Splash folds the retained rows into the state at the lane's next step
-instead (`gdn.metal:21-25`).
+instead (`gdn.metal:22-25`).
 
 ### D5: performance qualification
 
