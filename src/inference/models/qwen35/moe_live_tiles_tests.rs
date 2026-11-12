@@ -10,6 +10,10 @@
 //! * masked rows: a row the mask removed is never read (its input is NaN)
 //!   and the live rows keep their bits;
 //! * determinism: two encodings of one step agree bitwise;
+//! * the fused expert stages ([`super::moe_live_tiles_fused`]) against the
+//!   stage-by-stage form ([`super::moe_live_tiles`]): every output element,
+//!   expert id and routing weight of whole layers bitwise equal, masked and
+//!   unmasked, at widths 1 to 32, with experts of more than eight routes;
 //! * F64 reference of the whole layer with a K-scaled bound: BF16 expert
 //!   inputs and SwiGLU, half expert weights, FP32 sums, for the routed
 //!   experts and the shared expert.
@@ -88,6 +92,31 @@ fn run_route(
     verify_rows: Option<&[u32]>,
     route: MoeExpertRoute,
 ) -> Vec<RowResult> {
+    run_layer(
+        device,
+        registry,
+        weights,
+        x,
+        residual,
+        select,
+        verify_rows,
+        Some(route),
+    )
+}
+
+/// One layer over the rows `select` on `route`, or on the live-tile route's
+/// stage-by-stage form when `route` is `None`.
+#[allow(clippy::too_many_arguments)]
+fn run_layer(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    weights: &MoeFfnWeightsGpuQ,
+    x: &[Vec<f32>],
+    residual: &[Vec<f32>],
+    select: &[usize],
+    verify_rows: Option<&[u32]>,
+    route: Option<MoeExpertRoute>,
+) -> Vec<RowResult> {
     decode_pool::checked_reset_decode_pool().expect("reset decode pool");
     let r = select.len();
     let xin = packed(x, select, device);
@@ -119,20 +148,35 @@ fn run_route(
             },
         });
     let mut enc = device.command_encoder().expect("encoder");
-    let routing = build_moe_ffn_layer_gpu_batched_route_into(
-        &mut enc,
-        device,
-        registry,
-        &xin,
-        weights,
-        shape(),
-        Some(&res),
-        &mut out,
-        r as u32,
-        0,
-        route_mask,
-        route,
-    )
+    let routing = match route {
+        Some(route) => build_moe_ffn_layer_gpu_batched_route_into(
+            &mut enc,
+            device,
+            registry,
+            &xin,
+            weights,
+            shape(),
+            Some(&res),
+            &mut out,
+            r as u32,
+            0,
+            route_mask,
+            route,
+        ),
+        None => super::moe_live_tiles::build_moe_ffn_layer_tile_stages_into(
+            &mut enc,
+            device,
+            registry,
+            &xin,
+            weights,
+            shape(),
+            Some(&res),
+            &mut out,
+            r as u32,
+            0,
+            route_mask,
+        ),
+    }
     .expect("batched MoE layer");
     enc.commit_and_wait_labeled("test.qwen.moe_live_tiles")
         .expect("commit");
@@ -186,6 +230,96 @@ fn staged_m8_full_width_step_reserves_the_tile_slack() {
             "row {row} is not repeatable"
         );
     }
+}
+
+/// The live-tile route (fused expert stages, router blocks in one dispatch)
+/// against its stage-by-stage form: whole layers, every element.
+fn fused_stages_equal_tile_stages(down_t: GgmlType, seed: u64) {
+    const ROWS: usize = 32;
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let layer = Layer::random(down_t, seed);
+    let weights = live_tile_weights(&device, &mut registry, &layer);
+    let (x, residual) = rows(ROWS, seed ^ 0xf05e);
+    let all: Vec<usize> = (0..ROWS).collect();
+    // (rows of the step, verify rows per lane of eight).
+    let mut steps: Vec<(Vec<usize>, Option<Vec<u32>>)> = vec![
+        (all.clone(), None),
+        (all.iter().rev().copied().collect(), None),
+        ((0..24).collect(), None),
+        ((8..24).collect(), None),
+        ((24..32).collect(), None),
+        ((0..17).collect(), None),
+        (vec![6, 4, 6], None),
+        (vec![9], None),
+        // Experts of more than eight routes: one row in every place (its
+        // eight experts hold 32 routes each), and three rows in turn.
+        (vec![5; ROWS], None),
+        ((0..ROWS).map(|row| row % 3).collect(), None),
+    ];
+    for verify_rows in [[5u32, 8, 1, 3], [8, 8, 8, 8], [1, 1, 1, 1], [2, 7, 4, 6]] {
+        steps.push((all.clone(), Some(verify_rows.to_vec())));
+    }
+    steps.push(((8..24).collect(), Some(vec![3, 8])));
+    steps.push(((24..32).collect(), Some(vec![4])));
+    steps.push((
+        (0..ROWS).map(|row| row % 3).collect(),
+        Some(vec![8, 5, 8, 2]),
+    ));
+    let mut wide_experts = 0usize;
+    for (select, verify_rows) in &steps {
+        let label = format!("{down_t:?} rows {select:?} mask {verify_rows:?}");
+        let mut run = |route| {
+            run_layer(
+                &device,
+                &mut registry,
+                &weights,
+                &x,
+                &residual,
+                select,
+                verify_rows.as_deref(),
+                route,
+            )
+        };
+        let stages = run(None);
+        let fused = run(Some(MoeExpertRoute::LiveTiles));
+        assert!(
+            stages
+                .iter()
+                .all(|row| row.out.iter().all(|value| value.is_finite())),
+            "{label}: non-finite output"
+        );
+        for (place, (fused, stages)) in fused.iter().zip(&stages).enumerate() {
+            assert_row(fused, stages, &format!("{label}: place {place}"));
+        }
+        let mut counts = vec![0usize; NE];
+        for id in stages.iter().flat_map(|row| &row.ids) {
+            if (*id as usize) < NE {
+                counts[*id as usize] += 1;
+            }
+        }
+        wide_experts += counts.iter().filter(|count| **count > LANE_ROWS).count();
+    }
+    assert!(
+        wide_experts > 0,
+        "no step held an expert of more than eight routes"
+    );
+    eprintln!(
+        "moe_live_tiles {down_t:?}: {} whole layers bitwise equal to the stage-by-stage form \
+         ({wide_experts} experts of more than eight routes)",
+        steps.len()
+    );
+}
+
+#[test]
+fn live_tile_route_equals_its_stage_form_bitwise_down_q6_k() {
+    fused_stages_equal_tile_stages(GgmlType::Q6_K, 0x0f5e_d001);
+}
+
+#[test]
+fn live_tile_route_equals_its_stage_form_bitwise_down_q4_k() {
+    fused_stages_equal_tile_stages(GgmlType::Q4_K, 0x0f5e_d002);
 }
 
 fn assert_row(actual: &RowResult, expected: &RowResult, label: &str) {

@@ -111,6 +111,7 @@ pub(crate) mod moe_batched;
 #[cfg(test)]
 mod moe_batched_tests;
 mod moe_live_tiles;
+mod moe_live_tiles_fused;
 #[cfg(test)]
 mod moe_live_tiles_tests;
 pub mod mtp;
