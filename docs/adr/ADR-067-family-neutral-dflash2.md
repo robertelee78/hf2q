@@ -954,6 +954,101 @@ the retained prefix into the next graph. The next state-transaction slice must
 therefore add deferred retained-row state or an equivalent dynamic GPU commit;
 moving another host wait without removing that replay cannot close the gap.
 
+Staged M8 and the GPU adaptive-row route were each qualified alone and had
+never run together. With both switches set, every Qwen3.6 request failed
+(`embedding_q4_k: token_ids[9]=4294967295 exceeds vocabulary`): on the
+mlx-native 0.21.6 build with and without native profiling, and on the
+`main`-equivalent 0.21.5 build with profiling on. The 0.21.6 build without
+`HF2Q_QWEN_MOE_STAGED_M8` passed. The route mask rewrites
+every slot of an unselected row to the id `num_experts`. The staged-M8 compact
+schedule treated that as invalid metadata and poisoned itself, and the grouped
+M8 kernels write nothing under a poisoned schedule, so one masked row dropped
+the expert projections of every row in the step. Nothing refused the
+combination at startup; the request failed only because a later host-side
+token check happened to see the damage.
+
+mlx-native 0.21.7 adds a masked compact schedule: an id equal to
+`num_experts` is neither validated, counted nor listed, any other
+out-of-range or duplicate id still poisons, masked rows are left unwritten,
+and a masked weighted reduce skips zero-weight routes without reading them.
+hf2q uses those entry points whenever a route mask is present. This is
+Splash's rule that rows beyond a lane's selected prefix do not count toward
+expert groups. On a development build, the exact Qwen3.6 four-agent Q5 with
+both switches passed 10 of 11 runs; in the other, one agent did not follow
+the six-step workflow, which is a task failure, not a server error. The same
+build without staged M8 passed 11 of 11, and the build pinned to the
+published mlx-native 0.21.7 passed 2 of 2 with both switches. These counts do
+not separate the two rates, so the combination is not quality-qualified. A
+fixed six-block
+same-binary campaign (`$E/qwen36-staged-masked-dev-d5-v1`) against the masked
+native expert matvecs passed all 12 gates but did not resolve a makespan
+effect: 5.77% lower with a 95% CI from 8.88% higher to 18.45% lower. Qwen3.6
+output length varied from 4,703 to 6,409 completion tokens between runs of
+one arm, so six blocks of makespan cannot resolve an effect of this size.
+Unprofiled stage traces, one run per arm, put the median four-lane cycle at
+56.47 ms with staged M8 and 61.06 ms without, at 4.18 and 3.98 accepted
+tokens per lane-cycle. The combination no longer fails; it carries no
+performance or quality claim.
+
+The same traces count what one cycle encodes. A four-lane Qwen3.6 cycle
+issues 8,107 compute dispatches and 2,763 memory barriers in 25 command
+buffers with three host waits; a one-lane cycle issues 3,204 dispatches. A
+four-lane Qwen3.8 cycle issues 12,147 dispatches and 4,331 barriers; a
+one-lane cycle 5,652. Dispatch count grows by about 1,630 (Qwen3.6) and
+2,170 (Qwen3.8) per added lane, so a large share of the graph is encoded per
+lane or per row rather than once over the 32-row tile.
+
+The count itself is not what the cycle costs. A throwaway mlx-native probe
+encoded the same numbers of 64-element dispatches with a barrier after every
+third, split over the same number of command buffers, and waited for all of
+them: 8,107 dispatches took 3.90 ms and 12,147 took 5.40 ms, about 0.5
+microseconds each, with 2.4 and 3.7 ms of host encode. Metal's fixed
+dispatch and barrier cost is therefore about 6% of the 61 ms Qwen3.6 cycle
+and 5% of the 114 ms Qwen3.8 cycle. The probe reuses one pipeline and one
+set of buffers, so it bounds Metal's overhead, not hf2q's own per-dispatch
+host work.
+
+That host work was then measured as the worker thread's CPU time per cycle:
+a four-lane Qwen3.6 cycle uses 12.5–13.6 ms of host CPU (about 1.6
+microseconds per dispatch) and a four-lane Qwen3.8 cycle 29.6 ms (2.4
+microseconds per dispatch), 17–25% of the cycle. The host does not bound
+the cycle today; the GPU does. It is a floor on the way down: Splash's whole
+Qwen3.6 GPU decode averages 20.99 ms per batch.
+
+A stage profile of the current routes (explicit profiling, one run per arm,
+development build) gives the median GPU time per cycle by category at four
+lanes on Qwen3.6:
+
+| Category (ms) | GPU adaptive rows | + staged M8, masked routes |
+|---|---:|---:|
+| Expert FFN (MoE) | 27.24 | 20.69 |
+| Full attention | 12.27 | 11.97 |
+| Draft command | 8.08 | 8.11 |
+| Dense projections | 7.75 | 7.74 |
+| DeltaNet recurrence and convolution | 2.43 | 2.35 |
+| Output head | 1.32 | 1.33 |
+| Other | 1.05 | 1.04 |
+| Target total, excluding the draft (median of per-cycle sums) | 53.01 | 45.52 |
+
+Staged M8 with masked routes cut expert GPU time by 24% and target GPU time
+by 14% in this pair of runs. Against Splash's 17.93 ms average target forward
+and about 3 ms for everything else in its cycle, the largest remaining items
+are the expert FFN, full attention (which grows with the lane count: 4.1,
+7.9, 10.0 and 12.3 ms at one to four lanes) and the draft command, whose
+8.1 ms does not vary with lanes. A two-lane cycle still pays 13.75 ms for
+dense projections and 2.75 ms for the head, against 7.75 and 1.32 ms at four
+lanes: the 16-row tile takes a slower kernel route than the 32-row tile.
+
+The same profile on Qwen3.8 with the prepared BF16 route (one run, pinned
+build) gives a four-lane target of 102.97 ms: stock-kernel projections for
+the DeltaNet and attention layers 31.10, prepared FFN 30.09, full attention
+28.71, DeltaNet recurrence and convolution 5.69, output head 4.49 and other
+1.92, beside an 18.53 ms draft command. Full attention is 9.78, 16.47, 28.32
+and 28.71 ms at one to four lanes. The DeltaNet and attention projections are
+now the largest item and still run the stock kernel; the earlier rejection of
+prepared DeltaNet projections was measured with profiling forced on and is
+not a valid rejection.
+
 #### Prepared BF16 target successor
 
 The source-complete Splash comparison then identified a stronger target
@@ -1002,10 +1097,10 @@ profiling unintentionally enabled in both arms: the Q5 case exported
 `MLX_PROFILE_CB=""`, and mlx-native up to 0.21.6 treats any present value as
 on, which makes every labeled commit synchronous. Its absolute times are
 inflated and it is superseded by the campaign below. The per-stage numbers and
-the accept/reject decisions above and below that rest on them (single
-64-layer chain, BF16 gate/up epilogue, prepared DeltaNet and output-head
-projections, last-arriver reduction) were measured under the same condition
-and have not been re-measured.
+the accept/reject decisions above and below that rest on them were measured
+under the same condition. Command-chain length has since been re-measured
+(below); the BF16 gate/up epilogue, the prepared DeltaNet and output-head
+projections and the last-arriver reduction have not.
 
 After mlx-native 0.21.6 was published (crate SHA256 `a4287522…6de0`, source
 `a02890be`), hf2q was pinned to `=0.21.6` with no local patch; the locked
@@ -1024,8 +1119,86 @@ seconds for the candidate and 69.758 seconds for the control. The arms do not
 produce identical text: every candidate run generated 5,361 completion tokens
 and every control run 5,255, so the candidate finished sooner while emitting
 2.0% more tokens. This qualifies the prepared weight mechanism against hf2q's
-stock target kernels. It does not satisfy the separate Splash-parity release
-gate: the candidate median is 3.65 times Splash's 16.420-second median.
+stock target kernels.
+
+It supports no gated Splash comparison. The 16.420344-second Splash median
+quoted in this ADR is the 17-run Splash arm of the Qwen3.6 campaign
+`q4-qwen36-dflash2-release-gate-v2`. Splash does load and serve the Qwen3.8
+artifact: 33 runs are retained, and in every one a single agent failed with
+"initial six-step workflow not followed", which aborts the run, so none has a
+makespan. The Qwen3.8 statements in this ADR that apply the Qwen3.6 median
+(the "4.918 times" ratio above, and the D5 gate text and comparator-validity
+risk below that call the 17-run arm a valid Qwen3.8 comparator) are flagged
+here and left unchanged pending an operator decision.
+
+The aborted Splash runs still carry per-turn timing on the same workload,
+artifact and host. Over the 16 runs of the strict-parity sweep (eight
+configurations), Splash produced 41.4 completion tokens per lane-second
+(38.1–49.2 by configuration) with a 4.79-second median first turn. The six
+unprofiled prepared-route runs produced 28.9 and a 10.61-second first turn;
+the six stock-kernel runs 24.4 and 10.90 seconds. A least-squares fit of turn
+time on uncached prompt tokens, completion tokens and a constant gives
+Splash 2.17 ms per uncached prompt token and 16.63 ms per completion token,
+and the prepared route 8.71 ms and 23.00 ms. On the prepared route's own
+token counts, prefill and decode each account for about half of the
+difference. These are per-lane times under four-lane contention from
+truncated Splash runs with different text, so they attribute the gap; they
+are not a verdict. hf2q prefills the four lanes of the first turn one after
+another (1.88, 1.61, 1.65 and 1.61 seconds for 720 tokens each) and spends
+18.7 of about 60 seconds of a run in prefill.
+
+Prefill was then attributed on the Qwen3.8 artifact (one diagnostic run with
+per-section host timing, and a model-free probe of the stock GGML matmul at
+the served shapes). Per run, 28 content chunks and 28 five-token generation-cue
+chunks are prefilled:
+
+| Chunk tokens | Chunks | Mean (ms) | ms per token |
+|---:|---:|---:|---:|
+| 5 (generation cue) | 28 | 76.5 | 15.30 |
+| 31 | 4 | 225.7 | 7.28 |
+| 72–118 | 8 | 306.8 | 3.41 |
+| 157 | 4 | 439.1 | 2.80 |
+| 197–201 | 4 | 505.6 | 2.53 |
+| 263–267 | 4 | 750.3 | 2.83 |
+| 720 | 4 | 1,682.5 | 2.34 |
+
+Four causes are measured:
+
+1. Every turn prefills twice: the content up to the stable prompt boundary,
+   then the five-token cue, because the per-slot anchor needs the DeltaNet
+   state at the boundary. The cue chunk is one more pass over the weights:
+   28 of them cost about 2.1 seconds of a 60-second run.
+2. The stock matmul is slow per row on mid-size chunks. The FFN gate
+   projection (17,408 by 5,120, Q4_K) runs at 6.8 TFLOP/s at 32 rows, 12.2 at
+   157, 37.7 at 720 and 45.2 at 2,048. The prepared BF16 kernel does the
+   32-row case in 0.214 ms against 0.838 ms. Twenty-four of the 28 content
+   chunks are 267 tokens or fewer and take about 10.1 of the 16.9 seconds of
+   content prefill.
+3. A full-attention layer costs 30–54 ms of a 720-token chunk against
+   16.7 ms for a DeltaNet layer. The FFN is 10.2 ms in both. The attention
+   projections sum to 3.9 ms and the flash-attention kernel to 1.1 ms in
+   isolation, so about 20 ms per full-attention layer (about 0.3 seconds per
+   720-token chunk) is not yet explained.
+4. The four lanes of a turn prefill one after another and nothing is shared
+   between them. Splash reports 309 of the 725 first-turn prompt tokens as
+   cached on a first turn; hf2q reports none.
+
+The kernel floor for this model is about 45.6 GFLOP per token, or about
+1.14 ms per token at the 40 TFLOP/s the stock matmul reaches on large
+chunks. The 720-token chunk is at 2.34 ms and the mid-size chunks at
+2.5–7.3 ms.
+
+Command-chain length was then re-measured without profiling on the same
+binary and prepared route, each run emitting the identical 5,361 completion
+tokens. Thirteen four-layer-chain runs span 58.074–61.660 seconds.
+`HF2Q_PARTIAL_CHAIN_N` of 1, 2, 3, 6, 8, 16 and 64 measured 59.865, 59.413,
+58.759, 59.322, 57.990, 58.603 and 61.351 seconds. Chain length therefore
+has no measurable effect from 1 to 64 at single-run precision. A first pass
+measured 1, 16 and 64 at about 63 seconds; those three runs directly
+followed a ten-minute Qwen3.6 campaign, and a later Qwen3.8 run that
+directly followed Qwen3.6 runs measured 73.162 seconds against 59.7–61.7 for
+the same binary minutes afterwards. Runs that directly follow a different
+model's load are not comparable and are excluded here.
 
 The follow-up two-pass BF16 gate/up epilogue also passed model-free parity and
 the exact task/tool gate, but its 113.745 ms four-lane target median was flat

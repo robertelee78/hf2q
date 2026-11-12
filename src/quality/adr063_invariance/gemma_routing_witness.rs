@@ -81,7 +81,11 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// Re-reviewed 0.21.3 -> 0.21.6 (`3b1a15e` -> `a02890b`): the witness op and
 /// all routing/routing-witness shaders are byte-identical. Registry additions
 /// for prepared dense and grouped expert kernels do not alter this route.
-pub const WITNESS_NATIVE_VERSION: &str = "0.21.6";
+/// Re-reviewed 0.21.6 -> 0.21.7 (`a02890b` -> `0905b9d`): the witness op and
+/// routing-witness shaders are byte-identical. The compact expert schedule
+/// gained a masked-route mode that is off unless a caller passes it; the
+/// unmasked schedule's validation and output are unchanged.
+pub const WITNESS_NATIVE_VERSION: &str = "0.21.7";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
