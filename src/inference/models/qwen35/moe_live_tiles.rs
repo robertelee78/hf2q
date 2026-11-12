@@ -25,7 +25,10 @@
 //! step runs it once per block of eight; the expert tiles, routed and shared,
 //! are row-independent by construction (`mlx_native::moe_tiles_*`). A row of
 //! a width-32 verify step is therefore bitwise the row this route decodes
-//! alone, whichever other rows and lanes share its step.
+//! alone, whichever other rows and lanes share its step. The one exception
+//! is an expert product that underflows FP32, which the register path and
+//! the matmul tile may round differently (results of magnitude at most
+//! 4e-31 in review).
 
 use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::dense_matvec_f32_rows::DENSE_MATVEC_F32_ROWS_MAX_ROWS;

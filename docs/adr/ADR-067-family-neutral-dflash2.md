@@ -1344,9 +1344,15 @@ matmul tile; Splash documents that its two tiles differ and that its MoE
 results depend on the step's other rows (`moe_expert_slab.h:16-27`). The
 router and shared-gate logits run the row-exact kernel per block of eight
 rows. A row of a masked width-32 step is therefore bitwise the row decoded
-alone, which the staged-M8 route does not guarantee. The kernel keeps 8-row
-tiles only: a kernel that also held 16- and 32-row matmuls ran every tile
-15% slower.
+alone, which the staged-M8 route does not guarantee. The equality excludes
+expert products that underflow FP32: the register path and `matmul2d` may
+round a subnormal product differently, so a result of that magnitude (an
+independent review observed at most 4e-31) can depend on how many routes
+share its expert. The kernel keeps 8-row tiles only: a kernel that also held
+16- and 32-row matmuls ran every tile 15% slower. The three MoE switches are
+resolved together before any weight upload, so an invalid value or
+combination fails startup, and the worker logs the resolved route as
+`moe_experts`.
 
 Model-free, the layer takes 0.375 ms (Q4_K down) and 0.411 ms (Q6_K down) on
 the recorded routes, 1.10 and 1.07 times Splash on the same routes. In situ,
