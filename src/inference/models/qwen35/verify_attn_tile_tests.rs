@@ -27,7 +27,7 @@ use super::verify_attn_tile::{
 use super::{default_layer_types, Qwen35Config, Qwen35MoeConfig, Qwen35Variant};
 use crate::serve::multi_seq_kv::SlotId;
 
-const HD: u32 = 256;
+pub(super) const HD: u32 = 256;
 const CAPACITY: u32 = 2_112;
 const N_SEQS: u32 = 4;
 /// Cursor of each slot: one page, a split boundary region, an almost empty
@@ -35,24 +35,24 @@ const N_SEQS: u32 = 4;
 const CURSORS: [u32; 4] = [299, 2_040, 5, 799];
 
 #[derive(Clone, Copy)]
-struct Geometry {
-    nh: u32,
-    nkv: u32,
+pub(super) struct Geometry {
+    pub(super) nh: u32,
+    pub(super) nkv: u32,
 }
 
-const QWEN38: Geometry = Geometry { nh: 24, nkv: 4 };
-const QWEN36: Geometry = Geometry { nh: 16, nkv: 2 };
+pub(super) const QWEN38: Geometry = Geometry { nh: 24, nkv: 4 };
+pub(super) const QWEN36: Geometry = Geometry { nh: 16, nkv: 2 };
 
 impl Geometry {
-    fn q_total(self) -> usize {
+    pub(super) fn q_total(self) -> usize {
         (self.nh * HD) as usize
     }
 
-    fn kv_total(self) -> usize {
+    pub(super) fn kv_total(self) -> usize {
         (self.nkv * HD) as usize
     }
 
-    fn cfg(self) -> Qwen35Config {
+    pub(super) fn cfg(self) -> Qwen35Config {
         Qwen35Config {
             variant: Qwen35Variant::Moe,
             hidden_size: 2048,
@@ -182,11 +182,11 @@ fn f32_buffer(device: &MlxDevice, values: &[f32], shape: Vec<usize>) -> MlxBuffe
 
 /// One window row: IMROPE'd Q, K and V, and the attention gate.
 #[derive(Clone)]
-struct Row {
-    q: Vec<f32>,
-    k: Vec<f32>,
-    v: Vec<f32>,
-    gate: Vec<f32>,
+pub(super) struct Row {
+    pub(super) q: Vec<f32>,
+    pub(super) k: Vec<f32>,
+    pub(super) v: Vec<f32>,
+    pub(super) gate: Vec<f32>,
 }
 
 /// Eight rows for each slot.
@@ -280,15 +280,37 @@ fn tile_step(
     width: usize,
     scratch: &VerifyTileScratch,
 ) -> Vec<f32> {
+    let lanes: Vec<(u32, Vec<&Row>)> = step
+        .iter()
+        .map(|&(slot, rows)| (slot, inputs[slot as usize][..rows].iter().collect()))
+        .collect();
+    tile_step_rows(
+        device, registry, geometry, cache, &lanes, width, CAPACITY, scratch,
+    )
+}
+
+/// The tiled route for a step whose lanes are `(slot, window rows)` in packed
+/// order, on a cache of `capacity` tokens per slot: the gated packed rows.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn tile_step_rows(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    geometry: Geometry,
+    cache: &mut HybridKvCache,
+    lanes: &[(u32, Vec<&Row>)],
+    width: usize,
+    capacity: u32,
+    scratch: &VerifyTileScratch,
+) -> Vec<f32> {
     let mut windows = Vec::new();
     let mut packed: Vec<&Row> = Vec::new();
-    for &(slot, rows) in step {
+    for (slot, rows) in lanes {
         windows.push(JointWindow {
-            slot: SlotId(slot),
+            slot: SlotId(*slot),
             start: packed.len(),
-            rows,
+            rows: rows.len(),
         });
-        packed.extend(inputs[slot as usize][..rows].iter());
+        packed.extend(rows.iter().copied());
     }
     // Padding rows carry row 0's inputs, as the joint step packs them.
     while packed.len() < width {
@@ -314,7 +336,7 @@ fn tile_step(
         geometry.nh,
         geometry.nkv,
         HD,
-        CAPACITY
+        capacity
     )
     .expect("route probe"));
     let mut enc = device.command_encoder().expect("encoder");
@@ -333,18 +355,22 @@ fn tile_step(
         geometry.nh,
         geometry.nkv,
         HD,
-        CAPACITY,
+        capacity,
     )
     .expect("tiled verify attention");
     enc.commit_and_wait().expect("tiled verify completion");
     gated.as_slice::<f32>().unwrap()[..width * geometry.q_total()].to_vec()
 }
 
-fn bits(values: &[f32]) -> Vec<u32> {
+pub(super) fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|x| x.to_bits()).collect()
 }
 
-fn tile_available(device: &MlxDevice, registry: &mut KernelRegistry, geometry: Geometry) -> bool {
+pub(super) fn tile_available(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    geometry: Geometry,
+) -> bool {
     let cache =
         HybridKvCache::new_with_options(&geometry.cfg(), device, 64, 1, true).expect("cache");
     let window = [JointWindow {
