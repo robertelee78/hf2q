@@ -37,7 +37,7 @@ pub(in crate::serve::api) const DFLASH2_CONTEXT_FIRST_ENV: &str = "HF2Q_DFLASH2_
 
 /// Whether a step submits its draft-context commit before it encodes the
 /// DeltaNet replay (read once).
-fn context_first() -> bool {
+pub(in crate::serve::api) fn context_first() -> bool {
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
         std::env::var(DFLASH2_CONTEXT_FIRST_ENV)
             .map(|value| value == "1")
@@ -591,9 +591,8 @@ impl Qwen35LoadedModel {
         // Context first: the draft-context commit needs only the retained
         // counts, so it goes to the GPU before the replay is encoded. The
         // GPU, idle since the output head, starts it while the host encodes
-        // the replay behind it, and the replay's wait covers both commands.
-        // The commit's host checks run first, so only a failing replay
-        // command can leave a submitted context without its replay.
+        // the replay. The commit's host checks run first, so only a failing
+        // replay command can leave a submitted context without its replay.
         let context_first = !gpu_acceptance
             && context_first()
             && self
@@ -603,27 +602,28 @@ impl Qwen35LoadedModel {
         timeline_mark("target_commit_begin");
         let target_commit_started = trace_timing.then(Instant::now);
         let lease = supervisor.arm("Qwen35 DFlash2 commit", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
+        // Waits this step makes that mlx-native's sync counter does not see
+        // (it counts `commit_and_wait` only).
+        let mut uncounted_waits = 0_u64;
         let (committed, pipelined_context) = if context_first {
-            // No early return between the submission and its wait: nothing
-            // may touch the rings on the host while the command runs.
             let submitted = self.model.with_gpu_cache_mut(|device, registry| {
                 runtime.submit_target_context(device, registry, &retained)
             });
             timeline_mark("context_submitted");
-            let committed = self.model.commit_joint_verify(kv_cache, pending, &accepted);
-            // The context sits before the replay on the queue: after the
-            // waited replay this returns at once.
-            let context = submitted.and_then(|submitted| {
-                let finished =
-                    runtime.finish_target_context(submitted, &retained, committed.is_ok());
-                if committed.is_err() {
-                    // The rings hold rows of a step that did not commit.
-                    for &index in &verifying {
-                        runtime.clear_lane(states[index].slot_id.0 as usize)?;
-                    }
-                }
-                finished
-            });
+            uncounted_waits += u64::from(submitted.is_ok());
+            let step_lanes = verifying
+                .iter()
+                .map(|&index| states[index].slot_id.0 as usize)
+                .collect::<Vec<_>>();
+            // The replay and the context commit overlap on the GPU; they
+            // share no resource, and `settle_context_first` waits for the
+            // context command itself after the replay's wait, also when the
+            // replay failed. No early return may come between the
+            // submission above and that call.
+            let (committed, context) =
+                runtime.settle_context_first(submitted, &retained, &step_lanes, || {
+                    self.model.commit_joint_verify(kv_cache, pending, &accepted)
+                });
             (committed, Some(context))
         } else {
             (
@@ -638,6 +638,14 @@ impl Qwen35LoadedModel {
         timeline_mark("draft_commit_begin");
         let draft_commit_started = trace_timing.then(Instant::now);
         if let Err(error) = committed {
+            if let Some(Err(cleanup)) = &pipelined_context {
+                // The step failed after its context commit was submitted and
+                // the draft rings could not be waited for or cleared: stop
+                // the worker rather than draft from them.
+                return Err(error.context(format!(
+                    "Qwen DFlash2 draft rings left unsettled by a failed step: {cleanup:#}"
+                )));
+            }
             if gpu_acceptance || is_fatal(&error) {
                 return Err(error);
             }
@@ -721,7 +729,7 @@ impl Qwen35LoadedModel {
                 total_us = started.elapsed().as_micros(),
                 dispatches = now.0.wrapping_sub(entry.0),
                 command_buffers = now.1.wrapping_sub(entry.1),
-                host_waits = now.2.wrapping_sub(entry.2),
+                host_waits = now.2.wrapping_sub(entry.2) + uncounted_waits,
                 barriers = now.3.wrapping_sub(entry.3),
                 host_cpu_us = now.4.wrapping_sub(entry.4),
                 "Qwen DFlash2 stage timing"

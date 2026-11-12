@@ -176,11 +176,24 @@ def main():
     dispatches = barriers = 0
     previous_end = None
     previous_lanes = None
+    unfinished = 0
+    dropped = {"dropped_commands": 0, "dropped_marks": 0}
     with open(args.file, encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
             cycle = json.loads(line)
+            for key in dropped:
+                dropped[key] = max(dropped[key], cycle.get(key, 0))
+            if not cycle.get("finished", True):
+                # A step that returned early: its commands still advance the
+                # counters the next cycle's first command is measured from.
+                unfinished += 1
+                if cycle["commands"]:
+                    dispatches = cycle["commands"][-1]["dispatches_at_commit"]
+                    barriers = cycle["commands"][-1]["barriers_at_commit"]
+                previous_end = None
+                continue
             reduced, dispatches, barriers = reduce_cycle(cycle, dispatches, barriers)
             if reduced is None:
                 previous_end = None
@@ -203,6 +216,10 @@ def main():
             previous_end, previous_lanes = reduced["end"], cycle["active_lanes"]
             cycles.append(reduced)
 
+    if unfinished:
+        print(f"note: {unfinished} cycles returned early and are not reduced")
+    if any(dropped.values()):
+        print(f"WARNING: the recorder discarded records ({dropped}); the capture has gaps")
     kept = [cycle for cycle in cycles if cycle["lanes"] == args.lanes][args.skip :]
     if not kept:
         sys.exit(f"no {args.lanes}-lane cycles in {args.file}")

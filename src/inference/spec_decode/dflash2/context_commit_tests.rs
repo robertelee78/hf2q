@@ -1,11 +1,20 @@
-//! A submitted draft-context commit (`HF2Q_DFLASH2_CONTEXT_FIRST=1`) against
-//! the waited one.
+//! The context-first commit order (`HF2Q_DFLASH2_CONTEXT_FIRST=1`) against
+//! the waited draft-context commit.
 //!
-//! The context-first order hands the context commit to the GPU, commits
-//! another command behind it on the same queue (the DeltaNet replay) and
-//! waits once. The rings and lane lengths it leaves must be the waited
-//! commit's bits at every step, also past a ring wrap and with partial and
-//! empty retained counts.
+//! The context-first order hands the context commit to the GPU, runs the
+//! target's replay commit (another command, committed and waited for while
+//! the context commit may still be executing) and then waits for the
+//! context command itself. These tests call the function the scheduler's
+//! context-first branch calls, [`DFlash2Runtime::settle_context_first`]:
+//!
+//! - success: the rings and lane lengths are the waited commit's bits at
+//!   every step, also past a ring wrap and with partial and empty retained
+//!   counts, on both draft routes;
+//! - a replay that fails after the context was submitted: no lane length
+//!   advances, the step's lanes are cleared, other lanes keep their bytes,
+//!   and the replay's error is returned;
+//! - a lane that cannot be cleared: the remaining lanes are still cleared
+//!   and the failure is reported, not dropped.
 //!
 //! Needs Apple Metal (`hf2q_gpu_test_lock`):
 //!
@@ -13,8 +22,9 @@
 //! cargo test --release --bin hf2q context_commit_tests
 //! ```
 
+use anyhow::anyhow;
 use mlx_native::ops::copy::dispatch_copy_f32;
-use mlx_native::{DType, KernelRegistry, MlxDevice};
+use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::*;
 use crate::inference::spec_decode::dflash2::config::DFlash2LayerType;
@@ -107,18 +117,26 @@ fn rings(runtime: &DFlash2Runtime) -> Vec<Vec<u16>> {
         .collect()
 }
 
-#[test]
-fn submitted_context_commit_is_the_waited_commit_bitwise() {
-    let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let Ok(device) = MlxDevice::new() else {
-        return;
-    };
-    for staged in [false, true] {
-        let mut registry = KernelRegistry::new();
-        let mut waited = runtime(&device, staged);
-        let mut submitted = runtime(&device, staged);
-        // The command committed behind the submitted context: an unrelated
-        // copy, standing in for the replay.
+/// One lane's elements of every ring.
+fn lane_rings(runtime: &DFlash2Runtime, lane: usize) -> Vec<Vec<u16>> {
+    let per_lane = runtime.config.num_key_value_heads
+        * runtime.config.sliding_window
+        * runtime.config.head_dim;
+    rings(runtime)
+        .into_iter()
+        .map(|ring| ring[lane * per_lane..(lane + 1) * per_lane].to_vec())
+        .collect()
+}
+
+/// The stand-in for the target's replay commit: an unrelated command,
+/// committed and waited for while the context commit may still run.
+struct Replay {
+    source: MlxBuffer,
+    sink: MlxBuffer,
+}
+
+impl Replay {
+    fn new(device: &MlxDevice) -> Self {
         let mut source = device
             .alloc_buffer(4_096 * 4, DType::F32, vec![4_096])
             .unwrap();
@@ -126,7 +144,38 @@ fn submitted_context_commit_is_the_waited_commit_bitwise() {
         let sink = device
             .alloc_buffer(4_096 * 4, DType::F32, vec![4_096])
             .unwrap();
-        let (mut waited_state, mut submitted_state) = (29_u64, 29_u64);
+        Self { source, sink }
+    }
+
+    fn run(&self, device: &MlxDevice, registry: &mut KernelRegistry) -> anyhow::Result<()> {
+        let mut encoder = device.command_encoder()?;
+        dispatch_copy_f32(
+            &mut encoder,
+            registry,
+            device.metal_device(),
+            &self.source,
+            &self.sink,
+            0,
+            0,
+            4_096,
+        )?;
+        encoder.commit_and_wait()?;
+        Ok(())
+    }
+}
+
+#[test]
+fn context_first_is_the_waited_commit_bitwise() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let Ok(device) = MlxDevice::new() else {
+        return;
+    };
+    for staged in [false, true] {
+        let mut registry = KernelRegistry::new();
+        let mut waited = runtime(&device, staged);
+        let mut first = runtime(&device, staged);
+        let replay = Replay::new(&device);
+        let (mut waited_state, mut first_state) = (29_u64, 29_u64);
         for step in 0..40_u32 {
             let retained = [8, step % 9, 3, 0];
             stage_step(&mut waited, &mut waited_state);
@@ -134,60 +183,159 @@ fn submitted_context_commit_is_the_waited_commit_bitwise() {
                 .commit_target_context(&device, &mut registry, &retained)
                 .unwrap();
 
-            stage_step(&mut submitted, &mut submitted_state);
-            let pending = submitted
-                .submit_target_context(&device, &mut registry, &retained)
-                .unwrap();
+            stage_step(&mut first, &mut first_state);
+            let before = first.lane_lengths.clone();
+            let submitted = first.submit_target_context(&device, &mut registry, &retained);
             assert_eq!(
-                submitted.lane_lengths,
-                waited
-                    .lane_lengths
-                    .iter()
-                    .zip(&retained)
-                    .map(|(length, rows)| length - *rows as usize)
-                    .collect::<Vec<_>>(),
+                first.lane_lengths, before,
                 "step {step}: a submission moved the lane lengths"
             );
-            let mut behind = device.command_encoder().unwrap();
-            dispatch_copy_f32(
-                &mut behind,
-                &mut registry,
-                device.metal_device(),
-                &source,
-                &sink,
-                0,
-                0,
-                4_096,
-            )
-            .unwrap();
-            behind.commit_and_wait().unwrap();
-            submitted
-                .finish_target_context(pending, &retained, true)
-                .unwrap();
+            let (committed, context) =
+                first.settle_context_first(submitted, &retained, &[0, 1, 2, 3], || {
+                    replay.run(&device, &mut registry)
+                });
+            committed.unwrap();
+            context.unwrap();
 
             assert_eq!(
-                submitted.lane_lengths, waited.lane_lengths,
+                first.lane_lengths, waited.lane_lengths,
                 "staged={staged} step {step}: lane lengths"
             );
             assert!(
-                rings(&submitted) == rings(&waited),
-                "staged={staged} step {step}: the submitted commit left other ring bytes"
+                rings(&first) == rings(&waited),
+                "staged={staged} step {step}: the context-first order left other ring bytes"
             );
         }
         assert!(
             waited.lane_lengths[0] > waited.config.sliding_window,
             "the rings never wrapped"
         );
-
-        // A failed step: the wait still happens, the lengths stay.
-        let lengths = submitted.lane_lengths.clone();
-        stage_step(&mut submitted, &mut submitted_state);
-        let pending = submitted
-            .submit_target_context(&device, &mut registry, &[8, 8, 8, 8])
-            .unwrap();
-        submitted
-            .finish_target_context(pending, &[8, 8, 8, 8], false)
-            .unwrap();
-        assert_eq!(submitted.lane_lengths, lengths);
     }
+}
+
+/// The replay fails after the context commit was submitted.
+#[test]
+fn a_failed_replay_after_submission_advances_nothing_and_clears_the_step_lanes() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let Ok(device) = MlxDevice::new() else {
+        return;
+    };
+    for staged in [false, true] {
+        let mut registry = KernelRegistry::new();
+        let mut runtime = runtime(&device, staged);
+        let mut state = 31_u64;
+        // History in every lane, past a wrap in lanes 0 and 2.
+        for _ in 0..36 {
+            stage_step(&mut runtime, &mut state);
+            runtime
+                .commit_target_context(&device, &mut registry, &[8, 5, 8, 2])
+                .unwrap();
+        }
+        let lengths = runtime.lane_lengths.clone();
+        let untouched = [lane_rings(&runtime, 2), lane_rings(&runtime, 3)];
+        assert!(lane_rings(&runtime, 0)
+            .iter()
+            .flatten()
+            .any(|&bits| bits != 0));
+
+        // The failing step holds lanes 0 and 1.
+        let retained = [8, 3, 0, 0];
+        stage_step(&mut runtime, &mut state);
+        let submitted = runtime.submit_target_context(&device, &mut registry, &retained);
+        let (committed, context) =
+            runtime.settle_context_first(submitted, &retained, &[0, 1], || {
+                Err(anyhow!("replay command failed"))
+            });
+        assert_eq!(
+            committed.unwrap_err().to_string(),
+            "replay command failed",
+            "the replay's own error is what the caller sees"
+        );
+        context.expect("the context command was waited for and the lanes were cleared");
+        assert_eq!(
+            runtime.lane_lengths,
+            [0, 0, lengths[2], lengths[3]],
+            "staged={staged}: a failed step advanced a lane or left its lanes' lengths"
+        );
+        for lane in [0, 1] {
+            assert!(
+                lane_rings(&runtime, lane)
+                    .iter()
+                    .flatten()
+                    .all(|&bits| bits == 0),
+                "staged={staged}: lane {lane} of the failed step was not cleared"
+            );
+        }
+        assert!(
+            [lane_rings(&runtime, 2), lane_rings(&runtime, 3)] == untouched,
+            "staged={staged}: a lane outside the failed step changed"
+        );
+
+        // The cleared lanes take a new history like fresh ones.
+        stage_step(&mut runtime, &mut state);
+        runtime
+            .commit_target_context(&device, &mut registry, &[8, 8, 0, 0])
+            .unwrap();
+        assert_eq!(runtime.lane_lengths, [8, 8, lengths[2], lengths[3]]);
+    }
+}
+
+/// A lane that cannot be cleared does not stop the cleanup of the others,
+/// and its failure reaches the caller.
+#[test]
+fn a_failed_clear_is_reported_and_the_other_lanes_are_still_cleared() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let Ok(device) = MlxDevice::new() else {
+        return;
+    };
+    let mut registry = KernelRegistry::new();
+    let mut runtime = runtime(&device, false);
+    let mut state = 37_u64;
+    for _ in 0..4 {
+        stage_step(&mut runtime, &mut state);
+        runtime
+            .commit_target_context(&device, &mut registry, &[8, 8, 8, 8])
+            .unwrap();
+    }
+    let retained = [8, 8, 0, 0];
+    stage_step(&mut runtime, &mut state);
+    let submitted = runtime.submit_target_context(&device, &mut registry, &retained);
+    // Lane 9 does not exist: its clear fails, first in the list.
+    let (committed, context) =
+        runtime.settle_context_first(submitted, &retained, &[9, 0, 1], || {
+            Err(anyhow!("replay command failed"))
+        });
+    assert!(committed.is_err());
+    let error = format!("{:#}", context.unwrap_err());
+    assert!(
+        error.contains("clear DFlash2 lane 9"),
+        "the failed clear is not what was reported: {error}"
+    );
+    assert_eq!(runtime.lane_lengths, [0, 0, 32, 32]);
+    for lane in [0, 1] {
+        assert!(
+            lane_rings(&runtime, lane)
+                .iter()
+                .flatten()
+                .all(|&bits| bits == 0),
+            "lane {lane} was not cleared after an earlier clear failed"
+        );
+    }
+
+    // A submission that failed is reported after the replay ran; a replay
+    // that succeeded is not turned into a failure of the step's lanes.
+    let lengths = runtime.lane_lengths.clone();
+    let mut replay_ran = false;
+    let (committed, context) = runtime.settle_context_first(
+        Err(anyhow!("context encode failed")),
+        &retained,
+        &[0, 1],
+        || {
+            replay_ran = true;
+            Ok(())
+        },
+    );
+    assert!(replay_ran && committed.is_ok());
+    assert_eq!(context.unwrap_err().to_string(), "context encode failed");
+    assert_eq!(runtime.lane_lengths, lengths);
 }

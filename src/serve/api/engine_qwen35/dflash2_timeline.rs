@@ -11,9 +11,23 @@
 //! Recording changes no commit into a wait and adds nothing to a command.
 //! Command buffers are held until the cycle's line is written, after the
 //! cycle's own timing has been taken.
+//!
+//! Limits of a development diagnostic:
+//!
+//! - The file must not exist: a capture is never truncated or appended to.
+//!   The path must be absolute. Either refusal is logged once and leaves the
+//!   timeline off.
+//! - The recorder and the file are process-wide: one engine per process.
+//! - A cycle that returns early still writes its line (`finished: false`)
+//!   and releases the command buffers held for it. Command buffers
+//!   committed outside DFlash2 cycles (prefill, serial decode) are held
+//!   until the next cycle's line; mlx-native discards them beyond 4,096
+//!   commands and counts what it discarded, and every line carries those
+//!   counters (`dropped_commands`, `dropped_marks`; nonzero means a gap).
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 
 use mlx_native::command_timeline::{self, CommandTimeline};
@@ -21,19 +35,31 @@ use mlx_native::command_timeline::{self, CommandTimeline};
 /// Output file of the diagnostic cycle timeline; unset or empty is off.
 pub(super) const DFLASH2_CYCLE_TIMELINE_ENV: &str = "HF2Q_DFLASH2_CYCLE_TIMELINE";
 
+/// Open `path` for a new capture: absolute, and not an existing file.
+fn open_capture(path: &Path) -> Result<File, String> {
+    if !path.is_absolute() {
+        return Err("the path is not absolute".to_owned());
+    }
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| error.to_string())
+}
+
 static SINK: LazyLock<Option<Mutex<BufWriter<File>>>> = LazyLock::new(|| {
     let path = std::env::var(DFLASH2_CYCLE_TIMELINE_ENV).ok()?;
     if path.is_empty() {
         return None;
     }
-    match File::create(&path) {
+    match open_capture(Path::new(&path)) {
         Ok(file) => {
             command_timeline::set_enabled(true);
             tracing::info!(path, "Qwen DFlash2 cycle timeline enabled");
             Some(Mutex::new(BufWriter::new(file)))
         }
-        Err(error) => {
-            tracing::warn!(path, %error, "Qwen DFlash2 cycle timeline disabled: cannot create file");
+        Err(reason) => {
+            tracing::warn!(path, reason, "Qwen DFlash2 cycle timeline disabled");
             None
         }
     }
@@ -41,7 +67,11 @@ static SINK: LazyLock<Option<Mutex<BufWriter<File>>>> = LazyLock::new(|| {
 
 /// One scheduler step being recorded. Host marks are placed with
 /// `mlx_native::command_timeline::mark`, here and in the forward it calls.
-pub(super) struct Cycle(());
+/// Dropping it writes the cycle's line, so a step that returns early does
+/// not leave its command buffers held.
+pub(super) struct Cycle {
+    summary: Option<CycleSummary>,
+}
 
 /// Summary fields of a finished cycle.
 pub(super) struct CycleSummary {
@@ -59,24 +89,36 @@ impl Cycle {
         // no line.
         drop(command_timeline::drain_marks());
         command_timeline::mark("begin");
-        Some(Self(()))
+        Some(Self { summary: None })
     }
 
+    /// Record that the cycle ran to its end; its line is written when the
+    /// value drops.
+    pub(super) fn finish(mut self, summary: CycleSummary) {
+        self.summary = Some(summary);
+    }
+}
+
+impl Drop for Cycle {
     /// Write the cycle's line. Commands committed before the cycle began
-    /// (prefill, a previous cycle that returned early) are included; the
-    /// reducer attributes a command to the cycle by its commit time.
-    pub(super) fn finish(self, summary: CycleSummary) {
+    /// (prefill, serial decode) are included; the reducer attributes a
+    /// command to the cycle by its commit time.
+    fn drop(&mut self) {
         command_timeline::mark("end");
         let Some(sink) = SINK.as_ref() else {
             return;
         };
         let marks = command_timeline::drain_marks();
         let commands = command_timeline::drain();
+        let summary = self.summary.as_ref();
         let line = serde_json::json!({
-            "active_lanes": summary.active_lanes,
-            "selected_rows": summary.selected_rows,
-            "accepted_rows": summary.accepted_rows,
-            "gpu_acceptance": summary.gpu_acceptance,
+            "finished": summary.is_some(),
+            "active_lanes": summary.map(|summary| summary.active_lanes),
+            "selected_rows": summary.map(|summary| summary.selected_rows),
+            "accepted_rows": summary.map(|summary| summary.accepted_rows),
+            "gpu_acceptance": summary.map(|summary| summary.gpu_acceptance),
+            "dropped_commands": command_timeline::dropped(),
+            "dropped_marks": command_timeline::dropped_marks(),
             "marks": marks,
             "commands": commands.iter().map(command_json).collect::<Vec<_>>(),
         });
@@ -108,4 +150,28 @@ fn command_json(command: &CommandTimeline) -> serde_json::Value {
         "completed": command.completed,
         "waited_in_drain": command.waited_in_drain,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_capture_is_never_truncated_and_needs_an_absolute_path() {
+        let directory =
+            std::env::temp_dir().join(format!("hf2q-dflash2-timeline-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("capture.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(open_capture(Path::new("relative/capture.jsonl")).is_err());
+        drop(open_capture(&path).expect("a new file opens"));
+        std::fs::write(&path, b"earlier capture\n").unwrap();
+        assert!(
+            open_capture(&path).is_err(),
+            "an existing capture was opened"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"earlier capture\n");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 }

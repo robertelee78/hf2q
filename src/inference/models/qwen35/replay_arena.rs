@@ -18,12 +18,22 @@
 //! the reader on the same queue (the conv rows, scaled Q, normed K, V and the
 //! packed `g`/`beta` rows by the forward; the K-1 staged conv-state rows and
 //! the output scratch by the replay itself). A step's results are therefore
-//! the stock route's bits (Class A); `replay_arena_tests` holds that with an
-//! arena filled with NaN before every step.
+//! the stock route's bits (Class A); `replay_arena_tests` holds that with
+//! the arena poisoned before every step. A change to any dispatch that
+//! writes this storage must keep that property, or clear what it no longer
+//! writes.
 //!
 //! An arena is owned by exactly one step at a time: a step takes it out of
 //! the thread's cell and gives it back when its replay storage drops. A
 //! second live step allocates its own.
+//!
+//! The retained arena is not part of any memory admission or budget (the
+//! per-step allocation it replaces was not either): it grows to the largest
+//! step the worker has run, never shrinks, and is released when the worker
+//! thread ends. A retained arena too small for a step is released before
+//! the larger one is allocated, so a worker holds one arena at most while
+//! no step is between forward and commit. The cell is per thread, not per
+//! device; a worker owns one device for its lifetime.
 
 use std::cell::RefCell;
 use std::sync::LazyLock;
@@ -132,6 +142,12 @@ pub(crate) fn fill_retained(value: f32) -> bool {
 #[cfg(test)]
 pub(crate) fn release_retained() {
     RETAINED.with(|cell| cell.borrow_mut().take());
+}
+
+/// Whether this thread holds a retained arena.
+#[cfg(test)]
+pub(crate) fn has_retained() -> bool {
+    RETAINED.with(|cell| cell.borrow().is_some())
 }
 
 /// Fresh replay allocations made on this thread so far.

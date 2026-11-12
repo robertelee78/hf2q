@@ -304,6 +304,8 @@ pub(super) fn qwen35_joint_decode_config(
         }),
         pooled_outputs = selected.is_some_and(|config| config.step.pooled_outputs),
         joint_mtp = selected.is_some_and(|config| config.joint_mtp),
+        verify_replay_reuse = crate::inference::models::qwen35::replay_arena::enabled(),
+        dflash2_context_first = crate::serve::api::engine_qwen35::dflash2_context_first(),
         unavailable = unavailable.as_deref().unwrap_or("none"),
         "Qwen joint decode configuration"
     );

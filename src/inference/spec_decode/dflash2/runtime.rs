@@ -520,7 +520,14 @@ impl DFlash2Runtime {
     /// it to the GPU without waiting. The rings are being written until
     /// [`Self::finish_target_context`] returns: until then nothing may read
     /// or write them on the host, and the lane lengths are unchanged.
-    /// Commands committed after this one on the same queue run after it.
+    ///
+    /// Committing another command afterwards does not order it behind this
+    /// one: with a concurrent compute encoder per command, a later command
+    /// of the same queue was measured starting before this one ended in
+    /// most cycles. A later command may therefore share no resource with
+    /// the context commit (which reads the captured target rows, the
+    /// retained counts and the ring positions and writes the draft rings),
+    /// and only [`Self::finish_target_context`] says the rings are settled.
     pub(crate) fn submit_target_context(
         &mut self,
         device: &MlxDevice,
@@ -532,9 +539,10 @@ impl DFlash2Runtime {
         Ok(SubmittedContextCommit { encoder })
     }
 
-    /// Wait for a submitted context commit. `advance` moves each lane's
-    /// length past the rows it retained; pass `false` when the step the
-    /// rows belong to failed after the submission, and then clear those
+    /// Wait for a submitted context commit itself (a wait on a later
+    /// command of the queue does not stand in for it). `advance` moves each
+    /// lane's length past the rows it retained; pass `false` when the step
+    /// the rows belong to failed after the submission, and then clear those
     /// lanes: a ring that has wrapped lost its oldest rows to the commit.
     pub(crate) fn finish_target_context(
         &mut self,
@@ -550,6 +558,57 @@ impl DFlash2Runtime {
             self.advance_lane_lengths(retained_counts)?;
         }
         Ok(())
+    }
+
+    /// The context-first order of a step that settles acceptance on the
+    /// host, from the submission on: run `replay` (the target's verify
+    /// commit, which encodes, commits and waits for its own replay command)
+    /// while the submitted context commit executes, then wait for the
+    /// context command.
+    ///
+    /// The two commands overlap on the GPU in most cycles and either may
+    /// finish first; nothing orders them. That is correct because they share
+    /// no resource (the replay reads the verify step's replay storage and
+    /// writes the target's DeltaNet state; the context commit reads the
+    /// captured target rows and writes the draft rings) and because this
+    /// function waits for the context command before it returns, whatever
+    /// `replay` returned. That wait must not be removed: the replay's own
+    /// wait does not cover the context command.
+    ///
+    /// Returns `replay`'s result and the context's. A failed submission is
+    /// reported in the context's after `replay` ran, as in the stock order.
+    /// When `replay` fails, the lane lengths do not advance and the lanes of
+    /// `step_lanes` are cleared, because their rings hold rows of a step
+    /// that did not commit: every lane is attempted, and a clear that fails
+    /// is reported in the context's result (the first failure; later ones
+    /// are logged) so the caller can stop instead of serving from a ring it
+    /// could not reset.
+    pub(crate) fn settle_context_first(
+        &mut self,
+        submitted: Result<SubmittedContextCommit>,
+        retained_counts: &[u32],
+        step_lanes: &[usize],
+        replay: impl FnOnce() -> Result<()>,
+    ) -> (Result<()>, Result<()>) {
+        let committed = replay();
+        let mut context = submitted.and_then(|submitted| {
+            self.finish_target_context(submitted, retained_counts, committed.is_ok())
+        });
+        if committed.is_err() {
+            for &lane in step_lanes {
+                let cleared = self
+                    .clear_lane(lane)
+                    .with_context(|| format!("clear DFlash2 lane {lane} after a failed step"));
+                match (cleared, context.is_ok()) {
+                    (Ok(()), _) => {}
+                    (Err(error), true) => context = Err(error),
+                    (Err(error), false) => {
+                        tracing::error!(error = %format!("{error:#}"), "DFlash2 lane cleanup failed");
+                    }
+                }
+            }
+        }
+        (committed, context)
     }
 
     fn encode_target_context(
