@@ -1730,7 +1730,10 @@ fn apply_q_gate_projection_f32_into(
             )
         }
         FullAttnQGateWeightsGpu::Fused { weight, ggml_type } => {
-            let fused = apply_linear_projection_f32_with_ggml_type(
+            // Pooled, like the K/V/output projections of this layer: a fresh
+            // device buffer here was zero-filled on the CPU for every layer
+            // and dropped while its command buffer was still in flight.
+            let fused = apply_linear_projection_f32_pooled_with_ggml_type(
                 encoder,
                 registry,
                 device,
@@ -1740,38 +1743,270 @@ fn apply_q_gate_projection_f32_into(
                 seq_len,
                 hidden_size,
                 2 * q_total,
-            )?
-            .with_shape(vec![
-                seq_len as usize,
-                n_heads as usize,
-                (2 * head_dim) as usize,
-            ])
-            .map_err(|e| anyhow!("shape native fused Q/gate activation: {e}"))?;
-            let q_view = q_dst
-                .with_shape(vec![seq_len as usize, n_heads as usize, head_dim as usize])
-                .map_err(|e| anyhow!("shape Q destination: {e}"))?;
-            let gate_view = gate_dst
-                .with_shape(vec![seq_len as usize, n_heads as usize, head_dim as usize])
-                .map_err(|e| anyhow!("shape gate destination: {e}"))?;
-            // The fused matmul above produces `fused`; the deinterleave below
-            // reads it in the same concurrent command encoder.
-            encoder.memory_barrier();
-            mlx_native::dispatch_q_gate_deinterleave_f32(
+            )?;
+            deinterleave_q_gate_f32_into(
+                encoder, registry, device, fused, q_dst, gate_dst, seq_len, n_heads, head_dim,
+            )
+        }
+    }
+}
+
+/// Split a fused `[seq_len, 2 * n_heads * head_dim]` Q/gate projection into
+/// the caller's flat Q and gate buffers. Encodes the barrier that orders it
+/// after the projection.
+#[allow(clippy::too_many_arguments)]
+fn deinterleave_q_gate_f32_into(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    fused: MlxBuffer,
+    q_dst: &MlxBuffer,
+    gate_dst: &MlxBuffer,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+) -> Result<()> {
+    let fused = fused
+        .with_shape(vec![
+            seq_len as usize,
+            n_heads as usize,
+            (2 * head_dim) as usize,
+        ])
+        .map_err(|e| anyhow!("shape native fused Q/gate activation: {e}"))?;
+    let q_view = q_dst
+        .with_shape(vec![seq_len as usize, n_heads as usize, head_dim as usize])
+        .map_err(|e| anyhow!("shape Q destination: {e}"))?;
+    let gate_view = gate_dst
+        .with_shape(vec![seq_len as usize, n_heads as usize, head_dim as usize])
+        .map_err(|e| anyhow!("shape gate destination: {e}"))?;
+    // The fused matmul produces `fused`; the deinterleave below reads it in
+    // the same concurrent command encoder.
+    encoder.memory_barrier();
+    mlx_native::dispatch_q_gate_deinterleave_f32(
+        encoder,
+        registry,
+        device,
+        &fused,
+        &q_view,
+        &gate_view,
+        mlx_native::QGateDeinterleaveParams {
+            m: seq_len,
+            n_heads,
+            head_dim,
+        },
+    )
+    .map_err(|e| anyhow!("deinterleave native Q/gate activation: {e}"))
+}
+
+/// The Q/gate, K and V projections of an arena prefill layer, from
+/// `arena.x_norm_buf` into the arena's projection buffers. Inside a routed
+/// [`super::prefill_prepared::PrefillScope`] each admitted weight runs the
+/// prepared row-tile MM on one shared BF16 copy of the activation; otherwise
+/// the canonical dispatcher.
+#[allow(clippy::too_many_arguments)]
+fn project_attention_inputs_into_arena(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weights: &FullAttnWeightsGpu,
+    arena: &mut super::FaProjectionsArena,
+    seq_len: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    hidden_size: u32,
+) -> Result<()> {
+    use super::{prefill_prepared, prepared_projection};
+    let q_total = n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| anyhow!("Q/gate projection width overflow"))?;
+    let kv_total = n_kv_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| anyhow!("K/V projection width overflow"))?;
+    let fused_q_gate = match &weights.q_gate {
+        FullAttnQGateWeightsGpu::Fused { weight, ggml_type }
+            if prefill_prepared::admits(seq_len, weight, *ggml_type, hidden_size, 2 * q_total) =>
+        {
+            Some((weight, *ggml_type))
+        }
+        _ => None,
+    };
+    let k_prepared = prefill_prepared::admits(
+        seq_len,
+        &weights.wk,
+        weights.wk_ggml_type,
+        hidden_size,
+        kv_total,
+    );
+    let v_prepared = prefill_prepared::admits(
+        seq_len,
+        &weights.wv,
+        weights.wv_ggml_type,
+        hidden_size,
+        kv_total,
+    );
+    let x_bf16 = if fused_q_gate.is_some() || k_prepared || v_prepared {
+        let x_bf16 = prepared_projection::bf16_input(
+            encoder,
+            registry,
+            device,
+            &arena.x_norm_buf,
+            seq_len,
+            hidden_size,
+        )?;
+        // The prepared projections read the BF16 copy this cast writes.
+        encoder.memory_barrier();
+        Some(x_bf16)
+    } else {
+        None
+    };
+    match (x_bf16.as_ref(), fused_q_gate) {
+        (Some(x_bf16), Some((weight, ggml_type))) => {
+            let fused = prepared_projection::project(
                 encoder,
                 registry,
                 device,
-                &fused,
-                &q_view,
-                &gate_view,
-                mlx_native::QGateDeinterleaveParams {
-                    m: seq_len,
-                    n_heads,
-                    head_dim,
-                },
-            )
-            .map_err(|e| anyhow!("deinterleave native Q/gate activation: {e}"))
+                x_bf16,
+                weight,
+                ggml_type,
+                &weights.prepared_m32.q_gate,
+                seq_len,
+                hidden_size,
+                2 * q_total,
+            )?;
+            deinterleave_q_gate_f32_into(
+                encoder,
+                registry,
+                device,
+                fused,
+                &arena.q_proj_buf,
+                &arena.gate_proj_buf,
+                seq_len,
+                n_heads,
+                head_dim,
+            )?;
         }
+        _ => apply_q_gate_projection_f32_into(
+            encoder,
+            registry,
+            device,
+            &arena.x_norm_buf,
+            &weights.q_gate,
+            &mut arena.q_proj_buf,
+            &mut arena.gate_proj_buf,
+            seq_len,
+            n_heads,
+            head_dim,
+            hidden_size,
+        )?,
     }
+    match x_bf16.as_ref().filter(|_| k_prepared) {
+        Some(x_bf16) => prepared_projection::project_into(
+            encoder,
+            registry,
+            device,
+            x_bf16,
+            &weights.wk,
+            weights.wk_ggml_type,
+            &weights.prepared_m32.k,
+            &arena.k_proj_buf,
+            seq_len,
+            hidden_size,
+            kv_total,
+        )?,
+        None => apply_linear_projection_f32_into_with_ggml_type(
+            encoder,
+            registry,
+            device,
+            &arena.x_norm_buf,
+            &weights.wk,
+            weights.wk_ggml_type,
+            &mut arena.k_proj_buf,
+            seq_len,
+            hidden_size,
+            kv_total,
+        )?,
+    }
+    match x_bf16.as_ref().filter(|_| v_prepared) {
+        Some(x_bf16) => prepared_projection::project_into(
+            encoder,
+            registry,
+            device,
+            x_bf16,
+            &weights.wv,
+            weights.wv_ggml_type,
+            &weights.prepared_m32.v,
+            &arena.v_proj_buf,
+            seq_len,
+            hidden_size,
+            kv_total,
+        ),
+        None => apply_linear_projection_f32_into_with_ggml_type(
+            encoder,
+            registry,
+            device,
+            &arena.x_norm_buf,
+            &weights.wv,
+            weights.wv_ggml_type,
+            &mut arena.v_proj_buf,
+            seq_len,
+            hidden_size,
+            kv_total,
+        ),
+    }
+}
+
+/// The output projection of a full-attention layer from `gated` into a
+/// pooled `[seq_len, hidden_size]` buffer: the prepared row-tile MM inside a
+/// routed [`super::prefill_prepared::PrefillScope`], the canonical
+/// dispatcher otherwise.
+#[allow(clippy::too_many_arguments)]
+fn project_attention_output(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    gated: &MlxBuffer,
+    weights: &FullAttnWeightsGpu,
+    seq_len: u32,
+    q_total: u32,
+    hidden_size: u32,
+) -> Result<MlxBuffer> {
+    use super::{prefill_prepared, prepared_projection};
+    if !prefill_prepared::admits(
+        seq_len,
+        &weights.wo,
+        weights.wo_ggml_type,
+        q_total,
+        hidden_size,
+    ) {
+        return apply_linear_projection_f32_pooled_with_ggml_type(
+            encoder,
+            registry,
+            device,
+            gated,
+            &weights.wo,
+            weights.wo_ggml_type,
+            seq_len,
+            q_total,
+            hidden_size,
+        );
+    }
+    let gated_bf16 =
+        prepared_projection::bf16_input(encoder, registry, device, gated, seq_len, q_total)?;
+    // The prepared projection reads the BF16 copy this cast writes.
+    encoder.memory_barrier();
+    prepared_projection::project(
+        encoder,
+        registry,
+        device,
+        &gated_bf16,
+        &weights.wo,
+        weights.wo_ggml_type,
+        &weights.prepared_m32.out,
+        seq_len,
+        q_total,
+        hidden_size,
+    )
 }
 
 // ================================================================
@@ -6425,9 +6660,9 @@ pub fn build_gated_attn_layer(
     //    commit_and_wait_labeled. They outlive every Stage-A CB. No
     //    wrapper-local alloc_buffer drop occurs between dispatch and
     //    GPU completion. iter58b race is structurally unreachable.
-    //  - F11 (zero-init alloc): one new per-call alloc (`out_seq`),
-    //    matching the wrapper at gpu_full_attn.rs:1411-1413 byte-for-byte.
-    //    No new ad-hoc allocations introduced.
+    //  - F11 (zero-init alloc): `out_seq` is pooled; every element is
+    //    written by the bridge before the gate reads it. No ad-hoc
+    //    allocations remain in the stage.
     // ADR-034 task #89 Step 3b (2026-05-21) — extend fused stage to
     // `cur_len > 0` when `seq_len < 16`. The fresh-prefill case
     // (`cur_len == 0`) uses `apply_flash_attn_prefill_seq_major_into`
@@ -6670,42 +6905,17 @@ pub fn build_gated_attn_layer(
                     },
                 )?;
             } else {
-                apply_q_gate_projection_f32_into(
+                project_attention_inputs_into_arena(
                     enc.encoder(),
                     registry,
                     device,
-                    &arena.x_norm_buf,
-                    &weights_gpu.q_gate,
-                    &mut arena.q_proj_buf,
-                    &mut arena.gate_proj_buf,
+                    weights_gpu,
+                    arena,
                     seq_len,
                     n_heads,
+                    n_kv_heads,
                     head_dim,
                     hidden_size,
-                )?;
-                apply_linear_projection_f32_into_with_ggml_type(
-                    enc.encoder(),
-                    registry,
-                    device,
-                    &arena.x_norm_buf,
-                    &weights_gpu.wk,
-                    weights_gpu.wk_ggml_type,
-                    &mut arena.k_proj_buf,
-                    seq_len,
-                    hidden_size,
-                    kv_total,
-                )?;
-                apply_linear_projection_f32_into_with_ggml_type(
-                    enc.encoder(),
-                    registry,
-                    device,
-                    &arena.x_norm_buf,
-                    &weights_gpu.wv,
-                    weights_gpu.wv_ggml_type,
-                    &mut arena.v_proj_buf,
-                    seq_len,
-                    hidden_size,
-                    kv_total,
                 )?;
             }
             // Barrier: ops 3 read from q_proj/k_proj written above.
@@ -6847,16 +7057,23 @@ pub fn build_gated_attn_layer(
                 // correctness and profiling attribution.
                 enc.encoder().memory_barrier();
 
-                // Allocate `out_seq` (the FA bridge's F32 seq-major output).
-                // Same per-call alloc shape as the wrapper at line 1411-1413
-                // — caller-owned, moved into attn_out_fused below.
+                // `out_seq` (the FA bridge's F32 seq-major output) comes from
+                // the decode pool, like the resumed route's output: the pool
+                // keeps it alive until the reset that follows this layer's
+                // host wait, and both producers below write every element.
+                // A fresh device buffer here was zero-filled on the CPU for
+                // every layer while the GPU sat idle.
                 let seq = seq_len as usize;
                 let nh = n_heads as usize;
                 let d = head_dim as usize;
                 let out_elems = seq * nh * d;
-                let out_seq = device
-                    .alloc_buffer(out_elems * 4, DType::F32, vec![seq, nh, d])
-                    .map_err(|e| anyhow!("alloc out_seq (fused stage_ab): {e}"))?;
+                let out_seq = super::decode_pool::pooled_alloc_buffer(
+                    device,
+                    out_elems * 4,
+                    DType::F32,
+                    vec![seq, nh, d],
+                )
+                .map_err(|e| anyhow!("alloc out_seq (fused stage_ab): {e}"))?;
                 // ADR-019 Phase 2 iter92 — push Arc-clone into K-batch hold-vec.
                 if let Some(hold) = out_seq_hold.as_deref_mut() {
                     hold.push(out_seq.clone());
@@ -7591,13 +7808,12 @@ pub fn build_gated_attn_layer(
         // must be made explicit via `memory_barrier()`, never inferred from
         // submission order.
         enc.encoder().memory_barrier();
-        let out = apply_linear_projection_f32_pooled_with_ggml_type(
+        let out = project_attention_output(
             enc.encoder(),
             registry,
             device,
             &gated,
-            &weights_gpu.wo,
-            weights_gpu.wo_ggml_type,
+            weights_gpu,
             seq_len,
             q_total,
             hidden_size,
