@@ -476,7 +476,7 @@ this release:
 | `HF2Q_QWEN_JOINT_Q1_STEPS` | `development-only` | 1 |
 | `HF2Q_QWEN_LA_GPU_RESTORE` | `documented-escape` | 4 |
 | `HF2Q_QWEN_MOE_BATCHED` | `documented-escape` | 14 |
-| `HF2Q_QWEN_MOE_LIVE_TILES` | `documented-escape` | 4 |
+| `HF2Q_QWEN_MOE_LIVE_TILES` | `documented-escape` | 8 |
 | `HF2Q_QWEN_MOE_Q1_FORCED` | `development-only` | 2 |
 | `HF2Q_QWEN_MOE_Q1_OUT` | `development-only` | 4 |
 | `HF2Q_QWEN_MOE_Q1_PROMPTS` | `development-only` | 4 |

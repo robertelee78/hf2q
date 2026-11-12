@@ -1590,6 +1590,75 @@ per-cycle medians are the comparison. The switch is off by default pending
 the combined-candidate quality campaign. It needs an mlx-native release that
 contains `tq_hb_verify_tile`.
 
+#### Combined candidate after the stage work
+
+The staged draft command, the live-tile MoE route, the tiled verify attention
+and the prepared prefill route were built into one binary (`d5f48657`, mlx-native
+0.21.8 sources) and measured together, every switch on against the previous
+best configuration (`HF2Q_REPACKED_GGUF_M32=1` with `_PROJ=1`) of the same
+binary. `$E` is `/Users/robert/.local/state/hf2q/campaigns`.
+
+Qwen3.8, six balanced blocks (`$E/qwen38-int-all-d5-v1`): 12 of 12
+`CalibrationPass`. Client makespan −28.18% (95% CI 19.83–35.66%; 47.37
+against 63.36 seconds) and the four-lane cycle −28.77% (95% CI 20.13–36.48%).
+The host was loaded during this campaign; on a quiet host one run per arm read
+41.45 against 55.65 seconds and an 80.3 against 100.5 ms four-lane cycle. The
+text differs (5,462 against 5,237 completion tokens, each arm repeating its own
+text exactly). Peak footprint 70.59 against 70.08 GiB.
+
+Qwen3.6, twenty interleaved rounds (`$E/qwen36-int-isolate-v1`, arms `all`
+and `control`): 19 of 20 candidate runs and 18 of 20 control runs passed; all
+three failures are the workflow oracle's "initial six-step workflow not
+followed". Over the 17 rounds where both arms passed:
+
+| Metric | All switches | Previous best | Ratio (95% CI) |
+|---|---:|---:|---|
+| Four-lane cycle (ms) | 33.57 | 51.04 | 0.657 (0.652–0.661) |
+| Client makespan (s) | 21.75 | 31.31 | 0.695 (0.659–0.732) |
+| Total prefill per run (s) | 5.27 | 6.44 | 0.815 (0.776–0.856) |
+| Accepted tokens per lane-cycle | 3.964 | 4.121 | 0.959 (0.950–0.968) |
+
+A first six-block Qwen3.6 campaign (`$E/qwen36-int-all-d5-v1`) was invalid:
+two of six candidate runs failed the same oracle. Five runs of each switch
+alone then gave 5/5 (staged draft), 5/5 (attention tile), 4/5 (prepared
+prefill) and 4/5 (live tiles), and the twenty-round comparison above shows the
+control failing as often as the candidate. The failing transcripts are
+coherent tool calls that take a wrong turn, not corrupted output. Qwen3.6 on
+this workload therefore fails the oracle in roughly one run in twelve with or
+without these routes, which a release campaign has to budget for.
+
+Two things the combined measurement shows that the single-switch ones did
+not:
+
+- The gains are not additive. On Qwen3.6 the staged draft alone and the live
+  tiles alone left the four-lane cycle at the control's 51–52 ms, and the
+  attention tile alone brought it to 42 ms; together they reach 33.6 ms. A
+  route must be judged on the combined candidate with one switch removed, not
+  alone.
+- Draft acceptance on Qwen3.6 falls by about 4% with every switch on (live
+  tiles alone read 4.01 against 4.12 accepted tokens per lane-cycle in four
+  runs). It is paid for many times over by the shorter cycle, but it is a
+  cost of the changed target arithmetic and remains open.
+
+One profiled run of each combined candidate gives the four-lane GPU time by
+category, which is where the remaining distance to Splash (50.6 ms per
+Qwen3.8 cycle, 20.8 ms per Qwen3.6 cycle on its own synthetic routing) sits:
+
+| Category (GPU ms) | Qwen3.8 | Splash 3.8 | Qwen3.6 | Splash 3.6 |
+|---|---:|---:|---:|---:|
+| Draft | 5.5 | 5.98 | 3.6 | 3.36 |
+| Attention and KV write | 2.4 | 4.7 | 1.2 | 1.8 |
+| FFN or MoE | 29.1 | 24.0 | 21.5 | 9.7 |
+| Projections and DeltaNet | 22.3 | 12.8 | 8.6 | 4.7 |
+| Head | 4.5 | 1.95 | 1.9 | 0.86 |
+
+The draft and attention stages now meet Splash's. The Qwen3.8 cycle's wall
+time (80 ms) exceeds its GPU categories (66 ms) by about 14 ms of host and
+synchronization time over 9,063 dispatches. Profiling serializes dispatches,
+so the Qwen3.6 MoE figure overstates its unprofiled cost, and Splash's 9.7 ms
+is for lanes that share experts; on the recorded routes of this workload its
+own kernels take 13.6 ms.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,
