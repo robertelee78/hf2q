@@ -16,7 +16,8 @@ use mlx_native::ops::copy::{dispatch_strided_copy_f32, StridedCopyParams};
 use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::repacked_gguf_mm::{
-    dispatch_repacked_gguf_mm_bf16_input, prepare_repacked_gguf_weight, PreparedGgufWeight,
+    dispatch_repacked_gguf_mm_bf16_input, dispatch_repacked_gguf_mm_bf16_input_one_pass,
+    prepare_repacked_gguf_weight, PreparedGgufWeight,
 };
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -24,6 +25,18 @@ use super::decode_pool::pooled_alloc_buffer;
 
 /// Load-once prepared planes of one projection weight.
 pub(crate) type Planes = OnceLock<PreparedGgufWeight>;
+
+/// How a prepared product is issued. Both give the same bits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Pass {
+    /// The weight's own schedule: with several K splits a split-grid pass, a
+    /// memory barrier and a reduce pass.
+    Scheduled,
+    /// One kernel pass and no barrier
+    /// (`dispatch_repacked_gguf_mm_bf16_input_one_pass`): for the products of
+    /// one activation that are issued together and fill the GPU jointly.
+    One,
+}
 
 /// Prepared planes of a DeltaNet layer's large projections.
 #[derive(Default)]
@@ -301,6 +314,38 @@ pub(crate) fn project_alpha_beta(
     in_features: u32,
     heads: u32,
 ) -> Result<MlxBuffer> {
+    project_alpha_beta_pass(
+        enc,
+        registry,
+        device,
+        input_bf16,
+        alpha,
+        beta,
+        ggml_type,
+        planes,
+        rows,
+        in_features,
+        heads,
+        Pass::Scheduled,
+    )
+}
+
+/// [`project_alpha_beta`] issued as `pass`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_alpha_beta_pass(
+    enc: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input_bf16: &MlxBuffer,
+    alpha: &MlxBuffer,
+    beta: &MlxBuffer,
+    ggml_type: GgmlType,
+    planes: &DeltaNetPlanes,
+    rows: u32,
+    in_features: u32,
+    heads: u32,
+    pass: Pass,
+) -> Result<MlxBuffer> {
     let fused_rows = alpha_beta_rows(heads);
     if planes.alpha_beta_weight.get().is_none() {
         let row_bytes =
@@ -338,7 +383,7 @@ pub(crate) fn project_alpha_beta(
         .alpha_beta_weight
         .get()
         .context("fused alpha/beta weight was not retained")?;
-    project(
+    project_pass(
         enc,
         registry,
         device,
@@ -349,6 +394,7 @@ pub(crate) fn project_alpha_beta(
         rows,
         in_features,
         fused_rows,
+        pass,
     )
 }
 
@@ -429,6 +475,66 @@ pub(crate) fn bf16_input(
     Ok(output)
 }
 
+/// Whether [`normed_bf16_input`] serves activations of `in_features`
+/// columns: the stock RMS norm would run its float4 kernel on them, whose
+/// bits the BF16-output kernel reproduces.
+pub(crate) fn normed_bf16_available(in_features: u32) -> bool {
+    mlx_native::ops::rms_norm::rms_norm_f32_to_bf16_available(in_features)
+}
+
+/// Encode the RMS norm of the F32 `[rows, in_features]` activation straight
+/// into the BF16 rows the prepared projections read: bitwise the stock norm
+/// followed by [`bf16_input`], without the cast dispatch and its barrier.
+/// The caller checked [`normed_bf16_available`] and places the barrier
+/// before the projections.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn normed_bf16_input(
+    enc: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    norm_weight: &MlxBuffer,
+    rows: u32,
+    in_features: u32,
+    eps: f32,
+) -> Result<MlxBuffer> {
+    let elements = rows as usize * in_features as usize;
+    let output = pooled_alloc_buffer(
+        device,
+        elements * std::mem::size_of::<half::bf16>(),
+        DType::BF16,
+        vec![rows as usize, in_features as usize],
+    )
+    .map_err(|error| anyhow!("allocate normalized prepared projection input: {error}"))?;
+    let mut params = pooled_alloc_buffer(device, 8, DType::F32, vec![2])
+        .map_err(|error| anyhow!("allocate norm params: {error}"))?;
+    params
+        .as_mut_slice::<f32>()
+        .map_err(|error| anyhow!("write norm params: {error}"))?
+        .copy_from_slice(&[eps, in_features as f32]);
+    crate::inference::native_observation::witness_command_rms_norm(
+        enc,
+        input,
+        rows as usize,
+        in_features as usize,
+        |enc| {
+            mlx_native::ops::rms_norm::dispatch_rms_norm_f32_to_bf16(
+                enc,
+                registry,
+                device.metal_device(),
+                input,
+                norm_weight,
+                &output,
+                &params,
+                rows,
+                in_features,
+            )
+        },
+    )
+    .context("RMS norm into the prepared projection input")?;
+    Ok(output)
+}
+
 /// Encode one prepared projection of `input_bf16` into a pooled F32
 /// `[rows, out_features]` buffer, preparing the weight's planes on first use.
 #[allow(clippy::too_many_arguments)]
@@ -444,6 +550,36 @@ pub(crate) fn project(
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
+    project_pass(
+        enc,
+        registry,
+        device,
+        input_bf16,
+        weight,
+        ggml_type,
+        planes,
+        rows,
+        in_features,
+        out_features,
+        Pass::Scheduled,
+    )
+}
+
+/// [`project`] issued as `pass`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_pass(
+    enc: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input_bf16: &MlxBuffer,
+    weight: &MlxBuffer,
+    ggml_type: GgmlType,
+    planes: &Planes,
+    rows: u32,
+    in_features: u32,
+    out_features: u32,
+    pass: Pass,
+) -> Result<MlxBuffer> {
     let output = pooled_alloc_buffer(
         device,
         rows as usize * out_features as usize * std::mem::size_of::<f32>(),
@@ -451,7 +587,7 @@ pub(crate) fn project(
         vec![rows as usize, out_features as usize],
     )
     .map_err(|error| anyhow!("allocate prepared projection output: {error}"))?;
-    project_into(
+    project_into_pass(
         enc,
         registry,
         device,
@@ -463,6 +599,7 @@ pub(crate) fn project(
         rows,
         in_features,
         out_features,
+        pass,
     )?;
     Ok(output)
 }
@@ -517,6 +654,38 @@ pub(crate) fn project_into(
     in_features: u32,
     out_features: u32,
 ) -> Result<()> {
+    project_into_pass(
+        enc,
+        registry,
+        device,
+        input_bf16,
+        weight,
+        ggml_type,
+        planes,
+        output,
+        rows,
+        in_features,
+        out_features,
+        Pass::Scheduled,
+    )
+}
+
+/// [`project_into`] issued as `pass`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_into_pass(
+    enc: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input_bf16: &MlxBuffer,
+    weight: &MlxBuffer,
+    ggml_type: GgmlType,
+    planes: &Planes,
+    output: &MlxBuffer,
+    rows: u32,
+    in_features: u32,
+    out_features: u32,
+    pass: Pass,
+) -> Result<()> {
     let params = params(rows, ggml_type, in_features, out_features);
     ensure_planes(
         registry,
@@ -530,8 +699,13 @@ pub(crate) fn project_into(
     let prepared = planes
         .get()
         .context("prepared projection GGUF weight was not retained")?;
-    dispatch_repacked_gguf_mm_bf16_input(
-        enc, registry, device, input_bf16, prepared, output, &params,
-    )
+    match pass {
+        Pass::Scheduled => dispatch_repacked_gguf_mm_bf16_input(
+            enc, registry, device, input_bf16, prepared, output, &params,
+        ),
+        Pass::One => dispatch_repacked_gguf_mm_bf16_input_one_pass(
+            enc, registry, device, input_bf16, prepared, output, &params,
+        ),
+    }
     .context("dispatch prepared GGUF projection")
 }

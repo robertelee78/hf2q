@@ -803,7 +803,7 @@ fn synthetic_cache(model: &Qwen35Model, arm: Arm) -> HybridKvCache {
     cache
 }
 
-fn with_synthetic_fixture(
+pub(super) fn with_synthetic_fixture(
     policy: mlx_native::GgmlRoutingPolicy,
     arm: Arm,
     run: impl FnOnce(&Fixture<'_>),
@@ -878,17 +878,22 @@ pub(super) fn dflash_arm() -> Arm {
             projection: JointProjectionKernel::Canonical,
             pooled_outputs: true,
             verify_attention_tile: false,
+            verify_mixer_fused: false,
         },
     }
 }
 
-struct DFlashCaseTrace {
-    rows: Vec<Vec<RowBits>>,
-    committed: Vec<LaneDigest>,
-    captured: Vec<Vec<u32>>,
+pub(super) struct DFlashCaseTrace {
+    pub rows: Vec<Vec<RowBits>>,
+    pub committed: Vec<LaneDigest>,
+    pub captured: Vec<Vec<u32>>,
 }
 
-fn run_dflash_case(fixture: &Fixture<'_>, lanes: &[LaneCase], label: &str) -> DFlashCaseTrace {
+pub(super) fn run_dflash_case(
+    fixture: &Fixture<'_>,
+    lanes: &[LaneCase],
+    label: &str,
+) -> DFlashCaseTrace {
     let mut cache = (fixture.new_cache)();
     let token_rows = lanes
         .iter()
@@ -1270,6 +1275,7 @@ fn mma_arm() -> Arm {
             projection: JointProjectionKernel::ColumnInvariantMma,
             pooled_outputs: true,
             verify_attention_tile: false,
+            verify_mixer_fused: false,
         },
     }
 }

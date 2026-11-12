@@ -143,6 +143,8 @@ pub(super) struct JointPacking<'a> {
     /// may serve it at every width (`HF2Q_REPACKED_GGUF_ANY_WIDTH=1`). Plain
     /// joint decode and joint MTP verify steps are not.
     pub dflash2_verify: bool,
+    /// DFlash2 verify with the fused mixer stage requested.
+    pub mixer_fused: bool,
 }
 
 fn plan_joint_routes(
@@ -377,6 +379,7 @@ impl Qwen35Model {
             width: joint_padded_width(mode, rows.len()),
             attention_tile: false,
             dflash2_verify: false,
+            mixer_fused: false,
         };
         self.with_joint_forward(
             mode,
@@ -554,6 +557,7 @@ impl Qwen35Model {
             windows: packing.windows,
             width,
             attention_tile: packing.attention_tile.then_some(&tile_scratch),
+            mixer_fused: packing.mixer_fused,
         };
         // Padding rows replay row 0's token and position; their outputs are
         // discarded and they never reach a cache.

@@ -415,6 +415,7 @@ fn mma_forward() -> Qwen35JointMtpForward {
             projection: JointProjectionKernel::ColumnInvariantMma,
             pooled_outputs: true,
             verify_attention_tile: false,
+            verify_mixer_fused: false,
         },
     }
 }
