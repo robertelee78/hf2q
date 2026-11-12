@@ -1297,6 +1297,79 @@ text are also running different workloads, and six repeats do not sample
 that. Stage time per cycle is the comparable quantity between such arms;
 makespan between them is one draw.
 
+#### Staged draft command
+
+A probe that replays every dispatch of one draft command as its own command
+buffer (`dflash2::probe::dflash2_draft_command_dispatch_probe`, real target
+and checkpoint, four lanes, 512 ring rows per lane, median of 20 rounds)
+reproduces the profiled draft cost and splits it. GPU ms, Splash from its
+`decode-profile` dispatch lists on the same host:
+
+| Group | Splash Qwen3.8 | hf2q Qwen3.8 | staged | Splash Qwen3.6 | hf2q Qwen3.6 | staged |
+|---|---:|---:|---:|---:|---:|---:|
+| Projections | 2.89 | 8.23 | 2.55 | 1.46 | 2.36 | 1.14 |
+| Attention | 0.34 | 3.30 | 0.30 | 0.39 | 3.95 | 0.37 |
+| Norms, convolutions, input | 0.20 | 0.24 | 0.17 | 0.19 | 0.20 | 0.15 |
+| Vocabulary head | 1.95 | 4.38 | 1.96 | 0.85 | 1.33 | 0.85 |
+| Selection | 0.14 | 0.15 | 0.14 | 0.15 | 0.14 | 0.14 |
+| Draft command | 5.51 | 16.30 | 5.12 | 3.04 | 7.98 | 2.64 |
+| Context commit | 0.46 | 1.09 | 0.37 | 0.32 | 0.50 | 0.23 |
+
+The three differences are kernels, not dispatch count (171 draft dispatches
+against Splash's 90). hf2q multiplied AF4G64 planes on the register tile
+where Splash's Apple10 plan stages them (`runtime/ops/LinearGguf.cpp:190-212,
+272-275`) and runs gate and up in one pass
+(`runtime/metal/kernels/shared/gguf_linear.metal:131-180`). hf2q copied every
+lane's 2,047-row ring window into a packed K/V tile and filled a dense mask
+before each layer's flash attention, whatever the context length; Splash
+multiplies the ring in place over the live 128-slot tiles in four splits
+(`runtime/metal/kernels/decode/draft.metal:151-398`). hf2q's draft head ran
+the stock Q6_K kernel; Splash runs the target's prepared tile
+(`runtime/model/DFlashDraft.cpp:334-341`).
+
+`HF2Q_DFLASH2_DRAFT_STAGED=1` (requires `HF2Q_DFLASH2_DRAFT_AF4_G64=1`)
+adopts all three on unchanged weights: mlx-native's
+`dflash2_af4g64_staged` tile for projections of at least 960 outputs, with
+the split count from Splash's wave law evaluated once for 40 cores and 32
+rows so that it never depends on the row count; `dflash2_ring_attention`;
+and, at four lanes, the prepared head. Projections and attention are Class B
+against the default route. Each kernel has an F64 reference test with a
+K-scaled bound, a determinism test and a row and lane independence test
+(bitwise, across tile heights, positions and neighbours), and a synthetic
+checkpoint runs both routes to within 5e-3 relative RMS in rings, hidden
+states and logits. Against the pinned Qwen3.6 reference fixture the first
+layer's relative maximum error is 0.1960 staged and 0.1962 on the register
+tile: four-bit quantization, not the tile, sets the draft's distance from
+the BF16 oracle.
+
+In situ on the exact four-agent Q5 workload, each arm on one binary, with the
+draft command waited (`HF2Q_DFLASH2_GPU_TARGET_TOKENS=0`) so that `draft_us`
+is its wall time, the four-lane median fell from 17.20 to 6.01 ms on Qwen3.8
+(one run per arm) and from 8.25 and 8.19 ms to 3.07 ms on Qwen3.6 (two
+passing off-runs, one passing on-run). `draft_commit_us` fell from 1.39–1.50
+to 0.60–0.66 ms on Qwen3.8 and from 0.72–0.78 to 0.45–0.47 ms on Qwen3.6 in
+every passing run. In the served GPU-token mode Qwen3.8 emits the same
+completion tokens with the switch on or off (5,237 in each of seven runs of
+the measured binary) and accepts 5.334 against 5.330 tokens per lane-cycle.
+On Qwen3.6, whose text varies between runs of one arm, four on-runs accepted
+4.03–4.18 tokens per lane-cycle against 4.10 and 4.25 for two off-runs. All
+six Qwen3.8 and all four Qwen3.6 on-runs in the GPU-token mode passed
+calibration. In the waited mode two of three Qwen3.6 on-runs failed the
+six-step workflow oracle on model text (a tool call cut short after a
+reasoning-budget close, and an extra edit after a compiler warning), which
+two off-runs did not; five runs do not separate that from the run-to-run
+variation of Qwen3.6's text, and the combined campaign must.
+
+The cycle does not yet show the saved draft time reliably. With the draft
+unwaited, four interleaved Qwen3.8 runs gave four-lane cycle medians of 95.7
+and 98.9 ms on against 106.4 and 103.3 ms off, but the two on-runs before
+them, of the same binary, measured 109.7 and 108.6 ms against 100.9 ms off,
+with one-lane cycles 10 ms slower than in the later on-runs; the cause was
+not found. In the waited mode the four-lane cycle fell from 102.0 to 92.7 ms.
+The head is prepared a second time beside `HF2Q_REPACKED_GGUF_M32_HEAD`
+(0.98 GiB on Qwen3.8 and 0.39 GiB on Qwen3.6 by plane size) until the two
+routes share one. The switch stays off by default.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,
