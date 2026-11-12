@@ -351,6 +351,7 @@ pub fn load_full_attn_layer_native(
         )?,
         wo,
         wo_ggml_type,
+        prepared_m32: Default::default(),
     })
 }
 
@@ -442,6 +443,7 @@ pub fn load_delta_net_layer_native(
         ssm_norm_cpu: ssm_norm,
         ssm_out,
         ssm_out_ggml_type,
+        prepared_m32: Default::default(),
     })
 }
 

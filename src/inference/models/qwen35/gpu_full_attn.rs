@@ -531,6 +531,10 @@ pub struct FullAttnWeightsGpu {
     pub attn_k_norm: MlxBuffer,
     pub wo: MlxBuffer,
     pub wo_ggml_type: GgmlType,
+    /// Width-32 load-once prepared planes of the projections. Shared by clones
+    /// and dropped with the last one, so model replacement cannot retain
+    /// stale GPU buffers.
+    pub(crate) prepared_m32: std::sync::Arc<super::prepared_projection::FullAttnPlanes>,
 }
 
 impl FullAttnWeightsGpu {
@@ -567,6 +571,7 @@ impl FullAttnWeightsGpu {
             attn_k_norm: upload_f32_weight(&weights.attn_k_norm, device)?,
             wo: upload_q4_0_from_f32(&weights.wo, device)?,
             wo_ggml_type: GgmlType::Q4_0,
+            prepared_m32: Default::default(),
         })
     }
 
@@ -622,6 +627,7 @@ impl FullAttnWeightsGpu {
             attn_k_norm: upload_f32(&weights.attn_k_norm, device)?,
             wo: upload_f32(&weights.wo, device)?,
             wo_ggml_type: GgmlType::F32,
+            prepared_m32: Default::default(),
         })
     }
 }
@@ -1598,61 +1604,80 @@ pub(super) fn apply_q_gate_projection_f32(
                 seq_len,
                 hidden_size,
                 2 * q_total,
-            )?
-            .with_shape(vec![
-                seq_len as usize,
-                n_heads as usize,
-                (2 * head_dim) as usize,
-            ])
-            .map_err(|e| anyhow!("shape native fused Q/gate activation: {e}"))?;
-            let alloc_output = |label: &str| -> Result<MlxBuffer> {
-                let bytes = (seq_len * q_total) as usize * std::mem::size_of::<f32>();
-                if seq_len == 1 || super::decode_pool::step_pooled_outputs() {
-                    super::decode_pool::pooled_alloc_buffer(
-                        device,
-                        bytes,
-                        DType::F32,
-                        vec![seq_len as usize, n_heads as usize, head_dim as usize],
-                    )
-                    .map_err(|e| anyhow!("allocate {label}: {e}"))
-                } else {
-                    device
-                        .alloc_buffer(
-                            bytes,
-                            DType::F32,
-                            vec![seq_len as usize, n_heads as usize, head_dim as usize],
-                        )
-                        .map_err(|e| anyhow!("allocate {label}: {e}"))
-                }
-            };
-            let q = alloc_output("native Q activation")?;
-            let gate = alloc_output("native gate activation")?;
-            // `CommandEncoder` uses concurrent dispatch by default. The
-            // deinterleave kernel consumes the fused projection written by
-            // the preceding matmul, so this RAW dependency must be explicit.
-            encoder.memory_barrier();
-            mlx_native::dispatch_q_gate_deinterleave_f32(
-                encoder,
-                registry,
-                device,
-                &fused,
-                &q,
-                &gate,
-                mlx_native::QGateDeinterleaveParams {
-                    m: seq_len,
-                    n_heads,
-                    head_dim,
-                },
-            )
-            .map_err(|e| anyhow!("deinterleave native Q/gate activation: {e}"))?;
-            Ok((
-                q.with_shape(vec![seq_len as usize, q_total as usize])
-                    .map_err(|e| anyhow!("flatten native Q activation: {e}"))?,
-                gate.with_shape(vec![seq_len as usize, q_total as usize])
-                    .map_err(|e| anyhow!("flatten native gate activation: {e}"))?,
-            ))
+            )?;
+            deinterleave_q_gate_f32(encoder, registry, device, fused, seq_len, n_heads, head_dim)
         }
     }
+}
+
+/// Split a fused `[seq_len, 2 * n_heads * head_dim]` Q/gate projection,
+/// interleaved per head as `[Q(head_dim), gate(head_dim)]`, into flat Q and
+/// gate activations. Encodes the barrier that orders it after the projection.
+pub(super) fn deinterleave_q_gate_f32(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    fused: MlxBuffer,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+) -> Result<(MlxBuffer, MlxBuffer)> {
+    let q_total = n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| anyhow!("Q/gate projection width overflow"))?;
+    let fused = fused
+        .with_shape(vec![
+            seq_len as usize,
+            n_heads as usize,
+            (2 * head_dim) as usize,
+        ])
+        .map_err(|e| anyhow!("shape native fused Q/gate activation: {e}"))?;
+    let alloc_output = |label: &str| -> Result<MlxBuffer> {
+        let bytes = (seq_len * q_total) as usize * std::mem::size_of::<f32>();
+        if seq_len == 1 || super::decode_pool::step_pooled_outputs() {
+            super::decode_pool::pooled_alloc_buffer(
+                device,
+                bytes,
+                DType::F32,
+                vec![seq_len as usize, n_heads as usize, head_dim as usize],
+            )
+            .map_err(|e| anyhow!("allocate {label}: {e}"))
+        } else {
+            device
+                .alloc_buffer(
+                    bytes,
+                    DType::F32,
+                    vec![seq_len as usize, n_heads as usize, head_dim as usize],
+                )
+                .map_err(|e| anyhow!("allocate {label}: {e}"))
+        }
+    };
+    let q = alloc_output("native Q activation")?;
+    let gate = alloc_output("native gate activation")?;
+    // `CommandEncoder` uses concurrent dispatch by default. The
+    // deinterleave kernel consumes the fused projection written by
+    // the preceding matmul, so this RAW dependency must be explicit.
+    encoder.memory_barrier();
+    mlx_native::dispatch_q_gate_deinterleave_f32(
+        encoder,
+        registry,
+        device,
+        &fused,
+        &q,
+        &gate,
+        mlx_native::QGateDeinterleaveParams {
+            m: seq_len,
+            n_heads,
+            head_dim,
+        },
+    )
+    .map_err(|e| anyhow!("deinterleave native Q/gate activation: {e}"))?;
+    Ok((
+        q.with_shape(vec![seq_len as usize, q_total as usize])
+            .map_err(|e| anyhow!("flatten native Q activation: {e}"))?,
+        gate.with_shape(vec![seq_len as usize, q_total as usize])
+            .map_err(|e| anyhow!("flatten native gate activation: {e}"))?,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8440,6 +8465,7 @@ mod tests {
             attn_k_norm: unused.clone(),
             wo: unused,
             wo_ggml_type: GgmlType::F32,
+            prepared_m32: Default::default(),
         };
         let mut baseline: Option<Vec<u32>> = None;
 
