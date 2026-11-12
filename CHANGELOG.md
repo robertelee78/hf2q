@@ -105,6 +105,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Q5 supervisor: a case control left at its empty default is no longer exported to the server or client process. The Qwen3.8, Gemma 4 and DeepSeek-V4 cases exported `MLX_PROFILE_CB=""`, and mlx-native up to 0.21.6 enables per-command-buffer profiling for any present value, so every Qwen3.8 run launched from those cases since 2026-11-09 ran with synchronous labeled commits and printed `[CB_PROFILE …]` dumps (188 retained Qwen3.8 runs). On the Qwen3.8 DFlash2 four-agent workload, the same binary with identical output (16 requests, 5,361 completion tokens) measured 72.072 and 69.694 seconds with the empty variable and 61.145, 60.267 and 60.089 seconds without it. Gemma 4 and DeepSeek-V4 production paths issue no labeled commits, so their runs carried the variable without that effect (source reading; not re-measured). Launcher variables are read as `${VAR:-}`, so their behavior is unchanged. Earlier Qwen3.8 receipts measured under this condition are not corrected by this change.
+
 - The Qwen3.6 C2 calibration and divergent-edit cases now use the family’s declared one-repair-turn workload instead of the failing no-repair workflow. Case validation refuses future Qwen3.6 C2 cases that omit the repair grant.
 
 - `scripts/serve_gemma4_opencode.sh` now checks whether the selected `HF2Q_BIN` supports `--lcp-resume-budget`: current binaries still receive the explicit 8 GiB default, while older frozen baselines preserve their built-in behavior instead of failing before model load.
