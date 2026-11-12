@@ -1676,9 +1676,12 @@ DeltaNet replay storage (188 MB per step; 91 MB and 2.6 ms on Qwen3.6), and
 GPU's 0.5 ms start latency), plus two waited commit commands.
 
 Two Class A switches, off by default, remove most of it:
-`HF2Q_QWEN_VERIFY_REPLAY_REUSE=1` keeps the replay storage between steps and
-`HF2Q_DFLASH2_CONTEXT_FIRST=1` submits the draft-context commit before the
-replay is encoded and waits once for both. With both on, GPU idle per
+`HF2Q_QWEN_VERIFY_REPLAY_REUSE=1` keeps the replay storage between steps
+(almost all of the gain; the retained storage is outside memory admission)
+and `HF2Q_DFLASH2_CONTEXT_FIRST=1` submits the draft-context commit before
+the replay is encoded, so the two commit commands overlap on the GPU (the
+step still waits for both; 0.4–0.5 ms off the cycle's tail). With both on,
+GPU idle per
 four-lane cycle falls to 2.7 ms on Qwen3.8 and 1.7 ms on Qwen3.6. The same
 timelines explain the non-additive single-switch readings: GPU time per
 command class adds exactly (live tiles −3.3 ms, attention tile −11.3 ms,
