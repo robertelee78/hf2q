@@ -521,6 +521,18 @@ pub(crate) struct PreparedMoeExpertsM8 {
     pub gate: PreparedGroupedM8Experts,
     pub up: PreparedGroupedM8Experts,
     pub down: PreparedGroupedM8Experts,
+    /// Present under [`super::moe_batched::QWEN_MOE_LIVE_TILES_ENV`].
+    pub live_tiles: Option<PreparedMoeLiveTiles>,
+}
+
+/// What the live-tile route ([`super::moe_live_tiles`]) needs beyond the
+/// routed experts' planes.
+pub(crate) struct PreparedMoeLiveTiles {
+    /// The shared expert's gate, up and down as one-expert planes.
+    pub shared: [PreparedGroupedM8Experts; 3],
+    /// Whether one- and two-route experts may run in registers
+    /// (`mlx_native::moe_tiles_column_tile_exact` on this device).
+    pub column_tile: bool,
 }
 
 pub struct MoeFfnWeightsGpuQ {
@@ -699,6 +711,7 @@ impl MoeFfnWeightsGpuQ {
         device: &MlxDevice,
         hidden_size: u32,
         moe_intermediate_size: u32,
+        shared_intermediate_size: u32,
     ) -> Result<()> {
         anyhow::ensure!(
             self.dense_storage.is_native()
@@ -707,6 +720,17 @@ impl MoeFfnWeightsGpuQ {
                 && self.expert_down_affine.is_none(),
             "staged M8 preparation requires native expert stacks without affine overlays"
         );
+        let live_tiles = if super::moe_batched::qwen_moe_live_tiles_requested()? {
+            Some(self.prepare_live_tiles(
+                encoder,
+                registry,
+                device,
+                hidden_size,
+                shared_intermediate_size,
+            )?)
+        } else {
+            None
+        };
         let gate_params = GgmlQuantizedMatmulIdParams {
             n_tokens: 1,
             top_k: 1,
@@ -752,8 +776,51 @@ impl MoeFfnWeightsGpuQ {
                 &down_params,
             )
             .context("prepare down expert M8 planes")?,
+            live_tiles,
         });
         Ok(())
+    }
+
+    /// The shared expert's one-expert planes and this device's register-path
+    /// probe, for the live-tile route.
+    pub(crate) fn prepare_live_tiles(
+        &self,
+        encoder: &mut CommandEncoder,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        hidden_size: u32,
+        shared_intermediate_size: u32,
+    ) -> Result<PreparedMoeLiveTiles> {
+        let MoeDenseStorage::Native {
+            shared_gate_up,
+            shared_down,
+        } = self.dense_storage
+        else {
+            anyhow::bail!("live-tile preparation requires a native shared expert");
+        };
+        let mut prepare = |weight: &MlxBuffer, ggml_type: GgmlType, n: u32, k: u32, label: &str| {
+            let params = GgmlQuantizedMatmulIdParams {
+                n_tokens: 1,
+                top_k: 1,
+                n,
+                k,
+                n_experts: 1,
+                expert_stride: ggml_type_stride(ggml_type, n as usize, k as usize)?,
+                ggml_type,
+            };
+            prepare_quantized_matmul_id_ggml_grouped_m8(encoder, registry, device, weight, &params)
+                .with_context(|| format!("prepare shared {label} live-tile planes"))
+        };
+        let shared = [
+            prepare(&self.shared_gate, shared_gate_up, shared_intermediate_size, hidden_size, "gate")?,
+            prepare(&self.shared_up, shared_gate_up, shared_intermediate_size, hidden_size, "up")?,
+            prepare(&self.shared_down, shared_down, hidden_size, shared_intermediate_size, "down")?,
+        ];
+        Ok(PreparedMoeLiveTiles {
+            shared,
+            column_tile: mlx_native::moe_tiles_column_tile_exact(device, registry)
+                .context("probe the live-tile register path")?,
+        })
     }
 }
 

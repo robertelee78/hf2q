@@ -1394,6 +1394,80 @@ The head is prepared a second time beside `HF2Q_REPACKED_GGUF_M32_HEAD`
 (0.98 GiB on Qwen3.8 and 0.39 GiB on Qwen3.6 by plane size) until the two
 routes share one. The switch stays off by default.
 
+#### Live-tile MoE expert route
+
+The Qwen3.6 MoE stage was then attributed model-free at the served shape
+(mlx-native `bench_qwen36_moe_layer`: hidden 2,048, 256 experts, top 8,
+intermediate 512, one weight set, 16 layers per command, median of 20
+commands). Its routes are the expert ids of real four-lane verify steps,
+recorded from one exact Q5 run: 24.6 of 32 rows live, 80 live experts, 69% of
+them with one or two routes. Splash's `decode-profile` figure of 9.7 ms per
+cycle (0.24 ms per layer) does not describe that routing. Its four lanes
+replay one synthetic prompt, so every lane routes to the same experts and no
+expert holds fewer than four routes. Splash's own MoE operator, replayed on
+the recorded routes through a copy of its `gguf-moe-benchmark`, takes 0.340 ms
+per layer with Q4_K down experts and 0.383 ms with Q6_K; on those routes with
+one lane repeated in all four it takes 0.212 and 0.250 ms. The staged-M8 route
+takes 0.465 and 0.51–0.54 ms on the recorded routes. Serialized, its router
+and shared-gate logit cost 0.068 and 0.063 ms (a 32-row tensor matmul of four
+and one threadgroups), the shared expert 0.10 ms, gate and up 0.30 ms against
+0.21 ms for Splash's one pass, and down 0.13 against 0.10 ms.
+
+The earlier one-pass BF16 route was re-examined on fixed inputs
+(mlx-native `moe_expert_tiles`, ignored test `fused_bf16`). Its kernel stores
+exactly `BF16(SiLU(BF16(gate)) * BF16(up))` of the sums the served kernels
+produce (65,285 of 65,536 elements bitwise; the rest are SwiGLU values that
+underflow, within 4e-38 of the row's RMS), so it has no kernel defect. Against
+an F64 reference its SwiGLU and down outputs carry 4.0e-3 and 4.3–4.6e-3
+relative RMS error, the served route 3.3e-3 and 3.7e-3, and Splash's
+arithmetic order 3.6e-3 and 3.5–3.6e-3 (3.9e-3 with its BF16 down store). The
+withdrawn route was Splash's order except that it staged weights as BF16
+where Splash stages half. One failed task run does not separate a 1.2 times
+larger rounding error from the workload's sensitivity to any change of bits.
+
+`HF2Q_QWEN_MOE_LIVE_TILES=1` (with `HF2Q_QWEN_MOE_STAGED_M8=1`) adopts
+Splash's plan on the staged-M8 planes (`runtime/ops/MoE.cpp:102-166,225-283`,
+`kernels/shared/moe_gguf.metal`, `kernels/common/gguf_staged_tile.h:83-130`,
+`gguf_column_tile.h`): one route schedule; one gate/up pass whose SwiGLU stays
+in the schedule's grouped rows; a down pass over those rows; both on the
+indirect grid of live tiles; weights staged as half in two alternating stages
+with the next payload loaded during the matmul; experts of one or two routes
+in registers; the shared expert as tiles of the same passes. It differs from
+Splash in three ways. The SwiGLU is rounded to BF16 once, from FP32 gate and
+up (2.6e-3 and 2.6–2.8e-3 relative RMS error, the lowest of the four). The
+register path adds a group's products in the order the device's `matmul2d`
+adds them, found by probing and re-proved at model load, so it is bitwise the
+matmul tile; Splash documents that its two tiles differ and that its MoE
+results depend on the step's other rows (`moe_expert_slab.h:16-27`). The
+router and shared-gate logits run the row-exact kernel per block of eight
+rows. A row of a masked width-32 step is therefore bitwise the row decoded
+alone, which the staged-M8 route does not guarantee. The equality excludes
+expert products that underflow FP32: the register path and `matmul2d` may
+round a subnormal product differently, so a result of that magnitude (an
+independent review observed at most 4e-31) can depend on how many routes
+share its expert. The kernel keeps 8-row tiles only: a kernel that also held
+16- and 32-row matmuls ran every tile 15% slower. The three MoE switches are
+resolved together before any weight upload, so an invalid value or
+combination fails startup, and the worker logs the resolved route as
+`moe_experts`.
+
+Model-free, the layer takes 0.375 ms (Q4_K down) and 0.411 ms (Q6_K down) on
+the recorded routes, 1.10 and 1.07 times Splash on the same routes. In situ,
+ten of ten exact four-agent Q5 runs with the switch and six of six without it
+were `CalibrationPass`, over three successive binaries of this branch (two,
+four and four runs with the switch, two without on each; the first binary ran
+the shared expert on its FP32 kernels in blocks of eight rows). On the last
+two binaries the median four-lane target stage is 45.0 ms with the switch
+(eight runs, 44.2–46.7) against 48.2 ms without (four runs, 47.8–48.4).
+Explicit stage profiles (diagnostic, one pair per binary) put the MoE
+category at 17.6 against 21.2 ms at four lanes on the final binary. What
+remains against
+Splash on the same routes is the gate/up pass (0.219 against 0.208 ms), the
+schedule and its extra barriers, and, on routes where lanes share experts,
+experts of more than eight routes, which this route runs as successive 8-row
+tiles in one threadgroup where Splash launches one threadgroup per tile. The
+route needs unpublished mlx-native kernels and is not quality-qualified.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,

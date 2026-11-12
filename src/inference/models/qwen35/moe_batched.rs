@@ -22,6 +22,10 @@
 //! both projections reuse one compact route schedule and gathered input.
 //! Under a DFlash2 verify-row mask the schedule skips masked routes, so an
 //! unselected row costs no expert tile and phase F never reads its rows.
+//! With `HF2Q_QWEN_MOE_LIVE_TILES=1` as well, the layer runs
+//! [`super::moe_live_tiles`] instead: row-exact router logits at every width,
+//! one gate/up pass with a BF16 SwiGLU intermediate, and expert passes that
+//! launch the live tiles alone.
 //!
 //! Decode dispatches of one to eight rows preserve the established bitwise
 //! single-row invariant. The DFlash2 verifier's width-32 pass uses dense MM
@@ -67,32 +71,84 @@ pub(crate) const QWEN_MOE_BATCHED_ENV: &str = "HF2Q_QWEN_MOE_BATCHED";
 /// This requires the batched native-storage MoE decode route.
 pub(crate) const QWEN_MOE_STAGED_M8_ENV: &str = "HF2Q_QWEN_MOE_STAGED_M8";
 
-pub(crate) fn qwen_moe_staged_m8_requested() -> Result<bool> {
-    static REQUESTED: LazyLock<Result<bool, String>> = LazyLock::new(|| {
-        let Some(raw) = std::env::var(QWEN_MOE_STAGED_M8_ENV)
-            .ok()
-            .map(|raw| raw.trim().to_ascii_lowercase())
-            .filter(|raw| !raw.is_empty())
-        else {
-            return Ok(false);
-        };
-        match raw.as_str() {
-            "1" | "on" | "true" => Ok(true),
-            "0" | "off" | "false" => Ok(false),
-            _ => Err(format!(
-                "{QWEN_MOE_STAGED_M8_ENV} must be 1/on/true or 0/off/false, got {raw:?}"
-            )),
+/// Experimental live-tile expert route over the staged-M8 planes
+/// ([`super::moe_live_tiles`]). Requires [`QWEN_MOE_STAGED_M8_ENV`].
+pub(crate) const QWEN_MOE_LIVE_TILES_ENV: &str = "HF2Q_QWEN_MOE_LIVE_TILES";
+
+/// How one batched layer runs its routed experts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MoeExpertRoute {
+    /// Native-block expert matvecs.
+    Matvec,
+    /// [`QWEN_MOE_STAGED_M8_ENV`]: separate F32 gate and up tiles.
+    StagedM8,
+    /// [`QWEN_MOE_LIVE_TILES_ENV`].
+    LiveTiles,
+}
+
+impl MoeExpertRoute {
+    /// Name of the route in the worker's configuration log.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Matvec => "matvec",
+            Self::StagedM8 => "staged_m8",
+            Self::LiveTiles => "live_tiles",
         }
+    }
+}
+
+/// The expert route for the resolved batched switch and the raw values of
+/// [`QWEN_MOE_STAGED_M8_ENV`] and [`QWEN_MOE_LIVE_TILES_ENV`] (unset or blank
+/// means off). An invalid value, staged M8 without the batched route and
+/// live tiles without staged M8 are errors: no combination falls back to
+/// another route.
+pub(crate) fn resolve_moe_expert_route(
+    batched: bool,
+    staged_m8: Option<&str>,
+    live_tiles: Option<&str>,
+) -> Result<MoeExpertRoute, String> {
+    use super::joint_step_options::parse_switch;
+    let staged = parse_switch(QWEN_MOE_STAGED_M8_ENV, staged_m8)?;
+    let live = parse_switch(QWEN_MOE_LIVE_TILES_ENV, live_tiles)?;
+    if staged && !batched {
+        return Err(format!(
+            "{QWEN_MOE_STAGED_M8_ENV}=1 requires {QWEN_MOE_BATCHED_ENV}=1"
+        ));
+    }
+    if live && !staged {
+        return Err(format!(
+            "{QWEN_MOE_LIVE_TILES_ENV}=1 requires {QWEN_MOE_STAGED_M8_ENV}=1"
+        ));
+    }
+    Ok(match (staged, live) {
+        (_, true) => MoeExpertRoute::LiveTiles,
+        (true, false) => MoeExpertRoute::StagedM8,
+        (false, false) => MoeExpertRoute::Matvec,
+    })
+}
+
+/// [`resolve_moe_expert_route`] over the process environment, read once.
+/// Model load calls this before any upload, so an invalid value or
+/// combination fails startup.
+pub(crate) fn qwen_moe_expert_route() -> Result<MoeExpertRoute> {
+    static ROUTE: LazyLock<Result<MoeExpertRoute, String>> = LazyLock::new(|| {
+        let staged_m8 = std::env::var(QWEN_MOE_STAGED_M8_ENV).ok();
+        let live_tiles = std::env::var(QWEN_MOE_LIVE_TILES_ENV).ok();
+        resolve_moe_expert_route(
+            qwen_moe_batched_requested(),
+            staged_m8.as_deref(),
+            live_tiles.as_deref(),
+        )
     });
-    let requested = match &*REQUESTED {
-        Ok(requested) => *requested,
+    match &*ROUTE {
+        Ok(route) => Ok(*route),
         Err(error) => bail!("{error}"),
-    };
-    ensure!(
-        !requested || qwen_moe_batched_requested(),
-        "{QWEN_MOE_STAGED_M8_ENV}=1 requires {QWEN_MOE_BATCHED_ENV}=1"
-    );
-    Ok(requested)
+    }
+}
+
+/// Whether the live-tile route is selected.
+pub(crate) fn qwen_moe_live_tiles_requested() -> Result<bool> {
+    Ok(qwen_moe_expert_route()? == MoeExpertRoute::LiveTiles)
 }
 
 /// Widest row count one batched MoE layer accepts: the DFlash2 target width.
@@ -333,7 +389,7 @@ pub(crate) struct DFlash2MoeRouteMask<'a> {
     pub params: DFlash2MoeRouteMaskParams,
 }
 
-fn pooled(device: &MlxDevice, elements: usize, dtype: DType, shape: Vec<usize>, label: &str) -> Result<MlxBuffer> {
+pub(super) fn pooled(device: &MlxDevice, elements: usize, dtype: DType, shape: Vec<usize>, label: &str) -> Result<MlxBuffer> {
     pooled_alloc_buffer(device, elements * dtype.size_of(), dtype, shape)
         .map_err(|e| anyhow!("allocate batched MoE {label}: {e}"))
 }
@@ -356,6 +412,38 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     layer_idx: usize,
     route_mask: Option<DFlash2MoeRouteMask<'_>>,
 ) -> Result<MoeBatchedRouting> {
+    build_moe_ffn_layer_gpu_batched_route_into(
+        enc,
+        device,
+        registry,
+        x,
+        weights,
+        shape,
+        residual,
+        out,
+        rows,
+        layer_idx,
+        route_mask,
+        qwen_moe_expert_route()?,
+    )
+}
+
+/// [`build_moe_ffn_layer_gpu_batched_into`] on an explicit expert route.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_moe_ffn_layer_gpu_batched_route_into(
+    enc: &mut CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &MoeFfnWeightsGpuQ,
+    shape: MoeFfnShape,
+    residual: Option<&MlxBuffer>,
+    out: &mut MlxBuffer,
+    rows: u32,
+    layer_idx: usize,
+    route_mask: Option<DFlash2MoeRouteMask<'_>>,
+    route: MoeExpertRoute,
+) -> Result<MoeBatchedRouting> {
     ensure!(
         (1..=MOE_BATCHED_MAX_ROWS).contains(&(rows as usize)),
         "batched MoE layer {layer_idx} accepts 1..={MOE_BATCHED_MAX_ROWS} rows, got {rows}"
@@ -370,7 +458,12 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
             && weights.expert_down_affine.is_none(),
         "batched MoE layer {layer_idx} does not support DWQ affine expert overlays"
     );
-    let staged_m8 = qwen_moe_staged_m8_requested()?;
+    if route == MoeExpertRoute::LiveTiles {
+        return super::moe_live_tiles::build_moe_ffn_layer_live_tiles_into(
+            enc, device, registry, x, weights, shape, residual, out, rows, layer_idx, route_mask,
+        );
+    }
+    let staged_m8 = route == MoeExpertRoute::StagedM8;
     if staged_m8 {
         ensure!(
             matches!(shape.num_experts_per_tok, 1 | 6 | 8)
@@ -445,11 +538,15 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     let gathered_m8 = staged_m8
         .then(|| {
             let width = h.max(m_moe);
+            // The route list and the rows its last eight-row tile reads past it.
+            let gathered_rows =
+                mlx_native::grouped_m8_gathered_rows(rows, shape.num_experts_per_tok, ne)
+                    .map_err(|e| anyhow!("staged M8 gathered rows: {e}"))?;
             pooled(
                 device,
-                (ne as usize + pairs) * width,
+                gathered_rows * width,
                 DType::BF16,
-                vec![ne as usize + pairs, width],
+                vec![gathered_rows, width],
                 "staged M8 gathered input",
             )
         })
@@ -756,25 +853,27 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     .map_err(|e| anyhow!("batched MoE layer {layer_idx} weighted reduce: {e}"))?;
 
     #[cfg(test)]
-    {
-        crate::adr063_invariance::qwen::retain_current(
-            "moe_router_logits",
-            &logits,
-            vec![r, ne as usize],
-        )
-        .map_err(anyhow::Error::msg)?;
-        crate::adr063_invariance::qwen::retain_current("moe_router_ids", &ids, vec![r, top_k])
-            .map_err(anyhow::Error::msg)?;
-        crate::adr063_invariance::qwen::retain_current(
-            "moe_router_weights",
-            &routing_weights,
-            vec![r, top_k],
-        )
-        .map_err(anyhow::Error::msg)?;
-    }
+    retain_routing_for_tests(&logits, &ids, &routing_weights, r, ne as usize, top_k)?;
 
     Ok(MoeBatchedRouting {
         ids,
         weights: routing_weights,
     })
+}
+
+/// Retain a layer's routing for the ADR-063 invariance captures.
+#[cfg(test)]
+pub(super) fn retain_routing_for_tests(
+    logits: &MlxBuffer,
+    ids: &MlxBuffer,
+    routing_weights: &MlxBuffer,
+    rows: usize,
+    experts: usize,
+    top_k: usize,
+) -> Result<()> {
+    use crate::adr063_invariance::qwen::retain_current;
+    retain_current("moe_router_logits", logits, vec![rows, experts]).map_err(anyhow::Error::msg)?;
+    retain_current("moe_router_ids", ids, vec![rows, top_k]).map_err(anyhow::Error::msg)?;
+    retain_current("moe_router_weights", routing_weights, vec![rows, top_k])
+        .map_err(anyhow::Error::msg)
 }
