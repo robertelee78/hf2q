@@ -71,6 +71,9 @@ mod joint_decode_ffn_tests;
 pub(crate) mod joint_decode_routes;
 #[cfg(test)]
 pub(crate) mod joint_decode_test_support;
+pub(crate) mod joint_mixer_fused;
+#[cfg(test)]
+mod joint_mixer_fused_tests;
 pub(crate) mod joint_projection;
 pub(crate) mod joint_step_options;
 #[cfg(test)]

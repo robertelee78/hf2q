@@ -1936,6 +1936,94 @@ measured tables, commands and what remains (host acceptance between the
 target and its commit commands, which Splash runs as one command) are in
 `splash-gap/CycleHost.md` of the campaign state.
 
+#### Splash mixer differential (projections and DeltaNet)
+
+The combined candidate's profiled `projections` + `delta_conv` + `delta_gdn`
+categories read 23.2 ms per four-lane Qwen3.8 cycle and 8.4 ms per Qwen3.6
+cycle. They hold more than Splash's "DeltaNet" stage (12.8 and 4.7 ms): the
+pre-mixer norm of every layer and the attention projections, head norms and
+rotary encoding are in them too. Splash spends 16.5 and 6.0 ms on the same
+work (its decode profile, `splash-kernel-bench/REPORT.md` section 4).
+
+A per-dispatch-group profile and two model-free benches (mlx-native
+`bench_qwen_delta_proj`, `bench_qwen_delta_core`; DRAM-cold weights and
+state, samples behind a filler command buffer) place the difference:
+
+- Product for product the prepared kernel is at or below Splash's (qkv
+  0.072 against 0.083 ms, z gate 0.057 against 0.072, output 0.046 against
+  0.062). But each prepared product with several K splits is a split-grid
+  pass, a barrier and a reduce pass, so the three input products of a layer
+  ran as four serialized stages: 0.177 ms per Qwen3.8 DeltaNet layer against
+  0.129 for Splash's one fused dispatch
+  (`runtime/metal/kernels/shared/gguf_linear.metal:197-232`, in-kernel split
+  reduce `common/split_reduce.h`).
+- Between the projections a DeltaNet layer issued 148 dispatches in five
+  stages at four lanes (two convolution dispatches, a raw-row copy and the
+  recurrence per window; Q norm, K norm, V copy and query scale per row):
+  0.098 ms per Qwen3.8 layer against 0.073 for Splash's one
+  `verify_gdn_fused` (`runtime/metal/kernels/decode/gdn.metal`), which hands
+  its phases their operands in threadgroup memory.
+- Two F32 to BF16 cast stages per layer, which Splash's BF16 residual stream
+  does not have.
+
+`HF2Q_QWEN_VERIFY_MIXER_FUSED=1` (default off) adopts the structure and keeps
+hf2q's arithmetic. The input products of a layer are issued as one wave, one
+kernel pass per product with no reduce pass or barrier
+(`dispatch_repacked_gguf_mm_bf16_input_one_pass`, the bits of the default
+entry): 0.130 ms per Qwen3.8 layer with Q4_K qkv (Splash 0.129), 0.153 with
+Q6_K (0.148), 0.048 per Qwen3.6 layer (0.041). When every product of a layer
+is prepared the pre-mixer norm writes their BF16 rows
+(`dispatch_rms_norm_f32_to_bf16`). The DeltaNet core of every window is one
+dispatch (`gdn_window_fused`) that writes the output projection's BF16 rows:
+0.068 ms per Qwen3.8 layer and 0.054 per Qwen3.6 layer at four lanes. Every
+kernel repeats the stock kernels' operations in their order, including the
+128-thread tree of the norm reductions, and the route is Class A: rows,
+captures, state and retained replay rows are bitwise the stock route's. That
+equality is qualified by test on the Apple M5 Max, not by the source alone:
+outside the pinned norm sums and scales the fused kernel's phases keep
+Metal's fast-math flags, as the stock kernels do, so mlx-native
+`tests/test_gdn_window_fused.rs` is the gate for any other GPU family. The
+core serves head dimension 128, two to nine convolution taps and windows of
+at most eight rows within the device's threadgroup limits; other layers keep
+the stock chain, and the first use and first refusal are logged. A DeltaNet
+layer is 7 dispatches in five stages instead of 159 in 14.
+
+Exact four-agent runs, every other switch of the combined candidate on, same
+binary with the switch on and off, all `CalibrationPass`
+(`$V/splash-gap/deltaproj/runs`; two runs per arm; first the binary
+without the BF16 norm on a quiet host, then the final binary on a host that
+ran both arms about 22% slower):
+
+| Four lanes | Qwen3.8 off | Qwen3.8 on | Qwen3.6 off | Qwen3.6 on |
+|---|---:|---:|---:|---:|
+| Cycle, first binary (ms) | 75.1 / 75.6 | 70.6 / 70.9 | 33.3 / 33.9 | 31.2 / 31.7 |
+| Cycle, final binary (ms) | 92.6 / 92.3 | 86.0 / 88.0 | 36.6 / 36.4 | 35.6 / 34.7 |
+| Dispatches per cycle | 9,063 | 1,703 | 6,316 | 1,716 |
+| Barriers per cycle | 1,683 | 1,203 | 1,146 | 846 |
+| Profiled projections + DeltaNet (GPU ms, final binary) | 23.8 | 17.0 | 8.2 | 6.9 |
+
+Qwen3.8 emitted the same text in every run of both arms (5,462 completion
+tokens, 5.3191 accepted rows per lane-cycle), as a bitwise route must. Qwen3.6
+text varies from run to run in both arms; over six runs per arm its accepted
+rows per lane-cycle read 3.87-4.34 with the switch and 4.04-4.21 without,
+which these runs cannot separate. No paired campaign has been run.
+
+Left of the like-for-like distance (0.5 ms on Qwen3.8, 0.9 ms on Qwen3.6,
+profiled, with the profile's own command buffer per category boundary on the
+hf2q side): the attention layers' Q/gate de-interleave, head norms and rotary
+stages (0.3 against 0.15 ms), one cast stage per attention layer, and on
+Qwen3.6 the stock projections of 8- and 16-row steps. (Those runs predate
+`HF2Q_REPACKED_GGUF_ANY_WIDTH`. With it the prepared routes serve every tile
+width of a DFlash2 verify step and the wave and the BF16 norm follow the
+same width rule; tests hold the step bitwise equal to the stock chain at
+widths 4, 8, 16 and 32 on the synthetic MoE layout and on the official
+Qwen3.6 artifact. Its effect on the Qwen3.6 cycle has not been measured.)
+Outside these
+categories the DeltaNet replay command of a partially accepted window still
+costs 2.1 ms GPU per Qwen3.8 cycle and 1.2 ms per Qwen3.6 cycle plus a host
+wait; Splash folds the retained rows into the state at the lane's next step
+instead (`gdn.metal:22-25`).
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,

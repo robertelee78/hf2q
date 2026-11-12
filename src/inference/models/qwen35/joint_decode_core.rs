@@ -58,6 +58,7 @@ use super::gpu_full_attn::{
     FullAttnQGateWeightsGpu, FullAttnWeightsGpu,
 };
 use super::joint_decode_routes::{projection_route, JointProductRoute};
+use super::joint_mixer_fused;
 use super::kv_cache::{HybridKvCache, LayerSlot};
 use super::prepared_projection;
 use super::replay_arena::ReplayArena;
@@ -81,6 +82,9 @@ pub(crate) struct JointRows<'a> {
     /// `Some` on a DFlash2 verify step that requests the tiled TQ full
     /// attention: the step's shared split scratch.
     pub attention_tile: Option<&'a VerifyTileScratch>,
+    /// DFlash2 verify step that requests the fused mixer stage
+    /// ([`super::joint_mixer_fused`]).
+    pub mixer_fused: bool,
 }
 
 /// One lane's rows of a joint step: packed rows `start..start + rows`, all
@@ -443,12 +447,19 @@ struct DeltaNetReplayLane {
 }
 
 /// Per-layer buffers a multi-row window stages during the verify forward.
-struct WindowStage {
-    q: MlxBuffer,
-    k: MlxBuffer,
-    v: MlxBuffer,
-    conv_rows: MlxBuffer,
-    output: MlxBuffer,
+pub(super) struct WindowStage {
+    pub(super) q: MlxBuffer,
+    pub(super) k: MlxBuffer,
+    pub(super) v: MlxBuffer,
+    pub(super) conv_rows: MlxBuffer,
+    pub(super) output: MlxBuffer,
+}
+
+/// Alpha and beta logits of a DeltaNet layer: projected separately, or one
+/// fused output `[width, alpha_beta_rows]` with alpha's columns first.
+pub(super) enum AlphaBeta {
+    Separate(MlxBuffer, MlxBuffer),
+    Fused(MlxBuffer),
 }
 
 impl DeltaNetReplay {
@@ -492,7 +503,21 @@ impl DeltaNetReplay {
         }))
     }
 
-    fn take(&mut self, elements: usize) -> Result<MlxBuffer> {
+    /// The storage every retained view is a range of.
+    pub(super) fn storage(&self) -> &MlxBuffer {
+        &self.arena
+    }
+
+    /// Element offset of a [`Self::take`] view in [`Self::storage`].
+    pub(super) fn offset_of(&self, view: &MlxBuffer) -> Result<u32> {
+        let bytes = view
+            .byte_offset()
+            .checked_sub(self.arena.byte_offset())
+            .context("Qwen joint verify replay view precedes its storage")?;
+        u32::try_from(bytes / 4).context("Qwen joint verify replay offset exceeds u32")
+    }
+
+    pub(super) fn take(&mut self, elements: usize) -> Result<MlxBuffer> {
         let end = self.used + replay_elements(elements);
         ensure!(
             end <= self.capacity,
@@ -756,49 +781,6 @@ pub(crate) fn encode_joint_delta_net_layer(
     let v_elems = nv * d_v as usize;
 
     // ---- Packed: pre-norm and the four input projections ----
-    let x_norm = apply_pre_norm(
-        enc,
-        registry,
-        device,
-        x,
-        &weights.attn_norm,
-        width_u32,
-        hidden,
-        eps,
-    )?;
-    enc.memory_barrier();
-    let input_projection = |enc: &mut CommandEncoder,
-                            registry: &mut KernelRegistry,
-                            route: JointProductRoute,
-                            weight: &MlxBuffer,
-                            ggml_type: GgmlType,
-                            out_features: u32,
-                            label: &str| {
-        project_rows(
-            enc,
-            registry,
-            device,
-            route,
-            &x_norm,
-            width,
-            hidden as usize,
-            |enc, registry, input, seq| {
-                apply_proj_with_ggml_type(
-                    enc,
-                    registry,
-                    device,
-                    input,
-                    weight,
-                    ggml_type,
-                    seq,
-                    hidden,
-                    out_features,
-                )
-                .map(|output| vec![output])
-            },
-        )
-        .and_then(|outputs| single(outputs, label))
-    };
     // Prepared route: one BF16 copy of the normalized rows feeds the admitted
     // large projections and, as one fused product, the alpha and beta logit
     // projections. Alpha / beta that stay stock run beside the copy. The stock
@@ -820,6 +802,89 @@ pub(crate) fn encode_joint_delta_net_layer(
         weights.attn_gate_ggml_type,
         z_channels,
     );
+    let alpha_beta_prepared = (qkv_prepared || gate_prepared)
+        && routes.alpha == JointProductRoute::Batched
+        && routes.beta == JointProductRoute::Batched
+        && prepared_projection::admits_alpha_beta(
+            width_u32,
+            &weights.ssm_alpha,
+            weights.ssm_alpha_ggml_type,
+            &weights.ssm_beta,
+            weights.ssm_beta_ggml_type,
+            hidden,
+            n_v_heads,
+        );
+    // Fused mixer with every product prepared: nothing reads the F32 norm,
+    // so the norm writes the BF16 rows itself (the stock norm's bits, cast).
+    let (x_norm, x_norm_direct) = if rows.mixer_fused
+        && qkv_prepared
+        && gate_prepared
+        && alpha_beta_prepared
+        && prepared_projection::normed_bf16_available(registry, device, hidden)?
+    {
+        // The stock DeltaNet pre-norm publishes a trace witness; so does
+        // this one.
+        let direct = prepared_projection::normed_bf16_input(
+            enc,
+            registry,
+            device,
+            x,
+            &weights.attn_norm,
+            width_u32,
+            hidden,
+            eps,
+            prepared_projection::NormWitness::Publish,
+        )?;
+        (None, Some(direct))
+    } else {
+        let x_norm = apply_pre_norm(
+            enc,
+            registry,
+            device,
+            x,
+            &weights.attn_norm,
+            width_u32,
+            hidden,
+            eps,
+        )?;
+        (Some(x_norm), None)
+    };
+    enc.memory_barrier();
+    let input_projection = |enc: &mut CommandEncoder,
+                            registry: &mut KernelRegistry,
+                            route: JointProductRoute,
+                            weight: &MlxBuffer,
+                            ggml_type: GgmlType,
+                            out_features: u32,
+                            label: &str| {
+        let x_norm = x_norm
+            .as_ref()
+            .context("Qwen joint DeltaNet stock projection without an F32 norm")?;
+        project_rows(
+            enc,
+            registry,
+            device,
+            route,
+            x_norm,
+            width,
+            hidden as usize,
+            |enc, registry, input, seq| {
+                apply_proj_with_ggml_type(
+                    enc,
+                    registry,
+                    device,
+                    input,
+                    weight,
+                    ggml_type,
+                    seq,
+                    hidden,
+                    out_features,
+                )
+                .map(|output| vec![output])
+            },
+        )
+        .and_then(|outputs| single(outputs, label))
+    };
     let small_projections = |enc: &mut CommandEncoder, registry: &mut KernelRegistry| {
         let alpha = input_projection(
             enc,
@@ -841,35 +906,36 @@ pub(crate) fn encode_joint_delta_net_layer(
         )?;
         Ok::<_, anyhow::Error>((alpha, beta))
     };
+    // The fused mixer issues the prepared products of this activation as one
+    // wave: one pass each and no barrier between them (same bits).
+    let pass = if rows.mixer_fused {
+        prepared_projection::Pass::One
+    } else {
+        prepared_projection::Pass::Scheduled
+    };
     // Alpha and beta logits: projected separately, or one fused output that
     // is split after the projections' barrier.
-    enum AlphaBeta {
-        Separate(MlxBuffer, MlxBuffer),
-        Fused(MlxBuffer),
-    }
     let (qkv_raw, z, alpha_beta) = if qkv_prepared || gate_prepared {
-        let x_norm_bf16 =
-            prepared_projection::bf16_input(enc, registry, device, &x_norm, width_u32, hidden)?;
-        let alpha_beta_prepared = routes.alpha == JointProductRoute::Batched
-            && routes.beta == JointProductRoute::Batched
-            && prepared_projection::admits_alpha_beta(
-                width_u32,
-                &weights.ssm_alpha,
-                weights.ssm_alpha_ggml_type,
-                &weights.ssm_beta,
-                weights.ssm_beta_ggml_type,
-                hidden,
-                n_v_heads,
-            );
-        let separate = if alpha_beta_prepared {
-            None
-        } else {
-            Some(small_projections(enc, registry)?)
+        let (x_norm_bf16, separate) = match (x_norm_direct, x_norm.as_ref()) {
+            // The barrier behind the norm already orders the products.
+            (Some(direct), _) => (direct, None),
+            (None, x_norm) => {
+                let x_norm = x_norm.context("Qwen joint DeltaNet norm was not encoded")?;
+                let x_norm_bf16 = prepared_projection::bf16_input(
+                    enc, registry, device, x_norm, width_u32, hidden,
+                )?;
+                let separate = if alpha_beta_prepared {
+                    None
+                } else {
+                    Some(small_projections(enc, registry)?)
+                };
+                enc.memory_barrier();
+                (x_norm_bf16, separate)
+            }
         };
-        enc.memory_barrier();
         let alpha_beta = match separate {
             Some((alpha, beta)) => AlphaBeta::Separate(alpha, beta),
-            None => AlphaBeta::Fused(prepared_projection::project_alpha_beta(
+            None => AlphaBeta::Fused(prepared_projection::project_alpha_beta_pass(
                 enc,
                 registry,
                 device,
@@ -881,10 +947,11 @@ pub(crate) fn encode_joint_delta_net_layer(
                 width_u32,
                 hidden,
                 n_v_heads,
+                pass,
             )?),
         };
         let qkv_raw = if qkv_prepared {
-            prepared_projection::project(
+            prepared_projection::project_pass(
                 enc,
                 registry,
                 device,
@@ -895,6 +962,7 @@ pub(crate) fn encode_joint_delta_net_layer(
                 width_u32,
                 hidden,
                 qkv_channels,
+                pass,
             )?
         } else {
             input_projection(
@@ -908,7 +976,7 @@ pub(crate) fn encode_joint_delta_net_layer(
             )?
         };
         let z = if gate_prepared {
-            prepared_projection::project(
+            prepared_projection::project_pass(
                 enc,
                 registry,
                 device,
@@ -919,6 +987,7 @@ pub(crate) fn encode_joint_delta_net_layer(
                 width_u32,
                 hidden,
                 z_channels,
+                pass,
             )?
         } else {
             input_projection(
@@ -957,6 +1026,55 @@ pub(crate) fn encode_joint_delta_net_layer(
     enc.memory_barrier();
     crate::inference::stage_profile::boundary(enc, "adr065.projections")
         .context("profile Qwen joint DeltaNet projections")?;
+    if rows.mixer_fused && joint_mixer_fused::delta_core_admits(registry, device, &shape, rows)? {
+        // Fused mixer: the whole core of every window in one dispatch.
+        let out_prepared = delta_output_prepared(weights, routes, width_u32, z_channels, hidden);
+        let core = joint_mixer_fused::encode_delta_core(
+            enc,
+            device,
+            registry,
+            weights,
+            &kv_cache.linear_attn[rank],
+            &shape,
+            rows,
+            &qkv_raw,
+            &z,
+            &alpha_beta,
+            replay.as_deref_mut(),
+            if out_prepared {
+                DType::BF16
+            } else {
+                DType::F32
+            },
+        )
+        .with_context(|| format!("Qwen joint fused DeltaNet core layer {layer_idx}"))?;
+        enc.memory_barrier();
+        crate::inference::stage_profile::boundary(enc, "adr065.delta_gdn")
+            .context("profile Qwen joint fused DeltaNet core")?;
+        let output = project_delta_output(
+            enc,
+            registry,
+            device,
+            weights,
+            routes,
+            &core.gated,
+            width,
+            z_channels,
+            hidden,
+        )?;
+        crate::inference::stage_profile::boundary(enc, "adr065.projections")
+            .context("profile Qwen joint DeltaNet output projection")?;
+        settle_delta_windows(
+            kv_cache,
+            rank,
+            rows,
+            core.stages,
+            replay,
+            core.gates.as_ref().map(|(g, beta)| (g, beta)),
+            nv,
+        )?;
+        return Ok(output);
+    }
     // Read by the recurrence's gate / beta kernel, which follows the conv
     // and norm barriers below.
     let (alpha_logit, beta_logit) = match alpha_beta {
@@ -1237,71 +1355,141 @@ pub(crate) fn encode_joint_delta_net_layer(
     let gated = gated
         .with_shape(vec![width, z_channels as usize])
         .map_err(|e| anyhow!("shape Qwen joint gated output: {e}"))?;
-    let output = if routes.out == JointProductRoute::Batched
+    let output = project_delta_output(
+        enc, registry, device, weights, routes, &gated, width, z_channels, hidden,
+    )?;
+    crate::inference::stage_profile::boundary(enc, "adr065.projections")
+        .context("profile Qwen joint DeltaNet output projection")?;
+    let stages = lanes.into_iter().map(|(_, stage)| stage).collect();
+    settle_delta_windows(
+        kv_cache,
+        rank,
+        rows,
+        stages,
+        replay,
+        Some((&g_buf, &beta_buf)),
+        nv,
+    )?;
+    Ok(output)
+}
+
+/// Whether the DeltaNet output projection of a `width`-row step takes the
+/// prepared route.
+fn delta_output_prepared(
+    weights: &DeltaNetWeightsGpu,
+    routes: &DeltaNetRoutes,
+    width: u32,
+    z_channels: u32,
+    hidden: u32,
+) -> bool {
+    routes.out == JointProductRoute::Batched
         && prepared_projection::admits(
-            width_u32,
+            width,
             &weights.ssm_out,
             weights.ssm_out_ggml_type,
             z_channels,
             hidden,
-        ) {
-        let gated_bf16 =
-            prepared_projection::bf16_input(enc, registry, device, &gated, width_u32, z_channels)?;
-        enc.memory_barrier();
-        prepared_projection::project(
+        )
+}
+
+/// Encode the output projection of a DeltaNet layer's gated rows
+/// `[width, z_channels]`. BF16 rows feed the prepared product directly (the
+/// caller checked [`delta_output_prepared`]); F32 rows are cast for it or
+/// take the stock route.
+#[allow(clippy::too_many_arguments)]
+fn project_delta_output(
+    enc: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weights: &DeltaNetWeightsGpu,
+    routes: &DeltaNetRoutes,
+    gated: &MlxBuffer,
+    width: usize,
+    z_channels: u32,
+    hidden: u32,
+) -> Result<MlxBuffer> {
+    let width_u32 = width as u32;
+    if delta_output_prepared(weights, routes, width_u32, z_channels, hidden) {
+        let cast;
+        let gated_bf16 = if gated.dtype() == DType::BF16 {
+            gated
+        } else {
+            cast = prepared_projection::bf16_input(
+                enc, registry, device, gated, width_u32, z_channels,
+            )?;
+            enc.memory_barrier();
+            &cast
+        };
+        return prepared_projection::project(
             enc,
             registry,
             device,
-            &gated_bf16,
+            gated_bf16,
             &weights.ssm_out,
             weights.ssm_out_ggml_type,
             &weights.prepared_m32.out,
             width_u32,
             z_channels,
             hidden,
-        )?
-    } else {
-        project_rows(
-            enc,
-            registry,
-            device,
-            routes.out,
-            &gated,
-            width,
-            z_channels as usize,
-            |enc, registry, input, seq| {
-                apply_proj_with_ggml_type(
-                    enc,
-                    registry,
-                    device,
-                    input,
-                    &weights.ssm_out,
-                    weights.ssm_out_ggml_type,
-                    seq,
-                    z_channels,
-                    hidden,
-                )
-                .map(|output| vec![output])
-            },
-        )
-        .and_then(|outputs| single(outputs, "ssm_out"))?
-    };
-    crate::inference::stage_profile::boundary(enc, "adr065.projections")
-        .context("profile Qwen joint DeltaNet output projection")?;
+        );
+    }
+    ensure!(
+        gated.dtype() == DType::F32,
+        "Qwen joint stock DeltaNet output projection reads F32 rows, got {}",
+        gated.dtype()
+    );
+    project_rows(
+        enc,
+        registry,
+        device,
+        routes.out,
+        gated,
+        width,
+        z_channels as usize,
+        |enc, registry, input, seq| {
+            apply_proj_with_ggml_type(
+                enc,
+                registry,
+                device,
+                input,
+                &weights.ssm_out,
+                weights.ssm_out_ggml_type,
+                seq,
+                z_channels,
+                hidden,
+            )
+            .map(|output| vec![output])
+        },
+    )
+    .and_then(|outputs| single(outputs, "ssm_out"))
+}
 
-    // Same CPU-side parity flip the serial path performs after encoding,
-    // once per window: a window's dispatches read the current parity and
-    // wrote the opposite one.
+/// Same CPU-side parity flip the serial path performs after encoding, once
+/// per window (a window's dispatches read the current parity and wrote the
+/// opposite one), and the hand-over of each multi-row window's retained rows
+/// to the replay commit. `gates` are the layer's packed `g` and `beta` rows;
+/// a step with replay storage must pass them.
+fn settle_delta_windows(
+    kv_cache: &mut HybridKvCache,
+    rank: usize,
+    rows: &JointRows<'_>,
+    stages: Vec<Option<WindowStage>>,
+    replay: Option<&mut DeltaNetReplay>,
+    gates: Option<(&MlxBuffer, &MlxBuffer)>,
+    nv: usize,
+) -> Result<()> {
     let slot = &mut kv_cache.linear_attn[rank];
     for window in rows.windows {
         slot.swap_for_slot(window.slot);
     }
     if let Some(replay) = replay {
+        let (g_buf, beta_buf) =
+            gates.context("Qwen joint verify replay storage without retained gate rows")?;
         let lanes = rows
             .windows
             .iter()
-            .zip(lanes)
-            .filter_map(|(window, (_, stage))| {
+            .zip(stages)
+            .filter_map(|(window, stage)| {
                 stage.map(|stage| {
                     let rows_nv = window.rows * nv;
                     let offset = (window.start * nv * 4) as u64;
@@ -1321,7 +1509,7 @@ pub(crate) fn encode_joint_delta_net_layer(
             .collect();
         replay.layers.push(DeltaNetReplayLayer { rank, lanes });
     }
-    Ok(output)
+    Ok(())
 }
 
 /// Encode one gated full-attention layer for every joint row into `enc` (no
@@ -1361,24 +1549,69 @@ pub(crate) fn encode_joint_full_attn_layer(
     let kv_total = n_kv_heads * head_dim;
 
     // ---- Packed: pre-norm, projections, Q/K norms, IMROPE ----
-    let x_norm = apply_pre_attn_rms_norm(
-        enc,
-        registry,
-        device,
-        x,
-        weights,
-        width_u32,
-        hidden,
-        shape.rms_norm_eps,
-    )?;
+    // Prepared route: the fused Q/gate, K and V projections read one BF16
+    // copy of the normalized rows and overlap; the Q/gate split follows them.
+    let admitted =
+        |route: JointProductRoute, weight: &MlxBuffer, ggml_type: GgmlType, out_features: u32| {
+            route == JointProductRoute::Batched
+                && prepared_projection::admits(width_u32, weight, ggml_type, hidden, out_features)
+        };
+    let fused_prepared = match &weights.q_gate {
+        FullAttnQGateWeightsGpu::Fused { weight, ggml_type }
+            if admitted(routes.q_gate, weight, *ggml_type, 2 * q_total as u32) =>
+        {
+            Some((weight, *ggml_type))
+        }
+        _ => None,
+    };
+    let k_prepared = admitted(routes.k, &weights.wk, weights.wk_ggml_type, kv_total);
+    let v_prepared = admitted(routes.v, &weights.wv, weights.wv_ggml_type, kv_total);
+    // Fused mixer with every product prepared: nothing reads the F32 norm,
+    // so the norm writes the BF16 rows itself (the stock norm's bits, cast).
+    let (x_norm, x_norm_direct) = if rows.mixer_fused
+        && fused_prepared.is_some()
+        && k_prepared
+        && v_prepared
+        && prepared_projection::normed_bf16_available(registry, device, hidden)?
+    {
+        // The stock attention pre-norm publishes no trace witness; neither
+        // does this one.
+        let direct = prepared_projection::normed_bf16_input(
+            enc,
+            registry,
+            device,
+            x,
+            &weights.attn_norm,
+            width_u32,
+            hidden,
+            shape.rms_norm_eps,
+            prepared_projection::NormWitness::None,
+        )?;
+        (None, Some(direct))
+    } else {
+        let x_norm = apply_pre_attn_rms_norm(
+            enc,
+            registry,
+            device,
+            x,
+            weights,
+            width_u32,
+            hidden,
+            shape.rms_norm_eps,
+        )?;
+        (Some(x_norm), None)
+    };
     enc.memory_barrier();
     let stock_q_gate = |enc: &mut CommandEncoder, registry: &mut KernelRegistry| {
+        let x_norm = x_norm
+            .as_ref()
+            .context("Qwen joint stock Q/gate projection without an F32 norm")?;
         let mut q_gate = project_rows(
             enc,
             registry,
             device,
             routes.q_gate,
-            &x_norm,
+            x_norm,
             width,
             hidden as usize,
             |enc, registry, input, seq| {
@@ -1407,12 +1640,15 @@ pub(crate) fn encode_joint_full_attn_layer(
                          weight: &MlxBuffer,
                          ggml_type: GgmlType,
                          label: &str| {
+        let x_norm = x_norm
+            .as_ref()
+            .context("Qwen joint stock K/V projection without an F32 norm")?;
         project_rows(
             enc,
             registry,
             device,
             route,
-            &x_norm,
+            x_norm,
             width,
             hidden as usize,
             |enc, registry, input, seq| {
@@ -1424,31 +1660,30 @@ pub(crate) fn encode_joint_full_attn_layer(
         )
         .and_then(|outputs| single(outputs, label))
     };
-    // Prepared route: the fused Q/gate, K and V projections read one BF16
-    // copy of the normalized rows and overlap; the Q/gate split follows them.
-    let admitted =
-        |route: JointProductRoute, weight: &MlxBuffer, ggml_type: GgmlType, out_features: u32| {
-            route == JointProductRoute::Batched
-                && prepared_projection::admits(width_u32, weight, ggml_type, hidden, out_features)
-        };
-    let fused_prepared = match &weights.q_gate {
-        FullAttnQGateWeightsGpu::Fused { weight, ggml_type }
-            if admitted(routes.q_gate, weight, *ggml_type, 2 * q_total as u32) =>
-        {
-            Some((weight, *ggml_type))
-        }
-        _ => None,
-    };
-    let k_prepared = admitted(routes.k, &weights.wk, weights.wk_ggml_type, kv_total);
-    let v_prepared = admitted(routes.v, &weights.wv, weights.wv_ggml_type, kv_total);
     let (q_flat, gate_flat, k_flat, v_flat) =
         if fused_prepared.is_some() || k_prepared || v_prepared {
-            let x_norm_bf16 =
-                prepared_projection::bf16_input(enc, registry, device, &x_norm, width_u32, hidden)?;
-            enc.memory_barrier();
+            let x_norm_bf16 = match (x_norm_direct, x_norm.as_ref()) {
+                // The barrier behind the norm already orders the products.
+                (Some(direct), _) => direct,
+                (None, x_norm) => {
+                    let x_norm = x_norm.context("Qwen joint attention norm was not encoded")?;
+                    let x_norm_bf16 = prepared_projection::bf16_input(
+                        enc, registry, device, x_norm, width_u32, hidden,
+                    )?;
+                    enc.memory_barrier();
+                    x_norm_bf16
+                }
+            };
+            // The fused mixer issues the three products as one wave: one pass
+            // each and no barrier between them (same bits).
+            let pass = if rows.mixer_fused {
+                prepared_projection::Pass::One
+            } else {
+                prepared_projection::Pass::Scheduled
+            };
             let fused = fused_prepared
                 .map(|(weight, ggml_type)| {
-                    prepared_projection::project(
+                    prepared_projection::project_pass(
                         enc,
                         registry,
                         device,
@@ -1459,6 +1694,7 @@ pub(crate) fn encode_joint_full_attn_layer(
                         width_u32,
                         hidden,
                         2 * q_total as u32,
+                        pass,
                     )
                 })
                 .transpose()?;
@@ -1471,7 +1707,7 @@ pub(crate) fn encode_joint_full_attn_layer(
                       planes: &prepared_projection::Planes,
                       label: &str| {
                 if prepared {
-                    prepared_projection::project(
+                    prepared_projection::project_pass(
                         enc,
                         registry,
                         device,
@@ -1482,6 +1718,7 @@ pub(crate) fn encode_joint_full_attn_layer(
                         width_u32,
                         hidden,
                         kv_total,
+                        pass,
                     )
                 } else {
                     kv_projection(enc, registry, route, weight, ggml_type, label)
@@ -1507,6 +1744,11 @@ pub(crate) fn encode_joint_full_attn_layer(
                 &weights.prepared_m32.v,
                 "attn_v",
             )?;
+            if pass == prepared_projection::Pass::One {
+                // A wave has no barrier of its own; the Q/gate split below
+                // reads the fused product.
+                enc.memory_barrier();
+            }
             let (q_flat, gate_flat) = match fused {
                 Some(fused) => deinterleave_q_gate_f32(
                     enc, registry, device, fused, width_u32, n_heads, head_dim,

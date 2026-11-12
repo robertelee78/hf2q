@@ -262,6 +262,11 @@ impl Qwen35Model {
                 "Qwen joint MTP verify rows are the joint decode step's; the tiled verify \
                  attention is a DFlash2 route"
             );
+            ensure!(
+                !options.verify_mixer_fused,
+                "Qwen joint MTP verify rows are the joint decode step's; the fused mixer \
+                 stage is a DFlash2 route"
+            );
         }
         let total = lanes.iter().map(|lane| lane.tokens.len()).sum::<usize>();
         let max_rows = layout.max_rows();
@@ -366,6 +371,7 @@ impl Qwen35Model {
             width,
             attention_tile: options.verify_attention_tile,
             dflash2_verify: layout == VerifyLayout::DFlash2,
+            mixer_fused: options.verify_mixer_fused,
         };
         let linear_layers = kv_cache.linear_attn.len();
         let (outputs, normed, replay) = self.with_joint_forward(
