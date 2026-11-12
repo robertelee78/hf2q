@@ -538,11 +538,15 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_route_into(
     let gathered_m8 = staged_m8
         .then(|| {
             let width = h.max(m_moe);
+            // The route list and the rows its last eight-row tile reads past it.
+            let gathered_rows =
+                mlx_native::grouped_m8_gathered_rows(rows, shape.num_experts_per_tok, ne)
+                    .map_err(|e| anyhow!("staged M8 gathered rows: {e}"))?;
             pooled(
                 device,
-                (ne as usize + pairs) * width,
+                gathered_rows * width,
                 DType::BF16,
-                vec![ne as usize + pairs, width],
+                vec![gathered_rows, width],
                 "staged M8 gathered input",
             )
         })

@@ -64,6 +64,30 @@ fn run_live_tiles(
     select: &[usize],
     verify_rows: Option<&[u32]>,
 ) -> Vec<RowResult> {
+    run_route(
+        device,
+        registry,
+        weights,
+        x,
+        residual,
+        select,
+        verify_rows,
+        MoeExpertRoute::LiveTiles,
+    )
+}
+
+/// [`run_live_tiles`] on an explicit expert route.
+#[allow(clippy::too_many_arguments)]
+fn run_route(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    weights: &MoeFfnWeightsGpuQ,
+    x: &[Vec<f32>],
+    residual: &[Vec<f32>],
+    select: &[usize],
+    verify_rows: Option<&[u32]>,
+    route: MoeExpertRoute,
+) -> Vec<RowResult> {
     decode_pool::checked_reset_decode_pool().expect("reset decode pool");
     let r = select.len();
     let xin = packed(x, select, device);
@@ -107,9 +131,9 @@ fn run_live_tiles(
         r as u32,
         0,
         route_mask,
-        MoeExpertRoute::LiveTiles,
+        route,
     )
-    .expect("live-tile MoE layer");
+    .expect("batched MoE layer");
     enc.commit_and_wait_labeled("test.qwen.moe_live_tiles")
         .expect("commit");
     let out = out.as_slice::<f32>().expect("read out");
@@ -122,6 +146,46 @@ fn run_live_tiles(
             weights: w[i * TOP_K..(i + 1) * TOP_K].to_vec(),
         })
         .collect()
+}
+
+/// A fully live width-32 staged-M8 step: its gathered rows are exactly a
+/// 2 MiB pool bucket without the rows the last eight-row tile reads past the
+/// route list, which mlx-native now requires.
+#[test]
+fn staged_m8_full_width_step_reserves_the_tile_slack() {
+    const ROWS: usize = 32;
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().expect("device");
+    let mut registry = KernelRegistry::new();
+    let layer = Layer::random(GgmlType::Q4_K, 0x51ac);
+    let weights = live_tile_weights(&device, &mut registry, &layer);
+    let (x, residual) = rows(ROWS, 0x51ac ^ 0x5eed);
+    let all: Vec<usize> = (0..ROWS).collect();
+    let mut run = || {
+        run_route(
+            &device,
+            &mut registry,
+            &weights,
+            &x,
+            &residual,
+            &all,
+            None,
+            MoeExpertRoute::StagedM8,
+        )
+    };
+    let first = run();
+    let again = run();
+    for (row, (first, again)) in first.iter().zip(&again).enumerate() {
+        assert!(
+            first.out.iter().all(|v| v.is_finite()),
+            "row {row} is not finite"
+        );
+        assert_eq!(
+            bits(&first.out),
+            bits(&again.out),
+            "row {row} is not repeatable"
+        );
+    }
 }
 
 fn assert_row(actual: &RowResult, expected: &RowResult, label: &str) {
@@ -416,7 +480,14 @@ fn live_tile_route_matches_f64_reference_down_q4_k() {
 fn expert_switch_combinations_resolve_or_fail_closed() {
     use super::moe_batched::resolve_moe_expert_route as resolve;
     let on = Some("1");
-    let off = [None, Some(""), Some("  "), Some("0"), Some("off"), Some("false")];
+    let off = [
+        None,
+        Some(""),
+        Some("  "),
+        Some("0"),
+        Some("off"),
+        Some("false"),
+    ];
     for batched in [false, true] {
         for staged in off {
             for live in off {
@@ -425,25 +496,61 @@ fn expert_switch_combinations_resolve_or_fail_closed() {
         }
     }
     assert_eq!(resolve(true, on, None), Ok(MoeExpertRoute::StagedM8));
-    assert_eq!(resolve(true, Some("TRUE"), Some("off")), Ok(MoeExpertRoute::StagedM8));
+    assert_eq!(
+        resolve(true, Some("TRUE"), Some("off")),
+        Ok(MoeExpertRoute::StagedM8)
+    );
     assert_eq!(resolve(true, on, on), Ok(MoeExpertRoute::LiveTiles));
-    assert_eq!(resolve(true, Some(" on "), Some("True")), Ok(MoeExpertRoute::LiveTiles));
+    assert_eq!(
+        resolve(true, Some(" on "), Some("True")),
+        Ok(MoeExpertRoute::LiveTiles)
+    );
 
     let fails = |batched, staged, live, needle: &str| {
         let error = resolve(batched, staged, live).expect_err("combination must fail");
         assert!(error.contains(needle), "{error:?} does not name {needle:?}");
     };
     // Staged M8 without the batched route.
-    fails(false, on, None, "HF2Q_QWEN_MOE_STAGED_M8=1 requires HF2Q_QWEN_MOE_BATCHED=1");
-    fails(false, on, on, "HF2Q_QWEN_MOE_STAGED_M8=1 requires HF2Q_QWEN_MOE_BATCHED=1");
+    fails(
+        false,
+        on,
+        None,
+        "HF2Q_QWEN_MOE_STAGED_M8=1 requires HF2Q_QWEN_MOE_BATCHED=1",
+    );
+    fails(
+        false,
+        on,
+        on,
+        "HF2Q_QWEN_MOE_STAGED_M8=1 requires HF2Q_QWEN_MOE_BATCHED=1",
+    );
     // Live tiles without staged M8, with and without the batched route.
-    fails(true, None, on, "HF2Q_QWEN_MOE_LIVE_TILES=1 requires HF2Q_QWEN_MOE_STAGED_M8=1");
-    fails(true, Some("0"), on, "HF2Q_QWEN_MOE_LIVE_TILES=1 requires HF2Q_QWEN_MOE_STAGED_M8=1");
-    fails(false, None, on, "HF2Q_QWEN_MOE_LIVE_TILES=1 requires HF2Q_QWEN_MOE_STAGED_M8=1");
+    fails(
+        true,
+        None,
+        on,
+        "HF2Q_QWEN_MOE_LIVE_TILES=1 requires HF2Q_QWEN_MOE_STAGED_M8=1",
+    );
+    fails(
+        true,
+        Some("0"),
+        on,
+        "HF2Q_QWEN_MOE_LIVE_TILES=1 requires HF2Q_QWEN_MOE_STAGED_M8=1",
+    );
+    fails(
+        false,
+        None,
+        on,
+        "HF2Q_QWEN_MOE_LIVE_TILES=1 requires HF2Q_QWEN_MOE_STAGED_M8=1",
+    );
     // Invalid values, whatever the other switches say.
     for batched in [false, true] {
         for other in [None, on] {
-            fails(batched, other, Some("bogus"), "HF2Q_QWEN_MOE_LIVE_TILES must be");
+            fails(
+                batched,
+                other,
+                Some("bogus"),
+                "HF2Q_QWEN_MOE_LIVE_TILES must be",
+            );
             fails(batched, Some("2"), other, "HF2Q_QWEN_MOE_STAGED_M8 must be");
         }
     }
