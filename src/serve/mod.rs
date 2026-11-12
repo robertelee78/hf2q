@@ -7052,7 +7052,8 @@ fn cmd_parity_check(
     eprintln!();
 
     let tokenizer_path = find_tokenizer(model_path, None)?;
-    let mut ctx = gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
+    let mut ctx =
+        gpu::GpuContext::new_for_gemma4().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
     // ADR-022 P1.8 (operator pushback "requiring the config seems dumb"):
@@ -7217,7 +7218,8 @@ fn cmd_parity_capture(
 
     // Load model once
     let tokenizer_path = find_tokenizer(model_path, None)?;
-    let mut ctx = gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
+    let mut ctx =
+        gpu::GpuContext::new_for_gemma4().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
     // ADR-022 P1.8 — prefer GGUF-self-sufficient config; see cmd_parity_check.

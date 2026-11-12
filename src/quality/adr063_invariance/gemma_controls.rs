@@ -178,10 +178,15 @@ fn q1_gemma_endpoint_expected_is_the_reviewed_t0_t2_extent() {
     }
 }
 #[test]
-fn q1_gemma_warm_kernel_defaults_to_shipped_vec_hybrid_and_refuses_undeclared_tiled() {
+fn q1_gemma_packet_kernels_default_to_the_retained_routes_and_refuse_undeclared_ones() {
     use crate::inference::models::gemma4::GemmaLiveKernel as K;
-    assert_eq!(crate::serve::gemma_live_attention::default_warm_live_kernel(),K::VecHybrid);
+    // The shipped default is the tensor route (v0.1.30); a packet without the
+    // field still means VecHybrid, the kernel of every retained Q1 run, so a
+    // default-route run must declare its kernel.
+    assert_eq!(crate::serve::gemma_live_attention::default_warm_live_kernel(),K::TensorF16);
     assert_eq!(WarmLiveKernel::default(),WarmLiveKernel::VecHybrid);
+    assert!(require_warm_kernel(WarmLiveKernel::default(),K::TensorF16).is_err());
+    assert_eq!(require_warm_kernel(WarmLiveKernel::TensorF16,K::TensorF16).unwrap(),WarmLiveKernel::TensorF16);
     assert_eq!(require_warm_kernel(WarmLiveKernel::VecHybrid,K::VecHybrid).unwrap(),WarmLiveKernel::VecHybrid);
     assert!(require_warm_kernel(WarmLiveKernel::VecHybrid,K::TiledF16).is_err());
     assert!(require_warm_kernel(WarmLiveKernel::TiledF16,K::VecHybrid).is_err());

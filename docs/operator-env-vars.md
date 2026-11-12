@@ -145,6 +145,11 @@ With two or more agents decoding at once, DeepSeek-V4 advances every eligible sl
 |---|---|---|---|
 | `HF2Q_DEEPSEEK_JOINT_DECODE` | on | `0`/`off`/`false`, `1`/`on`/`true` | Escape hatch. `0` restores serial per-slot decode, including the exact B=4 cohort. Read once at worker start. It is also forced serial by `MLX_UNRETAINED_REFS`, DeepSeek layer dumps or stage profiling, and an explicit `HF2Q_DECODE_MV_EXT=1`. The routing policy is frozen into the DeepSeek-V4 model's registries at load, so loading a Qwen3.8 model in the same process does not affect it. |
 | `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` | `4` | `2`–`8` | Widest joint step. Widths above 4 are covered only by the official-artifact bitwise test and have no serving measurement; use them only for experiments. Invalid values warn and use 4. |
+| `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC` | on | `0`, `1` | Kill switch of the row-exact few-row products (default since v0.1.30). On: F16 products at one row and independent F16 rows, Q8_0 products at up to 8 rows and Q8_0 grouped output-A run one mlx-native `row_exact_matvec_stock` dispatch whose every row is bitwise the stock one-row result. A product the kernel does not reproduce (other storage types; Q8_0 under `HF2Q_Q8_0_MV_NR2=0` or at 2–8 rows under `HF2Q_DECODE_MV_EXT=1`) keeps its stock route. `0` restores one dispatch per row. Any other value refuses the model load. |
+| `HF2Q_DEEPSEEK_TAIL_ROWS_STEP` | on | `0`, `1` | Kill switch of rows steps over token-wise prompt work (default since v0.1.30): the 8-token recovery tail and cached suffixes below the 33-token matrix floor run as rows steps of up to 8 tokens whose every row and cache byte equal the one-token steps. While joint decode is unavailable for the artifact or process the work runs one-token steps and the load logs why. `0` restores one-token steps. Any other value refuses the model load. |
+| `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES` | on | `0`, `1` | Kill switch of the batched joint attention cores (default since v0.1.30): per layer, one rows dispatch per op covers every joint row, each row bitwise equal to its per-row core. A layer with a row at position 0 keeps the per-row cores. `0` restores one row at a time. Any other value refuses the model load. |
+
+The three routes above are the configuration of the DeepSeek-V4 release gate (ADR-063 Q4-DS4-RACE, campaign `q4-deepseek4-ds4file-release-gate-v4`) and change dispatch counts only: every output bit equals the v0.1.29 routes, on hf2q's own artifact and on the ds4 file. They are read once at model load, which logs one audit line, `DeepSeek-V4 default routes resolved`, with each value, its source (`default` or `environment`), the tokens per token-wise step and whether the joint routes are available. No other model family reads them.
 
 ## Dense KV / decode layout
 
@@ -310,35 +315,85 @@ decision` at start, and each cohort logs `Gemma4 cold stable cohort prefilled
 in one joint transaction` with its phase timings. Evidence:
 `docs/research/adr063-q4-gemma-cold-design.md`.
 
-### Gemma tiled warm attention (default off)
+### Gemma 4 release-gate routes (default on)
+
+Since v0.1.30 the four routes of the Gemma 4 release gate are the defaults
+of a Gemma 4 model (ADR-063 Q4-GEMMA-ATTN, campaign
+`q4-gemma-release-gate-max40-v3`): decode attention head split NE 4,
+`row_exact` decode dense kernel, tensor-API warm attention and the Q5_0
+tensor matmul. Nothing has to be set to get them; each switch below is a
+kill switch. No other model family reads them or changes a bit.
+
+Every Gemma 4 model load logs one audit line, `Gemma 4 default routes
+resolved`, with each resolved value and its source (`default`,
+`environment`, or `fallback` when the default route is unavailable on the
+device), and `/hf2q/v1/runtime` publishes the four values under
+`measurement_snapshot.active_controls`. To serve exactly the v0.1.29 route
+set, set all four kill switches:
+
+```
+HF2Q_GEMMA_DECODE_ATTN_NE=0 HF2Q_GEMMA_DECODE_DENSE=stock \
+HF2Q_GEMMA_WARM_TILED_ATTENTION=0 HF2Q_Q5_0_TENSOR_MM=0
+```
+
+The defaults never refuse a model: a layer, weight or device a route does
+not admit keeps the stock route (details per switch). Explicit values keep
+their previous behaviour.
+
+#### Gemma decode attention head split (default NE 4)
+
+`HF2Q_GEMMA_DECODE_ATTN_NE` selects the decode attention kernel of d256
+(sliding) layers on every decode path (batched cohort dispatch, mixed-bucket
+per-slot fallback and single-slot decode). It is read once when the model
+loads.
+- **Unset (default) or `4`:** mlx-native's NE 4 head-split kernels. They
+  share their per-row math, so a slot's decode is bitwise the same on each
+  path. Numerics class B against the stock kernels.
+- **`0`, `1`, `off`, `false` or `stock`:** kill switch; the stock vec-hybrid
+  kernels.
+- **`2`:** the NE 2 head split.
+- **Any other value:** logs a warning and keeps the default.
+
+Layers whose head dimension is not 256 (the d512 global layers) keep the
+stock kernels under every value. `/hf2q/v1/runtime` publishes `Stock`, `Ne2`
+or `Ne4` as `measurement_snapshot.active_controls.gemma_decode_attn_ne`. The
+Gemma launcher forwards `DECODE_ATTN_NE=0|2|4`.
+
+#### Gemma warm attention (default tensor)
 
 `HF2Q_GEMMA_WARM_TILED_ATTENTION` selects the attention kernel of Gemma 4
 warm prefills (ADR-063 Stage 2): every single-slot prefill that resumes a
 cached prefix, and every lane of a joint warm cohort. It is read once when
 the model loads.
-- **Unset, `0`, `off` or `false` (default):** warm prefills use the
-  vec-hybrid kernel (one decode-style pass per query over the whole history).
-- **`1`, `on` or `true`:** opt in to tiled F16 flash attention over the
-  slot's K and dequantized V range, one sequence per dispatch (1,024-query
-  sliding chunks, 4,096-query global chunks). Suffixes shorter than 32 tokens
-  keep vec-hybrid attention. A joint cohort stays bitwise equal to its
-  per-slot prefills, but the route changes warm-prefill decisions against
-  the default: on the canonical four-agent task it moved a follow-up turn's
-  top-2 log-probabilities from −0.149/−1.978 to −0.368/−1.179 and changed the
-  written code (`$E/gemma-divergence-v1`). Default off since the ADR-063
-  quality gate (2026-11-01).
+- **Unset (default) or `tensor`:** mlx-native's tensor-API flash attention
+  over the slot's compacted K and dequantized V range, one sequence per
+  dispatch (1,024-query sliding chunks, 4,096-query global chunks). Suffixes
+  shorter than 32 tokens keep vec-hybrid attention. A joint cohort stays
+  bitwise equal to its per-slot prefills. When the switch is unset and the
+  device cannot build the tensor pipelines (no Metal tensor API), the load
+  logs `Gemma warm live attention default is unavailable; using the stock
+  kernel` and serves vec-hybrid; an explicit `tensor` is not replaced.
+- **`0`, `off` or `false`:** kill switch; warm prefills use the vec-hybrid
+  kernel (one decode-style pass per query over the whole history).
+- **`1`, `on` or `true`:** opt in to tiled F16 flash attention with the same
+  chunking. This route is not a default: on the canonical four-agent task it
+  moved a follow-up turn's top-2 log-probabilities from −0.149/−1.978 to
+  −0.368/−1.179 and changed the written code (`$E/gemma-divergence-v1`,
+  ADR-063 quality gate, 2026-11-01).
 - **Any other value:** logs a warning and keeps the default.
 
 The switch also covers installed long-prompt lanes (prompts over 4,096
 tokens), which run the single-slot warm route (#725). The model load logs `Gemma warm live
 attention kernel`, each live prefill banner prints `live=`, and
-`/hf2q/v1/runtime` publishes the resolved kernel (`VecHybrid` or `TiledF16`)
-as `measurement_snapshot.active_controls.gemma_warm_attention_kernel`.
-Evidence: `docs/research/adr063-gemma-four-agent-reuse.md`. A precise F32
+`/hf2q/v1/runtime` publishes the resolved kernel (`TensorF16`, `VecHybrid`
+or `TiledF16`) as
+`measurement_snapshot.active_controls.gemma_warm_attention_kernel`.
+Evidence: `docs/research/adr063-gemma-four-agent-reuse.md`,
+`docs/research/adr063-q4-gemma-attn-tensor-design.md`. A precise F32
 tiled route was evaluated and falsified (ADR-063 Q4-GEMMA-ATTN,
 `docs/research/adr063-gemma-tiled-attn-design.md` §12).
 
-### Gemma decode dense kernel (default `stock`)
+#### Gemma decode dense kernel (default `row_exact`)
 
 `HF2Q_GEMMA_DECODE_DENSE` selects the kernel of the dense GGUF matmuls of
 Gemma 4 decode (attention q/k/v/o, dense FFN gate/up/down and the lm head) in
@@ -346,10 +401,11 @@ the solo decode, the `[N,hidden]` batched body, the batched and fused lm head,
 the speculative verify heads and tree-verify layers, and the prefill
 first-token head, so every logit row comes from the same per-row kernel (ADR-063
 Q4-GEMMA-DECODE op parity). It is read once per process, at model load.
-- **Unset or `stock` (default):** the existing routes.
-- **`row_exact`:** the row-exact few-row mat-vec (`row_exact_matvec`) for
-  Q4_K or Q6_K weights with `K % 256 == 0` (Q4_K also needs a 16-byte-aligned
-  weight start) and Q5_0 or Q8_0 weights with `K % 32 == 0`.
+- **Unset (default) or `row_exact`:** the row-exact few-row mat-vec
+  (`row_exact_matvec`) for Q4_K or Q6_K weights with `K % 256 == 0` (Q4_K
+  also needs a 16-byte-aligned weight start) and Q5_0 or Q8_0 weights with
+  `K % 32 == 0`.
+- **`stock`:** kill switch; the previous routes.
 - **`mma`:** the column-invariant few-row MMA mat-vec (the peer's
   `mul_mv_mma` technique) for Q4_K, Q6_K or Q5_0 weights with `K % 64 == 0`
   (and the type's block size) and Q8_0 weights with `K % 32 == 0`. Numerics
@@ -360,25 +416,34 @@ Under `row_exact` and `mma` each row's result is bitwise the same however many
 rows share the dispatch, so a slot's logits do not depend on the decode width
 or path; products wider than 8 rows run in chunks of at most 8 rows. Whether a
 weight takes the kernel depends on the weight alone, never on the width; every
-other weight (F32 router, F16/BF16, other types) and the other prefill
-matmuls keep their routes. `/hf2q/v1/runtime` publishes the resolved kernel (`Stock`,
+other weight (F32 router, F16/BF16, DWQ affine overlays, other quantization
+types, other K) and the other prefill matmuls keep their stock routes, so no
+artifact is refused. `/hf2q/v1/runtime` publishes the resolved kernel (`Stock`,
 `RowExact` or `ColumnInvariantMma`) as
 `measurement_snapshot.active_controls.gemma_decode_dense_kernel`; Gemma Q1
-endpoint and localizer packets declare it as `decode_dense_kernel`.
+endpoint and localizer packets declare it as `decode_dense_kernel` (a packet
+without the field means `Stock`, so a retained packet replays under
+`HF2Q_GEMMA_DECODE_DENSE=stock`).
 The Gemma launcher forwards `DECODE_DENSE=stock|row_exact|mma`; the Q5 case
-maps `HF2Q_Q5_GEMMA_DECODE_DENSE` to that launcher variable. Leaving it unset
-keeps the stock route.
+maps `HF2Q_Q5_GEMMA_DECODE_DENSE` to that launcher variable.
 
-### Native Q5_0 tensor matmul (default off)
+#### Q5_0 tensor matmul (default on for Gemma 4)
 
-`HF2Q_Q5_0_TENSOR_MM` is read by mlx-native (0.18.0 and later), not by hf2q.
-Only the exact value `1` routes Q5_0 dense and expert matrix multiplications
-through the tensor pipeline; unset or any other value keeps the simdgroup
-route. It exists for the Gemma combined-candidate quality campaign; the
-tensor route is not yet qualified as a default. The first Gemma 4 model load
-of a process logs one line `Gemma4 native routing: q5_0_tensor_mm=<true|false>
-mm_id_schedule=<grid|compact>`, and
-`/hf2q/v1/runtime` publishes the resolved value as
+`HF2Q_Q5_0_TENSOR_MM` selects whether Q5_0 dense and expert matrix
+multiplications use mlx-native's tensor pipeline. mlx-native's own default
+is off and stays off: hf2q sets the routing-policy field `q5_0_tensor_mm`
+in the policy a Gemma 4 model freezes into its own kernel registries, so a
+Qwen, DeepSeek-V4 or embedding model in any process keeps the simdgroup
+route unless the variable is `1`.
+- **Unset (default):** on for a Gemma 4 model, off for every other family.
+- **`1`:** on for every family (mlx-native's reading, as before).
+- **`0`, or any other value:** kill switch; the simdgroup route.
+
+The tensor pipeline still depends on mlx-native's device probe; a device
+without it serves the simdgroup route, as for the other tensor-routed
+types. The first Gemma 4 model load of a process logs one line `Gemma4
+native routing: q5_0_tensor_mm=<true|false> mm_id_schedule=<grid|compact>`,
+and `/hf2q/v1/runtime` publishes the value the loaded model froze as
 `measurement_snapshot.active_controls.q5_0_tensor_mm` (`true`/`false`) beside
-`mm_id_schedule`. The Gemma launcher forwards it from `Q5_0_TENSOR_MM=1`
-and the Q5 case from `HF2Q_Q5_Q5_0_TENSOR_MM=1`.
+`mm_id_schedule`. The Gemma launcher forwards `Q5_0_TENSOR_MM=0|1` and the
+Q5 case `HF2Q_Q5_Q5_0_TENSOR_MM`.

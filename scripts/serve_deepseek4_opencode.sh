@@ -60,6 +60,13 @@
 #                           "hf2q=info,mlx_native=info,hf2q::serve::api::engine_deepseek4::progress=debug"
 #                           for the per-turn joint decode trace (ADR-063 S3).
 #
+# The launcher sets no HF2Q_* route switch: the release-gate routes (row-exact
+# few-row products, rows steps over token-wise prompt work, batched joint
+# attention cores) are hf2q defaults. Their kill switches, inherited from the
+# caller's environment when set, are HF2Q_DEEPSEEK_ROW_EXACT_MATVEC=0,
+# HF2Q_DEEPSEEK_TAIL_ROWS_STEP=0 and HF2Q_DEEPSEEK_BATCHED_ATTN_CORES=0
+# (docs/operator-env-vars.md).
+#
 # Unlike the Qwen launcher, this does not set HF2Q_KV_LCP_RESUME or configure
 # --kv-persist. DeepSeek-V4 owns a family-specific live cache and recovery
 # checkpoint; it currently does not serialize them across server restarts.

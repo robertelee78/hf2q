@@ -62,13 +62,13 @@ with the audit script for this change (the lexical count of
 
 - `HF2Q_DEEPSEEK_JOINT_DECODE` (`documented-escape`) is the DeepSeek-V4 joint decode kill switch. It is on by default; `0`/`off`/`false` restores serial per-slot decode.
 - `HF2Q_DEEPSEEK_JOINT_DECODE_MAX_ROWS` (`development-only`) sets the joint width, 2..8 with a default of 4. Widths 5–8 have no serving measurement.
-- `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC` (`development-only`, ADR-063 gap program, 2026-11-06) selects the DeepSeek-V4 few-row kernel family. `0`: the existing routes. Unset: the build default (`HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT`, the existing routes unless the build set it). `1`: F16 products at `m = 1` and independent F16 rows, Q8_0 products at `m <= 8` and Q8_0 grouped output-A run mlx-native's `row_exact_matvec_stock`, one dispatch per product whose every row is bitwise the stock one-row kernel's, so both settings produce the same bits; Q8_0 takes it only where the stock route is the NR2 matvec (never under `HF2Q_Q8_0_MV_NR2=0`, only one-row products under `HF2Q_DECODE_MV_EXT=1`) and otherwise keeps the stock route; F16 prefill rows keep the stock tiled kernel. Any other value refuses model load. Read once at model load; the serial, joint, prefill and verifier graphs of the process share the choice.
-- `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT` (`development-only`, build time) sets the family used when `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC` is unset at run time: `1` builds a binary whose default is the row-exact family, `0` or unset keeps Stock, and any other value fails the build. Resolution order is the runtime switch, then this build default, then Stock. It exists for harnesses that strip `HF2Q_*` from the runtime environment (the Q1 endpoint supervisor): the two Q1 arms are two binaries of one commit.
-- `HF2Q_DEEPSEEK_TAIL_ROWS_STEP` (`development-only`, ADR-063 gap program fix 1, 2026-11-07) runs DeepSeek-V4 token-wise prompt work (the 8-token recovery tail and cached suffixes below the 33-token matrix floor) as rows steps of up to 8 tokens instead of one-token verifier steps. A rows step is one layer-major transaction on the joint-decode routes with the per-row attention cores in row order on the request's cache, so every row's state and every cache byte equal the one-token steps (Class A). Unset or `0`: one-token steps; `1`: rows steps when joint decode is admissible for the artifact and process (otherwise one-token steps). Any other value refuses model load. Read once at model load.
-- `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES` (`development-only`, ADR-063 gap program fix B stage 1, 2026-11-06) selects how DeepSeek-V4 joint decode encodes the cache-dependent attention cores. Unset or `0`: one row at a time, as before. `1`: phase-major, one mlx-native `deepseek_rows` dispatch per op over all joint rows (compressor recurrences, indexer score + top-k, sparse attention; the flash path once per distinct width), each row against its own cache through a fixed binding slot; the compressor/indexer F16 projections become one `row_matmul` over the rows (one `m = B` dispatch with `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC=1`). Every row stays bitwise equal to the per-row cores; layers with a row at position 0 keep the per-row cores. Serial decode is unaffected. Any other value refuses model load. Read once at model load. Off by default until the real-artifact joint ≡ serial gate passes with the switch on.
+- `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`; ADR-063 gap program, 2026-11-06; default on since v0.1.30) is the kill switch of the DeepSeek-V4 row-exact few-row kernel family. Unset or `1`: F16 products at `m = 1` and independent F16 rows, Q8_0 products at `m <= 8` and Q8_0 grouped output-A run mlx-native's `row_exact_matvec_stock`, one dispatch per product whose every row is bitwise the stock one-row kernel's, so both settings produce the same bits; Q8_0 takes it only where the stock route is the NR2 matvec (never under `HF2Q_Q8_0_MV_NR2=0`, only one-row products under `HF2Q_DECODE_MV_EXT=1`) and otherwise keeps the stock route; F16 prefill rows keep the stock tiled kernels. `0`: the routes of v0.1.29. Any other value refuses model load. Read once at model load and reported in the `DeepSeek-V4 default routes resolved` audit line.
+- `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT` (build time) is removed in v0.1.30: the row-exact family is the run-time default, so a harness that strips `HF2Q_*` from the environment runs it from the ordinary binary.
+- `HF2Q_DEEPSEEK_TAIL_ROWS_STEP` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`; ADR-063 gap program fix 1, 2026-11-07; default on since v0.1.30) is the kill switch of DeepSeek-V4 rows steps: token-wise prompt work (the 8-token recovery tail and cached suffixes below the 33-token matrix floor) runs as rows steps of up to 8 tokens instead of one-token verifier steps. A rows step is one layer-major transaction on the joint-decode routes with the per-row attention cores in row order on the request's cache, so every row's state and every cache byte equal the one-token steps (Class A). Unset or `1`: rows steps when joint decode is admissible for the artifact and process (otherwise one-token steps, with the reason logged at load); `0`: one-token steps. Any other value refuses model load. Read once at model load.
+- `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`; ADR-063 gap program fix B stage 1, 2026-11-06; default on since v0.1.30) is the kill switch of the batched DeepSeek-V4 joint attention cores. Unset or `1`: phase-major, one mlx-native `deepseek_rows` dispatch per op over all joint rows (compressor recurrences, indexer score + top-k, sparse attention; the flash path once per distinct width), each row against its own cache through a fixed binding slot; the compressor/indexer F16 projections become one `row_matmul` over the rows. Every row stays bitwise equal to the per-row cores; layers with a row at position 0 keep the per-row cores. `0`: one row at a time, as in v0.1.29. Serial decode is unaffected. Any other value refuses model load. Read once at model load.
 - `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` (`documented-escape`) is the Gemma 4 full-input checkpoint switch. Unset means on where the worker's substrate and quota plan allow it; `0` is the kill switch (also skips the slot-route warmup); `1` forces it and refuses startup otherwise. It no longer needs `HF2Q_UNSAFE_EXPERIMENTS`.
 - `HF2Q_GEMMA_JOINT_WARM_PREFILL` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the Gemma 4 joint warm prefill kill switch (ADR-063 Stage 1). Unset or `1`/`on`/`true`: same-step warm tool-turn suffixes share one bitwise-exact transaction; `0`/`off`/`false` restores per-slot warm prefill. Invalid values warn and keep the default. Read once per SlotAware worker; also off when `HF2Q_CROSS_SLOT_ADMIT` is off, `HF2Q_PREFILL_SLOT_BATCHED=0` or `HF2Q_MM_ID_ROUTING_THRESHOLD` is set.
-- `HF2Q_GEMMA_WARM_TILED_ATTENTION` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects the Gemma 4 warm-prefill attention kernel (ADR-063 Stage 2). Unset or `0`/`off`/`false` (default since the 2026-11-01 quality gate): vec-hybrid warm attention. `1`/`on`/`true`: single-slot warm prefills, joint warm cohorts and installed long-prompt lanes attend with tiled F16 flash attention (suffixes under 32 rows keep vec-hybrid); this route changed agent decisions on the canonical four-agent task. Invalid values warn and keep the default. Read once per model load.
+- `HF2Q_GEMMA_WARM_TILED_ATTENTION` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects the Gemma 4 warm-prefill attention kernel (ADR-063 Stage 2). Unset or `tensor` (default since v0.1.30, the release-gate route): mlx-native's tensor-API flash attention for single-slot warm prefills, joint warm cohorts and installed long-prompt lanes (suffixes under 32 rows keep vec-hybrid); unset falls back to vec-hybrid, with a logged reason, on a device without the Metal tensor API. `0`/`off`/`false`: kill switch, vec-hybrid warm attention. `1`/`on`/`true`: tiled F16 flash attention, which changed agent decisions on the canonical four-agent task and stays opt-in. Invalid values warn and keep the default. Read once per model load.
 - `HF2Q_GEMMA4_GGUF` (`development-only`) names the official Gemma 4 GGUF for the ignored real-artifact checkpoint/warmup/joint-warm-prefill/warm-tiled-attention tests.
 - `HF2Q_QWEN_JOINT_DECODE` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) is the Qwen joint decode switch. Unset, it is on for dense (Qwen3.8) and MoE (Qwen3.6) artifacts; `0`/`off`/`false` restores serial per-slot decode, including MTP K3 and history speculation.
 - `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` (`development-only`) sets the Qwen joint width, 2..8 with a default of 4; the padded `mul_mv_ext` mode caps at 4.
@@ -129,7 +129,7 @@ This row was added by hand.
 
 ## Added in the ADR-063 gap program (2026-11-07)
 
-- `HF2Q_GEMMA_DECODE_ATTN_NE` (`development-only`) selects the Gemma 4 decode attention head split of d256 (sliding) layers. Unset or `0`/`1`/`off`/`false`/`stock`: stock vec-hybrid decode attention. `4` or `2`: the NE head-split kernels on every decode path (batched cohort dispatch, mixed-bucket per-slot fallback and single-slot decode), which share their per-row math, so a slot's decode stays bitwise the same on each path; d512 layers keep stock. Class B against stock. Read once at model load; invalid values warn and keep stock; published as `active_controls.gemma_decode_attn_ne` and bound by the Gemma Q1 packet field `decode_attn_ne`. `serve_gemma4_opencode.sh` forwards `DECODE_ATTN_NE`, and the Gemma Q5 case forwards `HF2Q_Q5_GEMMA_DECODE_ATTN_NE`.
+- `HF2Q_GEMMA_DECODE_ATTN_NE` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects the Gemma 4 decode attention head split of d256 (sliding) layers. Unset or `4` (default since v0.1.30, the release-gate route) or `2`: the NE head-split kernels on every decode path (batched cohort dispatch, mixed-bucket per-slot fallback and single-slot decode), which share their per-row math, so a slot's decode stays bitwise the same on each path; layers of any other head dimension keep stock. Class B against stock. `0`/`1`/`off`/`false`/`stock`: kill switch, stock vec-hybrid decode attention. Read once at model load; invalid values warn and keep the default; published as `active_controls.gemma_decode_attn_ne` and bound by the Gemma Q1 packet field `decode_attn_ne`. `serve_gemma4_opencode.sh` forwards `DECODE_ATTN_NE`, and the Gemma Q5 case forwards `HF2Q_Q5_GEMMA_DECODE_ATTN_NE`.
 
 This row was added by hand.
 
@@ -141,13 +141,13 @@ These rows were added by hand.
 
 ## Added in ADR-063 Q4-GEMMA-DECODE op parity (2026-11-06)
 
-- `HF2Q_GEMMA_DECODE_DENSE` (`development-only`) selects the kernel of every Gemma 4 decode dense GGUF matmul — attention q/k/v/o, dense FFN gate/up/down and the lm head, in the solo decode, the `[N,hidden]` batched body, the batched/fused lm head, the speculative verify heads and tree-verify layers, and the m=1 prefill first-token head. `stock` or unset (default): the existing routes. `row_exact`: mlx-native's row-exact few-row mat-vec for Q4_K/Q6_K with `K % 256 == 0` (Q4_K also with a 16-byte-aligned weight start) and Q5_0/Q8_0 with `K % 32 == 0`. `mma`: the column-invariant few-row MMA mat-vec for Q4_K/Q6_K/Q5_0 with `K % 64 == 0` (and the block size) and Q8_0 with `K % 32 == 0` (numerics class B). Any other value fails the model load; the switch is read once per process. Admission depends on the weight alone, never on the decode width; products wider than 8 rows run in chunks of at most 8 rows, so each row is bitwise equal at every width. Other weights (F32 router, F16/BF16, affine, other block types) and the other (m > 8) prefill matmuls keep their routes. Published as `measurement_snapshot.active_controls.gemma_decode_dense_kernel` (`Stock` / `RowExact` / `ColumnInvariantMma`) and declared as `decode_dense_kernel` in Gemma Q1 endpoint and localizer packets.
+- `HF2Q_GEMMA_DECODE_DENSE` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects the kernel of every Gemma 4 decode dense GGUF matmul — attention q/k/v/o, dense FFN gate/up/down and the lm head, in the solo decode, the `[N,hidden]` batched body, the batched/fused lm head, the speculative verify heads and tree-verify layers, and the m=1 prefill first-token head. `stock`: kill switch, the routes of v0.1.29. Unset (default since v0.1.30, the release-gate route) or `row_exact`: mlx-native's row-exact few-row mat-vec for Q4_K/Q6_K with `K % 256 == 0` (Q4_K also with a 16-byte-aligned weight start) and Q5_0/Q8_0 with `K % 32 == 0`. `mma`: the column-invariant few-row MMA mat-vec for Q4_K/Q6_K/Q5_0 with `K % 64 == 0` (and the block size) and Q8_0 with `K % 32 == 0` (numerics class B). Any other value fails the model load; the switch is read once per process. Admission depends on the weight alone, never on the decode width; products wider than 8 rows run in chunks of at most 8 rows, so each row is bitwise equal at every width. Other weights (F32 router, F16/BF16, affine, other block types) and the other (m > 8) prefill matmuls keep their routes. Published as `measurement_snapshot.active_controls.gemma_decode_dense_kernel` (`Stock` / `RowExact` / `ColumnInvariantMma`) and declared as `decode_dense_kernel` in Gemma Q1 endpoint and localizer packets.
 
 This row was added by hand.
 
 ## Added for the native Q5_0 tensor-MM opt-in (2026-11-07)
 
-- `HF2Q_Q5_0_TENSOR_MM` (`development-only`) is read by mlx-native 0.18.0, not by hf2q: only `1` routes Q5_0 dense and expert matmuls through the tensor pipeline (default off). hf2q publishes the resolved value as `/hf2q/v1/runtime` `active_controls.q5_0_tensor_mm` and logs it once at the first Gemma 4 load (`Gemma4 native routing: q5_0_tensor_mm=<true|false> mm_id_schedule=<grid|compact>`); the Gemma launcher and Q5 case forward it (`Q5_0_TENSOR_MM`, `HF2Q_Q5_Q5_0_TENSOR_MM`).
+- `HF2Q_Q5_0_TENSOR_MM` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects the tensor pipeline for Q5_0 dense and expert matmuls. mlx-native reads it for every family (only `1` is on; its default stays off). For a Gemma 4 model hf2q resolves it itself and freezes the result into that model's kernel registries as the routing-policy field `q5_0_tensor_mm`: unset is on (default since v0.1.30, the release-gate route), `1` on, `0` or any other value the kill switch. Other families are unaffected by the Gemma default. hf2q publishes the value the loaded model froze as `/hf2q/v1/runtime` `active_controls.q5_0_tensor_mm` and logs it once at the first Gemma 4 load (`Gemma4 native routing: q5_0_tensor_mm=<true|false> mm_id_schedule=<grid|compact>`); the Gemma launcher and Q5 case forward it (`Q5_0_TENSOR_MM`, `HF2Q_Q5_Q5_0_TENSOR_MM`).
 - `HF2Q_Q5_0_TENSOR_MM_TEST_EXPECT` (`development-only`) marks the child process of the unit test of that runtime field.
 
 These rows were added by hand.
@@ -244,7 +244,7 @@ this release:
 | `HF2Q_DEEPSEEK4_REQUEST_JSON` | `development-only` | 1 |
 | `HF2Q_DEEPSEEK4_TOKENIZER` | `development-only` | 8 |
 | `HF2Q_DEEPSEEK4_TOKENIZER_JSON` | `development-only` | 2 |
-| `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES` | `development-only` | 10 |
+| `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES` | `documented-escape` | 10 |
 | `HF2Q_DEEPSEEK_COMPRESSED_STAGE_PROFILE` | `development-only` | 4 |
 | `HF2Q_DEEPSEEK_DUMP_ATTENTION_DIR` | `development-only` | 6 |
 | `HF2Q_DEEPSEEK_DUMP_LAYER_DIR` | `development-only` | 5 |
@@ -258,13 +258,12 @@ this release:
 | `HF2Q_DEEPSEEK_MMAP_WEIGHTS` | `development-only` | 3 |
 | `HF2Q_DEEPSEEK_PREFILL_TIMING` | `development-only` | 3 |
 | `HF2Q_DEEPSEEK_PREFILL_WINDOWS` | `development-only` | 6 |
-| `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC` | `development-only` | 10 |
-| `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT` | `development-only` | 5 |
+| `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC` | `documented-escape` | 10 |
 | `HF2Q_DEEPSEEK_SEQUENTIAL_PREFILL` | `development-only` | 1 |
 | `HF2Q_DEEPSEEK_SKIP_WARMUP` | `development-only` | 1 |
 | `HF2Q_DEEPSEEK_SLOT_DECODE_QUANTUM` | `development-only` | 1 |
 | `HF2Q_DEEPSEEK_STAGE_PROFILE` | `development-only` | 5 |
-| `HF2Q_DEEPSEEK_TAIL_ROWS_STEP` | `development-only` | 4 |
+| `HF2Q_DEEPSEEK_TAIL_ROWS_STEP` | `documented-escape` | 4 |
 | `HF2Q_DENSE_Q_ARENA_RESET` | `development-only` | 6 |
 | `HF2Q_DENSE_Q_LEGACY` | `development-only` | 5 |
 | `HF2Q_DFLASH2_CONTEXT_FIRST` | `documented-escape` | 2 |
@@ -354,8 +353,8 @@ this release:
 | `HF2Q_GEMMA_COLD_GS3_REPEATS` | `development-only` | 2 |
 | `HF2Q_GEMMA_COLD_TURN0_PROMPTS` | `development-only` | 5 |
 | `HF2Q_GEMMA_COLD_TURN0_RUN` | `development-only` | 1 |
-| `HF2Q_GEMMA_DECODE_DENSE` | `development-only` | 11 |
-| `HF2Q_GEMMA_DECODE_ATTN_NE` | `development-only` | 5 |
+| `HF2Q_GEMMA_DECODE_DENSE` | `documented-escape` | 13 |
+| `HF2Q_GEMMA_DECODE_ATTN_NE` | `documented-escape` | 7 |
 | `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` | `documented-escape` | 4 |
 | `HF2Q_GEMMA_JOINT_COLD_PREFILL` | `documented-escape` | 4 |
 | `HF2Q_GEMMA_JOINT_WARM_PREFILL` | `documented-escape` | 3 |
@@ -366,7 +365,7 @@ this release:
 | `HF2Q_GEMMA_N8_RESUME_REPEATS` | `development-only` | 1 |
 | `HF2Q_GEMMA_PREFILL_CATSPLIT` | `development-only` | 3 |
 | `HF2Q_GEMMA_ROUTING_OVERLAP` | `development-only` | 5 |
-| `HF2Q_GEMMA_WARM_TILED_ATTENTION` | `documented-escape` | 7 |
+| `HF2Q_GEMMA_WARM_TILED_ATTENTION` | `documented-escape` | 10 |
 | `HF2Q_GLOBAL_FA` | `development-only` | 7 |
 | `HF2Q_GPU_BUSY` | `development-only` | 5 |
 | `HF2Q_GPU_SAMPLE` | `development-only` | 4 |
@@ -450,7 +449,7 @@ this release:
 | `HF2Q_PROFILE_W5B17` | `development-only` | 5 |
 | `HF2Q_PROFILE_W5B22` | `development-only` | 5 |
 | `HF2Q_PROFILE_W5B8` | `development-only` | 19 |
-| `HF2Q_Q5_0_TENSOR_MM` | `development-only` | 7 |
+| `HF2Q_Q5_0_TENSOR_MM` | `documented-escape` | 8 |
 | `HF2Q_Q5_0_TENSOR_MM_TEST_EXPECT` | `development-only` | 1 |
 | `HF2Q_Q6K_ID_MV_NR2` | `development-only` | 2 |
 | `HF2Q_Q6K_MV_NR2` | `development-only` | 3 |

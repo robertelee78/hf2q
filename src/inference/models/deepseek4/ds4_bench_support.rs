@@ -54,14 +54,20 @@ impl Rng {
 /// the model loader reads it, so one run times one family (each cell records it).
 pub(super) fn bench_matvec() -> MatvecKernels {
     static MATVEC: std::sync::OnceLock<MatvecKernels> = std::sync::OnceLock::new();
-    *MATVEC.get_or_init(|| MatvecKernels::from_env().expect("HF2Q_DEEPSEEK_ROW_EXACT_MATVEC"))
+    *MATVEC.get_or_init(|| {
+        MatvecKernels::from_env()
+            .expect("HF2Q_DEEPSEEK_ROW_EXACT_MATVEC")
+            .value
+    })
 }
 
 /// Joint-decode attention cores for the M2b cells: `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES`, read the
 /// way the model loader reads it (each cell records it).
 pub(super) fn bench_cores() -> AttnCores {
     static CORES: std::sync::LazyLock<AttnCores> = std::sync::LazyLock::new(|| {
-        AttnCores::from_env().expect("HF2Q_DEEPSEEK_BATCHED_ATTN_CORES")
+        AttnCores::from_env()
+            .expect("HF2Q_DEEPSEEK_BATCHED_ATTN_CORES")
+            .value
     });
     *CORES
 }

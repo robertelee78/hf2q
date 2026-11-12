@@ -43,6 +43,7 @@ use anyhow::Result;
 use mlx_native::{DType, GraphSession, KernelRegistry, MlxBuffer, MlxDevice};
 
 use crate::inference::models::gemma4::{GemmaLiveKernel, HybridKvBuffers};
+use crate::inference::models::route_default::{Resolved, RouteSource};
 use crate::serve::forward_prefill::GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS;
 
 /// Vec-hybrid query chunk: bounds the attention scratch while keeping every
@@ -67,59 +68,116 @@ pub(crate) const TILED_GLOBAL_QUERY_CHUNK: usize = 4096;
 pub(crate) const WARM_TILED_MIN_ROWS: usize = GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS;
 
 pub(crate) const WARM_TILED_ATTENTION_ENV: &str = "HF2Q_GEMMA_WARM_TILED_ATTENTION";
-/// Off by default (ADR-063 quality gate, 2026-11-01): under a four-agent
-/// cohort the tiled route moved a lane's decision logits enough to change
-/// its greedy choice at a 1.5-nat solo margin, so the vec-hybrid route
-/// serves unless `1` opts in.
-const WARM_TILED_ATTENTION_DEFAULT: bool = false;
+/// Unset default: the tensor-API route of the Gemma 4 release gate (ADR-063
+/// Q4-GEMMA-ATTN, campaign `q4-gemma-release-gate-max40-v3`). The tiled F16
+/// route stays opt-in: under a four-agent cohort it moved a lane's decision
+/// logits enough to change its greedy choice at a 1.5-nat solo margin
+/// (quality gate, 2026-11-01).
+const WARM_ATTENTION_DEFAULT: GemmaLiveKernel = GemmaLiveKernel::TensorF16;
+/// Kill-switch route (`0`/`off`/`false`), and the route an unset switch
+/// falls back to on a device without the Metal tensor API.
+const WARM_ATTENTION_STOCK: GemmaLiveKernel = GemmaLiveKernel::VecHybrid;
 
-fn default_warm_kernel() -> GemmaLiveKernel {
-    if WARM_TILED_ATTENTION_DEFAULT {
-        GemmaLiveKernel::TiledF16
-    } else {
-        GemmaLiveKernel::VecHybrid
-    }
-}
-
-/// `1`/`on`/`true` selects `TiledF16`, `tensor` the gap-program F1 route
-/// `TensorF16`, `0`/`off`/`false` vec-hybrid.
-fn parse_warm_tiled_switch(raw: Option<&str>) -> std::result::Result<GemmaLiveKernel, String> {
+/// `tensor` selects the gap-program F1 route `TensorF16` (also the unset
+/// default), `1`/`on`/`true` `TiledF16`, `0`/`off`/`false` vec-hybrid.
+fn parse_warm_tiled_switch(
+    raw: Option<&str>,
+) -> std::result::Result<Resolved<GemmaLiveKernel>, String> {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return Ok(default_warm_kernel());
+        return Ok(Resolved::default_value(WARM_ATTENTION_DEFAULT));
     };
     match raw.to_ascii_lowercase().as_str() {
-        "1" | "on" | "true" => Ok(GemmaLiveKernel::TiledF16),
-        "tensor" => Ok(GemmaLiveKernel::TensorF16),
-        "0" | "off" | "false" => Ok(GemmaLiveKernel::VecHybrid),
+        "1" | "on" | "true" => Ok(Resolved::environment(GemmaLiveKernel::TiledF16)),
+        "tensor" => Ok(Resolved::environment(GemmaLiveKernel::TensorF16)),
+        "0" | "off" | "false" => Ok(Resolved::environment(WARM_ATTENTION_STOCK)),
         _ => Err(format!(
-            "{WARM_TILED_ATTENTION_ENV} must be 1/on/true, tensor or 0/off/false, got {raw:?}"
+            "{WARM_TILED_ATTENTION_ENV} must be tensor, 1/on/true or 0/off/false, got {raw:?}"
         )),
     }
 }
 
-fn warm_kernel_for_switch(raw: Option<&str>) -> GemmaLiveKernel {
+fn warm_kernel_for_switch(raw: Option<&str>) -> Resolved<GemmaLiveKernel> {
     parse_warm_tiled_switch(raw).unwrap_or_else(|error| {
-        let fallback = default_warm_kernel();
-        tracing::warn!(error, ?fallback, "invalid Gemma warm tiled attention switch");
-        fallback
+        let fallback = WARM_ATTENTION_DEFAULT;
+        tracing::warn!(
+            error,
+            ?fallback,
+            "invalid Gemma warm tiled attention switch"
+        );
+        Resolved::default_value(fallback)
     })
+}
+
+/// Applies the device probe to a resolved switch: an unset switch whose
+/// default route cannot build on this device falls back to vec-hybrid.
+/// An explicit value is never replaced; its dispatch reports the failure.
+fn admit_warm_kernel(
+    resolved: Resolved<GemmaLiveKernel>,
+    tensor_unavailable: impl FnOnce() -> Option<String>,
+) -> (Resolved<GemmaLiveKernel>, Option<String>) {
+    if resolved.source != RouteSource::Default || resolved.value != GemmaLiveKernel::TensorF16 {
+        return (resolved, None);
+    }
+    match tensor_unavailable() {
+        None => (resolved, None),
+        Some(reason) => (Resolved::fallback(WARM_ATTENTION_STOCK), Some(reason)),
+    }
+}
+
+/// Why the tensor-API warm attention pipelines cannot run on `device`
+/// (`None` when both head dims build).
+fn tensor_route_unavailable(registry: &mut KernelRegistry, device: &MlxDevice) -> Option<String> {
+    use mlx_native::ops::flash_attn_prefill_tensor::flash_attn_prefill_tensor_available;
+    for head_dim in [256, 512] {
+        match flash_attn_prefill_tensor_available(registry, device, head_dim) {
+            Ok(true) => {}
+            Ok(false) => return Some(format!(
+                "the Metal tensor API is unavailable for the d{head_dim} warm attention pipeline"
+            )),
+            Err(error) => {
+                return Some(format!(
+                    "the d{head_dim} tensor warm attention pipeline does not build: {error}"
+                ))
+            }
+        }
+    }
+    None
 }
 
 /// Kernel for warm live-resume attention (single-slot resumes, joint warm
 /// cohorts and installed long-prompt lanes), resolved once per model load
-/// from `HF2Q_GEMMA_WARM_TILED_ATTENTION`.
-pub(crate) fn warm_live_kernel_from_env() -> GemmaLiveKernel {
+/// from `HF2Q_GEMMA_WARM_TILED_ATTENTION`. Unset selects the tensor-API
+/// route where the device builds it and vec-hybrid otherwise.
+pub(crate) fn warm_live_kernel_from_env(
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+) -> Resolved<GemmaLiveKernel> {
     let raw = std::env::var(WARM_TILED_ATTENTION_ENV).ok();
-    let kernel = warm_kernel_for_switch(raw.as_deref());
-    tracing::info!(?kernel, "Gemma warm live attention kernel");
+    let (kernel, fallback_reason) =
+        admit_warm_kernel(warm_kernel_for_switch(raw.as_deref()), || {
+            tensor_route_unavailable(registry, device)
+        });
+    if let Some(reason) = &fallback_reason {
+        tracing::warn!(
+            reason,
+            kernel = ?kernel.value,
+            "Gemma warm live attention default is unavailable; using the stock kernel"
+        );
+    }
+    tracing::info!(
+        kernel = ?kernel.value,
+        source = kernel.source.as_str(),
+        "Gemma warm live attention kernel"
+    );
     kernel
 }
 
-/// Warm kernel with `HF2Q_GEMMA_WARM_TILED_ATTENTION` unset (the shipped
-/// default); ADR-063 Q1 harnesses pin their expected route to it.
+/// Warm kernel with `HF2Q_GEMMA_WARM_TILED_ATTENTION` unset on a device with
+/// the Metal tensor API (the shipped default); ADR-063 Q1 harnesses pin
+/// their expected route against it.
 #[cfg(test)]
 pub(crate) fn default_warm_live_kernel() -> GemmaLiveKernel {
-    warm_kernel_for_switch(None)
+    warm_kernel_for_switch(None).value
 }
 
 /// Attention route of one live-resume forward: the model's warm kernel, with
@@ -1156,19 +1214,74 @@ mod tests {
     }
 
     #[test]
-    fn warm_switch_defaults_off_and_one_selects_the_tiled_route() {
-        for raw in [None, Some(""), Some("  "), Some("0"), Some("off"), Some("False"), Some(" 0 ")] {
-            assert_eq!(warm_kernel_for_switch(raw), VecHybrid, "{raw:?}");
+    fn warm_switch_defaults_to_the_release_gate_tensor_route() {
+        for raw in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                warm_kernel_for_switch(raw),
+                Resolved::default_value(TensorF16),
+                "{raw:?}"
+            );
+        }
+        assert_eq!(default_warm_live_kernel(), TensorF16);
+        for raw in ["0", "off", "False", " 0 "] {
+            assert_eq!(
+                warm_kernel_for_switch(Some(raw)),
+                Resolved::environment(VecHybrid),
+                "kill switch {raw:?}"
+            );
         }
         for raw in ["1", "on", "TRUE"] {
-            assert_eq!(warm_kernel_for_switch(Some(raw)), TiledF16, "{raw:?}");
+            assert_eq!(
+                warm_kernel_for_switch(Some(raw)),
+                Resolved::environment(TiledF16),
+                "{raw:?}"
+            );
         }
         for raw in ["tensor", " Tensor "] {
-            assert_eq!(warm_kernel_for_switch(Some(raw)), TensorF16, "{raw:?}");
+            assert_eq!(
+                warm_kernel_for_switch(Some(raw)),
+                Resolved::environment(TensorF16),
+                "{raw:?}"
+            );
         }
         assert!(parse_warm_tiled_switch(Some("yes")).is_err());
-        // An invalid value keeps the vec-hybrid default rather than opting in.
-        assert_eq!(warm_kernel_for_switch(Some("yes")), VecHybrid);
+        // An invalid value warns and keeps the default, reported as such.
+        assert_eq!(
+            warm_kernel_for_switch(Some("yes")),
+            Resolved::default_value(TensorF16)
+        );
+    }
+
+    #[test]
+    fn warm_default_falls_back_to_vec_hybrid_without_the_tensor_api() {
+        let unavailable = || Some("no tensor API".to_string());
+        // Unset: the default falls back and reports why.
+        let (kernel, reason) = admit_warm_kernel(Resolved::default_value(TensorF16), unavailable);
+        assert_eq!(kernel, Resolved::fallback(VecHybrid));
+        assert_eq!(reason.as_deref(), Some("no tensor API"));
+        // Unset on a capable device: the default serves.
+        let (kernel, reason) = admit_warm_kernel(Resolved::default_value(TensorF16), || None);
+        assert_eq!(kernel, Resolved::default_value(TensorF16));
+        assert_eq!(reason, None);
+        // Explicit values are never replaced and never probed.
+        for explicit in [TensorF16, TiledF16, VecHybrid] {
+            let (kernel, reason) = admit_warm_kernel(Resolved::environment(explicit), || {
+                panic!("an explicit warm kernel must not be probed")
+            });
+            assert_eq!(kernel, Resolved::environment(explicit));
+            assert_eq!(reason, None);
+        }
+    }
+
+    #[test]
+    fn warm_default_tensor_probe_reports_instead_of_failing() {
+        let device = MlxDevice::new().expect("Metal device");
+        let mut registry = KernelRegistry::new();
+        // A device with the Metal tensor API builds both pipelines; one
+        // without it reports the reason instead of failing the probe.
+        if let Some(reason) = tensor_route_unavailable(&mut registry, &device) {
+            assert!(reason.contains("Metal tensor API"), "{reason}");
+        }
     }
 
     #[test]

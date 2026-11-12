@@ -3552,8 +3552,10 @@ impl GemmaLoadedModel {
             );
             t_phase = Instant::now();
         }
-        let mut ctx =
-            GpuContext::new().map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
+        // Gemma 4 freezes its own routing policy (Q5_0 tensor matmul on by
+        // default); no other family's registry sees it.
+        let mut ctx = GpuContext::new_for_gemma4()
+            .map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
         if load_timing {
             tracing::info!(
                 "[LOAD_TIMING] gpu_ctx_new={:.0}ms",

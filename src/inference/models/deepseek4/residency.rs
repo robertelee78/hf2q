@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use super::weights::{validate_tensor_catalog, TensorRole, WeightCatalogError};
 use super::Deepseek4Config;
+use crate::inference::models::route_default::Resolved;
 
 #[derive(Debug, Error)]
 pub enum WeightResidencyError {
@@ -71,11 +72,15 @@ struct ResidentTensor {
 /// and verifier graphs of a process share one family. Both families produce
 /// the same bits; they differ in how many dispatches and weight reads a
 /// joint step costs.
+///
+/// `Default` is [`Self::Stock`], the family fixtures build with; the serving
+/// default is [`Self::resolve`] of an unset switch ([`Self::RowExact`]).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MatvecKernels {
-    /// Existing routes: the F16 `m = 1` matvec (L9) with tiled kernels above
-    /// it, the canonical GGUF matvec family (Q8_0 NR2) for block storage;
-    /// independent F16 rows run one dispatch per row.
+    /// The routes of every release through v0.1.29 (kill switch): the F16
+    /// `m = 1` matvec (L9) with tiled kernels above it, the canonical GGUF
+    /// matvec family (Q8_0 NR2) for block storage; independent F16 rows run
+    /// one dispatch per row.
     #[default]
     Stock,
     /// mlx-native `row_exact_matvec_stock` where it reproduces the stock
@@ -92,41 +97,16 @@ impl MatvecKernels {
     /// Process switch read by [`Self::from_env`].
     pub const ENV: &'static str = "HF2Q_DEEPSEEK_ROW_EXACT_MATVEC";
 
-    /// Family used when [`Self::ENV`] is unset: the build-time
-    /// `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT` (`1` = [`Self::RowExact`],
-    /// `0` or unset = [`Self::Stock`]; any other value fails the build).
-    /// Lets a harness that strips `HF2Q_*` from the runtime environment run
-    /// the row-exact family from a separately built binary.
-    pub const BUILD_DEFAULT: Self =
-        Self::build_default(option_env!("HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT"));
-
-    const fn build_default(value: Option<&str>) -> Self {
-        match value {
-            None => Self::Stock,
-            Some(value) => match value.as_bytes() {
-                b"0" => Self::Stock,
-                b"1" => Self::RowExact,
-                _ => panic!("HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT must be 0 or 1"),
-            },
-        }
+    /// `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC`: unset or `1` selects
+    /// [`Self::RowExact`] (the release-gate family), `0` [`Self::Stock`]
+    /// (kill switch); anything else is an error.
+    pub(crate) fn from_env() -> anyhow::Result<Resolved<Self>> {
+        Self::resolve(std::env::var_os(Self::ENV).as_deref())
     }
 
-    /// `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC`: `1` selects [`Self::RowExact`], `0`
-    /// [`Self::Stock`]; unset falls back to [`Self::BUILD_DEFAULT`]; anything
-    /// else is an error.
-    pub fn from_env() -> anyhow::Result<Self> {
-        Self::resolve(std::env::var_os(Self::ENV).as_deref(), Self::BUILD_DEFAULT)
-    }
-
-    /// Resolution order of [`Self::from_env`]: the runtime value when set,
-    /// else `build_default`.
-    pub fn resolve(value: Option<&std::ffi::OsStr>, build_default: Self) -> anyhow::Result<Self> {
-        match value.map(|value| value.to_str()) {
-            None => Ok(build_default),
-            Some(Some("0")) => Ok(Self::Stock),
-            Some(Some("1")) => Ok(Self::RowExact),
-            Some(_) => anyhow::bail!("{} must be 0 or 1 (got {value:?})", Self::ENV),
-        }
+    /// Resolution rule of [`Self::from_env`].
+    pub(crate) fn resolve(value: Option<&std::ffi::OsStr>) -> anyhow::Result<Resolved<Self>> {
+        super::route_defaults::resolve_zero_one(Self::ENV, value, Self::Stock, Self::RowExact)
     }
 }
 

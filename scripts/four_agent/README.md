@@ -542,7 +542,8 @@ HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_T
   --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-gemma4-joint-cold-off-$(date -u +%Y%m%dT%H%M%SZ)"
 
-# Gemma4 tiled F16 warm attention A/B (ADR-063 Stage 2): same case, tiled opt-in arm (alternate ABAB with the default vec-hybrid arm).
+# Gemma4 tiled F16 warm attention A/B (ADR-063 Stage 2): same case, tiled opt-in arm (alternate ABAB with the default arm,
+# which is the tensor route since v0.1.30; HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION=0 is the vec-hybrid kill-switch arm).
 # HF2Q_Q5_GEMMA_WARM_ATTENTION_KERNEL names the arm's resolved kernel; readiness requires /hf2q/v1/runtime to report it.
 HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION=1 HF2Q_Q5_GEMMA_WARM_ATTENTION_KERNEL=TiledF16 \
 HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
@@ -557,19 +558,31 @@ HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_T
   python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
   --negative-control-receipt "$NC_RECEIPT" \
   --output "$Q5_ROOT/q5-gemma4-prefill-moe-A-$(date -u +%Y%m%dT%H%M%SZ)"
-# Gemma4 native Q5_0 tensor-MM opt-in (mlx-native #99, needs mlx-native 0.18.0): the launcher forwards
-# HF2Q_Q5_0_TENSOR_MM=1 (only the value 1; anything else refuses); /hf2q/v1/runtime records active_controls.q5_0_tensor_mm.
-HF2Q_Q5_Q5_0_TENSOR_MM=1 \
+# Gemma4 Q5_0 tensor matmul (mlx-native #99): on by default for Gemma 4 since v0.1.30. The launcher forwards
+# HF2Q_Q5_0_TENSOR_MM=0|1 (0 is the kill-switch arm; anything else refuses); /hf2q/v1/runtime records active_controls.q5_0_tensor_mm.
+HF2Q_Q5_Q5_0_TENSOR_MM=0 \
 HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
   python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
   --negative-control-receipt "$NC_RECEIPT" \
-  --output "$Q5_ROOT/q5-gemma4-q5-0-tensor-mm-$(date -u +%Y%m%dT%H%M%SZ)"
-# Gemma4 decode dense-kernel A/B: the case and launcher forward only an explicit arm.
-HF2Q_Q5_GEMMA_DECODE_DENSE=row_exact \
+  --output "$Q5_ROOT/q5-gemma4-q5-0-tensor-mm-off-$(date -u +%Y%m%dT%H%M%SZ)"
+# Gemma4 decode dense-kernel A/B: the case and launcher forward only an explicit arm; row_exact is the default since
+# v0.1.30 and stock is the kill-switch arm.
+HF2Q_Q5_GEMMA_DECODE_DENSE=stock \
 HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
   python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
   --negative-control-receipt "$NC_RECEIPT" \
-  --output "$Q5_ROOT/q5-gemma4-decode-dense-row-exact-$(date -u +%Y%m%dT%H%M%SZ)"
+  --output "$Q5_ROOT/q5-gemma4-decode-dense-stock-$(date -u +%Y%m%dT%H%M%SZ)"
+# Gemma4 release-gate routes, kill-switch control (v0.1.30): the empty defaults run the gate configuration; this arm is the
+# v0.1.29 route set. /hf2q/v1/runtime records the four resolved values and server.stderr the audit line
+# "Gemma 4 default routes resolved".
+HF2Q_Q5_GEMMA_DECODE_ATTN_NE=0 HF2Q_Q5_GEMMA_DECODE_DENSE=stock HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION=0 HF2Q_Q5_Q5_0_TENSOR_MM=0 \
+HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \
+  python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/gemma4.json \
+  --negative-control-receipt "$NC_RECEIPT" \
+  --output "$Q5_ROOT/q5-gemma4-gate-routes-off-$(date -u +%Y%m%dT%H%M%SZ)"
+# DeepSeek-V4 release-gate routes, kill-switch control (v0.1.30; deepseek4.json and deepseek4-ds4file.json declare the
+# variables with empty defaults, which export nothing): HF2Q_Q5_DEEPSEEK_ROW_EXACT_MATVEC=0
+# HF2Q_Q5_DEEPSEEK_TAIL_ROWS_STEP=0 HF2Q_Q5_DEEPSEEK_BATCHED_ATTN_CORES=0 in front of the DeepSeek-V4 command below.
 # Gemma4 V2 decode-workload diagnostic (ADR-063 Q4-GEMMA-DECODE §7.4; untimed): prints [ROUTING_OVERLAP] at worker exit
 HF2Q_Q5_GEMMA_ROUTING_OVERLAP=1 \
 HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \

@@ -16,7 +16,8 @@ pub(super) struct Packet {
     /// Witness budget, opaque here: [`routing::budget`] admits it on witness-ON
     /// packets; DriftAll128 requires it null and never parses it.
     #[serde(default)] routing_witness:Option<serde_json::Value>,
-    /// Warm live-resume kernel the loaded model must resolve; absent = VecHybrid.
+    /// Warm live-resume kernel the loaded model must resolve; absent = VecHybrid
+    /// (the kill-switch route since v0.1.30).
     #[serde(default)] warm_live_kernel:WarmLiveKernel,
     /// Decode dense/lm-head kernel the process must resolve; absent = Stock.
     #[serde(default)] decode_dense_kernel:DecodeDenseKernel,
@@ -37,33 +38,36 @@ pub(super) struct Packet {
 }
 /// Gemma warm live-resume attention kernel (T1/T3/T6 64-row resumes and the
 /// localizer's `[64,64]` route). It is resolved once at model load and is not
-/// in `config_sha256`. `VecHybrid` is the shipped default since #544 and the
-/// kernel of every retained Gemma Q1 run; `TiledF16` must be declared.
+/// in `config_sha256`. `VecHybrid` is the kernel of every retained Gemma Q1
+/// run and of `HF2Q_GEMMA_WARM_TILED_ATTENTION=0`; the shipped default since
+/// v0.1.30 (`TensorF16`) and `TiledF16` must be declared.
 #[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
 pub(super) enum WarmLiveKernel {#[default] VecHybrid,TiledF16,TensorF16}
 /// Gemma decode attention head split of d256 layers (gap program,
 /// `HF2Q_GEMMA_DECODE_ATTN_NE`). Resolved once at model load and not in
-/// `config_sha256`; `Stock` is the shipped default, `Ne2`/`Ne4` must be declared.
+/// `config_sha256`; `Stock` is the route of every retained Gemma Q1 run and of
+/// `HF2Q_GEMMA_DECODE_ATTN_NE=0`; `Ne2` and `Ne4` (the shipped default since
+/// v0.1.30) must be declared.
 #[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
 pub(super) enum DecodeAttnNe {#[default] Stock,Ne2,Ne4}
 /// Refuses a loaded model whose decode head split is not the packet's declared one.
 pub(super) fn require_decode_attn_ne(declared:DecodeAttnNe,resolved:crate::serve::gemma_decode_attention::GemmaDecodeAttnNe)->Result<DecodeAttnNe> {
     use crate::serve::gemma_decode_attention::GemmaDecodeAttnNe as N;
     let resolved=match resolved {N::Stock=>DecodeAttnNe::Stock,N::Ne(2)=>DecodeAttnNe::Ne2,N::Ne(4)=>DecodeAttnNe::Ne4,N::Ne(n)=>anyhow::bail!("unsupported decode head split NE {n}")};
-    ensure!(resolved==declared,"resolved Gemma decode attention head split {resolved:?} differs from the packet's {declared:?} (absent = shipped Stock)");
+    ensure!(resolved==declared,"resolved Gemma decode attention head split {resolved:?} differs from the packet's {declared:?} (absent = Stock, HF2Q_GEMMA_DECODE_ATTN_NE=0)");
     Ok(resolved)
 }
 /// Refuses a loaded model whose warm kernel is not the packet's declared one.
 pub(super) fn require_warm_kernel(declared:WarmLiveKernel,resolved:crate::inference::models::gemma4::GemmaLiveKernel)->Result<WarmLiveKernel> {
     use crate::inference::models::gemma4::GemmaLiveKernel as K;
     let resolved=match resolved {K::VecHybrid=>WarmLiveKernel::VecHybrid,K::TiledF16=>WarmLiveKernel::TiledF16,K::TensorF16=>WarmLiveKernel::TensorF16};
-    ensure!(resolved==declared,"resolved Gemma warm live kernel {resolved:?} differs from the packet's {declared:?} (absent = shipped VecHybrid)");
+    ensure!(resolved==declared,"resolved Gemma warm live kernel {resolved:?} differs from the packet's {declared:?} (absent = VecHybrid, HF2Q_GEMMA_WARM_TILED_ATTENTION=0)");
     Ok(resolved)
 }
 /// Gemma decode dense/lm-head kernel (`HF2Q_GEMMA_DECODE_DENSE`, read once per
-/// process, not in `config_sha256`). `Stock` is the shipped default and the
-/// kernel of every retained Gemma Q1 run; `RowExact` and `ColumnInvariantMma`
-/// must be declared.
+/// process, not in `config_sha256`). `Stock` is the kernel of every retained
+/// Gemma Q1 run and of `HF2Q_GEMMA_DECODE_DENSE=stock`; `RowExact` (the
+/// shipped default since v0.1.30) and `ColumnInvariantMma` must be declared.
 #[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
 pub(super) enum DecodeDenseKernel {#[default] Stock,RowExact,ColumnInvariantMma}
 /// Refuses a process whose decode dense kernel is not the packet's declared one.
@@ -72,7 +76,7 @@ pub(super) fn require_decode_dense_kernel(declared:DecodeDenseKernel,
     use crate::inference::models::gemma4::decode_dense::DecodeDenseKernel as K;
     let resolved=match resolved {K::Stock=>DecodeDenseKernel::Stock,K::RowExact=>DecodeDenseKernel::RowExact,
         K::ColumnInvariantMma=>DecodeDenseKernel::ColumnInvariantMma};
-    ensure!(resolved==declared,"resolved Gemma decode dense kernel {resolved:?} differs from the packet's {declared:?} (absent = shipped Stock)");
+    ensure!(resolved==declared,"resolved Gemma decode dense kernel {resolved:?} differs from the packet's {declared:?} (absent = Stock, HF2Q_GEMMA_DECODE_DENSE=stock)");
     Ok(resolved)
 }
 const ENDPOINT_PACKET_BYTES:usize=1024*1024;
@@ -274,7 +278,7 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
         else {anyhow::bail!("explicit Gemma model required")};
     scope.check_config(&p.identity,&recipe_for(&model.config))?;
     let warm_live_kernel=require_warm_kernel(p.warm_live_kernel,model.weights.warm_live_kernel)?;
-    let decode_dense_kernel=require_decode_dense_kernel(p.decode_dense_kernel,crate::inference::models::gemma4::decode_dense::resolve()?)?;
+    let decode_dense_kernel=require_decode_dense_kernel(p.decode_dense_kernel,crate::inference::models::gemma4::decode_dense::resolve()?.value)?;
     let decode_attn_ne=require_decode_attn_ne(p.decode_attn_ne,model.weights.decode_attn_ne)?;
     let observed=scope.observed(model.ctx.executor.device(),&model as *const _ as usize as u64,3)?;
     store.bind_acquisition(observed.clone()).map_err(anyhow::Error::msg)?;
