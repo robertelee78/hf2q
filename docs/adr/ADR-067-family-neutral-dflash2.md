@@ -1335,12 +1335,19 @@ rows so that it never depends on the row count; `dflash2_ring_attention`;
 and, at four lanes, the prepared head. Projections and attention are Class B
 against the default route. Each kernel has an F64 reference test with a
 K-scaled bound, a determinism test and a row and lane independence test
-(bitwise, across tile heights, positions and neighbours), and a synthetic
-checkpoint runs both routes to within 5e-3 relative RMS in rings, hidden
-states and logits. Against the pinned Qwen3.6 reference fixture the first
-layer's relative maximum error is 0.1960 staged and 0.1962 on the register
-tile: four-bit quantization, not the tile, sets the draft's distance from
-the BF16 oracle.
+(bitwise, across tile heights, positions and neighbours). Sparse probes
+check that every 32-input step of every served projection shape, up to
+K = 25,600, is summed exactly once; the served 32-over-8-head attention is
+checked at every tile and window boundary, alone and in every cohort; and
+every test's scratch starts as NaN. The ring split kernel holds 16,384 bytes
+of threadgroup memory, which Metal shader validation doubles to the device
+limit, and the kernel tests give the same bits under
+`MTL_SHADER_VALIDATION=1 MTL_DEBUG_LAYER=1`. A synthetic checkpoint runs
+both routes to within 5e-3 relative RMS in rings, hidden states and logits,
+and the prepared head to within 5e-3 of the stock head. Against the pinned
+Qwen3.6 reference fixture the first layer's relative maximum error is 0.1960
+staged and 0.1962 on the register tile: four-bit quantization, not the tile,
+sets the draft's distance from the BF16 oracle.
 
 In situ on the exact four-agent Q5 workload, each arm on one binary, with the
 draft command waited (`HF2Q_DFLASH2_GPU_TARGET_TOKENS=0`) so that `draft_us`
@@ -1350,22 +1357,39 @@ passing off-runs, one passing on-run). `draft_commit_us` fell from 1.39–1.50
 to 0.60–0.66 ms on Qwen3.8 and from 0.72–0.78 to 0.45–0.47 ms on Qwen3.6 in
 every passing run. In the served GPU-token mode Qwen3.8 emits the same
 completion tokens with the switch on or off (5,237 in each of seven runs of
-the measured binary) and accepts 5.334 against 5.330 tokens per lane-cycle.
+the measured binary) and accepts 5.334 against 5.330 tokens per lane-cycle;
+rebased onto the capture-wait fix (`eea0fa1a`), one run per arm accepts 5.366
+against 5.370 for the same 5,237 tokens (1,184 against 1,183 lane-cycles).
 On Qwen3.6, whose text varies between runs of one arm, four on-runs accepted
 4.03–4.18 tokens per lane-cycle against 4.10 and 4.25 for two off-runs. All
 six Qwen3.8 and all four Qwen3.6 on-runs in the GPU-token mode passed
-calibration. In the waited mode two of three Qwen3.6 on-runs failed the
-six-step workflow oracle on model text (a tool call cut short after a
-reasoning-budget close, and an extra edit after a compiler warning), which
-two off-runs did not; five runs do not separate that from the run-to-run
-variation of Qwen3.6's text, and the combined campaign must.
+calibration.
 
-The cycle does not yet show the saved draft time reliably. With the draft
-unwaited, four interleaved Qwen3.8 runs gave four-lane cycle medians of 95.7
-and 98.9 ms on against 106.4 and 103.3 ms off, but the two on-runs before
-them, of the same binary, measured 109.7 and 108.6 ms against 100.9 ms off,
-with one-lane cycles 10 ms slower than in the later on-runs; the cause was
-not found. In the waited mode the four-lane cycle fell from 102.0 to 92.7 ms.
+Root's six-block paired campaign on that binary
+(`$E/qwen38-draft-staged-d5-v1`: Qwen3.8, GPU-token mode, the switch against
+unset with every other setting equal, fixed alternating order, a loaded
+host) passed all 12 runs with identical text in both arms (5,237 tokens).
+The four-lane cycle fell by 7.41% (95% CI 6.70–8.12%; medians 126.96
+against 136.56 ms), the four-lane target stage by 6.87% (6.17–7.56%; 121.43
+against 130.03 ms) and client makespan by 5.89% (4.02–7.71%; 67.94 against
+71.80 seconds). Peak footprint was 71.10 against 70.08 GiB. The owner's
+seven unpaired runs had not shown this (on 109.7, 108.6, 95.7 and 98.9 ms
+against off 100.9, 106.4 and 103.3 ms); root attributes the two slow
+on-runs to host load. In the waited mode the four-lane cycle fell from
+102.0 to 92.7 ms in one run per arm.
+
+Qwen3.6 is not qualified. In the waited mode, which is the Qwen MoE default,
+two of three on-runs failed the six-step workflow oracle on model text (a
+tool call cut short after a reasoning-budget close, and an extra edit after
+a compiler warning); two off-runs did not. Every emitted token is the
+target's own decision, so a draft cannot emit an unverified token. In that
+mode, however, the host selects verify rows from the draft's confidence and
+the Qwen3.6 verify tile width follows the row total
+(`dflash2_verify_width`), so a different draft changes the target kernels
+that run and the target's logit bits. Dense Qwen3.8 verifies at a fixed
+width, which is why its text is identical. Five runs do not separate the
+arms (Fisher p about 0.4); root's waited-mode Qwen3.6 campaign must.
+
 The head is prepared a second time beside `HF2Q_REPACKED_GGUF_M32_HEAD`
 (0.98 GiB on Qwen3.8 and 0.39 GiB on Qwen3.6 by plane size) until the two
 routes share one. The switch stays off by default.
