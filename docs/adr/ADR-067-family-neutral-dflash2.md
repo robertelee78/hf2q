@@ -1659,6 +1659,36 @@ so the Qwen3.6 MoE figure overstates its unprofiled cost, and Splash's 9.7 ms
 is for lanes that share experts; on the recorded routes of this workload its
 own kernels take 13.6 ms.
 
+#### Cycle scheduling: wall time against GPU time
+
+A per-command-buffer timeline (`HF2Q_DFLASH2_CYCLE_TIMELINE`, mlx-native
+`command_timeline`: host encode, commit and wait times beside Metal's
+`kernelStartTime`/`GPUStartTime`/`GPUEndTime` on one clock, no commit turned
+into a wait) replaces the estimate above with a measurement. One four-lane
+Qwen3.8 cycle of the combined candidate: 73.6 ms wall, 64.3 ms of GPU
+execution, 9.3 ms of GPU idle. The 16 layer commands (9,063 dispatches,
+1,683 barriers) are encoded in 11.8 ms and all committed by 22.6 ms, 3 to
+41 ms before the GPU reaches them: dispatch count costs worker CPU, not wall
+time. The idle is 6.9 ms between the draft command and the target's first
+command, where the worker allocates and zero-fills the verify step's
+DeltaNet replay storage (188 MB per step; 91 MB and 2.6 ms on Qwen3.6), and
+2.2 ms after the output head (readback, host plan, replay encode, an idle
+GPU's 0.5 ms start latency), plus two waited commit commands.
+
+Two Class A switches, off by default, remove most of it:
+`HF2Q_QWEN_VERIFY_REPLAY_REUSE=1` keeps the replay storage between steps and
+`HF2Q_DFLASH2_CONTEXT_FIRST=1` submits the draft-context commit before the
+replay is encoded and waits once for both. With both on, GPU idle per
+four-lane cycle falls to 2.7 ms on Qwen3.8 and 1.7 ms on Qwen3.6. The same
+timelines explain the non-additive single-switch readings: GPU time per
+command class adds exactly (live tiles −3.3 ms, attention tile −11.3 ms,
+both −14.7 ms of layer time); half of the staged draft's 5.0 ms was hidden
+behind the replay-storage allocation; and the single-switch arms had been
+measured in a block that ran about 3 ms slower than the control block. The
+measured tables, commands and what remains (host acceptance between the
+target and its commit commands, which Splash runs as one command) are in
+`splash-gap/CycleHost.md` of the campaign state.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,
