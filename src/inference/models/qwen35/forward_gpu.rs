@@ -8178,8 +8178,11 @@ impl Qwen35Model {
         let qkv_channels = (2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
             + cfg.linear_num_value_heads * cfg.linear_value_head_dim)
             as usize;
+        // Resolve the MoE expert switches before any upload: an invalid value
+        // or combination fails the load here, not at the first decode step.
+        let moe_expert_route = super::moe_batched::qwen_moe_expert_route()?;
         let mut staged_m8_preparation =
-            if super::moe_batched::qwen_moe_staged_m8_requested()? {
+            if moe_expert_route != super::moe_batched::MoeExpertRoute::Matvec {
                 Some((
                     KernelRegistry::new(),
                     device

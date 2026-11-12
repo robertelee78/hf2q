@@ -260,6 +260,17 @@ impl Qwen35Model {
         }
     }
 
+    /// Expert route of the batched MoE layers, as the process switches
+    /// resolved it at model load: `matvec`, `staged_m8` or `live_tiles`, and
+    /// `none` when the layers do not run the batched route.
+    pub(crate) fn moe_expert_decode_route(&self) -> &'static str {
+        if self.moe_ffn_decode_route() != "batched_native" {
+            return "none";
+        }
+        crate::inference::models::qwen35::moe_batched::qwen_moe_expert_route()
+            .map_or("invalid", |route| route.label())
+    }
+
     /// Joint route mode for this artifact and its routing policy, or why decode must
     /// stay serial. Primes the GPU weight cache so storage types are known.
     pub(crate) fn joint_decode_mode(&self) -> Result<JointRouteMode, String> {

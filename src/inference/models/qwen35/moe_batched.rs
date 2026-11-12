@@ -71,54 +71,9 @@ pub(crate) const QWEN_MOE_BATCHED_ENV: &str = "HF2Q_QWEN_MOE_BATCHED";
 /// This requires the batched native-storage MoE decode route.
 pub(crate) const QWEN_MOE_STAGED_M8_ENV: &str = "HF2Q_QWEN_MOE_STAGED_M8";
 
-pub(crate) fn qwen_moe_staged_m8_requested() -> Result<bool> {
-    static REQUESTED: LazyLock<Result<bool, String>> = LazyLock::new(|| {
-        let Some(raw) = std::env::var(QWEN_MOE_STAGED_M8_ENV)
-            .ok()
-            .map(|raw| raw.trim().to_ascii_lowercase())
-            .filter(|raw| !raw.is_empty())
-        else {
-            return Ok(false);
-        };
-        match raw.as_str() {
-            "1" | "on" | "true" => Ok(true),
-            "0" | "off" | "false" => Ok(false),
-            _ => Err(format!(
-                "{QWEN_MOE_STAGED_M8_ENV} must be 1/on/true or 0/off/false, got {raw:?}"
-            )),
-        }
-    });
-    let requested = match &*REQUESTED {
-        Ok(requested) => *requested,
-        Err(error) => bail!("{error}"),
-    };
-    ensure!(
-        !requested || qwen_moe_batched_requested(),
-        "{QWEN_MOE_STAGED_M8_ENV}=1 requires {QWEN_MOE_BATCHED_ENV}=1"
-    );
-    Ok(requested)
-}
-
 /// Experimental live-tile expert route over the staged-M8 planes
 /// ([`super::moe_live_tiles`]). Requires [`QWEN_MOE_STAGED_M8_ENV`].
 pub(crate) const QWEN_MOE_LIVE_TILES_ENV: &str = "HF2Q_QWEN_MOE_LIVE_TILES";
-
-/// [`QWEN_MOE_LIVE_TILES_ENV`], read once per process; an invalid value or a
-/// missing prerequisite fails closed.
-pub(crate) fn qwen_moe_live_tiles_requested() -> Result<bool> {
-    static REQUESTED: LazyLock<Result<bool, String>> = LazyLock::new(|| {
-        super::joint_step_options::switch_from_process(QWEN_MOE_LIVE_TILES_ENV)
-    });
-    let requested = match &*REQUESTED {
-        Ok(requested) => *requested,
-        Err(error) => bail!("{error}"),
-    };
-    ensure!(
-        !requested || qwen_moe_staged_m8_requested()?,
-        "{QWEN_MOE_LIVE_TILES_ENV}=1 requires {QWEN_MOE_STAGED_M8_ENV}=1"
-    );
-    Ok(requested)
-}
 
 /// How one batched layer runs its routed experts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,15 +86,69 @@ pub(crate) enum MoeExpertRoute {
     LiveTiles,
 }
 
-/// The expert route the process switches select.
-pub(crate) fn qwen_moe_expert_route() -> Result<MoeExpertRoute> {
-    Ok(if qwen_moe_live_tiles_requested()? {
-        MoeExpertRoute::LiveTiles
-    } else if qwen_moe_staged_m8_requested()? {
-        MoeExpertRoute::StagedM8
-    } else {
-        MoeExpertRoute::Matvec
+impl MoeExpertRoute {
+    /// Name of the route in the worker's configuration log.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Matvec => "matvec",
+            Self::StagedM8 => "staged_m8",
+            Self::LiveTiles => "live_tiles",
+        }
+    }
+}
+
+/// The expert route for the resolved batched switch and the raw values of
+/// [`QWEN_MOE_STAGED_M8_ENV`] and [`QWEN_MOE_LIVE_TILES_ENV`] (unset or blank
+/// means off). An invalid value, staged M8 without the batched route and
+/// live tiles without staged M8 are errors: no combination falls back to
+/// another route.
+pub(crate) fn resolve_moe_expert_route(
+    batched: bool,
+    staged_m8: Option<&str>,
+    live_tiles: Option<&str>,
+) -> Result<MoeExpertRoute, String> {
+    use super::joint_step_options::parse_switch;
+    let staged = parse_switch(QWEN_MOE_STAGED_M8_ENV, staged_m8)?;
+    let live = parse_switch(QWEN_MOE_LIVE_TILES_ENV, live_tiles)?;
+    if staged && !batched {
+        return Err(format!(
+            "{QWEN_MOE_STAGED_M8_ENV}=1 requires {QWEN_MOE_BATCHED_ENV}=1"
+        ));
+    }
+    if live && !staged {
+        return Err(format!(
+            "{QWEN_MOE_LIVE_TILES_ENV}=1 requires {QWEN_MOE_STAGED_M8_ENV}=1"
+        ));
+    }
+    Ok(match (staged, live) {
+        (_, true) => MoeExpertRoute::LiveTiles,
+        (true, false) => MoeExpertRoute::StagedM8,
+        (false, false) => MoeExpertRoute::Matvec,
     })
+}
+
+/// [`resolve_moe_expert_route`] over the process environment, read once.
+/// Model load calls this before any upload, so an invalid value or
+/// combination fails startup.
+pub(crate) fn qwen_moe_expert_route() -> Result<MoeExpertRoute> {
+    static ROUTE: LazyLock<Result<MoeExpertRoute, String>> = LazyLock::new(|| {
+        let staged_m8 = std::env::var(QWEN_MOE_STAGED_M8_ENV).ok();
+        let live_tiles = std::env::var(QWEN_MOE_LIVE_TILES_ENV).ok();
+        resolve_moe_expert_route(
+            qwen_moe_batched_requested(),
+            staged_m8.as_deref(),
+            live_tiles.as_deref(),
+        )
+    });
+    match &*ROUTE {
+        Ok(route) => Ok(*route),
+        Err(error) => bail!("{error}"),
+    }
+}
+
+/// Whether the live-tile route is selected.
+pub(crate) fn qwen_moe_live_tiles_requested() -> Result<bool> {
+    Ok(qwen_moe_expert_route()? == MoeExpertRoute::LiveTiles)
 }
 
 /// Widest row count one batched MoE layer accepts: the DFlash2 target width.

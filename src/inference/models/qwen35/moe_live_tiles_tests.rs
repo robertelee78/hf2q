@@ -409,3 +409,45 @@ fn live_tile_route_matches_f64_reference_down_q6_k() {
 fn live_tile_route_matches_f64_reference_down_q4_k() {
     matches_f64_reference(GgmlType::Q4_K, 0x64_14);
 }
+
+/// Every combination of the three MoE switches either selects one route or
+/// fails: none falls back to another route.
+#[test]
+fn expert_switch_combinations_resolve_or_fail_closed() {
+    use super::moe_batched::resolve_moe_expert_route as resolve;
+    let on = Some("1");
+    let off = [None, Some(""), Some("  "), Some("0"), Some("off"), Some("false")];
+    for batched in [false, true] {
+        for staged in off {
+            for live in off {
+                assert_eq!(resolve(batched, staged, live), Ok(MoeExpertRoute::Matvec));
+            }
+        }
+    }
+    assert_eq!(resolve(true, on, None), Ok(MoeExpertRoute::StagedM8));
+    assert_eq!(resolve(true, Some("TRUE"), Some("off")), Ok(MoeExpertRoute::StagedM8));
+    assert_eq!(resolve(true, on, on), Ok(MoeExpertRoute::LiveTiles));
+    assert_eq!(resolve(true, Some(" on "), Some("True")), Ok(MoeExpertRoute::LiveTiles));
+
+    let fails = |batched, staged, live, needle: &str| {
+        let error = resolve(batched, staged, live).expect_err("combination must fail");
+        assert!(error.contains(needle), "{error:?} does not name {needle:?}");
+    };
+    // Staged M8 without the batched route.
+    fails(false, on, None, "HF2Q_QWEN_MOE_STAGED_M8=1 requires HF2Q_QWEN_MOE_BATCHED=1");
+    fails(false, on, on, "HF2Q_QWEN_MOE_STAGED_M8=1 requires HF2Q_QWEN_MOE_BATCHED=1");
+    // Live tiles without staged M8, with and without the batched route.
+    fails(true, None, on, "HF2Q_QWEN_MOE_LIVE_TILES=1 requires HF2Q_QWEN_MOE_STAGED_M8=1");
+    fails(true, Some("0"), on, "HF2Q_QWEN_MOE_LIVE_TILES=1 requires HF2Q_QWEN_MOE_STAGED_M8=1");
+    fails(false, None, on, "HF2Q_QWEN_MOE_LIVE_TILES=1 requires HF2Q_QWEN_MOE_STAGED_M8=1");
+    // Invalid values, whatever the other switches say.
+    for batched in [false, true] {
+        for other in [None, on] {
+            fails(batched, other, Some("bogus"), "HF2Q_QWEN_MOE_LIVE_TILES must be");
+            fails(batched, Some("2"), other, "HF2Q_QWEN_MOE_STAGED_M8 must be");
+        }
+    }
+    assert_eq!(MoeExpertRoute::Matvec.label(), "matvec");
+    assert_eq!(MoeExpertRoute::StagedM8.label(), "staged_m8");
+    assert_eq!(MoeExpertRoute::LiveTiles.label(), "live_tiles");
+}
