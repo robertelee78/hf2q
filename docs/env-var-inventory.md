@@ -99,6 +99,7 @@ with the audit script for this change (the lexical count of
 - `HF2Q_QWEN_ATTN_ROWS` (`documented-escape`, listed in `scripts/audit_hf2q_env_surface.sh`) selects the row-batched Qwen TQ full-attention decode core. Unset or `1`/`on`/`true` (default): serial and joint decode run every row's K/V encode, Q rotation, attention and output gate in one pass, and `HF2Q_QWEN_GQA_Q2=auto` uses the measured Qwen3.6 crossovers (KV ≥ 4,096 for one row, ≥ 1,024 for several). `0`/`off`/`false`: the per-row chain and the single 8,192 crossover. Both give the same bits (Class A). Read once; invalid values warn and keep the default.
 - `HF2Q_QWEN_JOINT_Q1_PROMPTS`, `HF2Q_QWEN_JOINT_Q1_OUT` and `HF2Q_QWEN_JOINT_Q1_STEPS` (`development-only`) drive the ignored Q1 Class B trace test.
 - `HF2Q_QWEN_MOE_Q1_PROMPTS`, `HF2Q_QWEN_MOE_Q1_OUT`, `HF2Q_QWEN_MOE_Q1_STEPS` and `HF2Q_QWEN_MOE_Q1_FORCED` (`development-only`) drive the ignored two-process Q1 trace test of the batched MoE route (`qwen36_moe_route_q1_envelope_trace`).
+- `HF2Q_QWEN_MOE_REPLAY_TEXTS`, `HF2Q_QWEN_MOE_REPLAY_OUT` and `HF2Q_QWEN_MOE_REPLAY_STEPS` (`development-only`) drive the ignored teacher-forced DFlash2 verify replay of the process's MoE expert route (`qwen36_dflash2_verify_moe_route_replay`): a JSON array of one to four texts, the output file of top logits per row, and the verify steps (default 64). `scripts/qwen_moe_route_replay_compare.py` compares the files of several routes.
 - `HF2Q_QWEN36_GGUF` and `HF2Q_QWEN38_GGUF` (`development-only`) select the official artifacts for the ignored Qwen joint decode hardware gates.
 - `HF2Q_DFLASH2_PROBE_GGUF`, `HF2Q_DFLASH2_PROBE_CONFIG`, `HF2Q_DFLASH2_PROBE_WEIGHTS`, `HF2Q_DFLASH2_PROBE_CONTEXT_ROWS` and `HF2Q_DFLASH2_PROBE_ROUNDS` (`development-only`) drive the ignored per-dispatch draft-command probe (`dflash2_draft_command_dispatch_probe`): the target GGUF, the draft checkpoint, the ring rows filled per lane (default 512) and the measured rounds (default 20).
 
@@ -481,6 +482,9 @@ this release:
 | `HF2Q_QWEN_MOE_Q1_OUT` | `development-only` | 4 |
 | `HF2Q_QWEN_MOE_Q1_PROMPTS` | `development-only` | 4 |
 | `HF2Q_QWEN_MOE_Q1_STEPS` | `development-only` | 2 |
+| `HF2Q_QWEN_MOE_REPLAY_OUT` | `development-only` | 5 |
+| `HF2Q_QWEN_MOE_REPLAY_STEPS` | `development-only` | 1 |
+| `HF2Q_QWEN_MOE_REPLAY_TEXTS` | `development-only` | 3 |
 | `HF2Q_QWEN_MOE_STAGED_M8` | `documented-escape` | 1 |
 | `HF2Q_QWEN_RESUME_ATTN_FAST` | `documented-escape` | 7 |
 | `HF2Q_QWEN_RESUME_FAST_PROMPTS` | `development-only` | 3 |

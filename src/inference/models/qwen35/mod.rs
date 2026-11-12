@@ -98,6 +98,8 @@ mod real_artifact_resume_attn_fast_tests;
 #[cfg(test)]
 mod real_artifact_moe_batched_q1_tests;
 #[cfg(test)]
+mod real_artifact_moe_route_replay_tests;
+#[cfg(test)]
 mod real_artifact_prefill_schedule_tests;
 #[cfg(test)]
 mod real_artifact_mtp_acceptance_probe_tests;
