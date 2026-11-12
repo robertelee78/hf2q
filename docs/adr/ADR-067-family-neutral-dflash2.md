@@ -292,8 +292,8 @@ acceptance gate are complete; these measurements do not promote the route.
 - Prove DeltaNet sequential state, full-attention KV positions, and mixed lane
   lengths, then prove exact retained-prefix cache state after accepting zero
   through seven proposals.
-- Keep the promoted route available behind `HF2Q_QWEN_DFLASH2=0` until the new
-  default passes Q5.
+- Keep the promoted route available behind `HF2Q_DFLASH2=0` (the one kill
+  switch; D6) until the new default passes Q5.
 - Stop if a 32-row target forward scales approximately with rows instead of
   streaming the target weights once. The architecture only wins if temporal
   batching amortizes the target.
@@ -329,7 +329,9 @@ for Qwen3.6. External GGUFs, a different source receipt and descriptors without 
 qualified target receipt are rejected before draft weights upload. A startup
 smoke with the release-gate `qwen36-abliterix-t63-APEX` GGUF exercised this
 boundary and was rejected as intended; matching dimensions did not admit the
-fine-tuned target.
+fine-tuned target. (Superseded by the operator decision of 2026-11-12: a
+target with a pinned target's architecture and shapes now qualifies; see
+"D6 policy as implemented".)
 
 The Qwen SlotAware path captures cold-prefill target layers, keeps one persistent
 draft ring per physical slot, drafts all provisioned slots in one graph, verifies
@@ -2158,6 +2160,87 @@ not qualify the adapter.
   family's prior promoted route remains correct.
 - Remove superseded family-specific DFlash code and temporary fixtures only
   after that family's cutover.
+
+#### D6 policy as implemented (Qwen3.8 and Qwen3.6)
+
+`HF2Q_DFLASH2` is a three-state policy resolved once per model load in
+`serve::load_engine`, from the GGUF header, before any weight is read
+(`src/serve/dflash2_policy.rs`).
+
+- **Unset: auto.** On a SlotAware worker of one to four slots DFlash2 is
+  selected for a target in either of two classes. A *pinned pair* carries
+  hf2q provenance and the `target_source_sha256` of a pinned Qwen descriptor
+  of its architecture. A target with the *same architecture and shapes* as a
+  pinned descriptor's target has its architecture string, hidden size, layer
+  count, vocabulary size, tokenizer identity, attention and DeltaNet head
+  counts and dimensions, FFN width, MoE expert count, routed experts per
+  token and expert widths, and embedding and output-head tensor shapes;
+  hf2q provenance is not required. The descriptor is chosen from the target;
+  the drafter is then located: both explicit path variables, else the
+  Hugging Face cache snapshot of the descriptor's repository at its pinned
+  revision, else a download at that revision into that cache, verified by
+  the configuration digest, the weight length and the weight digest. The
+  checkpoint is bound to the target by the adapter's own shape check
+  (`DFlash2Config::validate_target`, what `DFlash2TargetFamily::validate`
+  runs), on the header before the load and on the loaded model at
+  provisioning. Every D0 checkpoint identity check still runs when the
+  checkpoint is provisioned; the target-source identity check runs for a
+  pinned pair. Auto never fails startup: a target in neither class, a
+  drafter that cannot be obtained or bound, too little memory and a load
+  that fails with DFlash2 selected all end on the prior route with the
+  reason logged.
+- **`0`: kill switch.** No drafter is located and no profile applies. Every
+  switch of the route profile resolves from the environment alone, so the
+  server runs what it ran before this policy, for every family.
+- **`1`: required.** A target in neither class, or a drafter that cannot be
+  obtained or bound, fails startup. It accepts both classes.
+
+This supersedes the earlier rule that admitted the exact source identity
+only (operator decision, 2026-11-12: fine-tunes of a qualified model get the
+fast path by default, with no automatic drop-back; the off switch is
+`HF2Q_DFLASH2=0`). The drafter proposes and the target decides every emitted
+token, so a drafter that fits a fine-tune less well costs acceptance, never
+correctness. Measured on the launcher-default models, exact four-agent Q5,
+two runs per arm, prior route against the default:
+
+FINE_TUNE_MEASUREMENT_PLACEHOLDER
+
+Each pinned Qwen descriptor has one route profile, a row per switch in one
+table (`src/inference/spec_decode/dflash2/route_profile.rs`): the draft
+AF4G64 and staged command, GPU target tokens (Qwen3.6), the context-first
+commit, the prepared FFN, projections, head, any-width and shared-head
+routes, tiled verify attention, the fused verify mixer, the replay reuse,
+prepared prefill with the cue fold and, for Qwen3.6, the batched, staged-M8
+and live-tile MoE routes. A switch resolves to its environment value when one
+is set, else to the profile's value when DFlash2 is selected for that model
+and the row is not withheld, else to its own default. The profile is applied
+switch by switch: a row is withheld when the switch it requires is off, when
+its kernels would refuse the artifact's storage (for example Q5_K, where the
+prepared and staged routes take Q4_K and Q6_K only), or when the memory rule
+dropped it; the drafter serves with the rows that are left and the audit
+line gives each reason. The resolved set belongs to the model: its load
+thread and its worker thread bind it, so a second model in the same process,
+or any path outside `hf2q serve`, reads the environment alone. The prepared
+prefill and the MoE switches, which act on every artifact of a family, are
+therefore on by default only for a selected target.
+
+A memory rule runs before selection: headroom is physical memory minus the
+model file, the configured KV budget and 8 GiB; the drafter costs its file
+size and the prepared planes the native layout's bytes for the weights they
+cover. When the planes do not fit, the plane-carrying rows are withheld and
+DFlash2 is kept if the drafter fits; otherwise the prior route is kept.
+
+MEMORY_ADR_PLACEHOLDER
+
+One INFO line per load, `DFlash2 policy resolved`, is the startup audit the
+first two D6 items quote: `policy`, `selected`, `reason` (the qualifying
+class), `descriptor`, `target_source`, `drafter_source`, `profile`,
+`withheld`, the memory figures and every table switch as
+`NAME=value(source)`.
+
+Not implemented by this change: Gemma and DeepSeek have no DFlash2 serving
+transaction, so the policy reports them as unselected; the configuration
+with the planes dropped has no exact Q5 run.
 
 ## Risks
 

@@ -31,7 +31,7 @@
 //! 256-thread pipeline; a layer that does not qualify keeps the stock chain
 //! behind the wave. The first use and the first refusal are logged.
 
-use std::sync::{LazyLock, Once, OnceLock};
+use std::sync::{Once, OnceLock};
 
 use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::gdn_window_fused::{
@@ -47,18 +47,15 @@ use super::gpu_delta_net::DeltaNetWeightsGpu;
 use super::joint_decode_core::{AlphaBeta, DeltaNetReplay, JointRows, WindowStage};
 use super::kv_cache::LinearAttnStateSlot;
 use super::prepared_projection;
+use crate::inference::spec_decode::dflash2::route_profile;
 
 /// Opt-in switch of the fused mixer stage; exact value `1`.
 pub(crate) const QWEN_VERIFY_MIXER_FUSED_ENV: &str = "HF2Q_QWEN_VERIFY_MIXER_FUSED";
 
-/// Whether the serving worker requests the fused stage (read once).
+/// Whether this model's resolved routes request the fused stage.
 pub(crate) fn enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var(QWEN_VERIFY_MIXER_FUSED_ENV)
-            .map(|value| value == "1")
-            .unwrap_or(false)
-    });
-    *ENABLED
+    const SWITCH: route_profile::Switch = route_profile::switch(QWEN_VERIFY_MIXER_FUSED_ENV);
+    route_profile::is_one(SWITCH)
 }
 
 /// Padding lanes that cover packed rows `real..width`.

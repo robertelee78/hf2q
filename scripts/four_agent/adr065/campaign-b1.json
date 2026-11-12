@@ -52,7 +52,7 @@
                    "bytes": 16810714976,
                    "conversion_receipt_sha256": "8a370d80c6f06a5f7111abe1dad46ae9cc1dbf66034e6fa2abe90276b0f13b23"},
       "q5_case": {"path": "scripts/four_agent/q5_cases/qwen38.json",
-                  "sha256": "37ab3e832f06e15b6465757feaec6d7d337bb4d477cb819bf50dad1f20caee6f"},
+                  "sha256": "f4ad9064a518e9e7aa590bda1daab66bee7351efdb46670b9dd710f44f70757b"},
       "client_approval_template": {"path": "{E}/approval-templates-proof-4b2bea77-cargo199/qwen38-client-approval.json",
                                    "sha256": "facc7afa42cb76330b207292979dcbc846cd2bad0433c81450be0b6cd7d46776"},
       "ab_blocks": 6,

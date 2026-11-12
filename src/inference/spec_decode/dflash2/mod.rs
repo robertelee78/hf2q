@@ -9,6 +9,7 @@ pub mod config;
 pub mod forward;
 #[cfg(test)]
 mod probe;
+pub(crate) mod route_profile;
 pub mod runtime;
 pub mod schema;
 pub mod selector;

@@ -35,7 +35,6 @@
 //! (Qwen3.6-35B-A3B, 10 layers) over a four-agent coding run.
 
 use std::cell::OnceCell;
-use std::sync::LazyLock;
 
 use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::tq_hb_verify_tile::{
@@ -48,19 +47,17 @@ use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 use super::decode_pool::pooled_alloc_buffer;
 use super::joint_decode_core::JointWindow;
 use super::kv_cache::FullAttnKvSlot;
+use crate::inference::spec_decode::dflash2::route_profile;
 use crate::serve::multi_seq_kv::SlotId;
 
-/// Opt-in switch of the tiled DFlash2 verify attention; exact value `1`.
+/// Switch of the tiled DFlash2 verify attention; exact value `1`. On in the
+/// route profile of a qualified DFlash2 pair, off otherwise.
 pub(crate) const QWEN_VERIFY_ATTN_TILE_ENV: &str = "HF2Q_QWEN_VERIFY_ATTN_TILE";
 
-/// Whether the serving worker requests the tiled route (read once).
+/// Whether this model's resolved routes request the tiled route.
 pub(crate) fn enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var(QWEN_VERIFY_ATTN_TILE_ENV)
-            .map(|value| value == "1")
-            .unwrap_or(false)
-    });
-    *ENABLED
+    const SWITCH: route_profile::Switch = route_profile::switch(QWEN_VERIFY_ATTN_TILE_ENV);
+    route_profile::is_one(SWITCH)
 }
 
 /// The split scratch of one verify step, shared by its full-attention

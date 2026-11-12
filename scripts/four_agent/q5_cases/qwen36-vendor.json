@@ -24,7 +24,10 @@
     "TOOLCHAIN": null,
     "SANDBOX_PROOF": null,
     "SANDBOX_PROOF_SHA256": null,
-    "CLIENT_APPROVAL_TEMPLATE": null
+    "CLIENT_APPROVAL_TEMPLATE": null,
+    "DFLASH2": "",
+    "HF_HUB_CACHE": "",
+    "HF_HUB_OFFLINE": ""
   },
   "binary": "{HF2Q_BIN}",
   "artifact": {
@@ -47,7 +50,10 @@
       "MAX_SLOTS": "4",
       "HOST": "127.0.0.1",
       "PORT": "{PORT}",
-      "HF2Q_BIN": "{HF2Q_BIN}"
+      "HF2Q_BIN": "{HF2Q_BIN}",
+      "HF2Q_DFLASH2": "{DFLASH2}",
+      "HF_HUB_CACHE": "{HF_HUB_CACHE}",
+      "HF_HUB_OFFLINE": "{HF_HUB_OFFLINE}"
     }
   },
   "readiness": {

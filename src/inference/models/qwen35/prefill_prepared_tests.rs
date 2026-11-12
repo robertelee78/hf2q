@@ -1171,3 +1171,73 @@ fn qwen_prepared_vs_stock_on_served_prompts() {
         }
     }
 }
+
+/// Every row's logits of one chunk through the scope the engine opens: the
+/// route is whatever this thread's resolved switches say.
+fn chunk_rows_as_served(model: &Qwen35Model, len: usize) -> Vec<u32> {
+    let _scope = PrefillScope::enter();
+    let logits = model
+        .forward_gpu(
+            &tokens(0, 0, len),
+            &positions_for_range(0, len),
+            &mut cache(model),
+            SlotId(0),
+        )
+        .expect("prefill chunk");
+    logits.iter().map(|value| value.to_bits()).collect()
+}
+
+/// ADR-067 D6: a load on which the DFlash2 policy selects nothing (the kill
+/// switch, or an artifact that is not a qualified pair) prefills with the
+/// kernels it had before the route profile existed, bit for bit; only a
+/// selected profile, or an explicit switch, moves it to the prepared route.
+#[test]
+fn prefill_bits_change_only_when_the_route_profile_is_selected() {
+    use crate::inference::spec_decode::dflash2::route_profile::{
+        bind, ResolvedRoutes, RouteProfile,
+    };
+    use std::sync::Arc;
+    let unset = |_: &str| None;
+    let routes = |profile, env: &dyn Fn(&str) -> Option<String>| {
+        Arc::new(ResolvedRoutes::resolve(profile, &|_| None, env))
+    };
+    with_synthetic_model(|model| {
+        let stock = chunk_rows(model, &mut cache(model), 0, 0, 33, false);
+        let prepared = chunk_rows(model, &mut cache(model), 0, 0, 33, true);
+        assert!(stock != prepared, "the two kernels must be told apart");
+        {
+            let _prior_route = bind(routes(None, &unset));
+            assert!(
+                chunk_rows_as_served(model, 33) == stock,
+                "without a selected profile the prefill left the stock kernels"
+            );
+        }
+        for profile in [RouteProfile::Qwen38, RouteProfile::Qwen36] {
+            let _selected = bind(routes(Some(profile), &unset));
+            assert!(
+                chunk_rows_as_served(model, 33) == prepared,
+                "{profile:?} did not select the prepared prefill"
+            );
+        }
+        {
+            let off = |name: &str| {
+                (name == "HF2Q_QWEN_PREFILL_PREPARED").then(|| "0".to_owned())
+            };
+            let _escape = bind(routes(Some(RouteProfile::Qwen38), &off));
+            assert!(
+                chunk_rows_as_served(model, 33) == stock,
+                "an explicit 0 did not override the profile"
+            );
+        }
+        {
+            let on = |name: &str| {
+                (name == "HF2Q_QWEN_PREFILL_PREPARED").then(|| "1".to_owned())
+            };
+            let _explicit = bind(routes(None, &on));
+            assert!(
+                chunk_rows_as_served(model, 33) == prepared,
+                "an explicit 1 did not select the prepared prefill"
+            );
+        }
+    });
+}

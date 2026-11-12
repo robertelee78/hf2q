@@ -6,7 +6,8 @@
     "Repair-turn workload (ADR-063 Q4-QWEN36, operator decision 2026-11-03): the client runs --repair-turns 1 (qwen38_n1_verdict.Workflow). After a failed run_tests the agent gets exactly one repair cycle: one more write_file src/ports.rs, then run_tests on the same target; the six steps then resume. A second failed run_tests fails the agent. Prompts, tools, templates, sampling, budgets and every other step are canonical, and the approval binds repair_turns 1. Qwen3.6 only (q5_case.REPAIR_FAMILIES), on the hf2q-converted GGUF (MODEL_SHA256 815a22ca...), identical on hf2q and the peer.",
     "Derived from: Qwen3.6 runner: current-hf normal baseline and largest-tool-result supervisors; launcher text-only, 48 GiB shared KV budget.",
     "Override any variable with HF2Q_Q5_<NAME>; null variables are required. See scripts/four_agent/README.md.",
-    "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv."
+    "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv.",
+    "Release-gate default arm (ADR-067 D6): the case passes no HF2Q_* route switch and the target is the qualified vanilla artifact, so the server's `DFlash2 policy resolved` INFO line must report policy=auto selected=true with every profile switch sourced `profile`. HF2Q_Q5_DFLASH2=0 is the kill-switch control arm (prior promoted route; policy=off selected=false). HF2Q_Q5_HF_HUB_CACHE and HF2Q_Q5_HF_HUB_OFFLINE=1 point the drafter lookup at another Hugging Face cache and forbid the download: with an empty cache the server must log the drafter WARN line and pass on the prior route. Empty values are not exported."
   ],
   "workload": {
     "id": "adr063-q5-qwen36-repair1-n4-coding-ctx262144",
@@ -24,7 +25,10 @@
     "TOOLCHAIN": null,
     "SANDBOX_PROOF": null,
     "SANDBOX_PROOF_SHA256": null,
-    "CLIENT_APPROVAL_TEMPLATE": null
+    "CLIENT_APPROVAL_TEMPLATE": null,
+    "DFLASH2": "",
+    "HF_HUB_CACHE": "",
+    "HF_HUB_OFFLINE": ""
   },
   "binary": "{HF2Q_BIN}",
   "artifact": {
@@ -47,7 +51,10 @@
       "MAX_SLOTS": "4",
       "HOST": "127.0.0.1",
       "PORT": "{PORT}",
-      "HF2Q_BIN": "{HF2Q_BIN}"
+      "HF2Q_BIN": "{HF2Q_BIN}",
+      "HF2Q_DFLASH2": "{DFLASH2}",
+      "HF_HUB_CACHE": "{HF_HUB_CACHE}",
+      "HF_HUB_OFFLINE": "{HF_HUB_OFFLINE}"
     }
   },
   "readiness": {

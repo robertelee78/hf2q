@@ -36,7 +36,6 @@
 //! joint step both run this route whenever the layer's weights were loaded
 //! in native storage, so the switch is decided once at load.
 
-use std::sync::LazyLock;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use mlx_native::ops::dflash2_attention_pack::{
@@ -65,8 +64,11 @@ use super::decode_pool::pooled_alloc_buffer;
 use super::execution_dispatch::quantized_matmul_ggml;
 use super::ffn::MoeFfnShape;
 use super::gpu_ffn::MoeFfnWeightsGpuQ;
+use crate::inference::spec_decode::dflash2::route_profile;
 
-/// Switch for the batched native-storage MoE decode route. Default off.
+/// Switch for the batched native-storage MoE decode route. On, with the two
+/// expert switches below, in the Qwen3.6 route profile of a qualified
+/// DFlash2 pair; off for every other artifact.
 pub(crate) const QWEN_MOE_BATCHED_ENV: &str = "HF2Q_QWEN_MOE_BATCHED";
 /// Experimental prepared staged-M8 route for Q4_K/Q6_K expert stacks.
 /// This requires the batched native-storage MoE decode route.
@@ -128,23 +130,19 @@ pub(crate) fn resolve_moe_expert_route(
     })
 }
 
-/// [`resolve_moe_expert_route`] over the process environment, read once.
-/// Model load calls this before any upload, so an invalid value or
-/// combination fails startup.
+/// [`resolve_moe_expert_route`] over the routes resolved for the model this
+/// thread loads or serves. Model load calls this before any upload, so an
+/// invalid value or combination fails startup.
 pub(crate) fn qwen_moe_expert_route() -> Result<MoeExpertRoute> {
-    static ROUTE: LazyLock<Result<MoeExpertRoute, String>> = LazyLock::new(|| {
-        let staged_m8 = std::env::var(QWEN_MOE_STAGED_M8_ENV).ok();
-        let live_tiles = std::env::var(QWEN_MOE_LIVE_TILES_ENV).ok();
-        resolve_moe_expert_route(
-            qwen_moe_batched_requested(),
-            staged_m8.as_deref(),
-            live_tiles.as_deref(),
-        )
-    });
-    match &*ROUTE {
-        Ok(route) => Ok(*route),
-        Err(error) => bail!("{error}"),
-    }
+    const STAGED_M8: route_profile::Switch = route_profile::switch(QWEN_MOE_STAGED_M8_ENV);
+    const LIVE_TILES: route_profile::Switch = route_profile::switch(QWEN_MOE_LIVE_TILES_ENV);
+    let batched = qwen_moe_batched_requested();
+    route_profile::with_value(STAGED_M8, |staged_m8| {
+        route_profile::with_value(LIVE_TILES, |live_tiles| {
+            resolve_moe_expert_route(batched, staged_m8, live_tiles)
+        })
+    })
+    .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 /// Whether the live-tile route is selected.
@@ -169,18 +167,17 @@ pub(crate) fn parse_qwen_moe_batched(raw: Option<&str>) -> Result<bool, String> 
     }
 }
 
-/// [`QWEN_MOE_BATCHED_ENV`] read once per process (at the first MoE layer
-/// load). Invalid values warn and keep the default (off).
+/// [`QWEN_MOE_BATCHED_ENV`] as resolved for the model this thread loads or
+/// serves. Invalid values warn once and keep the default (off).
 pub(crate) fn qwen_moe_batched_requested() -> bool {
-    static REQUESTED: LazyLock<bool> = LazyLock::new(|| {
-        parse_qwen_moe_batched(std::env::var(QWEN_MOE_BATCHED_ENV).ok().as_deref()).unwrap_or_else(
-            |error| {
-                tracing::warn!(error, fallback = false, "invalid Qwen MoE batched switch");
-                false
-            },
-        )
-    });
-    *REQUESTED
+    const SWITCH: route_profile::Switch = route_profile::switch(QWEN_MOE_BATCHED_ENV);
+    route_profile::with_value(SWITCH, parse_qwen_moe_batched).unwrap_or_else(|error| {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(error, fallback = false, "invalid Qwen MoE batched switch");
+        });
+        false
+    })
 }
 
 /// Shared-expert storage types the batched route admits. Their GGML matmul

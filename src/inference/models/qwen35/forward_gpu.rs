@@ -4208,6 +4208,25 @@ impl Qwen35Model {
         Ok(result)
     }
 
+    /// Drop this thread's GPU cache if it belongs to this model.
+    ///
+    /// The cache is per thread, and everything it creates at upload (BF16
+    /// copies, the staged MoE planes) exists once per cache. A thread that
+    /// primed it only to provision something, and then hands the model to
+    /// another thread, releases it here so those buffers are not resident
+    /// twice. Buffers the model itself owns are untouched.
+    pub fn release_gpu_cache(&self) {
+        GPU_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if cache
+                .as_ref()
+                .is_some_and(|cache| cache.model_ptr == self as *const _ as *const ())
+            {
+                *cache = None;
+            }
+        });
+    }
+
     #[cfg(test)]
     pub(super) fn loaded_candidate_executed_catalog(
         &self,

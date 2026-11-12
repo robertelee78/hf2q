@@ -18,27 +18,35 @@
 //! and keep their kernels.
 
 use std::cell::Cell;
-use std::sync::LazyLock;
 
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType, MlxBuffer};
 
-use super::joint_step_options::{parse_switch, switch_from_process};
+use super::joint_step_options::parse_switch;
+use crate::inference::spec_decode::dflash2::route_profile;
 
-/// Switch, default off: `1`/`on`/`true` routes prompt-prefill chunks through
-/// the prepared row-tile MM.
+/// Switch: `1`/`on`/`true` routes prompt-prefill chunks through the prepared
+/// row-tile MM. On in the route profile of a qualified DFlash2 pair, off for
+/// every other artifact; an explicit value wins either way.
 pub(crate) const QWEN_PREFILL_PREPARED_ENV: &str = "HF2Q_QWEN_PREFILL_PREPARED";
 
-static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    switch_from_process(QWEN_PREFILL_PREPARED_ENV).unwrap_or_else(|error| {
-        tracing::warn!(
-            error,
-            fallback = false,
-            "invalid Qwen prepared-prefill switch"
-        );
-        false
-    })
-});
+/// The switch as resolved for the model this thread serves. An invalid value
+/// warns once and keeps the route off.
+fn enabled() -> bool {
+    const SWITCH: route_profile::Switch = route_profile::switch(QWEN_PREFILL_PREPARED_ENV);
+    route_profile::with_value(SWITCH, |raw| parse_switch(QWEN_PREFILL_PREPARED_ENV, raw))
+        .unwrap_or_else(|error| {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    error,
+                    fallback = false,
+                    "invalid Qwen prepared-prefill switch"
+                );
+            });
+            false
+        })
+}
 
 thread_local! {
     static SCOPE: Cell<bool> = const { Cell::new(false) };
@@ -56,7 +64,7 @@ impl PrefillScope {
         if let Some(switches) = SwitchesForTest::current() {
             return Self::with_route(switches.prepared);
         }
-        Self::with_route(*ENABLED)
+        Self::with_route(enabled())
     }
 
     /// Open the scope with the route forced on or off, whatever the switch.
@@ -160,15 +168,22 @@ pub(crate) fn switches_or_refusal(
         .map_err(|cause| anyhow::anyhow!("Qwen prompt prefill switches: {cause}"))
 }
 
-/// The switches of this process, read strictly. Called before a Qwen model
-/// is loaded, so a mistyped value is refused before the load is paid for.
+/// The switches as resolved for the model this thread loads or serves, read
+/// strictly. Called before a Qwen model is loaded, so a mistyped value is
+/// refused before the load is paid for.
 pub(crate) fn switches_from_process() -> anyhow::Result<PrefillSwitches> {
-    let read = |name: &str| std::env::var(name).ok();
-    switches_or_refusal(
-        read(QWEN_PREFILL_PREPARED_ENV).as_deref(),
-        read(super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV).as_deref(),
-        crate::debug::INVESTIGATION_ENV.chunk_scan_prefill,
-    )
+    const PREPARED: route_profile::Switch = route_profile::switch(QWEN_PREFILL_PREPARED_ENV);
+    const FOLD_CUE: route_profile::Switch =
+        route_profile::switch(super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV);
+    route_profile::with_value(PREPARED, |prepared| {
+        route_profile::with_value(FOLD_CUE, |fold_cue| {
+            switches_or_refusal(
+                prepared,
+                fold_cue,
+                crate::debug::INVESTIGATION_ENV.chunk_scan_prefill,
+            )
+        })
+    })
 }
 
 /// Validate the switches when a SlotAware worker provisions its slots, so a
@@ -211,7 +226,6 @@ pub(crate) fn admits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::models::qwen35::joint_step_options::parse_switch;
     use mlx_native::MlxDevice;
 
     #[test]

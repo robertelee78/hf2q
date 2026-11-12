@@ -1,6 +1,7 @@
 //! GPU-resident DFlash2 weights shared by every target-family adapter.
 
 use super::config::DFlash2Config;
+use super::route_profile;
 use super::weights::{DFlash2Weights, OPTIONAL_MASK_EMBEDDING};
 use half::bf16;
 use mlx_native::{DType, MlxBuffer, MlxDevice, MlxError};
@@ -369,7 +370,8 @@ impl DFlash2ModelTensors {
         config: &DFlash2Config,
         weights: &DFlash2Weights<'_>,
     ) -> Result<Self, DFlash2TensorsError> {
-        let format = if std::env::var(DFLASH2_DRAFT_AF4_G64_ENV).as_deref() == Ok("1") {
+        const AF4_G64: route_profile::Switch = route_profile::switch(DFLASH2_DRAFT_AF4_G64_ENV);
+        let format = if route_profile::is_one(AF4_G64) {
             ProjectionFormat::Af4G64
         } else {
             ProjectionFormat::Bf16

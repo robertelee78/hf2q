@@ -6,7 +6,6 @@
 //! in-turn drain used by joint MTP. DFlash2 is optional and fail-closed: a lane
 //! joins only when its target cursor and persistent draft-ring cursor agree.
 
-use std::sync::LazyLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -19,6 +18,7 @@ use crate::inference::models::qwen35::{
 };
 use crate::inference::spec_decode::dflash2::{
     adapters::{DFlash2TargetFamily, QwenDFlash2Adapter},
+    route_profile,
     verify_budget::VerifyBudgetLane,
 };
 use crate::serve::api::engine_supervisor::EngineSupervisor;
@@ -36,14 +36,10 @@ const DFLASH2_PROPOSALS_PER_LANE: usize = DFLASH2_MAX_ROWS_PER_LANE - 1;
 pub(in crate::serve::api) const DFLASH2_CONTEXT_FIRST_ENV: &str = "HF2Q_DFLASH2_CONTEXT_FIRST";
 
 /// Whether a step submits its draft-context commit before it encodes the
-/// DeltaNet replay (read once).
+/// DeltaNet replay, as this model's routes resolved it.
 pub(in crate::serve::api) fn context_first() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var(DFLASH2_CONTEXT_FIRST_ENV)
-            .map(|value| value == "1")
-            .unwrap_or(false)
-    });
-    *ENABLED
+    const SWITCH: route_profile::Switch = route_profile::switch(DFLASH2_CONTEXT_FIRST_ENV);
+    route_profile::is_one(SWITCH)
 }
 
 #[derive(Clone, Copy, Debug)]

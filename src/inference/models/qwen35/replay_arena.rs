@@ -36,10 +36,11 @@
 //! device; a worker owns one device for its lifetime.
 
 use std::cell::RefCell;
-use std::sync::LazyLock;
 
 use anyhow::{anyhow, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
+
+use crate::inference::spec_decode::dflash2::route_profile;
 
 /// Opt-in switch of the retained verify replay storage; exact value `1`.
 pub(crate) const QWEN_VERIFY_REPLAY_REUSE_ENV: &str = "HF2Q_QWEN_VERIFY_REPLAY_REUSE";
@@ -52,18 +53,14 @@ thread_local! {
     static FRESH_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Whether the serving worker retains the replay storage (read once).
+/// Whether this model's resolved routes retain the replay storage.
 pub(crate) fn enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var(QWEN_VERIFY_REPLAY_REUSE_ENV)
-            .map(|value| value == "1")
-            .unwrap_or(false)
-    });
+    const SWITCH: route_profile::Switch = route_profile::switch(QWEN_VERIFY_REPLAY_REUSE_ENV);
     #[cfg(test)]
     if let Some(forced) = TEST_OVERRIDE.get() {
         return forced;
     }
-    *ENABLED
+    route_profile::is_one(SWITCH)
 }
 
 /// One step's replay storage: `F32` elements, at least as many as asked for.

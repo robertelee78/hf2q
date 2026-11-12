@@ -28,6 +28,7 @@ use crate::inference::models::qwen35::prefill_prepared::PrefillScope;
 use crate::inference::spec_decode::cost_controller::SpeculationCostController;
 use crate::inference::spec_decode::dflash2::{
     adapters::QwenDFlash2Adapter,
+    route_profile,
     runtime::DFlash2Runtime,
     schema::{DFlash2CheckpointDescriptor, DFlash2FamilyAdapter, KNOWN_DFLASH2_CHECKPOINTS},
 };
@@ -249,9 +250,17 @@ pub struct Qwen35LoadedModel {
     /// preserves type information on the decode hot path and avoids a
     /// virtual cache interface in `EngineInner`.
     pub persistent_kv_cache: Option<HybridKvCache>,
-    /// Default-off DFlash2 runtime. Present only after exact checkpoint,
-    /// target-family and slot-width validation at worker provisioning.
+    /// DFlash2 runtime. Present only after exact checkpoint, target-family
+    /// and slot-width validation at worker provisioning.
     pub dflash2: Option<DFlash2Runtime>,
+    /// The drafter the DFlash2 policy selected for this model before its
+    /// weights were loaded (`serve::dflash2_policy`). `None` keeps DFlash2
+    /// off; provisioning consumes it.
+    pub dflash2_plan: Option<crate::serve::dflash2_policy::DFlash2Plan>,
+    /// Fast-route switches as resolved for this model at load: the process
+    /// environment, then the route profile the DFlash2 policy selected.
+    /// Provisioning and the worker thread bind them.
+    pub routes: Arc<route_profile::ResolvedRoutes>,
     /// Server-side MTP policy and per-conversation profitability state. The
     /// native runner owns no persistent speculative KV yet, so this state
     /// deliberately contains no cache tensors.
@@ -762,6 +771,8 @@ impl Qwen35LoadedModel {
             // (... n_seqs = max_slots, ...)`.
             persistent_kv_cache: None,
             dflash2: None,
+            dflash2_plan: None,
+            routes: route_profile::current(),
             // ADR-044 (2026-08-21) / ADR-063 D1: an unset
             // HF2Q_QWEN_SPECULATION is `auto` here (one slot); a SlotAware
             // worker re-resolves it at start, to `off` when it selected joint
@@ -1108,30 +1119,26 @@ impl Qwen35LoadedModel {
         Ok(())
     }
 
+    /// Provision the drafter the DFlash2 policy planned for this model. The
+    /// policy made every fallback decision before the weights were loaded;
+    /// from here each identity check fails the load, as it always has.
     fn provision_dflash2(&mut self, max_slots: usize) -> anyhow::Result<()> {
-        let enabled = match std::env::var("HF2Q_DFLASH2").ok().as_deref() {
-            None | Some("") | Some("0" | "off" | "false") => false,
-            Some("1" | "on" | "true") => true,
-            Some(value) => {
-                anyhow::bail!("HF2Q_DFLASH2 must be 1/on/true or 0/off/false, got {value:?}")
-            }
-        };
-        if !enabled {
+        let Some(plan) = self.dflash2_plan.take() else {
             self.dflash2 = None;
             return Ok(());
-        }
+        };
+        let _routes = route_profile::bind(Arc::clone(&self.routes));
         anyhow::ensure!(
             (1..=4).contains(&max_slots),
             "DFlash2 supports 1..=4 physical slots, got {max_slots}"
         );
-        let config_path = PathBuf::from(
-            std::env::var_os("HF2Q_DFLASH2_CONFIG")
-                .context("HF2Q_DFLASH2=1 requires HF2Q_DFLASH2_CONFIG")?,
-        );
-        let weights_path = PathBuf::from(
-            std::env::var_os("HF2Q_DFLASH2_WEIGHTS")
-                .context("HF2Q_DFLASH2=1 requires HF2Q_DFLASH2_WEIGHTS")?,
-        );
+        let crate::serve::dflash2_policy::DFlash2Plan {
+            descriptor: planned,
+            class,
+            config_path,
+            weights_path,
+            ..
+        } = plan;
         let config_bytes = std::fs::read(&config_path)
             .with_context(|| format!("read DFlash2 config {}", config_path.display()))?;
         let (descriptor, config) = KNOWN_DFLASH2_CHECKPOINTS
@@ -1149,7 +1156,18 @@ impl Qwen35LoadedModel {
                     .map(|config| (descriptor, config))
             })
             .context("DFlash2 config does not match a pinned Qwen checkpoint")?;
-        validate_dflash2_target_source(descriptor, &self.provenance)?;
+        anyhow::ensure!(
+            descriptor.id == planned.id,
+            "DFlash2 config is checkpoint {}, the policy selected {} for this target",
+            descriptor.id,
+            planned.id
+        );
+        // A pinned pair is bound by its source identity. A target admitted
+        // for having the pinned target's architecture and shapes is bound by
+        // the adapter below, which validates the loaded model itself.
+        if class == crate::serve::dflash2_policy::QualifiedClass::PinnedPair {
+            validate_dflash2_target_source(descriptor, &self.provenance)?;
+        }
         self.model.ensure_gpu_cache_primed()?;
         let runtime = self.model.with_gpu_cache_mut(|device, _registry| {
             let adapter = QwenDFlash2Adapter::new(&self.model, &config)?;
@@ -1161,7 +1179,13 @@ impl Qwen35LoadedModel {
                 &adapter,
                 max_slots,
             )
-        })?;
+        });
+        // This thread primed the model's GPU cache only to upload the
+        // drafter; the worker thread primes its own. Everything the cache
+        // created at upload (the staged MoE planes are 20 GB on Qwen3.6)
+        // would otherwise stay resident twice.
+        self.model.release_gpu_cache();
+        let runtime = runtime?;
         tracing::info!(
             checkpoint = descriptor.id,
             lanes = max_slots,
@@ -12170,6 +12194,8 @@ mod tests {
             // construction shape; iter-2a always leaves this `None`.
             persistent_kv_cache: None,
             dflash2: None,
+            dflash2_plan: None,
+            routes: route_profile::current(),
             speculation: crate::serve::api::qwen35_speculation::QwenSpeculationController::new(
                 crate::serve::api::qwen35_speculation::QwenSpeculationPolicy::Off,
             ),

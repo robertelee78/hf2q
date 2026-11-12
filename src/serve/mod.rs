@@ -9,6 +9,7 @@ pub mod auto_pipeline;
 pub mod cache;
 pub mod config;
 mod deepseek4_cli;
+pub(crate) mod dflash2_policy;
 pub(crate) mod discovery;
 pub mod encoder_worker_singleton;
 // forward_mlx removed — gemma4 moved to inference::models::gemma4 (ADR-038 §3.3)
@@ -3986,6 +3987,48 @@ impl multi_model::EngineConfig {
 
 pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<api::engine::Engine> {
     anyhow::ensure!(path.exists(), "Model not found: {}", path.display());
+    // ADR-067 D6: the DFlash2 policy and its route profile are resolved from
+    // the GGUF header, the scheduler and the drafter's availability before
+    // any weight is read. Several profile switches are consumed while the
+    // weights are uploaded, and a missing drafter is fetched here, ahead of
+    // the large load.
+    let selection = dflash2_policy::resolve_for_load(
+        path,
+        config.engine_mode,
+        config.kv_cache_budget_bytes,
+        config.dwq_overlay_path.is_some(),
+    )?;
+    selection.log(path);
+    match load_engine_on_route(path, config, &selection) {
+        Err(error) if selection.falls_back_on_load_error() => {
+            // Auto never fails startup for a reason of its own making: a
+            // load that fails with DFlash2 selected is repeated on the prior
+            // route, whose errors are the model's own.
+            tracing::warn!(
+                model = %path.display(),
+                error = %format!("{error:#}"),
+                "DFlash2 route failed to load; loading the prior route"
+            );
+            let prior =
+                selection.without_dflash2(format!("the DFlash2 route failed to load: {error:#}"));
+            prior.log(path);
+            load_engine_on_route(path, config, &prior)
+        }
+        result => result,
+    }
+}
+
+/// Load and spawn one engine on the route `selection` resolved.
+fn load_engine_on_route(
+    path: &Path,
+    config: &multi_model::EngineConfig,
+    selection: &dflash2_policy::Selection,
+) -> Result<api::engine::Engine> {
+    // Bound for the load and the spawn: weight upload and worker
+    // provisioning read the table switches on this thread.
+    let _routes = crate::inference::spec_decode::dflash2::route_profile::bind(
+        std::sync::Arc::clone(&selection.routes),
+    );
     // Header-only parse surfaces bad magic + populates the diagnostic
     // log line.  Cheap (memory-mapped header, no tensor read).
     //
@@ -4051,6 +4094,9 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         if let Some(logical_path) = config.operator_model_path.as_deref() {
             loaded.apply_operator_model_id(logical_path);
         }
+    }
+    if let api::engine::LoadedModel::Qwen35(q) = &mut loaded {
+        q.dflash2_plan = selection.plan.clone();
     }
     // ADR-017 Phase E.a iter-2: thread the metrics sink onto the
     // GemmaLoadedModel BEFORE Engine::spawn moves `loaded` into the

@@ -9,7 +9,7 @@
 //! and owned by the layer's weights. Projections that read the same
 //! activation share one BF16 copy of it.
 
-use std::sync::{LazyLock, OnceLock};
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::copy::{dispatch_strided_copy_f32, StridedCopyParams};
@@ -22,6 +22,7 @@ use mlx_native::ops::repacked_gguf_mm::{
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::decode_pool::pooled_alloc_buffer;
+use crate::inference::spec_decode::dflash2::route_profile;
 
 /// Load-once prepared planes of one projection weight.
 pub(crate) type Planes = OnceLock<PreparedGgufWeight>;
@@ -64,12 +65,8 @@ fn enabled() -> bool {
     if let Some(switches) = super::prepared_switch_override::current() {
         return switches.projections;
     }
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("HF2Q_REPACKED_GGUF_M32_PROJ")
-            .map(|value| value == "1")
-            .unwrap_or(false)
-    })
+    const SWITCH: route_profile::Switch = route_profile::switch("HF2Q_REPACKED_GGUF_M32_PROJ");
+    route_profile::is_one(SWITCH)
 }
 
 fn head_enabled() -> bool {
@@ -77,12 +74,8 @@ fn head_enabled() -> bool {
     if let Some(switches) = super::prepared_switch_override::current() {
         return switches.head;
     }
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("HF2Q_REPACKED_GGUF_M32_HEAD")
-            .map(|value| value == "1")
-            .unwrap_or(false)
-    })
+    const SWITCH: route_profile::Switch = route_profile::switch("HF2Q_REPACKED_GGUF_M32_HEAD");
+    route_profile::is_one(SWITCH)
 }
 
 fn shared_head_enabled() -> bool {
@@ -90,9 +83,9 @@ fn shared_head_enabled() -> bool {
     if let Some(switches) = super::prepared_switch_override::current() {
         return switches.shared_head;
     }
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var("HF2Q_REPACKED_GGUF_SHARED_HEAD").as_deref() == Ok("1"));
-    *ENABLED
+    const SWITCH: route_profile::Switch =
+        route_profile::switch("HF2Q_REPACKED_GGUF_SHARED_HEAD");
+    route_profile::is_one(SWITCH)
 }
 
 /// The model's output head, prepared once for every prepared consumer

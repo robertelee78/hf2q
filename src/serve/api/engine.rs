@@ -21252,6 +21252,11 @@ fn worker_run(
     let phase_trace_supervisor = supervisor.clone();
     let _phase_trace_worker =
         crate::serve::phase_trace::worker(move || phase_trace_supervisor.is_healthy());
+    // The worker reads the fast-route switches as its model resolved them at
+    // load, not as another model in this process did.
+    if let LoadedModel::Qwen35(q) = &loaded {
+        crate::inference::spec_decode::dflash2::route_profile::bind_thread(Arc::clone(&q.routes));
+    }
     tracing::info!(
         model = %loaded.model_id(),
         ?mode,
@@ -36420,6 +36425,8 @@ assistant:
             // production `Qwen35LoadedModel::load` site).
             persistent_kv_cache: None,
             dflash2: None,
+            dflash2_plan: None,
+            routes: crate::inference::spec_decode::dflash2::route_profile::current(),
             speculation: super::super::qwen35_speculation::QwenSpeculationController::new(
                 super::super::qwen35_speculation::QwenSpeculationPolicy::Off,
             ),

@@ -76,6 +76,7 @@ use mlx_native::ops::quantized_matmul_id_ggml::{
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
+use crate::inference::spec_decode::dflash2::route_profile;
 use crate::serve::forward_mlx_shared::MlxAffineMoeStack;
 
 use super::execution_dispatch::{
@@ -402,12 +403,8 @@ fn repacked_dense_m32_enabled() -> bool {
     if let Some(switches) = super::prepared_switch_override::current() {
         return switches.ffn;
     }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("HF2Q_REPACKED_GGUF_M32")
-            .map(|value| value == "1")
-            .unwrap_or(false)
-    })
+    const SWITCH: route_profile::Switch = route_profile::switch("HF2Q_REPACKED_GGUF_M32");
+    route_profile::is_one(SWITCH)
 }
 
 /// Whether the prepared route serves a DFlash2 target verify step at every
@@ -421,10 +418,8 @@ fn repacked_any_width_enabled() -> bool {
     if let Some(switches) = super::prepared_switch_override::current() {
         return switches.any_width;
     }
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("HF2Q_REPACKED_GGUF_ANY_WIDTH").as_deref() == Ok("1")
-    });
-    *ENABLED
+    const SWITCH: route_profile::Switch = route_profile::switch("HF2Q_REPACKED_GGUF_ANY_WIDTH");
+    route_profile::is_one(SWITCH)
 }
 
 /// Largest joint width the prepared route is admitted at.
