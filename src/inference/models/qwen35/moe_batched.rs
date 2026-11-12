@@ -20,6 +20,8 @@
 //! Q4_K/Q6_K planes. Gate and up remain separate F32 projections so the
 //! established F32 SwiGLU and down-projection input preserve task quality;
 //! both projections reuse one compact route schedule and gathered input.
+//! Under a DFlash2 verify-row mask the schedule skips masked routes, so an
+//! unselected row costs no expert tile and phase F never reads its rows.
 //!
 //! Decode dispatches of one to eight rows preserve the established bitwise
 //! single-row invariant. The DFlash2 verifier's width-32 pass uses dense MM
@@ -40,10 +42,13 @@ use mlx_native::ops::dense_matvec_f32_rows::{
 };
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk_simd;
-use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
+use mlx_native::ops::moe_weighted_reduce::{
+    dispatch_moe_weighted_reduce, dispatch_moe_weighted_reduce_masked,
+};
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    quantized_matmul_id_ggml_grouped_m8_epilogue, quantized_matmul_id_ggml_mv,
+    quantized_matmul_id_ggml_grouped_m8_epilogue,
+    quantized_matmul_id_ggml_grouped_m8_epilogue_masked, quantized_matmul_id_ggml_mv,
     quantized_matmul_id_ggml_mv_masked, quantized_matmul_id_ggml_mv_q4_k_nr2,
     quantized_matmul_id_ggml_mv_q4_k_nr2_masked, GgmlQuantizedMatmulIdParams, GroupedM8Epilogue,
     GroupedM8Input,
@@ -554,6 +559,14 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
         expert_stride: weights.expert_up_stride,
         ..gate_params
     };
+    // The route mask rewrote unselected rows' ids to `num_experts`. The
+    // masked projection keeps them out of the compact schedule; the plain one
+    // would treat them as invalid metadata and skip every row's expert work.
+    let staged_projection = if route_mask.is_some() {
+        quantized_matmul_id_ggml_grouped_m8_epilogue_masked
+    } else {
+        quantized_matmul_id_ggml_grouped_m8_epilogue
+    };
     if staged_m8 {
         super::decode_pool::with_id_mm_scratch(
             super::decode_pool::MmIdSlot::Gate,
@@ -562,7 +575,7 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
             rows * shape.num_experts_per_tok,
             |scratch| {
                 let prepared = prepared_m8.expect("validated prepared M8");
-                quantized_matmul_id_ggml_grouped_m8_epilogue(
+                staged_projection(
                     enc,
                     registry,
                     device,
@@ -580,7 +593,7 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
                     GroupedM8Input::F32,
                     GroupedM8Epilogue::F32,
                 )?;
-                quantized_matmul_id_ggml_grouped_m8_epilogue(
+                staged_projection(
                     enc,
                     registry,
                     device,
@@ -680,7 +693,7 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
             ne,
             rows * shape.num_experts_per_tok,
             |scratch| {
-                quantized_matmul_id_ggml_grouped_m8_epilogue(
+                staged_projection(
                     enc,
                     registry,
                     device,
@@ -719,7 +732,13 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_into(
     enc.memory_barrier();
 
     // ---- F: weighted reduce + sigmoid(shared gate) * shared + residual ----
-    dispatch_moe_weighted_reduce(
+    // A masked staged projection leaves masked routes' rows unwritten.
+    let weighted_reduce = if staged_m8 && route_mask.is_some() {
+        dispatch_moe_weighted_reduce_masked
+    } else {
+        dispatch_moe_weighted_reduce
+    };
+    weighted_reduce(
         enc,
         registry,
         device,

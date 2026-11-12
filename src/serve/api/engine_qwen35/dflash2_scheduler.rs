@@ -273,6 +273,31 @@ impl Qwen35LoadedModel {
             tracing::Level::DEBUG
         );
         let cycle_started = trace_timing.then(Instant::now);
+        // Native encode counters and this worker thread's CPU time at cycle
+        // entry; the DEBUG record reports the dispatches, command buffers,
+        // host waits, barriers and host CPU one cycle costs. CPU time close
+        // to the cycle's wall time means the host, not the GPU, bounds it.
+        let native_counters = || {
+            let mut cpu = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `cpu` is a valid, exclusively borrowed timespec.
+            let cpu_us =
+                if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut cpu) } == 0 {
+                    cpu.tv_sec as u64 * 1_000_000 + cpu.tv_nsec as u64 / 1_000
+                } else {
+                    0
+                };
+            (
+                mlx_native::dispatch_count(),
+                mlx_native::commit_count(),
+                mlx_native::sync_count(),
+                mlx_native::barrier_count(),
+                cpu_us,
+            )
+        };
+        let counters_at_entry = trace_timing.then(native_counters);
 
         let physical_lanes = runtime.workspace.max_lanes;
         let mut anchors = vec![0_u32; physical_lanes];
@@ -609,7 +634,8 @@ impl Qwen35LoadedModel {
                     .with_context(|| format!("bind DFlash2 slot {slot} retained token prefix"))?;
             }
         }
-        if let Some(started) = cycle_started {
+        if let (Some(started), Some(entry)) = (cycle_started, counters_at_entry) {
+            let now = native_counters();
             tracing::debug!(
                 target: "hf2q::serve::api::engine_qwen35::progress",
                 active_lanes = verifying.len(),
@@ -622,6 +648,11 @@ impl Qwen35LoadedModel {
                 target_commit_us = target_commit_micros.unwrap_or_default(),
                 draft_commit_us = draft_commit_micros.unwrap_or_default(),
                 total_us = started.elapsed().as_micros(),
+                dispatches = now.0.wrapping_sub(entry.0),
+                command_buffers = now.1.wrapping_sub(entry.1),
+                host_waits = now.2.wrapping_sub(entry.2),
+                barriers = now.3.wrapping_sub(entry.3),
+                host_cpu_us = now.4.wrapping_sub(entry.4),
                 "Qwen DFlash2 stage timing"
             );
         }
