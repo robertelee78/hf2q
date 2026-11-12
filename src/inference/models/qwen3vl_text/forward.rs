@@ -684,6 +684,7 @@ pub fn forward_text_prefill_logits_last(
                 ggml_type_down: ffn_down_type,
                 intermediate_size: intermediate,
                 hidden_size: hidden,
+                repacked_m32: Default::default(),
             };
             let l_out = build_dense_ffn_layer_gpu_q_into(
                 enc,

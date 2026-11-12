@@ -732,6 +732,7 @@ fn synthetic_mtp(device: &MlxDevice, cfg: &Qwen35Config, seed: &mut u32) -> MtpW
                 ggml_type_down: GgmlType::Q6_K,
                 intermediate_size: inter as u32,
                 hidden_size: cfg.hidden_size,
+                repacked_m32: Default::default(),
             },
         },
     }
