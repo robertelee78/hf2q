@@ -8,7 +8,7 @@
 //! and owned by the layer's weights. Projections that read the same
 //! activation share one BF16 copy of it.
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::copy::{dispatch_strided_copy_f32, StridedCopyParams};
@@ -61,6 +61,82 @@ fn head_enabled() -> bool {
             .map(|value| value == "1")
             .unwrap_or(false)
     })
+}
+
+fn shared_head_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("HF2Q_REPACKED_GGUF_SHARED_HEAD").as_deref() == Ok("1")
+    });
+    *ENABLED
+}
+
+/// The model's output head, prepared once for every prepared consumer
+/// (`HF2Q_REPACKED_GGUF_SHARED_HEAD=1`): the joint target step's head and the
+/// staged DFlash2 draft's vocabulary projection read the same planes instead
+/// of preparing the head once each.
+///
+/// The planes are written by a command buffer of their own that completes
+/// before the head is handed out, so no consumer can hold planes that an
+/// abandoned command never wrote.
+#[derive(Default)]
+pub(crate) struct SharedHead {
+    /// The source blocks' address and the planes prepared from them.
+    prepared: OnceLock<(usize, PreparedGgufWeight)>,
+}
+
+impl SharedHead {
+    /// Whether the switch is on and the prepared kernels take this head.
+    pub(crate) fn serves(
+        weight: &MlxBuffer,
+        ggml_type: GgmlType,
+        in_features: u32,
+        out_features: u32,
+    ) -> bool {
+        shared_head_enabled()
+            && weight.dtype() == DType::U8
+            && out_features % 64 == 0
+            && in_features % 256 == 0
+            && matches!(ggml_type, GgmlType::Q4_K | GgmlType::Q6_K)
+    }
+
+    /// The planes of `weight`, preparing them on first use. Fails if the
+    /// model's head was replaced after they were prepared.
+    pub(crate) fn get_or_prepare(
+        &self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        weight: &MlxBuffer,
+        ggml_type: GgmlType,
+        in_features: u32,
+        out_features: u32,
+    ) -> Result<&PreparedGgufWeight> {
+        let source = weight.contents_ptr() as usize + weight.byte_offset() as usize;
+        if self.prepared.get().is_none() {
+            let mut enc = device
+                .command_encoder()
+                .map_err(|error| anyhow!("shared output head encoder: {error}"))?;
+            let prepared = prepare_repacked_gguf_weight(
+                &mut enc,
+                registry,
+                device,
+                weight,
+                &params(1, ggml_type, in_features, out_features),
+            )
+            .context("prepare shared output head")?;
+            enc.commit_and_wait_labeled("qwen35.shared_output_head.prepare")
+                .map_err(|error| anyhow!("prepare shared output head: {error}"))?;
+            let _ = self.prepared.set((source, prepared));
+        }
+        let (prepared_source, prepared) = self
+            .prepared
+            .get()
+            .context("shared output head was not retained")?;
+        anyhow::ensure!(
+            *prepared_source == source,
+            "the output head was replaced after its shared planes were prepared"
+        );
+        Ok(prepared)
+    }
 }
 
 fn params(
@@ -317,6 +393,40 @@ pub(crate) fn project(
         in_features,
         out_features,
     )?;
+    Ok(output)
+}
+
+/// Encode the projection of `input_bf16` through already prepared planes into
+/// a pooled F32 `[rows, out_features]` buffer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_prepared(
+    enc: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input_bf16: &MlxBuffer,
+    prepared: &PreparedGgufWeight,
+    ggml_type: GgmlType,
+    rows: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<MlxBuffer> {
+    let output = pooled_alloc_buffer(
+        device,
+        rows as usize * out_features as usize * std::mem::size_of::<f32>(),
+        DType::F32,
+        vec![rows as usize, out_features as usize],
+    )
+    .map_err(|error| anyhow!("allocate prepared projection output: {error}"))?;
+    dispatch_repacked_gguf_mm_bf16_input(
+        enc,
+        registry,
+        device,
+        input_bf16,
+        prepared,
+        &output,
+        &params(rows, ggml_type, in_features, out_features),
+    )
+    .context("dispatch prepared GGUF projection")?;
     Ok(output)
 }
 

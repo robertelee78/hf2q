@@ -912,8 +912,9 @@ impl Qwen35Model {
         )
         .context("Qwen joint output norm")?;
         enc.memory_barrier();
+        // The width rule is the prepared route's own: 32 rows, or every
+        // joint width with `HF2Q_REPACKED_GGUF_ANY_WIDTH=1`.
         let prepared_head = plan.head == JointProductRoute::Batched
-            && width == DFLASH2_VERIFY_WIDTH
             && prepared_projection::admits_head(
                 width_u32,
                 &output_head.lm_head,
@@ -934,18 +935,35 @@ impl Qwen35Model {
                 hidden_size,
             )?;
             enc.memory_barrier();
-            prepared_projection::project(
-                &mut enc,
-                registry,
-                device,
-                &normed_bf16,
-                &output_head.lm_head,
-                output_head.lm_head_ggml_type,
-                &output_head.prepared_m32,
-                width_u32,
-                hidden_size,
-                cfg.vocab_size,
-            )
+            match self
+                .shared_prepared_output_head(registry, device)
+                .context("Qwen joint shared prepared lm_head")?
+            {
+                // The planes the staged draft reads too.
+                Some(shared) => prepared_projection::project_prepared(
+                    &mut enc,
+                    registry,
+                    device,
+                    &normed_bf16,
+                    shared,
+                    output_head.lm_head_ggml_type,
+                    width_u32,
+                    hidden_size,
+                    cfg.vocab_size,
+                ),
+                None => prepared_projection::project(
+                    &mut enc,
+                    registry,
+                    device,
+                    &normed_bf16,
+                    &output_head.lm_head,
+                    output_head.lm_head_ggml_type,
+                    &output_head.prepared_m32,
+                    width_u32,
+                    hidden_size,
+                    cfg.vocab_size,
+                ),
+            }
             .context("Qwen joint prepared lm_head")?
         } else {
             let mut logits = decode_pool::pooled_alloc_buffer(

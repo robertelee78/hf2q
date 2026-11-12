@@ -1042,6 +1042,7 @@ impl Qwen35Model {
             output_weight,
             output_weight_native: None,
             tied_word_embeddings: false,
+            prepared_output_head: Default::default(),
             output_norm,
             mtp: None,
             glp: None,

@@ -405,11 +405,37 @@ fn repacked_dense_m32_enabled() -> bool {
     })
 }
 
-fn repacked_dense_m32_eligible(params: &GgmlQuantizedMatmulParams) -> bool {
-    params.m == 32
+/// Whether the prepared route serves every joint width instead of only 32
+/// rows (`HF2Q_REPACKED_GGUF_ANY_WIDTH=1`). The prepared kernels cover any
+/// row count with 32-row tiles and a partial last tile, and a row's bits do
+/// not depend on the row count, so with the switch on a joint row is computed
+/// by one kernel family whatever the width of its step.
+fn repacked_any_width_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("HF2Q_REPACKED_GGUF_ANY_WIDTH").as_deref() == Ok("1")
+    });
+    *ENABLED
+}
+
+/// Largest joint width the prepared route is admitted at.
+const REPACKED_MAX_ROWS: u32 = 32;
+
+/// The one width rule of the prepared route, shared by the dense FFN, the
+/// attention and DeltaNet projections and the output head: 32 rows, or with
+/// `any_width` every row count up to 32.
+pub(super) fn repacked_rows_eligible(rows: u32, any_width: bool) -> bool {
+    rows == REPACKED_MAX_ROWS || (any_width && (1..REPACKED_MAX_ROWS).contains(&rows))
+}
+
+fn repacked_dense_shape_eligible(params: &GgmlQuantizedMatmulParams, any_width: bool) -> bool {
+    repacked_rows_eligible(params.m, any_width)
         && params.n % 64 == 0
         && params.k % 256 == 0
         && matches!(params.ggml_type, GgmlType::Q4_K | GgmlType::Q6_K)
+}
+
+fn repacked_dense_m32_eligible(params: &GgmlQuantizedMatmulParams) -> bool {
+    repacked_dense_shape_eligible(params, repacked_any_width_enabled())
 }
 fn repacked_dense_m32_in_joint_scope(params: &GgmlQuantizedMatmulParams) -> bool {
     super::joint_projection::active_width(params.m) && repacked_dense_m32_eligible(params)
@@ -1625,7 +1651,7 @@ pub(crate) fn build_dense_ffn_layer_gpu_q_into_with_gate_up(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_dense_ffn_layer_gpu_q_prepared_m32(
+pub(super) fn build_dense_ffn_layer_gpu_q_prepared_m32(
     enc: &mut mlx_native::CommandEncoder,
     device: &MlxDevice,
     registry: &mut KernelRegistry,

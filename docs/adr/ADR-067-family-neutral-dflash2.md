@@ -1394,6 +1394,73 @@ The head is prepared a second time beside `HF2Q_REPACKED_GGUF_M32_HEAD`
 (0.98 GiB on Qwen3.8 and 0.39 GiB on Qwen3.6 by plane size) until the two
 routes share one. The switch stays off by default.
 
+#### Prepared routes at every joint width, shared head (wave 2)
+
+`HF2Q_REPACKED_GGUF_SHARED_HEAD=1` makes the model own one prepared output
+head (`Qwen35Model::prepared_output_head`, prepared in a command buffer of
+its own on first use); the staged draft takes it through
+`DFlash2TargetFamily::shared_prepared_vocabulary_head` and the prepared
+target head reads the same planes. Logits are bitwise those of the separate
+copies (`staged::tests::shared_prepared_head_gives_the_bits_of_the_drafts_own_copy`,
+`prepared_width_tests`). On Qwen3.8 the prepared target head then costs no
+footprint: peak 75.80 / 75.69 GB with the shared planes against 75.81 /
+75.79 GB with the stock target head, and 76.75 GB (one run) with the
+prepared target head and a second copy.
+
+`HF2Q_REPACKED_GGUF_ANY_WIDTH=1` admits the prepared dense FFN, projections
+and head at every joint width from 1 to 32 rows (one rule,
+`gpu_ffn::repacked_rows_eligible`, behind `prepared_projection::admits*`).
+The Qwen3.6 verify tile is 4, 8, 16 or 32 rows; before, only 32 took the
+prepared kernels, so one- and two-lane cycles ran the stock ones and a row's
+bits depended on the tile width. Model-free gate (`prepared_width_tests`): a
+row of a prepared projection, of the fused alpha/beta product and of the
+whole dense FFN layer has the same bits at widths 1, 4, 8, 16, 24 and 32 in
+three cohorts each, repeated runs agree, and every product is inside an
+F64-referenced bound; the gate also passes under `MTL_SHADER_VALIDATION=1`
+with and without `MTL_DEBUG_LAYER=1`.
+
+Exact Q5 runs on the combined candidate (binary `455a172c`, every other
+candidate switch on; "on" is `_M32_HEAD`, `_SHARED_HEAD` and `_ANY_WIDTH`
+together), all `CalibrationPass`:
+
+| Model, arm | 1 lane ms | 2 lanes ms | 3 lanes ms | 4 lanes ms | accepted per lane-cycle (4 lanes) | dispatches (4 lanes) |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.8 off (two runs) | 61.3 / 61.4 | 62.8 / 62.9 | 67.5 / 67.5 | 72.5 / 72.4 | 5.30 / 5.32 | 9,063 |
+| Qwen3.8 on (two runs) | 59.8 / 59.2 | 60.5 / 60.1 | 64.9 / 65.2 | 71.0 / 70.7 | 5.22 / 5.22 | 9,208 |
+| Qwen3.6 off (two runs) | 22.6 / 22.1 | 36.8 / 34.5 | 29.3 / 27.8 | 33.6 / 32.8 | 3.97 / 4.07 | 6,316 |
+| Qwen3.6 on (three runs) | 17.1 / 17.4 / 18.6 | 22.0 / 23.0 / 23.0 | 28.5 / 28.0 / 28.0 | 32.3 / 32.9 / 32.6 | 3.89 / 4.00 / 3.96 | 6,317 |
+
+Qwen3.8's gain is the prepared target head (the dense target always verifies
+at 32 rows). The dispatch medians differ by the head's input cast; the
+9,063 / 9,208 split is a bimodal per-cycle count present in both arms.
+Diagnostic category profile on Qwen3.6 (one run each, GPU ms, widths of one
+to four lanes): head 4.55 / 4.27 / 1.95 / 1.65 off against 0.86 / 1.10 /
+0.94 / 1.02 on; projections 11.93 / 20.71 / 5.20 / 4.69 off against 4.45 /
+5.56 / 5.23 / 5.42 on.
+
+Run-to-run text on Qwen3.6. With the switches off every pair of runs
+differs in every agent within its first five turns (three runs compared).
+With them on, three of four runs (two timing runs and the profiled run,
+whose cycle mix and timing are very different) produced the same transcript
+in all four agents and all turns; the fourth differs from them at one token
+of one agent's last turn and nowhere else. So the width-dependent
+projections and head were the main source of the variation but not the
+only one: something that depends on the cohort or the timing remains and
+was not identified. Four runs do not measure quality; the workflow-oracle
+pass rate needs root's long comparison.
+
+A one-pass gate/up pair over the prepared planes with a BF16 SiLU epilogue,
+a residual folded into the down projection's reduce pass and a row-batched
+argmax were built and rejected: none was faster on the GPU, and the pair
+was not bitwise the separate route (3 of 278,528 products). Model free, at
+the GPU's top performance state, the existing prepared FFN layer takes
+0.354-0.42 ms (Q4_K down) and 0.39-0.52 ms (Q6_K down), 23.9-30 ms per 64
+layers against Splash's 24.0 ms. The same projection reads 0.118 ms when
+the GPU queue never drains and drifts to 0.18 ms within seconds when each
+sample leaves an idle gap, so the profiled FFN category (29.1 ms) measures
+the cycle's duty cycle, not a kernel deficit
+(mlx-native `benches/bench_qwen_dense_ffn.rs`).
+
 #### Live-tile MoE expert route
 
 The Qwen3.6 MoE stage was then attributed model-free at the served shape

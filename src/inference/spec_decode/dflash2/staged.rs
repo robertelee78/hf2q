@@ -347,15 +347,18 @@ pub(super) fn dispatch_ring_attention(
 
 /// Project `input` through the target's native head on the prepared tile.
 /// Returns `false`, encoding nothing, when the head or the row count is not
-/// one the tile takes. The first command also repacks the head; the caller
-/// reports that command's commit with
+/// one the tile takes. With `shared`, the planes are the target's own and
+/// nothing is repacked here. Otherwise the first command also repacks the
+/// head; the caller reports that command's commit with
 /// [`DFlash2StagedScratch::command_committed`].
+#[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_prepared_head(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     staged: &mut DFlash2StagedScratch,
     weight: &MlxQWeight,
+    shared: Option<&PreparedGgufWeight>,
     input: &MlxBuffer,
     output: &MlxBuffer,
     rows: usize,
@@ -369,16 +372,15 @@ pub(super) fn dispatch_prepared_head(
         return Ok(false);
     }
     let params = weight.matmul_params(u32::try_from(rows)?)?;
-    if staged.head.is_none() {
+    if shared.is_none() && staged.head.is_none() {
         // Replaces a head that a command abandoned before its commit prepared.
         staged.pending_head = Some(
             prepare_repacked_gguf_weight(encoder, registry, device, &weight.buffer, &params)
                 .context("prepare the DFlash2 vocabulary head")?,
         );
     }
-    let prepared = staged
-        .head
-        .as_ref()
+    let prepared = shared
+        .or(staged.head.as_ref())
         .or(staged.pending_head.as_ref())
         .expect("prepared above");
     staged.round_input(encoder, registry, device, input, rows, weight.info.cols)?;
@@ -706,6 +708,14 @@ mod tests {
     /// Encode one draft forward through a native head; commit it or abandon
     /// it as a failed encode would.
     fn forward_native(fixture: &mut Fixture, head: &MlxQWeight, commit: bool) -> Vec<f32> {
+        forward_head(fixture, DFlash2VocabularyHead::Native(head), commit)
+    }
+
+    fn forward_head(
+        fixture: &mut Fixture,
+        head: DFlash2VocabularyHead<'_>,
+        commit: bool,
+    ) -> Vec<f32> {
         // A forward overwrites its input rows; every call starts from the same.
         let mut state = 43_u64;
         for value in fixture.workspace.hidden[0].as_mut_slice::<f32>().unwrap() {
@@ -718,7 +728,7 @@ mod tests {
             &fixture.device,
             &fixture.cfg,
             &fixture.tensors,
-            DFlash2VocabularyHead::Native(head),
+            head,
             &mut fixture.workspace,
         )
         .unwrap();
@@ -729,6 +739,54 @@ mod tests {
             }
         }
         fixture.workspace.logits.as_slice::<f32>().unwrap().to_vec()
+    }
+
+    /// The target's shared planes give the logits of the draft's own copy,
+    /// bit for bit, and the draft then prepares no head of its own.
+    #[test]
+    fn shared_prepared_head_gives_the_bits_of_the_drafts_own_copy() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut own = fixture(4, true);
+        let head = q4k_head(&own.device, &own.cfg);
+        let own_logits = forward_native(&mut own, &head, true);
+        assert!(own.workspace.staged.as_ref().unwrap().head.is_some());
+        assert!(own_logits.iter().any(|value| *value != 0.0));
+
+        let mut shared = fixture(4, true);
+        let head = q4k_head(&shared.device, &shared.cfg);
+        let params = head.matmul_params(32).unwrap();
+        let mut encoder = shared.device.command_encoder().unwrap();
+        let prepared = prepare_repacked_gguf_weight(
+            &mut encoder,
+            &mut shared.registry,
+            &shared.device,
+            &head.buffer,
+            &params,
+        )
+        .unwrap();
+        encoder.commit_and_wait().unwrap();
+        for _ in 0..2 {
+            let logits = forward_head(
+                &mut shared,
+                DFlash2VocabularyHead::SharedPrepared {
+                    weight: &head,
+                    prepared: &prepared,
+                },
+                true,
+            );
+            assert!(
+                logits
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .eq(own_logits.iter().map(|v| v.to_bits())),
+                "shared planes changed the draft logits"
+            );
+        }
+        let staged = shared.workspace.staged.as_ref().unwrap();
+        assert!(
+            staged.head.is_none(),
+            "the draft prepared a head beside the shared one"
+        );
     }
 
     #[test]

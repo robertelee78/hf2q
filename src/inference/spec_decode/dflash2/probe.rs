@@ -230,13 +230,14 @@ fn probe(
         &anchors,
         &mut runtime.workspace,
     )?;
+    let vocabulary_head = target_vocabulary_head(&adapter, registry, device)?;
     dispatch_dflash2_forward(
         &mut encoder,
         registry,
         device,
         &config,
         &runtime.tensors,
-        target_vocabulary_head(&adapter)?,
+        vocabulary_head,
         &mut runtime.workspace,
     )?;
     dispatch_dflash2_selection(

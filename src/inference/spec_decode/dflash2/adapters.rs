@@ -14,6 +14,7 @@ use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::dflash2_attention_pack::{
     dispatch_dflash2_mask_rows_f32, DFlash2MaskRowsParams,
 };
+use mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight;
 use mlx_native::{CommandEncoder, GgmlType, KernelRegistry, MlxBuffer, MlxDevice};
 
 /// Family-neutral target hidden-capture destination for one packed verify.
@@ -35,6 +36,16 @@ pub trait DFlash2TargetFamily {
     fn target_shape(&self) -> DFlash2TargetShape<'_>;
     fn embedding(&self) -> Result<&MlxQWeight>;
     fn vocabulary_head(&self) -> Result<&MlxQWeight>;
+    /// Prepared planes of the vocabulary head that the target owns and shares
+    /// with its own head, when the family offers them. The default prepares
+    /// nothing: the staged draft then prepares a head of its own.
+    fn shared_prepared_vocabulary_head(
+        &self,
+        _registry: &mut KernelRegistry,
+        _device: &MlxDevice,
+    ) -> Result<Option<&PreparedGgufWeight>> {
+        Ok(None)
+    }
     fn embedding_scale(&self) -> f32;
     /// Whether target verification should budget rows from selector confidence.
     ///
@@ -116,6 +127,14 @@ impl DFlash2TargetFamily for QwenDFlash2Adapter<'_> {
             .resolved_native_output_head()?
             .map(|(weight, _)| weight)
             .context("Qwen DFlash2 requires a native output head")
+    }
+
+    fn shared_prepared_vocabulary_head(
+        &self,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+    ) -> Result<Option<&PreparedGgufWeight>> {
+        self.model.shared_prepared_output_head(registry, device)
     }
 
     fn embedding_scale(&self) -> f32 {
@@ -376,6 +395,14 @@ pub fn dispatch_dflash2_input<T: DFlash2TargetFamily>(
 
 pub fn target_vocabulary_head<'a, T: DFlash2TargetFamily>(
     adapter: &'a T,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
 ) -> Result<DFlash2VocabularyHead<'a>> {
-    Ok(DFlash2VocabularyHead::Native(adapter.vocabulary_head()?))
+    let weight = adapter.vocabulary_head()?;
+    Ok(
+        match adapter.shared_prepared_vocabulary_head(registry, device)? {
+            Some(prepared) => DFlash2VocabularyHead::SharedPrepared { weight, prepared },
+            None => DFlash2VocabularyHead::Native(weight),
+        },
+    )
 }

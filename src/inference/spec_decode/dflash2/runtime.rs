@@ -303,7 +303,7 @@ impl DFlash2Runtime {
             anchors,
             &mut self.workspace,
         )?;
-        let vocabulary_head = target_vocabulary_head(target)?;
+        let vocabulary_head = target_vocabulary_head(target, registry, device)?;
         dispatch_dflash2_forward(
             &mut encoder,
             registry,
