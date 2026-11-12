@@ -1297,6 +1297,103 @@ text are also running different workloads, and six repeats do not sample
 that. Stage time per cycle is the comparable quantity between such arms;
 makespan between them is one draw.
 
+#### Staged draft command
+
+A probe that replays every dispatch of one draft command as its own command
+buffer (`dflash2::probe::dflash2_draft_command_dispatch_probe`, real target
+and checkpoint, four lanes, 512 ring rows per lane, median of 20 rounds)
+reproduces the profiled draft cost and splits it. GPU ms, Splash from its
+`decode-profile` dispatch lists on the same host:
+
+| Group | Splash Qwen3.8 | hf2q Qwen3.8 | staged | Splash Qwen3.6 | hf2q Qwen3.6 | staged |
+|---|---:|---:|---:|---:|---:|---:|
+| Projections | 2.89 | 8.23 | 2.55 | 1.46 | 2.36 | 1.14 |
+| Attention | 0.34 | 3.30 | 0.30 | 0.39 | 3.95 | 0.37 |
+| Norms, convolutions, input | 0.20 | 0.24 | 0.17 | 0.19 | 0.20 | 0.15 |
+| Vocabulary head | 1.95 | 4.38 | 1.96 | 0.85 | 1.33 | 0.85 |
+| Selection | 0.14 | 0.15 | 0.14 | 0.15 | 0.14 | 0.14 |
+| Draft command | 5.51 | 16.30 | 5.12 | 3.04 | 7.98 | 2.64 |
+| Context commit | 0.46 | 1.09 | 0.37 | 0.32 | 0.50 | 0.23 |
+
+The three differences are kernels, not dispatch count (171 draft dispatches
+against Splash's 90). hf2q multiplied AF4G64 planes on the register tile
+where Splash's Apple10 plan stages them (`runtime/ops/LinearGguf.cpp:190-212,
+272-275`) and runs gate and up in one pass
+(`runtime/metal/kernels/shared/gguf_linear.metal:131-180`). hf2q copied every
+lane's 2,047-row ring window into a packed K/V tile and filled a dense mask
+before each layer's flash attention, whatever the context length; Splash
+multiplies the ring in place over the live 128-slot tiles in four splits
+(`runtime/metal/kernels/decode/draft.metal:151-398`). hf2q's draft head ran
+the stock Q6_K kernel; Splash runs the target's prepared tile
+(`runtime/model/DFlashDraft.cpp:334-341`).
+
+`HF2Q_DFLASH2_DRAFT_STAGED=1` (requires `HF2Q_DFLASH2_DRAFT_AF4_G64=1`)
+adopts all three on unchanged weights: mlx-native's
+`dflash2_af4g64_staged` tile for projections of at least 960 outputs, with
+the split count from Splash's wave law evaluated once for 40 cores and 32
+rows so that it never depends on the row count; `dflash2_ring_attention`;
+and, at four lanes, the prepared head. Projections and attention are Class B
+against the default route. Each kernel has an F64 reference test with a
+K-scaled bound, a determinism test and a row and lane independence test
+(bitwise, across tile heights, positions and neighbours). Sparse probes
+check that every 32-input step of every served projection shape, up to
+K = 25,600, is summed exactly once; the served 32-over-8-head attention is
+checked at every tile and window boundary, alone and in every cohort; and
+every test's scratch starts as NaN. The ring split kernel holds 16,384 bytes
+of threadgroup memory, which Metal shader validation doubles to the device
+limit, and the kernel tests give the same bits under
+`MTL_SHADER_VALIDATION=1 MTL_DEBUG_LAYER=1`. A synthetic checkpoint runs
+both routes to within 5e-3 relative RMS in rings, hidden states and logits,
+and the prepared head to within 5e-3 of the stock head. Against the pinned
+Qwen3.6 reference fixture the first layer's relative maximum error is 0.1960
+staged and 0.1962 on the register tile: four-bit quantization, not the tile,
+sets the draft's distance from the BF16 oracle.
+
+In situ on the exact four-agent Q5 workload, each arm on one binary, with the
+draft command waited (`HF2Q_DFLASH2_GPU_TARGET_TOKENS=0`) so that `draft_us`
+is its wall time, the four-lane median fell from 17.20 to 6.01 ms on Qwen3.8
+(one run per arm) and from 8.25 and 8.19 ms to 3.07 ms on Qwen3.6 (two
+passing off-runs, one passing on-run). `draft_commit_us` fell from 1.39–1.50
+to 0.60–0.66 ms on Qwen3.8 and from 0.72–0.78 to 0.45–0.47 ms on Qwen3.6 in
+every passing run. In the served GPU-token mode Qwen3.8 emits the same
+completion tokens with the switch on or off (5,237 in each of seven runs of
+the measured binary) and accepts 5.334 against 5.330 tokens per lane-cycle;
+rebased onto the capture-wait fix (`eea0fa1a`), one run per arm accepts 5.366
+against 5.370 for the same 5,237 tokens (1,184 against 1,183 lane-cycles).
+On Qwen3.6, whose text varies between runs of one arm, four on-runs accepted
+4.03–4.18 tokens per lane-cycle against 4.10 and 4.25 for two off-runs. All
+six Qwen3.8 and all four Qwen3.6 on-runs in the GPU-token mode passed
+calibration.
+
+Root's six-block paired campaign on that binary
+(`$E/qwen38-draft-staged-d5-v1`: Qwen3.8, GPU-token mode, the switch against
+unset with every other setting equal, fixed alternating order, a loaded
+host) passed all 12 runs with identical text in both arms (5,237 tokens).
+The four-lane cycle fell by 7.41% (95% CI 6.70–8.12%; medians 126.96
+against 136.56 ms), the four-lane target stage by 6.87% (6.17–7.56%; 121.43
+against 130.03 ms) and client makespan by 5.89% (4.02–7.71%; 67.94 against
+71.80 seconds). Peak footprint was 71.10 against 70.08 GiB. The owner's
+seven unpaired runs had not shown this (on 109.7, 108.6, 95.7 and 98.9 ms
+against off 100.9, 106.4 and 103.3 ms); root attributes the two slow
+on-runs to host load. In the waited mode the four-lane cycle fell from
+102.0 to 92.7 ms in one run per arm.
+
+Qwen3.6 is not qualified. In the waited mode, which is the Qwen MoE default,
+two of three on-runs failed the six-step workflow oracle on model text (a
+tool call cut short after a reasoning-budget close, and an extra edit after
+a compiler warning); two off-runs did not. Every emitted token is the
+target's own decision, so a draft cannot emit an unverified token. In that
+mode, however, the host selects verify rows from the draft's confidence and
+the Qwen3.6 verify tile width follows the row total
+(`dflash2_verify_width`), so a different draft changes the target kernels
+that run and the target's logit bits. Dense Qwen3.8 verifies at a fixed
+width, which is why its text is identical. Five runs do not separate the
+arms (Fisher p about 0.4); root's waited-mode Qwen3.6 campaign must.
+
+The head is prepared a second time beside `HF2Q_REPACKED_GGUF_M32_HEAD`
+(0.98 GiB on Qwen3.8 and 0.39 GiB on Qwen3.6 by plane size) until the two
+routes share one. The switch stays off by default.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,
