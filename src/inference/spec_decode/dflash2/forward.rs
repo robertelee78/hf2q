@@ -2,6 +2,7 @@
 
 use super::{
     config::DFlash2Config,
+    staged::{dispatch_prepared_head, dispatch_ring_attention, staged_tile_takes},
     tensors::{DFlash2LayerTensors, DFlash2ModelTensors, DFlash2Projection},
     workspace::DFlash2Workspace,
 };
@@ -36,6 +37,8 @@ use mlx_native::ops::{
 };
 use mlx_native::{CommandEncoder, GgmlType, KernelRegistry, MlxBuffer, MlxDevice};
 
+/// Project F32 rows. On the staged route a projection the staged tile takes
+/// reads their BF16 rounding.
 fn project(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -48,6 +51,25 @@ fn project(
     input_width: usize,
     output_width: usize,
 ) -> Result<()> {
+    if let (Some(staged), DFlash2Projection::Af4G64 { .. }) =
+        (workspace.staged.as_ref(), projection)
+    {
+        if staged_tile_takes(output_width) {
+            staged.round_input(encoder, registry, device, input, rows, input_width)?;
+            return project_rounded(
+                encoder,
+                registry,
+                device,
+                workspace,
+                projection,
+                &staged.projection_input,
+                output,
+                rows,
+                input_width,
+                output_width,
+            );
+        }
+    }
     match projection {
         DFlash2Projection::Dense { weight } => project_bf16(
             encoder,
@@ -78,6 +100,40 @@ fn project(
             .map_err(anyhow::Error::from)
         }
     }
+}
+
+/// Project BF16 rows on the staged tile.
+fn project_rounded(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    workspace: &DFlash2Workspace,
+    projection: &DFlash2Projection,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    rows: usize,
+    input_width: usize,
+    output_width: usize,
+) -> Result<()> {
+    let (Some(staged), DFlash2Projection::Af4G64 { weights, metadata }) =
+        (workspace.staged.as_ref(), projection)
+    else {
+        return Err(anyhow!(
+            "DFlash2 BF16 projection rows require the staged AF4G64 route"
+        ));
+    };
+    staged.project(
+        encoder,
+        registry,
+        device,
+        weights,
+        metadata,
+        input,
+        output,
+        rows,
+        input_width,
+        output_width,
+    )
 }
 
 fn project_bf16(
@@ -186,6 +242,9 @@ pub fn prepare_decode_positions(
     Ok(())
 }
 
+/// Attention of the current rows over the layer's rings and themselves. The
+/// staged route's ring attention leaves BF16 rows in its scratch `output`;
+/// the packed attention leaves F32 rows in `workspace.attention`.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_attention(
     encoder: &mut CommandEncoder,
@@ -231,6 +290,24 @@ fn dispatch_attention(
         head_dim as u32,
     )?;
     encoder.memory_barrier();
+
+    if let Some(scratch) = workspace
+        .staged
+        .as_ref()
+        .and_then(|staged| staged.attention.as_ref())
+    {
+        dispatch_ring_attention(
+            encoder,
+            registry,
+            device,
+            config,
+            workspace,
+            scratch,
+            layer_index,
+        )?;
+        encoder.memory_barrier();
+        return Ok(());
+    }
 
     let current_query = workspace
         .query
@@ -443,18 +520,36 @@ pub(super) fn dispatch_layer(
     )?;
     encoder.memory_barrier();
     dispatch_attention(encoder, registry, device, config, workspace, layer_index)?;
-    project(
-        encoder,
-        registry,
-        device,
-        workspace,
-        &tensors.output_projection,
-        &workspace.attention,
-        &workspace.projected,
-        rows,
-        q_width,
-        hidden,
-    )?;
+    match workspace
+        .staged
+        .as_ref()
+        .and_then(|staged| staged.attention.as_ref())
+    {
+        Some(scratch) => project_rounded(
+            encoder,
+            registry,
+            device,
+            workspace,
+            &tensors.output_projection,
+            &scratch.output,
+            &workspace.projected,
+            rows,
+            q_width,
+            hidden,
+        )?,
+        None => project(
+            encoder,
+            registry,
+            device,
+            workspace,
+            &tensors.output_projection,
+            &workspace.attention,
+            &workspace.projected,
+            rows,
+            q_width,
+            hidden,
+        )?,
+    }
     encoder.memory_barrier();
     dispatch_dflash2_dynamic_conv_f32(
         encoder,
@@ -508,66 +603,7 @@ pub(super) fn dispatch_layer(
         DFlash2ConvolutionStage::Prepare,
     )?;
     encoder.memory_barrier();
-    project(
-        encoder,
-        registry,
-        device,
-        workspace,
-        &tensors.gate_up_projection,
-        &workspace.convolved,
-        &workspace.gate_up,
-        rows,
-        hidden,
-        2 * config.intermediate_size,
-    )?;
-    encoder.memory_barrier();
-    let fused_gate_up =
-        workspace
-            .gate_up
-            .with_shape(vec![rows, 1, 2 * config.intermediate_size])?;
-    let gate = workspace
-        .gate
-        .with_shape(vec![rows, 1, config.intermediate_size])?;
-    let up = workspace
-        .up
-        .with_shape(vec![rows, 1, config.intermediate_size])?;
-    dispatch_q_gate_deinterleave_f32(
-        encoder,
-        registry,
-        device,
-        &fused_gate_up,
-        &gate,
-        &up,
-        QGateDeinterleaveParams {
-            m: u32::try_from(rows)?,
-            n_heads: 1,
-            head_dim: u32::try_from(config.intermediate_size)?,
-        },
-    )?;
-    encoder.memory_barrier();
-    dispatch_silu_mul(
-        encoder,
-        registry,
-        device.metal_device(),
-        &workspace.gate,
-        &workspace.up,
-        &workspace.intermediate,
-        &workspace.silu_params,
-        (rows * config.intermediate_size) as u32,
-    )?;
-    encoder.memory_barrier();
-    project(
-        encoder,
-        registry,
-        device,
-        workspace,
-        &tensors.down_projection,
-        &workspace.intermediate,
-        &workspace.projected,
-        rows,
-        config.intermediate_size,
-        hidden,
-    )?;
+    dispatch_mlp(encoder, registry, device, config, tensors, workspace)?;
     encoder.memory_barrier();
     dispatch_dflash2_dynamic_conv_f32(
         encoder,
@@ -583,6 +619,111 @@ pub(super) fn dispatch_layer(
     )?;
     encoder.memory_barrier();
     Ok(())
+}
+
+/// `projected = down(SiLU(gate(convolved)) * up(convolved))`. The staged
+/// route runs gate and up in one pass into BF16 rows the down projection
+/// reads in place.
+fn dispatch_mlp(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    config: &DFlash2Config,
+    tensors: &DFlash2LayerTensors,
+    workspace: &DFlash2Workspace,
+) -> Result<()> {
+    let rows = workspace.max_lanes * config.block_size;
+    let hidden = config.hidden_size;
+    let intermediate = config.intermediate_size;
+    if let (Some(staged), Some(halves)) =
+        (workspace.staged.as_ref(), tensors.gate_up_halves.as_ref())
+    {
+        staged.round_input(
+            encoder,
+            registry,
+            device,
+            &workspace.convolved,
+            rows,
+            hidden,
+        )?;
+        staged.gate_up(
+            encoder,
+            registry,
+            device,
+            halves,
+            rows,
+            hidden,
+            intermediate,
+        )?;
+        encoder.memory_barrier();
+        return project_rounded(
+            encoder,
+            registry,
+            device,
+            workspace,
+            &tensors.down_projection,
+            &staged.gated,
+            &workspace.projected,
+            rows,
+            intermediate,
+            hidden,
+        );
+    }
+    project(
+        encoder,
+        registry,
+        device,
+        workspace,
+        &tensors.gate_up_projection,
+        &workspace.convolved,
+        &workspace.gate_up,
+        rows,
+        hidden,
+        2 * intermediate,
+    )?;
+    encoder.memory_barrier();
+    let fused_gate_up = workspace
+        .gate_up
+        .with_shape(vec![rows, 1, 2 * intermediate])?;
+    let gate = workspace.gate.with_shape(vec![rows, 1, intermediate])?;
+    let up = workspace.up.with_shape(vec![rows, 1, intermediate])?;
+    dispatch_q_gate_deinterleave_f32(
+        encoder,
+        registry,
+        device,
+        &fused_gate_up,
+        &gate,
+        &up,
+        QGateDeinterleaveParams {
+            m: u32::try_from(rows)?,
+            n_heads: 1,
+            head_dim: u32::try_from(intermediate)?,
+        },
+    )?;
+    encoder.memory_barrier();
+    dispatch_silu_mul(
+        encoder,
+        registry,
+        device.metal_device(),
+        &workspace.gate,
+        &workspace.up,
+        &workspace.intermediate,
+        &workspace.silu_params,
+        (rows * intermediate) as u32,
+    )?;
+    encoder.memory_barrier();
+    project(
+        encoder,
+        registry,
+        device,
+        workspace,
+        &tensors.down_projection,
+        &workspace.intermediate,
+        &workspace.projected,
+        rows,
+        intermediate,
+        hidden,
+    )
 }
 
 /// Target-family vocabulary projection. Dense BF16 is useful for controlled
@@ -751,18 +892,37 @@ pub fn dispatch_dflash2_forward(
         config.hidden_size,
     )?;
     encoder.memory_barrier();
-    dispatch_vocabulary_head(
-        encoder,
-        registry,
-        device,
-        vocabulary_head,
-        &workspace.final_hidden,
-        &workspace.logits,
-        &mut workspace.head_meta,
-        rows,
-        config.hidden_size,
-        config.vocab_size,
-    )?;
+    let prepared = match (&vocabulary_head, workspace.staged.as_mut()) {
+        (DFlash2VocabularyHead::Native(weight), Some(staged))
+            if weight.info.rows == config.vocab_size && weight.info.cols == config.hidden_size =>
+        {
+            dispatch_prepared_head(
+                encoder,
+                registry,
+                device,
+                staged,
+                weight,
+                &workspace.final_hidden,
+                &workspace.logits,
+                rows,
+            )?
+        }
+        _ => false,
+    };
+    if !prepared {
+        dispatch_vocabulary_head(
+            encoder,
+            registry,
+            device,
+            vocabulary_head,
+            &workspace.final_hidden,
+            &workspace.logits,
+            &mut workspace.head_meta,
+            rows,
+            config.hidden_size,
+            config.vocab_size,
+        )?;
+    }
     project(
         encoder,
         registry,
@@ -851,21 +1011,51 @@ pub fn dispatch_dflash2_context_commit(
     )?;
     encoder.memory_barrier();
     let pack = attention_params(config, workspace.max_lanes);
+    let kv_width = config.num_key_value_heads * config.head_dim;
+    // Every layer's key and value projection reads the same normalized rows;
+    // the staged route rounds them once.
+    let rounded = match workspace.staged.as_ref() {
+        Some(staged) if staged_tile_takes(2 * kv_width) => {
+            staged.round_input(
+                encoder,
+                registry,
+                device,
+                &workspace.normalized,
+                rows,
+                config.hidden_size,
+            )?;
+            Some(&staged.projection_input)
+        }
+        _ => None,
+    };
     for (index, layer) in tensors.layers.iter().enumerate() {
-        project(
-            encoder,
-            registry,
-            device,
-            workspace,
-            &layer.context_kv_projection,
-            &workspace.normalized,
-            &workspace.qkv,
-            rows,
-            config.hidden_size,
-            2 * config.num_key_value_heads * config.head_dim,
-        )?;
+        match rounded {
+            Some(input) => project_rounded(
+                encoder,
+                registry,
+                device,
+                workspace,
+                &layer.context_kv_projection,
+                input,
+                &workspace.qkv,
+                rows,
+                config.hidden_size,
+                2 * kv_width,
+            )?,
+            None => project(
+                encoder,
+                registry,
+                device,
+                workspace,
+                &layer.context_kv_projection,
+                &workspace.normalized,
+                &workspace.qkv,
+                rows,
+                config.hidden_size,
+                2 * kv_width,
+            )?,
+        }
         encoder.memory_barrier();
-        let kv_width = config.num_key_value_heads * config.head_dim;
         let fused_kv = workspace
             .qkv
             .slice_view(0, rows * 2 * kv_width)
@@ -1020,6 +1210,7 @@ mod tests {
             mlp_dynamic: projection(device, &[4 * groups, hidden]),
             post_attention_norm: norm_weight(device, hidden),
             gate_up_projection: projection(device, &[2 * intermediate, hidden]),
+            gate_up_halves: None,
             down_projection: projection(device, &[hidden, intermediate]),
             mlp_convolution: buffer(device, DType::BF16, &[2, 2, hidden]).unwrap(),
         };
@@ -1042,7 +1233,7 @@ mod tests {
         let cfg = config();
         let tensors = tensors(&device, &cfg);
         let head = buffer(&device, DType::BF16, &[cfg.vocab_size, cfg.hidden_size]).unwrap();
-        let mut workspace = DFlash2Workspace::new(&device, &cfg, 4).unwrap();
+        let mut workspace = DFlash2Workspace::new(&device, &cfg, 4, false).unwrap();
         prepare_decode_positions(&mut workspace, &cfg, &[0; 4]).unwrap();
         workspace.uniforms.as_mut_slice::<f32>().unwrap().fill(0.5);
         let mut retained = buffer(&device, DType::U32, &[4]).unwrap();

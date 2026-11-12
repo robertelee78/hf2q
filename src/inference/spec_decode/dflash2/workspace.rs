@@ -1,6 +1,6 @@
 //! Bounded, reusable DFlash2 decode workspace.
 
-use super::config::DFlash2Config;
+use super::{config::DFlash2Config, staged::DFlash2StagedScratch};
 use mlx_native::{ops::dflash2_selector::DFLASH2_MAX_LANES, DType, MlxBuffer, MlxDevice, MlxError};
 
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +69,8 @@ pub struct DFlash2Workspace {
     pub verify_rows: MlxBuffer,
     pub retained_counts: MlxBuffer,
     pub accepted_counts: MlxBuffer,
+    /// Present when the staged draft route is selected.
+    pub staged: Option<DFlash2StagedScratch>,
     allocated_bytes: usize,
 }
 
@@ -80,7 +82,7 @@ fn elements(shape: &[usize]) -> Result<usize, DFlash2WorkspaceError> {
     })
 }
 
-fn allocate(
+pub(super) fn allocate(
     device: &MlxDevice,
     dtype: DType,
     shape: &[usize],
@@ -100,6 +102,7 @@ impl DFlash2Workspace {
         device: &MlxDevice,
         config: &DFlash2Config,
         max_lanes: usize,
+        staged: bool,
     ) -> Result<Self, DFlash2WorkspaceError> {
         if max_lanes == 0 || max_lanes > 4 {
             return Err(DFlash2WorkspaceError::Invalid(format!(
@@ -363,6 +366,9 @@ impl DFlash2Workspace {
         let verify_rows = allocate(device, DType::U32, &[lanes], &mut allocated_bytes)?;
         let retained_counts = allocate(device, DType::U32, &[lanes], &mut allocated_bytes)?;
         let accepted_counts = allocate(device, DType::U32, &[lanes], &mut allocated_bytes)?;
+        let staged = staged
+            .then(|| DFlash2StagedScratch::allocate(device, config, lanes, &mut allocated_bytes))
+            .transpose()?;
 
         Ok(Self {
             max_lanes,
@@ -421,6 +427,7 @@ impl DFlash2Workspace {
             verify_rows,
             retained_counts,
             accepted_counts,
+            staged,
             allocated_bytes,
         })
     }

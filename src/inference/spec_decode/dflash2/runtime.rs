@@ -14,6 +14,7 @@ use super::{
     },
     schema::{DFlash2CheckpointDescriptor, DFlash2FamilyAdapter},
     selector::dispatch_dflash2_selection,
+    staged::{resolve_staged_draft, DFLASH2_DRAFT_STAGED_ENV},
     tensors::DFlash2ModelTensors,
     verify_budget::{DFlash2VerifyBudget, VerifyBudgetLane},
     weights::DFlash2WeightsFile,
@@ -153,8 +154,13 @@ impl DFlash2Runtime {
             .context("validate DFlash2 tensor manifest")?;
         let tensors = DFlash2ModelTensors::upload(device, &config, &weights)
             .context("upload DFlash2 tensors")?;
-        let workspace =
-            DFlash2Workspace::new(device, &config, lanes).context("allocate DFlash2 workspace")?;
+        let staged = resolve_staged_draft(
+            std::env::var(DFLASH2_DRAFT_STAGED_ENV).ok().as_deref(),
+            &config,
+            &tensors,
+        )?;
+        let workspace = DFlash2Workspace::new(device, &config, lanes, staged)
+            .context("allocate DFlash2 workspace")?;
         let gpu_target_tokens = resolve_gpu_target_tokens(
             descriptor,
             std::env::var(GPU_TARGET_TOKENS_ENV).ok().as_deref(),
@@ -162,6 +168,7 @@ impl DFlash2Runtime {
         tracing::info!(
             checkpoint = descriptor.id,
             gpu_target_tokens,
+            staged_draft = staged,
             "DFlash2 transaction policy resolved"
         );
         let rewind_limit = config.sliding_window;

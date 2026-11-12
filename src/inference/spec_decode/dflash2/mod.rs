@@ -7,9 +7,12 @@
 pub mod adapters;
 pub mod config;
 pub mod forward;
+#[cfg(test)]
+mod probe;
 pub mod runtime;
 pub mod schema;
 pub mod selector;
+pub mod staged;
 pub mod tensors;
 pub(crate) mod verify_budget;
 pub mod weights;
