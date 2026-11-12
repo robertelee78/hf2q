@@ -1503,8 +1503,9 @@ at another window offset can differ once the history crosses a split
 boundary (first at 1,536 tokens, then every 768), and the window
 boundaries follow a verify budget fed by wall-clock time. That belongs to
 the attention tile and the scheduler, not to this change, and was not
-fixed here. Eight runs do not measure quality; the workflow-oracle pass
-rate needs root's long comparison.
+fixed here; mlx-native 0.21.9 removes it (see the attention-kernel
+differential below). Eight runs do not measure quality; the
+workflow-oracle pass rate needs root's long comparison.
 
 Prepared planes are published only after the command buffer that writes
 them has completed (`prepared_projection::ensure_planes`; one buffer per
@@ -1701,14 +1702,22 @@ a split that holds none of a row's tokens leaves its bits alone, and a window
 whose rows ask for two lengths runs as two tiles on the lane's scratch. A
 token's output is now bitwise the same at every row index, window length,
 lane count and width. mlx-native verifies every position up to 9,152 tokens
-of history at every row index over every window start, at both geometries,
-plain, under Metal shader validation, under the debug layer and under both;
-with the cut disabled the same test fails on 70 Qwen3.8 tokens.
-`verify_attn_tile_window_tests` repeats it on hf2q's cache: 24 positions
-around every such boundary below 9,000 tokens, around plain page boundaries
-and at an empty slot, under eleven window plans including partial
+of history at every row index over every window start, and every window
+start within 48 tokens of each of the 43 such boundaries up to 33,824 tokens,
+at both geometries, plain, under Metal shader validation, under the debug
+layer and under both; with the cut disabled the first test fails on 70
+Qwen3.8 tokens. Its F64 reference, determinism, saturation, cohort and
+causal-end tests each include cut windows.
+`verify_attn_tile_window_tests` repeats the sweep on hf2q's cache: 24
+positions around every such boundary below 9,000 tokens, around plain page
+boundaries and at an empty slot, under eleven window plans including partial
 acceptance, in steps of one to four lanes at widths 8, 16 and 32, with equal
-cache bytes after every plan. Everywhere else the partition and the bits are
+cache bytes after every plan; and seven steps of partial acceptance and
+rollback from cursors just below 1,536 tokens keep the serial chain's cache
+bytes and cursors and ignore rejected tokens in cut windows. An independent
+review confirmed the independence for every window start up to 33,824
+tokens and that the only bits that differ from 0.21.8 are those of the rows
+before the boundary in a cut window. Everywhere else the partition and the bits are
 those of 0.21.8, and so is the cost: −2 to +1% at 512 to 32,768 tokens with
 one and four lanes (two passes of the median of 20,
 `$V/splash-gap/attnverify/align/batch1.log`). A cut window costs 0.142

@@ -18,8 +18,8 @@
 //! ```
 //!
 //! Every window here starts at the same cursor. A token verified at another
-//! window offset is outside this gate: the tiled attention's split length
-//! follows the window's start (mlx-native `verify_tile_splits`).
+//! window offset is outside this gate; for the tiled attention that is
+//! `verify_attn_tile_window_tests` (bitwise equal from mlx-native 0.21.9).
 
 use mlx_native::DType;
 
