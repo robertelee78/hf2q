@@ -17,6 +17,7 @@ use super::{
     runtime::DFlash2Runtime,
     schema::{DFlash2CheckpointDescriptor, QWEN36_DFLASH2, QWEN38_DFLASH2},
     selector::dispatch_dflash2_selection,
+    staged::reads_prepared_head,
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::serve::header::LoadProgress;
@@ -230,13 +231,19 @@ fn probe(
         &anchors,
         &mut runtime.workspace,
     )?;
+    let vocabulary_head = target_vocabulary_head(
+        &adapter,
+        registry,
+        device,
+        reads_prepared_head(&runtime.workspace, &config),
+    )?;
     dispatch_dflash2_forward(
         &mut encoder,
         registry,
         device,
         &config,
         &runtime.tensors,
-        target_vocabulary_head(&adapter)?,
+        vocabulary_head,
         &mut runtime.workspace,
     )?;
     dispatch_dflash2_selection(

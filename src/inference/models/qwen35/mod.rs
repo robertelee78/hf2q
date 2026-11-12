@@ -101,6 +101,8 @@ mod real_artifact_moe_batched_q1_tests;
 mod real_artifact_prefill_schedule_tests;
 #[cfg(test)]
 mod real_artifact_mtp_acceptance_probe_tests;
+#[cfg(test)]
+mod real_artifact_dflash2_width_tests;
 pub mod kernels;
 pub mod kv_cache;
 pub mod model;
@@ -117,6 +119,12 @@ pub(crate) mod prefill_prepared;
 #[cfg(test)]
 mod prefill_prepared_tests;
 pub(crate) mod prepared_projection;
+#[cfg(test)]
+mod prepared_step_tests;
+#[cfg(test)]
+pub(crate) mod prepared_switch_override;
+#[cfg(test)]
+mod prepared_width_tests;
 mod source_config;
 pub(crate) mod source_precision;
 pub(crate) mod resume_attn_fast;

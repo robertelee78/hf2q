@@ -155,6 +155,10 @@ pub struct Qwen35Model {
     /// the output projection. This is explicit because `None` alone already
     /// means an F32 synthetic/lazy head on older construction paths.
     pub tied_word_embeddings: bool,
+    /// The native output head's prepared planes, shared by the joint target
+    /// head and the staged DFlash2 draft (`HF2Q_REPACKED_GGUF_SHARED_HEAD=1`).
+    /// Empty until a consumer first asks for them; dropped with the model.
+    pub(crate) prepared_output_head: super::prepared_projection::SharedHead,
     /// Final-layer RMSNorm weight, shape `[hidden_size]`.
     pub output_norm: Vec<f32>,
     /// Optional MTP draft block. Executed only by speculative decoding, never
@@ -229,6 +233,7 @@ impl Qwen35Model {
             output_weight: vec![0.0f32; h * vocab],
             output_weight_native: None,
             tied_word_embeddings: false,
+            prepared_output_head: Default::default(),
             output_norm: vec![1.0f32; h],
             mtp: None,
             glp: None,
@@ -294,6 +299,43 @@ impl Qwen35Model {
             .output_weight_native
             .as_ref()
             .map(|output| (output, "output.weight")))
+    }
+
+    /// The shared prepared planes of the native output head, or `None` when
+    /// the switch is off or the head is not one the prepared kernels take.
+    pub(crate) fn shared_prepared_output_head(
+        &self,
+        registry: &mut mlx_native::KernelRegistry,
+        device: &mlx_native::MlxDevice,
+    ) -> Result<Option<&mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>> {
+        let Some((head, _)) = self.resolved_native_output_head()? else {
+            return Ok(None);
+        };
+        let (ggml_type, in_features, out_features) = (
+            head.info.ggml_dtype,
+            u32::try_from(head.info.cols)?,
+            u32::try_from(head.info.rows)?,
+        );
+        if head.affine.is_some()
+            || !super::prepared_projection::SharedHead::serves(
+                &head.buffer,
+                ggml_type,
+                in_features,
+                out_features,
+            )
+        {
+            return Ok(None);
+        }
+        self.prepared_output_head
+            .get_or_prepare(
+                registry,
+                device,
+                &head.buffer,
+                ggml_type,
+                in_features,
+                out_features,
+            )
+            .map(Some)
     }
 
     #[cfg(test)]
@@ -477,6 +519,7 @@ impl Qwen35Model {
             output_weight,
             output_weight_native,
             tied_word_embeddings,
+            prepared_output_head: Default::default(),
             output_norm,
             mtp,
             glp: None,

@@ -163,7 +163,11 @@ fn parse_qwen_joint_mma(raw: Option<&str>, joint_mtp: bool) -> Result<bool, Stri
 /// the column-invariant MMA projection applies only to the padded mode.
 /// `joint_mtp` needs a lone lane to be able to run as a one-lane joint step
 /// whose row equals the spec-off row: exact mode (joint ≡ serial), or the
-/// padded mode with the solo route.
+/// padded mode with the solo route. "Joint" here is plain joint decode and
+/// joint MTP verify; a DFlash2 target verify step is a route of its own
+/// (Class B against serial decode at every tile width once the prepared
+/// routes serve it), so a lane that leaves DFlash2 for these steps changes
+/// route.
 #[allow(clippy::too_many_arguments)]
 fn select_qwen_joint_decode(
     requested: bool,

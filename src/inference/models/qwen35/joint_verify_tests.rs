@@ -97,7 +97,7 @@ pub(super) struct Fixture<'a> {
 /// Bits of one row: logits, then post-norm hidden.
 pub(super) type RowBits = (Vec<u32>, Vec<u32>);
 
-fn row_bits(model: &Qwen35Model, output: &super::Qwen35JointRowOutput) -> RowBits {
+pub(super) fn row_bits(model: &Qwen35Model, output: &super::Qwen35JointRowOutput) -> RowBits {
     let hidden = model.cfg.hidden_size as usize;
     let logits = output.logits.as_ref().expect("row logits");
     let hidden_row = output.nextn_hidden.as_ref().expect("row hidden");
@@ -530,7 +530,7 @@ fn quant_blocks(
     buffer
 }
 
-fn synthetic_cfg() -> Qwen35Config {
+pub(super) fn synthetic_cfg() -> Qwen35Config {
     let layer_types = default_layer_types(8, 4);
     assert_eq!(layer_types[3], Qwen35LayerKind::FullAttention);
     Qwen35Config {
@@ -811,17 +811,49 @@ fn with_synthetic_fixture(
     with_synthetic_fixture_cfg(policy, arm, synthetic_cfg(), run);
 }
 
-fn with_synthetic_fixture_cfg(
+pub(super) fn with_synthetic_fixture_cfg(
     policy: mlx_native::GgmlRoutingPolicy,
     arm: Arm,
     cfg: Qwen35Config,
+    run: impl FnOnce(&Fixture<'_>),
+) {
+    with_synthetic_fixture_embedding(policy, arm, cfg, false, run);
+}
+
+/// [`with_synthetic_fixture_cfg`]; with `native_embedding` the model also
+/// carries a native Q4_K token-embedding table. The GPU-token verify path
+/// gathers its rows from that table on the GPU, and the host-token path,
+/// plain joint steps and the serial forward then read the same table.
+pub(super) fn with_synthetic_fixture_embedding(
+    policy: mlx_native::GgmlRoutingPolicy,
+    arm: Arm,
+    cfg: Qwen35Config,
+    native_embedding: bool,
     run: impl FnOnce(&Fixture<'_>),
 ) {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let Ok(device) = MlxDevice::new() else {
         return;
     };
-    let model = synthetic_model_with_cfg(&device, policy, false, cfg);
+    let mut model = synthetic_model_with_cfg(&device, policy, false, cfg);
+    if native_embedding {
+        let (vocab, h) = (
+            model.cfg.vocab_size as usize,
+            model.cfg.hidden_size as usize,
+        );
+        let mut seed = 0x0E3B_ED01_u32;
+        model.token_embd_native = Some(MlxQWeight {
+            buffer: quant_blocks(&device, GgmlType::Q4_K, vocab, h, &mut seed),
+            info: QuantWeightInfo {
+                ggml_dtype: GgmlType::Q4_K,
+                rows: vocab,
+                cols: h,
+            },
+            affine: None,
+            f16_shadow: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        });
+    }
     assert_eq!(
         model.joint_decode_mode(),
         Ok(arm.mode),
@@ -838,7 +870,7 @@ fn with_synthetic_fixture_cfg(
     });
 }
 
-fn dflash_arm() -> Arm {
+pub(super) fn dflash_arm() -> Arm {
     Arm {
         mode: JointRouteMode::PaddedMvExt,
         dense_ffn: JointDenseFfnRoute::SharedWeights,

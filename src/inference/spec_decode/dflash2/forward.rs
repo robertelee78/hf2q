@@ -8,6 +8,7 @@ use super::{
 };
 use crate::serve::forward_mlx_shared::MlxQWeight;
 use anyhow::{anyhow, Context, Result};
+use mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight;
 use mlx_native::ops::{
     dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params},
     dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params},
@@ -732,6 +733,12 @@ fn dispatch_mlp(
 pub enum DFlash2VocabularyHead<'a> {
     DenseBf16(&'a MlxBuffer),
     Native(&'a MlxQWeight),
+    /// The native head with prepared planes the target owns and shares with
+    /// its own head. The staged route reads them instead of preparing a copy.
+    SharedPrepared {
+        weight: &'a MlxQWeight,
+        prepared: &'a PreparedGgufWeight,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -747,13 +754,14 @@ fn dispatch_vocabulary_head(
     hidden: usize,
     vocabulary: usize,
 ) -> Result<()> {
-    let DFlash2VocabularyHead::Native(weight) = head else {
-        let DFlash2VocabularyHead::DenseBf16(weight) = head else {
-            unreachable!()
-        };
-        return project_bf16(
-            encoder, registry, device, weight, input, output, rows, hidden, vocabulary,
-        );
+    let weight = match head {
+        DFlash2VocabularyHead::DenseBf16(weight) => {
+            return project_bf16(
+                encoder, registry, device, weight, input, output, rows, hidden, vocabulary,
+            );
+        }
+        DFlash2VocabularyHead::Native(weight)
+        | DFlash2VocabularyHead::SharedPrepared { weight, .. } => weight,
     };
     if weight.info.rows != vocabulary || weight.info.cols != hidden {
         return Err(anyhow!(
@@ -895,15 +903,22 @@ pub fn dispatch_dflash2_forward(
     )?;
     encoder.memory_barrier();
     let prepared = match (&vocabulary_head, workspace.staged.as_mut()) {
-        (DFlash2VocabularyHead::Native(weight), Some(staged))
-            if weight.info.rows == config.vocab_size && weight.info.cols == config.hidden_size =>
-        {
+        (
+            DFlash2VocabularyHead::Native(weight)
+            | DFlash2VocabularyHead::SharedPrepared { weight, .. },
+            Some(staged),
+        ) if weight.info.rows == config.vocab_size && weight.info.cols == config.hidden_size => {
+            let shared = match &vocabulary_head {
+                DFlash2VocabularyHead::SharedPrepared { prepared, .. } => Some(*prepared),
+                _ => None,
+            };
             dispatch_prepared_head(
                 encoder,
                 registry,
                 device,
                 staged,
                 weight,
+                shared,
                 &workspace.final_hidden,
                 &workspace.logits,
                 rows,

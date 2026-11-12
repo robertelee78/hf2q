@@ -62,23 +62,42 @@ thread_local! {
     static MMA_SCOPE_WIDTH: Cell<Option<u32>> = const { Cell::new(None) };
     /// Packed width of the open joint layer chain, independent of its kernel.
     static JOINT_SCOPE_WIDTH: Cell<Option<u32>> = const { Cell::new(None) };
+    /// Whether the open joint layer chain is a DFlash2 target verify step.
+    static DFLASH2_VERIFY_SCOPE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Marks this thread's packed joint products until dropped.
 pub(crate) struct JointProjectionScope {
     previous: Option<u32>,
     previous_joint: Option<u32>,
+    previous_dflash2_verify: bool,
 }
 
 impl JointProjectionScope {
+    /// [`Self::enter_step`] for a plain joint decode or joint MTP verify
+    /// step.
+    #[cfg(test)]
+    pub(crate) fn enter(kernel: JointProjectionKernel, width: u32) -> Self {
+        Self::enter_step(kernel, width, false)
+    }
+
     /// Open a scope for products of exactly `width` rows. Only
     /// [`JointProjectionKernel::ColumnInvariantMma`] changes MMA routing;
     /// both kernels expose the joint width to other joint-only projections.
-    pub(crate) fn enter(kernel: JointProjectionKernel, width: u32) -> Self {
+    /// `dflash2_verify` marks a DFlash2 target verify step: the only step
+    /// whose rows are not held to the serial one-token forward's bits, and
+    /// so the only one the prepared routes may serve at widths below 32
+    /// ([`dflash2_verify_scope`]).
+    pub(crate) fn enter_step(
+        kernel: JointProjectionKernel,
+        width: u32,
+        dflash2_verify: bool,
+    ) -> Self {
         let scoped = (kernel == JointProjectionKernel::ColumnInvariantMma).then_some(width);
         Self {
             previous: MMA_SCOPE_WIDTH.with(|cell| cell.replace(scoped)),
             previous_joint: JOINT_SCOPE_WIDTH.with(|cell| cell.replace(Some(width))),
+            previous_dflash2_verify: DFLASH2_VERIFY_SCOPE.with(|cell| cell.replace(dflash2_verify)),
         }
     }
 }
@@ -87,12 +106,19 @@ impl Drop for JointProjectionScope {
     fn drop(&mut self) {
         MMA_SCOPE_WIDTH.with(|cell| cell.set(self.previous));
         JOINT_SCOPE_WIDTH.with(|cell| cell.set(self.previous_joint));
+        DFLASH2_VERIFY_SCOPE.with(|cell| cell.set(self.previous_dflash2_verify));
     }
 }
 
 /// Whether this thread is encoding the layer chain for this packed width.
 pub(crate) fn active_width(width: u32) -> bool {
     JOINT_SCOPE_WIDTH.with(Cell::get) == Some(width)
+}
+
+/// Whether this thread is encoding the layer chain of a DFlash2 target
+/// verify step.
+pub(crate) fn dflash2_verify_scope() -> bool {
+    DFLASH2_VERIFY_SCOPE.with(Cell::get)
 }
 
 /// Whether the open scope takes this product: the packed width, a Q4_K /
@@ -190,5 +216,21 @@ mod tests {
         }
         assert!(!admits(&input, &params(4, GgmlType::Q4_K, 5120)));
         assert!(!active_width(4));
+    }
+
+    #[test]
+    fn only_a_dflash2_verify_step_marks_its_scope_and_the_mark_is_restored() {
+        assert!(!dflash2_verify_scope());
+        {
+            let _plain = JointProjectionScope::enter(JointProjectionKernel::Canonical, 8);
+            assert!(!dflash2_verify_scope());
+            {
+                let _verify =
+                    JointProjectionScope::enter_step(JointProjectionKernel::Canonical, 8, true);
+                assert!(dflash2_verify_scope() && active_width(8));
+            }
+            assert!(!dflash2_verify_scope() && active_width(8));
+        }
+        assert!(!dflash2_verify_scope());
     }
 }

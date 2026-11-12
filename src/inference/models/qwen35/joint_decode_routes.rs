@@ -34,6 +34,17 @@
 //!
 //! Any other block storage type is refused, so an unproven artifact keeps the
 //! serial path instead of coupling one conversation's numerics to another's.
+//!
+//! This contract covers plain joint decode and joint MTP verify steps. A
+//! DFlash2 target verify step (`joint_verify`) is a route of its own: it
+//! runs wide tiles and, with the prepared-route switches
+//! (`HF2Q_REPACKED_GGUF_M32*`, `HF2Q_REPACKED_GGUF_ANY_WIDTH`), prepared
+//! Q4_K / Q6_K kernels that the serial graph never takes, so a token it
+//! verifies and the same token decoded serially or in a plain joint step
+//! need not agree in bits (Q1 Class B). Outside a DFlash2 verify step those
+//! switches act only on a 32-row joint step, and plain joint decode and
+//! joint MTP verify never exceed [`MAX_JOINT_VERIFY_ROWS`] rows, so their
+//! routes and this contract are unchanged by them.
 
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::DType;
