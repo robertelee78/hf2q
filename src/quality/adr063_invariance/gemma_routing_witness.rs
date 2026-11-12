@@ -85,7 +85,13 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// routing-witness shaders are byte-identical. The compact expert schedule
 /// gained a masked-route mode that is off unless a caller passes it; the
 /// unmasked schedule's validation and output are unchanged.
-pub const WITNESS_NATIVE_VERSION: &str = "0.21.7";
+/// Re-reviewed 0.21.7 -> 0.21.8 (`0905b9d` -> `3cfe0ad`): the witness op and
+/// all routing/routing-witness shaders are byte-identical. The release adds
+/// opt-in kernels (prepared projections at any row count, staged draft
+/// projections, ring draft attention, tiled verify attention, MoE live tiles),
+/// makes forced Q4 routes exact at 32 rows without changing ordinary dispatch,
+/// and requires the rows a grouped M8 tile reads past its route list.
+pub const WITNESS_NATIVE_VERSION: &str = "0.21.8";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {

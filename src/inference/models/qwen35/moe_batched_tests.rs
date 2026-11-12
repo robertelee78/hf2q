@@ -36,13 +36,13 @@ use super::gpu_ffn::{build_moe_ffn_layer_gpu_q_into, MoeDenseStorage, MoeFfnWeig
 use super::gpu_full_attn::{upload_bf16_from_f32, upload_f32};
 use super::moe_batched::build_moe_ffn_layer_gpu_batched_into;
 
-const H: usize = 2048;
-const NE: usize = 256;
-const TOP_K: usize = 8;
-const MI: usize = 512;
-const MSH: usize = 512;
+pub(super) const H: usize = 2048;
+pub(super) const NE: usize = 256;
+pub(super) const TOP_K: usize = 8;
+pub(super) const MI: usize = 512;
+pub(super) const MSH: usize = 512;
 
-fn shape() -> MoeFfnShape {
+pub(super) fn shape() -> MoeFfnShape {
     MoeFfnShape {
         hidden_size: H as u32,
         num_experts: NE as u32,
@@ -52,7 +52,7 @@ fn shape() -> MoeFfnShape {
     }
 }
 
-struct Rng(u64);
+pub(super) struct Rng(u64);
 
 impl Rng {
     fn next_u64(&mut self) -> u64 {
@@ -100,7 +100,7 @@ fn random_blocks(t: GgmlType, rows: usize, cols: usize, rng: &mut Rng) -> Vec<u8
     bytes
 }
 
-fn dequant_rows(bytes: &[u8], t: GgmlType, row0: usize, rows: usize, cols: usize) -> Vec<f32> {
+pub(super) fn dequant_rows(bytes: &[u8], t: GgmlType, row0: usize, rows: usize, cols: usize) -> Vec<f32> {
     let row_bytes = cols / t.block_values() as usize * t.block_bytes() as usize;
     let mut out = vec![0.0f32; rows * cols];
     test_only_dequantize(&bytes[row0 * row_bytes..(row0 + rows) * row_bytes], t, &mut out)
@@ -121,20 +121,20 @@ fn uniform_vec(rng: &mut Rng, n: usize, scale: f32) -> Vec<f32> {
 }
 
 /// Host copy of one random layer.
-struct Layer {
-    down_t: GgmlType,
-    router: Vec<f32>,
-    gate_inp: Vec<f32>,
-    shared_gate: Vec<u8>,
-    shared_up: Vec<u8>,
-    shared_down: Vec<u8>,
-    gate_exps: Vec<u8>,
-    up_exps: Vec<u8>,
-    down_exps: Vec<u8>,
+pub(super) struct Layer {
+    pub(super) down_t: GgmlType,
+    pub(super) router: Vec<f32>,
+    pub(super) gate_inp: Vec<f32>,
+    pub(super) shared_gate: Vec<u8>,
+    pub(super) shared_up: Vec<u8>,
+    pub(super) shared_down: Vec<u8>,
+    pub(super) gate_exps: Vec<u8>,
+    pub(super) up_exps: Vec<u8>,
+    pub(super) down_exps: Vec<u8>,
 }
 
 impl Layer {
-    fn random(down_t: GgmlType, seed: u64) -> Self {
+    pub(super) fn random(down_t: GgmlType, seed: u64) -> Self {
         let mut rng = Rng(seed);
         Self {
             down_t,
@@ -150,7 +150,7 @@ impl Layer {
     }
 
     /// Expert stacks on the GPU (shared by both storages of a test).
-    fn gpu_experts(&self, device: &MlxDevice) -> [MlxBuffer; 3] {
+    pub(super) fn gpu_experts(&self, device: &MlxDevice) -> [MlxBuffer; 3] {
         [
             upload_u8(device, &self.gate_exps),
             upload_u8(device, &self.up_exps),
@@ -160,7 +160,7 @@ impl Layer {
 
     /// GPU weights; `native` selects the batched route's storage, otherwise
     /// the BF16 router/shared copies of the per-row route.
-    fn gpu(&self, device: &MlxDevice, native: bool, experts: &[MlxBuffer; 3]) -> MoeFfnWeightsGpuQ {
+    pub(super) fn gpu(&self, device: &MlxDevice, native: bool, experts: &[MlxBuffer; 3]) -> MoeFfnWeightsGpuQ {
         let stride = |t: GgmlType, rows: usize, cols: usize| {
             (rows * cols / t.block_values() as usize * t.block_bytes() as usize) as u64
         };
@@ -215,20 +215,20 @@ impl Layer {
 }
 
 /// Inputs and residuals for `n` rows.
-fn rows(n: usize, seed: u64) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+pub(super) fn rows(n: usize, seed: u64) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     let mut rng = Rng(seed);
     let x = (0..n).map(|_| uniform_vec(&mut rng, H, 1.5)).collect();
     let residual = (0..n).map(|_| uniform_vec(&mut rng, H, 1.0)).collect();
     (x, residual)
 }
 
-struct RowResult {
-    out: Vec<f32>,
-    ids: Vec<u32>,
-    weights: Vec<f32>,
+pub(super) struct RowResult {
+    pub(super) out: Vec<f32>,
+    pub(super) ids: Vec<u32>,
+    pub(super) weights: Vec<f32>,
 }
 
-fn packed(values: &[Vec<f32>], select: &[usize], device: &MlxDevice) -> MlxBuffer {
+pub(super) fn packed(values: &[Vec<f32>], select: &[usize], device: &MlxDevice) -> MlxBuffer {
     let mut flat = Vec::with_capacity(select.len() * H);
     for &row in select {
         flat.extend_from_slice(&values[row]);
@@ -321,17 +321,17 @@ fn old_route_ids(
     ids.as_slice::<u32>().expect("ids").to_vec()
 }
 
-fn bits(values: &[f32]) -> Vec<u32> {
+pub(super) fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|v| v.to_bits()).collect()
 }
 
-fn silu(v: f64) -> f64 {
+pub(super) fn silu(v: f64) -> f64 {
     v / (1.0 + (-v).exp())
 }
 
 /// F64 top-k by (probability desc, expert asc) of `logits`, with the smallest
 /// logit gap among the top `TOP_K + 1` (how close the selection is to a tie).
-fn top_k_f64(logits: &[f64]) -> (Vec<usize>, Vec<f64>, f64) {
+pub(super) fn top_k_f64(logits: &[f64]) -> (Vec<usize>, Vec<f64>, f64) {
     let max = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let e: Vec<f64> = logits.iter().map(|&l| (l - max).exp()).collect();
     let sum: f64 = e.iter().sum();
@@ -347,7 +347,7 @@ fn top_k_f64(logits: &[f64]) -> (Vec<usize>, Vec<f64>, f64) {
     (chosen, weights, gap)
 }
 
-fn router_logits_f64(router: &[f32], x: &[f32]) -> Vec<f64> {
+pub(super) fn router_logits_f64(router: &[f32], x: &[f32]) -> Vec<f64> {
     (0..NE)
         .map(|e| {
             router[e * H..(e + 1) * H]

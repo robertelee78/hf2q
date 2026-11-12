@@ -53,6 +53,9 @@ pub struct DFlash2LayerTensors {
     pub mlp_dynamic: DFlash2Projection,
     pub post_attention_norm: MlxBuffer,
     pub gate_up_projection: DFlash2Projection,
+    /// The gate and up rows of `gate_up_projection` as views, when both
+    /// start at a storage tile of its format.
+    pub gate_up_halves: Option<[DFlash2Projection; 2]>,
     pub down_projection: DFlash2Projection,
     pub mlp_convolution: MlxBuffer,
 }
@@ -429,6 +432,16 @@ impl DFlash2ModelTensors {
                 projection_row_view(&qkv_projection, qkv_rows, q_rows, k_rows + v_rows)?;
             let gate = tensor(weights, &format!("{prefix}.mlp.gate_proj.weight"))?;
             let up = tensor(weights, &format!("{prefix}.mlp.up_proj.weight"))?;
+            let gate_up_projection = upload_fused_projection(device, &[gate, up], format)?;
+            let (gate_rows, _) = projection_geometry(gate)?;
+            let (up_rows, _) = projection_geometry(up)?;
+            let half = |first_row, rows| {
+                projection_row_view(&gate_up_projection, gate_rows + up_rows, first_row, rows).ok()
+            };
+            let gate_up_halves = match (half(0, gate_rows), half(gate_rows, up_rows)) {
+                (Some(gate), Some(up)) if gate_rows == up_rows => Some([gate, up]),
+                _ => None,
+            };
             layers.push(DFlash2LayerTensors {
                 attention_dynamic: projection("attention_conv.kernel_projection.weight")?,
                 attention_convolution: bf16("attention_conv.base_kernel")?,
@@ -440,7 +453,8 @@ impl DFlash2ModelTensors {
                 key_norm: norm("self_attn.k_norm.weight")?,
                 mlp_dynamic: projection("mlp_conv.kernel_projection.weight")?,
                 post_attention_norm: norm("post_attention_layernorm.weight")?,
-                gate_up_projection: upload_fused_projection(device, &[gate, up], format)?,
+                gate_up_projection,
+                gate_up_halves,
                 down_projection: projection("mlp.down_proj.weight")?,
                 mlp_convolution: bf16("mlp_conv.base_kernel")?,
             });
@@ -455,6 +469,121 @@ impl DFlash2ModelTensors {
             mask_embedding,
             layers,
         })
+    }
+}
+
+#[cfg(test)]
+impl DFlash2ModelTensors {
+    /// Seeded AF4G64 tensors of `config`'s shapes with unit norm weights, for
+    /// tests that compare draft routes on one checkpoint.
+    pub(super) fn synthetic_af4_g64(device: &MlxDevice, config: &DFlash2Config, seed: u64) -> Self {
+        use safetensors::Dtype;
+        let mut state = seed;
+        let mut bf16_bytes = |count: usize, scale: f32| -> Vec<u8> {
+            (0..count)
+                .flat_map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    let unit = (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+                    bf16::from_f32(2.0 * scale * unit).to_le_bytes()
+                })
+                .collect()
+        };
+        let mut projection = |parts: &[usize], columns: usize| {
+            let scale = 1.0 / (columns as f32).sqrt();
+            let bytes: Vec<Vec<u8>> = parts
+                .iter()
+                .map(|rows| bf16_bytes(rows * columns, scale))
+                .collect();
+            let views: Vec<TensorView<'_>> = parts
+                .iter()
+                .zip(&bytes)
+                .map(|(rows, bytes)| {
+                    TensorView::new(Dtype::BF16, vec![*rows, columns], bytes).unwrap()
+                })
+                .collect();
+            upload_fused_projection(
+                device,
+                &views.iter().collect::<Vec<_>>(),
+                ProjectionFormat::Af4G64,
+            )
+            .unwrap()
+        };
+        let ones = |width: usize| {
+            let mut buffer = device
+                .alloc_buffer(width * 4, DType::F32, vec![width])
+                .unwrap();
+            buffer.as_mut_slice::<f32>().unwrap().fill(1.0);
+            buffer
+        };
+        let hidden = config.hidden_size;
+        let intermediate = config.intermediate_size;
+        let query = config.num_attention_heads * config.head_dim;
+        let key_value = config.num_key_value_heads * config.head_dim;
+        let dynamic = config.dynamic_projection_width();
+        let layers = (0..config.num_hidden_layers)
+            .map(|_| {
+                let qkv_projection = projection(&[query, key_value, key_value], hidden);
+                let context_kv_projection = projection_row_view(
+                    &qkv_projection,
+                    query + 2 * key_value,
+                    query,
+                    2 * key_value,
+                )
+                .unwrap();
+                let gate_up_projection = projection(&[intermediate, intermediate], hidden);
+                let half = |first_row| {
+                    projection_row_view(
+                        &gate_up_projection,
+                        2 * intermediate,
+                        first_row,
+                        intermediate,
+                    )
+                    .unwrap()
+                };
+                let gate_up_halves = Some([half(0), half(intermediate)]);
+                DFlash2LayerTensors {
+                    attention_dynamic: projection(&[dynamic], hidden),
+                    attention_convolution: device
+                        .alloc_buffer(8 * hidden, DType::BF16, vec![2, 2, hidden])
+                        .unwrap(),
+                    input_norm: ones(hidden),
+                    qkv_projection,
+                    context_kv_projection,
+                    output_projection: projection(&[hidden], query),
+                    query_norm: ones(config.head_dim),
+                    key_norm: ones(config.head_dim),
+                    mlp_dynamic: projection(&[dynamic], hidden),
+                    post_attention_norm: ones(hidden),
+                    gate_up_projection,
+                    gate_up_halves,
+                    down_projection: projection(&[hidden], intermediate),
+                    mlp_convolution: device
+                        .alloc_buffer(8 * hidden, DType::BF16, vec![2, 2, hidden])
+                        .unwrap(),
+                }
+            })
+            .collect();
+        let codebook = || {
+            device
+                .alloc_buffer(
+                    config.vocab_size * config.selector_rank * 2,
+                    DType::BF16,
+                    vec![config.vocab_size, config.selector_rank],
+                )
+                .unwrap()
+        };
+        Self {
+            context_projection: projection(&[hidden], config.fc_input_dim()),
+            hidden_norm: ones(hidden),
+            final_norm: ones(hidden),
+            selector_projection: projection(&[config.selector_rank], hidden),
+            predecessor_codebook: codebook(),
+            successor_codebook: codebook(),
+            mask_embedding: None,
+            layers,
+        }
     }
 }
 

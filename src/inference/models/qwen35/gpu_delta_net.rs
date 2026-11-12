@@ -3827,6 +3827,9 @@ pub fn build_delta_net_layer_with_arena(
     //      out in §4.F5 of the Phase 3a design doc; the byte-exact unit
     //      test below is the empirical guard against forgetting it).
     let v_sp = nv * dv;
+    // The BF16 copy of the normalized input, when the prepared prefill
+    // route made one; the alpha/beta projection further down reuses it.
+    let x_bf16: Option<MlxBuffer>;
     {
         let _w5b8 = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::LayerOps1to3,
@@ -3867,29 +3870,17 @@ pub fn build_delta_net_layer_with_arena(
             rms_norm_eps,
         )?;
         enc.encoder().memory_barrier();
-        apply_proj_into_with_ggml_type(
+        x_bf16 = project_qkv_and_gate_into_arena(
             enc.encoder(),
             registry,
             device,
-            &arena.x_norm_buf,
-            &weights.attn_qkv,
-            weights.attn_qkv_ggml_type,
-            &mut arena.qkv_raw_buf,
+            weights,
+            arena,
             seq_len,
             hidden_size,
             qkv_channels,
-        )?;
-        apply_proj_into_with_ggml_type(
-            enc.encoder(),
-            registry,
-            device,
-            &arena.x_norm_buf,
-            &weights.attn_gate,
-            weights.attn_gate_ggml_type,
-            &mut arena.z_buf,
-            seq_len,
-            hidden_size,
             z_channels,
+            n_v_heads,
         )?;
         enc.encoder().memory_barrier();
         if let Some(capture) = conv_state_capture {
@@ -4175,13 +4166,12 @@ pub fn build_delta_net_layer_with_arena(
         enc.memory_barrier();
         // Final out_proj — output crosses to next layer; pooled_alloc_buffer
         // path keeps existing residency contract (matches non-arena variant).
-        let output = apply_proj_with_ggml_type(
+        let output = project_arena_output(
             &mut enc,
             registry,
             device,
             &arena.gated_buf,
-            &weights.ssm_out,
-            weights.ssm_out_ggml_type,
+            weights,
             seq_len,
             z_channels,
             hidden_size,
@@ -4227,30 +4217,62 @@ pub fn build_delta_net_layer_with_arena(
             d_k,
             rms_norm_eps,
         )?;
-        apply_proj_into_with_ggml_type(
-            &mut enc,
-            registry,
-            device,
-            &arena.x_norm_buf,
-            &weights.ssm_alpha,
-            weights.ssm_alpha_ggml_type,
-            &mut arena.alpha_logit_buf,
-            seq_len,
-            hidden_size,
-            n_v_heads,
-        )?;
-        apply_proj_into_with_ggml_type(
-            &mut enc,
-            registry,
-            device,
-            &arena.x_norm_buf,
-            &weights.ssm_beta,
-            weights.ssm_beta_ggml_type,
-            &mut arena.beta_logit_buf,
-            seq_len,
-            hidden_size,
-            n_v_heads,
-        )?;
+        let fused_logits = match x_bf16
+            .as_ref()
+            .filter(|_| alpha_beta_prefill_prepared(weights, seq_len, hidden_size, n_v_heads))
+        {
+            Some(x_bf16) => {
+                let fused = super::prepared_projection::project_alpha_beta(
+                    &mut enc,
+                    registry,
+                    device,
+                    x_bf16,
+                    &weights.ssm_alpha,
+                    &weights.ssm_beta,
+                    weights.ssm_alpha_ggml_type,
+                    &weights.prepared_m32,
+                    seq_len,
+                    hidden_size,
+                    n_v_heads,
+                )?;
+                // The split reads the fused logits.
+                enc.memory_barrier();
+                Some(super::prepared_projection::split_alpha_beta(
+                    &mut enc, registry, device, &fused, seq_len, n_v_heads,
+                )?)
+            }
+            None => {
+                apply_proj_into_with_ggml_type(
+                    &mut enc,
+                    registry,
+                    device,
+                    &arena.x_norm_buf,
+                    &weights.ssm_alpha,
+                    weights.ssm_alpha_ggml_type,
+                    &mut arena.alpha_logit_buf,
+                    seq_len,
+                    hidden_size,
+                    n_v_heads,
+                )?;
+                apply_proj_into_with_ggml_type(
+                    &mut enc,
+                    registry,
+                    device,
+                    &arena.x_norm_buf,
+                    &weights.ssm_beta,
+                    weights.ssm_beta_ggml_type,
+                    &mut arena.beta_logit_buf,
+                    seq_len,
+                    hidden_size,
+                    n_v_heads,
+                )?;
+                None
+            }
+        };
+        let (alpha_logits, beta_logits) = match fused_logits.as_ref() {
+            Some((alpha, beta)) => (alpha, beta),
+            None => (&arena.alpha_logit_buf, &arena.beta_logit_buf),
+        };
         enc.memory_barrier();
         scalar_mul_f32(
             &mut enc,
@@ -4266,8 +4288,8 @@ pub fn build_delta_net_layer_with_arena(
             &mut enc,
             registry,
             device.metal_device(),
-            &arena.alpha_logit_buf,
-            &arena.beta_logit_buf,
+            alpha_logits,
+            beta_logits,
             &weights.ssm_dt_bias,
             &weights.ssm_a,
             &arena.g_buf,
@@ -4357,13 +4379,12 @@ pub fn build_delta_net_layer_with_arena(
         enc.memory_barrier();
         // Final out_proj — output crosses to next layer; pooled path keeps
         // existing residency contract.
-        let output = apply_proj_with_ggml_type(
+        let output = project_arena_output(
             &mut enc,
             registry,
             device,
             &arena.gated_buf,
-            &weights.ssm_out,
-            weights.ssm_out_ggml_type,
+            weights,
             seq_len,
             z_channels,
             hidden_size,
@@ -4373,6 +4394,188 @@ pub fn build_delta_net_layer_with_arena(
     };
 
     Ok(output)
+}
+
+/// Whether the alpha and beta logit projections of an arena prefill layer
+/// run as one prepared product (see
+/// [`super::prepared_projection::project_alpha_beta`]).
+fn alpha_beta_prefill_prepared(
+    weights: &DeltaNetWeightsGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    n_v_heads: u32,
+) -> bool {
+    weights.ssm_alpha_ggml_type == weights.ssm_beta_ggml_type
+        && weights.ssm_beta.dtype() == DType::U8
+        && super::prefill_prepared::admits(
+            seq_len,
+            &weights.ssm_alpha,
+            weights.ssm_alpha_ggml_type,
+            hidden_size,
+            super::prepared_projection::alpha_beta_rows(n_v_heads),
+        )
+}
+
+/// The qkv and gate projections of an arena prefill layer, from
+/// `arena.x_norm_buf` into `arena.qkv_raw_buf` and `arena.z_buf`. Inside a
+/// routed [`super::prefill_prepared::PrefillScope`] each admitted weight runs
+/// the prepared row-tile MM on one shared BF16 copy of the activation;
+/// otherwise the canonical dispatcher. Returns that BF16 copy, which the
+/// layer's alpha/beta projection reuses.
+#[allow(clippy::too_many_arguments)]
+fn project_qkv_and_gate_into_arena(
+    enc: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weights: &DeltaNetWeightsGpu,
+    arena: &mut super::DnPrefillArena,
+    seq_len: u32,
+    hidden_size: u32,
+    qkv_channels: u32,
+    z_channels: u32,
+    n_v_heads: u32,
+) -> Result<Option<MlxBuffer>> {
+    use super::{prefill_prepared, prepared_projection};
+    let qkv_prepared = prefill_prepared::admits(
+        seq_len,
+        &weights.attn_qkv,
+        weights.attn_qkv_ggml_type,
+        hidden_size,
+        qkv_channels,
+    );
+    let gate_prepared = prefill_prepared::admits(
+        seq_len,
+        &weights.attn_gate,
+        weights.attn_gate_ggml_type,
+        hidden_size,
+        z_channels,
+    );
+    let x_bf16 = if qkv_prepared
+        || gate_prepared
+        || alpha_beta_prefill_prepared(weights, seq_len, hidden_size, n_v_heads)
+    {
+        let x_bf16 = prepared_projection::bf16_input(
+            enc,
+            registry,
+            device,
+            &arena.x_norm_buf,
+            seq_len,
+            hidden_size,
+        )?;
+        // The prepared projections read the BF16 copy this cast writes.
+        enc.memory_barrier();
+        Some(x_bf16)
+    } else {
+        None
+    };
+    match x_bf16.as_ref().filter(|_| qkv_prepared) {
+        Some(x_bf16) => prepared_projection::project_into(
+            enc,
+            registry,
+            device,
+            x_bf16,
+            &weights.attn_qkv,
+            weights.attn_qkv_ggml_type,
+            &weights.prepared_m32.qkv,
+            &arena.qkv_raw_buf,
+            seq_len,
+            hidden_size,
+            qkv_channels,
+        )?,
+        None => apply_proj_into_with_ggml_type(
+            enc,
+            registry,
+            device,
+            &arena.x_norm_buf,
+            &weights.attn_qkv,
+            weights.attn_qkv_ggml_type,
+            &mut arena.qkv_raw_buf,
+            seq_len,
+            hidden_size,
+            qkv_channels,
+        )?,
+    }
+    match x_bf16.as_ref().filter(|_| gate_prepared) {
+        Some(x_bf16) => prepared_projection::project_into(
+            enc,
+            registry,
+            device,
+            x_bf16,
+            &weights.attn_gate,
+            weights.attn_gate_ggml_type,
+            &weights.prepared_m32.gate,
+            &arena.z_buf,
+            seq_len,
+            hidden_size,
+            z_channels,
+        )?,
+        None => apply_proj_into_with_ggml_type(
+            enc,
+            registry,
+            device,
+            &arena.x_norm_buf,
+            &weights.attn_gate,
+            weights.attn_gate_ggml_type,
+            &mut arena.z_buf,
+            seq_len,
+            hidden_size,
+            z_channels,
+        )?,
+    }
+    Ok(x_bf16)
+}
+
+/// The output projection of an arena prefill layer from `gated` into a
+/// pooled `[seq_len, hidden_size]` buffer: the prepared row-tile MM inside a
+/// routed [`super::prefill_prepared::PrefillScope`], the canonical
+/// dispatcher otherwise.
+#[allow(clippy::too_many_arguments)]
+fn project_arena_output(
+    enc: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    gated: &MlxBuffer,
+    weights: &DeltaNetWeightsGpu,
+    seq_len: u32,
+    z_channels: u32,
+    hidden_size: u32,
+) -> Result<MlxBuffer> {
+    use super::{prefill_prepared, prepared_projection};
+    if !prefill_prepared::admits(
+        seq_len,
+        &weights.ssm_out,
+        weights.ssm_out_ggml_type,
+        z_channels,
+        hidden_size,
+    ) {
+        return apply_proj_with_ggml_type(
+            enc,
+            registry,
+            device,
+            gated,
+            &weights.ssm_out,
+            weights.ssm_out_ggml_type,
+            seq_len,
+            z_channels,
+            hidden_size,
+        );
+    }
+    let gated_bf16 =
+        prepared_projection::bf16_input(enc, registry, device, gated, seq_len, z_channels)?;
+    // The prepared projection reads the BF16 copy this cast writes.
+    enc.memory_barrier();
+    prepared_projection::project(
+        enc,
+        registry,
+        device,
+        &gated_bf16,
+        &weights.ssm_out,
+        weights.ssm_out_ggml_type,
+        &weights.prepared_m32.out,
+        seq_len,
+        z_channels,
+        hidden_size,
+    )
 }
 
 // ================================================================

@@ -1297,6 +1297,368 @@ text are also running different workloads, and six repeats do not sample
 that. Stage time per cycle is the comparable quantity between such arms;
 makespan between them is one draw.
 
+#### Staged draft command
+
+A probe that replays every dispatch of one draft command as its own command
+buffer (`dflash2::probe::dflash2_draft_command_dispatch_probe`, real target
+and checkpoint, four lanes, 512 ring rows per lane, median of 20 rounds)
+reproduces the profiled draft cost and splits it. GPU ms, Splash from its
+`decode-profile` dispatch lists on the same host:
+
+| Group | Splash Qwen3.8 | hf2q Qwen3.8 | staged | Splash Qwen3.6 | hf2q Qwen3.6 | staged |
+|---|---:|---:|---:|---:|---:|---:|
+| Projections | 2.89 | 8.23 | 2.55 | 1.46 | 2.36 | 1.14 |
+| Attention | 0.34 | 3.30 | 0.30 | 0.39 | 3.95 | 0.37 |
+| Norms, convolutions, input | 0.20 | 0.24 | 0.17 | 0.19 | 0.20 | 0.15 |
+| Vocabulary head | 1.95 | 4.38 | 1.96 | 0.85 | 1.33 | 0.85 |
+| Selection | 0.14 | 0.15 | 0.14 | 0.15 | 0.14 | 0.14 |
+| Draft command | 5.51 | 16.30 | 5.12 | 3.04 | 7.98 | 2.64 |
+| Context commit | 0.46 | 1.09 | 0.37 | 0.32 | 0.50 | 0.23 |
+
+The three differences are kernels, not dispatch count (171 draft dispatches
+against Splash's 90). hf2q multiplied AF4G64 planes on the register tile
+where Splash's Apple10 plan stages them (`runtime/ops/LinearGguf.cpp:190-212,
+272-275`) and runs gate and up in one pass
+(`runtime/metal/kernels/shared/gguf_linear.metal:131-180`). hf2q copied every
+lane's 2,047-row ring window into a packed K/V tile and filled a dense mask
+before each layer's flash attention, whatever the context length; Splash
+multiplies the ring in place over the live 128-slot tiles in four splits
+(`runtime/metal/kernels/decode/draft.metal:151-398`). hf2q's draft head ran
+the stock Q6_K kernel; Splash runs the target's prepared tile
+(`runtime/model/DFlashDraft.cpp:334-341`).
+
+`HF2Q_DFLASH2_DRAFT_STAGED=1` (requires `HF2Q_DFLASH2_DRAFT_AF4_G64=1`)
+adopts all three on unchanged weights: mlx-native's
+`dflash2_af4g64_staged` tile for projections of at least 960 outputs, with
+the split count from Splash's wave law evaluated once for 40 cores and 32
+rows so that it never depends on the row count; `dflash2_ring_attention`;
+and, at four lanes, the prepared head. Projections and attention are Class B
+against the default route. Each kernel has an F64 reference test with a
+K-scaled bound, a determinism test and a row and lane independence test
+(bitwise, across tile heights, positions and neighbours). Sparse probes
+check that every 32-input step of every served projection shape, up to
+K = 25,600, is summed exactly once; the served 32-over-8-head attention is
+checked at every tile and window boundary, alone and in every cohort; and
+every test's scratch starts as NaN. The ring split kernel holds 16,384 bytes
+of threadgroup memory, which Metal shader validation doubles to the device
+limit, and the kernel tests give the same bits under
+`MTL_SHADER_VALIDATION=1 MTL_DEBUG_LAYER=1`. A synthetic checkpoint runs
+both routes to within 5e-3 relative RMS in rings, hidden states and logits,
+and the prepared head to within 5e-3 of the stock head. Against the pinned
+Qwen3.6 reference fixture the first layer's relative maximum error is 0.1960
+staged and 0.1962 on the register tile: four-bit quantization, not the tile,
+sets the draft's distance from the BF16 oracle.
+
+In situ on the exact four-agent Q5 workload, each arm on one binary, with the
+draft command waited (`HF2Q_DFLASH2_GPU_TARGET_TOKENS=0`) so that `draft_us`
+is its wall time, the four-lane median fell from 17.20 to 6.01 ms on Qwen3.8
+(one run per arm) and from 8.25 and 8.19 ms to 3.07 ms on Qwen3.6 (two
+passing off-runs, one passing on-run). `draft_commit_us` fell from 1.39–1.50
+to 0.60–0.66 ms on Qwen3.8 and from 0.72–0.78 to 0.45–0.47 ms on Qwen3.6 in
+every passing run. In the served GPU-token mode Qwen3.8 emits the same
+completion tokens with the switch on or off (5,237 in each of seven runs of
+the measured binary) and accepts 5.334 against 5.330 tokens per lane-cycle;
+rebased onto the capture-wait fix (`eea0fa1a`), one run per arm accepts 5.366
+against 5.370 for the same 5,237 tokens (1,184 against 1,183 lane-cycles).
+On Qwen3.6, whose text varies between runs of one arm, four on-runs accepted
+4.03–4.18 tokens per lane-cycle against 4.10 and 4.25 for two off-runs. All
+six Qwen3.8 and all four Qwen3.6 on-runs in the GPU-token mode passed
+calibration.
+
+Root's six-block paired campaign on that binary
+(`$E/qwen38-draft-staged-d5-v1`: Qwen3.8, GPU-token mode, the switch against
+unset with every other setting equal, fixed alternating order, a loaded
+host) passed all 12 runs with identical text in both arms (5,237 tokens).
+The four-lane cycle fell by 7.41% (95% CI 6.70–8.12%; medians 126.96
+against 136.56 ms), the four-lane target stage by 6.87% (6.17–7.56%; 121.43
+against 130.03 ms) and client makespan by 5.89% (4.02–7.71%; 67.94 against
+71.80 seconds). Peak footprint was 71.10 against 70.08 GiB. The owner's
+seven unpaired runs had not shown this (on 109.7, 108.6, 95.7 and 98.9 ms
+against off 100.9, 106.4 and 103.3 ms); root attributes the two slow
+on-runs to host load. In the waited mode the four-lane cycle fell from
+102.0 to 92.7 ms in one run per arm.
+
+Qwen3.6 is not qualified. In the waited mode, which is the Qwen MoE default,
+two of three on-runs failed the six-step workflow oracle on model text (a
+tool call cut short after a reasoning-budget close, and an extra edit after
+a compiler warning); two off-runs did not. Every emitted token is the
+target's own decision, so a draft cannot emit an unverified token. In that
+mode, however, the host selects verify rows from the draft's confidence and
+the Qwen3.6 verify tile width follows the row total
+(`dflash2_verify_width`), so a different draft changes the target kernels
+that run and the target's logit bits. Dense Qwen3.8 verifies at a fixed
+width, which is why its text is identical. Five runs do not separate the
+arms (Fisher p about 0.4); root's waited-mode Qwen3.6 campaign must.
+
+The head is prepared a second time beside `HF2Q_REPACKED_GGUF_M32_HEAD`
+(0.98 GiB on Qwen3.8 and 0.39 GiB on Qwen3.6 by plane size) until the two
+routes share one. The switch stays off by default.
+
+#### Live-tile MoE expert route
+
+The Qwen3.6 MoE stage was then attributed model-free at the served shape
+(mlx-native `bench_qwen36_moe_layer`: hidden 2,048, 256 experts, top 8,
+intermediate 512, one weight set, 16 layers per command, median of 20
+commands). Its routes are the expert ids of real four-lane verify steps,
+recorded from one exact Q5 run: 24.6 of 32 rows live, 80 live experts, 69% of
+them with one or two routes. Splash's `decode-profile` figure of 9.7 ms per
+cycle (0.24 ms per layer) does not describe that routing. Its four lanes
+replay one synthetic prompt, so every lane routes to the same experts and no
+expert holds fewer than four routes. Splash's own MoE operator, replayed on
+the recorded routes through a copy of its `gguf-moe-benchmark`, takes 0.340 ms
+per layer with Q4_K down experts and 0.383 ms with Q6_K; on those routes with
+one lane repeated in all four it takes 0.212 and 0.250 ms. The staged-M8 route
+takes 0.465 and 0.51–0.54 ms on the recorded routes. Serialized, its router
+and shared-gate logit cost 0.068 and 0.063 ms (a 32-row tensor matmul of four
+and one threadgroups), the shared expert 0.10 ms, gate and up 0.30 ms against
+0.21 ms for Splash's one pass, and down 0.13 against 0.10 ms.
+
+The earlier one-pass BF16 route was re-examined on fixed inputs
+(mlx-native `moe_expert_tiles`, ignored test `fused_bf16`). Its kernel stores
+exactly `BF16(SiLU(BF16(gate)) * BF16(up))` of the sums the served kernels
+produce (65,285 of 65,536 elements bitwise; the rest are SwiGLU values that
+underflow, within 4e-38 of the row's RMS), so it has no kernel defect. Against
+an F64 reference its SwiGLU and down outputs carry 4.0e-3 and 4.3–4.6e-3
+relative RMS error, the served route 3.3e-3 and 3.7e-3, and Splash's
+arithmetic order 3.6e-3 and 3.5–3.6e-3 (3.9e-3 with its BF16 down store). The
+withdrawn route was Splash's order except that it staged weights as BF16
+where Splash stages half. One failed task run does not separate a 1.2 times
+larger rounding error from the workload's sensitivity to any change of bits.
+
+`HF2Q_QWEN_MOE_LIVE_TILES=1` (with `HF2Q_QWEN_MOE_STAGED_M8=1`) adopts
+Splash's plan on the staged-M8 planes (`runtime/ops/MoE.cpp:102-166,225-283`,
+`kernels/shared/moe_gguf.metal`, `kernels/common/gguf_staged_tile.h:83-130`,
+`gguf_column_tile.h`): one route schedule; one gate/up pass whose SwiGLU stays
+in the schedule's grouped rows; a down pass over those rows; both on the
+indirect grid of live tiles; weights staged as half in two alternating stages
+with the next payload loaded during the matmul; experts of one or two routes
+in registers; the shared expert as tiles of the same passes. It differs from
+Splash in three ways. The SwiGLU is rounded to BF16 once, from FP32 gate and
+up (2.6e-3 and 2.6–2.8e-3 relative RMS error, the lowest of the four). The
+register path adds a group's products in the order the device's `matmul2d`
+adds them, found by probing and re-proved at model load, so it is bitwise the
+matmul tile; Splash documents that its two tiles differ and that its MoE
+results depend on the step's other rows (`moe_expert_slab.h:16-27`). The
+router and shared-gate logits run the row-exact kernel per block of eight
+rows. A row of a masked width-32 step is therefore bitwise the row decoded
+alone, which the staged-M8 route does not guarantee. The equality excludes
+expert products that underflow FP32: the register path and `matmul2d` may
+round a subnormal product differently, so a result of that magnitude (an
+independent review observed at most 4e-31) can depend on how many routes
+share its expert. The kernel keeps 8-row tiles only: a kernel that also held
+16- and 32-row matmuls ran every tile 15% slower. The three MoE switches are
+resolved together before any weight upload, so an invalid value or
+combination fails startup, and the worker logs the resolved route as
+`moe_experts`.
+
+Model-free, the layer takes 0.375 ms (Q4_K down) and 0.411 ms (Q6_K down) on
+the recorded routes, 1.10 and 1.07 times Splash on the same routes. In situ,
+ten of ten exact four-agent Q5 runs with the switch and six of six without it
+were `CalibrationPass`, over three successive binaries of this branch (two,
+four and four runs with the switch, two without on each; the first binary ran
+the shared expert on its FP32 kernels in blocks of eight rows). On the last
+two binaries the median four-lane target stage is 45.0 ms with the switch
+(eight runs, 44.2–46.7) against 48.2 ms without (four runs, 47.8–48.4).
+Explicit stage profiles (diagnostic, one pair per binary) put the MoE
+category at 17.6 against 21.2 ms at four lanes on the final binary. What
+remains against
+Splash on the same routes is the gate/up pass (0.219 against 0.208 ms), the
+schedule and its extra barriers, and, on routes where lanes share experts,
+experts of more than eight routes, which this route runs as successive 8-row
+tiles in one threadgroup where Splash launches one threadgroup per tile. The
+route needs unpublished mlx-native kernels and is not quality-qualified.
+
+#### Splash attention-kernel differential
+
+The full-attention kernels (K/V cache write, attention, output gate; the
+Q/K/V and output projections are counted above) were then attributed model
+free. A DFlash2 verify step repeats each lane's slot eight times, so
+`tq_sdpa_rows_route` never admitted it and every full-attention layer ran the
+serial chain once per row behind barriers: two TQ encodes, the Q rotation,
+the split-K main and its reduce, the un-rotation and a row copy, 225
+dispatches in about 160 serialized stages per layer at four lanes, each row
+and query head scanning the slot's history on its own. mlx-native
+`bench_qwen_verify_attn` (one layer, served shapes, GPU at serving clocks,
+median of 20, `$V/splash-gap/attnverify/bench-qwen3{8,6}.log`) reads 1.03, 1.81
+and 3.59 ms per Qwen3.8 layer at four lanes over 512, 2,048 and 8,192 tokens
+of history (0.27, 0.46, 0.90 ms at one lane); Splash's three dispatches take
+0.073, 0.130 and 0.341 ms. Running the same per-row kernels row-batched
+behind two barriers (bitwise the serial chain) only reaches 0.36, 1.14 and
+2.31 ms: past a few hundred tokens the per-row kernel's own work dominates,
+because each of the 32 rows and 24 query heads dequantizes the history again.
+
+Splash computes a lane's eight rows and a KV head's query heads together, 48
+fused rows for Qwen3.8 and 64 for Qwen3.6, one threadgroup per KV head, lane
+and history split, with Metal tensor matmuls over 32-token pages, and
+combines the splits in a fixed order (`paged_attention_tile.h:279-387`,
+`:414-457`; split count from the lane's own history only,
+`PagedAttention.hpp:56-73`). `HF2Q_QWEN_VERIFY_ATTN_TILE=1` adopts that
+structure over hf2q's unchanged TQ-HB cache (mlx-native
+`tq_hb_verify_tile`): one batched K and one V encode for all rows, one query
+rotation and pack, one split, one reduce and one fused un-rotation and gate,
+six dispatches in four stages. The Lloyd-Max codebook is not linear, so a
+page's codes are dequantized to half centroids in threadgroup memory instead
+of being a matmul operand as Splash's INT8 pages are; that costs one more
+barrier per page and no change to the cache format, the prefill writer, the
+anchors or the spill path. Cache bytes and cursors are bitwise the serial
+chain's. The attention output is Class B: half matmul operands and a
+per-page online softmax. Its gates are an F64 reference with a K-scaled
+bound at both served geometries (largest observed error 0.43 of the bound),
+bitwise determinism, and bitwise independence of a row from the other lanes,
+the window's later rows, its packed row and the padding. Against the serial
+chain on hf2q's cache one layer's gated output moves by at most 1.0% of the
+row RMS in a deliberately peaked fixture, a relative RMS of 6.2e-4 to 7.9e-4
+per row, also across five steps with partial acceptance and cursor
+truncation; the test limits are 2% and 2e-3. The same token verified at
+another offset of another window can differ in its last bits (relative RMS
+about 4e-6), because the split partition follows the window's start; that
+alignment comes from the lane's own acceptance history, never from its
+cohort.
+
+An independent review measured the route's error against the exact F64
+attention at 3e-4 on flat and about 1e-3 on peaked attention, 1.1 to 2.5
+times the serial chain's on peaked attention; half the tile's error is the
+half query the serial chain also uses, the rest the half centroids. The
+probability operand of P·V is `p * norm / 16` in half: it saturates for value
+norms above 1,048,064, and a token that shares a split with a dominant one
+drops out once the operand is below 3e-8, which is invisible for norms from
+1 up, 1.7e-3 in the worst head at 0.25 and 2% at 0.02. The stored norms were
+therefore surveyed on the real caches: a diagnostic binary printed, every 50
+verify commits of one exact four-agent run per model, the norms of every
+committed token of the step's lanes (about 2,900 tokens per lane at the
+end, `$V/splash-gap/attnverify/runs/norm-table.txt`).
+
+| Stored value norm | min | 0.1% | 1% | 50% | 99% | 99.9% | max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Qwen3.8, lowest layer (rank 1) | 2.02 | 2.16 | 2.58 | 7.03 | 11.90 | 13.91 | 15.40 |
+| Qwen3.8, highest layer (rank 15) | 56.70 | 60.48 | 65.21 | 84.99 | 107.09 | 125.94 | 168.20 |
+| Qwen3.8, all 16 layers, all snapshots | 1.99 | | | | | | 168.20 |
+| Qwen3.6, lowest layer (rank 1) | 2.89 | 3.16 | 3.50 | 7.01 | 9.97 | 11.12 | 13.19 |
+| Qwen3.6, highest layer (rank 9) | 16.72 | 17.36 | 17.90 | 26.27 | 33.20 | 34.65 | 36.33 |
+| Qwen3.6, all 10 layers, all snapshots | 2.83 | | | | | | 36.33 |
+
+Key norms are 16.2 to 29.1. No layer is below 0.5 or above 1e5, so the
+operand needs no rescaling for these models; a model whose value norms left
+1 to 1e6 would need a per-row power-of-two operand scale first.
+
+The review also found that the split kernel's 26 to 29 KiB of static
+threadgroup memory doubled under Metal shader validation and aborted under
+the debug layer. That storage is now threadgroup memory bound by the host
+(same arithmetic, equal output digests plain, under either layer, under
+both, and from runtime-compiled source), and the route reports itself
+unavailable, so the step keeps the per-row chain, when a kernel's threads or
+threadgroup memory exceed the device's limits. A step the switch asked for
+and the route refused logs its reason once.
+
+Model free the route takes 0.051, 0.116 and 0.331 ms per Qwen3.8 layer at
+four lanes (0.033, 0.048, 0.103 ms at one) and 0.046, 0.083 and 0.195 ms per
+Qwen3.6 layer, including the K/V encodes and the gate: 0.70 to 0.97 times
+Splash's store, split and reduce at four lanes and 1.2 to 1.5 times at one
+lane, where six dispatches against three and the extra barrier decide.
+Splash's numbers are from its own tool and warm-up; they were not
+re-measured under this bench's filler protocol.
+
+In situ, same binary (sha256 `a57c958d…`: this change before its rebase
+onto `eea0fa1a` and before the review fixes above, which leave the
+arithmetic unchanged; prepared FFN and projections on), one exact Q5 run per
+cell, all `CalibrationPass` (`$V/splash-gap/attnverify/runs`):
+
+| Qwen3.8, per cycle | 1 lane | 2 lanes | 3 lanes | 4 lanes |
+|---|---:|---:|---:|---:|
+| Attention category off, GPU ms | 9.45 | 16.12 | 23.27 | 25.95 |
+| Attention plus KV write on, GPU ms | 1.14 | 1.24 | 2.10 | 2.02 |
+| Cycle total off, ms | 106.88 | 104.39 | 120.11 | 130.08 |
+| Cycle total on, ms (two runs) | 100.59, 89.52 | 102.55, 100.97 | 105.83, 103.35 | 109.87, 106.52 |
+| Dispatches off / on | 6,084 / 4,884 | 8,201 / 6,233 | 10,462 / 7,726 | 12,579 / 9,219 |
+
+| Qwen3.6, per cycle | 1 lane | 2 lanes | 3 lanes | 4 lanes |
+|---|---:|---:|---:|---:|
+| Attention category off, GPU ms | 4.42 | 8.27 | 10.54 | 11.48 |
+| Attention plus KV write on, GPU ms | 0.63 | 0.75 | 0.91 | 0.81 |
+| Cycle total off, ms | 36.74 | 58.75 | 51.63 | 58.23 |
+| Cycle total on, ms (two runs) | 34.58, 34.51 | 53.03, 52.59 | 42.91, 42.18 | 45.98, 45.79 |
+| Dispatches off / on | 3,324 / 2,814 | 4,751 / 3,681 | 7,079 / 5,369 | 8,407 / 6,217 |
+
+The category rows are explicit stage profiles (one profiled run per arm);
+the totals are unprofiled medians of the DEBUG stage timing. Splash's
+attention kernels take 1.71 ms per Qwen3.8 cycle at a 512-token history and
+2.68 ms at 2,048, and 0.72 ms per Qwen3.6 cycle. The Qwen3.8 arms emit
+different text (5,206 completion tokens in both runs with the switch, 5,237
+without; makespan 62.5 and 60.5 against 68.7 seconds), and the Qwen3.6 runs
+differ from run to run in both arms, so makespan is one draw per run and the
+per-cycle medians are the comparison. The switch is off by default pending
+the combined-candidate quality campaign. It needs an mlx-native release that
+contains `tq_hb_verify_tile`.
+
+#### Combined candidate after the stage work
+
+The staged draft command, the live-tile MoE route, the tiled verify attention
+and the prepared prefill route were built into one binary (`d5f48657`, mlx-native
+0.21.8 sources) and measured together, every switch on against the previous
+best configuration (`HF2Q_REPACKED_GGUF_M32=1` with `_PROJ=1`) of the same
+binary. `$E` is `/Users/robert/.local/state/hf2q/campaigns`.
+
+Qwen3.8, six balanced blocks (`$E/qwen38-int-all-d5-v1`): 12 of 12
+`CalibrationPass`. Client makespan −28.18% (95% CI 19.83–35.66%; 47.37
+against 63.36 seconds) and the four-lane cycle −28.77% (95% CI 20.13–36.48%).
+The host was loaded during this campaign; on a quiet host one run per arm read
+41.45 against 55.65 seconds and an 80.3 against 100.5 ms four-lane cycle. The
+text differs (5,462 against 5,237 completion tokens, each arm repeating its own
+text exactly). Peak footprint 70.59 against 70.08 GiB.
+
+Qwen3.6, twenty interleaved rounds (`$E/qwen36-int-isolate-v1`, arms `all`
+and `control`): 19 of 20 candidate runs and 18 of 20 control runs passed; all
+three failures are the workflow oracle's "initial six-step workflow not
+followed". Over the 17 rounds where both arms passed:
+
+| Metric | All switches | Previous best | Ratio (95% CI) |
+|---|---:|---:|---|
+| Four-lane cycle (ms) | 33.57 | 51.04 | 0.657 (0.652–0.661) |
+| Client makespan (s) | 21.75 | 31.31 | 0.695 (0.659–0.732) |
+| Total prefill per run (s) | 5.27 | 6.44 | 0.815 (0.776–0.856) |
+| Accepted tokens per lane-cycle | 3.964 | 4.121 | 0.959 (0.950–0.968) |
+
+A first six-block Qwen3.6 campaign (`$E/qwen36-int-all-d5-v1`) was invalid:
+two of six candidate runs failed the same oracle. Five runs of each switch
+alone then gave 5/5 (staged draft), 5/5 (attention tile), 4/5 (prepared
+prefill) and 4/5 (live tiles), and the twenty-round comparison above shows the
+control failing as often as the candidate. The failing transcripts are
+coherent tool calls that take a wrong turn, not corrupted output. Qwen3.6 on
+this workload therefore fails the oracle in roughly one run in twelve with or
+without these routes, which a release campaign has to budget for.
+
+Two things the combined measurement shows that the single-switch ones did
+not:
+
+- The gains are not additive. On Qwen3.6 the staged draft alone and the live
+  tiles alone left the four-lane cycle at the control's 51–52 ms, and the
+  attention tile alone brought it to 42 ms; together they reach 33.6 ms. A
+  route must be judged on the combined candidate with one switch removed, not
+  alone.
+- Draft acceptance on Qwen3.6 falls by about 4% with every switch on (live
+  tiles alone read 4.01 against 4.12 accepted tokens per lane-cycle in four
+  runs). It is paid for many times over by the shorter cycle, but it is a
+  cost of the changed target arithmetic and remains open.
+
+One profiled run of each combined candidate gives the four-lane GPU time by
+category, which is where the remaining distance to Splash (50.6 ms per
+Qwen3.8 cycle, 20.8 ms per Qwen3.6 cycle on its own synthetic routing) sits:
+
+| Category (GPU ms) | Qwen3.8 | Splash 3.8 | Qwen3.6 | Splash 3.6 |
+|---|---:|---:|---:|---:|
+| Draft | 5.5 | 5.98 | 3.6 | 3.36 |
+| Attention and KV write | 2.4 | 4.7 | 1.2 | 1.8 |
+| FFN or MoE | 29.1 | 24.0 | 21.5 | 9.7 |
+| Projections and DeltaNet | 22.3 | 12.8 | 8.6 | 4.7 |
+| Head | 4.5 | 1.95 | 1.9 | 0.86 |
+
+The draft and attention stages now meet Splash's. The Qwen3.8 cycle's wall
+time (80 ms) exceeds its GPU categories (66 ms) by about 14 ms of host and
+synchronization time over 9,063 dispatches. Profiling serializes dispatches,
+so the Qwen3.6 MoE figure overstates its unprofiled cost, and Splash's 9.7 ms
+is for lanes that share experts; on the recorded routes of this workload its
+own kernels take 13.6 ms.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,

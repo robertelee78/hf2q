@@ -534,7 +534,7 @@ impl FullAttnKvSlot {
         })
     }
 
-    /// Write one new decode token per joint row into this layer's TQ cache:
+    /// Write one new token per joint row into this layer's TQ cache:
     /// row `r` of `k_rows` / `v_rows` (`[rows, n_kv_heads * head_dim]` F32,
     /// rows `0..rows.len()`) lands at position `rows[r].1` of slot
     /// `rows[r].0`, with one batched dispatch per side and no barrier.
@@ -543,9 +543,10 @@ impl FullAttnKvSlot {
     /// [`Self::encode_seq_tokens_to_tq_for_slot`] with `n_tokens = 1` at the
     /// same position (same Hadamard + Lloyd-Max arithmetic; only the slot and
     /// position addressing is per row — mlx-native's batched-encode parity
-    /// gate and `test_qwen36_attn_rows`). The slots must be distinct and every
-    /// position inside the capacity. The caller orders readers of the cache
-    /// after this call with a barrier and advances the cursors.
+    /// gate and `test_qwen36_attn_rows`). The `(slot, position)` pairs must be
+    /// distinct (a verify window writes several positions of one slot) and
+    /// every position inside the capacity. The caller orders readers of the
+    /// cache after this call with a barrier and advances the cursors.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_rows_to_tq(
         &self,
@@ -573,8 +574,8 @@ impl FullAttnKvSlot {
                 slot_id.0
             );
             anyhow::ensure!(
-                rows[..index].iter().all(|&(other, _)| other != slot_id),
-                "encode_rows_to_tq: slot {} appears twice",
+                !rows[..index].contains(&(slot_id, position)),
+                "encode_rows_to_tq: slot {} position {position} appears twice",
                 slot_id.0
             );
         }

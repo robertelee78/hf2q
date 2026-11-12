@@ -189,6 +189,7 @@ fn select_qwen_joint_decode(
                         requested_step.projection == JointProjectionKernel::ColumnInvariantMma,
                     ),
                     pooled_outputs: requested_step.pooled_outputs,
+                    verify_attention_tile: false,
                 },
                 joint_mtp: joint_mtp && (mode == JointRouteMode::Exact || solo),
             })
@@ -272,6 +273,7 @@ pub(super) fn qwen35_joint_decode_config(
             JointProjectionKernel::Canonical
         },
         pooled_outputs: switch(QWEN_JOINT_POOLED_OUTPUTS_ENV, "pooled outputs"),
+        verify_attention_tile: false,
     };
     let selected = select_qwen_joint_decode(
         requested,
@@ -291,6 +293,7 @@ pub(super) fn qwen35_joint_decode_config(
         dense_decode_mvn = model.ggml_routing_policy().dense_decode_mvn,
         dense_decode_mv_ext = model.ggml_routing_policy().dense_decode_mv_ext,
         moe_ffn = model.moe_ffn_decode_route(),
+        moe_experts = model.moe_expert_decode_route(),
         max_rows = selected.map_or(max_rows, |config| config.max_rows),
         selected = selected.is_some(),
         mode = selected.map_or("serial", |config| config.mode.label()),

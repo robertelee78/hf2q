@@ -297,6 +297,45 @@ pub(crate) fn project(
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
+    let output = pooled_alloc_buffer(
+        device,
+        rows as usize * out_features as usize * std::mem::size_of::<f32>(),
+        DType::F32,
+        vec![rows as usize, out_features as usize],
+    )
+    .map_err(|error| anyhow!("allocate prepared projection output: {error}"))?;
+    project_into(
+        enc,
+        registry,
+        device,
+        input_bf16,
+        weight,
+        ggml_type,
+        planes,
+        &output,
+        rows,
+        in_features,
+        out_features,
+    )?;
+    Ok(output)
+}
+
+/// Encode one prepared projection of `input_bf16` into the caller's F32
+/// `[rows, out_features]` buffer, preparing the weight's planes on first use.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_into(
+    enc: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input_bf16: &MlxBuffer,
+    weight: &MlxBuffer,
+    ggml_type: GgmlType,
+    planes: &Planes,
+    output: &MlxBuffer,
+    rows: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<()> {
     let params = params(rows, ggml_type, in_features, out_features);
     if planes.get().is_none() {
         let prepared = prepare_repacked_gguf_weight(enc, registry, device, weight, &params)
@@ -308,16 +347,8 @@ pub(crate) fn project(
     let prepared = planes
         .get()
         .context("prepared projection GGUF weight was not retained")?;
-    let output = pooled_alloc_buffer(
-        device,
-        rows as usize * out_features as usize * std::mem::size_of::<f32>(),
-        DType::F32,
-        vec![rows as usize, out_features as usize],
-    )
-    .map_err(|error| anyhow!("allocate prepared projection output: {error}"))?;
     dispatch_repacked_gguf_mm_bf16_input(
-        enc, registry, device, input_bf16, prepared, &output, &params,
+        enc, registry, device, input_bf16, prepared, output, &params,
     )
-    .context("dispatch prepared GGUF projection")?;
-    Ok(output)
+    .context("dispatch prepared GGUF projection")
 }

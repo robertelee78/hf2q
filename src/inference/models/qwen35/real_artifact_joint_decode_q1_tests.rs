@@ -31,6 +31,7 @@ const PREFILL_CHUNK: usize = 512;
 const CANONICAL: JointStepOptions = JointStepOptions {
     projection: JointProjectionKernel::Canonical,
     pooled_outputs: false,
+    verify_attention_tile: false,
 };
 
 /// Joint arms of the trace: the production default first, then the
@@ -56,6 +57,7 @@ const JOINT_ARMS: [(JointDenseFfnRoute, JointStepOptions, &str); 4] = [
         JointStepOptions {
             projection: JointProjectionKernel::ColumnInvariantMma,
             pooled_outputs: false,
+            verify_attention_tile: false,
         },
         "joint_shared_ffn_mma",
     ),
@@ -64,6 +66,7 @@ const JOINT_ARMS: [(JointDenseFfnRoute, JointStepOptions, &str); 4] = [
         JointStepOptions {
             projection: JointProjectionKernel::Canonical,
             pooled_outputs: true,
+            verify_attention_tile: false,
         },
         "joint_shared_ffn_pooled",
     ),

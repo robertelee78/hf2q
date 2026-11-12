@@ -108,8 +108,14 @@ pub mod moe;
 pub(crate) mod moe_batched;
 #[cfg(test)]
 mod moe_batched_tests;
+mod moe_live_tiles;
+#[cfg(test)]
+mod moe_live_tiles_tests;
 pub mod mtp;
 pub mod mtp_weights_load;
+pub(crate) mod prefill_prepared;
+#[cfg(test)]
+mod prefill_prepared_tests;
 pub(crate) mod prepared_projection;
 mod source_config;
 pub(crate) mod source_precision;
@@ -117,6 +123,9 @@ pub(crate) mod resume_attn_fast;
 pub mod routing_policy;
 pub mod spec_decode;
 pub mod tokenizer;
+pub(crate) mod verify_attn_tile;
+#[cfg(test)]
+mod verify_attn_tile_tests;
 pub mod wave5b8_profile;
 pub mod weight_loader;
 pub mod weight_pool;

@@ -521,6 +521,18 @@ pub(crate) struct PreparedMoeExpertsM8 {
     pub gate: PreparedGroupedM8Experts,
     pub up: PreparedGroupedM8Experts,
     pub down: PreparedGroupedM8Experts,
+    /// Present under [`super::moe_batched::QWEN_MOE_LIVE_TILES_ENV`].
+    pub live_tiles: Option<PreparedMoeLiveTiles>,
+}
+
+/// What the live-tile route ([`super::moe_live_tiles`]) needs beyond the
+/// routed experts' planes.
+pub(crate) struct PreparedMoeLiveTiles {
+    /// The shared expert's gate, up and down as one-expert planes.
+    pub shared: [PreparedGroupedM8Experts; 3],
+    /// Whether one- and two-route experts may run in registers
+    /// (`mlx_native::moe_tiles_column_tile_exact` on this device).
+    pub column_tile: bool,
 }
 
 pub struct MoeFfnWeightsGpuQ {
@@ -699,6 +711,7 @@ impl MoeFfnWeightsGpuQ {
         device: &MlxDevice,
         hidden_size: u32,
         moe_intermediate_size: u32,
+        shared_intermediate_size: u32,
     ) -> Result<()> {
         anyhow::ensure!(
             self.dense_storage.is_native()
@@ -707,6 +720,17 @@ impl MoeFfnWeightsGpuQ {
                 && self.expert_down_affine.is_none(),
             "staged M8 preparation requires native expert stacks without affine overlays"
         );
+        let live_tiles = if super::moe_batched::qwen_moe_live_tiles_requested()? {
+            Some(self.prepare_live_tiles(
+                encoder,
+                registry,
+                device,
+                hidden_size,
+                shared_intermediate_size,
+            )?)
+        } else {
+            None
+        };
         let gate_params = GgmlQuantizedMatmulIdParams {
             n_tokens: 1,
             top_k: 1,
@@ -752,8 +776,51 @@ impl MoeFfnWeightsGpuQ {
                 &down_params,
             )
             .context("prepare down expert M8 planes")?,
+            live_tiles,
         });
         Ok(())
+    }
+
+    /// The shared expert's one-expert planes and this device's register-path
+    /// probe, for the live-tile route.
+    pub(crate) fn prepare_live_tiles(
+        &self,
+        encoder: &mut CommandEncoder,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        hidden_size: u32,
+        shared_intermediate_size: u32,
+    ) -> Result<PreparedMoeLiveTiles> {
+        let MoeDenseStorage::Native {
+            shared_gate_up,
+            shared_down,
+        } = self.dense_storage
+        else {
+            anyhow::bail!("live-tile preparation requires a native shared expert");
+        };
+        let mut prepare = |weight: &MlxBuffer, ggml_type: GgmlType, n: u32, k: u32, label: &str| {
+            let params = GgmlQuantizedMatmulIdParams {
+                n_tokens: 1,
+                top_k: 1,
+                n,
+                k,
+                n_experts: 1,
+                expert_stride: ggml_type_stride(ggml_type, n as usize, k as usize)?,
+                ggml_type,
+            };
+            prepare_quantized_matmul_id_ggml_grouped_m8(encoder, registry, device, weight, &params)
+                .with_context(|| format!("prepare shared {label} live-tile planes"))
+        };
+        let shared = [
+            prepare(&self.shared_gate, shared_gate_up, shared_intermediate_size, hidden_size, "gate")?,
+            prepare(&self.shared_up, shared_gate_up, shared_intermediate_size, hidden_size, "up")?,
+            prepare(&self.shared_down, shared_down, hidden_size, shared_intermediate_size, "down")?,
+        ];
+        Ok(PreparedMoeLiveTiles {
+            shared,
+            column_tile: mlx_native::moe_tiles_column_tile_exact(device, registry)
+                .context("probe the live-tile register path")?,
+        })
     }
 }
 
@@ -2207,31 +2274,75 @@ pub fn build_dense_ffn_layer_gpu_q_into_with_arena(
         ggml_type: weights.ggml_type_down,
     };
 
-    // Ops 1+2: gate and up projections via quantized_matmul_ggml (both read x, concurrent).
+    // Inside a routed prefill scope the three products run the prepared
+    // row-tile MM on BF16 copies of their activations (all three or none, so
+    // a layer never mixes kernels); otherwise the canonical dispatcher.
+    let prepared_rows = [
+        (&weights.gate_q, weights.ggml_type_gate_up, h, m),
+        (&weights.up_q, weights.ggml_type_gate_up, h, m),
+        (&weights.down_q, weights.ggml_type_down, m, h),
+    ]
+    .into_iter()
+    .all(|(weight, ggml_type, in_features, out_features)| {
+        super::prefill_prepared::admits(seq_len, weight, ggml_type, in_features, out_features)
+    });
+
+    // Ops 1+2: gate and up projections (both read x, concurrent).
     {
         let _w5b = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FfnPhaseAProj,
         );
-        quantized_matmul_ggml(
-            enc,
-            registry,
-            device,
-            x,
-            &weights.gate_q,
-            &mut arena.gate_buf,
-            &gate_up_params,
-        )
-        .context("dense_q gate proj (arena)")?;
-        quantized_matmul_ggml(
-            enc,
-            registry,
-            device,
-            x,
-            &weights.up_q,
-            &mut arena.up_buf,
-            &gate_up_params,
-        )
-        .context("dense_q up proj (arena)")?;
+        if prepared_rows {
+            let x_bf16 =
+                super::prepared_projection::bf16_input(enc, registry, device, x, seq_len, h)?;
+            // The prepared projections read the BF16 copy this cast writes.
+            enc.memory_barrier();
+            for (weight, planes, output, label) in [
+                (
+                    &weights.gate_q,
+                    &weights.repacked_m32.gate,
+                    &arena.gate_buf,
+                    "gate",
+                ),
+                (&weights.up_q, &weights.repacked_m32.up, &arena.up_buf, "up"),
+            ] {
+                super::prepared_projection::project_into(
+                    enc,
+                    registry,
+                    device,
+                    &x_bf16,
+                    weight,
+                    weights.ggml_type_gate_up,
+                    planes,
+                    output,
+                    seq_len,
+                    h,
+                    m,
+                )
+                .with_context(|| format!("dense_q prepared {label} proj (arena)"))?;
+            }
+        } else {
+            quantized_matmul_ggml(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.gate_q,
+                &mut arena.gate_buf,
+                &gate_up_params,
+            )
+            .context("dense_q gate proj (arena)")?;
+            quantized_matmul_ggml(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.up_q,
+                &mut arena.up_buf,
+                &gate_up_params,
+            )
+            .context("dense_q up proj (arena)")?;
+        }
     }
 
     // Barrier: silu_mul reads gate_buf/up_buf written above.
@@ -2284,16 +2395,43 @@ pub fn build_dense_ffn_layer_gpu_q_into_with_arena(
         } else {
             out_slot
         };
-        quantized_matmul_ggml(
-            enc,
-            registry,
-            device,
-            &arena.hidden_buf,
-            &weights.down_q,
-            down_dst,
-            &down_params,
-        )
-        .context("dense_q down proj (arena)")?;
+        if prepared_rows {
+            let hidden_bf16 = super::prepared_projection::bf16_input(
+                enc,
+                registry,
+                device,
+                &arena.hidden_buf,
+                seq_len,
+                m,
+            )?;
+            // The prepared projection reads the BF16 copy this cast writes.
+            enc.memory_barrier();
+            super::prepared_projection::project_into(
+                enc,
+                registry,
+                device,
+                &hidden_bf16,
+                &weights.down_q,
+                weights.ggml_type_down,
+                &weights.repacked_m32.down,
+                down_dst,
+                seq_len,
+                m,
+                h,
+            )
+            .context("dense_q prepared down proj (arena)")?;
+        } else {
+            quantized_matmul_ggml(
+                enc,
+                registry,
+                device,
+                &arena.hidden_buf,
+                &weights.down_q,
+                down_dst,
+                &down_params,
+            )
+            .context("dense_q down proj (arena)")?;
+        }
     }
 
     // Op 5 (optional): out_slot = down_out_buf + residual — folded to save

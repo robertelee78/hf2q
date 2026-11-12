@@ -60,6 +60,9 @@ use super::gpu_full_attn::{
 use super::joint_decode_routes::{projection_route, JointProductRoute};
 use super::kv_cache::{HybridKvCache, LayerSlot};
 use super::prepared_projection;
+use super::verify_attn_tile::{
+    apply_tq_verify_tile_gated_into, tq_verify_tile_route, VerifyTileScratch,
+};
 use super::Qwen35Config;
 use crate::serve::multi_seq_kv::SlotId;
 
@@ -74,6 +77,9 @@ pub(crate) struct JointRows<'a> {
     /// drafts at consecutive positions).
     pub windows: &'a [JointWindow],
     pub width: usize,
+    /// `Some` on a DFlash2 verify step that requests the tiled TQ full
+    /// attention: the step's shared split scratch.
+    pub attention_tile: Option<&'a VerifyTileScratch>,
 }
 
 /// One lane's rows of a joint step: packed rows `start..start + rows`, all
@@ -1583,7 +1589,45 @@ pub(crate) fn encode_joint_full_attn_layer(
     // ---- KV write at each slot's cursor + attention over each slot + gate ----
     let max_seq_len = kv_cache.max_seq_len;
     let slot = &mut kv_cache.full_attn[rank];
-    let gated = if tq_sdpa_rows_route(slot, rows.slots, head_dim, max_seq_len) {
+    let tile = match rows.attention_tile {
+        Some(scratch)
+            if tq_verify_tile_route(
+                registry,
+                device,
+                slot,
+                rows.windows,
+                width,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq_len,
+            )? =>
+        {
+            Some(scratch)
+        }
+        _ => None,
+    };
+    let gated = if let Some(scratch) = tile {
+        // Opt-in DFlash2 verify route: every window in one tiled pass.
+        apply_tq_verify_tile_gated_into(
+            enc,
+            device,
+            registry,
+            &q_rope,
+            &k_rope,
+            &v_flat,
+            &gate_flat,
+            slot,
+            rows.windows,
+            scratch,
+            width,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+        )
+        .with_context(|| format!("Qwen joint tiled verify attention layer {layer_idx}"))?
+    } else if tq_sdpa_rows_route(slot, rows.slots, head_dim, max_seq_len) {
         // Production TQ cache: every row in one pass, no per-row barriers.
         apply_tq_sdpa_rows_gated_into(
             enc,
