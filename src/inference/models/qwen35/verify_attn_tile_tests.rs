@@ -695,45 +695,54 @@ fn same_committed(a: &HybridKvCache, b: &HybridKvCache, geometry: Geometry) -> b
         })
 }
 
-/// Five consecutive verify steps with partial acceptance, as the DFlash2
-/// commit truncates the cursors: after every step the tiled route's cache
-/// bytes and cursors are the serial chain's, its rows stay in the envelope,
-/// and a twin cache whose rejected and never-written tokens hold NaN,
-/// infinity or -1e30 norms and flipped codes gives the same output bits and
-/// writes the same windows, so no row reads a rejected or stale token.
-#[test]
-fn tiled_verify_attention_survives_rollbacks_and_ignores_rejected_tokens() {
+/// A lane's window and the rows it keeps, per step.
+type RollbackSteps<'a> = &'a [(Step<'a>, &'a [usize])];
+
+/// Consecutive verify steps with partial acceptance, as the DFlash2 commit
+/// truncates the cursors, from cursors `start`: after every step and after
+/// every truncation the tiled route's cache bytes and cursors are the serial
+/// chain's, its rows stay in the envelope, and a twin cache whose rejected
+/// and never-written tokens hold NaN, infinity or -1e30 norms and flipped
+/// codes gives the same output bits and writes the same windows, so no row
+/// reads a rejected or stale token. Returns the windows that were cut at
+/// 1,536 tokens (rows on both sides of the page boundary where the kernel's
+/// split length steps) per geometry.
+fn rollback_steps(start: [u32; N_SEQS as usize], seed: u32, steps: RollbackSteps<'_>) -> usize {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let device = match MlxDevice::new() {
         Ok(device) => device,
         Err(error) => {
             eprintln!("skipping: no Metal device: {error}");
-            return;
+            return usize::MAX;
         }
     };
     let mut registry = KernelRegistry::new();
-    // (lanes as (slot, window rows), rows each lane keeps)
-    let steps: [(Step<'_>, &[usize]); 5] = [
-        (&[(0, 8), (1, 8), (2, 3), (3, 1)], &[3, 0, 3, 1]),
-        (&[(0, 8), (1, 8), (2, 8), (3, 8)], &[8, 5, 0, 2]),
-        (&[(3, 2), (1, 8), (0, 5)], &[1, 8, 0]),
-        (&[(2, 8), (0, 1), (1, 4), (3, 7)], &[7, 1, 0, 6]),
-        (&[(1, 8)], &[2]),
-    ];
+    let mut fewest_cut = usize::MAX;
     for (name, geometry) in [("qwen38", QWEN38), ("qwen36", QWEN36)] {
         if !tile_available(&device, &mut registry, geometry) {
             eprintln!("RECORDED SKIP: tiled verify attention unavailable (no Metal tensor API)");
-            return;
+            return usize::MAX;
         }
         let q_total = geometry.q_total();
         let init = cache_init(geometry);
         let mut serial_cache = new_cache(&device, geometry, &init);
         let mut tile_cache = new_cache(&device, geometry, &init);
+        for cache in [&mut serial_cache, &mut tile_cache] {
+            cache.full_attn[0].current_len.copy_from_slice(&start);
+        }
+        let mut cut_windows = 0;
         for (index, (step, accepted)) in steps.iter().enumerate() {
-            let label = format!("{name} step {index}");
-            let inputs = rows_seeded(geometry, 0x5EED_0000 + index as u32);
+            let label = format!("{name} from {start:?} step {index}");
+            let inputs = rows_seeded(geometry, seed + index as u32);
             let before = tile_cache.full_attn[0].current_len.clone();
             assert_eq!(before, serial_cache.full_attn[0].current_len, "{label}");
+            cut_windows += step
+                .iter()
+                .filter(|&&(slot, rows)| {
+                    let cursor = before[slot as usize];
+                    cursor < 1_536 && cursor + rows as u32 > 1_536
+                })
+                .count();
             let mut serial = Vec::new();
             for &(slot, rows) in step.iter() {
                 for row in &inputs[slot as usize][..rows] {
@@ -799,6 +808,53 @@ fn tiled_verify_attention_survives_rollbacks_and_ignores_rejected_tokens() {
                         .expect("truncate to the accepted rows");
                 }
             }
+            assert!(
+                cache_state(&tile_cache) == cache_state(&serial_cache),
+                "{label}: cache bytes or cursors differ after the rollback"
+            );
         }
+        eprintln!(
+            "{name} from {start:?}: {} steps, {cut_windows} cut windows; final cursors {:?}",
+            steps.len(),
+            tile_cache.full_attn[0].current_len
+        );
+        fewest_cut = fewest_cut.min(cut_windows);
     }
+    fewest_cut
+}
+
+/// Five steps from the fixture's cursors (299, 2,040, 5, 799).
+#[test]
+fn tiled_verify_attention_survives_rollbacks_and_ignores_rejected_tokens() {
+    rollback_steps(
+        CURSORS,
+        0x5EED_0000,
+        &[
+            (&[(0, 8), (1, 8), (2, 3), (3, 1)], &[3, 0, 3, 1]),
+            (&[(0, 8), (1, 8), (2, 8), (3, 8)], &[8, 5, 0, 2]),
+            (&[(3, 2), (1, 8), (0, 5)], &[1, 8, 0]),
+            (&[(2, 8), (0, 1), (1, 4), (3, 7)], &[7, 1, 0, 6]),
+            (&[(1, 8)], &[2]),
+        ],
+    );
+}
+
+/// Seven steps from cursors just below 1,536 tokens, so most windows are cut
+/// there (two tiles per lane) and are verified again after a rollback.
+#[test]
+fn tiled_verify_attention_cut_windows_survive_rollbacks() {
+    let cut_windows = rollback_steps(
+        [1_531, 1_529, 1_533, 1_535],
+        0x5EED_1000,
+        &[
+            (&[(0, 8), (1, 8), (2, 8), (3, 8)], &[2, 0, 1, 0]),
+            (&[(0, 8), (1, 8), (2, 3), (3, 8)], &[1, 4, 3, 0]),
+            (&[(3, 2), (1, 8), (0, 5)], &[1, 2, 0]),
+            (&[(1, 8), (0, 8), (2, 4)], &[0, 1, 0]),
+            (&[(1, 8)], &[0]),
+            (&[(1, 2), (0, 8), (3, 8), (2, 8)], &[2, 8, 8, 8]),
+            (&[(1, 8), (0, 8), (3, 8), (2, 8)], &[8, 3, 0, 5]),
+        ],
+    );
+    assert!(cut_windows >= 10, "only {cut_windows} cut windows");
 }
