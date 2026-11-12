@@ -11,7 +11,9 @@
 //!   its F64 bound is mlx-native's `test_tq_hb_verify_tile`,
 //! - be deterministic, and give a lane the same bits alone and in any
 //!   cohort, packed position or padding,
-//! - reuse one step scratch across layers.
+//! - reuse one step scratch across layers,
+//! - keep all of that across steps with partial acceptance, and never read
+//!   a rejected or never-written cache token.
 
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -189,7 +191,10 @@ struct Row {
 
 /// Eight rows for each slot.
 fn rows(geometry: Geometry) -> Vec<Vec<Row>> {
-    let mut seed = 0x0DDB_711E_u32;
+    rows_seeded(geometry, 0x0DDB_711E)
+}
+
+fn rows_seeded(geometry: Geometry, mut seed: u32) -> Vec<Vec<Row>> {
     (0..N_SEQS)
         .map(|_| {
             (0..8)
@@ -361,8 +366,46 @@ fn tile_available(device: &MlxDevice, registry: &mut KernelRegistry, geometry: G
     .expect("route probe")
 }
 
-/// Largest `|tile - serial|` over a row, relative to the serial row's RMS.
-const ENVELOPE: f32 = 2e-2;
+/// Envelope of the tiled rows around the serial chain's, over the rows of a
+/// step: the largest `|tile - serial|` of a row relative to the serial row's
+/// RMS (measured 0.78e-2 to 1.01e-2), and the worst row's relative RMS error
+/// (measured 6.2e-4 to 7.9e-4; the limit catches a doubling).
+const ENVELOPE_MAX: f64 = 2e-2;
+const ENVELOPE_RMS: f64 = 2e-3;
+
+/// `(largest |tile - serial| / rms(serial), worst relative RMS)` over the
+/// rows of `serial`, which `tiled` holds packed in the same order.
+fn envelope(serial: &[Vec<f32>], tiled: &[f32], q_total: usize) -> (f64, f64) {
+    let (mut worst_max, mut worst_rms) = (0.0_f64, 0.0_f64);
+    for (row, expected) in serial.iter().enumerate() {
+        let got = &tiled[row * q_total..(row + 1) * q_total];
+        let signal: f64 = expected.iter().map(|x| f64::from(*x).powi(2)).sum();
+        let (mut error, mut largest) = (0.0_f64, 0.0_f64);
+        for (a, b) in got.iter().zip(expected) {
+            let delta = (f64::from(*a) - f64::from(*b)).abs();
+            error += delta * delta;
+            largest = largest.max(delta);
+        }
+        assert!(
+            error.is_finite() && signal > 0.0,
+            "row {row}: degenerate output"
+        );
+        worst_max = worst_max.max(largest / (signal / q_total as f64).sqrt());
+        worst_rms = worst_rms.max((error / signal).sqrt());
+    }
+    (worst_max, worst_rms)
+}
+
+fn assert_envelope(label: &str, serial: &[Vec<f32>], tiled: &[f32], q_total: usize) {
+    let (worst_max, worst_rms) = envelope(serial, tiled, q_total);
+    eprintln!(
+        "{label}: worst row max |tile - serial| / rms(serial) {worst_max:.3e}, relative RMS {worst_rms:.3e}"
+    );
+    assert!(
+        worst_max <= ENVELOPE_MAX && worst_rms <= ENVELOPE_RMS,
+        "{label}: tile leaves the serial envelope: max {worst_max:.3e}, relative RMS {worst_rms:.3e}"
+    );
+}
 
 #[test]
 fn tiled_verify_attention_keeps_the_serial_cache_and_envelope() {
@@ -418,26 +461,7 @@ fn tiled_verify_attention_keeps_the_serial_cache_and_envelope() {
             cache_state(&cache) == serial_state,
             "{name}: cache bytes or cursors differ from the serial chain"
         );
-        let mut worst = 0.0_f32;
-        for (row, expected) in serial.iter().enumerate() {
-            let got = &tiled[row * q_total..(row + 1) * q_total];
-            let rms = (expected.iter().map(|x| x * x).sum::<f32>() / q_total as f32).sqrt();
-            let delta = got
-                .iter()
-                .zip(expected)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f32, f32::max);
-            assert!(
-                delta.is_finite() && rms > 0.0,
-                "{name} row {row}: degenerate output"
-            );
-            worst = worst.max(delta / rms);
-        }
-        eprintln!("{name}: max |tile - serial| / rms(serial) = {worst:.3e}");
-        assert!(
-            worst <= ENVELOPE,
-            "{name}: tile leaves the serial envelope: {worst:.3e}"
-        );
+        assert_envelope(name, &serial, &tiled, q_total);
         // Padding rows carry row 0's inputs and so its bits.
         let first = bits(&tiled[..q_total]);
         for row in 20..32 {
@@ -568,4 +592,187 @@ fn tiled_verify_attention_route_needs_a_compiled_tq_step() {
     let f32_cache =
         HybridKvCache::new_with_options(&geometry.cfg(), &device, 64, 2, false).expect("cache");
     assert!(!route(&f32_cache, &[window(0, 0, 8)], 16, HD, 64));
+}
+
+/// A copy of `source`'s layer cache and cursors in a fresh cache.
+fn clone_cache(device: &MlxDevice, geometry: Geometry, source: &HybridKvCache) -> HybridKvCache {
+    let (k_packed, v_packed, k_norms, v_norms, cursors) = cache_state(source);
+    let mut cache =
+        HybridKvCache::new_with_options(&geometry.cfg(), device, CAPACITY, N_SEQS, true)
+            .expect("TQ cache");
+    let slot = &mut cache.full_attn[0];
+    slot.current_len.copy_from_slice(&cursors);
+    let tq = slot.tq.as_mut().expect("TQ buffers");
+    tq.k_packed
+        .as_mut_slice::<u8>()
+        .unwrap()
+        .copy_from_slice(&k_packed);
+    tq.v_packed
+        .as_mut_slice::<u8>()
+        .unwrap()
+        .copy_from_slice(&v_packed);
+    for (buffer, bits) in [(&mut tq.k_norms, &k_norms), (&mut tq.v_norms, &v_norms)] {
+        for (dst, &src) in buffer.as_mut_slice::<f32>().unwrap().iter_mut().zip(bits) {
+            *dst = f32::from_bits(src);
+        }
+    }
+    cache
+}
+
+/// Every token at or after each slot's cursor (rejected or never written):
+/// norms set to `value`, codes flipped.
+fn poison_from_cursor(cache: &mut HybridKvCache, geometry: Geometry, value: f32) {
+    let slot = &mut cache.full_attn[0];
+    let cursors = slot.current_len.clone();
+    let (nkv, capacity, hd) = (geometry.nkv as usize, CAPACITY as usize, HD as usize);
+    let tq = slot.tq.as_mut().expect("TQ buffers");
+    let tokens = |s: usize, h: usize| {
+        let base = (s * nkv + h) * capacity;
+        base + cursors[s] as usize..base + capacity
+    };
+    for buffer in [&mut tq.k_norms, &mut tq.v_norms] {
+        let norms = buffer.as_mut_slice::<f32>().unwrap();
+        for s in 0..N_SEQS as usize {
+            for h in 0..nkv {
+                norms[tokens(s, h)].fill(value);
+            }
+        }
+    }
+    for buffer in [&mut tq.k_packed, &mut tq.v_packed] {
+        let codes = buffer.as_mut_slice::<u8>().unwrap();
+        for s in 0..N_SEQS as usize {
+            for h in 0..nkv {
+                let range = tokens(s, h);
+                for byte in &mut codes[range.start * hd..range.end * hd] {
+                    *byte ^= 0xA5;
+                }
+            }
+        }
+    }
+}
+
+/// Whether two caches agree on the cursors and on every token before them.
+fn same_committed(a: &HybridKvCache, b: &HybridKvCache, geometry: Geometry) -> bool {
+    let (a, b) = (cache_state(a), cache_state(b));
+    let (nkv, capacity, hd) = (geometry.nkv as usize, CAPACITY as usize, HD as usize);
+    a.4 == b.4
+        && (0..N_SEQS as usize).all(|s| {
+            (0..nkv).all(|h| {
+                let first = (s * nkv + h) * capacity;
+                let tokens = first..first + a.4[s] as usize;
+                let codes = tokens.start * hd..tokens.end * hd;
+                a.2[tokens.clone()] == b.2[tokens.clone()]
+                    && a.3[tokens.clone()] == b.3[tokens]
+                    && a.0[codes.clone()] == b.0[codes.clone()]
+                    && a.1[codes.clone()] == b.1[codes]
+            })
+        })
+}
+
+/// Five consecutive verify steps with partial acceptance, as the DFlash2
+/// commit truncates the cursors: after every step the tiled route's cache
+/// bytes and cursors are the serial chain's, its rows stay in the envelope,
+/// and a twin cache whose rejected and never-written tokens hold NaN,
+/// infinity or -1e30 norms and flipped codes gives the same output bits and
+/// writes the same windows, so no row reads a rejected or stale token.
+#[test]
+fn tiled_verify_attention_survives_rollbacks_and_ignores_rejected_tokens() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = match MlxDevice::new() {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("skipping: no Metal device: {error}");
+            return;
+        }
+    };
+    let mut registry = KernelRegistry::new();
+    // (lanes as (slot, window rows), rows each lane keeps)
+    let steps: [(Step<'_>, &[usize]); 5] = [
+        (&[(0, 8), (1, 8), (2, 3), (3, 1)], &[3, 0, 3, 1]),
+        (&[(0, 8), (1, 8), (2, 8), (3, 8)], &[8, 5, 0, 2]),
+        (&[(3, 2), (1, 8), (0, 5)], &[1, 8, 0]),
+        (&[(2, 8), (0, 1), (1, 4), (3, 7)], &[7, 1, 0, 6]),
+        (&[(1, 8)], &[2]),
+    ];
+    for (name, geometry) in [("qwen38", QWEN38), ("qwen36", QWEN36)] {
+        if !tile_available(&device, &mut registry, geometry) {
+            eprintln!("RECORDED SKIP: tiled verify attention unavailable (no Metal tensor API)");
+            return;
+        }
+        let q_total = geometry.q_total();
+        let init = cache_init(geometry);
+        let mut serial_cache = new_cache(&device, geometry, &init);
+        let mut tile_cache = new_cache(&device, geometry, &init);
+        for (index, (step, accepted)) in steps.iter().enumerate() {
+            let label = format!("{name} step {index}");
+            let inputs = rows_seeded(geometry, 0x5EED_0000 + index as u32);
+            let before = tile_cache.full_attn[0].current_len.clone();
+            assert_eq!(before, serial_cache.full_attn[0].current_len, "{label}");
+            let mut serial = Vec::new();
+            for &(slot, rows) in step.iter() {
+                for row in &inputs[slot as usize][..rows] {
+                    serial.push(per_row(
+                        &device,
+                        &mut registry,
+                        geometry,
+                        &mut serial_cache,
+                        SlotId(slot),
+                        row,
+                    ));
+                }
+            }
+            let twins: Vec<(f32, HybridKvCache)> = [f32::NAN, f32::INFINITY, -1e30]
+                .into_iter()
+                .map(|value| {
+                    let mut twin = clone_cache(&device, geometry, &tile_cache);
+                    poison_from_cursor(&mut twin, geometry, value);
+                    (value, twin)
+                })
+                .collect();
+            let tiled = tile_step(
+                &device,
+                &mut registry,
+                geometry,
+                &mut tile_cache,
+                &inputs,
+                step,
+                32,
+                &VerifyTileScratch::default(),
+            );
+            assert!(
+                cache_state(&tile_cache) == cache_state(&serial_cache),
+                "{label}: cache bytes or cursors differ from the serial chain"
+            );
+            assert_envelope(&label, &serial, &tiled, q_total);
+            for (value, mut twin) in twins {
+                let out = tile_step(
+                    &device,
+                    &mut registry,
+                    geometry,
+                    &mut twin,
+                    &inputs,
+                    step,
+                    32,
+                    &VerifyTileScratch::default(),
+                );
+                assert_eq!(
+                    bits(&out),
+                    bits(&tiled),
+                    "{label}: a row read a rejected or stale cache token ({value})"
+                );
+                assert!(
+                    same_committed(&twin, &tile_cache, geometry),
+                    "{label}: the twin with {value} wrote other windows"
+                );
+            }
+            for (&(slot, _), &kept) in step.iter().zip(accepted.iter()) {
+                let new_len = before[slot as usize] + kept as u32;
+                for cache in [&mut serial_cache, &mut tile_cache] {
+                    cache
+                        .truncate_full_attn_to_for_slot(SlotId(slot), new_len)
+                        .expect("truncate to the accepted rows");
+                }
+            }
+        }
+    }
 }

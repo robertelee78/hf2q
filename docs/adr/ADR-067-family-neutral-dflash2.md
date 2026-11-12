@@ -1336,17 +1336,61 @@ bound at both served geometries (largest observed error 0.43 of the bound),
 bitwise determinism, and bitwise independence of a row from the other lanes,
 the window's later rows, its packed row and the padding. Against the serial
 chain on hf2q's cache one layer's gated output moves by at most 1.0% of the
-row RMS in a deliberately peaked fixture.
+row RMS in a deliberately peaked fixture, a relative RMS of 6.2e-4 to 7.9e-4
+per row, also across five steps with partial acceptance and cursor
+truncation; the test limits are 2% and 2e-3. The same token verified at
+another offset of another window can differ in its last bits (relative RMS
+about 4e-6), because the split partition follows the window's start; that
+alignment comes from the lane's own acceptance history, never from its
+cohort.
+
+An independent review measured the route's error against the exact F64
+attention at 3e-4 on flat and about 1e-3 on peaked attention, 1.1 to 2.5
+times the serial chain's on peaked attention; half the tile's error is the
+half query the serial chain also uses, the rest the half centroids. The
+probability operand of P·V is `p * norm / 16` in half: it saturates for value
+norms above 1,048,064, and a token that shares a split with a dominant one
+drops out once the operand is below 3e-8, which is invisible for norms from
+1 up, 1.7e-3 in the worst head at 0.25 and 2% at 0.02. The stored norms were
+therefore surveyed on the real caches: a diagnostic binary printed, every 50
+verify commits of one exact four-agent run per model, the norms of every
+committed token of the step's lanes (about 2,900 tokens per lane at the
+end, `$V/splash-gap/attnverify/runs/norm-table.txt`).
+
+| Stored value norm | min | 0.1% | 1% | 50% | 99% | 99.9% | max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Qwen3.8, lowest layer (rank 1) | 2.02 | 2.16 | 2.58 | 7.03 | 11.90 | 13.91 | 15.40 |
+| Qwen3.8, highest layer (rank 15) | 56.70 | 60.48 | 65.21 | 84.99 | 107.09 | 125.94 | 168.20 |
+| Qwen3.8, all 16 layers, all snapshots | 1.99 | | | | | | 168.20 |
+| Qwen3.6, lowest layer (rank 1) | 2.89 | 3.16 | 3.50 | 7.01 | 9.97 | 11.12 | 13.19 |
+| Qwen3.6, highest layer (rank 9) | 16.72 | 17.36 | 17.90 | 26.27 | 33.20 | 34.65 | 36.33 |
+| Qwen3.6, all 10 layers, all snapshots | 2.83 | | | | | | 36.33 |
+
+Key norms are 16.2 to 29.1. No layer is below 0.5 or above 1e5, so the
+operand needs no rescaling for these models; a model whose value norms left
+1 to 1e6 would need a per-row power-of-two operand scale first.
+
+The review also found that the split kernel's 26 to 29 KiB of static
+threadgroup memory doubled under Metal shader validation and aborted under
+the debug layer. That storage is now threadgroup memory bound by the host
+(same arithmetic, equal output digests plain, under either layer, under
+both, and from runtime-compiled source), and the route reports itself
+unavailable, so the step keeps the per-row chain, when a kernel's threads or
+threadgroup memory exceed the device's limits. A step the switch asked for
+and the route refused logs its reason once.
 
 Model free the route takes 0.051, 0.116 and 0.331 ms per Qwen3.8 layer at
 four lanes (0.033, 0.048, 0.103 ms at one) and 0.046, 0.083 and 0.195 ms per
 Qwen3.6 layer, including the K/V encodes and the gate: 0.70 to 0.97 times
 Splash's store, split and reduce at four lanes and 1.2 to 1.5 times at one
 lane, where six dispatches against three and the extra barrier decide.
+Splash's numbers are from its own tool and warm-up; they were not
+re-measured under this bench's filler protocol.
 
-In situ, same binary (`86cb2fda` on unpublished mlx-native `f06c7f6`,
-prepared FFN and projections on), one exact Q5 run per cell, all
-`CalibrationPass` (`$V/splash-gap/attnverify/runs`):
+In situ, same binary (sha256 `a57c958d…`: this change before its rebase
+onto `eea0fa1a` and before the review fixes above, which leave the
+arithmetic unchanged; prepared FFN and projections on), one exact Q5 run per
+cell, all `CalibrationPass` (`$V/splash-gap/attnverify/runs`):
 
 | Qwen3.8, per cycle | 1 lane | 2 lanes | 3 lanes | 4 lanes |
 |---|---:|---:|---:|---:|

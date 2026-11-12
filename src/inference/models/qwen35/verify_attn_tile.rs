@@ -22,7 +22,15 @@
 //! A row's output depends on its lane's cursor, its offset in the window, its
 //! query and the cache before its causal end only, never on the other lanes,
 //! the window's later rows, its packed row or the padding (mlx-native
-//! `test_tq_hb_verify_tile`, `verify_attn_tile_tests`).
+//! `test_tq_hb_verify_tile`, `verify_attn_tile_tests`). The same token
+//! verified at another offset of another window (another split partition)
+//! may differ in its last bits.
+//!
+//! The kernel carries probability times value norm in half, which is exact
+//! to half precision for stored value norms from about 1 to 1e6 (below 1,
+//! tokens next to a dominant one start to drop out). The stored norms of the
+//! served models are 2.0 to 168 (Qwen3.8-27B, 16 layers) and 2.8 to 36
+//! (Qwen3.6-35B-A3B, 10 layers) over a four-agent coding run.
 
 use std::cell::OnceCell;
 use std::sync::LazyLock;
@@ -90,8 +98,8 @@ fn tile_shape(
 /// full-attention layer: a TQ-only cache with 8-bit codes, a compiled
 /// geometry (head dim 256, six or eight query heads per KV head, capacity a
 /// page multiple), every window of at most eight rows with room in its slot,
-/// and the Metal tensor pipelines on this device. Otherwise the caller runs
-/// the stock chain.
+/// and the Metal tensor pipelines within this device's threadgroup limits.
+/// Otherwise the caller runs the stock chain; the first refusal is logged.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tq_verify_tile_route(
     registry: &mut KernelRegistry,
@@ -105,21 +113,45 @@ pub(crate) fn tq_verify_tile_route(
     max_seq_len: u32,
 ) -> Result<bool> {
     let shape = tile_shape(n_heads, n_kv_heads, head_dim, max_seq_len, width);
-    let admitted = slot.tq.is_some()
-        && slot.k.is_none()
-        && shape.supported()
-        && windows.iter().all(|window| {
-            (1..=VERIFY_TILE_ROWS as usize).contains(&window.rows)
-                && slot
-                    .current_len
-                    .get(window.slot.0 as usize)
-                    .is_some_and(|&len| len as usize + window.rows <= max_seq_len as usize)
+    let refusal = if slot.tq.is_none() || slot.k.is_some() {
+        Some("the cache is not TQ-only")
+    } else if !shape.supported() {
+        Some(
+            "no kernel for this geometry (needs 8-bit codes, head dim 256, six or eight \
+             query heads per KV head and a capacity that is a multiple of 32)",
+        )
+    } else if !windows.iter().all(|window| {
+        (1..=VERIFY_TILE_ROWS as usize).contains(&window.rows)
+            && slot
+                .current_len
+                .get(window.slot.0 as usize)
+                .is_some_and(|&len| len as usize + window.rows <= max_seq_len as usize)
+    }) {
+        Some("a window has more than eight rows or no room in its slot")
+    } else if !tq_hb_verify_tile_available(registry, device, &shape)
+        .map_err(|e| anyhow!("probe tiled verify attention: {e}"))?
+    {
+        Some("the device lacks the Metal tensor API or the kernels' threadgroup limits")
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        // The switch asked for the route; say once why a step keeps the
+        // per-row chain.
+        static FIRST_REFUSAL: std::sync::Once = std::sync::Once::new();
+        FIRST_REFUSAL.call_once(|| {
+            tracing::info!(
+                reason,
+                num_heads = n_heads,
+                num_kv_heads = n_kv_heads,
+                head_dim,
+                codebook_bits = shape.codebook_bits,
+                capacity = max_seq_len,
+                "Qwen DFlash2 verify keeps the per-row attention chain: tiled TQ attention refused"
+            );
         });
-    if !admitted {
-        return Ok(false);
     }
-    tq_hb_verify_tile_available(registry, device, &shape)
-        .map_err(|e| anyhow!("probe tiled verify attention: {e}"))
+    Ok(refusal.is_none())
 }
 
 /// Tiled TQ attention and output gate of one joint full-attention layer.
