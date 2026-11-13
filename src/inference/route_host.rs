@@ -128,6 +128,7 @@ pub(crate) const SWITCHES: &[SwitchRow] = &[
     row("HF2Q_QWEN_VERIFY_REPLAY_REUSE",  One,       &[]),
     row("HF2Q_DFLASH2_CONTEXT_FIRST",     One,       &[]),
     row("HF2Q_DFLASH2_DRAFT_PREFETCH",    One,       &[]),
+    // The decision-candidate kernel is portable; `check` is a diagnostic.
     row("HF2Q_DFLASH2_GPU_DECISIONS",     One,       &[]),
     // Row-exact matvec, top-k and reduce kernels: portable.
     row("HF2Q_QWEN_MOE_BATCHED",          OnOffTrue, &[]),

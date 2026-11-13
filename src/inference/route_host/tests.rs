@@ -100,6 +100,8 @@ fn route_host_grammar_is_each_readers_own() {
         "HF2Q_QWEN_VERIFY_MIXER_FUSED",
         "HF2Q_QWEN_VERIFY_REPLAY_REUSE",
         "HF2Q_DFLASH2_CONTEXT_FIRST",
+        "HF2Q_DFLASH2_DRAFT_PREFETCH",
+        "HF2Q_DFLASH2_GPU_DECISIONS",
     ] {
         assert_eq!(grammar(name), Some(Grammar::One), "{name}");
     }
