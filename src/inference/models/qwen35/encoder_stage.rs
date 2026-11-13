@@ -101,21 +101,37 @@ use mlx_native::{CommandEncoder, EncoderSession, MlxDevice};
 /// The command buffers a multi-row forward has committed without a wait
 /// since its last host wait, in commit order.
 struct Submitted {
-    /// The device of a forward that submits its layers without a wait and
-    /// without the shared-event fence (`HF2Q_QWEN_PREFILL_WAIT_LAYERS`
-    /// above 1); `None` at the default cadence.
-    pipelined: Option<MlxDevice>,
-    commands: Vec<CommandEncoder>,
+    /// Whether the forward submits its layers without a wait and without
+    /// the shared-event fence (`HF2Q_QWEN_PREFILL_WAIT_LAYERS` above 1).
+    pipelined: bool,
+    commands: Vec<Kept>,
     /// The label each command was committed under.
     #[cfg(test)]
     labels: Vec<String>,
+}
+
+/// A command buffer committed without a wait: the encoder that committed
+/// it, or the command a session handed over when it moved on to its next
+/// stage.
+enum Kept {
+    Encoder(CommandEncoder),
+    Command(mlx_native::SubmittedCommand),
+}
+
+impl Kept {
+    fn wait_until_completed(&self) -> mlx_native::Result<()> {
+        match self {
+            Kept::Encoder(encoder) => encoder.wait_until_completed(),
+            Kept::Command(command) => command.wait_until_completed(),
+        }
+    }
 }
 
 thread_local! {
     static SUBMITTED: std::cell::RefCell<Option<Submitted>> =
         const { std::cell::RefCell::new(None) };
     /// The emptied list of the last forward: its allocation serves the next.
-    static SPARE: std::cell::RefCell<Vec<CommandEncoder>> =
+    static SPARE: std::cell::RefCell<Vec<Kept>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// Test failpoint ([`FailSubmitted`]).
     #[cfg(test)]
@@ -141,7 +157,7 @@ impl SubmittedCommands {
     /// (decode) forward keeps nothing and releases at commit, as before.
     pub(super) fn open(active: bool) -> Self {
         let next = active.then(|| Submitted {
-            pipelined: None,
+            pipelined: false,
             commands: SPARE.with(|spare| std::mem::take(&mut *spare.borrow_mut())),
             #[cfg(test)]
             labels: Vec::new(),
@@ -167,11 +183,11 @@ impl Drop for SubmittedCommands {
 }
 
 /// Mark this thread's forward as one that submits its layers without a
-/// wait and without the fence (`device`: `Some`), or not.
-pub(super) fn set_pipelined(device: Option<&MlxDevice>) {
+/// wait and without the fence, or not.
+pub(super) fn set_pipelined(pipelined: bool) {
     SUBMITTED.with(|cell| {
         if let Some(submitted) = cell.borrow_mut().as_mut() {
-            submitted.pipelined = device.cloned();
+            submitted.pipelined = pipelined;
         }
     });
 }
@@ -186,7 +202,7 @@ fn pipelined() -> bool {
     SUBMITTED.with(|cell| {
         cell.borrow()
             .as_ref()
-            .is_some_and(|submitted| submitted.pipelined.is_some())
+            .is_some_and(|submitted| submitted.pipelined)
     })
 }
 
@@ -194,6 +210,10 @@ fn pipelined() -> bool {
 /// forward's next host wait. Outside a multi-row forward the command is
 /// released at once, as before.
 pub(super) fn retain_submitted(command: CommandEncoder, label: &str) {
+    retain(Kept::Encoder(command), label);
+}
+
+fn retain(command: Kept, label: &str) {
     SUBMITTED.with(|cell| {
         if let Some(submitted) = cell.borrow_mut().as_mut() {
             submitted.commands.push(command);
@@ -203,24 +223,6 @@ pub(super) fn retain_submitted(command: CommandEncoder, label: &str) {
     });
     #[cfg(not(test))]
     let _ = label;
-}
-
-/// A fresh command encoder when this thread's forward is pipelined.
-fn pipelined_encoder() -> Result<Option<CommandEncoder>> {
-    SUBMITTED.with(|cell| {
-        cell.borrow()
-            .as_ref()
-            .and_then(|submitted| submitted.pipelined.as_ref())
-            .map(observed_encoder)
-            .transpose()
-    })
-}
-
-fn observed_encoder(device: &MlxDevice) -> Result<CommandEncoder> {
-    device
-        .command_encoder()
-        .map(crate::inference::native_observation::encoder)
-        .context("command encoder behind a kept command buffer")
 }
 
 /// Wait for every kept command buffer and report the first failure in
@@ -257,8 +259,11 @@ fn settle_kept(last: Option<(&CommandEncoder, &str)>) -> Result<()> {
     let total = commands.len() + usize::from(last.is_some());
     let mut first: Option<(usize, anyhow::Error)> = None;
     let mut failed = 0usize;
-    for (index, command) in commands.iter().chain(last.map(|(command, _)| command)).enumerate() {
-        let waited = command.wait_until_completed();
+    for index in 0..total {
+        let waited = match commands.get(index) {
+            Some(command) => command.wait_until_completed(),
+            None => last.map_or(Ok(()), |(command, _)| command.wait_until_completed()),
+        };
         #[cfg(test)]
         let waited = if FailPoint::hits(&labels[index]) {
             waited.and(Err(mlx_native::MlxError::CommandBufferError(format!(
@@ -498,33 +503,39 @@ impl<'sess> LayerEncoder<'sess> {
                 Ok(())
             }
             LayerEncoder::Sessioned(sess) => {
-                if let Some(next) = pipelined_encoder()? {
+                if pipelined() {
                     // A prefill forward that submits its layers without a
                     // wait: commit without the shared-event fence. The
                     // next command buffer then starts without a wait for
                     // the event (measured 0.08 ms per command buffer),
                     // ordered behind this one by Metal's tracking of the
                     // buffers both use, like every `Plain` command buffer
-                    // of a layer. The session continues on a fresh
-                    // encoder; the committed one is kept so the forward's
-                    // next host wait reads its status.
-                    let mut submitted = std::mem::replace(sess.encoder(), next);
-                    submitted.commit_labeled(label);
-                    retain_submitted(submitted, label);
-                    return Ok(());
+                    // of a layer.
+                    sess.begin_stage(label);
+                    sess.commit_stage()
+                        .with_context(|| format!("EncoderSession::commit_stage({label})"))?;
+                } else {
+                    sess.fence_stage(Some(label))
+                        .with_context(|| format!("EncoderSession::fence_stage({label})"))?;
                 }
-                sess.fence_stage(Some(label))
-                    .with_context(|| format!("EncoderSession::fence_stage({label})"))?;
-                // iter91 borrowed-session: the session lives until the outer
-                // forward_gpu_impl drops the Option<EncoderSession> AFTER the
-                // output-head terminal commit_and_wait drains the GPU.  The
-                // freshly-rotated CB here is the NEXT stage's dispatch target,
-                // and the encoded wait orders its GPU work behind this fence's
-                // signal.  This is exactly the iter90b spec §2 H1b shape that
-                // the wait_event + cb_count smoke tests prove correct in
-                // mlx-native — see /opt/mlx-native/tests/encoder_session_*.rs.
-                sess.reset_for_next_stage()
-                    .with_context(|| format!("EncoderSession::reset_for_next_stage({label})"))?;
+                // The session moves on to a fresh command buffer (with the
+                // wait for a pending fence encoded on it: the next stage's
+                // GPU work is ordered behind this stage's signal). A
+                // multi-row forward keeps the committed command so its next
+                // host wait reads this stage's status; a decode forward
+                // releases it as before.
+                if retaining() {
+                    let committed = sess.reset_for_next_stage_keeping().with_context(|| {
+                        format!("EncoderSession::reset_for_next_stage_keeping({label})")
+                    })?;
+                    if let Some(command) = committed {
+                        retain(Kept::Command(command), label);
+                    }
+                } else {
+                    sess.reset_for_next_stage().with_context(|| {
+                        format!("EncoderSession::reset_for_next_stage({label})")
+                    })?;
+                }
                 Ok(())
             }
         }
@@ -636,28 +647,6 @@ impl<'sess> LayerEncoder<'sess> {
     /// decode path.  The arm is preserved for completeness — callers may
     /// reach it on greedy/argmax paths if they thread a session in the
     /// future.
-    /// [`Self::fence_or_commit`] for a stage whose command buffer must be
-    /// kept at every wait cadence (the joint prefill's gather and join):
-    /// under the session at the default cadence the stage is fenced as
-    /// before, and the session continues on a fresh encoder so the committed
-    /// one can be kept; `reset_for_next_stage` encodes the wait for the
-    /// fence on it. Dispatches, the fence and the waits are unchanged.
-    pub(super) fn fence_or_commit_kept(self, device: &MlxDevice, label: &str) -> Result<()> {
-        match self {
-            LayerEncoder::Sessioned(sess) if retaining() && !pipelined() => {
-                sess.fence_stage(Some(label))
-                    .with_context(|| format!("EncoderSession::fence_stage({label})"))?;
-                let submitted = std::mem::replace(sess.encoder(), observed_encoder(device)?);
-                sess.reset_for_next_stage().with_context(|| {
-                    format!("EncoderSession::reset_for_next_stage({label})")
-                })?;
-                retain_submitted(submitted, label);
-                Ok(())
-            }
-            encoder => encoder.fence_or_commit(label),
-        }
-    }
-
     pub(super) fn commit_unlabeled(self) -> Result<()> {
         match self {
             LayerEncoder::Plain(mut enc) => {

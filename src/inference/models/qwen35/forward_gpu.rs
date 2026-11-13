@@ -5605,7 +5605,7 @@ impl Qwen35Model {
         // Such a forward's layer submits skip the shared-event fence and
         // hand their command buffers to the forward's kept list
         // (`encoder_stage::SubmittedCommands`, opened by `forward_gpu_impl`).
-        super::encoder_stage::set_pipelined(pipelined_layers.then_some(device));
+        super::encoder_stage::set_pipelined(pipelined_layers);
         let ffn_terminal_k_batch = if small_nextn_verifier {
             // Exact speculative verification is a fixed, short graph whose
             // scratch buffers are retained until the output-head drain. One
@@ -6149,7 +6149,7 @@ impl Qwen35Model {
                                 })?;
                             }
                         }
-                        enc.fence_or_commit_kept(&device, "layer.full_attn.joint_gather")
+                        enc.fence_or_commit("layer.full_attn.joint_gather")
                             .context("commit joint prefill attention gather")?;
                     }
                     let mut outputs = Vec::with_capacity(joint_segments.len());
@@ -6218,7 +6218,7 @@ impl Qwen35Model {
                         )
                         .with_context(|| format!("joint prefill attention join layer {layer_idx}"))?;
                     }
-                    enc.fence_or_commit_kept(&device, "layer.full_attn.cue_fold_join")
+                    enc.fence_or_commit("layer.full_attn.cue_fold_join")
                         .context("commit joint prefill attention join")?;
                     joined
                 }

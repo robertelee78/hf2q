@@ -1313,6 +1313,22 @@ fn every_command_buffer_committed_without_a_wait_can_fail_the_forward() {
                     );
                 }
             }
+            // A layer's fenced stages: the DeltaNet projection stage and
+            // the attention stages. Under the encoder session they are
+            // session command buffers, handed over when the session moves
+            // on; a session forward that carries a whole layer in one
+            // command buffer has no such stage of its own.
+            for label in ["layer.gdn.stage_a", "layer.full_attn."] {
+                let (error, kept) = fails(label, 0);
+                assert_eq!(
+                    error.is_some(),
+                    kept,
+                    "wait {wait} (session {session}): a failed {label} command was dropped"
+                );
+                if wait == 1 {
+                    assert!(kept, "wait 1 (session {session}): no {label} stage command was kept");
+                }
+            }
             // The DeltaNet recurrence stage is its own command buffer except
             // where a session forward carries a whole layer in one.
             let (error, kept) = fails("layer.gdn.ops5-9", 1);
