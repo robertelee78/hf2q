@@ -387,7 +387,8 @@ the model loads.
   bitwise equal to its per-slot prefills. When the switch is unset and the
   device cannot build the tensor pipelines (no Metal tensor API), the load
   logs `Gemma warm live attention default is unavailable; using the stock
-  kernel` and serves vec-hybrid; an explicit `tensor` is not replaced.
+  kernel` and serves vec-hybrid; an explicit `tensor` on such a device
+  refuses the model load with the reason.
 - **`0`, `off`, `false` or `stock`:** kill switch; warm prefills use the
   vec-hybrid kernel (one decode-style pass per query over the whole
   history).

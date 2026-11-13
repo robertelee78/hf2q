@@ -295,19 +295,27 @@ fn parse_warm_tiled_switch(
     }
 }
 
-/// Applies the device probe to a resolved switch: an unset switch whose
-/// default route cannot build on this device falls back to vec-hybrid.
-/// An explicit value is never replaced; its dispatch reports the failure.
+/// Applies the device probe to a resolved switch. The tensor route needs
+/// the Metal tensor API: an unset switch whose default cannot build on this
+/// device falls back to vec-hybrid (with the reason), and an explicit
+/// `tensor` there is an error, so the load refuses it instead of failing at
+/// the first warm resume. Other kernels are never probed.
 fn admit_warm_kernel(
     resolved: Resolved<GemmaLiveKernel>,
     tensor_unavailable: impl FnOnce() -> Option<String>,
-) -> (Resolved<GemmaLiveKernel>, Option<String>) {
-    if resolved.source != RouteSource::Default || resolved.value != GemmaLiveKernel::TensorF16 {
-        return (resolved, None);
+) -> std::result::Result<(Resolved<GemmaLiveKernel>, Option<String>), String> {
+    if resolved.value != GemmaLiveKernel::TensorF16 {
+        return Ok((resolved, None));
     }
-    match tensor_unavailable() {
-        None => (resolved, None),
-        Some(reason) => (Resolved::fallback(WARM_ATTENTION_STOCK), Some(reason)),
+    match (tensor_unavailable(), resolved.source) {
+        (None, _) => Ok((resolved, None)),
+        (Some(reason), RouteSource::Default) => {
+            Ok((Resolved::fallback(WARM_ATTENTION_STOCK), Some(reason)))
+        }
+        (Some(reason), _) => Err(format!(
+            "{WARM_TILED_ATTENTION_ENV}=tensor cannot run on this host: {reason}. Unset it for \
+             the automatic route (vec-hybrid here) or set 0 for vec-hybrid"
+        )),
     }
 }
 
@@ -346,7 +354,8 @@ pub(crate) fn warm_live_kernel_from_env(
     let raw = std::env::var(WARM_TILED_ATTENTION_ENV).ok();
     let resolved = parse_warm_tiled_switch(raw.as_deref()).map_err(anyhow::Error::msg)?;
     let (kernel, fallback_reason) =
-        admit_warm_kernel(resolved, || tensor_route_unavailable(registry, device));
+        admit_warm_kernel(resolved, || tensor_route_unavailable(registry, device))
+            .map_err(anyhow::Error::msg)?;
     if let Some(reason) = &fallback_reason {
         tracing::warn!(
             reason,
@@ -1956,18 +1965,32 @@ mod tests {
     fn warm_default_falls_back_to_vec_hybrid_without_the_tensor_api() {
         let unavailable = || Some("no tensor API".to_string());
         // Unset: the default falls back and reports why.
-        let (kernel, reason) = admit_warm_kernel(Resolved::default_value(TensorF16), unavailable);
+        let (kernel, reason) =
+            admit_warm_kernel(Resolved::default_value(TensorF16), unavailable).unwrap();
         assert_eq!(kernel, Resolved::fallback(VecHybrid));
         assert_eq!(reason.as_deref(), Some("no tensor API"));
         // Unset on a capable device: the default serves.
-        let (kernel, reason) = admit_warm_kernel(Resolved::default_value(TensorF16), || None);
+        let (kernel, reason) =
+            admit_warm_kernel(Resolved::default_value(TensorF16), || None).unwrap();
         assert_eq!(kernel, Resolved::default_value(TensorF16));
         assert_eq!(reason, None);
-        // Explicit values are never replaced and never probed.
-        for explicit in [TensorF16, TiledF16, VecHybrid] {
+        // Explicit `tensor`: kept on a capable device, refused at load (not
+        // at the first warm resume) on a host without the tensor API, with a
+        // message naming the switch, the reason and the way out.
+        let (kernel, reason) =
+            admit_warm_kernel(Resolved::environment(TensorF16), || None).unwrap();
+        assert_eq!(kernel, Resolved::environment(TensorF16));
+        assert_eq!(reason, None);
+        let refusal = admit_warm_kernel(Resolved::environment(TensorF16), unavailable).unwrap_err();
+        for needle in [WARM_TILED_ATTENTION_ENV, "no tensor API", "Unset it", "set 0"] {
+            assert!(refusal.contains(needle), "{refusal}");
+        }
+        // The other explicit kernels need no tensor API and are not probed.
+        for explicit in [TiledF16, VecHybrid] {
             let (kernel, reason) = admit_warm_kernel(Resolved::environment(explicit), || {
-                panic!("an explicit warm kernel must not be probed")
-            });
+                panic!("a kernel without tensor pipelines must not be probed")
+            })
+            .unwrap();
             assert_eq!(kernel, Resolved::environment(explicit));
             assert_eq!(reason, None);
         }
@@ -1998,7 +2021,7 @@ mod tests {
             "{reason:?} {native:?}"
         );
         let (resolved, why) =
-            admit_warm_kernel(Resolved::default_value(TensorF16), || reason.clone());
+            admit_warm_kernel(Resolved::default_value(TensorF16), || reason.clone()).unwrap();
         if native == [true, true] {
             assert_eq!(resolved, Resolved::default_value(TensorF16));
             assert_eq!(why, None);
