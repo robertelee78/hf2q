@@ -1546,6 +1546,67 @@ fn the_scratch_caps_bound_the_pool_and_change_no_bit() {
     });
 }
 
+/// A pool that uncapped forwards left warm is trimmed when a capped forward
+/// puts its caps on, before that forward's first capped allocation: the pool
+/// never holds more free bytes than the retained cap while caps are in
+/// force, from the first window on. (Without the trim the warm pool stayed
+/// resident, beside everything the capped forward was served outside it,
+/// until the first layer boundary.) The capped forward's bits are those of
+/// the uncapped one.
+#[test]
+fn caps_trim_a_pool_that_uncapped_forwards_left_warm() {
+    use super::decode_pool;
+    use super::prefill_prepared::{ForcedWaitLayers, ScratchCapsForTest};
+    with_synthetic_model(|model| {
+        // No cue and one lane: at the default cadence this forward is not
+        // capped.
+        let lane = Lane::new(0, &[40], 800, 0);
+        let run = |wait: usize| -> Vec<u32> {
+            let _cadence = ForcedWaitLayers::set(wait);
+            let mut cache = cache(model);
+            let _scope = PrefillScope::forced(true);
+            prefill_history(model, &mut cache, &lane);
+            let logits = model
+                .forward_gpu_last_logits(
+                    &lane.tokens(lane.start(), lane.rows()),
+                    &positions_for_range(lane.start() as i32, lane.rows()),
+                    &mut cache,
+                    SlotId(0),
+                )
+                .expect("forward");
+            bits(&logits)
+        };
+        decode_pool::take_capped_free_peak();
+        let reference = run(1);
+        assert_eq!(
+            decode_pool::take_capped_free_peak(),
+            0,
+            "the warming forward ran under caps"
+        );
+        decode_pool::checked_reset_decode_pool().expect("reset");
+        let warm = decode_pool::free_bytes();
+        assert!(warm > 0, "the uncapped forward left no pool");
+        // A capped forward under caps far below the warm pool.
+        let retained = warm / 8;
+        let capped = {
+            let _caps = ScratchCapsForTest::set(usize::MAX, retained, warm / 4);
+            run(8)
+        };
+        let peak = decode_pool::take_capped_free_peak();
+        assert!(
+            peak <= retained,
+            "the pool held {peak} free bytes under a retained cap of {retained} (warm pool {warm})"
+        );
+        decode_pool::checked_reset_decode_pool().expect("reset");
+        assert!(
+            decode_pool::free_bytes() <= retained,
+            "the pool kept {} bytes over the retained cap of {retained}",
+            decode_pool::free_bytes()
+        );
+        assert!(capped == reference, "the trimmed, capped forward changed bits");
+    });
+}
+
 /// `HF2Q_DENSE_Q_ARENA_RESET=0` turns the scratch reset at a layer's host
 /// wait off. A forward that skipped host waits would then accumulate
 /// scratch under caps that count on the reset, so with the override the

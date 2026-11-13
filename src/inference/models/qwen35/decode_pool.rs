@@ -113,6 +113,10 @@ pub fn pooled_alloc_buffer(
         });
     }
     if let Some(caps) = CAPS.with(std::cell::Cell::get) {
+        #[cfg(test)]
+        CAPPED_FREE_PEAK.with(|peak| {
+            peak.set(peak.get().max(DECODE_POOL.with(|cell| cell.borrow().free_bytes())))
+        });
         // Before the allocation: what the pool held free at its last reset
         // plus what it has handed out since bounds what it holds now (a
         // reused buffer counts as if it were new). A request that could
@@ -152,7 +156,8 @@ thread_local! {
     static LAYER_SCRATCH_REPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The pool's part of [`ISSUED_BYTES`].
     static POOLED_SINCE_RESET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Free bytes the pool held after its last reset.
+    /// Free bytes the pool held after its last reset or, later, when caps
+    /// were put on it.
     static FREE_AT_RESET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The caps in force, and whether they end with the next reset.
     static CAPS: std::cell::Cell<Option<PoolCaps>> = const { std::cell::Cell::new(None) };
@@ -224,9 +229,50 @@ pub(crate) fn take_layer_scratch_peak() -> u64 {
 ///   every issued buffer, so the free buffers have no user.
 /// Released and outside buffers are allocated again when needed: that costs
 /// allocation time, never memory.
+///
+/// Putting caps on a pool that earlier, uncapped forwards left warm trims
+/// it at once: its free buffers are released when they exceed
+/// `caps.retained`, before the first capped allocation, so the hard cap
+/// holds from the first window on. The free buffers are those the
+/// forward's own initial reset took back (a reset follows a drained queue
+/// and the last use of every issued buffer); what the forward has issued
+/// since (its embedding) is in use and is not touched. The release takes
+/// effect immediately (the pool removes them from the residency set and
+/// commits the set); no command buffer is needed for it.
 pub(crate) fn cap_pool(caps: Option<PoolCaps>) {
     CAPS.with(|cell| cell.set(caps));
     CAPS_END_AT_RESET.with(|cell| cell.set(false));
+    if let Some(caps) = caps {
+        if !default_pool() {
+            return;
+        }
+        DECODE_POOL.with(|cell| {
+            let mut pool = cell.borrow_mut();
+            if pool.free_bytes() > caps.retained {
+                pool.clear();
+            }
+            // What the pool holds now is this plus what is in use, which is
+            // exactly what it has handed out since its reset.
+            FREE_AT_RESET.with(|free| free.set(pool.free_bytes()));
+            #[cfg(test)]
+            CAPPED_FREE_PEAK.with(|peak| peak.set(peak.get().max(pool.free_bytes())));
+        });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The most free bytes the pool held at a capped allocation or at a cap
+    /// activation since the last [`take_capped_free_peak`].
+    static CAPPED_FREE_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The most free bytes this thread's pool held while caps were in force
+/// (sampled when the caps were put on and at every capped allocation) since
+/// the last call.
+#[cfg(test)]
+pub(crate) fn take_capped_free_peak() -> usize {
+    CAPPED_FREE_PEAK.with(|peak| peak.replace(0))
 }
 
 /// The caps of [`cap_pool`] apply through one more reset and then end. A
