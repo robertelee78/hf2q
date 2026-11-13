@@ -1,30 +1,73 @@
-//! What the engines resident in this process have committed of the host's
-//! memory.
+//! What the engines of this process have committed of the host's memory, and
+//! how a load is admitted against it.
 //!
-//! Every `serve::load_engine` call reserves its engine's commitment here
-//! before it reads a weight. A load that selects memory-carrying routes (a
-//! DFlash2 drafter, prepared planes, retained scratch) is admitted against
-//! what the engines already resident have committed, not against the
-//! incoming model alone, and the decision and its reservation are one
-//! transaction ([`Ledger::admit`]): two loads that run at once, through one
-//! pool or through independent ones, cannot both decide against the same
-//! total.
+//! # The two bounds of an admission
+//!
+//! A load that selects memory-carrying routes (a DFlash2 drafter, prepared
+//! planes, retained scratch) may take them only within both of these
+//! (`dflash2_policy::memory_verdict`):
+//!
+//! - **the budget**: physical memory minus every commitment charged here,
+//!   minus the incoming model's file and KV budget, minus a reserve. A
+//!   commitment is an engine's whole claim (model file, KV budget, drafter,
+//!   planes, scratch), allocated or not. What a running engine may still
+//!   allocate (a KV cache it has not filled, planes it prepares on first
+//!   use, scratch) is inside its charge, so the budget already withholds it
+//!   from the incoming load.
+//! - **the present**: the memory the host reports available at the decision
+//!   (free, inactive and purgeable pages), minus the incoming model's file
+//!   and the reserve. This is what nobody holds now, whatever the ledger
+//!   says: it excludes memory of a torn-down engine that the kernel has not
+//!   reclaimed yet, buffers a command still running holds, the allocator's
+//!   cache, and every other process.
+//!
+//! The budget alone would hand out bytes that are promised to no engine but
+//! not back from the kernel; the present alone would hand out bytes a
+//! running engine has been promised and not yet taken. A load takes the
+//! smaller of the two. Neither bound covers another process that grows
+//! after the decision; the reserve is the only margin for that.
+//!
+//! # Why an admission cannot race
+//!
+//! - **Against another admission.** The decision and its reservation are
+//!   one transaction ([`Ledger::admit`]): the commitment is reserved only if
+//!   the charged total has not grown since the decision read it, else the
+//!   decision is made again. Two loads, through one pool or through
+//!   independent ones, are never both decided against the same total. The
+//!   later of two loads sees the earlier one charged in full from the
+//!   moment it was admitted, before it has allocated anything.
+//! - **Against a teardown.** A reservation stays charged until its engine's
+//!   teardown has completed, so a decision that overlaps a teardown counts
+//!   the engine in full. An admission also waits for every teardown that is
+//!   in progress before it decides ([`TeardownMarker`]), so that it reads
+//!   the host's available memory after the engine has let go and not in the
+//!   middle. A teardown that does not end does not block loads for good: the
+//!   wait is bounded, and the engine stays charged.
+//! - **Against a running engine that allocates.** Those allocations are
+//!   inside the engine's charge: the budget withheld them before the engine
+//!   made them.
+//!
+//! # Who releases a reservation
 //!
 //! A reservation is owned by whoever owns the model's buffers. While a load
 //! is in progress that is the loading thread; `Engine::spawn*` then gives it
 //! to the worker thread with the model, and it is released by the worker's
 //! teardown alone (`WorkerTeardown` in `serve::api::engine_supervisor`):
-//! after the model is dropped, the thread's GPU caches are released, the
-//! thread has terminated, the dropped buffers are flushed from the Metal
-//! residency set and the kernel has reclaimed them
-//! ([`wait_until_reclaimed`]). Dropping the last `Engine` handle does not release it: an
-//! evicted engine whose worker is still tearing down, or is wedged inside
-//! Metal, still holds its memory and is still counted, and a teardown that
-//! fails leaves it counted for good ([`Reservation::strand`]).
+//! after the model is dropped, the thread's GPU caches are dropped, the
+//! thread has terminated and every queue the model's threads encoded on is
+//! settled (`inference::device_settle`). Dropping the last `Engine` handle
+//! does not release it: an evicted engine whose worker is still tearing
+//! down, or is wedged inside Metal, still holds its memory and is still
+//! charged, and a teardown that fails leaves it charged for good
+//! ([`Reservation::strand`]).
+//!
+//! The kernel returns the pages of released buffers on its own, some time
+//! after user space has let go. The ledger does not claim to know when: the
+//! present bound is what keeps those bytes from being handed out.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
 /// What one engine holds resident, by component.
@@ -61,12 +104,19 @@ struct Entry {
     /// The model the engine was loaded from, for diagnostics.
     model: PathBuf,
     commitment: Commitment,
+    /// The thread that owns the model has begun to tear it down.
+    tearing_down: bool,
 }
 
 #[derive(Default)]
 struct Entries {
     next_id: u64,
     reserved: BTreeMap<u64, Entry>,
+    /// Reservations whose teardown is in progress.
+    tearing_down: usize,
+    /// Admissions waiting for those teardowns.
+    #[cfg(test)]
+    admissions_waiting: usize,
 }
 
 impl Entries {
@@ -85,21 +135,56 @@ impl Entries {
             Entry {
                 model: model.to_path_buf(),
                 commitment,
+                tearing_down: false,
             },
         );
         id
     }
+
+    /// The teardown of `id` is over, released or stranded. Returns whether
+    /// one was in progress.
+    fn end_teardown(&mut self, id: u64, release: bool) -> bool {
+        let entry = if release {
+            self.reserved.remove(&id)
+        } else {
+            None
+        };
+        let was_tearing_down = match (entry, self.reserved.get_mut(&id)) {
+            (Some(entry), _) => entry.tearing_down,
+            (None, Some(entry)) => std::mem::take(&mut entry.tearing_down),
+            (None, None) => false,
+        };
+        if was_tearing_down {
+            self.tearing_down -= 1;
+        }
+        was_tearing_down
+    }
 }
 
-/// The commitments of the resident engines.
-#[derive(Default)]
+/// How long an admission waits for teardowns in progress before it decides
+/// with their engines still charged.
+const ADMISSION_TEARDOWN_WAIT: Duration = Duration::from_secs(30);
+
+/// The commitments of the engines of this process.
 pub(crate) struct Ledger {
     entries: Mutex<Entries>,
+    teardown_ended: Condvar,
+    teardown_wait: Duration,
 }
 
 impl Ledger {
     pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Self::with_teardown_wait(ADMISSION_TEARDOWN_WAIT)
+    }
+
+    /// A ledger whose admissions wait at most `teardown_wait` for teardowns
+    /// in progress.
+    pub(crate) fn with_teardown_wait(teardown_wait: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            entries: Mutex::default(),
+            teardown_ended: Condvar::new(),
+            teardown_wait,
+        })
     }
 
     fn entries(&self) -> std::sync::MutexGuard<'_, Entries> {
@@ -110,6 +195,7 @@ impl Ledger {
     }
 
     /// Sum of every reservation's commitment.
+    #[cfg(test)]
     pub(crate) fn total(&self) -> u64 {
         self.entries().total()
     }
@@ -124,12 +210,51 @@ impl Ledger {
         }
     }
 
-    /// Decide a load against what is resident and reserve what it decided,
-    /// as one transaction.
+    /// Wait for the teardowns in progress to end, for at most the ledger's
+    /// bound, and return the charged total.
+    fn total_after_teardowns(&self, model: &Path) -> u64 {
+        // Mutated only by the test-only count of waiting admissions.
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut entries = self.entries();
+        if entries.tearing_down > 0 {
+            tracing::info!(
+                model = %model.display(),
+                teardowns = entries.tearing_down,
+                "load waits for engine teardowns in progress"
+            );
+        }
+        #[cfg(test)]
+        {
+            entries.admissions_waiting += 1;
+        }
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let (mut entries, waited) = self
+            .teardown_ended
+            .wait_timeout_while(entries, self.teardown_wait, |entries| {
+                entries.tearing_down > 0
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        {
+            entries.admissions_waiting -= 1;
+        }
+        if waited.timed_out() {
+            tracing::warn!(
+                model = %model.display(),
+                teardowns = entries.tearing_down,
+                waited_s = self.teardown_wait.as_secs(),
+                "engine teardowns did not end; the load is decided with their engines charged"
+            );
+        }
+        entries.total()
+    }
+
+    /// Decide a load against what is charged and reserve what it decided,
+    /// as one transaction, after the teardowns in progress have ended.
     ///
-    /// `decide` receives the resident total and returns its decision with
+    /// `decide` receives the charged total and returns its decision with
     /// the commitment that decision needs. The commitment is reserved only
-    /// if the resident total has not grown since `decide` read it; if
+    /// if the charged total has not grown since `decide` read it; if
     /// another load reserved in between, `decide` runs again against the new
     /// total. A total that shrank leaves the decision valid, only more
     /// cautious than it had to be. `decide` runs without the ledger locked,
@@ -140,7 +265,7 @@ impl Ledger {
         model: &Path,
         mut decide: impl FnMut(u64) -> Result<(T, Commitment), E>,
     ) -> Result<(T, Reservation), E> {
-        let mut resident = self.total();
+        let mut resident = self.total_after_teardowns(model);
         loop {
             let (decision, commitment) = decide(resident)?;
             let mut entries = self.entries();
@@ -159,6 +284,12 @@ impl Ledger {
             resident = now;
         }
     }
+
+    /// Admissions that are waiting for a teardown to end.
+    #[cfg(test)]
+    pub(crate) fn admissions_waiting(&self) -> usize {
+        self.entries().admissions_waiting
+    }
 }
 
 /// One engine's commitment; released when dropped.
@@ -168,11 +299,20 @@ pub(crate) struct Reservation {
 }
 
 impl Reservation {
-    /// Keep the commitment counted for the rest of the process: the teardown
+    /// What the thread that owns the engine's model uses to say that its
+    /// teardown has begun.
+    pub(crate) fn teardown_marker(&self) -> TeardownMarker {
+        TeardownMarker {
+            ledger: Arc::clone(&self.ledger),
+            id: self.id,
+        }
+    }
+
+    /// Keep the commitment charged for the rest of the process: the teardown
     /// of the engine it stands for failed, so its memory cannot be taken to
     /// be free. `reason` is logged with the model.
     pub(crate) fn strand(self, reason: &str) {
-        let entries = self.ledger.entries();
+        let mut entries = self.ledger.entries();
         let entry = entries.reserved.get(&self.id);
         tracing::error!(
             model = %entry.map_or_else(String::new, |entry| entry.model.display().to_string()),
@@ -180,14 +320,21 @@ impl Reservation {
             reason,
             "engine memory stays reserved until the process restarts"
         );
+        let ended = entries.end_teardown(self.id, false);
         drop(entries);
+        if ended {
+            self.ledger.teardown_ended.notify_all();
+        }
         std::mem::forget(self);
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.ledger.entries().reserved.remove(&self.id);
+        let ended = self.ledger.entries().end_teardown(self.id, true);
+        if ended {
+            self.ledger.teardown_ended.notify_all();
+        }
     }
 }
 
@@ -197,6 +344,27 @@ impl std::fmt::Debug for Reservation {
             .debug_struct("Reservation")
             .field("id", &self.id)
             .finish()
+    }
+}
+
+/// Marks the start of an engine's teardown. From [`Self::begin`] until the
+/// reservation is released or stranded, new admissions wait
+/// ([`Ledger::admit`]).
+pub(crate) struct TeardownMarker {
+    ledger: Arc<Ledger>,
+    id: u64,
+}
+
+impl TeardownMarker {
+    /// The thread that owns the model has stopped serving and is giving the
+    /// model's memory back.
+    pub(crate) fn begin(self) {
+        let mut entries = self.ledger.entries();
+        if let Some(entry) = entries.reserved.get_mut(&self.id) {
+            if !std::mem::replace(&mut entry.tearing_down, true) {
+                entries.tearing_down += 1;
+            }
+        }
     }
 }
 
@@ -223,39 +391,39 @@ pub(crate) fn process_footprint_bytes() -> anyhow::Result<u64> {
 
 /// How often the footprint is read while the kernel reclaims.
 const RECLAIM_POLL: Duration = Duration::from_millis(5);
-/// The footprint counts as settled when it has not fallen for this many
-/// polls in a row (100 ms).
+/// The footprint counts as quiet when it has not fallen for this many polls
+/// in a row (100 ms).
 const RECLAIM_QUIET_POLLS: u32 = 20;
 /// A fall smaller than this between the start of a quiet stretch and a poll
 /// is not a reclaim in progress.
 const RECLAIM_TOLERANCE_BYTES: u64 = 64 << 20;
-/// Polls after which a footprint that is still falling is a failed teardown
-/// (60 s).
-const RECLAIM_LIMIT_POLLS: u32 = 12_000;
+/// Polls after which the wait gives up (10 s).
+const RECLAIM_LIMIT_POLLS: u32 = 2_000;
 
-/// Wait until the kernel has returned the memory of buffers this process
-/// released.
+/// Give the kernel time to return the memory of buffers this process
+/// released, before the loads that waited for a teardown read what the host
+/// has available.
 ///
 /// Releasing a Metal buffer is not the end of it: the kernel reclaims the
-/// pages afterwards, on its own. Measured on the Qwen3.6 gate artifact, 15
-/// to 28 GiB of a 40 GiB engine were still charged to the process when every
-/// thread of the engine had terminated and its devices were flushed, and
-/// were gone 0.1 to 1 s later. The kernel gives no handle to wait on, so
-/// this watches the one thing that shows it, the process footprint, until it
-/// has stopped falling: until no poll in [`RECLAIM_QUIET_POLLS`] consecutive
-/// polls is more than [`RECLAIM_TOLERANCE_BYTES`] below the first of them.
-/// A footprint that keeps falling for [`RECLAIM_LIMIT_POLLS`] polls is an
-/// error.
+/// pages afterwards, on its own, and gives no handle to wait on. Measured on
+/// the Qwen3.6 gate artifact, 15 to 28 GiB of a 40 GiB engine were still
+/// charged to the process when every thread of the engine had terminated
+/// and its queues were settled, and were gone 0.1 to 1 s later. This watches
+/// the process footprint until [`RECLAIM_QUIET_POLLS`] consecutive polls are
+/// none more than [`RECLAIM_TOLERANCE_BYTES`] below the first of them, and
+/// reports whether it saw that within [`RECLAIM_LIMIT_POLLS`] polls.
 ///
-/// The footprint is the whole process's. Memory another engine frees at the
-/// same time only prolongs the wait; memory allocated elsewhere in the
-/// process faster than the kernel reclaims (it reclaimed 100 GiB/s and more
-/// in the measurement) would hide a reclaim that is still running.
-pub(crate) fn wait_until_reclaimed() -> anyhow::Result<()> {
-    settle(process_footprint_bytes, std::thread::sleep)
+/// It is a courtesy, not a proof, and nothing relies on it for safety. The
+/// footprint is the whole process's: it cannot say that one engine's bytes
+/// are back. A load that reads the host's available memory too early is
+/// admitted to less than it could have had; what keeps it from being
+/// admitted to more is the present bound of the admission (module
+/// documentation).
+pub(crate) fn await_kernel_reclaim() -> anyhow::Result<()> {
+    quiet_footprint(process_footprint_bytes, std::thread::sleep)
 }
 
-fn settle(
+fn quiet_footprint(
     mut footprint: impl FnMut() -> anyhow::Result<u64>,
     mut pause: impl FnMut(Duration),
 ) -> anyhow::Result<()> {
@@ -451,12 +619,12 @@ mod tests {
         assert_eq!(ledger.total(), (16 + 4 + 1 + 10) * GIB);
     }
 
-    /// Runs [`settle`] over a scripted footprint (the last value repeats)
+    /// Runs [`quiet_footprint`] over a scripted footprint (the last value repeats)
     /// and returns its result with the number of polls it made.
     fn settled(script: &[u64]) -> (anyhow::Result<()>, usize) {
         let mut reads = 0;
         let mut pauses = 0;
-        let result = settle(
+        let result = quiet_footprint(
             || {
                 let value = script[reads.min(script.len() - 1)];
                 reads += 1;
@@ -503,7 +671,7 @@ mod tests {
     fn a_footprint_that_never_stops_falling_fails_the_wait() {
         let mut reads = 0_u64;
         let mut polls = 0;
-        let result = settle(
+        let result = quiet_footprint(
             || {
                 reads += 1;
                 Ok(u64::MAX - reads * 2 * RECLAIM_TOLERANCE_BYTES)
@@ -513,7 +681,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("still falling"));
         assert_eq!(polls, RECLAIM_LIMIT_POLLS);
         // A footprint that cannot be read fails it at once.
-        let unreadable = settle(|| anyhow::bail!("no rusage"), |_| {});
+        let unreadable = quiet_footprint(|| anyhow::bail!("no rusage"), |_| {});
         assert!(unreadable.is_err());
     }
 

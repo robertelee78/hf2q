@@ -1,8 +1,9 @@
 //! The memory reservation of a model follows the teardown of the worker
-//! thread that owns it ([`WorkerTeardown`]). Model-free: the worker body, the
-//! thread's caches and the flush are stand-ins that block where a real
-//! teardown can block, and the loads that compete for the memory are decided
-//! by the real DFlash2 policy against the real ledger.
+//! thread that owns it ([`WorkerTeardown`]), and new loads are serialized
+//! against it. Model-free: the worker body, the thread's caches and the flush
+//! are stand-ins that block where a real teardown can block, and the loads
+//! that compete for the memory are decided by the real DFlash2 policy against
+//! the real ledger.
 
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -31,6 +32,10 @@ struct Host {
 
 impl Host {
     fn new() -> Self {
+        Self::on(Ledger::new())
+    }
+
+    fn on(ledger: Arc<Ledger>) -> Self {
         let facts = qwen38();
         let planes = plane_bytes(
             &facts.tensors,
@@ -44,7 +49,7 @@ impl Host {
             physical: MEMORY_RESERVE_BYTES + 2 * one_engine - 1,
             one_engine,
             facts,
-            ledger: Ledger::new(),
+            ledger,
         }
     }
 
@@ -57,6 +62,7 @@ impl Host {
                     &self.facts,
                     HostFacts {
                         physical_bytes: self.physical,
+                        available_bytes: self.physical,
                         kv_budget_bytes: KV,
                         resident_bytes,
                     },
@@ -70,8 +76,9 @@ impl Host {
             .expect("auto never fails")
     }
 
-    /// A load made now is admitted against the first engine: it does not
-    /// get the planes that engine still holds.
+    /// No teardown is in progress: a load made now is decided at once, and
+    /// against the first engine. It does not get the planes that engine
+    /// still holds.
     fn assert_first_engine_still_counted(&self, stage: &str) {
         assert_eq!(self.ledger.total(), self.one_engine, "{stage}");
         let (selection, reservation) = self.load();
@@ -83,8 +90,8 @@ impl Host {
         assert_eq!(selection.commitment.plane_bytes, 0, "{stage}");
         assert!(selection.routes.any_withheld(), "{stage}");
         drop(reservation);
-        // Loads racing each other while the teardown is blocked fare no
-        // better: none of them gets the planes.
+        // Loads racing each other fare no better: none of them gets the
+        // planes.
         std::thread::scope(|scope| {
             let loads: Vec<_> = (0..4).map(|_| scope.spawn(|| self.load())).collect();
             for load in loads {
@@ -113,6 +120,14 @@ thread_local! {
 /// A gate a teardown step waits at.
 fn gate() -> (Sender<()>, Receiver<()>) {
     channel()
+}
+
+/// Spins until `ready` holds. The conditions waited for here are reached by
+/// another thread without any further input, so this ends or the test hangs.
+fn until(ready: impl Fn() -> bool) {
+    while !ready() {
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -148,7 +163,7 @@ fn another_load_cannot_claim_an_engines_memory_until_its_teardown_is_complete() 
         })
         .expect("spawn");
 
-    // The engine is running.
+    // The engine is running: a load is decided at once, with it charged.
     host.assert_first_engine_still_counted("running");
 
     // Evicted: every handle is gone and the worker is told to stop. It
@@ -157,23 +172,87 @@ fn another_load_cannot_claim_an_engines_memory_until_its_teardown_is_complete() 
     drop(stop);
     assert_eq!(seen.recv(), Ok("model dropped"));
     assert_eq!(seen.recv(), Ok("releasing thread caches"));
-    host.assert_first_engine_still_counted("model dropped, thread caches not released");
 
-    // The caches are released and the thread ends, which destroys the
-    // thread-local the release did not name. The flush blocks.
-    drop(open_cache_release);
-    assert_eq!(seen.recv(), Ok("thread caches released"));
-    assert_eq!(seen.recv(), Ok("other thread-local destroyed"));
+    std::thread::scope(|scope| {
+        // Loads that arrive during the teardown are not decided: they wait.
+        let loads: Vec<_> = (0..3).map(|_| scope.spawn(|| host.load())).collect();
+        until(|| host.ledger.admissions_waiting() == loads.len());
+        assert_eq!(
+            host.ledger.total(),
+            host.one_engine,
+            "model dropped, thread caches not released: charged, nothing reserved beside it"
+        );
+
+        // The caches are released and the thread ends, which destroys the
+        // thread-local the release did not name. The flush blocks.
+        drop(open_cache_release);
+        assert_eq!(seen.recv(), Ok("thread caches released"));
+        assert_eq!(seen.recv(), Ok("other thread-local destroyed"));
+        assert_eq!(seen.recv(), Ok("flushing"));
+        assert_eq!(host.ledger.admissions_waiting(), loads.len());
+        assert_eq!(
+            host.ledger.total(),
+            host.one_engine,
+            "thread gone, queues not settled: charged, nothing reserved beside it"
+        );
+
+        // The flush completes. Only now are the loads decided, one after
+        // the other: the first gets the whole profile the engine held, and
+        // the others are admitted against it.
+        drop(open_flush);
+        engine.join().expect("teardown thread");
+        let decided: Vec<_> = loads
+            .into_iter()
+            .map(|load| load.join().expect("load"))
+            .collect();
+        let whole: Vec<_> = decided
+            .iter()
+            .filter(|(selection, _)| selection.commitment.plane_bytes > 0)
+            .collect();
+        assert_eq!(whole.len(), 1, "the planes fit once");
+        assert_eq!(
+            whole[0].0.memory.map(|memory| memory.resident_bytes),
+            Some(0),
+            "it was decided after the engine was released"
+        );
+        assert_eq!(whole[0].0.commitment.total(), host.one_engine);
+    });
+    assert_eq!(host.ledger.total(), 0);
+    assert_eq!(host.ledger.admissions_waiting(), 0);
+}
+
+#[test]
+fn a_teardown_that_does_not_end_delays_a_load_only_for_the_bound() {
+    let host = Host::on(Ledger::with_teardown_wait(
+        std::time::Duration::from_millis(50),
+    ));
+    let (_selection, reservation) = host.load();
+    let (events, seen) = channel::<&'static str>();
+    let (open_flush, flush_gate) = gate();
+    let teardown = WorkerTeardown::new(Some(reservation), move || {
+        Ok(Box::new(move || {
+            let _ = events.send("flushing");
+            let _ = flush_gate.recv();
+            Ok(())
+        }) as DeferredFlush)
+    });
+    let supervisor = EngineSupervisor::new_with_monitor_start(|_| Ok(()));
+    let engine = spawn_supervised_worker("teardown-stuck-test", supervisor, teardown, |_| {})
+        .expect("spawn");
     assert_eq!(seen.recv(), Ok("flushing"));
-    host.assert_first_engine_still_counted("thread gone, residency not flushed");
-
-    // The flush completes: only now is the memory another load's to claim.
+    // The flush hangs. A load waits for the bound, then is decided with the
+    // engine still charged: it gets no planes.
+    let (selection, reservation) = host.load();
+    assert_eq!(
+        selection.memory.map(|memory| memory.resident_bytes),
+        Some(host.one_engine)
+    );
+    assert_eq!(selection.commitment.plane_bytes, 0);
+    drop(reservation);
+    assert_eq!(host.ledger.total(), host.one_engine);
     drop(open_flush);
     engine.join().expect("teardown thread");
     assert_eq!(host.ledger.total(), 0);
-    let (after, _reservation) = host.load();
-    assert!(!after.routes.any_withheld());
-    assert_eq!(after.commitment.total(), host.one_engine);
 }
 
 /// Runs one worker to the end of its teardown with the given outcomes and

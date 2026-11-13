@@ -9,6 +9,7 @@
 //! Populated by ADR-013 (Qwen3.5 / Qwen3.5-MoE).
 
 pub mod models;
+pub(crate) mod device_settle;
 pub(crate) mod native_observation;
 pub(crate) mod route_host;
 pub mod spec_decode;

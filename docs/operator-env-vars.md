@@ -244,7 +244,9 @@ and the drafter is resident beside the target. Before selecting, the server
 computes
 
 ```
-headroom = physical memory - resident engines - model file bytes - KV budget - 8 GiB
+budget   = physical memory - charged engines - model file bytes - KV budget - 8 GiB
+present  = memory available now - model file bytes - 8 GiB
+headroom = the smaller of budget and present
 planes   = sum over the covered Q4_K/Q6_K weights of the plane sets of every
            switch that resolved on:
            Q4_K: 16 bytes per 32 weights + 16 bytes per 256 weights
@@ -253,32 +255,57 @@ scratch  = what the kernels of those switches retain between steps
 ```
 
 where the KV budget is the configured `--kv-cache-budget` (zero when none is
-configured), the drafter is its file size, and *resident engines* is what
-every engine already loaded in this process has committed: its model file,
-KV budget, drafter, planes and scratch. The decision and the reservation of
-what it decided are one transaction, so two loads running at once, through
-one pool or through separate ones, are never both decided against the same
-total. A reservation belongs to whoever owns the model's buffers: the
-loading thread during the load, then the engine's worker thread. It is
-released by the worker's teardown and by nothing else, in this order: the
-worker drops the model; it drops the GPU weight cache it built for it
-(uploaded copies and prepared planes); the thread terminates, which destroys
-every other thread-local cache it had; the cache's device is flushed, which
-commits the removals the dropped buffers staged in the Metal residency set
-and waits for the commands the worker had committed there; the teardown
-waits until the process footprint has stopped falling, because the kernel
-reclaims the pages of released buffers on its own, after user space has let
-go (measured on the Qwen3.6 gate artifact: 15 to 28 GiB of a 40 GiB engine
-were still charged to the process at that point and were gone 0.1 to 1 s
-later); then the reservation goes. Evicting an engine or dropping its last handle releases
-nothing: an engine whose worker is still tearing down, or is wedged inside
-Metal, is still counted, and a teardown step that fails leaves it counted
-until the process restarts (one ERROR line, `engine memory stays reserved
-until the process restarts`). A load that fails after its worker started
-stops the worker and waits for that teardown before the load is retried on
-the prior route, and the retry reserves its own commitment. The loading
-thread gives up the GPU cache it primed before a reservation it still holds
-is released.
+configured), the drafter is its file size, *charged engines* is what every
+engine of this process has committed (its model file, KV budget, drafter,
+planes and scratch, allocated or not), and *memory available now* is what
+the host reports free, inactive or purgeable at the decision.
+
+The two bounds answer different questions. The budget withholds what a
+running engine has been promised and has not taken yet (a KV cache it has
+not filled, planes it prepares on first use). The present withholds what
+somebody holds now whatever the ledger says: memory of an engine that was
+just torn down and that the kernel has not reclaimed yet, another process,
+the allocator's cache. A load takes the smaller, so on a host where other
+programs hold memory the default may keep fewer routes than on an idle one;
+the audit line gives both bounds and what the host had available. Another
+process that grows after the decision is covered by neither; the 8 GiB
+reserve is the only margin for it.
+
+The decision and the reservation of what it decided are one transaction, so
+two loads running at once, through one pool or through separate ones, are
+never both decided against the same total. A reservation belongs to whoever
+owns the model's buffers: the loading thread during the load, then the
+engine's worker thread. It is released by the worker's teardown and by
+nothing else, in this order: the worker drops the model; it drops the GPU
+weight cache it built for it (uploaded copies and prepared planes); the
+thread terminates, which destroys every other thread-local cache it had;
+every command queue the model's threads encoded on is settled (an empty
+command buffer is committed and waited for, which commits the removals the
+dropped buffers staged in the Metal residency set and waits for the commands
+committed earlier on that queue; request-local queues are settled as each
+request ends); then the reservation goes. Evicting an engine or dropping its
+last handle releases nothing: an engine whose worker is still tearing down,
+or is wedged inside Metal, is still charged, and a teardown step that fails
+leaves it charged until the process restarts (one ERROR line, `engine memory
+stays reserved until the process restarts`).
+
+New loads are serialized against teardowns: a load that arrives while an
+engine is being torn down waits for the teardown to end before it is
+decided (at most 30 s; after that it is decided with the engine still
+charged). The kernel returns the pages of released buffers on its own, some
+time after the process has let go of them (measured on the Qwen3.6 gate
+artifact: 15 to 28 GiB of a 40 GiB engine were still charged to the process
+after the last step above and were gone 0.1 to 1 s later). The teardown
+gives it up to 10 s, watching the process footprint, so that a waiting load
+reads the available memory afterwards; that is a courtesy and no claim
+rests on it. What keeps a load from being given memory that is not back is
+the present bound.
+
+A load that fails after its worker started stops the worker and waits for
+that teardown before the load is retried on the prior route, and the retry
+reserves its own commitment. The loading thread drops the GPU cache it
+primed and settles its queues before a reservation it still holds is
+released.
 
 The planes of the model's own prepared routes are resident whatever the
 policy says: `HF2Q_DFLASH2=0 HF2Q_QWEN_PREFILL_PREPARED=1` prepares and keeps
@@ -290,14 +317,16 @@ before the loader is called. A plane set is prepared once however many switches 
 it, except the output head: the staged draft (at four slots) and the
 prepared target head each keep a copy of their own when
 `HF2Q_REPACKED_GGUF_SHARED_HEAD=0` (1,052,876,800 bytes each on Qwen3.8).
-No current switch retains scratch; a route that does gets its figure in
-`switch_scratch_bytes` (`src/serve/dflash2_policy.rs`).
+No current route retains scratch; one that does gets its figure in
+`route_scratch_bytes` (`src/serve/dflash2_policy.rs`), which sees the
+resolved routes as a whole because routes may share a scratch pool.
 
 If `drafter + planes + scratch <= headroom` every admitted row applies.
 Otherwise every plane-carrying row is withheld and DFlash2 is kept when the
 drafter and what is left fit; if not even the drafter fits, auto keeps the
-prior route. The audit line reports the headroom, the resident engines, the
-drafter, the plane and the scratch bytes. A plane-carrying switch set by
+prior route. The audit line reports the headroom, the present bound, the
+available memory, the charged engines, the drafter, the plane and the
+scratch bytes. A plane-carrying switch set by
 hand is never dropped, and its planes count.
 
 Measured, exact four-agent Q5 on the gate artifacts, peak process
@@ -341,7 +370,12 @@ switch as `NAME=value(source)` with source `env`, `profile`, `default` or
 `target_source`, `drafter_source`, `profile`, `switches.<NAME>` =
 `{value, source, withheld}`, `memory`), so a gate receipt that records the
 runtime document binds the route that ran, not the environment that asked.
-It is `null` for an engine that was not loaded by `hf2q serve`.
+It is `null` for an engine that was not loaded by `hf2q serve`. The memory
+rule, the host probe and the artifact's storage can each leave a route of
+the profile off without failing startup, so the default a gate measures is
+only the qualified default when `profile` is `full`: the release-gate Q5
+cases require it (`HF2Q_Q5_DFLASH2_PROFILE=full` is a readiness check on
+that field, beside the policy, descriptor and qualification checks).
 
 | Var | Default | Values | Effect |
 |---|---|---|---|

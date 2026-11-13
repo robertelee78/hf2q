@@ -2397,36 +2397,51 @@ the planes a route keeps and the row another row requires, so a value the
 reader leaves off (`HF2Q_REPACKED_GGUF_M32=on`) selects no kernel, counts no
 plane and never refuses the stock load it leaves.
 
-A memory rule runs before selection: headroom is physical memory minus what
-the engines already resident in the process have committed, the model file,
-the configured KV budget and 8 GiB; the drafter costs its file size, the
-prepared planes the native layout's bytes for the weights they cover (two
-output heads when the shared head is off), and a route's retained scratch
-its declared figure (none today). When the planes do not fit, the
+A memory rule runs before selection. A load may take its drafter, planes
+and scratch only within two bounds, and takes the smaller. The budget is
+physical memory minus what the engines of the process have committed
+(allocated or not), the model file, the configured KV budget and 8 GiB: it
+withholds what a running engine has been promised and has not taken yet.
+The present is the memory the host reports available at the decision minus
+the model file and 8 GiB: it withholds what somebody holds now whatever the
+ledger says (memory of a torn-down engine that the kernel has not reclaimed,
+another process). The drafter costs its file size, the prepared planes the
+native layout's bytes for the weights they cover (two output heads when the
+shared head is off), and the routes' retained scratch its declared figure
+(none today; `route_scratch_bytes`). When the planes do not fit, the
 plane-carrying rows are withheld and DFlash2 is kept if the drafter fits;
-otherwise the prior route is kept. Every `load_engine` call decides against
-a process ledger (`serve::resident_memory`) and reserves what it decided in
-one transaction, before it allocates, so concurrent loads through one pool
-or several are never decided against the same total. The reservation is
-owned by whoever owns the model's buffers: the loading thread, then the
-worker thread, to which `Engine::spawn*` hands it with the model. Only the
-worker's teardown releases it (`WorkerTeardown`): the model is dropped, the
-thread's GPU weight cache is dropped, the thread terminates (a second
-thread joins it, so every thread-local it had is destroyed), the cache's
-device is flushed (the staged residency-set removals are committed and the
-commands committed on its queue are waited for), the teardown waits until
-the process footprint has stopped falling (the kernel reclaims released
-buffers asynchronously: up to 28 GiB of a 40 GiB engine were still charged
-to the process after the flush, for up to a second), and then the
-reservation is released. An evicted engine whose worker is still tearing down or is
-wedged stays counted, and a teardown step that fails strands the
-reservation for the life of the process; a load that fails after its worker
-started waits for that teardown before the prior-route retry, which
-reserves its own commitment. The planes of a
-prepared route the operator set are the model's own and are committed with
-or without a drafter, also beside `HF2Q_DFLASH2=0`; only the staged draft's
-head needs the drafter. The hot-swap pool charges the same figure instead of
-the GGUF file size.
+otherwise the prior route is kept.
+
+Every `load_engine` call decides against a process ledger
+(`serve::resident_memory`) and reserves what it decided in one transaction,
+before it allocates, so concurrent loads through one pool or several are
+never decided against the same total. The reservation is owned by whoever
+owns the model's buffers: the loading thread, then the worker thread, to
+which `Engine::spawn*` hands it with the model. Only the worker's teardown
+releases it (`WorkerTeardown`): the model is dropped, the thread's GPU
+weight cache is dropped, the thread terminates (a second thread joins it, so
+every thread-local it had is destroyed), and every command queue the
+model's threads encoded on is settled (`inference::device_settle`: the
+staged residency-set removals are committed and the commands committed on
+the queue are waited for; request-local queues are settled as each request
+ends). An evicted engine whose worker is still tearing down or is wedged
+stays charged, and a teardown step that fails strands the reservation for
+the life of the process. New loads are serialized against teardowns: a load
+waits (bounded) for a teardown in progress before it is decided. A load
+that fails after its worker started waits for that teardown before the
+prior-route retry, which reserves its own commitment.
+
+The kernel returns the pages of released buffers asynchronously (up to
+28 GiB of a 40 GiB engine were still charged to the process after the last
+teardown step, for up to a second) and gives no per-engine signal. The
+ledger does not claim to know when they are back: the present bound is what
+keeps them from being handed out, and the teardown only gives the kernel
+time before the waiting loads read it.
+
+The planes of a prepared route the operator set are the model's own and are
+committed with or without a drafter, also beside `HF2Q_DFLASH2=0`; only the
+staged draft's head needs the drafter. The hot-swap pool charges the same
+figure instead of the GGUF file size.
 
 Measured peak process footprint of the default profile on the exact
 four-agent Q5: Qwen3.8 76.73 GB against 57.87 GB on the prior route (the rule
@@ -2441,8 +2456,13 @@ every consumer to read the planes and is not part of this change.
 The decision is published by `/hf2q/v1/runtime` as
 `measurement_snapshot.active_controls.dflash2` (policy, selection, qualifying
 class, descriptor, target and drafter source, every switch with value,
-source and withholding reason, memory commitment), so a Q5 receipt, which
-records that document, binds the route that ran.
+source and withholding reason, memory commitment and both memory bounds), so
+a Q5 receipt, which records that document, binds the route that ran. Because
+the memory rule (now also bounded by what the host has available), the host
+probe and the artifact's storage can each withhold a profile route without
+failing startup, the release-gate Q5 cases require `profile == full` as a
+readiness check: a default that kept fewer routes cannot pass as the
+qualified default.
 
 One INFO line per load, `DFlash2 policy resolved`, is the startup audit the
 first two D6 items quote: `policy`, `selected`, `reason` (the qualifying

@@ -6,7 +6,7 @@
     "Override any variable with HF2Q_Q5_<NAME>; null variables are required. See scripts/four_agent/README.md.",
     "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv.",
     "Release-gate default arm (ADR-067 D6): the case passes no HF2Q_* route switch and the target is the qualified vanilla artifact, so the server's `DFlash2 policy resolved` INFO line must report policy=auto selected=true with every profile switch sourced `profile`. HF2Q_Q5_DFLASH2=0 is the kill-switch control arm (prior promoted route; policy=off selected=false). HF2Q_Q5_HF_HUB_CACHE and HF2Q_Q5_HF_HUB_OFFLINE=1 point the drafter lookup at another Hugging Face cache and forbid the download: with an empty cache the server must log the drafter WARN line and pass on the prior route. Empty values are not exported.",
-    "Route binding (ADR-067 D6): HF2Q_Q5_DFLASH2_POLICY (auto|off|required), HF2Q_Q5_DFLASH2_DESCRIPTOR (a pinned descriptor id) and HF2Q_Q5_DFLASH2_QUALIFICATION (pinned_pair|same_shapes) are readiness checks against measurement_snapshot.active_controls.dflash2 of /hf2q/v1/runtime, skipped when empty (a binary before the field publishes none). The release-gate default arm sets all three; the kill-switch arm sets HF2Q_Q5_DFLASH2=0 and HF2Q_Q5_DFLASH2_POLICY=off. The recorded runtime document carries every switch's resolved value and source."
+    "Route binding (ADR-067 D6): HF2Q_Q5_DFLASH2_POLICY (auto|off|required), HF2Q_Q5_DFLASH2_DESCRIPTOR (a pinned descriptor id), HF2Q_Q5_DFLASH2_QUALIFICATION (pinned_pair|same_shapes) and HF2Q_Q5_DFLASH2_PROFILE (full|partial|none) are readiness checks against measurement_snapshot.active_controls.dflash2 of /hf2q/v1/runtime, skipped when empty (a binary before the field publishes none). The release-gate default arm sets all four, with HF2Q_Q5_DFLASH2_PROFILE=full: a load whose memory rule or host withheld a profile route is not the qualified default and must not pass as it; the kill-switch arm sets HF2Q_Q5_DFLASH2=0 and HF2Q_Q5_DFLASH2_POLICY=off. The recorded runtime document carries every switch's resolved value and source."
   ],
   "workload": {
     "id": "adr063-q5-qwen36-n4-coding-ctx262144",
@@ -30,7 +30,8 @@
     "HF_HUB_OFFLINE": "",
     "DFLASH2_POLICY": "",
     "DFLASH2_DESCRIPTOR": "",
-    "DFLASH2_QUALIFICATION": ""
+    "DFLASH2_QUALIFICATION": "",
+    "DFLASH2_PROFILE": ""
   },
   "binary": "{HF2Q_BIN}",
   "artifact": {
@@ -105,6 +106,12 @@
         "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
         "field": "measurement_snapshot.active_controls.dflash2.qualification",
         "equals": "{DFLASH2_QUALIFICATION}",
+        "skip_if_empty": true
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "measurement_snapshot.active_controls.dflash2.profile",
+        "equals": "{DFLASH2_PROFILE}",
         "skip_if_empty": true
       }
     ]

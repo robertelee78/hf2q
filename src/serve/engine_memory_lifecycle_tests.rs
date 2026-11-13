@@ -1,12 +1,16 @@
-//! Real-artifact proof that an engine's memory reservation is released only
-//! when its memory is free.
+//! Real-artifact observation of an engine's teardown.
 //!
 //! Loads a Qwen model through `serve::load_engine` on the default route,
 //! drops the engine as an eviction does (nobody stops or joins the worker),
 //! and reads the process's physical footprint at the moment the process
-//! ledger lets the reservation go: by then the engine's memory must be back
-//! with the kernel, not merely released by user space. Run alone, on a
-//! release build:
+//! ledger lets the reservation go, and for six seconds after. It checks that
+//! the teardown the code performs (model dropped, thread caches dropped,
+//! thread terminated, queues settled, kernel given time) leaves nothing that
+//! comes back later, on this host and this model. It is an observation of
+//! the whole process, not a proof that an engine's bytes are back: what
+//! keeps a load from being admitted to memory that is not back is the
+//! present bound of the admission (`serve::resident_memory`). Run alone, on
+//! a release build:
 //!
 //! ```text
 //! HF2Q_ENGINE_LIFECYCLE_GGUF=/path/model.gguf cargo test --release --locked --bin hf2q -- \
@@ -38,7 +42,7 @@ fn footprint_bytes() -> u64 {
 
 #[test]
 #[ignore = "loads a real model twice; set HF2Q_ENGINE_LIFECYCLE_GGUF"]
-fn a_real_engines_reservation_is_released_only_when_its_memory_is_free() {
+fn nothing_of_a_real_engine_comes_back_after_its_reservation_is_released() {
     let path = PathBuf::from(
         std::env::var("HF2Q_ENGINE_LIFECYCLE_GGUF").expect("set HF2Q_ENGINE_LIFECYCLE_GGUF"),
     );
@@ -108,11 +112,12 @@ fn a_real_engines_reservation_is_released_only_when_its_memory_is_free() {
         let held = loaded.saturating_sub(baseline);
         let returned_late = released - settled;
         println!(
-            "[LIFECYCLE] round={round} selected={} profile={} committed_gib={:.2} \
-             loaded_gib={:.2} at_release_gib={:.2} after_release_gib=[{}] \
-             returned_after_release_gib={:.3} teardown_ms={}",
+            "[LIFECYCLE] round={round} selected={} profile={} available_gib={:.2} \
+             committed_gib={:.2} loaded_gib={:.2} at_release_gib={:.2} \
+             after_release_gib=[{}] returned_after_release_gib={:.3} teardown_ms={}",
             decision["selected"],
             decision["profile"],
+            decision["memory"]["available_bytes"].as_u64().unwrap_or(0) as f64 / GIB,
             committed as f64 / GIB,
             loaded as f64 / GIB,
             released as f64 / GIB,
@@ -130,7 +135,8 @@ fn a_real_engines_reservation_is_released_only_when_its_memory_is_free() {
         );
         // What stays after a teardown is the allocator's cache of freed host
         // blocks (`Malloc Large (empty)` in vmmap), which this process can
-        // reuse. Nothing of the engine may come back after the release.
+        // reuse. Nothing of the engine was seen to come back after the
+        // release.
         if returned_late > 256 << 20 {
             still_resident.push(format!(
                 "round {round}: {returned_late} bytes came back after the reservation was \

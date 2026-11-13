@@ -30,7 +30,8 @@
     "HF_HUB_OFFLINE": "",
     "DFLASH2_POLICY": "",
     "DFLASH2_DESCRIPTOR": "",
-    "DFLASH2_QUALIFICATION": ""
+    "DFLASH2_QUALIFICATION": "",
+    "DFLASH2_PROFILE": ""
   },
   "binary": "{HF2Q_BIN}",
   "artifact": {
@@ -115,6 +116,12 @@
         "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
         "field": "measurement_snapshot.active_controls.dflash2.qualification",
         "equals": "{DFLASH2_QUALIFICATION}",
+        "skip_if_empty": true
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "measurement_snapshot.active_controls.dflash2.profile",
+        "equals": "{DFLASH2_PROFILE}",
         "skip_if_empty": true
       }
     ]

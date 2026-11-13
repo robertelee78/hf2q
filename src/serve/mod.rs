@@ -4001,13 +4001,7 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     // the same total.
     let ledger = resident_memory::process();
     let (selection, reservation) = ledger.admit(path, |resident_bytes| {
-        let selection = dflash2_policy::resolve_for_load(
-            path,
-            config.engine_mode,
-            config.kv_cache_budget_bytes,
-            config.dwq_overlay_path.is_some(),
-            resident_bytes,
-        )?;
+        let selection = dflash2_policy::resolve_for_load(path, config, resident_bytes)?;
         let commitment = selection.commitment;
         anyhow::Ok((selection, commitment))
     })?;
@@ -4051,37 +4045,41 @@ fn load_engine_on_route(
     selection: &dflash2_policy::Selection,
     reservation: resident_memory::Reservation,
 ) -> Result<api::engine::Engine> {
-    use crate::inference::models::qwen35::forward_gpu::flush_released_gpu_cache;
+    use crate::inference::device_settle::{settle, take_thread_unsettled};
     let mut reservation = Some(reservation);
     let engine = load_and_spawn_on_route(path, config, selection, &mut reservation);
     // This thread held the model while it loaded and provisioned it. A GPU
     // weight cache it primed for that is a second copy of what the worker
     // builds for itself, or belongs to a model that failed to load: it is
-    // dropped and flushed either way, before a reservation still held here
-    // is released.
-    let cache_released =
+    // dropped and its queue settled either way. The devices the load itself
+    // created settled their queues as the load ended; one that could not is
+    // on the thread's record.
+    let settled =
         match crate::inference::models::qwen35::model::Qwen35Model::take_thread_gpu_cache() {
-            Some(device) => flush_released_gpu_cache(&device),
+            Some(device) => settle(&device),
             None => Ok(()),
-        };
-    match (reservation.take(), cache_released) {
-        // The load failed before a worker owned the model: this thread
-        // dropped it. The reservation goes when the kernel has returned
-        // what the model held; if that cannot be established the memory
-        // cannot be taken to be free.
-        (Some(reservation), released) => {
-            if let Err(error) = released.and_then(|()| resident_memory::wait_until_reclaimed()) {
-                reservation.strand(&format!(
-                    "a load of {} failed and its memory could not be released: {error:#}",
-                    path.display()
-                ));
-            }
         }
+        .and_then(|()| match take_thread_unsettled() {
+            Some(reason) => Err(anyhow::anyhow!(
+                "a command queue of the load could not be settled: {reason}"
+            )),
+            None => Ok(()),
+        });
+    match (reservation.take(), settled) {
+        // The load failed before a worker owned the model: this thread
+        // dropped it, and the reservation goes with it.
+        (Some(reservation), Ok(())) => drop(reservation),
+        // What the load allocated on this thread cannot be taken to be
+        // free.
+        (Some(reservation), Err(error)) => reservation.strand(&format!(
+            "a load of {} failed and its queues could not be settled: {error:#}",
+            path.display()
+        )),
         (None, Ok(())) => {}
         (None, Err(error)) => tracing::error!(
             model = %path.display(),
             error = %format!("{error:#}"),
-            "the loading thread's GPU cache was not released"
+            "the loading thread's command queues were not settled"
         ),
     }
     engine

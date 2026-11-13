@@ -166,6 +166,11 @@ pub(crate) struct TargetFacts {
     pub(crate) provenance: Provenance,
     /// Slots of a SlotAware worker; `None` for any other scheduler.
     pub(crate) slots: Option<u32>,
+    /// Rows one slot's KV cache can hold: the context length the engine is
+    /// loaded with. `None` when the header does not resolve one. A scratch
+    /// bound that grows with the cache takes this capacity, never the rows a
+    /// conversation happens to use.
+    pub(crate) kv_rows: Option<usize>,
     pub(crate) model_file_bytes: u64,
     pub(crate) tensors: Vec<TensorFact>,
     /// Architecture, dimensions, bound tensor shapes and tokenizer identity;
@@ -220,6 +225,7 @@ impl TargetFacts {
         path: &Path,
         engine_mode: EngineMode,
         dwq_overlay: bool,
+        requested_context: Option<crate::serve::operator_settings::RequestedContext>,
     ) -> Self {
         let architecture = gguf
             .metadata_string("general.architecture")
@@ -245,6 +251,13 @@ impl TargetFacts {
                 EngineMode::SlotAware { max_slots } => Some(max_slots),
                 _ => None,
             },
+            // The same resolution the load performs.
+            kv_rows: crate::serve::operator_settings::resolve_context_for_gguf(
+                gguf,
+                requested_context,
+            )
+            .ok()
+            .map(|context| context.effective_tokens as usize),
             model_file_bytes: std::fs::metadata(path).map_or(0, |metadata| metadata.len()),
             tensors,
             geometry: qwen.then(|| read_geometry(gguf)).flatten(),
@@ -267,6 +280,9 @@ impl TargetFacts {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HostFacts {
     pub(crate) physical_bytes: u64,
+    /// What the host reports available now: free, inactive and purgeable
+    /// pages. Nobody holds these bytes, whatever the ledger says.
+    pub(crate) available_bytes: u64,
     /// The configured aggregate KV budget; zero when none is configured.
     pub(crate) kv_budget_bytes: u64,
     /// What the engines already resident in this process have committed
@@ -280,6 +296,7 @@ impl HostFacts {
         system.refresh_memory();
         Self {
             physical_bytes: system.total_memory(),
+            available_bytes: system.available_memory(),
             kv_budget_bytes: kv_budget_bytes.unwrap_or(0),
             resident_bytes,
         }
@@ -456,6 +473,8 @@ pub(crate) struct Selection {
     /// This model without a drafter: what a load that gives the drafter up
     /// is served on.
     prior: PriorRoute,
+    /// Rows one slot's KV cache can hold ([`TargetFacts::kv_rows`]).
+    kv_rows: Option<usize>,
 }
 
 /// The route of a model without a drafter: every switch from the process
@@ -491,7 +510,7 @@ fn route_commitment(
         kv_budget_bytes: host.kv_budget_bytes,
         drafter_bytes: drafter_bytes.unwrap_or(0),
         plane_bytes: routed_plane_bytes(facts, routes, drafter_bytes.is_some()),
-        scratch_bytes: routed_scratch_bytes(facts, routes),
+        scratch_bytes: route_scratch_bytes(facts, routes),
     }
 }
 
@@ -514,6 +533,7 @@ impl Selection {
             commitment: prior.commitment,
             class: None,
             prior: prior.clone(),
+            kv_rows: facts.kv_rows,
         }
     }
 
@@ -543,6 +563,7 @@ impl Selection {
             commitment: self.prior.commitment,
             class: self.class,
             prior: self.prior.clone(),
+            kv_rows: self.kv_rows,
         }
     }
 
@@ -577,7 +598,11 @@ impl Selection {
                 "prepared_plane_bytes": self.commitment.plane_bytes,
                 "scratch_bytes": self.commitment.scratch_bytes,
                 "headroom_bytes": self.memory.map(|memory| memory.headroom_bytes),
+                "present_headroom_bytes":
+                    self.memory.map(|memory| memory.present_headroom_bytes),
+                "available_bytes": self.memory.map(|memory| memory.available_bytes),
                 "resident_bytes": self.memory.map(|memory| memory.resident_bytes),
+                "kv_rows": self.kv_rows,
             },
         })
     }
@@ -611,6 +636,8 @@ impl Selection {
             profile = self.profile_label(),
             withheld = %self.routes.withheld_audit(),
             memory_headroom_bytes = memory.headroom_bytes,
+            present_headroom_bytes = memory.present_headroom_bytes,
+            available_bytes = memory.available_bytes,
             resident_bytes = memory.resident_bytes,
             drafter_bytes = commitment.drafter_bytes,
             prepared_plane_bytes = commitment.plane_bytes,
@@ -916,34 +943,33 @@ pub(crate) fn routed_plane_bytes(
         .saturating_add(plane_bytes(&facts.tensors, &[PlaneSet::Head]).saturating_mul(copies))
 }
 
-/// Bytes of scratch the kernels of the table switch `row` retain between
-/// steps on the target `facts` describes, beyond what the stock route
-/// retains.
+/// Bytes of scratch the kernels of the routes `routes` selects retain
+/// between steps on the target `facts` describes.
 ///
-/// The one place a route's retained scratch enters memory admission: a
-/// switch whose kernels keep scratch resident gets its measured figure
-/// here, and the memory rule, the commitment, the pool's charge and the
-/// published decision carry it, with or without a drafter. No current row
-/// retains any.
-pub(crate) fn switch_scratch_bytes(_row: &SwitchRow, _facts: &TargetFacts) -> u64 {
+/// The one place a route's retained scratch enters memory admission: the
+/// memory rule, the commitment, the pool's charge and the published
+/// decision carry what this returns, with or without a drafter. It takes the
+/// resolved routes as a whole, not one switch at a time, because routes can
+/// share a pool: their scratch is then one figure, not a sum. A bound that
+/// grows with a slot's KV cache takes the cache's capacity
+/// ([`TargetFacts::kv_rows`]) and the slot count ([`TargetFacts::slots`]),
+/// never the rows in use. No current route retains any.
+pub(crate) fn route_scratch_bytes(_facts: &TargetFacts, _routes: &ResolvedRoutes) -> u64 {
     0
-}
-
-fn routed_scratch_bytes(facts: &TargetFacts, routes: &ResolvedRoutes) -> u64 {
-    SWITCHES
-        .iter()
-        .filter(|row| routes.is_on(switch(row.name)))
-        .map(|row| switch_scratch_bytes(row, facts))
-        .fold(0, u64::saturating_add)
 }
 
 /// The memory rule's numbers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MemoryEstimate {
-    /// Physical memory minus what resident engines have committed, the
-    /// model file, the configured KV budget and [`MEMORY_RESERVE_BYTES`].
+    /// What the load could take: the smaller of the budget and the present
+    /// bound ([`memory_verdict`]).
     pub(crate) headroom_bytes: u64,
-    /// What the engines already resident have committed.
+    /// The present bound: what the host reported available, minus the model
+    /// file and [`MEMORY_RESERVE_BYTES`].
+    pub(crate) present_headroom_bytes: u64,
+    /// What the host reported available at the decision.
+    pub(crate) available_bytes: u64,
+    /// What the engines already charged have committed.
     pub(crate) resident_bytes: u64,
     pub(crate) drafter_bytes: u64,
     /// Prepared planes of the routes as resolved.
@@ -963,30 +989,61 @@ pub(crate) enum MemoryVerdict {
     NoDrafter,
 }
 
-/// `headroom = physical - resident engines - model file - KV budget -
-/// reserve`; the full profile needs `drafter + planes + scratch <=
-/// headroom`, the drafter alone `drafter + its scratch <= headroom`.
+/// The memory a load may take for its drafter, planes and scratch: the
+/// smaller of two bounds (`serve::resident_memory` says why both).
+///
+/// - budget: `physical - charged engines - model file - KV budget - reserve`;
+/// - present: `available now - model file - reserve`. The model file is
+///   subtracted because loading it takes that much of what is available
+///   (cached pages of the file count as available). The KV budget is not: it
+///   is a claim on the future, which the budget bound holds, not memory the
+///   load takes now.
+///
+/// The full profile needs `drafter + planes + scratch <= headroom`, the
+/// drafter alone `drafter + its scratch <= headroom`.
 pub(crate) fn memory_verdict(
     host: HostFacts,
     model_file_bytes: u64,
     drafter_bytes: u64,
     full_route_bytes: u64,
     drafter_only_route_bytes: u64,
-) -> (MemoryVerdict, u64) {
-    let headroom = host
-        .physical_bytes
-        .saturating_sub(host.resident_bytes)
-        .saturating_sub(model_file_bytes)
-        .saturating_sub(host.kv_budget_bytes)
-        .saturating_sub(MEMORY_RESERVE_BYTES);
-    let verdict = if drafter_bytes.saturating_add(full_route_bytes) <= headroom {
+) -> (MemoryVerdict, Headroom) {
+    let headroom = Headroom {
+        budget_bytes: host
+            .physical_bytes
+            .saturating_sub(host.resident_bytes)
+            .saturating_sub(model_file_bytes)
+            .saturating_sub(host.kv_budget_bytes)
+            .saturating_sub(MEMORY_RESERVE_BYTES),
+        present_bytes: host
+            .available_bytes
+            .saturating_sub(model_file_bytes)
+            .saturating_sub(MEMORY_RESERVE_BYTES),
+    };
+    let verdict = if drafter_bytes.saturating_add(full_route_bytes) <= headroom.bytes() {
         MemoryVerdict::Full
-    } else if drafter_bytes.saturating_add(drafter_only_route_bytes) <= headroom {
+    } else if drafter_bytes.saturating_add(drafter_only_route_bytes) <= headroom.bytes() {
         MemoryVerdict::DropPlanes
     } else {
         MemoryVerdict::NoDrafter
     };
     (verdict, headroom)
+}
+
+/// The two bounds of an admission.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Headroom {
+    /// Not promised to any charged engine.
+    pub(crate) budget_bytes: u64,
+    /// Not held by anyone now.
+    pub(crate) present_bytes: u64,
+}
+
+impl Headroom {
+    /// What the load may take: within both bounds.
+    pub(crate) fn bytes(self) -> u64 {
+        self.budget_bytes.min(self.present_bytes)
+    }
 }
 
 fn gib(bytes: u64) -> String {
@@ -1262,7 +1319,7 @@ pub(crate) fn decide(
     let route_bytes = |routes: &ResolvedRoutes| {
         (
             routed_plane_bytes(facts, routes, true),
-            routed_scratch_bytes(facts, routes),
+            route_scratch_bytes(facts, routes),
         )
     };
     let (admitted_planes, admitted_scratch) = route_bytes(&admitted);
@@ -1275,13 +1332,19 @@ pub(crate) fn decide(
         dropped_planes.saturating_add(dropped_scratch),
     );
     let formula = format!(
-        "headroom {} = physical {} - resident engines {} - model file {} - KV budget {} - \
-         reserve {}",
-        gib(headroom),
+        "headroom {} = the smaller of budget {} (physical {} - resident engines {} - model \
+         file {} - KV budget {} - reserve {}) and present {} (available {} - model file {} - \
+         reserve {})",
+        gib(headroom.bytes()),
+        gib(headroom.budget_bytes),
         gib(host.physical_bytes),
         gib(host.resident_bytes),
         gib(facts.model_file_bytes),
         gib(host.kv_budget_bytes),
+        gib(MEMORY_RESERVE_BYTES),
+        gib(headroom.present_bytes),
+        gib(host.available_bytes),
+        gib(facts.model_file_bytes),
         gib(MEMORY_RESERVE_BYTES)
     );
     let qualified = match class {
@@ -1291,7 +1354,9 @@ pub(crate) fn decide(
         }
     };
     let estimate = |plane_bytes, scratch_bytes| MemoryEstimate {
-        headroom_bytes: headroom,
+        headroom_bytes: headroom.bytes(),
+        present_headroom_bytes: headroom.present_bytes,
+        available_bytes: host.available_bytes,
         resident_bytes: host.resident_bytes,
         drafter_bytes: descriptor.weights_bytes,
         plane_bytes,
@@ -1352,6 +1417,7 @@ pub(crate) fn decide(
         commitment,
         class: Some(class),
         prior,
+        kv_rows: facts.kv_rows,
     })
 }
 
@@ -1375,6 +1441,7 @@ pub(crate) fn admission_bytes(
             config.engine_mode
         }),
         config.is_some_and(|config| config.dwq_overlay_path.is_some()),
+        config.and_then(|config| config.requested_context),
     );
     let env = |name: &str| std::env::var(name).ok();
     let host = host_routes();
@@ -1399,7 +1466,7 @@ pub(crate) fn route_upper_bound(
 ) -> u64 {
     let route_bytes = |routes: &ResolvedRoutes, drafter: bool| {
         routed_plane_bytes(facts, routes, drafter)
-            .saturating_add(routed_scratch_bytes(facts, routes))
+            .saturating_add(route_scratch_bytes(facts, routes))
     };
     let prior = route_bytes(&ResolvedRoutes::resolve(None, &|_| None, env), false);
     if !matches!(
@@ -1430,22 +1497,26 @@ pub(crate) fn route_upper_bound(
 /// `resident_bytes` is what the engines already resident have committed.
 pub(crate) fn resolve_for_load(
     path: &Path,
-    engine_mode: EngineMode,
-    kv_budget_bytes: Option<u64>,
-    dwq_overlay: bool,
+    config: &crate::serve::multi_model::EngineConfig,
     resident_bytes: u64,
 ) -> Result<Selection> {
     let facts = {
         let gguf = GgufFile::open(path)
             .map_err(|error| anyhow::anyhow!("GGUF header parse failed: {error}"))?;
-        TargetFacts::read(&gguf, path, engine_mode, dwq_overlay)
+        TargetFacts::read(
+            &gguf,
+            path,
+            config.engine_mode,
+            config.dwq_overlay_path.is_some(),
+            config.requested_context,
+        )
     };
     // Asking the host here also seeds the process's host answers before any
     // prefill scope or drafter load reads them.
     let host = host_routes();
     decide(
         &facts,
-        HostFacts::read(kv_budget_bytes, resident_bytes),
+        HostFacts::read(config.kv_cache_budget_bytes, resident_bytes),
         &|name| std::env::var(name).ok(),
         &HubDrafterStore,
         &|name| host_switch_refusal(&host, name),

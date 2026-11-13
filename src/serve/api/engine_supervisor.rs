@@ -66,12 +66,15 @@ pub(super) type DeferredFlush = Box<dyn FnOnce() -> Result<()> + Send>;
 ///    returns the flush they need;
 /// 3. the worker thread terminates, which destroys every other thread-local
 ///    it had; the teardown thread waits for that with a join;
-/// 4. the teardown thread runs the flush: buffers dropped in steps 1 to 3
-///    only staged their removal from the Metal residency set, commands the
-///    worker committed may still hold them, and the kernel reclaims what
-///    user space released on its own time, so the flush ends by waiting for
-///    that (`resident_memory::wait_until_reclaimed`);
+/// 4. the teardown thread runs the flush, which settles every queue the
+///    model's threads encoded on (`inference::device_settle`): buffers
+///    dropped in steps 1 to 3 only staged their removal from the Metal
+///    residency set, and commands the worker committed without waiting may
+///    still hold them;
 /// 5. the reservation is released.
+///
+/// From step 2 until step 5 the teardown is in progress, and new admissions
+/// wait for it (`resident_memory::Ledger::admit`).
 ///
 /// A step that fails, panics or never returns leaves the reservation
 /// counted: a wedged worker and a failed flush keep their memory charged for
@@ -599,6 +602,11 @@ pub(super) fn spawn_supervised_worker(
         memory,
         release_thread_caches,
     } = teardown;
+    // The worker says when its teardown begins: from then until the
+    // reservation is released or stranded, new admissions wait.
+    let teardown_begins = memory
+        .as_ref()
+        .map(crate::serve::resident_memory::Reservation::teardown_marker);
     let worker_name = name.to_string();
     let (started, worker_started) =
         std::sync::mpsc::channel::<JoinHandle<std::result::Result<DeferredFlush, String>>>();
@@ -662,6 +670,9 @@ pub(super) fn spawn_supervised_worker(
             }
             // The body has returned or unwound: the model is dropped. The
             // caches this thread built for it go next, here, where they live.
+            if let Some(teardown) = teardown_begins {
+                teardown.begin();
+            }
             match panic::catch_unwind(AssertUnwindSafe(release_thread_caches)) {
                 Ok(released) => released.map_err(|error| format!("{error:#}")),
                 Err(payload) => Err(format!(

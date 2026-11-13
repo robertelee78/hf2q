@@ -396,23 +396,6 @@ struct ForwardGpuCache {
     decode_bufs: Option<DecodeBuffers>,
 }
 
-/// Commit an empty command buffer on `device` and wait for it.
-///
-/// Dropping a buffer only stages its removal from the device's Metal
-/// residency set; the set keeps the allocation until its next commit, which
-/// a thread that encodes nothing further never issues. The commit flushes
-/// the staged removals, and waiting for it also waits for every command
-/// committed earlier on the device's queue, which may still hold the
-/// buffers.
-pub(crate) fn flush_released_gpu_cache(device: &MlxDevice) -> Result<()> {
-    device
-        .command_encoder()
-        .context("create the encoder that flushes the released GPU cache")?
-        .commit_and_wait()
-        .context("flush the released GPU cache from the residency set")?;
-    Ok(())
-}
-
 // SAFETY: the thread_local cache is only accessed on the thread that owns it.
 // MlxBuffer is not Send but we never move the cache across thread boundaries.
 unsafe impl Send for ForwardGpuCache {}
@@ -4258,14 +4241,14 @@ impl Qwen35Model {
         };
         let device = cache.device.clone();
         drop(cache);
-        flush_released_gpu_cache(&device)
+        crate::inference::device_settle::settle(&device)
     }
 
     /// Drop the GPU weight cache of this thread, whichever model it was
     /// built for, and return the device it was built on. A thread that held
     /// a model and is done with it (the worker thread at its end, the
     /// loading thread once the model is with its worker) calls this; the
-    /// returned device still needs [`flush_released_gpu_cache`], after
+    /// returned device still needs `device_settle::settle`, after
     /// everything else that drops buffers of that model has run.
     pub(crate) fn take_thread_gpu_cache() -> Option<MlxDevice> {
         let cache = GPU_CACHE.with(|cell| cell.borrow_mut().take())?;

@@ -1798,33 +1798,48 @@ pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
 /// `serve::load_engine` made one; `model_devices` are the devices the model
 /// itself owns and encodes on ([`LoadedModel::owned_devices`]).
 ///
-/// After the worker body has dropped the model, the thread drops the GPU
-/// weight cache it built for it (BF16 copies, prepared and staged planes:
-/// tens of GiB on the full Qwen routes). Once the thread has terminated,
-/// every device the model encoded on is flushed: the dropped buffers only
-/// staged their removal from the device's residency set, and waiting for the
-/// commit also waits for the commands the worker committed on that device's
-/// queue. The kernel reclaims the pages of released buffers on its own
-/// afterwards, so the teardown then waits until the process footprint has
-/// stopped falling (`resident_memory::wait_until_reclaimed`). Only then is
-/// the reservation released; if a flush or that wait fails it never is.
+/// The reservation is released only when every queue the worker encoded on
+/// is settled (`inference::device_settle`):
+///
+/// - request-local devices were settled as each request ended; one that
+///   could not be is on the thread's record, and the teardown fails;
+/// - after the worker body has dropped the model, the thread drops the GPU
+///   weight cache it built for it (BF16 copies, prepared and staged planes:
+///   tens of GiB on the full Qwen routes);
+/// - once the thread has terminated, the model's own devices and the
+///   cache's device are settled: the dropped buffers only staged their
+///   removal from the residency set, and the forward pipeline commits most
+///   of its command buffers on those queues without waiting.
+///
+/// A step that fails leaves the reservation charged for good. The kernel
+/// reclaims the pages of released buffers afterwards, on its own; the
+/// teardown gives it time (`resident_memory::await_kernel_reclaim`) so that
+/// the loads waiting for this teardown read the host's available memory
+/// after it, but no claim rests on that.
 fn model_worker_teardown(
     memory: Option<crate::serve::resident_memory::Reservation>,
     model_devices: Vec<mlx_native::MlxDevice>,
 ) -> WorkerTeardown {
-    use crate::inference::models::qwen35::forward_gpu::flush_released_gpu_cache;
+    use crate::inference::device_settle::{settle, take_thread_unsettled};
     use crate::inference::models::qwen35::model::Qwen35Model;
     WorkerTeardown::new(memory, move || {
         let mut devices = model_devices;
         // The Qwen forward encodes on the device of the thread's GPU weight
         // cache; a thread that never built one has none.
         devices.extend(Qwen35Model::take_thread_gpu_cache());
+        if let Some(reason) = take_thread_unsettled() {
+            anyhow::bail!("a command queue of a request could not be settled: {reason}");
+        }
         Ok(Box::new(move || {
-            devices.iter().try_for_each(flush_released_gpu_cache)?;
+            devices.iter().try_for_each(settle)?;
             drop(devices);
-            // User space has let go of everything; the kernel has not
-            // necessarily returned it yet.
-            crate::serve::resident_memory::wait_until_reclaimed()
+            if let Err(error) = crate::serve::resident_memory::await_kernel_reclaim() {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "the kernel was still reclaiming an engine's memory when its teardown ended"
+                );
+            }
+            Ok(())
         }) as super::engine_supervisor::DeferredFlush)
     })
 }
