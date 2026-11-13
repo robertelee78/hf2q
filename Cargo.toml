@@ -27,6 +27,8 @@ exclude = [
     # deliberately outside the crate, even when a developer has not added
     # them to a personal gitignore yet.
     ".agents/**",
+    # Repository-only agent memory is not a CLI/runtime input.
+    "memory-bank/**",
     "artifacts/**",
     # Test harnesses are excluded except the small source/fixture files that
     # crate-local unit tests read with include_str!. Keeping those makes the
@@ -71,10 +73,11 @@ exclude = [
     # reproducible from the committed generators (w5_gen.py, w6_gen.py,
     # harvest_lexicon.py) and the judged corpora; the shipped default grammar
     # lives in src/serve/api/grammar/gcd_w1.gbnf. The multi-MB generated
-    # .gbnf outputs and .jsonl results are not consumer source.
-    "scripts/grammar_probe/*.gbnf",
-    "scripts/grammar_probe/*.jsonl",
-    "scripts/grammar_probe/__pycache__/",
+    # .gbnf outputs, .gguf probes and .jsonl results are not consumer source.
+    "scripts/grammar_probe/**/*.gbnf",
+    "scripts/grammar_probe/**/*.gguf",
+    "scripts/grammar_probe/**/*.jsonl",
+    "scripts/grammar_probe/**/__pycache__/**",
     # CI/CD workflow definitions are not consumer-facing source.
     ".github/",
     # macOS Finder metadata never belongs in a published tarball.

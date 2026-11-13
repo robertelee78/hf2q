@@ -87,10 +87,7 @@ Resume versus fresh dispatch:
 - A commit cut before these release-reliability changes cannot be released
   by a fresh dispatch: the build job stops at once with "commit predates the
   release-reliability changes". Finish it by resuming its existing run, or
-  release a new version cut after the merge. v0.1.29 is finished with
-  `scripts/release.sh --resume 41586213149`. That run uses its original
-  workflow files, which publish only with `CARGO_REGISTRY_TOKEN`, so rotate
-  that secret first (its 403 is what failed attempt 1).
+  release a new version cut after the merge.
 
 ### crates.io credential
 
@@ -111,9 +108,10 @@ lives until the action's post step revokes it at the end of the publish job.
 In the hf2q.us repository, follow `docs/release-activation.md` → "Future
 releases" for the new version: take `install.sh` and
 `stable-aarch64-apple-darwin.json` from the exact versioned GitHub release,
-update the Apache redirect, the stable record, and the pinned hashes, run
-`npm run verify`, deploy, `apache2ctl configtest`, reload, and run the
-transport verifier.
+update the stable record and its pinned hashes, registry identity and evidence,
+run `npm run verify`, deploy the built site, and run the transport verifier.
+The version-agnostic `public/install.sh` bootstrap and Apache configuration
+stay unchanged during a normal release activation; no Apache reload is needed.
 
 ## Done
 

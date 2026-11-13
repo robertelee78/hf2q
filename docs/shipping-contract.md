@@ -176,7 +176,7 @@ without Hub traffic or full-payload hashing.
   pre-request turn anchor; poisoned or inconsistent state resets fully.
   The 0.1.7 release also pairs large automatic MoE gate/up
   projections through the routing-schedule primitive introduced in
-  `mlx-native 0.10.10` and retained by the pinned `mlx-native 0.11.2`.
+  `mlx-native 0.10.10` and retained by the registry-pinned `mlx-native` dependency.
   Decode-sized and forced diagnostic routes remain independent;
   native microbenchmarks do not replace the exact packed hf2q hardware gates.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
@@ -254,7 +254,7 @@ candidate MUST also prove that every generated dylib and the final hf2q
 Mach-O have a LINKEDIT string-pool offset aligned to eight bytes before any
 candidate is signed.
 Its dependency receipt binds the packed `Cargo.lock` and raw `cargo metadata`
-bytes, including the exact `mlx-native 0.11.2` crates.io source and checksum.
+bytes, including the exact registry-pinned `mlx-native` version, source and checksum.
 The protected release workflow rehashes and revalidates those downloaded raw
 files, then requires its newly packed `Cargo.lock` to be byte-identical before
 publishing.
