@@ -9,6 +9,7 @@ import q3_campaign
 import q3_mechanism
 import q3_report
 import q3_splash_evidence as evidence
+import q5_calibration
 from q3_fake_splash import mechanism_campaign, rebind_approval, reviewed_template_fixture
 
 HERE = Path(__file__).resolve().parent
@@ -53,8 +54,8 @@ class OriginalProvenance(unittest.TestCase):
         path = run / 'client-approval.json'
         packet = read(path)
         current = copy.deepcopy(packet)
-        packet['sources'][str(HERE / 'qwen38_n1_smoke.py')] = '2bb07db9bd67a1ea5feeb4892cf08485f005a1d8127497d4971ac9bf1db31e0c'
-        packet['sources'][str(HERE / 'qwen_n4_live_smoke.py')] = 'cf137e169e087fcee2f303ccddbbe887c8f9a0a3b7b1463c0ab36969f992a33e'
+        packet['sources']['qwen38_n1_smoke.py'] = '2bb07db9bd67a1ea5feeb4892cf08485f005a1d8127497d4971ac9bf1db31e0c'
+        packet['sources']['qwen_n4_live_smoke.py'] = 'cf137e169e087fcee2f303ccddbbe887c8f9a0a3b7b1463c0ab36969f992a33e'
         write(path, packet)
         rebind_approval(run)  # Construct the original historical-source synthetic launch.
         self.refused(manifest, selection, 'workload source drift')
@@ -62,7 +63,8 @@ class OriginalProvenance(unittest.TestCase):
         self.refused(manifest, selection, 'original launch approval path/hash mismatch')
 
     def test_original_receipt_input_and_approval_path_are_required(self):
-        for fault in ('source-input', 'approval-path', 'approval-hash', 'missing-flag'):
+        for fault in ('source-input', 'approval-path', 'approval-hash', 'missing-flag',
+                      'ambiguous-input', 'wrong-coordinator-path'):
             with self.subTest(fault=fault):
                 manifest, selection, run = self.fixture(fault)
                 path = run / 'receipt.json'
@@ -75,11 +77,35 @@ class OriginalProvenance(unittest.TestCase):
                     receipt['client_argv'][receipt['client_argv'].index('--approval') + 1] = str(clone)
                 elif fault == 'approval-hash':
                     receipt['client_argv'][receipt['client_argv'].index('--approval-sha256') + 1] = 'f' * 64
+                elif fault in ('ambiguous-input', 'wrong-coordinator-path'):
+                    coordinator = receipt['client_argv'][4]
+                    receipt['inputs']['/other/source/' + Path(coordinator).name] = receipt['inputs'][coordinator]
+                    if fault == 'wrong-coordinator-path':
+                        receipt['inputs'].pop(coordinator)
                 else:
                     index = receipt['client_argv'].index('--approval-sha256')
                     del receipt['client_argv'][index:index+2]
                 write(path, receipt)
                 self.refused(manifest, selection, 'original')
+
+    def test_production_resolve_set_source_maps_pass_planning_and_the_full_report(self):
+        manifest, selection, run = self.fixture('production-map')
+        packet = read(run / 'client-approval.json')
+        case = read(HERE / 'q5_cases/splash-qwen38.json')
+        expected = q5_calibration.resolve_set(case['client']['approval']['set']['sources'],
+                                             {'REPO': str(HERE.parent.parent)})
+        self.assertEqual(packet['sources'], expected)
+        self.assertTrue(all(name == Path(name).name for name in packet['sources']))
+        receipt = read(run / 'receipt.json')
+        self.assertIn(receipt['client_argv'][4], receipt['inputs'])
+        self.assertNotIn(receipt['client_argv'][4], packet['sources'])
+        evidence.original_approval(run, receipt)
+        verdict = q3_report.compute_verdict(manifest)
+        self.assertEqual(verdict['verdict'], 'Win', verdict['reasons'])
+        args = q3_campaign.parse_args(['--dry-run', '--family', 'qwen38',
+                                      '--splash-unavailable-evidence', str(selection)])
+        plan, _ = q3_campaign.build_plan(args, {}, 'qwen38')
+        self.assertIs(plan['splash_required'], False)
 
     def test_raw_parity_inputs_observations_sources_and_failed_turn_coverage_fail_closed(self):
         faults = ('missing-render', 'changed-render', 'missing-canonical', 'canonical-not-wire',

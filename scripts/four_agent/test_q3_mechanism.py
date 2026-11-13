@@ -62,7 +62,7 @@ class MechanismVerdict(unittest.TestCase):
         path = run / 'client-approval.json'
         approval = json.loads(path.read_text())
         for name, group in splash_evidence.SOURCE_CONTINUITY_WHITELIST.items():
-            approval['sources'][str(HERE / name)] = next(value for value in group if value != mechanism.digest(HERE / name))
+            approval['sources'][name] = next(value for value in group if value != mechanism.digest(HERE / name))
         path.write_text(json.dumps(approval))
         rebind_approval(run)
         m['plan']['qwen38_splash_substitution'] = splash_evidence.freeze(
@@ -127,7 +127,7 @@ class MechanismVerdict(unittest.TestCase):
                     elif fault == 'splash-source':
                         path = run / 'client-approval.json'
                         value = json.loads(path.read_text())
-                        value['sources'][str(HERE / 'qwen_n4_live_smoke.py')] = 'f' * 64
+                        value['sources']['qwen_n4_live_smoke.py'] = 'f' * 64
                         path.write_text(json.dumps(value))
                     else:
                         path = run / 'receipt.json'

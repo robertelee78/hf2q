@@ -81,13 +81,19 @@ def original_approval(run, receipt):
     inputs, sources = receipt["inputs"], approval["sources"]
     coordinator = argv[4]
     require(isinstance(inputs, dict) and isinstance(sources, dict)
-            and all(isinstance(p, str) and isinstance(sha, str) for p, sha in sources.items()),
+            and all(isinstance(p, str) and isinstance(sha, str) for p, sha in inputs.items())
+            and all(isinstance(p, str) and p and p == Path(p).name and p != ".."
+                    and isinstance(sha, str) for p, sha in sources.items()),
             "invalid-Splash original receipt source inputs malformed")
-    require(coordinator in inputs and coordinator in sources and inputs[coordinator] == sources[coordinator]
-            and all(inputs[p] == sha for p, sha in sources.items() if p in inputs),
+    # resolve_set emits source basenames, whereas Q5 inputs retain exact absolute
+    # argv paths. Never choose arbitrarily between two inputs sharing a basename.
+    applicable = {p: sha for p, sha in inputs.items() if Path(p).name in sources}
+    require(all(Path(p).is_absolute() for p in applicable)
+            and len({Path(p).name for p in applicable}) == len(applicable),
+            "invalid-Splash original receipt has ambiguous source input basenames")
+    require(coordinator in applicable and applicable[coordinator] == sources[Path(coordinator).name]
+            and all(sha == sources[Path(p).name] for p, sha in applicable.items()),
             "invalid-Splash original receipt client-source input mismatch")
-    require(len({Path(p).name for p in sources}) == len(sources),
-            "invalid-Splash original approval has ambiguous source identities")
     return path, approval
 
 

@@ -29,8 +29,8 @@ def rebind_approval(run):
     argv = receipt["client_argv"]
     argv[argv.index("--approval-sha256") + 1] = mechanism.digest(run / "client-approval.json")
     for name in receipt["inputs"]:
-        if name in approval["sources"]:
-            receipt["inputs"][name] = approval["sources"][name]
+        if Path(name).name in approval["sources"]:
+            receipt["inputs"][name] = approval["sources"][Path(name).name]
     path.write_text(json.dumps(receipt))
 
 
@@ -42,10 +42,8 @@ def invalid_sweep(root):
     template = root / 'reviewed-template.jinja'
     template.write_bytes(TEMPLATE)
     base = json.loads((HERE / 'q5_cases/splash-qwen38.json').read_text())
-    expected = json.loads((HERE / 'q5_cases/qwen38.json').read_text())
-    sources = {str(HERE / Path(p).name): mechanism.digest(HERE / Path(p).name)
-               for p in expected['client']['approval']['set']['sources']['sha256_of']
-               if not Path(p).name.startswith('test_')}
+    sources = q5_calibration.resolve_set(base['client']['approval']['set']['sources'],
+                                       {'REPO': str(HERE.parent.parent)})
     records = []
     for point in sp.PRESETS:
         if point == 'verify-all':
@@ -79,7 +77,7 @@ def invalid_sweep(root):
                        'case': {'path': str(path), 'sha256': mechanism.digest(path)},
                        'artifact': splash_evidence.ARTIFACT, 'binary': {'sha256': spec['binary_sha256']},
                        'workload': case['workload'], 'cleanup_proven': True,
-                       'inputs': {str(HERE / 'qwen_n4_live_smoke.py'): sources[str(HERE / 'qwen_n4_live_smoke.py')]},
+                       'inputs': {str(HERE / 'qwen_n4_live_smoke.py'): sources['qwen_n4_live_smoke.py']},
                        'verdict': {'verdict': 'ClientFailed', 'reason': 'synthetic failed client'},
                        'client_argv': q3_campaign.q5_case.expand(case['client']['argv'], values)}
             (run / 'receipt.json').write_text(json.dumps(receipt))
