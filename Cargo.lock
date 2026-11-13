@@ -2545,7 +2545,7 @@ dependencies = [
 [[package]]
 name = "mlx-native"
 version = "0.21.9"
-source = "git+https://github.com/robertelee78/mlx-native?branch=fix%2Fkernel-availability#de7ce6a140212350a789bb81bc1ef964be6f8791"
+source = "git+https://github.com/robertelee78/mlx-native?branch=fix%2Fkernel-availability#345d3df9340c054a7ebd11ec15f5d27439539571"
 dependencies = [
  "block",
  "bytemuck",
