@@ -59,7 +59,29 @@ static ENABLED: LazyLock<bool> = LazyLock::new(|| {
 
 /// Whether the operator switched the fold on.
 pub(crate) fn enabled() -> bool {
+    #[cfg(test)]
+    if let Some(switches) = super::prefill_prepared::SwitchesForTest::current() {
+        return switches.fold_cue;
+    }
     *ENABLED
+}
+
+/// Forward routes that have no folded form: with any of them a prompt
+/// prefill keeps its two forwards. GLP steering writes the residual stream
+/// between layers, the dump-bisect instrument downloads per-layer tensors,
+/// and the dense-Q split profile commits each FFN stage on its own; none of
+/// the three is split at the prompt boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnfoldedRoutes {
+    pub(crate) glp_bound: bool,
+    pub(crate) dump_bisect: bool,
+    pub(crate) dense_q_split_profile: bool,
+}
+
+impl UnfoldedRoutes {
+    pub(crate) fn any(self) -> bool {
+        self.glp_bound || self.dump_bisect || self.dense_q_split_profile
+    }
 }
 
 /// Whether a chunk of `prefix_rows` content rows followed by `cue_rows` cue
@@ -114,7 +136,8 @@ pub(crate) fn with_request<R>(
     let logits = BOUNDARY_LOGITS.with(|cell| cell.borrow_mut().take());
     let result = result?;
     ensure!(!unconsumed, "the target forward did not take the cue fold");
-    let logits = logits.ok_or_else(|| anyhow!("the folded forward published no boundary logits"))?;
+    let logits =
+        logits.ok_or_else(|| anyhow!("the folded forward published no boundary logits"))?;
     Ok((result, logits))
 }
 
@@ -123,9 +146,12 @@ pub(crate) fn take_request(seq_len: u32) -> Result<Option<BoundaryFold>> {
     let Some(request) = REQUEST.with(|cell| cell.borrow_mut().take()) else {
         return Ok(None);
     };
-    let cue_rows = seq_len
-        .checked_sub(request.prefix_rows)
-        .ok_or_else(|| anyhow!("cue fold boundary {} beyond {seq_len} rows", request.prefix_rows))?;
+    let cue_rows = seq_len.checked_sub(request.prefix_rows).ok_or_else(|| {
+        anyhow!(
+            "cue fold boundary {} beyond {seq_len} rows",
+            request.prefix_rows
+        )
+    })?;
     ensure!(
         rows_admitted(request.prefix_rows as usize, cue_rows as usize),
         "cue fold of {} + {cue_rows} rows is outside the served shape",
@@ -252,7 +278,10 @@ mod tests {
     #[test]
     fn a_short_chunk_is_not_folded_past_the_short_chunk_cadence() {
         assert!(rows_worth_folding(720, 5));
-        assert!(rows_worth_folding(157, 5), "a new tile, but one forward less");
+        assert!(
+            rows_worth_folding(157, 5),
+            "a new tile, but one forward less"
+        );
         assert!(rows_worth_folding(33, 5));
         assert!(rows_worth_folding(27, 5), "32 rows: still a short chunk");
         assert!(!rows_worth_folding(28, 5));

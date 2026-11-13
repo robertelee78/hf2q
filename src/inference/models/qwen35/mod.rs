@@ -120,7 +120,7 @@ pub(crate) mod prefill_fold;
 mod prefill_fold_tests;
 pub(crate) mod prefill_prepared;
 #[cfg(test)]
-mod prefill_prepared_tests;
+pub(crate) mod prefill_prepared_tests;
 pub(crate) mod prepared_projection;
 #[cfg(test)]
 mod prepared_step_tests;

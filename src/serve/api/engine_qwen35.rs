@@ -21,7 +21,7 @@ use mlx_native::MlxBuffer;
 use tokenizers::Tokenizer;
 
 use crate::inference::models::qwen35::kv_cache::{
-    HybridKvCache, HybridKvCacheSnapshot, HybridKvSlotAnchor, LaRestoreRoute,
+    HybridKvCache, HybridKvCacheSnapshot, HybridKvSlotAnchor, LaAnchorImage, LaRestoreRoute,
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::inference::models::qwen35::prefill_prepared::PrefillScope;
@@ -365,6 +365,10 @@ impl Qwen35LoadedModel {
             "Model not found: {}",
             model_path.display()
         );
+        // A mistyped prompt-prefill switch, or a combination that cannot
+        // keep its promise, is refused here, before the weights load is
+        // paid for; the worker checks again when it provisions its slots.
+        crate::inference::models::qwen35::prefill_prepared::switches_from_process()?;
 
         // Open GGUF (header + metadata only).  Re-opens after the
         // dispatcher-level open in `LoadedModel::load`; the cost is a
@@ -1065,8 +1069,7 @@ impl Qwen35LoadedModel {
         // Every agent slot receives the complete model context. The Qwen KV
         // allocator reserves full-attention storage lazily, while scheduler
         // admission governs aggregate physical high-water use.
-        crate::inference::models::qwen35::prefill_prepared::validate_at_worker_start()
-            .context("Qwen prompt prefill switches")?;
+        crate::inference::models::qwen35::prefill_prepared::validate_at_worker_start()?;
         let max_seq_len = self.model.cfg.max_position_embeddings;
         let restore_value = std::env::var_os("HF2Q_QWEN_LA_GPU_RESTORE");
         let restore_value = restore_value
@@ -1245,8 +1248,9 @@ impl Qwen35LoadedModel {
     /// The last content chunk and the generation cue behind it as one
     /// target forward (`HF2Q_QWEN_PREFILL_FOLD_CUE`): `prefix_rows` content
     /// rows end at the stable prompt boundary, whose physical cursor is
-    /// `boundary_len`. With `dflash2` the draft lane receives the content
-    /// rows and then the cue rows, as after the two forwards.
+    /// `boundary_len`, and `image` receives the checkpoint there. With
+    /// `dflash2` the draft lane receives the content rows and then the cue
+    /// rows, as after the two forwards.
     #[allow(clippy::too_many_arguments)]
     fn forward_prefill_chunk_folded(
         &mut self,
@@ -1257,6 +1261,7 @@ impl Qwen35LoadedModel {
         logical_start: usize,
         prefix_rows: usize,
         boundary_len: usize,
+        image: LaAnchorImage,
         dflash2: bool,
     ) -> Result<crate::inference::models::qwen35::forward_gpu::FoldedPrefill> {
         if !dflash2 {
@@ -1269,6 +1274,7 @@ impl Qwen35LoadedModel {
                 slot_id,
                 prefix_rows,
                 boundary_len,
+                image,
             );
         }
         let mut runtime = self
@@ -1293,6 +1299,7 @@ impl Qwen35LoadedModel {
                     slot_id,
                     prefix_rows,
                     boundary_len,
+                    image,
                 )?
             };
             let lane = slot_id.0 as usize;
@@ -4384,13 +4391,16 @@ impl Qwen35PrefillState {
         })
     }
 
-    /// The content rows of this chunk when it and the generation cue behind
-    /// it run as one folded forward (`HF2Q_QWEN_PREFILL_FOLD_CUE`), `None`
-    /// for the two-forward path. The fold applies when the chunk ends at
-    /// the stable prompt boundary of a text-only, ungrafted request on the
-    /// DFlash2 or the plain target route, both segments are multi-row, the
-    /// boundary checkpoint fits its quota (the fold takes it inside the
-    /// forward), and the fold is exact for the loaded model.
+    /// The content rows of this chunk and the checkpoint storage when the
+    /// chunk and the generation cue behind it run as one folded forward
+    /// (`HF2Q_QWEN_PREFILL_FOLD_CUE`), `None` for the two-forward path. The
+    /// fold applies when the chunk ends at the stable prompt boundary of a
+    /// text-only, ungrafted request on the DFlash2 or the plain target
+    /// route, both segments are multi-row, the boundary checkpoint fits its
+    /// quota and its storage can be allocated (the fold takes it inside the
+    /// forward), and the fold is exact for the loaded model and process.
+    /// Everything that keeps a request off the fold is decided here, before
+    /// the slot changes, so the request then runs its two forwards.
     fn cue_fold_prefix_rows(
         &self,
         qwen: &Qwen35LoadedModel,
@@ -4399,7 +4409,7 @@ impl Qwen35PrefillState {
         dflash2_prefill: bool,
         mtp_prefill: bool,
         anchor_quota_headroom: Option<usize>,
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<(usize, LaAnchorImage)>> {
         use crate::inference::models::qwen35::prefill_fold;
         let prefix_rows = boundary_end - self.next_token_index;
         let cue_rows = self.prompt_tokens.len() - boundary_end;
@@ -4430,7 +4440,22 @@ impl Qwen35PrefillState {
         if anchor_quota_headroom.is_some_and(|headroom| capture_bytes > headroom) {
             return Ok(None);
         }
-        Ok(qwen.prefill_cue_fold_exact()?.then_some(prefix_rows))
+        if !qwen.prefill_cue_fold_exact()? {
+            return Ok(None);
+        }
+        // Without checkpoint storage the two forwards run; their snapshot
+        // then fails or is skipped by the rule it always had.
+        match kv_cache.boundary_anchor_image() {
+            Ok(image) => Ok(Some((prefix_rows, image))),
+            Err(error) => {
+                tracing::warn!(
+                    slot = self.slot_id.0,
+                    error = %format!("{error:#}"),
+                    "Qwen35 cue fold skipped: checkpoint storage allocation failed"
+                );
+                Ok(None)
+            }
+        }
     }
 
     pub(super) fn advance(
@@ -4509,7 +4534,7 @@ impl Qwen35PrefillState {
             // Cue fold: a chunk that ends at the stable prompt boundary takes
             // the generation cue behind it into the same forward, which
             // captures the boundary checkpoint itself.
-            let fold_prefix_rows = self.cue_fold_prefix_rows(
+            let fold = self.cue_fold_prefix_rows(
                 qwen,
                 kv_cache,
                 boundary_end,
@@ -4517,7 +4542,7 @@ impl Qwen35PrefillState {
                 mtp_prefill,
                 anchor_quota_headroom,
             )?;
-            let end = if fold_prefix_rows.is_some() {
+            let end = if fold.is_some() {
                 self.prompt_tokens.len()
             } else {
                 boundary_end
@@ -4548,7 +4573,7 @@ impl Qwen35PrefillState {
             let lease =
                 supervisor.arm("Qwen35 bounded prefill", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
             let mut folded_boundary = None;
-            let (forward, mtp_hidden) = if let Some(prefix_rows) = fold_prefix_rows {
+            let (forward, mtp_hidden) = if let Some((prefix_rows, image)) = fold {
                 let folded = qwen.forward_prefill_chunk_folded(
                     chunk,
                     &positions,
@@ -4557,11 +4582,16 @@ impl Qwen35PrefillState {
                     chunk_start,
                     prefix_rows,
                     self.graft_len + boundary_end,
+                    image,
                     dflash2_prefill,
                 );
                 (
                     folded.map(|folded| {
-                        folded_boundary = Some((folded.boundary_logits, folded.boundary));
+                        folded_boundary = Some((
+                            folded.boundary_logits,
+                            folded.boundary,
+                            folded.boundary_wall,
+                        ));
                         folded.logits
                     }),
                     None,
@@ -4732,25 +4762,47 @@ impl Qwen35PrefillState {
             );
             let advanced = end - self.next_token_index;
             self.next_token_index = end;
-            let checkpoint = if let Some((boundary_logits, kv)) = folded_boundary {
+            let checkpoint = if let Some((boundary_logits, boundary, wall)) = folded_boundary {
                 // The folded forward took the checkpoint at the stable
-                // boundary itself; its quota was decided before the fold.
-                let spec = self
-                    .mtp_pending_hidden
-                    .as_ref()
-                    .map(|hidden| {
-                        qwen.model.with_gpu_cache_mut(|device, _registry| {
-                            anchor_store::owned_spec_boundary(device, boundary_end, hidden)
+                // boundary itself; its quota was decided before the fold. A
+                // checkpoint that could not be assembled is counted, and
+                // skipped or fatal, exactly as a failed snapshot between two
+                // forwards is.
+                anchor_store::record_anchor_snapshot(wall);
+                match boundary {
+                    Ok(kv) => {
+                        let spec = self
+                            .mtp_pending_hidden
+                            .as_ref()
+                            .map(|hidden| {
+                                qwen.model.with_gpu_cache_mut(|device, _registry| {
+                                    anchor_store::owned_spec_boundary(device, boundary_end, hidden)
+                                })
+                            })
+                            .transpose()?;
+                        Some(Qwen35StablePromptCheckpoint {
+                            prompt_tokens: self.prompt_tokens[..boundary_end].to_vec(),
+                            kv,
+                            prefill_logits: boundary_logits,
+                            vision_fingerprint: self.params.vision_fingerprint,
+                            spec,
                         })
-                    })
-                    .transpose()?;
-                Some(Qwen35StablePromptCheckpoint {
-                    prompt_tokens: self.prompt_tokens[..boundary_end].to_vec(),
-                    kv,
-                    prefill_logits: boundary_logits,
-                    vision_fingerprint: self.params.vision_fingerprint,
-                    spec,
-                })
+                    }
+                    Err(error)
+                        if !supervisor.is_healthy()
+                            || super::engine::is_fatal_command_buffer_error(&error) =>
+                    {
+                        return Err(error.context("capture Qwen35 stable prompt boundary"));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            slot = self.slot_id.0,
+                            error = %error,
+                            "Qwen35 stable prompt checkpoint capture skipped"
+                        );
+                        None
+                    }
+                }
             } else if self.stable_prompt_prefix_tokens == Some(end) {
                 let spec = self
                     .mtp_pending_hidden
@@ -5028,6 +5080,9 @@ pub(in crate::serve::api) use joint_mtp::{run_joint_mtp_step, Qwen35JointMtpForw
 #[path = "engine_qwen35/k3_transaction.rs"]
 mod k3_transaction;
 use k3_transaction::K3_VERIFY_ROWS;
+#[cfg(test)]
+#[path = "engine_qwen35/prefill_fold_scheduler_tests.rs"]
+mod prefill_fold_scheduler_tests;
 #[cfg(test)]
 #[path = "engine_qwen35/round_slot_independence_tests.rs"]
 mod round_slot_independence_tests;

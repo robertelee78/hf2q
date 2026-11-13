@@ -304,12 +304,17 @@ enum OutputHeadMode {
 }
 
 /// What [`Qwen35Model::forward_gpu_last_logits_folded`] returns: the logits
-/// of the chunk's last row, and the stable-boundary checkpoint taken inside
-/// the forward (its last-row logits and the slot state there).
+/// of the chunk's last row, the logits of the last content row, and the
+/// stable-boundary checkpoint taken inside the forward. The checkpoint is a
+/// result of its own: the forward has run and the slot holds both segments
+/// whether or not the checkpoint could be assembled, and the caller treats
+/// a failed one as it treats a failed snapshot between two forwards.
 pub(crate) struct FoldedPrefill {
     pub(crate) logits: Vec<f32>,
     pub(crate) boundary_logits: Vec<f32>,
-    pub(crate) boundary: super::kv_cache::HybridKvSlotAnchor,
+    pub(crate) boundary: Result<super::kv_cache::HybridKvSlotAnchor>,
+    /// Host time spent assembling `boundary` after the forward.
+    pub(crate) boundary_wall: std::time::Duration,
 }
 
 /// One ADR-054 per-family calibration capture request (#300): read the
@@ -3582,12 +3587,34 @@ impl Qwen35Model {
         )
     }
 
+    /// The forward routes of this model and process that have no folded
+    /// form ([`super::prefill_fold::UnfoldedRoutes`]).
+    pub(crate) fn unfolded_routes(&self) -> super::prefill_fold::UnfoldedRoutes {
+        super::prefill_fold::UnfoldedRoutes {
+            glp_bound: self.glp.is_some(),
+            dump_bisect: super::dump_bisect::is_enabled(),
+            dense_q_split_profile: super::execution_dispatch::dense_q_split_profile_enabled(),
+        }
+    }
+
     /// Whether the cue fold ([`super::prefill_fold`]) is exact for this
-    /// model in the open prefill scope: every product a folded forward runs
-    /// once over both segments takes the prepared row-tile MM, whose output
-    /// row depends on that input row alone. Full attention and the MoE FFN
-    /// are built per segment and need no such guarantee; an F32 FFN has none.
+    /// model in the open prefill scope: no route without a folded form is
+    /// active, and every product a folded forward runs once over both
+    /// segments takes the prepared row-tile MM, whose output row depends on
+    /// that input row alone. Full attention and the MoE FFN are built per
+    /// segment and need no such guarantee; an F32 FFN has none.
     pub(crate) fn prefill_fold_exact(&self) -> Result<bool> {
+        self.prefill_fold_exact_under(self.unfolded_routes())
+    }
+
+    /// [`Self::prefill_fold_exact`] for the given route state.
+    pub(crate) fn prefill_fold_exact_under(
+        &self,
+        routes: super::prefill_fold::UnfoldedRoutes,
+    ) -> Result<bool> {
+        if routes.any() {
+            return Ok(false);
+        }
         self.ensure_gpu_cache_primed()?;
         let shape = DeltaNetLayerShape::from_config(&self.cfg);
         GPU_CACHE.with(|cell| -> Result<bool> {
@@ -3631,11 +3658,14 @@ impl Qwen35Model {
     /// One prompt-prefill forward over the last content chunk and the
     /// generation cue behind it ([`super::prefill_fold`]). `prefix_rows`
     /// content rows end at the stable prompt boundary, whose physical cursor
-    /// is `boundary_len`. Returns the last-row logits, the logits of the last
-    /// content row, and the slot checkpoint at the boundary: what a forward
-    /// over the content rows, [`HybridKvCache::snapshot_slot_anchor`], and a
-    /// forward over the cue rows produce, bit for bit. The caller opens the
-    /// prefill scope and has checked [`Self::prefill_fold_exact`].
+    /// is `boundary_len`; `image` is the checkpoint storage the caller
+    /// allocated ([`HybridKvCache::boundary_anchor_image`]) before it chose
+    /// the fold. Returns the last-row logits, the logits of the last content
+    /// row, and the slot checkpoint at the boundary: what a forward over the
+    /// content rows, [`HybridKvCache::snapshot_slot_anchor`], and a forward
+    /// over the cue rows produce, bit for bit. The caller opens the prefill
+    /// scope and has checked [`Self::prefill_fold_exact`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_gpu_last_logits_folded(
         &self,
         tokens: &[u32],
@@ -3647,6 +3677,7 @@ impl Qwen35Model {
         slot_id: SlotId,
         prefix_rows: usize,
         boundary_len: usize,
+        image: super::kv_cache::LaAnchorImage,
     ) -> Result<FoldedPrefill> {
         ensure!(
             super::prefill_fold::rows_admitted(
@@ -3656,15 +3687,12 @@ impl Qwen35Model {
             "cue fold of {prefix_rows} + {} rows is outside the served shape",
             tokens.len().saturating_sub(prefix_rows)
         );
-        let image = kv_cache
-            .boundary_anchor_image()
-            .context("cue fold checkpoint image")?;
         let request = super::prefill_fold::BoundaryFold {
             prefix_rows: prefix_rows as u32,
             image: image.clone(),
         };
-        let (logits, boundary_logits) = super::prefill_fold::with_request(request, || {
-            match dflash_capture {
+        let (logits, boundary_logits) =
+            super::prefill_fold::with_request(request, || match dflash_capture {
                 Some(capture) => self
                     .forward_gpu_last_logits_with_hidden_dflash(
                         tokens,
@@ -3675,15 +3703,16 @@ impl Qwen35Model {
                     )
                     .map(|(logits, _hidden)| logits),
                 None => self.forward_gpu_last_logits(tokens, positions_flat, kv_cache, slot_id),
-            }
-        })?;
+            })?;
+        let assembling = std::time::Instant::now();
         let boundary = kv_cache
             .slot_anchor_at_boundary(slot_id, boundary_len, image)
-            .context("cue fold checkpoint")?;
+            .context("cue fold checkpoint");
         Ok(FoldedPrefill {
             logits,
             boundary_logits,
             boundary,
+            boundary_wall: assembling.elapsed(),
         })
     }
 

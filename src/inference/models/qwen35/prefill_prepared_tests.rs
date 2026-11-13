@@ -174,7 +174,12 @@ fn prepared_products_stay_within_the_k_scaled_bound_of_an_f64_reference() {
     // Qwen3.8 FFN gate (K = 5120) and FFN down (K = 17408) at their real
     // output widths, whose columns are sampled for the reference.
     for (ggml_type, n, k, row_counts) in [
-        (GgmlType::Q4_K, 128usize, 512usize, &[2usize, 5, 31, 32, 33, 157][..]),
+        (
+            GgmlType::Q4_K,
+            128usize,
+            512usize,
+            &[2usize, 5, 31, 32, 33, 157][..],
+        ),
         (GgmlType::Q6_K, 128, 512, &[2, 5, 31, 32, 33, 157]),
         (GgmlType::Q4_K, 64, 1024, &[2, 5, 31, 32, 33, 157]),
         (GgmlType::Q6_K, 192, 768, &[2, 5, 31, 32, 33, 157]),
@@ -202,8 +207,7 @@ fn prepared_products_stay_within_the_k_scaled_bound_of_an_f64_reference() {
             for row in 0..rows {
                 let xr = &x[row * k..(row + 1) * k];
                 for &col in &columns {
-                    let (exact, magnitude, squares) =
-                        exact_product(&w[col * k..(col + 1) * k], xr);
+                    let (exact, magnitude, squares) = exact_product(&w[col * k..(col + 1) * k], xr);
                     let got = f64::from(y[row * n + col]);
                     let error = (got - exact).abs();
                     let bound = gamma(k) * magnitude + 1e-30;
@@ -321,7 +325,9 @@ fn fused_alpha_beta_stays_within_the_bounds_of_an_f64_reference() {
             "prepared fused alpha/beta {ggml_type:?} heads={heads} K={k}: RMS error / RMS bound = {:.3}",
             rms.ratio()
         );
-        rms.assert_within(&format!("fused alpha/beta {ggml_type:?} heads={heads} K={k}"));
+        rms.assert_within(&format!(
+            "fused alpha/beta {ggml_type:?} heads={heads} K={k}"
+        ));
     }
 }
 
@@ -381,7 +387,7 @@ fn chunk_rows(
 /// first layer, where no attention product and no later layer can move a
 /// logit; at 1/64 of it every routed product of every layer does
 /// (`the_fixture_observes_every_routed_product_in_every_layer`).
-const OBSERVABLE_SCALE: u16 = 0x091F;
+pub(super) const OBSERVABLE_SCALE: u16 = 0x091F;
 
 /// `(block bytes, quant bytes, scale field offsets)` of a K-quant block.
 fn block_layout(ty: GgmlType) -> (usize, std::ops::Range<usize>, &'static [usize]) {
@@ -393,7 +399,7 @@ fn block_layout(ty: GgmlType) -> (usize, std::ops::Range<usize>, &'static [usize
 }
 
 /// Flip quant bits of every block in place; twice restores the weight.
-fn xor_quants(buffer: &MlxBuffer, ty: GgmlType) {
+pub(super) fn xor_quants(buffer: &MlxBuffer, ty: GgmlType) {
     let (block, quants, _) = block_layout(ty);
     let mut handle = buffer.clone();
     for chunk in handle
@@ -407,7 +413,7 @@ fn xor_quants(buffer: &MlxBuffer, ty: GgmlType) {
     }
 }
 
-fn set_scale(buffer: &MlxBuffer, ty: GgmlType, scale: u16) {
+pub(super) fn set_scale(buffer: &MlxBuffer, ty: GgmlType, scale: u16) {
     let (block, _, offsets) = block_layout(ty);
     let mut handle = buffer.clone();
     for chunk in handle
@@ -430,11 +436,36 @@ fn routed_weights(model: &Qwen35Model) -> Vec<(usize, &'static str, MlxBuffer, G
     for (index, layer) in model.layers.iter().enumerate() {
         let ffn = match layer {
             Qwen35LayerWeights::NativeLinearAttn { attn, ffn } => {
-                out.push((index, "gdn.qkv", attn.attn_qkv.clone(), attn.attn_qkv_ggml_type));
-                out.push((index, "gdn.gate", attn.attn_gate.clone(), attn.attn_gate_ggml_type));
-                out.push((index, "gdn.alpha", attn.ssm_alpha.clone(), attn.ssm_alpha_ggml_type));
-                out.push((index, "gdn.beta", attn.ssm_beta.clone(), attn.ssm_beta_ggml_type));
-                out.push((index, "gdn.out", attn.ssm_out.clone(), attn.ssm_out_ggml_type));
+                out.push((
+                    index,
+                    "gdn.qkv",
+                    attn.attn_qkv.clone(),
+                    attn.attn_qkv_ggml_type,
+                ));
+                out.push((
+                    index,
+                    "gdn.gate",
+                    attn.attn_gate.clone(),
+                    attn.attn_gate_ggml_type,
+                ));
+                out.push((
+                    index,
+                    "gdn.alpha",
+                    attn.ssm_alpha.clone(),
+                    attn.ssm_alpha_ggml_type,
+                ));
+                out.push((
+                    index,
+                    "gdn.beta",
+                    attn.ssm_beta.clone(),
+                    attn.ssm_beta_ggml_type,
+                ));
+                out.push((
+                    index,
+                    "gdn.out",
+                    attn.ssm_out.clone(),
+                    attn.ssm_out_ggml_type,
+                ));
                 ffn
             }
             Qwen35LayerWeights::NativeFullAttn { attn, ffn } => {
@@ -449,30 +480,62 @@ fn routed_weights(model: &Qwen35Model) -> Vec<(usize, &'static str, MlxBuffer, G
             _ => panic!("the synthetic model holds a float layer"),
         };
         if let Qwen35FfnWeights::DenseQ(weights) = ffn {
-            out.push((index, "ffn.gate", weights.gate_q.clone(), weights.ggml_type_gate_up));
-            out.push((index, "ffn.up", weights.up_q.clone(), weights.ggml_type_gate_up));
-            out.push((index, "ffn.down", weights.down_q.clone(), weights.ggml_type_down));
+            out.push((
+                index,
+                "ffn.gate",
+                weights.gate_q.clone(),
+                weights.ggml_type_gate_up,
+            ));
+            out.push((
+                index,
+                "ffn.up",
+                weights.up_q.clone(),
+                weights.ggml_type_gate_up,
+            ));
+            out.push((
+                index,
+                "ffn.down",
+                weights.down_q.clone(),
+                weights.ggml_type_down,
+            ));
         }
     }
     out
 }
 
-/// The synthetic model at [`OBSERVABLE_SCALE`], its GPU cache primed.
-pub(super) fn with_synthetic_model(run: impl FnOnce(&Qwen35Model)) {
+/// Rescale every weight the prepared prefill route serves to
+/// [`OBSERVABLE_SCALE`].
+pub(super) fn rescale_routed_weights(model: &Qwen35Model) {
+    for (_, _, buffer, ty) in &routed_weights(model) {
+        set_scale(buffer, *ty, OBSERVABLE_SCALE);
+    }
+}
+
+/// The synthetic model at [`OBSERVABLE_SCALE`]. `synthetic_model` primed
+/// the thread's GPU cache for an address the model no longer has: the
+/// caller primes it again where the model finally lives.
+pub(crate) fn observable_synthetic_model(device: &MlxDevice) -> Qwen35Model {
+    let model = synthetic_model(device, padded_policy(), false);
+    rescale_routed_weights(&model);
+    model
+}
+
+/// [`observable_synthetic_model`] with its GPU cache primed, mutable.
+pub(super) fn with_synthetic_model_mut(run: impl FnOnce(&mut Qwen35Model)) {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let Ok(device) = MlxDevice::new() else {
         return;
     };
-    let model = synthetic_model(&device, padded_policy(), false);
-    for (_, _, buffer, ty) in &routed_weights(&model) {
-        set_scale(buffer, *ty, OBSERVABLE_SCALE);
-    }
-    // `synthetic_model` primed the thread's GPU cache for the model's
-    // address before the move out of it.
+    let mut model = observable_synthetic_model(&device);
     model
         .ensure_gpu_cache_primed()
         .expect("prime the GPU cache at the model's final address");
-    run(&model);
+    run(&mut model);
+}
+
+/// [`observable_synthetic_model`] with its GPU cache primed.
+pub(super) fn with_synthetic_model(run: impl FnOnce(&Qwen35Model)) {
+    with_synthetic_model_mut(|model| run(model));
 }
 
 /// A schedule that reaches every attention route: a fresh chunk, a short
@@ -518,8 +581,18 @@ fn the_fixture_observes_every_routed_product_in_every_layer() {
             "the weights were not restored"
         );
         let expected: std::collections::BTreeSet<&str> = [
-            "attn.k", "attn.out", "attn.q_gate", "attn.v", "ffn.down", "ffn.gate", "ffn.up",
-            "gdn.alpha", "gdn.beta", "gdn.gate", "gdn.out", "gdn.qkv",
+            "attn.k",
+            "attn.out",
+            "attn.q_gate",
+            "attn.v",
+            "ffn.down",
+            "ffn.gate",
+            "ffn.up",
+            "gdn.alpha",
+            "gdn.beta",
+            "gdn.gate",
+            "gdn.out",
+            "gdn.qkv",
         ]
         .into_iter()
         .collect();
@@ -694,7 +767,12 @@ fn decode_after_a_prepared_prefill_is_repeatable_and_close_to_the_stock_prefill(
                     .expect("prefill");
             }
             let mut out = Vec::new();
-            for (start, rows) in [(HISTORY, 1), (HISTORY + 1, 1), (HISTORY + 2, 1), (HISTORY + 3, 4)] {
+            for (start, rows) in [
+                (HISTORY, 1),
+                (HISTORY + 1, 1),
+                (HISTORY + 2, 1),
+                (HISTORY + 3, 4),
+            ] {
                 out.extend(
                     model
                         .forward_gpu(
@@ -713,14 +791,22 @@ fn decode_after_a_prepared_prefill_is_repeatable_and_close_to_the_stock_prefill(
         let stock = decode(false);
         assert!(first.iter().all(|value| value.is_finite()));
         assert!(
-            first.iter().zip(&second).all(|(a, b)| a.to_bits() == b.to_bits()),
+            first
+                .iter()
+                .zip(&second)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
             "decode after a prepared prefill is not repeatable"
         );
         assert!(
-            first.iter().zip(&stock).any(|(a, b)| a.to_bits() != b.to_bits()),
+            first
+                .iter()
+                .zip(&stock)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
             "decode does not see which route prefilled its history"
         );
-        let scale = stock.iter().fold(0.0f32, |scale, value| scale.max(value.abs()));
+        let scale = stock
+            .iter()
+            .fold(0.0f32, |scale, value| scale.max(value.abs()));
         let worst = first
             .iter()
             .zip(&stock)
@@ -804,7 +890,15 @@ fn a_prepared_chunk_capture_equals_the_wait_every_layer_capture() {
                 logits.iter().map(|v| v.to_bits()).collect(),
             )
         };
-        for (history, rows) in [(0usize, 20usize), (20, 5), (20, 31), (40, 2), (17, 32), (0, 97), (97, 40)] {
+        for (history, rows) in [
+            (0usize, 20usize),
+            (20, 5),
+            (20, 31),
+            (40, 2),
+            (17, 32),
+            (0, 97),
+            (97, 40),
+        ] {
             let batched = capture(history, rows);
             let waited = {
                 let _wait = WaitEveryLayer::set();
@@ -914,7 +1008,12 @@ fn qwen38_prepared_prefill_real_model_gate() {
 }
 
 fn rms(values: &[f32]) -> f64 {
-    (values.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / values.len() as f64).sqrt()
+    (values
+        .iter()
+        .map(|v| f64::from(*v) * f64::from(*v))
+        .sum::<f64>()
+        / values.len() as f64)
+        .sqrt()
 }
 
 fn rms_diff(a: &[f32], b: &[f32]) -> f64 {
