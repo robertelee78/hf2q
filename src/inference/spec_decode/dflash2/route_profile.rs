@@ -203,7 +203,7 @@ impl SwitchSource {
 
 /// Whether a raw switch value turns its route on, for the rules that are
 /// decided before a reader parses the value.
-fn turns_on(value: Option<&str>) -> bool {
+pub(crate) fn turns_on(value: Option<&str>) -> bool {
     value.is_some_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
@@ -244,9 +244,9 @@ impl ResolvedRoutes {
                 (Some(value), _) => (Some(value), SwitchSource::Env),
                 (None, None) => (None, SwitchSource::Default),
                 (None, Some(value)) => {
-                    let unmet = row.requires.filter(|required| {
-                        !turns_on(values[switch(required).0].as_deref())
-                    });
+                    let unmet = row
+                        .requires
+                        .filter(|required| !turns_on(values[switch(required).0].as_deref()));
                     let reason = match unmet {
                         Some(required) => Some(format!("{required} is off")),
                         None => withhold(row),
@@ -548,7 +548,9 @@ mod tests {
         // tiles cannot run without it. An explicit value is never withheld.
         let routes = ResolvedRoutes::resolve(
             Some(RouteProfile::Qwen36),
-            &|row| (row.name == "HF2Q_QWEN_MOE_BATCHED").then(|| "shared expert is Q5_K".to_owned()),
+            &|row| {
+                (row.name == "HF2Q_QWEN_MOE_BATCHED").then(|| "shared expert is Q5_K".to_owned())
+            },
             &env(&[("HF2Q_REPACKED_GGUF_M32", "0")]),
         );
         for name in [
@@ -560,13 +562,23 @@ mod tests {
             "HF2Q_REPACKED_GGUF_ANY_WIDTH",
         ] {
             assert_eq!(routes.value(switch(name)), None, "{name}");
-            assert_eq!(routes.source(switch(name)), SwitchSource::Withheld, "{name}");
+            assert_eq!(
+                routes.source(switch(name)),
+                SwitchSource::Withheld,
+                "{name}"
+            );
         }
         assert_eq!(routes.source(M32), SwitchSource::Env);
-        assert!(routes.is_one(PREFILL), "an unrelated row keeps its profile value");
+        assert!(
+            routes.is_one(PREFILL),
+            "an unrelated row keeps its profile value"
+        );
         assert!(routes.any_withheld());
         let audit = routes.withheld_audit();
-        assert!(audit.contains("HF2Q_QWEN_MOE_BATCHED: shared expert is Q5_K"), "{audit}");
+        assert!(
+            audit.contains("HF2Q_QWEN_MOE_BATCHED: shared expert is Q5_K"),
+            "{audit}"
+        );
         assert!(
             audit.contains("HF2Q_QWEN_MOE_STAGED_M8: HF2Q_QWEN_MOE_BATCHED is off"),
             "{audit}"
@@ -575,8 +587,13 @@ mod tests {
             audit.contains("HF2Q_REPACKED_GGUF_M32_PROJ: HF2Q_REPACKED_GGUF_M32 is off"),
             "{audit}"
         );
-        assert_eq!(routes.plane_sets(), vec![PlaneSet::Head, PlaneSet::DenseFfn, PlaneSet::Projections]);
-        assert!(routes.audit().contains("HF2Q_QWEN_MOE_BATCHED=unset(withheld)"));
+        assert_eq!(
+            routes.plane_sets(),
+            vec![PlaneSet::Head, PlaneSet::DenseFfn, PlaneSet::Projections]
+        );
+        assert!(routes
+            .audit()
+            .contains("HF2Q_QWEN_MOE_BATCHED=unset(withheld)"));
 
         // An explicit dependent survives a withheld requirement: the reader
         // decides, as it does without a profile.
@@ -597,7 +614,11 @@ mod tests {
     fn every_requirement_names_an_earlier_row() {
         for (index, row) in SWITCHES.iter().enumerate() {
             if let Some(required) = row.requires {
-                assert!(switch(required).0 < index, "{} requires {required}", row.name);
+                assert!(
+                    switch(required).0 < index,
+                    "{} requires {required}",
+                    row.name
+                );
             }
         }
     }

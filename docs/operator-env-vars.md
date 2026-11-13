@@ -191,14 +191,17 @@ are left) when:
 - the weights its planes cover exist and none is Q4_K or Q6_K (a weight kind
   stored partly in those types keeps its row: the prepared kernels admit
   weight by weight and the rest keep their stock kernels);
+- this host cannot run its kernels (for example a Metal runtime without the
+  tensor API the prepared kernels are written over);
 - the memory rule below dropped it.
 
 For example a Q5_K quantization with Q5_K shared experts runs the drafter
 with the AF4G64 and staged draft, GPU target tokens, the tiled verify
 attention, the fused mixer and the replay reuse, and keeps the default MoE
 route. Nothing here fails startup, under auto or `HF2Q_DFLASH2=1`. A switch
-set by hand is never withheld, and on storage it does not admit it still
-refuses the load as it always has.
+set by hand is never withheld: on storage it does not admit it still refuses
+the load as it always has, and on a host that cannot run its kernels the
+server refuses to start, naming the switch, before the model is loaded.
 
 **Memory rule.** Prepared planes are a second copy of the weights they cover,
 and the drafter is resident beside the target. Before selecting, the server

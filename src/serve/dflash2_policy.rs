@@ -30,7 +30,7 @@ use mlx_native::GgmlType;
 use crate::core::provenance::Provenance;
 use crate::inference::spec_decode::dflash2::config::DFlash2TargetShape;
 use crate::inference::spec_decode::dflash2::route_profile::{
-    PlaneSet, ResolvedRoutes, RouteProfile, SwitchRow,
+    turns_on, PlaneSet, ResolvedRoutes, RouteProfile, SwitchRow, SWITCHES,
 };
 use crate::inference::spec_decode::dflash2::schema::{
     DFlash2CheckpointDescriptor, DFlash2FamilyAdapter, QwenTargetGeometry,
@@ -196,7 +196,10 @@ pub(crate) fn tokenizer_identity(gguf: &GgufFile) -> Option<String> {
     };
     section("pre", &[gguf.metadata_string("tokenizer.ggml.pre")?]);
     section("tokens", &strings("tokenizer.ggml.tokens")?);
-    section("merges", &strings("tokenizer.ggml.merges").unwrap_or_default());
+    section(
+        "merges",
+        &strings("tokenizer.ggml.merges").unwrap_or_default(),
+    );
     Some(hex::encode(hasher.finalize()))
 }
 
@@ -604,7 +607,10 @@ fn moe_batched_refusal(facts: &TargetFacts) -> Option<String> {
     if facts.dwq_overlay {
         return Some("a DWQ overlay is applied to the MoE target".to_owned());
     }
-    let layers = facts.geometry.as_ref().map_or(0, |geometry| geometry.layers);
+    let layers = facts
+        .geometry
+        .as_ref()
+        .map_or(0, |geometry| geometry.layers);
     for block in 0..layers {
         let tensor = |leaf: &str| {
             let name = format!("blk.{block}.{leaf}.weight");
@@ -826,16 +832,38 @@ fn gib(bytes: u64) -> String {
 
 const MEMORY_REFUSAL: &str = "its prepared planes do not fit in memory";
 
+/// Why this host cannot run the kernels of the table switch `name`, if it
+/// cannot (for example a Metal runtime without the tensor API the prepared
+/// kernels are written over). The one place the policy asks the host about a
+/// route: every row of the table is passed through it before it is turned
+/// on.
+pub(crate) fn host_switch_refusal(_name: &str) -> Option<String> {
+    None
+}
+
 /// Decide the route of one model load. `env` reads one process environment
-/// variable. An error is a startup error: an invalid `HF2Q_DFLASH2`, or a
-/// required DFlash2 that cannot be satisfied.
+/// variable; `host_refusal` says why this host cannot run a table switch's
+/// kernels, if it cannot. An error is a startup error: an invalid
+/// `HF2Q_DFLASH2`, a required DFlash2 that cannot be satisfied, or a switch
+/// set on by hand that this host cannot run.
 pub(crate) fn decide(
     facts: &TargetFacts,
     host: HostFacts,
     env: &dyn Fn(&str) -> Option<String>,
     store: &dyn DrafterStore,
+    host_refusal: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Selection> {
     let request = parse_policy(env(DFLASH2_ENV).as_deref()).map_err(anyhow::Error::msg)?;
+    // A switch the operator set on is the operator's: it is never withheld,
+    // so a host that cannot run its kernels refuses the load here, by name,
+    // instead of failing at the first dispatch.
+    for row in SWITCHES {
+        if turns_on(env(row.name).as_deref()) {
+            if let Some(reason) = host_refusal(row.name) {
+                bail!("{}=1 cannot run on this host: {reason}", row.name);
+            }
+        }
+    }
     if request == PolicyRequest::Off {
         return Ok(Selection::prior_route(
             request,
@@ -962,7 +990,12 @@ pub(crate) fn decide(
     // does not admit keeps its own default, and the drafter serves with the
     // rows that are left.
     let profile = RouteProfile::of(descriptor);
-    let admitted = ResolvedRoutes::resolve(profile, &|row| switch_refusal(facts, row), env);
+    let refusal = |row: &SwitchRow| {
+        host_refusal(row.name)
+            .map(|reason| format!("this host cannot run it: {reason}"))
+            .or_else(|| switch_refusal(facts, row))
+    };
+    let admitted = ResolvedRoutes::resolve(profile, &refusal, env);
     let admitted_planes = plane_bytes(&facts.tensors, &admitted.plane_sets());
     let (verdict, headroom) = memory_verdict(
         host,
@@ -1005,7 +1038,7 @@ pub(crate) fn decide(
             let dropped = ResolvedRoutes::resolve(
                 profile,
                 &|row| {
-                    switch_refusal(facts, row)
+                    refusal(row)
                         .or_else(|| (!row.planes.is_empty()).then(|| MEMORY_REFUSAL.to_owned()))
                 },
                 env,
@@ -1067,6 +1100,7 @@ pub(crate) fn resolve_for_load(
         HostFacts::read(kv_budget_bytes),
         &|name| std::env::var(name).ok(),
         &HubDrafterStore,
+        &host_switch_refusal,
     )
     .with_context(|| format!("DFlash2 policy for {}", path.display()))
 }
