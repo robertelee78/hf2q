@@ -308,6 +308,9 @@ class Harness(unittest.TestCase):
 
     def driver(self, decide, *extra, workloads="n4", identify=None, thermal=lambda: 0):
         plan, cases = q3.build_plan(self.args(*extra, workloads=workloads), {}, "qwen38")
+        # These generic driver fixtures represent legacy frozen campaigns. The
+        # new source-bound Qwen3.8 mechanism contract has full-report tests.
+        plan.pop("qwen38_mechanism", None)
         runner = FakeRunner(decide)
         identify = identify or (lambda: fake_identities(plan))
         return q3.Driver(plan, cases, self.out, {}, runner, thermal, identify), runner

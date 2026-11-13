@@ -47,6 +47,7 @@ import q5_artifacts
 import q5_case
 import q5_host
 import quality_campaign as qc
+import q3_mechanism
 
 HERE = Path(__file__).resolve().parent
 SCHEMA = "hf2q.adr063.q3-campaign.v1"
@@ -344,6 +345,12 @@ def build_plan(args, environ, family):
         # arm or declares Splash unavailable needs it: a peer-unavailable campaign is Unavailable already, and a
         # controls-only campaign follows its primary's arms.
         plan["splash_required"] = True
+    if family == "qwen38" and record is None and not args.no_stock_arm:
+        plan["qwen38_mechanism"] = dict(q3_mechanism.CONTRACT)
+        if splash_evidence:
+            # ADR-063 Q4 substitutes the absolute mechanism gate only for Qwen3.8's
+            # documented invalid Splash arm. Historical frozen plans keep their rule.
+            plan["splash_required"] = False
     return plan, cases
 
 
@@ -625,6 +632,9 @@ class Driver:
                       makespan_s=metrics["makespan_s"], client_elapsed_s=metrics["client_elapsed_s"],
                       tasks_passed=metrics["tasks_passed"], thermal_valid=metrics["thermal"]["valid"],
                       settled_utc=now())
+        if "qwen38_mechanism" in self.plan and entry["arm"] == "experiment":
+            log = output / "server.stderr"
+            record["server_stderr_sha256"] = sha256(log) if log.is_file() else None
         frozen = self.frozen["arms"][entry["arm"]]
         drift = []
         if metrics["binary_sha256"] is not None and metrics["binary_sha256"] != frozen["binary"]["sha256"]:
@@ -686,8 +696,8 @@ def parse_args(argv):
     parser.add_argument("--splash-case", help="Splash best valid configuration (default q5_cases/splash-<family>.json "
                         "for qwen38/qwen36, whose default campaign always runs it; ADR-063 Splash peer of record)")
     parser.add_argument("--splash-unavailable-evidence", action="append", metavar="FILE",
-                        help="receipt proving no runnable Splash arm (repeatable): the Qwen campaign runs without it "
-                             "and its verdict is Unavailable, never a Win against the peer alone")
+                        help="receipt proving no runnable Splash arm (repeatable): Qwen3.6 remains Unavailable; "
+                             "new Qwen3.8 plans substitute the mandatory source-bound 5.304 mechanism gate (ADR-063 Q4)")
     for arm in ARMS:
         parser.add_argument(f"--{arm.replace('_', '-')}-var", action="append", metavar="NAME=VALUE",
                             help=f"HF2Q_Q5_<NAME> override for the {arm} arm only (repeatable)")

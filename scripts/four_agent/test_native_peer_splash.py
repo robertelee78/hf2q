@@ -704,7 +704,8 @@ class Campaign(unittest.TestCase):
         plan, _ = q3.build_plan(self.args('qwen38', '--splash-unavailable-evidence', str(self.evidence)), {}, 'qwen38')
         self.assertNotIn('splash', plan['measured_arms'])
         self.assertEqual(plan['splash_unavailable_evidence'][0]['path'], str(self.evidence))
-        self.assertIs(plan['splash_required'], True)  # declared unavailable: the verdict is Unavailable
+        self.assertIs(plan['splash_required'], False)  # Qwen3.8 substitutes its mandatory mechanism gate
+        self.assertEqual(plan['qwen38_mechanism']['minimum'], 5.304)
         plan, _ = q3.build_plan(self.args('qwen38', '--peer-unavailable-evidence', str(self.evidence)), {}, 'qwen38')
         self.assertNotIn('splash', plan['measured_arms'])
         self.assertNotIn('splash_required', plan)  # already Unavailable without the peer; no Splash gate asked
