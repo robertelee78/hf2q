@@ -3625,7 +3625,7 @@ pub fn build_delta_net_layer_with_arena(
     // consumes the borrow via `as_deref_mut()`; the terminal
     // `fence_or_commit("layer.gdn.stage_a")` releases the borrow back to
     // the caller's `Option`.
-    layer_session: Option<&mut mlx_native::EncoderSession>,
+    mut layer_session: Option<&mut mlx_native::EncoderSession>,
     // ADR-040 Phase A2b-cont (2026-05-30) — per-slot identity. See the
     // sister docstring at `build_delta_net_layer` (`gpu_delta_net.rs`
     // around line 2205).  SlotId(0) is byte-equivalent to the
@@ -3638,6 +3638,13 @@ pub fn build_delta_net_layer_with_arena(
         seq_len > 1,
         "build_delta_net_layer_with_arena: seq_len must be > 1 (decode uses pooled path)"
     );
+    // One command buffer per layer: with a session and the autoregressive
+    // recurrence, every stage of the layer is encoded into the session's
+    // open command buffer (the chunk-scan route commits and waits on a
+    // command of its own, so it keeps the staged commits).
+    let carry_stages = layer_session.is_some()
+        && super::prefill_prepared::single_command_layers()
+        && !chunk_path_eligible(seq_len, d_k);
     if let Some(runs) = runs {
         // A one-row dispatch is the decode kernel; the runs tile the rows.
         anyhow::ensure!(
@@ -3877,7 +3884,7 @@ pub fn build_delta_net_layer_with_arena(
         // `Option::take`-like consumption — there's only one
         // LayerEncoder::from_session_or_plain site in this function, so we
         // can move the Option directly without `as_deref_mut`.
-        let mut enc = LayerEncoder::from_session_or_plain(device, layer_session)
+        let mut enc = LayerEncoder::from_session_or_plain(device, layer_session.as_deref_mut())
             .context("enc gdn stage_a prefill (arena)")?;
         apply_pre_norm_into(
             enc.encoder(),
@@ -4031,8 +4038,16 @@ pub fn build_delta_net_layer_with_arena(
         //   FIFO drain. THE primary STAGE_FENCE site on the Qwen3.6 27B-DWQ46
         //   DN-dominated path (≈30 DN layers per chunk-engaged pp4096
         //   prefill).
-        enc.fence_or_commit("layer.gdn.stage_a")
-            .context("fence/commit DN stage_a (arena)")?;
+        //
+        // One command buffer per layer ([`carry_layer_stages`]): the stage
+        // stays in the session's open command buffer and the recurrence
+        // stage below is encoded behind it.
+        if carry_stages {
+            enc.carry_into_next_stage("layer.gdn.stage_a")
+        } else {
+            enc.fence_or_commit("layer.gdn.stage_a")
+        }
+        .context("fence/commit DN stage_a (arena)")?;
     }
     let _ = (k_sp, q_sp, v_sp); // shape sanity; locals used above
 
@@ -4269,9 +4284,30 @@ pub fn build_delta_net_layer_with_arena(
         let _w5b8 = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::LayerAutoregOps5to9,
         );
-        let mut enc = device
-            .command_encoder().map(crate::inference::native_observation::encoder)
-            .context("enc ops5-9 prefill (arena)")?;
+        let mut carried_stage = if carry_stages {
+            Some(
+                LayerEncoder::from_session_or_plain(device, layer_session.as_deref_mut())
+                    .context("enc ops5-9 prefill (arena, carried)")?,
+            )
+        } else {
+            None
+        };
+        let mut own_command = if carry_stages {
+            None
+        } else {
+            Some(
+                device
+                    .command_encoder()
+                    .map(crate::inference::native_observation::encoder)
+                    .context("enc ops5-9 prefill (arena)")?,
+            )
+        };
+        let mut enc: &mut mlx_native::CommandEncoder =
+            match (carried_stage.as_mut(), own_command.as_mut()) {
+                (Some(stage), _) => stage.encoder(),
+                (None, Some(command)) => command,
+                (None, None) => unreachable!("one of the two encoders exists"),
+            };
         apply_l2_norm_per_head_into(
             &mut enc,
             registry,
@@ -4507,7 +4543,13 @@ pub fn build_delta_net_layer_with_arena(
             z_channels,
             hidden_size,
         )?;
-        enc.commit_labeled("layer.gdn.ops5-9");
+        match (carried_stage, own_command) {
+            (Some(stage), _) => stage
+                .carry_into_next_stage("layer.gdn.ops5-9")
+                .context("carry DN ops5-9 (arena)")?,
+            (None, Some(mut command)) => command.commit_labeled("layer.gdn.ops5-9"),
+            (None, None) => unreachable!("one of the two encoders exists"),
+        }
         output
     };
 

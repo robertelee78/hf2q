@@ -426,6 +426,7 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
                     positions_flat: &chunks[slot as usize].1,
                     shares_prefix: shared > 0,
                     fold: Some((content, start + content)),
+                    image: None,
                 }
             })
             .collect();
@@ -449,6 +450,9 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
             let mut solo_capture = DFlashCaptureSession::new(layer_ids.clone(), rows, hidden, false);
             {
                 let _scope = PrefillScope::forced(true);
+                let image = solo_caches[slot as usize]
+                    .boundary_anchor_image()
+                    .expect("checkpoint storage");
                 model
                     .forward_gpu_last_logits_folded(
                         tokens,
@@ -458,6 +462,7 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
                         SlotId(slot),
                         content,
                         start + content,
+                        image,
                     )
                     .unwrap_or_else(|error| panic!("{turn}: solo forward of slot {slot}: {error:#}"));
             }

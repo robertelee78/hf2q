@@ -163,6 +163,38 @@ pub(crate) fn wait_layers() -> usize {
     WAIT.with(Cell::get)
 }
 
+thread_local! {
+    static SINGLE_COMMAND_LAYERS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// While alive, the layer builders of this thread's forward keep every
+/// stage of a layer in the encoder session's open command buffer instead of
+/// committing each stage on its own. The layer loop sets it for a forward
+/// that submits one command buffer per layer
+/// ([`QWEN_PREFILL_WAIT_LAYERS_ENV`] above 1).
+pub(crate) struct SingleCommandLayers {
+    previous: bool,
+}
+
+impl SingleCommandLayers {
+    pub(crate) fn set(on: bool) -> Self {
+        Self {
+            previous: SINGLE_COMMAND_LAYERS.with(|cell| cell.replace(on)),
+        }
+    }
+}
+
+impl Drop for SingleCommandLayers {
+    fn drop(&mut self) {
+        SINGLE_COMMAND_LAYERS.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Whether this thread's forward keeps a layer in one command buffer.
+pub(crate) fn single_command_layers() -> bool {
+    SINGLE_COMMAND_LAYERS.with(Cell::get)
+}
+
 /// The prompt-prefill switches of a SlotAware Qwen worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PrefillSwitches {

@@ -5349,6 +5349,12 @@ impl Qwen35Model {
             1
         };
         let pipelined_layers = prefill_wait_layers > 1;
+        // One command buffer per layer: the layer builders carry their
+        // stages into the session's open command buffer, which the FFN
+        // terminal then submits.
+        let _single_command_layers = super::prefill_prepared::SingleCommandLayers::set(
+            pipelined_layers && encoder_session_enabled,
+        );
         let ffn_terminal_k_batch = if small_nextn_verifier {
             // Exact speculative verification is a fixed, short graph whose
             // scratch buffers are retained until the output-head drain. One
