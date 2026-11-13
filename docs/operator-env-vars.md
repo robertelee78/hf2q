@@ -176,6 +176,8 @@ is, and `HF2Q_DFLASH2=0` turns the whole bundle off.
 | `HF2Q_DFLASH2_DRAFT_STAGED` | `1` | `1` | `HF2Q_DFLASH2_DRAFT_AF4_G64` | output head |
 | `HF2Q_DFLASH2_GPU_TARGET_TOKENS` | unset (descriptor default: on) | `1` | | none |
 | `HF2Q_DFLASH2_CONTEXT_FIRST` | `1` | `1` | | none |
+| `HF2Q_DFLASH2_DRAFT_PREFETCH` | unset | unset | | none |
+| `HF2Q_DFLASH2_GPU_DECISIONS` | unset | unset | | none |
 | `HF2Q_REPACKED_GGUF_M32` | `1` | `1` | | dense FFN |
 | `HF2Q_REPACKED_GGUF_M32_PROJ` | `1` | `1` | `HF2Q_REPACKED_GGUF_M32` | DeltaNet and attention projections |
 | `HF2Q_REPACKED_GGUF_M32_HEAD` | `1` | `1` | `HF2Q_REPACKED_GGUF_M32` | output head |
@@ -189,6 +191,10 @@ is, and `HF2Q_DFLASH2=0` turns the whole bundle off.
 | `HF2Q_QWEN_MOE_BATCHED` | unset | `1` | | none |
 | `HF2Q_QWEN_MOE_STAGED_M8` | unset | `1` | `HF2Q_QWEN_MOE_BATCHED` | routed expert stacks |
 | `HF2Q_QWEN_MOE_LIVE_TILES` | unset | `1` | `HF2Q_QWEN_MOE_STAGED_M8` | shared expert |
+
+`HF2Q_DFLASH2_DRAFT_PREFETCH` and `HF2Q_DFLASH2_GPU_DECISIONS` are rows without a
+profile value: they are resolved per model like every other row and stay off
+until the combined configuration with them is qualified.
 
 The profile is applied switch by switch. A row's profile value is *withheld*
 (the switch keeps its own default, and the drafter serves with the rows that
