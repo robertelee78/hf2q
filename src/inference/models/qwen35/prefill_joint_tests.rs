@@ -1607,6 +1607,89 @@ fn caps_trim_a_pool_that_uncapped_forwards_left_warm() {
     });
 }
 
+/// The trim of a warm pool at a cap activation gives the memory back to the
+/// device at once, with the forward's embedding command buffer committed and
+/// not waited for: the device's allocated bytes, read immediately before and
+/// after the release, fall by at least the bytes the pool released. Read in
+/// a fresh process with one test thread, since the figure is the device's
+/// and every test thread of this process allocates on it.
+#[test]
+fn a_trimmed_warm_pool_leaves_the_device_at_once() {
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "inference::models::qwen35::prefill_joint_tests::warm_pool_trim_in_a_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("P834_TRIM_CHILD", "1")
+        .output()
+        .expect("run the child test process");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success() && text.contains("[TRIM_CHILD] released") && text.contains("1 passed"),
+        "the child process did not see the device memory fall at the trim:\n{text}"
+    );
+}
+
+/// The child of [`a_trimmed_warm_pool_leaves_the_device_at_once`]; a no-op
+/// in an ordinary test run.
+#[test]
+fn warm_pool_trim_in_a_child() {
+    use super::decode_pool;
+    use super::prefill_prepared::{ForcedWaitLayers, ScratchCapsForTest};
+    if std::env::var_os("P834_TRIM_CHILD").is_none() {
+        return;
+    }
+    with_synthetic_model(|model| {
+        let lane = Lane::new(0, &[40], 800, 0);
+        let run = |wait: usize| {
+            let _cadence = ForcedWaitLayers::set(wait);
+            let mut cache = cache(model);
+            let _scope = PrefillScope::forced(true);
+            prefill_history(model, &mut cache, &lane);
+            model
+                .forward_gpu_last_logits(
+                    &lane.tokens(lane.start(), lane.rows()),
+                    &positions_for_range(lane.start() as i32, lane.rows()),
+                    &mut cache,
+                    SlotId(0),
+                )
+                .expect("forward");
+        };
+        run(1);
+        decode_pool::checked_reset_decode_pool().expect("reset");
+        let warm = decode_pool::free_bytes();
+        assert!(warm > 0, "the uncapped forward left no pool");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        decode_pool::set_trim_probe(Some(Box::new(move || {
+            device.metal_device().current_allocated_size() as usize
+        })));
+        decode_pool::take_trim_sample();
+        {
+            let _caps = ScratchCapsForTest::set(usize::MAX, warm / 8, warm / 4);
+            run(8);
+        }
+        decode_pool::set_trim_probe(None);
+        let (freed, before, after) =
+            decode_pool::take_trim_sample().expect("no trim at the cap activation");
+        eprintln!(
+            "[TRIM_CHILD] warm pool {warm} B, released {freed} B, device allocated {before} -> {after} B"
+        );
+        assert_eq!(freed, warm, "the trim released something other than the warm pool");
+        assert!(
+            before.saturating_sub(after) >= freed,
+            "the device's allocated bytes fell by {} of the {freed} released",
+            before.saturating_sub(after)
+        );
+        eprintln!("[TRIM_CHILD] released");
+    });
+}
+
 /// `HF2Q_DENSE_Q_ARENA_RESET=0` turns the scratch reset at a layer's host
 /// wait off. A forward that skipped host waits would then accumulate
 /// scratch under caps that count on the reset, so with the override the

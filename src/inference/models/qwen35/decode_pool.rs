@@ -249,7 +249,14 @@ pub(crate) fn cap_pool(caps: Option<PoolCaps>) {
         DECODE_POOL.with(|cell| {
             let mut pool = cell.borrow_mut();
             if pool.free_bytes() > caps.retained {
+                #[cfg(test)]
+                let before = (pool.free_bytes(), trim_probe());
                 pool.clear();
+                #[cfg(test)]
+                if let (freed, Some(before)) = before {
+                    let after = trim_probe().unwrap_or(before);
+                    TRIM_SAMPLE.with(|sample| sample.set(Some((freed, before, after))));
+                }
             }
             // What the pool holds now is this plus what is in use, which is
             // exactly what it has handed out since its reset.
@@ -265,6 +272,36 @@ thread_local! {
     /// The most free bytes the pool held at a capped allocation or at a cap
     /// activation since the last [`take_capped_free_peak`].
     static CAPPED_FREE_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's reading of the device's allocated bytes.
+    static TRIM_PROBE: std::cell::RefCell<Option<Box<dyn Fn() -> usize>>> =
+        const { std::cell::RefCell::new(None) };
+    /// `(free bytes released, probe before, probe after)` of the last trim
+    /// at a cap activation with a probe set.
+    static TRIM_SAMPLE: std::cell::Cell<Option<(usize, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn trim_probe() -> Option<usize> {
+    TRIM_PROBE.with(|probe| probe.borrow().as_ref().map(|read| read()))
+}
+
+/// Sample `probe` immediately before and after the release of a warm pool
+/// at a cap activation on this thread.
+#[cfg(test)]
+pub(crate) fn set_trim_probe(probe: Option<Box<dyn Fn() -> usize>>) {
+    TRIM_PROBE.with(|cell| *cell.borrow_mut() = probe);
+}
+
+/// `(free bytes released, probe before, probe after)` of the last trim at a
+/// cap activation since the last call.
+#[cfg(test)]
+pub(crate) fn take_trim_sample() -> Option<(usize, usize, usize)> {
+    TRIM_SAMPLE.with(std::cell::Cell::take)
 }
 
 /// The most free bytes this thread's pool held while caps were in force
