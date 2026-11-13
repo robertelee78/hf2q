@@ -1,13 +1,14 @@
 # ADR-067: Family-neutral DFlash2 speculative decoding
 
-Date: 2026-11-10
-Status: Accepted; implementation authorized for the v0.1.30 program
-Decider: Robert E. Lee (product owner), 2026-11-10
-Scope: every enabled hf2q text-generation architecture; Qwen3.8 is the first qualified checkpoint
+- **Date:** 2026-11-10
+- **Status:** Accepted; implementation authorized for the v0.1.30 program
+- **Decider:** Robert E. Lee (product owner), 2026-11-10
+- **Scope:** every enabled hf2q text-generation architecture; Qwen3.8 is the first qualified checkpoint
+- **Updated:** 2026-11-12 — correct the family binding of the retained Splash arm; preserve ADR-063's existing mechanism, stock, peer, quality and serving gates.
 
 ## Problem
 
-ADR-063 requires a valid Qwen3.8 comparison against Splash for Q4. The corrected
+ADR-063 originally required a valid Qwen3.8 comparison against Splash for Q4. The corrected
 Splash campaign cannot supply one: all 16 corrected Splash runs preserved prompt,
 artifact, and output-token parity, but every run failed the coding-task floor and
 therefore lacked `CalibrationPass`. A failed comparator cannot count as a Win.
@@ -922,9 +923,9 @@ supports the complete GPU adaptive-row route when
 `HF2Q_DFLASH2_GPU_TARGET_TOKENS=1`, but remains staged by default pending a
 repeatable fixed-count quality campaign. Gemma remains fail-closed because no
 exact release-gate target/checkpoint pair exists. This is not the complete
-Splash transaction: Qwen3.8 remains 4.918 times Splash's 16.420-second median,
-and target output readback, host acceptance, target-state settlement and
-draft-context commit remain separate boundaries.
+Splash transaction: target output readback, host acceptance, target-state
+settlement and draft-context commit remain separate boundaries. The previously
+quoted 4.918 ratio compared Qwen3.8 with Qwen3.6's Splash median and is withdrawn.
 
 The next bounded transaction slice adds mlx-native's
 `dispatch_dflash2_accept_greedy` operation. On transform-free exact-greedy
@@ -1126,10 +1127,10 @@ quoted in this ADR is the 17-run Splash arm of the Qwen3.6 campaign
 `q4-qwen36-dflash2-release-gate-v2`. Splash does load and serve the Qwen3.8
 artifact: 33 runs are retained, and in every one a single agent failed with
 "initial six-step workflow not followed", which aborts the run, so none has a
-makespan. The Qwen3.8 statements in this ADR that apply the Qwen3.6 median
-(the "4.918 times" ratio above, and the D5 gate text and comparator-validity
-risk below that call the 17-run arm a valid Qwen3.8 comparator) are flagged
-here and left unchanged pending an operator decision.
+makespan. Earlier statements applying that Qwen3.6 median to Qwen3.8 are
+attribution errors, not a valid cross-family performance comparison. D5 and the
+comparator-validity risk below follow ADR-063's existing family-specific
+amendment; no acceptance threshold is changed by this correction.
 
 The aborted Splash runs still carry per-turn timing on the same workload,
 artifact and host. Over the 16 runs of the strict-parity sweep (eight
@@ -2116,6 +2117,135 @@ On Qwen3.8, where no valid Splash end-to-end run exists, prefill is 12.0 s
 of a 32.8 s run and the four-lane cycle is 60.2 ms against Splash's 50.6 ms
 profile.
 
+#### Cycle tail: draft prefetch and decision candidates
+
+After the stage work the four-lane Qwen3.8 cycle (59.7–60.1 ms begin to
+begin on the second combined candidate) spends 4.5–4.6 ms between the output
+head's GPU end and the GPU start of the next cycle's draft; Qwen3.6 spends
+2.9 ms of 28.3. Splash has 0.46 ms of GPU work there (acceptance and the
+draft-context update are dispatches of its one command). In hf2q's tail the
+host copies 32 rows of 248,320 logits out of the head's buffer (0.50 ms),
+samples them (0.77 ms; 0.48 on Qwen3.6), pays a residency-set commit for the
+step's released layer outputs (0.40 ms on Qwen3.8), and then runs the
+draft-context commit and the DeltaNet replay in front of the next draft.
+This workload always settles acceptance on the host: every request carries a
+repetition penalty, a thinking budget and the lazy tool grammar.
+
+Two Class A switches, off by default, remove the tail without changing a
+decision:
+
+- `HF2Q_DFLASH2_DRAFT_PREFETCH=1`. Once the plan exists the step knows every
+  input of the next step's draft (anchors, positions, row limits, lane
+  order). It submits the draft-context commit, which reads its own copy of
+  the step's positions so the next positions can be written at once; commits
+  the replay behind it; commits the next draft behind both; and only then
+  waits for the replay and the context commit. The draft's ring reads are
+  ordered behind the context commit's ring writes by Metal's synchronization
+  of tracked resources (the rings are default-tracked shared buffers bound
+  directly to both commands), not by the queue as such: the replay shares no
+  resource with either and overlaps them. The next step's draft call
+  adopts the committed command when its inputs are exactly the prefetched
+  ones and nothing wrote the rings in between; a lane that joined or left, a
+  prefill ingest or a cleared lane makes it wait for the command, drop its
+  outputs and draft again. A step that runs while another slot is in prefill
+  does not prefetch. The order of the three commits matters: a wait on a
+  command buffer returns only when every command committed before it on the
+  queue has completed, so a replay committed behind the draft is waited for
+  until the draft ends (measured: the cycle then gains 1 ms instead of 4).
+  The step's layer outputs are released after the commit settles.
+- `HF2Q_DFLASH2_GPU_DECISIONS=1`. For a lane at temperature zero whose
+  sampler is a repetition penalty followed by an argmax, the penalty changes
+  at most 64 logits of a row. The output-head command gathers those logits
+  (the lane's repetition window after the window's earlier drafts, assembled
+  on the GPU from the lane's base window and the token tile), masks them and
+  runs the stock argmax over the row; the host finishes each decision from at
+  most 65 candidates with `apply_repetition_penalty` and `sample_greedy`
+  themselves and hands it to the same decision path a greedy lane uses
+  (forced thinking-budget tokens, grammar advance, tool trigger and terminal
+  handling are unchanged host code). The GPU copies and compares logits; it
+  performs no arithmetic on them. A row the candidates cannot decide (the
+  tool grammar is constraining it, a logit is not finite, the history is not
+  the one the kernel assembled) is sampled on the host from that row's own
+  logits, restored bit for bit; a request with logit bias, top-k, top-p,
+  min-p, a seed or logprobs keeps the host route for its whole window.
+  `check` runs both routes for every window and compares the plans.
+
+Rejected for this step: acceptance and the context commit inside the head's
+command (it needs the penalty multiply on the GPU and a second context commit
+for lanes the GPU cannot decide, for a further 0.2–0.35 ms), and a host-step
+spin (start latency only; mlx-native has no shared-event split).
+
+Gates. `draft_prefetch_tests`: on a synthetic checkpoint, both draft routes
+and both entry points, 40 steps past a ring wrap leave every draft output and
+the rings bitwise the stock order's with 39 of 40 prefetches adopted; five
+kinds of mismatching next step, a cleared lane and a prefill ingest each drop
+the command and redraft with the stock bits; a step that fails after its
+submissions leaves no prefetched draft and clears its lanes.
+`dflash2_submitted_commit_*`: one to four lanes at every accept count, stock
+and tiled attention, bitwise the waited commit. `verify_decision` tests: the
+kernels against `sampler_pure::sample_token` at vocabularies up to the served
+248,320 under penalties 1.0, 1.05, 1.3 and 0.8, with history tokens on top,
+exact ties on either side, signed zeros, duplicate history tokens and
+non-finite logits; identical digests plain, under shader validation, with the
+debug layer and from runtime source. `dflash2_scheduler::decision_tests`: 600
+verify windows with penalties, thinking-budget closes forced inside the
+window, the lazy grammar waiting, triggered inside the window and active,
+planned by both routes with equal plans.
+
+In situ, Qwen3.8 (the second combined candidate with and without the two
+switches, one binary, eight exact four-agent runs interleaved inside one
+measurement ticket, all passing with one transcript): the time from the
+head's GPU end to the next draft's GPU start falls from 4.63 to 1.00 ms and
+GPU idle per four-lane cycle from 2.7 to 0.5 ms; the four-lane cycle falls
+from 60.1 to 58.2–58.4 ms (−1.85 ms, 3.1%) and four-agent makespan from 33.0
+to 32.5 seconds (−1.5%); peak footprint is unchanged. Alternating the
+switches in blocks of 16 cycles inside one run gives −2.75 ms for both
+(se 0.35), −1.93 ms for the prefetch alone and −1.63 ms for the decision
+candidates alone. Less than the tail's 3.6 ms reaches the cycle for two
+reasons. The replay now runs beside the next draft and slows it by 0.8–1.0 ms
+(a cycle with no partially accepted lane is 56.5–57.4 ms head to head, one
+with four is 59.2–59.7 ms): the replay still costs about 1.3 ms per four-lane
+cycle, which folding the retained rows into the next step's DeltaNet kernel,
+as Splash does, would remove. And the GPU's performance state falls when its
+idle goes: the layer commands take 0.5 ms longer in whole runs with the
+switches, which the 16-cycle blocks do not show.
+
+Qwen3.6, ten exact runs interleaved in one ticket (all passing, one
+transcript): tail 2.84 to 0.88 ms, four-lane cycle 27.34 to 26.28 ms (−3.9%),
+one-lane cycle 16.83 to 16.31 ms, makespan 18.79 to 18.36 seconds (−2.3%;
+four runs per arm, every run with the switches below every run without),
+peak footprint unchanged. With `check`, 5,646 served verify windows on the
+two models were planned by both routes with equal plans.
+
+Equal-clock comparison with Splash. Splash's `decode-profile` and the hf2q
+server were run in the same tickets with a GPU performance-state sampler
+beside each. Run after a pause, Splash's tool reads 51.59 ms per fused
+four-lane cycle at 1617 MHz (its attributed stage table at 1620 MHz); the
+hf2q server ran minutes later at 1394 MHz (1342 MHz with the switches). The
+difference is not the engines. The GPU leaves its top state after a few
+seconds of sustained load: Splash's tool with 160 fused cycles per width
+instead of 8 holds 1620 MHz for 3.5 seconds and then runs at 1200–1300 MHz,
+with nothing else on the host and the GPU never idle, and its cycles
+lengthen with it (three lanes: 8.3 + 66,968 / MHz ms, 49.1 ms at 1620 MHz,
+61.1 ms after ten seconds); run straight after an hf2q run it reads 55.17 ms
+at 1483 MHz. hf2q's served runs slide the same way from their first cycle
+to their last (1511 to 1277 MHz) and their command classes follow the
+frequency (16 layer commands: 10.3 + 51,088 / MHz ms, r = 0.96). A 140 W
+adapter in place of a 65 W one with the battery supplying did not raise the
+served state. Compared at equal frequency, by interpolation on both sides
+between 1306 and 1620 MHz, the hf2q cycle with the two switches is within
+1.5 ms of Splash's measured points on either side (51.7 against 51.6 ms at
+1620 MHz, 54.7 against 55.2 at 1483) and without them 1 to 4 ms above: the
+nine milliseconds between hf2q's 60.1 ms and Splash's published 50.6 ms were
+four of tail and five of comparing a served run in the settled state with a
+tool's first seconds. By stage at equal clock (one category profile scaled
+by the fit): hf2q is faster in the output projections (−1.6 ms) and the
+DeltaNet core (−0.5 ms) and slower in the FFN block's surrounding stages
+(+0.9 ms: casts, SiLU, reduce and residual as separate dispatches behind six
+barriers where Splash has two dispatches with epilogues) and on the
+attention side (+0.3 to +0.6 ms). Whether the envelope is thermal or
+electrical was not measured.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,
@@ -2131,16 +2261,19 @@ for:
   and exact quality verdicts.
 
 Qwen3.8's mechanism gate is at least 5.304 accepted-plus-bonus tokens per
-lane-cycle on the matched workload without a quality or task regression. The
-17 completed Splash runs form an independently valid arm despite the separate
-peer arm's failure: Splash's median is 16.420344 seconds, with no Splash-arm
-failure. Promotion therefore requires candidate/Splash statistical parity,
-with the candidate/Splash 95% CI upper ratio at most 1.00. Qwen3.8 must also
-finish at least 5% sooner than v0.1.29, with the candidate/stock 95% CI upper
-ratio at most 0.95, and reach statistical parity with every other valid
-same-artifact peer, with each candidate/peer upper ratio at most 1.00. The
-absolute mechanism gate remains necessary but cannot substitute for the valid
-Splash arm.
+lane-cycle on the matched workload without a quality or task regression.
+It must also finish at least 5% sooner than v0.1.29, with the candidate/stock
+95% CI upper ratio at most 0.95, and reach statistical parity with every valid
+same-artifact peer, with each candidate/peer upper ratio at most 1.00.
+No retained Splash Qwen3.8 run passes the task gate, so it supplies no valid
+end-to-end performance denominator; ADR-063's mechanism substitution remains
+in force for that family.
+
+The 17 completed Splash runs with median 16.420344 seconds belong to
+`q4-qwen36-dflash2-release-gate-v2`, not Qwen3.8. They establish the required
+Splash comparator for Qwen3.6: its candidate/Splash 95% CI upper ratio must
+be at most 1.00. The Qwen3.8 mechanism gate cannot substitute for that valid
+Qwen3.6 comparator or for any family's other valid same-artifact peer.
 
 Every additional family preregisters its own mechanism and end-to-end gates
 against spec-off, stock and valid peers before seeing candidate results. It
@@ -2178,10 +2311,10 @@ not qualify the adapter.
   target families must fail closed until identity-matched weights with
   reproducible provenance exist; support cannot be inferred from a nearby
   model.
-- **Comparator validity:** the overall Qwen3.8 campaign is invalid because its
-  separate peer arm failed, but the 17/17 completed Splash arm is independently
-  valid and binding. Neither the absolute mechanism gate nor another peer can
-  waive candidate/Splash parity.
+- **Comparator validity:** an arm is bound to its own model artifact and
+  workload. The retained valid Splash arm is Qwen3.6's, not Qwen3.8's.
+  Qwen3.6 must establish candidate/Splash parity; Qwen3.8 retains ADR-063's
+  absolute mechanism gate and every valid same-artifact peer comparison.
 
 ## Operator decision
 
@@ -2222,6 +2355,8 @@ still requires an exact family adapter and compatible trained checkpoint; this
 decision does not authorize routing another architecture through Qwen state.
 
 The operator further clarified on 2026-11-11 that a DFlash2 candidate slower
-than the valid Splash arm must not be promoted. This supersedes the temporary
-unavailable-Splash substitution in item 2 above now that a valid Splash arm
-exists; it does not relax the absolute mechanism, stock or other peer gates.
+than a valid same-artifact Splash arm must not be promoted. This is binding
+for Qwen3.6, whose retained Splash arm is valid. It does not turn those
+Qwen3.6 runs into a valid Qwen3.8 denominator or supersede Qwen3.8's existing
+mechanism substitution; the absolute mechanism, stock and other peer gates
+remain unchanged.

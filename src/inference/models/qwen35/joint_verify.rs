@@ -83,6 +83,22 @@ pub(crate) struct Qwen35JointVerify {
 pub(crate) struct Qwen35JointVerifyPending {
     lanes: Vec<PendingLane>,
     replay: Option<DeltaNetReplay>,
+    /// The step's layer outputs when it ran with
+    /// [`super::super::joint_step_options::DFlash2VerifyOptions::hold_layer_outputs`]:
+    /// kept only so that they are released with this value.
+    #[allow(dead_code, reason = "held for the moment of its release")]
+    held_outputs: Vec<MlxBuffer>,
+}
+
+/// A verify commit whose replay command, if it needed one, is on the queue
+/// ([`Qwen35Model::submit_joint_verify_commit`]). The lanes' DeltaNet state
+/// is being written until [`Qwen35Model::finish_joint_verify_commit`]
+/// returns; nothing else may read or write the lanes' caches before that.
+#[must_use = "a submitted verify commit must be finished before its lanes run again"]
+pub(crate) struct Qwen35SubmittedVerifyCommit {
+    pending: Qwen35JointVerifyPending,
+    accepted: Vec<usize>,
+    replay: Option<mlx_native::CommandEncoder>,
 }
 
 struct PendingLane {
@@ -158,6 +174,7 @@ impl Qwen35Model {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -197,6 +214,7 @@ impl Qwen35Model {
             None,
             capture,
             None,
+            None,
         )
     }
 
@@ -225,6 +243,42 @@ impl Qwen35Model {
             Some(target_tokens),
             capture,
             output_tail,
+            None,
+        )
+    }
+
+    /// A DFlash2 verify whose host-sampled lanes return decision candidates
+    /// ([`crate::inference::models::qwen35::verify_decision`]) beside or instead of their logits:
+    /// `decision_histories[i]` is lane `i`'s repetition window at its
+    /// committed cursor (the sampler's `previous_tokens` for the window's
+    /// first row), or `None` for a lane without candidates. `target_tokens`
+    /// is the GPU-composed token tile, or `None` for the lanes' own tokens.
+    /// Rows, hidden state, cache state and captures are those of
+    /// [`Self::forward_gpu_dflash2_verify`] /
+    /// [`Self::forward_gpu_dflash2_verify_from_gpu_tokens`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_gpu_dflash2_verify_with_decisions(
+        &self,
+        lanes: &[Qwen35JointVerifyLane<'_>],
+        target_tokens: Option<&MlxBuffer>,
+        kv_cache: &mut HybridKvCache,
+        mode: JointRouteMode,
+        dense_ffn: JointDenseFfnRoute,
+        options: JointStepOptions,
+        capture: Option<DFlash2TargetCapture<'_>>,
+        decision_histories: &[Option<&[u32]>],
+    ) -> Result<Qwen35JointVerify> {
+        self.forward_gpu_joint_verify_layout(
+            lanes,
+            kv_cache,
+            mode,
+            dense_ffn,
+            options,
+            VerifyLayout::DFlash2,
+            target_tokens,
+            capture,
+            None,
+            Some(decision_histories),
         )
     }
 
@@ -240,7 +294,17 @@ impl Qwen35Model {
         gpu_token_ids: Option<&MlxBuffer>,
         capture: Option<DFlash2TargetCapture<'_>>,
         output_tail: Option<&mut JointOutputHeadTail<'_>>,
+        decision_histories: Option<&[Option<&[u32]>]>,
     ) -> Result<Qwen35JointVerify> {
+        if let Some(histories) = decision_histories {
+            ensure!(
+                layout == VerifyLayout::DFlash2
+                    && output_tail.is_none()
+                    && histories.len() == lanes.len(),
+                "Qwen verify decisions are a DFlash2 host-acceptance route with one history \
+                 entry per lane"
+            );
+        }
         ensure!(
             !lanes.is_empty(),
             "Qwen {} verify requires a lane",
@@ -374,6 +438,7 @@ impl Qwen35Model {
             mixer_fused: options.verify_mixer_fused,
         };
         let linear_layers = kv_cache.linear_attn.len();
+        let mut held_outputs = Vec::new();
         let (outputs, normed, replay) = self.with_joint_forward(
             mode,
             |device, registry, layer_weights, output_head, plan| {
@@ -394,6 +459,11 @@ impl Qwen35Model {
                     replay.as_mut(),
                     capture,
                     output_tail,
+                    options
+                        .dflash2
+                        .hold_layer_outputs
+                        .then_some(&mut held_outputs),
+                    decision_histories,
                 )?;
                 Ok((outputs, normed, replay))
             },
@@ -421,6 +491,7 @@ impl Qwen35Model {
             pending: Qwen35JointVerifyPending {
                 lanes: pending,
                 replay,
+                held_outputs,
             },
         })
     }
@@ -479,6 +550,67 @@ impl Qwen35Model {
         accepted: &[usize],
     ) -> Result<()> {
         self.validate_joint_verify_commit(kv_cache, &pending, accepted)?;
+        if let Some(mut enc) = self.encode_verify_replay(kv_cache, &pending, accepted)? {
+            enc.commit_and_wait_labeled("qwen35.joint_verify.replay")
+                .map_err(|e| anyhow!("Qwen joint verify replay command buffer: {e}"))?;
+        }
+        mlx_native::command_timeline::mark("commit.replay_completed");
+        settle_verify_lanes(kv_cache, &pending, accepted)
+    }
+
+    /// [`Self::commit_joint_verify`] up to the replay command's commit: the
+    /// host checks, then the replay encoded and handed to the GPU without a
+    /// wait. The caller may commit other commands that share no resource
+    /// with the lanes' caches while it executes, and must then call
+    /// [`Self::finish_joint_verify_commit`].
+    pub(crate) fn submit_joint_verify_commit(
+        &self,
+        kv_cache: &HybridKvCache,
+        pending: Qwen35JointVerifyPending,
+        accepted: &[usize],
+    ) -> Result<Qwen35SubmittedVerifyCommit> {
+        self.validate_joint_verify_commit(kv_cache, &pending, accepted)?;
+        let mut replay = self.encode_verify_replay(kv_cache, &pending, accepted)?;
+        if let Some(enc) = replay.as_mut() {
+            enc.commit_labeled("qwen35.joint_verify.replay");
+        }
+        mlx_native::command_timeline::mark("commit.replay_submitted");
+        Ok(Qwen35SubmittedVerifyCommit {
+            pending,
+            accepted: accepted.to_vec(),
+            replay,
+        })
+    }
+
+    /// Wait for a submitted commit's replay command and settle the lanes'
+    /// parities and attention cursors, as [`Self::commit_joint_verify`]
+    /// does after its own wait.
+    pub(crate) fn finish_joint_verify_commit(
+        &self,
+        kv_cache: &mut HybridKvCache,
+        submitted: Qwen35SubmittedVerifyCommit,
+    ) -> Result<()> {
+        let Qwen35SubmittedVerifyCommit {
+            pending,
+            accepted,
+            replay,
+        } = submitted;
+        if let Some(enc) = replay {
+            enc.wait_until_completed()
+                .map_err(|e| anyhow!("Qwen joint verify replay command buffer: {e}"))?;
+        }
+        mlx_native::command_timeline::mark("commit.replay_completed");
+        settle_verify_lanes(kv_cache, &pending, &accepted)
+    }
+
+    /// The replay command of a commit, encoded and not committed; `None`
+    /// when no lane keeps a proper prefix of its window.
+    fn encode_verify_replay(
+        &self,
+        kv_cache: &HybridKvCache,
+        pending: &Qwen35JointVerifyPending,
+        accepted: &[usize],
+    ) -> Result<Option<mlx_native::CommandEncoder>> {
         let partial = pending
             .lanes
             .iter()
@@ -486,40 +618,48 @@ impl Qwen35Model {
             .filter(|(lane, &rows)| (1..lane.rows).contains(&rows))
             .map(|(lane, &rows)| (lane.slot, rows))
             .collect::<Vec<_>>();
-        if !partial.is_empty() {
-            let replay = pending
-                .replay
-                .as_ref()
-                .context("Qwen joint verify partial commit without replay storage")?;
-            let cache: &HybridKvCache = kv_cache;
-            self.with_gpu_cache_mut(|device, registry| {
-                let mut enc = device
-                    .command_encoder()
-                    .map_err(|e| anyhow!("Qwen joint verify replay encoder: {e}"))?;
-                encode_delta_net_replay(
-                    &mut enc, device, registry, cache, replay, &partial, &self.cfg,
-                )?;
-                enc.commit_and_wait_labeled("qwen35.joint_verify.replay")
-                    .map_err(|e| anyhow!("Qwen joint verify replay command buffer: {e}"))
-            })?;
+        if partial.is_empty() {
+            return Ok(None);
         }
-        mlx_native::command_timeline::mark("commit.replay_completed");
-        for (lane, &rows) in pending.lanes.iter().zip(accepted) {
-            if rows == 0 {
-                for layer in kv_cache.linear_attn.iter_mut() {
-                    layer.swap_for_slot(lane.slot);
-                }
-            }
-            if rows < lane.rows {
-                kv_cache
-                    .truncate_full_attn_to_for_slot(lane.slot, lane.position + rows as u32)
-                    .with_context(|| {
-                        format!("Qwen joint verify lane {} cursor truncate", lane.slot.0)
-                    })?;
-            }
-        }
-        Ok(())
+        let replay = pending
+            .replay
+            .as_ref()
+            .context("Qwen joint verify partial commit without replay storage")?;
+        self.with_gpu_cache_mut(|device, registry| {
+            let mut enc = device
+                .command_encoder()
+                .map_err(|e| anyhow!("Qwen joint verify replay encoder: {e}"))?;
+            encode_delta_net_replay(
+                &mut enc, device, registry, kv_cache, replay, &partial, &self.cfg,
+            )?;
+            Ok(Some(enc))
+        })
     }
+}
+
+/// The host half of a verify commit, after its replay command completed:
+/// a lane that keeps nothing flips its DeltaNet parity back, and a lane
+/// that keeps less than its window has its attention cursor truncated.
+fn settle_verify_lanes(
+    kv_cache: &mut HybridKvCache,
+    pending: &Qwen35JointVerifyPending,
+    accepted: &[usize],
+) -> Result<()> {
+    for (lane, &rows) in pending.lanes.iter().zip(accepted) {
+        if rows == 0 {
+            for layer in kv_cache.linear_attn.iter_mut() {
+                layer.swap_for_slot(lane.slot);
+            }
+        }
+        if rows < lane.rows {
+            kv_cache
+                .truncate_full_attn_to_for_slot(lane.slot, lane.position + rows as u32)
+                .with_context(|| {
+                    format!("Qwen joint verify lane {} cursor truncate", lane.slot.0)
+                })?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

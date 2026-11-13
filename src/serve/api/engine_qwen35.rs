@@ -5071,7 +5071,9 @@ pub(in crate::serve::api) mod critical_path;
 #[path = "engine_qwen35/dflash2_scheduler.rs"]
 mod dflash2_scheduler;
 pub(in crate::serve::api) use dflash2_scheduler::{
-    context_first as dflash2_context_first, Qwen35DFlash2Forward,
+    context_first as dflash2_context_first, decision_route as dflash2_decision_route,
+    draft_prefetch as dflash2_draft_prefetch, tail_block_arm as dflash2_tail_block_arm,
+    DecisionRoute as Qwen35DecisionRoute, Qwen35DFlash2Forward,
 };
 #[path = "engine_qwen35/dflash2_timeline.rs"]
 mod dflash2_timeline;

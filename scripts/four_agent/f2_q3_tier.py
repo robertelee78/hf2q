@@ -43,6 +43,10 @@ RECORD_KEYS = {"verdict", "verdict_ref", "campaign_ref", "campaign_status", "hal
 # record on hf2q's artifact that its vs-stock effects and the stock-hf2q gate come from (records before it carry none).
 STOCK_RECORD = "stock_record"
 STOCK_RECORD_KEYS = {"verdict_ref", "artifact_sha256", "stock_label"}
+# Optional record field of a campaign in which a comparison arm (stock, the peer, Splash) failed a run (ADR-063 Q4
+# comparison-arm failure amendment, 2026-11-12): the rule the verdict was computed under and, per comparison arm, the
+# failed and scored attempts. Records without such a failure carry none.
+COMPARISON_FAILURES = "comparison_failures"
 GATE_KEYS = {"reference", "manifest", "status", "q1_verdict", "reference_sha256"}
 # The tier's wording for a native-engine statement, by artifact relation (native_peers.same_file_baselines).
 NATIVE_STATEMENT = "the native-engine statement (different artifact)"
@@ -233,6 +237,8 @@ def build_record(verdict, campaign, root, refs, gates, review):
     # An effect is unmeasurable only when the primary has paired blocks but the metric was empty in them; a primary
     # stopped before any block (Failed) has no fairness effect at all.
     paired = ((verdict.get("primary") or {}).get("stop") or {}).get("blocks", 0) >= 2
+    lost = {arm: {"attempts": r["attempts"], "failures": r["failures"]}
+            for arm, r in (verdict.get("arm_reliability") or {}).items() if arm != "experiment"}
     return {"verdict": verdict["verdict"], "verdict_ref": refs[0], "campaign_ref": refs[1],
             "campaign_status": verdict["campaign_status"], "halt": halt_record(campaign, root),
             "primary_stop": (verdict.get("primary") or {}).get("stop"),
@@ -251,6 +257,8 @@ def build_record(verdict, campaign, root, refs, gates, review):
                 else symbolic(verdict["splash"]["unavailable"]["reason"], root),
                 "failures": [symbolic(f, root) for f in verdict["splash"]["failures"]],
                 "label": verdict["splash"]["label"]}}),
+            **({COMPARISON_FAILURES: {"rule": verdict["failure_rule"], "arms": lost}}
+               if any(r["failures"] for r in lost.values()) else {}),
             **({} if stock is None else {STOCK_RECORD: {
                 "verdict_ref": symbolic(stock["path"], root), "artifact_sha256": stock["artifact_sha256"],
                 "stock_label": stock["stock"]["label"]}})}
@@ -263,8 +271,15 @@ def validate(groups):
         rec = group.get("q3_record")
         if rec is None:
             continue
-        require(isinstance(rec, dict) and RECORD_KEYS <= set(rec) <= RECORD_KEYS | {SPLASH, STOCK_RECORD},
+        require(isinstance(rec, dict) and RECORD_KEYS <= set(rec) <= RECORD_KEYS | {SPLASH, STOCK_RECORD, COMPARISON_FAILURES},
                 f"{gid}: q3_record fields")
+        lost = rec.get(COMPARISON_FAILURES)
+        require(COMPARISON_FAILURES not in rec or (
+            isinstance(lost, dict) and set(lost) == {"rule", "arms"} and isinstance(lost["rule"], str)
+            and isinstance(lost["arms"], dict) and lost["arms"] and all(
+                isinstance(a, dict) and set(a) == {"attempts", "failures"} and type(a["attempts"]) is int
+                and type(a["failures"]) is int and 0 <= a["failures"] <= a["attempts"] for a in lost["arms"].values())),
+            f"{gid}: q3_record comparison_failures")
         stock = rec.get(STOCK_RECORD)
         require(STOCK_RECORD not in rec or (
             isinstance(stock, dict) and set(stock) == STOCK_RECORD_KEYS and isinstance(stock["verdict_ref"], str)

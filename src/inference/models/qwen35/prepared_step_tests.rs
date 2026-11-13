@@ -72,6 +72,7 @@ pub(super) fn exact_arm(attention_tile: bool) -> Arm {
             pooled_outputs: true,
             verify_attention_tile: attention_tile,
             verify_mixer_fused: false,
+            dflash2: Default::default(),
         },
     }
 }
