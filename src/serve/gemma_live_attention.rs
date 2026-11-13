@@ -46,7 +46,8 @@
 //! before it would hold more than [`TENSOR_GLOBAL_SCRATCH_BUDGET_BYTES`] of
 //! submitted global scratch. Every buffer the global path allocates is
 //! accounted at its exact size: both dense copies, each mask and each `blk`
-//! buffer ([`tensor_global_envelope_bytes`] is the resulting bound). Sub-chunks start on threadgroup boundaries and
+//! buffer (`tensor_global_envelope_bytes`, used by the tests, is the
+//! resulting bound). Sub-chunks start on threadgroup boundaries and
 //! the waits only order work, so every output bit equals the unsplit route.
 //!
 //! Everything that reaches a kernel is a function of the sequence alone
@@ -298,50 +299,70 @@ fn parse_warm_tiled_switch(
     }
 }
 
-/// Applies the device probe to a resolved switch. The tensor route needs
-/// the Metal tensor API: an unset switch whose default cannot build on this
-/// device falls back to vec-hybrid (with the reason), and an explicit
-/// `tensor` there is an error, so the load refuses it instead of failing at
-/// the first warm resume. Other kernels are never probed.
+/// Outcome of probing the tensor warm attention pipelines on a device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TensorProbe {
+    /// Both head-dim pipelines build.
+    Available,
+    /// The toolchain or device lacks the Metal tensor API: a capability the
+    /// host does not have.
+    MissingApi(String),
+    /// A pipeline failed to build for another reason on a device that has
+    /// the API: a defect, never reported as a missing capability. Carries
+    /// the probe's error.
+    BuildFailed(String),
+}
+
+/// Applies the device probe to a resolved switch. Only the tensor route is
+/// probed. With the switch unset the load never fails: a missing tensor API
+/// or a failed pipeline build falls back to vec-hybrid and the outcome is
+/// returned so the caller logs the true reason. An explicit `tensor` is
+/// refused at load in both cases, with the missing capability or the
+/// probe's own build error, instead of failing at the first warm resume.
 fn admit_warm_kernel(
     resolved: Resolved<GemmaLiveKernel>,
-    tensor_unavailable: impl FnOnce() -> Option<String>,
-) -> std::result::Result<(Resolved<GemmaLiveKernel>, Option<String>), String> {
+    probe: impl FnOnce() -> TensorProbe,
+) -> std::result::Result<(Resolved<GemmaLiveKernel>, TensorProbe), String> {
     if resolved.value != GemmaLiveKernel::TensorF16 {
-        return Ok((resolved, None));
+        return Ok((resolved, TensorProbe::Available));
     }
-    match (tensor_unavailable(), resolved.source) {
-        (None, _) => Ok((resolved, None)),
-        (Some(reason), RouteSource::Default) => {
-            Ok((Resolved::fallback(WARM_ATTENTION_STOCK), Some(reason)))
-        }
-        (Some(reason), _) => Err(format!(
+    let outcome = probe();
+    match (&outcome, resolved.source) {
+        (TensorProbe::Available, _) => Ok((resolved, outcome)),
+        (_, RouteSource::Default) => Ok((Resolved::fallback(WARM_ATTENTION_STOCK), outcome)),
+        (TensorProbe::MissingApi(reason), _) => Err(format!(
             "{WARM_TILED_ATTENTION_ENV}=tensor cannot run on this host: {reason}. Unset it for \
              the automatic route (vec-hybrid here) or set 0 for vec-hybrid"
+        )),
+        (TensorProbe::BuildFailed(error), _) => Err(format!(
+            "{WARM_TILED_ATTENTION_ENV}=tensor: the tensor warm attention pipeline failed to \
+             build on a device that has the Metal tensor API (a defect, not a missing \
+             capability): {error}"
         )),
     }
 }
 
-/// Why the tensor-API warm attention pipelines cannot run on `device`
-/// (`None` when both head dims build).
-fn tensor_route_unavailable(registry: &mut KernelRegistry, device: &MlxDevice) -> Option<String> {
+/// Probes both tensor-API warm attention pipelines on `device`. mlx-native
+/// answers `Ok(false)` only for a missing tensor API; any other compile
+/// failure is an error and stays one here.
+fn probe_tensor_route(registry: &mut KernelRegistry, device: &MlxDevice) -> TensorProbe {
     use mlx_native::ops::flash_attn_prefill_tensor::flash_attn_prefill_tensor_available;
     for head_dim in [256, 512] {
         match flash_attn_prefill_tensor_available(registry, device, head_dim) {
             Ok(true) => {}
             Ok(false) => {
-                return Some(format!(
+                return TensorProbe::MissingApi(format!(
                 "the Metal tensor API is unavailable for the d{head_dim} warm attention pipeline"
             ))
             }
             Err(error) => {
-                return Some(format!(
-                    "the d{head_dim} tensor warm attention pipeline does not build: {error}"
+                return TensorProbe::BuildFailed(format!(
+                    "d{head_dim} tensor warm attention pipeline: {error}"
                 ))
             }
         }
     }
-    None
+    TensorProbe::Available
 }
 
 /// Kernel for warm live-resume attention (single-slot resumes, joint warm
@@ -356,15 +377,23 @@ pub(crate) fn warm_live_kernel_from_env(
 ) -> Result<Resolved<GemmaLiveKernel>> {
     let raw = std::env::var(WARM_TILED_ATTENTION_ENV).ok();
     let resolved = parse_warm_tiled_switch(raw.as_deref()).map_err(anyhow::Error::msg)?;
-    let (kernel, fallback_reason) =
-        admit_warm_kernel(resolved, || tensor_route_unavailable(registry, device))
-            .map_err(anyhow::Error::msg)?;
-    if let Some(reason) = &fallback_reason {
-        tracing::warn!(
+    let (kernel, probe) = admit_warm_kernel(resolved, || probe_tensor_route(registry, device))
+        .map_err(anyhow::Error::msg)?;
+    match &probe {
+        TensorProbe::Available => {}
+        TensorProbe::MissingApi(reason) => tracing::warn!(
             reason,
             kernel = ?kernel.value,
             "Gemma warm live attention default is unavailable; using the stock kernel"
-        );
+        ),
+        // Not a missing capability: keep serving (an unset switch never
+        // fails a load) but report the build error as an error.
+        TensorProbe::BuildFailed(error) => tracing::error!(
+            error,
+            kernel = ?kernel.value,
+            "Gemma tensor warm attention pipeline failed to build on a device with the \
+             Metal tensor API; the unset default falls back to the stock kernel"
+        ),
     }
     tracing::info!(
         kernel = ?kernel.value,
@@ -1437,6 +1466,7 @@ fn tensor_dispatch_scratch_bytes(len: usize, kv_pad: usize, bq: usize) -> Result
 /// largest sub-chunk. Holds for any number of lanes and layers, because a
 /// forward holds one sequence's dense K/V at a time and waits before
 /// submitted scratch would pass the budget.
+#[cfg(test)]
 pub(crate) fn tensor_global_envelope_bytes(
     nkv: usize,
     hd: usize,
@@ -2073,25 +2103,28 @@ mod tests {
 
     #[test]
     fn warm_default_falls_back_to_vec_hybrid_without_the_tensor_api() {
-        let unavailable = || Some("no tensor API".to_string());
-        // Unset: the default falls back and reports why.
-        let (kernel, reason) =
-            admit_warm_kernel(Resolved::default_value(TensorF16), unavailable).unwrap();
-        assert_eq!(kernel, Resolved::fallback(VecHybrid));
-        assert_eq!(reason.as_deref(), Some("no tensor API"));
-        // Unset on a capable device: the default serves.
-        let (kernel, reason) =
-            admit_warm_kernel(Resolved::default_value(TensorF16), || None).unwrap();
-        assert_eq!(kernel, Resolved::default_value(TensorF16));
-        assert_eq!(reason, None);
-        // Explicit `tensor`: kept on a capable device, refused at load (not
-        // at the first warm resume) on a host without the tensor API, with a
-        // message naming the switch, the reason and the way out.
-        let (kernel, reason) =
-            admit_warm_kernel(Resolved::environment(TensorF16), || None).unwrap();
-        assert_eq!(kernel, Resolved::environment(TensorF16));
-        assert_eq!(reason, None);
-        let refusal = admit_warm_kernel(Resolved::environment(TensorF16), unavailable).unwrap_err();
+        let missing = || TensorProbe::MissingApi("no tensor API".to_string());
+        let broken = || TensorProbe::BuildFailed("d512: shader error X".to_string());
+        // Unset: a missing API and a failed build both fall back (an unset
+        // switch never fails a load), and the outcome keeps the true cause.
+        for probe in [missing(), broken()] {
+            let expect = probe.clone();
+            let (kernel, outcome) =
+                admit_warm_kernel(Resolved::default_value(TensorF16), move || probe).unwrap();
+            assert_eq!(kernel, Resolved::fallback(VecHybrid));
+            assert_eq!(outcome, expect);
+        }
+        // Unset or explicit on a capable device: the tensor route serves.
+        for resolved in [
+            Resolved::default_value(TensorF16),
+            Resolved::environment(TensorF16),
+        ] {
+            let (kernel, outcome) = admit_warm_kernel(resolved, || TensorProbe::Available).unwrap();
+            assert_eq!((kernel, outcome), (resolved, TensorProbe::Available));
+        }
+        // Explicit `tensor` without the API: refused at load (not at the
+        // first warm resume), naming the switch, the reason and the way out.
+        let refusal = admit_warm_kernel(Resolved::environment(TensorF16), missing).unwrap_err();
         for needle in [
             WARM_TILED_ATTENTION_ENV,
             "no tensor API",
@@ -2100,46 +2133,60 @@ mod tests {
         ] {
             assert!(refusal.contains(needle), "{refusal}");
         }
+        // Explicit `tensor` with a failed build: the probe's error surfaces,
+        // and it is not described as a missing capability of the host.
+        let failure = admit_warm_kernel(Resolved::environment(TensorF16), broken).unwrap_err();
+        assert!(failure.contains("shader error X") && failure.contains("failed to build"));
+        assert!(failure.contains("not a missing capability"), "{failure}");
+        assert!(!failure.contains("cannot run on this host"), "{failure}");
         // The other explicit kernels need no tensor API and are not probed.
         for explicit in [TiledF16, VecHybrid] {
-            let (kernel, reason) = admit_warm_kernel(Resolved::environment(explicit), || {
+            let (kernel, outcome) = admit_warm_kernel(Resolved::environment(explicit), || {
                 panic!("a kernel without tensor pipelines must not be probed")
             })
             .unwrap();
             assert_eq!(kernel, Resolved::environment(explicit));
-            assert_eq!(reason, None);
+            assert_eq!(outcome, TensorProbe::Available);
         }
     }
 
     /// The real probe on this device, through a production context: it
-    /// agrees with mlx-native's own availability answer for both head dims,
-    /// a capable device builds both pipelines (their compiled entries exist
-    /// afterwards) and resolves the tensor default, and an incapable one
-    /// reports the reason and falls back. Either way the frozen routing
-    /// policy is untouched.
+    /// agrees with mlx-native's own availability answer for both head dims
+    /// (a probe error stays an error, never "unavailable"), a capable device
+    /// builds both pipelines (their compiled entries exist afterwards) and
+    /// resolves the tensor default, and a device without the API reports
+    /// that and falls back. Either way the frozen routing policy is
+    /// untouched.
     #[test]
     fn warm_default_probe_builds_both_tensor_pipelines_or_reports_why() {
-        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::ops::flash_attn_prefill_tensor as tensor;
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut ctx = crate::serve::gpu::GpuContext::new().expect("Metal device");
         let policy = *ctx.ggml_routing_policy();
         let (exec, registry) = ctx.split();
         let device = exec.device();
-        let native: Vec<bool> = [256, 512]
+        let native: Vec<Option<bool>> = [256, 512]
             .into_iter()
-            .map(|hd| tensor::flash_attn_prefill_tensor_available(registry, device, hd).unwrap())
+            .map(|hd| tensor::flash_attn_prefill_tensor_available(registry, device, hd).ok())
             .collect();
-        let reason = tensor_route_unavailable(registry, device);
-        assert_eq!(
-            reason.is_none(),
-            native == [true, true],
-            "{reason:?} {native:?}"
-        );
-        let (resolved, why) =
-            admit_warm_kernel(Resolved::default_value(TensorF16), || reason.clone()).unwrap();
-        if native == [true, true] {
+        let probe = probe_tensor_route(registry, device);
+        match &probe {
+            TensorProbe::Available => assert_eq!(native, [Some(true), Some(true)]),
+            TensorProbe::MissingApi(reason) => {
+                assert!(native.contains(&Some(false)) && !native.contains(&None));
+                assert!(reason.contains("Metal tensor API"), "{reason}");
+            }
+            TensorProbe::BuildFailed(error) => {
+                assert!(native.contains(&None), "{error}");
+                panic!("tensor warm attention pipeline failed to build on this device: {error}");
+            }
+        }
+        let expect = probe.clone();
+        let (resolved, outcome) =
+            admit_warm_kernel(Resolved::default_value(TensorF16), move || probe).unwrap();
+        assert_eq!(outcome, expect);
+        if expect == TensorProbe::Available {
             assert_eq!(resolved, Resolved::default_value(TensorF16));
-            assert_eq!(why, None);
             for name in [tensor::K_TENSOR_F16_D256, tensor::K_TENSOR_F16_D512] {
                 assert!(
                     registry.get_pipeline(name, device.metal_device()).is_ok(),
@@ -2147,11 +2194,8 @@ mod tests {
                 );
             }
         } else {
-            let reason = reason.expect("an unavailable route names its reason");
-            assert!(reason.contains("Metal tensor API"), "{reason}");
             assert_eq!(resolved, Resolved::fallback(VecHybrid));
-            assert_eq!(why.as_deref(), Some(reason.as_str()));
-            eprintln!("RECORDED SKIP: no Metal tensor API on this device ({reason})");
+            eprintln!("RECORDED SKIP: no Metal tensor API on this device ({expect:?})");
         }
         assert_eq!(registry.ggml_routing_policy(), Some(&policy));
     }
