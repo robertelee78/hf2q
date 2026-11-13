@@ -2398,19 +2398,34 @@ reader leaves off (`HF2Q_REPACKED_GGUF_M32=on`) selects no kernel, counts no
 plane and never refuses the stock load it leaves.
 
 A memory rule runs before selection. A load may take its drafter, planes
-and scratch only within two bounds, and takes the smaller. The budget is
-physical memory minus what the engines of the process have committed
-(allocated or not), the model file, the configured KV budget and 8 GiB: it
-withholds what a running engine has been promised and has not taken yet.
-The present is the memory the host reports available at the decision minus
-the model file and 8 GiB: it withholds what somebody holds now whatever the
-ledger says (memory of a torn-down engine that the kernel has not reclaimed,
-another process). The drafter costs its file size, the prepared planes the
-native layout's bytes for the weights they cover (two output heads when the
-shared head is off), and the routes' retained scratch its declared figure
-(none today; `route_scratch_bytes`). When the planes do not fit, the
-plane-carrying rows are withheld and DFlash2 is kept if the drafter fits;
-otherwise the prior route is kept.
+and scratch only within two bounds, and takes the smaller:
+
+```
+present = memory available now - charged engines - model file - KV budget - 8 GiB
+budget  = physical memory      - charged engines - model file - KV budget - 8 GiB
+```
+
+*Charged engines* is every engine's whole commitment, allocated or not;
+*memory available now* is what the host reports free, inactive or purgeable
+at the decision. Every claim is taken from both, because what is available
+now is still owed to whatever was promised memory and has not taken it: the
+incoming model's file and KV budget (scheduler admission later honors the
+KV budget without asking the host again) and the unallocated part of every
+charged commitment. The ledger does not know how much of a commitment an
+engine has materialized, so the whole of it is subtracted and the allocated
+part is counted twice, on the safe side; no resident-size estimate is
+attempted. Available memory excludes by itself what anybody holds now:
+memory of a torn-down engine that the kernel has not reclaimed, another
+process. On an idle host the bounds are equal; elsewhere the present bound
+is the smaller, so other programs' memory lowers what the default takes
+(the whole profile needs about 90 GiB available for the Qwen3.8 gate
+artifact and 97 GiB for the Qwen3.6 one at a 48 GiB KV budget). The drafter
+costs its file size, the prepared planes the native layout's bytes for the
+weights they cover (two output heads when the shared head is off), and the
+routes' retained scratch its declared figure (none today;
+`route_scratch_bytes`). When the planes do not fit, the plane-carrying rows
+are withheld and DFlash2 is kept if the drafter fits; otherwise the prior
+route is kept.
 
 Every `load_engine` call decides against a process ledger
 (`serve::resident_memory`) and reserves what it decided in one transaction,
@@ -2423,8 +2438,11 @@ weight cache is dropped, the thread terminates (a second thread joins it, so
 every thread-local it had is destroyed), and every command queue the
 model's threads encoded on is settled (`inference::device_settle`: the
 staged residency-set removals are committed and the commands committed on
-the queue are waited for; request-local queues are settled as each request
-ends). An evicted engine whose worker is still tearing down or is wedged
+the queue are waited for). A request's own queue is settled under the
+engine's supervision before the request reports success, and a load step's
+before the step reports success; a settle that fails is that request's or
+that load's error and marks the thread, whose owner then never releases the
+model's reservation. An evicted engine whose worker is still tearing down or is wedged
 stays charged, and a teardown step that fails strands the reservation for
 the life of the process. New loads are serialized against teardowns: a load
 waits (bounded) for a teardown in progress before it is decided. A load

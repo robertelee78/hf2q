@@ -281,7 +281,8 @@ impl TargetFacts {
 pub(crate) struct HostFacts {
     pub(crate) physical_bytes: u64,
     /// What the host reports available now: free, inactive and purgeable
-    /// pages. Nobody holds these bytes, whatever the ledger says.
+    /// pages. Nobody holds these bytes, whatever the ledger says; what was
+    /// promised and not yet taken still comes out of them.
     pub(crate) available_bytes: u64,
     /// The configured aggregate KV budget; zero when none is configured.
     pub(crate) kv_budget_bytes: u64,
@@ -964,8 +965,8 @@ pub(crate) struct MemoryEstimate {
     /// What the load could take: the smaller of the budget and the present
     /// bound ([`memory_verdict`]).
     pub(crate) headroom_bytes: u64,
-    /// The present bound: what the host reported available, minus the model
-    /// file and [`MEMORY_RESERVE_BYTES`].
+    /// The present bound: what the host reported available, minus every
+    /// claim on it ([`memory_verdict`]).
     pub(crate) present_headroom_bytes: u64,
     /// What the host reported available at the decision.
     pub(crate) available_bytes: u64,
@@ -990,14 +991,18 @@ pub(crate) enum MemoryVerdict {
 }
 
 /// The memory a load may take for its drafter, planes and scratch: the
-/// smaller of two bounds (`serve::resident_memory` says why both).
+/// smaller of two bounds (`serve::resident_memory` says why every term is in
+/// both).
 ///
-/// - budget: `physical - charged engines - model file - KV budget - reserve`;
-/// - present: `available now - model file - reserve`. The model file is
-///   subtracted because loading it takes that much of what is available
-///   (cached pages of the file count as available). The KV budget is not: it
-///   is a claim on the future, which the budget bound holds, not memory the
-///   load takes now.
+/// - present: `available now - charged engines - model file - KV budget -
+///   reserve`;
+/// - budget: `physical - charged engines - model file - KV budget - reserve`.
+///
+/// What is available now is still owed to everything that was promised
+/// memory and has not taken it: the incoming model's file and KV budget, and
+/// whatever the charged engines have not allocated of their commitments.
+/// How much of a commitment an engine has allocated is not known, so the
+/// whole of it is subtracted.
 ///
 /// The full profile needs `drafter + planes + scratch <= headroom`, the
 /// drafter alone `drafter + its scratch <= headroom`.
@@ -1008,17 +1013,16 @@ pub(crate) fn memory_verdict(
     full_route_bytes: u64,
     drafter_only_route_bytes: u64,
 ) -> (MemoryVerdict, Headroom) {
-    let headroom = Headroom {
-        budget_bytes: host
-            .physical_bytes
+    let after_claims = |bytes: u64| {
+        bytes
             .saturating_sub(host.resident_bytes)
             .saturating_sub(model_file_bytes)
             .saturating_sub(host.kv_budget_bytes)
-            .saturating_sub(MEMORY_RESERVE_BYTES),
-        present_bytes: host
-            .available_bytes
-            .saturating_sub(model_file_bytes)
-            .saturating_sub(MEMORY_RESERVE_BYTES),
+            .saturating_sub(MEMORY_RESERVE_BYTES)
+    };
+    let headroom = Headroom {
+        budget_bytes: after_claims(host.physical_bytes),
+        present_bytes: after_claims(host.available_bytes),
     };
     let verdict = if drafter_bytes.saturating_add(full_route_bytes) <= headroom.bytes() {
         MemoryVerdict::Full
@@ -1033,9 +1037,9 @@ pub(crate) fn memory_verdict(
 /// The two bounds of an admission.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Headroom {
-    /// Not promised to any charged engine.
+    /// Of the host's physical memory, what no claim is on.
     pub(crate) budget_bytes: u64,
-    /// Not held by anyone now.
+    /// Of what the host has available now, what no claim is on.
     pub(crate) present_bytes: u64,
 }
 
@@ -1332,19 +1336,16 @@ pub(crate) fn decide(
         dropped_planes.saturating_add(dropped_scratch),
     );
     let formula = format!(
-        "headroom {} = the smaller of budget {} (physical {} - resident engines {} - model \
-         file {} - KV budget {} - reserve {}) and present {} (available {} - model file {} - \
-         reserve {})",
+        "headroom {} = the smaller of present {} (available {}) and budget {} (physical {}), \
+         each after resident engines {}, model file {}, KV budget {} and reserve {}",
         gib(headroom.bytes()),
+        gib(headroom.present_bytes),
+        gib(host.available_bytes),
         gib(headroom.budget_bytes),
         gib(host.physical_bytes),
         gib(host.resident_bytes),
         gib(facts.model_file_bytes),
         gib(host.kv_budget_bytes),
-        gib(MEMORY_RESERVE_BYTES),
-        gib(headroom.present_bytes),
-        gib(host.available_bytes),
-        gib(facts.model_file_bytes),
         gib(MEMORY_RESERVE_BYTES)
     );
     let qualified = match class {

@@ -4045,43 +4045,31 @@ fn load_engine_on_route(
     selection: &dflash2_policy::Selection,
     reservation: resident_memory::Reservation,
 ) -> Result<api::engine::Engine> {
-    use crate::inference::device_settle::{settle, take_thread_unsettled};
+    use crate::inference::device_settle::{settle_or_record, take_thread_unsettled};
+    // Kept for a cleanup of this thread that fails after the reservation
+    // has moved on with the model.
+    let condemner = reservation.condemner();
     let mut reservation = Some(reservation);
     let engine = load_and_spawn_on_route(path, config, selection, &mut reservation);
     // This thread held the model while it loaded and provisioned it. A GPU
-    // weight cache it primed for that is a second copy of what the worker
+    // weight cache it still has for that is a second copy of what the worker
     // builds for itself, or belongs to a model that failed to load: it is
-    // dropped and its queue settled either way. The devices the load itself
-    // created settled their queues as the load ended; one that could not is
-    // on the thread's record.
-    let settled =
-        match crate::inference::models::qwen35::model::Qwen35Model::take_thread_gpu_cache() {
-            Some(device) => settle(&device),
-            None => Ok(()),
-        }
-        .and_then(|()| match take_thread_unsettled() {
-            Some(reason) => Err(anyhow::anyhow!(
-                "a command queue of the load could not be settled: {reason}"
-            )),
-            None => Ok(()),
-        });
-    match (reservation.take(), settled) {
-        // The load failed before a worker owned the model: this thread
-        // dropped it, and the reservation goes with it.
-        (Some(reservation), Ok(())) => drop(reservation),
-        // What the load allocated on this thread cannot be taken to be
-        // free.
-        (Some(reservation), Err(error)) => reservation.strand(&format!(
-            "a load of {} failed and its queues could not be settled: {error:#}",
+    // dropped and its queue settled either way. Every settle that failed on
+    // this thread during the load, this one included, is on the thread's
+    // record, also when the load reported another error first.
+    if let Some(device) =
+        crate::inference::models::qwen35::model::Qwen35Model::take_thread_gpu_cache()
+    {
+        let _ = settle_or_record(&device);
+    }
+    let settled = match take_thread_unsettled() {
+        Some(reason) => Err(anyhow::anyhow!(
+            "a command queue of the load of {} could not be settled: {reason}",
             path.display()
         )),
-        (None, Ok(())) => {}
-        (None, Err(error)) => tracing::error!(
-            model = %path.display(),
-            error = %format!("{error:#}"),
-            "the loading thread's command queues were not settled"
-        ),
-    }
+        None => Ok(()),
+    };
+    resident_memory::conclude_load(reservation.take(), condemner, settled);
     engine
 }
 

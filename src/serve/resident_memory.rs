@@ -1,31 +1,44 @@
 //! What the engines of this process have committed of the host's memory, and
 //! how a load is admitted against it.
 //!
-//! # The two bounds of an admission
+//! # The bounds of an admission
 //!
 //! A load that selects memory-carrying routes (a DFlash2 drafter, prepared
-//! planes, retained scratch) may take them only within both of these
+//! planes, retained scratch) may take them only within
 //! (`dflash2_policy::memory_verdict`):
 //!
-//! - **the budget**: physical memory minus every commitment charged here,
-//!   minus the incoming model's file and KV budget, minus a reserve. A
-//!   commitment is an engine's whole claim (model file, KV budget, drafter,
-//!   planes, scratch), allocated or not. What a running engine may still
-//!   allocate (a KV cache it has not filled, planes it prepares on first
-//!   use, scratch) is inside its charge, so the budget already withholds it
-//!   from the incoming load.
-//! - **the present**: the memory the host reports available at the decision
-//!   (free, inactive and purgeable pages), minus the incoming model's file
-//!   and the reserve. This is what nobody holds now, whatever the ledger
-//!   says: it excludes memory of a torn-down engine that the kernel has not
-//!   reclaimed yet, buffers a command still running holds, the allocator's
-//!   cache, and every other process.
+//! ```text
+//! present = available now - charged engines - model file - KV budget - reserve
+//! budget  = physical      - charged engines - model file - KV budget - reserve
+//! ```
 //!
-//! The budget alone would hand out bytes that are promised to no engine but
-//! not back from the kernel; the present alone would hand out bytes a
-//! running engine has been promised and not yet taken. A load takes the
-//! smaller of the two. Neither bound covers another process that grows
-//! after the decision; the reserve is the only margin for that.
+//! and it takes the smaller. *Charged engines* is every commitment in this
+//! ledger: an engine's whole claim (model file, KV budget, drafter, planes,
+//! scratch), allocated or not. *Available now* is what the host reports
+//! free, inactive or purgeable at the decision.
+//!
+//! Why every term is in the present bound. What is available now is still
+//! owed, later, to everything that has been promised memory and has not
+//! taken it: the incoming model's file and its KV budget, and the part of
+//! each charged engine's commitment that it has not allocated yet (a KV
+//! cache it has not filled, planes it prepares on first use, scratch).
+//! Scheduler admission later honors those promises without asking the host
+//! again, so the load must leave room for all of them now. The ledger knows
+//! what each engine was promised, not how much of it the engine has
+//! materialized, so the whole of every commitment is subtracted. The part an
+//! engine has already allocated is then counted twice (it is also missing
+//! from what is available), which errs on the safe side and by at most the
+//! engines' resident size; no estimate of that size is attempted.
+//!
+//! What is available now also excludes, by itself, everything anybody holds
+//! at the decision whatever the ledger says: memory of a torn-down engine
+//! that the kernel has not reclaimed yet, buffers a command still running
+//! holds, the allocator's cache, and every other process. On an idle host
+//! the two bounds are equal; otherwise the present bound is the smaller, so
+//! other programs' memory lowers what a load may take. The budget remains as
+//! the bound that does not depend on a reading. Neither covers another
+//! process that grows after the decision; the reserve is the only margin for
+//! that.
 //!
 //! # Why an admission cannot race
 //!
@@ -44,8 +57,8 @@
 //!   middle. A teardown that does not end does not block loads for good: the
 //!   wait is bounded, and the engine stays charged.
 //! - **Against a running engine that allocates.** Those allocations are
-//!   inside the engine's charge: the budget withheld them before the engine
-//!   made them.
+//!   inside the engine's charge, and the whole charge is withheld from both
+//!   bounds before the engine makes them.
 //!
 //! # Who releases a reservation
 //!
@@ -63,7 +76,8 @@
 //!
 //! The kernel returns the pages of released buffers on its own, some time
 //! after user space has let go. The ledger does not claim to know when: the
-//! present bound is what keeps those bytes from being handed out.
+//! present bound is what keeps those bytes from being handed out, because
+//! they are not in what the host reports available.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -106,6 +120,9 @@ struct Entry {
     commitment: Commitment,
     /// The thread that owns the model has begun to tear it down.
     tearing_down: bool,
+    /// Why the commitment must never be released, if a thread that held the
+    /// model found that out after the reservation had moved on.
+    condemned: Option<String>,
 }
 
 #[derive(Default)]
@@ -136,6 +153,7 @@ impl Entries {
                 model: model.to_path_buf(),
                 commitment,
                 tearing_down: false,
+                condemned: None,
             },
         );
         id
@@ -308,6 +326,15 @@ impl Reservation {
         }
     }
 
+    /// What the loading thread keeps when it hands the reservation on with
+    /// the model, to condemn it if its own cleanup fails afterwards.
+    pub(crate) fn condemner(&self) -> Condemner {
+        Condemner {
+            ledger: Arc::clone(&self.ledger),
+            id: self.id,
+        }
+    }
+
     /// Keep the commitment charged for the rest of the process: the teardown
     /// of the engine it stands for failed, so its memory cannot be taken to
     /// be free. `reason` is logged with the model.
@@ -331,7 +358,23 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let ended = self.ledger.entries().end_teardown(self.id, true);
+        let mut entries = self.ledger.entries();
+        // A condemned commitment is never released, whoever lets go of it.
+        let condemned = entries
+            .reserved
+            .get(&self.id)
+            .and_then(|entry| entry.condemned.clone());
+        if let Some(reason) = &condemned {
+            let entry = entries.reserved.get(&self.id);
+            tracing::error!(
+                model = %entry.map_or_else(String::new, |entry| entry.model.display().to_string()),
+                bytes = entry.map_or(0, |entry| entry.commitment.total()),
+                reason,
+                "engine memory stays reserved until the process restarts"
+            );
+        }
+        let ended = entries.end_teardown(self.id, condemned.is_none());
+        drop(entries);
         if ended {
             self.ledger.teardown_ended.notify_all();
         }
@@ -344,6 +387,49 @@ impl std::fmt::Debug for Reservation {
             .debug_struct("Reservation")
             .field("id", &self.id)
             .finish()
+    }
+}
+
+/// Condemns a reservation that has moved on with its model: the commitment
+/// then stays charged for the rest of the process, like a stranded one,
+/// whenever its owner lets go of it.
+pub(crate) struct Condemner {
+    ledger: Arc<Ledger>,
+    id: u64,
+}
+
+impl Condemner {
+    pub(crate) fn condemn(self, reason: &str) {
+        if let Some(entry) = self.ledger.entries().reserved.get_mut(&self.id) {
+            entry.condemned.get_or_insert_with(|| reason.to_owned());
+        }
+    }
+}
+
+/// What the loading thread does with an engine's reservation once the load
+/// has ended, given whether the thread could give back what it held for the
+/// model itself (`settled`).
+///
+/// `reservation` is still here when the load failed before a worker owned
+/// the model: the model is dropped, and the reservation goes with it, unless
+/// the thread's cleanup failed, in which case its memory cannot be taken to
+/// be free and it is stranded. When the reservation has moved on with the
+/// model, a cleanup that failed condemns it: the worker's teardown will not
+/// release it either.
+pub(crate) fn conclude_load(
+    reservation: Option<Reservation>,
+    condemner: Condemner,
+    settled: anyhow::Result<()>,
+) {
+    match (reservation, settled) {
+        (Some(reservation), Ok(())) => drop(reservation),
+        (Some(reservation), Err(error)) => reservation.strand(&format!(
+            "the load failed and the loading thread could not give its memory back: {error:#}"
+        )),
+        (None, Ok(())) => {}
+        (None, Err(error)) => condemner.condemn(&format!(
+            "the loading thread could not give back what it held for the model: {error:#}"
+        )),
     }
 }
 
@@ -688,6 +774,51 @@ mod tests {
     #[test]
     fn the_process_footprint_is_readable() {
         assert!(process_footprint_bytes().expect("footprint") > 0);
+    }
+
+    #[test]
+    fn the_loading_thread_concludes_a_load_by_what_it_could_give_back() {
+        let ledger = Ledger::new();
+        let reserve = || ledger.reserve(Path::new("/a.gguf"), commitment(16, 10));
+        let one = (16 + 4 + 1 + 10) * GIB;
+        let failed = || Err(anyhow::anyhow!("a command queue could not be settled"));
+
+        // The load failed before a worker owned the model, and the thread
+        // gave everything back: the reservation goes.
+        let reservation = reserve();
+        let condemner = reservation.condemner();
+        conclude_load(Some(reservation), condemner, Ok(()));
+        assert_eq!(ledger.total(), 0);
+
+        // The load failed and the thread could not give its memory back:
+        // stranded, so a retry is admitted against it.
+        let reservation = reserve();
+        let condemner = reservation.condemner();
+        conclude_load(Some(reservation), condemner, failed());
+        assert_eq!(ledger.total(), one);
+
+        // The reservation moved on with the model and the thread's cleanup
+        // succeeded: the worker releases it in its own time.
+        let with_worker = reserve();
+        conclude_load(None, with_worker.condemner(), Ok(()));
+        assert_eq!(ledger.total(), 2 * one);
+        drop(with_worker);
+        assert_eq!(ledger.total(), one);
+
+        // It moved on and the thread's cleanup failed: condemned. The
+        // worker's teardown, however clean, does not release it, and it does
+        // not leave admissions waiting.
+        let with_worker = reserve();
+        conclude_load(None, with_worker.condemner(), failed());
+        with_worker.teardown_marker().begin();
+        drop(with_worker);
+        assert_eq!(ledger.total(), 2 * one);
+        let (resident, _reservation) = ledger
+            .admit(Path::new("/b.gguf"), |resident| {
+                Ok::<_, ()>((resident, Commitment::default()))
+            })
+            .expect("admitted without waiting");
+        assert_eq!(resident, 2 * one);
     }
 
     #[test]

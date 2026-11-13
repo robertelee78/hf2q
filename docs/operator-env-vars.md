@@ -244,9 +244,9 @@ and the drafter is resident beside the target. Before selecting, the server
 computes
 
 ```
-budget   = physical memory - charged engines - model file bytes - KV budget - 8 GiB
-present  = memory available now - model file bytes - 8 GiB
-headroom = the smaller of budget and present
+present  = memory available now - charged engines - model file bytes - KV budget - 8 GiB
+budget   = physical memory      - charged engines - model file bytes - KV budget - 8 GiB
+headroom = the smaller of present and budget
 planes   = sum over the covered Q4_K/Q6_K weights of the plane sets of every
            switch that resolved on:
            Q4_K: 16 bytes per 32 weights + 16 bytes per 256 weights
@@ -260,16 +260,22 @@ engine of this process has committed (its model file, KV budget, drafter,
 planes and scratch, allocated or not), and *memory available now* is what
 the host reports free, inactive or purgeable at the decision.
 
-The two bounds answer different questions. The budget withholds what a
-running engine has been promised and has not taken yet (a KV cache it has
-not filled, planes it prepares on first use). The present withholds what
-somebody holds now whatever the ledger says: memory of an engine that was
-just torn down and that the kernel has not reclaimed yet, another process,
-the allocator's cache. A load takes the smaller, so on a host where other
-programs hold memory the default may keep fewer routes than on an idle one;
-the audit line gives both bounds and what the host had available. Another
-process that grows after the decision is covered by neither; the 8 GiB
-reserve is the only margin for it.
+What is available now is still owed to everything that has been promised
+memory and has not taken it: the incoming model's file and KV budget, and
+whatever the engines already loaded have not allocated of their commitments
+(a KV cache not filled yet, planes prepared on first use). The server knows
+what each engine was promised, not how much of it the engine has allocated,
+so it subtracts the whole of every commitment; the part an engine has
+already allocated is then counted twice, which errs on the safe side. What
+is available also leaves out, by itself, everything anybody holds now:
+memory of an engine that was just torn down and that the kernel has not
+reclaimed yet, and every other program. On an idle host the two bounds are
+equal; on a host where other programs hold memory the present bound is the
+smaller and the default may keep fewer routes. With a 48 GiB KV budget the
+whole profile needs about 90 GiB available for the Qwen3.8 gate artifact
+and about 97 GiB for the Qwen3.6 one. The audit line gives both bounds and
+what the host had available. Another process that grows after the decision
+is covered by neither; the 8 GiB reserve is the only margin for it.
 
 The decision and the reservation of what it decided are one transaction, so
 two loads running at once, through one pool or through separate ones, are
@@ -282,8 +288,11 @@ thread terminates, which destroys every other thread-local cache it had;
 every command queue the model's threads encoded on is settled (an empty
 command buffer is committed and waited for, which commits the removals the
 dropped buffers staged in the Metal residency set and waits for the commands
-committed earlier on that queue; request-local queues are settled as each
-request ends); then the reservation goes. Evicting an engine or dropping its
+committed earlier on that queue); then the reservation goes. A request's own
+queue is settled under the engine's supervision as the last GPU step of the
+request, before its result or `Done` is reported: a settle that fails is
+that request's error, and one that never returns fails the engine like any
+other GPU call that does. Evicting an engine or dropping its
 last handle releases nothing: an engine whose worker is still tearing down,
 or is wedged inside Metal, is still charged, and a teardown step that fails
 leaves it charged until the process restarts (one ERROR line, `engine memory

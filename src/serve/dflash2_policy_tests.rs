@@ -1318,43 +1318,67 @@ fn host_with_headroom(facts: &TargetFacts, headroom: u64, resident: u64) -> Host
 }
 
 #[test]
-fn a_load_takes_only_what_the_host_has_available_now() {
-    // The budget is generous: 128 - 0 - 16 - 32 - 8 = 72 GiB. What decides
-    // is what the host has available at the decision.
-    let host = |available: u64| HostFacts {
+fn a_load_takes_only_what_is_available_now_and_not_already_promised() {
+    let host = |available_gib: u64, kv_gib: u64, charged_gib: u64| HostFacts {
         physical_bytes: 128 * GIB,
-        available_bytes: available,
-        kv_budget_bytes: 32 * GIB,
-        resident_bytes: 0,
+        available_bytes: available_gib * GIB,
+        kv_budget_bytes: kv_gib * GIB,
+        resident_bytes: charged_gib * GIB,
     };
-    let verdict = |available: u64| memory_verdict(host(available), 16 * GIB, 4 * GIB, 16 * GIB, 0);
-    // present = available - model file - reserve. The KV budget is a claim
-    // on the future and is not taken from what is available now.
-    let (full, headroom) = verdict(16 * GIB + MEMORY_RESERVE_BYTES + 20 * GIB);
-    assert_eq!(full, MemoryVerdict::Full);
-    assert_eq!(headroom.budget_bytes, 72 * GIB);
-    assert_eq!(headroom.present_bytes, 20 * GIB);
-    assert_eq!(headroom.bytes(), 20 * GIB);
+    let headroom =
+        |host: HostFacts, model_gib: u64| memory_verdict(host, model_gib * GIB, 0, 0, 0).1;
+    // The counterexample the first form of the present bound allowed: 34 GiB
+    // are held by others (94 available of 128), nothing is charged, the
+    // model is 16 GiB with a 48 GiB KV budget. What is available must still
+    // hold the model, its KV budget and the reserve: 94 - 16 - 48 - 8 = 22,
+    // not the budget's 128 - 16 - 48 - 8 = 56. With 56 the host would end at
+    // 34 + 16 + 48 + 56 = 154 GiB.
+    let bounds = headroom(host(94, 48, 0), 16);
+    assert_eq!(bounds.budget_bytes, 56 * GIB);
+    assert_eq!(bounds.present_bytes, 22 * GIB);
+    assert_eq!(bounds.bytes(), 22 * GIB);
     assert_eq!(
-        verdict(16 * GIB + MEMORY_RESERVE_BYTES + 20 * GIB - 1).0,
-        MemoryVerdict::DropPlanes
+        34 * GIB + 16 * GIB + 48 * GIB + bounds.bytes() + MEMORY_RESERVE_BYTES,
+        128 * GIB,
+        "what the load may take, the promises and the reserve fit the host exactly"
     );
+    let verdict =
+        |routes_gib: u64| memory_verdict(host(94, 48, 0), 16 * GIB, 4 * GIB, routes_gib * GIB, 0).0;
+    assert_eq!(verdict(18), MemoryVerdict::Full);
+    assert_eq!(verdict(19), MemoryVerdict::DropPlanes);
     assert_eq!(
-        verdict(16 * GIB + MEMORY_RESERVE_BYTES + 4 * GIB).0,
-        MemoryVerdict::DropPlanes
+        verdict(52),
+        MemoryVerdict::DropPlanes,
+        "the budget alone said yes"
     );
+
+    // 44 GiB available, model 16, KV 32: nothing is left once the model and
+    // its KV budget are set aside, so not even a 4 GiB drafter is admitted
+    // (the first form admitted a 20 GiB route here and left the KV budget
+    // nothing).
+    assert_eq!(headroom(host(44, 32, 0), 16).bytes(), 0);
     assert_eq!(
-        verdict(16 * GIB + MEMORY_RESERVE_BYTES + 4 * GIB - 1).0,
+        memory_verdict(host(44, 32, 0), 16 * GIB, 4 * GIB, 16 * GIB, 0).0,
         MemoryVerdict::NoDrafter
     );
-    let (none, headroom) = verdict(GIB);
-    assert_eq!(none, MemoryVerdict::NoDrafter);
-    assert_eq!(headroom.bytes(), 0, "no headroom, not a wrapped one");
 
-    // The case the present bound exists for: an engine was torn down and is
-    // no longer charged, and the kernel has not returned its memory yet (or
-    // a command still holds it, or another process took it). The budget says
-    // the whole profile fits; the load does not get bytes nobody has.
+    // Engines already charged: all they were promised comes out of what is
+    // available, because how much of it they have allocated is not known.
+    // An engine charged 40 GiB that has allocated all of it shows as 88
+    // available; one that has allocated nothing yet shows as 128. Both
+    // leave the new load the same or less than the truth, never more.
+    let allocated = headroom(host(88, 32, 40), 16);
+    assert_eq!(allocated.present_bytes, 0, "88 - 40 - 16 - 32 - 8, floored");
+    let unallocated = headroom(host(128, 32, 40), 16);
+    assert_eq!(unallocated.present_bytes, 32 * GIB);
+    assert_eq!(unallocated.budget_bytes, 32 * GIB);
+    // No headroom is not a wrapped one.
+    assert_eq!(headroom(host(1, 48, 64), 21).bytes(), 0);
+
+    // On the real policy: an engine was torn down and is no longer charged,
+    // and the kernel has not returned its memory yet (or a command still
+    // holds it, or another process took it). The budget says the whole
+    // profile fits; the load does not get bytes nobody has.
     let facts = qwen38();
     let drafter = QWEN38_DFLASH2.weights_bytes;
     let planes = plane_bytes(
@@ -1374,30 +1398,34 @@ fn a_load_takes_only_what_the_host_has_available_now() {
         )
         .expect("auto never fails")
     };
-    let needed = facts.model_file_bytes + MEMORY_RESERVE_BYTES + drafter + planes;
-    let back = decide_with(needed);
+    let claims = facts.model_file_bytes + ROOMY.kv_budget_bytes + MEMORY_RESERVE_BYTES;
+    let back = decide_with(claims + drafter + planes);
     assert_eq!(back.profile_label(), "full");
     let memory = back.memory.expect("memory");
-    assert_eq!(memory.available_bytes, needed);
+    assert_eq!(memory.available_bytes, claims + drafter + planes);
     assert_eq!(memory.present_headroom_bytes, drafter + planes);
     assert_eq!(memory.headroom_bytes, drafter + planes);
-    assert_eq!(back.published()["memory"]["available_bytes"], needed);
+    assert_eq!(
+        back.published()["memory"]["available_bytes"],
+        claims + drafter + planes
+    );
     assert_eq!(
         back.published()["memory"]["present_headroom_bytes"],
         drafter + planes
     );
-    // 28 GiB not back yet: the planes are withheld, the drafter is kept.
-    let lagging = decide_with(needed - 1);
+    // One byte less is available: the planes are withheld, the drafter is
+    // kept.
+    let lagging = decide_with(claims + drafter + planes - 1);
     assert!(lagging.selected());
     assert_eq!(lagging.profile_label(), "partial");
     assert_eq!(lagging.commitment.plane_bytes, 0);
     assert!(
-        lagging.reason.contains("the smaller of budget") && lagging.reason.contains("present"),
+        lagging.reason.contains("the smaller of present") && lagging.reason.contains("available"),
         "{}",
         lagging.reason
     );
     // Not even the drafter is available: the prior route.
-    let none = decide_with(facts.model_file_bytes + MEMORY_RESERVE_BYTES + drafter - 1);
+    let none = decide_with(claims + drafter - 1);
     assert_prior_route(&none, &[]);
     assert!(none.reason.contains("available"), "{}", none.reason);
 }
@@ -1427,8 +1455,8 @@ fn insufficient_memory_drops_the_planes_then_the_drafter() {
         Some(MemoryEstimate {
             headroom_bytes: drafter + planes,
             // The host is otherwise idle: all of it is available, and the
-            // budget (which also sets the 4 GiB KV budget aside) binds.
-            present_headroom_bytes: drafter + planes + 4 * GIB,
+            // two bounds are equal.
+            present_headroom_bytes: drafter + planes,
             available_bytes: facts.model_file_bytes
                 + MEMORY_RESERVE_BYTES
                 + 4 * GIB

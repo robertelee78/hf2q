@@ -59,9 +59,9 @@ for its storage (a static rule read from the header; the server never
 monitors acceptance or changes route after the load). Every other model
 (other shapes, another family, another scheduler, more slots) runs the route
 it ran before, bit for bit. Memory-carrying routes are admitted within what
-the engines of the process have not been promised and within what the host
-reports available at the load, and a host that cannot run a route's kernels
-leaves that switch off; a release-gate run must therefore show
+the host reports available at the load once every engine's commitment, the
+model file, the KV budget and 8 GiB are set aside, and a host that cannot
+run a route's kernels leaves that switch off; a release-gate run must therefore show
 `profile=full`, which its Q5 case checks. The default never fails startup
 on its own account: a drafter that cannot be obtained or bound, too little
 memory for the drafter, and a load that fails with DFlash2 selected each

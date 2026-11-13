@@ -4241,7 +4241,10 @@ impl Qwen35Model {
         };
         let device = cache.device.clone();
         drop(cache);
-        crate::inference::device_settle::settle(&device)
+        // The cache is gone from the thread, so a settle that fails here
+        // would leave nothing for the thread's owner to find: it goes on the
+        // thread's record, whatever error the caller reports first.
+        crate::inference::device_settle::settle_or_record(&device)
     }
 
     /// Drop the GPU weight cache of this thread, whichever model it was
