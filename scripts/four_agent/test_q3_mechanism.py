@@ -23,7 +23,10 @@ class MechanismVerdict(unittest.TestCase):
         m = splash_manifest(arms=('stock', 'experiment', 'peer'))
         p = m['plan']
         p['splash_required'] = False
-        p['splash_unavailable_evidence'] = [{'path': '/recorded/invalid-splash.json', 'sha256': 'a' * 64}]
+        selection = self.root / 'invalid-splash.json'
+        selection.write_text(json.dumps({'schema': 'hf2q.splash-sweep-selection.v1', 'pass_floor': .75,
+                                         'choice': None, 'configurations': {'s0': {'valid': False}}}))
+        p['splash_unavailable_evidence'] = [{'path': str(selection), 'sha256': mechanism.digest(selection)}]
         p['qwen38_mechanism'] = dict(mechanism.CONTRACT)
         p['design'].update(stock_margin_ratio=.95, peer_margin_ratio=1.)
         m['identities']['harness'] = {'git_commit': p['declared']['experiment']['commit']}
@@ -75,7 +78,7 @@ class MechanismVerdict(unittest.TestCase):
     def test_every_position_required_and_source_case_binary_model_bound(self):
         for fault in ('missing-log', 'changed-log', 'missing-attempt', 'source', 'missing-source', 'missing-artifact',
                       'case', 'receipt', 'binary', 'artifact', 'workload', 'q5', 'zero', 'negative', 'nan',
-                      'fractional', 'duplicate', 'inconsistent'):
+                      'fractional', 'duplicate', 'inconsistent', 'missing-splash', 'changed-splash', 'valid-splash'):
             with self.subTest(fault=fault):
                 self.root = Path(self.tmp.name) / fault
                 self.root.mkdir()
@@ -96,6 +99,18 @@ class MechanismVerdict(unittest.TestCase):
                     m['identities']['harness']['git_commit'] = None
                 elif fault == 'missing-artifact':
                     m['identities']['arms']['experiment']['artifact']['sha256'] = None
+                elif fault == 'missing-splash':
+                    m['plan'].pop('splash_unavailable_evidence')
+                elif fault == 'changed-splash':
+                    Path(m['plan']['splash_unavailable_evidence'][0]['path']).write_text('{}')
+                elif fault == 'valid-splash':
+                    bound = m['plan']['splash_unavailable_evidence'][0]
+                    path = Path(bound['path'])
+                    selection = json.loads(path.read_text())
+                    selection['choice'] = 's0'
+                    selection['configurations']['s0']['valid'] = True
+                    path.write_text(json.dumps(selection))
+                    bound['sha256'] = mechanism.digest(path)
                 elif fault == 'case':
                     Path(a['case']).write_text('{}')
                 elif fault == 'receipt':
