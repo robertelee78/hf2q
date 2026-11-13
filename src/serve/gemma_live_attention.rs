@@ -37,13 +37,16 @@
 //! Transient scratch of the tensor route. Sliding layers stage at most one
 //! window of history plus the chunk, so their scratch is bounded by the
 //! suffix rows. Global layers attend the whole history: the dense F16 K and V
-//! copies cost `4 · nkv · hd` bytes per key and the additive mask
-//! `2 · rows · keys` bytes. [`LiveScratch`] keeps that history-proportional
+//! copies cost `4 · nkv · hd` bytes per key, the additive mask
+//! `2 · rows · keys` bytes and its tile classification (`blk`) one byte per
+//! tile of queries-per-threadgroup × 64 keys. [`LiveScratch`] keeps that history-proportional
 //! part bounded for one forward: a sequence's dense K/V are built once per
 //! global layer, its queries run in sub-chunks whose mask stays under
 //! [`TENSOR_GLOBAL_MASK_BYTES_MAX`], and the forward waits for the GPU
 //! before it would hold more than [`TENSOR_GLOBAL_SCRATCH_BUDGET_BYTES`] of
-//! submitted global scratch. Sub-chunks start on threadgroup boundaries and
+//! submitted global scratch. Every buffer the global path allocates is
+//! accounted at its exact size: both dense copies, each mask and each `blk`
+//! buffer ([`tensor_global_envelope_bytes`] is the resulting bound). Sub-chunks start on threadgroup boundaries and
 //! the waits only order work, so every output bit equals the unsplit route.
 //!
 //! Everything that reaches a kernel is a function of the sequence alone
@@ -1339,11 +1342,29 @@ fn build_tensor_dense_kv(
     let range = (rows, rows);
     let f16_row = hd * DType::F16.size_of();
     linearize_rows(
-        s, reg, dev, (src_k, &k_body), nkv, rings, range, f16_row, layer_idx, "tensor K",
+        s,
+        reg,
+        dev,
+        (src_k, &k_body),
+        nkv,
+        rings,
+        range,
+        f16_row,
+        layer_idx,
+        "tensor K",
     )?;
     if src_v.dtype() == DType::F16 {
         linearize_rows(
-            s, reg, dev, (src_v, &v_body), nkv, rings, range, f16_row, layer_idx, "tensor V",
+            s,
+            reg,
+            dev,
+            (src_v, &v_body),
+            nkv,
+            rings,
+            range,
+            f16_row,
+            layer_idx,
+            "tensor V",
         )?;
     } else {
         mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_hb_kv_seq_f16(
@@ -1380,6 +1401,56 @@ fn tensor_kv_pad(lead: usize, kv_seq_len: usize) -> usize {
 /// Bytes of the additive mask of one `len`-query dispatch over `kv_pad` keys.
 fn tensor_mask_bytes(len: usize, kv_pad: usize) -> u64 {
     (len * kv_pad * DType::F16.size_of()) as u64
+}
+
+/// Tile classification of one `len`-query dispatch over `kv_pad` keys with
+/// `bq` queries per threadgroup: the parameters [`encode_tensor_attend`]
+/// allocates and dispatches with.
+fn tensor_blk_params(
+    len: usize,
+    kv_pad: usize,
+    bq: usize,
+) -> mlx_native::ops::flash_attn_prefill_blk::BlkParams {
+    mlx_native::ops::flash_attn_prefill_blk::BlkParams {
+        seq_len_q: len as u32,
+        seq_len_k: kv_pad as u32,
+        bq: bq as u32,
+        bk: mlx_native::ops::flash_attn_prefill_tensor::CACHE_ROWS_PER_STEP,
+    }
+}
+
+/// Bytes one tensor dispatch allocates beside the dense K/V: its additive
+/// mask and its `blk` buffer, the latter at mlx-native's own size
+/// (`blk_buffer_byte_len`: one byte per tile, padded to 32).
+fn tensor_dispatch_scratch_bytes(len: usize, kv_pad: usize, bq: usize) -> Result<u64> {
+    let blk = mlx_native::ops::flash_attn_prefill_blk::blk_buffer_byte_len(&tensor_blk_params(
+        len, kv_pad, bq,
+    ))
+    .map_err(|e| anyhow::anyhow!("live tensor blk size: {e}"))?;
+    Ok(tensor_mask_bytes(len, kv_pad) + blk as u64)
+}
+
+/// Upper bound of the accounted global-layer scratch of one forward whose
+/// deepest sequence attends `total_keys` keys on layers of `nkv` KV heads
+/// and head dim `hd`, under `limits`: the larger of the budget and that
+/// sequence's dense K/V of one layer, plus the mask and `blk` buffer of its
+/// largest sub-chunk. Holds for any number of lanes and layers, because a
+/// forward holds one sequence's dense K/V at a time and waits before
+/// submitted scratch would pass the budget.
+pub(crate) fn tensor_global_envelope_bytes(
+    nkv: usize,
+    hd: usize,
+    total_keys: usize,
+    limits: TensorScratchLimits,
+) -> Result<u64> {
+    let bq = mlx_native::ops::flash_attn_prefill_tensor::queries_per_threadgroup(hd as u32)
+        .map_err(|e| anyhow::anyhow!("live tensor envelope: {e}"))? as usize;
+    let kv_pad = tensor_kv_pad(0, total_keys);
+    let rows = tensor_global_query_rows(kv_pad, bq, limits.mask_bytes);
+    Ok(
+        tensor_dense_kv_bytes(nkv, hd, total_keys, 0).max(limits.budget_bytes)
+            + tensor_dispatch_scratch_bytes(rows, kv_pad, bq)?,
+    )
 }
 
 /// One tensor-API dispatch: `len` queries of `q` against the first
@@ -1422,13 +1493,9 @@ fn encode_tensor_attend(
     // The mask is allocated inside its builder, so its write is undeclared:
     // fence before the blk classifier reads it (see `encode_tiled_chunk`).
     s.barrier();
-    let blk_params = mlx_native::ops::flash_attn_prefill_blk::BlkParams {
-        seq_len_q: len as u32,
-        seq_len_k: kv_pad as u32,
-        bq: tensor::queries_per_threadgroup(hd as u32)
-            .map_err(|e| anyhow::anyhow!("live tensor L{layer_idx}: {e}"))?,
-        bk: tensor::CACHE_ROWS_PER_STEP,
-    };
+    let bq = tensor::queries_per_threadgroup(hd as u32)
+        .map_err(|e| anyhow::anyhow!("live tensor L{layer_idx}: {e}"))?;
+    let blk_params = tensor_blk_params(len, kv_pad, bq as usize);
     let blk = mlx_native::ops::flash_attn_prefill_blk::alloc_blk_buffer(dev, &blk_params)
         .map_err(|e| anyhow::anyhow!("live tensor blk alloc L{layer_idx}: {e}"))?;
     s.barrier_between(&[&mask], &[&blk]);
@@ -1542,9 +1609,11 @@ fn encode_tensor_global_seq<'e>(
     while local < span.rows {
         let len = sub_rows.min(span.rows - local);
         let keys = chunk_keys(false, kv.capacity, layer.graft_len, span.start + local, len);
+        // The dispatch's mask and `blk` buffer, both alive until its
+        // command buffer finishes.
         scratch.admit(
             s,
-            tensor_mask_bytes(len, tensor_kv_pad(dense.lead, keys.kv_seq_len)),
+            tensor_dispatch_scratch_bytes(len, tensor_kv_pad(dense.lead, keys.kv_seq_len), bq)?,
             false,
         )?;
         let stream_row = span.offset + local;
@@ -1640,6 +1709,47 @@ mod tests {
         assert_eq!(
             tensor_global_query_rows(262_144, 16, TensorScratchLimits::UNBOUNDED.mask_bytes),
             TILED_GLOBAL_QUERY_CHUNK
+        );
+    }
+
+    /// The accounted scratch of a dispatch is its mask plus mlx-native's
+    /// own `blk` size, and the envelope adds exactly that to the larger of
+    /// the budget and one dense K/V pair.
+    #[test]
+    fn tensor_dispatch_scratch_counts_the_mask_and_the_blk_buffer_exactly() {
+        use mlx_native::ops::flash_attn_prefill_blk::blk_buffer_byte_len;
+        // 128 queries (8 threadgroups of 16) over 262,144 keys (4,096 key
+        // tiles): a 64 MiB mask and 32 KiB of tile classification.
+        assert_eq!(tensor_mask_bytes(128, 262_144), 64 << 20);
+        assert_eq!(
+            tensor_dispatch_scratch_bytes(128, 262_144, 16).unwrap(),
+            (64 << 20) + (32 << 10)
+        );
+        for (len, kv_pad, bq) in [
+            (1, 64, 16),
+            (150, 384, 16),
+            (4_096, 8_192, 16),
+            (1_024, 2_048, 32),
+        ] {
+            let blk = blk_buffer_byte_len(&tensor_blk_params(len, kv_pad, bq)).unwrap() as u64;
+            assert!(blk >= (len.div_ceil(bq) * (kv_pad / 64)) as u64 && blk % 32 == 0);
+            assert_eq!(
+                tensor_dispatch_scratch_bytes(len, kv_pad, bq).unwrap(),
+                tensor_mask_bytes(len, kv_pad) + blk,
+                "{len} {kv_pad} {bq}"
+            );
+        }
+        let serving = TensorScratchLimits::SERVING;
+        // 262,144 keys: 1 GiB of dense K/V, one 64 MiB mask, 32 KiB of blk.
+        assert_eq!(
+            tensor_global_envelope_bytes(2, 512, 262_144, serving).unwrap(),
+            (1 << 30) + (64 << 20) + (32 << 10)
+        );
+        // Shallow: the budget dominates; a 4,096-row dispatch over 2,048
+        // keys has a 16 MiB mask and 256 x 32 tiles.
+        assert_eq!(
+            tensor_global_envelope_bytes(2, 512, 2_048, serving).unwrap(),
+            (512 << 20) + (16 << 20) + 256 * 32
         );
     }
 
@@ -1982,7 +2092,12 @@ mod tests {
         assert_eq!(kernel, Resolved::environment(TensorF16));
         assert_eq!(reason, None);
         let refusal = admit_warm_kernel(Resolved::environment(TensorF16), unavailable).unwrap_err();
-        for needle in [WARM_TILED_ATTENTION_ENV, "no tensor API", "Unset it", "set 0"] {
+        for needle in [
+            WARM_TILED_ATTENTION_ENV,
+            "no tensor API",
+            "Unset it",
+            "set 0",
+        ] {
             assert!(refusal.contains(needle), "{refusal}");
         }
         // The other explicit kernels need no tensor API and are not probed.

@@ -1,0 +1,18 @@
+hf2q load: backend = mlx-native (M5 Max)
+hf2q load: model = Gemma 4 26B A4B It (arch = gemma4, family = gemma4)
+hf2q load: source = /Users/robert/.local/share/hf2q/models/gemma4-google/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf (15.64 GiB on disk)
+hf2q load: layout = 30 layers, 16 heads (8 kv), head_dim=256, hidden=2816, vocab=262144
+hf2q load: features = sliding_window=1024, full_attn_every=6, moe=128 experts/8 active
+hf2q load: quant = Q4_K_M dominant, ~5.31 bpw, mlx-native resident none
+hf2q load: max_ctx_train = 262144, kv_budget = none
+hf2q load: tokenizer = hf-tokenizer-json (<gguf-embedded>)
+hf2q load: chat_template = gguf-embedded
+hf2q load: provenance = hf2q (producer hf2q 0.1.26, source_sha 05b3…)
+hf2q load: vision = mmproj-required (no mmproj loaded; pass --mmproj)
+hf2q load: kv_spill = inactive
+hf2q load: tq_kv = active (8-bit Lloyd-Max + D1 SRHT, ADR-007 Path C; production default; HF2Q_USE_DENSE=1 to opt out)
+hf2q load: routes = gemma_decode_attn_ne=Ne4 (default) gemma_decode_dense_kernel=RowExact (default) gemma_warm_attention_kernel=TensorF16 (default) q5_0_tensor_mm=true (default)
+hf2q load: ready in 0.27 s
+prefill: 16 tok in 1954ms (8 tok/s)
+
+Hi! How can

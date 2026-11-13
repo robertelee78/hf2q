@@ -1,0 +1,1 @@
+Error: GemmaLoadedModel::load: HF2Q_GEMMA_WARM_TILED_ATTENTION must be tensor, 1/on/true or 0/off/false/stock, got "of"

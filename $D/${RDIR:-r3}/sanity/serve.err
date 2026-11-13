@@ -1,0 +1,15 @@
+warning: config.toml `serve.repetition_penalty = 1.05` is retired and ignored (ADR-062 D1); serving uses the family built-in, and `hf2q serve --default-repetition-penalty` remains the explicit override
+warning: config.toml `serve.thinking_token_budget = 2048` is retired and ignored (ADR-062 D1); serving uses the family built-in, and `hf2q serve --default-thinking-token-budget` remains the explicit override
+warning: config.toml `serve.tool_thinking_token_budget = 512` is retired and ignored (ADR-062 D1); serving uses the family built-in, and `hf2q serve --default-tool-thinking-token-budget` remains the explicit override
+[hf2q lcp] byte_budget=8589934592 (source=default)
+Preparing /Users/robert/.local/share/hf2q/models/gemma4-google/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf
+load: loading local Q4_K_M GGUF `gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf` (15.6 GiB) into Metal and warming kernels
+ INFO hf2q::audit: Gemma 4 default routes resolved routes=gemma_decode_attn_ne=Ne4 (default) gemma_decode_dense_kernel=RowExact (default) gemma_warm_attention_kernel=TensorF16 (default) q5_0_tensor_mm=true (default)
+[ADR-028 Phase 10c] Allocating hybrid_kv (30 layers, F16 K + TQ-HB V 8-bit) [prefill]
+[TQ KV] 8-bit Lloyd-Max native HB SDPA (default)
+Batched prefill: KV=F32, seq_len=256, path=flash-attn, globals=tensor-mm
+Batched prefill complete: 256 tokens in 259.8 ms (985.5 tok/s), first decode token = 59373
+load: text model load and warmup complete in 1s
+load: loading and warming local multimodal projector `gemma-4-26B-A4B-it-hf2q-q4_k_m-mmproj.gguf` (1.1 GiB)
+load: multimodal projector ready in 0.6s
+listen: model prepared; listener bound at http://127.0.0.1:18299; starting HTTP service

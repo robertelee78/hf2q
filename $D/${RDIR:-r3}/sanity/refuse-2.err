@@ -1,0 +1,1 @@
+Error: GemmaLoadedModel::load: HF2Q_GEMMA_DECODE_ATTN_NE must be 4, 2 or 0/off/false/stock, got "8"

@@ -405,13 +405,18 @@ needs scratch that lives for one prefill forward:
   chunk, so its size follows the suffix rows, not the history.
 - *Global layers:* dense F16 K and V copies of the sequence's whole history
   (`4 · kv_heads · head_dim` bytes per key: 4 KiB per key on 26B-A4B) and an
-  additive mask of `2 · rows · keys` bytes. hf2q builds the copies once per
+  additive mask of `2 · rows · keys` bytes with its tile-classification
+  buffer (one byte per tile of 16 queries × 64 keys at head dim 512, at most
+  32 KiB). hf2q builds the copies once per
   sequence and layer, runs the sequence's queries in sub-chunks whose mask
   stays under 64 MiB, and waits for the GPU before it would hold more than
   512 MiB of submitted global-layer scratch.
 
 Envelope of the global-layer scratch, for any number of lanes and layers:
-the larger of 512 MiB and one sequence's copies of one layer, plus one mask.
+the larger of 512 MiB and one sequence's copies of one layer, plus one mask
+(at most 64 MiB) and its tile-classification buffer (at most 32 KiB). Every
+buffer of the global path is accounted at its exact size
+(`tensor_global_envelope_bytes`); the table rounds to MiB.
 
 | Keys (history plus suffix) | One sequence's copies | Envelope |
 |---:|---:|---:|

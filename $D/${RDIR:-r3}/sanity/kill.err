@@ -1,0 +1,7 @@
+Batched prefill: KV=F32, seq_len=16, path=flash-attn, globals=flash-attn
+[ADR-028 Phase 10c] Allocating hybrid_kv (30 layers, F16 K + TQ-HB V 8-bit, cap=32) [batched]
+Batched prefill complete: 16 tokens in 61.3 ms (261.0 tok/s), first decode token = 10979
+[TQ KV] 8-bit Lloyd-Max native HB SDPA (default)
+
+
+--- mlx-native: [ Prompt: 72.1 t/s | Generation: 136.7 t/s ]  (4 gen tokens in 0.03s) ---

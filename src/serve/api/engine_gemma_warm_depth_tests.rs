@@ -5,7 +5,8 @@
 //! * is bit for bit the unbounded route (first token, logits, every K/V
 //!   row), for one lane and for a joint cohort, and
 //! * keeps its accounted scratch inside the documented envelope
-//!   (`max(budget, one sequence's dense K/V) + one mask`).
+//!   (`max(budget, one sequence's dense K/V) + one mask + its blk buffer`,
+//!   `gemma_live_attention::tensor_global_envelope_bytes`).
 //!
 //! It also prints wall time and peak transient Metal allocation of the
 //! vec-hybrid (kill switch), bounded tensor (default) and unbounded tensor
@@ -32,8 +33,8 @@ use crate::inference::models::gemma4::kv_cache::{
 };
 use crate::inference::models::gemma4::GemmaLiveKernel;
 use crate::serve::gemma_live_attention::{
-    last_forward_scratch_stats, set_test_tensor_scratch_limits, LiveScratchStats,
-    TensorScratchLimits, TENSOR_GLOBAL_MASK_BYTES_MAX, TENSOR_GLOBAL_SCRATCH_BUDGET_BYTES,
+    last_forward_scratch_stats, set_test_tensor_scratch_limits, tensor_global_envelope_bytes,
+    LiveScratchStats, TensorScratchLimits,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -41,9 +42,10 @@ use std::time::{Duration, Instant};
 
 const BUILD_STEP: usize = 4_096;
 const MIB: u64 = 1 << 20;
-/// Dense F16 K and V bytes per key of one 26B-A4B global layer (2 KV heads
-/// of head dim 512).
-const GLOBAL_DENSE_BYTES_PER_KEY: u64 = 4_096;
+/// Global-layer geometry of Gemma 4 26B-A4B: 2 KV heads of head dim 512
+/// (4 KiB of dense F16 K and V per key).
+const GLOBAL_KV_HEADS: usize = 2;
+const GLOBAL_HEAD_DIM: usize = 512;
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -254,10 +256,10 @@ fn gemma_warm_tensor_scratch_is_bounded_and_bitwise_at_depth() {
         );
         eprintln!(
             "GEMMA_WARM_DEPTH ARM lanes={lanes} history={depth} rows={rows} arm={label} wall_ms={:.0} \
-             peak_extra_mib={} accounted_global_scratch_mib={} waits={} first_tokens={:?}",
+             peak_extra_mib={} accounted_global_scratch_bytes={} waits={} first_tokens={:?}",
             wall.as_secs_f64() * 1e3,
             peak_extra / MIB,
-            stats.peak_bytes / MIB,
+            stats.peak_bytes,
             stats.waits,
             images.iter().map(|image| image.first_token).collect::<Vec<_>>()
         );
@@ -272,15 +274,25 @@ fn gemma_warm_tensor_scratch_is_bounded_and_bitwise_at_depth() {
 
     let arm = |label: &str| arms.iter().find(|arm| arm.label == label);
     if let Some(bounded) = arm("bounded") {
-        // Envelope: one sequence's dense K/V of one global layer (or the
-        // budget when that is smaller) plus one mask.
-        let pair = GLOBAL_DENSE_BYTES_PER_KEY * (depth + rows + 64) as u64;
-        let envelope = pair.max(TENSOR_GLOBAL_SCRATCH_BUDGET_BYTES) + TENSOR_GLOBAL_MASK_BYTES_MAX;
+        // Envelope, exact: one sequence's dense K/V of one global layer (or
+        // the budget when that is smaller) plus the mask and blk buffer of
+        // its largest sub-chunk.
+        let envelope = tensor_global_envelope_bytes(
+            GLOBAL_KV_HEADS,
+            GLOBAL_HEAD_DIM,
+            depth + rows,
+            TensorScratchLimits::SERVING,
+        )
+        .unwrap();
+        eprintln!(
+            "GEMMA_WARM_DEPTH envelope lanes={lanes} history={depth} accounted_bytes={} envelope_bytes={envelope}",
+            bounded.stats.peak_bytes
+        );
         assert!(
             bounded.stats.peak_bytes <= envelope,
-            "accounted global scratch {} MiB exceeds the envelope {} MiB",
-            bounded.stats.peak_bytes / MIB,
-            envelope / MIB
+            "accounted global scratch {} bytes exceeds the envelope {} bytes",
+            bounded.stats.peak_bytes,
+            envelope
         );
         if let Some(vec) = arm("vec") {
             // Measured: the tensor default adds at most the envelope (and
