@@ -1,0 +1,3 @@
+# Scratch branch only: the unreleased mlx-native branch of robertelee78/mlx-native#157.
+[patch.crates-io]
+mlx-native = { git = "https://github.com/robertelee78/mlx-native", branch = "fix/kernel-availability" }
