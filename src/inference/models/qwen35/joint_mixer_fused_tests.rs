@@ -46,6 +46,8 @@ use super::prepared_step_tests::{
 use super::prepared_switch_override::{Override, PreparedSwitches};
 use super::{Qwen35Config, Qwen35JointOutput, Qwen35JointVerifyLane, Qwen35LayerKind};
 use crate::serve::multi_seq_kv::SlotId;
+use mlx_native::metal::MTLGPUFamily;
+use mlx_native::{KernelRegistry, MlxDevice};
 
 /// The projection routes every whole-step case runs under.
 const ROUTES: [(&str, PreparedSwitches); 2] = [
@@ -483,6 +485,58 @@ fn dflash2_fused_mixer_keeps_the_stock_chain_at_ten_conv_taps() {
     });
 }
 
+/// Whether mlx-native can route this host's dense matmuls of more than eight
+/// rows, the 32-row products every step here is made of. Its route first
+/// asks whether the tensor pipeline `kernel_mul_mm_q4_0_tensor_f32` builds on
+/// the device (the probe is that kernel whatever the weight's type), and
+/// takes the simdgroup kernels when the runtime compiler has no
+/// `<metal_tensor>` header. The same build is asked here.
+///
+/// Native defect: mlx-native 0.21.9 treats every other failure of that build
+/// as an error of the dispatch instead of taking the simdgroup kernels. A
+/// device outside the Metal 4 GPU family under macOS 26 has one: GitHub's
+/// hosted runner ("Apple Paravirtual device") compiles the shader and fails
+/// pipeline creation with `unsupported deferred-static-alloca-size function
+/// body in ...cooperative_tensor...`, so no dense matmul of more than eight
+/// rows runs there, at any shape. The fix is mlx-native branch
+/// `fix/tensor-route-availability` (such a device has no tensor API: the
+/// route falls back). This skip waits for the release that carries it and
+/// goes away with that pin.
+///
+/// A device of the Metal 4 family is never skipped: a failed build there is a
+/// defect and the step reports it.
+fn dense_matmul_route_resolves() -> bool {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let Ok(device) = MlxDevice::new() else {
+        return true;
+    };
+    let metal = device.metal_device();
+    let mut registry = KernelRegistry::new();
+    let Err(error) = registry
+        .get_pipeline_with_constants(
+            "kernel_mul_mm_q4_0_tensor_f32",
+            metal,
+            &[],
+            &[(700, 1), (701, 1), (702, 1)],
+        )
+        .map(|_| ())
+    else {
+        return true;
+    };
+    let error = error.to_string();
+    if error.contains("'metal_tensor' file not found")
+        || metal.supports_family(MTLGPUFamily::Metal4)
+    {
+        return true;
+    }
+    eprintln!(
+        "RECORDED SKIP: mlx-native 0.21.9 cannot route a dense matmul of more than eight rows \
+         on {} (no Metal 4 GPU family; the tensor probe fails: {error})",
+        device.name()
+    );
+    false
+}
+
 /// The served DeltaNet head counts (16 key heads; `value_heads` value heads)
 /// with an attention geometry the tiled verify attention admits
 /// (`query_heads` query heads on one KV head), with the serial and with the
@@ -495,7 +549,7 @@ fn served_heads(value_heads: u32, query_heads: u32) {
         num_key_value_heads: 1,
         ..synthetic_cfg()
     };
-    if !whole_steps_repeat() {
+    if !whole_steps_repeat() || !dense_matmul_route_resolves() {
         return;
     }
     with_synthetic_fixture_cfg(padded_policy(), dflash_arm(), cfg, |fixture| {
