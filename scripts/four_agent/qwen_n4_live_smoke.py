@@ -466,7 +466,7 @@ def main():
         summary["engine_kind"] = args.engine_kind
         if args.engine_kind == "peer":
             from family_peer import readiness
-            summary["peer_readiness"] = readiness(args.base_url, args.model, output, args.family)
+            summary["peer_readiness"] = readiness(args.base_url, args.model, output, args.family, packet=packet)
         elif native is not None:
             summary["native_readiness"] = native.readiness(args.base_url, args.model, output, packet)
         require(packet.get("sources") == sources, "N4 source freeze drift")
@@ -623,6 +623,10 @@ def main():
                 summary["status"] = aggregate(results, exits, cleanup, args.server_pid, run, args.engine_kind, args.family,
                                               summary.get("instance"), args.phase_plan, summary.get("workload_variant"),
                                               args.request_setup, args.repair_turns)
+                if (args.engine_kind == "peer" and packet.get("peer_reference") is not None
+                        and summary["status"] == "FourAgentProtocolCompleteAwaitingIndependentReview"):
+                    from family_peer import validate_speculation_proof
+                    summary["peer_speculation_proof"] = validate_speculation_proof(output, packet)
             except BaseException as exc:
                 summary["status"], summary["error"] = "Failed", str(exc)
         if summary["status"] == "FourAgentProtocolCompleteAwaitingIndependentReview":
