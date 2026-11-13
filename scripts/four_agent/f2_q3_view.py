@@ -74,6 +74,7 @@ def stock_reasons(rec, effects, band, family):
     mechanism = rec.get(QWEN38_MECHANISM)
     if QWEN38_MECHANISM in rec and (mechanism or {}).get("status") != "pass":
         reasons.append("Qwen3.8 mechanism: " + ((mechanism or {}).get("reason") or "unresolved"))
+    reasons.extend(reason for reason in rec["reasons"] if reason.startswith("no usable stock arm"))
     if not rec["primary_stop"]:
         reasons.append("the primary stage has not reached its stopping rule")
     row = effects.get(("makespan_s", STOCK_ARM))

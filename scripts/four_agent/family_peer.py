@@ -19,7 +19,10 @@ hf2q_overflow_policy=reject has no request field: the launch binds
 tools/server/server-context.cpp:3975-3991.
 """
 import hashlib
+import json
 import math
+from pathlib import Path
+import re
 
 import qwen_n4_peer
 from qwen38_n1_verdict import require
@@ -171,14 +174,154 @@ def served_template_matches(served, family):
     return any(hashlib.sha256(text.encode()).hexdigest() == pin for text in (served, served + '\n'))
 
 
-def validate_readiness(health, props, slots, model, family):
+def _selected_speculation(reference):
+    require(isinstance(reference, dict), 'peer reference binding required')
+    argv = reference.get('serve_argv')
+    require(isinstance(argv, list) and bool(argv) and all(isinstance(arg, str) for arg in argv),
+            'peer reference launch argv required')
+    require(argv.count('--spec-type') == 1 and argv.index('--spec-type') + 1 < len(argv),
+            'peer reference requires one explicit speculation setting')
+    selected = argv[argv.index('--spec-type') + 1]
+    require(selected in ('none', 'draft-mtp', 'ngram-simple', 'ngram-mod') and
+            reference.get('selected_speculation') == selected,
+            'peer reference speculation differs from the frozen launch selection')
+    return selected
+
+
+def _supervised_launch(packet, base_url=None):
+    launch = packet.get('peer_supervised_launch')
+    require(isinstance(launch, dict) and set(launch) == {
+        'schema', 'server_pid', 'base_url', 'binary', 'binary_sha256', 'serve_argv'} and
+        launch.get('schema') == 'hf2q.peer.supervised-launch.v1',
+        'peer reference requires supervisor-issued launch identity')
+    require(type(launch.get('server_pid')) is int and launch['server_pid'] > 0 and
+            launch['server_pid'] == packet.get('server_pid') and
+            launch.get('base_url') == packet.get('base_url') and
+            (base_url is None or launch['base_url'] == base_url),
+            'peer supervised PID/endpoint binding differs')
+    return launch
+
+
+def _reference_identity(reference, build, supervised):
+    require(isinstance(reference, dict) and set(reference) == {
+        'identity_receipt', 'identity_sha256', 'source_commit', 'build_info',
+        'serve_argv', 'selected_speculation'}, 'peer reference binding fields')
+    commit = reference.get('source_commit')
+    require(isinstance(commit, str) and re.fullmatch(r'[0-9a-f]{40}', commit),
+            'peer reference requires a full source commit')
+    expected = reference.get('build_info')
+    short = expected.split('-', 1)[1] if isinstance(expected, str) and '-' in expected else ''
+    require(isinstance(expected, str) and re.fullmatch(r'b[0-9]+-[0-9a-f]{7,40}', expected) and
+            commit.startswith(short) and build == expected,
+            'peer build differs from the frozen source/build identity')
+    receipt_path, digest = reference.get('identity_receipt'), reference.get('identity_sha256')
+    require(isinstance(receipt_path, str) and Path(receipt_path).is_absolute() and
+            isinstance(digest, str) and re.fullmatch(r'[0-9a-f]{64}', digest),
+            'peer identity receipt path/hash required')
+    raw = Path(receipt_path).read_bytes()
+    require(hashlib.sha256(raw).hexdigest() == digest, 'peer identity receipt hash mismatch')
+    identity = json.loads(raw)
+    require(isinstance(identity, dict) and identity.get('source_commit') == commit and
+            identity.get('peer_build_info') == expected, 'peer identity receipt source/build mismatch')
+    selected = _selected_speculation(reference)
+    require(identity.get('binary') == reference['serve_argv'][0],
+            'peer reference executable differs from the frozen launch')
+    require(isinstance(supervised, dict) and supervised.get('serve_argv') == reference['serve_argv'] and
+            supervised.get('binary') == identity['binary'] and
+            supervised.get('binary_sha256') == identity.get('binary_sha256'),
+            'peer reference differs from actual supervised executable/argv')
+    binary_hash = identity.get('binary_sha256')
+    require(isinstance(binary_hash, str) and re.fullmatch(r'[0-9a-f]{64}', binary_hash) and
+            hashlib.sha256(Path(identity['binary']).read_bytes()).hexdigest() == binary_hash,
+            'peer reference executable hash mismatch')
+    libraries = identity.get('libraries_and_binary_sha256')
+    require(isinstance(libraries, dict) and libraries.get(identity['binary']) == binary_hash,
+            'peer identity receipt must bind the executable and sibling libraries')
+    siblings = {str(path) for path in Path(identity['binary']).parent.glob('*.dylib')
+                if path.is_file() and not path.is_symlink()}
+    require(siblings <= set(libraries), 'peer identity receipt omits actual sibling libraries')
+    external = identity.get('external_dylibs_sha256', {})
+    require(isinstance(external, dict), 'peer external library identity fields')
+    hashes = {Path(identity['binary']).resolve(): binary_hash}
+    for name, expected_hash in {**libraries, **external}.items():
+        require(isinstance(name, str) and Path(name).is_absolute() and
+                isinstance(expected_hash, str) and re.fullmatch(r'[0-9a-f]{64}', expected_hash),
+                'peer library identity path/hash required')
+        path = Path(name).resolve()
+        if path not in hashes:
+            hashes[path] = hashlib.sha256(path.read_bytes()).hexdigest()
+        require(hashes[path] == expected_hash, 'peer sibling/external library hash mismatch')
+    return {'source_revision': commit, 'build_info': expected,
+            'identity_receipt': receipt_path, 'identity_sha256': digest,
+            'binary_sha256': binary_hash, 'selected_speculation': selected,
+            'serve_argv_sha256': hashlib.sha256(json.dumps(
+                reference['serve_argv'], separators=(',', ':')).encode()).hexdigest()}
+
+
+def validate_speculation_proof(output, packet):
+    """Check actual retained replies, never /props sampler metadata, for MTP exercise."""
+    reference = packet.get('peer_reference')
+    if reference is None:
+        return None
+    binding = _reference_identity(reference, reference.get('build_info') if isinstance(reference, dict) else None,
+                                  _supervised_launch(packet))
+    selected = binding['selected_speculation']
+    transports = {mode: {'responses': 0, 'drafted_tokens': 0, 'accepted_tokens': 0}
+                  for mode in ('unary', 'sse')}
+    for turn in sorted(Path(output).glob('agent-*/turn-*')):
+        receipt = json.loads((turn / 'receipt.json').read_bytes())
+        raw = (turn / 'response.bin').read_bytes()
+        require(hashlib.sha256(raw).hexdigest() == receipt.get('response_sha256'),
+                'peer response proof hash mismatch')
+        require(type(receipt.get('stream')) is bool, 'peer response proof transport missing')
+        mode = 'sse' if receipt['stream'] else 'unary'
+        if receipt['stream']:
+            frames = [json.loads(line[5:].strip()) for line in raw.splitlines()
+                      if line.startswith(b'data:') and line[5:].strip() != b'[DONE]']
+        else:
+            frames = [json.loads(raw)]
+        timings = [frame['timings'] for frame in frames if isinstance(frame, dict) and
+                   isinstance(frame.get('timings'), dict)]
+        if selected == 'draft-mtp':
+            require(bool(timings) and {'draft_n', 'draft_n_accepted'} <= set(timings[-1]),
+                    f'peer MTP {mode} response lacks draft timing counters')
+        if not timings:
+            continue
+        latest = timings[-1]
+        n, a = latest.get('draft_n', 0), latest.get('draft_n_accepted', 0)
+        require(type(n) is int and type(a) is int and 0 <= a <= n,
+                'peer draft proof counters malformed')
+        transports[mode]['responses'] += 1
+        transports[mode]['drafted_tokens'] += n
+        transports[mode]['accepted_tokens'] += a
+    if selected == 'draft-mtp':
+        for mode, proof in transports.items():
+            require(all(value > 0 for value in proof.values()),
+                    f'declared peer MTP was not exercised with nonzero drafted/accepted tokens on {mode}')
+    drafted = sum(proof['drafted_tokens'] for proof in transports.values())
+    accepted = sum(proof['accepted_tokens'] for proof in transports.values())
+    if selected == 'none':
+        require(drafted == 0 and accepted == 0, 'peer draft counters contradict no speculation')
+    return {'selected_speculation': selected, 'transports': transports,
+            'responses_with_timings': sum(proof['responses'] for proof in transports.values()),
+            'drafted_tokens': drafted, 'accepted_tokens': accepted,
+            'source': 'retained actual request response bytes and their receipt hashes',
+            'sampler_metadata_is_launch_selection': False}
+
+
+def validate_readiness(health, props, slots, model, family, reference=None, supervised=None):
     if family == 'qwen':
-        return qwen_n4_peer.validate_readiness(health, props, slots, model)
+        result = qwen_n4_peer.validate_readiness(health, props, slots, model)
+        return {**result, **_reference_identity(reference, props.get('build_info'), supervised)} if reference is not None else result
     _family(family)
     qwen_n4_peer.validate_readiness(health, props, slots, model)  # shared slot/context/alias checks
     build = props.get('build_info')
-    commit = build.split('-', 1)[1] if isinstance(build, str) and '-' in build else ''
-    require(len(commit) >= 7 and PEER_COMMIT.startswith(commit), 'peer build is not the inspected source')
+    if reference is None:
+        commit = build.split('-', 1)[1] if isinstance(build, str) and '-' in build else ''
+        require(len(commit) >= 7 and PEER_COMMIT.startswith(commit), 'peer build is not the inspected source')
+        binding = {'source_revision': PEER_COMMIT, 'build_info': build}
+    else:
+        binding = _reference_identity(reference, build, supervised)
     template = props.get('chat_template')
     require(served_template_matches(template, family), f'{family} peer template is not the hf2q family template')
     modalities = props.get('modalities')
@@ -187,12 +330,16 @@ def validate_readiness(health, props, slots, model, family):
     params = props.get('default_generation_settings', {}).get('params')
     require(isinstance(params, dict) and all(_close(params.get(k), v) for k, v in SAMPLING[family].items())
             and params.get('speculative.types') == 'none', f'{family} peer sampling settings differ')
-    return {'engine_kind': 'peer', 'family': family, 'source_revision': PEER_COMMIT, 'build_info': build,
+    return {'engine_kind': 'peer', 'family': family, **binding,
             'chat_template_sha256': TEMPLATE_SHA256[family], 'logical_slots': SLOTS,
             'context_per_slot': CONTEXT_PER_SLOT, 'sampling': dict(SAMPLING[family]),
             'physical_cohort': 'Unavailable:not proved by readiness or HTTP overlap',
             'pool_profile': 'NotApplicable:HF-only', 'full_prefix_reuse': 'PendingPostOracle'}
 
 
-def readiness(base, model, output, family):
-    return validate_readiness(*qwen_n4_peer.fetch_readiness(base, output), model, family)
+def readiness(base, model, output, family, packet=None):
+    reference = (packet or {}).get('peer_reference')
+    supervised = _supervised_launch(packet, base) if reference is not None else None
+    require(reference is not None or 'peer_supervised_launch' not in (packet or {}),
+            'peer supervised identity requires a frozen reference')
+    return validate_readiness(*qwen_n4_peer.fetch_readiness(base, output), model, family, reference, supervised)

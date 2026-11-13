@@ -796,6 +796,19 @@ class ComparisonFailures(Harness):
         self.assertIn("| Unavailable: no usable stock arm: stock failed its task in all 3 attempts", line)
         self.assertIn("sooner than the peer, speculation off (matched settings) (95% CI", line)
         self.assertIn("; comparison-arm failed runs: stock 3 of 6, peer 0 of 6 (comparison_failure_policy v1", line)
+        self.assertEqual(f2.verify_rows(board, self.root), [r["id"] for r in record["rows"]])
+        for fault in ("missing", "zero"):
+            with self.subTest(fault=fault):
+                tampered = json.loads(json.dumps(board))
+                rec = tampered["groups"]["qwen38-q3-record"]["q3_record"]
+                if fault == "missing":
+                    del rec["comparison_failures"]
+                else:
+                    for arm in rec["comparison_failures"]["arms"].values():
+                        arm["failures"] = 0
+                f2.validate_manifest(tampered)
+                with self.assertRaisesRegex(ValueError, "q3_record comparison_failures drift"):
+                    f2.verify_rows(tampered, self.root)
         broken = json.loads(json.dumps(board))
         broken["groups"]["qwen38-q3-record"]["q3_record"]["comparison_failures"]["arms"]["stock"]["failures"] = 7
         with self.assertRaisesRegex(Exception, "comparison_failures"):
@@ -804,6 +817,13 @@ class ComparisonFailures(Harness):
         self.out = clean
         q3.write_verdict(clean, self.driver(self.win)[0].run(), [], None)
         self.assertNotIn("comparison_failures", q3_report.rows(clean, self.root, of_record=True)["groups"]["qwen38-q3-record"]["q3_record"])
+        clean_rows = q3_report.rows(clean, self.root, of_record=True)
+        forged = {**board, **clean_rows}
+        forged["groups"]["qwen38-q3-record"]["q3_record"]["comparison_failures"] = (
+            record["groups"]["qwen38-q3-record"]["q3_record"]["comparison_failures"])
+        f2.validate_manifest(forged)
+        with self.assertRaisesRegex(ValueError, "q3_record comparison_failures drift"):
+            f2.verify_rows(forged, self.root)
 
     def test_a_failure_the_policy_does_not_rerun_is_still_counted_by_kind(self):
         seen = itertools.count()

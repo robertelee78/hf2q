@@ -418,7 +418,7 @@ def verify(manifest, evidence_root, resolve):
             resolve(rec["review"], evidence_root)
         again = build_record(load(rec["verdict_ref"]), load(rec["campaign_ref"]), evidence_root,
                              (rec["verdict_ref"], rec["campaign_ref"]), gates, rec["review"])
-        optional = {key for key in (SPLASH, STOCK_RECORD) if key in rec or key in again}
+        optional = {key for key in (SPLASH, STOCK_RECORD, COMPARISON_FAILURES) if key in rec or key in again}
         if QWEN38_MECHANISM in rec or QWEN38_MECHANISM in again:
             optional.add(QWEN38_MECHANISM)
         for key in sorted(set(RECORD_KEYS) | optional):
