@@ -9,6 +9,7 @@ import f2_q3_tier
 import native_peers
 import q3_metrics
 import q3_stats
+import q3_mechanism
 
 VERDICT_SCHEMA = "hf2q.adr063.q3-verdict.v1"
 PATCH_REVIEW_SCHEMA = "hf2q.adr063.q3-patch-review.v1"
@@ -405,6 +406,11 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
             state["peer_unavailable"] = {"reason": comparison or native_peers.adapter(native).SAME_GGUF_UNAVAILABLE,
                                          "evidence": plan["peer_unavailable_evidence"]}
         verdict, reasons = q3_stats.family_verdict(state)
+        mechanism = q3_mechanism.evaluate(manifest)
+        if mechanism is not None and mechanism["status"] != "pass":
+            reasons.append("Qwen3.8 mechanism: " + mechanism["reason"])
+            if verdict == "Win":
+                verdict = "Inconclusive"
         if comparison and verdict == "Unavailable":
             reasons = [comparison]
     # Default mode: a control stage that halts the campaign (Invalid, IdentityDrift) does not replace the
@@ -427,6 +433,7 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
             "arm_reliability": {arm: arm_reliability(manifest, arm) for arm in plan["measured_arms"]},
             "discarded_runs": discarded_runs(manifest),
             **({"stock_record": stock_record} if stock_record else {}),
+            **({"mechanism": mechanism} if not record and mechanism is not None else {}),
             "quality": quality, "thermal_valid": state["thermal_valid"], "memory_valid": state["memory_valid"],
             "rejected_trials": [{"name": e["name"], "outcome": e["outcome"], "reason": e.get("reason")}
                                 for e in entries(manifest) if e["outcome"] in ("Invalid", "Abandoned", "Skipped")

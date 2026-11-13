@@ -8,6 +8,9 @@ volumes and per-output-token rate. Validation and `--verify` re-derive the recor
 quality manifests; nothing here launches or measures.
 """
 import json
+import math
+import re
+import q3_mechanism
 from pathlib import Path
 
 from f2_rows_extract import require
@@ -47,6 +50,10 @@ STOCK_RECORD_KEYS = {"verdict_ref", "artifact_sha256", "stock_label"}
 # comparison-arm failure amendment, 2026-11-12): the rule the verdict was computed under and, per comparison arm, the
 # failed and scored attempts. Records without such a failure carry none.
 COMPARISON_FAILURES = "comparison_failures"
+# Only plans that freeze this contract acquire the gate; historical records remain unchanged.
+QWEN38_MECHANISM = "qwen38_mechanism"
+MECHANISM_KEYS = {"contract", "status", "reason", "accepted_rows", "lane_cycles", "ratio", "runs", "binding"}
+MECHANISM_BINDING_KEYS = {"source_commit", "binary_sha256", "artifact_sha256", "artifact_bytes", "case_sha256", "workload"}
 GATE_KEYS = {"reference", "manifest", "status", "q1_verdict", "reference_sha256"}
 # The tier's wording for a native-engine statement, by artifact relation (native_peers.same_file_baselines).
 NATIVE_STATEMENT = "the native-engine statement (different artifact)"
@@ -219,6 +226,51 @@ def unavailable(peer, root):
         else symbolic(peer["reason"], root)
 
 
+def mechanism_record(verdict, campaign, root):
+    if QWEN38_MECHANISM not in campaign["plan"]:
+        return None
+    # Use the source reducer, not another counter implementation. Re-reading its
+    # raw bindings here also makes F2 --verify reject a stale passing verdict.
+    proof = q3_mechanism.evaluate(campaign)
+    require(verdict.get("mechanism") == proof, "Qwen3.8 mechanism result drift from raw campaign evidence")
+    require(campaign["plan"][QWEN38_MECHANISM] == q3_mechanism.CONTRACT, "unknown Qwen3.8 mechanism contract")
+    binding = proof.get("binding")
+    return {"contract": campaign["plan"][QWEN38_MECHANISM], "status": proof["status"],
+            "reason": None if proof["reason"] is None else symbolic(proof["reason"], root),
+            "accepted_rows": proof["accepted_rows"], "lane_cycles": proof["lane_cycles"], "ratio": proof["ratio"],
+            "runs": len(proof["runs"]), "binding": None if binding is None else {
+                "source_commit": binding["source_commit"], "binary_sha256": binding["binary_sha256"],
+                "artifact_sha256": binding["artifact"]["sha256"], "artifact_bytes": binding["artifact"]["bytes"],
+                "case_sha256": binding["case_sha256"], "workload": binding["workload"]}}
+
+
+def valid_mechanism(value, family):
+    if not (family == "qwen38" and isinstance(value, dict) and set(value) == MECHANISM_KEYS
+            and value["contract"] == q3_mechanism.CONTRACT and value["status"] in ("pass", "loss", "unresolved")
+            and all(type(value[k]) is int and value[k] >= 0 for k in ("accepted_rows", "lane_cycles", "runs"))):
+        return False
+    binding = value["binding"]
+    if binding is not None and not (
+            isinstance(binding, dict) and set(binding) == MECHANISM_BINDING_KEYS and binding["workload"] == "n4"
+            and type(binding["artifact_bytes"]) is int and binding["artifact_bytes"] > 0
+            and all(isinstance(binding[k], str) and re.fullmatch("[0-9a-f]{" + str(n) + "}", binding[k])
+                    for k, n in (("source_commit", 40), ("binary_sha256", 64), ("artifact_sha256", 64), ("case_sha256", 64)))):
+        return False
+    if value["status"] == "unresolved":
+        return value["ratio"] is None and isinstance(value["reason"], str) and bool(value["reason"])
+    ratio = value["ratio"]
+    if not (binding is not None and all(value[k] > 0 for k in ("accepted_rows", "lane_cycles", "runs"))
+            and type(ratio) is float and math.isfinite(ratio) and ratio > 0):
+        return False
+    try:
+        consistent = ratio == value["accepted_rows"] / value["lane_cycles"]
+    except OverflowError:
+        return False
+    passed = ratio >= q3_mechanism.CONTRACT["minimum"]
+    return consistent and (value["status"] == "pass") == passed and (
+        value["reason"] is None if passed else isinstance(value["reason"], str) and bool(value["reason"]))
+
+
 def build_record(verdict, campaign, root, refs, gates, review):
     """The group record of a verdict of record. refs: (verdict, campaign) `$E/` refs; gates: [(reference,
     `$E/` manifest ref, parsed manifest or None)]; review: `$E/` ref of the independent review or None."""
@@ -226,6 +278,7 @@ def build_record(verdict, campaign, root, refs, gates, review):
             "a controls-only or native-comparison verdict is never a Q3 verdict of record")
     arms = campaign["identities"]["arms"]
     bound = campaign["plan"].get(STOCK_RECORD)
+    mechanism = mechanism_record(verdict, campaign, root)
     quality = []
     for reference, ref, document in gates:
         status, q1, sha = gate_status(document, reference, verdict["family"], arms, bound)
@@ -251,6 +304,7 @@ def build_record(verdict, campaign, root, refs, gates, review):
             "thermal_valid": verdict["thermal_valid"], "memory_valid": verdict["memory_valid"],
             "patch_review_pending": list(verdict["quality"]["patch_review"]["pending"]),
             "quality_gate": quality, "review": review,
+            **({QWEN38_MECHANISM: mechanism} if mechanism is not None else {}),
             **({} if "splash" not in verdict else {SPLASH: {
                 "required": verdict["splash"]["required"],
                 "unavailable": None if verdict["splash"]["unavailable"] is None
@@ -271,8 +325,10 @@ def validate(groups):
         rec = group.get("q3_record")
         if rec is None:
             continue
-        require(isinstance(rec, dict) and RECORD_KEYS <= set(rec) <= RECORD_KEYS | {SPLASH, STOCK_RECORD, COMPARISON_FAILURES},
+        require(isinstance(rec, dict) and RECORD_KEYS <= set(rec) <= RECORD_KEYS | {SPLASH, STOCK_RECORD, COMPARISON_FAILURES, QWEN38_MECHANISM},
                 f"{gid}: q3_record fields")
+        require(QWEN38_MECHANISM not in rec or valid_mechanism(rec[QWEN38_MECHANISM], group["family"]),
+                f"{gid}: q3_record Qwen3.8 mechanism")
         lost = rec.get(COMPARISON_FAILURES)
         require(COMPARISON_FAILURES not in rec or (
             isinstance(lost, dict) and set(lost) == {"rule", "arms"} and isinstance(lost["rule"], str)
@@ -363,5 +419,7 @@ def verify(manifest, evidence_root, resolve):
         again = build_record(load(rec["verdict_ref"]), load(rec["campaign_ref"]), evidence_root,
                              (rec["verdict_ref"], rec["campaign_ref"]), gates, rec["review"])
         optional = {key for key in (SPLASH, STOCK_RECORD, COMPARISON_FAILURES) if key in rec or key in again}
+        if QWEN38_MECHANISM in rec or QWEN38_MECHANISM in again:
+            optional.add(QWEN38_MECHANISM)
         for key in sorted(set(RECORD_KEYS) | optional):
             require(again.get(key) == rec.get(key), f"{gid}: q3_record {key} drift: receipts give {again.get(key)!r}")

@@ -1,7 +1,7 @@
 """Markdown of the F2 'Q3 verdicts of record' tier (f2_q3_tier records and rows). Pure: no receipt reads."""
 import native_peers
 from f2_q3_tier import (COMPARISON_FAILURES, FAIRNESS, NATIVE_COMPARISON, PEER_SPEC_OFF, PRECISION_PP, REFERENCES, SSE,
-                        STOCK_ARM, STOCK_RECORD, TOKEN_ARMS, TOKENS, UNMEASURABLE, how_to_read, required_references)
+                        STOCK_ARM, STOCK_RECORD, TOKEN_ARMS, TOKENS, UNMEASURABLE, QWEN38_MECHANISM, how_to_read, required_references)
 
 
 def ratio(row):
@@ -71,6 +71,9 @@ def stock_reasons(rec, effects, band, family):
         return ["the family verdict is Failed (hf2q task failure)"]
     loss = "the family verdict is Loss vs the peer" + (" or Splash" if rec.get("splash") else "")
     reasons = [loss] if rec["verdict"] == "Loss" else []
+    mechanism = rec.get(QWEN38_MECHANISM)
+    if QWEN38_MECHANISM in rec and (mechanism or {}).get("status") != "pass":
+        reasons.append("Qwen3.8 mechanism: " + ((mechanism or {}).get("reason") or "unresolved"))
     reasons.extend(reason for reason in rec["reasons"] if reason.startswith("no usable stock arm"))
     if not rec["primary_stop"]:
         reasons.append("the primary stage has not reached its stopping rule")
@@ -125,6 +128,14 @@ def campaign_cell(rec, effects):
         text += ("; comparison-arm failed runs: "
                  + ", ".join(f"{arm} {a['failures']} of {a['attempts']}" for arm, a in lost["arms"].items())
                  + f" ({lost['rule']})")
+    mechanism = rec.get(QWEN38_MECHANISM)
+    if mechanism is not None:
+        text += "; Qwen3.8 mechanism " + mechanism["status"]
+        if mechanism["ratio"] is not None:
+            text += (f" ({mechanism['accepted_rows']}/{mechanism['lane_cycles']} = {mechanism['ratio']:.6f}, "
+                     f"minimum {mechanism['contract']['minimum']})")
+        elif mechanism["reason"]:
+            text += ": " + mechanism["reason"]
     return text
 
 
