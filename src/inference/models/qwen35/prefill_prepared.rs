@@ -161,25 +161,34 @@ impl Drop for PrefillScope {
 /// ([`QWEN_PREFILL_WAIT_LAYERS_ENV`] above 1) may have out when a layer
 /// ends without a wait. The worker's scratch pool takes its buffers back
 /// only at a host wait, so layers that do not wait accumulate theirs; a
-/// layer that ends with more than this out waits. What is out between two
-/// waits is therefore at most this plus one layer's scratch, and a forward
-/// that waits at every layer has one layer's scratch out as well.
+/// layer that ends with more than this out waits. This is a threshold, not
+/// a cap: the layer that crosses it has already allocated, so between two
+/// host waits up to this plus that one layer's scratch is out.
 pub(crate) const WAIT_LAYERS_WINDOW_SCRATCH_BYTES: usize = 1 << 30;
 
-/// Pooled scratch a worker keeps between host waits once a joint forward or
-/// a forward that skips host waits has run: above it the pool's free
-/// buffers are released at the next reset
-/// ([`super::decode_pool::release_free_above`]).
+/// Free bytes the pool keeps at a reset once a joint forward or a forward
+/// that skips host waits has run: above it the reset releases the free
+/// buffers.
 pub(crate) const PREFILL_RETAINED_SCRATCH_BYTES: usize = 2 << 30;
+
+/// What the pool may hold at any time while a joint forward or a forward
+/// that skips host waits runs, and until the reset after it. Checked before
+/// every pooled allocation ([`super::decode_pool::cap_pool`]): a request
+/// that could take the pool over it is served by a plain buffer that is
+/// released at the next host wait. A hard cap, so it holds for every model
+/// geometry, slot count, shared-prefix layout and sequence of forwards.
+pub(crate) const PREFILL_POOL_CAP_BYTES: usize =
+    PREFILL_RETAINED_SCRATCH_BYTES + WAIT_LAYERS_WINDOW_SCRATCH_BYTES;
 
 #[cfg(test)]
 thread_local! {
-    /// Test override of the two caps: (window, retained).
-    static SCRATCH_CAPS_FOR_TEST: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+    /// Test override: (window threshold, pool caps).
+    static SCRATCH_CAPS_FOR_TEST: Cell<Option<(usize, super::decode_pool::PoolCaps)>> =
+        const { Cell::new(None) };
 }
 
 /// [`WAIT_LAYERS_WINDOW_SCRATCH_BYTES`] (a test may lower it).
-pub(crate) fn window_scratch_cap() -> usize {
+pub(crate) fn window_scratch_threshold() -> usize {
     #[cfg(test)]
     if let Some((window, _)) = SCRATCH_CAPS_FOR_TEST.with(Cell::get) {
         return window;
@@ -187,27 +196,32 @@ pub(crate) fn window_scratch_cap() -> usize {
     WAIT_LAYERS_WINDOW_SCRATCH_BYTES
 }
 
-/// [`PREFILL_RETAINED_SCRATCH_BYTES`] (a test may lower it).
-pub(crate) fn retained_scratch_cap() -> usize {
+/// The pool caps of a joint forward and of a forward that skips host waits
+/// (a test may lower them).
+pub(crate) fn prefill_pool_caps() -> super::decode_pool::PoolCaps {
     #[cfg(test)]
-    if let Some((_, retained)) = SCRATCH_CAPS_FOR_TEST.with(Cell::get) {
-        return retained;
+    if let Some((_, caps)) = SCRATCH_CAPS_FOR_TEST.with(Cell::get) {
+        return caps;
     }
-    PREFILL_RETAINED_SCRATCH_BYTES
+    super::decode_pool::PoolCaps {
+        pool: PREFILL_POOL_CAP_BYTES,
+        retained: PREFILL_RETAINED_SCRATCH_BYTES,
+    }
 }
 
-/// Until dropped, this thread's forwards run under these caps instead of
-/// the two constants.
+/// Until dropped, this thread's forwards run under this window threshold
+/// and these pool caps instead of the constants.
 #[cfg(test)]
 pub(crate) struct ScratchCapsForTest {
-    previous: Option<(usize, usize)>,
+    previous: Option<(usize, super::decode_pool::PoolCaps)>,
 }
 
 #[cfg(test)]
 impl ScratchCapsForTest {
-    pub(crate) fn set(window: usize, retained: usize) -> Self {
+    pub(crate) fn set(window: usize, retained: usize, pool: usize) -> Self {
+        let caps = super::decode_pool::PoolCaps { pool, retained };
         Self {
-            previous: SCRATCH_CAPS_FOR_TEST.with(|cell| cell.replace(Some((window, retained)))),
+            previous: SCRATCH_CAPS_FOR_TEST.with(|cell| cell.replace(Some((window, caps)))),
         }
     }
 }
@@ -219,22 +233,108 @@ impl Drop for ScratchCapsForTest {
     }
 }
 
-/// Upper bound of the pooled scratch `HF2Q_QWEN_PREFILL_JOINT` keeps between
-/// steps: enforced, so it holds for every model geometry, slot count and
-/// sequence of forwards.
-pub(crate) const fn joint_scratch_bound_bytes() -> u64 {
-    PREFILL_RETAINED_SCRATCH_BYTES as u64
+/// Upper bound of the scratch one layer of a prompt-prefill forward on the
+/// prepared route requests from the worker's scratch pool (bucket bytes,
+/// whether the pool or a plain buffer serves them), for a forward of
+/// `forward_rows` rows over `lanes` slots.
+///
+/// Derived from the requests the prepared route makes (`pooled_alloc_buffer`
+/// call sites; a buffer of `n` bytes occupies the power of two it rounds up
+/// to, at most `2n`, which is exact for the single-call terms and the
+/// factor on the per-segment sums):
+/// - A DeltaNet layer runs its projections once over all rows `R`: the BF16
+///   copy of the normed input (`2Rh`), the fused alpha/beta logits
+///   (`4R·ab`, `ab` = 2·heads rounded up to 64), their two halves
+///   (`4R·heads` each), the BF16 copy of the gated values (`2R·z`,
+///   `z` = value heads × value head dim) and the output projection (`4Rh`).
+/// - A full-attention layer is built per slot and segment; a segment of `r`
+///   rows requests the BF16 input copy (`2rh`), the fused query/gate
+///   projection (`4r·2q`, `q` = heads × head dim), the BF16 copy of the gated
+///   attention output (`2rq`), the output projection (`4rh`) and the
+///   attention output (`4rq`); a segment of at most 32 rows on the direct TQ
+///   route adds its tile scratch (`4·32·32·heads·(head dim + 2)` at 32 rows)
+///   and two row-id lists. A lane's segments cover its own rows and its
+///   private copy of a shared prefix, at most `R` rows per lane, and at most
+///   two of them are short (a short content chunk and the cue). A forward
+///   with segments also requests the joined attention output (`4Rh`).
+/// - The dense FFN requests the BF16 copies of its input (`2Rh`) and of its
+///   hidden activations (`2Rm`); the MoE FFN the shared expert's output
+///   (`4rh`) per call: one call over the long segments' rows and one per
+///   short segment.
+/// - Outside the layers, in the same window: the token embedding when it is
+///   not gathered natively (`4Rh`) and, per slot, two output-head norm rows.
+///
+/// It holds for the prepared route (`HF2Q_QWEN_PREFILL_PREPARED`, every
+/// projection of the layer on the prepared kernel, per-forward arenas),
+/// which is the route joint forwards and the served profiles run; the
+/// legacy routes request other scratch and are not covered. The forward
+/// checks every layer against it and reports a layer that exceeds it
+/// (`decode_pool::note_layer_scratch`).
+pub(crate) fn prefill_layer_scratch_bound_bytes(
+    cfg: &super::Qwen35Config,
+    forward_rows: usize,
+    lanes: usize,
+) -> u64 {
+    let bucket = |bytes: u64| bytes.max(1).next_power_of_two();
+    let rows = forward_rows as u64;
+    let lanes = lanes.max(1) as u64;
+    let lane_rows = rows * lanes;
+    let h = u64::from(cfg.hidden_size);
+    let heads = u64::from(cfg.num_attention_heads);
+    let head_dim = u64::from(cfg.head_dim);
+    let q = heads * head_dim;
+    let value_heads = u64::from(cfg.linear_num_value_heads);
+    let z = value_heads * u64::from(cfg.linear_value_head_dim);
+    let ab = u64::from(super::prepared_projection::alpha_beta_rows(cfg.linear_num_value_heads));
+    let short_segments = 2 * lanes;
+    let attention = 2 * lane_rows * (2 * h + 8 * q + 2 * q + 4 * h + 4 * q)
+        + short_segments * (bucket(4 * 32 * 32 * heads * (head_dim + 2)) + 2 * bucket(4 * 32))
+        + bucket(4 * rows * h);
+    let delta_net = bucket(2 * rows * h)
+        + bucket(4 * rows * ab)
+        + 2 * bucket(4 * rows * value_heads)
+        + bucket(2 * rows * z)
+        + bucket(4 * rows * h);
+    let ffn = match cfg.intermediate_size {
+        Some(m) => bucket(2 * rows * h) + bucket(2 * rows * u64::from(m)),
+        None => 2 * 4 * h * (rows + 32 * short_segments),
+    };
+    let outside = bucket(4 * rows * h) + 2 * lanes * (bucket(4 * h) + bucket(8));
+    attention.max(delta_net) + ffn + outside
 }
 
-/// Upper bound of the pooled scratch a worker holds because of
-/// `HF2Q_QWEN_PREFILL_WAIT_LAYERS=wait_layers`, beyond what the same
-/// forwards hold when they wait at every layer: what the pool keeps between
-/// waits plus what a window may add before a layer waits. Enforced, so it
-/// holds for every model geometry, slot count and sequence of forwards; 0
-/// at the default cadence.
-pub(crate) const fn wait_layers_scratch_bound_bytes(wait_layers: usize) -> u64 {
+/// Upper bound of the scratch a worker holds for
+/// `HF2Q_QWEN_PREFILL_JOINT` forwards of at most `forward_rows` rows over
+/// `slots` slots: what the pool keeps at a reset
+/// ([`PREFILL_RETAINED_SCRATCH_BYTES`], enforced) plus one layer's requests
+/// ([`prefill_layer_scratch_bound_bytes`], derived). Absolute: nothing of
+/// the default route is subtracted.
+pub(crate) fn joint_scratch_bound_bytes(
+    cfg: &super::Qwen35Config,
+    forward_rows: usize,
+    slots: usize,
+) -> u64 {
+    PREFILL_RETAINED_SCRATCH_BYTES as u64
+        + prefill_layer_scratch_bound_bytes(cfg, forward_rows, slots)
+}
+
+/// Upper bound of the scratch a worker holds for forwards of at most
+/// `forward_rows` rows over `lanes` slots under
+/// `HF2Q_QWEN_PREFILL_WAIT_LAYERS=wait_layers`: what the pool keeps at a
+/// reset, what a window may have out when its last layer starts
+/// ([`WAIT_LAYERS_WINDOW_SCRATCH_BYTES`], enforced) and that layer's
+/// requests (derived); 0 at the default cadence. With the joint switch on
+/// as well this figure (with the joint forward's rows and slots) covers
+/// both: the caps are one pool's, not one per switch.
+pub(crate) fn wait_layers_scratch_bound_bytes(
+    cfg: &super::Qwen35Config,
+    forward_rows: usize,
+    lanes: usize,
+    wait_layers: usize,
+) -> u64 {
     if wait_layers > 1 {
         (PREFILL_RETAINED_SCRATCH_BYTES + WAIT_LAYERS_WINDOW_SCRATCH_BYTES) as u64
+            + prefill_layer_scratch_bound_bytes(cfg, forward_rows, lanes)
     } else {
         0
     }
@@ -391,6 +491,12 @@ pub(crate) fn switches_or_refusal(
     .map_err(|cause| anyhow::anyhow!("Qwen prompt prefill switches: {cause}"))
 }
 
+/// Whether this thread's forward runs in a prefill scope with the prepared
+/// route on.
+pub(crate) fn route_in_scope() -> bool {
+    SCOPE.with(Cell::get)
+}
+
 /// The switches of this process, read strictly. Called before a Qwen model
 /// is loaded, so a mistyped value is refused before the load is paid for.
 pub(crate) fn switches_from_process() -> anyhow::Result<PrefillSwitches> {
@@ -417,14 +523,6 @@ pub(crate) fn validate_at_worker_start() -> anyhow::Result<PrefillSwitches> {
         joint = switches.joint,
         wait_layers = switches.wait_layers,
         keep_fresh = switches.keep_fresh,
-        // Enforced caps on the pooled scratch the two switches add: what
-        // memory admission charges them.
-        joint_scratch_bound_bytes = if switches.joint {
-            joint_scratch_bound_bytes()
-        } else {
-            0
-        },
-        wait_layers_scratch_bound_bytes = wait_layers_scratch_bound_bytes(switches.wait_layers),
         "Qwen prompt prefill configuration"
     );
     Ok(switches)

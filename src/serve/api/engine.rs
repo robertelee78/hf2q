@@ -19099,6 +19099,33 @@ fn run_slot_aware_qwen35(
         );
         policy
     });
+    // What the two prefill switches may hold in scratch on this worker
+    // (enforced pool caps plus the derived scratch of one layer at the
+    // transaction row ceiling): the figures memory admission charges them.
+    {
+        use crate::inference::models::qwen35::prefill_prepared as prepared;
+        let rows = prefill_chunk_tokens as usize;
+        let slots = n_slots as usize;
+        tracing::info!(
+            target: "hf2q::serve::api::engine_qwen35::progress",
+            transaction_rows = rows,
+            slots,
+            layer_scratch_bound_bytes =
+                prepared::prefill_layer_scratch_bound_bytes(&guard.model.model.cfg, rows, slots),
+            joint_scratch_bound_bytes = if qwen_joint_prefill.is_some() {
+                prepared::joint_scratch_bound_bytes(&guard.model.model.cfg, rows, slots)
+            } else {
+                0
+            },
+            wait_layers_scratch_bound_bytes = prepared::wait_layers_scratch_bound_bytes(
+                &guard.model.model.cfg,
+                rows,
+                slots,
+                prepared::switches_from_process().map_or(1, |switches| switches.wait_layers),
+            ),
+            "Qwen prompt prefill scratch bounds"
+        );
+    }
     // When the first prompts of a cohort started to gather (see STEP).
     let mut cold_gather_deadline: Option<Instant> = None;
 

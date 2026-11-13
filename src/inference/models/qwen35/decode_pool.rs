@@ -91,6 +91,7 @@ pub(crate) fn worker_memory_snapshot() -> Result<(&'static str, mlx_native::Pool
 /// API-compatible with `MlxDevice::alloc_buffer` so call sites in the
 /// dispatch helpers can be edited mechanically.
 #[inline]
+#[cfg_attr(test, track_caller)]
 pub fn pooled_alloc_buffer(
     device: &MlxDevice,
     byte_len: usize,
@@ -98,44 +99,147 @@ pub fn pooled_alloc_buffer(
     shape: Vec<usize>,
 ) -> std::result::Result<MlxBuffer, mlx_native::MlxError> {
     if let Some(result) = profile::alloc(device, byte_len, dtype, &shape) { return result; }
-    let buffer = DECODE_POOL.with(|cell| cell.borrow_mut().alloc(device, byte_len, dtype, shape))?;
     // The pool hands out the power-of-two bucket the request rounds up to.
-    ISSUED_BYTES.with(|issued| issued.set(issued.get() + byte_len.max(1).next_power_of_two()));
+    let bucket = byte_len.max(1).next_power_of_two();
+    ISSUED_BYTES.with(|issued| issued.set(issued.get() + bucket));
+    ISSUED_TOTAL.with(|issued| issued.set(issued.get() + bucket as u64));
+    #[cfg(test)]
+    {
+        let site = std::panic::Location::caller();
+        SCRATCH_TRACE.with(|trace| {
+            if let Some(trace) = trace.borrow_mut().as_mut() {
+                trace.push((site.file(), site.line(), byte_len));
+            }
+        });
+    }
+    if let Some(caps) = CAPS.with(std::cell::Cell::get) {
+        // Before the allocation: what the pool held free at its last reset
+        // plus what it has handed out since bounds what it holds now (a
+        // reused buffer counts as if it were new). A request that could
+        // take the pool over its cap is served outside it.
+        let held = FREE_AT_RESET.with(std::cell::Cell::get)
+            + POOLED_SINCE_RESET.with(std::cell::Cell::get);
+        if held.saturating_add(bucket) > caps.pool {
+            let buffer = device.alloc_buffer(byte_len, dtype, shape)?;
+            OVERFLOW.with(|overflow| overflow.borrow_mut().push(buffer.clone()));
+            return Ok(buffer);
+        }
+    }
+    let buffer = DECODE_POOL.with(|cell| cell.borrow_mut().alloc(device, byte_len, dtype, shape))?;
+    POOLED_SINCE_RESET.with(|pooled| pooled.set(pooled.get() + bucket));
     Ok(buffer)
 }
 
-thread_local! {
-    /// Bucket bytes this thread's pool has handed out since its last reset.
-    static ISSUED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Free bytes above which a reset releases the pool's free buffers
-    /// ([`release_free_above`]), and whether that ends with the next reset;
-    /// `None`: the pool keeps everything.
-    static FREE_CAP: std::cell::Cell<Option<(usize, bool)>> = const { std::cell::Cell::new(None) };
+/// The caps a forward puts on this thread's pool ([`cap_pool`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PoolCaps {
+    /// What the pool may hold at any time: checked before every allocation.
+    pub(crate) pool: usize,
+    /// Free bytes above which a reset releases the pool's free buffers.
+    pub(crate) retained: usize,
 }
 
-/// Bucket bytes handed out by this thread's pool since its last reset: the
-/// pooled scratch that is out, and stays out until the next reset.
+thread_local! {
+    /// Bucket bytes handed out since the last reset, by the pool or outside
+    /// it.
+    static ISSUED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Bucket bytes handed out by this thread, ever (never reset).
+    static ISSUED_TOTAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The largest scratch one layer has requested since the last
+    /// [`take_layer_scratch_peak`], and whether a layer over its bound was
+    /// reported already.
+    static LAYER_SCRATCH_PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LAYER_SCRATCH_REPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The pool's part of [`ISSUED_BYTES`].
+    static POOLED_SINCE_RESET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Free bytes the pool held after its last reset.
+    static FREE_AT_RESET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The caps in force, and whether they end with the next reset.
+    static CAPS: std::cell::Cell<Option<PoolCaps>> = const { std::cell::Cell::new(None) };
+    static CAPS_END_AT_RESET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Buffers served outside the pool since the last reset. They are held
+    /// like pooled ones, so a command buffer still in flight keeps its
+    /// operands, and are released (not recycled) at the reset.
+    static OVERFLOW: RefCell<Vec<MlxBuffer>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test trace of the scratch requests: (file, line, bytes requested).
+    static SCRATCH_TRACE: RefCell<Option<Vec<(&'static str, u32, usize)>>> =
+        const { RefCell::new(None) };
+}
+
+/// Start (`true`) or stop a trace of this thread's scratch requests and
+/// return what was traced so far.
+#[cfg(test)]
+pub(crate) fn trace_scratch(on: bool) -> Vec<(&'static str, u32, usize)> {
+    SCRATCH_TRACE.with(|trace| trace.replace(on.then(Vec::new)).unwrap_or_default())
+}
+
+/// Bucket bytes of scratch this thread has out since its pool's last reset:
+/// handed out by the pool or served outside it.
 pub(crate) fn issued_bytes() -> usize {
     ISSUED_BYTES.with(std::cell::Cell::get)
 }
 
-/// From now on a reset of this thread's pool releases the pool's free
-/// buffers when they hold more than `cap` bytes (`None`: never, the
-/// default). A reset follows a drained queue and the last use of every
-/// issued buffer, so the free buffers have no user. The pool reuses a free
-/// buffer only in the exact bucket a request rounds up to and never shrinks
-/// on its own; with a cap what it keeps between resets is at most `cap`
-/// bytes, whatever sizes the forwards before asked for. Released buffers are
-/// allocated again when needed: that costs allocation time, never memory.
-pub(crate) fn release_free_above(cap: Option<usize>) {
-    FREE_CAP.with(|cell| cell.set(cap.map(|cap| (cap, false))));
+/// Bucket bytes of scratch this thread has requested so far (monotone).
+pub(crate) fn issued_total() -> u64 {
+    ISSUED_TOTAL.with(std::cell::Cell::get)
 }
 
-/// The cap of [`release_free_above`] applies to one more reset and then
-/// ends. A forward calls this when it returns: the reset that takes its last
+/// Record that one layer of a forward requested `bytes` of scratch, against
+/// the bound derived for the forward's shape (`None`: no bound applies). A
+/// layer over its bound ran on a route the derivation does not cover: it is
+/// reported once per thread, the forward is not affected.
+pub(crate) fn note_layer_scratch(bytes: u64, bound: Option<u64>) {
+    LAYER_SCRATCH_PEAK.with(|peak| peak.set(peak.get().max(bytes)));
+    if bound.is_some_and(|bound| bytes > bound) && !LAYER_SCRATCH_REPORTED.with(|cell| cell.replace(true)) {
+        tracing::warn!(
+            layer_scratch_bytes = bytes,
+            bound_bytes = bound.unwrap_or_default(),
+            "Qwen prefill: a layer requested more scratch than the bound derived for its shape"
+        );
+    }
+}
+
+/// The largest scratch one layer has requested since the last call.
+#[cfg(test)]
+pub(crate) fn take_layer_scratch_peak() -> u64 {
+    LAYER_SCRATCH_PEAK.with(|peak| peak.replace(0))
+}
+
+/// Put `caps` on this thread's pool from now on (`None`: no caps, the
+/// default).
+///
+/// The pool reuses a free buffer only in the exact bucket a request rounds
+/// up to and never shrinks on its own, so forwards of varying sizes, and
+/// forwards that skip host waits, grow it without bound. Under caps:
+/// - before every allocation, a request that could take the pool over
+///   `caps.pool` is served by a plain device buffer instead, held until the
+///   next reset and released there, so the pool never holds more than
+///   `caps.pool` bytes;
+/// - a reset releases the pool's free buffers when they exceed
+///   `caps.retained`. A reset follows a drained queue and the last use of
+///   every issued buffer, so the free buffers have no user.
+/// Released and outside buffers are allocated again when needed: that costs
+/// allocation time, never memory.
+pub(crate) fn cap_pool(caps: Option<PoolCaps>) {
+    CAPS.with(|cell| cell.set(caps));
+    CAPS_END_AT_RESET.with(|cell| cell.set(false));
+}
+
+/// The caps of [`cap_pool`] apply through one more reset and then end. A
+/// forward calls this when it returns: the reset that takes its last
 /// buffers back is the next forward's or the next decode step's.
-pub(crate) fn release_free_once_more() {
-    FREE_CAP.with(|cell| cell.set(cell.get().map(|(cap, _)| (cap, true))));
+pub(crate) fn end_caps_at_next_reset() {
+    CAPS_END_AT_RESET.with(|cell| cell.set(CAPS.with(std::cell::Cell::get).is_some()));
+}
+
+/// Release the buffers served outside the pool. The caller has drained the
+/// device queue: nothing in flight uses them.
+pub(crate) fn release_overflow() {
+    OVERFLOW.with(|overflow| overflow.borrow_mut().clear());
 }
 
 /// Whether this thread's pool is the default one (not the growth-limited
@@ -207,19 +311,21 @@ pub fn reset_decode_pool() {
 /// Caller guarantees no future issued-buffer access AND a successful drain.
 pub fn checked_reset_decode_pool() -> std::result::Result<(), mlx_native::MlxError> {
     if let Some(result) = profile::reset() { return result; }
+    let caps = CAPS.with(std::cell::Cell::get);
     DECODE_POOL.with(|cell| {
         let mut pool = cell.borrow_mut();
         pool.reset();
-        if let Some((cap, once)) = FREE_CAP.with(std::cell::Cell::get) {
-            if pool.free_bytes() > cap {
-                pool.clear();
-            }
-            if once {
-                FREE_CAP.with(|cell| cell.set(None));
-            }
+        if caps.is_some_and(|caps| pool.free_bytes() > caps.retained) {
+            pool.clear();
         }
+        FREE_AT_RESET.with(|free| free.set(pool.free_bytes()));
     });
+    release_overflow();
     ISSUED_BYTES.with(|issued| issued.set(0));
+    POOLED_SINCE_RESET.with(|pooled| pooled.set(0));
+    if CAPS_END_AT_RESET.with(|cell| cell.replace(false)) {
+        CAPS.with(|cell| cell.set(None));
+    }
     Ok(())
 }
 

@@ -150,13 +150,15 @@ impl Drop for FailForwardAtLayer {
     }
 }
 
-/// Whether a forward that skips host waits has so much pooled scratch out
-/// that the layer now ending must wait
+/// Whether a forward that skips host waits has so much scratch out that the
+/// layer now ending must wait
 /// ([`super::prefill_prepared::WAIT_LAYERS_WINDOW_SCRATCH_BYTES`]): the pool
-/// takes its buffers back only at a host wait.
+/// takes its buffers back only at a host wait. Evaluated when the layer has
+/// allocated, so what is out exceeds the threshold by at most this layer's
+/// scratch.
 fn window_scratch_full(pipelined_layers: bool) -> bool {
     pipelined_layers
-        && super::decode_pool::issued_bytes() > super::prefill_prepared::window_scratch_cap()
+        && super::decode_pool::issued_bytes() > super::prefill_prepared::window_scratch_threshold()
 }
 
 /// Block until every command buffer a failed forward committed has run.
@@ -4766,10 +4768,13 @@ impl Qwen35Model {
         if result.is_err() {
             drain_after_failed_forward();
         }
-        // The reset that takes this forward's last pooled buffers back is
-        // the next forward's or the next decode step's: the cap on what the
-        // pool keeps applies to it and ends there.
-        super::decode_pool::release_free_once_more();
+        // The queue is drained (the forward's last wait, the settle above
+        // and, after an error, the drain): the buffers served outside the
+        // pool have no user in flight. The reset that takes the pooled ones
+        // back is the next forward's or the next decode step's; the caps
+        // apply through it and end there.
+        super::decode_pool::release_overflow();
+        super::decode_pool::end_caps_at_next_reset();
         result
     }
 
@@ -5503,13 +5508,25 @@ impl Qwen35Model {
             configured_wait_layers > 1 && super::decode_pool::default_pool();
         // A joint forward, and a forward that skips host waits, pool more
         // scratch than a single slot's forward that waits at every layer.
-        // From here to the reset after this forward the pool releases its
-        // free buffers when they exceed the cap, so what such forwards leave
-        // in the pool between steps is bounded whatever their sizes.
-        super::decode_pool::release_free_above(
+        // From here to the reset after this forward the pool is capped:
+        // checked before every pooled allocation, and its free buffers are
+        // released at a reset when they exceed the retained cap.
+        super::decode_pool::cap_pool(
             (pipelined_layers || !joint_segments.is_empty())
-                .then(super::prefill_prepared::retained_scratch_cap),
+                .then(super::prefill_prepared::prefill_pool_caps),
         );
+        // The scratch one layer of this forward may request, where the bound
+        // is derived: the prepared route.
+        let layer_scratch_bound = (seq_len > 1 && super::prefill_prepared::route_in_scope()).then(|| {
+            let mut slots: Vec<u32> = joint_segments.iter().map(|segment| segment.slot.0).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            super::prefill_prepared::prefill_layer_scratch_bound_bytes(
+                cfg,
+                seq_len as usize,
+                slots.len().max(1),
+            )
+        });
         let prefill_wait_layers = if seq_len > 32 {
             configured_wait_layers
         } else {
@@ -5948,6 +5965,7 @@ impl Qwen35Model {
             if seq_len > 1 && FAIL_AT_LAYER.with(std::cell::Cell::get) == Some(layer_idx) {
                 return Err(anyhow!("injected forward failure at layer {layer_idx}"));
             }
+            let layer_scratch_before = super::decode_pool::issued_total();
             #[cfg(test)]
             let q1_layer_before = if q1_target_layers.is_some() {
                 Some(q1_layer_metadata::state(kv_cache,layer_idx,slot_id)?)
@@ -7553,6 +7571,12 @@ impl Qwen35Model {
             // `reset_for_prefill_chunk` (next prefill chunk) reclaims the
             // pool — one prefill of held scratches is below the W-5b.14
             // 33 GB residency-quota ceiling for production fixtures.
+            if seq_len > 1 {
+                super::decode_pool::note_layer_scratch(
+                    super::decode_pool::issued_total() - layer_scratch_before,
+                    layer_scratch_bound,
+                );
+            }
             if seq_len > 1
                 && is_k_boundary
                 && last_layer_held_enc.is_none()

@@ -1444,10 +1444,13 @@ fn a_failed_command_buffer_of_the_last_window_fails_the_forward() {
 /// The scratch pool takes its buffers back only at a host wait, keeps them in
 /// exact power-of-two buckets and never shrinks on its own, so a forward that
 /// skips host waits accumulates its layers' scratch. Two enforced caps bound
-/// that for every shape: a layer that ends with more than the window cap out
-/// waits, and after a joint forward or a forward that skips waits a reset
-/// releases the pool's free buffers above the retained cap. The caps change
-/// when the host waits and what the pool keeps, never a bit.
+/// that for every shape. A layer that ends with more than the window
+/// threshold out waits. After a joint forward or a forward that skips waits
+/// a reset releases the pool's free buffers above the retained cap. And
+/// before every pooled allocation the hard cap is checked: a request that
+/// could take the pool over it is served outside the pool and released at
+/// the next wait. They change when the host waits and what the pool keeps,
+/// never a bit.
 #[test]
 fn the_scratch_caps_bound_the_pool_and_change_no_bit() {
     use super::decode_pool;
@@ -1470,7 +1473,7 @@ fn the_scratch_caps_bound_the_pool_and_change_no_bit() {
         let unlimited = usize::MAX;
         // A wait after every layer: one layer's scratch at a time.
         let every_layer = {
-            let _caps = ScratchCapsForTest::set(unlimited, unlimited);
+            let _caps = ScratchCapsForTest::set(unlimited, unlimited, unlimited);
             run(1)
         };
         let one_layer = held();
@@ -1478,13 +1481,13 @@ fn the_scratch_caps_bound_the_pool_and_change_no_bit() {
         // Eight layers between waits under a window cap of zero: every layer
         // ends over the cap and waits, so the pool grows by nothing.
         let capped = {
-            let _caps = ScratchCapsForTest::set(0, unlimited);
+            let _caps = ScratchCapsForTest::set(0, unlimited, unlimited);
             run(8)
         };
         assert_eq!(held(), one_layer, "a window cap of zero still let layers skip their wait");
         // The same without the window cap: the layers' scratch accumulates.
         let uncapped = {
-            let _caps = ScratchCapsForTest::set(unlimited, unlimited);
+            let _caps = ScratchCapsForTest::set(unlimited, unlimited, unlimited);
             run(8)
         };
         let accumulated = held();
@@ -1496,7 +1499,7 @@ fn the_scratch_caps_bound_the_pool_and_change_no_bit() {
         // A retained cap below what the pool holds: the reset after the next
         // such forward releases the free buffers.
         let released = {
-            let _caps = ScratchCapsForTest::set(unlimited, one_layer / 2);
+            let _caps = ScratchCapsForTest::set(unlimited, one_layer / 2, unlimited);
             run(8)
         };
         let after = held();
@@ -1505,9 +1508,33 @@ fn the_scratch_caps_bound_the_pool_and_change_no_bit() {
             "the pool kept {after} bytes over a retained cap of {} bytes",
             one_layer / 2
         );
-        // The cap ended with that reset: a later reset keeps what a forward
-        // without it leaves.
-        for (what, other) in [("window cap", &capped), ("no cap", &uncapped), ("retained cap", &released)] {
+        // The hard cap: checked before every pooled allocation, so the pool
+        // never holds more than it. With a cap of what the pool holds now,
+        // eight-layer windows are served outside the pool and released at
+        // the wait: the pool does not grow by a byte.
+        let before = held();
+        let hard = {
+            let _caps = ScratchCapsForTest::set(unlimited, unlimited, before);
+            run(8)
+        };
+        assert!(
+            held() <= before,
+            "the pool grew from {before} to {} bytes under a hard cap of {before} bytes",
+            held()
+        );
+        // And with a hard cap of zero nothing is pooled at all.
+        let nothing = {
+            let _caps = ScratchCapsForTest::set(unlimited, 0, 0);
+            run(8)
+        };
+        assert_eq!(held(), 0, "a hard cap of zero left buffers in the pool");
+        for (what, other) in [
+            ("window threshold", &capped),
+            ("no cap", &uncapped),
+            ("retained cap", &released),
+            ("hard cap", &hard),
+            ("hard cap of zero", &nothing),
+        ] {
             for ((lane, a), b) in lanes.iter().zip(&every_layer).zip(other) {
                 let differences = a.differences(b);
                 assert!(
@@ -1517,6 +1544,205 @@ fn the_scratch_caps_bound_the_pool_and_change_no_bit() {
             }
         }
     });
+}
+
+/// One layer of a forward on the prepared route requests at most
+/// `prefill_layer_scratch_bound_bytes` of scratch for its shape: single-slot
+/// chunks (fresh, resumed, short, with a folded cue) and joint forwards with
+/// and without a shared prefix, on the dense and on the MoE fixture. The
+/// bound is derived from the route's request sites; this checks the
+/// derivation against what the layers actually request, and that it is
+/// within a small factor of it (a bound that stopped tracking the requests
+/// would pass forever).
+#[test]
+fn a_layer_requests_no_more_scratch_than_its_derived_bound() {
+    use super::decode_pool;
+    use super::prefill_prepared::prefill_layer_scratch_bound_bytes as bound;
+    let check = |model: &Qwen35Model, what: &str| {
+        let mut tightest = f64::INFINITY;
+        let mut probe = |name: &str, rows: usize, lanes: usize, run: &mut dyn FnMut()| {
+            decode_pool::take_layer_scratch_peak();
+            run();
+            let peak = decode_pool::take_layer_scratch_peak();
+            let limit = bound(&model.cfg, rows, lanes);
+            assert!(peak > 0, "{what}, {name}: the forward requested no scratch");
+            assert!(
+                peak <= limit,
+                "{what}, {name}: a layer requested {peak} bytes of scratch, over the bound of {limit} bytes \
+                 for {rows} rows and {lanes} lanes"
+            );
+            tightest = tightest.min(limit as f64 / peak as f64);
+        };
+        for (name, lane) in [
+            ("fresh chunk", Lane::new(0, &[], 507, 0)),
+            ("resumed chunk", Lane::new(0, &[155], 300, 0)),
+            ("resumed chunk with a folded cue", Lane::new(0, &[155], 300, 5)),
+            ("short resumed chunk", Lane::new(0, &[155], 20, 0)),
+        ] {
+            probe(name, lane.rows(), 1, &mut || {
+                solo(model, &lane, false);
+            });
+        }
+        let shared = [
+            Lane::cold(0, 96, 400, 5),
+            Lane::cold(1, 96, 300, 5),
+            Lane::cold(2, 96, 200, 0),
+            Lane::cold(3, 96, 150, 5),
+        ];
+        let rows: usize = 96 + shared.iter().map(|lane| lane.rows() - 96).sum::<usize>();
+        probe("joint, shared prefix", rows, 4, &mut || {
+            joint(model, &shared, 96, false);
+        });
+        let mixed = [
+            Lane::new(0, &[155], 200, 5),
+            Lane::new(1, &[125], 31, 0),
+            Lane::new(2, &[110], 266, 5),
+        ];
+        let rows: usize = mixed.iter().map(Lane::rows).sum();
+        probe("joint, resumed lanes", rows, 3, &mut || {
+            joint(model, &mixed, 0, false);
+        });
+        assert!(
+            tightest < 16.0,
+            "{what}: the bound is at least {tightest:.1} times every layer's requests"
+        );
+    };
+    with_synthetic_model(|model| check(model, "dense FFN"));
+    super::prefill_fold_tests::with_synthetic_moe_model(|model| check(model, "MoE FFN"));
+}
+
+/// The scratch requests of a forward by call site: (file:line, calls, bytes
+/// requested in total, bucket bytes in total).
+fn scratch_sites(trace: &[(&'static str, u32, usize)]) -> Vec<(String, usize, usize, usize)> {
+    let mut sites: std::collections::BTreeMap<(String, u32), (usize, usize, usize)> = Default::default();
+    for &(file, line, bytes) in trace {
+        let name = file.rsplit('/').next().unwrap_or(file).to_owned();
+        let entry = sites.entry((name, line)).or_default();
+        entry.0 += 1;
+        entry.1 += bytes;
+        entry.2 += bytes.max(1).next_power_of_two();
+    }
+    sites
+        .into_iter()
+        .map(|((file, line), (calls, bytes, buckets))| (format!("{file}:{line}"), calls, bytes, buckets))
+        .collect()
+}
+
+/// Diagnostic for the per-layer scratch bound, run explicitly on the real
+/// artifacts (`HF2Q_QWEN38_GGUF` or `HF2Q_QWEN36_GGUF`, served prefill
+/// switches): which call sites request scratch in a single-slot chunk and in
+/// a four-lane joint forward with a shared prefix, how often and how much.
+#[test]
+#[ignore = "requires HF2Q_QWEN38_GGUF or HF2Q_QWEN36_GGUF and Apple Metal; run alone"]
+fn qwen_prefill_scratch_sites_probe() {
+    use crate::serve::header::LoadProgress;
+    use mlx_native::gguf::GgufFile;
+
+    const PATTERN: [u32; 7] = [9707, 374, 279, 15, 1_782, 2_610, 13];
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let path = match (
+        std::env::var_os("HF2Q_QWEN38_GGUF"),
+        std::env::var_os("HF2Q_QWEN36_GGUF"),
+    ) {
+        (Some(path), None) | (None, Some(path)) => std::path::PathBuf::from(path),
+        _ => panic!("set exactly one of HF2Q_QWEN38_GGUF and HF2Q_QWEN36_GGUF"),
+    };
+    let policy = super::routing_policy::resolve_qwen_ggml_routing_policy(&path);
+    let gguf = GgufFile::open(&path).expect("open GGUF");
+    let mut progress = LoadProgress::new(false, 1, 0);
+    let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
+    model.bind_ggml_routing_policy(policy);
+    model.ensure_gpu_cache_primed().expect("prime GPU cache");
+    let vocab = model.cfg.vocab_size;
+    let layers = model.layers.len();
+    let hidden = model.cfg.hidden_size as usize;
+    let tokens = |seed: usize, start: usize, len: usize, common: usize| -> Vec<u32> {
+        (start..start + len)
+            .map(|index| {
+                let own = if index < common { 0 } else { seed + 1 };
+                (PATTERN[(index + own) % PATTERN.len()] + (own * 17) as u32) % vocab
+            })
+            .collect()
+    };
+    let _scope = PrefillScope::forced(true);
+    eprintln!("[SCRATCH_SITES] layers {layers} hidden {hidden}");
+    let report = |what: &str, rows: usize, lanes: usize, trace: Vec<(&'static str, u32, usize)>| {
+        let peak = super::decode_pool::take_layer_scratch_peak();
+        let limit = super::prefill_prepared::prefill_layer_scratch_bound_bytes(&model.cfg, rows, lanes);
+        eprintln!(
+            "[SCRATCH_SITES] {what}: largest layer {:.1} MiB, derived bound {:.1} MiB ({:.2}x)",
+            peak as f64 / 1048576.0,
+            limit as f64 / 1048576.0,
+            limit as f64 / peak.max(1) as f64
+        );
+        assert!(peak <= limit, "{what}: a layer requested {peak} bytes, over the derived bound of {limit}");
+        let sites = scratch_sites(&trace);
+        let total: usize = sites.iter().map(|site| site.3).sum();
+        eprintln!(
+            "[SCRATCH_SITES] {what}: {rows} forward rows, {} requests, {:.1} MiB of buckets in the forward, {:.2} MiB per layer",
+            trace.len(),
+            total as f64 / 1048576.0,
+            total as f64 / 1048576.0 / layers as f64
+        );
+        for (site, calls, bytes, buckets) in sites {
+            eprintln!(
+                "[SCRATCH_SITES]   {site} calls {calls} bytes {bytes} ({:.1} per row and call) buckets {buckets}",
+                bytes as f64 / calls as f64 / rows as f64
+            );
+        }
+    };
+    // Single slot: a fresh chunk and a resumed chunk with a folded cue.
+    let mut cache = model
+        .with_gpu_cache_mut(|device, _registry| {
+            HybridKvCache::new_with_options(&model.cfg, device, 4096, 4, true)
+        })
+        .expect("allocate TQ cache");
+    for (what, start, rows) in [("solo fresh", 0usize, 1024usize), ("solo resumed", 1024, 512)] {
+        super::decode_pool::trace_scratch(true);
+        super::decode_pool::take_layer_scratch_peak();
+        model
+            .forward_gpu_last_logits(
+                &tokens(0, start, rows, 0),
+                &positions_for_range(start as i32, rows),
+                &mut cache,
+                SlotId(0),
+            )
+            .unwrap_or_else(|error| panic!("{what}: {error:#}"));
+        report(what, rows, 1, super::decode_pool::trace_scratch(false));
+    }
+    // Four cold lanes sharing 444 rows, each with a folded 5-row cue.
+    for slot in 0..4 {
+        cache.reset_for_slot(SlotId(slot)).expect("reset");
+    }
+    const COMMON: usize = 444;
+    const CONTENT: usize = 720;
+    const CUE: usize = 5;
+    let chunks: Vec<(Vec<u32>, Vec<i32>)> = (0..4)
+        .map(|slot| (tokens(slot, 0, CONTENT + CUE, COMMON), positions_for_range(0, CONTENT + CUE)))
+        .collect();
+    let lanes: Vec<JointPrefillLane<'_>> = chunks
+        .iter()
+        .enumerate()
+        .map(|(slot, (tokens, positions))| JointPrefillLane {
+            slot_id: SlotId(slot as u32),
+            tokens,
+            positions_flat: positions,
+            shares_prefix: true,
+            fold: Some((CONTENT, CONTENT)),
+            image: None,
+        })
+        .collect();
+    super::decode_pool::trace_scratch(true);
+    super::decode_pool::take_layer_scratch_peak();
+    model
+        .forward_gpu_last_logits_joint(&lanes, COMMON, &mut cache, None)
+        .unwrap_or_else(|error| panic!("joint: {error:#}"));
+    report(
+        "joint, four lanes sharing 444 rows",
+        COMMON + 4 * (CONTENT + CUE - COMMON),
+        4,
+        super::decode_pool::trace_scratch(false),
+    );
 }
 
 /// Memory probe for `HF2Q_QWEN_PREFILL_WAIT_LAYERS`, run explicitly in a

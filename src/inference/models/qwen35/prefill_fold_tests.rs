@@ -1144,7 +1144,7 @@ fn a_request_diverging_behind_a_folded_checkpoint_sees_the_two_forward_bytes() {
 /// The synthetic model with every dense FFN replaced by a quantized MoE FFN
 /// (four experts, two per row, a shared expert), so a prefill forward takes
 /// the MoE arm the fold builds once per segment.
-fn with_synthetic_moe_model(run: impl FnOnce(&Qwen35Model)) {
+pub(super) fn with_synthetic_moe_model(run: impl FnOnce(&Qwen35Model)) {
     use mlx_native::ops::quantized_matmul_ggml::GgmlType;
     use mlx_native::MlxDevice;
 
