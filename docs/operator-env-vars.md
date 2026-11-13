@@ -259,12 +259,22 @@ KV budget, drafter, planes and scratch. The decision and the reservation of
 what it decided are one transaction, so two loads running at once, through
 one pool or through separate ones, are never both decided against the same
 total. A reservation belongs to whoever owns the model's buffers: the
-loading thread during the load, then the engine's worker thread, which
-releases it after it has dropped the model. Evicting an engine or dropping
-its last handle does not release it; an engine whose worker is still
-tearing down, or is wedged inside Metal, is still counted. A load that fails
-after its worker started stops the worker and waits for it before the load
-is retried on the prior route, and the retry reserves its own commitment.
+loading thread during the load, then the engine's worker thread. It is
+released by the worker's teardown and by nothing else, in this order: the
+worker drops the model; it drops the GPU weight cache it built for it
+(uploaded copies and prepared planes); the thread terminates, which destroys
+every other thread-local cache it had; the cache's device is flushed, which
+commits the removals the dropped buffers staged in the Metal residency set
+and waits for the commands the worker had committed there; then the
+reservation goes. Evicting an engine or dropping its last handle releases
+nothing: an engine whose worker is still tearing down, or is wedged inside
+Metal, is still counted, and a teardown step that fails leaves it counted
+until the process restarts (one ERROR line, `engine memory stays reserved
+until the process restarts`). A load that fails after its worker started
+stops the worker and waits for that teardown before the load is retried on
+the prior route, and the retry reserves its own commitment. The loading
+thread gives up the GPU cache it primed before a reservation it still holds
+is released.
 
 The planes of the model's own prepared routes are resident whatever the
 policy says: `HF2Q_DFLASH2=0 HF2Q_QWEN_PREFILL_PREPARED=1` prepares and keeps

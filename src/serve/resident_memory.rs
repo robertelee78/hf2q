@@ -11,12 +11,15 @@
 //! total.
 //!
 //! A reservation is owned by whoever owns the model's buffers. While a load
-//! is in progress that is the loading thread; once the worker thread is
-//! spawned it is the worker, which releases the reservation after it has
-//! dropped the model (`EngineSupervisor::hold_worker_memory`). Dropping the
-//! last `Engine` handle does not release it: an evicted engine whose worker
-//! is still tearing down, or is wedged inside Metal, still holds its memory
-//! and is still counted.
+//! is in progress that is the loading thread; `Engine::spawn*` then gives it
+//! to the worker thread with the model, and it is released by the worker's
+//! teardown alone (`WorkerTeardown` in `serve::api::engine_supervisor`):
+//! after the model is dropped, the thread's GPU caches are released, the
+//! thread has terminated and the dropped buffers are flushed from the Metal
+//! residency set. Dropping the last `Engine` handle does not release it: an
+//! evicted engine whose worker is still tearing down, or is wedged inside
+//! Metal, still holds its memory and is still counted, and a teardown that
+//! fails leaves it counted for good ([`Reservation::strand`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -54,7 +57,6 @@ impl Commitment {
 
 struct Entry {
     /// The model the engine was loaded from, for diagnostics.
-    #[allow(dead_code)]
     model: PathBuf,
     commitment: Commitment,
 }
@@ -161,6 +163,24 @@ impl Ledger {
 pub(crate) struct Reservation {
     ledger: Arc<Ledger>,
     id: u64,
+}
+
+impl Reservation {
+    /// Keep the commitment counted for the rest of the process: the teardown
+    /// of the engine it stands for failed, so its memory cannot be taken to
+    /// be free. `reason` is logged with the model.
+    pub(crate) fn strand(self, reason: &str) {
+        let entries = self.ledger.entries();
+        let entry = entries.reserved.get(&self.id);
+        tracing::error!(
+            model = %entry.map_or_else(String::new, |entry| entry.model.display().to_string()),
+            bytes = entry.map_or(0, |entry| entry.commitment.total()),
+            reason,
+            "engine memory stays reserved until the process restarts"
+        );
+        drop(entries);
+        std::mem::forget(self);
+    }
 }
 
 impl Drop for Reservation {
@@ -337,6 +357,16 @@ mod tests {
         drop(release);
         worker.join().expect("worker");
         assert_eq!(ledger.total(), 0);
+    }
+
+    #[test]
+    fn a_stranded_reservation_is_counted_for_good() {
+        let ledger = Ledger::new();
+        let failed = ledger.reserve(Path::new("/a.gguf"), commitment(16, 10));
+        let live = ledger.reserve(Path::new("/b.gguf"), commitment(20, 0));
+        failed.strand("its teardown failed");
+        drop(live);
+        assert_eq!(ledger.total(), (16 + 4 + 1 + 10) * GIB);
     }
 
     #[test]

@@ -19,6 +19,9 @@ use super::sse::GenerationEvent;
 
 #[path = "engine_supervisor/pool_census.rs"]
 mod pool_census;
+#[cfg(test)]
+#[path = "engine_supervisor/worker_teardown_tests.rs"]
+mod worker_teardown_tests;
 
 const HEALTHY: u8 = 0;
 const POISONED: u8 = 1;
@@ -43,20 +46,60 @@ struct EngineSupervisorInner {
     /// reported by `/readyz` as `engine failed: <summary>`.
     summary: Mutex<Option<String>>,
     health_tx: watch::Sender<bool>,
-    /// What the worker's model holds of the host's memory
-    /// ([`EngineSupervisor::hold_worker_memory`]).
-    worker_memory: Mutex<WorkerMemory>,
 }
 
-/// The memory reservation of the model a worker thread owns. The worker owns
-/// the model's buffers, so the reservation follows the worker and not the
-/// `Engine` handles: it is released when the worker has dropped the model.
-enum WorkerMemory {
-    /// The worker has not exited: a worker that is running, evicted and
-    /// still tearing down, or wedged inside Metal keeps the reservation.
-    Held(Option<crate::serve::resident_memory::Reservation>),
-    /// The worker thread has dropped the model and released the reservation.
-    Released,
+/// What must be flushed once a worker thread is gone: returned by the
+/// thread's own cache release ([`WorkerTeardown::new`]) and run after the
+/// thread has terminated.
+pub(super) type DeferredFlush = Box<dyn FnOnce() -> Result<()> + Send>;
+
+/// How a worker thread gives back what its model held, and the memory
+/// reservation that stands for it.
+///
+/// The worker thread owns the model's buffers, so the reservation is
+/// released by the worker's teardown and by nothing else. The teardown is,
+/// in this order:
+///
+/// 1. the worker body returns or unwinds, which drops the model;
+/// 2. on the worker thread, `release_thread_caches` drops the GPU caches the
+///    thread built for the model (uploaded weight copies, staged planes) and
+///    returns the flush they need;
+/// 3. the worker thread terminates, which destroys every other thread-local
+///    it had; the teardown thread waits for that with a join;
+/// 4. the teardown thread runs the flush: buffers dropped in steps 1 to 3
+///    only staged their removal from the Metal residency set, and commands
+///    the worker committed may still hold them;
+/// 5. the reservation is released.
+///
+/// A step that fails, panics or never returns leaves the reservation
+/// counted: a wedged worker and a failed flush keep their memory charged for
+/// the life of the process ([`Reservation::strand`]).
+///
+/// [`Reservation::strand`]: crate::serve::resident_memory::Reservation::strand
+pub(super) struct WorkerTeardown {
+    memory: Option<crate::serve::resident_memory::Reservation>,
+    release_thread_caches: Box<dyn FnOnce() -> Result<DeferredFlush> + Send>,
+}
+
+impl WorkerTeardown {
+    /// `memory` is the reservation of the model the worker body owns, if it
+    /// has one. `release_thread_caches` runs on the worker thread after the
+    /// body; the flush it returns runs once that thread has terminated.
+    pub(super) fn new(
+        memory: Option<crate::serve::resident_memory::Reservation>,
+        release_thread_caches: impl FnOnce() -> Result<DeferredFlush> + Send + 'static,
+    ) -> Self {
+        Self {
+            memory,
+            release_thread_caches: Box::new(release_thread_caches),
+        }
+    }
+
+    /// A worker that owns no model: nothing to release and nothing reserved.
+    #[cfg(test)]
+    pub(super) fn nothing() -> Self {
+        Self::new(None, || Ok(Box::new(|| Ok(())) as DeferredFlush))
+    }
 }
 
 /// RAII count of one request being prepared for the worker
@@ -106,7 +149,6 @@ impl EngineSupervisor {
             reason: Mutex::new(None),
             summary: Mutex::new(None),
             health_tx,
-            worker_memory: Mutex::new(WorkerMemory::Held(None)),
         });
         if let Err(error) = start(Arc::downgrade(&inner)) {
             tracing::error!(error = %error, "failed to start engine supervisor monitor");
@@ -131,37 +173,6 @@ impl EngineSupervisor {
                 std::thread::sleep(MONITOR_INTERVAL);
             })
             .map(|_| ())
-    }
-
-    fn worker_memory(&self) -> std::sync::MutexGuard<'_, WorkerMemory> {
-        // The guarded state is one owned value, valid after any panic.
-        self.inner
-            .worker_memory
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Give the worker the memory reservation of the model it owns. The
-    /// reservation is released on the worker thread after the worker body
-    /// has returned or unwound, which is after the model was dropped
-    /// ([`spawn_supervised_worker`]); no `Engine` handle releases it. A
-    /// worker that already exited holds nothing, so the reservation is
-    /// released at once.
-    pub(super) fn hold_worker_memory(
-        &self,
-        reservation: crate::serve::resident_memory::Reservation,
-    ) {
-        let released = match &mut *self.worker_memory() {
-            WorkerMemory::Held(held) => held.replace(reservation),
-            WorkerMemory::Released => Some(reservation),
-        };
-        drop(released);
-    }
-
-    /// The worker body has returned or unwound and its model is dropped.
-    fn release_worker_memory(&self) {
-        let released = std::mem::replace(&mut *self.worker_memory(), WorkerMemory::Released);
-        drop(released);
     }
 
     /// HTTP reads immutable numeric publication only, never native/TLS state.
@@ -570,16 +581,65 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
 /// `body` permanently fails the engine with the panic message; the panic is
 /// contained to this thread so shutdown joins never re-raise it.
 ///
-/// `body` owns the model. When it has returned or unwound, everything it
-/// owned is dropped, and only then is the model's memory reservation
-/// released ([`EngineSupervisor::hold_worker_memory`]).
+/// `body` owns the model. `teardown` says how the thread gives the model's
+/// memory back ([`WorkerTeardown`]); a second thread waits for the worker to
+/// terminate and completes it. The returned handle is that thread's: it is
+/// finished when the worker is gone and its teardown has ended, released or
+/// not.
 pub(super) fn spawn_supervised_worker(
     name: &str,
     supervisor: EngineSupervisor,
+    teardown: WorkerTeardown,
     body: impl FnOnce(EngineSupervisor) + Send + 'static,
 ) -> std::io::Result<JoinHandle<()>> {
     install_worker_panic_hook();
-    std::thread::Builder::new()
+    let WorkerTeardown {
+        memory,
+        release_thread_caches,
+    } = teardown;
+    let worker_name = name.to_string();
+    let (started, worker_started) =
+        std::sync::mpsc::channel::<JoinHandle<std::result::Result<DeferredFlush, String>>>();
+    let teardown_thread = std::thread::Builder::new()
+        .name(format!("{name}-teardown"))
+        .spawn(move || {
+            let Ok(worker) = worker_started.recv() else {
+                // The worker thread could not be started: its body, and the
+                // model in it, were dropped by the failed spawn.
+                drop(memory);
+                return;
+            };
+            // Joining waits for the thread itself, not for its closure: the
+            // worker's thread-locals are destroyed before this returns.
+            let torn_down = match worker.join() {
+                Ok(Ok(flush)) => {
+                    match panic::catch_unwind(AssertUnwindSafe(flush)) {
+                        Ok(flushed) => flushed.map_err(|error| format!("{error:#}")),
+                        Err(payload) => Err(format!(
+                            "the flush panicked: {}",
+                            panic_payload_message(payload.as_ref())
+                        )),
+                    }
+                }
+                Ok(Err(reason)) => Err(reason),
+                Err(payload) => Err(format!(
+                    "the worker thread panicked outside its body: {}",
+                    panic_payload_message(payload.as_ref())
+                )),
+            };
+            match (torn_down, memory) {
+                (Ok(()), memory) => drop(memory),
+                (Err(reason), Some(memory)) => memory.strand(&format!(
+                    "teardown of engine worker {worker_name} failed: {reason}"
+                )),
+                (Err(reason), None) => tracing::error!(
+                    worker = %worker_name,
+                    reason = %reason,
+                    "engine worker teardown failed"
+                ),
+            }
+        })?;
+    let worker = std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
             WORKER_SUPERVISOR.with(|slot| *slot.borrow_mut() = Some(supervisor.clone()));
@@ -589,7 +649,6 @@ pub(super) fn spawn_supervised_worker(
                 }
             }
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| body(supervisor.clone())));
-            supervisor.release_worker_memory();
             WORKER_SUPERVISOR.with(|slot| slot.borrow_mut().take());
             if let Err(payload) = outcome {
                 // Normally already recorded by the hook; this covers a hook
@@ -599,7 +658,21 @@ pub(super) fn spawn_supervised_worker(
                     panic_payload_message(payload.as_ref())
                 ));
             }
-        })
+            // The body has returned or unwound: the model is dropped. The
+            // caches this thread built for it go next, here, where they live.
+            match panic::catch_unwind(AssertUnwindSafe(release_thread_caches)) {
+                Ok(released) => released.map_err(|error| format!("{error:#}")),
+                Err(payload) => Err(format!(
+                    "releasing the worker's thread caches panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                )),
+            }
+        })?;
+    // Had the worker not started, the `?` above dropped `started` and the
+    // teardown thread ended, releasing the reservation of a model that was
+    // dropped with the worker's closure.
+    let _ = started.send(worker);
+    Ok(teardown_thread)
 }
 
 #[cfg(test)]
@@ -635,101 +708,6 @@ mod tests {
     }
 
     use super::*;
-
-    const GIB: u64 = 1 << 30;
-
-    fn reserved(
-        ledger: &Arc<crate::serve::resident_memory::Ledger>,
-    ) -> crate::serve::resident_memory::Reservation {
-        ledger.reserve(
-            std::path::Path::new("/model.gguf"),
-            crate::serve::resident_memory::Commitment {
-                model_file_bytes: 16 * GIB,
-                plane_bytes: 10 * GIB,
-                ..Default::default()
-            },
-        )
-    }
-
-    /// Stands for the model a worker owns: says when it is dropped and what
-    /// the ledger still counted at that moment.
-    struct Model {
-        ledger: Arc<crate::serve::resident_memory::Ledger>,
-        counted_at_drop: std::sync::mpsc::Sender<u64>,
-    }
-
-    impl Drop for Model {
-        fn drop(&mut self) {
-            let _ = self.counted_at_drop.send(self.ledger.total());
-        }
-    }
-
-    #[test]
-    fn worker_memory_is_held_until_the_worker_has_dropped_its_model() {
-        let ledger = crate::serve::resident_memory::Ledger::new();
-        let supervisor = EngineSupervisor::new_with_monitor_start(|_| Ok(()));
-        let (stop, stopped) = std::sync::mpsc::channel::<()>();
-        let (counted_at_drop, counted) = std::sync::mpsc::channel();
-        let model = Model {
-            ledger: Arc::clone(&ledger),
-            counted_at_drop,
-        };
-        let worker = spawn_supervised_worker("memory-test", supervisor.clone(), move |_| {
-            let _model = model;
-            let _ = stopped.recv();
-        })
-        .expect("spawn");
-        supervisor.hold_worker_memory(reserved(&ledger));
-        // Every engine-side handle goes: what an eviction does. The worker
-        // still owns the model, so its memory is still counted.
-        drop(supervisor);
-        assert_eq!(ledger.total(), 26 * GIB, "a live worker keeps it");
-        drop(stop);
-        worker.join().expect("worker");
-        assert_eq!(
-            counted.recv().expect("model dropped"),
-            26 * GIB,
-            "still counted while the model was being dropped"
-        );
-        assert_eq!(ledger.total(), 0, "released once the worker is gone");
-    }
-
-    #[test]
-    fn worker_memory_is_released_after_a_panicking_worker_has_unwound() {
-        let ledger = crate::serve::resident_memory::Ledger::new();
-        let supervisor = EngineSupervisor::new_with_monitor_start(|_| Ok(()));
-        let (start, started) = std::sync::mpsc::channel::<()>();
-        let (counted_at_drop, counted) = std::sync::mpsc::channel();
-        let model = Model {
-            ledger: Arc::clone(&ledger),
-            counted_at_drop,
-        };
-        let worker = spawn_supervised_worker("memory-panic-test", supervisor.clone(), move |_| {
-            let _model = model;
-            let _ = started.recv();
-            panic!("synthetic worker failure");
-        })
-        .expect("spawn");
-        supervisor.hold_worker_memory(reserved(&ledger));
-        assert_eq!(ledger.total(), 26 * GIB);
-        drop(start);
-        worker.join().expect("the panic is contained");
-        assert!(!supervisor.is_healthy());
-        assert_eq!(counted.recv().expect("model dropped"), 26 * GIB);
-        assert_eq!(ledger.total(), 0);
-    }
-
-    #[test]
-    fn memory_given_to_a_worker_that_already_exited_is_released_at_once() {
-        let ledger = crate::serve::resident_memory::Ledger::new();
-        let supervisor = EngineSupervisor::new_with_monitor_start(|_| Ok(()));
-        spawn_supervised_worker("memory-exited-test", supervisor.clone(), |_| {})
-            .expect("spawn")
-            .join()
-            .expect("worker");
-        supervisor.hold_worker_memory(reserved(&ledger));
-        assert_eq!(ledger.total(), 0);
-    }
 
     #[tokio::test]
     async fn expired_transaction_poison_is_one_way_and_not_receiver_closure() {

@@ -2409,10 +2409,17 @@ a process ledger (`serve::resident_memory`) and reserves what it decided in
 one transaction, before it allocates, so concurrent loads through one pool
 or several are never decided against the same total. The reservation is
 owned by whoever owns the model's buffers: the loading thread, then the
-worker thread, which releases it after it has dropped the model. An evicted
-engine whose worker is still tearing down or is wedged stays counted; a
-load that fails after its worker started stops and joins that worker before
-the prior-route retry, which reserves its own commitment. The planes of a
+worker thread, to which `Engine::spawn*` hands it with the model. Only the
+worker's teardown releases it (`WorkerTeardown`): the model is dropped, the
+thread's GPU weight cache is dropped, the thread terminates (a second
+thread joins it, so every thread-local it had is destroyed), the cache's
+device is flushed (the staged residency-set removals are committed and the
+commands committed on its queue are waited for), and then the reservation
+is released. An evicted engine whose worker is still tearing down or is
+wedged stays counted, and a teardown step that fails strands the
+reservation for the life of the process; a load that fails after its worker
+started waits for that teardown before the prior-route retry, which
+reserves its own commitment. The planes of a
 prepared route the operator set are the model's own and are committed with
 or without a drafter, also beside `HF2Q_DFLASH2=0`; only the staged draft's
 head needs the drafter. The hot-swap pool charges the same figure instead of

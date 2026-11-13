@@ -1480,4 +1480,4 @@ pub(crate) fn unprobed_host(selection: Selection, probe_error: Option<&str>) -> 
 
 #[cfg(test)]
 #[path = "dflash2_policy_tests.rs"]
-mod tests;
+pub(crate) mod tests;

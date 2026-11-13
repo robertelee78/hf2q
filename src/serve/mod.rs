@@ -11,6 +11,8 @@ pub mod config;
 mod deepseek4_cli;
 pub(crate) mod dflash2_policy;
 pub(crate) mod resident_memory;
+#[cfg(test)]
+mod engine_memory_lifecycle_tests;
 pub(crate) mod discovery;
 pub mod encoder_worker_singleton;
 // forward_mlx removed — gemma4 moved to inference::models::gemma4 (ADR-038 §3.3)
@@ -4041,14 +4043,48 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
 /// Load and spawn one engine on the route `selection` resolved.
 ///
 /// `reservation` is what the engine holds of the host's memory on that
-/// route. It stays with whoever owns the model: this call while it loads
-/// (an error drops the model, then the reservation), the worker thread once
-/// it is spawned.
+/// route. It stays with whoever owns the model: this thread while it loads,
+/// then the worker thread, whose teardown alone releases it.
 fn load_engine_on_route(
     path: &Path,
     config: &multi_model::EngineConfig,
     selection: &dflash2_policy::Selection,
     reservation: resident_memory::Reservation,
+) -> Result<api::engine::Engine> {
+    use crate::inference::models::qwen35::forward_gpu::flush_released_gpu_cache;
+    let mut reservation = Some(reservation);
+    let engine = load_and_spawn_on_route(path, config, selection, &mut reservation);
+    // This thread held the model while it loaded and provisioned it. A GPU
+    // weight cache it primed for that is a second copy of what the worker
+    // builds for itself, or belongs to a model that failed to load: it is
+    // dropped and flushed either way, before a reservation still held here
+    // is released.
+    let cache_released =
+        match crate::inference::models::qwen35::model::Qwen35Model::take_thread_gpu_cache() {
+            Some(device) => flush_released_gpu_cache(&device),
+            None => Ok(()),
+        };
+    if let Err(error) = cache_released {
+        let reason = format!("releasing the loading thread's GPU cache failed: {error:#}");
+        match reservation.take() {
+            // The load failed before a worker owned the model, and what
+            // this thread cached for it could not be flushed: its memory
+            // cannot be taken to be free.
+            Some(reservation) => reservation.strand(&reason),
+            None => tracing::error!(model = %path.display(), reason, "GPU cache not released"),
+        }
+    }
+    engine
+}
+
+/// [`load_engine_on_route`] up to the spawned, warmed-up engine. The
+/// reservation is taken out of `reservation` when the model is given to its
+/// worker thread.
+fn load_and_spawn_on_route(
+    path: &Path,
+    config: &multi_model::EngineConfig,
+    selection: &dflash2_policy::Selection,
+    reservation: &mut Option<resident_memory::Reservation>,
 ) -> Result<api::engine::Engine> {
     // Bound for the load and the spawn: weight upload and worker
     // provisioning read the table switches on this thread.
@@ -4171,6 +4207,10 @@ fn load_engine_on_route(
         config.queue_capacity,
         config.kv_cache_budget_bytes,
         config.engine_mode,
+        // Taken when the worker thread is created: it owns the model from
+        // there on, and with it the reservation. A spawn that fails before
+        // that leaves the reservation here.
+        reservation,
     )
     .map_err(|e| {
         anyhow::anyhow!(
@@ -4179,8 +4219,6 @@ fn load_engine_on_route(
              `hf2q info --model <GGUF>` to inspect static serve support."
         )
     })?;
-    // The worker owns the model from here on, and with it the reservation.
-    engine.hold_memory_until_worker_exit(reservation);
     load_info::emit_tracing(engine.info());
 
     if config.warmup_synchronously {
@@ -4208,10 +4246,10 @@ fn load_engine_on_route(
             .context("build tokio runtime for synchronous engine warmup")?;
         let warmup_started = std::time::Instant::now();
         if let Err(error) = warmup_rt.block_on(engine.warmup()) {
-            // The worker owns the model. Stop it and wait for it, so that a
-            // caller that loads again (the prior-route retry) does not load
-            // beside a model that is still resident. A worker that does not
-            // stop keeps its reservation.
+            // The worker owns the model. Stop it and wait for its teardown,
+            // so that a caller that loads again (the prior-route retry) does
+            // not load beside a model that is still resident. A worker that
+            // does not stop keeps its reservation.
             if let Err(shutdown) = warmup_rt.block_on(engine.shutdown()) {
                 tracing::warn!(
                     model = %path.display(),

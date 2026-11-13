@@ -13,7 +13,7 @@ use crate::serve::resident_memory::Commitment;
 
 const GIB: u64 = 1 << 30;
 
-fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+pub(crate) fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
     let map: HashMap<String, String> = pairs
         .iter()
         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -39,7 +39,7 @@ fn hf2q(source: &str) -> Provenance {
 
 /// The tensor directory of the Qwen3.8 gate artifact as far as the policy
 /// reads it: real shapes, one storage type per weight kind.
-fn qwen38() -> TargetFacts {
+pub(crate) fn qwen38() -> TargetFacts {
     let geometry = QWEN38_TARGET_GEOMETRY.clone();
     let mut tensors = vec![
         tensor("output.weight", GgmlType::Q6_K, &[248_320, 5_120]),
@@ -127,7 +127,7 @@ const ROOMY: HostFacts = HostFacts {
 
 /// A drafter store with a fixed cache state, download outcome and binding
 /// outcome that counts its downloads.
-struct Store {
+pub(crate) struct Store {
     cached: bool,
     download: std::result::Result<(), &'static str>,
     bind: std::result::Result<(), &'static str>,
@@ -136,7 +136,7 @@ struct Store {
 }
 
 impl Store {
-    fn cached() -> Self {
+    pub(crate) fn cached() -> Self {
         Self {
             cached: true,
             download: Err("the cache already holds the drafter"),

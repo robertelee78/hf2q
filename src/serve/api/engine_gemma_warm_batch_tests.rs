@@ -665,7 +665,7 @@ fn gemma_joint_warm_engine_cohort_matches_serial_tool_turns() {
     };
     let spawn = || {
         let loaded = LoadedModel::load(&load_options()).expect("load official Gemma GGUF");
-        Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 })
+        Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 }, &mut None)
             .expect("spawn SlotAware Gemma engine")
     };
     let concurrent = |engine: &Engine, prompts: [Vec<u32>; 4]| {
