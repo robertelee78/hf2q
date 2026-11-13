@@ -87,10 +87,7 @@ Resume versus fresh dispatch:
 - A commit cut before these release-reliability changes cannot be released
   by a fresh dispatch: the build job stops at once with "commit predates the
   release-reliability changes". Finish it by resuming its existing run, or
-  release a new version cut after the merge. v0.1.29 is finished with
-  `scripts/release.sh --resume 41586213149`. That run uses its original
-  workflow files, which publish only with `CARGO_REGISTRY_TOKEN`, so rotate
-  that secret first (its 403 is what failed attempt 1).
+  release a new version cut after the merge.
 
 ### crates.io credential
 
