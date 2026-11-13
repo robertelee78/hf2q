@@ -1329,6 +1329,54 @@ impl Qwen35LoadedModel {
         result
     }
 
+    /// Run the prompt-prefill route once at worker warmup, so that the first
+    /// request does not pay for the first use of every weight on that route
+    /// (measured on the four-agent workload: 1.6 s of the first Qwen3.8
+    /// prefill and 0.36 s of the first Qwen3.6 one, which every request
+    /// waiting behind it pays too). A fresh chunk above one row tile and a
+    /// short resumed chunk on slot 0 take the forward a served prompt takes,
+    /// with the DFlash2 capture and ingest when a draft runtime is
+    /// provisioned. The slot and its draft lane are reset before and after,
+    /// also when a warm forward fails, so the slot serves its first request
+    /// as a fresh slot. Returns whether it ran: it is a no-op unless the
+    /// prepared prefill route is on. The caller guarantees that no request
+    /// has been admitted yet.
+    pub(crate) fn warm_prefill_route(&mut self, kv_cache: &mut HybridKvCache) -> Result<bool> {
+        use crate::inference::models::qwen35::prefill_prepared;
+        /// `(first row, rows)`: the fresh route, then the short resumed one.
+        const CHUNKS: [(usize, usize); 2] = [(0, 40), (40, 5)];
+        if !prefill_prepared::enabled() {
+            return Ok(false);
+        }
+        let slot = SlotId(0);
+        let vocab = self.vocab_size.max(1) as u32;
+        let tokens: Vec<u32> = (0..45u32).map(|index| (1_000 + index) % vocab).collect();
+        kv_cache
+            .reset_for_slot(slot)
+            .context("reset slot 0 before the prefill warmup")?;
+        self.clear_dflash2_lane(slot)?;
+        let warmed = (|| -> Result<()> {
+            for (start, rows) in CHUNKS {
+                let chunk = &tokens[start..start + rows];
+                let positions = prefill_positions_from(start, rows);
+                if self.dflash2_lane_matches(slot, start) {
+                    self.forward_dflash2_prefill_chunk(chunk, &positions, kv_cache, slot, start)?;
+                } else {
+                    let _prefill = PrefillScope::enter();
+                    self.model
+                        .forward_gpu_last_logits(chunk, &positions, kv_cache, slot)?;
+                }
+            }
+            Ok(())
+        })();
+        kv_cache
+            .reset_for_slot(slot)
+            .context("reset slot 0 after the prefill warmup")?;
+        self.clear_dflash2_lane(slot)?;
+        warmed.context("Qwen35 prompt-prefill warmup")?;
+        Ok(true)
+    }
+
     /// The planned chunks of `lanes` as one joint target forward. With the
     /// DFlash2 route every lane's draft lane receives its own rows through
     /// the calls its own forward makes: the content rows, then the cue rows
