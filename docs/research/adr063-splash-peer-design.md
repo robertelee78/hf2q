@@ -449,6 +449,11 @@ because only hf2q has a server phase trace. Code changes:
   9. vs-Splash ratio CI above 1 → `Loss` ("experiment makespan is longer than Splash's");
   10. the Win conditions, where new v0.1.30 plans require `vs_splash` to be precise with a CI upper bound ≤
       `PEER_PARITY 1.00`, beside `vs_stock` and `vs_peer`; historical plans retain their frozen 0.95 threshold.
+
+  Amended 2026-11-12 (ADR-063 Q4 comparison-arm failure amendment): in a plan that carries
+  `comparison_failure_policy`, a peer or Splash task failure is rerun in its block position, at most twice, so steps
+  5 and 6 are reached only by a failure the policy does not rerun; three task failures in one position make the arm
+  unavailable (steps 3 and 4), and a stock arm exhausted the same way is `Unavailable` after step 4.
 - **Stopping rule.** `q3_report.required_effects` adds `vs_splash` while Splash is available and has not failed.
   `CONTRASTS` gains `("vs_splash", "splash")`.
 - **Report.** `verdict.json` gains a `splash` block (unavailable, failures, label). Rows render

@@ -17,6 +17,11 @@ Each workload stage (n4 primary pure-phase, then the n1 and 3+1/2+2/1+3 controls
 one discarded warmup per arm per driver session, then Williams-ordered blocks: at least 5,
 at most 20 by default or 40 when the campaign predeclares the approved precision extension,
 stopping once the 95% half-width of every required experiment contrast is <= 2.5 points.
+Comparison-arm failure policy (operator decision 2026-11-12, frozen in the plan as comparison_failure_policy): a
+stock, peer or Splash run whose client reports a failure (kind `task`: the client aborts at the first failing agent,
+client deadlines included) is kept, counted and rerun in the same block position, at most twice;
+three failures in one position make that arm Unavailable. Any experiment failure is Failed at once. Speed is paired on
+passing runs only; verdict.json reports every arm's attempts, failures and failure rate with its Clopper-Pearson 95% interval.
 Writes campaign.json and verdict.json. Design, estimator, verdict rules and root commands:
 docs/research/adr063-q3-campaign.md.
 --controls-of runs control stages only, as controls of a primary verdict of record (#369
@@ -130,7 +135,10 @@ def primary_of_record(path, family):
             "primary_workload": verdict["primary_workload"], "effects": verdict["primary"]["effects"],
             "plan_sha256": manifest["plan_sha256"], "identities_sha256": manifest["identities_sha256"],
             "identity": q3_identity.controls_identity(manifest["plan"], manifest["identities"]),
-            "harness": {"git_commit": harness["git_commit"], "sources": harness["sources"]}}
+            "harness": {"git_commit": harness["git_commit"], "sources": harness["sources"]},
+            # Only a primary planned under the policy carries it, so controls of an older record plan as before.
+            **({"comparison_failure_policy": q3_stats.failure_policy(manifest["plan"])}
+               if q3_stats.failure_policy(manifest["plan"]) is not None else {})}
 
 
 # --stock-record (ADR-063 Q4-DS4-RACE decision D1): the families whose stock binary cannot open the campaign's artifact.
@@ -317,6 +325,20 @@ def build_plan(args, environ, family):
         plan["controls_of"] = record
     if stock_record is not None:
         plan["stock_record"] = stock_record
+    # Comparison-arm failure policy (operator decision 2026-11-12): fixed here, before any run, and hashed into the
+    # plan, so it cannot change during a campaign. A controls-only campaign follows its primary of record. A plan
+    # without the field (planned before the policy, or --comparison-reruns 0) keeps the legacy rule.
+    followed = None if record is None else (record.get("comparison_failure_policy") or {}).get("reruns_per_position", 0)
+    qc.require(followed is None or args.comparison_reruns in (None, followed),
+               f"a controls-only campaign follows its primary's comparison failure rule ({followed} reruns per position)")
+    reruns = followed if followed is not None else (
+        q3_stats.RERUNS_PER_POSITION if args.comparison_reruns is None else args.comparison_reruns)
+    if reruns:
+        plan["comparison_failure_policy"] = {
+            "version": q3_stats.FAILURE_POLICY_VERSION, "reruns_per_position": reruns,
+            "rerun_failure_kinds": list(q3_stats.RERUN_FAILURE_KINDS),
+            "arms": [arm for arm in plan["measured_arms"] if arm in q3_stats.COMPARISON_ARMS]}
+        q3_stats.failure_policy(plan)
     if "splash" in plan["measured_arms"] or splash_evidence:
         # Recorded in the plan, so campaigns planned before Splash keep their rules. Only a campaign that runs the
         # arm or declares Splash unavailable needs it: a peer-unavailable campaign is Unavailable already, and a
@@ -331,7 +353,8 @@ def schedule_preview(plan):
                   "blocks": [{"block": b, "order": q3_stats.block_order(q3_report.stage_arms(plan, key), b)}
                              for b in range(1, max_blocks + 1)],
                   "stop": f"after block >= {q3_stats.MIN_BLOCKS} when every required contrast has 95% half-width "
-                          f"<= {q3_stats.HALF_WIDTH_PP} points; inconclusive at {max_blocks}"}
+                          f"<= {q3_stats.HALF_WIDTH_PP} points; inconclusive at {max_blocks}",
+                  "failure_rule": q3_stats.failure_rule(plan)}
             for key in plan["workloads"]}
 
 
@@ -399,6 +422,8 @@ class Driver:
             if drift:
                 self.manifest["identity_drift"] = drift
                 self.stop("IdentityDrift", None, "identities changed since campaign start: " + ", ".join(drift[:8]), False)
+            # An exhausted entry whose arm the earlier driver did not get to record (it died between the two saves).
+            self.manifest["unavailable"] = q3_report.unavailable(self.manifest)
         else:
             qc.require(not self.out.exists(), "campaign output must be a new directory")
             qc.require(not any((p / ".git").exists() for p in (self.out.parent.resolve(), *self.out.parent.resolve().parents)),
@@ -459,7 +484,7 @@ class Driver:
         """Apply the stopping rule once the last block is complete; True when the stage is done. A no-stock plan whose
         only contrast became unavailable or failed has nothing left to measure: its stage stops at once (no_contrast)."""
         required = q3_report.required_effects(stage, self.manifest)
-        if not required and "stock" not in self.plan["arms"]:
+        if not required and ("stock" not in self.plan["arms"] or "stock" in self.manifest["unavailable"]):
             reason = q3_stats.NO_CONTRAST
         elif not stage["blocks"] or not q3_report.block_complete(stage["blocks"][-1]):
             return False
@@ -502,7 +527,18 @@ class Driver:
                     return
 
     def step(self, stage, entry):
-        """Run one entry to a settled outcome; False when its stage stops (experiment failure)."""
+        """Run one entry to a settled outcome; False when its stage stops (experiment failure). Under the plan's
+        comparison failure policy a comparison arm's failed attempt is followed at once by a new attempt of the same
+        entry: same case, same block position, before the next arm runs. The only trigger is that attempt's task
+        failure (q3_stats.rerun_decision); no effect or timing is read between the attempts."""
+        while True:
+            record = self.attempt(stage, entry)
+            proceed = self.consequences(stage, entry, record, halt_unstarted=True)
+            if not (entry["outcome"] is None and record.get("disposition") == "rerun"):
+                return proceed
+
+    def attempt(self, stage, entry):
+        """Launch and settle one attempt of an entry; its record."""
         drift = q3_identity.diff(self.frozen, self.identify())
         if drift:
             self.manifest["identity_drift"] = drift
@@ -521,7 +557,7 @@ class Driver:
                                stdout, stderr)
         self.settle(stage, entry, record, code, self.thermal())
         self.save()
-        return self.consequences(stage, entry, record, halt_unstarted=True)
+        return record
 
     def consequences(self, stage, entry, record, halt_unstarted):
         """Halt or record what a settled attempt implies; False when its stage stops (experiment failure)."""
@@ -532,6 +568,9 @@ class Driver:
             entry.update(outcome="Invalid", reason=record["reason"])
             self.stop("Invalid", entry, f"{entry['name']} is Invalid ({record['reason']}); no reruns after the task "
                       "started, so start a new campaign", False)
+        if entry["outcome"] is None and record.get("disposition") == "rerun":
+            self.save()
+            return True  # a discarded comparison-arm task failure: the same entry runs again (now, or on resume)
         if entry["outcome"] is None:
             if halt_unstarted:
                 self.stop("Halted", entry, f"{entry['name']} did not start: {record['reason']}", True)
@@ -546,6 +585,8 @@ class Driver:
                 self.stop("Halted", entry, f"{entry['name']}: Splash tripped the Q5 memory stop ({record['reason']}); "
                           "record a --max-memory cap in SPLASH_CONFIG (decision D6), re-confirm that configuration "
                           "and start a new campaign", False)
+        if record.get("disposition") == "exhausted":
+            self.manifest["unavailable"][entry["arm"]] = q3_report.exhaustion(entry, q3_stats.failure_rule(self.plan))
         if entry["arm"] == "experiment" and entry["outcome"] == "Fail":
             stage.update(status="Stopped", stop={"reason": "experiment_failed", "blocks": len(stage["blocks"])})
             self.manifest["status"] = "Complete"  # Failed is terminal for the family; later stages do not run
@@ -581,6 +622,8 @@ class Driver:
                       q5_verdict=None if receipt is None else receipt.get("verdict"),
                       stop=None if receipt is None else receipt.get("stop"),
                       client_status=None if summary is None else summary.get("status"),
+                      makespan_s=metrics["makespan_s"], client_elapsed_s=metrics["client_elapsed_s"],
+                      tasks_passed=metrics["tasks_passed"], thermal_valid=metrics["thermal"]["valid"],
                       settled_utc=now())
         frozen = self.frozen["arms"][entry["arm"]]
         drift = []
@@ -595,6 +638,12 @@ class Driver:
         peer = entry["arm"] in PEER_LIKE
         if outcome in ("Pass", "Fail"):
             unavailable = peer and kind in ("out_of_memory", "memory_stop")
+            prior = sum(a.get("disposition") == "rerun" for a in entry["attempts"])
+            decision = q3_stats.rerun_decision(q3_stats.failure_policy(self.plan), entry["arm"], outcome, kind, prior)
+            if decision is not None:
+                record["disposition"] = decision
+            if decision == "rerun":
+                return  # the failed attempt stays on disk and in the manifest; the entry is not settled yet
             entry.update(outcome="Unavailable" if unavailable else outcome, failure_kind=kind, reason=reason, metrics=metrics)
         elif outcome == "NotStarted" and peer and kind == "load_failure":
             entry.update(outcome="Unavailable", failure_kind=kind, reason=reason, metrics=metrics)
@@ -648,6 +697,13 @@ def parse_args(argv):
                         default=q3_stats.MAX_BLOCKS,
                         help="predeclared sequential precision cap: 20 by default; 40 uses the approved fresh-campaign "
                              "precision extension and is frozen in campaign.json")
+    parser.add_argument("--comparison-reruns", type=int, choices=(0, q3_stats.RERUNS_PER_POSITION),
+                        help="comparison-arm failure policy, frozen in campaign.json (operator decision 2026-11-12): "
+                             f"reruns of a stock, peer or Splash task failure in the same block position (default "
+                             f"{q3_stats.RERUNS_PER_POSITION}; a controls-only campaign follows its primary). 0 plans "
+                             "a new campaign under the earlier rule (no reruns). It does not make an older campaign "
+                             "resumable: a campaign planned before the policy resumes only from the harness commit "
+                             "that started it")
     parser.add_argument("--controls-of", type=Path, metavar="PRIMARY_VERDICT_JSON",
                         help="controls-only campaign (#369 amendment): run control stages only, as controls of this "
                              "Q3 verdict.json of record; family and arm identities must match its campaign")
