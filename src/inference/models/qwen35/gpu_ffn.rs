@@ -5936,6 +5936,9 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::joint_projection::{JointProjectionKernel, JointProjectionScope};
         use super::super::prepared_switch_override::{Override, PreparedSwitches};
+        use crate::inference::route_host::HostForTest;
+        // The rule itself, on a host that runs the prepared kernels.
+        let _host = HostForTest::with_tensor_api();
         let params = |m| GgmlQuantizedMatmulParams {
             m,
             n: 17_408,
@@ -5978,8 +5981,16 @@ mod tests {
                     "{m} after the scope"
                 );
             }
-            let _scope = verify(33);
-            assert!(!repacked_dense_m32_admits(&params(33)), "above 32 rows");
+            {
+                let _scope = verify(33);
+                assert!(!repacked_dense_m32_admits(&params(33)), "above 32 rows");
+            }
+            // A host that cannot run the prepared kernels admits nothing,
+            // whatever the switches and the scope say.
+            let _incapable = HostForTest::without_tensor_api();
+            let _scope = verify(32);
+            assert!(!repacked_dense_m32_admits(&params(32)), "incapable host");
+            assert!(!repacked_dense_m32_shape_admits(&params(32), true));
         }
         // The base switch gates everything.
         let _off = Override::set(PreparedSwitches {

@@ -329,22 +329,54 @@ families the GPU runs and holds the table of what each switch needs:
 
 A switch from the "cannot run" rows that the operator sets fails the model
 load, before any weight is uploaded, with the switch, the kernel family and
-the device:
+the device. "Sets" follows each switch's own reader: exactly `1` for the
+`HF2Q_REPACKED_GGUF_*` switches and `HF2Q_DFLASH2_DRAFT_STAGED`, and
+`1`/`on`/`true` for `HF2Q_QWEN_PREFILL_PREPARED`, `HF2Q_QWEN_MOE_STAGED_M8`
+and `HF2Q_QWEN_MOE_LIVE_TILES`; a value the reader treats as off is not
+refused.
 
 ```text
 HF2Q_REPACKED_GGUF_M32 is on, but the prepared GGUF matmul (repacked_gguf_mm) cannot run on this host: the Metal tensor API is unavailable (a runtime compiler without <metal_tensor>, or a GPU outside the Metal 4 family) (Apple Paravirtual device). Unset HF2Q_REPACKED_GGUF_M32: the stock route serves this host.
 ```
 
-The admission points of those routes ask the same answers, so a switch that
-is on for any other reason leaves its route off on such a host and the stock
-route serves. A probe failure that is not a missing tensor API (a shader or
-toolchain regression on a Metal 4 device) is an error, not a fallback.
+A load that selects none of those switches never fails on this check. If the
+capability probe itself fails for a reason other than a missing tensor API (a
+shader or toolchain regression on a Metal 4 device), a load that selects one
+of the switches fails and names it; a load that selects none logs the failure
+once and serves on the stock route.
+
+What happens when such a switch is on without the operator having set it (a
+route profile) depends on the route:
+
+- The prepared GGUF matmul routes (`HF2Q_REPACKED_GGUF_*`,
+  `HF2Q_QWEN_PREFILL_PREPARED`) ask the host at every admission, so on a
+  host that cannot run them each product keeps its stock kernel.
+- `HF2Q_QWEN_MOE_STAGED_M8`, `HF2Q_QWEN_MOE_LIVE_TILES` and
+  `HF2Q_DFLASH2_DRAFT_STAGED` have no per-product admission: selected on
+  such a host they fail the load with the typed "unavailable on this host"
+  error. Whatever selects them asks `route_host` first
+  (`HostRoutes::switch`) and leaves them off with the reason.
+
+`MLX_NATIVE_DISABLE_METAL_TENSOR=1` makes the same kernel families
+unavailable on any host, and the reason then names the variable instead of
+the tensor API. It is not a faithful host without the API: mlx-native's
+quantized and expert matmuls, the Gemma tensor flash attention and the tiled
+verify attention keep their tensor kernels under it.
 
 Outside the switches, two stock kernels had the same dependency and now take
-their portable route on such a host: the head-major O-projection of Gemma's
-batched prefill (Q4_0, Q5_0, Q8_0 and Q6_K weights) permutes the activation
-and runs the ordinary matmul, and F16 weights of more than eight rows run
-mlx-native's portable F16 matmul.
+a portable route on such a host. Both are Class B against the tensor kernel
+they replace, not bitwise:
+
+- The head-major O-projection of Gemma's batched prefill (Q4_0, Q5_0, Q8_0
+  and Q6_K weights) permutes the activation and runs the ordinary matmul,
+  the route Q4_K O-projections take on every host. At nine or more rows the
+  two routes agree to about 2e-7 relative RMS; at eight or fewer rows the
+  ordinary matmul is the matvec family, so a row's bits differ between an
+  eight-row and a nine-row lane, as they already do for Q4_K.
+- F16 weights at two or more rows, and an F16 DFlash2 drafter head at any
+  row count, run mlx-native's portable F16 matmul (within
+  `2^-11 * sum(|w * x|)` of the F64 product, deterministic, row-independent;
+  about 4.5e-4 relative RMS from the tensor kernel).
 
 ## Qwen joint decode
 

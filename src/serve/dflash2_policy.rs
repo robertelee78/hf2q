@@ -982,10 +982,8 @@ pub(crate) fn host_switch_refusal(
             }),
         },
         Err(error) => {
-            let (_, families) = route_host::SWITCHES
-                .iter()
-                .find(|(switch, _)| *switch == name)?;
-            (!families.is_empty()).then(|| HostRefusal {
+            let row = route_host::SWITCHES.iter().find(|row| row.name == name)?;
+            (!row.families.is_empty()).then(|| HostRefusal {
                 reason: format!("the host's kernel support could not be established: {error}"),
                 explicit: format!(
                     "{name} is on, but the host's kernel support could not be established: \
