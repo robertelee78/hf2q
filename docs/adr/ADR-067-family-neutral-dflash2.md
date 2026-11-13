@@ -2205,25 +2205,41 @@ as Splash does, would remove. And the GPU's performance state falls when its
 idle goes: the layer commands take 0.5 ms longer in whole runs with the
 switches, which the 16-cycle blocks do not show.
 
+Qwen3.6, ten exact runs interleaved in one ticket (all passing, one
+transcript): tail 2.84 to 0.88 ms, four-lane cycle 27.34 to 26.28 ms (−3.9%),
+one-lane cycle 16.83 to 16.31 ms, makespan 18.79 to 18.36 seconds (−2.3%;
+four runs per arm, every run with the switches below every run without),
+peak footprint unchanged. With `check`, 5,646 served verify windows on the
+two models were planned by both routes with equal plans.
+
 Equal-clock comparison with Splash. Splash's `decode-profile` and the hf2q
-server were run in one ticket with a GPU performance-state sampler beside
-each. Splash's tool holds the GPU at its top state (1617 MHz mean in its
-fused four-lane cycles, 51.59 ms; 1620 MHz in its attributed cycles); the
-hf2q server ran at 1394 MHz (1342 MHz with the switches). Within an hf2q run
-each command class follows the frequency (16 layer commands: 10.3 +
-51,088 / MHz ms, r = 0.96), and fitted to 1620 MHz the layer commands take
-41.9 ms against Splash's 42.7 ms for the same stages, the draft 5.1 against
-5.5 and the head 2.0 against 2.0. The whole cycle fits to 53.6 ms without the
-switches and 51.7 ms with them, against Splash's 51.6: at equal clock the
-distance was the tail, and the switches close it. As served the cycle is
-58.2 ms, because the served GPU does not hold the top state; what holds it
-down under the serving workload (clients compiling on the CPU, prefill
-bursts, 21 commands and three waits per cycle) is not established. By stage
-at equal clock (one category profile scaled by the fit): hf2q is faster in
-the output projections (−1.6 ms) and the DeltaNet core (−0.5 ms) and slower
-in the FFN block's surrounding stages (+0.9 ms: casts, SiLU, reduce and
-residual as separate dispatches behind six barriers where Splash has two
-dispatches with epilogues) and on the attention side (+0.3 to +0.6 ms).
+server were run in the same tickets with a GPU performance-state sampler
+beside each. Run after a pause, Splash's tool reads 51.59 ms per fused
+four-lane cycle at 1617 MHz (its attributed stage table at 1620 MHz); the
+hf2q server ran minutes later at 1394 MHz (1342 MHz with the switches). The
+difference is not the engines. The GPU leaves its top state after a few
+seconds of sustained load: Splash's tool with 160 fused cycles per width
+instead of 8 holds 1620 MHz for 3.5 seconds and then runs at 1200–1300 MHz,
+with nothing else on the host and the GPU never idle, and its cycles
+lengthen with it (three lanes: 8.3 + 66,968 / MHz ms, 49.1 ms at 1620 MHz,
+61.1 ms after ten seconds); run straight after an hf2q run it reads 55.17 ms
+at 1483 MHz. hf2q's served runs slide the same way from their first cycle
+to their last (1511 to 1277 MHz) and their command classes follow the
+frequency (16 layer commands: 10.3 + 51,088 / MHz ms, r = 0.96). A 140 W
+adapter in place of a 65 W one with the battery supplying did not raise the
+served state. Compared at equal frequency, by interpolation on both sides
+between 1306 and 1620 MHz, the hf2q cycle with the two switches is within
+1.5 ms of Splash's measured points on either side (51.7 against 51.6 ms at
+1620 MHz, 54.7 against 55.2 at 1483) and without them 1 to 4 ms above: the
+nine milliseconds between hf2q's 60.1 ms and Splash's published 50.6 ms were
+four of tail and five of comparing a served run in the settled state with a
+tool's first seconds. By stage at equal clock (one category profile scaled
+by the fit): hf2q is faster in the output projections (−1.6 ms) and the
+DeltaNet core (−0.5 ms) and slower in the FFN block's surrounding stages
+(+0.9 ms: casts, SiLU, reduce and residual as separate dispatches behind six
+barriers where Splash has two dispatches with epilogues) and on the
+attention side (+0.3 to +0.6 ms). Whether the envelope is thermal or
+electrical was not measured.
 
 ### D5: performance qualification
 
