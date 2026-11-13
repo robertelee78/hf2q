@@ -4208,23 +4208,43 @@ impl Qwen35Model {
         Ok(result)
     }
 
-    /// Drop this thread's GPU cache if it belongs to this model.
+    /// Drop this thread's GPU cache if it belongs to this model, and return
+    /// its buffers to the system.
     ///
     /// The cache is per thread, and everything it creates at upload (BF16
     /// copies, the staged MoE planes) exists once per cache. A thread that
     /// primed it only to provision something, and then hands the model to
     /// another thread, releases it here so those buffers are not resident
     /// twice. Buffers the model itself owns are untouched.
-    pub fn release_gpu_cache(&self) {
-        GPU_CACHE.with(|cell| {
+    ///
+    /// Dropping a buffer only stages its removal from the device's Metal
+    /// residency set; the set keeps the allocation until its next commit,
+    /// which a thread that encodes nothing further never issues. An empty
+    /// command buffer is therefore committed on the cache's device, which
+    /// flushes the staged removals.
+    pub fn release_gpu_cache(&self) -> Result<()> {
+        let released = GPU_CACHE.with(|cell| {
             let mut cache = cell.borrow_mut();
             if cache
                 .as_ref()
                 .is_some_and(|cache| cache.model_ptr == self as *const _ as *const ())
             {
-                *cache = None;
+                cache.take()
+            } else {
+                None
             }
         });
+        let Some(cache) = released else {
+            return Ok(());
+        };
+        let device = cache.device.clone();
+        drop(cache);
+        device
+            .command_encoder()
+            .context("create the encoder that flushes the released GPU cache")?
+            .commit_and_wait()
+            .context("flush the released GPU cache from the residency set")?;
+        Ok(())
     }
 
     #[cfg(test)]

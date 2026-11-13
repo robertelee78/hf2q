@@ -1184,8 +1184,9 @@ impl Qwen35LoadedModel {
         // drafter; the worker thread primes its own. Everything the cache
         // created at upload (the staged MoE planes are 20 GB on Qwen3.6)
         // would otherwise stay resident twice.
-        self.model.release_gpu_cache();
+        let released = self.model.release_gpu_cache();
         let runtime = runtime?;
+        released?;
         tracing::info!(
             checkpoint = descriptor.id,
             lanes = max_slots,
