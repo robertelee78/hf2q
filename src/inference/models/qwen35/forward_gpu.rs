@@ -150,6 +150,83 @@ impl Drop for FailForwardAtLayer {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test stand-in for `HF2Q_DENSE_Q_ARENA_RESET=0` on this thread.
+    static NO_SCRATCH_RESET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Until dropped, this thread's forwards run as under
+/// `HF2Q_DENSE_Q_ARENA_RESET=0`: no scratch reset at a layer's host wait.
+#[cfg(test)]
+pub(crate) struct NoScratchResetForTest;
+
+#[cfg(test)]
+impl NoScratchResetForTest {
+    pub(crate) fn set() -> Self {
+        NO_SCRATCH_RESET.with(|cell| cell.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for NoScratchResetForTest {
+    fn drop(&mut self) {
+        NO_SCRATCH_RESET.with(|cell| cell.set(false));
+    }
+}
+
+/// Whether every layer of the model runs its prompt-prefill products on the
+/// prepared kernel in the open prefill scope: the condition under which a
+/// folded or joint forward is exact, and the route the per-layer scratch
+/// bound is derived for.
+fn prefill_layers_prepared(
+    layers: &[LayerWeightsGpu],
+    cfg: &Qwen35Config,
+    routes: super::prefill_fold::UnfoldedRoutes,
+) -> bool {
+    let shape = DeltaNetLayerShape::from_config(cfg);
+    layers.iter().all(|layer| {
+        let (ffn, linear) = match layer {
+            LayerWeightsGpu::FullAttn { ffn, .. } => (ffn, None),
+            LayerWeightsGpu::LinearAttn { attn, ffn } => (ffn, Some(attn)),
+        };
+        let ffn_exact = match ffn {
+            FfnWeightsGpu::DenseQ(weights) => {
+                super::gpu_ffn::dense_prefill_products_prepared(weights, 2)
+            }
+            FfnWeightsGpu::MoeQ(_) => !routes.moe_route_override,
+            FfnWeightsGpu::Dense(_) | FfnWeightsGpu::Moe(_) => false,
+        };
+        ffn_exact
+            && linear.is_none_or(|weights| {
+                shape.d_k % 32 == 0
+                    && shape.d_k <= 128
+                    && super::gpu_delta_net::prefill_products_prepared(
+                        weights,
+                        shape.hidden_size,
+                        shape.n_k_heads,
+                        shape.n_v_heads,
+                        shape.d_k,
+                        shape.d_v,
+                    )
+            })
+    })
+}
+
+/// Whether a multi-row forward takes its pooled scratch back at a layer's
+/// host wait. `HF2Q_DENSE_Q_ARENA_RESET=0` (a diagnostic) turns that off:
+/// scratch then stays out for the whole forward, so nothing that relies on
+/// the recycling may run: no fold, no joint forward, no skipped host wait,
+/// and with them no pool caps.
+pub(crate) fn layer_scratch_resets() -> bool {
+    #[cfg(test)]
+    if NO_SCRATCH_RESET.with(std::cell::Cell::get) {
+        return false;
+    }
+    super::execution_dispatch::dense_q_arena_reset_enabled()
+}
+
 /// Whether a forward that skips host waits has so much scratch out that the
 /// layer now ending must wait
 /// ([`super::prefill_prepared::WAIT_LAYERS_WINDOW_SCRATCH_BYTES`]): the pool
@@ -3740,6 +3817,7 @@ impl Qwen35Model {
             dump_bisect: super::dump_bisect::is_enabled(),
             dense_q_split_profile: super::execution_dispatch::dense_q_split_profile_enabled(),
             moe_route_override: super::prefill_fold::moe_route_override(),
+            scratch_reset_off: !layer_scratch_resets(),
         }
     }
 
@@ -3767,7 +3845,6 @@ impl Qwen35Model {
             return Ok(false);
         }
         self.ensure_gpu_cache_primed()?;
-        let shape = DeltaNetLayerShape::from_config(&self.cfg);
         GPU_CACHE.with(|cell| -> Result<bool> {
             let guard = cell.borrow();
             let cache = guard
@@ -3777,32 +3854,7 @@ impl Qwen35Model {
                 gpu_cache_matches_model(cache, self),
                 "prefill_fold_exact: GPU_CACHE belongs to a different Qwen35Model"
             );
-            Ok(cache.layer_weights.iter().all(|layer| {
-                let (ffn, linear) = match layer {
-                    LayerWeightsGpu::FullAttn { ffn, .. } => (ffn, None),
-                    LayerWeightsGpu::LinearAttn { attn, ffn } => (ffn, Some(attn)),
-                };
-                let ffn_exact = match ffn {
-                    FfnWeightsGpu::DenseQ(weights) => {
-                        super::gpu_ffn::dense_prefill_products_prepared(weights, 2)
-                    }
-                    FfnWeightsGpu::MoeQ(_) => !routes.moe_route_override,
-                    FfnWeightsGpu::Dense(_) | FfnWeightsGpu::Moe(_) => false,
-                };
-                ffn_exact
-                    && linear.is_none_or(|weights| {
-                        shape.d_k % 32 == 0
-                            && shape.d_k <= 128
-                            && super::gpu_delta_net::prefill_products_prepared(
-                                weights,
-                                shape.hidden_size,
-                                shape.n_k_heads,
-                                shape.n_v_heads,
-                                shape.d_k,
-                                shape.d_v,
-                            )
-                    })
-            }))
+            Ok(prefill_layers_prepared(&cache.layer_weights, &self.cfg, routes))
         })
     }
 
@@ -5504,8 +5556,20 @@ impl Qwen35Model {
         };
         // The growth-limited pool profile has its own quota and no release:
         // a forward keeps its waits there.
-        let pipelined_layers =
-            configured_wait_layers > 1 && super::decode_pool::default_pool();
+        // Without the scratch reset at a layer's host wait nothing bounds
+        // what skipped waits accumulate: such a forward keeps its waits too.
+        // And only on the prepared route with every layer's products on the
+        // prepared kernel: the route its scratch bound is derived for. A
+        // route switch that takes a forward off it (GLP, a dump, a profile)
+        // leaves the forward its waits.
+        let pipelined_layers = configured_wait_layers > 1
+            && super::decode_pool::default_pool()
+            && layer_scratch_resets()
+            && super::prefill_prepared::route_in_scope()
+            && {
+                let routes = self.unfolded_routes();
+                !routes.any() && prefill_layers_prepared(layer_weights_gpu, cfg, routes)
+            };
         // A joint forward, and a forward that skips host waits, pool more
         // scratch than a single slot's forward that waits at every layer.
         // From here to the reset after this forward the pool is capped:
@@ -7580,7 +7644,7 @@ impl Qwen35Model {
             if seq_len > 1
                 && is_k_boundary
                 && last_layer_held_enc.is_none()
-                && super::execution_dispatch::dense_q_arena_reset_enabled()
+                && layer_scratch_resets()
             {
                 // Both requirements: successful K drain AND last access to
                 // issued scratch. Outer FA/DN/FFN arenas/params, positions,

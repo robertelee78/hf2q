@@ -19106,14 +19106,20 @@ fn run_slot_aware_qwen35(
         use crate::inference::models::qwen35::prefill_prepared as prepared;
         let rows = prefill_chunk_tokens as usize;
         let slots = n_slots as usize;
+        // A slot's cache holds at most the context length.
+        let kv_rows = guard
+            .model
+            .context_length
+            .unwrap_or(guard.model.model.cfg.max_position_embeddings as usize);
         tracing::info!(
             target: "hf2q::serve::api::engine_qwen35::progress",
             transaction_rows = rows,
             slots,
+            kv_rows,
             layer_scratch_bound_bytes =
                 prepared::prefill_layer_scratch_bound_bytes(&guard.model.model.cfg, rows, slots),
             joint_scratch_bound_bytes = if qwen_joint_prefill.is_some() {
-                prepared::joint_scratch_bound_bytes(&guard.model.model.cfg, rows, slots)
+                prepared::joint_scratch_bound_bytes(&guard.model.model.cfg, rows, slots, kv_rows)
             } else {
                 0
             },

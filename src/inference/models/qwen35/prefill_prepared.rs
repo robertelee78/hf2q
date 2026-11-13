@@ -303,19 +303,85 @@ pub(crate) fn prefill_layer_scratch_bound_bytes(
     attention.max(delta_net) + ffn + outside
 }
 
-/// Upper bound of the scratch a worker holds for
-/// `HF2Q_QWEN_PREFILL_JOINT` forwards of at most `forward_rows` rows over
-/// `slots` slots: what the pool keeps at a reset
-/// ([`PREFILL_RETAINED_SCRATCH_BYTES`], enforced) plus one layer's requests
-/// ([`prefill_layer_scratch_bound_bytes`], derived). Absolute: nothing of
-/// the default route is subtracted.
+/// Upper bound of the per-forward buffers a joint forward of at most
+/// `forward_rows` rows over `slots` slots allocates beside the pool, on a
+/// cache of `kv_rows` rows per slot. A single slot's forward allocates one
+/// set of attention arenas for its rows; a joint forward allocates, for the
+/// life of the forward (plain device buffers, exact sizes):
+/// - per slot and segment of `r` rows the attention projection arena
+///   (`4r(h + 5q + 4kv)`: normed input, Q, gate, normed Q, rotated Q, gated
+///   output at `q` = heads × head dim; K, V, normed K, rotated K at
+///   `kv` = KV heads × head dim), the attention prefill arena
+///   (`r(6q + 8kv)`: three BF16 Q-sized and four KV-sized buffers) and the
+///   segment's positions (`16r`); a lane's segments cover at most all
+///   `forward_rows` rows (its own and its private copy of a shared prefix);
+/// - per slot one resume scratch for a resumed segment of more than 32
+///   rows: the dequantized history K and V in F32 and BF16
+///   (`12·kv` per attended row, at most `kv_rows`) and the F32 output
+///   (`4rq`);
+/// - per slot the gathered rows of a segment behind a shared prefix
+///   (`4rh`);
+/// - on a MoE model the forward-wide FFN arena and one per short segment
+///   (two per slot at most, 32 rows): per row `8k + 12k·m + 4k·h + 12·ms +
+///   4·experts + 4` with `k` experts per row;
+/// - the DeltaNet run scratch: one convolution and one recurrent state for
+///   the shared prefix and one convolution state per slot.
+/// The slots' stable-boundary checkpoints are not in this figure: each slot
+/// holds its own under the anchor store's quota with and without the switch.
+pub(crate) fn joint_arena_bound_bytes(
+    cfg: &super::Qwen35Config,
+    forward_rows: usize,
+    slots: usize,
+    kv_rows: usize,
+) -> u64 {
+    let rows = forward_rows as u64;
+    let slots = slots.max(1) as u64;
+    let lane_rows = rows * slots;
+    let h = u64::from(cfg.hidden_size);
+    let q = u64::from(cfg.num_attention_heads) * u64::from(cfg.head_dim);
+    let kv = u64::from(cfg.num_key_value_heads) * u64::from(cfg.head_dim);
+    let attention = lane_rows * (4 * (h + 5 * q + 4 * kv) + 6 * q + 8 * kv + 16);
+    let resume = slots * 12 * kv * kv_rows as u64 + 4 * q * lane_rows;
+    let gather = 4 * h * lane_rows;
+    let moe = cfg.moe.as_ref().map_or(0, |moe| {
+        let k = u64::from(moe.num_experts_per_tok);
+        let per_row = 8 * k
+            + 12 * k * u64::from(moe.moe_intermediate_size)
+            + 4 * k * h
+            + 12 * u64::from(moe.shared_expert_intermediate_size)
+            + 4 * u64::from(moe.num_experts)
+            + 4;
+        (rows + 2 * slots * 32) * per_row
+    });
+    let channels = 2 * u64::from(cfg.linear_num_key_heads) * u64::from(cfg.linear_key_head_dim)
+        + u64::from(cfg.linear_num_value_heads) * u64::from(cfg.linear_value_head_dim);
+    let conv_state = 4 * channels * u64::from(cfg.linear_conv_kernel_dim.saturating_sub(1));
+    let recurrent_state = 4
+        * u64::from(cfg.linear_key_head_dim)
+        * u64::from(cfg.linear_value_head_dim)
+        * u64::from(cfg.linear_num_value_heads);
+    let delta_net = (1 + slots) * conv_state + recurrent_state;
+    // Page rounding and the parameter blocks of at most 64 buffers per slot.
+    let slack = slots * 64 * 16 * 1024;
+    attention + resume + gather + moe + delta_net + slack
+}
+
+/// Upper bound of what a worker holds for `HF2Q_QWEN_PREFILL_JOINT`
+/// forwards of at most `forward_rows` rows over `slots` slots on a cache of
+/// `kv_rows` rows per slot: what the pool keeps at a reset
+/// ([`PREFILL_RETAINED_SCRATCH_BYTES`], enforced), one layer's requests
+/// ([`prefill_layer_scratch_bound_bytes`], derived) and the forward's own
+/// buffers ([`joint_arena_bound_bytes`], derived). Absolute: nothing of the
+/// default route is subtracted.
 pub(crate) fn joint_scratch_bound_bytes(
     cfg: &super::Qwen35Config,
     forward_rows: usize,
     slots: usize,
+    kv_rows: usize,
 ) -> u64 {
     PREFILL_RETAINED_SCRATCH_BYTES as u64
         + prefill_layer_scratch_bound_bytes(cfg, forward_rows, slots)
+        + joint_arena_bound_bytes(cfg, forward_rows, slots, kv_rows)
 }
 
 /// Upper bound of the scratch a worker holds for forwards of at most
@@ -323,9 +389,11 @@ pub(crate) fn joint_scratch_bound_bytes(
 /// `HF2Q_QWEN_PREFILL_WAIT_LAYERS=wait_layers`: what the pool keeps at a
 /// reset, what a window may have out when its last layer starts
 /// ([`WAIT_LAYERS_WINDOW_SCRATCH_BYTES`], enforced) and that layer's
-/// requests (derived); 0 at the default cadence. With the joint switch on
-/// as well this figure (with the joint forward's rows and slots) covers
-/// both: the caps are one pool's, not one per switch.
+/// requests (derived); 0 at the default cadence. A forward that skips host
+/// waits allocates no per-forward buffer a waiting forward does not. With
+/// the joint switch on as well, this figure with the joint forward's rows
+/// and slots plus [`joint_arena_bound_bytes`] covers both: the caps are one
+/// pool's, not one per switch.
 pub(crate) fn wait_layers_scratch_bound_bytes(
     cfg: &super::Qwen35Config,
     forward_rows: usize,
@@ -464,6 +532,13 @@ pub(crate) fn resolve_switches(
     if switches.joint && !switches.prepared {
         return Err(format!(
             "{QWEN_PREFILL_JOINT_ENV} requires {QWEN_PREFILL_PREPARED_ENV}"
+        ));
+    }
+    // A forward skips host waits only on the prepared route: its scratch
+    // bound is derived for that route alone.
+    if switches.wait_layers > 1 && !switches.prepared {
+        return Err(format!(
+            "{QWEN_PREFILL_WAIT_LAYERS_ENV} above 1 requires {QWEN_PREFILL_PREPARED_ENV}"
         ));
     }
     Ok(switches)
@@ -610,10 +685,18 @@ mod tests {
             resolve_switches(Some("1"), None, None, None, Some("250"), false).is_err(),
             "invalid keep-fresh value"
         );
-        // The wait cadence is a property of the layer loop, not of a route.
+        // A forward skips host waits only on the prepared route.
         assert_eq!(
-            resolve_switches(None, None, None, Some("8"), None, false).map(|s| s.wait_layers),
+            resolve_switches(Some("1"), None, None, Some("8"), None, false).map(|s| s.wait_layers),
             Ok(8)
+        );
+        assert_eq!(
+            resolve_switches(None, None, None, Some("1"), None, false).map(|s| s.wait_layers),
+            Ok(1)
+        );
+        assert!(
+            resolve_switches(None, None, None, Some("8"), None, false).is_err(),
+            "wait layers without prepared"
         );
         for invalid in ["0", "9", "on", "-1"] {
             assert!(

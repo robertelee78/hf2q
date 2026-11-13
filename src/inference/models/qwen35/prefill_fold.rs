@@ -69,7 +69,9 @@ pub(crate) fn enabled() -> bool {
 /// prefill keeps its two forwards. GLP steering writes the residual stream
 /// between layers, the dump-bisect instrument downloads per-layer tensors,
 /// and the dense-Q split profile commits each FFN stage on its own; none of
-/// the three is split at the prompt boundary.
+/// the three is split at the prompt boundary. And a forward that does not
+/// recycle its pooled scratch at a layer's host wait may not pool a folded
+/// or joint forward's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UnfoldedRoutes {
     pub(crate) glp_bound: bool,
@@ -81,6 +83,11 @@ pub(crate) struct UnfoldedRoutes {
     /// joint forward groups its MoE segments by. Concerns MoE models only
     /// and is therefore not part of [`Self::any`].
     pub(crate) moe_route_override: bool,
+    /// `HF2Q_DENSE_Q_ARENA_RESET=0`: a forward does not take its pooled
+    /// scratch back at a layer's host wait. A folded or joint forward pools
+    /// per-segment scratch and runs under pool caps that rely on that
+    /// reset, so neither is taken.
+    pub(crate) scratch_reset_off: bool,
 }
 
 /// Whether the process overrides the row count at which the MoE FFN changes
@@ -93,7 +100,10 @@ pub(crate) fn moe_route_override() -> bool {
 
 impl UnfoldedRoutes {
     pub(crate) fn any(self) -> bool {
-        self.glp_bound || self.dump_bisect || self.dense_q_split_profile
+        self.glp_bound
+            || self.dump_bisect
+            || self.dense_q_split_profile
+            || self.scratch_reset_off
     }
 }
 

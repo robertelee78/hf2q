@@ -870,6 +870,32 @@ fn moe_fold_refusal_in_a_child() {
     eprintln!("[OVERRIDE_CHILD] refused");
 }
 
+/// `HF2Q_DENSE_Q_ARENA_RESET=0` keeps a forward's pooled scratch out for the
+/// whole forward. The fold and the joint forward pool per-segment scratch
+/// and run under pool caps that rely on the reset at a layer's host wait, so
+/// with the override neither is admitted (one predicate serves both); the
+/// model reports the override itself.
+#[test]
+fn the_fold_is_not_taken_without_the_layer_scratch_reset() {
+    no_fold_under(
+        "HF2Q_DENSE_Q_ARENA_RESET=0",
+        super::prefill_fold::UnfoldedRoutes {
+            scratch_reset_off: true,
+            ..Default::default()
+        },
+    );
+    with_synthetic_model(|model| {
+        let _scope = PrefillScope::forced(true);
+        assert!(model.prefill_fold_exact().expect("exactness"));
+        let _override = super::forward_gpu::NoScratchResetForTest::set();
+        assert!(model.unfolded_routes().scratch_reset_off);
+        assert!(
+            !model.prefill_fold_exact().expect("exactness"),
+            "a model without the layer scratch reset still folds"
+        );
+    });
+}
+
 #[test]
 fn the_fold_is_not_taken_with_dump_bisect_enabled() {
     no_fold_under(

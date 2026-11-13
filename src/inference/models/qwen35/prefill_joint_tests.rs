@@ -1546,6 +1546,163 @@ fn the_scratch_caps_bound_the_pool_and_change_no_bit() {
     });
 }
 
+/// `HF2Q_DENSE_Q_ARENA_RESET=0` turns the scratch reset at a layer's host
+/// wait off. A forward that skipped host waits would then accumulate
+/// scratch under caps that count on the reset, so with the override the
+/// wait cadence has no effect: the forward waits after every layer, commits
+/// no layer without a wait, puts no caps on the pool, and its bits are those
+/// of the default cadence.
+#[test]
+fn without_the_layer_scratch_reset_a_forward_keeps_its_waits_and_runs_uncapped() {
+    use super::decode_pool;
+    use super::encoder_stage::FailSubmitted;
+    use super::forward_gpu::NoScratchResetForTest;
+    use super::prefill_prepared::{ForcedWaitLayers, ScratchCapsForTest};
+    with_synthetic_model(|model| {
+        let lane = Lane::new(0, &[40], 300, 0);
+        let run = |wait: usize, no_reset: bool| -> (Vec<u32>, usize, usize) {
+            let _cadence = ForcedWaitLayers::set(wait);
+            let _override = no_reset.then(NoScratchResetForTest::set);
+            // A hard cap of zero: a capped forward pools nothing.
+            let _caps = ScratchCapsForTest::set(usize::MAX, usize::MAX, 0);
+            let mut cache = cache(model);
+            let _scope = PrefillScope::forced(true);
+            prefill_history(model, &mut cache, &lane);
+            decode_pool::checked_reset_decode_pool().expect("reset");
+            let before = decode_pool::free_bytes();
+            // Counts the layer command buffers committed without a wait.
+            let layers = FailSubmitted::nth("layer.dense_ffn", usize::MAX);
+            let logits = model
+                .forward_gpu_last_logits(
+                    &lane.tokens(lane.start(), lane.rows()),
+                    &positions_for_range(lane.start() as i32, lane.rows()),
+                    &mut cache,
+                    SlotId(0),
+                )
+                .expect("forward");
+            let unwaited_layers = layers.seen().1;
+            drop(layers);
+            decode_pool::checked_reset_decode_pool().expect("reset");
+            (bits(&logits), unwaited_layers, decode_pool::free_bytes() - before)
+        };
+        let (reference, _, _) = run(1, false);
+        // With the reset, cadence 8 commits layers without a wait and runs
+        // under the caps (under a hard cap of zero the pool does not grow).
+        let (pipelined, unwaited, grown) = run(8, false);
+        assert!(unwaited > 0, "cadence 8 committed no layer without a wait");
+        assert_eq!(grown, 0, "the capped forward grew the pool under a hard cap of zero");
+        assert!(pipelined == reference, "cadence 8 changed bits");
+        // Without it: no layer is committed without a wait, and no caps
+        // apply (every layer's scratch stays out and the pool grows, as on
+        // the default route under that override).
+        let (kept_waits, unwaited, grown) = run(8, true);
+        assert_eq!(unwaited, 0, "a forward without the scratch reset skipped a host wait");
+        assert!(grown > 0, "a forward without the scratch reset ran under pool caps");
+        assert!(kept_waits == reference, "the override changed bits");
+    });
+}
+
+/// `joint_arena_bound_bytes` against what the per-segment arenas of a joint
+/// forward really allocate: the attention prefill and projection arenas a
+/// lane's segment gets and, on a MoE model, a segment's FFN arena, built by
+/// the constructors the forward calls. (The resume scratch and the DeltaNet
+/// run scratch are derived from their constructors and not built here.)
+#[test]
+fn the_joint_arena_bound_covers_the_arenas_a_segment_allocates() {
+    use super::full_attn::FullAttnShape;
+    use super::prefill_prepared::joint_arena_bound_bytes;
+    let check = |model: &Qwen35Model, what: &str| {
+        let cfg = &model.cfg;
+        let shape = FullAttnShape::from_config(cfg);
+        for rows in [5u32, 37, 300] {
+            let allocated = model
+                .with_gpu_cache_mut(|device, _registry| {
+                    let prefill = super::FaPrefillArena::new(
+                        device,
+                        rows,
+                        shape.n_head,
+                        shape.n_kv,
+                        shape.head_dim,
+                    )?;
+                    let projections = super::FaProjectionsArena::new(
+                        device,
+                        rows,
+                        shape.hidden_size,
+                        shape.n_head,
+                        shape.n_kv,
+                        shape.head_dim,
+                        shape.rms_norm_eps,
+                    )?;
+                    let mut buffers = vec![
+                        prefill.q_bf16_seq.byte_len(),
+                        prefill.q_bf16_hm.byte_len(),
+                        prefill.k_bf16_seq.byte_len(),
+                        prefill.k_bf16_hm.byte_len(),
+                        prefill.v_bf16_seq.byte_len(),
+                        prefill.v_bf16_hm.byte_len(),
+                        prefill.out_bf16_hm.byte_len(),
+                        projections.x_norm_buf.byte_len(),
+                        projections.pre_norm_params_buf.byte_len(),
+                        projections.q_proj_buf.byte_len(),
+                        projections.k_proj_buf.byte_len(),
+                        projections.v_proj_buf.byte_len(),
+                        projections.gate_proj_buf.byte_len(),
+                        projections.q_normed_buf.byte_len(),
+                        projections.k_normed_buf.byte_len(),
+                        projections.qk_rms_params_buf.byte_len(),
+                        projections.q_rope_buf.byte_len(),
+                        projections.k_rope_buf.byte_len(),
+                        projections.gated_buf.byte_len(),
+                        projections.sigmoid_params_buf.byte_len(),
+                    ];
+                    if let Some(moe) = cfg.moe.as_ref() {
+                        let arena = super::MoeFfnArena::new(
+                            device,
+                            rows,
+                            cfg.hidden_size,
+                            moe.num_experts_per_tok,
+                            moe.moe_intermediate_size,
+                            moe.shared_expert_intermediate_size,
+                            moe.num_experts,
+                        )?;
+                        buffers.extend([
+                            arena.ids_buf.byte_len(),
+                            arena.weights_buf.byte_len(),
+                            arena.gate_all_buf.byte_len(),
+                            arena.up_all_buf.byte_len(),
+                            arena.h_all_buf.byte_len(),
+                            arena.y_all_buf.byte_len(),
+                            arena.h_s_buf.byte_len(),
+                            arena.silu_params_buf.byte_len(),
+                            arena.silu_sh_params_buf.byte_len(),
+                            arena.dummy_residual_buf.byte_len(),
+                            arena.logits_buf.byte_len(),
+                            arena.sh_logit_buf.byte_len(),
+                            arena.a_s_buf.byte_len(),
+                            arena.b_s_buf.byte_len(),
+                        ]);
+                    }
+                    Ok(buffers.iter().sum::<usize>() as u64)
+                })
+                .expect("arenas");
+            // One slot, one segment of `rows` rows, no attended history.
+            let bound = joint_arena_bound_bytes(cfg, rows as usize, 1, 0);
+            assert!(
+                allocated <= bound,
+                "{what}: the arenas of a {rows}-row segment hold {allocated} bytes, over the bound of {bound}"
+            );
+        }
+        // The attended history: twelve bytes per KV element and slot.
+        let kv = u64::from(cfg.num_key_value_heads) * u64::from(cfg.head_dim);
+        assert_eq!(
+            joint_arena_bound_bytes(cfg, 64, 3, 1000) - joint_arena_bound_bytes(cfg, 64, 3, 0),
+            3 * 12 * kv * 1000
+        );
+    };
+    with_synthetic_model(|model| check(model, "dense FFN"));
+    super::prefill_fold_tests::with_synthetic_moe_model(|model| check(model, "MoE FFN"));
+}
+
 /// One layer of a forward on the prepared route requests at most
 /// `prefill_layer_scratch_bound_bytes` of scratch for its shape: single-slot
 /// chunks (fresh, resumed, short, with a folded cue) and joint forwards with
