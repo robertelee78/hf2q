@@ -4337,6 +4337,34 @@ impl Qwen35JointPrefillPolicy {
     }
 }
 
+/// What a slot is to the first-prompt gather.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Qwen35GatherSlot {
+    /// No request.
+    Free,
+    /// A text first prompt that has not run a forward yet.
+    FirstPrompt,
+    /// Anything else: a decoding slot, a resumed or started prefill.
+    Busy,
+}
+
+/// Whether first prompts are still gathering for a joint prefill: at least
+/// one waits, a slot is still free for another, and nothing else runs on
+/// the worker (so nobody but the waiting first prompts is delayed).
+pub(crate) fn qwen35_first_prompts_may_gather(
+    slots: impl IntoIterator<Item = Qwen35GatherSlot>,
+) -> bool {
+    let (mut waiting, mut free) = (0usize, 0usize);
+    for slot in slots {
+        match slot {
+            Qwen35GatherSlot::Free => free += 1,
+            Qwen35GatherSlot::FirstPrompt => waiting += 1,
+            Qwen35GatherSlot::Busy => return false,
+        }
+    }
+    waiting > 0 && free > 0
+}
+
 /// Choose the lanes of a joint prefill forward among the waiting requests
 /// `candidates` (FIFO order, the head first): the longest run from the head
 /// that `join` admits and whose forward fits `max_rows` rows, `None` unless
@@ -11491,6 +11519,23 @@ mod tests {
             None,
             "first prompts join for their shared rows only"
         );
+    }
+
+    #[test]
+    fn first_prompts_gather_only_while_a_slot_is_free_and_nothing_else_runs() {
+        use Qwen35GatherSlot::{Busy, FirstPrompt, Free};
+        let gather = |slots: &[Qwen35GatherSlot]| qwen35_first_prompts_may_gather(slots.iter().copied());
+        assert!(gather(&[FirstPrompt, Free, Free, Free]));
+        assert!(gather(&[Free, FirstPrompt, FirstPrompt, FirstPrompt]));
+        // Every slot holds a first prompt: nobody else can come.
+        assert!(!gather(&[FirstPrompt; 4]));
+        // An idle worker has nothing to gather.
+        assert!(!gather(&[Free; 4]));
+        // A decoding slot, or a prefill that is not a waiting first prompt,
+        // is never made to wait.
+        assert!(!gather(&[FirstPrompt, Busy, Free, Free]));
+        assert!(!gather(&[Busy, Free, Free, Free]));
+        assert!(!gather(&[]));
     }
 
     #[test]

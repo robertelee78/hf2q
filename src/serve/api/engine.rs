@@ -20446,18 +20446,17 @@ fn keep_qwen35_prefill_weights_fresh(guard: &Qwen35KvGuard<'_>) {
     }
 }
 
-/// Whether first prompts are still gathering for a joint prefill: a slot is
-/// free, nothing decodes, and every active slot holds the first prompt of a
-/// conversation that has not run a forward.
+/// Whether first prompts are still gathering for a joint prefill
+/// ([`super::engine_qwen35::qwen35_first_prompts_may_gather`]).
 fn qwen35_first_prompts_may_gather(slots: &[Option<Qwen35Slot>]) -> bool {
-    let mut waiting = 0usize;
-    for slot in slots.iter().flatten() {
-        match &slot.0 {
-            Qwen35SlotWork::Prefill(state) if state.starts_cold() => waiting += 1,
-            _ => return false,
+    use super::engine_qwen35::Qwen35GatherSlot;
+    super::engine_qwen35::qwen35_first_prompts_may_gather(slots.iter().map(|slot| match slot {
+        None => Qwen35GatherSlot::Free,
+        Some((Qwen35SlotWork::Prefill(state), _, _)) if state.starts_cold() => {
+            Qwen35GatherSlot::FirstPrompt
         }
-    }
-    waiting > 0 && waiting < slots.len()
+        Some(_) => Qwen35GatherSlot::Busy,
+    }))
 }
 
 /// Run the next prefill chunk of the scheduled slot `head` and of the slots
