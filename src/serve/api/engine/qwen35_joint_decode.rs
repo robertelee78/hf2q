@@ -195,7 +195,7 @@ fn select_qwen_joint_decode(
                     pooled_outputs: requested_step.pooled_outputs,
                     verify_attention_tile: false,
                     verify_mixer_fused: false,
-                    dflash2: Default::default(),
+                    dflash2: crate::inference::models::qwen35::joint_step_options::DFlash2VerifyOptions::OFF,
                 },
                 joint_mtp: joint_mtp && (mode == JointRouteMode::Exact || solo),
             })
@@ -281,7 +281,7 @@ pub(super) fn qwen35_joint_decode_config(
         pooled_outputs: switch(QWEN_JOINT_POOLED_OUTPUTS_ENV, "pooled outputs"),
         verify_attention_tile: false,
         verify_mixer_fused: false,
-        dflash2: Default::default(),
+        dflash2: crate::inference::models::qwen35::joint_step_options::DFlash2VerifyOptions::OFF,
     };
     let selected = select_qwen_joint_decode(
         requested,
