@@ -142,6 +142,7 @@ impl DFlash2Runtime {
         target: &T,
         lanes: usize,
     ) -> Result<Self> {
+        crate::inference::route_host::require_explicit(device)?;
         let config_bytes = std::fs::read(config_path.as_ref())
             .with_context(|| format!("read DFlash2 config {}", config_path.as_ref().display()))?;
         let config = descriptor

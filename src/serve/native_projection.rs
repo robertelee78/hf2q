@@ -84,7 +84,16 @@ pub fn dispatch_qmatmul_head_major_bf16(
     let k = u32::try_from(weight.info.cols)
         .map_err(|_| anyhow::anyhow!("head-major projection cols exceed u32"))?;
 
-    if supports_native_perm021(weight, m, head_dim_u32) {
+    // The direct kernel exists only on the Metal tensor API; without it the
+    // permuted activation takes the ordinary route below.
+    if supports_native_perm021(weight, m, head_dim_u32)
+        && mlx_native::tensor_kernel_family_available(
+            registry,
+            device,
+            mlx_native::TensorKernelFamily::MmPerm021,
+        )
+        .map_err(|error| anyhow::anyhow!("probe the head-major projection kernel: {error}"))?
+    {
         let params = mlx_native::GgmlQuantizedMatmulPerm021Params {
             m,
             n,
