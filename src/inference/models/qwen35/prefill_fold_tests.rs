@@ -683,15 +683,23 @@ fn qwen_prefill_fold_real_model_gate() {
 
 #[test]
 fn a_request_no_forward_took_is_an_error_and_does_not_linger() {
-    use super::prefill_fold::{take_request, with_request, BoundaryFold};
+    use super::prefill_joint::{take_request, with_request, JointRequest, LaneBoundary, LaneRequest};
     with_synthetic_model(|model| {
         let image = cache(model)
             .boundary_anchor_image()
             .expect("checkpoint image");
         let outcome = with_request(
-            BoundaryFold {
-                prefix_rows: 4,
-                image,
+            JointRequest {
+                shared_rows: 0,
+                lanes: vec![LaneRequest {
+                    slot: SlotId(0),
+                    rows: 9,
+                    shares_prefix: false,
+                    boundary: Some(LaneBoundary {
+                        prefix_rows: 4,
+                        image,
+                    }),
+                }],
             },
             || Ok(()),
         );
@@ -699,7 +707,7 @@ fn a_request_no_forward_took_is_an_error_and_does_not_linger() {
             outcome.is_err(),
             "nothing took the fold or published logits"
         );
-        assert!(take_request(9).expect("no request left").is_none());
+        assert!(take_request(9, SLOTS).expect("no request left").is_none());
     });
 }
 

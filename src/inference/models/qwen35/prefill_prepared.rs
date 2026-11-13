@@ -83,6 +83,7 @@ impl Drop for PrefillScope {
 pub(crate) struct PrefillSwitches {
     pub(crate) prepared: bool,
     pub(crate) fold_cue: bool,
+    pub(crate) joint: bool,
 }
 
 #[cfg(test)]
@@ -123,16 +124,20 @@ impl Drop for SwitchesForTest {
 /// keep their promise. With the chunk-scan DeltaNet investigation route on,
 /// alpha and beta would stay on the stock kernel beside prepared qkv, gate
 /// and output, and a row's bits would depend on whether its chunk is a
-/// multiple of 64 rows. The cue fold is exact only on the prepared kernels.
+/// multiple of 64 rows. The cue fold and the joint prefill are exact only on
+/// the prepared kernels.
 pub(crate) fn resolve_switches(
     prepared: Option<&str>,
     fold_cue: Option<&str>,
+    joint: Option<&str>,
     chunk_scan_prefill: bool,
 ) -> Result<PrefillSwitches, String> {
     use super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV;
+    use super::prefill_joint::QWEN_PREFILL_JOINT_ENV;
     let switches = PrefillSwitches {
         prepared: parse_switch(QWEN_PREFILL_PREPARED_ENV, prepared)?,
         fold_cue: parse_switch(QWEN_PREFILL_FOLD_CUE_ENV, fold_cue)?,
+        joint: parse_switch(QWEN_PREFILL_JOINT_ENV, joint)?,
     };
     if switches.prepared && chunk_scan_prefill {
         return Err(format!(
@@ -143,6 +148,11 @@ pub(crate) fn resolve_switches(
     if switches.fold_cue && !switches.prepared {
         return Err(format!(
             "{QWEN_PREFILL_FOLD_CUE_ENV} requires {QWEN_PREFILL_PREPARED_ENV}"
+        ));
+    }
+    if switches.joint && !switches.prepared {
+        return Err(format!(
+            "{QWEN_PREFILL_JOINT_ENV} requires {QWEN_PREFILL_PREPARED_ENV}"
         ));
     }
     Ok(switches)
@@ -167,6 +177,7 @@ pub(crate) fn switches_from_process() -> anyhow::Result<PrefillSwitches> {
     switches_or_refusal(
         read(QWEN_PREFILL_PREPARED_ENV).as_deref(),
         read(super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV).as_deref(),
+        read(super::prefill_joint::QWEN_PREFILL_JOINT_ENV).as_deref(),
         crate::debug::INVESTIGATION_ENV.chunk_scan_prefill,
     )
 }
@@ -180,6 +191,7 @@ pub(crate) fn validate_at_worker_start() -> anyhow::Result<PrefillSwitches> {
         target: "hf2q::serve::api::engine_qwen35::progress",
         prepared = switches.prepared,
         fold_cue = switches.fold_cue,
+        joint = switches.joint,
         "Qwen prompt prefill configuration"
     );
     Ok(switches)
@@ -226,20 +238,39 @@ mod tests {
 
     #[test]
     fn worker_start_rejects_invalid_values_and_combinations_that_break_a_promise() {
-        let resolve = |prepared, fold, chunk_scan| resolve_switches(prepared, fold, chunk_scan);
+        let resolve =
+            |prepared, fold, chunk_scan| resolve_switches(prepared, fold, None, chunk_scan);
         assert_eq!(
             resolve(None, None, false),
             Ok(PrefillSwitches {
                 prepared: false,
-                fold_cue: false
+                fold_cue: false,
+                joint: false
             })
         );
         assert_eq!(
             resolve(Some("1"), Some("on"), false),
             Ok(PrefillSwitches {
                 prepared: true,
-                fold_cue: true
+                fold_cue: true,
+                joint: false
             })
+        );
+        assert_eq!(
+            resolve_switches(Some("1"), None, Some("1"), false),
+            Ok(PrefillSwitches {
+                prepared: true,
+                fold_cue: false,
+                joint: true
+            })
+        );
+        assert!(
+            resolve_switches(None, None, Some("1"), false).is_err(),
+            "joint without prepared"
+        );
+        assert!(
+            resolve_switches(Some("1"), None, Some("lanes"), false).is_err(),
+            "invalid joint value"
         );
         // The stock route may run beside the chunk-scan investigation route.
         assert!(resolve(None, None, true).is_ok());
@@ -291,6 +322,7 @@ mod tests {
         let on = PrefillSwitches {
             prepared: true,
             fold_cue: true,
+            joint: false,
         };
         {
             let _switches = SwitchesForTest::set(on);

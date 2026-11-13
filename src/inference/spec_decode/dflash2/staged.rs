@@ -987,7 +987,7 @@ mod tests {
                 &capture,
                 lane,
                 start,
-                0..rows,
+                &[0..rows],
             )
             .unwrap();
         } else {

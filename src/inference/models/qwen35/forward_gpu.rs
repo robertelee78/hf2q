@@ -317,6 +317,64 @@ pub(crate) struct FoldedPrefill {
     pub(crate) boundary_wall: std::time::Duration,
 }
 
+/// One slot's chunk in [`Qwen35Model::forward_gpu_last_logits_joint`].
+pub(crate) struct JointPrefillLane<'a> {
+    pub(crate) slot_id: SlotId,
+    /// The lane's chunk, shared prefix rows included.
+    pub(crate) tokens: &'a [u32],
+    /// The chunk's `[4, rows]` axis-major positions.
+    pub(crate) positions_flat: &'a [i32],
+    /// Whether the chunk's leading rows are the forward's shared prefix.
+    pub(crate) shares_prefix: bool,
+    /// A cue fold in this chunk: the content rows before the stable prompt
+    /// boundary, and the boundary's physical cursor.
+    pub(crate) fold: Option<(usize, usize)>,
+    /// Checkpoint storage the caller allocated for the fold before it chose
+    /// it ([`HybridKvCache::boundary_anchor_image`]); `None`: the forward
+    /// allocates it.
+    pub(crate) image: Option<super::kv_cache::LaAnchorImage>,
+}
+
+/// What [`Qwen35Model::forward_gpu_last_logits_joint`] returns for a lane.
+pub(crate) struct JointPrefillOutput {
+    /// Logits of the lane's last row.
+    pub(crate) logits: Vec<f32>,
+    /// The stable-boundary checkpoint of a lane that folded its cue: the
+    /// logits of its last content row, the slot state there, and the host
+    /// time spent assembling it. The checkpoint is a result of its own: the
+    /// forward has run and the slot holds both segments whether or not the
+    /// checkpoint could be assembled.
+    pub(crate) boundary: Option<(
+        Vec<f32>,
+        Result<super::kv_cache::HybridKvSlotAnchor>,
+        std::time::Duration,
+    )>,
+    /// The forward row of the lane's first own (unshared) row.
+    own_first: usize,
+    /// Leading rows of the lane's chunk that are the shared prefix rows
+    /// (forward rows `0..shared_rows`).
+    shared_rows: usize,
+}
+
+impl JointPrefillOutput {
+    /// The forward rows (the rows of the forward's capture) that hold the
+    /// lane's rows `rows`, in order.
+    pub(crate) fn forward_rows(&self, rows: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>> {
+        let mut runs = Vec::with_capacity(2);
+        if rows.start < self.shared_rows {
+            runs.push(rows.start..rows.end.min(self.shared_rows));
+        }
+        if rows.end > self.shared_rows {
+            let own = rows.start.max(self.shared_rows);
+            runs.push(
+                self.own_first + (own - self.shared_rows)
+                    ..self.own_first + (rows.end - self.shared_rows),
+            );
+        }
+        runs
+    }
+}
+
 /// One ADR-054 per-family calibration capture request (#300): read the
 /// complete post-layer residual `hidden` (the exact tensor the
 /// `residual_stream_post_layer` steering mutates at the layer-loop tail)
@@ -3687,33 +3745,211 @@ impl Qwen35Model {
             "cue fold of {prefix_rows} + {} rows is outside the served shape",
             tokens.len().saturating_sub(prefix_rows)
         );
-        let request = super::prefill_fold::BoundaryFold {
-            prefix_rows: prefix_rows as u32,
-            image: image.clone(),
-        };
-        let (logits, boundary_logits) =
-            super::prefill_fold::with_request(request, || match dflash_capture {
-                Some(capture) => self
-                    .forward_gpu_last_logits_with_hidden_dflash(
-                        tokens,
-                        positions_flat,
-                        kv_cache,
-                        Some(capture),
-                        slot_id,
-                    )
-                    .map(|(logits, _hidden)| logits),
-                None => self.forward_gpu_last_logits(tokens, positions_flat, kv_cache, slot_id),
-            })?;
-        let assembling = std::time::Instant::now();
-        let boundary = kv_cache
-            .slot_anchor_at_boundary(slot_id, boundary_len, image)
-            .context("cue fold checkpoint");
+        let mut lanes = self.forward_gpu_last_logits_joint(
+            &[JointPrefillLane {
+                slot_id,
+                tokens,
+                positions_flat,
+                shares_prefix: false,
+                fold: Some((prefix_rows, boundary_len)),
+                image: Some(image),
+            }],
+            0,
+            kv_cache,
+            dflash_capture,
+        )?;
+        let lane = lanes
+            .pop()
+            .ok_or_else(|| anyhow!("the folded forward returned no lane"))?;
+        let (boundary_logits, boundary, boundary_wall) = lane
+            .boundary
+            .ok_or_else(|| anyhow!("the folded forward returned no checkpoint"))?;
         Ok(FoldedPrefill {
-            logits,
+            logits: lane.logits,
             boundary_logits,
             boundary,
-            boundary_wall: assembling.elapsed(),
+            boundary_wall,
         })
+    }
+
+    /// Rows of the joint forward over `lanes` sharing `shared_rows` rows.
+    pub(crate) fn joint_prefill_rows(lanes: &[JointPrefillLane<'_>], shared_rows: usize) -> usize {
+        shared_rows
+            + lanes
+                .iter()
+                .map(|lane| lane.tokens.len() - if lane.shares_prefix { shared_rows } else { 0 })
+                .sum::<usize>()
+    }
+
+    /// One prompt-prefill forward over the pending chunks of several slots
+    /// ([`super::prefill_joint`]). Each lane's cache rows and cursors,
+    /// DeltaNet state, checkpoint, captured target-layer rows and logits
+    /// are what its own forward(s) over its chunk produce, bit for bit.
+    ///
+    /// The lanes marked `shares_prefix` start with the same `shared_rows`
+    /// tokens at the same positions on a cold slot (the caller has checked
+    /// the slots; the tokens and positions are compared here); those rows
+    /// are computed once. `dflash_capture` is a session over the forward's
+    /// [`Self::joint_prefill_rows`] rows; [`JointPrefillOutput::forward_rows`]
+    /// maps a lane's rows into it. The caller opens the prefill scope and
+    /// has checked [`Self::prefill_fold_exact`].
+    pub(crate) fn forward_gpu_last_logits_joint(
+        &self,
+        lanes: &[JointPrefillLane<'_>],
+        shared_rows: usize,
+        kv_cache: &mut HybridKvCache,
+        dflash_capture: Option<
+            &mut crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession,
+        >,
+    ) -> Result<Vec<JointPrefillOutput>> {
+        use super::prefill_joint::{JointRequest, LaneBoundary, LaneRequest};
+        ensure!(!lanes.is_empty(), "a joint prefill needs a lane");
+        for (index, lane) in lanes.iter().enumerate() {
+            ensure!(
+                lane.positions_flat.len() == 4 * lane.tokens.len(),
+                "joint prefill lane {index}: {} positions for {} rows",
+                lane.positions_flat.len(),
+                lane.tokens.len()
+            );
+            ensure!(
+                !lane.shares_prefix || (shared_rows > 0 && lane.tokens.len() > shared_rows),
+                "joint prefill lane {index}: {} rows cannot share a prefix of {shared_rows}",
+                lane.tokens.len()
+            );
+        }
+        // The shared rows are the first sharing lane's; every other sharing
+        // lane must start with the same tokens at the same positions.
+        let donor = lanes.iter().find(|lane| lane.shares_prefix);
+        ensure!(
+            donor.is_some() == (shared_rows > 0),
+            "joint prefill: a shared prefix of {shared_rows} rows and {} sharing lanes",
+            lanes.iter().filter(|lane| lane.shares_prefix).count()
+        );
+        fn shared_axis<'a>(lane: &JointPrefillLane<'a>, axis: usize, shared: usize) -> &'a [i32] {
+            let rows = lane.tokens.len();
+            &lane.positions_flat[axis * rows..axis * rows + shared]
+        }
+        let shared_positions =
+            |lane: &JointPrefillLane<'_>, axis: usize| shared_axis(lane, axis, shared_rows).to_vec();
+        if let Some(donor) = donor {
+            for (index, lane) in lanes.iter().enumerate() {
+                ensure!(
+                    !lane.shares_prefix
+                        || (lane.tokens[..shared_rows] == donor.tokens[..shared_rows]
+                            && (0..4).all(|axis| {
+                                shared_positions(lane, axis) == shared_positions(donor, axis)
+                            })),
+                    "joint prefill lane {index} does not start with the shared prefix"
+                );
+            }
+        }
+        let total = Self::joint_prefill_rows(lanes, shared_rows);
+        let own = |lane: &JointPrefillLane<'_>| if lane.shares_prefix { shared_rows } else { 0 };
+        let mut tokens = Vec::with_capacity(total);
+        if let Some(donor) = donor {
+            tokens.extend_from_slice(&donor.tokens[..shared_rows]);
+        }
+        for lane in lanes {
+            tokens.extend_from_slice(&lane.tokens[own(lane)..]);
+        }
+        let mut positions = Vec::with_capacity(4 * total);
+        for axis in 0..4 {
+            if let Some(donor) = donor {
+                positions.extend_from_slice(shared_axis(donor, axis, shared_rows));
+            }
+            for lane in lanes {
+                let rows = lane.tokens.len();
+                positions
+                    .extend_from_slice(&lane.positions_flat[axis * rows + own(lane)..(axis + 1) * rows]);
+            }
+        }
+        let mut images = Vec::with_capacity(lanes.len());
+        let mut request_lanes = Vec::with_capacity(lanes.len());
+        for lane in lanes {
+            let image = match (lane.fold, lane.image.as_ref()) {
+                (Some(_), Some(image)) => Some(image.clone()),
+                (Some(_), None) => Some(
+                    kv_cache
+                        .boundary_anchor_image()
+                        .context("joint prefill checkpoint image")?,
+                ),
+                (None, None) => None,
+                (None, Some(_)) => {
+                    return Err(anyhow!("joint prefill: checkpoint storage without a fold"))
+                }
+            };
+            request_lanes.push(LaneRequest {
+                slot: lane.slot_id,
+                rows: lane.tokens.len() as u32,
+                shares_prefix: lane.shares_prefix,
+                boundary: lane.fold.zip(image.clone()).map(|((prefix_rows, _), image)| {
+                    LaneBoundary {
+                        prefix_rows: prefix_rows as u32,
+                        image,
+                    }
+                }),
+            });
+            images.push(image);
+        }
+        let request = JointRequest {
+            shared_rows: shared_rows as u32,
+            lanes: request_lanes,
+        };
+        let first_slot = lanes[0].slot_id;
+        let (last_logits, lane_logits) = super::prefill_joint::with_request(request, || {
+            match dflash_capture {
+                Some(capture) => self
+                    .forward_gpu_last_logits_with_hidden_dflash(
+                        &tokens,
+                        &positions,
+                        kv_cache,
+                        Some(capture),
+                        first_slot,
+                    )
+                    .map(|(logits, _hidden)| logits),
+                None => self.forward_gpu_last_logits(&tokens, &positions, kv_cache, first_slot),
+            }
+        })?;
+        let mut last_logits = Some(last_logits);
+        let mut own_first = shared_rows;
+        let mut outputs = Vec::with_capacity(lanes.len());
+        let last_lane = lanes.len() - 1;
+        for (index, ((lane, logits), image)) in
+            lanes.iter().zip(lane_logits).zip(images).enumerate()
+        {
+            let boundary = match (lane.fold, image, logits.boundary) {
+                (Some((_, boundary_len)), Some(image), Some(boundary_logits)) => {
+                    let assembling = std::time::Instant::now();
+                    let anchor = kv_cache
+                        .slot_anchor_at_boundary(lane.slot_id, boundary_len, image)
+                        .context("joint prefill checkpoint");
+                    Some((boundary_logits, anchor, assembling.elapsed()))
+                }
+                (None, None, None) => None,
+                _ => return Err(anyhow!("joint prefill lane {index}: checkpoint mismatch")),
+            };
+            let logits = if index == last_lane {
+                last_logits
+                    .take()
+                    .ok_or_else(|| anyhow!("joint prefill: last-row logits are missing"))?
+            } else {
+                logits.last
+            };
+            ensure!(
+                logits.len() == self.cfg.vocab_size as usize,
+                "joint prefill lane {index}: {} logits",
+                logits.len()
+            );
+            let lane_shared = own(lane);
+            outputs.push(JointPrefillOutput {
+                logits,
+                boundary,
+                own_first,
+                shared_rows: lane_shared,
+            });
+            own_first += lane.tokens.len() - lane_shared;
+        }
+        Ok(outputs)
     }
 
     /// ADR-034 task #78 Step 3c.A.2 (2026-05-21) — embed tokens to a
@@ -4442,10 +4678,11 @@ impl Qwen35Model {
         // accesses; durable nextn parents/rings are direct, not pool-issued.
         super::decode_pool::checked_reset_decode_pool()?;
         let seq_len = tokens.len() as u32;
-        // Cue fold ([`super::prefill_fold`]): this forward crosses the stable
-        // prompt boundary at `prefix_rows` and captures the checkpoint there.
-        let fold = super::prefill_fold::take_request(seq_len)?;
-        if fold.is_some() {
+        // Joint prefill ([`super::prefill_joint`]): this forward carries the
+        // chunks of one or more slots, each cut into the segments its own
+        // forwards would run (the cue fold is one lane with a boundary).
+        let joint = super::prefill_joint::take_request(seq_len, kv_cache.n_seqs)?;
+        if joint.is_some() {
             ensure!(
                 matches!(output_head_mode, OutputHeadMode::Last)
                     && soft_tokens.is_empty()
@@ -4456,7 +4693,7 @@ impl Qwen35Model {
                     && !kv_cache.la_capture_active()
                     && !super::dump_bisect::is_enabled()
                     && !super::execution_dispatch::dense_q_split_profile_enabled(),
-                "the cue fold serves the plain and the DFlash-capture prompt prefill only"
+                "a joint prefill serves the plain and the DFlash-capture prompt prefill only"
             );
         }
         // ---- ADR-019 Phase 2 iter91 Worker B (H2 production CB-count probe) ----
@@ -4677,10 +4914,10 @@ impl Qwen35Model {
         //
         // Skip when the model has no FullAttn layers: defensive — avoids a zero-
         // useful arena allocation when running DN-only models.
-        // A folded forward builds each full-attention layer per segment, on
+        // A joint forward builds each full-attention layer per segment, on
         // the segment scratch below, and has no use for chunk-sized scratch.
         let mut fa_arena: Option<super::FaPrefillArena> = if seq_len > 1
-            && fold.is_none()
+            && joint.is_none()
             && layer_weights_gpu
                 .iter()
                 .any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
@@ -4724,7 +4961,7 @@ impl Qwen35Model {
         // Skip when the model has no FullAttn layers: defensive — avoids a
         // zero-useful arena allocation when running DN-only models.
         let mut fa_proj_arena: Option<super::FaProjectionsArena> = if seq_len > 1
-            && fold.is_none()
+            && joint.is_none()
             && layer_weights_gpu
                 .iter()
                 .any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
@@ -4792,7 +5029,7 @@ impl Qwen35Model {
         // Memory footprint at 35B-A3B q4_0-flat pp4096 (h=5120, topk=8,
         // m_moe=512, m_sh=512): ~870 MB. Allocated once for the prefill;
         // M5 Max 128 GB unified memory keeps this well within budget.
-        let mut moe_ffn_arena: Option<super::MoeFfnArena> = if seq_len > 1 && fold.is_none() {
+        let mut moe_ffn_arena: Option<super::MoeFfnArena> = if seq_len > 1 && joint.is_none() {
             if let Some(moe) = cfg.moe.as_ref() {
                 Some(
                     super::MoeFfnArena::new(
@@ -4857,24 +5094,30 @@ impl Qwen35Model {
             None
         };
 
-        // ---- Cue fold: per-segment scratch ----
+        // ---- Joint prefill: per-segment scratch ----
         //
-        // The two segments of a folded forward run their row-mixing layers
-        // as the two forwards would: full attention and the MoE FFN on
-        // scratch sized for the segment, DeltaNet with the boundary state
-        // and the parameter blocks of its two dispatches.
-        let fold_segments: Option<[(u32, u32); 2]> = fold.as_ref().map(|fold| {
-            [
-                (0, fold.prefix_rows),
-                (fold.prefix_rows, seq_len - fold.prefix_rows),
-            ]
-        });
-        let mut fold_fa: Vec<(super::FaPrefillArena, super::FaProjectionsArena, MlxBuffer)> =
-            Vec::new();
-        let mut fold_moe: Vec<super::MoeFfnArena> = Vec::new();
-        let mut fold_dn: Option<super::prefill_fold::DnBoundaryScratch> = None;
+        // Every segment of every lane runs its row-mixing layers as its own
+        // forward would: full attention and the MoE FFN on scratch sized for
+        // the segment, DeltaNet with the states and the parameter blocks of
+        // its own dispatches. A segment whose rows are not contiguous in the
+        // forward (a shared prefix, then the lane's own rows) is built on a
+        // gathered copy of its rows.
+        struct JointSegmentScratch {
+            fa: Option<(super::FaPrefillArena, super::FaProjectionsArena, MlxBuffer)>,
+            moe: Option<super::MoeFfnArena>,
+            /// Gathered input rows; with a MoE FFN also the gathered residual
+            /// rows and the segment's output rows.
+            gather: Vec<MlxBuffer>,
+        }
+        let joint_segments: Vec<super::prefill_joint::Segment> = joint
+            .as_ref()
+            .map(|plan| plan.segments())
+            .unwrap_or_default();
+        let joint_shared_rows = joint.as_ref().map_or(0, |plan| plan.shared_rows);
+        let mut joint_scratch: Vec<JointSegmentScratch> = Vec::new();
+        let mut joint_dn: Option<super::prefill_joint::DnRunScratch> = None;
         ensure!(
-            fold.is_none()
+            joint.is_none()
                 || layer_weights_gpu.iter().all(|layer| {
                     matches!(
                         layer,
@@ -4887,72 +5130,87 @@ impl Qwen35Model {
                         }
                     )
                 }),
-            "the cue fold needs quantized FFN layers"
+            "a joint prefill needs quantized FFN layers"
         );
-        if let Some(segments) = fold_segments {
+        if let Some(plan) = joint.as_ref() {
             let has_full = layer_weights_gpu
                 .iter()
                 .any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }));
             let has_linear = layer_weights_gpu
                 .iter()
                 .any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }));
-            for (first, rows) in segments {
-                if has_full {
+            for segment in &joint_segments {
+                let fa = if has_full {
                     let shape = FullAttnShape::from_config(cfg);
-                    fold_fa.push((
+                    Some((
                         super::FaPrefillArena::new(
                             &device,
-                            rows,
+                            segment.rows,
                             shape.n_head,
                             shape.n_kv,
                             shape.head_dim,
                         )
-                        .context("alloc cue fold FaPrefillArena")?,
+                        .context("alloc joint prefill FaPrefillArena")?,
                         super::FaProjectionsArena::new(
                             &device,
-                            rows,
+                            segment.rows,
                             shape.hidden_size,
                             shape.n_head,
                             shape.n_kv,
                             shape.head_dim,
                             shape.rms_norm_eps,
                         )
-                        .context("alloc cue fold FaProjectionsArena")?,
-                        super::prefill_fold::segment_positions(
+                        .context("alloc joint prefill FaProjectionsArena")?,
+                        super::prefill_joint::segment_positions(
                             &device,
                             positions_flat,
                             seq_len,
-                            first,
-                            rows,
+                            &segment.runs,
                         )?,
-                    ));
-                }
-                if let Some(moe) = cfg.moe.as_ref() {
-                    fold_moe.push(
+                    ))
+                } else {
+                    None
+                };
+                let moe = match cfg.moe.as_ref() {
+                    Some(moe) => Some(
                         super::MoeFfnArena::new(
                             &device,
-                            rows,
+                            segment.rows,
                             h,
                             moe.num_experts_per_tok,
                             moe.moe_intermediate_size,
                             moe.shared_expert_intermediate_size,
                             moe.num_experts,
                         )
-                        .context("alloc cue fold MoeFfnArena")?,
-                    );
+                        .context("alloc joint prefill MoeFfnArena")?,
+                    ),
+                    None => None,
+                };
+                let mut gather = Vec::new();
+                if segment.runs.len() > 1 {
+                    for _ in 0..if cfg.moe.is_some() { 3 } else { 1 } {
+                        gather.push(super::prefill_joint::rows_scratch(
+                            &device,
+                            segment.rows,
+                            h as usize,
+                        )?);
+                    }
                 }
+                joint_scratch.push(JointSegmentScratch { fa, moe, gather });
             }
             if has_linear {
                 let dn_shape = DeltaNetLayerShape::from_config(cfg);
-                fold_dn = Some(super::prefill_fold::DnBoundaryScratch::new(
+                joint_dn = Some(super::prefill_joint::DnRunScratch::new(
                     &device,
-                    [segments[0].1, segments[1].1],
-                    dn_shape.n_k_heads,
-                    dn_shape.n_v_heads,
-                    dn_shape.d_k,
-                    dn_shape.d_v,
-                    dn_shape.conv_kernel,
-                    super::gpu_delta_net::FORWARD_DISPATCH_N_SEQS,
+                    plan,
+                    super::prefill_joint::DnDims {
+                        n_k_heads: dn_shape.n_k_heads,
+                        n_v_heads: dn_shape.n_v_heads,
+                        d_k: dn_shape.d_k,
+                        d_v: dn_shape.d_v,
+                        k_width: dn_shape.conv_kernel,
+                        n_seqs: super::gpu_delta_net::FORWARD_DISPATCH_N_SEQS,
+                    },
                 )?);
             }
         }
@@ -5474,11 +5732,10 @@ impl Qwen35Model {
                 None
             };
             let attn_out = match layer_gpu {
-                LayerWeightsGpu::FullAttn { attn, .. } if fold_segments.is_some() => {
-                    // Cue fold: the layer is built once per segment, with the
-                    // rows, cursor, positions and scratch that segment's own
-                    // forward has, and the two outputs are joined.
-                    let segments = fold_segments.unwrap_or_default();
+                LayerWeightsGpu::FullAttn { attn, .. } if joint.is_some() => {
+                    // Joint prefill: the layer is built once per segment,
+                    // with the rows, cursor, positions, slot and scratch that
+                    // segment's own forward has, and the outputs are joined.
                     let shape = FullAttnShape::from_config(cfg);
                     let full_attn_rank = match kv_cache.slot_index_for_layer(layer_idx as u32) {
                         Some(super::kv_cache::LayerSlot::Full(rank)) => rank as usize,
@@ -5491,20 +5748,59 @@ impl Qwen35Model {
                     };
                     let max_seq = kv_cache.max_seq_len;
                     let width = h as usize;
+                    ensure!(
+                        joint_scratch.len() == joint_segments.len(),
+                        "joint prefill: full-attention segment scratch is missing"
+                    );
                     let joined = super::decode_pool::pooled_alloc_buffer(
                         &device,
                         seq_len as usize * width * 4,
                         DType::F32,
                         vec![seq_len as usize, width],
                     )
-                    .map_err(|e| anyhow!("alloc cue fold attention output: {e}"))?;
-                    let mut outputs = Vec::with_capacity(segments.len());
-                    for ((first, rows), (arena, projections, positions)) in
-                        segments.into_iter().zip(fold_fa.iter_mut())
-                    {
-                        let x = super::prefill_fold::row_view(&hidden, first, rows, width)
-                            .with_shape(vec![rows as usize, width])
-                            .map_err(|e| anyhow!("cue fold attention input rows: {e}"))?;
+                    .map_err(|e| anyhow!("alloc joint prefill attention output: {e}"))?;
+                    if joint_scratch.iter().any(|scratch| !scratch.gather.is_empty()) {
+                        // A segment behind a shared prefix reads a private
+                        // copy of the shared rows followed by its own rows.
+                        let mut enc =
+                            LayerEncoder::from_session_or_plain(&device, layer_session.as_mut())
+                                .context("enc joint prefill attention gather")?;
+                        for (segment, scratch) in joint_segments.iter().zip(&joint_scratch) {
+                            if let Some(rows) = scratch.gather.first() {
+                                super::prefill_joint::gather_segment(
+                                    enc.encoder(),
+                                    &mut registry,
+                                    &device,
+                                    &hidden,
+                                    segment,
+                                    rows,
+                                    h,
+                                )
+                                .with_context(|| {
+                                    format!("joint prefill attention gather layer {layer_idx}")
+                                })?;
+                            }
+                        }
+                        enc.fence_or_commit("layer.full_attn.joint_gather")
+                            .context("commit joint prefill attention gather")?;
+                    }
+                    let mut outputs = Vec::with_capacity(joint_segments.len());
+                    for (segment, scratch) in joint_segments.iter().zip(joint_scratch.iter_mut()) {
+                        let x = match scratch.gather.first() {
+                            Some(rows) => rows.clone(),
+                            None => super::prefill_joint::row_view(
+                                &hidden,
+                                segment.runs[0].first,
+                                segment.rows,
+                                width,
+                            )
+                            .with_shape(vec![segment.rows as usize, width])
+                            .map_err(|e| anyhow!("joint prefill attention input rows: {e}"))?,
+                        };
+                        let (arena, projections, positions) = scratch
+                            .fa
+                            .as_mut()
+                            .ok_or_else(|| anyhow!("joint prefill: full-attention scratch is missing"))?;
                         let slot = &mut kv_cache.full_attn[full_attn_rank];
                         outputs.push(
                             build_gated_attn_layer(
@@ -5515,7 +5811,7 @@ impl Qwen35Model {
                                 attn,
                                 Some(slot),
                                 max_seq,
-                                rows,
+                                segment.rows,
                                 shape.hidden_size,
                                 shape.n_head,
                                 shape.n_kv,
@@ -5528,38 +5824,34 @@ impl Qwen35Model {
                                 Some(projections),
                                 Some(&mut attn_out_holds),
                                 layer_session.as_mut(),
-                                slot_id,
+                                segment.slot,
                             )
                             .with_context(|| {
-                                format!("full_attn layer {layer_idx} rows {first}+{rows}")
+                                format!(
+                                    "full_attn layer {layer_idx} slot {} rows {:?}",
+                                    segment.slot.0, segment.runs
+                                )
                             })?,
                         );
                     }
-                    ensure!(
-                        outputs.len() == segments.len(),
-                        "cue fold: full-attention segment scratch is missing"
-                    );
                     let mut enc =
                         LayerEncoder::from_session_or_plain(&device, layer_session.as_mut())
-                            .context("enc cue fold attention join")?;
-                    for ((first, rows), output) in segments.into_iter().zip(&outputs) {
-                        mlx_native::ops::copy::dispatch_strided_copy_f32(
+                            .context("enc joint prefill attention join")?;
+                    for (segment, output) in joint_segments.iter().zip(&outputs) {
+                        super::prefill_joint::scatter_segment(
                             enc.encoder(),
                             &mut registry,
-                            device.metal_device(),
+                            &device,
                             output,
-                            &super::prefill_fold::row_view(&joined, first, rows, width),
-                            &mlx_native::ops::copy::StridedCopyParams {
-                                rows,
-                                cols: h,
-                                stride_row: h,
-                                stride_col: 1,
-                            },
+                            segment,
+                            joint_shared_rows,
+                            &joined,
+                            h,
                         )
-                        .with_context(|| format!("cue fold attention join layer {layer_idx}"))?;
+                        .with_context(|| format!("joint prefill attention join layer {layer_idx}"))?;
                     }
                     enc.fence_or_commit("layer.full_attn.cue_fold_join")
-                        .context("commit cue fold attention join")?;
+                        .context("commit joint prefill attention join")?;
                     joined
                 }
                 LayerWeightsGpu::FullAttn { attn, .. } => {
@@ -5705,32 +5997,31 @@ impl Qwen35Model {
                     };
                     let state_capture_ref = state_capture_view.as_ref();
                     let conv_capture_ref = conv_capture_view.as_ref();
-                    // Cue fold: this layer's convolution and recurrence split
-                    // at the boundary, writing the state there into the
-                    // checkpoint image.
-                    let dn_boundary = match (fold.as_ref(), fold_dn.as_ref()) {
-                        (Some(fold), Some(scratch)) if linear_slot_idx != usize::MAX => {
-                            let views = fold
-                                .image
-                                .boundary_views(linear_slot_idx)
-                                .with_context(|| format!("cue fold image layer {layer_idx}"))?;
-                            Some(super::prefill_fold::DnBoundarySplit {
-                                prefix_rows: fold.prefix_rows,
-                                scratch,
-                                recurrent: views.recurrent,
-                                conv_image: views.conv,
-                            })
-                        }
+                    // Joint prefill: this layer's convolution and recurrence
+                    // run once per lane segment, each from and into that
+                    // lane's state (or its boundary checkpoint image).
+                    let dn_runs = match (joint.as_ref(), joint_dn.as_ref()) {
+                        (Some(plan), Some(scratch)) if linear_slot_idx != usize::MAX => Some(
+                            scratch
+                                .layer_runs(
+                                    plan,
+                                    &kv_cache.linear_attn[linear_slot_idx],
+                                    linear_slot_idx,
+                                )
+                                .with_context(|| {
+                                    format!("joint prefill DeltaNet runs layer {layer_idx}")
+                                })?,
+                        ),
                         (Some(_), _) => {
                             return Err(anyhow!(
-                                "cue fold: layer {layer_idx} has no DeltaNet cache slot"
+                                "joint prefill: layer {layer_idx} has no DeltaNet cache slot"
                             ))
                         }
                         (None, _) => None,
                     };
                     ensure!(
-                        dn_boundary.is_none() || dn_prefill_arena.is_some(),
-                        "cue fold: DeltaNet layer {layer_idx} has no prefill arena"
+                        dn_runs.is_none() || dn_prefill_arena.is_some(),
+                        "joint prefill: DeltaNet layer {layer_idx} has no prefill arena"
                     );
                     let out = if let Some(arena) = dn_prefill_arena.as_mut() {
                         build_delta_net_layer_with_arena(
@@ -5757,7 +6048,7 @@ impl Qwen35Model {
                             shape.rms_norm_eps,
                             state_capture_ref,
                             conv_capture_ref,
-                            dn_boundary.as_ref(),
+                            dn_runs.as_deref(),
                             // iter91: thread the borrowed session into the
                             // DN helper.  The DN helper has only one
                             // LayerEncoder site (stage_a) so it can
@@ -5828,7 +6119,14 @@ impl Qwen35Model {
 
                         // that corrupted every OTHER active slot at N>=2 concurrent).
 
-                        slot.swap_for_slot(slot_id);
+                        match joint.as_ref() {
+                            Some(plan) => {
+                                for lane in &plan.lanes {
+                                    slot.swap_for_slot(lane.slot);
+                                }
+                            }
+                            None => slot.swap_for_slot(slot_id),
+                        }
                     }
 
                     out
@@ -6377,54 +6675,126 @@ impl Qwen35Model {
                     // the iter91 race for the MoE path that fired at
                     // q4_0-flat layer-15 in the iter91 H4 run.
                     let out = match (
-                        fold_segments,
+                        joint.as_ref(),
                         moe_ffn_arena.as_mut(),
                         moe_ffn_output_ring.as_mut(),
                     ) {
-                        (Some(segments), _, Some(ring)) => {
-                            // Cue fold: the MoE FFN picks its router and
+                        (Some(_), _, Some(ring)) => {
+                            // Joint prefill: the MoE FFN picks its router and
                             // shared-expert kernels by row count, so each
                             // segment is built as its own forward builds it,
                             // on its own scratch, into its rows of the ring.
                             ensure!(
-                                fold_moe.len() == segments.len(),
-                                "cue fold: MoE segment scratch is missing"
+                                joint_scratch.len() == joint_segments.len(),
+                                "joint prefill: MoE segment scratch is missing"
                             );
                             let width = h as usize;
-                            for ((first, rows), arena) in
-                                segments.into_iter().zip(fold_moe.iter_mut())
+                            let ring_slot = ring.slot_clone(layer_idx as u32);
+                            for (segment, scratch) in
+                                joint_segments.iter().zip(joint_scratch.iter_mut())
                             {
-                                let rows_of = |buffer: &MlxBuffer| {
-                                    super::prefill_fold::row_view(buffer, first, rows, width)
-                                        .with_shape(vec![rows as usize, width])
-                                        .map_err(|e| anyhow!("cue fold MoE rows: {e}"))
-                                };
-                                let x = rows_of(&ffn_input)?;
-                                let residual = fold_residual.map(rows_of).transpose()?;
-                                let mut out_rows = rows_of(ring.slot_mut(layer_idx as u32))?;
-                                build_moe_ffn_layer_gpu_q_into_with_arena(
-                                    enc.encoder(),
-                                    &device,
-                                    &mut registry,
-                                    &x,
-                                    w_gpu,
-                                    shape,
-                                    residual.as_ref(),
-                                    arena,
-                                    &mut out_rows,
-                                    layer_idx,
-                                )
-                                .with_context(|| {
+                                let arena = scratch
+                                    .moe
+                                    .as_mut()
+                                    .ok_or_else(|| anyhow!("joint prefill: MoE scratch is missing"))?;
+                                let context = || {
                                     format!(
-                                        "moe_ffn_q_into_with_arena layer {layer_idx} rows {first}+{rows}"
+                                        "moe_ffn_q_into_with_arena layer {layer_idx} slot {} rows {:?}",
+                                        segment.slot.0, segment.runs
                                     )
-                                })?;
+                                };
+                                if let [x, residual_rows, out_rows] = scratch.gather.as_slice() {
+                                    // Behind a shared prefix: private copies
+                                    // of the segment's input and residual
+                                    // rows, and its kept output rows back.
+                                    super::prefill_joint::gather_segment(
+                                        enc.encoder(),
+                                        &mut registry,
+                                        &device,
+                                        &ffn_input,
+                                        segment,
+                                        x,
+                                        h,
+                                    )
+                                    .with_context(context)?;
+                                    if let Some(residual) = fold_residual {
+                                        super::prefill_joint::gather_segment(
+                                            enc.encoder(),
+                                            &mut registry,
+                                            &device,
+                                            residual,
+                                            segment,
+                                            residual_rows,
+                                            h,
+                                        )
+                                        .with_context(context)?;
+                                    }
+                                    enc.encoder().memory_barrier();
+                                    let mut out_rows = out_rows.clone();
+                                    build_moe_ffn_layer_gpu_q_into_with_arena(
+                                        enc.encoder(),
+                                        &device,
+                                        &mut registry,
+                                        x,
+                                        w_gpu,
+                                        shape,
+                                        fold_residual.map(|_| residual_rows),
+                                        arena,
+                                        &mut out_rows,
+                                        layer_idx,
+                                    )
+                                    .with_context(context)?;
+                                    enc.encoder().memory_barrier();
+                                    super::prefill_joint::scatter_segment(
+                                        enc.encoder(),
+                                        &mut registry,
+                                        &device,
+                                        &out_rows,
+                                        segment,
+                                        joint_shared_rows,
+                                        &ring_slot,
+                                        h,
+                                    )
+                                    .with_context(context)?;
+                                } else {
+                                    ensure!(
+                                        segment.runs.len() == 1,
+                                        "joint prefill: MoE gather scratch is missing"
+                                    );
+                                    let first = segment.runs[0].first;
+                                    let rows_of = |buffer: &MlxBuffer| {
+                                        super::prefill_joint::row_view(
+                                            buffer,
+                                            first,
+                                            segment.rows,
+                                            width,
+                                        )
+                                        .with_shape(vec![segment.rows as usize, width])
+                                        .map_err(|e| anyhow!("joint prefill MoE rows: {e}"))
+                                    };
+                                    let x = rows_of(&ffn_input)?;
+                                    let residual = fold_residual.map(rows_of).transpose()?;
+                                    let mut out_rows = rows_of(&ring_slot)?;
+                                    build_moe_ffn_layer_gpu_q_into_with_arena(
+                                        enc.encoder(),
+                                        &device,
+                                        &mut registry,
+                                        &x,
+                                        w_gpu,
+                                        shape,
+                                        residual.as_ref(),
+                                        arena,
+                                        &mut out_rows,
+                                        layer_idx,
+                                    )
+                                    .with_context(context)?;
+                                }
                             }
-                            ring.slot_clone(layer_idx as u32)
+                            ring_slot
                         }
                         (Some(_), _, None) => {
                             return Err(anyhow!(
-                                "cue fold: MoE output ring missing at layer {layer_idx}"
+                                "joint prefill: MoE output ring missing at layer {layer_idx}"
                             ))
                         }
                         (None, Some(arena), Some(ring)) => {
@@ -7131,23 +7501,42 @@ impl Qwen35Model {
                 Vec::new()
             }
         };
-        if let Some(fold) = fold.as_ref() {
-            // The checkpoint's logits: the head over the last prefix row, as
-            // the prefix's own forward projects it. The head above drained
-            // every layer, so `hidden` is settled.
-            let boundary_logits = apply_output_head_gpu_last(
-                None,
-                &device,
-                &mut registry,
-                &hidden,
-                &output_head,
-                fold.prefix_rows,
-                h,
-                cfg.vocab_size,
-                eps,
-            )
-            .context("cue fold boundary logits")?;
-            super::prefill_fold::publish_boundary_logits(boundary_logits);
+        if let Some(plan) = joint.as_ref() {
+            // The other rows a lane's own forwards project: each earlier
+            // lane's last row, and the last content row of a lane that folds
+            // its cue (the checkpoint's logits). The head above drained every
+            // layer, so `hidden` is settled; the last lane's last row is the
+            // forward's own.
+            let last_lane = plan.lanes.len() - 1;
+            let mut lane_logits = Vec::with_capacity(plan.lanes.len());
+            for (index, lane) in plan.lanes.iter().enumerate() {
+                let mut head = |row: u32| {
+                    apply_output_head_gpu_last(
+                        None,
+                        &device,
+                        &mut registry,
+                        &hidden,
+                        &output_head,
+                        row + 1,
+                        h,
+                        cfg.vocab_size,
+                        eps,
+                    )
+                    .with_context(|| format!("joint prefill lane {index} logits of row {row}"))
+                };
+                let boundary = lane.boundary_row().map(&mut head).transpose()?;
+                let last = if index == last_lane {
+                    ensure!(
+                        lane.last_row() + 1 == seq_len,
+                        "joint prefill: the last lane does not end the forward"
+                    );
+                    Vec::new()
+                } else {
+                    head(lane.last_row())?
+                };
+                lane_logits.push(super::prefill_joint::LaneLogits { last, boundary });
+            }
+            super::prefill_joint::publish_logits(lane_logits);
         }
         if let Some(t) = t_output_head {
             eprintln!(

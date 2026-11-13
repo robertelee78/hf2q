@@ -51,6 +51,7 @@ fn switches(fold_cue: bool) -> SwitchesForTest {
     SwitchesForTest::set(PrefillSwitches {
         prepared: true,
         fold_cue,
+        joint: false,
     })
 }
 
@@ -377,6 +378,7 @@ fn the_scheduler_keeps_two_forwards_where_the_fold_does_not_apply() {
     let _switches = SwitchesForTest::set(PrefillSwitches {
         prepared: false,
         fold_cue: true,
+        joint: false,
     });
     assert_eq!(folds(&qwen, &mut kv, 40, 5, false, None), None);
 }
