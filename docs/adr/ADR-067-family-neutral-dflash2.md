@@ -1503,8 +1503,9 @@ at another window offset can differ once the history crosses a split
 boundary (first at 1,536 tokens, then every 768), and the window
 boundaries follow a verify budget fed by wall-clock time. That belongs to
 the attention tile and the scheduler, not to this change, and was not
-fixed here. Eight runs do not measure quality; the workflow-oracle pass
-rate needs root's long comparison.
+fixed here; mlx-native 0.21.9 removes it (see the attention-kernel
+differential below). Eight runs do not measure quality; the
+workflow-oracle pass rate needs root's long comparison.
 
 Prepared planes are published only after the command buffer that writes
 them has completed (`prepared_projection::ensure_planes`; one buffer per
@@ -1609,6 +1610,57 @@ experts of more than eight routes, which this route runs as successive 8-row
 tiles in one threadgroup where Splash launches one threadgroup per tile. The
 route needs unpublished mlx-native kernels and is not quality-qualified.
 
+Second pass (wave 2). Measured inside the served cycle without the category
+profile (a diagnostic binary that gives every verify cycle one variant and
+reads each command buffer's GPU timestamps), the stage cost 15.5 ms of GPU
+time per four-lane cycle at the 20.3 rows the combined candidate verifies
+(8.7 ms plus 0.335 ms per verified row), not the profile's 17.6 to 21.5 ms:
+profiled cycles verify 24 to 25 rows because their waits flatten the verify
+budget's cost line, the category also holds the post-attention norm and the
+capture copy, and GPU time drifts inside a profiled process. The model-free
+0.375 ms came from one set of expert weights re-read sixteen times per
+command; with every layer on its own planes, as served, the layer took 0.323
+ms (Q4_K down) and 0.358 ms (Q6_K down) on the candidate's routes against
+Splash's 0.294 and 0.326 ms. The target of 13.6 ms was Splash on one weight
+set at 25 live rows; on the served routes and memory pattern it is 12.3 ms
+(medians of nine Q4_K-down and six Q6_K-down runs of 20 commands).
+
+The route now encodes its expert stages with `moe_tiles_fused` (Splash:
+`kernels/shared/moe.metal` grouping, `moe_expert_slab.h:63-100`): one
+schedule that applies the verify-row mask, emits tiles of at most eight
+routes (an expert of more routes is several threadgroups) and appends the
+shared expert's tiles; one gather; one gate/up and one down pass for routed
+and shared tiles together; and the router and shared-gate logits of all full
+blocks of eight rows in one dispatch each of the row-exact kernel. A layer
+is 8 dispatches and 6 barriers at 32 rows instead of 19 and 7. Every route
+keeps the tile arithmetic and register-path rule, so the layer is bitwise
+the stage-by-stage form (whole layers, masked and unmasked, widths 1 to 32,
+experts of up to 32 routes), which remains as the fallback for layers whose
+routed and shared planes differ in format or width. Model-free the layer
+takes 0.296 ms (Q4_K down) and 0.331 ms (Q6_K down), 12.5 ms for 40 layers
+against Splash's 12.3. In the served cycle, alternating the two forms per
+verify cycle in one process (506 four-lane cycles of two runs), the fused
+form uses 0.90 ± 0.13 ms less GPU time per cycle and its MoE stage takes
+14.8 instead of 15.7 ms at 20.6 verified rows. Four exact Q5 runs per form,
+interleaved on a host whose cycle time drifted between 34 and 43 ms, do not
+resolve that difference (median four-lane cycle 39.1 against 38.2 ms, three
+of four passes each); dispatches per cycle fall from 6,316 to 5,876. About
+1.5 ms of the stage in the server is not reproduced model-free: a GPU left
+idle before the command, as between cycles, accounts for 0.4 ms of it.
+
+The lower accepted-token count per lane-cycle of the combined candidate
+(4.00 against 4.17) follows the verify budget, not the tiles' arithmetic:
+the candidate removes fixed cycle cost (40.3 to 23.8 ms) while a verified
+row still costs 0.36 ms, so the budget verifies 4.29 instead of 4.73 draft
+rows per lane-cycle, and accepted tokens per second rise from 321 to 473.
+The first draft token matches equally often in every arm (0.815 to 0.823).
+On identical inputs (128 independent verify windows after a common prefill,
+teacher-forced), the staged-M8 route and the live tiles sit equally far from
+the FP32-expert route (relative logit error per window 3.2e-2 ± 0.25e-2 and
+3.1e-2 ± 0.18e-2, ten argmax differences in 1,024 rows each), and running
+the shared expert or the router on the staged-M8 route's FP32 kernels
+changes neither figure.
+
 #### Splash attention-kernel differential
 
 The full-attention kernels (K/V cache write, attention, output gate; the
@@ -1650,11 +1702,7 @@ the window's later rows, its packed row and the padding. Against the serial
 chain on hf2q's cache one layer's gated output moves by at most 1.0% of the
 row RMS in a deliberately peaked fixture, a relative RMS of 6.2e-4 to 7.9e-4
 per row, also across five steps with partial acceptance and cursor
-truncation; the test limits are 2% and 2e-3. The same token verified at
-another offset of another window can differ in its last bits (relative RMS
-about 4e-6), because the split partition follows the window's start; that
-alignment comes from the lane's own acceptance history, never from its
-cohort.
+truncation; the test limits are 2% and 2e-3.
 
 An independent review measured the route's error against the exact F64
 attention at 3e-4 on flat and about 1e-3 on peaked attention, 1.1 to 2.5
@@ -1690,6 +1738,72 @@ both, and from runtime-compiled source), and the route reports itself
 unavailable, so the step keeps the per-row chain, when a kernel's threads or
 threadgroup memory exceed the device's limits. A step the switch asked for
 and the route refused logs its reason once.
+
+A later review found that a token's bits depended on its verify window. As
+released in mlx-native 0.21.8 the tile cut a lane's history into splits by
+the pages of the whole window, so a window that crossed the page boundary
+where the split length steps (every 768 tokens of history from 1,536 on) gave
+its rows before the boundary another partition than the same tokens get in a
+window that ends there: at cursor 1,525 none of four tokens kept its bits and
+one logit moved by 0.85. Window starts follow the verify budget, which is fed
+by wall-clock time, so the served text could change from run to run. From
+mlx-native 0.21.9 a token's split length is a function of its own page count.
+Rows that ask for the same length share a tile as before, because a page or
+a split that holds none of a row's tokens leaves its bits alone, and a window
+whose rows ask for two lengths runs as two tiles on the lane's scratch. A
+token's output is now bitwise the same at every row index, window length,
+lane count and width. mlx-native verifies every position up to 9,152 tokens
+of history at every row index over every window start, and every window
+start within 48 tokens of each of the 43 such boundaries up to 33,824 tokens,
+at both geometries, plain, under Metal shader validation, under the debug
+layer and under both; with the cut disabled the first test fails on 70
+Qwen3.8 tokens. Its F64 reference, determinism, saturation, cohort and
+causal-end tests each include cut windows.
+`verify_attn_tile_window_tests` repeats the sweep on hf2q's cache: 24
+positions around every such boundary below 9,000 tokens, around plain page
+boundaries and at an empty slot, under eleven window plans including partial
+acceptance, in steps of one to four lanes at widths 8, 16 and 32, with equal
+cache bytes after every plan; and seven steps of partial acceptance and
+rollback from cursors just below 1,536 tokens keep the serial chain's cache
+bytes and cursors and ignore rejected tokens in cut windows. An independent
+review confirmed the independence for every window start up to 33,824
+tokens and that the only bits that differ from 0.21.8 are those of the rows
+before the boundary in a cut window. Everywhere else the partition and the bits are
+those of 0.21.8, and so is the cost: −2 to +1% at 512 to 32,768 tokens with
+one and four lanes (two passes of the median of 20,
+`$V/splash-gap/attnverify/align/batch1.log`). A cut window costs 0.142
+against 0.099 ms per Qwen3.8 layer at four lanes and is 7 of every 768 window
+starts. An absolute partition whose runs grow with their start page was
+built first and rejected: it gives the same independence but 53 to 105
+splits against 24 at 8,192 and 32,768 tokens, 3 to 36% slower there.
+
+In situ, every combined-candidate switch on, exact four-agent Q5
+(`$V/splash-gap/attnverify/align/runs`). With the any-width switches of #825
+(hf2q `68d90b67` plus this change, mlx-native `807ac72`, binary `ec64fe57`):
+seven Qwen3.6 runs, all `CalibrationPass`, all with the same transcripts for
+all four agents (5,322 completion tokens), and two Qwen3.8 runs with
+identical transcripts (5,198). The same switches on the 0.21.8 tile gave two
+transcripts in eight Qwen3.6 runs (six and two, see above). At that rate
+seven equal runs would happen by chance about 13% of the time, so this
+supports, and does not prove, that the tile was the remaining source; the
+proof is the model-free tests. Against the 0.21.8 runs every agent's text
+first differs after its history has crossed 1,536 tokens, never before, as
+the changed bits of tokens in cut windows allow. The four-lane cycle medians
+are 31.6 to 33.9 ms for Qwen3.6 (33.1 to 35.0 on the 0.21.8 tile) and 68.9
+and 69.9 ms for Qwen3.8 (72.0 and 72.4), runs of different sessions.
+
+Without the any-width switches (hf2q `991abc2e`, mlx-native `b76b42b`, binary
+`0a23d8a5`, before #825 merged): two Qwen3.8 runs with identical transcripts
+(5,330 completion tokens). Of six Qwen3.6 runs five are `CalibrationPass`
+and one is `ClientFailed` (an agent left the six-step workflow; two of the
+six 0.21.8 candidate runs were `ClientFailed` too, one with this error); no
+two of the five have the same transcripts. That variation is the
+width-dependent route #825 removes, not the defect fixed here: it starts in
+the first assistant message, at 687 prompt tokens and under 200 generated
+ones, below the first page boundary where the split length steps, and the
+0.21.8 control arm with the tile off shows it too (up to four variants of an
+agent's first message in six runs). No same-session control with the 0.21.8
+tile was run for either set.
 
 Model free the route takes 0.051, 0.116 and 0.331 ms per Qwen3.8 layer at
 four lanes (0.033, 0.048, 0.103 ms at one) and 0.046, 0.083 and 0.195 ms per
@@ -1799,6 +1913,208 @@ synchronization time over 9,063 dispatches. Profiling serializes dispatches,
 so the Qwen3.6 MoE figure overstates its unprofiled cost, and Splash's 9.7 ms
 is for lanes that share experts; on the recorded routes of this workload its
 own kernels take 13.6 ms.
+
+#### Cycle scheduling: wall time against GPU time
+
+A per-command-buffer timeline (`HF2Q_DFLASH2_CYCLE_TIMELINE`, mlx-native
+`command_timeline`: host encode, commit and wait times beside Metal's
+`kernelStartTime`/`GPUStartTime`/`GPUEndTime` on one clock, no commit turned
+into a wait) replaces the estimate above with a measurement. One four-lane
+Qwen3.8 cycle of the combined candidate: 73.6 ms wall, 64.3 ms of GPU
+execution, 9.3 ms of GPU idle. The 16 layer commands (9,063 dispatches,
+1,683 barriers) are encoded in 11.8 ms and all committed by 22.6 ms, 3 to
+41 ms before the GPU reaches them: dispatch count costs worker CPU, not wall
+time. The idle is 6.9 ms between the draft command and the target's first
+command, where the worker allocates and zero-fills the verify step's
+DeltaNet replay storage (188 MB per step; 91 MB and 2.6 ms on Qwen3.6), and
+2.2 ms after the output head (readback, host plan, replay encode, an idle
+GPU's 0.5 ms start latency), plus two waited commit commands.
+
+Two Class A switches, off by default, remove most of it:
+`HF2Q_QWEN_VERIFY_REPLAY_REUSE=1` keeps the replay storage between steps
+(almost all of the gain; the retained storage is outside memory admission)
+and `HF2Q_DFLASH2_CONTEXT_FIRST=1` submits the draft-context commit before
+the replay is encoded, so the two commit commands overlap on the GPU (the
+step still waits for both; 0.4–0.5 ms off the cycle's tail). With both on,
+GPU idle per
+four-lane cycle falls to 2.7 ms on Qwen3.8 and 1.7 ms on Qwen3.6. The same
+timelines explain the non-additive single-switch readings: GPU time per
+command class adds exactly (live tiles −3.3 ms, attention tile −11.3 ms,
+both −14.7 ms of layer time); half of the staged draft's 5.0 ms was hidden
+behind the replay-storage allocation; and the single-switch arms had been
+measured in a block that ran about 3 ms slower than the control block. The
+measured tables, commands and what remains (host acceptance between the
+target and its commit commands, which Splash runs as one command) are in
+`splash-gap/CycleHost.md` of the campaign state.
+
+#### Splash mixer differential (projections and DeltaNet)
+
+The combined candidate's profiled `projections` + `delta_conv` + `delta_gdn`
+categories read 23.2 ms per four-lane Qwen3.8 cycle and 8.4 ms per Qwen3.6
+cycle. They hold more than Splash's "DeltaNet" stage (12.8 and 4.7 ms): the
+pre-mixer norm of every layer and the attention projections, head norms and
+rotary encoding are in them too. Splash spends 16.5 and 6.0 ms on the same
+work (its decode profile, `splash-kernel-bench/REPORT.md` section 4).
+
+A per-dispatch-group profile and two model-free benches (mlx-native
+`bench_qwen_delta_proj`, `bench_qwen_delta_core`; DRAM-cold weights and
+state, samples behind a filler command buffer) place the difference:
+
+- Product for product the prepared kernel is at or below Splash's (qkv
+  0.072 against 0.083 ms, z gate 0.057 against 0.072, output 0.046 against
+  0.062). But each prepared product with several K splits is a split-grid
+  pass, a barrier and a reduce pass, so the three input products of a layer
+  ran as four serialized stages: 0.177 ms per Qwen3.8 DeltaNet layer against
+  0.129 for Splash's one fused dispatch
+  (`runtime/metal/kernels/shared/gguf_linear.metal:197-232`, in-kernel split
+  reduce `common/split_reduce.h`).
+- Between the projections a DeltaNet layer issued 148 dispatches in five
+  stages at four lanes (two convolution dispatches, a raw-row copy and the
+  recurrence per window; Q norm, K norm, V copy and query scale per row):
+  0.098 ms per Qwen3.8 layer against 0.073 for Splash's one
+  `verify_gdn_fused` (`runtime/metal/kernels/decode/gdn.metal`), which hands
+  its phases their operands in threadgroup memory.
+- Two F32 to BF16 cast stages per layer, which Splash's BF16 residual stream
+  does not have.
+
+`HF2Q_QWEN_VERIFY_MIXER_FUSED=1` (default off) adopts the structure and keeps
+hf2q's arithmetic. The input products of a layer are issued as one wave, one
+kernel pass per product with no reduce pass or barrier
+(`dispatch_repacked_gguf_mm_bf16_input_one_pass`, the bits of the default
+entry): 0.130 ms per Qwen3.8 layer with Q4_K qkv (Splash 0.129), 0.153 with
+Q6_K (0.148), 0.048 per Qwen3.6 layer (0.041). When every product of a layer
+is prepared the pre-mixer norm writes their BF16 rows
+(`dispatch_rms_norm_f32_to_bf16`). The DeltaNet core of every window is one
+dispatch (`gdn_window_fused`) that writes the output projection's BF16 rows:
+0.068 ms per Qwen3.8 layer and 0.054 per Qwen3.6 layer at four lanes. Every
+kernel repeats the stock kernels' operations in their order, including the
+128-thread tree of the norm reductions, and the route is Class A: rows,
+captures, state and retained replay rows are bitwise the stock route's. That
+equality is qualified by test on the Apple M5 Max, not by the source alone:
+outside the pinned norm sums and scales the fused kernel's phases keep
+Metal's fast-math flags, as the stock kernels do, so mlx-native
+`tests/test_gdn_window_fused.rs` is the gate for any other GPU family. The
+core serves head dimension 128, two to nine convolution taps and windows of
+at most eight rows within the device's threadgroup limits; other layers keep
+the stock chain, and the first use and first refusal are logged. A DeltaNet
+layer is 7 dispatches in five stages instead of 159 in 14.
+
+Exact four-agent runs, every other switch of the combined candidate on, same
+binary with the switch on and off, all `CalibrationPass`
+(`$V/splash-gap/deltaproj/runs`; two runs per arm; first the binary
+without the BF16 norm on a quiet host, then the final binary on a host that
+ran both arms about 22% slower):
+
+| Four lanes | Qwen3.8 off | Qwen3.8 on | Qwen3.6 off | Qwen3.6 on |
+|---|---:|---:|---:|---:|
+| Cycle, first binary (ms) | 75.1 / 75.6 | 70.6 / 70.9 | 33.3 / 33.9 | 31.2 / 31.7 |
+| Cycle, final binary (ms) | 92.6 / 92.3 | 86.0 / 88.0 | 36.6 / 36.4 | 35.6 / 34.7 |
+| Dispatches per cycle | 9,063 | 1,703 | 6,316 | 1,716 |
+| Barriers per cycle | 1,683 | 1,203 | 1,146 | 846 |
+| Profiled projections + DeltaNet (GPU ms, final binary) | 23.8 | 17.0 | 8.2 | 6.9 |
+
+Qwen3.8 emitted the same text in every run of both arms (5,462 completion
+tokens, 5.3191 accepted rows per lane-cycle), as a bitwise route must. Qwen3.6
+text varies from run to run in both arms; over six runs per arm its accepted
+rows per lane-cycle read 3.87-4.34 with the switch and 4.04-4.21 without,
+which these runs cannot separate. No paired campaign has been run.
+
+Left of the like-for-like distance (0.5 ms on Qwen3.8, 0.9 ms on Qwen3.6,
+profiled, with the profile's own command buffer per category boundary on the
+hf2q side): the attention layers' Q/gate de-interleave, head norms and rotary
+stages (0.3 against 0.15 ms), one cast stage per attention layer, and on
+Qwen3.6 the stock projections of 8- and 16-row steps. (Those runs predate
+`HF2Q_REPACKED_GGUF_ANY_WIDTH`. With it the prepared routes serve every tile
+width of a DFlash2 verify step and the wave and the BF16 norm follow the
+same width rule; tests hold the step bitwise equal to the stock chain at
+widths 4, 8, 16 and 32 on the synthetic MoE layout and on the official
+Qwen3.6 artifact. Its effect on the Qwen3.6 cycle has not been measured.)
+Outside these
+categories the DeltaNet replay command of a partially accepted window still
+costs 2.1 ms GPU per Qwen3.8 cycle and 1.2 ms per Qwen3.6 cycle plus a host
+wait; Splash folds the retained rows into the state at the lane's next step
+instead (`gdn.metal:22-25`).
+
+#### Second combined candidate and the end-to-end comparison with Splash
+
+The second round of stage work (prepared routes at every verify width with a
+shared head, fused MoE stages, replay-storage reuse and context-first commit,
+the fused DeltaNet mixer, the alignment-independent attention tile, the cue
+fold and lane-pass capture ingest; mlx-native 0.21.9) was built into one
+binary (`ff578ce3`) and measured with every switch on against the first
+combined candidate's switch set on the same binary. `$E` is
+`/Users/robert/.local/state/hf2q/campaigns`. Each block's two arms ran back
+to back with nothing else on the host.
+
+Qwen3.8, six balanced blocks (`$E/qwen38-w2-all-d5-v1`), 12 of 12
+`CalibrationPass`:
+
+| Metric | All switches | First combined candidate | Reduction (95% CI) |
+|---|---:|---:|---|
+| Client makespan (s) | 32.75 | 37.91 | 13.94% (13.05–14.81%) |
+| Four-lane cycle (ms) | 60.18 | 71.92 | 17.15% (16.18–18.10%) |
+| Total prefill per run (s) | 12.03 | 12.69 | 5.47% (4.63–6.30%) |
+
+Each arm repeats its own text exactly (5,198 and 5,330 completion tokens).
+Peak footprint 71.51 against 70.49 GiB.
+
+Qwen3.6, ten balanced blocks (`$E/qwen36-w2-all-d5-v1`): 10 of 10 candidate
+runs and 9 of 10 control runs passed (the control failure is the workflow
+oracle's "initial six-step workflow not followed"). Over the nine blocks
+where both passed:
+
+| Metric | All switches | First combined candidate | Ratio (95% CI) |
+|---|---:|---:|---|
+| Client makespan (s) | 18.85 | 22.82 | 0.870 (0.803–0.943) |
+| Four-lane cycle (ms) | 27.27 | 32.66 | 0.853 (0.834–0.873) |
+| Total prefill per run (s) | 4.99 | 5.28 | 0.997 (0.936–1.062) |
+| Accepted tokens per lane-cycle | 3.914 | 3.987 | 0.978 (0.960–0.997) |
+
+The Qwen3.6 candidate emitted the same 5,322 completion tokens in all ten
+runs, and in seven further runs of the attention-tile owner; the control
+emitted between 3,771 and 6,581. Qwen3.6 output used to vary from run to run
+because a target row's bits depended on the verify tile width (stock kernels
+at 8 and 16 rows, prepared at 32) and on the alignment of the verify window
+(the attention tile's split length), and both follow a verify budget fed by
+wall-clock time. With the prepared routes at every width and the tile's split
+length a function of the token's own position, a row's bits no longer depend
+on either. Rows decoded outside a DFlash2 verify step still use other
+kernels.
+
+A run's GPU speed follows the GPU clock. Over eleven Qwen3.8 runs with a
+100 ms sampler of the GPU performance state beside them, the 16 layer
+commands of a cycle took 50.3–53.2 ms in runs at 1,470–1,506 MHz and
+60.9–63.1 ms in runs at 1,133–1,189 MHz (r = 0.97 across run means; r =
+0.83–0.99 within a run). Builds and other work on the host lower the clock.
+Two runs minutes apart can therefore differ by 13 ms per cycle with identical
+commands, which is why earlier single-run comparisons disagreed and why the
+campaigns above ran their arms back to back on an otherwise idle host. A
+stage gain under about 5% needs the behaviour alternated inside one process
+or the sampler beside every run.
+
+The end-to-end comparison on the Qwen3.6 workload, from the retained
+artifacts of Splash's valid arm (17 runs, median 16.42 s) and of the first
+combined candidate (19 runs, median 21.98 s):
+
+| Part | hf2q | Splash | Difference |
+|---|---:|---:|---:|
+| Prompt prefill, GPU wall per run (s) | 5.27 | 2.78 | +2.5 |
+| Decode and host time while requests are in flight (s) | 16.66 | 13.58 | +3.1 |
+| Prefill cost per row (ms) | 0.709 | 0.241 | |
+| Tokens per lane-cycle | 4.00 | 4.23 | |
+
+Splash prefills several lanes' rows in one batch (about 383 rows and 95 ms
+per batch, 30 batches per run against hf2q's 56 chunks) and shares the prefix
+the four agents' first prompts have in common. Its served cycles cost about
+15, 20, 25 and 28 ms at one to four lanes, more than its synthetic profile's
+20.8 ms at four lanes suggests for the smaller cohorts; the second combined
+candidate's cycles are 16.5, 20.9, 25.5 and 27.0 ms. Splash did more work in
+that arm (69% of its agents needed the repair turns against 22% of hf2q's),
+so at equal work the gap was larger than the medians show. After this round
+the remaining distance on Qwen3.6 (18.85 against 16.42 s) is prompt prefill.
+On Qwen3.8, where no valid Splash end-to-end run exists, prefill is 12.0 s
+of a 32.8 s run and the four-lane cycle is 60.2 ms against Splash's 50.6 ms
+profile.
 
 ### D5: performance qualification
 

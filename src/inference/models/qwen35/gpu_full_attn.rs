@@ -1730,9 +1730,11 @@ fn apply_q_gate_projection_f32_into(
             )
         }
         FullAttnQGateWeightsGpu::Fused { weight, ggml_type } => {
-            // Pooled, like the K/V/output projections of this layer: a fresh
-            // device buffer here was zero-filled on the CPU for every layer
-            // and dropped while its command buffer was still in flight.
+            // This helper pools a one-row projection only; at prefill row
+            // counts it returns a fresh zero-filled `[rows, 2 * q_total]`
+            // device buffer per layer. The prepared prefill route does not
+            // come here (`project_attention_inputs_into_arena` writes a
+            // pooled buffer).
             let fused = apply_linear_projection_f32_pooled_with_ggml_type(
                 encoder,
                 registry,

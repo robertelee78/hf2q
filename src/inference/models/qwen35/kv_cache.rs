@@ -1262,6 +1262,21 @@ impl HybridKvSlotAnchor {
             linear_image: None,
         }
     }
+
+    /// Everything the checkpoint holds, for bitwise comparison in tests.
+    #[cfg(test)]
+    pub(crate) fn test_words(&self) -> (usize, u64, u32, Vec<u32>, Option<u32>, Vec<u32>) {
+        (
+            self.prompt_len,
+            self.state_generation,
+            self.graft_len,
+            self.full_attn_current_len.clone(),
+            self.mtp_current_len,
+            self.linear_image
+                .as_ref()
+                .map_or_else(Vec::new, LaAnchorImage::words),
+        )
+    }
 }
 
 /// **ADR-027 Phase B iter-35 (sub-iter 23d-α)** — deep-copy snapshot of
@@ -1846,6 +1861,69 @@ impl HybridKvCache {
             full_attn_current_len,
             mtp_current_len,
             linear_image: Some(linear_image),
+        })
+    }
+
+    /// The checkpoint [`Self::snapshot_slot_anchor`] would have taken at
+    /// `prompt_len`, for a forward that ran past that boundary and wrote the
+    /// slot's DeltaNet state there into `image` itself (the cue fold). The
+    /// full-attention rows below the boundary are in place, as for any
+    /// anchor, so the cursors are the boundary's; the MTP cursor is the live
+    /// one, which a target-only forward does not move.
+    pub(crate) fn slot_anchor_at_boundary(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        prompt_len: usize,
+        image: LaAnchorImage,
+    ) -> Result<HybridKvSlotAnchor> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "slot_anchor_at_boundary: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(
+            prompt_len > 0 && prompt_len <= self.max_seq_len as usize,
+            "slot_anchor_at_boundary: prompt_len={prompt_len} outside 1..={}",
+            self.max_seq_len
+        );
+        anyhow::ensure!(
+            image.layer_count() == self.linear_attn.len()
+                && image.total_bytes() == self.slot_anchor_image_bytes()?,
+            "slot_anchor_at_boundary: image does not have this cache's layout"
+        );
+        let boundary = u32::try_from(prompt_len)
+            .context("slot_anchor_at_boundary: prompt_len does not fit u32")?;
+        for (layer_idx, full) in self.full_attn.iter().enumerate() {
+            let cursor = *full.current_len.get(slot_idx).ok_or_else(|| {
+                anyhow!("slot_anchor_at_boundary: full_attn[{layer_idx}] cursor missing")
+            })?;
+            anyhow::ensure!(
+                cursor > boundary,
+                "slot_anchor_at_boundary: full_attn[{layer_idx}] cursor={cursor} is not past the boundary {prompt_len} for slot {}",
+                slot.0
+            );
+        }
+        let mtp_current_len = self
+            .mtp_slot
+            .as_ref()
+            .map(|mtp| {
+                mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
+                    anyhow!(
+                        "slot_anchor_at_boundary: MTP cursor missing for slot {}",
+                        slot.0
+                    )
+                })
+            })
+            .transpose()?;
+        Ok(HybridKvSlotAnchor {
+            prompt_len,
+            state_generation: self.slot_state_generation(slot)?,
+            graft_len: self.graft_len[slot_idx],
+            full_attn_current_len: vec![boundary; self.full_attn.len()],
+            mtp_current_len,
+            linear_image: Some(image),
         })
     }
 

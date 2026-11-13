@@ -32,6 +32,7 @@ const CANONICAL: JointStepOptions = JointStepOptions {
     projection: JointProjectionKernel::Canonical,
     pooled_outputs: false,
     verify_attention_tile: false,
+    verify_mixer_fused: false,
 };
 
 /// Joint arms of the trace: the production default first, then the
@@ -58,6 +59,7 @@ const JOINT_ARMS: [(JointDenseFfnRoute, JointStepOptions, &str); 4] = [
             projection: JointProjectionKernel::ColumnInvariantMma,
             pooled_outputs: false,
             verify_attention_tile: false,
+            verify_mixer_fused: false,
         },
         "joint_shared_ffn_mma",
     ),
@@ -67,6 +69,7 @@ const JOINT_ARMS: [(JointDenseFfnRoute, JointStepOptions, &str); 4] = [
             projection: JointProjectionKernel::Canonical,
             pooled_outputs: true,
             verify_attention_tile: false,
+            verify_mixer_fused: false,
         },
         "joint_shared_ffn_pooled",
     ),

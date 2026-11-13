@@ -32,6 +32,10 @@ pub(crate) struct JointStepOptions {
     /// ([`super::verify_attn_tile`], Class B). Decode steps never take it and
     /// MTP verify rejects it.
     pub verify_attention_tile: bool,
+    /// DFlash2 verify steps only: the fused mixer stage
+    /// ([`super::joint_mixer_fused`], Class A). Decode steps never take it
+    /// and MTP verify rejects it.
+    pub verify_mixer_fused: bool,
 }
 
 /// Parse an on/off switch named `name`; unset or blank means off.

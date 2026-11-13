@@ -91,7 +91,14 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// projections, ring draft attention, tiled verify attention, MoE live tiles),
 /// makes forced Q4 routes exact at 32 rows without changing ordinary dispatch,
 /// and requires the rows a grouped M8 tile reads past its route list.
-pub const WITNESS_NATIVE_VERSION: &str = "0.21.8";
+/// Re-reviewed 0.21.8 -> 0.21.9 (`3cfe0ad` -> `adb54f8`): the witness op and
+/// all routing/routing-witness shaders are byte-identical. The release adds
+/// opt-in kernels (fused DeltaNet window, one-pass prepared product, BF16
+/// norm output, fused MoE expert tiles, router blocks), makes the tiled verify
+/// attention independent of the window alignment, adds an opt-in command
+/// timeline, and rounds the stock norm's bound threadgroup memory up to 16
+/// bytes without changing its output.
+pub const WITNESS_NATIVE_VERSION: &str = "0.21.9";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {

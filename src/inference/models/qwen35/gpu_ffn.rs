@@ -2330,15 +2330,7 @@ pub fn build_dense_ffn_layer_gpu_q_into_with_arena(
     // Inside a routed prefill scope the three products run the prepared
     // row-tile MM on BF16 copies of their activations (all three or none, so
     // a layer never mixes kernels); otherwise the canonical dispatcher.
-    let prepared_rows = [
-        (&weights.gate_q, weights.ggml_type_gate_up, h, m),
-        (&weights.up_q, weights.ggml_type_gate_up, h, m),
-        (&weights.down_q, weights.ggml_type_down, m, h),
-    ]
-    .into_iter()
-    .all(|(weight, ggml_type, in_features, out_features)| {
-        super::prefill_prepared::admits(seq_len, weight, ggml_type, in_features, out_features)
-    });
+    let prepared_rows = dense_prefill_products_prepared(weights, seq_len);
 
     // Ops 1+2: gate and up projections (both read x, concurrent).
     {
@@ -2516,6 +2508,23 @@ pub fn build_dense_ffn_layer_gpu_q_into_with_arena(
     }
 
     Ok(out_slot.clone())
+}
+
+/// Whether the gate, up and down products of a `rows`-row prefill chunk all
+/// take the prepared row-tile MM in the open
+/// [`super::prefill_prepared::PrefillScope`].
+pub(crate) fn dense_prefill_products_prepared(weights: &DenseFfnWeightsGpuQ, rows: u32) -> bool {
+    let h = weights.hidden_size;
+    let m = weights.intermediate_size;
+    [
+        (&weights.gate_q, weights.ggml_type_gate_up, h, m),
+        (&weights.up_q, weights.ggml_type_gate_up, h, m),
+        (&weights.down_q, weights.ggml_type_down, m, h),
+    ]
+    .into_iter()
+    .all(|(weight, ggml_type, in_features, out_features)| {
+        super::prefill_prepared::admits(rows, weight, ggml_type, in_features, out_features)
+    })
 }
 
 /// Prefill-safe variant of [`build_dense_ffn_layer_gpu_q_into`]: uses

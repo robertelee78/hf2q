@@ -143,6 +143,8 @@ pub(super) struct JointPacking<'a> {
     /// may serve it at every width (`HF2Q_REPACKED_GGUF_ANY_WIDTH=1`). Plain
     /// joint decode and joint MTP verify steps are not.
     pub dflash2_verify: bool,
+    /// DFlash2 verify with the fused mixer stage requested.
+    pub mixer_fused: bool,
 }
 
 fn plan_joint_routes(
@@ -377,6 +379,7 @@ impl Qwen35Model {
             width: joint_padded_width(mode, rows.len()),
             attention_tile: false,
             dflash2_verify: false,
+            mixer_fused: false,
         };
         self.with_joint_forward(
             mode,
@@ -478,6 +481,7 @@ impl Qwen35Model {
                 .map_err(|reason| anyhow!("Qwen joint decode unavailable: {reason}"))?;
             decode_pool::checked_reset_decode_pool()
                 .map_err(|e| anyhow!("Qwen joint decode pool reset: {e}"))?;
+            mlx_native::command_timeline::mark("joint.pool_reset");
             encode(device, registry, layer_weights, output_head, &plan)
         });
         pool_operation.complete()?;
@@ -554,6 +558,7 @@ impl Qwen35Model {
             windows: packing.windows,
             width,
             attention_tile: packing.attention_tile.then_some(&tile_scratch),
+            mixer_fused: packing.mixer_fused,
         };
         // Padding rows replay row 0's token and position; their outputs are
         // discarded and they never reach a cache.
@@ -619,6 +624,7 @@ impl Qwen35Model {
             )
             .context("Qwen joint embedding gather")?;
         }
+        mlx_native::command_timeline::mark("joint.embedding_committed");
 
         drop(arena_setup);
         let chain_n = joint_chain_n(cfg, layer_weights);
@@ -891,6 +897,7 @@ impl Qwen35Model {
         if let Some(mut enc) = chain.take() {
             enc.commit_labeled("qwen35.joint_decode.layers.flush");
         }
+        mlx_native::command_timeline::mark("joint.layers_committed");
         drop(pooled_scope);
         drop(projection_scope);
 
@@ -1073,6 +1080,7 @@ impl Qwen35Model {
         };
         enc.commit_and_wait_labeled(head_label)
             .map_err(|e| anyhow!("Qwen joint decode command buffer: {e}"))?;
+        mlx_native::command_timeline::mark("joint.head_completed");
         drop(retained);
 
         let readback = crate::inference::stage_profile::CpuSpan::begin("logit_readback");
@@ -1110,6 +1118,7 @@ impl Qwen35Model {
             })
             .collect::<Result<Vec<_>>>();
         drop(readback);
+        mlx_native::command_timeline::mark("joint.readback_end");
         outputs.map(|outputs| (outputs, normed))
     }
 }

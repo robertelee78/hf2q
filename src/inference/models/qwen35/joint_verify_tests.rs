@@ -206,7 +206,7 @@ pub(super) fn lane_digest(cache: &HybridKvCache, cfg: &Qwen35Config, slot: u32) 
     }
 }
 
-fn digests(fixture: &Fixture<'_>, cache: &HybridKvCache) -> Vec<LaneDigest> {
+pub(super) fn digests(fixture: &Fixture<'_>, cache: &HybridKvCache) -> Vec<LaneDigest> {
     (0..SLOTS)
         .map(|slot| lane_digest(cache, &fixture.model.cfg, slot))
         .collect()
@@ -214,7 +214,7 @@ fn digests(fixture: &Fixture<'_>, cache: &HybridKvCache) -> Vec<LaneDigest> {
 
 /// One spec-off joint step: `slots` advance by one true token at
 /// `positions`; returns their rows.
-fn spec_off_step(
+pub(super) fn spec_off_step(
     fixture: &Fixture<'_>,
     cache: &mut HybridKvCache,
     slots: &[u32],
@@ -803,7 +803,7 @@ fn synthetic_cache(model: &Qwen35Model, arm: Arm) -> HybridKvCache {
     cache
 }
 
-fn with_synthetic_fixture(
+pub(super) fn with_synthetic_fixture(
     policy: mlx_native::GgmlRoutingPolicy,
     arm: Arm,
     run: impl FnOnce(&Fixture<'_>),
@@ -878,24 +878,49 @@ pub(super) fn dflash_arm() -> Arm {
             projection: JointProjectionKernel::Canonical,
             pooled_outputs: true,
             verify_attention_tile: false,
+            verify_mixer_fused: false,
         },
     }
 }
 
-struct DFlashCaseTrace {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct DFlashCaseTrace {
+    pub rows: Vec<Vec<RowBits>>,
+    pub committed: Vec<LaneDigest>,
+    pub captured: Vec<Vec<u32>>,
+}
+
+/// A DFlash2 verify step whose forward has run and whose commit has not:
+/// its cache, the pending commit (which owns the step's replay storage) and
+/// what the forward returned.
+pub(super) struct DFlashForward {
+    cache: HybridKvCache,
+    pending: super::Qwen35JointVerifyPending,
     rows: Vec<Vec<RowBits>>,
-    committed: Vec<LaneDigest>,
     captured: Vec<Vec<u32>>,
 }
 
-fn run_dflash_case(fixture: &Fixture<'_>, lanes: &[LaneCase], label: &str) -> DFlashCaseTrace {
-    let mut cache = (fixture.new_cache)();
+/// The verify forward of one DFlash2 step of `arm` on `cache`, each lane
+/// starting at `position[slot]` (its committed cursor). Returns the pending
+/// commit, the rows' bits and the lanes' target captures.
+fn dflash_verify_forward(
+    fixture: &Fixture<'_>,
+    arm: Arm,
+    cache: &mut HybridKvCache,
+    position: &[i32; SLOTS as usize],
+    lanes: &[LaneCase],
+    label: &str,
+) -> (
+    super::Qwen35JointVerifyPending,
+    Vec<Vec<RowBits>>,
+    Vec<Vec<u32>>,
+) {
     let token_rows = lanes
         .iter()
         .map(|lane| {
             (0..=lane.drafts)
                 .map(|row| {
-                    (fixture.token)(lane.slot, fixture.start[lane.slot as usize] + row as i32)
+                    (fixture.token)(lane.slot, position[lane.slot as usize] + row as i32)
                 })
                 .collect::<Vec<_>>()
         })
@@ -905,7 +930,7 @@ fn run_dflash_case(fixture: &Fixture<'_>, lanes: &[LaneCase], label: &str) -> DF
         .zip(&token_rows)
         .map(|(lane, tokens)| Qwen35JointVerifyLane {
             slot_id: SlotId(lane.slot),
-            position: fixture.start[lane.slot as usize],
+            position: position[lane.slot as usize],
             tokens,
             output: Qwen35JointOutput::LogitsAndHidden,
         })
@@ -938,20 +963,23 @@ fn run_dflash_case(fixture: &Fixture<'_>, lanes: &[LaneCase], label: &str) -> DF
         rows_per_lane: 8,
         feature_width,
     };
-    let arm = fixture.arm;
     let verify = fixture
         .model
         .forward_gpu_dflash2_verify(
             &verify_lanes,
-            &mut cache,
+            cache,
             arm.mode,
             arm.dense_ffn,
             arm.options,
             Some(capture),
         )
         .unwrap_or_else(|error| panic!("{label}: DFlash2 verify: {error:#}"));
-    let rows = verify
-        .rows
+    let super::Qwen35JointVerify {
+        rows: outputs,
+        pending,
+        ..
+    } = verify;
+    let rows = outputs
         .iter()
         .map(|rows| {
             rows.iter()
@@ -972,11 +1000,84 @@ fn run_dflash_case(fixture: &Fixture<'_>, lanes: &[LaneCase], label: &str) -> DF
                 .collect()
         })
         .collect();
+    (pending, rows, captured)
+}
+
+/// One DFlash2 verify step of `arm` and its commit on `cache`, each lane
+/// starting at `position[slot]` (its committed cursor). Returns the rows'
+/// bits and the lanes' target captures; the cache is left as the commit
+/// leaves it.
+pub(super) fn run_dflash_step(
+    fixture: &Fixture<'_>,
+    arm: Arm,
+    cache: &mut HybridKvCache,
+    position: &[i32; SLOTS as usize],
+    lanes: &[LaneCase],
+    label: &str,
+) -> (Vec<Vec<RowBits>>, Vec<Vec<u32>>) {
+    let (pending, rows, captured) =
+        dflash_verify_forward(fixture, arm, cache, position, lanes, label);
+    fixture
+        .model
+        .commit_joint_verify(
+            cache,
+            pending,
+            &lanes.iter().map(|lane| lane.accepted).collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|error| panic!("{label}: DFlash2 commit: {error:#}"));
+    (rows, captured)
+}
+
+pub(super) fn run_dflash_case(
+    fixture: &Fixture<'_>,
+    lanes: &[LaneCase],
+    label: &str,
+) -> DFlashCaseTrace {
+    let forward = dflash_forward(fixture, lanes, label);
+    dflash_commit(fixture, lanes, forward, label)
+}
+
+/// The verify forward of [`run_dflash_case`] on a fresh cache.
+pub(super) fn dflash_forward(
+    fixture: &Fixture<'_>,
+    lanes: &[LaneCase],
+    label: &str,
+) -> DFlashForward {
+    let mut cache = (fixture.new_cache)();
+    let (pending, rows, captured) = dflash_verify_forward(
+        fixture,
+        fixture.arm,
+        &mut cache,
+        &fixture.start,
+        lanes,
+        label,
+    );
+    DFlashForward {
+        cache,
+        pending,
+        rows,
+        captured,
+    }
+}
+
+/// The commit of [`run_dflash_case`]: every lane keeps its `accepted` rows.
+pub(super) fn dflash_commit(
+    fixture: &Fixture<'_>,
+    lanes: &[LaneCase],
+    forward: DFlashForward,
+    label: &str,
+) -> DFlashCaseTrace {
+    let DFlashForward {
+        mut cache,
+        pending,
+        rows,
+        captured,
+    } = forward;
     fixture
         .model
         .commit_joint_verify(
             &mut cache,
-            verify.pending,
+            pending,
             &lanes.iter().map(|lane| lane.accepted).collect::<Vec<_>>(),
         )
         .unwrap_or_else(|error| panic!("{label}: DFlash2 commit: {error:#}"));
@@ -1100,7 +1201,7 @@ fn dflash2_width32_meets_q1_and_is_cohort_invariant() {
 }
 
 /// The DFlash2 arm with the tiled TQ verify attention requested.
-fn dflash_tile_arm() -> Arm {
+pub(super) fn dflash_tile_arm() -> Arm {
     let mut arm = dflash_arm();
     arm.options.verify_attention_tile = true;
     arm
@@ -1108,7 +1209,7 @@ fn dflash_tile_arm() -> Arm {
 
 /// The synthetic config with eight query heads on its KV head: a geometry
 /// the tiled verify attention compiles (the default two do not).
-fn tile_cfg() -> Qwen35Config {
+pub(super) fn tile_cfg() -> Qwen35Config {
     Qwen35Config {
         num_attention_heads: 8,
         ..synthetic_cfg()
@@ -1262,7 +1363,7 @@ fn dflash2_tiled_attention_meets_q1_and_is_cohort_invariant() {
 }
 
 /// Arm M: padded mode, shared-weights FFN, column-invariant MMA products.
-fn mma_arm() -> Arm {
+pub(super) fn mma_arm() -> Arm {
     Arm {
         mode: JointRouteMode::PaddedMvExt,
         dense_ffn: JointDenseFfnRoute::SharedWeights,
@@ -1270,6 +1371,7 @@ fn mma_arm() -> Arm {
             projection: JointProjectionKernel::ColumnInvariantMma,
             pooled_outputs: true,
             verify_attention_tile: false,
+            verify_mixer_fused: false,
         },
     }
 }

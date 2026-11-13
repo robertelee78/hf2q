@@ -23,7 +23,7 @@ use std::sync::LazyLock;
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType, MlxBuffer};
 
-use super::joint_step_options::switch_from_process;
+use super::joint_step_options::{parse_switch, switch_from_process};
 
 /// Switch, default off: `1`/`on`/`true` routes prompt-prefill chunks through
 /// the prepared row-tile MM.
@@ -52,6 +52,10 @@ pub(crate) struct PrefillScope {
 impl PrefillScope {
     /// Open the scope; the route is taken only when the switch is on.
     pub(crate) fn enter() -> Self {
+        #[cfg(test)]
+        if let Some(switches) = SwitchesForTest::current() {
+            return Self::with_route(switches.prepared);
+        }
         Self::with_route(*ENABLED)
     }
 
@@ -72,6 +76,113 @@ impl Drop for PrefillScope {
     fn drop(&mut self) {
         SCOPE.with(|cell| cell.set(self.previous));
     }
+}
+
+/// The prompt-prefill switches of a SlotAware Qwen worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrefillSwitches {
+    pub(crate) prepared: bool,
+    pub(crate) fold_cue: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SWITCHES: Cell<Option<PrefillSwitches>> = const { Cell::new(None) };
+}
+
+/// The switches a test's thread runs under instead of the process's, until
+/// dropped: what [`PrefillScope::enter`] and the cue fold read in a
+/// scheduler-level test.
+#[cfg(test)]
+pub(crate) struct SwitchesForTest {
+    previous: Option<PrefillSwitches>,
+}
+
+#[cfg(test)]
+impl SwitchesForTest {
+    pub(crate) fn set(switches: PrefillSwitches) -> Self {
+        Self {
+            previous: TEST_SWITCHES.with(|cell| cell.replace(Some(switches))),
+        }
+    }
+
+    pub(crate) fn current() -> Option<PrefillSwitches> {
+        TEST_SWITCHES.with(Cell::get)
+    }
+}
+
+#[cfg(test)]
+impl Drop for SwitchesForTest {
+    fn drop(&mut self) {
+        TEST_SWITCHES.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// The switches as an operator wrote them, read strictly: an invalid value
+/// is an error, not a fallback, and so are the two combinations that cannot
+/// keep their promise. With the chunk-scan DeltaNet investigation route on,
+/// alpha and beta would stay on the stock kernel beside prepared qkv, gate
+/// and output, and a row's bits would depend on whether its chunk is a
+/// multiple of 64 rows. The cue fold is exact only on the prepared kernels.
+pub(crate) fn resolve_switches(
+    prepared: Option<&str>,
+    fold_cue: Option<&str>,
+    chunk_scan_prefill: bool,
+) -> Result<PrefillSwitches, String> {
+    use super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV;
+    let switches = PrefillSwitches {
+        prepared: parse_switch(QWEN_PREFILL_PREPARED_ENV, prepared)?,
+        fold_cue: parse_switch(QWEN_PREFILL_FOLD_CUE_ENV, fold_cue)?,
+    };
+    if switches.prepared && chunk_scan_prefill {
+        return Err(format!(
+            "{QWEN_PREFILL_PREPARED_ENV} cannot be combined with the chunk-scan prefill \
+             investigation route: its alpha/beta projections keep the stock kernel"
+        ));
+    }
+    if switches.fold_cue && !switches.prepared {
+        return Err(format!(
+            "{QWEN_PREFILL_FOLD_CUE_ENV} requires {QWEN_PREFILL_PREPARED_ENV}"
+        ));
+    }
+    Ok(switches)
+}
+
+/// [`resolve_switches`] with the refusal an operator reads: the spawn path
+/// prints an error's outer message only, so the variable and the reason are
+/// in it.
+pub(crate) fn switches_or_refusal(
+    prepared: Option<&str>,
+    fold_cue: Option<&str>,
+    chunk_scan_prefill: bool,
+) -> anyhow::Result<PrefillSwitches> {
+    resolve_switches(prepared, fold_cue, chunk_scan_prefill)
+        .map_err(|cause| anyhow::anyhow!("Qwen prompt prefill switches: {cause}"))
+}
+
+/// The switches of this process, read strictly. Called before a Qwen model
+/// is loaded, so a mistyped value is refused before the load is paid for.
+pub(crate) fn switches_from_process() -> anyhow::Result<PrefillSwitches> {
+    let read = |name: &str| std::env::var(name).ok();
+    switches_or_refusal(
+        read(QWEN_PREFILL_PREPARED_ENV).as_deref(),
+        read(super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV).as_deref(),
+        crate::debug::INVESTIGATION_ENV.chunk_scan_prefill,
+    )
+}
+
+/// Validate the switches when a SlotAware worker provisions its slots, so a
+/// mistyped value stops the server instead of warning at the first prefill,
+/// and log what the worker will run.
+pub(crate) fn validate_at_worker_start() -> anyhow::Result<PrefillSwitches> {
+    let switches = switches_from_process()?;
+    tracing::info!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        prepared = switches.prepared,
+        fold_cue = switches.fold_cue,
+        "Qwen prompt prefill configuration"
+    );
+    Ok(switches)
 }
 
 /// Whether the prepared kernel serves this weight shape.
@@ -111,6 +222,87 @@ mod tests {
         assert_eq!(parse(Some("1")), Ok(true));
         assert_eq!(parse(Some("off")), Ok(false));
         assert!(parse(Some("rows")).is_err());
+    }
+
+    #[test]
+    fn worker_start_rejects_invalid_values_and_combinations_that_break_a_promise() {
+        let resolve = |prepared, fold, chunk_scan| resolve_switches(prepared, fold, chunk_scan);
+        assert_eq!(
+            resolve(None, None, false),
+            Ok(PrefillSwitches {
+                prepared: false,
+                fold_cue: false
+            })
+        );
+        assert_eq!(
+            resolve(Some("1"), Some("on"), false),
+            Ok(PrefillSwitches {
+                prepared: true,
+                fold_cue: true
+            })
+        );
+        // The stock route may run beside the chunk-scan investigation route.
+        assert!(resolve(None, None, true).is_ok());
+        for (prepared, fold, chunk_scan, what, names) in [
+            (
+                Some("yes"),
+                None,
+                false,
+                "invalid prepared value",
+                QWEN_PREFILL_PREPARED_ENV,
+            ),
+            (
+                Some("1"),
+                Some("cue"),
+                false,
+                "invalid fold value",
+                super::super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV,
+            ),
+            (
+                Some("1"),
+                None,
+                true,
+                "prepared beside chunk scan",
+                QWEN_PREFILL_PREPARED_ENV,
+            ),
+            (
+                None,
+                Some("1"),
+                false,
+                "fold without prepared",
+                super::super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV,
+            ),
+        ] {
+            assert!(resolve(prepared, fold, chunk_scan).is_err(), "{what}");
+            // What the spawn path prints is the outer message alone.
+            let printed = switches_or_refusal(prepared, fold, chunk_scan)
+                .expect_err(what)
+                .to_string();
+            assert!(
+                printed.starts_with("Qwen prompt prefill switches: ") && printed.contains(names),
+                "{what}: the refusal reads {printed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_test_override_replaces_the_process_switches_on_its_thread_only() {
+        assert_eq!(SwitchesForTest::current(), None);
+        let on = PrefillSwitches {
+            prepared: true,
+            fold_cue: true,
+        };
+        {
+            let _switches = SwitchesForTest::set(on);
+            assert_eq!(SwitchesForTest::current(), Some(on));
+            assert!(super::super::prefill_fold::enabled());
+            let _scope = PrefillScope::enter();
+            assert!(SCOPE.with(Cell::get));
+            std::thread::spawn(|| assert_eq!(SwitchesForTest::current(), None))
+                .join()
+                .expect("other thread");
+        }
+        assert_eq!(SwitchesForTest::current(), None);
     }
 
     #[test]

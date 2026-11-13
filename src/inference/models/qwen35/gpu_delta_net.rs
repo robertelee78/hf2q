@@ -3610,6 +3610,10 @@ pub fn build_delta_net_layer_with_arena(
     // latest-turn recovery checkpoints and speculative verification.
     state_capture: Option<&MlxBuffer>,
     conv_state_capture: Option<&MlxBuffer>,
+    // Cue fold ([`super::prefill_fold`]): run the convolution and the
+    // recurrence as two dispatches split at this row, writing the state at
+    // the split into the checkpoint image. `None` on every other path.
+    boundary: Option<&super::prefill_fold::DnBoundarySplit<'_>>,
     // ADR-019 Phase 2 iter91: borrowed `&mut EncoderSession` for the
     // multi-stage chain.  `None` at env=0 (per-stage Plain CommandEncoder
     // shape, byte-identical to pre-iter91).  `Some(sess)` at env=1 — the
@@ -3632,6 +3636,18 @@ pub fn build_delta_net_layer_with_arena(
         seq_len > 1,
         "build_delta_net_layer_with_arena: seq_len must be > 1 (decode uses pooled path)"
     );
+    if let Some(split) = boundary {
+        anyhow::ensure!(
+            split.prefix_rows >= 2
+                && seq_len - split.prefix_rows.min(seq_len) >= 2
+                && state_capture.is_none()
+                && conv_state_capture.is_none(),
+            "DeltaNet boundary split of {} + {} rows with per-row capture {}",
+            split.prefix_rows,
+            seq_len.saturating_sub(split.prefix_rows),
+            state_capture.is_some() || conv_state_capture.is_some()
+        );
+    }
 
     // Validate arena fits the call shape. iter74 deployment is on a single
     // model in a single forward pass, so this is a guard against accidental
@@ -3883,7 +3899,66 @@ pub fn build_delta_net_layer_with_arena(
             n_v_heads,
         )?;
         enc.encoder().memory_barrier();
-        if let Some(capture) = conv_state_capture {
+        if let Some(split) = boundary {
+            // Two convolutions, as the two forwards run them: the prefix
+            // rows leave the state at the boundary in the scratch (slot
+            // layout), the cue rows start from it. The checkpoint image
+            // keeps the boundary state in its `[K-1, channels]` layout.
+            let channels = qkv_channels as usize;
+            let cue_rows = seq_len - split.prefix_rows;
+            for (segment, (first, rows, state_in, state_out)) in [
+                (
+                    0,
+                    split.prefix_rows,
+                    conv_state_in,
+                    &split.scratch.conv_state,
+                ),
+                (
+                    split.prefix_rows,
+                    cue_rows,
+                    &split.scratch.conv_state,
+                    conv_state_out,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if segment == 1 {
+                    // The cue rows read the boundary state the prefix wrote.
+                    enc.encoder().memory_barrier();
+                }
+                dispatch_ssm_conv(
+                    enc.encoder(),
+                    registry,
+                    device.metal_device(),
+                    &super::prefill_fold::row_view(&arena.qkv_raw_buf, first, rows, channels),
+                    &weights.ssm_conv1d,
+                    state_in,
+                    state_out,
+                    &super::prefill_fold::row_view(&arena.qkv_conv_buf, first, rows, channels),
+                    &split.scratch.ssm_params[segment],
+                    SsmConvParams {
+                        n_tokens: rows,
+                        ..ssm_conv_params
+                    },
+                )
+                .with_context(|| format!("dispatch_ssm_conv boundary segment {segment}"))?;
+            }
+            mlx_native::ops::copy::dispatch_strided_copy_f32(
+                enc.encoder(),
+                registry,
+                device.metal_device(),
+                &split.scratch.conv_state,
+                &split.conv_image,
+                &mlx_native::ops::copy::StridedCopyParams {
+                    rows: k_width - 1,
+                    cols: qkv_channels,
+                    stride_row: 1,
+                    stride_col: k_width - 1,
+                },
+            )
+            .context("boundary conv state into the checkpoint image")?;
+        } else if let Some(capture) = conv_state_capture {
             dispatch_ssm_conv_with_capture(
                 enc.encoder(),
                 registry,
@@ -3985,8 +4060,8 @@ pub fn build_delta_net_layer_with_arena(
 
     let output = if chunk_route {
         anyhow::ensure!(
-            state_capture.is_none() && conv_state_capture.is_none(),
-            "DeltaNet arena capture is supported only by the autoregressive prefill route"
+            state_capture.is_none() && conv_state_capture.is_none() && boundary.is_none(),
+            "DeltaNet arena capture and the boundary split are supported only by the autoregressive prefill route"
         );
         // ---- CHUNK PREFILL (3-encoder split) — arena variant ----
         {
@@ -4302,7 +4377,53 @@ pub fn build_delta_net_layer_with_arena(
         enc.memory_barrier();
         // Stage-4 unconditional NSG-decode kernel where supported.
         let decode_kernel_eligible = d_k % 32 == 0 && d_k <= 128;
-        if decode_kernel_eligible {
+        if let Some(split) = boundary {
+            // Two scans, as the two forwards run them: the prefix rows leave
+            // the recurrent state at the boundary in the checkpoint image
+            // (slot layout), the cue rows start from it.
+            anyhow::ensure!(
+                decode_kernel_eligible,
+                "DeltaNet boundary split requires an NSG-compatible key dimension"
+            );
+            let key_width = (n_k_heads * d_k) as usize;
+            let value_width = (n_v_heads * d_v) as usize;
+            let heads = n_v_heads as usize;
+            let cue_rows = seq_len - split.prefix_rows;
+            for (segment, (first, rows, segment_in, segment_out)) in [
+                (0, split.prefix_rows, state_in, &split.recurrent),
+                (split.prefix_rows, cue_rows, &split.recurrent, state_out),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if segment == 1 {
+                    // The cue rows read the boundary state the prefix wrote.
+                    enc.memory_barrier();
+                }
+                let rows_of = |buffer: &MlxBuffer, width: usize| {
+                    super::prefill_fold::row_view(buffer, first, rows, width)
+                };
+                dispatch_gated_delta_net_decode(
+                    &mut enc,
+                    registry,
+                    device.metal_device(),
+                    &rows_of(&arena.q_scaled_buf, key_width),
+                    &rows_of(&arena.k_normed_buf, key_width),
+                    &rows_of(&arena.v_split_buf, value_width),
+                    &rows_of(&arena.g_buf, heads),
+                    &rows_of(&arena.beta_buf, heads),
+                    segment_in,
+                    &rows_of(&arena.attn_out_buf, value_width),
+                    segment_out,
+                    &split.scratch.gdn_params[segment],
+                    GatedDeltaNetParams {
+                        n_tokens: rows,
+                        ..gdn_params
+                    },
+                )
+                .with_context(|| format!("dispatch_gated_delta_net_decode boundary segment {segment}"))?;
+            }
+        } else if decode_kernel_eligible {
             if let Some(capture) = state_capture {
                 use mlx_native::ops::gated_delta_net_decode::dispatch_gated_delta_net_decode_with_capture;
                 dispatch_gated_delta_net_decode_with_capture(
@@ -4413,6 +4534,43 @@ fn alpha_beta_prefill_prepared(
             weights.ssm_alpha_ggml_type,
             hidden_size,
             super::prepared_projection::alpha_beta_rows(n_v_heads),
+        )
+}
+
+/// Whether every projection of an arena prefill layer (qkv, gate, alpha
+/// with beta, output) takes the prepared row-tile MM in the open
+/// [`super::prefill_prepared::PrefillScope`], so that each of its output
+/// rows depends on that input row alone.
+pub(crate) fn prefill_products_prepared(
+    weights: &DeltaNetWeightsGpu,
+    hidden_size: u32,
+    n_k_heads: u32,
+    n_v_heads: u32,
+    d_k: u32,
+    d_v: u32,
+) -> bool {
+    use super::prefill_prepared::admits;
+    let qkv_channels = 2 * n_k_heads * d_k + n_v_heads * d_v;
+    let z_channels = n_v_heads * d_v;
+    admits(
+        2,
+        &weights.attn_qkv,
+        weights.attn_qkv_ggml_type,
+        hidden_size,
+        qkv_channels,
+    ) && admits(
+        2,
+        &weights.attn_gate,
+        weights.attn_gate_ggml_type,
+        hidden_size,
+        z_channels,
+    ) && alpha_beta_prefill_prepared(weights, 2, hidden_size, n_v_heads)
+        && admits(
+            2,
+            &weights.ssm_out,
+            weights.ssm_out_ggml_type,
+            z_channels,
+            hidden_size,
         )
 }
 
@@ -7084,6 +7242,7 @@ mod tests {
             shape.rms_norm_eps,
             None, // recurrent capture disabled in parity fixture
             None, // convolution capture disabled in parity fixture
+            None, // no boundary split
             // iter91: synthetic test exercises the per-stage Plain
             // CommandEncoder shape (env=0 equivalent) — pass None.
             None,
@@ -7151,6 +7310,7 @@ mod tests {
             shape.rms_norm_eps,
             Some(&recurrent_capture),
             Some(&convolution_capture),
+            None,
             None,
             SlotId(0),
         )

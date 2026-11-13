@@ -1001,6 +1001,98 @@ pub fn dispatch_dflash2_context_commit(
     retained_counts: &MlxBuffer,
     workspace: &DFlash2Workspace,
 ) -> Result<()> {
+    dispatch_context_rows(
+        encoder,
+        registry,
+        device,
+        config,
+        tensors,
+        workspace,
+        &workspace.captured_target_hidden,
+        &workspace.rope_positions,
+        ContextRings::Lanes {
+            retained_counts,
+            write_positions: &workspace.write_positions,
+        },
+    )
+}
+
+/// Project one pass of a prefill capture and append it to `lane`'s rings
+/// only. `captured` holds `max_lanes * block_size` consecutive target rows of
+/// that one lane (the workspace's row capacity, where a decode commit holds
+/// `block_size` rows of every lane), `rope_positions` their logical
+/// positions. The rows are appended in groups of `block_size`: group `g`
+/// writes `commit_counts[g]` rows at ring slot `write_positions[g]`.
+///
+/// The projections, norms and RoPE are the dispatches of
+/// [`dispatch_dflash2_context_commit`] over the same row count, so a row's
+/// ring bytes are those a decode-shaped commit of that row produces
+/// (`lane_passes_write_the_rings_of_block_commits`,
+/// `lane_passes_equal_block_commits_with_two_layers_on_dense_and_af4_routes`).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_dflash2_lane_ingest(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    config: &DFlash2Config,
+    tensors: &DFlash2ModelTensors,
+    workspace: &DFlash2Workspace,
+    lane: usize,
+    captured: &MlxBuffer,
+    rope_positions: &MlxBuffer,
+    write_positions: &MlxBuffer,
+    commit_counts: &MlxBuffer,
+) -> Result<()> {
+    if lane >= workspace.max_lanes {
+        return Err(anyhow!(
+            "DFlash2 ingest lane {lane} outside {} lanes",
+            workspace.max_lanes
+        ));
+    }
+    dispatch_context_rows(
+        encoder,
+        registry,
+        device,
+        config,
+        tensors,
+        workspace,
+        captured,
+        rope_positions,
+        ContextRings::OneLane {
+            lane,
+            commit_counts,
+            write_positions,
+        },
+    )
+}
+
+/// Which rings the rows of a context commit are appended to.
+enum ContextRings<'a> {
+    /// Row group `l` holds lane `l`'s rows and goes to lane `l`'s rings.
+    Lanes {
+        retained_counts: &'a MlxBuffer,
+        write_positions: &'a MlxBuffer,
+    },
+    /// Every row group holds rows of `lane` and goes to its rings.
+    OneLane {
+        lane: usize,
+        commit_counts: &'a MlxBuffer,
+        write_positions: &'a MlxBuffer,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_context_rows(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    config: &DFlash2Config,
+    tensors: &DFlash2ModelTensors,
+    workspace: &DFlash2Workspace,
+    captured: &MlxBuffer,
+    rope_positions: &MlxBuffer,
+    rings: ContextRings<'_>,
+) -> Result<()> {
     let rows = workspace.max_lanes * config.block_size;
     project(
         encoder,
@@ -1008,7 +1100,7 @@ pub fn dispatch_dflash2_context_commit(
         device,
         workspace,
         &tensors.context_projection,
-        &workspace.captured_target_hidden,
+        captured,
         &workspace.hidden[0],
         rows,
         config.fc_input_dim(),
@@ -1112,7 +1204,7 @@ pub fn dispatch_dflash2_context_commit(
             &workspace.key_normalized,
             &workspace.key,
             &workspace.rope_params,
-            &workspace.rope_positions,
+            rope_positions,
             None,
             rows as u32,
             config.num_key_value_heads as u32,
@@ -1120,30 +1212,91 @@ pub fn dispatch_dflash2_context_commit(
             config.head_dim as u32,
         )?;
         encoder.memory_barrier();
-        let commit_key = workspace.key.with_shape(vec![
-            workspace.max_lanes,
-            config.block_size,
-            config.num_key_value_heads,
-            config.head_dim,
-        ])?;
-        let commit_value = workspace.value.with_shape(vec![
-            workspace.max_lanes,
-            config.block_size,
-            config.num_key_value_heads,
-            config.head_dim,
-        ])?;
-        dispatch_dflash2_commit_kv_bf16(
-            encoder,
-            registry,
-            device,
-            &commit_key,
-            &commit_value,
-            retained_counts,
-            &workspace.write_positions,
-            &workspace.ring_keys[index],
-            &workspace.ring_values[index],
-            pack,
-        )?;
+        match rings {
+            ContextRings::Lanes {
+                retained_counts,
+                write_positions,
+            } => {
+                let commit_key = workspace.key.with_shape(vec![
+                    workspace.max_lanes,
+                    config.block_size,
+                    config.num_key_value_heads,
+                    config.head_dim,
+                ])?;
+                let commit_value = workspace.value.with_shape(vec![
+                    workspace.max_lanes,
+                    config.block_size,
+                    config.num_key_value_heads,
+                    config.head_dim,
+                ])?;
+                dispatch_dflash2_commit_kv_bf16(
+                    encoder,
+                    registry,
+                    device,
+                    &commit_key,
+                    &commit_value,
+                    retained_counts,
+                    write_positions,
+                    &workspace.ring_keys[index],
+                    &workspace.ring_values[index],
+                    pack,
+                )?;
+            }
+            ContextRings::OneLane {
+                lane,
+                commit_counts,
+                write_positions,
+            } => {
+                // One single-lane commit per group of `block_size` rows,
+                // each into the lane's own ring region. The groups hold
+                // distinct tokens, so they write distinct ring slots.
+                let one_lane = attention_params(config, 1);
+                let group_shape = vec![
+                    1,
+                    config.block_size,
+                    config.num_key_value_heads,
+                    config.head_dim,
+                ];
+                let group = config.block_size * kv_width;
+                let ring_shape = vec![
+                    1,
+                    config.num_key_value_heads,
+                    config.sliding_window,
+                    config.head_dim,
+                ];
+                let ring = kv_width * config.sliding_window;
+                let lane_ring = |rings: &MlxBuffer| {
+                    rings
+                        .slice_view((lane * ring * rings.dtype().size_of()) as u64, ring)
+                        .with_shape(ring_shape.clone())
+                };
+                let ring_keys = lane_ring(&workspace.ring_keys[index])?;
+                let ring_values = lane_ring(&workspace.ring_values[index])?;
+                for group_index in 0..workspace.max_lanes {
+                    let rows_of = |buffer: &MlxBuffer| {
+                        buffer
+                            .slice_view(
+                                (group_index * group * buffer.dtype().size_of()) as u64,
+                                group,
+                            )
+                            .with_shape(group_shape.clone())
+                    };
+                    let word = (group_index * std::mem::size_of::<u32>()) as u64;
+                    dispatch_dflash2_commit_kv_bf16(
+                        encoder,
+                        registry,
+                        device,
+                        &rows_of(&workspace.key)?,
+                        &rows_of(&workspace.value)?,
+                        &commit_counts.slice_view(word, 1),
+                        &write_positions.slice_view(word, 1),
+                        &ring_keys,
+                        &ring_values,
+                        one_lane,
+                    )?;
+                }
+            }
+        }
         encoder.memory_barrier();
     }
     Ok(())
