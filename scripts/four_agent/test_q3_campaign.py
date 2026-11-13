@@ -834,6 +834,23 @@ class ControlsOnly(Harness):
         self.assertEqual((plan["primary"], plan["workloads"]), ("n4", list(q3.WORKLOADS)))
         self.assertNotIn("controls_of", plan)
 
+    def test_controls_follow_the_comparison_failure_rule_of_their_primary(self):
+        record = self.record()
+        plan, _ = q3.build_plan(self.args("--controls-of", str(record), workloads="3+1"), {}, "qwen38")
+        primary = json.loads((record.parent / "campaign.json").read_text())["plan"]
+        self.assertEqual(plan["comparison_failure_policy"], primary["comparison_failure_policy"])
+        self.assertEqual(plan["controls_of"]["comparison_failure_policy"], primary["comparison_failure_policy"])
+        with self.assertRaisesRegex(q3.qc.CampaignError, r"follows its primary's comparison failure rule \(2 reruns"):
+            q3.build_plan(self.args("--controls-of", str(record), "--comparison-reruns", "0", workloads="3+1"), {}, "qwen38")
+        shutil.rmtree(record.parent)  # a primary planned before the policy: its controls keep the earlier rule
+        self.out = record.parent
+        old = self.record("--comparison-reruns", "0")
+        plan, _ = q3.build_plan(self.args("--controls-of", str(old), workloads="3+1"), {}, "qwen38")
+        self.assertNotIn("comparison_failure_policy", plan)
+        self.assertNotIn("comparison_failure_policy", plan["controls_of"])
+        with self.assertRaisesRegex(q3.qc.CampaignError, r"follows its primary's comparison failure rule \(0 reruns"):
+            q3.build_plan(self.args("--controls-of", str(old), "--comparison-reruns", "2", workloads="3+1"), {}, "qwen38")
+
     def test_controls_only_needs_the_flag_and_never_reruns_a_recorded_stage(self):
         for workloads in ("3+1,2+2,1+3", "n1", "n1,n4"):  # without --controls-of n4 comes first
             with self.subTest(workloads=workloads), self.assertRaisesRegex(q3.qc.CampaignError, "must start with n4"):
