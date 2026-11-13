@@ -72,7 +72,11 @@
 //! does not release it: an evicted engine whose worker is still tearing
 //! down, or is wedged inside Metal, still holds its memory and is still
 //! charged, and a teardown that fails leaves it charged for good
-//! ([`Reservation::strand`]).
+//! ([`Reservation::strand`]). The loading thread keeps a claim of its own
+//! ([`LoadingClaim`]) until it has given back what it held for the model:
+//! the commitment leaves the ledger only when the worker's teardown and the
+//! loading thread's cleanup have both succeeded, in whichever order they
+//! end. An entry that has left the ledger is never put back.
 //!
 //! The kernel returns the pages of released buffers on its own, some time
 //! after user space has let go. The ledger does not claim to know when: the
@@ -120,9 +124,14 @@ struct Entry {
     commitment: Commitment,
     /// The thread that owns the model has begun to tear it down.
     tearing_down: bool,
-    /// Why the commitment must never be released, if a thread that held the
-    /// model found that out after the reservation had moved on.
-    condemned: Option<String>,
+    /// The reservation's owner has let go of it.
+    owner_released: bool,
+    /// The loading thread has not said yet whether it could give back what
+    /// it held for the model ([`LoadingClaim`]).
+    loading_claim: bool,
+    /// The commitment is never released: a teardown or a loading cleanup
+    /// failed.
+    stranded: bool,
 }
 
 #[derive(Default)]
@@ -153,29 +162,54 @@ impl Entries {
                 model: model.to_path_buf(),
                 commitment,
                 tearing_down: false,
-                condemned: None,
+                owner_released: false,
+                loading_claim: false,
+                stranded: false,
             },
         );
         id
     }
 
-    /// The teardown of `id` is over, released or stranded. Returns whether
-    /// one was in progress.
-    fn end_teardown(&mut self, id: u64, release: bool) -> bool {
-        let entry = if release {
-            self.reserved.remove(&id)
-        } else {
-            None
-        };
-        let was_tearing_down = match (entry, self.reserved.get_mut(&id)) {
-            (Some(entry), _) => entry.tearing_down,
-            (None, Some(entry)) => std::mem::take(&mut entry.tearing_down),
-            (None, None) => false,
-        };
+    /// The teardown of `id`, if one was in progress, is over. Returns
+    /// whether one was.
+    fn end_teardown(&mut self, id: u64) -> bool {
+        let was_tearing_down = self
+            .reserved
+            .get_mut(&id)
+            .is_some_and(|entry| std::mem::take(&mut entry.tearing_down));
         if was_tearing_down {
             self.tearing_down -= 1;
         }
         was_tearing_down
+    }
+
+    /// Remove the entry of `id` if everyone who held it has let go of it
+    /// cleanly: its owner released it, the loading thread has concluded, and
+    /// neither stranded it. An entry is removed here and nowhere else, and a
+    /// removed entry is never put back.
+    fn release_if_unheld(&mut self, id: u64) {
+        let unheld = self
+            .reserved
+            .get(&id)
+            .is_some_and(|entry| entry.owner_released && !entry.loading_claim && !entry.stranded);
+        if unheld {
+            self.reserved.remove(&id);
+        }
+    }
+
+    /// Strand the entry of `id` and say so.
+    fn strand(&mut self, id: u64, reason: &str) {
+        let Some(entry) = self.reserved.get_mut(&id) else {
+            return;
+        };
+        if !std::mem::replace(&mut entry.stranded, true) {
+            tracing::error!(
+                model = %entry.model.display(),
+                bytes = entry.commitment.total(),
+                reason,
+                "engine memory stays reserved until the process restarts"
+            );
+        }
     }
 }
 
@@ -326,12 +360,17 @@ impl Reservation {
         }
     }
 
-    /// What the loading thread keeps when it hands the reservation on with
-    /// the model, to condemn it if its own cleanup fails afterwards.
-    pub(crate) fn condemner(&self) -> Condemner {
-        Condemner {
+    /// The loading thread's own claim on the commitment, taken before the
+    /// reservation can move on with the model. While it is outstanding the
+    /// commitment stays charged, whoever else lets go of it.
+    pub(crate) fn loading_claim(&self) -> LoadingClaim {
+        if let Some(entry) = self.ledger.entries().reserved.get_mut(&self.id) {
+            entry.loading_claim = true;
+        }
+        LoadingClaim {
             ledger: Arc::clone(&self.ledger),
             id: self.id,
+            concluded: false,
         }
     }
 
@@ -339,41 +378,19 @@ impl Reservation {
     /// of the engine it stands for failed, so its memory cannot be taken to
     /// be free. `reason` is logged with the model.
     pub(crate) fn strand(self, reason: &str) {
-        let mut entries = self.ledger.entries();
-        let entry = entries.reserved.get(&self.id);
-        tracing::error!(
-            model = %entry.map_or_else(String::new, |entry| entry.model.display().to_string()),
-            bytes = entry.map_or(0, |entry| entry.commitment.total()),
-            reason,
-            "engine memory stays reserved until the process restarts"
-        );
-        let ended = entries.end_teardown(self.id, false);
-        drop(entries);
-        if ended {
-            self.ledger.teardown_ended.notify_all();
-        }
-        std::mem::forget(self);
+        self.ledger.entries().strand(self.id, reason);
+        // Dropping it ends the teardown; a stranded entry is not removed.
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut entries = self.ledger.entries();
-        // A condemned commitment is never released, whoever lets go of it.
-        let condemned = entries
-            .reserved
-            .get(&self.id)
-            .and_then(|entry| entry.condemned.clone());
-        if let Some(reason) = &condemned {
-            let entry = entries.reserved.get(&self.id);
-            tracing::error!(
-                model = %entry.map_or_else(String::new, |entry| entry.model.display().to_string()),
-                bytes = entry.map_or(0, |entry| entry.commitment.total()),
-                reason,
-                "engine memory stays reserved until the process restarts"
-            );
+        let ended = entries.end_teardown(self.id);
+        if let Some(entry) = entries.reserved.get_mut(&self.id) {
+            entry.owner_released = true;
         }
-        let ended = entries.end_teardown(self.id, condemned.is_none());
+        entries.release_if_unheld(self.id);
         drop(entries);
         if ended {
             self.ledger.teardown_ended.notify_all();
@@ -390,47 +407,78 @@ impl std::fmt::Debug for Reservation {
     }
 }
 
-/// Condemns a reservation that has moved on with its model: the commitment
-/// then stays charged for the rest of the process, like a stranded one,
-/// whenever its owner lets go of it.
-pub(crate) struct Condemner {
+/// The loading thread's claim on an engine's commitment
+/// ([`Reservation::loading_claim`]).
+///
+/// The loading thread held the model while it loaded and provisioned it, and
+/// may still hold memory for it (a GPU cache it primed, a queue it encoded
+/// on) after the reservation has moved on to the worker with the model.
+/// The worker can be torn down before the loading thread has cleaned up: a
+/// warmup that fails joins the worker's teardown first. So the commitment is
+/// released only when both have let go cleanly, in either order, and the
+/// entry stays in the ledger, charged, until then.
+pub(crate) struct LoadingClaim {
     ledger: Arc<Ledger>,
     id: u64,
+    concluded: bool,
 }
 
-impl Condemner {
-    pub(crate) fn condemn(self, reason: &str) {
-        if let Some(entry) = self.ledger.entries().reserved.get_mut(&self.id) {
-            entry.condemned.get_or_insert_with(|| reason.to_owned());
+impl LoadingClaim {
+    /// The loading thread is done with the model. `settled` says whether it
+    /// could give back what it held for it; if it could not, the commitment
+    /// is stranded.
+    pub(crate) fn conclude(mut self, settled: anyhow::Result<()>) {
+        self.finish(settled);
+    }
+
+    fn finish(&mut self, settled: anyhow::Result<()>) {
+        if std::mem::replace(&mut self.concluded, true) {
+            return;
         }
+        let mut entries = self.ledger.entries();
+        if let Err(error) = settled {
+            entries.strand(
+                self.id,
+                &format!(
+                    "the loading thread could not give back what it held for the model: \
+                     {error:#}"
+                ),
+            );
+        }
+        if let Some(entry) = entries.reserved.get_mut(&self.id) {
+            entry.loading_claim = false;
+        }
+        entries.release_if_unheld(self.id);
     }
 }
 
-/// What the loading thread does with an engine's reservation once the load
+impl Drop for LoadingClaim {
+    fn drop(&mut self) {
+        // A loading thread that ends without concluding (it panicked) has
+        // not shown that it gave anything back.
+        self.finish(Err(anyhow::anyhow!(
+            "the loading thread ended without concluding the load"
+        )));
+    }
+}
+
+/// What the loading thread does with an engine's commitment once the load
 /// has ended, given whether the thread could give back what it held for the
 /// model itself (`settled`).
 ///
 /// `reservation` is still here when the load failed before a worker owned
-/// the model: the model is dropped, and the reservation goes with it, unless
-/// the thread's cleanup failed, in which case its memory cannot be taken to
-/// be free and it is stranded. When the reservation has moved on with the
-/// model, a cleanup that failed condemns it: the worker's teardown will not
-/// release it either.
+/// the model; the model is dropped, and the reservation is released with the
+/// claim. When the reservation has moved on with the model, the worker
+/// releases it in its own time, before or after this. In both cases the
+/// commitment leaves the ledger only once the reservation is released and
+/// the claim has concluded with `Ok`.
 pub(crate) fn conclude_load(
     reservation: Option<Reservation>,
-    condemner: Condemner,
+    claim: LoadingClaim,
     settled: anyhow::Result<()>,
 ) {
-    match (reservation, settled) {
-        (Some(reservation), Ok(())) => drop(reservation),
-        (Some(reservation), Err(error)) => reservation.strand(&format!(
-            "the load failed and the loading thread could not give its memory back: {error:#}"
-        )),
-        (None, Ok(())) => {}
-        (None, Err(error)) => condemner.condemn(&format!(
-            "the loading thread could not give back what it held for the model: {error:#}"
-        )),
-    }
+    claim.conclude(settled);
+    drop(reservation);
 }
 
 /// Marks the start of an engine's teardown. From [`Self::begin`] until the
@@ -776,49 +824,122 @@ mod tests {
         assert!(process_footprint_bytes().expect("footprint") > 0);
     }
 
-    #[test]
-    fn the_loading_thread_concludes_a_load_by_what_it_could_give_back() {
-        let ledger = Ledger::new();
-        let reserve = || ledger.reserve(Path::new("/a.gguf"), commitment(16, 10));
-        let one = (16 + 4 + 1 + 10) * GIB;
-        let failed = || Err(anyhow::anyhow!("a command queue could not be settled"));
+    fn settle_failed() -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("a command queue could not be settled"))
+    }
 
-        // The load failed before a worker owned the model, and the thread
-        // gave everything back: the reservation goes.
-        let reservation = reserve();
-        let condemner = reservation.condemner();
-        conclude_load(Some(reservation), condemner, Ok(()));
-        assert_eq!(ledger.total(), 0);
-
-        // The load failed and the thread could not give its memory back:
-        // stranded, so a retry is admitted against it.
-        let reservation = reserve();
-        let condemner = reservation.condemner();
-        conclude_load(Some(reservation), condemner, failed());
-        assert_eq!(ledger.total(), one);
-
-        // The reservation moved on with the model and the thread's cleanup
-        // succeeded: the worker releases it in its own time.
-        let with_worker = reserve();
-        conclude_load(None, with_worker.condemner(), Ok(()));
-        assert_eq!(ledger.total(), 2 * one);
-        drop(with_worker);
-        assert_eq!(ledger.total(), one);
-
-        // It moved on and the thread's cleanup failed: condemned. The
-        // worker's teardown, however clean, does not release it, and it does
-        // not leave admissions waiting.
-        let with_worker = reserve();
-        conclude_load(None, with_worker.condemner(), failed());
-        with_worker.teardown_marker().begin();
-        drop(with_worker);
-        assert_eq!(ledger.total(), 2 * one);
+    /// An admission made now: the charged total it sees, without waiting.
+    fn charged_now(ledger: &Arc<Ledger>) -> u64 {
+        let asked = std::time::Instant::now();
         let (resident, _reservation) = ledger
-            .admit(Path::new("/b.gguf"), |resident| {
+            .admit(Path::new("/next.gguf"), |resident| {
                 Ok::<_, ()>((resident, Commitment::default()))
             })
-            .expect("admitted without waiting");
-        assert_eq!(resident, 2 * one);
+            .expect("admitted");
+        assert!(
+            asked.elapsed() < ADMISSION_TEARDOWN_WAIT / 3,
+            "the admission waited for a teardown that had ended"
+        );
+        assert_eq!(ledger.admissions_waiting(), 0);
+        resident
+    }
+
+    #[test]
+    fn a_load_that_failed_before_a_worker_existed_concludes_by_its_cleanup() {
+        let ledger = Ledger::new();
+        let one = commitment(16, 10).total();
+        // The loading thread gave everything back: the reservation goes.
+        let reservation = ledger.reserve(Path::new("/a.gguf"), commitment(16, 10));
+        let claim = reservation.loading_claim();
+        conclude_load(Some(reservation), claim, Ok(()));
+        assert_eq!(ledger.total(), 0);
+        // It could not: stranded, so a retry is admitted against it.
+        let reservation = ledger.reserve(Path::new("/a.gguf"), commitment(16, 10));
+        let claim = reservation.loading_claim();
+        conclude_load(Some(reservation), claim, settle_failed());
+        assert_eq!(ledger.total(), one);
+        assert_eq!(charged_now(&ledger), one);
+    }
+
+    #[test]
+    fn a_worker_released_first_does_not_free_what_the_loading_thread_has_not_concluded() {
+        // The order a failed warmup takes: the worker is stopped and its
+        // teardown joined, and only then does the loading thread clean up.
+        let ledger = Ledger::new();
+        let one = commitment(16, 10).total();
+        let load = || {
+            let reservation = ledger.reserve(Path::new("/a.gguf"), commitment(16, 10));
+            let claim = reservation.loading_claim();
+            (reservation, claim)
+        };
+        let worker_teardown = |reservation: Reservation| {
+            reservation.teardown_marker().begin();
+            drop(reservation);
+        };
+
+        // The loading cleanup fails afterwards: the commitment the worker
+        // let go of is still there to strand. It was never out of the
+        // ledger, and it stays for good.
+        let (reservation, claim) = load();
+        worker_teardown(reservation);
+        assert_eq!(
+            ledger.total(),
+            one,
+            "the worker's release alone frees nothing"
+        );
+        // The teardown is over, so an admission is decided at once, and
+        // against the commitment.
+        assert_eq!(charged_now(&ledger), one);
+        conclude_load(None, claim, settle_failed());
+        assert_eq!(ledger.total(), one);
+        assert_eq!(charged_now(&ledger), one);
+
+        // The loading cleanup succeeds afterwards: released then, not
+        // before.
+        let (reservation, claim) = load();
+        worker_teardown(reservation);
+        assert_eq!(ledger.total(), 2 * one);
+        assert_eq!(charged_now(&ledger), 2 * one);
+        conclude_load(None, claim, Ok(()));
+        assert_eq!(ledger.total(), one, "only the stranded one is left");
+        assert_eq!(charged_now(&ledger), one);
+    }
+
+    #[test]
+    fn a_loading_thread_that_concludes_first_leaves_the_release_to_the_worker() {
+        let ledger = Ledger::new();
+        let one = commitment(16, 10).total();
+        // Cleanup succeeded: the worker's teardown releases, when it ends.
+        let reservation = ledger.reserve(Path::new("/a.gguf"), commitment(16, 10));
+        conclude_load(None, reservation.loading_claim(), Ok(()));
+        assert_eq!(ledger.total(), one);
+        drop(reservation);
+        assert_eq!(ledger.total(), 0);
+        // Cleanup failed: the worker's teardown, however clean, releases
+        // nothing, and does not leave admissions waiting.
+        let reservation = ledger.reserve(Path::new("/a.gguf"), commitment(16, 10));
+        conclude_load(None, reservation.loading_claim(), settle_failed());
+        reservation.teardown_marker().begin();
+        drop(reservation);
+        assert_eq!(ledger.total(), one);
+        assert_eq!(charged_now(&ledger), one);
+        // A worker whose own teardown failed strands it whatever the loading
+        // thread concludes.
+        let reservation = ledger.reserve(Path::new("/b.gguf"), commitment(20, 0));
+        let claim = reservation.loading_claim();
+        reservation.strand("its queues could not be settled");
+        conclude_load(None, claim, Ok(()));
+        assert_eq!(ledger.total(), one + commitment(20, 0).total());
+    }
+
+    #[test]
+    fn a_loading_thread_that_never_concludes_strands_the_commitment() {
+        let ledger = Ledger::new();
+        let reservation = ledger.reserve(Path::new("/a.gguf"), commitment(16, 10));
+        // The loading thread panics between the handoff and its cleanup.
+        drop(reservation.loading_claim());
+        drop(reservation);
+        assert_eq!(ledger.total(), commitment(16, 10).total());
     }
 
     #[test]

@@ -4046,9 +4046,10 @@ fn load_engine_on_route(
     reservation: resident_memory::Reservation,
 ) -> Result<api::engine::Engine> {
     use crate::inference::device_settle::{settle_or_record, take_thread_unsettled};
-    // Kept for a cleanup of this thread that fails after the reservation
-    // has moved on with the model.
-    let condemner = reservation.condemner();
+    // This thread's own claim on the commitment, held until its cleanup
+    // below has concluded: the reservation may move on with the model, and
+    // its worker may be torn down, before that.
+    let loading_claim = reservation.loading_claim();
     let mut reservation = Some(reservation);
     let engine = load_and_spawn_on_route(path, config, selection, &mut reservation);
     // This thread held the model while it loaded and provisioned it. A GPU
@@ -4069,7 +4070,7 @@ fn load_engine_on_route(
         )),
         None => Ok(()),
     };
-    resident_memory::conclude_load(reservation.take(), condemner, settled);
+    resident_memory::conclude_load(reservation.take(), loading_claim, settled);
     engine
 }
 
