@@ -17815,7 +17815,12 @@ const QWEN35_SLOT_PREFILL_CHUNK_TOKENS: u32 = 2_048;
 /// retain the 2K fairness/safety quantum.
 const QWEN35_SINGLE_SLOT_PREFILL_CHUNK_CEILING: u32 = 4_096;
 
-fn qwen35_slot_prefill_chunk_tokens(n_slots: usize) -> u32 {
+/// The most rows one prompt-prefill transaction of a SlotAware Qwen worker
+/// carries: a pure function of the slot count (a phase-trace diagnostic may
+/// select another quantum; no served profile does). Memory admission sizes
+/// the prefill scratch bounds with it before the model is loaded
+/// (`prefill_prepared::prefill_switch_scratch_bound_bytes`).
+pub(crate) fn qwen35_slot_prefill_chunk_tokens(n_slots: usize) -> u32 {
     if n_slots == 1 {
         QWEN35_SINGLE_SLOT_PREFILL_CHUNK_CEILING
     } else {
@@ -19118,15 +19123,15 @@ fn run_slot_aware_qwen35(
             kv_rows,
             layer_scratch_bound_bytes =
                 prepared::prefill_layer_scratch_bound_bytes(&guard.model.model.cfg, rows, slots),
-            joint_scratch_bound_bytes = if qwen_joint_prefill.is_some() {
-                prepared::joint_scratch_bound_bytes(&guard.model.model.cfg, rows, slots, kv_rows)
-            } else {
-                0
-            },
-            wait_layers_scratch_bound_bytes = prepared::wait_layers_scratch_bound_bytes(
+            joint_arena_bound_bytes =
+                prepared::joint_arena_bound_bytes(&guard.model.model.cfg, rows, slots, kv_rows),
+            // What the switches in force are charged, as one pool.
+            switch_scratch_bound_bytes = prepared::prefill_switch_scratch_bound_bytes(
                 &guard.model.model.cfg,
                 rows,
                 slots,
+                kv_rows,
+                qwen_joint_prefill.is_some(),
                 prepared::switches_from_process().map_or(1, |switches| switches.wait_layers),
             ),
             "Qwen prompt prefill scratch bounds"

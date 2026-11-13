@@ -408,6 +408,37 @@ pub(crate) fn wait_layers_scratch_bound_bytes(
     }
 }
 
+/// What memory admission charges a worker for `HF2Q_QWEN_PREFILL_JOINT`
+/// (`joint`) and `HF2Q_QWEN_PREFILL_WAIT_LAYERS` (`wait_layers`) together:
+/// the two switches cap one pool, so their figures do not add.
+/// `forward_rows`: the worker's per-transaction row ceiling
+/// (`qwen35_slot_prefill_chunk_tokens(slots)` in the engine); `kv_rows`:
+/// the rows a slot's cache can hold (the resolved context length).
+/// - neither: 0;
+/// - joint alone: [`joint_scratch_bound_bytes`];
+/// - wait layers alone: [`wait_layers_scratch_bound_bytes`] for one lane (a
+///   forward without the joint switch serves one slot);
+/// - both: [`wait_layers_scratch_bound_bytes`] for the joint forward's slots
+///   plus [`joint_arena_bound_bytes`].
+pub(crate) fn prefill_switch_scratch_bound_bytes(
+    cfg: &super::Qwen35Config,
+    forward_rows: usize,
+    slots: usize,
+    kv_rows: usize,
+    joint: bool,
+    wait_layers: usize,
+) -> u64 {
+    match (joint, wait_layers > 1) {
+        (false, false) => 0,
+        (true, false) => joint_scratch_bound_bytes(cfg, forward_rows, slots, kv_rows),
+        (false, true) => wait_layers_scratch_bound_bytes(cfg, forward_rows, 1, wait_layers),
+        (true, true) => {
+            wait_layers_scratch_bound_bytes(cfg, forward_rows, slots, wait_layers)
+                + joint_arena_bound_bytes(cfg, forward_rows, slots, kv_rows)
+        }
+    }
+}
+
 /// Layers between host waits for a chunk of more than 32 rows on this
 /// thread: the operator's value inside a prompt-prefill scope, 1 outside.
 pub(crate) fn wait_layers() -> usize {

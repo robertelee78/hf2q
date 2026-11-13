@@ -1703,6 +1703,34 @@ fn the_joint_arena_bound_covers_the_arenas_a_segment_allocates() {
     super::prefill_fold_tests::with_synthetic_moe_model(|model| check(model, "MoE FFN"));
 }
 
+/// The two switches cap one pool: what memory admission charges them
+/// together is not the sum of their figures.
+#[test]
+fn the_switches_are_charged_as_one_pool() {
+    use super::prefill_prepared::{
+        joint_arena_bound_bytes, joint_scratch_bound_bytes, prefill_switch_scratch_bound_bytes,
+        wait_layers_scratch_bound_bytes,
+    };
+    with_synthetic_model(|model| {
+        let cfg = &model.cfg;
+        let (rows, slots, kv_rows) = (2048, 4, 32_768);
+        let charged = |joint, wait| {
+            prefill_switch_scratch_bound_bytes(cfg, rows, slots, kv_rows, joint, wait)
+        };
+        assert_eq!(charged(false, 1), 0);
+        assert_eq!(charged(true, 1), joint_scratch_bound_bytes(cfg, rows, slots, kv_rows));
+        assert_eq!(charged(false, 8), wait_layers_scratch_bound_bytes(cfg, rows, 1, 8));
+        let both = charged(true, 8);
+        assert_eq!(
+            both,
+            wait_layers_scratch_bound_bytes(cfg, rows, slots, 8)
+                + joint_arena_bound_bytes(cfg, rows, slots, kv_rows)
+        );
+        assert!(both >= charged(true, 1) && both >= charged(false, 8));
+        assert!(both < charged(true, 1) + charged(false, 8), "the two figures were added");
+    });
+}
+
 /// One layer of a forward on the prepared route requests at most
 /// `prefill_layer_scratch_bound_bytes` of scratch for its shape: single-slot
 /// chunks (fresh, resumed, short, with a folded cue) and joint forwards with
