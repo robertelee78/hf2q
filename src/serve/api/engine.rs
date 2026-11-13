@@ -20432,20 +20432,6 @@ fn advance_qwen35_prefill_step(
     )
 }
 
-/// `HF2Q_QWEN_PREFILL_KEEP_FRESH`: between decode cycles, use the weights
-/// only the prompt prefill reads (at most one tiny command buffer per
-/// quarter second, committed without a wait). A failure is logged once and
-/// ends the keep-alive; it never fails a request.
-fn keep_qwen35_prefill_weights_fresh(guard: &Qwen35KvGuard<'_>) {
-    use crate::inference::models::qwen35::prefill_keep_fresh;
-    if !prefill_keep_fresh::enabled() {
-        return;
-    }
-    if let Err(error) = guard.model.model.keep_prefill_weights_fresh() {
-        tracing::warn!(error = %format!("{error:#}"), "Qwen35 prefill keep-fresh stopped");
-    }
-}
-
 /// Whether first prompts are still gathering for a joint prefill
 /// ([`super::engine_qwen35::qwen35_first_prompts_may_gather`]).
 fn qwen35_first_prompts_may_gather(slots: &[Option<Qwen35Slot>]) -> bool {
@@ -21288,6 +21274,20 @@ fn embed_qwen35_inline(
     }
     let _ = reply.send(result);
     None
+}
+
+/// `HF2Q_QWEN_PREFILL_KEEP_FRESH`: between decode cycles, use the weights
+/// only the prompt prefill reads (at most one tiny command buffer per
+/// quarter second, committed without a wait). A failure is logged once and
+/// ends the keep-alive; it never fails a request.
+fn keep_qwen35_prefill_weights_fresh(guard: &Qwen35KvGuard<'_>) {
+    use crate::inference::models::qwen35::prefill_keep_fresh;
+    if !prefill_keep_fresh::enabled() {
+        return;
+    }
+    if let Err(error) = guard.model.model.keep_prefill_weights_fresh() {
+        tracing::warn!(error = %format!("{error:#}"), "Qwen35 prefill keep-fresh stopped");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
