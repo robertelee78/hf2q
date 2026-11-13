@@ -111,10 +111,44 @@ def resolve_set(spec, values):
     return q5_case.runtime_value(spec, values)
 
 
-def render_approval(approval, values, out):
+def supervised_peer_launch(server, plan):
+    """Attest the actual Popen launch, never fields supplied by an approval template."""
+    argv = list(server.args)
+    if (not argv or argv[0] != plan['binary'] or argv.count('--host') != 1 or
+            argv.count('--port') != 1 or
+            any(argv.index(flag) + 1 >= len(argv) for flag in ('--host', '--port'))):
+        raise q5_case.CaseError('peer reference requires a directly supervised executable/host/port')
+    host = argv[argv.index('--host') + 1]
+    port = argv[argv.index('--port') + 1]
+    if host != '127.0.0.1' or port != str(plan['port']):
+        raise q5_case.CaseError('peer supervised endpoint differs from the case')
+    return {'schema': 'hf2q.peer.supervised-launch.v1', 'server_pid': server.pid,
+            'base_url': f'http://127.0.0.1:{port}/v1', 'binary': argv[0],
+            'binary_sha256': sha256(argv[0]), 'serve_argv': argv}
+
+
+def render_approval(approval, values, out, supervised_launch=None):
     packet = load_json(approval['template'])
+    if 'peer_supervised_launch' in packet or 'peer_supervised_launch' in approval['set']:
+        raise q5_case.CaseError('peer_supervised_launch is supervisor-owned, not caller supplied')
     for key, spec in approval['set'].items():
         packet[key] = resolve_set(spec, values)
+    reference = packet.get('peer_reference')
+    if reference is not None:
+        if not isinstance(reference, dict) or not isinstance(supervised_launch, dict):
+            raise q5_case.CaseError('peer reference requires an actual supervised launch')
+        if (reference.get('serve_argv') != supervised_launch['serve_argv'] or
+                packet.get('server_pid') != supervised_launch['server_pid'] or
+                packet.get('base_url') != supervised_launch['base_url']):
+            raise q5_case.CaseError('peer reference differs from actual supervised binary/argv/PID/endpoint')
+        identity_path = reference.get('identity_receipt')
+        if not isinstance(identity_path, str) or sha256(identity_path) != reference.get('identity_sha256'):
+            raise q5_case.CaseError('peer supervised identity receipt hash mismatch')
+        identity = load_json(identity_path)
+        if (identity.get('binary') != supervised_launch['binary'] or
+                identity.get('binary_sha256') != supervised_launch['binary_sha256']):
+            raise q5_case.CaseError('peer supervised executable differs from frozen identity')
+        packet['peer_supervised_launch'] = supervised_launch
     path = out / 'client-approval.json'
     save(path, packet)
     return {'CLIENT_APPROVAL': str(path), 'CLIENT_APPROVAL_SHA256': sha256(path)}
@@ -282,7 +316,10 @@ def supervise(plan, values, out, receipt, negative, state):
         if plan['client'] is not None and not latch.event.is_set():
             spec = plan['client']
             if spec.get('approval'):
-                values.update(render_approval(spec['approval'], values, out))
+                actual_launch = (supervised_peer_launch(server, plan)
+                                 if 'peer_reference' in spec['approval']['set'] or
+                                 'peer_reference' in load_json(spec['approval']['template']) else None)
+                values.update(render_approval(spec['approval'], values, out, actual_launch))
             argv = q5_case.validate_argv(q5_case.expand(spec['argv'], values), 'client')
             receipt['client_argv'] = argv
             started = time.monotonic()
