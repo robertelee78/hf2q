@@ -5443,9 +5443,11 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
     // terminal commit+wait, satisfying the unretained-reference lifetime
     // contract as well.
     enc.commit_labeled("layer.full_attn.tq_bridge_dequant");
-    // Release the submitted encoder so the native observer retains this
-    // command before the dense resume's wait checks the queue.
-    drop(enc);
+    // Hand the submitted encoder over: a pipelined forward keeps it for
+    // its next host wait; otherwise it is released here, so the native
+    // observer retains this command before the dense resume's wait checks
+    // the queue.
+    super::encoder_stage::retain_submitted(enc);
 
     // Dispatch the same dense resume kernel against the tight temp
     // buffers. kv_capacity = kv_seq_len so the kernel's head-stride
@@ -5630,6 +5632,7 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct_for_slot(
     // downstream gate/output projection consume `output` after attention;
     // a host wait here would serialize every full-attention layer.
     encoder.commit_labeled("layer.full_attn.tq_direct_prefill");
+    super::encoder_stage::retain_submitted(encoder);
     Ok(output)
 }
 
@@ -5961,6 +5964,7 @@ pub fn apply_sdpa_with_kv_cache(
                     .context("complete source-teacher KV prefill write")?;
             } else {
                 enc.commit_labeled("layer.full_attn.kv_cache_write");
+                super::encoder_stage::retain_submitted(enc);
             }
         }
 

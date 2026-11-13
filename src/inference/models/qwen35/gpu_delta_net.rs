@@ -3041,6 +3041,7 @@ pub fn build_delta_net_layer(
                     .context("complete source-teacher Delta prefill ops1-3")?;
             } else {
                 enc.commit_labeled("layer.gdn.ops1-3");
+                super::encoder_stage::retain_submitted(enc);
             }
             (x_norm, qkv_conv, z)
         };
@@ -3118,6 +3119,7 @@ pub fn build_delta_net_layer(
                     .context("complete source-teacher Delta QKV split")?;
             } else {
                 enc.commit_labeled("layer.gdn.qkv_split");
+                super::encoder_stage::retain_submitted(enc);
             }
             (q_gpu, k_gpu, v_gpu)
         };
@@ -3538,6 +3540,7 @@ pub fn build_delta_net_layer(
                     .context("complete source-teacher Delta prefill ops5-9")?;
             } else {
                 enc.commit_labeled("layer.gdn.ops5-9");
+                super::encoder_stage::retain_submitted(enc);
             }
             output
         };

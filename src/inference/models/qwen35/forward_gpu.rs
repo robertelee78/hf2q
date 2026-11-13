@@ -108,12 +108,74 @@ fn effective_ffn_terminal_k_batch(seq_len: u32, configured: usize) -> usize {
 /// has run. The layer loop calls this before a host copy of the residual
 /// stream whose producer was committed without a wait.
 fn wait_for_committed_gpu_work(device: &MlxDevice) -> Result<()> {
-    device
+    // A pipelined forward first waits for, and reads the status of, every
+    // command buffer it committed without a wait.
+    let settled = super::encoder_stage::settle_submitted();
+    let drained = device
         .command_encoder()
         .map(crate::inference::native_observation::encoder)
-        .context("host-read drain encoder")?
-        .commit_and_wait_labeled("qwen35.forward.host_read_drain")
-        .context("host-read drain")
+        .context("host-read drain encoder")
+        .and_then(|mut encoder| {
+            encoder
+                .commit_and_wait_labeled("qwen35.forward.host_read_drain")
+                .context("host-read drain")
+        });
+    settled.and(drained)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test failpoint: the layer at whose start a multi-row forward returns
+    /// an error, with whatever it committed before still running.
+    static FAIL_AT_LAYER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Until dropped, every multi-row forward on this thread fails at the start
+/// of `layer` (see `FAIL_AT_LAYER`).
+#[cfg(test)]
+pub(crate) struct FailForwardAtLayer;
+
+#[cfg(test)]
+impl FailForwardAtLayer {
+    pub(crate) fn set(layer: usize) -> Self {
+        FAIL_AT_LAYER.with(|cell| cell.set(Some(layer)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailForwardAtLayer {
+    fn drop(&mut self) {
+        FAIL_AT_LAYER.with(|cell| cell.set(None));
+    }
+}
+
+/// Block until every command buffer a failed forward committed has run.
+/// The forward's kept command buffers were waited for one by one when its
+/// scope ended ([`super::encoder_stage::SubmittedCommands`]); this covers
+/// the stage command buffers it released at commit. A drain that fails is
+/// logged: the forward's own error is the one the caller gets.
+fn drain_after_failed_forward() {
+    let device = GPU_CACHE.with(|cell| {
+        cell.try_borrow()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|cache| cache.device.clone()))
+    });
+    let Some(device) = device else {
+        return;
+    };
+    let drained = device
+        .command_encoder()
+        .map(crate::inference::native_observation::encoder)
+        .context("failed-forward drain encoder")
+        .and_then(|mut encoder| {
+            encoder
+                .commit_and_wait_labeled("qwen35.forward.failed_drain")
+                .context("failed-forward drain")
+        });
+    if let Err(error) = drained {
+        tracing::warn!(error = %format!("{error:#}"), "Qwen forward: drain after a failed forward failed");
+    }
 }
 
 // ================================================================
@@ -1129,6 +1191,7 @@ pub(super) fn embed_tokens_gpu_into(
                 .context("native embedding completion")?;
         } else {
             enc.commit_labeled("qwen35.embedding.native");
+            super::encoder_stage::retain_submitted(enc);
         }
         return Ok(());
     }
@@ -1267,6 +1330,7 @@ pub(super) fn embed_token_ids_gpu_into(
         NativeEmbeddingRoute::F32 => unreachable!("rejected above"),
     }
     enc.commit_labeled("qwen35.embedding.gpu_token_ids");
+    super::encoder_stage::retain_submitted(enc);
     Ok(())
 }
 
@@ -3664,6 +3728,7 @@ impl Qwen35Model {
             glp_bound: self.glp.is_some(),
             dump_bisect: super::dump_bisect::is_enabled(),
             dense_q_split_profile: super::execution_dispatch::dense_q_split_profile_enabled(),
+            moe_route_override: super::prefill_fold::moe_route_override(),
         }
     }
 
@@ -3671,8 +3736,13 @@ impl Qwen35Model {
     /// model in the open prefill scope: no route without a folded form is
     /// active, and every product a folded forward runs once over both
     /// segments takes the prepared row-tile MM, whose output row depends on
-    /// that input row alone. Full attention and the MoE FFN are built per
-    /// segment and need no such guarantee; an F32 FFN has none.
+    /// that input row alone. Full attention is built per segment and needs
+    /// no such guarantee. A quantized MoE FFN runs once over all rows of the
+    /// forward's segments of more than 32 rows
+    /// ([`super::prefill_joint::MOE_ROW_EXACT_MIN_ROWS`]), which is exact
+    /// only while mlx-native changes kernel family at that row count: with
+    /// `HF2Q_MM_ID_ROUTING_THRESHOLD` set, a MoE model keeps one forward
+    /// per segment and per slot. An F32 FFN has no prepared kernel.
     pub(crate) fn prefill_fold_exact(&self) -> Result<bool> {
         self.prefill_fold_exact_under(self.unfolded_routes())
     }
@@ -3705,7 +3775,7 @@ impl Qwen35Model {
                     FfnWeightsGpu::DenseQ(weights) => {
                         super::gpu_ffn::dense_prefill_products_prepared(weights, 2)
                     }
-                    FfnWeightsGpu::MoeQ(_) => true,
+                    FfnWeightsGpu::MoeQ(_) => !routes.moe_route_override,
                     FfnWeightsGpu::Dense(_) | FfnWeightsGpu::Moe(_) => false,
                 };
                 ffn_exact
@@ -4625,7 +4695,52 @@ impl Qwen35Model {
         Ok(captured)
     }
 
+    /// [`Self::forward_gpu_run`]; when it fails, the device queue is drained
+    /// before the error reaches the caller. A forward commits command
+    /// buffers without a wait (stages of a layer; whole layers with
+    /// `HF2Q_QWEN_PREFILL_WAIT_LAYERS` above 1) that write the slot's cache
+    /// rows and recurrent state, and the callers of a failed forward reset
+    /// and reuse its slots from the host: those writes must have landed
+    /// before the reset, or they land on the next conversation's state.
+    #[allow(clippy::too_many_arguments)]
     fn forward_gpu_impl(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        capture: Option<&mut LayerActivations>,
+        hidden_out: Option<&mut Option<MlxBuffer>>,
+        output_head_mode: OutputHeadMode,
+        soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+        deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
+        topk_out: Option<&mut Option<(Vec<u32>, Vec<f32>)>>,
+        nextn_hidden_out: Option<&mut Option<MlxBuffer>>,
+        logits_buffer_out: Option<&mut Option<MlxBuffer>>,
+        slot_id: SlotId,
+        residual_capture: Option<ResidualLayerCapture<'_>>,
+    ) -> Result<Vec<f32>> {
+        let result = self.forward_gpu_run(
+            tokens,
+            positions_flat,
+            kv_cache,
+            capture,
+            hidden_out,
+            output_head_mode,
+            soft_tokens,
+            deepstack,
+            topk_out,
+            nextn_hidden_out,
+            logits_buffer_out,
+            slot_id,
+            residual_capture,
+        );
+        if result.is_err() {
+            drain_after_failed_forward();
+        }
+        result
+    }
+
+    fn forward_gpu_run(
         &self,
         tokens: &[u32],
         positions_flat: &[i32],
@@ -5361,6 +5476,11 @@ impl Qwen35Model {
         let _single_command_layers = super::prefill_prepared::SingleCommandLayers::set(
             pipelined_layers && encoder_session_enabled,
         );
+        // Every command buffer such a forward commits without a wait is
+        // kept until its next host wait reads its status; a forward that
+        // returns an error waits for all of them first.
+        let _submitted_commands =
+            super::encoder_stage::SubmittedCommands::open(pipelined_layers.then_some(device));
         let ffn_terminal_k_batch = if small_nextn_verifier {
             // Exact speculative verification is a fixed, short graph whose
             // scratch buffers are retained until the output-head drain. One
@@ -5780,6 +5900,10 @@ impl Qwen35Model {
         // `phase1_fusion_env_eligible`, because both the last-layer held
         // encoder gate and the fold/apply sites below key on it.)
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
+            #[cfg(test)]
+            if seq_len > 1 && FAIL_AT_LAYER.with(std::cell::Cell::get) == Some(layer_idx) {
+                return Err(anyhow!("injected forward failure at layer {layer_idx}"));
+            }
             #[cfg(test)]
             let q1_layer_before = if q1_target_layers.is_some() {
                 Some(q1_layer_metadata::state(kv_cache,layer_idx,slot_id)?)

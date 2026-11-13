@@ -773,6 +773,46 @@ fn the_fold_is_not_taken_with_a_glp_vector_bound() {
     });
 }
 
+/// `HF2Q_MM_ID_ROUTING_THRESHOLD` moves the row count at which mlx-native
+/// changes the MoE FFN's kernel family, and with it the bits of segments
+/// between the two values: a MoE model then admits neither the fold nor a
+/// joint forward (each request keeps its own forwards, whose bits are its
+/// own by definition); a dense-FFN model has no such kernel and keeps both.
+#[test]
+fn a_moe_model_admits_no_fold_under_a_mm_id_threshold_override() {
+    let overridden = super::prefill_fold::UnfoldedRoutes {
+        moe_route_override: true,
+        ..Default::default()
+    };
+    assert!(!overridden.any(), "the override concerns MoE layers only");
+    with_synthetic_moe_model(|model| {
+        let _scope = PrefillScope::forced(true);
+        assert!(
+            model
+                .prefill_fold_exact_under(super::prefill_fold::UnfoldedRoutes::default())
+                .expect("exactness"),
+            "the synthetic MoE model does not fold at the stock threshold"
+        );
+        assert!(
+            !model.prefill_fold_exact_under(overridden).expect("exactness"),
+            "a MoE model still folds under a threshold override"
+        );
+    });
+    with_synthetic_model(|model| {
+        let _scope = PrefillScope::forced(true);
+        assert!(
+            model.prefill_fold_exact_under(overridden).expect("exactness"),
+            "a dense-FFN model stopped folding under a MoE threshold override"
+        );
+    });
+    // This process runs without the override: the production predicate
+    // reads the environment, never a default.
+    assert_eq!(
+        super::prefill_fold::moe_route_override(),
+        std::env::var_os("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some()
+    );
+}
+
 #[test]
 fn the_fold_is_not_taken_with_dump_bisect_enabled() {
     no_fold_under(

@@ -75,6 +75,20 @@ pub(crate) struct UnfoldedRoutes {
     pub(crate) glp_bound: bool,
     pub(crate) dump_bisect: bool,
     pub(crate) dense_q_split_profile: bool,
+    /// `HF2Q_MM_ID_ROUTING_THRESHOLD` is set (any value, as for the shared
+    /// expert schedule in `gpu_ffn`): mlx-native may change the MoE FFN's
+    /// kernel family at another row count than the 32 rows a folded or
+    /// joint forward groups its MoE segments by. Concerns MoE models only
+    /// and is therefore not part of [`Self::any`].
+    pub(crate) moe_route_override: bool,
+}
+
+/// Whether the process overrides the row count at which the MoE FFN changes
+/// kernel family ([`UnfoldedRoutes::moe_route_override`]).
+pub(crate) fn moe_route_override() -> bool {
+    static OVERRIDE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some());
+    *OVERRIDE
 }
 
 impl UnfoldedRoutes {

@@ -98,6 +98,151 @@ use anyhow::{Context, Result};
 
 use mlx_native::{CommandEncoder, EncoderSession, MlxDevice};
 
+/// The command buffers a pipelined prefill forward
+/// (`HF2Q_QWEN_PREFILL_WAIT_LAYERS` above 1) has committed without a wait
+/// since its last host wait, in commit order.
+struct Submitted {
+    device: MlxDevice,
+    commands: Vec<CommandEncoder>,
+}
+
+thread_local! {
+    static SUBMITTED: std::cell::RefCell<Option<Submitted>> =
+        const { std::cell::RefCell::new(None) };
+    /// Test failpoint: the position, among the commands one settle waits
+    /// for, of a command that is reported as failed after it completed.
+    #[cfg(test)]
+    static FAIL_SUBMITTED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// While alive, this thread's forward keeps every command buffer it commits
+/// without a wait until its next host wait, which then waits for each of
+/// them and reads each one's status ([`settle_submitted`]): command buffers
+/// of one queue may overlap, so the last one's status says nothing about
+/// the earlier ones. Dropping it waits for whatever is still kept, so a
+/// forward that returns an error leaves none of its layers running.
+pub(super) struct SubmittedCommands {
+    previous: Option<Submitted>,
+}
+
+impl SubmittedCommands {
+    /// `device`: `Some` for a forward that submits its layers without a
+    /// wait, `None` for every other forward (nothing is kept).
+    pub(super) fn open(device: Option<&MlxDevice>) -> Self {
+        let next = device.map(|device| Submitted {
+            device: device.clone(),
+            commands: Vec::new(),
+        });
+        Self {
+            previous: SUBMITTED.with(|cell| cell.replace(next)),
+        }
+    }
+}
+
+impl Drop for SubmittedCommands {
+    fn drop(&mut self) {
+        let mine = SUBMITTED.with(|cell| cell.replace(self.previous.take()));
+        for command in mine.into_iter().flat_map(|submitted| submitted.commands) {
+            // The forward is over: an error it has not reported yet is on
+            // its way to the caller already.
+            let _ = command.wait_until_completed();
+        }
+    }
+}
+
+/// Keep `command`, committed without a wait, for the forward's next host
+/// wait. Outside a pipelined forward the command is released at once, as
+/// before.
+pub(super) fn retain_submitted(command: CommandEncoder) {
+    SUBMITTED.with(|cell| {
+        if let Some(submitted) = cell.borrow_mut().as_mut() {
+            submitted.commands.push(command);
+        }
+    });
+}
+
+/// A fresh command encoder when this thread's forward is pipelined.
+fn pipelined_encoder() -> Result<Option<CommandEncoder>> {
+    SUBMITTED.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|submitted| {
+                submitted
+                    .device
+                    .command_encoder()
+                    .map(crate::inference::native_observation::encoder)
+                    .context("command encoder of a pipelined layer")
+            })
+            .transpose()
+    })
+}
+
+/// Wait for every kept command buffer and report the first failure in
+/// commit order. Every one is waited for, also behind a failed one, so the
+/// caller may reset or reuse the slots of a failed forward.
+pub(super) fn settle_submitted() -> Result<()> {
+    let commands = SUBMITTED
+        .with(|cell| {
+            cell.borrow_mut()
+                .as_mut()
+                .map(|submitted| std::mem::take(&mut submitted.commands))
+        })
+        .unwrap_or_default();
+    settle(&commands, None)
+}
+
+/// [`settle_submitted`] over `commands`, then over `last` (the command of a
+/// session whose terminal stage was committed in place).
+fn settle(commands: &[CommandEncoder], last: Option<&CommandEncoder>) -> Result<()> {
+    let total = commands.len() + usize::from(last.is_some());
+    let mut first: Option<(usize, anyhow::Error)> = None;
+    let mut failed = 0usize;
+    for (index, command) in commands.iter().chain(last).enumerate() {
+        let waited = command.wait_until_completed();
+        #[cfg(test)]
+        let waited = match FAIL_SUBMITTED.with(std::cell::Cell::get) {
+            Some(target) if target == index => {
+                waited.and(Err(mlx_native::MlxError::CommandBufferError(
+                    "injected command buffer failure".into(),
+                )))
+            }
+            _ => waited,
+        };
+        if let Err(error) = waited {
+            failed += 1;
+            first.get_or_insert((index, anyhow::Error::new(error)));
+        }
+    }
+    match first {
+        None => Ok(()),
+        Some((index, error)) => Err(error.context(format!(
+            "command buffer {} of {total} committed without a wait failed ({failed} failed)",
+            index + 1
+        ))),
+    }
+}
+
+/// Test failpoint for [`settle_submitted`]: until dropped, the command at
+/// `position` of every settle on this thread is reported as failed once it
+/// has completed.
+#[cfg(test)]
+pub(crate) struct FailSubmitted;
+
+#[cfg(test)]
+impl FailSubmitted {
+    pub(crate) fn at(position: usize) -> Self {
+        FAIL_SUBMITTED.with(|cell| cell.set(Some(position)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailSubmitted {
+    fn drop(&mut self) {
+        FAIL_SUBMITTED.with(|cell| cell.set(None));
+    }
+}
+
 /// Per-stage encoder used by qwen35 prefill paths.  The lifetime parameter
 /// `'sess` ties the `Sessioned` arm to a borrow of an outer-scope
 /// `EncoderSession` (constructed once per `forward_gpu_impl` call).  The
@@ -235,22 +380,23 @@ impl<'sess> LayerEncoder<'sess> {
         match self {
             LayerEncoder::Plain(mut enc) => {
                 enc.commit_labeled(label);
+                retain_submitted(enc);
                 Ok(())
             }
             LayerEncoder::Sessioned(sess) => {
-                if super::prefill_prepared::single_command_layers() {
-                    // A prefill forward that submits one command buffer
-                    // per layer: commit without the shared-event fence.
-                    // The next command buffer then starts without a wait
-                    // for the event (measured 0.08 ms per command buffer),
-                    // ordered behind this one by the queue's commit order
-                    // like every `Plain` command buffer of a layer.
-                    sess.begin_stage(label);
-                    sess.commit_stage()
-                        .with_context(|| format!("EncoderSession::commit_stage({label})"))?;
-                    sess.reset_for_next_stage().with_context(|| {
-                        format!("EncoderSession::reset_for_next_stage({label})")
-                    })?;
+                if let Some(next) = pipelined_encoder()? {
+                    // A prefill forward that submits its layers without a
+                    // wait: commit without the shared-event fence. The
+                    // next command buffer then starts without a wait for
+                    // the event (measured 0.08 ms per command buffer),
+                    // ordered behind this one by Metal's tracking of the
+                    // buffers both use, like every `Plain` command buffer
+                    // of a layer. The session continues on a fresh
+                    // encoder; the committed one is kept so the forward's
+                    // next host wait reads its status.
+                    let mut submitted = std::mem::replace(sess.encoder(), next);
+                    submitted.commit_labeled(label);
+                    retain_submitted(submitted);
                     return Ok(());
                 }
                 sess.fence_stage(Some(label))
@@ -311,6 +457,7 @@ impl<'sess> LayerEncoder<'sess> {
                 // env=0 has no session to carry; preserve pre-iter91
                 // per-stage CB termination behavior byte-for-byte.
                 enc.commit_labeled(label);
+                retain_submitted(enc);
                 Ok(())
             }
             LayerEncoder::Sessioned(sess) => {
@@ -423,6 +570,33 @@ impl<'sess> LayerEncoder<'sess> {
     }
 
     fn commit_and_wait_labeled_impl(self, label: &str, reset_for_next_stage: bool) -> Result<()> {
+        if SUBMITTED.with(|cell| cell.borrow().is_some()) {
+            // A pipelined forward's host wait: commit this command buffer
+            // like the layers before it, then wait for every one of them
+            // in commit order and read every status.
+            return match self {
+                LayerEncoder::Sessioned(sess) if !reset_for_next_stage => {
+                    // The forward's last stage: committed in place, the
+                    // session keeps the command buffer.
+                    sess.begin_stage(label);
+                    sess.commit_stage()
+                        .with_context(|| format!("EncoderSession::commit_stage({label})"))?;
+                    let commands = SUBMITTED
+                        .with(|cell| {
+                            cell.borrow_mut()
+                                .as_mut()
+                                .map(|submitted| std::mem::take(&mut submitted.commands))
+                        })
+                        .unwrap_or_default();
+                    settle(&commands, Some(&*sess.encoder()))
+                }
+                encoder => {
+                    encoder.fence_or_commit(label)?;
+                    settle_submitted()
+                }
+            }
+            .with_context(|| format!("host wait at {label}"));
+        }
         match self {
             LayerEncoder::Plain(mut enc) => enc
                 .commit_and_wait_labeled(label)

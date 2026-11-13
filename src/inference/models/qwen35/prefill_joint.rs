@@ -74,7 +74,10 @@ pub(crate) const MIN_SHARED_ROWS: usize = 32;
 /// eight rows or fewer, the row-exact router matvec, whose bits differ.
 pub(crate) const MOE_ROW_EXACT_MIN_ROWS: u32 = 32;
 
-// The threshold covers every row-count switch of the prefill MoE FFN.
+// The threshold covers every row-count switch of the prefill MoE FFN at
+// mlx-native's stock values. `HF2Q_MM_ID_ROUTING_THRESHOLD` moves one of
+// them at run time; a MoE model then admits neither the fold nor a joint
+// forward (`Qwen35Model::prefill_fold_exact`).
 const _: () = assert!(
     MOE_ROW_EXACT_MIN_ROWS >= mlx_native::ops::quantized_matmul_id_ggml::MM_ID_ROUTING_THRESHOLD
         && MOE_ROW_EXACT_MIN_ROWS

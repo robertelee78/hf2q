@@ -1033,3 +1033,361 @@ fn qwen_prefill_joint_real_model_gate() {
         }
     }
 }
+
+/// Non-zero words of `slot`'s DeltaNet state in all four ping-pong buffers.
+fn dn_state_nonzero(cache: &HybridKvCache, slot: u32) -> usize {
+    let count = |buffer: &mlx_native::MlxBuffer| -> usize {
+        let all = buffer.as_slice::<f32>().expect("state words");
+        let per_slot = all.len() / SLOTS as usize;
+        all[slot as usize * per_slot..(slot as usize + 1) * per_slot]
+            .iter()
+            .filter(|value| value.to_bits() != 0)
+            .count()
+    };
+    cache
+        .linear_attn
+        .iter()
+        .map(|layer| {
+            count(&layer.conv_state)
+                + count(&layer.recurrent)
+                + count(&layer.conv_state_scratch)
+                + count(&layer.recurrent_scratch)
+        })
+        .sum()
+}
+
+/// What a bystander slot holds: cursors, DeltaNet state and cache rows.
+fn held(model: &Qwen35Model, cache: &mut HybridKvCache, slot: u32, rows: usize) -> (AnchorWords, Vec<u8>) {
+    (
+        cache
+            .snapshot_slot_anchor(SlotId(slot), rows)
+            .expect("slot state")
+            .test_words(),
+        kv_rows(model, cache, slot),
+    )
+}
+
+/// The first forward of a new conversation in slot 0 (60 content rows and a
+/// folded 5-row cue), queued behind whatever the device still runs.
+fn next_conversation(model: &Qwen35Model, cache: &mut HybridKvCache, next: &Lane) -> Vec<u32> {
+    let _scope = PrefillScope::forced(true);
+    let image = cache.boundary_anchor_image().expect("image");
+    let folded = model
+        .forward_gpu_last_logits_folded(
+            &next.tokens(0, 65),
+            &positions_for_range(0, 65),
+            cache,
+            None,
+            SlotId(0),
+            60,
+            60,
+            image,
+        )
+        .expect("next conversation");
+    bits(&folded.logits)
+}
+
+/// A forward that returns an error has committed command buffers without a
+/// wait: stages of a layer at the default cadence, up to eight whole layers
+/// with `HF2Q_QWEN_PREFILL_WAIT_LAYERS`. They write the lanes' DeltaNet
+/// state and cache rows, and the engine resets the lanes of a failed
+/// forward from the host at once and admits the next conversation. The
+/// forward therefore drains everything it committed before the error
+/// leaves it: right after the reset the slots are zero and stay zero, the
+/// next conversation in a failed slot gets a fresh slot's bits, and a slot
+/// that was no lane of the forward keeps every byte.
+#[test]
+fn a_failed_forward_leaves_nothing_running_behind_the_slot_reset() {
+    use super::forward_gpu::FailForwardAtLayer;
+    use super::prefill_prepared::ForcedWaitLayers;
+    with_synthetic_model(|model| {
+        let next = Lane {
+            seed: 41,
+            common: 0,
+            ..Lane::new(0, &[], 60, 5)
+        };
+        let reference = solo(model, &next, false).logits;
+        for wait in [1usize, 2, 8] {
+            for admission_reset in [false, true] {
+                for round in 0..3 {
+                    let what = format!("wait {wait}, admission reset {admission_reset}, round {round}");
+                    let _cadence = ForcedWaitLayers::set(wait);
+                    let mut cache = cache(model);
+                    // Slot 0 has one earlier transaction (ping-pong parity
+                    // flipped); slot 3 is a bystander with state of its own.
+                    let victim = Lane::new(0, &[40], 800, 0);
+                    let other = Lane::new(1, &[], 500, 0);
+                    let bystander = Lane::new(3, &[155], 9, 0);
+                    {
+                        let _scope = PrefillScope::forced(true);
+                        prefill_history(model, &mut cache, &victim);
+                        prefill_history(model, &mut cache, &bystander);
+                    }
+                    let before = held(model, &mut cache, 3, 155);
+                    // The forward fails at the start of layer 7: layers 0
+                    // to 6 were committed before it.
+                    let failure = {
+                        let _fail = FailForwardAtLayer::set(7);
+                        joint_forward(model, &mut cache, &[other, victim], 0, false)
+                    };
+                    let error = failure.err().map(|error| format!("{error:#}"));
+                    assert!(
+                        error.as_deref().is_some_and(|text| text.contains("injected forward failure")),
+                        "{what}: the injected failure did not surface: {error:?}"
+                    );
+                    // What the engine does with the lanes of a failed
+                    // forward, and with the slot of the next cold request.
+                    cache.reset_for_slot(SlotId(0)).expect("reset");
+                    cache.reset_for_slot(SlotId(1)).expect("reset");
+                    if admission_reset {
+                        cache.reset_for_slot(SlotId(0)).expect("admission reset");
+                    }
+                    assert_eq!(
+                        dn_state_nonzero(&cache, 1),
+                        0,
+                        "{what}: a reset slot holds DeltaNet state"
+                    );
+                    assert!(
+                        next_conversation(model, &mut cache, &next) == reference,
+                        "{what}: the next conversation in a failed slot differs from a fresh slot"
+                    );
+                    // Slot 1 has run nothing since its reset.
+                    assert_eq!(
+                        dn_state_nonzero(&cache, 1),
+                        0,
+                        "{what}: a command of the failed forward wrote a reset slot"
+                    );
+                    assert!(
+                        before == held(model, &mut cache, 3, 155),
+                        "{what}: a slot that was no lane of the failed forward changed"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// After a failed joint forward and the reset of its lanes, the same cohort
+/// prefills as each lane does alone, and a bystander keeps every byte
+/// through the forward, the failure and the retry.
+#[test]
+fn a_cohort_retried_after_a_failed_joint_forward_holds_its_solo_bits() {
+    use super::forward_gpu::FailForwardAtLayer;
+    use super::prefill_prepared::ForcedWaitLayers;
+    with_synthetic_model(|model| {
+        for wait in [1usize, 8] {
+            let _cadence = ForcedWaitLayers::set(wait);
+            let mut cache = cache(model);
+            let bystander = Lane::new(3, &[155], 9, 0);
+            {
+                let _scope = PrefillScope::forced(true);
+                prefill_history(model, &mut cache, &bystander);
+            }
+            let before = held(model, &mut cache, 3, 155);
+            let lanes = [
+                Lane::cold(0, 96, 150, 5),
+                Lane::cold(1, 96, 120, 5),
+                Lane::cold(2, 96, 110, 0),
+            ];
+            let failure = {
+                let _fail = FailForwardAtLayer::set(5);
+                joint_forward(model, &mut cache, &lanes, 96, true)
+            };
+            assert!(failure.is_err(), "wait {wait}: the injected failure did not surface");
+            for lane in &lanes {
+                cache.reset_for_slot(SlotId(lane.slot)).expect("reset");
+            }
+            assert!(
+                before == held(model, &mut cache, 3, 155),
+                "wait {wait}: bystander changed by a failed joint forward"
+            );
+            let retry = joint_forward(model, &mut cache, &lanes, 96, true).expect("retry");
+            for (lane, (boundary, logits, captured)) in lanes.iter().zip(retry) {
+                let alone = solo(model, lane, true);
+                // The checkpoint's generation counts the slot's resets.
+                let same_generation = |boundary: Option<(Vec<u32>, AnchorWords)>| {
+                    boundary.map(|(logits, mut words)| {
+                        words.1 = 0;
+                        (logits, words)
+                    })
+                };
+                assert!(
+                    same_generation(alone.boundary) == same_generation(boundary)
+                        && alone.logits == logits
+                        && alone.captured == captured,
+                    "wait {wait}: {lane:?} retried after a failed joint forward differs from solo"
+                );
+            }
+            assert!(
+                before == held(model, &mut cache, 3, 155),
+                "wait {wait}: bystander changed by the retry"
+            );
+        }
+    });
+}
+
+/// With `HF2Q_QWEN_PREFILL_WAIT_LAYERS` above 1 the forward commits whole
+/// layers without a wait. Command buffers of one queue may overlap, so the
+/// status of the one the host waits for says nothing about the earlier
+/// ones: the forward keeps every one of them and each host wait reads every
+/// status. A failure of the first of several (injected once the command
+/// has completed) fails the forward, every command is still waited for, and
+/// the slots are reusable at once.
+#[test]
+fn a_failed_command_buffer_committed_without_a_wait_fails_the_forward() {
+    use super::encoder_stage::FailSubmitted;
+    use super::prefill_prepared::ForcedWaitLayers;
+    with_synthetic_model(|model| {
+        let next = Lane {
+            seed: 41,
+            common: 0,
+            ..Lane::new(0, &[], 60, 5)
+        };
+        let reference = solo(model, &next, false).logits;
+        let victim = Lane::new(0, &[40], 300, 5);
+        let other = Lane::new(1, &[], 200, 0);
+        for wait in [2usize, 8] {
+            let _cadence = ForcedWaitLayers::set(wait);
+            let mut cache = cache(model);
+            {
+                let _scope = PrefillScope::forced(true);
+                prefill_history(model, &mut cache, &victim);
+            }
+            let failure = {
+                let _fail = FailSubmitted::at(0);
+                joint_forward(model, &mut cache, &[other, victim], 0, false)
+            };
+            let text = failure
+                .err()
+                .map(|error| format!("{error:#}"))
+                .unwrap_or_else(|| panic!("wait {wait}: a failed command buffer was dropped"));
+            assert!(
+                text.contains("command buffer 1 of ")
+                    && text.contains("committed without a wait failed")
+                    && !text.contains("command buffer 1 of 1 "),
+                "wait {wait}: not the failure of an earlier command buffer: {text}"
+            );
+            cache.reset_for_slot(SlotId(0)).expect("reset");
+            cache.reset_for_slot(SlotId(1)).expect("reset");
+            assert_eq!(dn_state_nonzero(&cache, 1), 0, "wait {wait}: reset slot holds state");
+            assert!(
+                next_conversation(model, &mut cache, &next) == reference,
+                "wait {wait}: the next conversation after a failed command buffer differs from a fresh slot"
+            );
+            assert_eq!(dn_state_nonzero(&cache, 1), 0, "wait {wait}: a late command wrote a reset slot");
+        }
+        // The default cadence waits after every layer and keeps nothing.
+        let mut cache = cache(model);
+        {
+            let _scope = PrefillScope::forced(true);
+            prefill_history(model, &mut cache, &victim);
+        }
+        let _fail = FailSubmitted::at(0);
+        joint_forward(model, &mut cache, &[other, victim], 0, false)
+            .expect("the default cadence commits no layer without a wait");
+    });
+}
+
+/// Memory probe for `HF2Q_QWEN_PREFILL_WAIT_LAYERS`, run explicitly in a
+/// fresh process per cadence (the worker's scratch pool never shrinks):
+/// `P834_WAIT_LAYERS=<1..8> HF2Q_QWEN38_GGUF=… <test binary> qwen_prefill_wait_layers_memory_probe --ignored --nocapture --test-threads=1`
+///
+/// The pool takes its buffers back only at a host wait, so a forward that
+/// waits every N layers holds the scratch of up to N layers at once, and
+/// the pool keeps that much for the life of the worker. The probe prefills
+/// a fresh 2,048-row chunk (the multi-slot transaction ceiling), a fresh
+/// 4,096-row chunk (the single-slot chunk size) and a resumed 4,096-row
+/// chunk behind it, no capture (a captured layer waits and shortens the
+/// windows), and prints what the pool retains and the process footprint
+/// after each.
+#[test]
+#[ignore = "requires HF2Q_QWEN38_GGUF or HF2Q_QWEN36_GGUF and Apple Metal; run alone"]
+fn qwen_prefill_wait_layers_memory_probe() {
+    use super::prefill_prepared::ForcedWaitLayers;
+    use crate::serve::header::LoadProgress;
+    use mlx_native::gguf::GgufFile;
+
+    const PATTERN: [u32; 7] = [9707, 374, 279, 15, 1_782, 2_610, 13];
+
+    fn footprint_gib() -> (f64, f64) {
+        // SAFETY: a plain C call that fills a zeroed POD struct for this
+        // process.
+        unsafe {
+            let mut info: libc::rusage_info_v4 = std::mem::zeroed();
+            let rc = libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V4,
+                (&mut info as *mut libc::rusage_info_v4).cast(),
+            );
+            assert_eq!(rc, 0, "proc_pid_rusage");
+            let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+            (
+                gib(info.ri_phys_footprint),
+                gib(info.ri_lifetime_max_phys_footprint),
+            )
+        }
+    }
+
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let wait: usize = std::env::var("P834_WAIT_LAYERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .expect("set P834_WAIT_LAYERS to 1..8");
+    let path = match (
+        std::env::var_os("HF2Q_QWEN38_GGUF"),
+        std::env::var_os("HF2Q_QWEN36_GGUF"),
+    ) {
+        (Some(path), None) | (None, Some(path)) => std::path::PathBuf::from(path),
+        _ => panic!("set exactly one of HF2Q_QWEN38_GGUF and HF2Q_QWEN36_GGUF"),
+    };
+    let policy = super::routing_policy::resolve_qwen_ggml_routing_policy(&path);
+    let gguf = GgufFile::open(&path).expect("open GGUF");
+    let mut progress = LoadProgress::new(false, 1, 0);
+    let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
+    model.bind_ggml_routing_policy(policy);
+    model.ensure_gpu_cache_primed().expect("prime GPU cache");
+    let vocab = model.cfg.vocab_size;
+    let mut cache = model
+        .with_gpu_cache_mut(|device, _registry| {
+            HybridKvCache::new_with_options(&model.cfg, device, 8192, 1, true)
+        })
+        .expect("allocate TQ cache");
+    let retained = || {
+        super::decode_pool::worker_memory_snapshot()
+            .map(|(kind, snapshot)| (kind, snapshot.retained.bytes, snapshot.retained.roots))
+    };
+    let _scope = PrefillScope::forced(true);
+    let _cadence = ForcedWaitLayers::set(wait);
+    let (loaded, _) = footprint_gib();
+    eprintln!("[WAIT_LAYERS_MEMORY] wait={wait} loaded: footprint {loaded:.2} GiB, pool {:?}", retained());
+    for (what, start, rows) in [
+        ("fresh", 0usize, 2048usize),
+        ("fresh", 0, 4096),
+        ("resumed", 4096, 4096),
+    ] {
+        if start == 0 {
+            cache.reset_for_slot(SlotId(0)).expect("reset");
+        }
+        let tokens: Vec<u32> = (start..start + rows)
+            .map(|index| PATTERN[index % PATTERN.len()] % vocab)
+            .collect();
+        let started = std::time::Instant::now();
+        model
+            .forward_gpu_last_logits(
+                &tokens,
+                &positions_for_range(start as i32, rows),
+                &mut cache,
+                SlotId(0),
+            )
+            .unwrap_or_else(|error| panic!("{what} {rows}-row chunk: {error:#}"));
+        let wall = started.elapsed().as_secs_f64() * 1e3;
+        let (now, peak) = footprint_gib();
+        let pool = retained();
+        eprintln!(
+            "[WAIT_LAYERS_MEMORY] wait={wait} after a {what} {rows}-row chunk ({wall:.0} ms): pool retained {:.3} GiB in {} buffers ({}), footprint {now:.2} GiB, peak {peak:.2} GiB",
+            pool.as_ref().map_or(f64::NAN, |(_, bytes, _)| *bytes as f64 / (1u64 << 30) as f64),
+            pool.as_ref().map_or(0, |(_, _, roots)| *roots),
+            pool.as_ref().map_or("unavailable", |(kind, _, _)| *kind),
+        );
+    }
+}

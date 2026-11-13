@@ -19075,10 +19075,12 @@ fn run_slot_aware_qwen35(
     });
 
     // HF2Q_QWEN_PREFILL_JOINT: the waiting slots' prefill chunks share one
-    // forward of at most the per-transaction row ceiling, so a joint
-    // transaction is never longer than one a single slot can already run;
-    // beside decoding slots it is shorter still. Which lanes join follows
-    // the model's FFN kind (`Qwen35JointPrefillPolicy::for_worker`).
+    // forward of at most the per-transaction row ceiling (a quarter of it
+    // beside decoding slots). At equal rows a joint forward is not cheaper
+    // than a single slot's: four lanes of 2,048 rows together took
+    // 716-760 ms on Qwen3.6 against 590-645 ms for one 2,048-row lane
+    // (equal within 3% on Qwen3.8). Which lanes join follows the model's
+    // FFN kind (`Qwen35JointPrefillPolicy::for_worker`).
     let qwen_joint_prefill = (n_slots > 1
         && crate::inference::models::qwen35::prefill_joint::enabled())
     .then(|| {
