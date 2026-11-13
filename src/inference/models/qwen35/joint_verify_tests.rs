@@ -879,6 +879,7 @@ pub(super) fn dflash_arm() -> Arm {
             pooled_outputs: true,
             verify_attention_tile: false,
             verify_mixer_fused: false,
+            dflash2: Default::default(),
         },
     }
 }
@@ -1372,6 +1373,7 @@ pub(super) fn mma_arm() -> Arm {
             pooled_outputs: true,
             verify_attention_tile: false,
             verify_mixer_fused: false,
+            dflash2: Default::default(),
         },
     }
 }
@@ -1500,5 +1502,94 @@ fn verify_refuses_bad_windows_before_writing() {
         assert!(model
             .commit_joint_verify(&mut (fixture.new_cache)(), verify.pending, &[5])
             .is_err());
+    });
+}
+
+/// The commit of [`run_dflash_case`] as the draft-prefetch order issues it:
+/// the replay command submitted without a wait
+/// ([`Qwen35Model::submit_joint_verify_commit`]), then finished.
+fn dflash_commit_submitted(
+    fixture: &Fixture<'_>,
+    lanes: &[LaneCase],
+    forward: DFlashForward,
+    label: &str,
+) -> DFlashCaseTrace {
+    let DFlashForward {
+        mut cache,
+        pending,
+        rows,
+        captured,
+    } = forward;
+    let accepted = lanes.iter().map(|lane| lane.accepted).collect::<Vec<_>>();
+    let submitted = fixture
+        .model
+        .submit_joint_verify_commit(&cache, pending, &accepted)
+        .unwrap_or_else(|error| panic!("{label}: DFlash2 commit submission: {error:#}"));
+    fixture
+        .model
+        .finish_joint_verify_commit(&mut cache, submitted)
+        .unwrap_or_else(|error| panic!("{label}: DFlash2 submitted commit: {error:#}"));
+    DFlashCaseTrace {
+        rows,
+        committed: lanes
+            .iter()
+            .map(|lane| lane_digest(&cache, &fixture.model.cfg, lane.slot))
+            .collect(),
+        captured,
+    }
+}
+
+/// One to four lanes at every accept count 0..=8: a verify step that holds
+/// its layer outputs and settles through a submitted commit leaves the rows,
+/// captures and committed cache state of the stock step and its waited
+/// commit, bit for bit (`HF2Q_DFLASH2_DRAFT_PREFETCH=1`'s target half).
+fn check_submitted_commit(fixture: &Fixture<'_>, label: &str) {
+    let mut held_arm = fixture.arm;
+    held_arm.options.dflash2.hold_layer_outputs = true;
+    let held = Fixture {
+        model: fixture.model,
+        arm: held_arm,
+        new_cache: fixture.new_cache,
+        start: fixture.start,
+        token: fixture.token,
+    };
+    let mut refused = 0;
+    for lanes in 1..=4_usize {
+        for accept in 0..=8_usize {
+            let case = (0..lanes)
+                .map(|index| lane(((index + accept) % 4) as u32, 7, (accept + index) % 9))
+                .collect::<Vec<_>>();
+            let label = format!("{label} {case:?}");
+            let waited = run_dflash_case(fixture, &case, &label);
+            let forward = dflash_forward(&held, &case, &label);
+            let submitted = dflash_commit_submitted(&held, &case, forward, &label);
+            assert!(
+                submitted == waited,
+                "{label}: a submitted commit changed a row, a committed state or a capture"
+            );
+            // The submission runs the commit's host checks first.
+            let forward = dflash_forward(&held, &case, &label);
+            let too_many = vec![9; case.len()];
+            refused += usize::from(
+                held.model
+                    .submit_joint_verify_commit(&forward.cache, forward.pending, &too_many)
+                    .is_err(),
+            );
+        }
+    }
+    assert_eq!(refused, 36, "{label}: an invalid commit was submitted");
+}
+
+#[test]
+fn dflash2_submitted_commit_is_the_waited_commit_bitwise() {
+    with_synthetic_fixture(padded_policy(), dflash_arm(), |fixture| {
+        check_submitted_commit(fixture, "stock arm");
+    });
+}
+
+#[test]
+fn dflash2_submitted_commit_is_the_waited_commit_bitwise_on_the_tiled_arm() {
+    with_synthetic_fixture_cfg(padded_policy(), dflash_tile_arm(), tile_cfg(), |fixture| {
+        check_submitted_commit(fixture, "tiled arm");
     });
 }

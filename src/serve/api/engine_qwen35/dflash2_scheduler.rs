@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use crate::inference::models::qwen35::joint_decode_routes::{JointDenseFfnRoute, JointRouteMode};
 use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+use crate::inference::models::qwen35::verify_decision::DECISION_SLOTS;
 use crate::inference::models::qwen35::{
     Qwen35JointOutput, Qwen35JointRowOutput, Qwen35JointVerify, Qwen35JointVerifyLane,
 };
@@ -46,11 +47,112 @@ pub(in crate::serve::api) fn context_first() -> bool {
     *ENABLED
 }
 
+/// Opt-in switch of the draft prefetch; exact value `1`.
+pub(in crate::serve::api) const DFLASH2_DRAFT_PREFETCH_ENV: &str = "HF2Q_DFLASH2_DRAFT_PREFETCH";
+
+/// Whether a step that settles acceptance on the host commits the next
+/// step's draft command before it waits for its own replay (read once).
+pub(in crate::serve::api) fn draft_prefetch() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var(DFLASH2_DRAFT_PREFETCH_ENV)
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    });
+    *ENABLED
+}
+
+/// Switch of the GPU decision candidates of host-sampled verify rows:
+/// `1` uses them, `check` computes them beside the host sampler's decision
+/// over the full logits and compares the two plans (a diagnostic).
+pub(in crate::serve::api) const DFLASH2_GPU_DECISIONS_ENV: &str = "HF2Q_DFLASH2_GPU_DECISIONS";
+
+/// How a step decides the rows of its lanes that sample on the host.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::serve::api) enum DecisionRoute {
+    /// The host sampler over every row's logits.
+    #[default]
+    HostLogits,
+    /// The decision candidates; a row they cannot decide takes the host
+    /// sampler over that row's logits.
+    Candidates,
+    /// Both, compared; the host sampler's plan is the one used.
+    Check,
+}
+
+impl DecisionRoute {
+    pub(in crate::serve::api) fn label(self) -> &'static str {
+        match self {
+            Self::HostLogits => "host_logits",
+            Self::Candidates => "candidates",
+            Self::Check => "check",
+        }
+    }
+}
+
+fn parse_decision_route(raw: Option<&str>) -> DecisionRoute {
+    match raw {
+        Some("1") => DecisionRoute::Candidates,
+        Some("check") => DecisionRoute::Check,
+        _ => DecisionRoute::HostLogits,
+    }
+}
+
+/// The process's decision route (read once).
+pub(in crate::serve::api) fn decision_route() -> DecisionRoute {
+    static ROUTE: LazyLock<DecisionRoute> = LazyLock::new(|| {
+        parse_decision_route(std::env::var(DFLASH2_GPU_DECISIONS_ENV).ok().as_deref())
+    });
+    *ROUTE
+}
+
+/// Development diagnostic for measuring the two tail switches inside one
+/// process: a positive block length `n` runs the switches that are on for
+/// `n` cycles, then the stock route for `n` cycles, and so on, and marks
+/// every cycle in the cycle timeline (`tail_block.on` / `tail_block.off`).
+pub(in crate::serve::api) const DFLASH2_TAIL_BLOCKS_ENV: &str = "HF2Q_DFLASH2_TAIL_BLOCKS";
+
+/// The arm of the next cycle under [`DFLASH2_TAIL_BLOCKS_ENV`]: `None` when
+/// the diagnostic is off, else whether the tail switches apply.
+pub(in crate::serve::api) fn tail_block_arm() -> Option<bool> {
+    static BLOCK: LazyLock<Option<u64>> = LazyLock::new(|| {
+        std::env::var(DFLASH2_TAIL_BLOCKS_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&block| block > 0)
+    });
+    static CYCLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let block = (*BLOCK)?;
+    let cycle = CYCLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some((cycle / block) % 2 == 0)
+}
+
+/// Plans of a `check` run whose candidate plan was not the host sampler's.
+static DECISION_MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The draft call the step after this one will make, as far as this step
+/// can tell: every lane that verified goes on from the last token of its
+/// plan unless the plan ended it or it reached its length limit.
+struct NextDraft {
+    anchors: Vec<u32>,
+    positions: Vec<u32>,
+    maximum_rows: Vec<u32>,
+    lane_order: Vec<u32>,
+    gpu_target_tokens: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(in crate::serve::api) struct Qwen35DFlash2Forward {
     pub mode: JointRouteMode,
     pub dense_ffn: JointDenseFfnRoute,
     pub options: JointStepOptions,
+    /// Commit the next step's draft before waiting for this step's replay
+    /// ([`draft_prefetch`]).
+    pub draft_prefetch: bool,
+    /// How host-sampled rows are decided ([`decision_route`]).
+    pub decisions: DecisionRoute,
+    /// The cycle's arm under [`DFLASH2_TAIL_BLOCKS_ENV`], for its timeline
+    /// mark; the two fields above already follow it.
+    pub tail_block: Option<bool>,
 }
 
 struct Qwen35DFlash2Window {
@@ -58,12 +160,18 @@ struct Qwen35DFlash2Window {
     position: i32,
     greedy: bool,
     maximum_rows: usize,
+    /// How the window's rows are decided; [`DecisionRoute::HostLogits`] for
+    /// a greedy window (the GPU argmax decides it) and for a request the
+    /// candidates do not represent.
+    decisions: DecisionRoute,
 }
 
 impl Qwen35DFlash2Window {
     fn output(&self) -> Qwen35JointOutput {
         if self.greedy {
             Qwen35JointOutput::GreedyTokenAndHidden
+        } else if self.decisions == DecisionRoute::Candidates {
+            Qwen35JointOutput::Hidden
         } else {
             Qwen35JointOutput::LogitsAndHidden
         }
@@ -89,6 +197,10 @@ impl Qwen35DFlash2Window {
 
 struct Qwen35DFlash2Plan {
     plan: Qwen35VerifiedBlockPlan,
+    /// Rows the decision candidates decided, and rows that had candidates
+    /// but took the host sampler over their own logits.
+    candidate_rows: usize,
+    fallback_rows: usize,
 }
 
 impl Qwen35DFlash2Plan {
@@ -131,7 +243,22 @@ impl Qwen35DecodeState {
             position,
             greedy: self.is_greedy && !self.want_logprobs,
             maximum_rows: remaining.min(DFLASH2_MAX_ROWS_PER_LANE),
+            decisions: DecisionRoute::HostLogits,
         })
+    }
+
+    /// Whether the decision candidates represent this request's sampler: a
+    /// host-sampled window at temperature zero with nothing between the
+    /// logits and the argmax but the repetition penalty (no logit bias,
+    /// top-k, top-p, min-p, seed or logprobs), whose repetition window fits
+    /// the candidates' history. A grammar is admitted; the rows it
+    /// constrains fall back to the host sampler one by one.
+    fn decision_candidates_eligible(&self, window: &Qwen35DFlash2Window) -> bool {
+        !window.greedy
+            && !self.want_logprobs
+            && super::is_qwen_server_speculation_exact_eligible(&self.params)
+            && f64::from(self.params.temperature) < crate::serve::sampler_pure::SAMPLING_EPS
+            && self.sampling_history.len() <= DECISION_SLOTS
     }
 
     fn gpu_greedy_acceptance_eligible(&self, window: &Qwen35DFlash2Window) -> bool {
@@ -147,6 +274,19 @@ impl Qwen35DecodeState {
         drafts: &[u32],
         mut rows: Vec<Qwen35JointRowOutput>,
     ) -> Result<Qwen35DFlash2Plan> {
+        self.plan_dflash2_rows(qwen, window, drafts, &mut rows, window.decisions)
+    }
+
+    /// [`Self::plan_dflash2_window`] over borrowed rows with an explicit
+    /// decision route (`check` plans the same rows twice).
+    fn plan_dflash2_rows(
+        &self,
+        qwen: &Qwen35LoadedModel,
+        window: &Qwen35DFlash2Window,
+        drafts: &[u32],
+        rows: &mut [Qwen35JointRowOutput],
+        decisions: DecisionRoute,
+    ) -> Result<Qwen35DFlash2Plan> {
         anyhow::ensure!(
             rows.len() == drafts.len() + 1,
             "Qwen DFlash2 window verified {} rows for {} drafts",
@@ -154,23 +294,80 @@ impl Qwen35DecodeState {
             drafts.len()
         );
         let mut semantic = Qwen35SpecSemanticState::from_decode(self);
+        let penalty = super::effective_repetition_penalty(&self.params);
+        let vocab = qwen.vocab_size;
+        let (mut candidate_rows, mut fallback_rows) = (0, 0);
         let mut canonical_at = |row: usize| {
             let output = &mut rows[row];
-            let source = if window.greedy {
-                Qwen35DecisionSource::Argmax(
-                    output
-                        .greedy_token
-                        .context("Qwen DFlash2 greedy row returned no argmax")?,
-                )
-            } else {
-                Qwen35DecisionSource::Logits(
-                    output
-                        .logits
-                        .as_deref_mut()
-                        .context("Qwen DFlash2 row returned no logits")?,
-                )
+            if window.greedy {
+                let token = output
+                    .greedy_token
+                    .context("Qwen DFlash2 greedy row returned no argmax")?;
+                return semantic.select_and_observe_from(
+                    qwen,
+                    &self.params,
+                    Qwen35DecisionSource::Argmax(token),
+                );
+            }
+            let candidates = match decisions {
+                DecisionRoute::HostLogits => None,
+                DecisionRoute::Candidates | DecisionRoute::Check => output.decision.as_ref(),
             };
-            semantic.select_and_observe_from(qwen, &self.params, source)
+            if let Some(candidates) = candidates {
+                // The sampler is a penalised argmax exactly when no grammar
+                // constrains this row: none at all (and then no token table,
+                // which the sampler refuses), or one still waiting for its
+                // trigger (with the table the sampler checks first).
+                let unconstrained = match (
+                    semantic.grammar_runtime.as_ref(),
+                    self.params.token_bytes.as_deref(),
+                ) {
+                    (None, None) => true,
+                    (Some(grammar), Some(table)) => {
+                        grammar.is_awaiting_trigger() && table.len() == vocab
+                    }
+                    _ => false,
+                };
+                let token = unconstrained
+                    .then(|| candidates.greedy_token(&semantic.sampling_history, penalty))
+                    .flatten();
+                if let Some(token) = token {
+                    candidate_rows += 1;
+                    return semantic.select_and_observe_from(
+                        qwen,
+                        &self.params,
+                        Qwen35DecisionSource::Argmax(token),
+                    );
+                }
+                fallback_rows += 1;
+                let mut logits = candidates
+                    .logits()
+                    .context("Qwen DFlash2 decision fallback logits")?;
+                return semantic.select_and_observe_from(
+                    qwen,
+                    &self.params,
+                    Qwen35DecisionSource::Logits(&mut logits),
+                );
+            }
+            // The host sampler changes the logits it is given (penalty,
+            // grammar mask): sample from a copy when the row is planned
+            // twice.
+            let mut copy;
+            let logits = output
+                .logits
+                .as_deref_mut()
+                .context("Qwen DFlash2 row returned no logits")?;
+            let logits = if window.decisions == DecisionRoute::Check {
+                copy = logits.to_vec();
+                copy.as_mut_slice()
+            } else {
+                logits
+            };
+            semantic.select_and_observe_from(
+                qwen,
+                &self.params,
+                Qwen35DecisionSource::Logits(logits),
+            )
         };
         let plan = if drafts.is_empty() {
             let decision: Qwen35CanonicalDecision = canonical_at(0)?;
@@ -187,9 +384,13 @@ impl Qwen35DecodeState {
                 carry_hidden_row: 0,
             }
         } else {
-            plan_qwen35_verified_block(drafts, canonical_at)?
+            plan_qwen35_verified_block(drafts, &mut canonical_at)?
         };
-        Ok(Qwen35DFlash2Plan { plan })
+        Ok(Qwen35DFlash2Plan {
+            plan,
+            candidate_rows,
+            fallback_rows,
+        })
     }
 
     fn plan_selected_dflash2_window(
@@ -201,11 +402,39 @@ impl Qwen35DecodeState {
     ) -> Result<Qwen35DFlash2Plan> {
         anyhow::ensure!(!tokens.is_empty(), "Qwen DFlash2 selected no target rows");
         rows.truncate(tokens.len());
-        self.plan_dflash2_window(qwen, window, &tokens[1..], rows)
+        if window.decisions != DecisionRoute::Check {
+            return self.plan_dflash2_window(qwen, window, &tokens[1..], rows);
+        }
+        // Diagnostic: the candidates' plan beside the host sampler's over
+        // the full logits. The host sampler's is the one used.
+        let drafts = &tokens[1..];
+        let candidate =
+            self.plan_dflash2_rows(qwen, window, drafts, &mut rows, DecisionRoute::Candidates);
+        let mut host =
+            self.plan_dflash2_rows(qwen, window, drafts, &mut rows, DecisionRoute::HostLogits)?;
+        match candidate {
+            Ok(candidate) if candidate.plan == host.plan => {
+                host.candidate_rows = candidate.candidate_rows;
+                host.fallback_rows = candidate.fallback_rows;
+            }
+            other => {
+                let total =
+                    DECISION_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                tracing::error!(
+                    target: "hf2q::serve::api::engine_qwen35::progress",
+                    slot = self.slot_id.0,
+                    mismatches = total,
+                    host = ?host.plan,
+                    candidate = ?other.map(|plan| plan.plan),
+                    "Qwen DFlash2 decision candidates disagree with the host sampler"
+                );
+            }
+        }
+        Ok(host)
     }
 
     fn settle_dflash2_window(&mut self, plan: Qwen35DFlash2Plan) {
-        let Qwen35DFlash2Plan { plan } = plan;
+        let Qwen35DFlash2Plan { plan, .. } = plan;
         self.mtp = None;
         self.history_lookup = None;
         self.pending_speculation_output = plan.output;
@@ -270,7 +499,14 @@ impl Qwen35LoadedModel {
                 .context("Qwen DFlash2 slot exceeds runtime lanes")
                 .and_then(|&draft_context| state.prepare_dflash2_window(kv_cache, draft_context));
             match prepared {
-                Ok(window) => windows.push(Some(window)),
+                Ok(mut window) => {
+                    if forward.decisions != DecisionRoute::HostLogits
+                        && state.decision_candidates_eligible(&window)
+                    {
+                        window.decisions = forward.decisions;
+                    }
+                    windows.push(Some(window));
+                }
                 Err(error) => {
                     ticks[index] = Some(Err(error));
                     windows.push(None);
@@ -288,9 +524,14 @@ impl Qwen35LoadedModel {
             tracing::Level::DEBUG
         );
         let cycle_started = trace_timing.then(Instant::now);
-        let timeline = super::dflash2_timeline::Cycle::begin();
+        let mut timeline = super::dflash2_timeline::Cycle::begin();
         let timeline_on = timeline.is_some();
         let timeline_mark = mlx_native::command_timeline::mark;
+        match forward.tail_block {
+            Some(true) => timeline_mark("tail_block.on"),
+            Some(false) => timeline_mark("tail_block.off"),
+            None => {}
+        }
         // Native encode counters and this worker thread's CPU time at cycle
         // entry; the DEBUG record reports the dispatches, command buffers,
         // host waits, barriers and host CPU one cycle costs. CPU time close
@@ -460,7 +701,30 @@ impl Qwen35LoadedModel {
         timeline_mark("verify_begin");
         let verify_started = Instant::now();
         let lease = supervisor.arm("Qwen35 DFlash2 verify", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
-        let verify = if gpu_target_tokens {
+        // Base repetition windows of the lanes whose rows are decided from
+        // candidates (none when the route is off or no lane is eligible).
+        let decision_histories = verifying
+            .iter()
+            .map(|&index| {
+                let window = windows[index].as_ref().expect("verifying window");
+                (window.decisions != DecisionRoute::HostLogits)
+                    .then_some(states[index].sampling_history.as_slice())
+            })
+            .collect::<Vec<_>>();
+        let verify = if decision_histories.iter().any(Option::is_some) {
+            // Never together with GPU acceptance, which needs every lane
+            // greedy; candidates are for lanes that are not.
+            self.model.forward_gpu_dflash2_verify_with_decisions(
+                &verify_lanes,
+                gpu_target_tokens.then_some(&runtime.workspace.target_tokens),
+                kv_cache,
+                forward.mode,
+                forward.dense_ffn,
+                forward.options,
+                Some(capture),
+                &decision_histories,
+            )
+        } else if gpu_target_tokens {
             let mut output_tail =
                 |encoder: &mut mlx_native::CommandEncoder,
                  registry: &mut mlx_native::KernelRegistry,
@@ -496,10 +760,16 @@ impl Qwen35LoadedModel {
                 Some(capture),
             )
         };
+        drop(decision_histories);
         let verify = lease.finish().and(verify);
         let verify_elapsed = verify_started.elapsed();
         let verify_micros = trace_timing.then(|| verify_elapsed.as_micros());
         timeline_mark("verify_end");
+        if timeline_on {
+            // Every command committed before the output head has completed:
+            // a previous cycle that deferred its line can write it now.
+            super::dflash2_timeline::settle_deferred();
+        }
         // GPU acceptance has already committed the draft context when verify
         // returns. Any later failure must stop the worker rather than continue
         // with host and draft cursors that may differ.
@@ -541,6 +811,7 @@ impl Qwen35LoadedModel {
 
         let mut accepted = Vec::with_capacity(verifying.len());
         let mut verified = Vec::with_capacity(verifying.len());
+        let (mut candidate_rows, mut fallback_rows) = (0_usize, 0_usize);
         for ((&index, rows), lane_tokens) in verifying.iter().zip(rows).zip(
             verifying
                 .iter()
@@ -559,7 +830,11 @@ impl Qwen35LoadedModel {
                 })
                 .unwrap_or_else(Verified::Failed);
             accepted.push(match &step {
-                Verified::Window { plan, .. } => plan.accepted(),
+                Verified::Window { plan, .. } => {
+                    candidate_rows += plan.candidate_rows;
+                    fallback_rows += plan.fallback_rows;
+                    plan.accepted()
+                }
                 Verified::Failed(_) => 0,
             });
             verified.push(step);
@@ -593,19 +868,107 @@ impl Qwen35LoadedModel {
         // GPU, idle since the output head, starts it while the host encodes
         // the replay. The commit's host checks run first, so only a failing
         // replay command can leave a submitted context without its replay.
-        let context_first = !gpu_acceptance
-            && context_first()
+        let commit_valid = !gpu_acceptance
             && self
                 .model
                 .validate_joint_verify_commit(kv_cache, &pending, &accepted)
                 .is_ok();
+        let prefetch = commit_valid && forward.draft_prefetch;
+        let context_first = commit_valid && !prefetch && context_first();
+        // The verify-budget observation reads this step's draft confidences,
+        // which a prefetched draft overwrites: it runs first when the step
+        // prefetches, and after both commits otherwise.
+        let mut budget_observed = false;
+        if prefetch {
+            self.observe_dflash2_verify_budget(
+                runtime,
+                states,
+                &verifying,
+                &verified,
+                verify_elapsed,
+            );
+            budget_observed = true;
+        }
+        let next_draft = if prefetch {
+            next_draft(runtime, states, &verifying, &verified, &retained)
+        } else {
+            None
+        };
         timeline_mark("target_commit_begin");
         let target_commit_started = trace_timing.then(Instant::now);
         let lease = supervisor.arm("Qwen35 DFlash2 commit", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
         // Waits this step makes that mlx-native's sync counter does not see
         // (it counts `commit_and_wait` only).
         let mut uncounted_waits = 0_u64;
-        let (committed, pipelined_context) = if context_first {
+        let (committed, pipelined_context) = if prefetch {
+            // Prefetch: the context commit goes to the GPU first, reading
+            // its own copy of the step's positions; the replay is committed
+            // behind it (they share no resource, so they overlap); then the
+            // next step's draft, whose ring reads Metal orders behind the
+            // context commit's ring writes because the rings are tracked
+            // buffers bound directly to both commands
+            // (`submit_target_context_detached`). The step waits for its
+            // replay and its context commit while the draft runs on. The
+            // draft is committed last because a wait on a command returns
+            // only once every command committed before it has completed:
+            // behind the draft, the replay's wait would last until the
+            // draft's end.
+            let submitted = self.model.with_gpu_cache_mut(|device, registry| {
+                runtime.submit_target_context_detached(device, registry, &retained)
+            });
+            timeline_mark("context_submitted");
+            let step_lanes = verifying
+                .iter()
+                .map(|&index| states[index].slot_id.0 as usize)
+                .collect::<Vec<_>>();
+            // No early return from here to `settle_submitted_step`, which
+            // follows the waits on both commands.
+            let replay = match &submitted {
+                Ok(_) => self
+                    .model
+                    .submit_joint_verify_commit(kv_cache, pending, &accepted),
+                Err(_) => Err(anyhow::anyhow!(
+                    "Qwen DFlash2 replay not submitted: the context commit was not"
+                )),
+            };
+            uncounted_waits += u64::from(submitted.is_ok()) + u64::from(replay.is_ok());
+            if let (Ok(_), Ok(_), Some(next)) = (&submitted, &replay, &next_draft) {
+                let prefetched =
+                    QwenDFlash2Adapter::new(&self.model, &runtime.config).and_then(|adapter| {
+                        let temperatures = vec![0.0_f32; physical_lanes];
+                        self.model.with_gpu_cache_mut(|device, registry| {
+                            runtime.prefetch_draft(
+                                device,
+                                registry,
+                                &adapter,
+                                &next.anchors,
+                                &next.positions,
+                                &temperatures,
+                                0,
+                                &next.maximum_rows,
+                                &next.lane_order,
+                                &uniforms,
+                                !next.gpu_target_tokens,
+                            )
+                        })
+                    });
+                timeline_mark("draft.prefetch_committed");
+                if let Err(error) = prefetched {
+                    // Not a failure of this step: the next one drafts itself.
+                    tracing::warn!(
+                        target: "hf2q::serve::api::engine_qwen35::progress",
+                        error = %format!("{error:#}"),
+                        "Qwen DFlash2 draft prefetch failed"
+                    );
+                }
+            }
+            let committed = replay
+                .and_then(|submitted| self.model.finish_joint_verify_commit(kv_cache, submitted));
+            let context = submitted
+                .and_then(|submitted| runtime.finish_target_context(submitted, &retained, false));
+            let context = runtime.settle_submitted_step(committed.is_ok(), context, &step_lanes);
+            (committed, Some(context))
+        } else if context_first {
             let submitted = self.model.with_gpu_cache_mut(|device, registry| {
                 runtime.submit_target_context(device, registry, &retained)
             });
@@ -678,32 +1041,14 @@ impl Qwen35LoadedModel {
             distribute_error(&mut ticks, &verifying, error);
             return Ok(finish_ticks(ticks));
         }
-        if self.model.cfg.moe.is_some() {
-            let mut observations = [VerifyBudgetLane::default(); 4];
-            let mut observed = 0;
-            for (&index, step) in verifying.iter().zip(&verified) {
-                if let Verified::Window { plan, tokens } = step {
-                    observations[observed] = VerifyBudgetLane {
-                        lane_index: states[index].slot_id.0 as usize,
-                        verify_rows: tokens.len(),
-                        accepted: plan.plan.matched_drafts,
-                        labels: true,
-                    };
-                    observed += 1;
-                }
-            }
-            if observed == verifying.len() {
-                if let Err(error) = runtime.observe_verify_budget(
-                    &observations[..observed],
-                    verify_elapsed.as_secs_f64() * 1000.0,
-                ) {
-                    tracing::warn!(
-                        target: "hf2q::serve::api::engine_qwen35::progress",
-                        error = %error,
-                        "Qwen DFlash2 verify-budget observation discarded"
-                    );
-                }
-            }
+        if !budget_observed {
+            self.observe_dflash2_verify_budget(
+                runtime,
+                states,
+                &verifying,
+                &verified,
+                verify_elapsed,
+            );
         }
         for ((&index, step), &count) in verifying.iter().zip(&verified).zip(&accepted) {
             if let Verified::Window { tokens, .. } = step {
@@ -732,10 +1077,18 @@ impl Qwen35LoadedModel {
                 host_waits = now.2.wrapping_sub(entry.2) + uncounted_waits,
                 barriers = now.3.wrapping_sub(entry.3),
                 host_cpu_us = now.4.wrapping_sub(entry.4),
+                candidate_rows,
+                fallback_rows,
+                prefetched_drafts = runtime.prefetch_counts().prefetched,
+                adopted_drafts = runtime.prefetch_counts().adopted,
+                discarded_drafts = runtime.prefetch_counts().discarded,
                 "Qwen DFlash2 stage timing"
             );
         }
-        if let Some(timeline) = timeline {
+        if let Some(mut timeline) = timeline.take() {
+            if runtime.prefetch_outstanding() {
+                timeline.defer_line();
+            }
             timeline.finish(super::dflash2_timeline::CycleSummary {
                 active_lanes: verifying.len(),
                 selected_rows: selected_rows.unwrap_or_default(),
@@ -765,6 +1118,104 @@ impl Qwen35LoadedModel {
     }
 }
 
+impl Qwen35LoadedModel {
+    /// Feed a verified step to the MoE target's verify-row budget. Reads the
+    /// step's draft confidences from the runtime's workspace.
+    fn observe_dflash2_verify_budget(
+        &self,
+        runtime: &mut crate::inference::spec_decode::dflash2::runtime::DFlash2Runtime,
+        states: &[&mut Qwen35DecodeState],
+        verifying: &[usize],
+        verified: &[Verified],
+        verify_elapsed: std::time::Duration,
+    ) {
+        if self.model.cfg.moe.is_none() {
+            return;
+        }
+        let mut observations = [VerifyBudgetLane::default(); 4];
+        let mut observed = 0;
+        for (&index, step) in verifying.iter().zip(verified) {
+            if let Verified::Window { plan, tokens } = step {
+                observations[observed] = VerifyBudgetLane {
+                    lane_index: states[index].slot_id.0 as usize,
+                    verify_rows: tokens.len(),
+                    accepted: plan.plan.matched_drafts,
+                    labels: true,
+                };
+                observed += 1;
+            }
+        }
+        if observed == verifying.len() {
+            if let Err(error) = runtime.observe_verify_budget(
+                &observations[..observed],
+                verify_elapsed.as_secs_f64() * 1000.0,
+            ) {
+                tracing::warn!(
+                    target: "hf2q::serve::api::engine_qwen35::progress",
+                    error = %error,
+                    "Qwen DFlash2 verify-budget observation discarded"
+                );
+            }
+        }
+    }
+}
+
+/// The draft call of the step after one whose lanes `verifying` planned
+/// `verified` and retain `retained` rows; `None` when a lane failed or no
+/// lane goes on. A lane goes on from the last token of its plan unless the
+/// plan ended on a terminal decision or the lane reached its length limit;
+/// anything else that ends or changes a lane before the next step (a stop
+/// string, a closed client, a new lane) makes that step's inputs differ
+/// from these, and the runtime then drops the prefetched command.
+fn next_draft(
+    runtime: &crate::inference::spec_decode::dflash2::runtime::DFlash2Runtime,
+    states: &[&mut Qwen35DecodeState],
+    verifying: &[usize],
+    verified: &[Verified],
+    retained: &[u32],
+) -> Option<NextDraft> {
+    let physical_lanes = runtime.workspace.max_lanes;
+    let mut next = NextDraft {
+        anchors: vec![0; physical_lanes],
+        positions: Vec::with_capacity(physical_lanes),
+        maximum_rows: vec![1; physical_lanes],
+        lane_order: Vec::with_capacity(verifying.len()),
+        gpu_target_tokens: false,
+    };
+    for (&length, &retained) in runtime.lane_lengths().iter().zip(retained) {
+        next.positions
+            .push(u32::try_from(length.checked_add(retained as usize)?).ok()?);
+    }
+    for (&index, step) in verifying.iter().zip(verified) {
+        let Verified::Window { plan, .. } = step else {
+            return None;
+        };
+        let state = &states[index];
+        let generated = state.generated_tokens.len() + plan.plan.output.len();
+        let remaining = state.max_tokens.saturating_sub(generated);
+        let (false, Some(&anchor), true) = (
+            plan.plan.terminal_after_pending,
+            plan.plan.output.back(),
+            remaining > 0,
+        ) else {
+            continue;
+        };
+        let slot = state.slot_id.0;
+        next.anchors[slot as usize] = anchor;
+        next.maximum_rows[slot as usize] = remaining.min(DFLASH2_MAX_ROWS_PER_LANE) as u32;
+        next.lane_order.push(slot);
+    }
+    if next.lane_order.is_empty() {
+        return None;
+    }
+    next.gpu_target_tokens = runtime.gpu_target_tokens()
+        && next
+            .lane_order
+            .iter()
+            .all(|&slot| next.maximum_rows[slot as usize] == 8);
+    Some(next)
+}
+
 fn distribute_error(
     ticks: &mut [Option<Result<Qwen35TickOutcome>>],
     indices: &[usize],
@@ -787,6 +1238,10 @@ fn finish_ticks(ticks: Vec<Option<Result<Qwen35TickOutcome>>>) -> Vec<Result<Qwe
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "dflash2_decision_tests.rs"]
+mod decision_tests;
 
 #[cfg(test)]
 mod tests {
@@ -827,6 +1282,7 @@ mod tests {
             greedy_token: Some(token),
             logits: None,
             nextn_hidden: None,
+            decision: None,
         }
     }
 
@@ -837,6 +1293,7 @@ mod tests {
             greedy_token: None,
             logits: Some(values),
             nextn_hidden: None,
+            decision: None,
         }
     }
 
@@ -849,6 +1306,7 @@ mod tests {
             position: 4,
             greedy: true,
             maximum_rows: 4,
+            decisions: DecisionRoute::HostLogits,
         };
         let plan = state
             .plan_dflash2_window(
@@ -876,6 +1334,7 @@ mod tests {
             position: 4,
             greedy: true,
             maximum_rows: 4,
+            decisions: DecisionRoute::HostLogits,
         };
         let plan = state
             .plan_dflash2_window(
@@ -902,6 +1361,7 @@ mod tests {
             position: 4,
             greedy: true,
             maximum_rows: 8,
+            decisions: DecisionRoute::HostLogits,
         };
         let plan = state
             .plan_selected_dflash2_window(
@@ -936,6 +1396,7 @@ mod tests {
             position: 4,
             greedy: true,
             maximum_rows: 8,
+            decisions: DecisionRoute::HostLogits,
         };
         assert!(state.gpu_greedy_acceptance_eligible(&window));
 
@@ -956,6 +1417,7 @@ mod tests {
             position: 4,
             greedy: true,
             maximum_rows: 4,
+            decisions: DecisionRoute::HostLogits,
         };
         let plan = state
             .plan_dflash2_window(
@@ -982,6 +1444,7 @@ mod tests {
             position: 4,
             greedy: false,
             maximum_rows: 4,
+            decisions: DecisionRoute::HostLogits,
         };
         let plan = state
             .plan_dflash2_window(

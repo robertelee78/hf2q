@@ -1001,6 +1001,36 @@ pub fn dispatch_dflash2_context_commit(
     retained_counts: &MlxBuffer,
     workspace: &DFlash2Workspace,
 ) -> Result<()> {
+    dispatch_dflash2_context_commit_at(
+        encoder,
+        registry,
+        device,
+        config,
+        tensors,
+        retained_counts,
+        workspace,
+        &workspace.rope_positions,
+        &workspace.write_positions,
+    )
+}
+
+/// [`dispatch_dflash2_context_commit`] reading the rows' logical positions
+/// and each lane's ring slot from the given buffers (the layout of
+/// `workspace.rope_positions` and `workspace.write_positions`) instead of
+/// the workspace's own, so the host may rewrite those for the next draft
+/// while this commit executes.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_dflash2_context_commit_at(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    config: &DFlash2Config,
+    tensors: &DFlash2ModelTensors,
+    retained_counts: &MlxBuffer,
+    workspace: &DFlash2Workspace,
+    rope_positions: &MlxBuffer,
+    write_positions: &MlxBuffer,
+) -> Result<()> {
     dispatch_context_rows(
         encoder,
         registry,
@@ -1009,10 +1039,10 @@ pub fn dispatch_dflash2_context_commit(
         tensors,
         workspace,
         &workspace.captured_target_hidden,
-        &workspace.rope_positions,
+        rope_positions,
         ContextRings::Lanes {
             retained_counts,
-            write_positions: &workspace.write_positions,
+            write_positions,
         },
     )
 }

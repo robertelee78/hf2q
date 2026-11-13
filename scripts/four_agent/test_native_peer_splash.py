@@ -769,6 +769,53 @@ class Campaign(unittest.TestCase):
                                                                                  'evidence': []}}))
         self.assertEqual(gone['verdict'], 'Unavailable')
 
+    POLICY = {'version': 1, 'reruns_per_position': 2, 'rerun_failure_kinds': ['task'], 'arms': ['stock', 'peer', 'splash']}
+
+    def test_splash_task_failures_are_rerun_then_exhausted_without_the_memory_halt(self):
+        import q3_campaign as q3
+        from test_q3_campaign import write_run
+        out = self.root / 'campaign'
+        out.mkdir()
+        case = out / 'case.json'
+        case.write_text(json.dumps({'client': {'summary': '{OUT}/client/summary.json'}}))
+        driver = q3.Driver({'arms': {'splash': {'engine_kind': 'splash'}}, 'comparison_failure_policy': self.POLICY},
+                           {}, out, {}, None, None, None)
+        driver.manifest = {'unavailable': {}, 'status': 'Running'}
+        driver.save = lambda: None
+        driver.frozen = {'arms': {'splash': {'binary': {'sha256': 'b' * 64}, 'artifact': None, 'peer_build_info': None}}}
+        entry = {'name': 'n4-b1-splash', 'arm': 'splash', 'kind': 'measured', 'outcome': None, 'attempts': []}
+        stage = {'workload': 'n4', 'phase_plan': None, 'agents': 4, 'blocks': []}
+        seen = []
+        for i in range(3):
+            output = out / 'runs' / f'n4-b1-splash-a{i}'
+            write_run(output, 'b' * 64, outcome='fail', artifact_sha=None)
+            record = {'name': output.name, 'output': str(output), 'case': str(case), 'outcome': 'Launched'}
+            entry['attempts'].append(record)
+            driver.settle(stage, entry, record, 1, 0)
+            proceed = driver.consequences(stage, entry, record, halt_unstarted=True)
+            seen.append((record['outcome'], record['failure_kind'], record.get('disposition'), entry['outcome'], proceed))
+        self.assertEqual(seen, [('Fail', 'task', 'rerun', None, True), ('Fail', 'task', 'rerun', None, True),
+                                ('Fail', 'task', 'exhausted', 'Fail', True)])
+        self.assertEqual(driver.manifest['unavailable']['splash']['kind'], 'task_failures_exhausted')
+        self.assertEqual(driver.manifest['status'], 'Running')  # decision D6 halts on a memory stop, not a task failure
+
+    def test_an_exhausted_splash_arm_is_unavailable_and_failed_only_under_the_earlier_rule(self):
+        manifest = splash_manifest()
+        manifest['plan']['comparison_failure_policy'] = self.POLICY
+        entry = next(e for e in manifest['stages'][0]['blocks'][-1]['entries'] if e['arm'] == 'splash')
+        entry.update(outcome='Fail', failure_kind='task', reason='x')
+        entry['attempts'] = [{'name': f'a{i}', 'output': f'/r/a{i}', 'outcome': 'Fail', 'failure_kind': 'task',
+                              'reason': 'x', 'disposition': d} for i, d in enumerate(('rerun', 'rerun', 'exhausted'))]
+        legacy = json.loads(json.dumps(manifest))
+        del legacy['plan']['comparison_failure_policy']
+        for attempt in next(e for e in legacy['stages'][0]['blocks'][-1]['entries'] if e['arm'] == 'splash')['attempts']:
+            del attempt['disposition']
+        self.assertEqual(q3_report.compute_verdict(legacy)['verdict'], 'Failed')
+        verdict = q3_report.compute_verdict(manifest)  # the arm is read from the attempts, recorded or not
+        self.assertEqual(verdict['verdict'], 'Unavailable', verdict['reasons'])
+        self.assertIn('no runnable Splash arm: splash failed its task in all 3 attempts', verdict['reasons'][0])
+        self.assertEqual(verdict['arm_reliability']['splash']['failures'], 3)
+
     def test_tier_requires_a_splash_quality_gate(self):
         import f2_q3_tier as tier
         self.assertEqual(tier.required_references('qwen38', None, {'required': True}),
