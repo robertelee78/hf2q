@@ -103,6 +103,7 @@ with the audit script for this change (the lexical count of
 - `HF2Q_QWEN_JOINT_Q1_PROMPTS`, `HF2Q_QWEN_JOINT_Q1_OUT` and `HF2Q_QWEN_JOINT_Q1_STEPS` (`development-only`) drive the ignored Q1 Class B trace test.
 - `HF2Q_QWEN_MOE_Q1_PROMPTS`, `HF2Q_QWEN_MOE_Q1_OUT`, `HF2Q_QWEN_MOE_Q1_STEPS` and `HF2Q_QWEN_MOE_Q1_FORCED` (`development-only`) drive the ignored two-process Q1 trace test of the batched MoE route (`qwen36_moe_route_q1_envelope_trace`).
 - `HF2Q_QWEN36_GGUF` and `HF2Q_QWEN38_GGUF` (`development-only`) select the official artifacts for the ignored Qwen joint decode hardware gates.
+- `HF2Q_PREFILL_PROMPTS` (`development-only`) names the prompt file of the ignored real-artifact measurement `qwen_prepared_vs_stock_on_served_prompts`: a JSON list of `{"agent", "tokens", "spans"}` objects, a conversation's final prompt and the row spans the server ran. Read by that test only.
 - `HF2Q_DFLASH2_PROBE_GGUF`, `HF2Q_DFLASH2_PROBE_CONFIG`, `HF2Q_DFLASH2_PROBE_WEIGHTS`, `HF2Q_DFLASH2_PROBE_CONTEXT_ROWS` and `HF2Q_DFLASH2_PROBE_ROUNDS` (`development-only`) drive the ignored per-dispatch draft-command probe (`dflash2_draft_command_dispatch_probe`): the target GGUF, the draft checkpoint, the ring rows filled per lane (default 512) and the measured rounds (default 20).
 
 These rows were added by hand. The rest of this snapshot was not regenerated.
@@ -261,7 +262,7 @@ this release:
 | `HF2Q_DEEPSEEK_TAIL_ROWS_STEP` | `development-only` | 4 |
 | `HF2Q_DENSE_Q_ARENA_RESET` | `development-only` | 6 |
 | `HF2Q_DENSE_Q_LEGACY` | `development-only` | 5 |
-| `HF2Q_DFLASH2_DRAFT_STAGED` | `documented-escape` | 2 |
+| `HF2Q_DFLASH2_DRAFT_STAGED` | `documented-escape` | 3 |
 | `HF2Q_DFLASH2_PROBE_CONFIG` | `development-only` | 2 |
 | `HF2Q_DFLASH2_PROBE_CONTEXT_ROWS` | `development-only` | 1 |
 | `HF2Q_DFLASH2_PROBE_GGUF` | `development-only` | 2 |
@@ -314,7 +315,7 @@ this release:
 | `HF2Q_EAGLE3_TREE_BUDGET` | `development-only` | 2 |
 | `HF2Q_EAGLE3_TREE_MAX_DEPTH` | `development-only` | 2 |
 | `HF2Q_EMIT_NLL` | `development-only` | 3 |
-| `HF2Q_ENCODER_SESSION` | `promote-or-internalize` | 18 |
+| `HF2Q_ENCODER_SESSION` | `promote-or-internalize` | 19 |
 | `HF2Q_F16_KV` | `development-only` | 17 |
 | `HF2Q_F16_SHADOW` | `development-only` | 8 |
 | `HF2Q_F32_MATVEC` | `development-only` | 2 |
@@ -426,6 +427,7 @@ this release:
 | `HF2Q_POOL_BUDGET_BYTES` | `promote-or-internalize` | 3 |
 | `HF2Q_PREFILL_CROSS_SLOT` | `promote-or-internalize` | 1 |
 | `HF2Q_PREFILL_DUMP` | `development-only` | 4 |
+| `HF2Q_PREFILL_PROMPTS` | `development-only` | 5 |
 | `HF2Q_PREFILL_SLOT_BATCHED` | `promote-or-internalize` | 4 |
 | `HF2Q_PREFILL_TIMING` | `development-only` | 2 |
 | `HF2Q_PROFILE_BUCKETS` | `development-only` | 10 |
@@ -496,7 +498,7 @@ this release:
 | `HF2Q_REPACKED_GGUF_ANY_WIDTH` | `documented-escape` | 12 |
 | `HF2Q_REPACKED_GGUF_SHARED_HEAD` | `documented-escape` | 4 |
 | `HF2Q_QWEN_PREFILL_PREPARED` | `documented-escape` | 3 |
-| `HF2Q_QWEN_PREFILL_FOLD_CUE` | `documented-escape` | 5 |
+| `HF2Q_QWEN_PREFILL_FOLD_CUE` | `documented-escape` | 6 |
 | `HF2Q_RERANK_PROFILE` | `development-only` | 5 |
 | `HF2Q_RMS_NORM_V2` | `development-only` | 3 |
 | `HF2Q_RUNTIME_SCHEMA` | `development-only` | 2 |
