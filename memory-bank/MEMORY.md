@@ -1,7 +1,7 @@
 ---
 schema: "agent-memory/v1"
 project-id: "479fefc0-3903-4e30-b7fd-877c69979b81"
-router-updated: "2026-11-12T23:02:20.743885+00:00"
+router-updated: "2026-11-13T05:52:21.664035+00:00"
 canonical-remote: "repo://github.com/robertelee78/hf2q"
 ---
 # Project memory
@@ -29,6 +29,14 @@ Router time describes this map, not every file's revision.
 | [history/events/2b362872-a9d0-457c-8d8b-fe5764f10ac1.md](<history/events/2b362872-a9d0-457c-8d8b-fe5764f10ac1.md>) | Admission history for the Qwen3.6 workflow-oracle failure-rate finding | repository | active | When auditing how the Qwen3.6 workflow-oracle failure-rate finding was recorded |
 | [topics/48186f89-b2f4-45cd-a3f7-7974220b91b1.md](<topics/48186f89-b2f4-45cd-a3f7-7974220b91b1.md>) | Workflow fact: a change needing new mlx-native code is reproducible only after the crate is published and pinned; the pin lives in Cargo.toml, Cargo.lock, the provenance script constants and WITNESS_NATIVE_VERSION | repository | active | Before landing or measuring a change that depends on new mlx-native code, and when bumping the mlx-native version |
 | [history/events/607b1501-ab73-47e9-aed1-5d718a2c22b1.md](<history/events/607b1501-ab73-47e9-aed1-5d718a2c22b1.md>) | Admission history for the mlx-native pin workflow fact | repository | active | When auditing how the mlx-native pin workflow fact was recorded |
+| [topics/b4ad5314-bf1e-41b8-b203-19b9e9884f15.md](<topics/b4ad5314-bf1e-41b8-b203-19b9e9884f15.md>) | Operator decision: in a gate campaign any candidate failure fails the gate, and a failed stock, peer or Splash run is rerun up to twice per block position; a candidate that repeats its output needs its pass rate established on the exact case first | repository | active | Before planning, launching, resuming or reading a release-gate campaign, and when a comparison arm or the candidate fails a run |
+| [history/events/4c1ffea1-8c4e-4241-ab44-84a513512c3f.md](<history/events/4c1ffea1-8c4e-4241-ab44-84a513512c3f.md>) | Admission history for the gate failed-run rule | repository | active | When auditing how the gate failed-run rule was recorded |
+| [topics/bf36d8a3-d336-4961-8ed4-2e560c6b72ff.md](<topics/bf36d8a3-d336-4961-8ed4-2e560c6b72ff.md>) | Operator decision: a fine-tune of a qualified model gets the fast DFlash2 path by default with no automatic drop-back; HF2Q_DFLASH2=0 is the off switch; supersedes ADR-067's exact-identity rule (decided 2026-11-12, implementation in PR #833) | repository | active | Before changing DFlash2 target qualification or drop-back behaviour, serving a fine-tuned Qwen target, or citing ADR-067's rule on fine-tuned targets |
+| [history/events/fa6eb777-1501-4e2c-a3bb-99c8a940ed1a.md](<history/events/fa6eb777-1501-4e2c-a3bb-99c8a940ed1a.md>) | Admission history for the fine-tune DFlash2 decision | repository | active | When auditing how the fine-tune DFlash2 decision was recorded |
+| [topics/7c19625c-86d3-42ff-a710-bfc1e94ee952.md](<topics/7c19625c-86d3-42ff-a710-bfc1e94ee952.md>) | Measurement rule: GPU speed follows the GPU clock; a Splash decode-profile number is a top-state number (about 1617-1620 MHz) and an hf2q served number a lower-state one (about 1394 MHz), so compare at equal clock; Qwen3.8 layer commands fit to 41.85 ms at 1620 MHz against Splash's 42.72 ms (extrapolated) | repository | active | Before comparing hf2q stage or cycle times with Splash figures or between runs taken at different times, and before opening stage work on a measured gap |
+| [history/events/17765631-9109-4d51-9315-a5f429234eba.md](<history/events/17765631-9109-4d51-9315-a5f429234eba.md>) | Admission history for the equal-clock measurement rule | repository | active | When auditing how the equal-clock measurement rule was recorded |
+| [topics/5bce2bcb-7148-42d5-8bd8-2dc5f57fd8e3.md](<topics/5bce2bcb-7148-42d5-8bd8-2dc5f57fd8e3.md>) | Kernels over the Metal tensor API need an availability check with two cases (no <metal_tensor> header before macOS 26; a GPU outside the Metal 4 family fails pipeline creation); hosted CI is such a device and runs only whitelisted test filters | repository | active | Before adding, selecting by default or testing a kernel that uses the Metal tensor API, and when a hosted CI job fails or passes on a GPU route |
+| [history/events/4b10d7dd-53f7-46fa-a3bf-54d543e4d001.md](<history/events/4b10d7dd-53f7-46fa-a3bf-54d543e4d001.md>) | Admission history for the Metal tensor availability rule | repository | active | When auditing how the Metal tensor availability rule was recorded |
 
 ## Omitted contexts
 
