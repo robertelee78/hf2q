@@ -434,9 +434,11 @@ impl DFlash2Runtime {
 
     /// Append a target prefill capture to one physical draft-ring lane.
     ///
-    /// The legacy capture is CPU layer-major. This method performs the one
-    /// layout conversion, then projects and commits bounded eight-row chunks
-    /// through the same transaction used after target verification.
+    /// The capture is CPU layer-major. The rows are converted to the
+    /// draft's row-major layout as they are staged and appended in lane
+    /// passes, one command buffer for the chunk
+    /// ([`ingest_capture_lane_passes`]); the ring bytes are those of the
+    /// block commits made after target verification.
     pub fn ingest_target_capture(
         &mut self,
         device: &MlxDevice,

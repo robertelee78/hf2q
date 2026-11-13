@@ -1027,7 +1027,8 @@ pub fn dispatch_dflash2_context_commit(
 /// The projections, norms and RoPE are the dispatches of
 /// [`dispatch_dflash2_context_commit`] over the same row count, so a row's
 /// ring bytes are those a decode-shaped commit of that row produces
-/// (`lane_ingest_writes_the_rings_of_block_commits`).
+/// (`lane_passes_write_the_rings_of_block_commits`,
+/// `lane_passes_equal_block_commits_with_two_layers_on_dense_and_af4_routes`).
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_dflash2_lane_ingest(
     encoder: &mut CommandEncoder,

@@ -1042,9 +1042,12 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         for staged in [false, true] {
             for lanes in [1, 3, 4] {
-                for (lane, start, rows) in
-                    [(0, 0, 5), (lanes - 1, 3, 61), (0, 250, 200), (lanes - 1, 10, 300)]
-                {
+                for (lane, start, rows) in [
+                    (0, 0, 5),
+                    (lanes - 1, 3, 61),
+                    (0, 250, 200),
+                    (lanes - 1, 10, 300),
+                ] {
                     let blocks = ingest_rings(lanes, staged, lane, start, rows, false);
                     let passes = ingest_rings(lanes, staged, lane, start, rows, true);
                     assert!(blocks.iter().any(|&bits| bits != 0), "nothing was appended");
@@ -1061,6 +1064,260 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Draft context routes of the ingest gate below.
+    #[derive(Clone, Copy, Debug)]
+    enum IngestRoute {
+        /// Dense BF16 context projections (the default draft projection).
+        Dense,
+        /// AF4-G64 projections in one command.
+        Af4,
+        /// AF4-G64 projections on the per-product staged draft workspace.
+        Af4Staged,
+    }
+
+    fn dense_bf16_projection(
+        device: &MlxDevice,
+        shape: &[usize],
+        state: &mut u64,
+        scale: f32,
+    ) -> DFlash2Projection {
+        let elements: usize = shape.iter().product();
+        let mut weight = device
+            .alloc_buffer(elements * 2, DType::BF16, shape.to_vec())
+            .unwrap();
+        for bits in weight.as_mut_slice::<u16>().unwrap() {
+            *bits = bf16::from_f32(scale * random(state)).to_bits();
+        }
+        DFlash2Projection::Dense { weight }
+    }
+
+    /// Rings after every step of a multi-lane scenario with two target
+    /// layers: chunks of 5 to 300 rows on two lanes, a lane reset between
+    /// them, a ring wrap and a chunk longer than the ring. Arm 0: the
+    /// decode-shaped block commits the ingest replaced, the capture
+    /// converted from layer-major to row-major by `extract_drafter_concat`;
+    /// arm 1: lane passes; arm 2: lane passes with every chunk split into
+    /// two row ranges (a non-zero row start, as the cue fold appends);
+    /// arm 3: lane passes fed the row-major layout (negative control).
+    fn ingest_scenario(route: IngestRoute, lanes: usize, arm: usize) -> Vec<Vec<u16>> {
+        use crate::inference::spec_decode::dflash::hidden_capture::{
+            extract_drafter_concat, DFlashCaptureSession,
+        };
+        use crate::inference::spec_decode::dflash2::runtime::ingest_capture_lane_passes;
+
+        let device = MlxDevice::new().unwrap();
+        let mut registry = KernelRegistry::new();
+        let cfg = DFlash2Config {
+            num_target_layers: 2,
+            target_layer_ids: vec![3, 9],
+            ..config(1_024)
+        };
+        let mut tensors = DFlash2ModelTensors::synthetic_af4_g64(&device, &cfg, 5);
+        let staged = matches!(route, IngestRoute::Af4Staged);
+        if matches!(route, IngestRoute::Dense) {
+            let mut state = 991_u64;
+            let kv = cfg.num_key_value_heads * cfg.head_dim;
+            tensors.context_projection = dense_bf16_projection(
+                &device,
+                &[cfg.hidden_size, cfg.fc_input_dim()],
+                &mut state,
+                0.05,
+            );
+            for layer in &mut tensors.layers {
+                layer.context_kv_projection =
+                    dense_bf16_projection(&device, &[2 * kv, cfg.hidden_size], &mut state, 0.05);
+            }
+        }
+        let mut workspace = DFlash2Workspace::new(&device, &cfg, lanes, staged).unwrap();
+        assert_eq!(workspace.staged.is_some(), staged);
+        let other = lanes - 1;
+        let ops: [Option<(usize, usize)>; 8] = [
+            Some((0, 5)),
+            Some((other, 61)),
+            Some((0, 27)),
+            Some((other, 300)),
+            None,
+            Some((0, 13)),
+            Some((other, 9)),
+            Some((0, 250)),
+        ];
+        let width = cfg.fc_input_dim();
+        let layers = cfg.target_layer_ids.len();
+        let hidden = width / layers;
+        let mut lengths = vec![0_u32; lanes];
+        let mut state = 4_242_u64;
+        for value in workspace
+            .captured_target_hidden
+            .as_mut_slice::<f32>()
+            .unwrap()
+        {
+            *value = 2.0 * random(&mut state);
+        }
+        let mut data_state = 77_u64;
+        let mut retained = device
+            .alloc_buffer(lanes * 4, DType::U32, vec![lanes])
+            .unwrap();
+        let mut snapshots = Vec::new();
+        for op in ops {
+            match op {
+                None => {
+                    // Lane 0 starts over: its ring is cleared and refilled.
+                    let lane_elements = cfg.num_key_value_heads * cfg.sliding_window * cfg.head_dim;
+                    for ring in workspace
+                        .ring_keys
+                        .iter_mut()
+                        .chain(workspace.ring_values.iter_mut())
+                    {
+                        ring.as_mut_slice::<u16>().unwrap()[..lane_elements].fill(0);
+                    }
+                    lengths[0] = 0;
+                }
+                Some((lane, rows)) => {
+                    let capture = DFlashCaptureSession {
+                        target_layer_ids: cfg.target_layer_ids.clone(),
+                        hidden_output: (0..layers * rows * hidden)
+                            .map(|_| 2.0 * random(&mut data_state))
+                            .collect(),
+                        per_position_argmaxes: None,
+                        seq_len: rows,
+                        hidden_size: hidden,
+                    };
+                    let start = lengths[lane] as usize;
+                    let concatenated = extract_drafter_concat(
+                        &capture.hidden_output,
+                        &capture.target_layer_ids,
+                        &cfg.target_layer_ids,
+                        rows,
+                        hidden,
+                    )
+                    .unwrap();
+                    let mut lane_passes =
+                        |capture: &DFlashCaptureSession,
+                         start: usize,
+                         range: std::ops::Range<usize>| {
+                            ingest_capture_lane_passes(
+                                &device,
+                                &mut registry,
+                                &cfg,
+                                &tensors,
+                                &workspace,
+                                capture,
+                                lane,
+                                start,
+                                range,
+                            )
+                            .unwrap();
+                        };
+                    match arm {
+                        0 => {
+                            let lane_rows =
+                                lane * cfg.block_size * width..(lane + 1) * cfg.block_size * width;
+                            for chunk in concatenated.chunks(cfg.block_size * width) {
+                                let destination = &mut workspace
+                                    .captured_target_hidden
+                                    .as_mut_slice::<f32>()
+                                    .unwrap()[lane_rows.clone()];
+                                destination.fill(0.0);
+                                destination[..chunk.len()].copy_from_slice(chunk);
+                                prepare_decode_positions(&mut workspace, &cfg, &lengths).unwrap();
+                                let counts = retained.as_mut_slice::<u32>().unwrap();
+                                counts.fill(0);
+                                counts[lane] = (chunk.len() / width) as u32;
+                                let mut encoder = device.command_encoder().unwrap();
+                                dispatch_dflash2_context_commit(
+                                    &mut encoder,
+                                    &mut registry,
+                                    &device,
+                                    &cfg,
+                                    &tensors,
+                                    &retained,
+                                    &workspace,
+                                )
+                                .unwrap();
+                                encoder.commit_and_wait().unwrap();
+                                lengths[lane] += (chunk.len() / width) as u32;
+                            }
+                        }
+                        1 => {
+                            lane_passes(&capture, start, 0..rows);
+                            lengths[lane] += rows as u32;
+                        }
+                        2 => {
+                            let split = rows / 3;
+                            for range in [0..split, split..rows] {
+                                lane_passes(&capture, start + range.start, range);
+                            }
+                            lengths[lane] += rows as u32;
+                        }
+                        _ => {
+                            let row_major = DFlashCaptureSession {
+                                target_layer_ids: cfg.target_layer_ids.clone(),
+                                hidden_output: concatenated.clone(),
+                                per_position_argmaxes: None,
+                                seq_len: rows,
+                                hidden_size: hidden,
+                            };
+                            lane_passes(&row_major, start, 0..rows);
+                            lengths[lane] += rows as u32;
+                        }
+                    }
+                }
+            }
+            snapshots.push(
+                workspace
+                    .ring_keys
+                    .iter()
+                    .chain(&workspace.ring_values)
+                    .flat_map(|ring| ring.as_slice::<bf16>().unwrap())
+                    .map(|value| value.to_bits())
+                    .collect(),
+            );
+        }
+        snapshots
+    }
+
+    /// The ingest gate on what the one-layer AF4 gate above cannot see: the
+    /// capture's layer-major to row-major conversion (two target layers),
+    /// the Dense BF16 draft projection, a row range that does not start at
+    /// row 0, a lane reset between chunks and two lanes interleaved.
+    /// (Adopted from the independent review of the change.)
+    #[test]
+    fn lane_passes_equal_block_commits_with_two_layers_on_dense_and_af4_routes() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        for route in [IngestRoute::Dense, IngestRoute::Af4, IngestRoute::Af4Staged] {
+            for lanes in 1..=4_usize {
+                let blocks = ingest_scenario(route, lanes, 0);
+                let passes = ingest_scenario(route, lanes, 1);
+                let ranges = ingest_scenario(route, lanes, 2);
+                let mut failed = Vec::new();
+                for (step, block) in blocks.iter().enumerate() {
+                    let nonzero = block.iter().filter(|&&bits| bits != 0).count();
+                    let differing =
+                        |other: &[u16]| block.iter().zip(other).filter(|(a, b)| a != b).count();
+                    // Step 4 is the lane reset: with one lane it empties the rings.
+                    if (nonzero == 0 && !(step == 4 && lanes == 1))
+                        || differing(&passes[step]) != 0
+                        || differing(&ranges[step]) != 0
+                    {
+                        failed.push(step);
+                    }
+                }
+                assert!(
+                    failed.is_empty(),
+                    "{route:?} lanes {lanes}: steps {failed:?} differ from the block commits"
+                );
+            }
+            // The comparison sees the capture layout: the row-major layout
+            // fed as if it were layer-major leaves other rings.
+            let blocks = ingest_scenario(route, 2, 0);
+            let row_major = ingest_scenario(route, 2, 3);
+            assert!(
+                blocks[3] != row_major[3],
+                "{route:?}: the capture layout does not reach the rings"
+            );
         }
     }
 }
