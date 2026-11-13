@@ -2024,6 +2024,87 @@ costs 2.1 ms GPU per Qwen3.8 cycle and 1.2 ms per Qwen3.6 cycle plus a host
 wait; Splash folds the retained rows into the state at the lane's next step
 instead (`gdn.metal:22-25`).
 
+#### Second combined candidate and the end-to-end comparison with Splash
+
+The second round of stage work (prepared routes at every verify width with a
+shared head, fused MoE stages, replay-storage reuse and context-first commit,
+the fused DeltaNet mixer, the alignment-independent attention tile, the cue
+fold and lane-pass capture ingest; mlx-native 0.21.9) was built into one
+binary (`ff578ce3`) and measured with every switch on against the first
+combined candidate's switch set on the same binary. `$E` is
+`/Users/robert/.local/state/hf2q/campaigns`. Each block's two arms ran back
+to back with nothing else on the host.
+
+Qwen3.8, six balanced blocks (`$E/qwen38-w2-all-d5-v1`), 12 of 12
+`CalibrationPass`:
+
+| Metric | All switches | First combined candidate | Reduction (95% CI) |
+|---|---:|---:|---|
+| Client makespan (s) | 32.75 | 37.91 | 13.94% (13.05–14.81%) |
+| Four-lane cycle (ms) | 60.18 | 71.92 | 17.15% (16.18–18.10%) |
+| Total prefill per run (s) | 12.03 | 12.69 | 5.47% (4.63–6.30%) |
+
+Each arm repeats its own text exactly (5,198 and 5,330 completion tokens).
+Peak footprint 71.51 against 70.49 GiB.
+
+Qwen3.6, ten balanced blocks (`$E/qwen36-w2-all-d5-v1`): 10 of 10 candidate
+runs and 9 of 10 control runs passed (the control failure is the workflow
+oracle's "initial six-step workflow not followed"). Over the nine blocks
+where both passed:
+
+| Metric | All switches | First combined candidate | Ratio (95% CI) |
+|---|---:|---:|---|
+| Client makespan (s) | 18.85 | 22.82 | 0.870 (0.803–0.943) |
+| Four-lane cycle (ms) | 27.27 | 32.66 | 0.853 (0.834–0.873) |
+| Total prefill per run (s) | 4.99 | 5.28 | 0.997 (0.936–1.062) |
+| Accepted tokens per lane-cycle | 3.914 | 3.987 | 0.978 (0.960–0.997) |
+
+The Qwen3.6 candidate emitted the same 5,322 completion tokens in all ten
+runs, and in seven further runs of the attention-tile owner; the control
+emitted between 3,771 and 6,581. Qwen3.6 output used to vary from run to run
+because a target row's bits depended on the verify tile width (stock kernels
+at 8 and 16 rows, prepared at 32) and on the alignment of the verify window
+(the attention tile's split length), and both follow a verify budget fed by
+wall-clock time. With the prepared routes at every width and the tile's split
+length a function of the token's own position, a row's bits no longer depend
+on either. Rows decoded outside a DFlash2 verify step still use other
+kernels.
+
+A run's GPU speed follows the GPU clock. Over eleven Qwen3.8 runs with a
+100 ms sampler of the GPU performance state beside them, the 16 layer
+commands of a cycle took 50.3–53.2 ms in runs at 1,470–1,506 MHz and
+60.9–63.1 ms in runs at 1,133–1,189 MHz (r = 0.97 across run means; r =
+0.83–0.99 within a run). Builds and other work on the host lower the clock.
+Two runs minutes apart can therefore differ by 13 ms per cycle with identical
+commands, which is why earlier single-run comparisons disagreed and why the
+campaigns above ran their arms back to back on an otherwise idle host. A
+stage gain under about 5% needs the behaviour alternated inside one process
+or the sampler beside every run.
+
+The end-to-end comparison on the Qwen3.6 workload, from the retained
+artifacts of Splash's valid arm (17 runs, median 16.42 s) and of the first
+combined candidate (19 runs, median 21.98 s):
+
+| Part | hf2q | Splash | Difference |
+|---|---:|---:|---:|
+| Prompt prefill, GPU wall per run (s) | 5.27 | 2.78 | +2.5 |
+| Decode and host time while requests are in flight (s) | 16.66 | 13.58 | +3.1 |
+| Prefill cost per row (ms) | 0.709 | 0.241 | |
+| Tokens per lane-cycle | 4.00 | 4.23 | |
+
+Splash prefills several lanes' rows in one batch (about 383 rows and 95 ms
+per batch, 30 batches per run against hf2q's 56 chunks) and shares the prefix
+the four agents' first prompts have in common. Its served cycles cost about
+15, 20, 25 and 28 ms at one to four lanes, more than its synthetic profile's
+20.8 ms at four lanes suggests for the smaller cohorts; the second combined
+candidate's cycles are 16.5, 20.9, 25.5 and 27.0 ms. Splash did more work in
+that arm (69% of its agents needed the repair turns against 22% of hf2q's),
+so at equal work the gap was larger than the medians show. After this round
+the remaining distance on Qwen3.6 (18.85 against 16.42 s) is prompt prefill.
+On Qwen3.8, where no valid Splash end-to-end run exists, prefill is 12.0 s
+of a 32.8 s run and the four-lane cycle is 60.2 ms against Splash's 50.6 ms
+profile.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,
