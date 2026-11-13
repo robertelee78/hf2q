@@ -525,8 +525,16 @@ mod tests {
             assert_eq!(dense.source(switch(name)), SwitchSource::Default, "{name}");
         }
         let moe = ResolvedRoutes::resolve(Some(RouteProfile::Qwen36), &|_| None, &env(&[]));
-        for row in SWITCHES {
+        for row in SWITCHES.iter().filter(|row| row.qwen36.is_some()) {
             assert!(moe.is_one(switch(row.name)), "{}", row.name);
+        }
+        // Rows whose readers are per model and whose combined configuration
+        // is not qualified yet carry no profile value.
+        for name in ["HF2Q_DFLASH2_DRAFT_PREFETCH", "HF2Q_DFLASH2_GPU_DECISIONS"] {
+            for routes in [&dense, &moe] {
+                assert_eq!(routes.value(switch(name)), None, "{name}");
+                assert_eq!(routes.source(switch(name)), SwitchSource::Default, "{name}");
+            }
         }
         assert_eq!(
             moe.plane_sets(),

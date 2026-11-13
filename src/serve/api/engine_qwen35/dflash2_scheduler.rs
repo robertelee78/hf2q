@@ -6,6 +6,7 @@
 //! in-turn drain used by joint MTP. DFlash2 is optional and fail-closed: a lane
 //! joins only when its target cursor and persistent draft-ring cursor agree.
 
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
