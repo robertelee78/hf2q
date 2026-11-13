@@ -53,13 +53,19 @@ Hugging Face cache at its pinned revision, or downloaded into it and
 verified before the target is loaded; its identity checks do not depend on
 the class. The profile is applied switch by switch: a switch whose kernels
 do not admit the artifact's storage, or whose prepared planes do not fit in
-memory, keeps its own default and the drafter serves with the rest. Every
-other model (other shapes, another family, another scheduler, more slots)
-runs the route it ran before, bit for bit. The default never fails startup
+memory, keeps its own default and the drafter serves with the rest. A MoE
+target qualifies only when its batched MoE verification route is admitted
+for its storage (a static rule read from the header; the server never
+monitors acceptance or changes route after the load). Every other model
+(other shapes, another family, another scheduler, more slots) runs the route
+it ran before, bit for bit. Memory-carrying routes are admitted against what
+the engines already resident have committed, and a host that cannot run a
+route's kernels leaves that switch off. The default never fails startup
 on its own account: a drafter that cannot be obtained or bound, too little
 memory for the drafter, and a load that fails with DFlash2 selected each
 fall back to the prior route with the reason logged. One INFO line per load,
-`DFlash2 policy resolved`, records the policy, the selection and the class
+`DFlash2 policy resolved`, and the `active_controls.dflash2` object of
+`/hf2q/v1/runtime` record the policy, the selection and the class
 that qualified the target, the descriptor, the target's own source identity,
 the drafter source, the withheld switches with their reasons and every
 switch with its value and source. `HF2Q_DFLASH2=0` is the kill switch for

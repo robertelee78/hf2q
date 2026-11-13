@@ -2365,7 +2365,7 @@ mod tests {
 
     #[test]
     fn admission_charges_what_the_loader_says_an_engine_holds_resident() {
-        let pool = LoadedPool::with_capacity_and_budget(2, 1_200);
+        let pool = LoadedPool::with_capacity_and_budget(2, 1_100);
         let mut mgr = HotSwapManager::<MockEngine>::new(pool, Arc::new(RouteLoader));
         let first = synthetic_gguf(400);
         let second = synthetic_gguf(500);
@@ -2373,7 +2373,7 @@ mod tests {
         mgr.load_or_get("a/1", QuantType::Q4_K_M, first.path(), &empty_config())
             .unwrap();
         assert_eq!(mgr.pool_stats().total_resident_bytes, 400);
-        // 400 + 500 fits the 1,200-byte budget by file size; with the 300
+        // 400 + 500 fits the 1,100-byte budget by file size; with the 300
         // bytes its routes keep resident the second model does not fit
         // beside the first, and the loader is not called.
         let plan = mgr

@@ -2189,11 +2189,22 @@ not qualify the adapter.
   drafter that cannot be obtained or bound, too little memory and a load
   that fails with DFlash2 selected all end on the prior route with the
   reason logged.
+- **Static MoE boundary.** Auto qualifies a `qwen35moe` target only when its
+  batched MoE verification route is admitted for the artifact's storage.
+  Without it a 32-row verify step runs every row through the per-row expert
+  path, which is not a qualified fast path. This is a qualification rule
+  read from the GGUF header before the load. It is not the run-time
+  drop-back the operator rejected: nothing monitors acceptance, output or
+  timing, no route changes after the load, and the rule carries no
+  threshold. Same-base fine-tunes whose storage admits the fast graph keep
+  the automatic drafter.
 - **`0`: kill switch.** No drafter is located and no profile applies. Every
   switch of the route profile resolves from the environment alone, so the
   server runs what it ran before this policy, for every family.
 - **`1`: required.** A target in neither class, or a drafter that cannot be
-  obtained or bound, fails startup. It accepts both classes.
+  obtained or bound, fails startup. It accepts both classes, and it serves
+  the drafter on a MoE target without its batched route, with a WARN line
+  that the route is unqualified and was measured slower.
 
 This supersedes the earlier rule that admitted the exact source identity
 only (operator decision, 2026-11-12: fine-tunes of a qualified model get the
@@ -2203,7 +2214,17 @@ token, so a drafter that fits a fine-tune less well costs acceptance, never
 correctness. Measured on the launcher-default models, exact four-agent Q5,
 two runs per arm, prior route against the default:
 
-FINE_TUNE_MEASUREMENT_PLACEHOLDER
+| Launcher default | Class and routes under auto | Prior route | Drafter | Accepted per lane-cycle |
+|---|---|---:|---:|---:|
+| Qwen3.8 abliterated SFT (Q4_K_M, hf2q) | same shapes; full profile | 59.42 / 59.15 s | 29.56 / 27.10 s | 5.318 (vanilla pair 5.254) |
+| Qwen3.6 APEX-Q5_K_M (external) | same shapes; batched, staged and live-tile MoE and prepared head withheld | 39.46 / 39.57 s | 48.58 / 49.13 s | 4.43 / 4.53 (vanilla pair 3.93) |
+
+Every run is a `CalibrationPass`. The dense fine-tune halves its makespan.
+The Q5_K MoE artifact is slower with the drafter: its shared expert is
+Q5_K, the batched MoE route takes Q4_K and Q6_K, and a 32-row verify step
+on the per-row expert path costs 132 ms per four-lane cycle. Hence the
+static MoE boundary above: under auto that artifact keeps its prior route,
+and its audit line says the batched route was not admitted.
 
 Each pinned Qwen descriptor has one route profile, a row per switch in one
 table (`src/inference/spec_decode/dflash2/route_profile.rs`): the draft
@@ -2224,13 +2245,40 @@ or any path outside `hf2q serve`, reads the environment alone. The prepared
 prefill and the MoE switches, which act on every artifact of a family, are
 therefore on by default only for a selected target.
 
-A memory rule runs before selection: headroom is physical memory minus the
-model file, the configured KV budget and 8 GiB; the drafter costs its file
-size and the prepared planes the native layout's bytes for the weights they
-cover. When the planes do not fit, the plane-carrying rows are withheld and
-DFlash2 is kept if the drafter fits; otherwise the prior route is kept.
+A row is also withheld when the host cannot run its kernels: the policy
+asks `inference::route_host` (the Metal tensor API is absent on macOS before
+26 and on GPUs outside the Metal 4 family) for every row before turning it
+on. A switch set on by hand on such a host fails startup with the host's
+text; a host that could not be asked at all keeps the prior route under
+auto and fails a required DFlash2.
 
-MEMORY_ADR_PLACEHOLDER
+A memory rule runs before selection: headroom is physical memory minus what
+the engines already resident in the process have committed, the model file,
+the configured KV budget and 8 GiB; the drafter costs its file size, the
+prepared planes the native layout's bytes for the weights they cover (two
+output heads when the shared head is off), and a route's retained scratch
+its declared figure (none today). When the planes do not fit, the
+plane-carrying rows are withheld and DFlash2 is kept if the drafter fits;
+otherwise the prior route is kept. Every `load_engine` call reserves its
+commitment in a process ledger (`serve::resident_memory`) before it
+allocates, releases it on failure and on unload, and the hot-swap pool
+charges the same figure instead of the GGUF file size.
+
+Measured peak process footprint of the default profile on the exact
+four-agent Q5: Qwen3.8 76.73 GB against 57.87 GB on the prior route (the rule
+charges 19.94 GB), Qwen3.6 57.22 GB against 35.18 GB (the rule charges
+22.42 GB). Qwen3.6 had measured 77.16 GB: the loading thread primed a GPU
+weight cache of its own to upload the drafter and never released it, so the
+20 GB of staged expert planes existed twice (58.2 GiB after load against
+39.9 GiB now). The planes remain a second representation beside the GGUF
+blocks; holding one copy of every weight (about 61.7 GB and 36.2 GB) needs
+every consumer to read the planes and is not part of this change.
+
+The decision is published by `/hf2q/v1/runtime` as
+`measurement_snapshot.active_controls.dflash2` (policy, selection, qualifying
+class, descriptor, target and drafter source, every switch with value,
+source and withholding reason, memory commitment), so a Q5 receipt, which
+records that document, binds the route that ran.
 
 One INFO line per load, `DFlash2 policy resolved`, is the startup audit the
 first two D6 items quote: `policy`, `selected`, `reason` (the qualifying

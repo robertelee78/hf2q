@@ -643,36 +643,29 @@ fn stale_or_incomplete_drafter_paths_never_stop_auto_and_always_stop_required() 
 
 #[test]
 fn the_profile_is_applied_switch_by_switch_to_storage_it_does_not_admit() {
-    // The Qwen3.6 launcher default: Q5_K experts, shared expert and
-    // projections, a Q8_0 head, no hf2q provenance.
-    let apex = restored(
+    // A dense fine-tune quantized to Q5_K with a Q8_0 head: the prepared
+    // routes have nothing to take, and the drafter serves on the rest.
+    let q5_dense = restored(
         restored(
             TargetFacts {
                 provenance: Provenance::External,
-                ..qwen36()
+                ..qwen38()
             },
-            &[
-                "_exps",
-                "ffn_gate_shexp",
-                "ffn_up_shexp",
-                "ffn_down_shexp",
-                "attn_qkv",
-            ],
+            &["ffn_", "attn_qkv", "attn_gate", "ssm_out"],
             GgmlType::Q5_K,
         ),
         &["output.weight"],
         GgmlType::Q8_0,
     );
     for pairs in [&[][..], &[(DFLASH2_ENV, "1")][..]] {
-        let selection = decided(&apex, pairs, &Store::cached()).expect("nothing fails startup");
+        let selection = decided(&q5_dense, pairs, &Store::cached()).expect("nothing fails startup");
         assert!(selection.selected(), "{}", selection.reason);
         assert_eq!(selection.profile_label(), "partial");
         for name in [
-            "HF2Q_QWEN_MOE_BATCHED",
-            "HF2Q_QWEN_MOE_STAGED_M8",
-            "HF2Q_QWEN_MOE_LIVE_TILES",
+            "HF2Q_REPACKED_GGUF_M32",
             "HF2Q_REPACKED_GGUF_M32_PROJ",
             "HF2Q_REPACKED_GGUF_M32_HEAD",
+            "HF2Q_REPACKED_GGUF_ANY_WIDTH",
             "HF2Q_QWEN_PREFILL_PREPARED",
             "HF2Q_QWEN_PREFILL_FOLD_CUE",
         ] {
@@ -682,10 +675,7 @@ fn the_profile_is_applied_switch_by_switch_to_storage_it_does_not_admit() {
         for name in [
             "HF2Q_DFLASH2_DRAFT_AF4_G64",
             "HF2Q_DFLASH2_DRAFT_STAGED",
-            "HF2Q_DFLASH2_GPU_TARGET_TOKENS",
             "HF2Q_DFLASH2_CONTEXT_FIRST",
-            "HF2Q_REPACKED_GGUF_M32",
-            "HF2Q_REPACKED_GGUF_ANY_WIDTH",
             "HF2Q_REPACKED_GGUF_SHARED_HEAD",
             "HF2Q_QWEN_VERIFY_ATTN_TILE",
             "HF2Q_QWEN_VERIFY_MIXER_FUSED",
@@ -695,12 +685,9 @@ fn the_profile_is_applied_switch_by_switch_to_storage_it_does_not_admit() {
         }
         let audit = selection.routes.withheld_audit();
         for part in [
-            "HF2Q_QWEN_MOE_BATCHED: blk.0.ffn_gate_shexp.weight is Q5_K, not Q4_K or Q6_K",
-            "HF2Q_QWEN_MOE_STAGED_M8: HF2Q_QWEN_MOE_BATCHED is off",
-            "HF2Q_REPACKED_GGUF_M32_PROJ: the prepared kernels take Q4_K and Q6_K; these \
-             weights are Q5_K",
-            "HF2Q_REPACKED_GGUF_M32_HEAD: the prepared kernels take Q4_K and Q6_K; these \
-             weights are Q8_0",
+            "HF2Q_REPACKED_GGUF_M32: the prepared kernels take Q4_K and Q6_K; these weights \
+             are Q5_K",
+            "HF2Q_REPACKED_GGUF_M32_PROJ: HF2Q_REPACKED_GGUF_M32 is off",
             "HF2Q_QWEN_PREFILL_PREPARED: the prepared kernels take Q4_K and Q6_K; these \
              weights are Q5_K",
             "HF2Q_QWEN_PREFILL_FOLD_CUE: HF2Q_QWEN_PREFILL_PREPARED is off",
@@ -720,26 +707,11 @@ fn the_profile_is_applied_switch_by_switch_to_storage_it_does_not_admit() {
     let selection = decided(&mixed, &[], &Store::cached()).expect("auto");
     assert!(!selection.routes.any_withheld());
 
-    // Conditions that fail a load when the switch is set by hand.
-    let overlay = TargetFacts {
-        dwq_overlay: true,
-        ..qwen36()
-    };
-    let selection = decided(&overlay, &[], &Store::cached()).expect("auto");
-    assert!(selection.selected());
-    assert!(withheld(&selection, "HF2Q_QWEN_MOE_BATCHED"));
-    assert!(selection.routes.withheld_audit().contains("DWQ overlay"));
-    assert!(selection.routes.is_one(switch("HF2Q_REPACKED_GGUF_M32")));
-
-    let f16_router = restored(qwen36(), &["blk.7.ffn_gate_inp."], GgmlType::F16);
-    let selection = decided(&f16_router, &[], &Store::cached()).expect("auto");
-    assert!(selection
-        .routes
-        .withheld_audit()
-        .contains("blk.7.ffn_gate_inp.weight is F16, not F32"));
-
+    // A MoE target whose routed expert stacks the staged route does not
+    // take keeps the batched route and the drafter.
     let q8_experts = restored(qwen36(), &["blk.3.ffn_up_exps"], GgmlType::Q8_0);
     let selection = decided(&q8_experts, &[], &Store::cached()).expect("auto");
+    assert!(selection.selected());
     assert!(selection.routes.is_one(switch("HF2Q_QWEN_MOE_BATCHED")));
     assert!(withheld(&selection, "HF2Q_QWEN_MOE_STAGED_M8"));
     assert!(withheld(&selection, "HF2Q_QWEN_MOE_LIVE_TILES"));
@@ -755,27 +727,127 @@ fn the_profile_is_applied_switch_by_switch_to_storage_it_does_not_admit() {
     let selection = decided(&chunk_scan, &[], &Store::cached()).expect("auto");
     assert!(withheld(&selection, "HF2Q_QWEN_PREFILL_PREPARED"));
     assert!(withheld(&selection, "HF2Q_QWEN_PREFILL_FOLD_CUE"));
+}
 
-    // A switch set by hand is the operator's: it is never withheld, and its
-    // reader refuses storage it does not admit as it always has.
+/// A static qualification boundary read from the artifact's storage before
+/// the load. The policy has no run-time input: nothing in `decide` sees
+/// acceptance, output or timing, and a selection is never revisited.
+#[test]
+fn auto_qualifies_a_moe_target_only_with_its_batched_verification_route() {
+    // The Qwen3.6 launcher default: Q5_K experts, shared expert and
+    // projections, a Q8_0 head, no hf2q provenance. The batched MoE route
+    // does not admit its shared expert, and verifying 32 rows through the
+    // per-row expert path was measured slower than the prior route.
+    let apex = restored(
+        restored(
+            TargetFacts {
+                provenance: Provenance::External,
+                ..qwen36()
+            },
+            &[
+                "_exps",
+                "ffn_gate_shexp",
+                "ffn_up_shexp",
+                "ffn_down_shexp",
+                "attn_qkv",
+            ],
+            GgmlType::Q5_K,
+        ),
+        &["output.weight"],
+        GgmlType::Q8_0,
+    );
+    let overlay = TargetFacts {
+        dwq_overlay: true,
+        ..qwen36()
+    };
+    let f16_router = restored(qwen36(), &["blk.7.ffn_gate_inp."], GgmlType::F16);
+    let cases = [
+        (
+            &apex,
+            "blk.0.ffn_gate_shexp.weight is Q5_K, not Q4_K or Q6_K",
+        ),
+        (&overlay, "DWQ overlay"),
+        (&f16_router, "blk.7.ffn_gate_inp.weight is F16, not F32"),
+    ];
+    for (facts, reason) in cases {
+        // Decided before any memory is counted; the drafter is not loaded.
+        let auto = decided(facts, &[], &Store::cached()).expect("auto never fails");
+        assert_prior_route(&auto, &[]);
+        assert!(
+            auto.reason.contains("not a qualified fast path"),
+            "{}",
+            auto.reason
+        );
+        assert!(auto.reason.contains(reason), "{}", auto.reason);
+        assert_eq!(auto.descriptor.map(|d| d.id), Some(QWEN36_DFLASH2.id));
+
+        // Required is the operator's choice: the drafter serves with every
+        // route the storage admits.
+        let required = decided(facts, &[(DFLASH2_ENV, "1")], &Store::cached()).expect("required");
+        assert!(required.selected());
+        for name in [
+            "HF2Q_QWEN_MOE_BATCHED",
+            "HF2Q_QWEN_MOE_STAGED_M8",
+            "HF2Q_QWEN_MOE_LIVE_TILES",
+        ] {
+            assert!(withheld(&required, name), "{name}");
+        }
+        for name in [
+            "HF2Q_DFLASH2_DRAFT_AF4_G64",
+            "HF2Q_DFLASH2_DRAFT_STAGED",
+            "HF2Q_DFLASH2_GPU_TARGET_TOKENS",
+            "HF2Q_QWEN_VERIFY_ATTN_TILE",
+        ] {
+            assert!(required.routes.is_one(switch(name)), "{name}");
+        }
+        assert!(required.routes.withheld_audit().contains(reason));
+        let [warning] = required.warnings.as_slice() else {
+            panic!("one cost warning, got {:?}", required.warnings);
+        };
+        assert!(warning.contains("unqualified route"), "{warning}");
+        assert!(warning.contains("slower than the prior route"), "{warning}");
+    }
+    // The batched route switched off by hand is the same condition; switched
+    // on by hand it is the operator's, and the drafter is selected.
+    let off = decided(
+        &qwen36(),
+        &[("HF2Q_QWEN_MOE_BATCHED", "0")],
+        &Store::cached(),
+    )
+    .expect("auto");
+    assert_prior_route(&off, &[("HF2Q_QWEN_MOE_BATCHED", "0")]);
+    assert!(off.reason.contains("it is switched off"), "{}", off.reason);
     let forced = decided(&apex, &[("HF2Q_QWEN_MOE_BATCHED", "1")], &Store::cached()).expect("auto");
+    assert!(forced.selected());
     assert_eq!(
         forced.routes.source(switch("HF2Q_QWEN_MOE_BATCHED")),
         SwitchSource::Env
     );
+    // A dense target has no such condition.
+    assert!(decided(&qwen38(), &[], &Store::cached())
+        .expect("auto")
+        .selected());
+}
+
+/// A host that refuses `names` for `reason`.
+fn host_without<'a>(
+    names: &'a [&'a str],
+    reason: &'a str,
+) -> impl Fn(&str) -> Option<HostRefusal> + 'a {
+    move |name| {
+        names.contains(&name).then(|| HostRefusal {
+            reason: reason.to_owned(),
+            explicit: format!("{name} is on, but {reason}"),
+        })
+    }
 }
 
 #[test]
 fn a_host_that_cannot_run_a_switch_keeps_it_off_or_refuses_it_by_name() {
-    // A Metal runtime without the tensor API: the prepared kernels and the
-    // tiled verify attention cannot run.
-    let no_tensor_api = |name: &str| {
-        matches!(
-            name,
-            "HF2Q_REPACKED_GGUF_M32" | "HF2Q_QWEN_PREFILL_PREPARED" | "HF2Q_QWEN_VERIFY_ATTN_TILE"
-        )
-        .then(|| "the Metal runtime has no tensor API".to_owned())
-    };
+    let no_tensor_api = host_without(
+        &["HF2Q_REPACKED_GGUF_M32", "HF2Q_QWEN_PREFILL_PREPARED"],
+        "the prepared GGUF matmul cannot run on this host",
+    );
     let on_host = |facts: &TargetFacts, pairs: &[(&str, &str)]| {
         decide(facts, ROOMY, &env(pairs), &Store::cached(), &no_tensor_api)
     };
@@ -792,7 +864,6 @@ fn a_host_that_cannot_run_a_switch_keeps_it_off_or_refuses_it_by_name() {
             "HF2Q_REPACKED_GGUF_ANY_WIDTH",
             "HF2Q_QWEN_PREFILL_PREPARED",
             "HF2Q_QWEN_PREFILL_FOLD_CUE",
-            "HF2Q_QWEN_VERIFY_ATTN_TILE",
         ] {
             assert!(withheld(&selection, name), "{name}");
         }
@@ -802,8 +873,7 @@ fn a_host_that_cannot_run_a_switch_keeps_it_off_or_refuses_it_by_name() {
         let audit = selection.routes.withheld_audit();
         assert!(
             audit.contains(
-                "HF2Q_REPACKED_GGUF_M32: this host cannot run it: the Metal runtime has no \
-                 tensor API"
+                "HF2Q_REPACKED_GGUF_M32: the prepared GGUF matmul cannot run on this host"
             ),
             "{audit}"
         );
@@ -815,19 +885,183 @@ fn a_host_that_cannot_run_a_switch_keeps_it_off_or_refuses_it_by_name() {
     // A switch set on by hand is refused before the load, by name, whatever
     // the policy; set off, or left to a kill switch, it is not asked about.
     for policy in [None, Some("0"), Some("1")] {
-        let mut pairs = vec![("HF2Q_QWEN_VERIFY_ATTN_TILE", "1")];
+        let mut pairs = vec![("HF2Q_QWEN_PREFILL_PREPARED", "1")];
         pairs.extend(policy.map(|value| (DFLASH2_ENV, value)));
         let error = on_host(&qwen38(), &pairs).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "HF2Q_QWEN_VERIFY_ATTN_TILE=1 cannot run on this host: the Metal runtime has no \
-             tensor API"
+            "HF2Q_QWEN_PREFILL_PREPARED is on, but the prepared GGUF matmul cannot run on this \
+             host"
         );
     }
     let off = on_host(&qwen38(), &[("HF2Q_REPACKED_GGUF_M32", "0")]).expect("explicit off");
     assert!(off.selected());
     let kill = on_host(&qwen38(), &[(DFLASH2_ENV, "0")]).expect("kill switch");
     assert_prior_route(&kill, &[]);
+}
+
+#[test]
+fn the_host_probe_answers_for_every_table_switch() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    // Every row of the route profile has an answer in the host table.
+    {
+        let _host = route_host::HostForTest::without_tensor_api();
+        let host = host_routes();
+        let routes = host.as_ref().expect("the test host answers");
+        for row in SWITCHES {
+            assert!(routes.switch(row.name).is_some(), "{}", row.name);
+        }
+        // Without the Metal tensor API (macOS before 26, or a GPU outside
+        // the Metal 4 family) the tensor-only rows are left off under auto
+        // and under a required DFlash2, with the host's reason, and the
+        // drafter serves on the portable kernels.
+        for (facts, policy) in [(qwen38(), None), (qwen36(), None), (qwen36(), Some("1"))] {
+            let pairs: Vec<(&str, &str)> = policy
+                .map(|value| (DFLASH2_ENV, value))
+                .into_iter()
+                .collect();
+            let selection = decide(&facts, ROOMY, &env(&pairs), &Store::cached(), &|name| {
+                host_switch_refusal(&host, name)
+            })
+            .expect("nothing fails startup");
+            assert!(selection.selected());
+            for name in [
+                "HF2Q_DFLASH2_DRAFT_STAGED",
+                "HF2Q_REPACKED_GGUF_M32",
+                "HF2Q_REPACKED_GGUF_M32_PROJ",
+                "HF2Q_REPACKED_GGUF_M32_HEAD",
+                "HF2Q_REPACKED_GGUF_ANY_WIDTH",
+                "HF2Q_REPACKED_GGUF_SHARED_HEAD",
+                "HF2Q_QWEN_PREFILL_PREPARED",
+                "HF2Q_QWEN_PREFILL_FOLD_CUE",
+            ] {
+                assert!(withheld(&selection, name), "{name}");
+            }
+            let moe = facts.architecture == "qwen35moe";
+            for name in ["HF2Q_QWEN_MOE_STAGED_M8", "HF2Q_QWEN_MOE_LIVE_TILES"] {
+                assert_eq!(withheld(&selection, name), moe, "{name}");
+            }
+            for name in [
+                "HF2Q_DFLASH2_DRAFT_AF4_G64",
+                "HF2Q_DFLASH2_CONTEXT_FIRST",
+                "HF2Q_QWEN_VERIFY_ATTN_TILE",
+                "HF2Q_QWEN_VERIFY_MIXER_FUSED",
+                "HF2Q_QWEN_VERIFY_REPLAY_REUSE",
+            ] {
+                assert!(selection.routes.is_one(switch(name)), "{name}");
+            }
+            assert_eq!(
+                selection.routes.is_one(switch("HF2Q_QWEN_MOE_BATCHED")),
+                moe
+            );
+            assert!(
+                selection
+                    .routes
+                    .withheld_audit()
+                    .contains("HF2Q_REPACKED_GGUF_M32: "),
+                "{}",
+                selection.routes.withheld_audit()
+            );
+            assert_eq!(selection.commitment.plane_bytes, 0);
+        }
+        // A tensor-only switch set on by hand is refused with the host's
+        // own text; a portable one is not.
+        let refused = decide(
+            &qwen38(),
+            ROOMY,
+            &env(&[("HF2Q_REPACKED_GGUF_M32", "1")]),
+            &Store::cached(),
+            &|name| host_switch_refusal(&host, name),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refused.starts_with("HF2Q_REPACKED_GGUF_M32 is on, but "),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("Unset HF2Q_REPACKED_GGUF_M32"),
+            "{refused}"
+        );
+        decide(
+            &qwen38(),
+            ROOMY,
+            &env(&[("HF2Q_QWEN_VERIFY_ATTN_TILE", "1")]),
+            &Store::cached(),
+            &|name| host_switch_refusal(&host, name),
+        )
+        .expect("a portable switch");
+    }
+    // This host (the test machine) answers too, and whatever it answers a
+    // default load starts.
+    let host = host_routes();
+    let selection = decide(&qwen38(), ROOMY, &env(&[]), &Store::cached(), &|name| {
+        host_switch_refusal(&host, name)
+    })
+    .expect("auto never fails");
+    assert!(selection.selected());
+    if host.as_ref().is_ok_and(|routes| {
+        SWITCHES
+            .iter()
+            .all(|row| routes.switch(row.name) == Some(HostRoute::Runs))
+    }) {
+        assert_eq!(selection.profile_label(), "full");
+    }
+
+    // A host that could not be asked runs no tensor-only row.
+    let unknown: std::result::Result<HostRoutes, String> = Err("no Metal device".to_owned());
+    assert!(host_switch_refusal(&unknown, "HF2Q_REPACKED_GGUF_M32")
+        .is_some_and(|refusal| refusal.reason.contains("could not be established")));
+    assert_eq!(
+        host_switch_refusal(&unknown, "HF2Q_DFLASH2_DRAFT_AF4_G64"),
+        None
+    );
+    assert_eq!(host_switch_refusal(&unknown, "HF2Q_NOT_A_SWITCH"), None);
+}
+
+#[test]
+fn a_host_that_could_not_be_asked_keeps_the_prior_route_under_auto() {
+    let unknown: std::result::Result<HostRoutes, String> = Err("probe pipeline failed".to_owned());
+    let on_host = |pairs: &[(&str, &str)]| {
+        decide(&qwen38(), ROOMY, &env(pairs), &Store::cached(), &|name| {
+            host_switch_refusal(&unknown, name)
+        })
+    };
+    let error = unknown.as_ref().err().map(String::as_str);
+    // Auto: logged, prior route, and the fallback is not a DFlash2 load.
+    let auto = unprobed_host(on_host(&[]).expect("auto"), error).expect("auto never fails");
+    assert_prior_route(&auto, &[]);
+    assert!(
+        auto.reason.contains("probe pipeline failed"),
+        "{}",
+        auto.reason
+    );
+    assert_eq!(auto.warnings.len(), 1);
+    assert!(auto.warnings[0].contains("serving the prior route"));
+    assert_eq!(auto.commitment.drafter_bytes, 0);
+    // Required surfaces the failure.
+    let required = unprobed_host(on_host(&[(DFLASH2_ENV, "1")]).expect("decided"), error);
+    assert!(required
+        .unwrap_err()
+        .to_string()
+        .contains("probe pipeline failed"));
+    // So does a tensor-only switch set on by hand, before anything else.
+    let explicit = on_host(&[("HF2Q_REPACKED_GGUF_M32", "1")]).unwrap_err();
+    assert!(
+        explicit.to_string().contains("probe pipeline failed"),
+        "{explicit}"
+    );
+    // A selection that asks nothing of the host is left alone.
+    let kill = unprobed_host(on_host(&[(DFLASH2_ENV, "0")]).expect("off"), error).expect("off");
+    assert_eq!(kill.request, PolicyRequest::Off);
+    assert!(kill.warnings.is_empty());
+    // And a host that answered changes nothing.
+    let asked = unprobed_host(
+        decided(&qwen38(), &[], &Store::cached()).expect("auto"),
+        None,
+    )
+    .expect("auto");
+    assert!(asked.selected());
 }
 
 #[test]
@@ -1278,9 +1512,18 @@ fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
     assert_eq!(bound(&serial, &[]), 0);
     // A host that cannot run the prepared kernels prepares no planes.
     assert_eq!(
-        route_upper_bound(&dense, &env(&[]), &|name| {
-            (name != "HF2Q_DFLASH2_DRAFT_AF4_G64").then(|| "no tensor API".to_owned())
-        }),
+        route_upper_bound(
+            &dense,
+            &env(&[]),
+            &host_without(
+                &[
+                    "HF2Q_DFLASH2_DRAFT_STAGED",
+                    "HF2Q_REPACKED_GGUF_M32",
+                    "HF2Q_QWEN_PREFILL_PREPARED"
+                ],
+                "no tensor API"
+            )
+        ),
         QWEN38_DFLASH2.weights_bytes
     );
 }
@@ -1335,9 +1578,13 @@ fn the_published_decision_names_what_ran() {
         "default"
     );
 
-    let withheld = decide(&qwen38(), ROOMY, &env(&[]), &Store::cached(), &|name| {
-        (name == "HF2Q_REPACKED_GGUF_M32").then(|| "no tensor API".to_owned())
-    })
+    let withheld = decide(
+        &qwen38(),
+        ROOMY,
+        &env(&[]),
+        &Store::cached(),
+        &host_without(&["HF2Q_REPACKED_GGUF_M32"], "no tensor API"),
+    )
     .expect("auto")
     .published();
     assert_eq!(withheld["profile"], "partial");
@@ -1346,7 +1593,7 @@ fn the_published_decision_names_what_ran() {
         serde_json::json!({
             "value": null,
             "source": "withheld",
-            "withheld": "this host cannot run it: no tensor API"
+            "withheld": "no tensor API"
         })
     );
 }
@@ -1366,7 +1613,8 @@ fn a_failed_load_is_retried_on_the_route_of_main() {
 /// Real-artifact gate, header only (no weights are read, no GPU):
 /// `HF2Q_QWEN38_GGUF=… HF2Q_QWEN36_GGUF=… <test binary> pinned_geometry_is_the_gate_artifacts --ignored`.
 /// `HF2Q_DFLASH2_SAME_SHAPE_GGUFS` may name further GGUFs, separated by `:`,
-/// that must qualify for a descriptor by shape.
+/// that must have the shapes of a pinned descriptor's target; whether the
+/// drafter is selected for each is printed.
 #[test]
 #[ignore = "requires HF2Q_QWEN38_GGUF and HF2Q_QWEN36_GGUF"]
 fn pinned_geometry_is_the_gate_artifacts() {
@@ -1400,6 +1648,10 @@ fn pinned_geometry_is_the_gate_artifacts() {
             selection.target_source,
             selection.routes.withheld_audit()
         );
-        assert!(selection.selected(), "{path}: {}", selection.reason);
+        assert!(
+            selection.descriptor.is_some(),
+            "{path} has the shapes of no pinned target: {}",
+            selection.reason
+        );
     }
 }

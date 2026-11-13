@@ -25,7 +25,10 @@
     "TURN": "2",
     "CANCEL_AGENT": "0",
     "CANCEL_AFTER_EVENTS": "16",
-    "LOG_FILTER": "hf2q=info,mlx_native=info,hf2q::serve::api::engine_qwen35::progress=debug"
+    "LOG_FILTER": "hf2q=info,mlx_native=info,hf2q::serve::api::engine_qwen35::progress=debug",
+    "DFLASH2_POLICY": "",
+    "DFLASH2_DESCRIPTOR": "",
+    "DFLASH2_QUALIFICATION": ""
   },
   "binary": "{HF2Q_BIN}",
   "artifact": {
@@ -79,6 +82,24 @@
         "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
         "field": "measurement_snapshot.active_controls.vision_projector",
         "equals": false
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "measurement_snapshot.active_controls.dflash2.policy",
+        "equals": "{DFLASH2_POLICY}",
+        "skip_if_empty": true
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "measurement_snapshot.active_controls.dflash2.descriptor",
+        "equals": "{DFLASH2_DESCRIPTOR}",
+        "skip_if_empty": true
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "measurement_snapshot.active_controls.dflash2.qualification",
+        "equals": "{DFLASH2_QUALIFICATION}",
+        "skip_if_empty": true
       }
     ]
   },

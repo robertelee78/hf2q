@@ -27,7 +27,10 @@
     "CLIENT_APPROVAL_TEMPLATE": null,
     "DFLASH2": "",
     "HF_HUB_CACHE": "",
-    "HF_HUB_OFFLINE": ""
+    "HF_HUB_OFFLINE": "",
+    "DFLASH2_POLICY": "",
+    "DFLASH2_DESCRIPTOR": "",
+    "DFLASH2_QUALIFICATION": ""
   },
   "binary": "{HF2Q_BIN}",
   "artifact": {
@@ -95,6 +98,24 @@
         "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
         "field": "measurement_snapshot.sampling_defaults.tool_thinking_token_budget",
         "equals": 0
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "measurement_snapshot.active_controls.dflash2.policy",
+        "equals": "{DFLASH2_POLICY}",
+        "skip_if_empty": true
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "measurement_snapshot.active_controls.dflash2.descriptor",
+        "equals": "{DFLASH2_DESCRIPTOR}",
+        "skip_if_empty": true
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "measurement_snapshot.active_controls.dflash2.qualification",
+        "equals": "{DFLASH2_QUALIFICATION}",
+        "skip_if_empty": true
       }
     ]
   },

@@ -117,6 +117,15 @@ four slots, DFlash2 is selected for a target in either of two classes.
   emitted token, so a drafter that fits a fine-tune less well costs
   acceptance, not correctness. There is no acceptance-based drop-back.
 
+One static boundary narrows auto for MoE targets: auto qualifies a
+`qwen35moe` target only when its batched MoE verification route
+(`HF2Q_QWEN_MOE_BATCHED`) is admitted for the artifact's storage. Without it
+every row of a 32-row verify step runs the per-row expert path, which is not
+a qualified fast path (measured on the Q5_K launcher default, below). This is
+decided from the GGUF header before the load, like everything else here: the
+server does not watch acceptance, output or timing, and never changes route
+after the load.
+
 Anything else (other shapes, another family, more slots, another scheduler)
 keeps the prior route and the audit line says why. Auto never fails startup:
 when the drafter cannot be obtained or does not bind to the target, or the
@@ -125,10 +134,14 @@ prior route. `0` is the kill switch: no drafter, no profile, the route the
 server ran before DFlash2 was a default. `1` requires DFlash2: a target in
 neither class, or a drafter that cannot be obtained, fails startup
 (schedulers and families DFlash2 never served keep ignoring it, with a
-warning).
+warning). `1` also serves the drafter on a MoE target without its batched
+route, with a WARN line that the route is unqualified and was measured
+slower.
 
 **Drafter.** In order: `HF2Q_DFLASH2_CONFIG` and `HF2Q_DFLASH2_WEIGHTS` when
-both are set; the Hugging Face cache snapshot of the descriptor's repository
+both name a file (under auto a stale or incomplete pair is reported at WARN
+and ignored, under `HF2Q_DFLASH2=1` it fails startup, under `HF2Q_DFLASH2=0`
+it is not read; the launchers check the pair only when DFlash2 is required); the Hugging Face cache snapshot of the descriptor's repository
 at its pinned revision (`HF_HUB_CACHE`, `HF_HOME/hub`,
 `XDG_CACHE_HOME/huggingface/hub`, `~/.cache/huggingface/hub`); a download of
 `config.json` and `model.safetensors` at that revision into that cache, with
@@ -195,10 +208,10 @@ are left) when:
   tensor API the prepared kernels are written over);
 - the memory rule below dropped it.
 
-For example a Q5_K quantization with Q5_K shared experts runs the drafter
-with the AF4G64 and staged draft, GPU target tokens, the tiled verify
-attention, the fused mixer and the replay reuse, and keeps the default MoE
-route. Nothing here fails startup, under auto or `HF2Q_DFLASH2=1`. A switch
+For example a dense target quantized to Q5_K runs the drafter with the
+AF4G64 and staged draft, the tiled verify attention, the fused mixer and the
+replay reuse, and keeps its stock FFN and projection kernels. Nothing here
+fails startup, under auto or `HF2Q_DFLASH2=1`. A switch
 set by hand is never withheld: on storage it does not admit it still refuses
 the load as it always has, and on a host that cannot run its kernels the
 server refuses to start, naming the switch, before the model is loaded.
@@ -208,22 +221,63 @@ and the drafter is resident beside the target. Before selecting, the server
 computes
 
 ```
-headroom = physical memory - model file bytes - KV budget - 8 GiB
+headroom = physical memory - resident engines - model file bytes - KV budget - 8 GiB
 planes   = sum over the covered Q4_K/Q6_K weights of the plane sets of every
            switch that resolved on:
            Q4_K: 16 bytes per 32 weights + 16 bytes per 256 weights
            Q6_K: 24 bytes per 32 weights + 20 bytes per 256 weights
+scratch  = what the kernels of those switches retain between steps
 ```
 
 where the KV budget is the configured `--kv-cache-budget` (zero when none is
-configured) and the drafter is its file size. If `drafter + planes <=
-headroom` every admitted row applies. Otherwise every plane-carrying row is
-withheld and DFlash2 is kept when `drafter <= headroom`; if not even the
-drafter fits, auto keeps the prior route. The audit line reports the
-headroom, the drafter and the plane bytes. A plane-carrying switch set by
-hand is never dropped.
+configured), the drafter is its file size, and *resident engines* is what
+every engine already loaded in this process has committed: its model file,
+KV budget, drafter, planes and scratch. Each load reserves its own
+commitment before it allocates, releases it if the load fails and when the
+engine is unloaded, and amends it when a load is retried on the prior
+route, so a second model is admitted against what the first holds. The
+hot-swap pool charges a load the same figure without the KV budget (model
+file, drafter, planes, scratch) instead of the GGUF file size, before the
+loader is called. A plane set is prepared once however many switches read
+it, except the output head: the staged draft (at four slots) and the
+prepared target head each keep a copy of their own when
+`HF2Q_REPACKED_GGUF_SHARED_HEAD=0` (1,052,876,800 bytes each on Qwen3.8).
+No current switch retains scratch; a route that does gets its figure in
+`switch_scratch_bytes` (`src/serve/dflash2_policy.rs`).
 
-MEMORY_MEASUREMENT_PLACEHOLDER
+If `drafter + planes + scratch <= headroom` every admitted row applies.
+Otherwise every plane-carrying row is withheld and DFlash2 is kept when the
+drafter and what is left fit; if not even the drafter fits, auto keeps the
+prior route. The audit line reports the headroom, the resident engines, the
+drafter, the plane and the scratch bytes. A plane-carrying switch set by
+hand is never dropped, and its planes count.
+
+Measured, exact four-agent Q5 on the gate artifacts, peak process
+footprint (the KV caches and decode scratch are in both columns):
+
+| Target | Prior route | Default profile | Difference | Rule charges (drafter + planes) |
+|---|---:|---:|---:|---:|
+| Qwen3.8 gate artifact | 57.87 GB | 76.73 GB | 18.86 GB | 3.85 + 16.09 = 19.94 GB |
+| Qwen3.6 gate artifact | 35.18 GB | 57.22 GB | 22.04 GB | 1.05 + 21.37 = 22.42 GB |
+
+By component, Qwen3.6 gate artifact, physical footprint after load and
+worker provisioning with no request served (GiB): weights as the prior route
+holds them 21.6; with the drafter 22.3; with the batched MoE route 21.6 (the
+router and shared expert stay in GGUF storage instead of BF16 copies); with
+the staged expert planes 39.8 (one copy: 18.7 GiB by layout); with the live
+tiles' shared-expert planes 39.9. The projection and head planes (0.75 and
+0.39 GiB) are prepared on first use. On Qwen3.8 the planes are 9.83 GiB
+(dense FFN), 4.17 GiB (projections) and 0.98 GiB (head), all prepared on
+first use.
+
+The prepared planes are a second representation of weights the GGUF blocks
+already hold, and both stay resident: prefill outside the prepared scope,
+MTP and every non-prepared path still read the blocks. A single copy of
+every weight would cost about the prior route's footprint plus the drafter
+(Qwen3.8 about 61.7 GB, Qwen3.6 about 36.2 GB at the Q5 peak); that requires
+every consumer of a weight to read its planes and is not implemented. The
+plane-dropped configuration of either family has no exact Q5 run of its own.
+
 
 **Audit.** Each load logs one INFO line, `DFlash2 policy resolved`, with
 `policy` (`auto`, `off`, `required`), `selected`, `reason` (when selected:
@@ -233,7 +287,13 @@ MEMORY_MEASUREMENT_PLACEHOLDER
 `profile` (`full`, `partial`, `none`), `withheld` (`NAME: reason` for every
 withheld row, or `none`), the memory figures, and `switches`: every table
 switch as `NAME=value(source)` with source `env`, `profile`, `default` or
-`withheld`.
+`withheld`. The same decision is published by `/hf2q/v1/runtime` as
+`measurement_snapshot.active_controls.dflash2` (`policy`, `selected`,
+`reason`, `descriptor`, `qualification` = `pinned_pair` | `same_shapes`,
+`target_source`, `drafter_source`, `profile`, `switches.<NAME>` =
+`{value, source, withheld}`, `memory`), so a gate receipt that records the
+runtime document binds the route that ran, not the environment that asked.
+It is `null` for an engine that was not loaded by `hf2q serve`.
 
 | Var | Default | Values | Effect |
 |---|---|---|---|

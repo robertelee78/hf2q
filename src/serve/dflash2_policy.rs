@@ -28,6 +28,7 @@ use mlx_native::gguf::GgufFile;
 use mlx_native::GgmlType;
 
 use crate::core::provenance::Provenance;
+use crate::inference::route_host::{self, HostRoute, HostRoutes};
 use crate::inference::spec_decode::dflash2::config::DFlash2TargetShape;
 use crate::inference::spec_decode::dflash2::route_profile::{
     switch, turns_on, PlaneSet, ResolvedRoutes, RouteProfile, Switch, SwitchRow, SWITCHES,
@@ -946,26 +947,66 @@ fn gib(bytes: u64) -> String {
 
 const MEMORY_REFUSAL: &str = "its prepared planes do not fit in memory";
 
-/// Why this host cannot run the kernels of the table switch `name`, if it
-/// cannot (for example a Metal runtime without the tensor API the prepared
-/// kernels are written over). The one place the policy asks the host about a
-/// route: every row of the table is passed through it before it is turned
-/// on.
-pub(crate) fn host_switch_refusal(_name: &str) -> Option<String> {
-    None
+/// Why this host cannot run a table switch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostRefusal {
+    /// The reason, for a profile row left off (`withheld=` in the audit).
+    pub(crate) reason: String,
+    /// What an operator who set the switch on by hand reads when the load is
+    /// refused.
+    pub(crate) explicit: String,
+}
+
+/// What this host's GPU can run (`inference::route_host`), asked before any
+/// weight is read. The error is why the host could not be asked.
+pub(crate) fn host_routes() -> std::result::Result<HostRoutes, String> {
+    let device =
+        mlx_native::MlxDevice::new().map_err(|error| format!("no Metal device: {error}"))?;
+    route_host::probe(&device).map_err(|error| format!("{error:#}"))
+}
+
+/// Why `host` cannot run the kernels of the table switch `name`, if it
+/// cannot: the one place the policy asks the host about a route, for every
+/// row of the table before it is turned on. A host that could not be asked
+/// runs no route that needs a tensor-only kernel family.
+pub(crate) fn host_switch_refusal(
+    host: &std::result::Result<HostRoutes, String>,
+    name: &str,
+) -> Option<HostRefusal> {
+    match host {
+        Ok(routes) => match routes.switch(name)? {
+            HostRoute::Runs => None,
+            route @ HostRoute::Unavailable(_) => Some(HostRefusal {
+                reason: route.reason()?,
+                explicit: routes.explicit_refusal(name, route),
+            }),
+        },
+        Err(error) => {
+            let (_, families) = route_host::SWITCHES
+                .iter()
+                .find(|(switch, _)| *switch == name)?;
+            (!families.is_empty()).then(|| HostRefusal {
+                reason: format!("the host's kernel support could not be established: {error}"),
+                explicit: format!(
+                    "{name} is on, but the host's kernel support could not be established: \
+                     {error}. Unset {name}: the stock route serves this host."
+                ),
+            })
+        }
+    }
 }
 
 /// Decide the route of one model load. `env` reads one process environment
 /// variable; `host_refusal` says why this host cannot run a table switch's
-/// kernels, if it cannot. An error is a startup error: an invalid
-/// `HF2Q_DFLASH2`, a required DFlash2 that cannot be satisfied, or a switch
-/// set on by hand that this host cannot run.
+/// kernels, if it cannot ([`host_switch_refusal`]). An error is a startup
+/// error: an invalid `HF2Q_DFLASH2`, a required DFlash2 that cannot be
+/// satisfied, or a switch set on by hand that this host cannot run.
 pub(crate) fn decide(
     facts: &TargetFacts,
     host: HostFacts,
     env: &dyn Fn(&str) -> Option<String>,
     store: &dyn DrafterStore,
-    host_refusal: &dyn Fn(&str) -> Option<String>,
+    host_refusal: &dyn Fn(&str) -> Option<HostRefusal>,
 ) -> Result<Selection> {
     let request = parse_policy(env(DFLASH2_ENV).as_deref()).map_err(anyhow::Error::msg)?;
     // A switch the operator set on is the operator's: it is never withheld,
@@ -973,8 +1014,8 @@ pub(crate) fn decide(
     // instead of failing at the first dispatch.
     for row in SWITCHES {
         if turns_on(env(row.name).as_deref()) {
-            if let Some(reason) = host_refusal(row.name) {
-                bail!("{}=1 cannot run on this host: {reason}", row.name);
+            if let Some(refusal) = host_refusal(row.name) {
+                bail!("{}", refusal.explicit);
             }
         }
     }
@@ -1122,10 +1163,39 @@ pub(crate) fn decide(
     let profile = RouteProfile::of(descriptor);
     let refusal = |row: &SwitchRow| {
         host_refusal(row.name)
-            .map(|reason| format!("this host cannot run it: {reason}"))
+            .map(|refusal| refusal.reason)
             .or_else(|| switch_refusal(facts, row))
     };
     let admitted = ResolvedRoutes::resolve(profile, &refusal, env);
+    // A static qualification boundary, decided from the artifact's storage
+    // before the load: auto qualifies a MoE target only when its batched MoE
+    // verification route is admitted. Without it every row of a 32-row
+    // verify step runs the per-row expert path, which is not a qualified
+    // fast path: on the Qwen3.6 launcher default (Q5_K shared experts) the
+    // exact four-agent Q5 took 48.58 and 49.13 s with the drafter against
+    // 39.46 s on the prior route. Nothing here watches acceptance or output
+    // at run time, and no route is switched after the load. A required
+    // DFlash2 keeps the drafter and is told the cost.
+    const MOE_BATCHED: Switch = switch("HF2Q_QWEN_MOE_BATCHED");
+    if descriptor.family_adapter == DFlash2FamilyAdapter::QwenMoe && !admitted.is_on(MOE_BATCHED) {
+        let why = admitted
+            .entries()
+            .find(|(name, ..)| *name == "HF2Q_QWEN_MOE_BATCHED")
+            .and_then(|(_, _, _, withheld)| withheld.map(str::to_owned))
+            .unwrap_or_else(|| "it is switched off".to_owned());
+        let unqualified = format!(
+            "the batched MoE verification route is not admitted (HF2Q_QWEN_MOE_BATCHED is off: \
+             {why}), and DFlash2 verification on the per-row expert path is not a qualified \
+             fast path"
+        );
+        if !required {
+            return Ok(withdrawn(unqualified, warnings));
+        }
+        warnings.push(format!(
+            "{DFLASH2_ENV}=1 serves DFlash2 on an unqualified route: {unqualified}; it was \
+             measured slower than the prior route on such a target"
+        ));
+    }
     let dropped = ResolvedRoutes::resolve(
         profile,
         &|row| refusal(row).or_else(|| (!row.planes.is_empty()).then(|| MEMORY_REFUSAL.to_owned())),
@@ -1252,11 +1322,14 @@ pub(crate) fn admission_bytes(
         config.is_some_and(|config| config.dwq_overlay_path.is_some()),
     );
     let env = |name: &str| std::env::var(name).ok();
-    Some(facts.model_file_bytes.saturating_add(route_upper_bound(
-        &facts,
-        &env,
-        &host_switch_refusal,
-    )))
+    let host = host_routes();
+    Some(
+        facts
+            .model_file_bytes
+            .saturating_add(route_upper_bound(&facts, &env, &|name| {
+                host_switch_refusal(&host, name)
+            })),
+    )
 }
 
 /// Drafter, plane and scratch bytes of the fullest route the policy could
@@ -1264,7 +1337,7 @@ pub(crate) fn admission_bytes(
 pub(crate) fn route_upper_bound(
     facts: &TargetFacts,
     env: &dyn Fn(&str) -> Option<String>,
-    host_refusal: &dyn Fn(&str) -> Option<String>,
+    host_refusal: &dyn Fn(&str) -> Option<HostRefusal>,
 ) -> u64 {
     if !matches!(
         parse_policy(env(DFLASH2_ENV).as_deref()),
@@ -1277,7 +1350,11 @@ pub(crate) fn route_upper_bound(
     };
     let routes = ResolvedRoutes::resolve(
         RouteProfile::of(descriptor),
-        &|row| host_refusal(row.name).or_else(|| switch_refusal(facts, row)),
+        &|row| {
+            host_refusal(row.name)
+                .map(|refusal| refusal.reason)
+                .or_else(|| switch_refusal(facts, row))
+        },
         env,
     );
     descriptor
@@ -1300,14 +1377,42 @@ pub(crate) fn resolve_for_load(
             .map_err(|error| anyhow::anyhow!("GGUF header parse failed: {error}"))?;
         TargetFacts::read(&gguf, path, engine_mode, dwq_overlay)
     };
+    // Asking the host here also seeds the process's host answers before any
+    // prefill scope or drafter load reads them.
+    let host = host_routes();
     decide(
         &facts,
         HostFacts::read(kv_budget_bytes, resident_bytes),
         &|name| std::env::var(name).ok(),
         &HubDrafterStore,
-        &host_switch_refusal,
+        &|name| host_switch_refusal(&host, name),
     )
+    .and_then(|selection| unprobed_host(selection, host.as_ref().err().map(String::as_str)))
     .with_context(|| format!("DFlash2 policy for {}", path.display()))
+}
+
+/// What a host that could not be asked about its kernels does to a
+/// selection. Auto does not load a drafter on such a host: it logs the
+/// failure and keeps the prior route, whose load asks nothing of the probe.
+/// A required DFlash2 surfaces the failure.
+pub(crate) fn unprobed_host(selection: Selection, probe_error: Option<&str>) -> Result<Selection> {
+    let Some(error) = probe_error.filter(|_| selection.selected()) else {
+        return Ok(selection);
+    };
+    if selection.request == PolicyRequest::Required {
+        bail!(
+            "{DFLASH2_ENV}=1 cannot be satisfied: the host's kernel support could not be \
+             established: {error}"
+        );
+    }
+    let mut prior = selection.without_dflash2(format!(
+        "the host's kernel support could not be established: {error}"
+    ));
+    prior.warnings.push(format!(
+        "DFlash2 not selected: the host's kernel support could not be established: {error}; \
+         serving the prior route"
+    ));
+    Ok(prior)
 }
 
 #[cfg(test)]
