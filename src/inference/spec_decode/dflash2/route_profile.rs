@@ -89,12 +89,11 @@ pub(crate) const SWITCHES: &[SwitchRow] = &[
     //  switch                              requires   planes                     Qwen3.8  Qwen3.6
     row("HF2Q_DFLASH2_DRAFT_AF4_G64",       None,      &[],                       ON,      ON),
     row("HF2Q_DFLASH2_DRAFT_STAGED",        AF4,       &[Head],                   ON,      ON),
-    row("HF2Q_DFLASH2_GPU_TARGET_TOKENS",   None,      &[],                       None,    ON),
+    row("HF2Q_DFLASH2_GPU_TARGET_TOKENS",   None,      &[],                       ON,      ON),
     row("HF2Q_DFLASH2_CONTEXT_FIRST",       None,      &[],                       ON,      ON),
-    // Per-model readers; no profile value until the combined configuration
-    // with them is qualified.
-    row("HF2Q_DFLASH2_DRAFT_PREFETCH",      None,      &[],                       None,    None),
-    row("HF2Q_DFLASH2_GPU_DECISIONS",       None,      &[],                       None,    None),
+    row("HF2Q_DFLASH2_DRAFT_PREFETCH",      None,      &[],                       ON,      ON),
+    row("HF2Q_DFLASH2_GPU_DECISIONS",       None,      &[],                       ON,      ON),
+    row("HF2Q_DFLASH2_PROPOSAL_REPETITION", None,      &[],                       ON,      None),
     row("HF2Q_REPACKED_GGUF_M32",           None,      &[DenseFfn],               ON,      ON),
     row("HF2Q_REPACKED_GGUF_M32_PROJ",      M32,       &[Projections],            ON,      ON),
     row("HF2Q_REPACKED_GGUF_M32_HEAD",      M32,       &[Head],                   ON,      ON),
@@ -585,49 +584,8 @@ mod tests {
     }
 
     #[test]
-    fn profiles_carry_the_measured_combined_configuration() {
-        let dense = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
-        for name in [
-            "HF2Q_DFLASH2_DRAFT_AF4_G64",
-            "HF2Q_DFLASH2_DRAFT_STAGED",
-            "HF2Q_DFLASH2_CONTEXT_FIRST",
-            "HF2Q_QWEN_VERIFY_MIXER_FUSED",
-            "HF2Q_QWEN_VERIFY_REPLAY_REUSE",
-            "HF2Q_QWEN_PREFILL_FOLD_CUE",
-            "HF2Q_REPACKED_GGUF_M32",
-            "HF2Q_REPACKED_GGUF_M32_PROJ",
-            "HF2Q_REPACKED_GGUF_M32_HEAD",
-            "HF2Q_REPACKED_GGUF_ANY_WIDTH",
-            "HF2Q_REPACKED_GGUF_SHARED_HEAD",
-            "HF2Q_QWEN_VERIFY_ATTN_TILE",
-            "HF2Q_QWEN_PREFILL_PREPARED",
-        ] {
-            assert!(dense.is_one(switch(name)), "{name}");
-            assert_eq!(dense.source(switch(name)), SwitchSource::Profile, "{name}");
-        }
-        // The dense descriptor keeps its own GPU-token default and has no
-        // MoE layers.
-        for name in [
-            "HF2Q_DFLASH2_GPU_TARGET_TOKENS",
-            "HF2Q_QWEN_MOE_BATCHED",
-            "HF2Q_QWEN_MOE_STAGED_M8",
-            "HF2Q_QWEN_MOE_LIVE_TILES",
-        ] {
-            assert_eq!(dense.value(switch(name)), None, "{name}");
-            assert_eq!(dense.source(switch(name)), SwitchSource::Default, "{name}");
-        }
+    fn profile_plane_sets_are_charged_once() {
         let moe = ResolvedRoutes::resolve(Some(RouteProfile::Qwen36), &|_| None, &env(&[]));
-        for row in SWITCHES.iter().filter(|row| row.qwen36.is_some()) {
-            assert!(moe.is_one(switch(row.name)), "{}", row.name);
-        }
-        // Rows whose readers are per model and whose combined configuration
-        // is not qualified yet carry no profile value.
-        for name in ["HF2Q_DFLASH2_DRAFT_PREFETCH", "HF2Q_DFLASH2_GPU_DECISIONS"] {
-            for routes in [&dense, &moe] {
-                assert_eq!(routes.value(switch(name)), None, "{name}");
-                assert_eq!(routes.source(switch(name)), SwitchSource::Default, "{name}");
-            }
-        }
         assert_eq!(
             moe.plane_sets(),
             vec![

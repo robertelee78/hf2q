@@ -37,6 +37,51 @@ fn hf2q(source: &str) -> Provenance {
     }
 }
 
+fn config_for_geometry(geometry: &QwenTargetGeometry) -> Qwen35Config {
+    use crate::inference::models::qwen35::{Qwen35LayerKind, Qwen35MoeConfig, Qwen35Variant};
+    Qwen35Config {
+        variant: Qwen35Variant::from_arch(&geometry.architecture).expect("Qwen geometry"),
+        hidden_size: geometry.hidden_size,
+        num_hidden_layers: geometry.layers,
+        num_attention_heads: geometry.attention_heads,
+        num_key_value_heads: geometry.attention_kv_heads,
+        head_dim: geometry.head_dim,
+        linear_num_key_heads: geometry.linear_key_heads,
+        linear_num_value_heads: geometry.linear_value_heads,
+        linear_key_head_dim: geometry.linear_key_head_dim,
+        linear_value_head_dim: geometry.linear_value_head_dim,
+        linear_conv_kernel_dim: 4,
+        full_attention_interval: geometry.full_attention_interval,
+        layer_types: (0..geometry.layers)
+            .map(|layer| {
+                if (layer + 1) % geometry.full_attention_interval == 0 {
+                    Qwen35LayerKind::FullAttention
+                } else {
+                    Qwen35LayerKind::LinearAttention
+                }
+            })
+            .collect(),
+        partial_rotary_factor: 0.25,
+        rope_theta: 10_000_000.0,
+        rotary_dim: geometry.head_dim / 4,
+        mrope_section: [11, 11, 10, 0],
+        mrope_interleaved: true,
+        rms_norm_eps: 1e-6,
+        max_position_embeddings: 262_144,
+        vocab_size: geometry.vocab_size,
+        attn_output_gate: true,
+        mtp_num_hidden_layers: 0,
+        mtp_use_dedicated_embeddings: true,
+        intermediate_size: (geometry.intermediate_size > 0).then_some(geometry.intermediate_size),
+        moe: (geometry.moe_experts > 0).then_some(Qwen35MoeConfig {
+            moe_intermediate_size: geometry.moe_intermediate_size,
+            num_experts: geometry.moe_experts,
+            num_experts_per_tok: geometry.moe_top_k,
+            shared_expert_intermediate_size: geometry.moe_shared_intermediate_size,
+        }),
+    }
+}
+
 /// The tensor directory of the Qwen3.8 gate artifact as far as the policy
 /// reads it: real shapes, one storage type per weight kind.
 pub(crate) fn qwen38() -> TargetFacts {
@@ -70,6 +115,7 @@ pub(crate) fn qwen38() -> TargetFacts {
         kv_rows: Some(262_144),
         model_file_bytes: 16_810_714_976,
         tensors,
+        qwen_config: Some(config_for_geometry(&geometry)),
         geometry: Some(geometry),
         dwq_overlay: false,
         chunk_scan_prefill: false,
@@ -104,6 +150,7 @@ fn qwen36() -> TargetFacts {
         kv_rows: Some(262_144),
         model_file_bytes: 21 * GIB,
         tensors,
+        qwen_config: Some(config_for_geometry(&geometry)),
         geometry: Some(geometry),
         dwq_overlay: false,
         chunk_scan_prefill: false,
@@ -1315,6 +1362,40 @@ fn host_with_headroom(facts: &TargetFacts, headroom: u64, resident: u64) -> Host
         kv_budget_bytes: 4 * GIB,
         resident_bytes: resident,
     }
+}
+
+#[test]
+fn prefill_admission_charges_one_shared_pool_at_cache_capacity() {
+    let mut facts = qwen38();
+    facts.kv_rows = Some(1_024);
+    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
+    let scratch =
+        crate::inference::models::qwen35::prefill_prepared::prefill_switch_scratch_bound_bytes(
+            facts.qwen_config.as_ref().expect("geometry"),
+            crate::serve::api::engine::qwen35_slot_prefill_chunk_tokens(4) as usize,
+            4,
+            1_024,
+            true,
+            8,
+        );
+    let headroom =
+        QWEN38_DFLASH2.weights_bytes + routed_plane_bytes(&facts, &routes, true) + scratch;
+    let host = host_with_headroom(&facts, headroom, 0);
+    let small = decide(&facts, host, &env(&[]), &Store::cached(), &|_| None).expect("small cache");
+    assert!(small.plan.is_some());
+    assert!(
+        !small.routes.any_withheld(),
+        "one shared pool fits exactly: {}",
+        small.routes.withheld_audit()
+    );
+
+    facts.kv_rows = Some(262_144);
+    let large = decide(&facts, host, &env(&[]), &Store::cached(), &|_| None).expect("large cache");
+    assert!(large.plan.is_some(), "the drafter still fits");
+    assert!(
+        !large.routes.is_on(switch("HF2Q_QWEN_PREFILL_JOINT")),
+        "a larger cache must not reuse the smaller cache's scratch admission"
+    );
 }
 
 #[test]

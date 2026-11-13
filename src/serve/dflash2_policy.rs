@@ -28,6 +28,7 @@ use mlx_native::gguf::GgufFile;
 use mlx_native::GgmlType;
 
 use crate::core::provenance::Provenance;
+use crate::inference::models::qwen35::Qwen35Config;
 use crate::inference::route_host::{self, HostRoute, HostRoutes};
 use crate::inference::spec_decode::dflash2::config::DFlash2TargetShape;
 use crate::inference::spec_decode::dflash2::route_profile::{
@@ -176,6 +177,9 @@ pub(crate) struct TargetFacts {
     /// Architecture, dimensions, bound tensor shapes and tokenizer identity;
     /// `None` when the header does not describe a Qwen target.
     pub(crate) geometry: Option<QwenTargetGeometry>,
+    /// Parsed once from the target header; scratch bounds use the loader's
+    /// full geometry rather than reconstructing it from a descriptor.
+    pub(crate) qwen_config: Option<Qwen35Config>,
     /// Whether a DWQ overlay is applied on load.
     pub(crate) dwq_overlay: bool,
     /// Whether the chunk-scan prefill investigation route is on; the
@@ -185,8 +189,15 @@ pub(crate) struct TargetFacts {
 
 /// The geometry of a Qwen target, from its GGUF header alone.
 pub(crate) fn read_geometry(gguf: &GgufFile) -> Option<QwenTargetGeometry> {
+    let config = Qwen35Config::from_gguf(gguf).ok()?;
+    read_geometry_with_config(gguf, &config)
+}
+
+fn read_geometry_with_config(
+    gguf: &GgufFile,
+    config: &Qwen35Config,
+) -> Option<QwenTargetGeometry> {
     let architecture = gguf.metadata_string("general.architecture")?;
-    let config = crate::inference::models::qwen35::Qwen35Config::from_gguf(gguf).ok()?;
     let shape = |name: &str| -> Option<[usize; 2]> {
         <[usize; 2]>::try_from(gguf.tensor_info(name)?.shape.as_slice()).ok()
     };
@@ -245,6 +256,12 @@ impl TargetFacts {
         } else {
             Vec::new()
         };
+        let qwen_config = qwen
+            .then(|| Qwen35Config::from_gguf(gguf).ok())
+            .flatten();
+        let geometry = qwen_config
+            .as_ref()
+            .and_then(|config| read_geometry_with_config(gguf, config));
         Self {
             provenance: crate::core::provenance::detect(gguf),
             slots: match engine_mode {
@@ -260,7 +277,8 @@ impl TargetFacts {
             .map(|context| context.effective_tokens as usize),
             model_file_bytes: std::fs::metadata(path).map_or(0, |metadata| metadata.len()),
             tensors,
-            geometry: qwen.then(|| read_geometry(gguf)).flatten(),
+            geometry,
+            qwen_config,
             dwq_overlay,
             chunk_scan_prefill: crate::debug::INVESTIGATION_ENV.chunk_scan_prefill,
             architecture,
@@ -954,9 +972,41 @@ pub(crate) fn routed_plane_bytes(
 /// share a pool: their scratch is then one figure, not a sum. A bound that
 /// grows with a slot's KV cache takes the cache's capacity
 /// ([`TargetFacts::kv_rows`]) and the slot count ([`TargetFacts::slots`]),
-/// never the rows in use. No current route retains any.
-pub(crate) fn route_scratch_bytes(_facts: &TargetFacts, _routes: &ResolvedRoutes) -> u64 {
-    0
+/// never the rows in use. Joint prefill and deferred host waits share one
+/// pool, charged once at their combined absolute bound.
+pub(crate) fn route_scratch_bytes(facts: &TargetFacts, routes: &ResolvedRoutes) -> u64 {
+    if !matches!(facts.architecture.as_str(), "qwen35" | "qwen35moe") {
+        return 0;
+    }
+    let slots = facts.slots.unwrap_or(1).max(1) as usize;
+    let joint = slots > 1 && routes.is_on(switch("HF2Q_QWEN_PREFILL_JOINT"));
+    let Ok(wait_layers) =
+        crate::inference::models::qwen35::prefill_prepared::parse_wait_layers(
+            routes.value(switch("HF2Q_QWEN_PREFILL_WAIT_LAYERS")),
+        )
+    else {
+        return u64::MAX;
+    };
+    if !joint && wait_layers == 1 {
+        return 0;
+    }
+    let (Some(config), Some(kv_rows)) = (facts.qwen_config.as_ref(), facts.kv_rows) else {
+        // An unknown bound must never admit a large model as zero scratch.
+        return u64::MAX;
+    };
+    let forward_rows = if facts.slots.is_some() {
+        crate::serve::api::engine::qwen35_slot_prefill_chunk_tokens(slots) as usize
+    } else {
+        kv_rows
+    };
+    crate::inference::models::qwen35::prefill_prepared::prefill_switch_scratch_bound_bytes(
+        config,
+        forward_rows,
+        slots,
+        kv_rows,
+        joint,
+        wait_layers,
+    )
 }
 
 /// The memory rule's numbers.

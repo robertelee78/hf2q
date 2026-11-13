@@ -215,6 +215,7 @@ fn probe(
             0,
             &[block as u32; LANES],
             &vec![0.5; LANES * config.proposal_tokens()],
+            None,
         )?;
     }
 
