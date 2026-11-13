@@ -32,3 +32,11 @@ jobs:
           system_profiler SPDisplaysDataType | head -20 || true
       - name: route_host gates
         run: cargo test --locked --bin hf2q --all-features route_host -- --test-threads=1 --nocapture
+      - name: admission rules and the Gemma O-projection route
+        run: >-
+          cargo test --locked --bin hf2q --all-features --
+          prepared_dense_route_is_confined
+          route_is_admitted_only_inside
+          the_switch_is_off_unless
+          native_matrix_projection_dispatches_every_admitted_codec_and_width
+          --test-threads=1
