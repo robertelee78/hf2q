@@ -19,6 +19,8 @@
 //! kill switch (stock kernels); `2` and `4` select that NE; any other value
 //! refuses the model load.
 
+use std::ffi::OsStr;
+
 use crate::inference::models::route_default::{is_kill_spelling, Resolved};
 
 pub(crate) const DECODE_ATTN_NE_ENV: &str = "HF2Q_GEMMA_DECODE_ATTN_NE";
@@ -55,7 +57,13 @@ impl GemmaDecodeAttnNe {
     }
 }
 
-fn parse_switch(raw: Option<&str>) -> std::result::Result<Resolved<GemmaDecodeAttnNe>, String> {
+fn parse_switch(raw: Option<&OsStr>) -> std::result::Result<Resolved<GemmaDecodeAttnNe>, String> {
+    let raw = raw
+        .map(|raw| {
+            raw.to_str()
+                .ok_or_else(|| format!("{DECODE_ATTN_NE_ENV} is not valid UTF-8"))
+        })
+        .transpose()?;
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
         return Ok(Resolved::default_value(DECODE_ATTN_NE_DEFAULT));
     };
@@ -75,7 +83,7 @@ fn parse_switch(raw: Option<&str>) -> std::result::Result<Resolved<GemmaDecodeAt
 /// value refuses the load: a mistyped kill switch must never serve the
 /// route it was meant to turn off.
 pub(crate) fn decode_attn_ne_from_env() -> anyhow::Result<Resolved<GemmaDecodeAttnNe>> {
-    let raw = std::env::var(DECODE_ATTN_NE_ENV).ok();
+    let raw = std::env::var_os(DECODE_ATTN_NE_ENV);
     let ne = parse_switch(raw.as_deref()).map_err(anyhow::Error::msg)?;
     tracing::info!(
         kernel = ne.value.as_str(),
@@ -90,7 +98,7 @@ pub(crate) fn decode_attn_ne_from_env() -> anyhow::Result<Resolved<GemmaDecodeAt
 /// process with an invalid value never loads a Gemma 4 model).
 pub(crate) fn published_decode_attn_ne() -> &'static str {
     static VALUE: std::sync::LazyLock<GemmaDecodeAttnNe> = std::sync::LazyLock::new(|| {
-        parse_switch(std::env::var(DECODE_ATTN_NE_ENV).ok().as_deref())
+        parse_switch(std::env::var_os(DECODE_ATTN_NE_ENV).as_deref())
             .map_or(DECODE_ATTN_NE_DEFAULT, |resolved| resolved.value)
     });
     VALUE.as_str()
@@ -101,14 +109,14 @@ mod tests {
     use super::*;
 
     fn resolved(raw: &str) -> Resolved<GemmaDecodeAttnNe> {
-        parse_switch(Some(raw)).unwrap()
+        parse_switch(Some(OsStr::new(raw))).unwrap()
     }
 
     #[test]
     fn gemma_decode_attn_ne_defaults_to_the_release_gate_split() {
         for raw in [None, Some(""), Some(" ")] {
             assert_eq!(
-                parse_switch(raw),
+                parse_switch(raw.map(OsStr::new)),
                 Ok(Resolved::default_value(GemmaDecodeAttnNe::Ne(4))),
                 "{raw:?}"
             );
@@ -146,9 +154,19 @@ mod tests {
     #[test]
     fn gemma_decode_attn_ne_invalid_value_is_refused() {
         for raw in ["8", "3", "of", "no", "stok", "ne4", "-1"] {
-            let error = parse_switch(Some(raw)).unwrap_err();
+            let error = parse_switch(Some(OsStr::new(raw))).unwrap_err();
             assert!(error.contains(DECODE_ATTN_NE_ENV), "{raw:?}: {error}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemma_decode_attn_ne_non_unicode_value_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let error = parse_switch(Some(OsStr::from_bytes(b"off\xff"))).unwrap_err();
+        assert!(error.contains(DECODE_ATTN_NE_ENV), "{error}");
+        assert!(error.contains("not valid UTF-8"), "{error}");
     }
 
     #[test]

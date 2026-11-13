@@ -704,13 +704,14 @@ HF2Q_GEMMA_WARM_TILED_ATTENTION=0 HF2Q_Q5_0_TENSOR_MM=0
 ```
 
 All four accept the same off spellings: `0`, `off`, `false` or `stock`
-(case-insensitive). A set value that is not one of a switch's values
-refuses the Gemma 4 model load, so a mistyped kill switch never serves the
-route it was meant to turn off. Unset (or empty) is the only way to get a
-default.
+(case-insensitive). A set value that is not one of a switch's values,
+including a non-UTF-8 value, refuses the Gemma 4 model load, so a mistyped
+kill switch never serves the route it was meant to turn off. Unset (or
+empty) is the only way to get a default.
 
-The defaults never refuse a model: a layer, weight or device a route does
-not admit keeps the stock route (details per switch).
+The defaults do not reject unsupported model shapes or host capabilities:
+a layer, weight or device a route does not admit keeps the stock route
+(details per switch). Pipeline build defects still fail the load.
 
 Retained Gemma Q1 packets (`decode_dense_kernel`, `decode_attn_ne`,
 `warm_live_kernel` and `q5_0_tensor_mm` absent) mean the kill-switch routes.
@@ -749,10 +750,11 @@ the model loads.
   dispatch (1,024-query sliding chunks, 4,096-query global chunks). Suffixes
   shorter than 32 tokens keep vec-hybrid attention. A joint cohort stays
   bitwise equal to its per-slot prefills. When the switch is unset and the
-  device cannot build the tensor pipelines (no Metal tensor API), the load
-  logs `Gemma warm live attention default is unavailable; using the stock
-  kernel` and serves vec-hybrid; an explicit `tensor` on such a device
-  refuses the model load with the reason.
+  host lacks the Metal tensor API, the load logs `Gemma warm live attention
+  default is unavailable; using the stock kernel` and serves vec-hybrid;
+  an explicit `tensor` on such a device refuses the model load with the
+  reason. Other pipeline build errors refuse the load for both the default
+  and an explicit `tensor`; they are defects, not missing host capabilities.
 - **`0`, `off`, `false` or `stock`:** kill switch; warm prefills use the
   vec-hybrid kernel (one decode-style pass per query over the whole
   history).

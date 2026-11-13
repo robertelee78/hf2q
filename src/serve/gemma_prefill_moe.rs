@@ -12,6 +12,8 @@
 //! `HF2Q_GEMMA_PREFILL_MOE_DOWN=flat|slotted` exists only for the
 //! same-binary A/B; it is removed at promotion (design §4.5, §7.4).
 
+use std::ffi::OsStr;
+
 use mlx_native::MM_ID_ROUTING_THRESHOLD;
 
 use crate::inference::models::route_default::{is_kill_spelling, Resolved};
@@ -180,7 +182,13 @@ pub(crate) const Q5_0_TENSOR_MM_ENV: &str = "HF2Q_Q5_0_TENSOR_MM";
 /// (mlx-native's own spelling, which also turns it on for every other
 /// family); `0`, `off`, `false` or `stock` is the kill switch. Any other
 /// value is an error: a Gemma 4 load refuses it rather than guess.
-fn resolve_q5_0_tensor_mm(raw: Option<&str>) -> std::result::Result<Resolved<bool>, String> {
+fn resolve_q5_0_tensor_mm(raw: Option<&OsStr>) -> std::result::Result<Resolved<bool>, String> {
+    let raw = raw
+        .map(|raw| {
+            raw.to_str()
+                .ok_or_else(|| format!("{Q5_0_TENSOR_MM_ENV} is not valid UTF-8"))
+        })
+        .transpose()?;
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
         return Ok(Resolved::default_value(true));
     };
@@ -194,7 +202,7 @@ fn resolve_q5_0_tensor_mm(raw: Option<&str>) -> std::result::Result<Resolved<boo
 }
 
 fn q5_0_tensor_mm_from_env() -> std::result::Result<Resolved<bool>, String> {
-    resolve_q5_0_tensor_mm(std::env::var(Q5_0_TENSOR_MM_ENV).ok().as_deref())
+    resolve_q5_0_tensor_mm(std::env::var_os(Q5_0_TENSOR_MM_ENV).as_deref())
 }
 
 /// `environment` with the Gemma 4 Q5_0 tensor-MM resolution applied; no other
@@ -389,26 +397,36 @@ mod tests {
     fn gemma_q5_0_tensor_mm_defaults_on_and_zero_is_the_kill_switch() {
         for raw in [None, Some(""), Some("  ")] {
             assert_eq!(
-                resolve_q5_0_tensor_mm(raw),
+                resolve_q5_0_tensor_mm(raw.map(OsStr::new)),
                 Ok(Resolved::default_value(true)),
                 "{raw:?}"
             );
         }
         assert_eq!(
-            resolve_q5_0_tensor_mm(Some("1")),
+            resolve_q5_0_tensor_mm(Some(OsStr::new("1"))),
             Ok(Resolved::environment(true))
         );
         for raw in ["0", "off", "false", "stock", "OFF", " 0 "] {
             assert_eq!(
-                resolve_q5_0_tensor_mm(Some(raw)),
+                resolve_q5_0_tensor_mm(Some(OsStr::new(raw))),
                 Ok(Resolved::environment(false)),
                 "{raw:?}"
             );
         }
         for raw in ["true", "on", "2", "yes", "of"] {
-            let error = resolve_q5_0_tensor_mm(Some(raw)).unwrap_err();
+            let error = resolve_q5_0_tensor_mm(Some(OsStr::new(raw))).unwrap_err();
             assert!(error.contains(Q5_0_TENSOR_MM_ENV), "{raw:?}: {error}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemma_q5_0_tensor_mm_non_unicode_value_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let error = resolve_q5_0_tensor_mm(Some(OsStr::from_bytes(b"off\xff"))).unwrap_err();
+        assert!(error.contains(Q5_0_TENSOR_MM_ENV), "{error}");
+        assert!(error.contains("not valid UTF-8"), "{error}");
     }
 
     /// The Gemma 4 policy differs from the environment policy in
@@ -426,7 +444,7 @@ mod tests {
                 ..native
             }
         );
-        let killed = gemma4_policy_over(native, resolve_q5_0_tensor_mm(Some("0")).unwrap());
+        let killed = gemma4_policy_over(native, resolve_q5_0_tensor_mm(Some(OsStr::new("0"))).unwrap());
         assert_eq!(killed, native);
     }
 

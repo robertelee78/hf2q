@@ -55,6 +55,8 @@
 //! bitwise equal to the same sequence prefilled alone whenever both resolve
 //! the same kernel. [`LiveRoute`] guarantees that: a single-slot resume and
 //! every multi-sequence lane resolve the one warm route.
+use std::ffi::OsStr;
+
 use anyhow::Result;
 use mlx_native::{DType, GraphExecutor, GraphSession, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -301,8 +303,14 @@ const WARM_ATTENTION_STOCK: GemmaLiveKernel = GemmaLiveKernel::VecHybrid;
 /// default), `1`/`on`/`true` `TiledF16`, `0`/`off`/`false`/`stock`
 /// vec-hybrid; anything else is an error.
 fn parse_warm_tiled_switch(
-    raw: Option<&str>,
+    raw: Option<&OsStr>,
 ) -> std::result::Result<Resolved<GemmaLiveKernel>, String> {
+    let raw = raw
+        .map(|raw| {
+            raw.to_str()
+                .ok_or_else(|| format!("{WARM_TILED_ATTENTION_ENV} is not valid UTF-8"))
+        })
+        .transpose()?;
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
         return Ok(Resolved::default_value(WARM_ATTENTION_DEFAULT));
     };
@@ -354,11 +362,9 @@ enum TensorProbe {
 }
 
 /// Applies the device probe to a resolved switch. Only the tensor route is
-/// probed. With the switch unset the load never fails: a missing tensor API
-/// or a failed pipeline build falls back to vec-hybrid and the outcome is
-/// returned so the caller logs the true reason. An explicit `tensor` is
-/// refused at load in both cases, with the missing capability or the
-/// probe's own build error, instead of failing at the first warm resume.
+/// probed. An unset switch falls back to vec-hybrid only when the host lacks
+/// the tensor API. A pipeline build defect refuses the load under both the
+/// default and an explicit `tensor`, preserving the probe's error.
 fn admit_warm_kernel(
     resolved: Resolved<GemmaLiveKernel>,
     probe: impl FnOnce() -> TensorProbe,
@@ -369,13 +375,15 @@ fn admit_warm_kernel(
     let outcome = probe();
     match (&outcome, resolved.source) {
         (TensorProbe::Available, _) => Ok((resolved, outcome)),
-        (_, RouteSource::Default) => Ok((Resolved::fallback(WARM_ATTENTION_STOCK), outcome)),
+        (TensorProbe::MissingApi(_), RouteSource::Default) => {
+            Ok((Resolved::fallback(WARM_ATTENTION_STOCK), outcome))
+        }
         (TensorProbe::MissingApi(reason), _) => Err(format!(
             "{WARM_TILED_ATTENTION_ENV}=tensor cannot run on this host: {reason}. Unset it for \
              the automatic route (vec-hybrid here) or set 0 for vec-hybrid"
         )),
         (TensorProbe::BuildFailed(error), _) => Err(format!(
-            "{WARM_TILED_ATTENTION_ENV}=tensor: the tensor warm attention pipeline failed to \
+            "{WARM_TILED_ATTENTION_ENV}: the tensor warm attention pipeline failed to \
              build on a device that has the Metal tensor API (a defect, not a missing \
              capability): {error}"
         )),
@@ -408,14 +416,14 @@ fn probe_tensor_route(registry: &mut KernelRegistry, device: &MlxDevice) -> Tens
 /// Kernel for warm live-resume attention (single-slot resumes, joint warm
 /// cohorts and installed long-prompt lanes), resolved once per model load
 /// from `HF2Q_GEMMA_WARM_TILED_ATTENTION`. Unset selects the tensor-API
-/// route where the device builds it and vec-hybrid otherwise. An invalid
+/// route where the host supports it and vec-hybrid otherwise. An invalid
 /// value refuses the load: a mistyped kill switch must never serve the
 /// route it was meant to turn off.
 pub(crate) fn warm_live_kernel_from_env(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
 ) -> Result<Resolved<GemmaLiveKernel>> {
-    let raw = std::env::var(WARM_TILED_ATTENTION_ENV).ok();
+    let raw = std::env::var_os(WARM_TILED_ATTENTION_ENV);
     let resolved = parse_warm_tiled_switch(raw.as_deref()).map_err(anyhow::Error::msg)?;
     let recorded = std::env::var(GRAPH_OPT_PREFILL_ENV).as_deref() == Ok("1");
     let unguarded = resolved;
@@ -436,14 +444,7 @@ pub(crate) fn warm_live_kernel_from_env(
             kernel = ?kernel.value,
             "Gemma warm live attention default is unavailable; using the stock kernel"
         ),
-        // Not a missing capability: keep serving (an unset switch never
-        // fails a load) but report the build error as an error.
-        TensorProbe::BuildFailed(error) => tracing::error!(
-            error,
-            kernel = ?kernel.value,
-            "Gemma tensor warm attention pipeline failed to build on a device with the \
-             Metal tensor API; the unset default falls back to the stock kernel"
-        ),
+        TensorProbe::BuildFailed(_) => unreachable!("pipeline defects refuse admission"),
     }
     tracing::info!(
         kernel = ?kernel.value,
@@ -1723,14 +1724,14 @@ mod tests {
     }
 
     fn warm(raw: &str) -> Resolved<GemmaLiveKernel> {
-        parse_warm_tiled_switch(Some(raw)).unwrap()
+        parse_warm_tiled_switch(Some(OsStr::new(raw))).unwrap()
     }
 
     #[test]
     fn warm_switch_defaults_to_the_release_gate_tensor_route() {
         for raw in [None, Some(""), Some("  ")] {
             assert_eq!(
-                parse_warm_tiled_switch(raw),
+                parse_warm_tiled_switch(raw.map(OsStr::new)),
                 Ok(Resolved::default_value(TensorF16)),
                 "{raw:?}"
             );
@@ -1757,9 +1758,19 @@ mod tests {
     #[test]
     fn warm_switch_invalid_value_is_refused() {
         for raw in ["yes", "of", "no", "vec", "tiled", "2", "tensr"] {
-            let error = parse_warm_tiled_switch(Some(raw)).unwrap_err();
+            let error = parse_warm_tiled_switch(Some(OsStr::new(raw))).unwrap_err();
             assert!(error.contains(WARM_TILED_ATTENTION_ENV), "{raw:?}: {error}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_switch_non_unicode_value_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let error = parse_warm_tiled_switch(Some(OsStr::from_bytes(b"off\xff"))).unwrap_err();
+        assert!(error.contains(WARM_TILED_ATTENTION_ENV), "{error}");
+        assert!(error.contains("not valid UTF-8"), "{error}");
     }
 
     // ---- bounded global-layer scratch of the tensor route -----------------
@@ -2271,15 +2282,12 @@ mod tests {
     fn warm_default_falls_back_to_vec_hybrid_without_the_tensor_api() {
         let missing = || TensorProbe::MissingApi("no tensor API".to_string());
         let broken = || TensorProbe::BuildFailed("d512: shader error X".to_string());
-        // Unset: a missing API and a failed build both fall back (an unset
-        // switch never fails a load), and the outcome keeps the true cause.
-        for probe in [missing(), broken()] {
-            let expect = probe.clone();
-            let (kernel, outcome) =
-                admit_warm_kernel(Resolved::default_value(TensorF16), move || probe).unwrap();
-            assert_eq!(kernel, Resolved::fallback(VecHybrid));
-            assert_eq!(outcome, expect);
-        }
+        // Only a missing API falls back; the outcome keeps the true cause.
+        let expected = missing();
+        let (kernel, outcome) =
+            admit_warm_kernel(Resolved::default_value(TensorF16), missing).unwrap();
+        assert_eq!(kernel, Resolved::fallback(VecHybrid));
+        assert_eq!(outcome, expected);
         // Unset or explicit on a capable device: the tensor route serves.
         for resolved in [
             Resolved::default_value(TensorF16),
@@ -2299,12 +2307,17 @@ mod tests {
         ] {
             assert!(refusal.contains(needle), "{refusal}");
         }
-        // Explicit `tensor` with a failed build: the probe's error surfaces,
-        // and it is not described as a missing capability of the host.
-        let failure = admit_warm_kernel(Resolved::environment(TensorF16), broken).unwrap_err();
-        assert!(failure.contains("shader error X") && failure.contains("failed to build"));
-        assert!(failure.contains("not a missing capability"), "{failure}");
-        assert!(!failure.contains("cannot run on this host"), "{failure}");
+        // A failed build surfaces under both default and explicit routes;
+        // it is not described as a missing capability of the host.
+        for resolved in [
+            Resolved::default_value(TensorF16),
+            Resolved::environment(TensorF16),
+        ] {
+            let failure = admit_warm_kernel(resolved, broken).unwrap_err();
+            assert!(failure.contains("shader error X") && failure.contains("failed to build"));
+            assert!(failure.contains("not a missing capability"), "{failure}");
+            assert!(!failure.contains("cannot run on this host"), "{failure}");
+        }
         // The other explicit kernels need no tensor API and are not probed.
         for explicit in [TiledF16, VecHybrid] {
             let (kernel, outcome) = admit_warm_kernel(Resolved::environment(explicit), || {
