@@ -99,6 +99,15 @@ BOTH = [gate("stock-hf2q", "Pass"), gate("peer", "Pass")]
 
 
 class Tier(unittest.TestCase):
+    def test_exhausted_stock_keeps_its_effect_but_cannot_display_a_win(self):
+        manifest = qwen38(BOTH)
+        manifest["groups"]["qwen38-q3-record"]["q3_record"].update(
+            verdict="Unavailable", reasons=["no usable stock arm: task failures exhausted"])
+        cells = tier_line(r.render(manifest, [], "0" * 64), "Qwen3.8 27B")
+        self.assertTrue(cells[1].startswith("Unavailable:"))
+        self.assertNotIn("**Win**", cells[2])
+        self.assertIn("26.4%", cells[2])
+
     def test_win_vs_stock_needs_the_quality_gate_against_both_references(self):
         text = r.render(qwen38(BOTH), [], "0" * 64)
         cells = tier_line(text, "Qwen3.8 27B")

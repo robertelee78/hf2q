@@ -71,6 +71,7 @@ def stock_reasons(rec, effects, band, family):
         return ["the family verdict is Failed (hf2q task failure)"]
     loss = "the family verdict is Loss vs the peer" + (" or Splash" if rec.get("splash") else "")
     reasons = [loss] if rec["verdict"] == "Loss" else []
+    reasons.extend(reason for reason in rec["reasons"] if reason.startswith("no usable stock arm"))
     if not rec["primary_stop"]:
         reasons.append("the primary stage has not reached its stopping rule")
     row = effects.get(("makespan_s", STOCK_ARM))
