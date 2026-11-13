@@ -14,7 +14,7 @@
 
 use mlx_native::MM_ID_ROUTING_THRESHOLD;
 
-use crate::inference::models::route_default::Resolved;
+use crate::inference::models::route_default::{is_kill_spelling, Resolved};
 
 pub(crate) const PREFILL_MOE_DOWN_ENV: &str = "HF2Q_GEMMA_PREFILL_MOE_DOWN";
 
@@ -176,17 +176,24 @@ pub(crate) const Q5_0_TENSOR_MM_ENV: &str = "HF2Q_Q5_0_TENSOR_MM";
 /// Gemma 4 resolution of `HF2Q_Q5_0_TENSOR_MM`. Unset (or empty) selects the
 /// tensor pipeline for Q5_0 dense and expert matrix multiplications, the
 /// configuration of the Gemma 4 release gate (ADR-063 Q4-GEMMA-ATTN,
-/// campaign `q4-gemma-release-gate-max40-v3`). A set value keeps mlx-native's
-/// reading: exactly `1` selects the tensor pipeline and anything else (`0`,
-/// the kill switch) the simdgroup route.
-fn resolve_q5_0_tensor_mm(raw: Option<&str>) -> Resolved<bool> {
-    match raw.map(str::trim).filter(|raw| !raw.is_empty()) {
-        None => Resolved::default_value(true),
-        Some(raw) => Resolved::environment(raw == "1"),
+/// campaign `q4-gemma-release-gate-max40-v3`). `1` selects it explicitly
+/// (mlx-native's own spelling, which also turns it on for every other
+/// family); `0`, `off`, `false` or `stock` is the kill switch. Any other
+/// value is an error: a Gemma 4 load refuses it rather than guess.
+fn resolve_q5_0_tensor_mm(raw: Option<&str>) -> std::result::Result<Resolved<bool>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(Resolved::default_value(true));
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "1" => Ok(Resolved::environment(true)),
+        value if is_kill_spelling(value) => Ok(Resolved::environment(false)),
+        _ => Err(format!(
+            "{Q5_0_TENSOR_MM_ENV} must be 1 or 0/off/false/stock for a Gemma 4 model, got {raw:?}"
+        )),
     }
 }
 
-fn q5_0_tensor_mm_from_env() -> Resolved<bool> {
+fn q5_0_tensor_mm_from_env() -> std::result::Result<Resolved<bool>, String> {
     resolve_q5_0_tensor_mm(std::env::var(Q5_0_TENSOR_MM_ENV).ok().as_deref())
 }
 
@@ -207,38 +214,40 @@ fn gemma4_policy_over(
 /// for this family. mlx-native's own default stays off, so no other family's
 /// registry sees the Gemma default. The native device probe still decides
 /// whether a tensor pipeline exists; without one the simdgroup route serves,
-/// as for every other tensor-routed type.
-pub(crate) fn gemma4_routing_policy() -> mlx_native::GgmlRoutingPolicy {
-    gemma4_policy_over(
+/// as for every other tensor-routed type. An invalid switch value is an
+/// error (the load refuses).
+pub(crate) fn gemma4_routing_policy() -> anyhow::Result<mlx_native::GgmlRoutingPolicy> {
+    Ok(gemma4_policy_over(
         mlx_native::ggml_routing_policy_from_environment(),
-        q5_0_tensor_mm_from_env(),
-    )
+        q5_0_tensor_mm_from_env().map_err(anyhow::Error::msg)?,
+    ))
 }
 
 /// Audit spelling of where the Q5_0 tensor-MM value frozen in a Gemma 4
-/// model's `policy` came from: the family resolution (`default` or
-/// `environment`), or `caller` when the model was given a context that does
-/// not carry the family policy (a harness that built its own).
+/// model's `policy` came from: the family resolution (`default` or `env`),
+/// or `caller` when the model was given a context that does not carry the
+/// family policy (a harness that built its own).
 pub(crate) fn q5_0_tensor_mm_audit_source(policy: &mlx_native::GgmlRoutingPolicy) -> &'static str {
-    audit_source(policy.q5_0_tensor_mm, q5_0_tensor_mm_from_env())
+    audit_source(policy.q5_0_tensor_mm, q5_0_tensor_mm_from_env().ok())
 }
 
-fn audit_source(frozen: bool, family: Resolved<bool>) -> &'static str {
-    if frozen == family.value {
-        family.source.as_str()
-    } else {
-        "caller"
+fn audit_source(frozen: bool, family: Option<Resolved<bool>>) -> &'static str {
+    match family {
+        Some(family) if frozen == family.value => family.source.as_str(),
+        _ => "caller",
     }
 }
 
 /// The Q5_0 tensor-MM routing value the loaded engine's family resolves, for
 /// the runtime-controls surface: the Gemma 4 policy for a Gemma 4 engine,
-/// mlx-native's environment policy for every other family.
+/// mlx-native's environment policy for every other family. (A process whose
+/// switch value a Gemma 4 load refuses has no Gemma 4 engine.)
 pub(crate) fn published_q5_0_tensor_mm(gemma4: bool) -> bool {
+    let environment = mlx_native::ggml_routing_policy_from_environment();
     if gemma4 {
-        gemma4_routing_policy().q5_0_tensor_mm
+        gemma4_routing_policy().map_or(environment.q5_0_tensor_mm, |policy| policy.q5_0_tensor_mm)
     } else {
-        mlx_native::ggml_routing_policy_from_environment().q5_0_tensor_mm
+        environment.q5_0_tensor_mm
     }
 }
 
@@ -374,27 +383,31 @@ mod tests {
         ));
     }
 
-    /// `HF2Q_Q5_0_TENSOR_MM` for Gemma 4: unset is on, a set value keeps
-    /// mlx-native's reading (only `1` is on; `0` is the kill switch).
+    /// `HF2Q_Q5_0_TENSOR_MM` for Gemma 4: unset is on, `1` is on, the four
+    /// shared off spellings are the kill switch, anything else is refused.
     #[test]
     fn gemma_q5_0_tensor_mm_defaults_on_and_zero_is_the_kill_switch() {
         for raw in [None, Some(""), Some("  ")] {
             assert_eq!(
                 resolve_q5_0_tensor_mm(raw),
-                Resolved::default_value(true),
+                Ok(Resolved::default_value(true)),
                 "{raw:?}"
             );
         }
         assert_eq!(
             resolve_q5_0_tensor_mm(Some("1")),
-            Resolved::environment(true)
+            Ok(Resolved::environment(true))
         );
-        for raw in ["0", "off", "false", "true", "2"] {
+        for raw in ["0", "off", "false", "stock", "OFF", " 0 "] {
             assert_eq!(
                 resolve_q5_0_tensor_mm(Some(raw)),
-                Resolved::environment(false),
+                Ok(Resolved::environment(false)),
                 "{raw:?}"
             );
+        }
+        for raw in ["true", "on", "2", "yes", "of"] {
+            let error = resolve_q5_0_tensor_mm(Some(raw)).unwrap_err();
+            assert!(error.contains(Q5_0_TENSOR_MM_ENV), "{raw:?}: {error}");
         }
     }
 
@@ -413,7 +426,7 @@ mod tests {
                 ..native
             }
         );
-        let killed = gemma4_policy_over(native, resolve_q5_0_tensor_mm(Some("0")));
+        let killed = gemma4_policy_over(native, resolve_q5_0_tensor_mm(Some("0")).unwrap());
         assert_eq!(killed, native);
     }
 
@@ -481,19 +494,112 @@ mod tests {
         assert_eq!(rerouted, [32, 512], "only Q5_0 matrix-matrix widths move");
     }
 
+    /// The expert routes of the gate artifact (128 experts, top-8): the
+    /// Q5_0 `ffn_down_exps` shape 2816 x 704 and the gate/up shape
+    /// 704 x 2816. With the Gemma policy the Q5_0 matrix-matrix widths move
+    /// from the simdgroup to the device-selected (tensor) expert kernel and
+    /// the per-token decode widths keep their matvec; every other block type
+    /// keeps its route at every width.
+    #[test]
+    fn gemma_q5_0_default_reroutes_only_q5_0_expert_matrix_products() {
+        use mlx_native::{
+            GgmlCapabilityRequest, GgmlExpertShape, GgmlInvocation, GgmlKernelRoute,
+            GgmlRoutingPolicy, GgmlType, GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
+        };
+        const DOWN: (u32, u32) = (2816, 704);
+        const GATE_UP: (u32, u32) = (704, 2816);
+        let off = GgmlRoutingPolicy::default();
+        let on = gemma4_policy_over(off, Resolved::default_value(true));
+        let route = |ggml_type: GgmlType, (n, k): (u32, u32), n_tokens: u32, routing| {
+            let stride = mlx_native::ggml_matrix_bytes(ggml_type, n, k).unwrap();
+            let capability = mlx_native::ggml_capability(GgmlCapabilityRequest {
+                schema_version: GGML_CAPABILITY_SCHEMA_VERSION,
+                invocation: GgmlInvocation::ExpertAutoAllocated {
+                    shape: GgmlExpertShape {
+                        n_tokens,
+                        n,
+                        k,
+                        top_k: 8,
+                        n_experts: 128,
+                        expert_stride_bytes: stride,
+                        ids_are_distinct_per_token: true,
+                        ids_within_expert_range: true,
+                    },
+                },
+                ggml_type,
+                workload: if n_tokens == 1 {
+                    GgmlWorkloadClass::DecodeSingle
+                } else {
+                    GgmlWorkloadClass::Prompt
+                },
+                routing,
+            });
+            assert!(
+                capability.executable,
+                "{ggml_type:?} {n}x{k} tokens={n_tokens}: {}",
+                capability.diagnostic
+            );
+            capability.route
+        };
+        let widths = [1u32, 4, 8, 32, 64, 512];
+        // K-quants need K % 256 == 0: the gate/up shape only.
+        for (ggml_type, shapes) in [
+            (GgmlType::Q4_0, &[DOWN, GATE_UP][..]),
+            (GgmlType::Q8_0, &[DOWN, GATE_UP][..]),
+            (GgmlType::Q4_K, &[GATE_UP][..]),
+            (GgmlType::Q5_K, &[GATE_UP][..]),
+            (GgmlType::Q6_K, &[GATE_UP][..]),
+        ] {
+            for &shape in shapes {
+                for tokens in widths {
+                    assert_eq!(
+                        route(ggml_type, shape, tokens, on),
+                        route(ggml_type, shape, tokens, off),
+                        "{ggml_type:?} {shape:?} tokens={tokens}"
+                    );
+                }
+            }
+        }
+        for shape in [DOWN, GATE_UP] {
+            let mut rerouted = Vec::new();
+            for tokens in widths {
+                let (with, without) = (
+                    route(GgmlType::Q5_0, shape, tokens, on),
+                    route(GgmlType::Q5_0, shape, tokens, off),
+                );
+                if with != without {
+                    assert_eq!(with, Some(GgmlKernelRoute::ExpertMmDeviceSelected));
+                    assert_eq!(without, Some(GgmlKernelRoute::ExpertMmSimdgroup));
+                    rerouted.push(tokens);
+                }
+            }
+            assert!(
+                !rerouted.is_empty()
+                    && rerouted
+                        .iter()
+                        .all(|&tokens| tokens > off.expert_mm_threshold),
+                "{shape:?}: only expert matrix-matrix widths move: {rerouted:?}"
+            );
+            assert!(!rerouted.contains(&1), "{shape:?}");
+        }
+    }
+
     #[test]
     fn q5_0_tensor_mm_audit_names_the_source_of_the_frozen_value() {
-        assert_eq!(audit_source(true, Resolved::default_value(true)), "default");
-        assert_eq!(
-            audit_source(false, Resolved::environment(false)),
-            "environment"
-        );
-        assert_eq!(
-            audit_source(true, Resolved::environment(true)),
-            "environment"
-        );
+        let family = |value, set| {
+            Some(if set {
+                Resolved::environment(value)
+            } else {
+                Resolved::default_value(value)
+            })
+        };
+        assert_eq!(audit_source(true, family(true, false)), "default");
+        // A set variable is reported as `env`, whatever its value.
+        assert_eq!(audit_source(false, family(false, true)), "env");
+        assert_eq!(audit_source(true, family(true, true)), "env");
         // A context built without the family policy is reported as such.
-        assert_eq!(audit_source(false, Resolved::default_value(true)), "caller");
+        assert_eq!(audit_source(false, family(true, false)), "caller");
+        assert_eq!(audit_source(false, None), "caller");
     }
 
     /// `active_controls.q5_0_tensor_mm` per family and environment. Each
@@ -504,12 +610,18 @@ mod tests {
         const EXPECT: &str = "HF2Q_Q5_0_TENSOR_MM_TEST_EXPECT";
         if let Some(expected) = std::env::var_os(EXPECT) {
             let expected = expected.to_str().unwrap().as_bytes().to_vec();
-            assert_eq!(published_q5_0_tensor_mm(true), expected[0] == b'1');
             assert_eq!(published_q5_0_tensor_mm(false), expected[1] == b'1');
-            assert_eq!(
-                gemma4_routing_policy().q5_0_tensor_mm,
-                published_q5_0_tensor_mm(true)
-            );
+            match expected[0] {
+                // Refused: no Gemma 4 policy exists.
+                b'x' => assert!(gemma4_routing_policy().is_err()),
+                _ => {
+                    assert_eq!(published_q5_0_tensor_mm(true), expected[0] == b'1');
+                    assert_eq!(
+                        gemma4_routing_policy().unwrap().q5_0_tensor_mm,
+                        expected[0] == b'1'
+                    );
+                }
+            }
             return;
         }
         let exe = std::env::current_exe().unwrap();
@@ -519,7 +631,9 @@ mod tests {
             (Some("1"), "11"),
             // Kill switch: off everywhere.
             (Some("0"), "00"),
-            (Some("true"), "00"),
+            (Some("off"), "00"),
+            // Not a value: a Gemma 4 load refuses; mlx-native reads off.
+            (Some("true"), "x0"),
         ] {
             let mut child = std::process::Command::new(&exe);
             child

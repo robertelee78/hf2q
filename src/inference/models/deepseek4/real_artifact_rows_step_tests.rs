@@ -5,7 +5,8 @@
 //! Run on Apple Silicon with the converted checkpoint:
 //! `HF2Q_DEEPSEEK4_GGUF=/path/to/deepseek4.gguf cargo test --release --bin hf2q \
 //!   official_artifact_rows_step_matches_one_token_steps_bitwise -- --ignored --nocapture`
-//! Run it with `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC` both unset/0 and 1.
+//! Run it with `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC` unset or `1` (the row-exact
+//! family, the default) and with `0` (the stock family).
 
 use super::cache::Deepseek4Cache;
 use super::joint_decode::MAX_JOINT_DECODE_ROWS;

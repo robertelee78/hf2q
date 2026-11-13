@@ -200,11 +200,16 @@ fn q1_gemma_packet_kernels_default_to_the_retained_routes_and_refuse_undeclared_
         assert_eq!(require_decode_attn_ne(DecodeAttnNe::Ne4,N::Ne(4)).unwrap(),DecodeAttnNe::Ne4);
         assert_eq!(serde_json::to_value(DecodeAttnNe::Ne4).unwrap(),serde_json::json!("Ne4"));
     }
+    // Q5_0 tensor matmul: absent = false (retained runs); the shipped default (true) must be declared.
+    assert!(!require_q5_0_tensor_mm(false,false).unwrap());
+    assert!(require_q5_0_tensor_mm(true,true).unwrap());
+    assert!(require_q5_0_tensor_mm(false,true).is_err());
+    assert!(require_q5_0_tensor_mm(true,false).is_err());
     assert_eq!(serde_json::to_value(WarmLiveKernel::VecHybrid).unwrap(),serde_json::json!("VecHybrid"));
     assert!(serde_json::from_value::<WarmLiveKernel>(serde_json::json!("Tiled")).is_err());
 }
 #[test]
-fn q1_gemma_decode_dense_kernel_defaults_to_shipped_stock_and_refuses_undeclared_kernels() {
+fn q1_gemma_decode_dense_kernel_defaults_to_the_retained_stock_and_refuses_undeclared_kernels() {
     use crate::inference::models::gemma4::decode_dense::DecodeDenseKernel as K;
     assert_eq!(DecodeDenseKernel::default(),DecodeDenseKernel::Stock);
     let pairs=[(DecodeDenseKernel::Stock,K::Stock),(DecodeDenseKernel::RowExact,K::RowExact),

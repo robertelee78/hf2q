@@ -2,9 +2,9 @@
 //!
 //! Unset selects `row_exact`, the configuration of the Gemma 4 release gate
 //! (ADR-063 Q4-GEMMA-ATTN, campaign `q4-gemma-release-gate-max40-v3`).
-//! `stock` is the kill switch; `row_exact` and `mma` select that kernel; any
-//! other value is refused when the switch is first read (model load). The
-//! value is read once per process.
+//! `stock` (also `0`, `off`, `false`) is the kill switch; `row_exact` and
+//! `mma` select that kernel; any other value is refused when the switch is
+//! first read (model load). The value is read once per process.
 //!
 //! The selector covers every decode-width GGUF dense matmul of Gemma 4 —
 //! attention q/k/v/o, dense FFN gate/up/down and the lm head — in the solo
@@ -41,7 +41,7 @@ use mlx_native::{
     CommandEncoder, DType, GgmlType, GraphSession, KernelRegistry, MlxBuffer, MlxDevice,
 };
 
-use crate::inference::models::route_default::Resolved;
+use crate::inference::models::route_default::{is_kill_spelling, Resolved};
 use crate::quantize::imatrix::ImatrixHint;
 use crate::serve::forward_mlx_shared::{dispatch_qmatmul, qmatmul_preamble, MlxQWeight};
 
@@ -65,13 +65,15 @@ impl DecodeDenseKernel {
     pub(crate) const DEFAULT: Self = Self::RowExact;
 
     fn parse(raw: Option<&str>) -> Result<Resolved<Self>, String> {
-        match raw {
-            None => Ok(Resolved::default_value(Self::DEFAULT)),
-            Some("stock") => Ok(Resolved::environment(Self::Stock)),
-            Some("row_exact") => Ok(Resolved::environment(Self::RowExact)),
-            Some("mma") => Ok(Resolved::environment(Self::ColumnInvariantMma)),
-            Some(other) => Err(format!(
-                "{ENV}={other:?} is not one of `stock`, `row_exact`, `mma`"
+        let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+            return Ok(Resolved::default_value(Self::DEFAULT));
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            value if is_kill_spelling(value) => Ok(Resolved::environment(Self::Stock)),
+            "row_exact" => Ok(Resolved::environment(Self::RowExact)),
+            "mma" => Ok(Resolved::environment(Self::ColumnInvariantMma)),
+            _ => Err(format!(
+                "{ENV}={raw:?} is not one of `row_exact`, `mma` or `stock`/`0`/`off`/`false`"
             )),
         }
     }
@@ -97,7 +99,7 @@ static RESOLVED: LazyLock<Result<Resolved<DecodeDenseKernel>, String>> =
 
 /// The process's decode dense kernel and where it came from; an invalid
 /// `HF2Q_GEMMA_DECODE_DENSE` is an error. Gemma model load calls this before
-/// any allocation.
+/// it maps or allocates any weight.
 pub(crate) fn resolve() -> Result<Resolved<DecodeDenseKernel>> {
     RESOLVED.clone().map_err(anyhow::Error::msg)
 }
@@ -381,37 +383,41 @@ mod tests {
 
     #[test]
     fn gemma_decode_dense_switch_parses_three_values_and_refuses_the_rest() {
-        // Unset: the release-gate kernel, reported as the default.
-        assert_eq!(
-            DecodeDenseKernel::parse(None),
-            Ok(Resolved::default_value(DecodeDenseKernel::RowExact))
-        );
+        // Unset (or empty): the release-gate kernel, reported as the default.
+        for raw in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                DecodeDenseKernel::parse(raw),
+                Ok(Resolved::default_value(DecodeDenseKernel::RowExact)),
+                "{raw:?}"
+            );
+        }
         assert_eq!(DecodeDenseKernel::DEFAULT, DecodeDenseKernel::RowExact);
-        // Kill switch: the stock routes, which route nothing
+        // Kill switch, in every off spelling the Gemma 4 switches share: the
+        // stock routes, which route nothing
         // (`gemma_decode_dense_stock_routes_nothing`).
-        assert_eq!(
-            DecodeDenseKernel::parse(Some("stock")),
-            Ok(Resolved::environment(DecodeDenseKernel::Stock))
-        );
-        assert_eq!(
-            DecodeDenseKernel::parse(Some("row_exact")),
-            Ok(Resolved::environment(DecodeDenseKernel::RowExact))
-        );
-        assert_eq!(
-            DecodeDenseKernel::parse(Some("mma")),
-            Ok(Resolved::environment(DecodeDenseKernel::ColumnInvariantMma))
-        );
-        for raw in [
-            "",
-            "1",
-            "0",
-            "MMA",
-            "Stock",
-            "row-exact",
-            "rowexact",
-            " mma",
-            "mma ",
-        ] {
+        for raw in ["stock", "0", "off", "false", "Stock", " OFF "] {
+            assert_eq!(
+                DecodeDenseKernel::parse(Some(raw)),
+                Ok(Resolved::environment(DecodeDenseKernel::Stock)),
+                "{raw:?}"
+            );
+        }
+        for raw in ["row_exact", " Row_Exact "] {
+            assert_eq!(
+                DecodeDenseKernel::parse(Some(raw)),
+                Ok(Resolved::environment(DecodeDenseKernel::RowExact)),
+                "{raw:?}"
+            );
+        }
+        for raw in ["mma", "MMA"] {
+            assert_eq!(
+                DecodeDenseKernel::parse(Some(raw)),
+                Ok(Resolved::environment(DecodeDenseKernel::ColumnInvariantMma)),
+                "{raw:?}"
+            );
+        }
+        // Anything else refuses the load and never resolves to the default.
+        for raw in ["1", "on", "true", "row-exact", "rowexact", "stok", "tensor"] {
             let error = DecodeDenseKernel::parse(Some(raw)).unwrap_err();
             assert!(error.contains(ENV), "{raw:?}: {error}");
         }

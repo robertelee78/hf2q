@@ -1972,6 +1972,7 @@ fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
         kv_bytes_per_token_override: None,
         kv_fixed_bytes_per_slot_override: None,
         gemma_warm_attention_kernel: None,
+        default_routes: Vec::new(),
     })
 }
 
@@ -4091,6 +4092,7 @@ impl LoadInfoBuilder for GemmaLoadedModel {
                 &self.config,
             )),
             gemma_warm_attention_kernel: Some(self.weights.warm_live_kernel.wire_name()),
+            default_routes: self.weights.route_audit.clone(),
         }
     }
 }
@@ -59366,6 +59368,10 @@ mod gemma_cold_prefill_tests;
 #[cfg(test)]
 #[path = "engine_gemma_warm_batch_tests.rs"]
 mod gemma_warm_batch_tests;
+
+#[cfg(test)]
+#[path = "engine_gemma_warm_depth_tests.rs"]
+mod gemma_warm_depth_tests;
 
 #[cfg(test)]
 #[path = "engine_gemma_warm_batch_fault_tests.rs"]

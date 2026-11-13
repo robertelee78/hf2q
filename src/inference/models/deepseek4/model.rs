@@ -38,6 +38,8 @@ pub struct Deepseek4Model {
     /// (`HF2Q_DEEPSEEK_BATCHED_ATTN_CORES`, read once at load, default
     /// batched).
     pub(super) attn_cores: super::joint_decode_rows::AttnCores,
+    /// The three default-on routes as resolved at load, with their sources.
+    routes: super::route_defaults::DefaultRoutes,
 }
 
 impl Deepseek4Model {
@@ -94,9 +96,18 @@ impl Deepseek4Model {
             joint_route_unproven,
             tail_rows_step: routes.tail_rows_step.value,
             attn_cores: routes.attn_cores.value,
+            routes,
         };
         routes.log(model.joint_decode_unavailable_reason().as_deref());
         Ok(model)
+    }
+
+    /// The default-on routes resolved at load, each with its source (load
+    /// banner, `/hf2q/v1/runtime`).
+    pub(crate) fn default_route_audit(
+        &self,
+    ) -> Vec<crate::inference::models::route_default::RouteAudit> {
+        self.routes.audit()
     }
 
     /// Parse only the strict architecture metadata without allocating Metal

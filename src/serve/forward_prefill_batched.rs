@@ -37,7 +37,8 @@ use crate::inference::models::gemma4::{
 };
 use crate::serve::forward_mlx_shared::dispatch_qmatmul;
 use crate::serve::gemma_live_attention::{
-    encode_live_layer_attention, LiveLayer, LiveRoute, LiveSeq, LiveSpan, LiveVecScratch,
+    encode_live_layer_attention, LiveLayer, LiveRoute, LiveScratch, LiveSeq, LiveSpan,
+    LiveVecScratch,
 };
 use crate::serve::multi_seq_kv::SlotId;
 
@@ -2111,6 +2112,9 @@ impl MlxModelWeights {
                 ms.slot_ids.iter().zip(&ms.start_positions).zip(&ms.seq_lens).zip(&ms.seq_offsets)
                     .map(|(((slot, start), len), offset)| (slot.0, *start, *len, *offset)).collect()
             });
+        // Bounds the tensor route's history-proportional scratch across the
+        // layers of this forward (`gemma_live_attention` module doc).
+        let mut live_scratch = LiveScratch::new(exec);
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             #[cfg(test)]
             let mut q1_layer_terminal_checked = false;
@@ -2668,6 +2672,8 @@ impl MlxModelWeights {
                     // a single-slot resume passes its own view, a resumed
                     // multi-sequence cohort passes each lane's slot view.
                     let route = live_route.expect("live route resolved with live resume");
+                    // A recorded (graph-optimized) session cannot be split.
+                    live_scratch.set_can_wait(!graph_opt_prefill);
                     let live_layer = LiveLayer {
                         layer_idx,
                         nh,
@@ -2694,7 +2700,15 @@ impl MlxModelWeights {
                                     kv: &views[layer_idx],
                                     span,
                                 });
-                        encode_live_layer_attention(&mut s, reg, dev, &live_layer, route, seqs)?;
+                        encode_live_layer_attention(
+                            &mut s,
+                            reg,
+                            dev,
+                            &live_layer,
+                            route,
+                            seqs,
+                            &mut live_scratch,
+                        )?;
                     } else {
                         let hybrid = self.hybrid_kv.as_ref().ok_or_else(|| {
                             anyhow::anyhow!("batched live attention has no hybrid KV")
@@ -2710,6 +2724,7 @@ impl MlxModelWeights {
                             &live_layer,
                             route,
                             std::iter::once(seq),
+                            &mut live_scratch,
                         )?;
                     }
                     if warm_split {
@@ -4763,6 +4778,7 @@ impl MlxModelWeights {
                         s.finish()
                             .map_err(|e| anyhow::anyhow!("batched mlp finish L{layer_idx}: {e}"))?;
                     }
+                    live_scratch.layer_finished();
                     #[cfg(test)]
                     { q1_layer_terminal_checked = true; }
                     if std::env::var("HF2Q_PROFILE_LAYERS").is_ok() {

@@ -583,6 +583,8 @@ HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_T
 # DeepSeek-V4 release-gate routes, kill-switch control (v0.1.30; deepseek4.json and deepseek4-ds4file.json declare the
 # variables with empty defaults, which export nothing): HF2Q_Q5_DEEPSEEK_ROW_EXACT_MATVEC=0
 # HF2Q_Q5_DEEPSEEK_TAIL_ROWS_STEP=0 HF2Q_Q5_DEEPSEEK_BATCHED_ATTN_CORES=0 in front of the DeepSeek-V4 command below.
+# Either family: the recorded /hf2q/v1/runtime carries measurement_snapshot.active_controls.default_routes, one
+# {value, source} per route (source default | env | fallback), so the receipt binds its arm.
 # Gemma4 V2 decode-workload diagnostic (ADR-063 Q4-GEMMA-DECODE §7.4; untimed): prints [ROUTING_OVERLAP] at worker exit
 HF2Q_Q5_GEMMA_ROUTING_OVERLAP=1 \
 HF2Q_Q5_MODEL=/abs/gemma-4-26B-A4B-it-hf2q-q4_k_m.gguf HF2Q_Q5_CLIENT_APPROVAL_TEMPLATE=/abs/gemma4-client-approval.json \

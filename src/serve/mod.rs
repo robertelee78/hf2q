@@ -21,6 +21,8 @@ pub(crate) mod gemma_live_attention;
 pub(crate) mod gemma_prefill_catsplit;
 pub(crate) mod gemma_decode_attention;
 pub(crate) mod gemma_prefill_moe;
+#[cfg(test)]
+mod gemma_routing_scope_tests;
 pub mod gpu;
 pub(crate) mod gemma_cold_masks;
 pub mod header;
@@ -7396,6 +7398,7 @@ mod tests {
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
             gemma_warm_attention_kernel: None,
+            default_routes: Vec::new(),
         }
     }
 

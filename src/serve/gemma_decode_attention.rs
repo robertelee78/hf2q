@@ -16,9 +16,10 @@
 //! `HF2Q_GEMMA_DECODE_ATTN_NE` unset selects NE 4, the configuration of the
 //! Gemma 4 release gate (ADR-063 Q4-GEMMA-ATTN, campaign
 //! `q4-gemma-release-gate-max40-v3`). `0`, `off`, `false` or `stock` is the
-//! kill switch (stock kernels); `2` and `4` select that NE.
+//! kill switch (stock kernels); `2` and `4` select that NE; any other value
+//! refuses the model load.
 
-use crate::inference::models::route_default::Resolved;
+use crate::inference::models::route_default::{is_kill_spelling, Resolved};
 
 pub(crate) const DECODE_ATTN_NE_ENV: &str = "HF2Q_GEMMA_DECODE_ATTN_NE";
 
@@ -59,45 +60,38 @@ fn parse_switch(raw: Option<&str>) -> std::result::Result<Resolved<GemmaDecodeAt
         return Ok(Resolved::default_value(DECODE_ATTN_NE_DEFAULT));
     };
     match raw.to_ascii_lowercase().as_str() {
-        "0" | "1" | "off" | "false" | "stock" => {
-            Ok(Resolved::environment(GemmaDecodeAttnNe::Stock))
-        }
+        // `1` is NE 1, which is the stock kernel.
+        "1" => Ok(Resolved::environment(GemmaDecodeAttnNe::Stock)),
+        value if is_kill_spelling(value) => Ok(Resolved::environment(GemmaDecodeAttnNe::Stock)),
         "2" => Ok(Resolved::environment(GemmaDecodeAttnNe::Ne(2))),
         "4" => Ok(Resolved::environment(GemmaDecodeAttnNe::Ne(4))),
         _ => Err(format!(
-            "{DECODE_ATTN_NE_ENV} must be 2, 4 or 0/off, got {raw:?}"
+            "{DECODE_ATTN_NE_ENV} must be 4, 2 or 0/off/false/stock, got {raw:?}"
         )),
     }
 }
 
-fn switch_value(raw: Option<&str>) -> Resolved<GemmaDecodeAttnNe> {
-    parse_switch(raw).unwrap_or_else(|error| {
-        tracing::warn!(
-            error,
-            fallback = DECODE_ATTN_NE_DEFAULT.as_str(),
-            "invalid Gemma decode attention NE switch"
-        );
-        Resolved::default_value(DECODE_ATTN_NE_DEFAULT)
-    })
-}
-
-/// `HF2Q_GEMMA_DECODE_ATTN_NE`, resolved once at model load.
-pub(crate) fn decode_attn_ne_from_env() -> Resolved<GemmaDecodeAttnNe> {
+/// `HF2Q_GEMMA_DECODE_ATTN_NE`, resolved once at model load. An invalid
+/// value refuses the load: a mistyped kill switch must never serve the
+/// route it was meant to turn off.
+pub(crate) fn decode_attn_ne_from_env() -> anyhow::Result<Resolved<GemmaDecodeAttnNe>> {
     let raw = std::env::var(DECODE_ATTN_NE_ENV).ok();
-    let ne = switch_value(raw.as_deref());
+    let ne = parse_switch(raw.as_deref()).map_err(anyhow::Error::msg)?;
     tracing::info!(
         kernel = ne.value.as_str(),
         source = ne.source.as_str(),
         "Gemma decode attention head split"
     );
-    ne
+    Ok(ne)
 }
 
 /// The value the runtime-controls surface publishes (the environment is
-/// fixed for the process, so it equals the value every load resolved).
+/// fixed for the process, so it equals the value every load resolved; a
+/// process with an invalid value never loads a Gemma 4 model).
 pub(crate) fn published_decode_attn_ne() -> &'static str {
     static VALUE: std::sync::LazyLock<GemmaDecodeAttnNe> = std::sync::LazyLock::new(|| {
-        switch_value(std::env::var(DECODE_ATTN_NE_ENV).ok().as_deref()).value
+        parse_switch(std::env::var(DECODE_ATTN_NE_ENV).ok().as_deref())
+            .map_or(DECODE_ATTN_NE_DEFAULT, |resolved| resolved.value)
     });
     VALUE.as_str()
 }
@@ -105,14 +99,17 @@ pub(crate) fn published_decode_attn_ne() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::models::route_default::RouteSource;
+
+    fn resolved(raw: &str) -> Resolved<GemmaDecodeAttnNe> {
+        parse_switch(Some(raw)).unwrap()
+    }
 
     #[test]
     fn gemma_decode_attn_ne_defaults_to_the_release_gate_split() {
         for raw in [None, Some(""), Some(" ")] {
             assert_eq!(
-                switch_value(raw),
-                Resolved::default_value(GemmaDecodeAttnNe::Ne(4)),
+                parse_switch(raw),
+                Ok(Resolved::default_value(GemmaDecodeAttnNe::Ne(4))),
                 "{raw:?}"
             );
         }
@@ -121,9 +118,9 @@ mod tests {
 
     #[test]
     fn gemma_decode_attn_ne_kill_switch_restores_the_stock_kernels() {
-        for raw in ["0", "1", "off", "false", "Stock", " 0 "] {
+        for raw in ["0", "off", "false", "stock", "1", "Stock", "OFF", " 0 "] {
             assert_eq!(
-                switch_value(Some(raw)),
+                resolved(raw),
                 Resolved::environment(GemmaDecodeAttnNe::Stock),
                 "{raw:?}"
             );
@@ -131,22 +128,27 @@ mod tests {
     }
 
     #[test]
-    fn gemma_decode_attn_ne_explicit_values_and_invalid_input() {
+    fn gemma_decode_attn_ne_explicit_values_report_the_environment() {
         assert_eq!(
-            switch_value(Some("4")),
+            resolved("4"),
             Resolved::environment(GemmaDecodeAttnNe::Ne(4))
         );
         assert_eq!(
-            switch_value(Some(" 2 ")),
+            resolved(" 2 "),
             Resolved::environment(GemmaDecodeAttnNe::Ne(2))
         );
-        assert!(parse_switch(Some("8")).is_err());
-        // An invalid value warns and keeps the default; it is reported as
-        // the default, not as an operator choice.
-        let invalid = switch_value(Some("8"));
-        assert_eq!(invalid.value, DECODE_ATTN_NE_DEFAULT);
-        assert_eq!(invalid.source, RouteSource::Default);
+        assert_eq!(resolved("4").source.as_str(), "env");
         assert_eq!(GemmaDecodeAttnNe::Ne(4).as_str(), "Ne4");
+    }
+
+    /// A set value that is not a route refuses the load; it never resolves
+    /// to the default.
+    #[test]
+    fn gemma_decode_attn_ne_invalid_value_is_refused() {
+        for raw in ["8", "3", "of", "no", "stok", "ne4", "-1"] {
+            let error = parse_switch(Some(raw)).unwrap_err();
+            assert!(error.contains(DECODE_ATTN_NE_ENV), "{raw:?}: {error}");
+        }
     }
 
     #[test]

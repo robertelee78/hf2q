@@ -182,6 +182,7 @@ mod tests {
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
             gemma_warm_attention_kernel: None,
+            default_routes: Vec::new(),
         };
         let mut buf = Vec::new();
         print_banner(&info, &mut buf, false).expect("print banner");

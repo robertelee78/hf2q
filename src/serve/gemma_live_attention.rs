@@ -34,16 +34,28 @@
 //!   decode-style threadgroup per (query, head), in 256-query chunks split
 //!   at the 512/1024 cache-length buckets.
 //!
+//! Transient scratch of the tensor route. Sliding layers stage at most one
+//! window of history plus the chunk, so their scratch is bounded by the
+//! suffix rows. Global layers attend the whole history: the dense F16 K and V
+//! copies cost `4 · nkv · hd` bytes per key and the additive mask
+//! `2 · rows · keys` bytes. [`LiveScratch`] keeps that history-proportional
+//! part bounded for one forward: a sequence's dense K/V are built once per
+//! global layer, its queries run in sub-chunks whose mask stays under
+//! [`TENSOR_GLOBAL_MASK_BYTES_MAX`], and the forward waits for the GPU
+//! before it would hold more than [`TENSOR_GLOBAL_SCRATCH_BUDGET_BYTES`] of
+//! submitted global scratch. Sub-chunks start on threadgroup boundaries and
+//! the waits only order work, so every output bit equals the unsplit route.
+//!
 //! Everything that reaches a kernel is a function of the sequence alone
 //! (its rows, start, KV view and Q/K/V rows), so a lane of a joint cohort is
 //! bitwise equal to the same sequence prefilled alone whenever both resolve
 //! the same kernel. [`LiveRoute`] guarantees that: a single-slot resume and
 //! every multi-sequence lane resolve the one warm route.
 use anyhow::Result;
-use mlx_native::{DType, GraphSession, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{DType, GraphExecutor, GraphSession, KernelRegistry, MlxBuffer, MlxDevice};
 
 use crate::inference::models::gemma4::{GemmaLiveKernel, HybridKvBuffers};
-use crate::inference::models::route_default::{Resolved, RouteSource};
+use crate::inference::models::route_default::{is_kill_spelling, Resolved, RouteSource};
 use crate::serve::forward_prefill::GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS;
 
 /// Vec-hybrid query chunk: bounds the attention scratch while keeping every
@@ -67,6 +79,192 @@ pub(crate) const TILED_GLOBAL_QUERY_CHUNK: usize = 4096;
 /// lane.
 pub(crate) const WARM_TILED_MIN_ROWS: usize = GEMMA_SLOT_BATCHED_PREFILL_MIN_TOKENS;
 
+/// Largest additive mask of one tensor global-layer dispatch. A sequence's
+/// queries split into sub-chunks under it; 64 MiB leaves a 4,096-row suffix
+/// unsplit up to 8,192 keys.
+pub(crate) const TENSOR_GLOBAL_MASK_BYTES_MAX: u64 = 64 << 20;
+/// Submitted-but-unfinished global-layer tensor scratch one forward may hold
+/// before it waits for the GPU. One sequence's dense K/V of one layer may
+/// exceed it alone (4 KiB per key on Gemma 4 26B-A4B: 1 GiB at 262,144
+/// keys); the forward then holds that one pair plus one mask.
+pub(crate) const TENSOR_GLOBAL_SCRATCH_BUDGET_BYTES: u64 = 512 << 20;
+
+/// Limits of the tensor route's history-proportional scratch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TensorScratchLimits {
+    pub(crate) mask_bytes: u64,
+    pub(crate) budget_bytes: u64,
+}
+
+impl TensorScratchLimits {
+    pub(crate) const SERVING: Self = Self {
+        mask_bytes: TENSOR_GLOBAL_MASK_BYTES_MAX,
+        budget_bytes: TENSOR_GLOBAL_SCRATCH_BUDGET_BYTES,
+    };
+    /// One dispatch per chunk and no waits: the route as first shipped,
+    /// which real-artifact gates compare the bounded route against.
+    #[cfg(test)]
+    pub(crate) const UNBOUNDED: Self = Self {
+        mask_bytes: u64::MAX,
+        budget_bytes: u64::MAX,
+    };
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LIMITS: std::cell::Cell<Option<TensorScratchLimits>> =
+        const { std::cell::Cell::new(None) };
+    static LAST_FORWARD: std::cell::Cell<LiveScratchStats> =
+        const { std::cell::Cell::new(LiveScratchStats { waits: 0, peak_bytes: 0 }) };
+}
+
+/// Limits of the calling thread's next forwards (tests only).
+#[cfg(test)]
+pub(crate) fn set_test_tensor_scratch_limits(limits: Option<TensorScratchLimits>) {
+    TEST_LIMITS.with(|cell| cell.set(limits));
+}
+
+/// Scratch accounting of the calling thread's last live forward (tests only).
+#[cfg(test)]
+pub(crate) fn last_forward_scratch_stats() -> LiveScratchStats {
+    LAST_FORWARD.with(std::cell::Cell::get)
+}
+
+/// What one forward's [`LiveScratch`] did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LiveScratchStats {
+    /// GPU waits taken to release submitted scratch.
+    pub(crate) waits: u32,
+    /// Largest accounted global-layer tensor scratch alive at once.
+    pub(crate) peak_bytes: u64,
+}
+
+/// Accounting of the tensor route's global-layer scratch across one forward.
+///
+/// `held` is scratch the encoder still owns (a sequence's dense K/V while
+/// its sub-chunks run); `submitted` is scratch whose owner dropped it but
+/// whose command buffers may not have finished, so Metal still holds it.
+/// Before admitting more than the budget the forward finishes the session
+/// (a full GPU wait) and continues in a fresh one, which releases everything
+/// submitted. The accounting assumes no command buffer finishes on its own,
+/// so it is an upper bound.
+pub(crate) struct LiveScratch<'e> {
+    exec: &'e GraphExecutor,
+    limits: TensorScratchLimits,
+    /// False while the layer's session cannot be split (recorded graph
+    /// sessions of `HF2Q_GRAPH_OPT_PREFILL=1`): the route then accounts
+    /// without waiting.
+    can_wait: bool,
+    held: u64,
+    submitted: u64,
+    stats: LiveScratchStats,
+}
+
+impl<'e> LiveScratch<'e> {
+    pub(crate) fn new(exec: &'e GraphExecutor) -> Self {
+        #[cfg(test)]
+        let limits = TEST_LIMITS
+            .with(std::cell::Cell::get)
+            .unwrap_or(TensorScratchLimits::SERVING);
+        #[cfg(not(test))]
+        let limits = TensorScratchLimits::SERVING;
+        Self {
+            exec,
+            limits,
+            can_wait: true,
+            held: 0,
+            submitted: 0,
+            stats: LiveScratchStats::default(),
+        }
+    }
+
+    /// Whether the current layer's session may be finished and reopened.
+    pub(crate) fn set_can_wait(&mut self, can_wait: bool) {
+        self.can_wait = can_wait;
+    }
+
+    /// The layer boundary waited for the GPU: nothing submitted remains.
+    pub(crate) fn layer_finished(&mut self) {
+        self.submitted = 0;
+    }
+
+    fn admit(&mut self, s: &mut GraphSession<'e>, bytes: u64, held: bool) -> Result<()> {
+        if self.can_wait
+            && self.submitted > 0
+            && self
+                .held
+                .saturating_add(self.submitted)
+                .saturating_add(bytes)
+                > self.limits.budget_bytes
+        {
+            if crate::serve::gemma_prefill_catsplit::enabled() {
+                // Keep the warm-prefill split's attention time whole.
+                crate::serve::gemma_prefill_catsplit::boundary(
+                    s,
+                    self.exec,
+                    crate::serve::gemma_prefill_catsplit::Cat::Attention,
+                )?;
+            } else {
+                let fresh = self
+                    .exec
+                    .begin()
+                    .map(crate::inference::native_observation::session)
+                    .map_err(|e| anyhow::anyhow!("live tensor scratch re-begin: {e}"))?;
+                std::mem::replace(s, fresh)
+                    .finish()
+                    .map_err(|e| anyhow::anyhow!("live tensor scratch wait: {e}"))?;
+            }
+            self.submitted = 0;
+            self.stats.waits += 1;
+        }
+        if held {
+            self.held = self.held.saturating_add(bytes);
+        } else {
+            self.submitted = self.submitted.saturating_add(bytes);
+        }
+        self.stats.peak_bytes = self
+            .stats
+            .peak_bytes
+            .max(self.held.saturating_add(self.submitted));
+        Ok(())
+    }
+
+    /// The encoder dropped `bytes` of held scratch; Metal keeps it until
+    /// the command buffers that use it finish.
+    fn release(&mut self, bytes: u64) {
+        self.held = self.held.saturating_sub(bytes);
+        self.submitted = self.submitted.saturating_add(bytes);
+    }
+}
+
+impl Drop for LiveScratch<'_> {
+    fn drop(&mut self) {
+        if self.stats.waits > 0 {
+            tracing::debug!(
+                waits = self.stats.waits,
+                peak_bytes = self.stats.peak_bytes,
+                "Gemma live tensor attention waited to bound its global-layer scratch"
+            );
+        }
+        #[cfg(test)]
+        LAST_FORWARD.with(|cell| cell.set(self.stats));
+    }
+}
+
+/// Query rows per tensor global-layer dispatch of a sequence whose padded
+/// key count is `kv_pad`: the largest multiple of the kernel's queries per
+/// threadgroup (`bq`) whose `[rows, kv_pad]` F16 mask stays under
+/// `mask_bytes`, at least `bq` and at most [`TILED_GLOBAL_QUERY_CHUNK`]. A
+/// function of the sequence's own keys, so a lane splits exactly as the
+/// same sequence alone.
+fn tensor_global_query_rows(kv_pad: usize, bq: usize, mask_bytes: u64) -> usize {
+    let row_bytes = (kv_pad as u64)
+        .saturating_mul(DType::F16.size_of() as u64)
+        .max(1);
+    let rows = usize::try_from(mask_bytes / row_bytes).unwrap_or(usize::MAX);
+    (rows / bq * bq).clamp(bq, TILED_GLOBAL_QUERY_CHUNK)
+}
+
 pub(crate) const WARM_TILED_ATTENTION_ENV: &str = "HF2Q_GEMMA_WARM_TILED_ATTENTION";
 /// Unset default: the tensor-API route of the Gemma 4 release gate (ADR-063
 /// Q4-GEMMA-ATTN, campaign `q4-gemma-release-gate-max40-v3`). The tiled F16
@@ -79,7 +277,8 @@ const WARM_ATTENTION_DEFAULT: GemmaLiveKernel = GemmaLiveKernel::TensorF16;
 const WARM_ATTENTION_STOCK: GemmaLiveKernel = GemmaLiveKernel::VecHybrid;
 
 /// `tensor` selects the gap-program F1 route `TensorF16` (also the unset
-/// default), `1`/`on`/`true` `TiledF16`, `0`/`off`/`false` vec-hybrid.
+/// default), `1`/`on`/`true` `TiledF16`, `0`/`off`/`false`/`stock`
+/// vec-hybrid; anything else is an error.
 fn parse_warm_tiled_switch(
     raw: Option<&str>,
 ) -> std::result::Result<Resolved<GemmaLiveKernel>, String> {
@@ -89,23 +288,11 @@ fn parse_warm_tiled_switch(
     match raw.to_ascii_lowercase().as_str() {
         "1" | "on" | "true" => Ok(Resolved::environment(GemmaLiveKernel::TiledF16)),
         "tensor" => Ok(Resolved::environment(GemmaLiveKernel::TensorF16)),
-        "0" | "off" | "false" => Ok(Resolved::environment(WARM_ATTENTION_STOCK)),
+        value if is_kill_spelling(value) => Ok(Resolved::environment(WARM_ATTENTION_STOCK)),
         _ => Err(format!(
-            "{WARM_TILED_ATTENTION_ENV} must be tensor, 1/on/true or 0/off/false, got {raw:?}"
+            "{WARM_TILED_ATTENTION_ENV} must be tensor, 1/on/true or 0/off/false/stock, got {raw:?}"
         )),
     }
-}
-
-fn warm_kernel_for_switch(raw: Option<&str>) -> Resolved<GemmaLiveKernel> {
-    parse_warm_tiled_switch(raw).unwrap_or_else(|error| {
-        let fallback = WARM_ATTENTION_DEFAULT;
-        tracing::warn!(
-            error,
-            ?fallback,
-            "invalid Gemma warm tiled attention switch"
-        );
-        Resolved::default_value(fallback)
-    })
 }
 
 /// Applies the device probe to a resolved switch: an unset switch whose
@@ -131,9 +318,11 @@ fn tensor_route_unavailable(registry: &mut KernelRegistry, device: &MlxDevice) -
     for head_dim in [256, 512] {
         match flash_attn_prefill_tensor_available(registry, device, head_dim) {
             Ok(true) => {}
-            Ok(false) => return Some(format!(
+            Ok(false) => {
+                return Some(format!(
                 "the Metal tensor API is unavailable for the d{head_dim} warm attention pipeline"
-            )),
+            ))
+            }
             Err(error) => {
                 return Some(format!(
                     "the d{head_dim} tensor warm attention pipeline does not build: {error}"
@@ -147,16 +336,17 @@ fn tensor_route_unavailable(registry: &mut KernelRegistry, device: &MlxDevice) -
 /// Kernel for warm live-resume attention (single-slot resumes, joint warm
 /// cohorts and installed long-prompt lanes), resolved once per model load
 /// from `HF2Q_GEMMA_WARM_TILED_ATTENTION`. Unset selects the tensor-API
-/// route where the device builds it and vec-hybrid otherwise.
+/// route where the device builds it and vec-hybrid otherwise. An invalid
+/// value refuses the load: a mistyped kill switch must never serve the
+/// route it was meant to turn off.
 pub(crate) fn warm_live_kernel_from_env(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
-) -> Resolved<GemmaLiveKernel> {
+) -> Result<Resolved<GemmaLiveKernel>> {
     let raw = std::env::var(WARM_TILED_ATTENTION_ENV).ok();
+    let resolved = parse_warm_tiled_switch(raw.as_deref()).map_err(anyhow::Error::msg)?;
     let (kernel, fallback_reason) =
-        admit_warm_kernel(warm_kernel_for_switch(raw.as_deref()), || {
-            tensor_route_unavailable(registry, device)
-        });
+        admit_warm_kernel(resolved, || tensor_route_unavailable(registry, device));
     if let Some(reason) = &fallback_reason {
         tracing::warn!(
             reason,
@@ -169,7 +359,7 @@ pub(crate) fn warm_live_kernel_from_env(
         source = kernel.source.as_str(),
         "Gemma warm live attention kernel"
     );
-    kernel
+    Ok(kernel)
 }
 
 /// Warm kernel with `HF2Q_GEMMA_WARM_TILED_ATTENTION` unset on a device with
@@ -177,7 +367,7 @@ pub(crate) fn warm_live_kernel_from_env(
 /// their expected route against it.
 #[cfg(test)]
 pub(crate) fn default_warm_live_kernel() -> GemmaLiveKernel {
-    warm_kernel_for_switch(None).value
+    WARM_ATTENTION_DEFAULT
 }
 
 /// Attention route of one live-resume forward: the model's warm kernel, with
@@ -415,13 +605,14 @@ pub(crate) struct LiveLayer<'a> {
 /// Encode one layer's live attention for every sequence, then the FWHT sign
 /// undo. A single-slot resume passes one sequence; a multi-sequence resume
 /// passes each lane's own slot view.
-pub(crate) fn encode_live_layer_attention<'a>(
-    s: &mut GraphSession<'_>,
+pub(crate) fn encode_live_layer_attention<'a, 'e>(
+    s: &mut GraphSession<'e>,
     reg: &mut KernelRegistry,
     dev: &MlxDevice,
     layer: &LiveLayer<'_>,
     route: LiveRoute,
     seqs: impl IntoIterator<Item = LiveSeq<'a>>,
+    scratch: &mut LiveScratch<'e>,
 ) -> Result<()> {
     let mut packed_v: Option<bool> = None;
     for seq in seqs {
@@ -431,7 +622,15 @@ pub(crate) fn encode_live_layer_attention<'a>(
             "live attention L{}: sequences disagree on the V storage dtype",
             layer.layer_idx
         );
-        encode_live_seq(s, reg, dev, layer, &seq, route.seq_kernel(seq.span.rows))?;
+        encode_live_seq(
+            s,
+            reg,
+            dev,
+            layer,
+            &seq,
+            route.seq_kernel(seq.span.rows),
+            scratch,
+        )?;
     }
     if packed_v == Some(true) {
         s.barrier_between(&[layer.out], &[layer.out]);
@@ -611,13 +810,14 @@ fn linearize_rows(
     .map_err(|e| anyhow::anyhow!("live {what} L{layer_idx}: {e}"))
 }
 
-fn encode_live_seq(
-    s: &mut GraphSession<'_>,
+fn encode_live_seq<'e>(
+    s: &mut GraphSession<'e>,
     reg: &mut KernelRegistry,
     dev: &MlxDevice,
     layer: &LiveLayer<'_>,
     seq: &LiveSeq<'_>,
     kernel: GemmaLiveKernel,
+    scratch: &mut LiveScratch<'e>,
 ) -> Result<()> {
     let kv = seq.kv;
     let span = seq.span;
@@ -649,6 +849,10 @@ fn encode_live_seq(
             false,
             "global append",
         )?;
+    }
+
+    if !is_ring && kernel == GemmaLiveKernel::TensorF16 {
+        return encode_tensor_global_seq(s, reg, dev, layer, seq, scratch);
     }
 
     let stage = if is_ring {
@@ -1050,43 +1254,57 @@ fn encode_tiled_chunk(
     Ok(())
 }
 
-/// Tensor-API flash attention (gap program F1) for one chunk of one
-/// sequence. The dense K/V range is laid out so that dense row `r` holds
-/// absolute position `first_key_abs - lead + r` with `lead =
-/// first_key_abs % 64`: the kernel's 64-row key tiles then start at absolute
-/// multiples of 64, so a row's result does not depend on where its chunk or
-/// stage begins (design §3). The `lead` rows before the first key and the
-/// rows past the last key up to `kv_pad` are zero and masked `-inf`.
+/// Dense F16 K/V of one sequence for the tensor-API kernel (gap program
+/// F1). Dense row `r` holds absolute position `first_key_abs - lead + r`
+/// with `lead = first_key_abs % 64`: the kernel's 64-row key tiles then
+/// start at absolute multiples of 64, so a row's result does not depend on
+/// where its chunk or stage begins (design §3). The `lead` rows before the
+/// first key and the rows past the last key up to the padded length are zero
+/// and masked `-inf`.
 ///
-/// Layout of each dense buffer: `lead · hd` zeros, then the compacted
-/// `[nkv, kv_seq_len, hd]` rows, then `(kv_pad − lead − kv_seq_len) · hd`
-/// zeros. Head `h`, dense row `r` is element `h · kv_seq_len · hd + r · hd`
-/// of the buffer, so rows outside a head's own range read neighbouring
-/// finite rows (another head's, or the zero lead/tail), all masked.
+/// Layout of each buffer: `lead · hd` zeros, then the compacted
+/// `[nkv, rows, hd]` rows, then `(kv_pad − lead − rows) · hd` zeros. Head
+/// `h`, dense row `r` is element `h · rows · hd + r · hd`, so rows outside a
+/// head's own range read neighbouring finite rows (another head's, a later
+/// key of the same head, or the zero lead/tail), all masked.
+struct TensorDenseKv {
+    k: MlxBuffer,
+    v: MlxBuffer,
+    lead: usize,
+    /// Key rows compacted per head.
+    rows: usize,
+}
+
+/// Bytes of both dense buffers for `rows` keys per head starting at
+/// absolute position `first_key_abs`.
+fn tensor_dense_kv_bytes(nkv: usize, hd: usize, rows: usize, first_key_abs: usize) -> u64 {
+    let step = mlx_native::ops::flash_attn_prefill_tensor::CACHE_ROWS_PER_STEP as usize;
+    let lead = first_key_abs % step;
+    let pad = (lead + rows).div_ceil(step) * step;
+    let elems = (pad - rows) * hd + nkv * rows * hd;
+    2 * (elems * DType::F16.size_of()) as u64
+}
+
+/// Compact (K) and expand or compact (V) the first `rows` chronological
+/// rows of a `[nkv, src_capacity, hd]` cache into fresh dense buffers.
 #[allow(clippy::too_many_arguments)]
-fn encode_tensor_chunk(
+fn build_tensor_dense_kv(
     s: &mut GraphSession<'_>,
     reg: &mut KernelRegistry,
     dev: &MlxDevice,
     layer: &LiveLayer<'_>,
     (src_k, src_v, src_norms): (&MlxBuffer, &MlxBuffer, &MlxBuffer),
     src_capacity: usize,
-    is_ring: bool,
-    keys: ChunkKeys,
+    rows: usize,
     first_key_abs: usize,
-    len: usize,
-    q: &MlxBuffer,
-    out: &MlxBuffer,
-) -> Result<()> {
+) -> Result<TensorDenseKv> {
     use mlx_native::ops::flash_attn_prefill_tensor as tensor;
-    let metal_dev = dev.metal_device();
-    let (nh, nkv, hd, layer_idx) = (layer.nh, layer.nkv, layer.hd, layer.layer_idx);
-    let kv_seq_len = keys.kv_seq_len;
+    let (nkv, hd, layer_idx) = (layer.nkv, layer.hd, layer.layer_idx);
     let step = tensor::CACHE_ROWS_PER_STEP as usize;
     let lead = first_key_abs % step;
-    let kv_pad = tensor::kv_pad((lead + kv_seq_len) as u32) as usize;
-    let tail = kv_pad - lead - kv_seq_len;
-    let dense_elems = (lead + tail) * hd + nkv * kv_seq_len * hd;
+    let kv_pad = tensor::kv_pad((lead + rows) as u32) as usize;
+    let tail = kv_pad - lead - rows;
+    let dense_elems = (lead + tail) * hd + nkv * rows * hd;
     let dense = |what: &str| -> Result<MlxBuffer> {
         let mut buffer = dev
             .alloc_buffer(dense_elems * 2, DType::F16, vec![dense_elems])
@@ -1103,13 +1321,13 @@ fn encode_tensor_chunk(
     let dense_k = dense("K")?;
     let dense_v = dense("V")?;
     let body_bytes = (lead * hd * 2) as u64;
-    let body_elems = nkv * kv_seq_len * hd;
+    let body_elems = nkv * rows * hd;
     let k_body = dense_k.slice_view(body_bytes, body_elems);
     let v_body = dense_v.slice_view(body_bytes, body_elems);
 
     s.barrier_between(&[src_k, src_v, src_norms], &[&dense_k, &dense_v]);
-    let rings = (src_capacity, kv_seq_len);
-    let range = (kv_seq_len, kv_seq_len);
+    let rings = (src_capacity, rows);
+    let range = (rows, rows);
     let f16_row = hd * DType::F16.size_of();
     linearize_rows(
         s, reg, dev, (src_k, &k_body), nkv, rings, range, f16_row, layer_idx, "tensor K",
@@ -1122,7 +1340,7 @@ fn encode_tensor_chunk(
         mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_hb_kv_seq_f16(
             s.encoder_mut(),
             reg,
-            metal_dev,
+            dev.metal_device(),
             src_v,
             src_norms,
             &v_body,
@@ -1130,13 +1348,55 @@ fn encode_tensor_chunk(
             hd as u32,
             src_capacity as u32,
             0,
-            kv_seq_len as u32,
+            rows as u32,
             layer.tq_scale_factor_d512,
             layer.tq_codebook_bits,
         )
         .map_err(|e| anyhow::anyhow!("live tensor V expand L{layer_idx}: {e}"))?;
     }
+    Ok(TensorDenseKv {
+        k: dense_k,
+        v: dense_v,
+        lead,
+        rows,
+    })
+}
 
+/// Padded key count of a tensor dispatch whose last key is dense row
+/// `lead + kv_seq_len - 1`.
+fn tensor_kv_pad(lead: usize, kv_seq_len: usize) -> usize {
+    mlx_native::ops::flash_attn_prefill_tensor::kv_pad((lead + kv_seq_len) as u32) as usize
+}
+
+/// Bytes of the additive mask of one `len`-query dispatch over `kv_pad` keys.
+fn tensor_mask_bytes(len: usize, kv_pad: usize) -> u64 {
+    (len * kv_pad * DType::F16.size_of()) as u64
+}
+
+/// One tensor-API dispatch: `len` queries of `q` against the first
+/// `keys.kv_seq_len` rows of `dense`, written to `out`.
+#[allow(clippy::too_many_arguments)]
+fn encode_tensor_attend(
+    s: &mut GraphSession<'_>,
+    reg: &mut KernelRegistry,
+    dev: &MlxDevice,
+    layer: &LiveLayer<'_>,
+    dense: &TensorDenseKv,
+    is_ring: bool,
+    keys: ChunkKeys,
+    len: usize,
+    q: &MlxBuffer,
+    out: &MlxBuffer,
+) -> Result<()> {
+    use mlx_native::ops::flash_attn_prefill_tensor as tensor;
+    let (nh, nkv, hd, layer_idx) = (layer.nh, layer.nkv, layer.hd, layer.layer_idx);
+    anyhow::ensure!(
+        keys.kv_seq_len <= dense.rows,
+        "live tensor L{layer_idx}: {} keys exceed the {} dense rows",
+        keys.kv_seq_len,
+        dense.rows
+    );
+    let kv_pad = tensor_kv_pad(dense.lead, keys.kv_seq_len);
     let mask = mlx_native::ops::flash_attn_prefill_mask::build_sdpa_mask_f16(
         dev,
         reg,
@@ -1146,7 +1406,7 @@ fn encode_tensor_chunk(
             seq_len_k: kv_pad as u32,
             window_size: is_ring.then_some(layer.sliding_window),
             causal: true,
-            q_abs_offset: (lead + keys.query_offset) as u32,
+            q_abs_offset: (dense.lead + keys.query_offset) as u32,
         },
     )
     .map_err(|e| anyhow::anyhow!("live tensor mask L{layer_idx}: {e}"))?;
@@ -1172,14 +1432,14 @@ fn encode_tensor_chunk(
         &blk_params,
     )
     .map_err(|e| anyhow::anyhow!("live tensor blk L{layer_idx}: {e}"))?;
-    s.barrier_between(&[q, &dense_k, &dense_v, &mask, &blk], &[out]);
+    s.barrier_between(&[q, &dense.k, &dense.v, &mask, &blk], &[out]);
     tensor::dispatch_flash_attn_prefill_tensor_f16(
         s.encoder_mut(),
         reg,
         dev,
         q,
-        &dense_k,
-        &dense_v,
+        &dense.k,
+        &dense.v,
         &mask,
         &blk,
         out,
@@ -1192,13 +1452,104 @@ fn encode_tensor_chunk(
             q_row_stride: (nh * hd) as u32,
             q_head_stride: hd as u32,
             k_row_stride: hd as u32,
-            k_head_stride: (kv_seq_len * hd) as u32,
+            k_head_stride: (dense.rows * hd) as u32,
             v_row_stride: hd as u32,
-            v_head_stride: (kv_seq_len * hd) as u32,
+            v_head_stride: (dense.rows * hd) as u32,
             scale: 1.0,
         },
     )
     .map_err(|e| anyhow::anyhow!("live tensor FA L{layer_idx}: {e}"))?;
+    Ok(())
+}
+
+/// Tensor-API flash attention for one sliding-layer chunk of one sequence:
+/// its stage (at most one window of history plus the chunk) is compacted
+/// and attended in one dispatch.
+#[allow(clippy::too_many_arguments)]
+fn encode_tensor_chunk(
+    s: &mut GraphSession<'_>,
+    reg: &mut KernelRegistry,
+    dev: &MlxDevice,
+    layer: &LiveLayer<'_>,
+    src: (&MlxBuffer, &MlxBuffer, &MlxBuffer),
+    src_capacity: usize,
+    is_ring: bool,
+    keys: ChunkKeys,
+    first_key_abs: usize,
+    len: usize,
+    q: &MlxBuffer,
+    out: &MlxBuffer,
+) -> Result<()> {
+    let dense = build_tensor_dense_kv(
+        s,
+        reg,
+        dev,
+        layer,
+        src,
+        src_capacity,
+        keys.kv_seq_len,
+        first_key_abs,
+    )?;
+    encode_tensor_attend(s, reg, dev, layer, &dense, is_ring, keys, len, q, out)
+}
+
+/// Tensor-API flash attention of one sequence on a global layer, with
+/// history-proportional scratch bounded by `scratch` (module doc). The
+/// suffix is already appended, so one dense K/V pair over
+/// `graft + start + rows` keys serves every sub-chunk; sub-chunk `c` attends
+/// its first `graft + start + end_c` rows and masks the rest, which is what
+/// a dispatch over exactly those rows computes.
+fn encode_tensor_global_seq<'e>(
+    s: &mut GraphSession<'e>,
+    reg: &mut KernelRegistry,
+    dev: &MlxDevice,
+    layer: &LiveLayer<'_>,
+    seq: &LiveSeq<'_>,
+    scratch: &mut LiveScratch<'e>,
+) -> Result<()> {
+    use mlx_native::ops::flash_attn_prefill_tensor as tensor;
+    let (kv, span) = (seq.kv, seq.span);
+    let (nkv, hd, layer_idx) = (layer.nkv, layer.hd, layer.layer_idx);
+    let row_elems = layer.nh * hd;
+    let total_keys = layer.graft_len + span.start + span.rows;
+    let bq = tensor::queries_per_threadgroup(hd as u32)
+        .map_err(|e| anyhow::anyhow!("live tensor L{layer_idx}: {e}"))? as usize;
+    let sub_rows =
+        tensor_global_query_rows(tensor_kv_pad(0, total_keys), bq, scratch.limits.mask_bytes);
+
+    let dense_bytes = tensor_dense_kv_bytes(nkv, hd, total_keys, 0);
+    scratch.admit(s, dense_bytes, true)?;
+    let dense = build_tensor_dense_kv(
+        s,
+        reg,
+        dev,
+        layer,
+        (&kv.k, &kv.v_packed, &kv.v_norms),
+        kv.capacity,
+        total_keys,
+        0,
+    )?;
+    let mut local = 0usize;
+    while local < span.rows {
+        let len = sub_rows.min(span.rows - local);
+        let keys = chunk_keys(false, kv.capacity, layer.graft_len, span.start + local, len);
+        scratch.admit(
+            s,
+            tensor_mask_bytes(len, tensor_kv_pad(dense.lead, keys.kv_seq_len)),
+            false,
+        )?;
+        let stream_row = span.offset + local;
+        let q = layer
+            .q
+            .slice_view((stream_row * row_elems * 4) as u64, len * row_elems);
+        let out = layer
+            .out
+            .slice_view((stream_row * row_elems * 4) as u64, len * row_elems);
+        encode_tensor_attend(s, reg, dev, layer, &dense, false, keys, len, &q, &out)?;
+        local += len;
+    }
+    drop(dense);
+    scratch.release(dense_bytes);
     Ok(())
 }
 
@@ -1213,43 +1564,392 @@ mod tests {
             .collect()
     }
 
+    fn warm(raw: &str) -> Resolved<GemmaLiveKernel> {
+        parse_warm_tiled_switch(Some(raw)).unwrap()
+    }
+
     #[test]
     fn warm_switch_defaults_to_the_release_gate_tensor_route() {
         for raw in [None, Some(""), Some("  ")] {
             assert_eq!(
-                warm_kernel_for_switch(raw),
-                Resolved::default_value(TensorF16),
+                parse_warm_tiled_switch(raw),
+                Ok(Resolved::default_value(TensorF16)),
                 "{raw:?}"
             );
         }
         assert_eq!(default_warm_live_kernel(), TensorF16);
-        for raw in ["0", "off", "False", " 0 "] {
+        for raw in ["0", "off", "false", "stock", "False", "STOCK", " 0 "] {
             assert_eq!(
-                warm_kernel_for_switch(Some(raw)),
+                warm(raw),
                 Resolved::environment(VecHybrid),
                 "kill switch {raw:?}"
             );
         }
         for raw in ["1", "on", "TRUE"] {
-            assert_eq!(
-                warm_kernel_for_switch(Some(raw)),
-                Resolved::environment(TiledF16),
-                "{raw:?}"
-            );
+            assert_eq!(warm(raw), Resolved::environment(TiledF16), "{raw:?}");
         }
         for raw in ["tensor", " Tensor "] {
-            assert_eq!(
-                warm_kernel_for_switch(Some(raw)),
-                Resolved::environment(TensorF16),
-                "{raw:?}"
+            assert_eq!(warm(raw), Resolved::environment(TensorF16), "{raw:?}");
+        }
+        assert_eq!(warm("0").source.as_str(), "env");
+    }
+
+    /// A set value that is not a route refuses the load; it never resolves
+    /// to the default.
+    #[test]
+    fn warm_switch_invalid_value_is_refused() {
+        for raw in ["yes", "of", "no", "vec", "tiled", "2", "tensr"] {
+            let error = parse_warm_tiled_switch(Some(raw)).unwrap_err();
+            assert!(error.contains(WARM_TILED_ATTENTION_ENV), "{raw:?}: {error}");
+        }
+    }
+
+    // ---- bounded global-layer scratch of the tensor route -----------------
+
+    #[test]
+    fn tensor_global_sub_chunks_are_whole_threadgroups_under_the_mask_limit() {
+        let limit = TENSOR_GLOBAL_MASK_BYTES_MAX;
+        // Shallow histories keep one dispatch per 4,096-row chunk.
+        assert_eq!(tensor_global_query_rows(8_192, 16, limit), 4_096);
+        assert_eq!(tensor_global_query_rows(1_344, 16, limit), 4_096);
+        // Deep histories split; every sub-chunk is a multiple of the
+        // kernel's queries per threadgroup and its mask fits the limit.
+        for kv_pad in [16_384usize, 102_400, 131_072, 262_144, 1_048_576] {
+            for bq in [16usize, 32] {
+                let rows = tensor_global_query_rows(kv_pad, bq, limit);
+                assert!(rows >= bq && rows % bq == 0, "{kv_pad} {bq}: {rows}");
+                assert!(
+                    tensor_mask_bytes(rows, kv_pad) <= limit || rows == bq,
+                    "{kv_pad} {bq}: {rows}"
+                );
+            }
+        }
+        assert_eq!(tensor_global_query_rows(262_144, 16, limit), 128);
+        // A limit below one threadgroup's mask still makes progress.
+        assert_eq!(tensor_global_query_rows(262_144, 16, 1), 16);
+        // No limit: the route as first shipped (one dispatch per chunk).
+        assert_eq!(
+            tensor_global_query_rows(262_144, 16, TensorScratchLimits::UNBOUNDED.mask_bytes),
+            TILED_GLOBAL_QUERY_CHUNK
+        );
+    }
+
+    #[test]
+    fn tensor_dense_kv_bytes_follow_the_documented_formula() {
+        // Gemma 4 26B-A4B global layer: 2 KV heads, head dim 512, F16 K and
+        // V: 4 KiB per key (plus the padding rows of one tile).
+        let (nkv, hd) = (2usize, 512usize);
+        assert_eq!(tensor_dense_kv_bytes(nkv, hd, 262_144, 0), 262_144 * 4_096);
+        assert_eq!(tensor_dense_kv_bytes(nkv, hd, 102_400, 0), 102_400 * 4_096);
+        // 100 keys pad to 128 rows: 28 padding rows of one head each.
+        assert_eq!(
+            tensor_dense_kv_bytes(nkv, hd, 100, 0),
+            2 * 2 * (100 * nkv * hd + 28 * hd) as u64
+        );
+    }
+
+    /// One synthetic global layer (2 KV heads, 4 heads, head dim 512, the
+    /// production TQ-HB V or F16 V) with per-lane append-only caches.
+    struct GlobalFixture {
+        ctx: crate::serve::gpu::GpuContext,
+        v_dtype: DType,
+    }
+
+    const FX_NH: usize = 4;
+    const FX_NKV: usize = 2;
+    const FX_HD: usize = 512;
+    const FX_CAP: usize = 1_024;
+
+    fn fx_values(seed: u64, len: usize) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    impl GlobalFixture {
+        fn new(v_dtype: DType) -> Self {
+            Self {
+                ctx: crate::serve::gpu::GpuContext::new().expect("Metal device"),
+                v_dtype,
+            }
+        }
+
+        fn kv(&self) -> HybridKvBuffers {
+            let dev = self.ctx.device();
+            let elems = FX_NKV * FX_CAP * FX_HD;
+            let zeroed = |bytes: usize, dtype: DType, shape: Vec<usize>| {
+                dev.alloc_buffer(bytes, dtype, shape)
+                    .expect("fixture cache")
+            };
+            HybridKvBuffers {
+                k: zeroed(elems * 2, DType::F16, vec![FX_NKV, FX_CAP, FX_HD]),
+                v_packed: zeroed(
+                    elems * self.v_dtype.size_of(),
+                    self.v_dtype,
+                    vec![FX_NKV, FX_CAP, FX_HD],
+                ),
+                v_norms: zeroed(FX_NKV * FX_CAP * 2 * 4, DType::F32, vec![FX_NKV, FX_CAP, 2]),
+                capacity: FX_CAP,
+                is_sliding: false,
+                norms_per_pos: 2,
+                bf16_xlen_k: None,
+                bf16_xlen_v: None,
+            }
+        }
+
+        fn stream(&self, seed: u64, rows: usize, heads: usize) -> MlxBuffer {
+            let elems = rows * heads * FX_HD;
+            let mut buffer = self
+                .ctx
+                .device()
+                .alloc_buffer(elems * 4, DType::F32, vec![rows, heads, FX_HD])
+                .expect("fixture stream");
+            buffer
+                .as_mut_slice::<f32>()
+                .unwrap()
+                .copy_from_slice(&fx_values(seed, elems));
+            buffer
+        }
+
+        /// One live forward of `lanes` (`(cache, start, rows)` each) on the
+        /// tensor route under `limits`; returns the output bits per lane and
+        /// the forward's scratch statistics.
+        fn forward(
+            &mut self,
+            seed: u64,
+            lanes: &[(&HybridKvBuffers, usize, usize)],
+            limits: TensorScratchLimits,
+        ) -> (Vec<Vec<u32>>, LiveScratchStats) {
+            let total: usize = lanes.iter().map(|lane| lane.2).sum();
+            let q = self.stream(seed, total, FX_NH);
+            let k = self.stream(seed ^ 0x5151, total, FX_NKV);
+            let v = self.stream(seed ^ 0xa3a3, total, FX_NKV);
+            let out = self.stream(0, total, FX_NH);
+            let positions = self
+                .ctx
+                .device()
+                .alloc_buffer(total * 4, DType::U32, vec![total])
+                .unwrap();
+            let layer = LiveLayer {
+                layer_idx: 5,
+                nh: FX_NH,
+                nkv: FX_NKV,
+                hd: FX_HD,
+                sliding_window: 1_024,
+                graft_len: 0,
+                tq_scale_factor_d512: 1.0,
+                tq_codebook_bits: 8,
+                q: &q,
+                k: &k,
+                v: &v,
+                out: &out,
+                positions: &positions,
+                vec: None,
+                total_rows: total,
+            };
+            let mut offset = 0;
+            let seqs: Vec<LiveSeq<'_>> = lanes
+                .iter()
+                .map(|&(kv, start, rows)| {
+                    let span = LiveSpan {
+                        offset,
+                        rows,
+                        start,
+                    };
+                    offset += rows;
+                    LiveSeq { kv, span }
+                })
+                .collect();
+            set_test_tensor_scratch_limits(Some(limits));
+            {
+                let (exec, reg) = self.ctx.split();
+                let dev = exec.device();
+                let mut scratch = LiveScratch::new(exec);
+                let mut session = exec.begin().unwrap();
+                encode_live_layer_attention(
+                    &mut session,
+                    reg,
+                    dev,
+                    &layer,
+                    LiveRoute::resolve(TensorF16),
+                    seqs,
+                    &mut scratch,
+                )
+                .unwrap();
+                session.finish().unwrap();
+            }
+            set_test_tensor_scratch_limits(None);
+            let bits: Vec<u32> = out
+                .as_slice::<f32>()
+                .unwrap()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect();
+            let row = FX_NH * FX_HD;
+            let mut offset = 0;
+            let per_lane = lanes
+                .iter()
+                .map(|&(_, _, rows)| {
+                    let lane = bits[offset * row..(offset + rows) * row].to_vec();
+                    offset += rows;
+                    lane
+                })
+                .collect();
+            (per_lane, last_forward_scratch_stats())
+        }
+    }
+
+    fn cache_bytes(kv: &HybridKvBuffers) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let bytes = |buffer: &MlxBuffer| buffer.as_slice::<u8>().unwrap().to_vec();
+        (bytes(&kv.k), bytes(&kv.v_packed), bytes(&kv.v_norms))
+    }
+
+    /// Bounding the global-layer scratch changes no bit. On each V storage:
+    /// a history is appended, then a suffix resumes on it, once as the
+    /// route first shipped (one dispatch, no waits) and once with a mask
+    /// limit of two threadgroups and a one-byte budget (a sub-chunk per 32
+    /// queries and a GPU wait before every admission). Outputs and caches
+    /// are equal, and a two-lane cohort under the tight limits gives each
+    /// lane the bits it has alone.
+    #[test]
+    fn bounded_tensor_global_scratch_is_bitwise_equal_to_the_unsplit_route() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        const HISTORY: [usize; 2] = [200, 77];
+        const SUFFIX: [usize; 2] = [150, 96];
+        for v_dtype in [DType::U8, DType::F16] {
+            let mut fx = GlobalFixture::new(v_dtype);
+            // Two threadgroups (16 queries each at head dim 512) of the
+            // deepest dispatch: 350 keys pad to 384.
+            let tight = TensorScratchLimits {
+                mask_bytes: tensor_mask_bytes(32, 384),
+                budget_bytes: 1,
+            };
+            let mut alone = Vec::new();
+            for limits in [TensorScratchLimits::UNBOUNDED, tight] {
+                let mut arm = Vec::new();
+                for lane in 0..2 {
+                    let kv = fx.kv();
+                    let (_, built) =
+                        fx.forward(11 + lane as u64, &[(&kv, 0, HISTORY[lane])], limits);
+                    let (out, resumed) = fx.forward(
+                        23 + lane as u64,
+                        &[(&kv, HISTORY[lane], SUFFIX[lane])],
+                        limits,
+                    );
+                    if limits == TensorScratchLimits::UNBOUNDED {
+                        assert_eq!((built.waits, resumed.waits), (0, 0), "{v_dtype:?}");
+                    } else {
+                        // Lane 0: 350 keys pad to 384, so 32 queries per
+                        // sub-chunk and five masks for 150 rows. Lane 1: 173
+                        // keys pad to 192, 64 queries per sub-chunk, two
+                        // masks. Every mask after the first waits.
+                        assert_eq!(resumed.waits, [4, 1][lane], "{v_dtype:?} lane {lane}");
+                    }
+                    assert!(resumed.peak_bytes > 0);
+                    arm.push((out.into_iter().next().unwrap(), cache_bytes(&kv)));
+                }
+                alone.push(arm);
+            }
+            assert!(
+                alone[0] == alone[1],
+                "{v_dtype:?}: bounded scratch changed an output or cache bit"
+            );
+            assert!(
+                alone[0][0].0.iter().any(|&bits| bits != 0),
+                "{v_dtype:?}: empty output"
+            );
+
+            // The same two suffixes as one cohort (one concatenated stream).
+            // A lane's stream rows differ from its solo forward's, so compare
+            // the cohort under both limits, and lane 0 (whose rows lead the
+            // stream) against its solo bits.
+            let cohort: Vec<_> = [TensorScratchLimits::UNBOUNDED, tight]
+                .into_iter()
+                .map(|limits| {
+                    let caches = [fx.kv(), fx.kv()];
+                    for lane in 0..2 {
+                        fx.forward(
+                            11 + lane as u64,
+                            &[(&caches[lane], 0, HISTORY[lane])],
+                            limits,
+                        );
+                    }
+                    let lanes: Vec<_> = (0..2)
+                        .map(|lane| (&caches[lane], HISTORY[lane], SUFFIX[lane]))
+                        .collect();
+                    let (out, stats) = fx.forward(23, &lanes, limits);
+                    (out, cache_bytes(&caches[0]), stats)
+                })
+                .collect();
+            assert!(
+                cohort[0].0 == cohort[1].0,
+                "{v_dtype:?}: cohort bits differ"
+            );
+            assert!(
+                cohort[0].1 == cohort[1].1,
+                "{v_dtype:?}: cohort cache differs"
+            );
+            assert_eq!(cohort[0].2.waits, 0);
+            assert!(cohort[1].2.waits > 0);
+            assert!(
+                cohort[1].0[0] == alone[0][0].0,
+                "{v_dtype:?}: lane 0 in a cohort differs from lane 0 alone"
             );
         }
-        assert!(parse_warm_tiled_switch(Some("yes")).is_err());
-        // An invalid value warns and keeps the default, reported as such.
+    }
+
+    /// The accounting holds a sequence's dense K/V while its sub-chunks run,
+    /// counts dropped scratch as submitted until a wait, and waits only when
+    /// the budget would be exceeded and something can be released.
+    #[test]
+    fn live_scratch_waits_only_to_release_submitted_scratch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let ctx = crate::serve::gpu::GpuContext::new().expect("Metal device");
+        let exec = &ctx.executor;
+        set_test_tensor_scratch_limits(Some(TensorScratchLimits {
+            mask_bytes: 64,
+            budget_bytes: 1_000,
+        }));
+        let mut scratch = LiveScratch::new(exec);
+        set_test_tensor_scratch_limits(None);
+        let mut session = exec.begin().unwrap();
+        // One oversized pair is admitted without a wait: nothing to release.
+        scratch.admit(&mut session, 5_000, true).unwrap();
         assert_eq!(
-            warm_kernel_for_switch(Some("yes")),
-            Resolved::default_value(TensorF16)
+            (scratch.stats.waits, scratch.held, scratch.submitted),
+            (0, 5_000, 0)
         );
+        // Its first mask too; the second finds a submitted mask and waits.
+        scratch.admit(&mut session, 300, false).unwrap();
+        assert_eq!((scratch.stats.waits, scratch.submitted), (0, 300));
+        scratch.admit(&mut session, 300, false).unwrap();
+        assert_eq!((scratch.stats.waits, scratch.submitted), (1, 300));
+        // Dropping the pair moves it to submitted; the next layer's pair
+        // waits for it.
+        scratch.release(5_000);
+        assert_eq!((scratch.held, scratch.submitted), (0, 5_300));
+        scratch.admit(&mut session, 5_000, true).unwrap();
+        assert_eq!(
+            (scratch.stats.waits, scratch.held, scratch.submitted),
+            (2, 5_000, 0)
+        );
+        // Peak: the pair plus one mask; the waits keep it from adding up.
+        assert_eq!(scratch.stats.peak_bytes, 5_300);
+        // A recorded session cannot be split: account, never wait.
+        scratch.set_can_wait(false);
+        scratch.release(5_000);
+        scratch.admit(&mut session, 5_000, true).unwrap();
+        assert_eq!(scratch.stats.waits, 2);
+        // A layer boundary that waited releases everything submitted.
+        scratch.layer_finished();
+        assert_eq!(scratch.submitted, 0);
+        session.finish().unwrap();
     }
 
     #[test]
@@ -1273,15 +1973,49 @@ mod tests {
         }
     }
 
+    /// The real probe on this device, through a production context: it
+    /// agrees with mlx-native's own availability answer for both head dims,
+    /// a capable device builds both pipelines (their compiled entries exist
+    /// afterwards) and resolves the tensor default, and an incapable one
+    /// reports the reason and falls back. Either way the frozen routing
+    /// policy is untouched.
     #[test]
-    fn warm_default_tensor_probe_reports_instead_of_failing() {
-        let device = MlxDevice::new().expect("Metal device");
-        let mut registry = KernelRegistry::new();
-        // A device with the Metal tensor API builds both pipelines; one
-        // without it reports the reason instead of failing the probe.
-        if let Some(reason) = tensor_route_unavailable(&mut registry, &device) {
+    fn warm_default_probe_builds_both_tensor_pipelines_or_reports_why() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use mlx_native::ops::flash_attn_prefill_tensor as tensor;
+        let mut ctx = crate::serve::gpu::GpuContext::new().expect("Metal device");
+        let policy = *ctx.ggml_routing_policy();
+        let (exec, registry) = ctx.split();
+        let device = exec.device();
+        let native: Vec<bool> = [256, 512]
+            .into_iter()
+            .map(|hd| tensor::flash_attn_prefill_tensor_available(registry, device, hd).unwrap())
+            .collect();
+        let reason = tensor_route_unavailable(registry, device);
+        assert_eq!(
+            reason.is_none(),
+            native == [true, true],
+            "{reason:?} {native:?}"
+        );
+        let (resolved, why) =
+            admit_warm_kernel(Resolved::default_value(TensorF16), || reason.clone());
+        if native == [true, true] {
+            assert_eq!(resolved, Resolved::default_value(TensorF16));
+            assert_eq!(why, None);
+            for name in [tensor::K_TENSOR_F16_D256, tensor::K_TENSOR_F16_D512] {
+                assert!(
+                    registry.get_pipeline(name, device.metal_device()).is_ok(),
+                    "{name} must build after a successful probe"
+                );
+            }
+        } else {
+            let reason = reason.expect("an unavailable route names its reason");
             assert!(reason.contains("Metal tensor API"), "{reason}");
+            assert_eq!(resolved, Resolved::fallback(VecHybrid));
+            assert_eq!(why.as_deref(), Some(reason.as_str()));
+            eprintln!("RECORDED SKIP: no Metal tensor API on this device ({reason})");
         }
+        assert_eq!(registry.ggml_routing_policy(), Some(&policy));
     }
 
     #[test]

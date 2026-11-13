@@ -38,6 +38,14 @@ struct Packet {
     targets: Vec<Target>,
     host_payload_limit: u64,
     rerun_id: String,
+    /// The three default-on routes the loaded model must resolve; absent =
+    /// Stock / Off / PerRow (the routes of every retained localizer run).
+    #[serde(default)]
+    matvec_kernels: super::deepseek_actual::MatvecKernels,
+    #[serde(default)]
+    tail_rows_step: super::deepseek_actual::TailRowsStep,
+    #[serde(default)]
+    attn_cores: super::deepseek_actual::AttnCores,
 }
 #[test]
 #[ignore = "root-reviewed bounded real DS localizer rerun; no automatic model load"]
@@ -122,6 +130,15 @@ fn q1_deepseek_actual_stage_localizer() {
         .unwrap();
     let mut model =
         crate::inference::models::deepseek4::Deepseek4Model::load_from_gguf(&gguf).unwrap();
+    let routes = super::deepseek_actual::require_routes(
+        (
+            packet.matvec_kernels,
+            packet.tail_rows_step,
+            packet.attn_cores,
+        ),
+        &model,
+    )
+    .unwrap();
     assert!(packet.tokens.iter().all(|&t| t < model.cfg.vocab_size));
     if targets.keys().any(|(_, layer, stage)| {
         *layer >= model.cfg.hash_layer_count
@@ -169,7 +186,7 @@ fn q1_deepseek_actual_stage_localizer() {
         trace.coverage.errors
     );
     let evidence = serde_json::json!({"schema":"hf2q.adr063.q1.stage-localizer.v1","packet_sha256":hash(&raw),
-        "route":"ActualDSExistingSingleLayerDiagnosticRoute","rerun_id":packet.rerun_id,"tokens":packet.tokens.len(),
+        "route":"ActualDSExistingSingleLayerDiagnosticRoute","routes":routes,"rerun_id":packet.rerun_id,"tokens":packet.tokens.len(),
         "records":trace.coverage.captured.len(),"cursor":cache.position(),"whole_q1_qualified":false,
         "serving_grouped_route_equivalence":"NotEstablishedByDiagnosticSplit"});
     let mut file = OpenOptions::new()

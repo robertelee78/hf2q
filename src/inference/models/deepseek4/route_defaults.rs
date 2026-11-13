@@ -21,7 +21,7 @@ use std::ffi::OsStr;
 
 use anyhow::Result;
 
-use crate::inference::models::route_default::Resolved;
+use crate::inference::models::route_default::{audit_text, Resolved, RouteAudit, AUDIT_TARGET};
 
 use super::joint_decode_rows::AttnCores;
 use super::residency::MatvecKernels;
@@ -60,20 +60,38 @@ impl DefaultRoutes {
         })
     }
 
-    /// One audit line per model load: each resolved route, whether it is the
-    /// default or an operator setting, and what the artifact and process
-    /// admit. `joint_unavailable` is the model's
-    /// `joint_decode_unavailable_reason`: while it is set, token-wise prompt
-    /// work runs one-token steps and no joint step runs, whatever the
-    /// switches say.
+    /// The three routes as the load banner, the audit line and
+    /// `/hf2q/v1/runtime` report them.
+    pub(super) fn audit(&self) -> Vec<RouteAudit> {
+        vec![
+            RouteAudit::new(
+                "deepseek_row_exact_matvec",
+                format!("{:?}", self.matvec.value),
+                self.matvec.source.as_str(),
+            ),
+            RouteAudit::new(
+                "deepseek_tail_rows_step",
+                format!("{:?}", self.tail_rows_step.value),
+                self.tail_rows_step.source.as_str(),
+            ),
+            RouteAudit::new(
+                "deepseek_batched_attn_cores",
+                format!("{:?}", self.attn_cores.value),
+                self.attn_cores.source.as_str(),
+            ),
+        ]
+    }
+
+    /// One audit line per model load, visible on a default `hf2q serve`:
+    /// each resolved route, whether it is the default or an operator
+    /// setting, and what the artifact and process admit.
+    /// `joint_unavailable` is the model's `joint_decode_unavailable_reason`:
+    /// while it is set, token-wise prompt work runs one-token steps and no
+    /// joint step runs, whatever the switches say.
     pub(super) fn log(&self, joint_unavailable: Option<&str>) {
         tracing::info!(
-            row_exact_matvec = ?self.matvec.value,
-            row_exact_matvec_source = self.matvec.source.as_str(),
-            tail_rows_step = ?self.tail_rows_step.value,
-            tail_rows_step_source = self.tail_rows_step.source.as_str(),
-            batched_attn_cores = ?self.attn_cores.value,
-            batched_attn_cores_source = self.attn_cores.source.as_str(),
+            target: AUDIT_TARGET,
+            routes = %audit_text(&self.audit()),
             token_wise_step_rows =
                 token_wise_step_rows(self.tail_rows_step.value, joint_unavailable),
             joint_routes = joint_unavailable.unwrap_or("available"),
@@ -149,6 +167,30 @@ mod tests {
             assert!(TailRowsStep::resolve(os(bad)).is_err(), "{bad:?}");
             assert!(AttnCores::resolve(os(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    /// The audit names the three routes with the wire spellings a Q5
+    /// readiness check compares, and reports a set switch as `env`.
+    #[test]
+    fn audit_reports_wire_values_and_sources() {
+        let routes = DefaultRoutes {
+            matvec: MatvecKernels::resolve(None).unwrap(),
+            tail_rows_step: TailRowsStep::resolve(os("0")).unwrap(),
+            attn_cores: AttnCores::resolve(os("1")).unwrap(),
+        };
+        let audit = routes.audit();
+        let text: Vec<String> = audit
+            .iter()
+            .map(|route| format!("{}={}/{}", route.name, route.value, route.source))
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "deepseek_row_exact_matvec=RowExact/default",
+                "deepseek_tail_rows_step=Off/env",
+                "deepseek_batched_attn_cores=Batched/env",
+            ]
+        );
     }
 
     /// The default never refuses an artifact whose joint routes are
