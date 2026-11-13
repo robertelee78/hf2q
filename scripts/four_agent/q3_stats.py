@@ -1,7 +1,7 @@
 """ADR-063 Q3 crossover design, paired effect estimator, stopping rule and family verdict. Pure.
 
 Everything here is predeclared in docs/research/adr063-q3-campaign.md ("Design",
-"Estimator", "Verdict"); change the doc and this module together, before data.
+"Estimator", "Comparison-arm failure policy", "Verdict"); change the doc and this module together, before data.
 """
 import math
 import statistics
@@ -17,6 +17,15 @@ PEER_PARITY = 1.0            # v0.1.30: statistically no slower than every valid
 NEUTRAL_RATIO = 1.025        # fairness regression band (the F2 2.5-point neutral band)
 # Stop reason of a no-stock stage (--no-stock-arm) whose only contrast (the peer) became unavailable or failed.
 NO_CONTRAST = "no_contrast"
+# Comparison-arm failure policy (ADR-063 Q4, operator decision 2026-11-12, "strict on us, fair on them"). A plan that
+# carries `comparison_failure_policy` reruns a comparison arm (stock, the peer, Splash; never the experiment) whose run
+# failed its own task, in the same block position, at most `reruns_per_position` times. A plan without the field keeps
+# the rule it was planned under (LEGACY_FAILURE_RULE): no reruns.
+FAILURE_POLICY_VERSION = 1
+RERUNS_PER_POSITION = 2
+RERUN_FAILURE_KINDS = ("task",)   # q3_metrics.classify kind of a client that ran to its end and did not complete the task
+COMPARISON_ARMS = ("stock", "peer", "splash")
+LEGACY_FAILURE_RULE = "legacy: no reruns; a peer or required-Splash task failure is Failed"
 # Two-sided 95% Student t quantiles, df = complete blocks - 1.
 T975 = {1: 12.7062, 2: 4.3027, 3: 3.1824, 4: 2.7764, 5: 2.5706, 6: 2.4469, 7: 2.3646, 8: 2.3060,
         9: 2.2622, 10: 2.2281, 11: 2.2010, 12: 2.1788, 13: 2.1604, 14: 2.1448, 15: 2.1314,
@@ -92,6 +101,72 @@ def stop_decision(completed_blocks, required, max_blocks=MAX_BLOCKS):
     return None
 
 
+def failure_policy(plan):
+    """The plan's frozen comparison-arm failure policy, validated; None for a plan recorded before the policy (or
+    planned with zero reruns), which keeps the legacy rule."""
+    policy = plan.get("comparison_failure_policy")
+    if policy is None:
+        return None
+    if (not isinstance(policy, dict) or policy.get("version") != FAILURE_POLICY_VERSION
+            or policy.get("reruns_per_position") != RERUNS_PER_POSITION
+            or policy.get("rerun_failure_kinds") != list(RERUN_FAILURE_KINDS)
+            or not isinstance(policy.get("arms"), list) or not set(policy["arms"]) <= set(COMPARISON_ARMS)):
+        raise ValueError(f"unsupported comparison_failure_policy {policy!r}")
+    return policy
+
+
+def failure_rule(plan):
+    """One line naming the rule a verdict was computed under."""
+    policy = failure_policy(plan)
+    if policy is None:
+        return LEGACY_FAILURE_RULE
+    return (f"comparison_failure_policy v{policy['version']}: a task failure of {', '.join(policy['arms']) or 'no arm'} "
+            f"is rerun in its block position, at most {policy['reruns_per_position']} reruns; an experiment failure "
+            "is Failed")
+
+
+def rerun_decision(policy, arm, outcome, failure_kind, prior_failures):
+    """What a settled attempt means under the policy: None (the legacy handling applies), "rerun" (discard the failed
+    attempt and run the same arm again in the same position) or "exhausted" (every allowed attempt of the position
+    failed). The inputs are the arm, the attempt's outcome and failure kind and the number of failed attempts already
+    discarded in this position; no timing, metric or effect can reach the decision, so a slow passing run is never
+    rerun."""
+    if policy is None or arm not in policy["arms"] or outcome != "Fail" or failure_kind not in policy["rerun_failure_kinds"]:
+        return None
+    return "rerun" if prior_failures < policy["reruns_per_position"] else "exhausted"
+
+
+def _binomial_tail(k, n, p):
+    """P(X >= k) for X ~ Binomial(n, p)."""
+    return sum(math.comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(k, n + 1))
+
+
+def clopper_pearson(failures, attempts, confidence=0.95):
+    """Exact two-sided binomial interval [low, high] for a failure rate; None without attempts."""
+    if not (isinstance(failures, int) and isinstance(attempts, int) and 0 <= failures <= attempts):
+        raise ValueError("failures must be an integer in 0..attempts")
+    if attempts == 0:
+        return None
+    alpha = (1 - confidence) / 2
+
+    def solve(tail, target):  # tail is increasing in p
+        low, high = 0.0, 1.0
+        for _ in range(200):
+            mid = (low + high) / 2
+            low, high = (mid, high) if tail(mid) < target else (low, mid)
+        return (low + high) / 2
+
+    lower = 0.0 if failures == 0 else solve(lambda p: _binomial_tail(failures, attempts, p), alpha)
+    upper = 1.0 if failures == attempts else solve(lambda p: _binomial_tail(failures + 1, attempts, p), 1 - alpha)
+    return [lower, upper]
+
+
+def failure_rate(failures, attempts):
+    """{attempts, failures, failure_rate, failure_rate_ci95} of task-scored attempts (passes plus task failures)."""
+    return {"attempts": attempts, "failures": failures, "failure_rate": failures / attempts if attempts else None,
+            "failure_rate_ci95": clopper_pearson(failures, attempts)}
+
+
 def regression(effect):
     """Lower-is-better metric significantly worse than the reference beyond the neutral band."""
     return effect is not None and effect["ratio_ci95"] is not None and effect["ratio_ci95"][0] > NEUTRAL_RATIO
@@ -111,7 +186,11 @@ def family_verdict(state):
     yields a Win and the vs-Splash ratio must meet the same peer margin. ADR-063 Q4-DS4-RACE decision
     D1 optionally adds stock_source ({"record", "sha256", "status", "reason"}), naming the bound
     same-artifact record that supplies vs_stock and fairness; every vs-stock reason names it, and a
-    missing or non-Complete record yields Pending with its reason.
+    missing or non-Complete record yields Pending with its reason. The comparison-arm failure policy (operator
+    decision 2026-11-12) optionally adds stock_unavailable (dict or None): a stock arm that failed its task in every
+    allowed attempt of one block position. Under that policy the driver records the same exhaustion of the peer or
+    Splash as peer_unavailable or splash_unavailable, so an exhausted comparison arm is Unavailable, never Failed and
+    never a Win; a comparison failure that was rerun to a pass is not in peer_failures or splash_failures.
     """
     splash = bool(state.get("splash_required"))
     source = state.get("stock_source")
@@ -124,6 +203,8 @@ def family_verdict(state):
         return "Unavailable", ["no runnable peer arm: " + state["peer_unavailable"]["reason"]]
     if splash and state.get("splash_unavailable") is not None:
         return "Unavailable", ["no runnable Splash arm: " + state["splash_unavailable"]["reason"]]
+    if state.get("stock_unavailable") is not None:
+        return "Unavailable", ["no usable stock arm: " + state["stock_unavailable"]["reason"] + named]
     if state["peer_failures"]:
         return "Failed", ["peer arm failed its task (a failed peer cannot yield a win): "
                           + "; ".join(state["peer_failures"])]
