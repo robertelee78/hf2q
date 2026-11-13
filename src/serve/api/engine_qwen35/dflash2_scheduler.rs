@@ -20,6 +20,7 @@ use crate::inference::models::qwen35::{
 };
 use crate::inference::spec_decode::dflash2::{
     adapters::{DFlash2TargetFamily, QwenDFlash2Adapter},
+    proposal_repetition::{DraftRepetitionPrior, HISTORY_CAPACITY},
     verify_budget::VerifyBudgetLane,
 };
 use crate::serve::api::engine_supervisor::EngineSupervisor;
@@ -32,6 +33,7 @@ use super::{
 
 const DFLASH2_MAX_ROWS_PER_LANE: usize = 8;
 const DFLASH2_PROPOSALS_PER_LANE: usize = DFLASH2_MAX_ROWS_PER_LANE - 1;
+const _: () = assert!(HISTORY_CAPACITY == super::QWEN35_REPETITION_WINDOW);
 
 /// Opt-in switch of the context-first commit order; exact value `1`.
 pub(in crate::serve::api) const DFLASH2_CONTEXT_FIRST_ENV: &str = "HF2Q_DFLASH2_CONTEXT_FIRST";
@@ -138,6 +140,7 @@ struct NextDraft {
     maximum_rows: Vec<u32>,
     lane_order: Vec<u32>,
     gpu_target_tokens: bool,
+    repetition: Option<DraftRepetitionPrior>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -560,6 +563,9 @@ impl Qwen35LoadedModel {
 
         let physical_lanes = runtime.workspace.max_lanes;
         let mut anchors = vec![0_u32; physical_lanes];
+        let mut repetition = runtime
+            .proposal_repetition_enabled()
+            .then(DraftRepetitionPrior::default);
         let mut temperatures = vec![0.0_f32; physical_lanes];
         // The native selector validates every physical lane before dispatch,
         // including lanes omitted from this scheduler step. Give inactive
@@ -572,6 +578,13 @@ impl Qwen35LoadedModel {
             anchors[slot] = window.pending_token;
             temperatures[slot] = 0.0;
             maximum_rows[slot] = u32::try_from(window.maximum_rows)?;
+            if let Some(prior) = repetition.as_mut() {
+                prior.set_lane(
+                    slot,
+                    super::effective_repetition_penalty(&state.params) as f32,
+                    state.sampling_history.iter().copied(),
+                )?;
+            }
         }
         let positions = runtime
             .lane_lengths()
@@ -605,6 +618,7 @@ impl Qwen35LoadedModel {
                     &maximum_rows,
                     &target_lane_order,
                     &uniforms,
+                    repetition.as_ref(),
                 )
             } else {
                 runtime.run_draft(
@@ -617,6 +631,7 @@ impl Qwen35LoadedModel {
                     0,
                     &maximum_rows,
                     &uniforms,
+                    repetition.as_ref(),
                 )
             }
         });
@@ -949,6 +964,7 @@ impl Qwen35LoadedModel {
                                 &next.lane_order,
                                 &uniforms,
                                 !next.gpu_target_tokens,
+                                next.repetition.as_ref(),
                             )
                         })
                     });
@@ -1181,6 +1197,9 @@ fn next_draft(
         maximum_rows: vec![1; physical_lanes],
         lane_order: Vec::with_capacity(verifying.len()),
         gpu_target_tokens: false,
+        repetition: runtime
+            .proposal_repetition_enabled()
+            .then(DraftRepetitionPrior::default),
     };
     for (&length, &retained) in runtime.lane_lengths().iter().zip(retained) {
         next.positions
@@ -1201,7 +1220,22 @@ fn next_draft(
             continue;
         };
         let slot = state.slot_id.0;
-        next.anchors[slot as usize] = anchor;
+        {
+            if let Some(prior) = next.repetition.as_mut() {
+                prior
+                    .set_lane(
+                        slot as usize,
+                        super::effective_repetition_penalty(&state.params) as f32,
+                        state
+                            .sampling_history
+                            .iter()
+                            .chain(plan.plan.output.iter())
+                            .copied(),
+                    )
+                    .ok()?;
+            }
+            next.anchors[slot as usize] = anchor;
+        };
         next.maximum_rows[slot as usize] = remaining.min(DFLASH2_MAX_ROWS_PER_LANE) as u32;
         next.lane_order.push(slot);
     }
