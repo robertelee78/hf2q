@@ -334,7 +334,7 @@ pub(crate) fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_fast(
     // its next host wait; otherwise it is released here, so the native
     // observer retains this command before the layer's next wait checks
     // the queue.
-    super::encoder_stage::retain_submitted(enc);
+    super::encoder_stage::retain_submitted(enc, "layer.full_attn.tq_bridge_resume");
     Ok(out)
 }
 

@@ -3041,7 +3041,7 @@ pub fn build_delta_net_layer(
                     .context("complete source-teacher Delta prefill ops1-3")?;
             } else {
                 enc.commit_labeled("layer.gdn.ops1-3");
-                super::encoder_stage::retain_submitted(enc);
+                super::encoder_stage::retain_submitted(enc, "layer.gdn.ops1-3");
             }
             (x_norm, qkv_conv, z)
         };
@@ -3119,7 +3119,7 @@ pub fn build_delta_net_layer(
                     .context("complete source-teacher Delta QKV split")?;
             } else {
                 enc.commit_labeled("layer.gdn.qkv_split");
-                super::encoder_stage::retain_submitted(enc);
+                super::encoder_stage::retain_submitted(enc, "layer.gdn.qkv_split");
             }
             (q_gpu, k_gpu, v_gpu)
         };
@@ -3540,7 +3540,7 @@ pub fn build_delta_net_layer(
                     .context("complete source-teacher Delta prefill ops5-9")?;
             } else {
                 enc.commit_labeled("layer.gdn.ops5-9");
-                super::encoder_stage::retain_submitted(enc);
+                super::encoder_stage::retain_submitted(enc, "layer.gdn.ops5-9");
             }
             output
         };
@@ -4550,7 +4550,10 @@ pub fn build_delta_net_layer_with_arena(
             (Some(stage), _) => stage
                 .carry_into_next_stage("layer.gdn.ops5-9")
                 .context("carry DN ops5-9 (arena)")?,
-            (None, Some(mut command)) => command.commit_labeled("layer.gdn.ops5-9"),
+            (None, Some(mut command)) => {
+                command.commit_labeled("layer.gdn.ops5-9");
+                super::encoder_stage::retain_submitted(command, "layer.gdn.ops5-9");
+            }
             (None, None) => unreachable!("one of the two encoders exists"),
         }
         output

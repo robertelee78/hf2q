@@ -98,40 +98,53 @@ use anyhow::{Context, Result};
 
 use mlx_native::{CommandEncoder, EncoderSession, MlxDevice};
 
-/// The command buffers a pipelined prefill forward
-/// (`HF2Q_QWEN_PREFILL_WAIT_LAYERS` above 1) has committed without a wait
+/// The command buffers a multi-row forward has committed without a wait
 /// since its last host wait, in commit order.
 struct Submitted {
-    device: MlxDevice,
+    /// The device of a forward that submits its layers without a wait and
+    /// without the shared-event fence (`HF2Q_QWEN_PREFILL_WAIT_LAYERS`
+    /// above 1); `None` at the default cadence.
+    pipelined: Option<MlxDevice>,
     commands: Vec<CommandEncoder>,
+    /// The label each command was committed under.
+    #[cfg(test)]
+    labels: Vec<String>,
 }
 
 thread_local! {
     static SUBMITTED: std::cell::RefCell<Option<Submitted>> =
         const { std::cell::RefCell::new(None) };
-    /// Test failpoint: the position, among the commands one settle waits
-    /// for, of a command that is reported as failed after it completed.
+    /// The emptied list of the last forward: its allocation serves the next.
+    static SPARE: std::cell::RefCell<Vec<CommandEncoder>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Test failpoint ([`FailSubmitted`]).
     #[cfg(test)]
-    static FAIL_SUBMITTED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static FAIL_SUBMITTED: std::cell::RefCell<Option<FailPoint>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// While alive, this thread's forward keeps every command buffer it commits
-/// without a wait until its next host wait, which then waits for each of
-/// them and reads each one's status ([`settle_submitted`]): command buffers
-/// of one queue may overlap, so the last one's status says nothing about
-/// the earlier ones. Dropping it waits for whatever is still kept, so a
-/// forward that returns an error leaves none of its layers running.
+/// While alive, this thread's multi-row forward keeps every command buffer
+/// it commits without a wait through [`retain_submitted`], whatever its
+/// wait cadence, until a host wait settles them ([`settle_submitted`]):
+/// that wait then waits for each of them and reads each one's status.
+/// Command buffers of one queue may overlap, so the status of the one the
+/// host waited for says nothing about the earlier ones. The forward settles
+/// once more before it returns, with either result; dropping the scope
+/// waits for whatever is still kept, so nothing of the forward is running
+/// once the scope is gone.
 pub(super) struct SubmittedCommands {
     previous: Option<Submitted>,
 }
 
 impl SubmittedCommands {
-    /// `device`: `Some` for a forward that submits its layers without a
-    /// wait, `None` for every other forward (nothing is kept).
-    pub(super) fn open(device: Option<&MlxDevice>) -> Self {
-        let next = device.map(|device| Submitted {
-            device: device.clone(),
-            commands: Vec::new(),
+    /// `active`: whether the forward is a multi-row forward. A one-row
+    /// (decode) forward keeps nothing and releases at commit, as before.
+    pub(super) fn open(active: bool) -> Self {
+        let next = active.then(|| Submitted {
+            pipelined: None,
+            commands: SPARE.with(|spare| std::mem::take(&mut *spare.borrow_mut())),
+            #[cfg(test)]
+            labels: Vec::new(),
         });
         Self {
             previous: SUBMITTED.with(|cell| cell.replace(next)),
@@ -142,23 +155,54 @@ impl SubmittedCommands {
 impl Drop for SubmittedCommands {
     fn drop(&mut self) {
         let mine = SUBMITTED.with(|cell| cell.replace(self.previous.take()));
-        for command in mine.into_iter().flat_map(|submitted| submitted.commands) {
-            // The forward is over: an error it has not reported yet is on
-            // its way to the caller already.
-            let _ = command.wait_until_completed();
+        if let Some(mut submitted) = mine {
+            for command in submitted.commands.drain(..) {
+                // Reached only when the forward unwinds past its final
+                // settle; nothing is left to report to.
+                let _ = command.wait_until_completed();
+            }
+            SPARE.with(|spare| *spare.borrow_mut() = submitted.commands);
         }
     }
 }
 
-/// Keep `command`, committed without a wait, for the forward's next host
-/// wait. Outside a pipelined forward the command is released at once, as
-/// before.
-pub(super) fn retain_submitted(command: CommandEncoder) {
+/// Mark this thread's forward as one that submits its layers without a
+/// wait and without the fence (`device`: `Some`), or not.
+pub(super) fn set_pipelined(device: Option<&MlxDevice>) {
+    SUBMITTED.with(|cell| {
+        if let Some(submitted) = cell.borrow_mut().as_mut() {
+            submitted.pipelined = device.cloned();
+        }
+    });
+}
+
+/// Whether this thread's forward keeps the commands it commits.
+fn retaining() -> bool {
+    SUBMITTED.with(|cell| cell.borrow().is_some())
+}
+
+/// Whether this thread's forward submits its layers without a wait.
+fn pipelined() -> bool {
+    SUBMITTED.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|submitted| submitted.pipelined.is_some())
+    })
+}
+
+/// Keep `command`, committed without a wait under `label`, for the
+/// forward's next host wait. Outside a multi-row forward the command is
+/// released at once, as before.
+pub(super) fn retain_submitted(command: CommandEncoder, label: &str) {
     SUBMITTED.with(|cell| {
         if let Some(submitted) = cell.borrow_mut().as_mut() {
             submitted.commands.push(command);
+            #[cfg(test)]
+            submitted.labels.push(label.to_owned());
         }
     });
+    #[cfg(not(test))]
+    let _ = label;
 }
 
 /// A fresh command encoder when this thread's forward is pipelined.
@@ -166,53 +210,78 @@ fn pipelined_encoder() -> Result<Option<CommandEncoder>> {
     SUBMITTED.with(|cell| {
         cell.borrow()
             .as_ref()
-            .map(|submitted| {
-                submitted
-                    .device
-                    .command_encoder()
-                    .map(crate::inference::native_observation::encoder)
-                    .context("command encoder of a pipelined layer")
-            })
+            .and_then(|submitted| submitted.pipelined.as_ref())
+            .map(observed_encoder)
             .transpose()
     })
+}
+
+fn observed_encoder(device: &MlxDevice) -> Result<CommandEncoder> {
+    device
+        .command_encoder()
+        .map(crate::inference::native_observation::encoder)
+        .context("command encoder behind a kept command buffer")
 }
 
 /// Wait for every kept command buffer and report the first failure in
 /// commit order. Every one is waited for, also behind a failed one, so the
 /// caller may reset or reuse the slots of a failed forward.
 pub(super) fn settle_submitted() -> Result<()> {
-    let commands = SUBMITTED
-        .with(|cell| {
-            cell.borrow_mut()
-                .as_mut()
-                .map(|submitted| std::mem::take(&mut submitted.commands))
-        })
-        .unwrap_or_default();
-    settle(&commands, None)
+    settle_kept(None)
 }
 
-/// [`settle_submitted`] over `commands`, then over `last` (the command of a
-/// session whose terminal stage was committed in place).
-fn settle(commands: &[CommandEncoder], last: Option<&CommandEncoder>) -> Result<()> {
+/// [`settle_submitted`], then `last`: the command of a session whose
+/// terminal stage was committed in place under `last.1`.
+fn settle_kept(last: Option<(&CommandEncoder, &str)>) -> Result<()> {
+    let Some(mut commands) = SUBMITTED.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .map(|submitted| std::mem::take(&mut submitted.commands))
+    }) else {
+        return match last {
+            Some((command, _)) => command
+                .wait_until_completed()
+                .context("command buffer committed without a wait"),
+            None => Ok(()),
+        };
+    };
+    #[cfg(test)]
+    let mut labels = SUBMITTED.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .map(|submitted| std::mem::take(&mut submitted.labels))
+            .unwrap_or_default()
+    });
+    #[cfg(test)]
+    labels.extend(last.map(|(_, label)| label.to_owned()));
     let total = commands.len() + usize::from(last.is_some());
     let mut first: Option<(usize, anyhow::Error)> = None;
     let mut failed = 0usize;
-    for (index, command) in commands.iter().chain(last).enumerate() {
+    for (index, command) in commands.iter().chain(last.map(|(command, _)| command)).enumerate() {
         let waited = command.wait_until_completed();
         #[cfg(test)]
-        let waited = match FAIL_SUBMITTED.with(std::cell::Cell::get) {
-            Some(target) if target == index => {
-                waited.and(Err(mlx_native::MlxError::CommandBufferError(
-                    "injected command buffer failure".into(),
-                )))
-            }
-            _ => waited,
+        let waited = if FailPoint::hits(&labels[index]) {
+            waited.and(Err(mlx_native::MlxError::CommandBufferError(format!(
+                "injected failure of {}",
+                labels[index]
+            ))))
+        } else {
+            waited
         };
         if let Err(error) = waited {
             failed += 1;
             first.get_or_insert((index, anyhow::Error::new(error)));
         }
     }
+    // Hand the emptied list back: its allocation serves the next window.
+    commands.clear();
+    SUBMITTED.with(|cell| {
+        if let Some(submitted) = cell.borrow_mut().as_mut() {
+            if submitted.commands.is_empty() {
+                submitted.commands = commands;
+            }
+        }
+    });
     match first {
         None => Ok(()),
         Some((index, error)) => Err(error.context(format!(
@@ -222,24 +291,69 @@ fn settle(commands: &[CommandEncoder], last: Option<&CommandEncoder>) -> Result<
     }
 }
 
-/// Test failpoint for [`settle_submitted`]: until dropped, the command at
-/// `position` of every settle on this thread is reported as failed once it
-/// has completed.
+/// Test failpoint for the kept command buffers: until dropped, the
+/// `occurrence`-th command (0-based, counted over the thread's settles
+/// since the failpoint was set) whose label starts with `prefix` is
+/// reported as failed once it has completed.
 #[cfg(test)]
 pub(crate) struct FailSubmitted;
 
 #[cfg(test)]
+struct FailPoint {
+    prefix: String,
+    occurrence: usize,
+    seen: usize,
+    hit: bool,
+}
+
+#[cfg(test)]
+impl FailPoint {
+    fn hits(label: &str) -> bool {
+        FAIL_SUBMITTED.with(|cell| {
+            let mut point = cell.borrow_mut();
+            let Some(point) = point.as_mut() else {
+                return false;
+            };
+            if !label.starts_with(&point.prefix) {
+                return false;
+            }
+            point.seen += 1;
+            let hit = point.seen - 1 == point.occurrence;
+            point.hit |= hit;
+            hit
+        })
+    }
+}
+
+#[cfg(test)]
 impl FailSubmitted {
-    pub(crate) fn at(position: usize) -> Self {
-        FAIL_SUBMITTED.with(|cell| cell.set(Some(position)));
+    pub(crate) fn nth(prefix: &str, occurrence: usize) -> Self {
+        FAIL_SUBMITTED.with(|cell| {
+            *cell.borrow_mut() = Some(FailPoint {
+                prefix: prefix.to_owned(),
+                occurrence,
+                seen: 0,
+                hit: false,
+            });
+        });
         Self
+    }
+
+    /// Whether the failpoint has fired, and how many commands with its
+    /// prefix the settles have seen.
+    pub(crate) fn seen(&self) -> (bool, usize) {
+        FAIL_SUBMITTED.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map_or((false, 0), |point| (point.hit, point.seen))
+        })
     }
 }
 
 #[cfg(test)]
 impl Drop for FailSubmitted {
     fn drop(&mut self) {
-        FAIL_SUBMITTED.with(|cell| cell.set(None));
+        FAIL_SUBMITTED.with(|cell| *cell.borrow_mut() = None);
     }
 }
 
@@ -380,7 +494,7 @@ impl<'sess> LayerEncoder<'sess> {
         match self {
             LayerEncoder::Plain(mut enc) => {
                 enc.commit_labeled(label);
-                retain_submitted(enc);
+                retain_submitted(enc, label);
                 Ok(())
             }
             LayerEncoder::Sessioned(sess) => {
@@ -396,7 +510,7 @@ impl<'sess> LayerEncoder<'sess> {
                     // next host wait reads its status.
                     let mut submitted = std::mem::replace(sess.encoder(), next);
                     submitted.commit_labeled(label);
-                    retain_submitted(submitted);
+                    retain_submitted(submitted, label);
                     return Ok(());
                 }
                 sess.fence_stage(Some(label))
@@ -457,7 +571,7 @@ impl<'sess> LayerEncoder<'sess> {
                 // env=0 has no session to carry; preserve pre-iter91
                 // per-stage CB termination behavior byte-for-byte.
                 enc.commit_labeled(label);
-                retain_submitted(enc);
+                retain_submitted(enc, label);
                 Ok(())
             }
             LayerEncoder::Sessioned(sess) => {
@@ -522,6 +636,28 @@ impl<'sess> LayerEncoder<'sess> {
     /// decode path.  The arm is preserved for completeness — callers may
     /// reach it on greedy/argmax paths if they thread a session in the
     /// future.
+    /// [`Self::fence_or_commit`] for a stage whose command buffer must be
+    /// kept at every wait cadence (the joint prefill's gather and join):
+    /// under the session at the default cadence the stage is fenced as
+    /// before, and the session continues on a fresh encoder so the committed
+    /// one can be kept; `reset_for_next_stage` encodes the wait for the
+    /// fence on it. Dispatches, the fence and the waits are unchanged.
+    pub(super) fn fence_or_commit_kept(self, device: &MlxDevice, label: &str) -> Result<()> {
+        match self {
+            LayerEncoder::Sessioned(sess) if retaining() && !pipelined() => {
+                sess.fence_stage(Some(label))
+                    .with_context(|| format!("EncoderSession::fence_stage({label})"))?;
+                let submitted = std::mem::replace(sess.encoder(), observed_encoder(device)?);
+                sess.reset_for_next_stage().with_context(|| {
+                    format!("EncoderSession::reset_for_next_stage({label})")
+                })?;
+                retain_submitted(submitted, label);
+                Ok(())
+            }
+            encoder => encoder.fence_or_commit(label),
+        }
+    }
+
     pub(super) fn commit_unlabeled(self) -> Result<()> {
         match self {
             LayerEncoder::Plain(mut enc) => {
@@ -570,7 +706,7 @@ impl<'sess> LayerEncoder<'sess> {
     }
 
     fn commit_and_wait_labeled_impl(self, label: &str, reset_for_next_stage: bool) -> Result<()> {
-        if SUBMITTED.with(|cell| cell.borrow().is_some()) {
+        if pipelined() {
             // A pipelined forward's host wait: commit this command buffer
             // like the layers before it, then wait for every one of them
             // in commit order and read every status.
@@ -581,14 +717,7 @@ impl<'sess> LayerEncoder<'sess> {
                     sess.begin_stage(label);
                     sess.commit_stage()
                         .with_context(|| format!("EncoderSession::commit_stage({label})"))?;
-                    let commands = SUBMITTED
-                        .with(|cell| {
-                            cell.borrow_mut()
-                                .as_mut()
-                                .map(|submitted| std::mem::take(&mut submitted.commands))
-                        })
-                        .unwrap_or_default();
-                    settle(&commands, Some(&*sess.encoder()))
+                    settle_kept(Some((&*sess.encoder(), label)))
                 }
                 encoder => {
                     encoder.fence_or_commit(label)?;
@@ -597,6 +726,16 @@ impl<'sess> LayerEncoder<'sess> {
             }
             .with_context(|| format!("host wait at {label}"));
         }
+        let waited = self.commit_and_wait_now(label, reset_for_next_stage);
+        // The stage command buffers the forward kept since its last host
+        // wait were committed before this one: all are waited for, and the
+        // first failure in commit order is theirs.
+        let settled = settle_submitted().with_context(|| format!("host wait at {label}"));
+        settled.and(waited)
+    }
+
+    /// Commit this command buffer and wait for it.
+    fn commit_and_wait_now(self, label: &str, reset_for_next_stage: bool) -> Result<()> {
         match self {
             LayerEncoder::Plain(mut enc) => enc
                 .commit_and_wait_labeled(label)

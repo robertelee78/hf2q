@@ -1191,7 +1191,7 @@ pub(super) fn embed_tokens_gpu_into(
                 .context("native embedding completion")?;
         } else {
             enc.commit_labeled("qwen35.embedding.native");
-            super::encoder_stage::retain_submitted(enc);
+            super::encoder_stage::retain_submitted(enc, "qwen35.embedding.native");
         }
         return Ok(());
     }
@@ -1330,7 +1330,7 @@ pub(super) fn embed_token_ids_gpu_into(
         NativeEmbeddingRoute::F32 => unreachable!("rejected above"),
     }
     enc.commit_labeled("qwen35.embedding.gpu_token_ids");
-    super::encoder_stage::retain_submitted(enc);
+    super::encoder_stage::retain_submitted(enc, "qwen35.embedding.gpu_token_ids");
     Ok(())
 }
 
@@ -4719,6 +4719,10 @@ impl Qwen35Model {
         slot_id: SlotId,
         residual_capture: Option<ResidualLayerCapture<'_>>,
     ) -> Result<Vec<f32>> {
+        // Every command buffer a multi-row forward commits without a wait
+        // is kept from its first submission (the embedding) on, at every
+        // wait cadence.
+        let submitted = super::encoder_stage::SubmittedCommands::open(tokens.len() > 1);
         let result = self.forward_gpu_run(
             tokens,
             positions_flat,
@@ -4734,6 +4738,22 @@ impl Qwen35Model {
             slot_id,
             residual_capture,
         );
+        // Settle what the forward still keeps before either result leaves:
+        // the commands of its last window (a forward whose output head is
+        // fused into the last layer's command buffer waits for that one
+        // alone), and whatever a failed forward had committed. A failed
+        // command buffer is the forward's error even when the host saw
+        // another error or none: it is what the worker fail-stops on.
+        let settled = super::encoder_stage::settle_submitted()
+            .context("command buffers settled at the end of the forward");
+        drop(submitted);
+        let result = match (result, settled) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(gpu)) => Err(gpu),
+            (Err(host), Err(gpu)) => Err(gpu.context(format!(
+                "the forward had already failed on the host: {host:#}"
+            ))),
+        };
         if result.is_err() {
             drain_after_failed_forward();
         }
@@ -5476,11 +5496,10 @@ impl Qwen35Model {
         let _single_command_layers = super::prefill_prepared::SingleCommandLayers::set(
             pipelined_layers && encoder_session_enabled,
         );
-        // Every command buffer such a forward commits without a wait is
-        // kept until its next host wait reads its status; a forward that
-        // returns an error waits for all of them first.
-        let _submitted_commands =
-            super::encoder_stage::SubmittedCommands::open(pipelined_layers.then_some(device));
+        // Such a forward's layer submits skip the shared-event fence and
+        // hand their command buffers to the forward's kept list
+        // (`encoder_stage::SubmittedCommands`, opened by `forward_gpu_impl`).
+        super::encoder_stage::set_pipelined(pipelined_layers.then_some(device));
         let ffn_terminal_k_batch = if small_nextn_verifier {
             // Exact speculative verification is a fixed, short graph whose
             // scratch buffers are retained until the output-head drain. One
@@ -6023,7 +6042,7 @@ impl Qwen35Model {
                                 })?;
                             }
                         }
-                        enc.fence_or_commit("layer.full_attn.joint_gather")
+                        enc.fence_or_commit_kept(&device, "layer.full_attn.joint_gather")
                             .context("commit joint prefill attention gather")?;
                     }
                     let mut outputs = Vec::with_capacity(joint_segments.len());
@@ -6092,7 +6111,7 @@ impl Qwen35Model {
                         )
                         .with_context(|| format!("joint prefill attention join layer {layer_idx}"))?;
                     }
-                    enc.fence_or_commit("layer.full_attn.cue_fold_join")
+                    enc.fence_or_commit_kept(&device, "layer.full_attn.cue_fold_join")
                         .context("commit joint prefill attention join")?;
                     joined
                 }

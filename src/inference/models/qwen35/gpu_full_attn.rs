@@ -4774,6 +4774,7 @@ pub fn apply_flash_attn_prefill_seq_major(
         // so no deferred removeAllocation: is staged — iter58b race is
         // structurally unreachable (queen plan A.5 / ADR-013 P21 S1).
         enc.commit_labeled("fa.prefill_bridge");
+        super::encoder_stage::retain_submitted(enc, "fa.prefill_bridge");
 
         // ── ITER-17 DIAGNOSTIC (HF2Q_DUMP_FA_BF16=1) ────────────────────
         // Dim=10 NaN bug investigation: dump arena.out_bf16_hm bytes
@@ -5447,7 +5448,7 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
     // its next host wait; otherwise it is released here, so the native
     // observer retains this command before the dense resume's wait checks
     // the queue.
-    super::encoder_stage::retain_submitted(enc);
+    super::encoder_stage::retain_submitted(enc, "layer.full_attn.tq_bridge_dequant");
 
     // Dispatch the same dense resume kernel against the tight temp
     // buffers. kv_capacity = kv_seq_len so the kernel's head-stride
@@ -5632,7 +5633,7 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct_for_slot(
     // downstream gate/output projection consume `output` after attention;
     // a host wait here would serialize every full-attention layer.
     encoder.commit_labeled("layer.full_attn.tq_direct_prefill");
-    super::encoder_stage::retain_submitted(encoder);
+    super::encoder_stage::retain_submitted(encoder, "layer.full_attn.tq_direct_prefill");
     Ok(output)
 }
 
@@ -5964,7 +5965,7 @@ pub fn apply_sdpa_with_kv_cache(
                     .context("complete source-teacher KV prefill write")?;
             } else {
                 enc.commit_labeled("layer.full_attn.kv_cache_write");
-                super::encoder_stage::retain_submitted(enc);
+                super::encoder_stage::retain_submitted(enc, "layer.full_attn.kv_cache_write");
             }
         }
 
@@ -7577,6 +7578,7 @@ pub fn build_gated_attn_layer(
                     .context("complete source-teacher full-attention ops1-4")?;
             } else if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
                 enc.commit_labeled("layer.full_attn.ops1-4");
+                super::encoder_stage::retain_submitted(enc, "layer.full_attn.ops1-4");
             } else {
                 enc.commit_and_wait_labeled("layer.full_attn.ops1-4")
                     .context("commit ops1-4 prefill")?;

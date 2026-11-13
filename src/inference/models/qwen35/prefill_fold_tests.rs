@@ -813,6 +813,63 @@ fn a_moe_model_admits_no_fold_under_a_mm_id_threshold_override() {
     );
 }
 
+/// The same refusal through the process environment, which is what a
+/// served worker reads: this test runs [`moe_fold_refusal_in_a_child`] in a
+/// fresh process of this test binary with `HF2Q_MM_ID_ROUTING_THRESHOLD=64`
+/// (the predicate and mlx-native both read the variable once per process).
+#[test]
+fn a_process_with_a_mm_id_threshold_override_admits_no_moe_fold() {
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "inference::models::qwen35::prefill_fold_tests::moe_fold_refusal_in_a_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("HF2Q_MM_ID_ROUTING_THRESHOLD", "64")
+        .env("P834_OVERRIDE_CHILD", "1")
+        .output()
+        .expect("run the child test process");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success() && text.contains("[OVERRIDE_CHILD] refused") && text.contains("1 passed"),
+        "the child process under the override did not refuse the MoE fold:\n{text}"
+    );
+}
+
+/// The child of [`a_process_with_a_mm_id_threshold_override_admits_no_moe_fold`];
+/// a no-op in an ordinary test run.
+#[test]
+fn moe_fold_refusal_in_a_child() {
+    if std::env::var_os("P834_OVERRIDE_CHILD").is_none() {
+        return;
+    }
+    assert!(
+        super::prefill_fold::moe_route_override(),
+        "the override is not visible to the predicate"
+    );
+    with_synthetic_moe_model(|model| {
+        let _scope = PrefillScope::forced(true);
+        assert!(model.unfolded_routes().moe_route_override);
+        assert!(
+            !model.prefill_fold_exact().expect("exactness"),
+            "a MoE model folds in a process with the threshold override"
+        );
+    });
+    with_synthetic_model(|model| {
+        let _scope = PrefillScope::forced(true);
+        assert!(
+            model.prefill_fold_exact().expect("exactness"),
+            "a dense-FFN model stopped folding in a process with the MoE threshold override"
+        );
+    });
+    eprintln!("[OVERRIDE_CHILD] refused");
+}
+
 #[test]
 fn the_fold_is_not_taken_with_dump_bisect_enabled() {
     no_fold_under(

@@ -1226,65 +1226,218 @@ fn a_cohort_retried_after_a_failed_joint_forward_holds_its_solo_bits() {
     });
 }
 
-/// With `HF2Q_QWEN_PREFILL_WAIT_LAYERS` above 1 the forward commits whole
-/// layers without a wait. Command buffers of one queue may overlap, so the
-/// status of the one the host waits for says nothing about the earlier
-/// ones: the forward keeps every one of them and each host wait reads every
-/// status. A failure of the first of several (injected once the command
-/// has completed) fails the forward, every command is still waited for, and
-/// the slots are reusable at once.
-#[test]
-fn a_failed_command_buffer_committed_without_a_wait_fails_the_forward() {
+/// A joint forward of three cold lanes that share 96 rows (so the attention
+/// layers gather and join), one with a folded cue, under `fail`: the kept
+/// command buffer it names is reported as failed once it has completed.
+/// Returns the forward's error text, and whether a command with that label
+/// was kept at all. After a failure the lanes are reset at once and the
+/// next conversation in slot 0 must have a fresh slot's bits.
+fn joint_forward_with_a_failed_command(
+    model: &Qwen35Model,
+    reference: &[u32],
+    next: &Lane,
+    wait: usize,
+    prefix: &str,
+    occurrence: usize,
+) -> (Option<String>, bool) {
     use super::encoder_stage::FailSubmitted;
     use super::prefill_prepared::ForcedWaitLayers;
+    let _cadence = ForcedWaitLayers::set(wait);
+    let mut cache = cache(model);
+    let lanes = [
+        Lane::cold(0, 96, 150, 5),
+        Lane::cold(1, 96, 120, 0),
+        Lane::cold(2, 96, 110, 0),
+    ];
+    let fail = FailSubmitted::nth(prefix, occurrence);
+    let result = joint_forward(model, &mut cache, &lanes, 96, false);
+    let (hit, seen) = fail.seen();
+    drop(fail);
+    let error = result.err().map(|error| format!("{error:#}"));
+    assert_eq!(
+        hit,
+        error.is_some(),
+        "wait {wait}, {prefix}: a failed command buffer and the forward's result disagree \
+         ({seen} such commands settled, error {error:?})"
+    );
+    if let Some(text) = &error {
+        assert!(
+            text.contains("committed without a wait failed") && text.contains(prefix),
+            "wait {wait}, {prefix}: not the kept command's failure: {text}"
+        );
+        for lane in &lanes {
+            cache.reset_for_slot(SlotId(lane.slot)).expect("reset");
+        }
+        assert_eq!(dn_state_nonzero(&cache, 1), 0, "wait {wait}, {prefix}: reset slot holds state");
+        assert!(
+            next_conversation(model, &mut cache, next) == reference,
+            "wait {wait}, {prefix}: the next conversation after the failure differs from a fresh slot"
+        );
+        assert_eq!(dn_state_nonzero(&cache, 1), 0, "wait {wait}, {prefix}: a late command wrote a reset slot");
+    }
+    (error, seen > 0)
+}
+
+/// Command buffers of one queue may overlap, so the status of the one the
+/// host waits for says nothing about those committed before it. Every
+/// command buffer a multi-row forward commits without a wait is kept, at
+/// every wait cadence, and a failure of any of them (injected once the
+/// command has completed) is the forward's error: the DeltaNet recurrence
+/// stage of the arena route, the
+/// joint forward's attention gather and join, the attention stages, and a
+/// layer's own command buffer where the cadence submits it without a wait.
+/// All are still waited for, and the slots are reusable at once.
+#[test]
+fn every_command_buffer_committed_without_a_wait_can_fail_the_forward() {
+    use super::encoder_stage::LayerEncoder;
     with_synthetic_model(|model| {
+        let session = LayerEncoder::env_enabled();
         let next = Lane {
             seed: 41,
             common: 0,
             ..Lane::new(0, &[], 60, 5)
         };
         let reference = solo(model, &next, false).logits;
-        let victim = Lane::new(0, &[40], 300, 5);
-        let other = Lane::new(1, &[], 200, 0);
-        for wait in [2usize, 8] {
-            let _cadence = ForcedWaitLayers::set(wait);
-            let mut cache = cache(model);
-            {
-                let _scope = PrefillScope::forced(true);
-                prefill_history(model, &mut cache, &victim);
-            }
-            let failure = {
-                let _fail = FailSubmitted::at(0);
-                joint_forward(model, &mut cache, &[other, victim], 0, false)
+        for wait in [1usize, 2, 8] {
+            let fails = |prefix: &str, occurrence: usize| {
+                joint_forward_with_a_failed_command(model, &reference, &next, wait, prefix, occurrence)
             };
-            let text = failure
-                .err()
-                .map(|error| format!("{error:#}"))
-                .unwrap_or_else(|| panic!("wait {wait}: a failed command buffer was dropped"));
-            assert!(
-                text.contains("command buffer 1 of ")
-                    && text.contains("committed without a wait failed")
-                    && !text.contains("command buffer 1 of 1 "),
-                "wait {wait}: not the failure of an earlier command buffer: {text}"
+            // The joint forward's own stages, in both session modes and at
+            // the default cadence too.
+            for label in ["layer.full_attn.joint_gather", "layer.full_attn.cue_fold_join"] {
+                for occurrence in [0, 1] {
+                    let (error, _) = fails(label, occurrence);
+                    assert!(
+                        error.is_some(),
+                        "wait {wait} (session {session}): a failed {label} command was dropped"
+                    );
+                }
+            }
+            // The DeltaNet recurrence stage is its own command buffer except
+            // where a session forward carries a whole layer in one.
+            let (error, kept) = fails("layer.gdn.ops5-9", 1);
+            assert_eq!(
+                kept,
+                !(session && wait > 1),
+                "wait {wait} (session {session}): where the recurrence stage is its own command buffer"
             );
-            cache.reset_for_slot(SlotId(0)).expect("reset");
-            cache.reset_for_slot(SlotId(1)).expect("reset");
-            assert_eq!(dn_state_nonzero(&cache, 1), 0, "wait {wait}: reset slot holds state");
-            assert!(
-                next_conversation(model, &mut cache, &next) == reference,
-                "wait {wait}: the next conversation after a failed command buffer differs from a fresh slot"
+            assert_eq!(error.is_some(), kept, "wait {wait}: a failed recurrence command was dropped");
+            // A layer's own command buffer, submitted without a wait at a
+            // cadence above 1 (the FFN terminal of a layer that is no wait
+            // boundary).
+            let (error, kept) = fails("layer.dense_ffn", 0);
+            assert_eq!(
+                error.is_some(),
+                kept,
+                "wait {wait}: a failed layer command buffer was dropped"
             );
-            assert_eq!(dn_state_nonzero(&cache, 1), 0, "wait {wait}: a late command wrote a reset slot");
+            if wait > 1 {
+                assert!(kept, "wait {wait}: no layer was submitted without a wait");
+            }
         }
-        // The default cadence waits after every layer and keeps nothing.
-        let mut cache = cache(model);
-        {
-            let _scope = PrefillScope::forced(true);
-            prefill_history(model, &mut cache, &victim);
+    });
+}
+
+/// The served models gather their token embedding on the GPU: that command
+/// buffer is the forward's first submission, committed before the layer
+/// loop and before the wait cadence is known. It is kept like the others,
+/// and its failure is the forward's error at every cadence. (The fixture
+/// gives the synthetic model a Q4_K token embedding; its other weights and
+/// the test's reference come from the same model.)
+#[test]
+fn a_failed_embedding_command_fails_the_forward() {
+    use crate::serve::forward_mlx_shared::MlxQWeight;
+    use crate::serve::gpu::QuantWeightInfo;
+    use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+    super::prefill_prepared_tests::with_synthetic_model_mut(|model| {
+        let (vocab, hidden) = (model.cfg.vocab_size, model.cfg.hidden_size);
+        let mut seed = 0x0E3B_ED01_u32;
+        let buffer = model
+            .with_gpu_cache_mut(|device, _registry| {
+                Ok(super::joint_decode_test_support::synthetic_blocks(
+                    device,
+                    GgmlType::Q4_K,
+                    vocab,
+                    hidden,
+                    &mut seed,
+                ))
+            })
+            .expect("Q4_K embedding blocks");
+        model.token_embd_native = Some(MlxQWeight {
+            buffer,
+            info: QuantWeightInfo {
+                ggml_dtype: GgmlType::Q4_K,
+                rows: vocab as usize,
+                cols: hidden as usize,
+            },
+            affine: None,
+            f16_shadow: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        });
+        let model = &*model;
+        let next = Lane {
+            seed: 41,
+            common: 0,
+            ..Lane::new(0, &[], 60, 5)
+        };
+        let reference = solo(model, &next, false).logits;
+        for wait in [1usize, 2, 8] {
+            let (error, kept) =
+                joint_forward_with_a_failed_command(model, &reference, &next, wait, "qwen35.embedding", 0);
+            assert!(kept, "wait {wait}: the forward kept no embedding command buffer");
+            assert!(error.is_some(), "wait {wait}: a failed embedding command was dropped");
         }
-        let _fail = FailSubmitted::at(0);
-        joint_forward(model, &mut cache, &[other, victim], 0, false)
-            .expect("the default cadence commits no layer without a wait");
+    });
+}
+
+/// The last window: a forward whose output head is encoded into the last
+/// layer's command buffer waits for that command buffer alone, and a forward
+/// that ends on any other wait may still keep commands behind it. Whatever
+/// is kept when the layer loop is over is settled before the forward
+/// returns, so a failure there is the forward's error and never `Ok` with
+/// logits. The failpoint walks back from the forward's last kept command.
+#[test]
+fn a_failed_command_buffer_of_the_last_window_fails_the_forward() {
+    use super::encoder_stage::FailSubmitted;
+    use super::prefill_prepared::ForcedWaitLayers;
+    with_synthetic_model(|model| {
+        let lane = Lane::new(0, &[40], 157, 0);
+        for wait in [1usize, 8] {
+            let _cadence = ForcedWaitLayers::set(wait);
+            let run = |fail: Option<usize>| -> (anyhow::Result<Vec<f32>>, usize) {
+                let mut cache = cache(model);
+                let _scope = PrefillScope::forced(true);
+                prefill_history(model, &mut cache, &lane);
+                // Every kept command: an empty prefix matches all labels.
+                let point = fail.map(|occurrence| FailSubmitted::nth("", occurrence));
+                let counter = point.is_none().then(|| FailSubmitted::nth("", usize::MAX));
+                let result = model.forward_gpu_last_logits(
+                    &lane.tokens(lane.start(), lane.rows()),
+                    &positions_for_range(lane.start() as i32, lane.rows()),
+                    &mut cache,
+                    SlotId(0),
+                );
+                let seen = point.as_ref().or(counter.as_ref()).map_or(0, |point| point.seen().1);
+                (result, seen)
+            };
+            let (clean, kept) = run(None);
+            clean.expect("the forward without a failpoint");
+            assert!(kept > 0, "wait {wait}: the forward kept no command buffer");
+            // The last kept command of the forward, and the one before it.
+            for back in 1..=kept.min(2) {
+                let (result, _) = run(Some(kept - back));
+                let text = result
+                    .err()
+                    .map(|error| format!("{error:#}"))
+                    .unwrap_or_else(|| {
+                        panic!("wait {wait}: kept command {} of {kept} failed and the forward returned logits", kept - back + 1)
+                    });
+                assert!(
+                    text.contains("committed without a wait failed"),
+                    "wait {wait}: not the kept command's failure: {text}"
+                );
+            }
+        }
     });
 }
 
