@@ -357,6 +357,18 @@ pub(crate) struct JointPrefillOutput {
 }
 
 impl JointPrefillOutput {
+    /// A lane placed at `own_first` behind `shared_rows` shared rows, with
+    /// no logits: for tests of what reads a lane's rows out of a capture.
+    #[cfg(test)]
+    pub(crate) fn placed(own_first: usize, shared_rows: usize) -> Self {
+        Self {
+            logits: Vec::new(),
+            boundary: None,
+            own_first,
+            shared_rows,
+        }
+    }
+
     /// The forward rows (the rows of the forward's capture) that hold the
     /// lane's rows `rows`, in order.
     pub(crate) fn forward_rows(&self, rows: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>> {
