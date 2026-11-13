@@ -100,6 +100,93 @@ mod token_type {
     pub const BYTE: i32 = 6;
 }
 
+/// Whether a `tokenizer.ggml.token_type` value registers its token as an
+/// atomic special token.
+fn is_atomic_special(token_type: i32) -> bool {
+    matches!(token_type, token_type::CONTROL | token_type::USER_DEFINED)
+}
+
+/// Special-token id keys: the fallback special set of a GGUF without
+/// `tokenizer.ggml.token_type`, and the ids the serving engine reads.
+pub(crate) const SPECIAL_TOKEN_ID_KEYS: [&str; 6] = [
+    "tokenizer.ggml.bos_token_id",
+    "tokenizer.ggml.eos_token_id",
+    "tokenizer.ggml.padding_token_id",
+    "tokenizer.ggml.unknown_token_id",
+    "tokenizer.ggml.eot_token_id",
+    "tokenizer.ggml.eom_token_id",
+];
+
+/// SHA-256 identity of the tokenizer [`build_tokenizer_from_gguf`] builds
+/// from `gguf`: its pre-type, vocabulary, merges, the set of tokens it
+/// registers as atomic specials (from `tokenizer.ggml.token_type`, or from
+/// the special-token ids when a GGUF has no type array, exactly as the
+/// builder does) and the special-token ids themselves. Two GGUFs with the
+/// same identity tokenize alike; the chat template is not part of it.
+///
+/// Layout: for each section its name, its entry count and every entry
+/// length-prefixed (counts little-endian `u64`); then `ids`, the count and
+/// each of [`SPECIAL_TOKEN_ID_KEYS`] as a little-endian `u32` (`u32::MAX`
+/// when absent).
+pub(crate) fn tokenizer_identity(gguf: &GgufFile) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut section = |name: &str, entries: &[&[u8]]| {
+        hasher.update(name.as_bytes());
+        hasher.update((entries.len() as u64).to_le_bytes());
+        for entry in entries {
+            hasher.update((entry.len() as u64).to_le_bytes());
+            hasher.update(entry);
+        }
+    };
+    let bytes = |strings: &[String]| -> Vec<Vec<u8>> {
+        strings.iter().map(|text| text.as_bytes().to_vec()).collect()
+    };
+    let pre = gguf
+        .metadata_string("tokenizer.ggml.pre")
+        .ok_or_else(|| anyhow!("GGUF missing `tokenizer.ggml.pre`"))?;
+    let tokens = read_string_array(gguf, "tokenizer.ggml.tokens")?;
+    let merges = read_string_array(gguf, "tokenizer.ggml.merges").unwrap_or_default();
+    let ids = SPECIAL_TOKEN_ID_KEYS.map(|key| gguf.metadata_u32(key));
+    let special: Vec<u8> = match read_i32_array(gguf, "tokenizer.ggml.token_type") {
+        Ok(types) => {
+            if types.len() != tokens.len() {
+                bail!(
+                    "tokenizer.ggml.token_type length {} != tokens length {}",
+                    types.len(),
+                    tokens.len()
+                );
+            }
+            types
+                .iter()
+                .map(|token_type| u8::from(is_atomic_special(*token_type)))
+                .collect()
+        }
+        Err(_) => {
+            let mut special = vec![0_u8; tokens.len()];
+            for id in ids.into_iter().flatten() {
+                if let Some(flag) = special.get_mut(id as usize) {
+                    *flag = 1;
+                }
+            }
+            special
+        }
+    };
+    section("pre", &[pre.as_bytes()]);
+    for (name, strings) in [("tokens", &tokens), ("merges", &merges)] {
+        let entries = bytes(strings);
+        let entries: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
+        section(name, &entries);
+    }
+    section("special", &[&special]);
+    hasher.update(b"ids");
+    hasher.update((ids.len() as u64).to_le_bytes());
+    for id in ids {
+        hasher.update(id.unwrap_or(u32::MAX).to_le_bytes());
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// Construct a `tokenizers::Tokenizer` from `gguf`'s tokenizer metadata.
 ///
 /// Returns `Err` if the GGUF is missing required metadata or if its
@@ -261,8 +348,7 @@ pub fn build_tokenizer_from_gguf(gguf: &GgufFile) -> Result<Tokenizer> {
             .zip(tokens.iter())
             .enumerate()
             .filter_map(|(_id, (ttype, name))| {
-                let is_special = matches!(*ttype, token_type::CONTROL | token_type::USER_DEFINED);
-                if !is_special {
+                if !is_atomic_special(*ttype) {
                     return None;
                 }
                 // `AddedToken::special(true)` flags the token as a
@@ -280,14 +366,7 @@ pub fn build_tokenizer_from_gguf(gguf: &GgufFile) -> Result<Tokenizer> {
         // metadata keys, if present. This matches llama-vocab.cpp's
         // pre-toktypes-array path (older GGUFs).
         let mut specials: Vec<AddedToken> = Vec::new();
-        for key in [
-            "tokenizer.ggml.bos_token_id",
-            "tokenizer.ggml.eos_token_id",
-            "tokenizer.ggml.padding_token_id",
-            "tokenizer.ggml.unknown_token_id",
-            "tokenizer.ggml.eot_token_id",
-            "tokenizer.ggml.eom_token_id",
-        ] {
+        for key in SPECIAL_TOKEN_ID_KEYS {
             if let Some(id) = gguf.metadata_u32(key) {
                 if let Some(name) = tokens.get(id as usize) {
                     specials.push(AddedToken::from(name.clone(), true));
@@ -345,6 +424,70 @@ fn read_i32_array(gguf: &GgufFile, key: &str) -> Result<Vec<i32>> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// A metadata-only GGUF with a three-token vocabulary.
+    fn tokenizer_gguf(
+        tokens: [&str; 3],
+        token_types: Option<[i32; 3]>,
+        eos: Option<u32>,
+    ) -> (tempfile::TempDir, GgufFile) {
+        use crate::backends::gguf::types::MetaValue;
+        use crate::backends::gguf::writer::GgufWriter;
+        let mut metadata = vec![
+            ("general.architecture", MetaValue::String("qwen35".into())),
+            ("tokenizer.ggml.pre", MetaValue::String("qwen35".into())),
+            (
+                "tokenizer.ggml.tokens",
+                MetaValue::ArrayString(tokens.iter().map(|token| (*token).to_owned()).collect()),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                MetaValue::ArrayString(vec!["a b".into()]),
+            ),
+        ];
+        if let Some(types) = token_types {
+            metadata.push(("tokenizer.ggml.token_type", MetaValue::ArrayI32(types.to_vec())));
+        }
+        if let Some(eos) = eos {
+            metadata.push(("tokenizer.ggml.eos_token_id", MetaValue::U32(eos)));
+        }
+        let mut writer = GgufWriter::new(std::io::Cursor::new(Vec::new()));
+        writer.write_header(0, metadata.len() as u64).expect("header");
+        for (key, value) in &metadata {
+            writer.write_metadata_kv(key, value).expect("metadata");
+        }
+        writer.pad_to_alignment().expect("alignment");
+        writer.finalize().expect("finalize");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("tokenizer.gguf");
+        std::fs::write(&path, writer.into_inner().into_inner()).expect("write GGUF");
+        let gguf = GgufFile::open(&path).expect("open GGUF");
+        (directory, gguf)
+    }
+
+    #[test]
+    fn tokenizer_identity_follows_the_special_tokens_the_builder_registers() {
+        let identity = |tokens, types, eos| {
+            let (_directory, gguf) = tokenizer_gguf(tokens, types, eos);
+            tokenizer_identity(&gguf).expect("identity")
+        };
+        let tokens = ["a", "b", "<|end|>"];
+        let base = identity(tokens, Some([1, 1, 3]), Some(2));
+        assert_eq!(base, identity(tokens, Some([1, 1, 3]), Some(2)), "deterministic");
+        // The same strings and merges with the control token retyped as an
+        // ordinary one: the builder no longer registers it as atomic.
+        assert_ne!(base, identity(tokens, Some([1, 1, 1]), Some(2)));
+        // CONTROL and USER_DEFINED register alike, as do the ordinary types.
+        assert_eq!(base, identity(tokens, Some([1, 1, 4]), Some(2)));
+        assert_eq!(base, identity(tokens, Some([1, 6, 3]), Some(2)));
+        // Without a type array the special set is the special-token ids.
+        assert_eq!(base, identity(tokens, None, Some(2)));
+        assert_ne!(base, identity(tokens, None, Some(1)));
+        assert_ne!(base, identity(tokens, None, None));
+        // A special-token id the engine reads, and the vocabulary itself.
+        assert_ne!(base, identity(tokens, Some([1, 1, 3]), Some(1)));
+        assert_ne!(base, identity(["a", "c", "<|end|>"], Some([1, 1, 3]), Some(2)));
+    }
 
     /// The qwen35 pre-tokenizer regex must be identical to the peer's
     /// literal. If the peer updates the regex, this test reminds us to

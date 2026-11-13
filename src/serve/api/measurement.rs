@@ -174,6 +174,11 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
                     "alpha_override_bits": loaded.config_identity.glp_alpha_bits},
             "grammar": grammar_control(&state.config),
             "dwq_overlay": loaded.config_identity.dwq_overlay,
+            // ADR-067 D6: the DFlash2 policy as resolved for this engine
+            // (policy, selection and qualifying class, descriptor, drafter
+            // source, every route switch with its value and source, memory
+            // commitment), so a gate receipt binds the route that ran.
+            "dflash2": engine.route_decision(),
             "vision_projector": state.mmproj.is_some(),
             // ADR-063 Q4-GEMMA-PREFILL-MOE A/B arm (`flat` | `slotted`);
             // null for other families.

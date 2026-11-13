@@ -95,22 +95,381 @@ architecture.
 
 ## DFlash2
 
-DFlash2 remains opt-in and requires an identity-matched target/drafter pair.
-Unknown revisions, source identities, tensor manifests and family adapters
-fail before serving.
+DFlash2 is the default route of every Qwen target that a pinned drafter
+serves (ADR-067 D6). The server decides once per model load, from the GGUF
+header, before any weight is read. A default `hf2q serve` needs no variable
+and no manual download.
+
+**Policy (`HF2Q_DFLASH2`).** Unset is *auto*: on a SlotAware worker of one to
+four slots, DFlash2 is selected for a target in either of two classes.
+
+- *Pinned pair*: the target was produced by hf2q and its
+  `hf2q.source_sha256` equals the `target_source_sha256` of a pinned Qwen
+  descriptor of the same architecture.
+- *Same architecture and shapes*: the target has the architecture string,
+  hidden size, layer count, vocabulary size, tokenizer identity (SHA-256 over
+  the GGUF tokenizer pre-type, tokens and merges), attention and DeltaNet
+  head counts and dimensions, FFN width, MoE expert count, routed experts per
+  token and expert widths, and embedding and output-head tensor shapes of a
+  pinned descriptor's target. This admits fine-tunes and other quantizations
+  of the same base, with or without hf2q provenance (operator decision
+  2026-11-12). The drafter only proposes tokens; the target decides every
+  emitted token, so a drafter that fits a fine-tune less well costs
+  acceptance, not correctness. There is no acceptance-based drop-back.
+
+One static boundary narrows auto for MoE targets: auto qualifies a
+`qwen35moe` target only when its batched MoE verification route
+(`HF2Q_QWEN_MOE_BATCHED`) is admitted for the artifact's storage. Without it
+every row of a 32-row verify step runs the per-row expert path, which is not
+a qualified fast path (measured on the Q5_K launcher default, below). This is
+decided from the GGUF header before the load, like everything else here: the
+server does not watch acceptance, output or timing, and never changes route
+after the load.
+
+Anything else (other shapes, another family, more slots, another scheduler)
+keeps the prior route and the audit line says why. Auto never fails startup:
+when the drafter cannot be obtained or does not bind to the target, or the
+load fails with DFlash2 selected, the server logs the reason and loads the
+prior route. `0` is the kill switch: no drafter, no profile, the route the
+server ran before DFlash2 was a default. `1` requires DFlash2: a target in
+neither class, or a drafter that cannot be obtained, fails startup
+(schedulers and families DFlash2 never served keep ignoring it, with a
+warning). `1` also serves the drafter on a MoE target without its batched
+route, with a WARN line that the route is unqualified and was measured
+slower.
+
+**Drafter.** In order: `HF2Q_DFLASH2_CONFIG` and `HF2Q_DFLASH2_WEIGHTS` when
+both name a file (under auto a stale or incomplete pair is reported at WARN
+and ignored, under `HF2Q_DFLASH2=1` it fails startup, under `HF2Q_DFLASH2=0`
+it is not read; the launchers check the pair only when DFlash2 is required); the Hugging Face cache snapshot of the descriptor's repository
+at its pinned revision (`HF_HUB_CACHE`, `HF_HOME/hub`,
+`XDG_CACHE_HOME/huggingface/hub`, `~/.cache/huggingface/hub`); a download of
+`config.json` and `model.safetensors` at that revision into that cache, with
+progress logged, before the target's weights are loaded. `HF_HUB_OFFLINE=1`
+skips the download. A failed download under auto logs one WARN line naming
+the repository, revision and reason. The checkpoint identity checks are
+exactly as strict for either class: the configuration's SHA-256 and schema,
+the weights' byte length and SHA-256 and the tensor manifest must match the
+descriptor, and unknown revisions and family adapters are rejected. The
+checkpoint is bound to the target by the target adapter's own shape check,
+on the GGUF header before the load and on the loaded model at provisioning;
+a pinned pair is additionally bound by its source identity.
+
+| Descriptor | Repository at revision | Weights |
+|---|---|---:|
+| `qwen38-27b-dflash2-50307d4c` | `z-lab/Qwen3.8-27B-DFlash2` at `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` | 3,848,817,896 bytes |
+| `qwen36-35b-a3b-dflash2-51ef7b69` | `incoai/Qwen3.6-35B-A3B-DFlash2` at `51ef7b6923ad6c14cb1bb41c37a9041446496ab6` | 1,052,513,456 bytes |
+
+**Route profile.** Each pinned Qwen descriptor has one profile: the value of
+every fast-route switch in its measured combined configuration (one table,
+`src/inference/spec_decode/dflash2/route_profile.rs`). Each switch is
+resolved once per model load: a non-blank environment value wins, in either
+direction; otherwise the profile's value when DFlash2 is selected for that
+model and the row is not withheld (below); otherwise the switch's own
+default. A model for which DFlash2 is not selected therefore runs exactly the
+kernels it ran before, also when it shares a process with one for which it
+is, and `HF2Q_DFLASH2=0` turns the whole bundle off.
+
+| Switch | Qwen3.8 profile | Qwen3.6 profile | Requires | Prepared planes |
+|---|---|---|---|---|
+| `HF2Q_DFLASH2_DRAFT_AF4_G64` | `1` | `1` | | none |
+| `HF2Q_DFLASH2_DRAFT_STAGED` | `1` | `1` | `HF2Q_DFLASH2_DRAFT_AF4_G64` | output head |
+| `HF2Q_DFLASH2_GPU_TARGET_TOKENS` | unset (descriptor default: on) | `1` | | none |
+| `HF2Q_DFLASH2_CONTEXT_FIRST` | `1` | `1` | | none |
+| `HF2Q_DFLASH2_DRAFT_PREFETCH` | unset | unset | | none |
+| `HF2Q_DFLASH2_GPU_DECISIONS` | unset | unset | | none |
+| `HF2Q_REPACKED_GGUF_M32` | `1` | `1` | | dense FFN |
+| `HF2Q_REPACKED_GGUF_M32_PROJ` | `1` | `1` | `HF2Q_REPACKED_GGUF_M32` | DeltaNet and attention projections |
+| `HF2Q_REPACKED_GGUF_M32_HEAD` | `1` | `1` | `HF2Q_REPACKED_GGUF_M32` | output head |
+| `HF2Q_REPACKED_GGUF_ANY_WIDTH` | `1` | `1` | `HF2Q_REPACKED_GGUF_M32` | none |
+| `HF2Q_REPACKED_GGUF_SHARED_HEAD` | `1` | `1` | | none |
+| `HF2Q_QWEN_VERIFY_ATTN_TILE` | `1` | `1` | | none |
+| `HF2Q_QWEN_VERIFY_MIXER_FUSED` | `1` | `1` | | none |
+| `HF2Q_QWEN_VERIFY_REPLAY_REUSE` | `1` | `1` | | none |
+| `HF2Q_QWEN_PREFILL_PREPARED` | `1` | `1` | | dense FFN, projections |
+| `HF2Q_QWEN_PREFILL_FOLD_CUE` | `1` | `1` | `HF2Q_QWEN_PREFILL_PREPARED` | none |
+| `HF2Q_QWEN_MOE_BATCHED` | unset | `1` | | none |
+| `HF2Q_QWEN_MOE_STAGED_M8` | unset | `1` | `HF2Q_QWEN_MOE_BATCHED` | routed expert stacks |
+| `HF2Q_QWEN_MOE_LIVE_TILES` | unset | `1` | `HF2Q_QWEN_MOE_STAGED_M8` | shared expert |
+
+`HF2Q_DFLASH2_DRAFT_PREFETCH` and `HF2Q_DFLASH2_GPU_DECISIONS` are rows without a
+profile value: they are resolved per model like every other row and stay off
+until the combined configuration with them is qualified.
+
+The profile is applied switch by switch. A row's profile value is *withheld*
+(the switch keeps its own default, and the drafter serves with the rows that
+are left) when:
+
+- the switch it requires did not resolve on, whether withheld or set to `0`
+  by hand;
+- its kernels would refuse the artifact: the batched MoE route on a DWQ
+  overlay, a router or shared-expert gate logit that is not F32, or a shared
+  expert that is not Q4_K/Q6_K with gate and up stored alike; the staged MoE
+  route on routed expert stacks that are not 64-aligned Q4_K/Q6_K; the
+  prepared prefill beside the chunk-scan investigation route;
+- the weights its planes cover exist and none is Q4_K or Q6_K (a weight kind
+  stored partly in those types keeps its row: the prepared kernels admit
+  weight by weight and the rest keep their stock kernels);
+- this host cannot run its kernels (for example a Metal runtime without the
+  tensor API the prepared kernels are written over);
+- the memory rule below dropped it.
+
+For example a dense target quantized to Q5_K runs the drafter with the
+AF4G64 and staged draft, the tiled verify attention, the fused mixer and the
+replay reuse, and keeps its stock FFN and projection kernels. Nothing here
+fails startup, under auto or `HF2Q_DFLASH2=1`. A switch
+set by hand is never withheld: on storage it does not admit it still refuses
+the load as it always has, and on a host that cannot run its kernels the
+server refuses to start, naming the switch, before the model is loaded.
+"Set on" is what the switch's own reader takes as on, here and everywhere a
+rule is settled before the reader runs (the planes a route keeps, the row
+another row requires): exactly `1` for the `HF2Q_DFLASH2_*` and
+`HF2Q_REPACKED_GGUF_*` rows and the two `HF2Q_QWEN_VERIFY_*` rows that take
+no other value, and `1`, `on` or `true` for `HF2Q_DFLASH2_GPU_TARGET_TOKENS`,
+`HF2Q_QWEN_PREFILL_*` and `HF2Q_QWEN_MOE_*` (the grammars of
+`src/inference/route_host.rs`). `HF2Q_REPACKED_GGUF_M32=on` therefore selects
+no kernel, prepares no plane and refuses no load.
+
+A MoE target qualifies under auto only when its batched MoE verification
+route is admitted, and admitted means what the loader will do with the
+artifact's storage, not what the switch says: the loader keeps a layer on the
+per-row route when its storage is not the batched route's, whoever turned
+`HF2Q_QWEN_MOE_BATCHED` on. Setting the switch by hand on such an artifact
+does not select the drafter under auto. `HF2Q_DFLASH2=1` is the override: it
+serves the drafter there with a WARN that the route is unqualified, and the
+staged expert rows stay off because they need the batched layer.
+
+**Memory rule.** Prepared planes are a second copy of the weights they cover,
+and the drafter is resident beside the target. Before selecting, the server
+computes
+
+```
+present  = memory available now - charged engines - model file bytes - KV budget - 8 GiB
+budget   = physical memory      - charged engines - model file bytes - KV budget - 8 GiB
+headroom = the smaller of present and budget
+planes   = sum over the covered Q4_K/Q6_K weights of the plane sets of every
+           switch that resolved on:
+           Q4_K: 16 bytes per 32 weights + 16 bytes per 256 weights
+           Q6_K: 24 bytes per 32 weights + 20 bytes per 256 weights
+scratch  = what the kernels of those switches retain between steps
+```
+
+where the KV budget is the configured `--kv-cache-budget` (zero when none is
+configured), the drafter is its file size, *charged engines* is what every
+engine of this process has committed (its model file, KV budget, drafter,
+planes and scratch, allocated or not), and *memory available now* is what
+the host reports free, inactive or purgeable at the decision.
+
+What is available now is still owed to everything that has been promised
+memory and has not taken it: the incoming model's file and KV budget, and
+whatever the engines already loaded have not allocated of their commitments
+(a KV cache not filled yet, planes prepared on first use). The server knows
+what each engine was promised, not how much of it the engine has allocated,
+so it subtracts the whole of every commitment; the part an engine has
+already allocated is then counted twice, which errs on the safe side. What
+is available also leaves out, by itself, everything anybody holds now:
+memory of an engine that was just torn down and that the kernel has not
+reclaimed yet, and every other program. On an idle host the two bounds are
+equal; on a host where other programs hold memory the present bound is the
+smaller and the default may keep fewer routes. With a 48 GiB KV budget the
+whole profile needs about 90 GiB available for the Qwen3.8 gate artifact
+and about 97 GiB for the Qwen3.6 one. The audit line gives both bounds and
+what the host had available. Another process that grows after the decision
+is covered by neither; the 8 GiB reserve is the only margin for it.
+
+The decision and the reservation of what it decided are one transaction, so
+two loads running at once, through one pool or through separate ones, are
+never both decided against the same total. A reservation belongs to whoever
+owns the model's buffers: the loading thread during the load, then the
+engine's worker thread. It is released by the worker's teardown and by
+nothing else, in this order: the worker drops the model; it drops the GPU
+weight cache it built for it (uploaded copies and prepared planes); the
+thread terminates, which destroys every other thread-local cache it had;
+every command queue the model's threads encoded on is settled (an empty
+command buffer is committed and waited for, which commits the removals the
+dropped buffers staged in the Metal residency set and waits for the commands
+committed earlier on that queue); then the reservation goes. A request's own
+queue is settled under the engine's supervision as the last GPU step of the
+request, before its result or `Done` is reported: a settle that fails is
+that request's error, and one that never returns fails the engine like any
+other GPU call that does. Evicting an engine or dropping its
+last handle releases nothing: an engine whose worker is still tearing down,
+or is wedged inside Metal, is still charged, and a teardown step that fails
+leaves it charged until the process restarts (one ERROR line, `engine memory
+stays reserved until the process restarts`).
+
+New loads are serialized against teardowns: a load that arrives while an
+engine is being torn down waits for the teardown to end before it is
+decided (at most 30 s; after that it is decided with the engine still
+charged). The kernel returns the pages of released buffers on its own, some
+time after the process has let go of them (measured on the Qwen3.6 gate
+artifact: 15 to 28 GiB of a 40 GiB engine were still charged to the process
+after the last step above and were gone 0.1 to 1 s later). The teardown
+gives it up to 10 s, watching the process footprint, so that a waiting load
+reads the available memory afterwards; that is a courtesy and no claim
+rests on it. What keeps a load from being given memory that is not back is
+the present bound.
+
+A load that fails after its worker started stops the worker and waits for
+that teardown before the load is retried on the prior route, and the retry
+reserves its own commitment. The loading thread drops the GPU cache it
+primed and settles its queues before a reservation it still holds is
+released.
+
+The planes of the model's own prepared routes are resident whatever the
+policy says: `HF2Q_DFLASH2=0 HF2Q_QWEN_PREFILL_PREPARED=1` prepares and keeps
+the dense FFN and projection planes, and that engine is committed, published
+and charged for them like any other. Only the staged draft's head needs a
+drafter. The hot-swap pool charges a load the same figure without the KV
+budget (model file, drafter, planes, scratch) instead of the GGUF file size,
+before the loader is called. A plane set is prepared once however many switches read
+it, except the output head: the staged draft (at four slots) and the
+prepared target head each keep a copy of their own when
+`HF2Q_REPACKED_GGUF_SHARED_HEAD=0` (1,052,876,800 bytes each on Qwen3.8).
+No current route retains scratch; one that does gets its figure in
+`route_scratch_bytes` (`src/serve/dflash2_policy.rs`), which sees the
+resolved routes as a whole because routes may share a scratch pool.
+
+If `drafter + planes + scratch <= headroom` every admitted row applies.
+Otherwise every plane-carrying row is withheld and DFlash2 is kept when the
+drafter and what is left fit; if not even the drafter fits, auto keeps the
+prior route. The audit line reports the headroom, the present bound, the
+available memory, the charged engines, the drafter, the plane and the
+scratch bytes. A plane-carrying switch set by
+hand is never dropped, and its planes count.
+
+Measured, exact four-agent Q5 on the gate artifacts, peak process
+footprint (the KV caches and decode scratch are in both columns):
+
+| Target | Prior route | Default profile | Difference | Rule charges (drafter + planes) |
+|---|---:|---:|---:|---:|
+| Qwen3.8 gate artifact | 57.87 GB | 76.73 GB | 18.86 GB | 3.85 + 16.09 = 19.94 GB |
+| Qwen3.6 gate artifact | 35.18 GB | 57.22 GB | 22.04 GB | 1.05 + 21.37 = 22.42 GB |
+
+By component, Qwen3.6 gate artifact, physical footprint after load and
+worker provisioning with no request served (GiB): weights as the prior route
+holds them 21.6; with the drafter 22.3; with the batched MoE route 21.6 (the
+router and shared expert stay in GGUF storage instead of BF16 copies); with
+the staged expert planes 39.8 (one copy: 18.7 GiB by layout); with the live
+tiles' shared-expert planes 39.9. The projection and head planes (0.75 and
+0.39 GiB) are prepared on first use. On Qwen3.8 the planes are 9.83 GiB
+(dense FFN), 4.17 GiB (projections) and 0.98 GiB (head), all prepared on
+first use.
+
+The prepared planes are a second representation of weights the GGUF blocks
+already hold, and both stay resident: prefill outside the prepared scope,
+MTP and every non-prepared path still read the blocks. A single copy of
+every weight would cost about the prior route's footprint plus the drafter
+(Qwen3.8 about 61.7 GB, Qwen3.6 about 36.2 GB at the Q5 peak); that requires
+every consumer of a weight to read its planes and is not implemented. The
+plane-dropped configuration of either family has no exact Q5 run of its own.
+
+
+**Audit.** Each load logs one INFO line, `DFlash2 policy resolved`, with
+`policy` (`auto`, `off`, `required`), `selected`, `reason` (when selected:
+`pinned pair` or `same architecture and shapes as <descriptor id>`),
+`descriptor`, `target_source` (the target's own `hf2q.source_sha256`, or
+`external`), `drafter_source` (`explicit`, `cache`, `downloaded`, `none`),
+`profile` (`full`, `partial`, `none`), `withheld` (`NAME: reason` for every
+withheld row, or `none`), the memory figures, and `switches`: every table
+switch as `NAME=value(source)` with source `env`, `profile`, `default` or
+`withheld`. The same decision is published by `/hf2q/v1/runtime` as
+`measurement_snapshot.active_controls.dflash2` (`policy`, `selected`,
+`reason`, `descriptor`, `qualification` = `pinned_pair` | `same_shapes`,
+`target_source`, `drafter_source`, `profile`, `switches.<NAME>` =
+`{value, source, withheld}`, `memory`), so a gate receipt that records the
+runtime document binds the route that ran, not the environment that asked.
+It is `null` for an engine that was not loaded by `hf2q serve`. The memory
+rule, the host probe and the artifact's storage can each leave a route of
+the profile off without failing startup, so the default a gate measures is
+only the qualified default when `profile` is `full`: the release-gate Q5
+cases require it (`HF2Q_Q5_DFLASH2_PROFILE=full` is a readiness check on
+that field, beside the policy, descriptor and qualification checks).
 
 | Var | Default | Values | Effect |
 |---|---|---|---|
-| `HF2Q_DFLASH2` | off | `1` | Provisions the pinned DFlash2 checkpoint selected by the loaded target. Both checkpoint path variables below are required. |
-| `HF2Q_DFLASH2_CONFIG` | unset | path | Exact checkpoint configuration. Its SHA-256, schema and target binding must match a compiled descriptor. |
-| `HF2Q_DFLASH2_WEIGHTS` | unset | path | Exact safetensors checkpoint. Its SHA-256, byte length and tensor manifest must match the same descriptor. |
-| `HF2Q_DFLASH2_DRAFT_AF4_G64` | off | `1` | Uses source-bound group-64 affine four-bit draft projections (36 bytes per 64 weights) instead of BF16. Qwen3.8 and Qwen3.6 Q5 have passed; the route remains opt-in until every activated family is qualified. |
-| `HF2Q_DFLASH2_DRAFT_STAGED` | off | `0`, `1` | Requires `HF2Q_DFLASH2_DRAFT_AF4_G64=1`. `1` runs the draft command on Apple10-class kernels: staged AF4G64 projections over BF16 rows with gate and up in one pass, attention over the K/V rings in place, and, at four lanes, the vocabulary head on the prepared target tile (one extra repacked copy of a Q4_K/Q6_K head: 0.98 GiB for Qwen3.8 and 0.39 GiB for Qwen3.6 by plane size). Draft proposals may differ from the default route within the kernels' documented numeric bounds; the target still decides every emitted token. On Qwen MoE targets left at their default `HF2Q_DFLASH2_GPU_TARGET_TOKENS` (unset), verify rows are chosen from the draft's confidence and the verify tile width follows them, so a different draft also changes the target's logit bits and can change the generated text; that mode is not yet qualified with this switch. A checkpoint whose shapes or row count the staged tile does not take, or any other value, fails load. |
-| `HF2Q_DFLASH2_GPU_TARGET_TOKENS` | on for the pinned dense Qwen3.8 descriptor; off otherwise | `0`/`off`/`false`, `1`/`on`/`true` | Keeps selected proposals on the GPU through target embedding, removing the draft-to-target host wait and token packing. `0` restores staged host handoff. Explicit `1` on Qwen MoE or Gemma fails checkpoint load: their dynamic verification-row and target-state transaction is not yet qualified. Invalid values fail load. |
-| `HF2Q_DFLASH2_CONTEXT_FIRST` | off | `1` | Qwen DFlash2 steps that settle acceptance on the host. Exact value `1` submits the draft-context commit before the DeltaNet replay is encoded, so the GPU works on the context commit while the host encodes the replay and the two commands overlap; the step still waits for both. Output and cache state are bitwise unchanged. A replay command that fails after the submission clears the draft rings of the step's lanes (they re-fill on the next prefill); if they cannot be cleared the worker stops. Logged at worker start as `dflash2_context_first`. |
-| `HF2Q_DFLASH2_DRAFT_PREFETCH` | off | `1` | Qwen DFlash2 steps that settle acceptance on the host. Exact value `1` commits the next step's draft command right behind the draft-context commit and the DeltaNet replay, before the step waits for either, so the GPU drafts while the host waits, settles and emits tokens. The next step uses that draft only when its inputs are exactly the prefetched ones; otherwise the command is waited for and dropped and the step drafts again. Output, rings and cache state are bitwise unchanged. Supersedes `HF2Q_DFLASH2_CONTEXT_FIRST` on the steps it applies to. A step that fails after its submissions drops the draft and clears its lanes' draft rings (they re-fill on the next prefill). Logged at worker start as `dflash2_draft_prefetch`. |
-| `HF2Q_DFLASH2_GPU_DECISIONS` | off | `1`, `check` | Qwen DFlash2 lanes that sample on the host at temperature zero (repetition penalty, thinking budget, lazy tool grammar; no logit bias, top-k, top-p, min-p, seed or logprobs). `1` decides each verify row from candidates the output-head command computes (the repetition-window logits and the best logit outside the window) instead of copying and scanning 32 rows of logits on the host; rows under an active grammar and rows with a non-finite logit use the host sampler over their own logits. Emitted text is unchanged. `check` runs both routes, uses the host sampler's result and logs any disagreement at error level (diagnostic; slower than off). Logged at worker start as `dflash2_decisions`. |
-| `HF2Q_QWEN_VERIFY_REPLAY_REUSE` | off | `1` | Qwen verify steps (DFlash2 and joint MTP). Exact value `1` keeps the DeltaNet replay storage between verify steps instead of allocating and zero-filling it for every step (188 MB per four-lane step on Qwen3.8-27B, 91 MB on Qwen3.6-35B-A3B), which otherwise leaves the GPU idle between the draft command and the target's first command. Output and cache state are bitwise unchanged. The worker holds the largest storage a step has used for its lifetime; that memory is not counted by memory admission or any budget, so leave headroom for it. Logged at worker start as `verify_replay_reuse`. |
+| `HF2Q_DFLASH2` | auto | unset, `0`/`off`/`false`, `1`/`on`/`true` | The policy above. Unset selects DFlash2 for a pinned pair or a target with a pinned target's architecture and shapes, and never fails startup; `0` is the kill switch; `1` requires DFlash2. Any other value fails startup. |
+| `HF2Q_DFLASH2_CONFIG` | unset | path | Explicit checkpoint configuration, used only together with `HF2Q_DFLASH2_WEIGHTS`; unset, the pinned snapshot in the Hugging Face cache is used or downloaded. Its SHA-256, schema and target binding must match a compiled descriptor. |
+| `HF2Q_DFLASH2_WEIGHTS` | unset | path | Explicit safetensors checkpoint, used only together with `HF2Q_DFLASH2_CONFIG`. Its SHA-256, byte length and tensor manifest must match the same descriptor. |
+| `HF2Q_DFLASH2_DRAFT_AF4_G64` | off; `1` in the route profile of a selected DFlash2 target | `1` | Uses source-bound group-64 affine four-bit draft projections (36 bytes per 64 weights) instead of BF16. Qwen3.8 and Qwen3.6 Q5 have passed; the route remains opt-in until every activated family is qualified. |
+| `HF2Q_DFLASH2_DRAFT_STAGED` | off; `1` in the route profile of a selected DFlash2 target | `0`, `1` | Requires `HF2Q_DFLASH2_DRAFT_AF4_G64=1`. `1` runs the draft command on Apple10-class kernels: staged AF4G64 projections over BF16 rows with gate and up in one pass, attention over the K/V rings in place, and, at four lanes, the vocabulary head on the prepared target tile (one extra repacked copy of a Q4_K/Q6_K head: 0.98 GiB for Qwen3.8 and 0.39 GiB for Qwen3.6 by plane size). Draft proposals may differ from the default route within the kernels' documented numeric bounds; the target still decides every emitted token. On Qwen MoE targets left at their default `HF2Q_DFLASH2_GPU_TARGET_TOKENS` (unset), verify rows are chosen from the draft's confidence and the verify tile width follows them, so a different draft also changes the target's logit bits and can change the generated text; that mode is not yet qualified with this switch. A checkpoint whose shapes or row count the staged tile does not take, or any other value, fails load. |
+| `HF2Q_DFLASH2_GPU_TARGET_TOKENS` | on for the pinned dense Qwen3.8 descriptor; `1` in the Qwen3.6 route profile; off otherwise | `0`/`off`/`false`, `1`/`on`/`true` | Keeps selected proposals on the GPU through target embedding, removing the draft-to-target host wait and token packing. `0` restores staged host handoff. Explicit `1` is admitted on both Qwen adapters; the Qwen3.6 route profile sets it, because the staged draft is not qualified in the waited MoE mode. Explicit `1` on a Gemma descriptor fails checkpoint load: its dynamic verification-row and target-state transaction is not yet qualified. A blank value is unset; other invalid values fail load. |
+| `HF2Q_DFLASH2_CONTEXT_FIRST` | off; `1` in the route profile of a selected DFlash2 target | `1` | Qwen DFlash2 steps that settle acceptance on the host. Exact value `1` submits the draft-context commit before the DeltaNet replay is encoded, so the GPU works on the context commit while the host encodes the replay and the two commands overlap; the step still waits for both. Output and cache state are bitwise unchanged. A replay command that fails after the submission clears the draft rings of the step's lanes (they re-fill on the next prefill); if they cannot be cleared the worker stops. Logged at worker start as `dflash2_context_first`. |
+| `HF2Q_DFLASH2_DRAFT_PREFETCH` | off (a route-profile row with no profile value yet) | `1` | Qwen DFlash2 steps that settle acceptance on the host. Exact value `1` commits the next step's draft command right behind the draft-context commit and the DeltaNet replay, before the step waits for either, so the GPU drafts while the host waits, settles and emits tokens. The next step uses that draft only when its inputs are exactly the prefetched ones; otherwise the command is waited for and dropped and the step drafts again. Output, rings and cache state are bitwise unchanged. Supersedes `HF2Q_DFLASH2_CONTEXT_FIRST` on the steps it applies to. A step that fails after its submissions drops the draft and clears its lanes' draft rings (they re-fill on the next prefill). Logged at worker start as `dflash2_draft_prefetch`. |
+| `HF2Q_DFLASH2_GPU_DECISIONS` | off (a route-profile row with no profile value yet) | `1`, `check` | Qwen DFlash2 lanes that sample on the host at temperature zero (repetition penalty, thinking budget, lazy tool grammar; no logit bias, top-k, top-p, min-p, seed or logprobs). `1` decides each verify row from candidates the output-head command computes (the repetition-window logits and the best logit outside the window) instead of copying and scanning 32 rows of logits on the host; rows under an active grammar and rows with a non-finite logit use the host sampler over their own logits. Emitted text is unchanged. `check` runs both routes, uses the host sampler's result and logs any disagreement at error level (diagnostic; slower than off). Logged at worker start as `dflash2_decisions`. |
+| `HF2Q_QWEN_VERIFY_REPLAY_REUSE` | off; `1` in the route profile of a selected DFlash2 target | `1` | Qwen verify steps (DFlash2 and joint MTP). Exact value `1` keeps the DeltaNet replay storage between verify steps instead of allocating and zero-filling it for every step (188 MB per four-lane step on Qwen3.8-27B, 91 MB on Qwen3.6-35B-A3B), which otherwise leaves the GPU idle between the draft command and the target's first command. Output and cache state are bitwise unchanged. The worker holds the largest storage a step has used for its lifetime; that memory is not counted by memory admission or any budget, so leave headroom for it. Logged at worker start as `verify_replay_reuse`. |
+
+### Host capability of the fast routes
+
+Some fast-route kernels exist only on the Metal tensor API and have no
+portable twin. That API is absent when the runtime Metal compiler has no
+`<metal_tensor>` header (macOS before 26) or when the GPU is outside the
+Metal 4 family (virtual machines, including GitHub's hosted macOS runners).
+`src/inference/route_host.rs` asks mlx-native once per process which kernel
+families the GPU runs and holds the table of what each switch needs:
+
+| Switch | On a host without the Metal tensor API |
+|---|---|
+| `HF2Q_DFLASH2_DRAFT_STAGED` | cannot run (staged tiles, ring attention, prepared head) |
+| `HF2Q_REPACKED_GGUF_M32`, `_M32_PROJ`, `_M32_HEAD`, `_ANY_WIDTH`, `_SHARED_HEAD` | cannot run (prepared GGUF matmul) |
+| `HF2Q_QWEN_PREFILL_PREPARED` | cannot run (prepared GGUF matmul) |
+| `HF2Q_QWEN_MOE_STAGED_M8` | cannot run (prepared expert planes) |
+| `HF2Q_QWEN_MOE_LIVE_TILES` | cannot run (prepared expert planes, live tiles) |
+| `HF2Q_QWEN_VERIFY_ATTN_TILE` | runs: every layer keeps the per-row chain (logged once) |
+| `HF2Q_QWEN_PREFILL_FOLD_CUE` | runs: two forwards, as without a routed prepared prefill |
+| `HF2Q_QWEN_VERIFY_MIXER_FUSED` | runs: the fused core is portable; its wave follows the prepared routes |
+| `HF2Q_DFLASH2_DRAFT_AF4_G64`, `HF2Q_DFLASH2_GPU_TARGET_TOKENS`, `HF2Q_DFLASH2_GPU_DECISIONS`, `HF2Q_DFLASH2_CONTEXT_FIRST`, `HF2Q_DFLASH2_DRAFT_PREFETCH`, `HF2Q_QWEN_VERIFY_REPLAY_REUSE`, `HF2Q_QWEN_MOE_BATCHED` | run: portable kernels or host-side only |
+
+A switch from the "cannot run" rows that the operator sets fails the model
+load, before any weight is uploaded, with the switch, the kernel family and
+the device. "Sets" follows each switch's own reader: exactly `1` for the
+`HF2Q_REPACKED_GGUF_*` switches and `HF2Q_DFLASH2_DRAFT_STAGED`, and
+`1`/`on`/`true` for `HF2Q_QWEN_PREFILL_PREPARED`, `HF2Q_QWEN_MOE_STAGED_M8`
+and `HF2Q_QWEN_MOE_LIVE_TILES`; a value the reader treats as off is not
+refused.
+
+```text
+HF2Q_REPACKED_GGUF_M32 is on, but the prepared GGUF matmul (repacked_gguf_mm) cannot run on this host: the Metal tensor API is unavailable (a runtime compiler without <metal_tensor>, or a GPU outside the Metal 4 family) (Apple Paravirtual device). Unset HF2Q_REPACKED_GGUF_M32: the stock route serves this host.
+```
+
+A load that selects none of those switches never fails on this check. If the
+capability probe itself fails for a reason other than a missing tensor API (a
+shader or toolchain regression on a Metal 4 device), a load that selects one
+of the switches fails and names it; a load that selects none logs the failure
+once and serves on the stock route.
+
+What happens when such a switch is on without the operator having set it (a
+route profile) depends on the route:
+
+- The prepared GGUF matmul routes (`HF2Q_REPACKED_GGUF_*`,
+  `HF2Q_QWEN_PREFILL_PREPARED`) ask the host at every admission, so on a
+  host that cannot run them each product keeps its stock kernel.
+- `HF2Q_QWEN_MOE_STAGED_M8`, `HF2Q_QWEN_MOE_LIVE_TILES` and
+  `HF2Q_DFLASH2_DRAFT_STAGED` have no per-product admission: selected on
+  such a host they fail the load with the typed "unavailable on this host"
+  error. Whatever selects them asks `route_host` first
+  (`HostRoutes::switch`) and leaves them off with the reason.
+
+`MLX_NATIVE_DISABLE_METAL_TENSOR=1` makes the same kernel families
+unavailable on any host, and the reason then names the variable instead of
+the tensor API. It is not a faithful host without the API: mlx-native's
+quantized and expert matmuls, the Gemma tensor flash attention and the tiled
+verify attention keep their tensor kernels under it.
+
+Outside the switches, two stock kernels had the same dependency and now take
+a portable route on such a host. Both are Class B against the tensor kernel
+they replace, not bitwise:
+
+- The head-major O-projection of Gemma's batched prefill (Q4_0, Q5_0, Q8_0
+  and Q6_K weights) permutes the activation and runs the ordinary matmul,
+  the route Q4_K O-projections take on every host. At nine or more rows the
+  two routes agree to about 2e-7 relative RMS; at eight or fewer rows the
+  ordinary matmul is the matvec family, so a row's bits differ between an
+  eight-row and a nine-row lane, as they already do for Q4_K.
+- F16 weights at two or more rows, and an F16 DFlash2 drafter head at any
+  row count, run mlx-native's portable F16 matmul (within
+  `2^-11 * sum(|w * x|)` of the F64 product, deterministic, row-independent;
+  about 4.5e-4 relative RMS from the tensor kernel).
 
 ## Qwen joint decode
 
@@ -126,18 +485,18 @@ Joint decode is on by default for dense (Qwen3.8) and MoE (Qwen3.6) artifacts. M
 | `HF2Q_QWEN_JOINT_DECODE_MAX_ROWS` | `4` | `2`–`8` | Widest joint step. In exact mode, or with `HF2Q_QWEN_JOINT_SOLO=0`, further eligible slots stay serial that turn. In the padded mode they run in further joint steps. The padded `mul_mv_ext` mode caps at 4 regardless. Widths above 4 have no serving measurement. Invalid values warn and use 4. |
 | `HF2Q_QWEN_JOINT_FFN_SHARED` | on | `0`/`off`/`false`, `1`/`on`/`true` | Padded mode only. `0` restores the serial builder's per-row fused gate/up/SiLU kernel, which reads the gate and up weights once per packed row (four times per step). Read once at worker start. Invalid values warn and use on. |
 | `HF2Q_QWEN_JOINT_SOLO` | on | `0`/`off`/`false`, `1`/`on`/`true` | Padded mode on workers with two or more slots only. On: every eligible slot joins a joint step, and a lone ordinary slot runs a one-lane padded step instead of the serial forward, so N4 output with speculation off no longer depends on request timing. `0` restores the serial forward for a lone slot and for slots beyond the joint width (A/B and escape hatch). Read once at worker start. Invalid values warn and use on. |
-| `HF2Q_REPACKED_GGUF_M32` | off | `1` | Qwen3.8 dense DFlash2 target verification only. Exact value `1` prepares eligible Q4_K/Q6_K dense FFN gate/up/down planes once and dispatches the active 32-row joint transaction directly from BF16 activation rows. Ordinary prefill, serial decode, vision-language, MoE and other-family products retain their established kernels; ineligible shapes retain the stock GGUF route. The exact Qwen3.8 four-agent campaign peaked at 70.17 GB process footprint against 59.40 GB for the stock route, so admission must include the prepared buffers. Read once per process. |
-| `HF2Q_REPACKED_GGUF_M32_PROJ` | off | `1` | Qwen DFlash2 target verification only, and only with `HF2Q_REPACKED_GGUF_M32=1`. Exact value `1` also prepares the eligible Q4_K/Q6_K DeltaNet (qkv, gate, output, and alpha with beta as one fused product) and full-attention (fused Q/gate, K, V, output) projections on first use and dispatches them in the active 32-row joint transaction from one BF16 copy of the shared activation. Output differs numerically from the stock projections. On the exact Qwen3.8 four-agent campaign the process footprint peaked at 69.95 GiB against 65.34 GiB without it. Read once per process. |
-| `HF2Q_REPACKED_GGUF_M32_HEAD` | off | `1` | Qwen DFlash2 target verification only, and only with `HF2Q_REPACKED_GGUF_M32=1`. Exact value `1` prepares an eligible Q4_K/Q6_K output head on first use and runs the 32-row joint step's logits through it. Logits differ numerically from the stock head, so the greedy token can differ at near-ties. It shortened the four-lane target stage by 3.3% on Qwen3.8 without a resolved change in client makespan, and added about 0.94 GiB of footprint. Read once per process. |
-| `HF2Q_REPACKED_GGUF_ANY_WIDTH` | off | `1` | Qwen DFlash2 target verification only, and only with `HF2Q_REPACKED_GGUF_M32=1` (and `_PROJ` / `_HEAD` for the projections and the head). Exact value `1` admits the prepared dense FFN, DeltaNet and full-attention projections and output head at every tile width of a verify step instead of only at 32 rows, so a Qwen3.6 verify tile of 4, 8 or 16 rows no longer falls back to the stock kernels and a verified row's projection bits no longer depend on the tile width or the rows sharing its step. Plain joint decode and joint MTP verify steps keep their routes, so an exact-mode joint row stays bitwise its serial one-token forward. Output differs numerically from the stock kernels at tile widths below 32 (Class B): a token verified by DFlash2 and the same token decoded serially or in a plain joint step come from different routes at every tile width, as they already do at 32 rows, so a lane that drops out of DFlash2 changes route. On the exact Qwen3.6 four-agent run with every other candidate switch and the prepared head on (same binary): one-lane cycle 17.1 / 17.4 / 18.6 ms against 22.6 / 22.1 ms, two-lane 22.0 / 23.0 / 23.0 ms against 36.8 / 34.5 ms, three- and four-lane cycles unchanged within run noise; a registry build of the final change read 17.8-18.8 and 23.2-24.3 ms in four runs. All runs passed. Of eight runs with the switch, six gave one transcript and two another that differs at one token of one agent's last turn; without it every pair of runs differed in every agent. Dense Qwen3.8 DFlash2 always verifies at 32 rows and is unaffected. Needs mlx-native 0.21.8. Read once per process. |
-| `HF2Q_REPACKED_GGUF_SHARED_HEAD` | off | `1` | Qwen targets with a Q4_K/Q6_K native output head. Exact value `1` prepares the head once, owned by the model, when the first consumer that reads it asks, and gives the same planes to a staged DFlash2 draft command of 32 draft rows (`HF2Q_DFLASH2_DRAFT_STAGED=1`, four lanes) and to the prepared target head (`HF2Q_REPACKED_GGUF_M32_HEAD=1`) instead of one prepared copy each (0.98 GiB on Qwen3.8, 0.39 GiB on Qwen3.6 by plane size). With neither consumer nothing is prepared. Logits are bitwise unchanged. On the exact Qwen3.8 four-agent run the prepared target head with the shared planes peaked at 75.80 / 75.69 GB process footprint against 75.81 / 75.79 GB with the stock target head (76.75 GB with the prepared target head and no sharing), and shortened the four-lane cycle to 71.0 / 70.7 ms from 72.5 / 72.4 ms. Read once per process. |
-| `HF2Q_QWEN_PREFILL_PREPARED` | off | `0`/`off`/`false`, `1`/`on`/`true` | Qwen bounded prompt prefill (SlotAware). `1` runs the eligible Q4_K/Q6_K dense FFN (gate, up, down), DeltaNet (qkv, gate, output, and alpha with beta as one fused product) and full-attention (fused Q/gate, K, V, output) products of every prompt-prefill chunk of two or more rows through the prepared row-tile kernel: one BF16 copy of the activation, 32-row tiles with a partial last tile, where the stock matmul pays a whole 128-row tile for every started one. It uses the planes of `HF2Q_REPACKED_GGUF_M32` / `HF2Q_REPACKED_GGUF_M32_PROJ` and prepares them itself if those are off (their footprint then applies; not measured alone). MTP catch-up, verify windows and decode keep their kernels, and so do vision requests, one-row chunks, the `prefill_seed` path and the SerialFifo prefill. Output differs numerically from the stock prefill (Class B), so the greedy text can differ. On the exact Qwen3.8 four-agent workload with both `M32` switches on (two runs each) total prefill time went from 18.0–19.3 s to 13.6–14.3 s and client makespan from 54.2–55.4 s to 50.1–51.4 s, with a different greedy transcript (5,361 against 5,237 completion tokens) and unchanged peak footprint; a 31-row chunk went from 0.23 s to 0.07 s. Requires mlx-native 0.21.8: with 0.21.7 the prepared kernel accepts 32 rows only and a prefill under this switch fails. The switch is validated before a Qwen model is loaded and again when a SlotAware worker provisions its slots, which logs it (`Qwen prompt prefill configuration`): an invalid value, or the switch beside the chunk-scan prefill investigation route (whose alpha/beta projections would stay on the stock kernel), stops the server with `Qwen prompt prefill switches: <variable and reason>`. |
-| `HF2Q_QWEN_PREFILL_FOLD_CUE` | off | `0`/`off`/`false`, `1`/`on`/`true` | Qwen bounded prompt prefill (SlotAware); requires `HF2Q_QWEN_PREFILL_PREPARED=1` (the server refuses to start otherwise, as on an invalid value). `1` runs the last content chunk and the generation cue behind it as one forward that captures the stable-boundary checkpoint inside it, instead of a content forward, a checkpoint snapshot and a cue forward. The checkpoint, the logits, the DFlash2 capture and the slot state are bit-identical to the two-forward path, and the Qwen3.8 four-agent transcript is unchanged. A request keeps its two forwards, without an error, when any of these holds: a vision or grafted request; MTP catch-up; a content chunk of fewer than 2 rows or a cue outside 2 to 32 rows; a content chunk of at most 32 rows that the cue would carry past 32; an active linear-attention state capture; a GLP vector bound (`hf2q serve --glp`), dump-bisect or the dense-Q split profile enabled; a checkpoint over its quota or whose storage cannot be allocated; a model with a product off the prepared kernel. A folded checkpoint counts in `hf2q_qwen_anchor_snapshot_milliseconds_count`; its time there is only the host time of assembling it, because the state is captured inside the forward. Exact Qwen3.8 four-agent run pair on an undisturbed host, 24 of 28 turns folded: logged prefill 12.18 s to 11.43 s and makespan 37.71 s to 36.61 s; per turn (median, content chunk plus cue chunk against the folded chunk) 218 to 191 ms at 75–118 content rows, 300 to 293 ms at 157, 400 to 367 ms at 200 and 498 to 470 ms at 266, of the 55 ms a cue chunk costs; the folded turns' checkpoint snapshots (about 10 ms each, outside the logged time) are no longer taken. Qwen3.6: 4–9 ms per folded turn model-free (three runs), per-turn medians in the four-agent workload 2–16 ms lower in four of the five folded size classes and 6 ms higher in one; run totals do not resolve it because every run emits a different transcript. |
-| `HF2Q_QWEN_VERIFY_ATTN_TILE` | off | `1` | Qwen DFlash2 target verification only. Exact value `1` runs the full attention of every verify step as a tiled pass over the unchanged TQ-HB cache: one batched K and one V encode for all rows (the serial bytes), one query rotation, one split dispatch that computes a lane's whole window and a KV head's query heads together with Metal tensor matmuls, one reduce and one fused un-rotation + gate, instead of the serial chain once per row. Cache bytes and cursors are the serial chain's; the attention output differs in bits (Class B). This route's output for a token depends on neither the cohort nor the alignment of the verify window that carries it (where the window starts, the token's row in it, its length); that needs mlx-native 0.21.9 (with 0.21.8 a window crossing one page boundary in every 768 tokens of history from 1,536 on changed its tokens' bits). That alone does not make the served text independent of the wall-clock verify budget. Needs a TQ-only cache with 8-bit codes, head dim 256, six or eight query heads per KV head and the Metal tensor API; otherwise the step keeps the per-row chain. Joint decode, MTP verify and prefill are unchanged. Read once per process. |
-| `HF2Q_QWEN_VERIFY_MIXER_FUSED` | off | `1` | Qwen DFlash2 target verification only. Exact value `1` changes how each target layer's mixer is issued, not what it computes (Class A: rows, target captures, DeltaNet state and the rows retained for the replay commit are bitwise the stock route's; padding rows of the DeltaNet gated output are zero. The equality is qualified by test on the Apple M5 Max; on any other GPU family mlx-native `tests/test_gdn_window_fused.rs` must pass first). With `HF2Q_REPACKED_GGUF_M32_PROJ=1` the prepared input products of a layer (DeltaNet alpha/beta, qkv and z gate; attention Q/gate, K and V) run as one wave wherever they are prepared (32-row steps; every tile width, so Qwen3.6 steps of 4, 8 and 16 rows too, with `HF2Q_REPACKED_GGUF_ANY_WIDTH=1`; the in-situ numbers below predate that switch and were not repeated with it), one kernel pass each with no reduce pass or barrier between them, and when every product of a layer is prepared its pre-mixer RMS norm writes their BF16 rows without a cast dispatch. The DeltaNet core of every lane window (convolution, Q/K norms, query scale, gates, recurrence, gated norm, retained rows) runs as one dispatch that writes the BF16 rows of the output projection: 7 dispatches in five serialized stages per DeltaNet layer at four lanes instead of 159 in 14. The core needs DeltaNet head dimension 128, two to nine convolution taps, windows of at most eight rows and a device whose thread and threadgroup-memory limits admit its 256-thread pipeline; a layer that does not qualify keeps the stock chain, and the first use and the first refusal (with its reason) are logged at info level. Exact four-agent runs with every other combined-candidate switch on (two per arm and model on each of two binaries, all passing): Qwen3.8 four-lane cycle 75.1/75.6 to 70.6/70.9 ms and, on a slower host, 92.6/92.3 to 86.0/88.0 ms (about 6% both times), 9,063 to 1,703 dispatches per cycle, identical text in both arms; Qwen3.6 33.3/33.9 to 31.2/31.7 ms and 36.6/36.4 to 35.6/34.7 ms, 6,316 to 1,716 dispatches. No paired campaign has been run. Needs unreleased mlx-native kernels. Decode steps and MTP verify never take it. Read once per process. |
-| `HF2Q_QWEN_MOE_BATCHED` | off | `0`/`off`/`false`, `1`/`on`/`true` | Qwen3.6 MoE artifacts. `1` loads the router (`ffn_gate_inp`, F32), shared-expert gate logit (F32) and shared expert (Q4_K or Q6_K) in their GGUF storage instead of BF16 copies, and every MoE decode layer then runs one batched route over the step's rows (F32 row-exact router mat-vec, SIMD-group top-k over all rows, one `mul_mv_id` each for expert gate/up/down over rows × top-k pairs, one weighted reduce). A row's output is bitwise the same solo (serial decode, MTP drafting) and in a joint step of 2–8 rows, but differs from the default BF16 route (Class B: the router and shared expert are no longer BF16-rounded). Prefill reads the same native weights. Layers with other storage types keep the default route; DWQ affine expert overlays refuse to load. Read once at model load; the worker-start `Qwen joint decode configuration` line logs `moe_ffn=batched_native`. Invalid values warn and use off. |
-| `HF2Q_QWEN_MOE_STAGED_M8` | off | `0`/`off`/`false`, `1`/`on`/`true` | Qwen3.6 Q4_K/Q6_K MoE artifacts. Requires `HF2Q_QWEN_MOE_BATCHED=1`. `1` prepares quantized expert gate/up/down planes at model upload; separate grouped staged-M8 F32 gate and up projections reuse one compact route schedule and gathered input, followed by the established F32 SwiGLU and an F32-input prepared down projection. Unsupported top-k, shapes, quantization, affine overlays or imatrix collection fail startup. This is a quality-qualified opt-in, not the release default; unset or `0` keeps the established native expert matvecs. |
-| `HF2Q_QWEN_MOE_LIVE_TILES` | off | `0`/`off`/`false`, `1`/`on`/`true` | Qwen3.6 Q4_K/Q6_K MoE artifacts. Requires `HF2Q_QWEN_MOE_STAGED_M8=1` (and so `HF2Q_QWEN_MOE_BATCHED=1`). The three switches are resolved together at model load: an invalid value, or this switch without staged M8, fails startup whatever the other switches say, and the worker logs the resolved route as `moe_experts=matvec|staged_m8|live_tiles` in `Qwen joint decode configuration`. `1` also prepares the shared expert's planes at model upload and runs each MoE layer as one schedule (which also applies a DFlash2 verify-row mask), one gather, one gate/up pass that leaves a BF16 SwiGLU in the schedule's rows, and one down pass over those rows; the routed experts' tiles of at most eight routes and the shared expert's tiles (one per block of eight rows) share those dispatches. The passes launch only the live tiles, so rows a DFlash2 verify budget masks cost no routed-expert work. Router and shared-gate logits run on the single-row kernel, every full block of eight rows in one dispatch. A layer whose routed and shared planes differ in format or expert width, or with more than 256 experts or routes a step, runs the same arithmetic stage by stage (two schedules, two dispatches per pass) with the same bits; model upload logs `Qwen MoE live-tile layers` once with `fused_layers` and `stage_layers`, the number of layers on each form. A row's result does not depend on the other rows or lanes of its step and is bitwise the row decoded alone under this switch, except where an expert product underflows FP32: the one- and two-route register path and the matmul tile may round such a product differently (observed on results of magnitude at most 4e-31). Expert arithmetic differs from the staged-M8 route (half-precision staged weights, one BF16 rounding of the SwiGLU) and the shared expert moves from FP32 to that arithmetic. Experimental opt-in, not quality-qualified; unset or `0` keeps the staged-M8 route. |
+| `HF2Q_REPACKED_GGUF_M32` | off; `1` in the route profile of a selected DFlash2 target | `1` | Qwen3.8 dense DFlash2 target verification only. Exact value `1` prepares eligible Q4_K/Q6_K dense FFN gate/up/down planes once and dispatches the active 32-row joint transaction directly from BF16 activation rows. Ordinary prefill, serial decode, vision-language, MoE and other-family products retain their established kernels; ineligible shapes retain the stock GGUF route. The exact Qwen3.8 four-agent campaign peaked at 70.17 GB process footprint against 59.40 GB for the stock route, so admission must include the prepared buffers. Resolved once per model load. |
+| `HF2Q_REPACKED_GGUF_M32_PROJ` | off; `1` in the route profile of a selected DFlash2 target | `1` | Qwen DFlash2 target verification only, and only with `HF2Q_REPACKED_GGUF_M32=1`. Exact value `1` also prepares the eligible Q4_K/Q6_K DeltaNet (qkv, gate, output, and alpha with beta as one fused product) and full-attention (fused Q/gate, K, V, output) projections on first use and dispatches them in the active 32-row joint transaction from one BF16 copy of the shared activation. Output differs numerically from the stock projections. On the exact Qwen3.8 four-agent campaign the process footprint peaked at 69.95 GiB against 65.34 GiB without it. Resolved once per model load. |
+| `HF2Q_REPACKED_GGUF_M32_HEAD` | off; `1` in the route profile of a selected DFlash2 target | `1` | Qwen DFlash2 target verification only, and only with `HF2Q_REPACKED_GGUF_M32=1`. Exact value `1` prepares an eligible Q4_K/Q6_K output head on first use and runs the 32-row joint step's logits through it. Logits differ numerically from the stock head, so the greedy token can differ at near-ties. It shortened the four-lane target stage by 3.3% on Qwen3.8 without a resolved change in client makespan, and added about 0.94 GiB of footprint. Resolved once per model load. |
+| `HF2Q_REPACKED_GGUF_ANY_WIDTH` | off; `1` in the route profile of a selected DFlash2 target | `1` | Qwen DFlash2 target verification only, and only with `HF2Q_REPACKED_GGUF_M32=1` (and `_PROJ` / `_HEAD` for the projections and the head). Exact value `1` admits the prepared dense FFN, DeltaNet and full-attention projections and output head at every tile width of a verify step instead of only at 32 rows, so a Qwen3.6 verify tile of 4, 8 or 16 rows no longer falls back to the stock kernels and a verified row's projection bits no longer depend on the tile width or the rows sharing its step. Plain joint decode and joint MTP verify steps keep their routes, so an exact-mode joint row stays bitwise its serial one-token forward. Output differs numerically from the stock kernels at tile widths below 32 (Class B): a token verified by DFlash2 and the same token decoded serially or in a plain joint step come from different routes at every tile width, as they already do at 32 rows, so a lane that drops out of DFlash2 changes route. On the exact Qwen3.6 four-agent run with every other candidate switch and the prepared head on (same binary): one-lane cycle 17.1 / 17.4 / 18.6 ms against 22.6 / 22.1 ms, two-lane 22.0 / 23.0 / 23.0 ms against 36.8 / 34.5 ms, three- and four-lane cycles unchanged within run noise; a registry build of the final change read 17.8-18.8 and 23.2-24.3 ms in four runs. All runs passed. Of eight runs with the switch, six gave one transcript and two another that differs at one token of one agent's last turn; without it every pair of runs differed in every agent. Dense Qwen3.8 DFlash2 always verifies at 32 rows and is unaffected. Needs mlx-native 0.21.8. Resolved once per model load. |
+| `HF2Q_REPACKED_GGUF_SHARED_HEAD` | off; `1` in the route profile of a selected DFlash2 target | `1` | Qwen targets with a Q4_K/Q6_K native output head. Exact value `1` prepares the head once, owned by the model, when the first consumer that reads it asks, and gives the same planes to a staged DFlash2 draft command of 32 draft rows (`HF2Q_DFLASH2_DRAFT_STAGED=1`, four lanes) and to the prepared target head (`HF2Q_REPACKED_GGUF_M32_HEAD=1`) instead of one prepared copy each (0.98 GiB on Qwen3.8, 0.39 GiB on Qwen3.6 by plane size). With neither consumer nothing is prepared. Logits are bitwise unchanged. On the exact Qwen3.8 four-agent run the prepared target head with the shared planes peaked at 75.80 / 75.69 GB process footprint against 75.81 / 75.79 GB with the stock target head (76.75 GB with the prepared target head and no sharing), and shortened the four-lane cycle to 71.0 / 70.7 ms from 72.5 / 72.4 ms. Resolved once per model load. |
+| `HF2Q_QWEN_PREFILL_PREPARED` | off; `1` in the route profile of a selected DFlash2 target | `0`/`off`/`false`, `1`/`on`/`true` | Qwen bounded prompt prefill (SlotAware). `1` runs the eligible Q4_K/Q6_K dense FFN (gate, up, down), DeltaNet (qkv, gate, output, and alpha with beta as one fused product) and full-attention (fused Q/gate, K, V, output) products of every prompt-prefill chunk of two or more rows through the prepared row-tile kernel: one BF16 copy of the activation, 32-row tiles with a partial last tile, where the stock matmul pays a whole 128-row tile for every started one. It uses the planes of `HF2Q_REPACKED_GGUF_M32` / `HF2Q_REPACKED_GGUF_M32_PROJ` and prepares them itself if those are off (their footprint then applies; not measured alone). MTP catch-up, verify windows and decode keep their kernels. Output differs numerically from the stock prefill (Class B), so the greedy text can differ. On the exact Qwen3.8 four-agent workload with both `M32` switches on (two runs each) total prefill time went from 18.0–19.3 s to 13.6–14.3 s and client makespan from 54.2–55.4 s to 50.1–51.4 s, with a different greedy transcript (5,361 against 5,237 completion tokens) and unchanged peak footprint; a 31-row chunk went from 0.23 s to 0.07 s. Requires mlx-native 0.21.8: with 0.21.7 the prepared kernel accepts 32 rows only and a prefill under this switch fails. Resolved once per model load; invalid values warn and keep the default. |
+| `HF2Q_QWEN_PREFILL_FOLD_CUE` | off; `1` in the route profile of a selected DFlash2 target | `0`/`off`/`false`, `1`/`on`/`true` | Qwen bounded prompt prefill (SlotAware); requires `HF2Q_QWEN_PREFILL_PREPARED=1` (the server refuses to start otherwise, as on an invalid value). `1` runs the last content chunk and the generation cue behind it as one forward that captures the stable-boundary checkpoint inside it, instead of a content forward, a checkpoint snapshot and a cue forward. The checkpoint, the logits, the DFlash2 capture and the slot state are bit-identical to the two-forward path, and the Qwen3.8 four-agent transcript is unchanged. A request keeps its two forwards, without an error, when any of these holds: a vision or grafted request; MTP catch-up; a content chunk of fewer than 2 rows or a cue outside 2 to 32 rows; a content chunk of at most 32 rows that the cue would carry past 32; an active linear-attention state capture; a GLP vector bound (`hf2q serve --glp`), dump-bisect or the dense-Q split profile enabled; a checkpoint over its quota or whose storage cannot be allocated; a model with a product off the prepared kernel. A folded checkpoint counts in `hf2q_qwen_anchor_snapshot_milliseconds_count`; its time there is only the host time of assembling it, because the state is captured inside the forward. Exact Qwen3.8 four-agent run pair on an undisturbed host, 24 of 28 turns folded: logged prefill 12.18 s to 11.43 s and makespan 37.71 s to 36.61 s; per turn (median, content chunk plus cue chunk against the folded chunk) 218 to 191 ms at 75–118 content rows, 300 to 293 ms at 157, 400 to 367 ms at 200 and 498 to 470 ms at 266, of the 55 ms a cue chunk costs; the folded turns' checkpoint snapshots (about 10 ms each, outside the logged time) are no longer taken. Qwen3.6: 4–9 ms per folded turn model-free (three runs), per-turn medians in the four-agent workload 2–16 ms lower in four of the five folded size classes and 6 ms higher in one; run totals do not resolve it because every run emits a different transcript. |
+| `HF2Q_QWEN_VERIFY_ATTN_TILE` | off; `1` in the route profile of a selected DFlash2 target | `1` | Qwen DFlash2 target verification only. Exact value `1` runs the full attention of every verify step as a tiled pass over the unchanged TQ-HB cache: one batched K and one V encode for all rows (the serial bytes), one query rotation, one split dispatch that computes a lane's whole window and a KV head's query heads together with Metal tensor matmuls, one reduce and one fused un-rotation + gate, instead of the serial chain once per row. Cache bytes and cursors are the serial chain's; the attention output differs in bits (Class B) and does not depend on the cohort. Needs a TQ-only cache with 8-bit codes, head dim 256, six or eight query heads per KV head and the Metal tensor API; otherwise the step keeps the per-row chain. Joint decode, MTP verify and prefill are unchanged. Resolved once per model load. |
+| `HF2Q_QWEN_VERIFY_MIXER_FUSED` | off; `1` in the route profile of a selected DFlash2 target | `1` | Qwen DFlash2 target verification only. Exact value `1` changes how each target layer's mixer is issued, not what it computes (Class A: rows, target captures, DeltaNet state and the rows retained for the replay commit are bitwise the stock route's; padding rows of the DeltaNet gated output are zero. The equality is qualified by test on the Apple M5 Max; on any other GPU family mlx-native `tests/test_gdn_window_fused.rs` must pass first). With `HF2Q_REPACKED_GGUF_M32_PROJ=1` the prepared input products of a layer (DeltaNet alpha/beta, qkv and z gate; attention Q/gate, K and V) run as one wave wherever they are prepared (32-row steps; every tile width, so Qwen3.6 steps of 4, 8 and 16 rows too, with `HF2Q_REPACKED_GGUF_ANY_WIDTH=1`; the in-situ numbers below predate that switch and were not repeated with it), one kernel pass each with no reduce pass or barrier between them, and when every product of a layer is prepared its pre-mixer RMS norm writes their BF16 rows without a cast dispatch. The DeltaNet core of every lane window (convolution, Q/K norms, query scale, gates, recurrence, gated norm, retained rows) runs as one dispatch that writes the BF16 rows of the output projection: 7 dispatches in five serialized stages per DeltaNet layer at four lanes instead of 159 in 14. The core needs DeltaNet head dimension 128, two to nine convolution taps, windows of at most eight rows and a device whose thread and threadgroup-memory limits admit its 256-thread pipeline; a layer that does not qualify keeps the stock chain, and the first use and the first refusal (with its reason) are logged at info level. Exact four-agent runs with every other combined-candidate switch on (two per arm and model on each of two binaries, all passing): Qwen3.8 four-lane cycle 75.1/75.6 to 70.6/70.9 ms and, on a slower host, 92.6/92.3 to 86.0/88.0 ms (about 6% both times), 9,063 to 1,703 dispatches per cycle, identical text in both arms; Qwen3.6 33.3/33.9 to 31.2/31.7 ms and 36.6/36.4 to 35.6/34.7 ms, 6,316 to 1,716 dispatches. No paired campaign has been run. Needs unreleased mlx-native kernels. Decode steps and MTP verify never take it. Resolved once per model load. |
+| `HF2Q_QWEN_MOE_BATCHED` | off; `1` in the Qwen3.6 route profile of a selected DFlash2 target | `0`/`off`/`false`, `1`/`on`/`true` | Qwen3.6 MoE artifacts. `1` loads the router (`ffn_gate_inp`, F32), shared-expert gate logit (F32) and shared expert (Q4_K or Q6_K) in their GGUF storage instead of BF16 copies, and every MoE decode layer then runs one batched route over the step's rows (F32 row-exact router mat-vec, SIMD-group top-k over all rows, one `mul_mv_id` each for expert gate/up/down over rows × top-k pairs, one weighted reduce). A row's output is bitwise the same solo (serial decode, MTP drafting) and in a joint step of 2–8 rows, but differs from the default BF16 route (Class B: the router and shared expert are no longer BF16-rounded). Prefill reads the same native weights. Layers with other storage types keep the default route; DWQ affine expert overlays refuse to load. Read once at model load; the worker-start `Qwen joint decode configuration` line logs `moe_ffn=batched_native`. Invalid values warn and use off. |
+| `HF2Q_QWEN_MOE_STAGED_M8` | off; `1` in the Qwen3.6 route profile of a selected DFlash2 target | `0`/`off`/`false`, `1`/`on`/`true` | Qwen3.6 Q4_K/Q6_K MoE artifacts. Requires `HF2Q_QWEN_MOE_BATCHED=1`. `1` prepares quantized expert gate/up/down planes at model upload; separate grouped staged-M8 F32 gate and up projections reuse one compact route schedule and gathered input, followed by the established F32 SwiGLU and an F32-input prepared down projection. Unsupported top-k, shapes, quantization, affine overlays or imatrix collection fail startup. This is a quality-qualified opt-in, not the release default; unset or `0` keeps the established native expert matvecs. |
+| `HF2Q_QWEN_MOE_LIVE_TILES` | off; `1` in the Qwen3.6 route profile of a selected DFlash2 target | `0`/`off`/`false`, `1`/`on`/`true` | Qwen3.6 Q4_K/Q6_K MoE artifacts. Requires `HF2Q_QWEN_MOE_STAGED_M8=1` (and so `HF2Q_QWEN_MOE_BATCHED=1`). The three switches are resolved together at model load: an invalid value, or this switch without staged M8, fails startup whatever the other switches say, and the worker logs the resolved route as `moe_experts=matvec|staged_m8|live_tiles` in `Qwen joint decode configuration`. `1` also prepares the shared expert's planes at model upload and runs each MoE layer as one schedule (which also applies a DFlash2 verify-row mask), one gather, one gate/up pass that leaves a BF16 SwiGLU in the schedule's rows, and one down pass over those rows; the routed experts' tiles of at most eight routes and the shared expert's tiles (one per block of eight rows) share those dispatches. The passes launch only the live tiles, so rows a DFlash2 verify budget masks cost no routed-expert work. Router and shared-gate logits run on the single-row kernel, every full block of eight rows in one dispatch. A layer whose routed and shared planes differ in format or expert width, or with more than 256 experts or routes a step, runs the same arithmetic stage by stage (two schedules, two dispatches per pass) with the same bits; model upload logs `Qwen MoE live-tile layers` once with `fused_layers` and `stage_layers`, the number of layers on each form. A row's result does not depend on the other rows or lanes of its step and is bitwise the row decoded alone under this switch, except where an expert product underflows FP32: the one- and two-route register path and the matmul tile may round such a product differently (observed on results of magnitude at most 4e-31). Expert arithmetic differs from the staged-M8 route (half-precision staged weights, one BF16 rounding of the SwiGLU) and the shared expert moves from FP32 to that arithmetic. Experimental opt-in, not quality-qualified; unset or `0` keeps the staged-M8 route. |
 
 ## DeepSeek-V4 decode
 

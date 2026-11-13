@@ -13,6 +13,7 @@ use super::{
         dispatch_dflash2_context_commit, dispatch_dflash2_context_commit_at,
         dispatch_dflash2_forward, dispatch_dflash2_lane_ingest, prepare_decode_positions,
     },
+    route_profile,
     schema::{DFlash2CheckpointDescriptor, DFlash2FamilyAdapter},
     selector::dispatch_dflash2_selection,
     staged::{reads_prepared_head, resolve_staged_draft, DFLASH2_DRAFT_STAGED_ENV},
@@ -234,6 +235,7 @@ impl DFlash2Runtime {
         target: &T,
         lanes: usize,
     ) -> Result<Self> {
+        crate::inference::route_host::require_explicit(device)?;
         let config_bytes = std::fs::read(config_path.as_ref())
             .with_context(|| format!("read DFlash2 config {}", config_path.as_ref().display()))?;
         let config = descriptor
@@ -251,18 +253,17 @@ impl DFlash2Runtime {
             .context("validate DFlash2 tensor manifest")?;
         let tensors = DFlash2ModelTensors::upload(device, &config, &weights)
             .context("upload DFlash2 tensors")?;
-        let staged = resolve_staged_draft(
-            std::env::var(DFLASH2_DRAFT_STAGED_ENV).ok().as_deref(),
-            &config,
-            &tensors,
-            lanes,
-        )?;
+        const STAGED: route_profile::Switch = route_profile::switch(DFLASH2_DRAFT_STAGED_ENV);
+        const GPU_TARGET_TOKENS: route_profile::Switch =
+            route_profile::switch(GPU_TARGET_TOKENS_ENV);
+        let staged = route_profile::with_value(STAGED, |raw| {
+            resolve_staged_draft(raw, &config, &tensors, lanes)
+        })?;
         let workspace = DFlash2Workspace::new(device, &config, lanes, staged)
             .context("allocate DFlash2 workspace")?;
-        let gpu_target_tokens = resolve_gpu_target_tokens(
-            descriptor,
-            std::env::var(GPU_TARGET_TOKENS_ENV).ok().as_deref(),
-        )?;
+        let gpu_target_tokens = route_profile::with_value(GPU_TARGET_TOKENS, |raw| {
+            resolve_gpu_target_tokens(descriptor, raw)
+        })?;
         tracing::info!(
             checkpoint = descriptor.id,
             gpu_target_tokens,

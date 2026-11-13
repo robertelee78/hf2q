@@ -196,6 +196,7 @@ fn run_arm(policy: QwenSpeculationPolicy, reference: Option<&Arm>) -> Arm {
         EngineMode::SlotAware {
             max_slots: MAX_SLOTS,
         },
+        &mut None,
     )
     .expect("spawn Qwen3.8 SlotAware engine");
     let runtime = tokio::runtime::Builder::new_multi_thread()

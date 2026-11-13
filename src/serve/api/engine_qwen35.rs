@@ -28,6 +28,7 @@ use crate::inference::models::qwen35::prefill_prepared::PrefillScope;
 use crate::inference::spec_decode::cost_controller::SpeculationCostController;
 use crate::inference::spec_decode::dflash2::{
     adapters::QwenDFlash2Adapter,
+    route_profile,
     runtime::DFlash2Runtime,
     schema::{DFlash2CheckpointDescriptor, DFlash2FamilyAdapter, KNOWN_DFLASH2_CHECKPOINTS},
 };
@@ -249,9 +250,17 @@ pub struct Qwen35LoadedModel {
     /// preserves type information on the decode hot path and avoids a
     /// virtual cache interface in `EngineInner`.
     pub persistent_kv_cache: Option<HybridKvCache>,
-    /// Default-off DFlash2 runtime. Present only after exact checkpoint,
-    /// target-family and slot-width validation at worker provisioning.
+    /// DFlash2 runtime. Present only after exact checkpoint, target-family
+    /// and slot-width validation at worker provisioning.
     pub dflash2: Option<DFlash2Runtime>,
+    /// The drafter the DFlash2 policy selected for this model before its
+    /// weights were loaded (`serve::dflash2_policy`). `None` keeps DFlash2
+    /// off; provisioning consumes it.
+    pub dflash2_plan: Option<crate::serve::dflash2_policy::DFlash2Plan>,
+    /// Fast-route switches as resolved for this model at load: the process
+    /// environment, then the route profile the DFlash2 policy selected.
+    /// Provisioning and the worker thread bind them.
+    pub routes: Arc<route_profile::ResolvedRoutes>,
     /// Server-side MTP policy and per-conversation profitability state. The
     /// native runner owns no persistent speculative KV yet, so this state
     /// deliberately contains no cache tensors.
@@ -762,6 +771,8 @@ impl Qwen35LoadedModel {
             // (... n_seqs = max_slots, ...)`.
             persistent_kv_cache: None,
             dflash2: None,
+            dflash2_plan: None,
+            routes: route_profile::current(),
             // ADR-044 (2026-08-21) / ADR-063 D1: an unset
             // HF2Q_QWEN_SPECULATION is `auto` here (one slot); a SlotAware
             // worker re-resolves it at start, to `off` when it selected joint
@@ -1064,7 +1075,7 @@ impl Qwen35LoadedModel {
                  boundary — caller violated)"
             );
         }
-        let device = mlx_native::MlxDevice::new()
+        let device = crate::inference::device_settle::SettledDevice::new()
             .context("ADR-040 C2d: MlxDevice::new for Qwen35 multi-seq KV provisioning")?;
         // Every agent slot receives the complete model context. The Qwen KV
         // allocator reserves full-attention storage lazily, while scheduler
@@ -1105,33 +1116,35 @@ impl Qwen35LoadedModel {
         );
         self.persistent_kv_cache = Some(cache);
         self.provision_dflash2(max_slots as usize)?;
+        // Before provisioning reports success, and so before the model can
+        // be handed to a worker: a queue that cannot be settled fails the
+        // load here, on the thread that still holds the reservation.
+        device
+            .settle()
+            .context("settle the queue of the Qwen35 slot KV provisioning")?;
         Ok(())
     }
 
+    /// Provision the drafter the DFlash2 policy planned for this model. The
+    /// policy made every fallback decision before the weights were loaded;
+    /// from here each identity check fails the load, as it always has.
     fn provision_dflash2(&mut self, max_slots: usize) -> anyhow::Result<()> {
-        let enabled = match std::env::var("HF2Q_DFLASH2").ok().as_deref() {
-            None | Some("") | Some("0" | "off" | "false") => false,
-            Some("1" | "on" | "true") => true,
-            Some(value) => {
-                anyhow::bail!("HF2Q_DFLASH2 must be 1/on/true or 0/off/false, got {value:?}")
-            }
-        };
-        if !enabled {
+        let Some(plan) = self.dflash2_plan.take() else {
             self.dflash2 = None;
             return Ok(());
-        }
+        };
+        let _routes = route_profile::bind(Arc::clone(&self.routes));
         anyhow::ensure!(
             (1..=4).contains(&max_slots),
             "DFlash2 supports 1..=4 physical slots, got {max_slots}"
         );
-        let config_path = PathBuf::from(
-            std::env::var_os("HF2Q_DFLASH2_CONFIG")
-                .context("HF2Q_DFLASH2=1 requires HF2Q_DFLASH2_CONFIG")?,
-        );
-        let weights_path = PathBuf::from(
-            std::env::var_os("HF2Q_DFLASH2_WEIGHTS")
-                .context("HF2Q_DFLASH2=1 requires HF2Q_DFLASH2_WEIGHTS")?,
-        );
+        let crate::serve::dflash2_policy::DFlash2Plan {
+            descriptor: planned,
+            class,
+            config_path,
+            weights_path,
+            ..
+        } = plan;
         let config_bytes = std::fs::read(&config_path)
             .with_context(|| format!("read DFlash2 config {}", config_path.display()))?;
         let (descriptor, config) = KNOWN_DFLASH2_CHECKPOINTS
@@ -1149,7 +1162,18 @@ impl Qwen35LoadedModel {
                     .map(|config| (descriptor, config))
             })
             .context("DFlash2 config does not match a pinned Qwen checkpoint")?;
-        validate_dflash2_target_source(descriptor, &self.provenance)?;
+        anyhow::ensure!(
+            descriptor.id == planned.id,
+            "DFlash2 config is checkpoint {}, the policy selected {} for this target",
+            descriptor.id,
+            planned.id
+        );
+        // A pinned pair is bound by its source identity. A target admitted
+        // for having the pinned target's architecture and shapes is bound by
+        // the adapter below, which validates the loaded model itself.
+        if class == crate::serve::dflash2_policy::QualifiedClass::PinnedPair {
+            validate_dflash2_target_source(descriptor, &self.provenance)?;
+        }
         self.model.ensure_gpu_cache_primed()?;
         let runtime = self.model.with_gpu_cache_mut(|device, _registry| {
             let adapter = QwenDFlash2Adapter::new(&self.model, &config)?;
@@ -1161,7 +1185,14 @@ impl Qwen35LoadedModel {
                 &adapter,
                 max_slots,
             )
-        })?;
+        });
+        // This thread primed the model's GPU cache only to upload the
+        // drafter; the worker thread primes its own. Everything the cache
+        // created at upload (the staged MoE planes are 20 GB on Qwen3.6)
+        // would otherwise stay resident twice.
+        let released = self.model.release_gpu_cache();
+        let runtime = runtime?;
+        released?;
         tracing::info!(
             checkpoint = descriptor.id,
             lanes = max_slots,
@@ -1836,6 +1867,74 @@ fn alloc_serial_kv_cache(
     Ok(cache)
 }
 
+/// A device a SerialFifo request creates for its own KV allocation,
+/// snapshots and restores. Its queue is settled under the engine's
+/// supervision when the request ends (`inference::device_settle`).
+///
+/// A request that succeeds calls [`Self::settle`] before it reports its
+/// result or `Done`, so a settle that fails is that request's error and a
+/// settle that never returns is a transaction the supervisor times out,
+/// like any other GPU call of the request. A request that fails or unwinds
+/// leaves the settle to the destructor, which runs it under the same
+/// supervision. A settle that fails or could not be attempted (the engine is
+/// already unhealthy) is recorded for the worker thread, whose teardown then
+/// keeps the model's memory reserved. It is attempted once.
+pub(super) struct RequestDevice<'s> {
+    device: MlxDevice,
+    supervisor: &'s EngineSupervisor,
+    settled: bool,
+}
+
+impl<'s> RequestDevice<'s> {
+    pub(super) fn new(supervisor: &'s EngineSupervisor) -> mlx_native::Result<Self> {
+        MlxDevice::new().map(|device| Self {
+            device,
+            supervisor,
+            settled: false,
+        })
+    }
+
+    /// Settle the queue now, as the last GPU step of a request that
+    /// succeeded.
+    pub(super) fn settle(mut self) -> Result<()> {
+        self.settle_supervised()
+    }
+
+    fn settle_supervised(&mut self) -> Result<()> {
+        self.settled = true;
+        let settled = supervised_gpu_call(self.supervisor, "qwen35_request_settle", || {
+            crate::inference::device_settle::settle(&self.device)
+        });
+        if let Err(error) = &settled {
+            crate::inference::device_settle::record_thread_unsettled(format!("{error:#}"));
+        }
+        settled.context("settle the request's command queue")
+    }
+}
+
+impl std::ops::Deref for RequestDevice<'_> {
+    type Target = MlxDevice;
+
+    fn deref(&self) -> &MlxDevice {
+        &self.device
+    }
+}
+
+impl Drop for RequestDevice<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            // The request is failing or unwinding: its own error is on its
+            // way, and this one is on the thread's record.
+            if let Err(error) = self.settle_supervised() {
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    "a failed request could not settle its command queue"
+                );
+            }
+        }
+    }
+}
+
 /// Allocate a fresh `HybridKvCache` sized for `prompt_len + max_tokens + 64`,
 /// clamped to `cfg.max_position_embeddings` and floored at 128.
 ///
@@ -2444,8 +2543,8 @@ fn generate_qwen35_once_ordinary(
     let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
 
     let cache_alloc_start = Instant::now();
-    let device =
-        MlxDevice::new().map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate): {e}"))?;
+    let device = RequestDevice::new(supervisor)
+        .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate): {e}"))?;
     let (mut kv_cache, cache_reused) = take_serial_kv_cache(qwen, &device, prompt_len, max_tokens)?;
     tracing::info!(
         target: "hf2q::serve::api::engine_qwen35::progress",
@@ -3356,6 +3455,10 @@ fn generate_qwen35_once_ordinary(
 
     validate_grammar_terminal(grammar_runtime.as_ref(), params.grammar_kind, finish_reason)?;
 
+    // Before the result is reported: the request's queue is settled under
+    // the engine's supervision, and a failure is this request's failure.
+    device.settle()?;
+
     Ok(GenerationResult {
         text: content,
         reasoning_text,
@@ -3772,9 +3875,6 @@ pub fn generate_qwen35_once_slot_aware(
     let prefill_duration = prefill_start.elapsed();
 
     // ── Decode loop ───────────────────────────────────────────────────
-    let device = MlxDevice::new()
-        .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 slot-aware decode): {e}"))?;
-    let _ = &device; // sample_logits_qwen35 doesn't need the device handle
     let decode_start = Instant::now();
     let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
     generated_tokens.push(next_token);
@@ -5092,6 +5192,9 @@ mod prefill_fold_scheduler_tests;
 #[cfg(test)]
 #[path = "engine_qwen35/round_slot_independence_tests.rs"]
 mod round_slot_independence_tests;
+#[cfg(test)]
+#[path = "engine_qwen35/request_device_tests.rs"]
+mod request_device_tests;
 #[path = "engine_qwen35/shadow_draft.rs"]
 mod shadow_draft;
 #[cfg(test)]
@@ -7137,16 +7240,6 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
 
     let is_greedy = is_greedy_eligible(params);
 
-    let device = match MlxDevice::new() {
-        Ok(d) => d,
-        Err(e) => {
-            send!(GenerationEvent::Error(format!(
-                "qwen35 stream slot-aware: MlxDevice::new failed: {e}"
-            )));
-            return;
-        }
-    };
-    let _ = &device; // sampling helpers don't need the device handle
 
     // Per-slot reset at entry — persistent cache may carry stale bytes
     // from a prior request on this slot.
@@ -7816,7 +7909,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
     };
     let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
 
-    let device = MlxDevice::new()
+    let device = RequestDevice::new(supervisor)
         .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate w/ soft tokens): {e}"))?;
     let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_len, max_tokens)?;
 
@@ -7994,6 +8087,10 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
         &generated_tokens,
     );
 
+    // Before the result is reported: the request's queue is settled under
+    // the engine's supervision, and a failure is this request's failure.
+    device.settle()?;
+
     Ok(GenerationResult {
         text: content,
         reasoning_text,
@@ -8067,7 +8164,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
     };
     let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
 
-    let device = MlxDevice::new()
+    let device = RequestDevice::new(supervisor)
         .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 vision generate): {e}"))?;
     let (mut kv_cache, cache_reused) = take_serial_kv_cache(qwen, &device, prompt_len, max_tokens)?;
 
@@ -8319,6 +8416,10 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
         &generated_tokens,
     );
 
+    // Before the result is reported: the request's queue is settled under
+    // the engine's supervision, and a failure is this request's failure.
+    device.settle()?;
+
     Ok(GenerationResult {
         text: content,
         reasoning_text,
@@ -8510,7 +8611,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
     }
 
     let cache_alloc_start = Instant::now();
-    let device = match MlxDevice::new() {
+    let device = match RequestDevice::new(supervisor) {
         Ok(d) => d,
         Err(e) => {
             return Err(e).context("Qwen35 SerialFifo streaming device initialization");
@@ -9627,6 +9728,11 @@ pub(super) fn generate_stream_qwen35_once_extended(
         "Qwen35 request complete"
     );
 
+    // Before `Done`: the request's queue is settled under the engine's
+    // supervision, and a failure is this request's failure.
+    device
+        .settle()
+        .context("Qwen35 SerialFifo streaming request")?;
     send!(GenerationEvent::Done {
         finish_reason,
         prompt_tokens: prompt_len,
@@ -9655,13 +9761,13 @@ pub(super) fn embed_qwen35(
         !prompt_tokens.is_empty(),
         "embed_qwen35: empty prompt_tokens"
     );
-    let device =
-        MlxDevice::new().map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 embed): {e}"))?;
+    let device = RequestDevice::new(supervisor)
+        .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 embed): {e}"))?;
     // For embeddings we don't need decode budget; pass max_tokens=0 to
     // size the cache to just the prompt.
     let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_tokens.len(), 0)?;
     let positions = prefill_positions_for(prompt_tokens.len());
-    supervised_gpu_call(supervisor, "qwen35_serial_embed", || {
+    let embedding = supervised_gpu_call(supervisor, "qwen35_serial_embed", || {
         qwen.model
             // ADR-040 Phase B4b (2026-05-24): embed-last is single-stream
             // chat-as-embedder; slot 0 preserves pre-B4b behaviour. The
@@ -9670,7 +9776,10 @@ pub(super) fn embed_qwen35(
             // can pass SlotId(N) directly.
             .forward_embed_last(prompt_tokens, &positions, &mut kv_cache, SlotId(0))
             .context("Qwen35Model::forward_embed_last")
-    })
+    })?;
+    drop(kv_cache);
+    device.settle()?;
+    Ok(embedding)
 }
 
 /// **ADR-040 iter-C2d-cont-kernel iter-3 (2026-05-30)** — slot-aware
@@ -12172,6 +12281,8 @@ mod tests {
             // construction shape; iter-2a always leaves this `None`.
             persistent_kv_cache: None,
             dflash2: None,
+            dflash2_plan: None,
+            routes: route_profile::current(),
             speculation: crate::serve::api::qwen35_speculation::QwenSpeculationController::new(
                 crate::serve::api::qwen35_speculation::QwenSpeculationPolicy::Off,
             ),

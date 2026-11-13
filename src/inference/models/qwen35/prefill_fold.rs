@@ -33,13 +33,13 @@
 //! [`Qwen35Model::prefill_fold_exact`]: super::model::Qwen35Model
 
 use std::cell::RefCell;
-use std::sync::LazyLock;
 
 use anyhow::{anyhow, ensure, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
-use super::joint_step_options::switch_from_process;
+use super::joint_step_options::parse_switch;
 use super::kv_cache::LaAnchorImage;
+use crate::inference::spec_decode::dflash2::route_profile;
 
 /// Switch, default off: `1`/`on`/`true` folds the generation cue into the
 /// last content chunk of a bounded prompt prefill.
@@ -50,12 +50,19 @@ pub(crate) const QWEN_PREFILL_FOLD_CUE_ENV: &str = "HF2Q_QWEN_PREFILL_FOLD_CUE";
 /// cover.
 pub(crate) const MAX_CUE_ROWS: usize = 32;
 
-static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    switch_from_process(QWEN_PREFILL_FOLD_CUE_ENV).unwrap_or_else(|error| {
-        tracing::warn!(error, fallback = false, "invalid Qwen cue-fold switch");
-        false
-    })
-});
+/// The switch as resolved for the model this thread serves. An invalid value
+/// warns once and keeps the fold off.
+fn resolved() -> bool {
+    const SWITCH: route_profile::Switch = route_profile::switch(QWEN_PREFILL_FOLD_CUE_ENV);
+    route_profile::with_value(SWITCH, |raw| parse_switch(QWEN_PREFILL_FOLD_CUE_ENV, raw))
+        .unwrap_or_else(|error| {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(error, fallback = false, "invalid Qwen cue-fold switch");
+            });
+            false
+        })
+}
 
 /// Whether the operator switched the fold on.
 pub(crate) fn enabled() -> bool {
@@ -63,7 +70,7 @@ pub(crate) fn enabled() -> bool {
     if let Some(switches) = super::prefill_prepared::SwitchesForTest::current() {
         return switches.fold_cue;
     }
-    *ENABLED
+    resolved()
 }
 
 /// Forward routes that have no folded form: with any of them a prompt

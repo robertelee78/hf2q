@@ -9,6 +9,10 @@ pub mod auto_pipeline;
 pub mod cache;
 pub mod config;
 mod deepseek4_cli;
+pub(crate) mod dflash2_policy;
+pub(crate) mod resident_memory;
+#[cfg(test)]
+mod engine_memory_lifecycle_tests;
 pub(crate) mod discovery;
 pub mod encoder_worker_singleton;
 // forward_mlx removed — gemma4 moved to inference::models::gemma4 (ADR-038 §3.3)
@@ -3986,6 +3990,104 @@ impl multi_model::EngineConfig {
 
 pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<api::engine::Engine> {
     anyhow::ensure!(path.exists(), "Model not found: {}", path.display());
+    // ADR-067 D6: the DFlash2 policy and its route profile are resolved from
+    // the GGUF header, the scheduler and the drafter's availability before
+    // any weight is read. Several profile switches are consumed while the
+    // weights are uploaded, and a missing drafter is fetched here, ahead of
+    // the large load.
+    // Memory-carrying routes are admitted against what the engines already
+    // resident have committed. The decision and its reservation are one
+    // transaction, so two loads running at once cannot both decide against
+    // the same total.
+    let ledger = resident_memory::process();
+    let (selection, reservation) = ledger.admit(path, |resident_bytes| {
+        let selection = dflash2_policy::resolve_for_load(path, config, resident_bytes)?;
+        let commitment = selection.commitment;
+        anyhow::Ok((selection, commitment))
+    })?;
+    selection.log(path);
+    let (engine, selection) = match load_engine_on_route(path, config, &selection, reservation) {
+        Err(error) if selection.falls_back_on_load_error() => {
+            // Auto never fails startup for a reason of its own making: a
+            // load that fails with DFlash2 selected is repeated on the prior
+            // route, whose errors are the model's own.
+            tracing::warn!(
+                model = %path.display(),
+                error = %format!("{error:#}"),
+                "DFlash2 route failed to load; loading the prior route"
+            );
+            let prior =
+                selection.without_dflash2(format!("the DFlash2 route failed to load: {error:#}"));
+            prior.log(path);
+            // The failed attempt's reservation went with its model: it is
+            // gone if the model was dropped, and still counted if a worker
+            // that could not be stopped holds it. The retry reserves its
+            // own; the prior route is subject to no admission rule.
+            let reservation = ledger.reserve(path, prior.commitment);
+            (
+                load_engine_on_route(path, config, &prior, reservation)?,
+                prior,
+            )
+        }
+        result => (result?, selection),
+    };
+    Ok(engine.with_route_decision(selection.published()))
+}
+
+/// Load and spawn one engine on the route `selection` resolved.
+///
+/// `reservation` is what the engine holds of the host's memory on that
+/// route. It stays with whoever owns the model: this thread while it loads,
+/// then the worker thread, whose teardown alone releases it.
+fn load_engine_on_route(
+    path: &Path,
+    config: &multi_model::EngineConfig,
+    selection: &dflash2_policy::Selection,
+    reservation: resident_memory::Reservation,
+) -> Result<api::engine::Engine> {
+    use crate::inference::device_settle::{settle_or_record, take_thread_unsettled};
+    // This thread's own claim on the commitment, held until its cleanup
+    // below has concluded: the reservation may move on with the model, and
+    // its worker may be torn down, before that.
+    let loading_claim = reservation.loading_claim();
+    let mut reservation = Some(reservation);
+    let engine = load_and_spawn_on_route(path, config, selection, &mut reservation);
+    // This thread held the model while it loaded and provisioned it. A GPU
+    // weight cache it still has for that is a second copy of what the worker
+    // builds for itself, or belongs to a model that failed to load: it is
+    // dropped and its queue settled either way. Every settle that failed on
+    // this thread during the load, this one included, is on the thread's
+    // record, also when the load reported another error first.
+    if let Some(device) =
+        crate::inference::models::qwen35::model::Qwen35Model::take_thread_gpu_cache()
+    {
+        let _ = settle_or_record(&device);
+    }
+    let settled = match take_thread_unsettled() {
+        Some(reason) => Err(anyhow::anyhow!(
+            "a command queue of the load of {} could not be settled: {reason}",
+            path.display()
+        )),
+        None => Ok(()),
+    };
+    resident_memory::conclude_load(reservation.take(), loading_claim, settled);
+    engine
+}
+
+/// [`load_engine_on_route`] up to the spawned, warmed-up engine. The
+/// reservation is taken out of `reservation` when the model is given to its
+/// worker thread.
+fn load_and_spawn_on_route(
+    path: &Path,
+    config: &multi_model::EngineConfig,
+    selection: &dflash2_policy::Selection,
+    reservation: &mut Option<resident_memory::Reservation>,
+) -> Result<api::engine::Engine> {
+    // Bound for the load and the spawn: weight upload and worker
+    // provisioning read the table switches on this thread.
+    let _routes = crate::inference::spec_decode::dflash2::route_profile::bind(
+        std::sync::Arc::clone(&selection.routes),
+    );
     // Header-only parse surfaces bad magic + populates the diagnostic
     // log line.  Cheap (memory-mapped header, no tensor read).
     //
@@ -4052,6 +4154,9 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
             loaded.apply_operator_model_id(logical_path);
         }
     }
+    if let api::engine::LoadedModel::Qwen35(q) = &mut loaded {
+        q.dflash2_plan = selection.plan.clone();
+    }
     // ADR-017 Phase E.a iter-2: thread the metrics sink onto the
     // GemmaLoadedModel BEFORE Engine::spawn moves `loaded` into the
     // worker. Qwen35 / Qwen3VlText variants don't yet have an LCP
@@ -4099,6 +4204,10 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         config.queue_capacity,
         config.kv_cache_budget_bytes,
         config.engine_mode,
+        // Taken when the worker thread is created: it owns the model from
+        // there on, and with it the reservation. A spawn that fails before
+        // that leaves the reservation here.
+        reservation,
     )
     .map_err(|e| {
         anyhow::anyhow!(
@@ -4133,9 +4242,20 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
             .build()
             .context("build tokio runtime for synchronous engine warmup")?;
         let warmup_started = std::time::Instant::now();
-        warmup_rt
-            .block_on(engine.warmup())
-            .context("synchronous engine warmup")?;
+        if let Err(error) = warmup_rt.block_on(engine.warmup()) {
+            // The worker owns the model. Stop it and wait for its teardown,
+            // so that a caller that loads again (the prior-route retry) does
+            // not load beside a model that is still resident. A worker that
+            // does not stop keeps its reservation.
+            if let Err(shutdown) = warmup_rt.block_on(engine.shutdown()) {
+                tracing::warn!(
+                    model = %path.display(),
+                    error = %format!("{shutdown:#}"),
+                    "engine worker did not stop after its warmup failed; its memory stays reserved"
+                );
+            }
+            return Err(error).context("synchronous engine warmup");
+        }
         tracing::info!(
             elapsed_ms = warmup_started.elapsed().as_millis() as u64,
             "Engine warmed up synchronously (pre-mmproj order — iter-103 fix)"

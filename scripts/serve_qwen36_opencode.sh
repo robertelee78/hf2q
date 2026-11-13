@@ -96,6 +96,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/hf2q_process_guard.sh"
+source "$SCRIPT_DIR/hf2q_dflash2_launcher_check.sh"
 
 MODEL="${MODEL:-/opt/hf2q/models/qwen3.6/APEX-Q5_K_M.gguf}"
 MMPROJ="${MMPROJ:-/opt/hf2q/models/qwen3.6/mmproj-qwen36-F16.gguf}"
@@ -137,6 +138,18 @@ case "$VISION_MODE" in
         exit 3
         ;;
 esac
+# DFlash2 (ADR-067 D6) needs no variable here. hf2q decides per model, from
+# the GGUF header and before it reads any weight: a Qwen3.8/Qwen3.6 target
+# that is a pinned pair, or has a pinned target's architecture and shapes (the
+# fine-tuned defaults of these launchers), gets its pinned drafter from the
+# Hugging Face cache (downloaded and verified first when absent, so the fetch
+# always precedes the large load) and every fast-route switch its storage
+# admits; any other artifact keeps the prior route. The
+# `DFlash2 policy resolved` log line records the decision. HF2Q_DFLASH2=0 is
+# the kill switch, HF2Q_DFLASH2=1 makes a missing drafter or an unqualified
+# target a startup error; both pass through from the caller's environment.
+# Only what cannot depend on the policy is checked here: see the helper.
+hf2q_dflash2_launcher_check || exit 3
 # Refuse before loading the model when another service already owns the port.
 if command -v lsof >/dev/null 2>&1; then
     PORT_LISTENER="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"

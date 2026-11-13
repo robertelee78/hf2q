@@ -435,6 +435,8 @@ fn new_model_registry(model: &Qwen35Model) -> Result<KernelRegistry> {
     registry
         .freeze_ggml_routing_policy(model.ggml_routing_policy)
         .map_err(|error| anyhow!("freeze Qwen GGML routing policy: {error}"))?;
+    #[cfg(test)]
+    crate::inference::route_host::simulate_in(&mut registry)?;
     Ok(registry)
 }
 
@@ -4206,6 +4208,56 @@ impl Qwen35Model {
         })?;
         pool_operation.complete()?;
         Ok(result)
+    }
+
+    /// Drop this thread's GPU cache if it belongs to this model, and return
+    /// its buffers to the system.
+    ///
+    /// The cache is per thread, and everything it creates at upload (BF16
+    /// copies, the staged MoE planes) exists once per cache. A thread that
+    /// primed it only to provision something, and then hands the model to
+    /// another thread, releases it here so those buffers are not resident
+    /// twice. Buffers the model itself owns are untouched.
+    ///
+    /// Dropping a buffer only stages its removal from the device's Metal
+    /// residency set; the set keeps the allocation until its next commit,
+    /// which a thread that encodes nothing further never issues. An empty
+    /// command buffer is therefore committed on the cache's device, which
+    /// flushes the staged removals.
+    pub fn release_gpu_cache(&self) -> Result<()> {
+        let released = GPU_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if cache
+                .as_ref()
+                .is_some_and(|cache| cache.model_ptr == self as *const _ as *const ())
+            {
+                cache.take()
+            } else {
+                None
+            }
+        });
+        let Some(cache) = released else {
+            return Ok(());
+        };
+        let device = cache.device.clone();
+        drop(cache);
+        // The cache is gone from the thread, so a settle that fails here
+        // would leave nothing for the thread's owner to find: it goes on the
+        // thread's record, whatever error the caller reports first.
+        crate::inference::device_settle::settle_or_record(&device)
+    }
+
+    /// Drop the GPU weight cache of this thread, whichever model it was
+    /// built for, and return the device it was built on. A thread that held
+    /// a model and is done with it (the worker thread at its end, the
+    /// loading thread once the model is with its worker) calls this; the
+    /// returned device still needs `device_settle::settle`, after
+    /// everything else that drops buffers of that model has run.
+    pub(crate) fn take_thread_gpu_cache() -> Option<MlxDevice> {
+        let cache = GPU_CACHE.with(|cell| cell.borrow_mut().take())?;
+        let device = cache.device.clone();
+        drop(cache);
+        Some(device)
     }
 
     #[cfg(test)]
@@ -8627,6 +8679,9 @@ impl Qwen35Model {
         let qkv_channels = (2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
             + cfg.linear_num_value_heads * cfg.linear_value_head_dim)
             as usize;
+        // A fast-route switch the operator set that this host's GPU cannot
+        // run fails the load here, with the switch and the reason.
+        crate::inference::route_host::require_explicit(device)?;
         // Resolve the MoE expert switches before any upload: an invalid value
         // or combination fails the load here, not at the first decode step.
         let moe_expert_route = super::moe_batched::qwen_moe_expert_route()?;

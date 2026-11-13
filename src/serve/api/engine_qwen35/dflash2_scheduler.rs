@@ -20,6 +20,7 @@ use crate::inference::models::qwen35::{
 };
 use crate::inference::spec_decode::dflash2::{
     adapters::{DFlash2TargetFamily, QwenDFlash2Adapter},
+    route_profile,
     verify_budget::VerifyBudgetLane,
 };
 use crate::serve::api::engine_supervisor::EngineSupervisor;
@@ -37,28 +38,21 @@ const DFLASH2_PROPOSALS_PER_LANE: usize = DFLASH2_MAX_ROWS_PER_LANE - 1;
 pub(in crate::serve::api) const DFLASH2_CONTEXT_FIRST_ENV: &str = "HF2Q_DFLASH2_CONTEXT_FIRST";
 
 /// Whether a step submits its draft-context commit before it encodes the
-/// DeltaNet replay (read once).
+/// DeltaNet replay, as this model's routes resolved it.
 pub(in crate::serve::api) fn context_first() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var(DFLASH2_CONTEXT_FIRST_ENV)
-            .map(|value| value == "1")
-            .unwrap_or(false)
-    });
-    *ENABLED
+    const SWITCH: route_profile::Switch = route_profile::switch(DFLASH2_CONTEXT_FIRST_ENV);
+    route_profile::is_one(SWITCH)
 }
 
 /// Opt-in switch of the draft prefetch; exact value `1`.
 pub(in crate::serve::api) const DFLASH2_DRAFT_PREFETCH_ENV: &str = "HF2Q_DFLASH2_DRAFT_PREFETCH";
 
 /// Whether a step that settles acceptance on the host commits the next
-/// step's draft command before it waits for its own replay (read once).
+/// step's draft command before it waits for its own replay, as this model's
+/// routes resolved it.
 pub(in crate::serve::api) fn draft_prefetch() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var(DFLASH2_DRAFT_PREFETCH_ENV)
-            .map(|value| value == "1")
-            .unwrap_or(false)
-    });
-    *ENABLED
+    const SWITCH: route_profile::Switch = route_profile::switch(DFLASH2_DRAFT_PREFETCH_ENV);
+    route_profile::is_one(SWITCH)
 }
 
 /// Switch of the GPU decision candidates of host-sampled verify rows:
@@ -97,12 +91,10 @@ fn parse_decision_route(raw: Option<&str>) -> DecisionRoute {
     }
 }
 
-/// The process's decision route (read once).
+/// The decision route as this model's routes resolved it.
 pub(in crate::serve::api) fn decision_route() -> DecisionRoute {
-    static ROUTE: LazyLock<DecisionRoute> = LazyLock::new(|| {
-        parse_decision_route(std::env::var(DFLASH2_GPU_DECISIONS_ENV).ok().as_deref())
-    });
-    *ROUTE
+    const SWITCH: route_profile::Switch = route_profile::switch(DFLASH2_GPU_DECISIONS_ENV);
+    route_profile::with_value(SWITCH, parse_decision_route)
 }
 
 /// Development diagnostic for measuring the two tail switches inside one

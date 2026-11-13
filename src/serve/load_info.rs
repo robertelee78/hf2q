@@ -1810,6 +1810,8 @@ mod tests {
             // compatible. Production iter-2a path also stores `None`.
             persistent_kv_cache: None,
             dflash2: None,
+            dflash2_plan: None,
+            routes: crate::inference::spec_decode::dflash2::route_profile::current(),
             speculation: crate::serve::api::qwen35_speculation::QwenSpeculationController::new(
                 crate::serve::api::qwen35_speculation::QwenSpeculationPolicy::Off,
             ),

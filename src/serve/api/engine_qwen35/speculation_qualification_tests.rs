@@ -108,6 +108,8 @@ pub(super) fn loaded_model(policy: QwenSpeculationPolicy) -> Qwen35LoadedModel {
         tq_kv_active: false,
         persistent_kv_cache: None,
         dflash2: None,
+        dflash2_plan: None,
+        routes: crate::inference::spec_decode::dflash2::route_profile::current(),
         speculation: QwenSpeculationController::new(policy),
         slot_spill_budget_bytes: 0,
     }

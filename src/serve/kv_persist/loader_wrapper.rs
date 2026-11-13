@@ -289,6 +289,10 @@ where
     /// Returns `Err(...)` iff the inner loader failed OR the bind
     /// hook held a clone of the type-erased Arc (contract violation;
     /// see module docs).
+    fn admission_bytes(&self, path: &Path, config: Option<&EngineConfig>) -> Option<u64> {
+        self.inner.admission_bytes(path, config)
+    }
+
     fn load(&self, path: &Path, config: &EngineConfig) -> Result<E> {
         // 1. Drive the inner loader. Propagate errors verbatim — the
         //    wrapper does NOT bind on failure (per Hypothesis 2 in the
