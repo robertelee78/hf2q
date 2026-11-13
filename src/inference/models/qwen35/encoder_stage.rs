@@ -238,6 +238,21 @@ impl<'sess> LayerEncoder<'sess> {
                 Ok(())
             }
             LayerEncoder::Sessioned(sess) => {
+                if super::prefill_prepared::single_command_layers() {
+                    // A prefill forward that submits one command buffer
+                    // per layer: commit without the shared-event fence.
+                    // The next command buffer then starts without a wait
+                    // for the event (measured 0.08 ms per command buffer),
+                    // ordered behind this one by the queue's commit order
+                    // like every `Plain` command buffer of a layer.
+                    sess.begin_stage(label);
+                    sess.commit_stage()
+                        .with_context(|| format!("EncoderSession::commit_stage({label})"))?;
+                    sess.reset_for_next_stage().with_context(|| {
+                        format!("EncoderSession::reset_for_next_stage({label})")
+                    })?;
+                    return Ok(());
+                }
                 sess.fence_stage(Some(label))
                     .with_context(|| format!("EncoderSession::fence_stage({label})"))?;
                 // iter91 borrowed-session: the session lives until the outer
