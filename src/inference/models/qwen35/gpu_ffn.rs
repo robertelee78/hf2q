@@ -437,6 +437,15 @@ fn repacked_dense_shape_eligible(params: &GgmlQuantizedMatmulParams, any_width: 
         && params.n % 64 == 0
         && params.k % 256 == 0
         && matches!(params.ggml_type, GgmlType::Q4_K | GgmlType::Q6_K)
+        && prepared_mm_runs()
+}
+
+/// Whether this host's GPU runs the prepared kernels at all
+/// ([`crate::inference::route_host`]): they exist only on the Metal tensor
+/// API. Every admission of a prepared product asks it, so a host without
+/// that API keeps the stock kernels whatever the switches say.
+pub(super) fn prepared_mm_runs() -> bool {
+    crate::inference::route_host::runs(mlx_native::TensorKernelFamily::RepackedGgufMm)
 }
 
 /// Whether a step may take the prepared route below 32 rows: the switch is

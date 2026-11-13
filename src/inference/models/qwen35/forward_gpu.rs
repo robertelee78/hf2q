@@ -435,6 +435,8 @@ fn new_model_registry(model: &Qwen35Model) -> Result<KernelRegistry> {
     registry
         .freeze_ggml_routing_policy(model.ggml_routing_policy)
         .map_err(|error| anyhow!("freeze Qwen GGML routing policy: {error}"))?;
+    #[cfg(test)]
+    crate::inference::route_host::simulate_in(&mut registry)?;
     Ok(registry)
 }
 
@@ -8666,6 +8668,9 @@ impl Qwen35Model {
         let qkv_channels = (2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
             + cfg.linear_num_value_heads * cfg.linear_value_head_dim)
             as usize;
+        // A fast-route switch the operator set that this host's GPU cannot
+        // run fails the load here, with the switch and the reason.
+        crate::inference::route_host::require_explicit(device)?;
         // Resolve the MoE expert switches before any upload: an invalid value
         // or combination fails the load here, not at the first decode step.
         let moe_expert_route = super::moe_batched::qwen_moe_expert_route()?;

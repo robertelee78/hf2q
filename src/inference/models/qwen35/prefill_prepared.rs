@@ -73,7 +73,11 @@ impl PrefillScope {
         Self::with_route(route)
     }
 
+    /// The route is taken only on a host whose GPU runs the prepared
+    /// kernels ([`super::gpu_ffn::prepared_mm_runs`]); elsewhere the scope
+    /// is open with the route off, and the cue fold with it.
     fn with_route(route: bool) -> Self {
+        let route = route && super::gpu_ffn::prepared_mm_runs();
         Self {
             previous: SCOPE.with(|cell| cell.replace(route)),
         }

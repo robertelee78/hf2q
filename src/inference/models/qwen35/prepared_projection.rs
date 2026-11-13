@@ -115,6 +115,7 @@ impl SharedHead {
             && out_features % 64 == 0
             && in_features % 256 == 0
             && matches!(ggml_type, GgmlType::Q4_K | GgmlType::Q6_K)
+            && super::gpu_ffn::prepared_mm_runs()
     }
 
     /// Whether the planes have been prepared.

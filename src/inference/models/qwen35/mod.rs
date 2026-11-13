@@ -136,6 +136,8 @@ pub(crate) mod prepared_switch_override;
 mod prepared_width_tests;
 pub(crate) mod replay_arena;
 #[cfg(test)]
+mod route_host_tests;
+#[cfg(test)]
 mod replay_arena_tests;
 mod source_config;
 pub(crate) mod source_precision;

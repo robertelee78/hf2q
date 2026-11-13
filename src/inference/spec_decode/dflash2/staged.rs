@@ -13,6 +13,7 @@ use super::{
     tensors::{DFlash2ModelTensors, DFlash2Projection},
     workspace::{allocate, DFlash2Workspace, DFlash2WorkspaceError},
 };
+use crate::inference::route_host;
 use crate::serve::forward_mlx_shared::MlxQWeight;
 use anyhow::{bail, ensure, Context, Result};
 use mlx_native::ops::{
@@ -30,7 +31,9 @@ use mlx_native::ops::{
         dispatch_repacked_gguf_mm_bf16_input, prepare_repacked_gguf_weight, PreparedGgufWeight,
     },
 };
-use mlx_native::{CommandEncoder, DType, GgmlType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{
+    CommandEncoder, DType, GgmlType, KernelRegistry, MlxBuffer, MlxDevice, TensorKernelFamily,
+};
 
 pub const DFLASH2_DRAFT_STAGED_ENV: &str = "HF2Q_DFLASH2_DRAFT_STAGED";
 
@@ -65,6 +68,20 @@ pub(super) fn staged_tile_takes(output_width: usize) -> bool {
 
 /// Whether the checkpoint's shapes at `lanes` lanes fit the staged route.
 fn supports(config: &DFlash2Config, tensors: &DFlash2ModelTensors, lanes: usize) -> Result<()> {
+    // The staged tiles, the ring attention and the prepared head tile exist
+    // only on the Metal tensor API.
+    for family in [
+        TensorKernelFamily::Dflash2Af4g64Staged,
+        TensorKernelFamily::Dflash2RingAttention,
+        TensorKernelFamily::RepackedGgufMm,
+    ] {
+        ensure!(
+            route_host::runs(family),
+            "{DFLASH2_DRAFT_STAGED_ENV}=1: {} cannot run on this host: {}",
+            family.name(),
+            mlx_native::TENSOR_API_UNAVAILABLE
+        );
+    }
     ensure!(
         matches!(tensors.context_projection, DFlash2Projection::Af4G64 { .. }),
         "{DFLASH2_DRAFT_STAGED_ENV}=1 requires HF2Q_DFLASH2_DRAFT_AF4_G64=1"
@@ -445,6 +462,32 @@ mod tests {
             final_logit_softcapping: None,
             output_multiplier: None,
         }
+    }
+
+    /// The staged tiles, the ring attention and the prepared head exist only
+    /// on the Metal tensor API: on a host without it the switch is refused
+    /// at load with the reason, and off stays off.
+    #[test]
+    fn route_host_without_the_tensor_api_refuses_the_staged_draft() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().unwrap();
+        let cfg = config(1_024);
+        let tensors = DFlash2ModelTensors::synthetic_af4_g64(&device, &cfg, 3);
+        let _host = route_host::HostForTest::without_tensor_api();
+        for off in [None, Some(""), Some("0")] {
+            assert!(!resolve_staged_draft(off, &cfg, &tensors, 4).unwrap());
+        }
+        let error = resolve_staged_draft(Some("1"), &cfg, &tensors, 4)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("HF2Q_DFLASH2_DRAFT_STAGED=1: "),
+            "{error}"
+        );
+        assert!(
+            error.contains(mlx_native::TENSOR_API_UNAVAILABLE),
+            "{error}"
+        );
     }
 
     #[test]

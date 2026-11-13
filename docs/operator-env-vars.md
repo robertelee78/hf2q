@@ -246,6 +246,46 @@ switch as `NAME=value(source)` with source `env`, `profile`, `default` or
 | `HF2Q_DFLASH2_CONTEXT_FIRST` | off; `1` in the route profile of a selected DFlash2 target | `1` | Qwen DFlash2 steps that settle acceptance on the host. Exact value `1` submits the draft-context commit before the DeltaNet replay is encoded, so the GPU works on the context commit while the host encodes the replay and the two commands overlap; the step still waits for both. Output and cache state are bitwise unchanged. A replay command that fails after the submission clears the draft rings of the step's lanes (they re-fill on the next prefill); if they cannot be cleared the worker stops. Logged at worker start as `dflash2_context_first`. |
 | `HF2Q_QWEN_VERIFY_REPLAY_REUSE` | off; `1` in the route profile of a selected DFlash2 target | `1` | Qwen verify steps (DFlash2 and joint MTP). Exact value `1` keeps the DeltaNet replay storage between verify steps instead of allocating and zero-filling it for every step (188 MB per four-lane step on Qwen3.8-27B, 91 MB on Qwen3.6-35B-A3B), which otherwise leaves the GPU idle between the draft command and the target's first command. Output and cache state are bitwise unchanged. The worker holds the largest storage a step has used for its lifetime; that memory is not counted by memory admission or any budget, so leave headroom for it. Logged at worker start as `verify_replay_reuse`. |
 
+### Host capability of the fast routes
+
+Some fast-route kernels exist only on the Metal tensor API and have no
+portable twin. That API is absent when the runtime Metal compiler has no
+`<metal_tensor>` header (macOS before 26) or when the GPU is outside the
+Metal 4 family (virtual machines, including GitHub's hosted macOS runners).
+`src/inference/route_host.rs` asks mlx-native once per process which kernel
+families the GPU runs and holds the table of what each switch needs:
+
+| Switch | On a host without the Metal tensor API |
+|---|---|
+| `HF2Q_DFLASH2_DRAFT_STAGED` | cannot run (staged tiles, ring attention, prepared head) |
+| `HF2Q_REPACKED_GGUF_M32`, `_M32_PROJ`, `_M32_HEAD`, `_ANY_WIDTH`, `_SHARED_HEAD` | cannot run (prepared GGUF matmul) |
+| `HF2Q_QWEN_PREFILL_PREPARED` | cannot run (prepared GGUF matmul) |
+| `HF2Q_QWEN_MOE_STAGED_M8` | cannot run (prepared expert planes) |
+| `HF2Q_QWEN_MOE_LIVE_TILES` | cannot run (prepared expert planes, live tiles) |
+| `HF2Q_QWEN_VERIFY_ATTN_TILE` | runs: every layer keeps the per-row chain (logged once) |
+| `HF2Q_QWEN_PREFILL_FOLD_CUE` | runs: two forwards, as without a routed prepared prefill |
+| `HF2Q_QWEN_VERIFY_MIXER_FUSED` | runs: the fused core is portable; its wave follows the prepared routes |
+| `HF2Q_DFLASH2_DRAFT_AF4_G64`, `HF2Q_DFLASH2_GPU_TARGET_TOKENS`, `HF2Q_DFLASH2_CONTEXT_FIRST`, `HF2Q_QWEN_VERIFY_REPLAY_REUSE`, `HF2Q_QWEN_MOE_BATCHED` | run: portable kernels or host-side only |
+
+A switch from the "cannot run" rows that the operator sets fails the model
+load, before any weight is uploaded, with the switch, the kernel family and
+the device:
+
+```text
+HF2Q_REPACKED_GGUF_M32 is on, but the prepared GGUF matmul (repacked_gguf_mm) cannot run on this host: the Metal tensor API is unavailable (a runtime compiler without <metal_tensor>, or a GPU outside the Metal 4 family) (Apple Paravirtual device). Unset HF2Q_REPACKED_GGUF_M32: the stock route serves this host.
+```
+
+The admission points of those routes ask the same answers, so a switch that
+is on for any other reason leaves its route off on such a host and the stock
+route serves. A probe failure that is not a missing tensor API (a shader or
+toolchain regression on a Metal 4 device) is an error, not a fallback.
+
+Outside the switches, two stock kernels had the same dependency and now take
+their portable route on such a host: the head-major O-projection of Gemma's
+batched prefill (Q4_0, Q5_0, Q8_0 and Q6_K weights) permutes the activation
+and runs the ordinary matmul, and F16 weights of more than eight rows run
+mlx-native's portable F16 matmul.
+
 ## Qwen joint decode
 
 With two or more Qwen agents decoding at once, eligible slots can advance through one shared target forward per scheduler turn instead of one forward per slot. Joint rows run ordinary target decode: MTP drafting and history proposals are suppressed for them (slots with MTP state still run their MTP catch-up, so a later solo turn resumes K3). In exact mode, a turn with fewer than two eligible slots is serial, including MTP K3 and history speculation, and slots beyond the joint width stay serial that turn. In the padded mode (below), every eligible slot runs in consecutive joint steps of at most the joint width. That includes a lone slot whose next tick is ordinary target decode, so an ordinary request's arithmetic does not depend on which tenants share its turns (#717). A lone slot with MTP or history speculation state keeps its serial speculative round.
