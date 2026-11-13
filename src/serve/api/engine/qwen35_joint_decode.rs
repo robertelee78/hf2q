@@ -195,6 +195,7 @@ fn select_qwen_joint_decode(
                     pooled_outputs: requested_step.pooled_outputs,
                     verify_attention_tile: false,
                     verify_mixer_fused: false,
+                    dflash2: crate::inference::models::qwen35::joint_step_options::DFlash2VerifyOptions::OFF,
                 },
                 joint_mtp: joint_mtp && (mode == JointRouteMode::Exact || solo),
             })
@@ -280,6 +281,7 @@ pub(super) fn qwen35_joint_decode_config(
         pooled_outputs: switch(QWEN_JOINT_POOLED_OUTPUTS_ENV, "pooled outputs"),
         verify_attention_tile: false,
         verify_mixer_fused: false,
+        dflash2: crate::inference::models::qwen35::joint_step_options::DFlash2VerifyOptions::OFF,
     };
     let selected = select_qwen_joint_decode(
         requested,
@@ -312,6 +314,8 @@ pub(super) fn qwen35_joint_decode_config(
         joint_mtp = selected.is_some_and(|config| config.joint_mtp),
         verify_replay_reuse = crate::inference::models::qwen35::replay_arena::enabled(),
         dflash2_context_first = crate::serve::api::engine_qwen35::dflash2_context_first(),
+        dflash2_draft_prefetch = crate::serve::api::engine_qwen35::dflash2_draft_prefetch(),
+        dflash2_decisions = crate::serve::api::engine_qwen35::dflash2_decision_route().label(),
         unavailable = unavailable.as_deref().unwrap_or("none"),
         "Qwen joint decode configuration"
     );

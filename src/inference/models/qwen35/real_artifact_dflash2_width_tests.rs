@@ -157,6 +157,7 @@ fn verify_with(
         pooled_outputs: true,
         verify_attention_tile: tile,
         verify_mixer_fused: mixer_fused,
+        dflash2: Default::default(),
     };
     let verify = if live.is_some() {
         model.forward_gpu_dflash2_verify_from_gpu_tokens(

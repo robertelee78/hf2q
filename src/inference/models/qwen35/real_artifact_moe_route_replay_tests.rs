@@ -156,6 +156,7 @@ fn qwen36_dflash2_verify_moe_route_replay() {
         pooled_outputs: true,
         verify_attention_tile: false,
         verify_mixer_fused: false,
+        dflash2: Default::default(),
     };
     let vocab = model.cfg.vocab_size as usize;
     let sample_ids: Vec<usize> = (0..SAMPLE)

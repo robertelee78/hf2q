@@ -21,6 +21,14 @@ For the cycles of one lane count (default 4) this prints medians of:
   latency after the GPU finished;
 - the gap between consecutive cycles.
 
+A cycle that prefetched the next cycle's draft (HF2Q_DFLASH2_DRAFT_PREFETCH=1)
+carries that draft command in its own line and the next cycle's line has no
+draft command of its own, so the per-command table here mixes two cycles'
+drafts. Use scripts/dflash2_cycle_tail.py for such captures: it assigns each
+draft to the cycle that used it and reports the begin-to-begin period, the
+time from the output head's GPU end to the next draft's GPU start, GPU time
+per command class, and the two halves of a HF2Q_DFLASH2_TAIL_BLOCKS run.
+
 usage: dflash2_cycle_timeline.py FILE [--lanes N] [--skip K] [--json OUT]
                                  [--dump INDEX]
 """

@@ -150,6 +150,7 @@ pub(crate) mod verify_attn_tile;
 mod verify_attn_tile_tests;
 #[cfg(test)]
 mod verify_attn_tile_window_tests;
+pub(crate) mod verify_decision;
 pub mod wave5b8_profile;
 pub mod weight_loader;
 pub mod weight_pool;

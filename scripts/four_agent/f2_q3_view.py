@@ -1,6 +1,6 @@
 """Markdown of the F2 'Q3 verdicts of record' tier (f2_q3_tier records and rows). Pure: no receipt reads."""
 import native_peers
-from f2_q3_tier import (FAIRNESS, NATIVE_COMPARISON, PEER_SPEC_OFF, PRECISION_PP, REFERENCES, SSE,
+from f2_q3_tier import (COMPARISON_FAILURES, FAIRNESS, NATIVE_COMPARISON, PEER_SPEC_OFF, PRECISION_PP, REFERENCES, SSE,
                         STOCK_ARM, STOCK_RECORD, TOKEN_ARMS, TOKENS, UNMEASURABLE, how_to_read, required_references)
 
 
@@ -119,6 +119,11 @@ def campaign_cell(rec, effects):
                                             for w, s in controls if w in halted)
     if unrun:
         text += "; not run: " + ", ".join(unrun)
+    lost = rec.get(COMPARISON_FAILURES)
+    if lost:  # the comparison arms' failure counts travel with the speed measured on their passing runs
+        text += ("; comparison-arm failed runs: "
+                 + ", ".join(f"{arm} {a['failures']} of {a['attempts']}" for arm, a in lost["arms"].items())
+                 + f" ({lost['rule']})")
     return text
 
 
@@ -156,6 +161,8 @@ def render(manifest, q3_rows, native_rows, baseline_labels):
             verdict = "Withheld: " + "; ".join(unmet)
         elif verdict in ("Failed", "Inconclusive", "Pending") and rec["reasons"]:
             verdict += ": " + "; ".join(rec["reasons"])
+        elif verdict == "Unavailable" and rec["reasons"] and rec["reasons"][0].startswith("no usable stock arm"):
+            verdict += ": " + "; ".join(rec["reasons"])  # the peer cell keeps its measured contrast
         if fam in notices:
             verdict += f" — **{notices[fam]}**"
         peer = effects.get(("makespan_s", "peer"))

@@ -90,6 +90,10 @@ pub(crate) const SWITCHES: &[SwitchRow] = &[
     row("HF2Q_DFLASH2_DRAFT_STAGED",        AF4,       &[Head],                   ON,      ON),
     row("HF2Q_DFLASH2_GPU_TARGET_TOKENS",   None,      &[],                       None,    ON),
     row("HF2Q_DFLASH2_CONTEXT_FIRST",       None,      &[],                       ON,      ON),
+    // Per-model readers; no profile value until the combined configuration
+    // with them is qualified.
+    row("HF2Q_DFLASH2_DRAFT_PREFETCH",      None,      &[],                       None,    None),
+    row("HF2Q_DFLASH2_GPU_DECISIONS",       None,      &[],                       None,    None),
     row("HF2Q_REPACKED_GGUF_M32",           None,      &[DenseFfn],               ON,      ON),
     row("HF2Q_REPACKED_GGUF_M32_PROJ",      M32,       &[Projections],            ON,      ON),
     row("HF2Q_REPACKED_GGUF_M32_HEAD",      M32,       &[Head],                   ON,      ON),

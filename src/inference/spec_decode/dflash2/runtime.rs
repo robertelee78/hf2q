@@ -10,8 +10,8 @@ use super::{
     adapters::{dispatch_dflash2_input, target_vocabulary_head, DFlash2TargetFamily},
     config::DFlash2Config,
     forward::{
-        dispatch_dflash2_context_commit, dispatch_dflash2_forward, dispatch_dflash2_lane_ingest,
-        prepare_decode_positions,
+        dispatch_dflash2_context_commit, dispatch_dflash2_context_commit_at,
+        dispatch_dflash2_forward, dispatch_dflash2_lane_ingest, prepare_decode_positions,
     },
     route_profile,
     schema::{DFlash2CheckpointDescriptor, DFlash2FamilyAdapter},
@@ -121,6 +121,80 @@ pub(crate) struct SubmittedContextCommit {
     encoder: CommandEncoder,
 }
 
+/// Every input of one draft command. Two drafts with equal inputs, issued
+/// over the same rings and verify-budget state, are the same command. Built
+/// only when a prefetched command is stored.
+#[derive(Clone, Debug)]
+struct DraftInputs {
+    anchors: Vec<u32>,
+    logical_positions: Vec<u32>,
+    temperature_bits: Vec<u32>,
+    sampling_mask: u32,
+    maximum_verify_rows: Vec<u32>,
+    target_lane_order: Vec<u32>,
+    uniform_bits: Vec<u32>,
+    /// The caller reads the proposals on the host (the draft is waited for)
+    /// rather than leaving the target tokens on the queue.
+    wait: bool,
+    /// [`DFlash2Runtime::budget_epoch`] when the command was encoded: the
+    /// GPU row selection of an adaptive target reads the verify budget.
+    budget_epoch: u64,
+}
+
+impl DraftInputs {
+    /// Whether a draft call with these borrowed inputs is the command this
+    /// snapshot describes. Floats compare by bits. Allocates nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn matches(
+        &self,
+        anchors: &[u32],
+        logical_positions: &[u32],
+        temperatures: &[f32],
+        sampling_mask: u32,
+        maximum_verify_rows: &[u32],
+        target_lane_order: &[u32],
+        uniforms: &[f32],
+        wait: bool,
+        budget_epoch: u64,
+    ) -> bool {
+        let same_bits = |bits: &[u32], values: &[f32]| {
+            bits.len() == values.len()
+                && bits
+                    .iter()
+                    .zip(values)
+                    .all(|(bits, value)| *bits == value.to_bits())
+        };
+        self.wait == wait
+            && self.sampling_mask == sampling_mask
+            && self.budget_epoch == budget_epoch
+            && self.anchors == anchors
+            && self.logical_positions == logical_positions
+            && self.maximum_verify_rows == maximum_verify_rows
+            && self.target_lane_order == target_lane_order
+            && same_bits(&self.temperature_bits, temperatures)
+            && same_bits(&self.uniform_bits, uniforms)
+    }
+}
+
+/// A draft command committed ahead of the step that will use it
+/// ([`DFlash2Runtime::prefetch_draft`]).
+struct PrefetchedDraft {
+    inputs: DraftInputs,
+    encoder: CommandEncoder,
+}
+
+/// What became of the draft commands a runtime prefetched.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DraftPrefetchCounts {
+    /// Committed ahead of their step.
+    pub prefetched: u64,
+    /// Taken by the next draft call because its inputs were the same.
+    pub adopted: u64,
+    /// Waited for and dropped: the next draft call had other inputs, or the
+    /// rings were about to change under it.
+    pub discarded: u64,
+}
+
 /// GPU-resident DFlash2 checkpoint and persistent per-slot draft rings.
 pub struct DFlash2Runtime {
     pub descriptor: &'static DFlash2CheckpointDescriptor,
@@ -131,6 +205,24 @@ pub struct DFlash2Runtime {
     lane_bindings: Vec<DFlash2LaneBinding>,
     verify_budget: DFlash2VerifyBudget,
     gpu_target_tokens: bool,
+    /// The next step's draft, when the previous step committed it
+    /// ([`Self::prefetch_draft`]). While it is `Some` the command may be
+    /// executing: it reads the rings and writes the draft outputs of the
+    /// workspace, so nothing may touch either before [`Self::settle_prefetch`].
+    prefetched: Option<PrefetchedDraft>,
+    prefetch_counts: DraftPrefetchCounts,
+    /// Counts verify-budget observations ([`DraftInputs::budget_epoch`]).
+    budget_epoch: u64,
+    /// Copies of the workspace's row positions and ring slots that a
+    /// context commit submitted ahead of the next draft reads
+    /// ([`Self::submit_target_context_detached`]); allocated on first use.
+    context_positions: Option<ContextPositions>,
+}
+
+/// `rope_positions` and `write_positions` of one context commit.
+struct ContextPositions {
+    rope: MlxBuffer,
+    write: MlxBuffer,
 }
 
 impl DFlash2Runtime {
@@ -190,6 +282,10 @@ impl DFlash2Runtime {
                 .collect(),
             verify_budget: DFlash2VerifyBudget::default(),
             gpu_target_tokens,
+            prefetched: None,
+            prefetch_counts: DraftPrefetchCounts::default(),
+            budget_epoch: 0,
+            context_positions: None,
         })
     }
 
@@ -225,6 +321,7 @@ impl DFlash2Runtime {
             &target_lane_order,
             uniforms,
             true,
+            false,
         )
     }
 
@@ -258,6 +355,7 @@ impl DFlash2Runtime {
             target_lane_order,
             uniforms,
             false,
+            false,
         )
     }
 
@@ -275,6 +373,7 @@ impl DFlash2Runtime {
         target_lane_order: &[u32],
         uniforms: &[f32],
         wait: bool,
+        prefetch: bool,
     ) -> Result<()> {
         let lanes = self.workspace.max_lanes;
         let proposals = self.config.proposal_tokens();
@@ -291,6 +390,38 @@ impl DFlash2Runtime {
             "DFlash2 draft positions {logical_positions:?} do not match lane contexts {:?}",
             self.lane_lengths
         );
+        // A draft that does not involve a prefetch (the stock route, and a
+        // step with nothing outstanding) allocates nothing here: the
+        // outstanding snapshot is compared with the borrowed inputs, and a
+        // snapshot is built only when a prefetched command is stored.
+        if let Some(prefetched) = self.prefetched.take() {
+            if !prefetch
+                && prefetched.inputs.matches(
+                    anchors,
+                    logical_positions,
+                    temperatures,
+                    sampling_mask,
+                    maximum_verify_rows,
+                    target_lane_order,
+                    uniforms,
+                    wait,
+                    self.budget_epoch,
+                )
+            {
+                // The command this call would encode is already on the
+                // queue, issued over the rings and budget this call sees.
+                self.prefetch_counts.adopted += 1;
+                mlx_native::command_timeline::mark("draft.prefetch_adopted");
+                if wait {
+                    prefetched
+                        .encoder
+                        .wait_until_completed()
+                        .context("execute prefetched DFlash2 draft cycle")?;
+                }
+                return Ok(());
+            }
+            self.discard_prefetched(prefetched)?;
+        }
         self.workspace
             .uniforms
             .as_mut_slice::<f32>()?
@@ -343,7 +474,7 @@ impl DFlash2Runtime {
             target_lane_order,
             verify_model,
         )?;
-        if wait {
+        if wait && !prefetch {
             encoder
                 .commit_and_wait_labeled("adr067.dflash2_draft")
                 .context("execute DFlash2 draft cycle")?;
@@ -353,15 +484,123 @@ impl DFlash2Runtime {
         if let Some(staged) = self.workspace.staged.as_mut() {
             staged.command_committed();
         }
+        if prefetch {
+            self.prefetch_counts.prefetched += 1;
+            let inputs = DraftInputs {
+                anchors: anchors.to_vec(),
+                logical_positions: logical_positions.to_vec(),
+                temperature_bits: temperatures.iter().map(|value| value.to_bits()).collect(),
+                sampling_mask,
+                maximum_verify_rows: maximum_verify_rows.to_vec(),
+                target_lane_order: target_lane_order.to_vec(),
+                uniform_bits: uniforms.iter().map(|value| value.to_bits()).collect(),
+                wait,
+                budget_epoch: self.budget_epoch,
+            };
+            self.prefetched = Some(PrefetchedDraft { inputs, encoder });
+        }
         Ok(())
     }
 
+    /// Commit the draft command of the step that follows the one being
+    /// settled, without waiting for it. `host_tokens` says how that step
+    /// will call for its draft: [`Self::run_draft`] (`true`) or
+    /// [`Self::run_draft_for_gpu_target`] with `target_lane_order`.
+    ///
+    /// The next draft call adopts the command when its inputs are exactly
+    /// these and neither the rings nor the verify budget changed in between
+    /// (any ring write goes through [`Self::settle_prefetch`], and a budget
+    /// observation changes the inputs' epoch); otherwise it waits for the
+    /// command, drops its outputs and drafts again. A draft command writes
+    /// only this workspace's draft outputs and scratch, never the rings, so
+    /// a discarded one leaves no trace.
+    ///
+    /// The caller has finished with the current step's draft outputs
+    /// (proposals, verify rows, confidences): the command overwrites them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefetch_draft<T: DFlash2TargetFamily>(
+        &mut self,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        target: &T,
+        anchors: &[u32],
+        logical_positions: &[u32],
+        temperatures: &[f32],
+        sampling_mask: u32,
+        maximum_verify_rows: &[u32],
+        target_lane_order: &[u32],
+        uniforms: &[f32],
+        host_tokens: bool,
+    ) -> Result<()> {
+        let every_lane;
+        let target_lane_order = if host_tokens {
+            every_lane = (0..self.workspace.max_lanes as u32).collect::<Vec<_>>();
+            &every_lane
+        } else {
+            target_lane_order
+        };
+        self.run_draft_inner(
+            device,
+            registry,
+            target,
+            anchors,
+            logical_positions,
+            temperatures,
+            sampling_mask,
+            maximum_verify_rows,
+            target_lane_order,
+            uniforms,
+            host_tokens,
+            true,
+        )
+    }
+
+    /// Wait for a prefetched draft command and drop it. Called before
+    /// anything writes the rings or encodes another command over this
+    /// workspace; a no-op when nothing is prefetched.
+    pub(crate) fn settle_prefetch(&mut self) -> Result<()> {
+        match self.prefetched.take() {
+            Some(prefetched) => self.discard_prefetched(prefetched),
+            None => Ok(()),
+        }
+    }
+
+    fn discard_prefetched(&mut self, prefetched: PrefetchedDraft) -> Result<()> {
+        self.prefetch_counts.discarded += 1;
+        mlx_native::command_timeline::mark("draft.prefetch_discarded");
+        prefetched
+            .encoder
+            .wait_until_completed()
+            .context("wait for a discarded DFlash2 draft prefetch")
+    }
+
+    /// Whether a prefetched draft command is on the queue, possibly executing.
+    pub(crate) fn prefetch_outstanding(&self) -> bool {
+        self.prefetched.is_some()
+    }
+
+    pub(crate) fn prefetch_counts(&self) -> DraftPrefetchCounts {
+        self.prefetch_counts
+    }
+
+    /// The current step's proposals. A prefetched draft overwrites them, so
+    /// they are unreadable from the prefetch until the next draft call.
     pub fn proposals(&self) -> Result<&[u32]> {
+        self.ensure_draft_outputs_current()?;
         Ok(self.workspace.proposed_tokens.as_slice::<u32>()?)
     }
 
     pub fn verify_rows(&self) -> Result<&[u32]> {
+        self.ensure_draft_outputs_current()?;
         Ok(self.workspace.verify_rows.as_slice::<u32>()?)
+    }
+
+    fn ensure_draft_outputs_current(&self) -> Result<()> {
+        ensure!(
+            self.prefetched.is_none(),
+            "DFlash2 draft outputs read after the next draft was prefetched"
+        );
+        Ok(())
     }
 
     pub(crate) fn select_verify_rows(
@@ -369,6 +608,7 @@ impl DFlash2Runtime {
         lane_indices: &[usize],
         maximum_rows: &[u32],
     ) -> Result<()> {
+        self.ensure_draft_outputs_current()?;
         let rows = self
             .verify_budget
             .select_rows(&self.workspace, lane_indices, maximum_rows)?;
@@ -379,11 +619,18 @@ impl DFlash2Runtime {
         Ok(())
     }
 
+    /// Reads the current step's draft confidences from the workspace: call
+    /// it before [`Self::prefetch_draft`] overwrites them.
     pub(crate) fn observe_verify_budget(
         &mut self,
         lanes: &[VerifyBudgetLane],
         milliseconds: f64,
     ) -> Result<()> {
+        ensure!(
+            self.prefetched.is_none(),
+            "DFlash2 verify-budget observation after the next draft was prefetched"
+        );
+        self.budget_epoch = self.budget_epoch.wrapping_add(1);
         self.verify_budget
             .observe(&self.workspace, lanes, milliseconds)
     }
@@ -475,6 +722,7 @@ impl DFlash2Runtime {
             lane < self.workspace.max_lanes,
             "DFlash2 capture lane {lane} is out of range"
         );
+        self.settle_prefetch()?;
         ensure!(
             logical_start == self.lane_lengths[lane],
             "DFlash2 capture starts at {logical_start}, lane {lane} is at {}",
@@ -533,6 +781,77 @@ impl DFlash2Runtime {
     ) -> Result<SubmittedContextCommit> {
         let mut encoder = self.encode_target_context(device, registry, retained_counts)?;
         encoder.commit();
+        Ok(SubmittedContextCommit { encoder })
+    }
+
+    /// [`Self::submit_target_context`] for a step that commits the next
+    /// draft behind it: the commit reads copies of the workspace's row
+    /// positions and ring slots, so the next draft's positions can be
+    /// written while it executes, and every lane's length moves past the
+    /// rows it retains at once (the next draft is issued from those
+    /// lengths). The rings are settled only when
+    /// [`Self::finish_target_context`] (with `advance` false) returns.
+    ///
+    /// What orders the draft committed behind this command after it is not
+    /// the queue as such (commands of one queue that share no resource
+    /// overlap; the replay beside this commit does): it is Metal's
+    /// dependency ordering of tracked resources. mlx-native allocates
+    /// buffers with `newBufferWithLength` and shared storage, whose hazard
+    /// tracking is the default tracked mode, and the draft rings (and the
+    /// workspace scratch) are bound directly to both commands, so on an
+    /// `MTLCommandQueue` the draft's reads of the rings are synchronized
+    /// behind this command's writes. A ring moved to an untracked heap or
+    /// reached through anything but a direct binding would lose that
+    /// ordering.
+    ///
+    /// If the step fails after this call, clear its lanes
+    /// ([`Self::settle_submitted_step`]): their lengths have moved.
+    pub(crate) fn submit_target_context_detached(
+        &mut self,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        retained_counts: &[u32],
+    ) -> Result<SubmittedContextCommit> {
+        self.settle_prefetch()?;
+        self.stage_retained_counts(retained_counts)?;
+        if self.context_positions.is_none() {
+            let copy = |source: &MlxBuffer| {
+                device.alloc_buffer(
+                    source.element_count() * std::mem::size_of::<u32>(),
+                    mlx_native::DType::U32,
+                    vec![source.element_count()],
+                )
+            };
+            self.context_positions = Some(ContextPositions {
+                rope: copy(&self.workspace.rope_positions)?,
+                write: copy(&self.workspace.write_positions)?,
+            });
+        }
+        let positions = self.context_positions.as_mut().expect("allocated above");
+        positions
+            .rope
+            .as_mut_slice::<u32>()?
+            .copy_from_slice(self.workspace.rope_positions.as_slice::<u32>()?);
+        positions
+            .write
+            .as_mut_slice::<u32>()?
+            .copy_from_slice(self.workspace.write_positions.as_slice::<u32>()?);
+        let mut encoder = device
+            .command_encoder()
+            .context("create DFlash2 context encoder")?;
+        dispatch_dflash2_context_commit_at(
+            &mut encoder,
+            registry,
+            device,
+            &self.config,
+            &self.tensors,
+            &self.workspace.retained_counts,
+            &self.workspace,
+            &positions.rope,
+            &positions.write,
+        )?;
+        encoder.commit();
+        self.advance_lane_lengths(retained_counts)?;
         Ok(SubmittedContextCommit { encoder })
     }
 
@@ -608,12 +927,65 @@ impl DFlash2Runtime {
         (committed, context)
     }
 
+    /// Close a step whose context commit
+    /// ([`Self::submit_target_context_detached`]) and replay have both been
+    /// waited for: `context` is the context command's result, `committed`
+    /// whether the target's commit succeeded. A step with either failed
+    /// must not leave anything of itself behind: a draft prefetched for the
+    /// next step is waited for and dropped, and the lanes of `step_lanes`
+    /// are cleared as in [`Self::settle_context_first`] (their lengths
+    /// moved at the submission). Returns the context's result, or the
+    /// first cleanup failure.
+    pub(crate) fn settle_submitted_step(
+        &mut self,
+        committed: bool,
+        mut context: Result<()>,
+        step_lanes: &[usize],
+    ) -> Result<()> {
+        if committed && context.is_ok() {
+            return context;
+        }
+        for &lane in step_lanes {
+            let cleared = self
+                .clear_lane(lane)
+                .with_context(|| format!("clear DFlash2 lane {lane} after a failed step"));
+            match (cleared, context.is_ok()) {
+                (Ok(()), _) => {}
+                (Err(error), true) => context = Err(error),
+                (Err(error), false) => {
+                    tracing::error!(error = %format!("{error:#}"), "DFlash2 lane cleanup failed");
+                }
+            }
+        }
+        context
+    }
+
     fn encode_target_context(
         &mut self,
         device: &MlxDevice,
         registry: &mut KernelRegistry,
         retained_counts: &[u32],
     ) -> Result<CommandEncoder> {
+        // A context commit shares the workspace's scratch and position
+        // buffers with a draft command and writes the rings it reads.
+        self.settle_prefetch()?;
+        self.stage_retained_counts(retained_counts)?;
+        let mut encoder = device
+            .command_encoder()
+            .context("create DFlash2 context encoder")?;
+        dispatch_dflash2_context_commit(
+            &mut encoder,
+            registry,
+            device,
+            &self.config,
+            &self.tensors,
+            &self.workspace.retained_counts,
+            &self.workspace,
+        )?;
+        Ok(encoder)
+    }
+
+    fn stage_retained_counts(&mut self, retained_counts: &[u32]) -> Result<()> {
         ensure!(
             retained_counts.len() == self.workspace.max_lanes,
             "DFlash2 retained-count length {} != workspace lanes {}",
@@ -631,19 +1003,7 @@ impl DFlash2Runtime {
             .retained_counts
             .as_mut_slice::<u32>()?
             .copy_from_slice(retained_counts);
-        let mut encoder = device
-            .command_encoder()
-            .context("create DFlash2 context encoder")?;
-        dispatch_dflash2_context_commit(
-            &mut encoder,
-            registry,
-            device,
-            &self.config,
-            &self.tensors,
-            &self.workspace.retained_counts,
-            &self.workspace,
-        )?;
-        Ok(encoder)
+        Ok(())
     }
 
     fn advance_lane_lengths(&mut self, retained_counts: &[u32]) -> Result<()> {
@@ -756,6 +1116,7 @@ impl DFlash2Runtime {
             lane < self.workspace.max_lanes,
             "DFlash2 lane {lane} is out of range"
         );
+        self.settle_prefetch()?;
         let heads = self.config.num_key_value_heads;
         let width = self.config.sliding_window;
         let dim = self.config.head_dim;
@@ -910,6 +1271,10 @@ pub(super) fn ingest_capture_lane_passes(
 #[cfg(test)]
 #[path = "context_commit_tests.rs"]
 mod context_commit_tests;
+
+#[cfg(test)]
+#[path = "draft_prefetch_tests.rs"]
+mod draft_prefetch_tests;
 
 #[cfg(test)]
 mod tests {
