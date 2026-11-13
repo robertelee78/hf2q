@@ -10,7 +10,8 @@
     "The client is the checked-in canonical four-agent coding workload. Q5 requires the largest declared workload: if the operator declares a larger one (e.g. largest prompt or tool result), copy this case and replace client.argv.",
     "MAX_COMPRESSOR_USED_GIB=16: the launcher refuses before load when the compressor holds more than MAX_COMPRESSOR_USED_GIB (default 8). The first a1 attempt (a1-20261030T042017Z) was refused for 'compressor use exceeds 8 GiB'. The dedicated host's idle baseline compressor is 9.3-10.0 GiB (QE verdict; final receipt baseline.compressor_bytes 10002579456). 16 GiB admits that measured baseline with ~6 GiB headroom while still refusing a compressor at twice the launcher default. The launcher's swap (8 GiB) and other-process (8 GiB) refusals stay active. The Q5 live stops (critical pressure, swap +512 MiB, Free+cached < 2 GiB, footprint cap) govern the run.",
     "Scope: the canonical C262144 coding workload only (about 2.3k prompt tokens per slot, no demand-grown cache migration). Calibrate any deeper DeepSeek-V4 workload separately.",
-    "LOG_FILTER (empty default: the launcher keeps -v, and RUST_LOG below stays ignored) is the ADR-063 S3 trace arm: HF2Q_Q5_LOG_FILTER='hf2q=info,mlx_native=info,hf2q::serve::api::engine_deepseek4::progress=debug' replaces -v with RUST_LOG=LOG_FILTER, adding the per-turn joint decode lines for cancel_smoke.py widths."
+    "LOG_FILTER (empty default: the launcher keeps -v, and RUST_LOG below stays ignored) is the ADR-063 S3 trace arm: HF2Q_Q5_LOG_FILTER='hf2q=info,mlx_native=info,hf2q::serve::api::engine_deepseek4::progress=debug' replaces -v with RUST_LOG=LOG_FILTER, adding the per-turn joint decode lines for cancel_smoke.py widths.",
+    "Kill-switch arms of the three DeepSeek-V4 default routes (v0.1.30, ADR-063 Q4-DS4-RACE): HF2Q_Q5_DEEPSEEK_ROW_EXACT_MATVEC=0, HF2Q_Q5_DEEPSEEK_TAIL_ROWS_STEP=0 and HF2Q_Q5_DEEPSEEK_BATCHED_ATTN_CORES=0 are passed to the server as HF2Q_DEEPSEEK_ROW_EXACT_MATVEC, HF2Q_DEEPSEEK_TAIL_ROWS_STEP and HF2Q_DEEPSEEK_BATCHED_ATTN_CORES; 1 selects the route explicitly. The empty defaults export nothing, so the server runs the hf2q defaults (all three on); a binary older than v0.1.30 then runs them off. Use a distinct --output per arm."
   ],
   "workload": {
     "id": "adr063-q5-deepseek4-ds4file-n4-coding-ctx262144",
@@ -31,7 +32,10 @@
     "CLIENT_APPROVAL_TEMPLATE": null,
     "LOG_FILTER": "",
     "ADR065_STAGE_PROFILE": "",
-    "NATIVE_PROFILE_CB": ""
+    "NATIVE_PROFILE_CB": "",
+    "DEEPSEEK_ROW_EXACT_MATVEC": "",
+    "DEEPSEEK_TAIL_ROWS_STEP": "",
+    "DEEPSEEK_BATCHED_ATTN_CORES": ""
   },
   "binary": "{HF2Q_BIN}",
   "artifact": {
@@ -59,7 +63,10 @@
       "RUST_LOG": "info",
       "LOG_FILTER": "{LOG_FILTER}",
       "HF2Q_ADR065_STAGE_PROFILE": "{ADR065_STAGE_PROFILE}",
-      "MLX_PROFILE_CB": "{NATIVE_PROFILE_CB}"
+      "MLX_PROFILE_CB": "{NATIVE_PROFILE_CB}",
+      "HF2Q_DEEPSEEK_ROW_EXACT_MATVEC": "{DEEPSEEK_ROW_EXACT_MATVEC}",
+      "HF2Q_DEEPSEEK_TAIL_ROWS_STEP": "{DEEPSEEK_TAIL_ROWS_STEP}",
+      "HF2Q_DEEPSEEK_BATCHED_ATTN_CORES": "{DEEPSEEK_BATCHED_ATTN_CORES}"
     }
   },
   "readiness": {

@@ -154,6 +154,61 @@ class Localizer(unittest.TestCase):
             self.run_case({"prefill_chunks": [64, 64], "warm_live_kernel": "TiledF16"})
 
 
+class RouteEnv(unittest.TestCase):
+    """The child's default-on route switches come from the packet alone (v0.1.30 defaults)."""
+    GEMMA_KILL = {"HF2Q_GEMMA_WARM_TILED_ATTENTION": "0", "HF2Q_GEMMA_DECODE_DENSE": "stock",
+                  "HF2Q_GEMMA_DECODE_ATTN_NE": "0", "HF2Q_Q5_0_TENSOR_MM": "0"}
+    DEEPSEEK_KILL = {"HF2Q_DEEPSEEK_ROW_EXACT_MATVEC": "0", "HF2Q_DEEPSEEK_TAIL_ROWS_STEP": "0",
+                     "HF2Q_DEEPSEEK_BATCHED_ATTN_CORES": "0"}
+
+    def test_retained_packets_replay_under_the_kill_switches(self):
+        self.assertEqual(s.route_env("gemma", {}), self.GEMMA_KILL)
+        self.assertEqual(s.route_env("deepseek", {}), self.DEEPSEEK_KILL)
+        self.assertEqual(s.route_env("gemma", {"warm_live_kernel": "VecHybrid", "decode_dense_kernel": "Stock"}), self.GEMMA_KILL)
+
+    def test_declared_default_routes_select_them_explicitly(self):
+        shipped = {"warm_live_kernel": "TensorF16", "decode_dense_kernel": "RowExact", "decode_attn_ne": "Ne4", "q5_0_tensor_mm": True}
+        self.assertEqual(s.route_env("gemma", shipped), {
+            "HF2Q_GEMMA_WARM_TILED_ATTENTION": "tensor", "HF2Q_GEMMA_DECODE_DENSE": "row_exact",
+            "HF2Q_GEMMA_DECODE_ATTN_NE": "4", "HF2Q_Q5_0_TENSOR_MM": "1"})
+        self.assertEqual(s.route_env("gemma", {"warm_live_kernel": "TiledF16", "decode_dense_kernel": "ColumnInvariantMma",
+                                              "decode_attn_ne": "Ne2"}),
+                         {**self.GEMMA_KILL, "HF2Q_GEMMA_WARM_TILED_ATTENTION": "1", "HF2Q_GEMMA_DECODE_DENSE": "mma",
+                          "HF2Q_GEMMA_DECODE_ATTN_NE": "2"})
+        self.assertEqual(s.route_env("deepseek", {"matvec_kernels": "RowExact", "tail_rows_step": "On", "attn_cores": "Batched"}),
+                         {key: "1" for key in self.DEEPSEEK_KILL})
+        # One family at a time: the stock DeepSeek family stays reachable under supervision.
+        self.assertEqual(s.route_env("deepseek", {"matvec_kernels": "RowExact"}),
+                         {**self.DEEPSEEK_KILL, "HF2Q_DEEPSEEK_ROW_EXACT_MATVEC": "1"})
+
+    def test_only_the_family_switches_and_only_known_values(self):
+        for family in ("qwen38", "qwen36"):
+            self.assertEqual(s.route_env(family, {"warm_live_kernel": "TensorF16"}), {})
+        every = {switch for routes in s.ROUTE_SWITCHES.values() for switch, _, _ in routes.values()}
+        self.assertTrue(all(switch.startswith(s.AMBIENT) for switch in every))
+        self.assertEqual(len(every), 7)
+        for family, packet in (("gemma", {"warm_live_kernel": "Tiled"}), ("gemma", {"decode_attn_ne": 4}),
+                               ("gemma", {"q5_0_tensor_mm": "true"}), ("gemma", {"q5_0_tensor_mm": 1}),
+                               ("gemma", {"decode_dense_kernel": "row_exact"}), ("deepseek", {"tail_rows_step": True}),
+                               ("deepseek", {"matvec_kernels": "1"})):
+            with self.assertRaises(ValueError, msg=(family, packet)):
+                s.route_env(family, packet)
+
+    def test_reported_routes_must_equal_the_packet(self):
+        kernel = {"warm_live_kernel": "VecHybrid"}
+        s.require_gemma_warm_kernel("gemma", {**kernel, "decode_dense_kernel": "Stock", "decode_attn_ne": "Stock", "q5_0_tensor_mm": False}, {})
+        s.require_gemma_warm_kernel("gemma", kernel, {})  # an older runner reports the warm kernel only
+        for execution, packet in (({**kernel, "q5_0_tensor_mm": True}, {}), ({**kernel, "decode_attn_ne": "Ne4"}, {}),
+                                  ({**kernel, "decode_dense_kernel": "RowExact"}, {"decode_dense_kernel": "ColumnInvariantMma"})):
+            with self.assertRaises(ValueError):
+                s.require_gemma_warm_kernel("gemma", execution, packet)
+        shipped = {"matvec_kernels": "RowExact", "tail_rows_step": "On", "attn_cores": "Batched"}
+        s.require_gemma_warm_kernel("deepseek", {"routes": shipped}, shipped)
+        s.require_gemma_warm_kernel("deepseek", {}, {})
+        with self.assertRaises(ValueError):
+            s.require_gemma_warm_kernel("deepseek", {"routes": shipped}, {})
+
+
 class GemmaEndpointWarmKernel(unittest.TestCase):
     def run_case(self, resolved, declared=None):
         with tempfile.TemporaryDirectory() as root:

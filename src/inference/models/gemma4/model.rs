@@ -10,6 +10,7 @@ use anyhow::Result;
 use mlx_native::{MlxBuffer, MlxDevice};
 
 use crate::debug::INVESTIGATION_ENV;
+use crate::inference::models::route_default::RouteAudit;
 use crate::inference::models::gemma4::kv_cache::{
     DecodeRegime, DenseKvBuffers, HbKvBuffers, HybridKvBuffers, MlxKvCache,
 };
@@ -652,8 +653,9 @@ pub struct MlxModelWeights {
     /// single-slot resume and every resumed multi-sequence lane (joint warm,
     /// stable cue and installed long-prompt lanes).
     /// Resolved once at load from `HF2Q_GEMMA_WARM_TILED_ATTENTION` (default
-    /// [`GemmaLiveKernel::VecHybrid`]; `1` opts in to
-    /// [`GemmaLiveKernel::TiledF16`], `tensor` to [`GemmaLiveKernel::TensorF16`]).
+    /// [`GemmaLiveKernel::TensorF16`] where the device has the Metal tensor
+    /// API; `0` is the kill switch to [`GemmaLiveKernel::VecHybrid`], `1`
+    /// opts in to [`GemmaLiveKernel::TiledF16`]).
     pub warm_live_kernel: GemmaLiveKernel,
 
     /// ADR-063 Q4-GEMMA-PREFILL-MOE — shape of the prefill MoE down call
@@ -663,8 +665,13 @@ pub struct MlxModelWeights {
 
     /// ADR-063 gap program — decode attention head split of d256 layers on
     /// every decode path. Resolved once at load from
-    /// `HF2Q_GEMMA_DECODE_ATTN_NE` (default stock).
+    /// `HF2Q_GEMMA_DECODE_ATTN_NE` (default NE 4; `0` is the kill switch).
     pub(crate) decode_attn_ne: crate::serve::gemma_decode_attention::GemmaDecodeAttnNe,
+
+    /// The four default-on routes as resolved at load, each with its source
+    /// (load banner, audit line, `/hf2q/v1/runtime`). Empty for a weights
+    /// struct a test builds by hand.
+    pub(crate) route_audit: Vec<RouteAudit>,
 }
 
 /// ADR-040 iter-G(a) — per-call descriptor for cross-slot batched prefill.
@@ -719,7 +726,8 @@ pub enum GemmaLiveKernel {
     /// (query, head) over F16 K and TQ-HB V.
     VecHybrid,
     /// ADR-063 gap program F1: mlx-native's tensor-API flash attention over
-    /// compacted K and dequantized V (`HF2Q_GEMMA_WARM_TILED_ATTENTION=tensor`).
+    /// compacted K and dequantized V (the default; also
+    /// `HF2Q_GEMMA_WARM_TILED_ATTENTION=tensor`).
     TensorF16,
 }
 
@@ -903,6 +911,56 @@ impl MlxModelWeights {
         gpu: &mut GpuContext,
         progress: &mut crate::serve::header::LoadProgress,
     ) -> Result<Self> {
+        // Every route switch is validated first, so an invalid value refuses
+        // the load before the tensor probe and before any weight is mapped.
+        let decode_dense = super::decode_dense::resolve()?;
+        tracing::info!(
+            kernel = decode_dense.value.wire_name(),
+            source = decode_dense.source.as_str(),
+            "Gemma decode dense kernel"
+        );
+        let decode_attn_ne = crate::serve::gemma_decode_attention::decode_attn_ne_from_env()?;
+        // The warm attention default needs the device probe, which borrows
+        // the registry; resolve it before the device borrow below.
+        let warm_live_kernel = {
+            let (executor, registry) = gpu.split();
+            crate::serve::gemma_live_attention::warm_live_kernel_from_env(
+                registry,
+                executor.device(),
+            )?
+        };
+        let routing_policy = *gpu.ggml_routing_policy();
+        // The four release-gate routes (ADR-063 Q4-GEMMA-ATTN): each resolved
+        // value and whether it is the family default, an operator setting or
+        // a fallback. `q5_0_tensor_mm` is the value frozen into this model's
+        // registries. One audit line, visible on a default `hf2q serve`.
+        let route_audit = vec![
+            RouteAudit::new(
+                "gemma_decode_attn_ne",
+                decode_attn_ne.value.as_str(),
+                decode_attn_ne.source.as_str(),
+            ),
+            RouteAudit::new(
+                "gemma_decode_dense_kernel",
+                decode_dense.value.wire_name(),
+                decode_dense.source.as_str(),
+            ),
+            RouteAudit::new(
+                "gemma_warm_attention_kernel",
+                warm_live_kernel.value.wire_name(),
+                warm_live_kernel.source.as_str(),
+            ),
+            RouteAudit::new(
+                "q5_0_tensor_mm",
+                routing_policy.q5_0_tensor_mm.to_string(),
+                crate::serve::gemma_prefill_moe::q5_0_tensor_mm_audit_source(&routing_policy),
+            ),
+        ];
+        tracing::info!(
+            target: crate::inference::models::route_default::AUDIT_TARGET,
+            routes = %crate::inference::models::route_default::audit_text(&route_audit),
+            "Gemma 4 default routes resolved"
+        );
         let mlx_device = gpu.device();
         tracing::debug!("Loading mlx-native weights directly from GGUF...");
 
@@ -913,10 +971,6 @@ impl MlxModelWeights {
         let t_pre = std::time::Instant::now();
         let io_plan = preflight_io(gguf, cfg.vocab_size, cfg.hidden_size)?;
         preflight_projections(gguf, cfg)?;
-        // `HF2Q_GEMMA_DECODE_DENSE` is read here first, so an invalid value
-        // refuses the load instead of failing mid-decode.
-        let decode_dense = super::decode_dense::resolve()?;
-        tracing::info!(kernel = decode_dense.wire_name(), "Gemma decode dense kernel");
         let mapped = gguf
             .map_tensor_data(mlx_device)
             .map_err(|e| anyhow::anyhow!("map GGUF tensor data: {e}"))?;
@@ -1456,11 +1510,12 @@ impl MlxModelWeights {
             // installed by default. The forward_prefill_batched_multi_seq
             // wrapper sets it per-call; None preserves byte-identical single-seq.
             multi_seq_prefill: None,
-            warm_live_kernel: crate::serve::gemma_live_attention::warm_live_kernel_from_env(),
+            warm_live_kernel: warm_live_kernel.value,
             prefill_moe_down: crate::serve::gemma_prefill_moe::prefill_moe_down_from_env(),
-            decode_attn_ne: crate::serve::gemma_decode_attention::decode_attn_ne_from_env(),
+            decode_attn_ne: decode_attn_ne.value,
+            route_audit,
         });
-        crate::serve::gemma_prefill_moe::log_native_routing();
+        crate::serve::gemma_prefill_moe::log_native_routing(&routing_policy);
 
         // Pre-initialize constant param buffers so we never write them
         // inside the hot forward_decode path.

@@ -2034,6 +2034,7 @@ fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
         kv_bytes_per_token_override: None,
         kv_fixed_bytes_per_slot_override: None,
         gemma_warm_attention_kernel: None,
+        default_routes: Vec::new(),
     })
 }
 
@@ -3628,8 +3629,10 @@ impl GemmaLoadedModel {
             );
             t_phase = Instant::now();
         }
-        let mut ctx =
-            GpuContext::new().map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
+        // Gemma 4 freezes its own routing policy (Q5_0 tensor matmul on by
+        // default); no other family's registry sees it.
+        let mut ctx = GpuContext::new_for_gemma4()
+            .map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
         if load_timing {
             tracing::info!(
                 "[LOAD_TIMING] gpu_ctx_new={:.0}ms",
@@ -4165,6 +4168,7 @@ impl LoadInfoBuilder for GemmaLoadedModel {
                 &self.config,
             )),
             gemma_warm_attention_kernel: Some(self.weights.warm_live_kernel.wire_name()),
+            default_routes: self.weights.route_audit.clone(),
         }
     }
 }
@@ -59924,6 +59928,10 @@ mod gemma_cold_prefill_tests;
 #[cfg(test)]
 #[path = "engine_gemma_warm_batch_tests.rs"]
 mod gemma_warm_batch_tests;
+
+#[cfg(test)]
+#[path = "engine_gemma_warm_depth_tests.rs"]
+mod gemma_warm_depth_tests;
 
 #[cfg(test)]
 #[path = "engine_gemma_warm_batch_fault_tests.rs"]

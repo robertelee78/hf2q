@@ -65,12 +65,18 @@ use super::prefill_annotations;
 use super::residency::RawMatrixRef;
 use super::row_matmul::{row_matmul, row_view, splits_independent_rows, RowMatmul};
 use super::Deepseek4Config;
+use crate::inference::models::route_default::Resolved;
 
 /// How joint decode encodes the per-row, cache-dependent attention cores.
-/// Chosen once at model load.
+/// Chosen once at model load. Both encodings produce the same bits.
+///
+/// `Default` is [`Self::PerRow`], the encoding fixtures build with; the
+/// serving default is [`Self::resolve`] of an unset switch
+/// ([`Self::Batched`]).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AttnCores {
-    /// One row at a time (`joint_decode_core`).
+    /// One row at a time (`joint_decode_core`), as in every release through
+    /// v0.1.29 (kill switch).
     #[default]
     PerRow,
     /// Phase-major rows dispatches over all rows of a layer (this module).
@@ -81,18 +87,16 @@ impl AttnCores {
     /// Process switch read by [`Self::from_env`].
     pub const ENV: &'static str = "HF2Q_DEEPSEEK_BATCHED_ATTN_CORES";
 
-    /// `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES`: `1` selects [`Self::Batched`],
-    /// `0` or unset [`Self::PerRow`]; anything else is an error.
-    pub fn from_env() -> Result<Self> {
+    /// `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES`: unset or `1` selects
+    /// [`Self::Batched`] (the release-gate encoding), `0` [`Self::PerRow`]
+    /// (kill switch); anything else is an error.
+    pub(crate) fn from_env() -> Result<Resolved<Self>> {
         Self::resolve(std::env::var_os(Self::ENV).as_deref())
     }
 
-    pub fn resolve(value: Option<&std::ffi::OsStr>) -> Result<Self> {
-        match value.map(|value| value.to_str()) {
-            None | Some(Some("0")) => Ok(Self::PerRow),
-            Some(Some("1")) => Ok(Self::Batched),
-            Some(_) => anyhow::bail!("{} must be 0 or 1 (got {value:?})", Self::ENV),
-        }
+    /// Resolution rule of [`Self::from_env`].
+    pub(crate) fn resolve(value: Option<&std::ffi::OsStr>) -> Result<Resolved<Self>> {
+        super::route_defaults::resolve_zero_one(Self::ENV, value, Self::PerRow, Self::Batched)
     }
 }
 

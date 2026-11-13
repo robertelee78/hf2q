@@ -32,6 +32,15 @@ Changes:
      cap: Q5 "a calibration run without a prior receipt uses the effective floor
      as its cap"); every run records its measured memory footprint
      (`receipt.json` `memory`, per-sample `memory-series.json`).
+  9. the child's default-on route switches come from the packet and from
+     nothing else. Since v0.1.30 the Gemma 4 and DeepSeek-V4 release-gate
+     routes are hf2q defaults, while a packet without a route field means the
+     route of every retained run (the kill-switch value). `route_env` maps
+     each declared (or absent) packet route field of the family to its one
+     switch value, the child gets exactly that set, `command.json` records
+     it, and ambient `HF2Q_*` stays refused. A retained packet therefore
+     replays under the kill switches, and a default-route run declares its
+     routes in the packet.
 The foreign-process denylist and the listener ports are read from the reviewed
 Gemma supervisor source (sha-pinned) so the reviewed list is reused verbatim.
 No physical-admission, performance, float-policy or whole-Q1 qualification.
@@ -61,7 +70,23 @@ MULTISTORE_OPTIONAL_KEYS = {'manifest', 'completion_line'}  # manifest: bound ex
 MULTISTORE_EXTENT_KEYS = {'lanes', 'host_payload_limit', 'expected_stores'}
 # Rust-side localizer token lengths: Gemma 128 prompt + 16 forced; DS/Qwen 64 or 128.
 LOCALIZER_TOKENS = {'gemma': (144,), 'qwen38': (64, 128), 'qwen36': (64, 128), 'deepseek': (64, 128)}
-GEMMA_DEFAULT_WARM_KERNEL = 'VecHybrid'  # shipped since #544; packets must declare any other
+GEMMA_DEFAULT_WARM_KERNEL = 'VecHybrid'  # every retained run (the kill-switch route since v0.1.30); packets must declare any other
+# Default-on route switches per family: packet field -> (switch, value absent from the packet, {packet value: switch value}).
+# The absent value is the route of every retained Q1 run, which is each switch's kill value; the Rust runner refuses a
+# model whose resolved route differs from the packet's (gemma_actual::require_*, deepseek_actual::require_routes).
+ROUTE_SWITCHES = {
+    'gemma': {
+        'warm_live_kernel': ('HF2Q_GEMMA_WARM_TILED_ATTENTION', 'VecHybrid', {'VecHybrid': '0', 'TiledF16': '1', 'TensorF16': 'tensor'}),
+        'decode_dense_kernel': ('HF2Q_GEMMA_DECODE_DENSE', 'Stock', {'Stock': 'stock', 'RowExact': 'row_exact', 'ColumnInvariantMma': 'mma'}),
+        'decode_attn_ne': ('HF2Q_GEMMA_DECODE_ATTN_NE', 'Stock', {'Stock': '0', 'Ne2': '2', 'Ne4': '4'}),
+        'q5_0_tensor_mm': ('HF2Q_Q5_0_TENSOR_MM', False, {False: '0', True: '1'}),
+    },
+    'deepseek': {
+        'matvec_kernels': ('HF2Q_DEEPSEEK_ROW_EXACT_MATVEC', 'Stock', {'Stock': '0', 'RowExact': '1'}),
+        'tail_rows_step': ('HF2Q_DEEPSEEK_TAIL_ROWS_STEP', 'Off', {'Off': '0', 'On': '1'}),
+        'attn_cores': ('HF2Q_DEEPSEEK_BATCHED_ATTN_CORES', 'PerRow', {'PerRow': '0', 'Batched': '1'}),
+    },
+}
 COHORT_SCHEMA = 'hf2q.adr063.q1.cohort-stage-localizer.v1'
 COHORT_ROUTES = {'T0ColdSerial': 'SerialAll128PrefillSingleRowDecode', 'T2ActualCohort': 'PackedPrefill512OwnersBatchedDecodeRows'}
 # Runtime pressure rules (kern.memorystatus_vm_pressure_level: 1 normal, 2 warning, 4 critical). Absent = the
@@ -281,9 +306,28 @@ def checked_trace(out, identity):
     return execution, captured, expected
 
 
+def route_env(family, packet):
+    """The route switches the child gets: one value per default-on route of the family, from the packet alone.
+
+    A field the packet omits takes the retained (kill-switch) value. A value outside the closed map refuses. Families
+    without default-on routes get no switch."""
+    env = {}
+    for field, (switch, absent, values) in ROUTE_SWITCHES.get(family, {}).items():
+        value = packet.get(field, absent)
+        require(type(value) is type(absent) and value in values, 'packet ' + field + ' is a known route')
+        env[switch] = values[value]
+    return env
+
+
 def require_gemma_warm_kernel(family, execution, packet):
+    """Resolved routes = packet declaration. The warm kernel is always reported; a runner that reports another route
+    (the decode kernels, `q5_0_tensor_mm`, the DeepSeek `routes` object) must report the packet's value too."""
     if family == 'gemma':
-        require(execution['warm_live_kernel'] == packet.get('warm_live_kernel', GEMMA_DEFAULT_WARM_KERNEL), 'resolved Gemma warm kernel = packet declaration (absent = shipped VecHybrid)')
+        require(execution['warm_live_kernel'] == packet.get('warm_live_kernel', GEMMA_DEFAULT_WARM_KERNEL), 'resolved Gemma warm kernel = packet declaration (absent = VecHybrid, the kill-switch route)')
+    reported = execution.get('routes', execution) if family == 'deepseek' else execution
+    for field, (_, absent, _) in ROUTE_SWITCHES.get(family, {}).items():
+        if type(reported) is dict and field in reported:
+            require(reported[field] == packet.get(field, absent), 'resolved ' + field + ' = packet declaration (absent = the retained route)')
 
 
 def validate_localizer(out, b, plan, packet, identity, policy):
@@ -706,6 +750,7 @@ def main():
     acquisition = dict(composition=b['composition'], independent_review=b['acquisition_review'])
     require(packet.get('acquisition') in (None, acquisition) or packet['acquisition']['composition'] == b['composition'], 'packet composition binding')
     packet.update(execution_approved=True, acquisition=acquisition, output=str(out / 'output'))
+    routes = route_env(b['family'], packet)
     os.umask(0o077); out.mkdir(mode=0o700); shutil.copy2(__file__, out / 'supervisor.py'); (out / 'bindings.json').write_bytes(bindings_bytes); subprocess.run(['/bin/cp', '-c', str(binary), str(out / 'test-binary')], check=True, timeout=30); shutil.copy2(parser_source, out / 'meminfo_interface.py'); save(out / 'resource-policy.json', policy); save(out / 'acquisition-composition.json', composition); save(out / 'acquisition-review.json', review); (out / 'operating-review.json').write_bytes(operating_bytes)
     save(out / 'packet.json', packet)
     if manifest_bytes is not None: (out / 'manifest.json').write_bytes(manifest_bytes)
@@ -737,8 +782,8 @@ def main():
             require(x['pressure_raw'] == '1' and available_live(x, 0) >= policy['preload_available_floor_bytes'], 'preload operating headroom/pressure (nothing else resident)')
         require(not INTERRUPTED, 'interrupted before load'); stat_model(); require(sha(binary) == b['binary_sha256'], 'prelaunch binary'); memory = MemoryRecord(baseline)
         selected_filter = plan['filter']
-        command = [str(out / 'test-binary'), selected_filter, '--exact', '--ignored', '--nocapture', '--test-threads=1']; save(out / 'command.json', dict(argv=command, binary_sha256=b['binary_sha256'], source_commit=b['source_commit'], packet_sha256=sha(out / 'packet.json'), packet_env=plan['packet_env'], deadline_seconds=deadline, mode=mode, kind=plan['kind']))
-        env = {k: v for k, v in os.environ.items() if not k.startswith(AMBIENT)}; env[plan['packet_env']] = str(out / 'packet.json')
+        command = [str(out / 'test-binary'), selected_filter, '--exact', '--ignored', '--nocapture', '--test-threads=1']; save(out / 'command.json', dict(argv=command, binary_sha256=b['binary_sha256'], source_commit=b['source_commit'], packet_sha256=sha(out / 'packet.json'), packet_env=plan['packet_env'], route_env=routes, deadline_seconds=deadline, mode=mode, kind=plan['kind']))
+        env = {k: v for k, v in os.environ.items() if not k.startswith(AMBIENT)}; env.update(routes); env[plan['packet_env']] = str(out / 'packet.json')
         with (out / 'stdout').open('xb') as so, (out / 'stderr').open('xb') as se:
             quiet(out, 'immediate-prelaunch', deny); require(not INTERRUPTED, 'interrupted immediately before Popen'); spawn_ns = time.monotonic_ns(); started = time.monotonic(); child = subprocess.Popen(command, cwd=out, env=env, stdout=so, stderr=se, stdin=subprocess.DEVNULL, start_new_session=True); result.update(model_launch_attempted=True, pid=child.pid, spawn_ns=spawn_ns); i = 0; next_sample = time.monotonic_ns(); proc_identity = None; last_live_ledger = None; previous_sample_ns = None
             while child.poll() is None:

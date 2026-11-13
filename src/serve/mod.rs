@@ -25,6 +25,8 @@ pub(crate) mod gemma_live_attention;
 pub(crate) mod gemma_prefill_catsplit;
 pub(crate) mod gemma_decode_attention;
 pub(crate) mod gemma_prefill_moe;
+#[cfg(test)]
+mod gemma_routing_scope_tests;
 pub mod gpu;
 pub(crate) mod gemma_cold_masks;
 pub mod header;
@@ -7172,7 +7174,8 @@ fn cmd_parity_check(
     eprintln!();
 
     let tokenizer_path = find_tokenizer(model_path, None)?;
-    let mut ctx = gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
+    let mut ctx =
+        gpu::GpuContext::new_for_gemma4().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
     // ADR-022 P1.8 (operator pushback "requiring the config seems dumb"):
@@ -7337,7 +7340,8 @@ fn cmd_parity_capture(
 
     // Load model once
     let tokenizer_path = find_tokenizer(model_path, None)?;
-    let mut ctx = gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
+    let mut ctx =
+        gpu::GpuContext::new_for_gemma4().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
     // ADR-022 P1.8 — prefer GGUF-self-sufficient config; see cmd_parity_check.
@@ -7514,6 +7518,7 @@ mod tests {
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
             gemma_warm_attention_kernel: None,
+            default_routes: Vec::new(),
         }
     }
 

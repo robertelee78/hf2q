@@ -197,16 +197,59 @@ pub(super) fn snapshot(state: &AppState, engines: &[Arc<LoadedEngine<Engine>>]) 
             "gemma_warm_attention_kernel": engine.info().gemma_warm_attention_kernel,
             // Native expert-matmul tile schedule (`HF2Q_MM_ID_SCHEDULE`).
             "mm_id_schedule": crate::serve::gemma_prefill_moe::published_mm_id_schedule(),
-            // Native Q5_0 tensor-MM opt-in (`HF2Q_Q5_0_TENSOR_MM=1`).
-            "q5_0_tensor_mm": crate::serve::gemma_prefill_moe::published_q5_0_tensor_mm(),
+            // Native Q5_0 tensor-MM routing (`HF2Q_Q5_0_TENSOR_MM`): on by
+            // default for Gemma 4, mlx-native's opt-in for other families.
+            "q5_0_tensor_mm": crate::serve::gemma_prefill_moe::published_q5_0_tensor_mm(
+                engine.info().arch_str == "gemma4",
+            ),
+            // Default-on release-gate routes of the loaded family (Gemma 4,
+            // DeepSeek-V4; ADR-063 Q4), each `{value, source}` as resolved
+            // at model load, so a Q5 receipt binds a default or kill-switch
+            // arm. Empty for other families.
+            "default_routes": default_routes_control(&engine.info().default_routes),
         },
     }))
+}
+
+/// `{name: {value, source}}` of the loaded model's default-on routes.
+fn default_routes_control(
+    routes: &[crate::inference::models::route_default::RouteAudit],
+) -> serde_json::Value {
+    serde_json::Value::Object(
+        routes
+            .iter()
+            .map(|route| {
+                (
+                    route.name.to_string(),
+                    json!({"value": route.value, "source": route.source}),
+                )
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
+
+    #[test]
+    fn default_routes_control_publishes_value_and_source_per_route() {
+        use crate::inference::models::route_default::RouteAudit;
+        assert_eq!(default_routes_control(&[]), json!({}));
+        let routes = [
+            RouteAudit::new("deepseek_row_exact_matvec", "RowExact", "default"),
+            RouteAudit::new("deepseek_tail_rows_step", "Off", "env"),
+        ];
+        assert_eq!(
+            default_routes_control(&routes),
+            json!({
+                "deepseek_row_exact_matvec": {"value": "RowExact", "source": "default"},
+                "deepseek_tail_rows_step": {"value": "Off", "source": "env"},
+            })
+        );
+    }
+
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 

@@ -346,6 +346,13 @@ pub struct LoadInfo {
     /// `None` for every other family. Published as
     /// `active_controls.gemma_warm_attention_kernel` in `/hf2q/v1/runtime`.
     pub gemma_warm_attention_kernel: Option<&'static str>,
+
+    /// Default-on routes resolved at model load, each with its source
+    /// (`default`, `env`, `fallback`): the Gemma 4 and DeepSeek-V4
+    /// release-gate routes (ADR-063 Q4). Empty for every other family.
+    /// Shown in the load banner as `routes = …` and published as
+    /// `active_controls.default_routes` in `/hf2q/v1/runtime`.
+    pub default_routes: Vec<crate::inference::models::route_default::RouteAudit>,
 }
 
 impl LoadInfo {
@@ -890,6 +897,15 @@ pub fn print_banner<W: std::io::Write>(
         "inactive"
     };
     writeln!(w, "{d}hf2q load: tq_kv = {}{r}", tq_kv_text)?;
+    // Families with default-on release-gate routes (Gemma 4, DeepSeek-V4)
+    // show what each resolved to and why; other families print no line.
+    if !info.default_routes.is_empty() {
+        writeln!(
+            w,
+            "{d}hf2q load: routes = {}{r}",
+            crate::inference::models::route_default::audit_text(&info.default_routes)
+        )?;
+    }
     writeln!(
         w,
         "{d}hf2q load: ready in {:.2} s{r}",
@@ -1620,6 +1636,7 @@ mod tests {
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
             gemma_warm_attention_kernel: None,
+            default_routes: Vec::new(),
         };
 
         let cloned = info.clone();
@@ -1672,7 +1689,33 @@ mod tests {
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
             gemma_warm_attention_kernel: None,
+            default_routes: Vec::new(),
         }
+    }
+
+    /// A family with default-on release-gate routes prints them, with their
+    /// sources, between `tq_kv` and `ready`; other families print no line
+    /// (the golden banner below).
+    #[test]
+    fn print_banner_shows_default_routes_and_their_sources() {
+        use crate::inference::models::route_default::RouteAudit;
+        let mut info = golden_qwen35moe_info();
+        info.default_routes = vec![
+            RouteAudit::new("gemma_decode_attn_ne", "Ne4", "default"),
+            RouteAudit::new("gemma_warm_attention_kernel", "VecHybrid", "env"),
+        ];
+        let mut buf = Vec::new();
+        print_banner(&info, &mut buf, false).expect("print banner");
+        let got = String::from_utf8(buf).expect("utf8");
+        assert!(
+            got.contains(
+                "hf2q load: tq_kv = inactive\n\
+                 hf2q load: routes = gemma_decode_attn_ne=Ne4 (default) \
+                 gemma_warm_attention_kernel=VecHybrid (env)\n\
+                 hf2q load: ready in"
+            ),
+            "{got}"
+        );
     }
 
     #[test]
@@ -1922,6 +1965,7 @@ mod tests {
             kv_bytes_per_token_override: None,
             kv_fixed_bytes_per_slot_override: None,
             gemma_warm_attention_kernel: None,
+            default_routes: Vec::new(),
         };
         assert_eq!(info.arch_family, ArchFamily::Gemma4);
         assert_eq!(info.quant_label, Some("Q6_K".to_string()));
@@ -2331,6 +2375,7 @@ mod tests {
             kv_bytes_per_token_override: Some(exact),
             kv_fixed_bytes_per_slot_override: Some(super::gemma4_fixed_kv_bytes_per_slot(&cfg)),
             gemma_warm_attention_kernel: Some("VecHybrid"),
+            default_routes: Vec::new(),
         };
         // Override wins over the flattened formula.
         assert_eq!(

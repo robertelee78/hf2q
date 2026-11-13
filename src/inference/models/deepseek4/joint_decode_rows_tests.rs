@@ -502,17 +502,23 @@ fn batched_projections_dispatch_only_proven_routes_at_m_b() {
 
 #[test]
 fn batched_cores_switch_resolution() {
+    use crate::inference::models::route_default::Resolved;
     use std::ffi::OsStr;
-    assert_eq!(AttnCores::resolve(None).unwrap(), AttnCores::PerRow);
+    // Unset: the release-gate encoding; `0` is the kill switch.
+    assert_eq!(
+        AttnCores::resolve(None).unwrap(),
+        Resolved::default_value(AttnCores::Batched)
+    );
     assert_eq!(
         AttnCores::resolve(Some(OsStr::new("0"))).unwrap(),
-        AttnCores::PerRow
+        Resolved::environment(AttnCores::PerRow)
     );
     assert_eq!(
         AttnCores::resolve(Some(OsStr::new("1"))).unwrap(),
-        AttnCores::Batched
+        Resolved::environment(AttnCores::Batched)
     );
     assert!(AttnCores::resolve(Some(OsStr::new("yes"))).is_err());
+    // Fixtures build with the pre-promotion encoding.
     assert_eq!(AttnCores::default(), AttnCores::PerRow);
     // Position-zero rows have no recurrent compressor state: per-row cores.
     assert!(!batched_cores_admit(4, &[0, 5]));

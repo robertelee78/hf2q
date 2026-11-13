@@ -99,9 +99,10 @@
 #                                    A/B kill switch (per-slot cold turn 0).
 #     WARM_TILED_ATTENTION=0|1|tensor (this script) forwards
 #                                    HF2Q_GEMMA_WARM_TILED_ATTENTION; unset
-#                                    keeps the hf2q default (off, vec-hybrid
-#                                    warm attention). 1 opts in to tiled F16,
-#                                    tensor to the tensor-API route (gap F1).
+#                                    keeps the hf2q default (the tensor-API
+#                                    route, gap F1). 0 is the kill switch
+#                                    (vec-hybrid warm attention); 1 opts in
+#                                    to tiled F16.
 #     PREFILL_MOE_DOWN=flat|slotted  (this script) forwards
 #                                    HF2Q_GEMMA_PREFILL_MOE_DOWN; unset
 #                                    keeps the hf2q default (slotted). flat
@@ -111,11 +112,12 @@
 #                                    HF2Q_MM_ID_SCHEDULE; unset keeps the
 #                                    mlx-native expert-matmul schedule
 #                                    default. grid is the bitwise A/B arm.
-#     Q5_0_TENSOR_MM=1               (this script) forwards
-#                                    HF2Q_Q5_0_TENSOR_MM=1, the mlx-native
-#                                    Q5_0 tensor-MM opt-in (published as
+#     Q5_0_TENSOR_MM=0|1             (this script) forwards
+#                                    HF2Q_Q5_0_TENSOR_MM, the Q5_0 tensor
+#                                    matmul route (published as
 #                                    active_controls.q5_0_tensor_mm); unset
-#                                    keeps the native default (off).
+#                                    keeps the Gemma 4 default (on). 0 is
+#                                    the kill switch (simdgroup route).
 #     ROUTING_OVERLAP=0|1            (this script) forwards
 #                                    HF2Q_GEMMA_ROUTING_OVERLAP; unset keeps
 #                                    it off. 1 prints the V2 [ROUTING_OVERLAP]
@@ -123,13 +125,15 @@
 #                                    (diagnostic, untimed runs only).
 #     DECODE_ATTN_NE=0|2|4           (this script) forwards
 #                                    HF2Q_GEMMA_DECODE_ATTN_NE; unset keeps
-#                                    the stock decode attention. 4 is the
-#                                    gap-program NE head split of d256
-#                                    decode attention (Class B A/B arm).
+#                                    the hf2q default (4, the gap-program NE
+#                                    head split of d256 decode attention).
+#                                    0 is the kill switch (stock decode
+#                                    attention).
 #     DECODE_DENSE=stock|row_exact|mma
 #                                    (this script) forwards
 #                                    HF2Q_GEMMA_DECODE_DENSE; unset keeps the
-#                                    stock decode dense route.
+#                                    hf2q default (row_exact). stock is the
+#                                    kill switch.
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):
 #   * Disk persistence of the LCP registry for gemma (ADR-017 spiller
@@ -287,9 +291,9 @@ esac
 Q5_0_TENSOR_MM_ENV=""
 case "${Q5_0_TENSOR_MM:-}" in
     "") ;;
-    1) Q5_0_TENSOR_MM_ENV=1 ;;
+    0|1) Q5_0_TENSOR_MM_ENV="$Q5_0_TENSOR_MM" ;;
     *)
-        echo "Q5_0_TENSOR_MM must be 1 or unset" >&2
+        echo "Q5_0_TENSOR_MM must be 0, 1 or unset" >&2
         exit 2
         ;;
 esac
