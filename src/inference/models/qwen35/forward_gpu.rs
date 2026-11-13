@@ -5327,13 +5327,14 @@ impl Qwen35Model {
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&k| k >= 1)
             .unwrap_or(8);
-        // `HF2Q_QWEN_PREFILL_WAIT_LAYERS`: a text prompt-prefill chunk of more
-        // than 32 rows may run several layers between host waits. Each
-        // layer's command buffer is then committed as soon as it is encoded
-        // (`pipelined_layers` below), so the GPU runs it while the host
-        // encodes the next layer. Forwards with a host-side reader or writer
-        // beyond the captured layers keep the wait after every layer.
-        let prefill_wait_layers = if seq_len > 32
+        // `HF2Q_QWEN_PREFILL_WAIT_LAYERS` above 1: a text prompt-prefill
+        // forward submits each layer's command buffer as soon as it is
+        // encoded (`pipelined_layers` below), so the GPU runs it while the
+        // host encodes the next layer, and the host waits once per that many
+        // layers (a forward of at most 32 rows keeps its cadence of
+        // `HF2Q_FFN_TERMINAL_K_BATCH` layers). Forwards with a host-side
+        // reader or writer beyond the captured layers keep their waits.
+        let configured_wait_layers = if seq_len > 1
             && soft_tokens.is_empty()
             && deepstack.is_none()
             && residual_capture.is_none()
@@ -5348,7 +5349,12 @@ impl Qwen35Model {
         } else {
             1
         };
-        let pipelined_layers = prefill_wait_layers > 1;
+        let pipelined_layers = configured_wait_layers > 1;
+        let prefill_wait_layers = if seq_len > 32 {
+            configured_wait_layers
+        } else {
+            configured_ffn_terminal_k_batch
+        };
         // One command buffer per layer: the layer builders carry their
         // stages into the session's open command buffer, which the FFN
         // terminal then submits.
