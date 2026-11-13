@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn worker_start_rejects_invalid_values_and_combinations_that_break_a_promise() {
         let resolve =
-            |prepared, fold, chunk_scan| resolve_switches(prepared, fold, None, chunk_scan);
+            |prepared, fold, chunk_scan| resolve_switches(prepared, fold, None, None, None, chunk_scan);
         assert_eq!(
             resolve(None, None, false),
             Ok(PrefillSwitches {
@@ -262,7 +262,7 @@ mod tests {
             })
         );
         assert_eq!(
-            resolve_switches(Some("1"), None, Some("1"), false),
+            resolve_switches(Some("1"), None, Some("1"), Some("4"), Some("1"), false),
             Ok(PrefillSwitches {
                 prepared: true,
                 fold_cue: false,
@@ -270,11 +270,11 @@ mod tests {
             })
         );
         assert!(
-            resolve_switches(None, None, Some("1"), false).is_err(),
+            resolve_switches(None, None, Some("1"), None, None, false).is_err(),
             "joint without prepared"
         );
         assert!(
-            resolve_switches(Some("1"), None, Some("lanes"), false).is_err(),
+            resolve_switches(Some("1"), None, Some("lanes"), None, None, false).is_err(),
             "invalid joint value"
         );
         // The stock route may run beside the chunk-scan investigation route.
@@ -311,7 +311,7 @@ mod tests {
         ] {
             assert!(resolve(prepared, fold, chunk_scan).is_err(), "{what}");
             // What the spawn path prints is the outer message alone.
-            let printed = switches_or_refusal(prepared, fold, chunk_scan)
+            let printed = switches_or_refusal(prepared, fold, None, None, None, chunk_scan)
                 .expect_err(what)
                 .to_string();
             assert!(

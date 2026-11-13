@@ -19076,10 +19076,29 @@ fn run_slot_aware_qwen35(
 
     // HF2Q_QWEN_PREFILL_JOINT: the waiting slots' prefill chunks share one
     // forward of at most the per-transaction row ceiling, so a joint
-    // transaction is never longer than one a single slot can already run.
-    let qwen_joint_prefill_rows = (n_slots > 1
+    // transaction is never longer than one a single slot can already run;
+    // beside decoding slots it is shorter still. Which lanes join follows
+    // the model's FFN kind (`Qwen35JointPrefillPolicy::for_worker`).
+    let qwen_joint_prefill = (n_slots > 1
         && crate::inference::models::qwen35::prefill_joint::enabled())
-    .then_some(prefill_chunk_tokens as usize);
+    .then(|| {
+        let policy = super::engine_qwen35::Qwen35JointPrefillPolicy::for_worker(
+            moe,
+            prefill_chunk_tokens as usize,
+        );
+        tracing::info!(
+            target: "hf2q::serve::api::engine_qwen35::progress",
+            join = ?policy.join,
+            idle_rows = policy.idle_rows,
+            decode_rows = policy.decode_rows,
+            cold_gather_ms = policy.cold_gather.as_millis() as u64,
+            prefill_first = policy.prefill_first,
+            "Qwen joint prompt prefill policy"
+        );
+        policy
+    });
+    // When the first prompts of a cohort started to gather (see STEP).
+    let mut cold_gather_deadline: Option<Instant> = None;
 
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {
@@ -19466,6 +19485,30 @@ fn run_slot_aware_qwen35(
             break 'worker;
         }
 
+        // HF2Q_QWEN_PREFILL_JOINT: first prompts gather. While nothing else
+        // runs on the worker and a slot is still free, the first prompt of a
+        // conversation waits a moment for other first prompts, so that
+        // agents started together prefill in one forward and share their
+        // common prompt prefix. Nobody but the waiting requests is delayed,
+        // and a cohort waits once: the window opens when its first request
+        // is admitted and is not reopened until no slot is prefilling.
+        if let Some(policy) = qwen_joint_prefill.filter(|_| !shutdown_requested) {
+            if qwen35_first_prompts_may_gather(&slots) {
+                let deadline = *cold_gather_deadline
+                    .get_or_insert_with(|| Instant::now() + policy.cold_gather);
+                if Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_micros(100));
+                    continue 'worker;
+                }
+            } else if !slots
+                .iter()
+                .flatten()
+                .any(|(work, _, _)| matches!(work, Qwen35SlotWork::Prefill(_)))
+            {
+                cold_gather_deadline = None;
+            }
+        }
+
         // ── STEP ─────────────────────────────────────────────────────
         let step = match scheduler.step() {
             Ok(s) => s,
@@ -19524,7 +19567,8 @@ fn run_slot_aware_qwen35(
                     &scheduler_stats_snapshot,
                     handle,
                     n_tokens,
-                    qwen_joint_prefill_rows,
+                    // Nothing decodes: the transaction ceiling.
+                    qwen_joint_prefill.map(|policy| (policy.idle_rows, policy.join)),
                     kv_bytes_per_token,
                     &supervisor,
                 ) {
@@ -19578,59 +19622,60 @@ fn run_slot_aware_qwen35(
                 n_prefill_tokens,
                 decode_handles,
             } => {
-                // Existing streams run before one bounded cold transaction.
-                // This ordering is the observable fairness contract: a newly
-                // admitted large tool prompt cannot make a decode-ready peer
-                // wait for its entire prefill.
-                if let Some(fatal) = decode_batch_qwen35(
-                    &mut guard,
-                    &mut scheduler,
-                    &mut slots,
-                    &mut retained_tokens,
-                    &mut prompt_caches,
-                    &mut prompt_anchors,
-                    registration.as_ref(),
-                    &decode_handles,
-                    kv_bytes_per_token,
-                    qwen_joint_decode,
-                    &supervisor,
-                ) {
-                    fail_qwen35_worker_after_gpu_fatal(
-                        &supervisor,
-                        &mut rx,
-                        &mut pending,
-                        &mut slots,
-                        &mut scheduler,
-                        &scheduler_stats_snapshot,
-                        fatal,
-                    );
-                    break 'worker;
-                }
-                if let Some(fatal) = advance_qwen35_prefill_step(
-                    &mut guard,
-                    &mut scheduler,
-                    &mut slots,
-                    &mut retained_tokens,
-                    &mut prompt_caches,
-                    &mut prompt_anchors,
-                    registration.as_ref(),
-                    &scheduler_stats_snapshot,
-                    prefill,
-                    n_prefill_tokens,
-                    qwen_joint_prefill_rows,
-                    kv_bytes_per_token,
-                    &supervisor,
-                ) {
-                    fail_qwen35_worker_after_gpu_fatal(
-                        &supervisor,
-                        &mut rx,
-                        &mut pending,
-                        &mut slots,
-                        &mut scheduler,
-                        &scheduler_stats_snapshot,
-                        fatal,
-                    );
-                    break 'worker;
+                // Without the joint prefill policy, existing streams run
+                // before one bounded cold transaction. With it
+                // (`Qwen35JointPrefillPolicy::prefill_first`) the transaction
+                // runs first: a decoding slot's cycles and the transactions
+                // alternate either way, so its largest gap between tokens
+                // is one transaction plus one cycle in both orders, and the
+                // waiting request no longer spends a decode cycle of time
+                // to first token behind streams that lose nothing by it.
+                let prefill_first = qwen_joint_prefill.is_some_and(|policy| policy.prefill_first);
+                for decode_phase in [!prefill_first, prefill_first] {
+                    let fatal = if decode_phase {
+                        decode_batch_qwen35(
+                            &mut guard,
+                            &mut scheduler,
+                            &mut slots,
+                            &mut retained_tokens,
+                            &mut prompt_caches,
+                            &mut prompt_anchors,
+                            registration.as_ref(),
+                            &decode_handles,
+                            kv_bytes_per_token,
+                            qwen_joint_decode,
+                            &supervisor,
+                        )
+                    } else {
+                        advance_qwen35_prefill_step(
+                            &mut guard,
+                            &mut scheduler,
+                            &mut slots,
+                            &mut retained_tokens,
+                            &mut prompt_caches,
+                            &mut prompt_anchors,
+                            registration.as_ref(),
+                            &scheduler_stats_snapshot,
+                            prefill,
+                            n_prefill_tokens,
+                            // The decoding streams wait for this transaction.
+                            qwen_joint_prefill.map(|policy| (policy.decode_rows, policy.join)),
+                            kv_bytes_per_token,
+                            &supervisor,
+                        )
+                    };
+                    if let Some(fatal) = fatal {
+                        fail_qwen35_worker_after_gpu_fatal(
+                            &supervisor,
+                            &mut rx,
+                            &mut pending,
+                            &mut slots,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            fatal,
+                        );
+                        break 'worker;
+                    }
                 }
                 let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
@@ -20345,11 +20390,11 @@ fn advance_qwen35_prefill_step(
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     handle: SlotHandle,
     requested_tokens: u32,
-    joint_rows: Option<usize>,
+    joint: Option<(usize, super::engine_qwen35::Qwen35PrefillJoin)>,
     kv_bytes_per_token: u64,
     supervisor: &EngineSupervisor,
 ) -> Option<Qwen35FatalFailure> {
-    if let Some(max_rows) = joint_rows {
+    if let Some((max_rows, join)) = joint {
         if let Some(outcome) = advance_qwen35_prefill_joint(
             guard,
             scheduler,
@@ -20361,6 +20406,7 @@ fn advance_qwen35_prefill_step(
             scheduler_stats_snapshot,
             handle,
             max_rows,
+            join,
             kv_bytes_per_token,
             supervisor,
         ) {
@@ -20381,6 +20427,19 @@ fn advance_qwen35_prefill_step(
         kv_bytes_per_token,
         supervisor,
     )
+}
+
+/// Whether first prompts are still gathering for a joint prefill
+/// ([`super::engine_qwen35::qwen35_first_prompts_may_gather`]).
+fn qwen35_first_prompts_may_gather(slots: &[Option<Qwen35Slot>]) -> bool {
+    use super::engine_qwen35::Qwen35GatherSlot;
+    super::engine_qwen35::qwen35_first_prompts_may_gather(slots.iter().map(|slot| match slot {
+        None => Qwen35GatherSlot::Free,
+        Some((Qwen35SlotWork::Prefill(state), _, _)) if state.starts_cold() => {
+            Qwen35GatherSlot::FirstPrompt
+        }
+        Some(_) => Qwen35GatherSlot::Busy,
+    }))
 }
 
 /// Run the next prefill chunk of the scheduled slot `head` and of the slots
@@ -20405,6 +20464,7 @@ fn advance_qwen35_prefill_joint(
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     head: SlotHandle,
     max_rows: usize,
+    join: super::engine_qwen35::Qwen35PrefillJoin,
     kv_bytes_per_token: u64,
     supervisor: &EngineSupervisor,
 ) -> Option<Option<Qwen35FatalFailure>> {
@@ -20456,7 +20516,7 @@ fn advance_qwen35_prefill_joint(
                 _ => None,
             })
             .collect::<Option<_>>()?;
-        super::engine_qwen35::qwen35_prefill_cohort(&shapes, max_rows, true)?
+        super::engine_qwen35::qwen35_prefill_cohort(&shapes, max_rows, true, join)?
     };
     candidates.truncate(cohort.lanes);
 

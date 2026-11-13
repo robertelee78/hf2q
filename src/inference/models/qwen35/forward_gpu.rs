@@ -5104,9 +5104,11 @@ impl Qwen35Model {
         // gathered copy of its rows.
         struct JointSegmentScratch {
             fa: Option<(super::FaPrefillArena, super::FaProjectionsArena, MlxBuffer)>,
+            /// MoE FFN scratch of a segment the layer is built for on its
+            /// own (`None` for a segment served by the forward-wide call).
             moe: Option<super::MoeFfnArena>,
-            /// Gathered input rows; with a MoE FFN also the gathered residual
-            /// rows and the segment's output rows.
+            /// Gathered full-attention input rows of a segment whose rows
+            /// are not contiguous in the forward.
             gather: Vec<MlxBuffer>,
         }
         let joint_segments: Vec<super::prefill_joint::Segment> = joint
@@ -5116,6 +5118,9 @@ impl Qwen35Model {
         let joint_shared_rows = joint.as_ref().map_or(0, |plan| plan.shared_rows);
         let mut joint_scratch: Vec<JointSegmentScratch> = Vec::new();
         let mut joint_dn: Option<super::prefill_joint::DnRunScratch> = None;
+        // MoE FFN scratch of the one call that serves every row-exact
+        // segment of the forward (see the layer loop).
+        let mut joint_moe_all: Option<super::MoeFfnArena> = None;
         ensure!(
             joint.is_none()
                 || layer_weights_gpu.iter().all(|layer| {
@@ -5172,31 +5177,52 @@ impl Qwen35Model {
                     None
                 };
                 let moe = match cfg.moe.as_ref() {
-                    Some(moe) => Some(
+                    Some(moe) if !segment.moe_row_exact() => {
+                        ensure!(
+                            segment.runs.len() == 1,
+                            "joint prefill: a segment of {} rows behind a shared prefix",
+                            segment.rows
+                        );
+                        Some(
+                            super::MoeFfnArena::new(
+                                &device,
+                                segment.rows,
+                                h,
+                                moe.num_experts_per_tok,
+                                moe.moe_intermediate_size,
+                                moe.shared_expert_intermediate_size,
+                                moe.num_experts,
+                            )
+                            .context("alloc joint prefill MoeFfnArena")?,
+                        )
+                    }
+                    _ => None,
+                };
+                let mut gather = Vec::new();
+                if segment.runs.len() > 1 {
+                    gather.push(super::prefill_joint::rows_scratch(
+                        &device,
+                        segment.rows,
+                        h as usize,
+                    )?);
+                }
+                joint_scratch.push(JointSegmentScratch { fa, moe, gather });
+            }
+            if let Some(moe) = cfg.moe.as_ref() {
+                if joint_segments.iter().any(|segment| segment.moe_row_exact()) {
+                    joint_moe_all = Some(
                         super::MoeFfnArena::new(
                             &device,
-                            segment.rows,
+                            seq_len,
                             h,
                             moe.num_experts_per_tok,
                             moe.moe_intermediate_size,
                             moe.shared_expert_intermediate_size,
                             moe.num_experts,
                         )
-                        .context("alloc joint prefill MoeFfnArena")?,
-                    ),
-                    None => None,
-                };
-                let mut gather = Vec::new();
-                if segment.runs.len() > 1 {
-                    for _ in 0..if cfg.moe.is_some() { 3 } else { 1 } {
-                        gather.push(super::prefill_joint::rows_scratch(
-                            &device,
-                            segment.rows,
-                            h as usize,
-                        )?);
-                    }
+                        .context("alloc joint prefill forward-wide MoeFfnArena")?,
+                    );
                 }
-                joint_scratch.push(JointSegmentScratch { fa, moe, gather });
             }
             if has_linear {
                 let dn_shape = DeltaNetLayerShape::from_config(cfg);
@@ -6680,115 +6706,97 @@ impl Qwen35Model {
                         moe_ffn_output_ring.as_mut(),
                     ) {
                         (Some(_), _, Some(ring)) => {
-                            // Joint prefill: the MoE FFN picks its router and
-                            // shared-expert kernels by row count, so each
-                            // segment is built as its own forward builds it,
-                            // on its own scratch, into its rows of the ring.
+                            // Joint prefill. Above
+                            // `prefill_joint::MOE_ROW_EXACT_MIN_ROWS` rows the
+                            // MoE FFN computes an output row from that input
+                            // row alone, with one kernel family whatever the
+                            // row count (`moe_prefill_rows_tests`). So one
+                            // call over every row of the forward gives each
+                            // segment of more than that many rows the bits
+                            // of its own call, and streams the expert stacks
+                            // once for all of them (and computes a shared
+                            // prefix once). A shorter segment (a folded cue,
+                            // a short resumed chunk) takes other kernels in
+                            // its own forward, so it is built on its own
+                            // scratch as that forward builds it, over the
+                            // rows the forward-wide call wrote for it.
                             ensure!(
                                 joint_scratch.len() == joint_segments.len(),
                                 "joint prefill: MoE segment scratch is missing"
                             );
                             let width = h as usize;
                             let ring_slot = ring.slot_clone(layer_idx as u32);
+                            if let Some(arena) = joint_moe_all.as_mut() {
+                                let mut out_rows = ring_slot.clone();
+                                build_moe_ffn_layer_gpu_q_into_with_arena(
+                                    enc.encoder(),
+                                    &device,
+                                    &mut registry,
+                                    &ffn_input,
+                                    w_gpu,
+                                    shape,
+                                    fold_residual,
+                                    arena,
+                                    &mut out_rows,
+                                    layer_idx,
+                                )
+                                .with_context(|| {
+                                    format!("moe_ffn_q_into_with_arena joint layer {layer_idx}")
+                                })?;
+                                // The short segments below overwrite their
+                                // rows of this call's output.
+                                enc.encoder().memory_barrier();
+                            }
                             for (segment, scratch) in
                                 joint_segments.iter().zip(joint_scratch.iter_mut())
                             {
+                                if segment.moe_row_exact() {
+                                    ensure!(
+                                        joint_moe_all.is_some(),
+                                        "joint prefill: the forward-wide MoE scratch is missing"
+                                    );
+                                    continue;
+                                }
                                 let arena = scratch
                                     .moe
                                     .as_mut()
                                     .ok_or_else(|| anyhow!("joint prefill: MoE scratch is missing"))?;
-                                let context = || {
+                                ensure!(
+                                    segment.runs.len() == 1,
+                                    "joint prefill: a short MoE segment is not contiguous"
+                                );
+                                let first = segment.runs[0].first;
+                                let rows_of = |buffer: &MlxBuffer| {
+                                    super::prefill_joint::row_view(
+                                        buffer,
+                                        first,
+                                        segment.rows,
+                                        width,
+                                    )
+                                    .with_shape(vec![segment.rows as usize, width])
+                                    .map_err(|e| anyhow!("joint prefill MoE rows: {e}"))
+                                };
+                                let x = rows_of(&ffn_input)?;
+                                let residual = fold_residual.map(rows_of).transpose()?;
+                                let mut out_rows = rows_of(&ring_slot)?;
+                                build_moe_ffn_layer_gpu_q_into_with_arena(
+                                    enc.encoder(),
+                                    &device,
+                                    &mut registry,
+                                    &x,
+                                    w_gpu,
+                                    shape,
+                                    residual.as_ref(),
+                                    arena,
+                                    &mut out_rows,
+                                    layer_idx,
+                                )
+                                .with_context(|| {
                                     format!(
                                         "moe_ffn_q_into_with_arena layer {layer_idx} slot {} rows {:?}",
                                         segment.slot.0, segment.runs
                                     )
-                                };
-                                if let [x, residual_rows, out_rows] = scratch.gather.as_slice() {
-                                    // Behind a shared prefix: private copies
-                                    // of the segment's input and residual
-                                    // rows, and its kept output rows back.
-                                    super::prefill_joint::gather_segment(
-                                        enc.encoder(),
-                                        &mut registry,
-                                        &device,
-                                        &ffn_input,
-                                        segment,
-                                        x,
-                                        h,
-                                    )
-                                    .with_context(context)?;
-                                    if let Some(residual) = fold_residual {
-                                        super::prefill_joint::gather_segment(
-                                            enc.encoder(),
-                                            &mut registry,
-                                            &device,
-                                            residual,
-                                            segment,
-                                            residual_rows,
-                                            h,
-                                        )
-                                        .with_context(context)?;
-                                    }
-                                    enc.encoder().memory_barrier();
-                                    let mut out_rows = out_rows.clone();
-                                    build_moe_ffn_layer_gpu_q_into_with_arena(
-                                        enc.encoder(),
-                                        &device,
-                                        &mut registry,
-                                        x,
-                                        w_gpu,
-                                        shape,
-                                        fold_residual.map(|_| residual_rows),
-                                        arena,
-                                        &mut out_rows,
-                                        layer_idx,
-                                    )
-                                    .with_context(context)?;
-                                    enc.encoder().memory_barrier();
-                                    super::prefill_joint::scatter_segment(
-                                        enc.encoder(),
-                                        &mut registry,
-                                        &device,
-                                        &out_rows,
-                                        segment,
-                                        joint_shared_rows,
-                                        &ring_slot,
-                                        h,
-                                    )
-                                    .with_context(context)?;
-                                } else {
-                                    ensure!(
-                                        segment.runs.len() == 1,
-                                        "joint prefill: MoE gather scratch is missing"
-                                    );
-                                    let first = segment.runs[0].first;
-                                    let rows_of = |buffer: &MlxBuffer| {
-                                        super::prefill_joint::row_view(
-                                            buffer,
-                                            first,
-                                            segment.rows,
-                                            width,
-                                        )
-                                        .with_shape(vec![segment.rows as usize, width])
-                                        .map_err(|e| anyhow!("joint prefill MoE rows: {e}"))
-                                    };
-                                    let x = rows_of(&ffn_input)?;
-                                    let residual = fold_residual.map(rows_of).transpose()?;
-                                    let mut out_rows = rows_of(&ring_slot)?;
-                                    build_moe_ffn_layer_gpu_q_into_with_arena(
-                                        enc.encoder(),
-                                        &device,
-                                        &mut registry,
-                                        &x,
-                                        w_gpu,
-                                        shape,
-                                        residual.as_ref(),
-                                        arena,
-                                        &mut out_rows,
-                                        layer_idx,
-                                    )
-                                    .with_context(context)?;
-                                }
+                                })?;
                             }
                             ring_slot
                         }

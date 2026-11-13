@@ -115,6 +115,8 @@ pub mod moe;
 pub(crate) mod moe_batched;
 #[cfg(test)]
 mod moe_batched_tests;
+#[cfg(test)]
+mod moe_prefill_rows_tests;
 mod moe_live_tiles;
 mod moe_live_tiles_fused;
 #[cfg(test)]
