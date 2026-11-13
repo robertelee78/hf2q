@@ -313,7 +313,7 @@ impl ResolvedRoutes {
 
     /// The process environment alone: no profile.
     pub(crate) fn from_process_env() -> Self {
-        Self::resolve(None, &|_| None, &|name| std::env::var(name).ok())
+        Self::resolve(None, &|_| None, &process_value)
     }
 
     /// The active profile, if any.
@@ -415,6 +415,16 @@ thread_local! {
     static BOUND: RefCell<Option<Arc<ResolvedRoutes>>> = const { RefCell::new(None) };
     /// The bound routes' exact-`1` bits, for readers on the dispatch path.
     static BOUND_ONES: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+/// Preserve a set, invalid-Unicode value as invalid input, never as unset.
+/// Otherwise a malformed kill switch could silently select a profile default.
+pub(crate) fn process_value(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(value)) => Some(value.to_string_lossy().into_owned()),
+    }
 }
 
 static PROCESS: LazyLock<Arc<ResolvedRoutes>> =

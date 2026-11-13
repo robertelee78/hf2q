@@ -1494,7 +1494,7 @@ pub(crate) fn admission_bytes(
         config.is_some_and(|config| config.dwq_overlay_path.is_some()),
         config.and_then(|config| config.requested_context),
     );
-    let env = |name: &str| std::env::var(name).ok();
+    let env = route_profile::process_value;
     let host = host_routes();
     Some(
         facts
@@ -1568,7 +1568,7 @@ pub(crate) fn resolve_for_load(
     decide(
         &facts,
         HostFacts::read(config.kv_cache_budget_bytes, resident_bytes),
-        &|name| std::env::var(name).ok(),
+        &route_profile::process_value,
         &HubDrafterStore,
         &|name| host_switch_refusal(&host, name),
     )
