@@ -1,1 +1,0 @@
-Error: GemmaLoadedModel::load: mlx-native init failed: HF2Q_Q5_0_TENSOR_MM must be 1 or 0/off/false/stock for a Gemma 4 model, got "true"
