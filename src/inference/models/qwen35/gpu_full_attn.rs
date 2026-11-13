@@ -7858,17 +7858,6 @@ pub fn build_gated_attn_layer(
         if super::execution_dispatch::source_teacher_scope_active() {
             enc.commit_and_wait_labeled("source_teacher.layer.full_attn.ops6-7")
                 .context("complete source-teacher full-attention ops6-7")?;
-        } else if seq_len > 1
-            && matches!(enc, LayerEncoder::Sessioned(_))
-            && super::prefill_prepared::single_command_layers()
-            && (fused_into_stage_a || use_arena)
-        {
-            // One command buffer per layer: the stage stays in the
-            // session's open command buffer and the layer's FFN is encoded
-            // behind it. Every command this stage reads from (the attention
-            // bridge of a resumed chunk) was committed before this one is.
-            enc.carry_into_next_stage("layer.full_attn.ops6-7")
-                .context("carry FA ops6-7")?;
         } else if fused_into_stage_a {
             enc.fence_or_commit("layer.full_attn.stage_a")
                 .context("fence/commit FA stage_a")?;
