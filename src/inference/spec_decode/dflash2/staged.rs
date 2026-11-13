@@ -79,7 +79,7 @@ fn supports(config: &DFlash2Config, tensors: &DFlash2ModelTensors, lanes: usize)
             route_host::runs(family),
             "{DFLASH2_DRAFT_STAGED_ENV}=1: {} cannot run on this host: {}",
             family.name(),
-            mlx_native::TENSOR_API_UNAVAILABLE
+            mlx_native::tensor_kernel_family_unavailable_reason()
         );
     }
     ensure!(
@@ -485,7 +485,7 @@ mod tests {
             "{error}"
         );
         assert!(
-            error.contains(mlx_native::TENSOR_API_UNAVAILABLE),
+            error.contains(mlx_native::tensor_kernel_family_unavailable_reason()),
             "{error}"
         );
     }
@@ -493,6 +493,8 @@ mod tests {
     #[test]
     fn the_switch_is_off_unless_exactly_one_and_fails_closed() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
+        // The rule itself, on a host that runs the staged kernels.
+        let _host = route_host::HostForTest::with_tensor_api();
         let device = MlxDevice::new().unwrap();
         let cfg = config(1_024);
         let mut tensors = DFlash2ModelTensors::synthetic_af4_g64(&device, &cfg, 3);
