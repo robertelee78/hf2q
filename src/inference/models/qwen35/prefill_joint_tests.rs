@@ -1441,6 +1441,84 @@ fn a_failed_command_buffer_of_the_last_window_fails_the_forward() {
     });
 }
 
+/// The scratch pool takes its buffers back only at a host wait, keeps them in
+/// exact power-of-two buckets and never shrinks on its own, so a forward that
+/// skips host waits accumulates its layers' scratch. Two enforced caps bound
+/// that for every shape: a layer that ends with more than the window cap out
+/// waits, and after a joint forward or a forward that skips waits a reset
+/// releases the pool's free buffers above the retained cap. The caps change
+/// when the host waits and what the pool keeps, never a bit.
+#[test]
+fn the_scratch_caps_bound_the_pool_and_change_no_bit() {
+    use super::decode_pool;
+    use super::prefill_prepared::{ForcedWaitLayers, ScratchCapsForTest};
+    with_synthetic_model(|model| {
+        let lanes = [
+            Lane::cold(0, 96, 507, 5),
+            Lane::cold(1, 96, 400, 0),
+            Lane::cold(2, 96, 300, 5),
+        ];
+        // What the pool holds once the forward's buffers are back.
+        let held = || {
+            decode_pool::checked_reset_decode_pool().expect("reset");
+            decode_pool::free_bytes()
+        };
+        let run = |wait: usize| {
+            let _cadence = ForcedWaitLayers::set(wait);
+            joint(model, &lanes, 96, false)
+        };
+        let unlimited = usize::MAX;
+        // A wait after every layer: one layer's scratch at a time.
+        let every_layer = {
+            let _caps = ScratchCapsForTest::set(unlimited, unlimited);
+            run(1)
+        };
+        let one_layer = held();
+        assert!(one_layer > 0, "the joint forward pooled no scratch");
+        // Eight layers between waits under a window cap of zero: every layer
+        // ends over the cap and waits, so the pool grows by nothing.
+        let capped = {
+            let _caps = ScratchCapsForTest::set(0, unlimited);
+            run(8)
+        };
+        assert_eq!(held(), one_layer, "a window cap of zero still let layers skip their wait");
+        // The same without the window cap: the layers' scratch accumulates.
+        let uncapped = {
+            let _caps = ScratchCapsForTest::set(unlimited, unlimited);
+            run(8)
+        };
+        let accumulated = held();
+        assert!(
+            accumulated > one_layer,
+            "eight layers between waits pooled no more than one layer ({accumulated} against {one_layer} bytes): \
+             the test would not see a missing cap"
+        );
+        // A retained cap below what the pool holds: the reset after the next
+        // such forward releases the free buffers.
+        let released = {
+            let _caps = ScratchCapsForTest::set(unlimited, one_layer / 2);
+            run(8)
+        };
+        let after = held();
+        assert!(
+            after <= one_layer / 2,
+            "the pool kept {after} bytes over a retained cap of {} bytes",
+            one_layer / 2
+        );
+        // The cap ended with that reset: a later reset keeps what a forward
+        // without it leaves.
+        for (what, other) in [("window cap", &capped), ("no cap", &uncapped), ("retained cap", &released)] {
+            for ((lane, a), b) in lanes.iter().zip(&every_layer).zip(other) {
+                let differences = a.differences(b);
+                assert!(
+                    differences.is_empty(),
+                    "{what}: {lane:?} differs from the forward that waits after every layer in {differences:?}"
+                );
+            }
+        }
+    });
+}
+
 /// Memory probe for `HF2Q_QWEN_PREFILL_WAIT_LAYERS`, run explicitly in a
 /// fresh process per cadence (the worker's scratch pool never shrinks):
 /// `P834_WAIT_LAYERS=<1..8> HF2Q_QWEN38_GGUF=… <test binary> qwen_prefill_wait_layers_memory_probe --ignored --nocapture --test-threads=1`
@@ -1509,8 +1587,11 @@ fn qwen_prefill_wait_layers_memory_probe() {
         super::decode_pool::worker_memory_snapshot()
             .map(|(kind, snapshot)| (kind, snapshot.retained.bytes, snapshot.retained.roots))
     };
-    let _scope = PrefillScope::forced(true);
+    // The cadence first: a scope takes the cadence that is forced when it
+    // opens.
     let _cadence = ForcedWaitLayers::set(wait);
+    let _scope = PrefillScope::forced(true);
+    assert_eq!(super::prefill_prepared::wait_layers(), wait, "the probe's cadence is not in force");
     let (loaded, _) = footprint_gib();
     eprintln!("[WAIT_LAYERS_MEMORY] wait={wait} loaded: footprint {loaded:.2} GiB, pool {:?}", retained());
     for (what, start, rows) in [

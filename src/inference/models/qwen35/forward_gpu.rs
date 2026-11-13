@@ -150,6 +150,15 @@ impl Drop for FailForwardAtLayer {
     }
 }
 
+/// Whether a forward that skips host waits has so much pooled scratch out
+/// that the layer now ending must wait
+/// ([`super::prefill_prepared::WAIT_LAYERS_WINDOW_SCRATCH_BYTES`]): the pool
+/// takes its buffers back only at a host wait.
+fn window_scratch_full(pipelined_layers: bool) -> bool {
+    pipelined_layers
+        && super::decode_pool::issued_bytes() > super::prefill_prepared::window_scratch_cap()
+}
+
 /// Block until every command buffer a failed forward committed has run.
 /// The forward's kept command buffers were waited for one by one when its
 /// scope ended ([`super::encoder_stage::SubmittedCommands`]); this covers
@@ -4757,6 +4766,10 @@ impl Qwen35Model {
         if result.is_err() {
             drain_after_failed_forward();
         }
+        // The reset that takes this forward's last pooled buffers back is
+        // the next forward's or the next decode step's: the cap on what the
+        // pool keeps applies to it and ends there.
+        super::decode_pool::release_free_once_more();
         result
     }
 
@@ -5484,7 +5497,19 @@ impl Qwen35Model {
         } else {
             1
         };
-        let pipelined_layers = configured_wait_layers > 1;
+        // The growth-limited pool profile has its own quota and no release:
+        // a forward keeps its waits there.
+        let pipelined_layers =
+            configured_wait_layers > 1 && super::decode_pool::default_pool();
+        // A joint forward, and a forward that skips host waits, pool more
+        // scratch than a single slot's forward that waits at every layer.
+        // From here to the reset after this forward the pool releases its
+        // free buffers when they exceed the cap, so what such forwards leave
+        // in the pool between steps is bounded whatever their sizes.
+        super::decode_pool::release_free_above(
+            (pipelined_layers || !joint_segments.is_empty())
+                .then(super::prefill_prepared::retained_scratch_cap),
+        );
         let prefill_wait_layers = if seq_len > 32 {
             configured_wait_layers
         } else {
@@ -5946,7 +5971,7 @@ impl Qwen35Model {
                 || residual_capture
                     .as_ref()
                     .is_some_and(|cap| cap.layer == layer_idx);
-            let is_k_boundary = seq_len == 1
+            let mut is_k_boundary = seq_len == 1
                 || ffn_terminal_k_batch <= 1
                 || (layer_idx + 1) % ffn_terminal_k_batch == 0
                 || (layer_idx + 1) == n_layers
@@ -6805,7 +6830,10 @@ impl Qwen35Model {
                             enc.commit_unlabeled().with_context(|| {
                                 format!("commit fused-DenseQ decode layer {layer_idx}")
                             })?;
-                        } else if is_k_boundary {
+                        } else if {
+                            is_k_boundary |= window_scratch_full(pipelined_layers);
+                            is_k_boundary
+                        } {
                             // ADR-019 Phase 1: hold the LAST layer's
                             // FFN-terminal encoder open (skip commit_and_wait)
                             // so the output head can fold its dispatches into
@@ -7081,7 +7109,10 @@ impl Qwen35Model {
                         enc.commit_unlabeled().with_context(|| {
                             format!("commit fused-MoeQ decode layer {layer_idx}")
                         })?;
-                    } else if is_k_boundary {
+                    } else if {
+                        is_k_boundary |= window_scratch_full(pipelined_layers);
+                        is_k_boundary
+                    } {
                         // ADR-019 Phase 1: see DenseQ fusion comment above.
                         // ADR-019 Phase 2 iter90 OQ2: phase1_fusion_env_eligible
                         // is gated on !LayerEncoder::env_enabled(); held branch

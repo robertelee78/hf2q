@@ -157,6 +157,89 @@ impl Drop for PrefillScope {
     }
 }
 
+/// Pooled scratch a forward that skips host waits
+/// ([`QWEN_PREFILL_WAIT_LAYERS_ENV`] above 1) may have out when a layer
+/// ends without a wait. The worker's scratch pool takes its buffers back
+/// only at a host wait, so layers that do not wait accumulate theirs; a
+/// layer that ends with more than this out waits. What is out between two
+/// waits is therefore at most this plus one layer's scratch, and a forward
+/// that waits at every layer has one layer's scratch out as well.
+pub(crate) const WAIT_LAYERS_WINDOW_SCRATCH_BYTES: usize = 1 << 30;
+
+/// Pooled scratch a worker keeps between host waits once a joint forward or
+/// a forward that skips host waits has run: above it the pool's free
+/// buffers are released at the next reset
+/// ([`super::decode_pool::release_free_above`]).
+pub(crate) const PREFILL_RETAINED_SCRATCH_BYTES: usize = 2 << 30;
+
+#[cfg(test)]
+thread_local! {
+    /// Test override of the two caps: (window, retained).
+    static SCRATCH_CAPS_FOR_TEST: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+}
+
+/// [`WAIT_LAYERS_WINDOW_SCRATCH_BYTES`] (a test may lower it).
+pub(crate) fn window_scratch_cap() -> usize {
+    #[cfg(test)]
+    if let Some((window, _)) = SCRATCH_CAPS_FOR_TEST.with(Cell::get) {
+        return window;
+    }
+    WAIT_LAYERS_WINDOW_SCRATCH_BYTES
+}
+
+/// [`PREFILL_RETAINED_SCRATCH_BYTES`] (a test may lower it).
+pub(crate) fn retained_scratch_cap() -> usize {
+    #[cfg(test)]
+    if let Some((_, retained)) = SCRATCH_CAPS_FOR_TEST.with(Cell::get) {
+        return retained;
+    }
+    PREFILL_RETAINED_SCRATCH_BYTES
+}
+
+/// Until dropped, this thread's forwards run under these caps instead of
+/// the two constants.
+#[cfg(test)]
+pub(crate) struct ScratchCapsForTest {
+    previous: Option<(usize, usize)>,
+}
+
+#[cfg(test)]
+impl ScratchCapsForTest {
+    pub(crate) fn set(window: usize, retained: usize) -> Self {
+        Self {
+            previous: SCRATCH_CAPS_FOR_TEST.with(|cell| cell.replace(Some((window, retained)))),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScratchCapsForTest {
+    fn drop(&mut self) {
+        SCRATCH_CAPS_FOR_TEST.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Upper bound of the pooled scratch `HF2Q_QWEN_PREFILL_JOINT` keeps between
+/// steps: enforced, so it holds for every model geometry, slot count and
+/// sequence of forwards.
+pub(crate) const fn joint_scratch_bound_bytes() -> u64 {
+    PREFILL_RETAINED_SCRATCH_BYTES as u64
+}
+
+/// Upper bound of the pooled scratch a worker holds because of
+/// `HF2Q_QWEN_PREFILL_WAIT_LAYERS=wait_layers`, beyond what the same
+/// forwards hold when they wait at every layer: what the pool keeps between
+/// waits plus what a window may add before a layer waits. Enforced, so it
+/// holds for every model geometry, slot count and sequence of forwards; 0
+/// at the default cadence.
+pub(crate) const fn wait_layers_scratch_bound_bytes(wait_layers: usize) -> u64 {
+    if wait_layers > 1 {
+        (PREFILL_RETAINED_SCRATCH_BYTES + WAIT_LAYERS_WINDOW_SCRATCH_BYTES) as u64
+    } else {
+        0
+    }
+}
+
 /// Layers between host waits for a chunk of more than 32 rows on this
 /// thread: the operator's value inside a prompt-prefill scope, 1 outside.
 pub(crate) fn wait_layers() -> usize {
@@ -334,6 +417,14 @@ pub(crate) fn validate_at_worker_start() -> anyhow::Result<PrefillSwitches> {
         joint = switches.joint,
         wait_layers = switches.wait_layers,
         keep_fresh = switches.keep_fresh,
+        // Enforced caps on the pooled scratch the two switches add: what
+        // memory admission charges them.
+        joint_scratch_bound_bytes = if switches.joint {
+            joint_scratch_bound_bytes()
+        } else {
+            0
+        },
+        wait_layers_scratch_bound_bytes = wait_layers_scratch_bound_bytes(switches.wait_layers),
         "Qwen prompt prefill configuration"
     );
     Ok(switches)

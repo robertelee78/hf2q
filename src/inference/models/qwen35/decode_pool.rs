@@ -98,7 +98,56 @@ pub fn pooled_alloc_buffer(
     shape: Vec<usize>,
 ) -> std::result::Result<MlxBuffer, mlx_native::MlxError> {
     if let Some(result) = profile::alloc(device, byte_len, dtype, &shape) { return result; }
-    DECODE_POOL.with(|cell| cell.borrow_mut().alloc(device, byte_len, dtype, shape))
+    let buffer = DECODE_POOL.with(|cell| cell.borrow_mut().alloc(device, byte_len, dtype, shape))?;
+    // The pool hands out the power-of-two bucket the request rounds up to.
+    ISSUED_BYTES.with(|issued| issued.set(issued.get() + byte_len.max(1).next_power_of_two()));
+    Ok(buffer)
+}
+
+thread_local! {
+    /// Bucket bytes this thread's pool has handed out since its last reset.
+    static ISSUED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Free bytes above which a reset releases the pool's free buffers
+    /// ([`release_free_above`]), and whether that ends with the next reset;
+    /// `None`: the pool keeps everything.
+    static FREE_CAP: std::cell::Cell<Option<(usize, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Bucket bytes handed out by this thread's pool since its last reset: the
+/// pooled scratch that is out, and stays out until the next reset.
+pub(crate) fn issued_bytes() -> usize {
+    ISSUED_BYTES.with(std::cell::Cell::get)
+}
+
+/// From now on a reset of this thread's pool releases the pool's free
+/// buffers when they hold more than `cap` bytes (`None`: never, the
+/// default). A reset follows a drained queue and the last use of every
+/// issued buffer, so the free buffers have no user. The pool reuses a free
+/// buffer only in the exact bucket a request rounds up to and never shrinks
+/// on its own; with a cap what it keeps between resets is at most `cap`
+/// bytes, whatever sizes the forwards before asked for. Released buffers are
+/// allocated again when needed: that costs allocation time, never memory.
+pub(crate) fn release_free_above(cap: Option<usize>) {
+    FREE_CAP.with(|cell| cell.set(cap.map(|cap| (cap, false))));
+}
+
+/// The cap of [`release_free_above`] applies to one more reset and then
+/// ends. A forward calls this when it returns: the reset that takes its last
+/// buffers back is the next forward's or the next decode step's.
+pub(crate) fn release_free_once_more() {
+    FREE_CAP.with(|cell| cell.set(cell.get().map(|(cap, _)| (cap, true))));
+}
+
+/// Whether this thread's pool is the default one (not the growth-limited
+/// investigation profile, which has its own quota and no release).
+pub(crate) fn default_pool() -> bool {
+    !profile::selected()
+}
+
+/// Free bytes this thread's default pool holds.
+#[cfg(test)]
+pub(crate) fn free_bytes() -> usize {
+    DECODE_POOL.with(|cell| cell.borrow().free_bytes())
 }
 
 thread_local! {
@@ -158,7 +207,19 @@ pub fn reset_decode_pool() {
 /// Caller guarantees no future issued-buffer access AND a successful drain.
 pub fn checked_reset_decode_pool() -> std::result::Result<(), mlx_native::MlxError> {
     if let Some(result) = profile::reset() { return result; }
-    DECODE_POOL.with(|cell| cell.borrow_mut().reset());
+    DECODE_POOL.with(|cell| {
+        let mut pool = cell.borrow_mut();
+        pool.reset();
+        if let Some((cap, once)) = FREE_CAP.with(std::cell::Cell::get) {
+            if pool.free_bytes() > cap {
+                pool.clear();
+            }
+            if once {
+                FREE_CAP.with(|cell| cell.set(None));
+            }
+        }
+    });
+    ISSUED_BYTES.with(|issued| issued.set(0));
     Ok(())
 }
 
