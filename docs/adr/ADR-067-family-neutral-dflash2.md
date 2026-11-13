@@ -2246,6 +2246,35 @@ barriers where Splash has two dispatches with epilogues) and on the
 attention side (+0.3 to +0.6 ms). Whether the envelope is thermal or
 electrical was not measured.
 
+#### Proposal repetition-prior diagnostic
+
+The target applies its repetition penalty to recent sampling history while the
+drafter originally ranked raw logits. An isolated Qwen3.8 spike applies that
+known-prefix prior to non-anchor draft rows before selection. It uses the
+target's actual latest 64 history entries (which may include prompt tokens),
+not guessed future history; target sampling and verification are unchanged.
+Prefetched draft logits are reusable only with the same prior fingerprint.
+
+One preregistered same-binary candidate/control pair at source
+`0609b1d2538e878423c4cc065e6c3bfb38461ec7`, binary SHA256
+`e56ba5fd723a820e8799c9599aedd65c1a3c49a05a59a7cb08aae4f14cdfb70e`,
+passed both task and cleanup gates. The prior accepted 6,337 tokens in 1,177
+active lane-cycles (5.384027); its `HF2Q_DFLASH2_PROPOSAL_REPETITION=0`
+control needed 1,206 cycles (5.254561). Independent per-window counts agree.
+All 28 assistant payloads matched after removing only generated tool-call IDs;
+content, reasoning, function names and argument bytes were preserved.
+
+The pair used `paired_q5_campaign.py run_block` with `PAIRED_Q5_BLOCK=1`,
+one run per arm and no retries. Private receipts retain the sealed case
+digests, raw hashes, policy audit and count reduction. A 65 W adapter and
+varying clocks make its elapsed times unsuitable for a speed claim.
+This is mechanism evidence on that source and binary, not D5/D6 or release
+qualification. Subsequent public-POD input guards passed plain,
+shader-validation and debug regressions; those runs do not establish binary
+equivalence to the measured pair. Production integration must use the single
+resolved profile table and repeat qualification on the final published
+dependency and default configuration.
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,
