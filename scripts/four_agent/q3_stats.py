@@ -23,7 +23,12 @@ NO_CONTRAST = "no_contrast"
 # the rule it was planned under (LEGACY_FAILURE_RULE): no reruns.
 FAILURE_POLICY_VERSION = 1
 RERUNS_PER_POSITION = 2
-RERUN_FAILURE_KINDS = ("task",)   # q3_metrics.classify kind of a client that ran to its end and did not complete the task
+# q3_metrics.classify kind `task`: every failure the client itself reports after the four-agent release, with no
+# supervisor stop and no out-of-memory marker. The client aborts the run at its first failing agent, so the kind covers
+# a broken workflow, a failed test with no repair cycle left, an API or context reject and a client request, agent or
+# tool deadline alike. A comparison run that stalls past a client deadline is therefore rerun too; that removes the
+# reference arm's slowest run, which works against the candidate, never for it.
+RERUN_FAILURE_KINDS = ("task",)
 COMPARISON_ARMS = ("stock", "peer", "splash")
 LEGACY_FAILURE_RULE = "legacy: no reruns; a peer or required-Splash task failure is Failed"
 # Two-sided 95% Student t quantiles, df = complete blocks - 1.
@@ -129,8 +134,9 @@ def rerun_decision(policy, arm, outcome, failure_kind, prior_failures):
     """What a settled attempt means under the policy: None (the legacy handling applies), "rerun" (discard the failed
     attempt and run the same arm again in the same position) or "exhausted" (every allowed attempt of the position
     failed). The inputs are the arm, the attempt's outcome and failure kind and the number of failed attempts already
-    discarded in this position; no timing, metric or effect can reach the decision, so a slow passing run is never
-    rerun."""
+    discarded in this position; no metric or effect can reach the decision, so a slow passing run is never rerun.
+    Timing reaches it only through the failure kind: a run the client abandoned at one of its own deadlines is a `task`
+    failure (RERUN_FAILURE_KINDS)."""
     if policy is None or arm not in policy["arms"] or outcome != "Fail" or failure_kind not in policy["rerun_failure_kinds"]:
         return None
     return "rerun" if prior_failures < policy["reruns_per_position"] else "exhausted"
@@ -162,7 +168,9 @@ def clopper_pearson(failures, attempts, confidence=0.95):
 
 
 def failure_rate(failures, attempts):
-    """{attempts, failures, failure_rate, failure_rate_ci95} of task-scored attempts (passes plus task failures)."""
+    """{attempts, failures, failure_rate, failure_rate_ci95} of the attempts that ran the task (passes plus failures).
+    The interval is the Clopper-Pearson formula; its 95% coverage is nominal here, because attempts are rerun until
+    one passes rather than drawn as a fixed number of independent trials."""
     return {"attempts": attempts, "failures": failures, "failure_rate": failures / attempts if attempts else None,
             "failure_rate_ci95": clopper_pearson(failures, attempts)}
 

@@ -18,9 +18,10 @@ one discarded warmup per arm per driver session, then Williams-ordered blocks: a
 at most 20 by default or 40 when the campaign predeclares the approved precision extension,
 stopping once the 95% half-width of every required experiment contrast is <= 2.5 points.
 Comparison-arm failure policy (operator decision 2026-11-12, frozen in the plan as comparison_failure_policy): a
-stock, peer or Splash run that fails its own task is kept, counted and rerun in the same block position, at most twice;
+stock, peer or Splash run whose client reports a failure (kind `task`: the client aborts at the first failing agent,
+client deadlines included) is kept, counted and rerun in the same block position, at most twice;
 three failures in one position make that arm Unavailable. Any experiment failure is Failed at once. Speed is paired on
-passing runs only; verdict.json reports every arm's attempts, failures and exact failure-rate interval.
+passing runs only; verdict.json reports every arm's attempts, failures and failure rate with its Clopper-Pearson 95% interval.
 Writes campaign.json and verdict.json. Design, estimator, verdict rules and root commands:
 docs/research/adr063-q3-campaign.md.
 --controls-of runs control stages only, as controls of a primary verdict of record (#369
@@ -421,6 +422,8 @@ class Driver:
             if drift:
                 self.manifest["identity_drift"] = drift
                 self.stop("IdentityDrift", None, "identities changed since campaign start: " + ", ".join(drift[:8]), False)
+            # An exhausted entry whose arm the earlier driver did not get to record (it died between the two saves).
+            self.manifest["unavailable"] = q3_report.unavailable(self.manifest)
         else:
             qc.require(not self.out.exists(), "campaign output must be a new directory")
             qc.require(not any((p / ".git").exists() for p in (self.out.parent.resolve(), *self.out.parent.resolve().parents)),
@@ -583,12 +586,7 @@ class Driver:
                           "record a --max-memory cap in SPLASH_CONFIG (decision D6), re-confirm that configuration "
                           "and start a new campaign", False)
         if record.get("disposition") == "exhausted":
-            failed = [a for a in entry["attempts"] if a.get("disposition") in ("rerun", "exhausted")]
-            self.manifest["unavailable"][entry["arm"]] = {
-                "kind": "task_failures_exhausted",
-                "reason": f"{entry['arm']} failed its task in all {len(failed)} attempts of {entry['name']} "
-                          f"({q3_stats.failure_rule(self.plan)}): {record['reason']}",
-                "evidence": [a["output"] for a in failed]}
+            self.manifest["unavailable"][entry["arm"]] = q3_report.exhaustion(entry, q3_stats.failure_rule(self.plan))
         if entry["arm"] == "experiment" and entry["outcome"] == "Fail":
             stage.update(status="Stopped", stop={"reason": "experiment_failed", "blocks": len(stage["blocks"])})
             self.manifest["status"] = "Complete"  # Failed is terminal for the family; later stages do not run
@@ -703,8 +701,9 @@ def parse_args(argv):
                         help="comparison-arm failure policy, frozen in campaign.json (operator decision 2026-11-12): "
                              f"reruns of a stock, peer or Splash task failure in the same block position (default "
                              f"{q3_stats.RERUNS_PER_POSITION}; a controls-only campaign follows its primary). 0 plans "
-                             "under the earlier rule (no reruns), which is also what resuming a campaign planned "
-                             "before the policy needs")
+                             "a new campaign under the earlier rule (no reruns). It does not make an older campaign "
+                             "resumable: a campaign planned before the policy resumes only from the harness commit "
+                             "that started it")
     parser.add_argument("--controls-of", type=Path, metavar="PRIMARY_VERDICT_JSON",
                         help="controls-only campaign (#369 amendment): run control stages only, as controls of this "
                              "Q3 verdict.json of record; family and arm identities must match its campaign")

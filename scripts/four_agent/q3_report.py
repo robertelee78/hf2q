@@ -85,9 +85,10 @@ def required_effects(stage, manifest):
     """Contrasts the stopping rule waits for: stock whenever the plan has a stock arm, the peer and Splash while each
     is available and has not failed. A stock-record campaign (no stock arm) therefore waits on the peer."""
     effects = stage_effects(stage, stage_arms(manifest["plan"], stage["workload"]))["effects"]
-    required = {"vs_stock": effects["vs_stock"]} if "vs_stock" in effects and "stock" not in manifest["unavailable"] else {}
+    required = {"vs_stock": effects["vs_stock"]} if "vs_stock" in effects and "stock" not in unavailable(manifest) else {}
+    gone = unavailable(manifest)
     for name, arm in (("vs_peer", "peer"), ("vs_splash", "splash")):
-        if name in effects and arm not in manifest["unavailable"] and not failures(manifest, arm):
+        if name in effects and arm not in gone and not failures(manifest, arm):
             required[name] = effects[name]
     return required
 
@@ -96,39 +97,70 @@ def failures(manifest, arm):
     return [f"{e['name']}: {e['failure_kind']}: {e['reason']}" for e in entries(manifest, arm) if e["outcome"] == "Fail"]
 
 
-def task_attempts(stages, arm, kind=None):
-    """(workload, entry, attempt) of every attempt of one arm that was scored on its task: a pass, or a failure of a
-    kind the comparison failure policy reruns (q3_stats.RERUN_FAILURE_KINDS). Runs that did not start, memory and
-    supervisor stops and Invalid runs are not task attempts."""
+def exhaustion(entry, rule):
+    """The `unavailable` record of an arm whose entry failed its task in every attempt the comparison failure policy
+    allows (its last acted-on attempt is `exhausted`); None otherwise."""
+    failed = [a for a in entry["attempts"] if a.get("disposition") in ("rerun", "exhausted")]
+    if not failed or failed[-1]["disposition"] != "exhausted":
+        return None
+    return {"kind": "task_failures_exhausted",
+            "reason": f"{entry['arm']} failed its task in all {len(failed)} attempts of {entry['name']} ({rule}): "
+                      f"{failed[-1].get('reason')}",
+            "evidence": [a["output"] for a in failed]}
+
+
+def unavailable(manifest):
+    """manifest `unavailable` plus every arm with an exhausted entry. The driver writes both, the entry first; reading
+    the attempts as well means a driver that died between the two writes cannot hide an exhaustion."""
+    out = dict(manifest["unavailable"])
+    rule = q3_stats.failure_rule(manifest["plan"])
+    for entry in entries(manifest):
+        if entry["arm"] not in out:
+            record = exhaustion(entry, rule)
+            if record is not None:
+                out[entry["arm"]] = record
+    return out
+
+
+def scored_attempts(stages, arm, kind=None):
+    """(workload, entry, attempt) of every attempt of one arm that ran its task after the four-agent release: outcome
+    Pass or Fail, whatever the failure kind. Runs that did not start and Invalid runs are not scored."""
     for stage in stages:
         for entry in stage["warmups"] + [e for block in stage["blocks"] for e in block["entries"]]:
             if entry["arm"] != arm or (kind is not None and entry["kind"] != kind):
                 continue
             for attempt in entry["attempts"]:
-                if attempt.get("outcome") == "Pass" or (attempt.get("outcome") == "Fail" and
-                                                        attempt.get("failure_kind") in q3_stats.RERUN_FAILURE_KINDS):
+                if attempt.get("outcome") in ("Pass", "Fail"):
                     yield stage["workload"], entry, attempt
 
 
-def task_failure_rate(stages, arm, kind=None):
-    scored = [a["outcome"] for _, _, a in task_attempts(stages, arm, kind)]
-    return q3_stats.failure_rate(scored.count("Fail"), len(scored))
+def run_failure_rate(stages, arm, kind=None):
+    """q3_stats.failure_rate over the scored attempts, with the failures broken down by failure kind (`task` is the
+    only kind the comparison failure policy reruns)."""
+    failed = [a.get("failure_kind") or "unclassified" for _, _, a in scored_attempts(stages, arm, kind)
+              if a["outcome"] == "Fail"]
+    scored = sum(1 for _ in scored_attempts(stages, arm, kind))
+    return {**q3_stats.failure_rate(len(failed), scored),
+            "failures_by_kind": {k: failed.count(k) for k in sorted(set(failed))}}
 
 
 def arm_reliability(manifest, arm):
-    """Attempts, task failures and failure rate (exact 95% interval) of one arm over the whole campaign, split into
-    measured and warmup runs, with the reruns the policy spent and the positions it exhausted."""
+    """Attempts, failures (every post-release failure, by kind) and failure rate with its 95% interval for one arm
+    over the whole campaign, split into measured and warmup runs, with the reruns the policy spent and the positions
+    it exhausted."""
     stages = manifest["stages"]
-    spent = [a.get("disposition") for _, _, a in task_attempts(stages, arm)]
-    return {**task_failure_rate(stages, arm), "measured": task_failure_rate(stages, arm, "measured"),
-            "warmup": task_failure_rate(stages, arm, "warmup"), "reruns": spent.count("rerun"),
-            "exhausted_positions": [e["name"] for _, e, a in task_attempts(stages, arm) if a.get("disposition") == "exhausted"]}
+    spent = [a.get("disposition") for _, _, a in scored_attempts(stages, arm)]
+    return {**run_failure_rate(stages, arm), "measured": run_failure_rate(stages, arm, "measured"),
+            "warmup": run_failure_rate(stages, arm, "warmup"), "reruns": spent.count("rerun"),
+            "exhausted_positions": [e["name"] for _, e, a in scored_attempts(stages, arm) if a.get("disposition") == "exhausted"]}
 
 
 def discarded_runs(manifest):
-    """Every failed attempt the comparison failure policy acted on, in run order: the receipt, the failure reason and
-    the makespan where the client recorded one. `rerun` attempts were followed by another attempt of the same entry;
-    an `exhausted` attempt was the last one allowed."""
+    """Every failed attempt the comparison failure policy acted on, in run order: the receipt, the client's reason,
+    the failing agent's own error (`detail`, read from the run's client/summary.json) and the time to the abort
+    (`client_elapsed_s`). The client records a makespan only for a successful run, so `makespan_s` is null unless a
+    failed run's summary carries one. `rerun` attempts were followed by another attempt of the same entry; an
+    `exhausted` attempt was the last one allowed."""
     out = []
     for stage in manifest["stages"]:
         for entry in stage["warmups"] + [e for block in stage["blocks"] for e in block["entries"]]:
@@ -142,10 +174,24 @@ def discarded_runs(manifest):
                                 "attempt": attempt["name"], "disposition": attempt["disposition"],
                                 "output": attempt["output"], "receipt_sha256": attempt.get("receipt_sha256"),
                                 "failure_kind": attempt.get("failure_kind"), "reason": attempt.get("reason"),
+                                "detail": run_failure_detail(attempt["output"]) or None,
                                 "makespan_s": attempt.get("makespan_s"),
                                 "client_elapsed_s": attempt.get("client_elapsed_s"),
                                 "tasks_passed": attempt.get("tasks_passed")})
     return out
+
+
+def rerun_sensitivity(stage, arms):
+    """Descriptive, never a verdict input: the primary-metric effects over the complete blocks in which no attempt was
+    discarded, beside the numbers of the blocks that had one. A rerun puts extra runs of one arm before the next arm
+    of its block; this shows how much the effects depend on those blocks."""
+    touched = [block["block"] for block in stage["blocks"]
+               if any(a.get("disposition") for e in block["entries"] for a in e["attempts"])]
+    if not touched:
+        return {"blocks_with_discarded_runs": [], "effects": None}
+    rest = {**stage, "blocks": [block for block in stage["blocks"] if block["block"] not in touched]}
+    return {"blocks_with_discarded_runs": touched,
+            "effects": {name: effect(rest, "experiment", arm, PRIMARY_METRIC) for name, arm in CONTRASTS if arm in arms}}
 
 
 def arm_summary(stage, arm):
@@ -164,7 +210,7 @@ def arm_summary(stage, arm):
     swap = [m["memory"]["swap_growth_bytes"] for m in observed if m["memory"]["swap_growth_bytes"] is not None]
     states = [s for m in observed for s in (m["thermal"]["preflight_state"], m["thermal"]["post_run_state"]) if s is not None]
     return {"runs": len(runs), "outcomes": {o: sum(e["outcome"] == o for e in runs) for o in sorted({e["outcome"] for e in runs if e["outcome"]})},
-            "task_failures": task_failure_rate([stage], arm, "measured"),
+            "reliability": run_failure_rate([stage], arm, "measured"),
             "makespan_median_s": median("makespan_s"), "goodput_median_tasks_per_hour": median("goodput_tasks_per_hour"),
             "worst_slot_ttft_p95_median_s": median("worst_slot_ttft_p95_s"),
             "worst_slot_sse_gap_max_median_s": median("worst_slot_sse_gap_max_s"),
@@ -243,6 +289,9 @@ def controls_only_reasons(manifest, record, state):
     reasons += [f"peer failed its task: {f}" for f in state["peer_failures"]]
     if state["peer_unavailable"]:
         reasons.append(f"peer unavailable: {state['peer_unavailable']['reason']}")
+    for label, key in (("stock", "stock_unavailable"), ("Splash", "splash_unavailable")):
+        if (state.get(key) or {}).get("kind") == "task_failures_exhausted":
+            reasons.append(f"{label} unavailable: {state[key]['reason']}")
     if state["quality"]["status"] == "loss":
         reasons.append(f"quality loss: {state['quality']['reason']}")
     return reasons
@@ -303,6 +352,7 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
     primary = None if record else stages[plan["primary"]]
     report = {name: {"phase_plan": stage["phase_plan"], "status": stage["status"], "stop": stage["stop"],
                      "blocks": len(stage["blocks"]), **stage_effects(stage, stage_arms(plan, name)),
+                     "rerun_sensitivity": rerun_sensitivity(stage, stage_arms(plan, name)),
                      "arms": {arm: arm_summary(stage, arm) for arm in stage_arms(plan, name)}}
               for name, stage in stages.items()}
     quality = quality_state(manifest, quality_paths, review_path)
@@ -314,10 +364,11 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
     stock_record = None if "stock_record" not in plan else bound_stock_record(plan["stock_record"])
     tagged = lambda items: [f"{f} (stock record {stock_record['path']})" for f in items]
     design = plan["design"]
+    gone = unavailable(manifest)
     state = {"experiment_failures": failures(manifest, "experiment")
                                     + (tagged(stock_record["experiment_failures"]) if stock_record else []),
-             "peer_unavailable": manifest["unavailable"].get("peer"),
-             "stock_unavailable": manifest["unavailable"].get("stock") or (stock_record or {}).get("stock_unavailable"),
+             "peer_unavailable": gone.get("peer"),
+             "stock_unavailable": gone.get("stock") or (stock_record or {}).get("stock_unavailable"),
              "peer_failures": failures(manifest, "peer"), "quality": quality,
              "stock_margin_ratio": design.get("stock_margin_ratio", q3_stats.LEGACY_STOCK_MARGIN),
              "peer_margin_ratio": design.get("peer_margin_ratio", q3_stats.LEGACY_PEER_MARGIN),
@@ -333,7 +384,7 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
     splash_measured = "splash" in plan["measured_arms"]
     if required or splash_measured:
         state.update(splash_required=required, splash_failures=failures(manifest, "splash"),
-                     splash_unavailable=manifest["unavailable"].get("splash") or (
+                     splash_unavailable=gone.get("splash") or (
                          None if splash_measured else {"reason": "the campaign has no Splash arm (ADR-063 Splash peer "
                                                                  "of record for the Qwen families)", "evidence": []}))
     native = native_peers.peer_kind(plan)
@@ -365,7 +416,7 @@ def compute_verdict(manifest, quality_paths=(), review_path=None, campaign_sha25
             "primary": None if record else report[plan["primary"]],
             **({"primary_of_record": primary_of_record(manifest, record)} if record else {}),
             "controls": {k: v for k, v in report.items() if k != plan["primary"]},
-            "peer": {"unavailable": manifest["unavailable"], "failures": state["peer_failures"]},
+            "peer": {"unavailable": gone, "failures": state["peer_failures"]},
             **({"splash": {"required": state["splash_required"], "unavailable": state["splash_unavailable"],
                            "failures": state["splash_failures"],
                            "label": plan["arms"].get("splash", {}).get("label")}}
@@ -508,11 +559,14 @@ def peer_sentence(stage, report, root, experiment):
 
 
 def failure_detail(entry):
-    """The agents that failed an experiment run on their own (not those the coordinator stopped afterwards), each
-    with its error and the target and compiler error code of its last failed run_tests (client/summary.json)."""
-    if not entry["attempts"]:
-        return ""
-    path = Path(entry["attempts"][-1]["output"]) / "client" / "summary.json"
+    """run_failure_detail of an entry's last attempt."""
+    return run_failure_detail(entry["attempts"][-1]["output"]) if entry["attempts"] else ""
+
+
+def run_failure_detail(output):
+    """The agents that failed a run on their own (not those the coordinator stopped afterwards), each with its error
+    and the target and compiler error code of its last failed run_tests (the run's client/summary.json)."""
+    path = Path(output) / "client" / "summary.json"
     if not path.is_file():
         return ""
     parts = []
@@ -666,7 +720,9 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
     for prefix, control, stage, section_native in sections:
         of_record_row = of_record and control is None
         splash_gone = bool((verdict.get("splash") or {}).get("unavailable"))
-        peer_gone = ((verdict["verdict"] == "Unavailable" and not (splash_gone and not verdict["peer"]["unavailable"].get("peer")))
+        # Unavailable because only Splash or only the stock arm is gone keeps the measured peer contrast.
+        stock_gone = bool(verdict["peer"]["unavailable"].get("stock"))
+        peer_gone = ((verdict["verdict"] == "Unavailable" and not ((splash_gone or stock_gone) and not verdict["peer"]["unavailable"].get("peer")))
                      if control is None else bool(verdict["peer"]["unavailable"].get("peer")))
         # A campaign whose peer arm is a native engine (ds4, TensorFold) is never the verdict of record: it emits
         # only its native row(s), never experiment-vs-stock (that effect belongs to the same-GGUF campaign of record).
@@ -695,12 +751,13 @@ def rows(campaign_dir, evidence_root, of_record=False, quality_gate=(), review=N
                 blocks = (f"{e['blocks']} paired blocks, half-width {e['half_width_pp']:.2f} points "
                           f"(baseline {stock_baseline if name == 'vs_stock' else 'Splash best valid configuration (same GGUF)' if name == 'vs_splash' else peer_note}).")
                 reference = (stage.get("arms") or {}).get(dict(CONTRASTS)[name]) or {}
-                lost = reference.get("task_failures") or {}
+                lost = reference.get("reliability") or {}
                 if lost.get("failures"):  # the reference arm's failure rate travels with the speed it is paired on
                     low, high = lost["failure_rate_ci95"]
-                    blocks += (f" The {dict(CONTRASTS)[name]} arm failed its task in {lost['failures']} of "
-                               f"{lost['attempts']} measured attempts of this stage ({100 * lost['failure_rate']:.1f}%, "
-                               f"exact 95% CI {100 * low:.1f}–{100 * high:.1f}%); speed is paired on passing runs "
+                    kinds = ", ".join(f"{count} {kind}" for kind, count in lost["failures_by_kind"].items())
+                    blocks += (f" The {dict(CONTRASTS)[name]} arm failed {lost['failures']} of "
+                               f"{lost['attempts']} measured attempts of this stage ({kinds}; {100 * lost['failure_rate']:.1f}%, "
+                               f"Clopper-Pearson 95% CI {100 * low:.1f}–{100 * high:.1f}%); speed is paired on passing runs "
                                f"only ({verdict.get('failure_rule', q3_stats.LEGACY_FAILURE_RULE)}).")
                 if (control is not None or superseded_by is not None) and name == "vs_peer" and not native_label:
                     blocks += " " + peer_sentence(next(s for s in manifest["stages"] if s["workload"] == (control or plan["primary"])),

@@ -659,14 +659,15 @@ class ComparisonFailures(Harness):
         self.assertEqual(peer["failure_rate_ci95"], q3_stats.clopper_pearson(1, 7))
         self.assertEqual((peer["measured"]["attempts"], peer["measured"]["failures"], peer["warmup"]["attempts"]), (6, 1, 1))
         self.assertEqual((verdict["arm_reliability"]["stock"]["failures"], verdict["arm_reliability"]["experiment"]["failures"]), (0, 0))
-        self.assertEqual(verdict["primary"]["arms"]["peer"]["task_failures"]["failures"], 1)
+        self.assertEqual(verdict["primary"]["arms"]["peer"]["reliability"]["failures"], 1)
+        self.assertEqual(peer["failures_by_kind"], {"task": 1})
         [discarded] = verdict["discarded_runs"]
         attempt = rerun["attempts"][0]
         self.assertEqual(discarded, {"stage": "n4", "kind": "measured", "block": 2,
                                      "position": stage["blocks"][1]["order"].index("peer") + 1, "arm": "peer",
                                      "entry": rerun["name"], "attempt": attempt["name"], "disposition": "rerun",
                                      "output": attempt["output"], "receipt_sha256": attempt["receipt_sha256"],
-                                     "failure_kind": "task", "reason": "None", "makespan_s": 1.0,
+                                     "failure_kind": "task", "reason": "None", "detail": None, "makespan_s": 1.0,
                                      "client_elapsed_s": 1.5, "tasks_passed": 0})
         self.assertTrue((Path(discarded["output"]) / "receipt.json").is_file())  # the failed run stays on disk
         # speed: five pairs on passing runs; the 1 s failed attempt is in no effect and no median
@@ -677,8 +678,22 @@ class ComparisonFailures(Harness):
         self.assertGreater(verdict["primary"]["arms"]["peer"]["makespan_median_s"], 90)
         self.assertEqual(verdict["primary"]["arms"]["peer"]["outcomes"], {"Pass": 5})
         note = next(r["note"] for r in q3_report.rows(self.out, self.root)["rows"] if r["baseline_arm"] == "peer")
-        self.assertIn("The peer arm failed its task in 1 of 6 measured attempts of this stage (16.7%, exact 95% CI "
+        self.assertIn("The peer arm failed 1 of 6 measured attempts of this stage (1 task; 16.7%, Clopper-Pearson 95% CI "
                       "0.4–64.1%); speed is paired on passing runs only (comparison_failure_policy v1", note)
+        # descriptive sensitivity: the effect without the block that had a discarded run
+        sensitivity = verdict["primary"]["rerun_sensitivity"]
+        self.assertEqual((sensitivity["blocks_with_discarded_runs"], sensitivity["effects"]["vs_peer"]["blocks"],
+                          sensitivity["effects"]["vs_stock"]["blocks"]), ([2], 4, 4))
+        self.assertEqual(self.verdict(reference)["primary"]["rerun_sensitivity"],
+                         {"blocks_with_discarded_runs": [], "effects": None})
+        # the failing agent's own error replaces the client's generic reason in the report
+        summary = Path(discarded["output"]) / "client" / "summary.json"
+        document = json.loads(summary.read_text())
+        document["agents"]["agent-1"]["error"] = "KeyboardInterrupt: signal 15"  # stopped by the coordinator
+        document["agents"]["agent-3"]["error"] = "TimeoutError: absolute request deadline"
+        summary.write_text(json.dumps(document))
+        self.assertEqual(self.verdict(manifest)["discarded_runs"][0]["detail"],
+                         "agent-3: TimeoutError: absolute request deadline")
 
     def test_two_failures_then_a_pass_keeps_the_block_and_reports_both(self):
         driver, runner = self.driver(self.failing("stock", {3, 4}))
@@ -694,6 +709,8 @@ class ComparisonFailures(Harness):
         stock = verdict["arm_reliability"]["stock"]
         self.assertEqual((stock["attempts"], stock["failures"], stock["reruns"]), (8, 2, 2))
         self.assertEqual([d["disposition"] for d in verdict["discarded_runs"]], ["rerun", "rerun"])
+        # as the real client does, a failed run records no makespan: the time to the abort is what the report has
+        self.assertEqual([(d["makespan_s"], d["client_elapsed_s"]) for d in verdict["discarded_runs"]], [(None, 1.5)] * 2)
         self.assertEqual(verdict["stock_failures"], [])
 
     def test_a_failed_warmup_of_a_comparison_arm_is_rerun_too(self):
@@ -739,6 +756,142 @@ class ComparisonFailures(Harness):
         self.assertEqual(verdict["verdict"], "Unavailable")
         self.assertIn("no usable stock arm: stock failed its task in all 3 attempts", verdict["reasons"][0])
         self.assertEqual(verdict["primary"]["effects"]["vs_peer"]["blocks"], 5)
+        # the exhaustion is read from the attempts too: a driver that died before recording the arm cannot hide it
+        lost = json.loads(json.dumps(manifest))
+        del lost["unavailable"]["stock"]
+        self.assertEqual(q3_report.unavailable(lost)["stock"], manifest["unavailable"]["stock"])
+        again = self.verdict(lost)
+        self.assertEqual((again["verdict"], again["reasons"]), (verdict["verdict"], verdict["reasons"]))
+        self.assertEqual(again["peer"]["unavailable"]["stock"]["kind"], "task_failures_exhausted")
+
+    def test_rows_keep_the_measured_peer_contrast_when_only_the_stock_arm_is_exhausted(self):
+        driver, _ = self.driver(self.failing("stock", {3, 4, 5}))  # two paired stock blocks, then three failures
+        manifest = driver.run()
+        verdict = q3.write_verdict(self.out, manifest, [], None)
+        self.assertEqual((verdict["verdict"], verdict["primary"]["effects"]["vs_peer"]["blocks"],
+                          verdict["primary"]["effects"]["vs_stock"]["blocks"]), ("Unavailable", 5, 2))
+        rows = q3_report.rows(self.out, self.root)["rows"]
+        self.assertEqual({r["baseline_arm"] for r in rows}, {"v0128_stock", "peer"})
+        peer_row = next(r for r in rows if r["baseline_arm"] == "peer")
+        self.assertIn("5 paired blocks", peer_row["note"])
+        self.assertAlmostEqual(peer_row["value"], 20.0, places=0)
+        stock_row = next(r for r in rows if r["baseline_arm"] == "v0128_stock")
+        self.assertIn("The stock arm failed 3 of 5 measured attempts of this stage (3 task; 60.0%", stock_row["note"])
+        # the verdict of record carries the comparison arms' failure counts and shows them in the tier
+        record = q3_report.rows(self.out, self.root, of_record=True)
+        self.assertEqual(record["groups"]["qwen38-q3-record"]["q3_record"]["comparison_failures"],
+                         {"rule": verdict["failure_rule"], "arms": {"stock": {"attempts": 6, "failures": 3},
+                                                                    "peer": {"attempts": 6, "failures": 0}}})
+        board = {"schema": f2.ROWS_SCHEMA, "evidence_root_symbol": "$E", "evidence_root_description": "test",
+                 "neutral_band_ratio": 1.025, "neutral_band_basis": "test",
+                 "families": {"qwen38": {"title": "Qwen3.8 27B", "artifact_sha256": MODEL_SHA, "note": ""}}, **record}
+        line = next(l for l in f2.render(f2.validate_manifest(board), [], "0" * 64).splitlines()
+                    if l.startswith("| Qwen3.8 27B | "))
+        self.assertIn("| Unavailable: no usable stock arm: stock failed its task in all 3 attempts", line)
+        self.assertIn("sooner than the peer, speculation off (matched settings) (95% CI", line)
+        self.assertIn("; comparison-arm failed runs: stock 3 of 6, peer 0 of 6 (comparison_failure_policy v1", line)
+        broken = json.loads(json.dumps(board))
+        broken["groups"]["qwen38-q3-record"]["q3_record"]["comparison_failures"]["arms"]["stock"]["failures"] = 7
+        with self.assertRaisesRegex(Exception, "comparison_failures"):
+            f2.validate_manifest(broken)
+        clean = self.root / "evidence" / "q3-qwen38-clean"  # a record without a comparison failure carries no field
+        self.out = clean
+        q3.write_verdict(clean, self.driver(self.win)[0].run(), [], None)
+        self.assertNotIn("comparison_failures", q3_report.rows(clean, self.root, of_record=True)["groups"]["qwen38-q3-record"]["q3_record"])
+
+    def test_a_failure_the_policy_does_not_rerun_is_still_counted_by_kind(self):
+        seen = itertools.count()
+
+        def decide(arm, workload, call):  # the stock arm's second measured run dies of a Metal out-of-memory
+            return {"outcome": "oom"} if arm == "stock" and next(seen) == 2 else self.win(arm, workload, call)
+        driver, _ = self.driver(decide)
+        manifest = driver.run()
+        entry = self.measured(manifest, "stock")[1]
+        self.assertEqual([(a["outcome"], a["failure_kind"], a.get("disposition")) for a in entry["attempts"]],
+                         [("Fail", "out_of_memory", None)])
+        verdict = self.verdict(manifest)
+        self.assertEqual((verdict["verdict"], len(verdict["stock_failures"]), verdict["discarded_runs"]), ("Win", 1, []))
+        stock = verdict["arm_reliability"]["stock"]
+        self.assertEqual((stock["attempts"], stock["failures"], stock["failures_by_kind"], stock["reruns"]),
+                         (7, 1, {"out_of_memory": 1}, 0))
+        self.assertEqual(stock["failure_rate_ci95"], q3_stats.clopper_pearson(1, 7))
+        self.assertEqual(verdict["primary"]["arms"]["stock"]["reliability"]["failures_by_kind"], {"out_of_memory": 1})
+        self.assertEqual((verdict["primary"]["effects"]["vs_stock"]["blocks"], verdict["primary"]["blocks"]), (5, 6))
+
+    def test_a_discarded_attempt_in_a_serious_thermal_state_still_blocks_a_win(self):
+        seen = itertools.count()
+
+        def decide(arm, workload, call):
+            return {"outcome": "fail", "thermal": 2} if arm == "peer" and next(seen) == 2 else self.win(arm, workload, call)
+        driver, _ = self.driver(decide)
+        manifest = driver.run()
+        self.assertEqual([a["thermal_valid"] for a in self.measured(manifest, "peer")[1]["attempts"]], [False, True])
+        verdict = self.verdict(manifest)
+        self.assertEqual((verdict["thermal_valid"], verdict["verdict"]), (False, "Inconclusive"))
+        self.assertIn("a run observed serious or critical thermal state", verdict["reasons"])
+
+    def crash_on(self, decide, name_end):
+        """Run until the attempt whose name ends with `name_end` has written its evidence, then kill the driver."""
+        class Crash(Exception):
+            pass
+        driver, inner = self.driver(decide)
+
+        def runner(argv, env, stdout, stderr):
+            code = inner(argv, env, stdout, stderr)
+            if Path(argv[5]).name.endswith(name_end):
+                raise Crash(argv[5])
+            return code
+        driver.runner = runner
+        with self.assertRaises(Crash):
+            driver.run()
+        return json.loads((self.out / "campaign.json").read_text())
+
+    def test_a_driver_that_dies_during_a_rerun_keeps_the_count_on_resume(self):
+        manifest = self.crash_on(self.failing("peer", {2, 3}), "-b02-peer-a1")
+        entry = self.measured(manifest, "peer")[1]
+        self.assertEqual([(a["outcome"], a.get("disposition")) for a in entry["attempts"]],
+                         [("Fail", "rerun"), ("Launched", None)])
+        # the resumed session scores the second failure from disk, runs fresh warmups, and the position fails again
+        resumed, _ = self.driver(self.failing("peer", {1}))
+        manifest = resumed.run(resume=True)
+        entry = self.measured(manifest, "peer")[1]
+        self.assertEqual([(a["outcome"], a.get("disposition")) for a in entry["attempts"]],
+                         [("Fail", "rerun"), ("Fail", "rerun"), ("Fail", "exhausted")])
+        self.assertEqual(manifest["unavailable"]["peer"]["kind"], "task_failures_exhausted")
+        self.assertEqual(self.verdict(manifest)["verdict"], "Unavailable")
+
+    def test_a_driver_that_dies_during_the_last_allowed_attempt_never_runs_a_fourth(self):
+        self.crash_on(self.failing("peer", {2, 3, 4}), "-b02-peer-a2")
+        resumed, runner = self.driver(self.win)
+        manifest = resumed.run(resume=True)
+        entry = self.measured(manifest, "peer")[1]
+        self.assertEqual([(a["outcome"], a.get("disposition")) for a in entry["attempts"]],
+                         [("Fail", "rerun"), ("Fail", "rerun"), ("Fail", "exhausted")])
+        self.assertIn("peer", manifest["unavailable"])
+        self.assertNotIn("peer", [c[1] for c in runner.calls])
+        self.assertEqual(self.verdict(manifest)["verdict"], "Unavailable")
+
+    def test_resume_records_an_exhausted_arm_the_dead_driver_did_not(self):
+        peer_runs = itertools.count()
+
+        def decide(arm, workload, call):  # stock exhausts in block 1; a later peer run does not start, so the driver halts
+            if arm == "stock":
+                return {"outcome": "fail"} if call > 1 else self.win(arm, workload, call)
+            if arm == "peer" and next(peer_runs) == 2:
+                return {"outcome": "preflight"}
+            return self.win(arm, workload, call)
+        driver, _ = self.driver(decide)
+        manifest = driver.run()
+        self.assertEqual((manifest["status"], set(manifest["unavailable"])), ("Halted", {"stock"}))
+        path = self.out / "campaign.json"
+        lost = json.loads(path.read_text())
+        del lost["unavailable"]["stock"]  # as if the driver had died between saving the entry and recording the arm
+        path.write_text(json.dumps(lost))
+        resumed, runner = self.driver(self.win)
+        manifest = resumed.run(resume=True)
+        self.assertEqual(manifest["unavailable"]["stock"]["kind"], "task_failures_exhausted")
+        self.assertNotIn("stock", [c[1] for c in runner.calls])
+        self.assertEqual(self.verdict(manifest)["verdict"], "Unavailable")
 
     def test_with_no_contrast_left_the_stage_stops_instead_of_running_experiment_only_blocks(self):
         seen = {"stock": itertools.count(), "peer": itertools.count()}
@@ -850,6 +1003,18 @@ class ControlsOnly(Harness):
         self.assertNotIn("comparison_failure_policy", plan["controls_of"])
         with self.assertRaisesRegex(q3.qc.CampaignError, r"follows its primary's comparison failure rule \(0 reruns"):
             q3.build_plan(self.args("--controls-of", str(old), "--comparison-reruns", "2", workloads="3+1"), {}, "qwen38")
+
+    def test_controls_only_reasons_name_an_exhausted_stock_arm(self):
+        record = self.record()
+        seen = itertools.count()
+
+        def decide(arm, workload, call):
+            return {"outcome": "fail"} if arm == "stock" and next(seen) >= 1 else self.win(arm, workload, call)
+        driver, _ = self.driver(decide, "--controls-of", str(record), workloads="3+1")
+        verdict = self.verdict(driver.run())
+        self.assertEqual(verdict["verdict"], q3_report.CONTROLS_ONLY)
+        self.assertTrue(any(r.startswith("stock unavailable: stock failed its task in all 3 attempts") for r in verdict["reasons"]),
+                        verdict["reasons"])
 
     def test_controls_only_needs_the_flag_and_never_reruns_a_recorded_stage(self):
         for workloads in ("3+1,2+2,1+3", "n1", "n1,n4"):  # without --controls-of n4 comes first
