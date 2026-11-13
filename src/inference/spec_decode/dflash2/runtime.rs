@@ -1292,6 +1292,8 @@ mod context_commit_tests;
 #[cfg(test)]
 #[path = "draft_prefetch_tests.rs"]
 mod draft_prefetch_tests;
+
+#[cfg(test)]
 #[path = "joint_capture_tests.rs"]
 mod joint_capture_tests;
 
