@@ -1777,22 +1777,33 @@ starts. An absolute partition whose runs grow with their start page was
 built first and rejected: it gives the same independence but 53 to 105
 splits against 24 at 8,192 and 32,768 tokens, 3 to 36% slower there.
 
-In situ (hf2q `991abc2e` plus the window test, mlx-native `b76b42b`, binary
-`0a23d8a5`, every combined-candidate switch on, without the any-width
-switches of #825; `$V/splash-gap/attnverify/align/runs`): two Qwen3.8 runs,
-both `CalibrationPass`, have identical transcripts for all four agents
-(5,330 completion tokens); two of the four agents' transcripts differ from
-the 0.21.8 campaign's in their last message, as the changed bits of tokens
-in cut windows allow. Of six Qwen3.6 runs five are `CalibrationPass` and one
-is `ClientFailed` (an agent left the six-step workflow, as in two of the six
-0.21.8 candidate runs); no two of the five have the same transcripts. That
-variation is not the defect fixed here: it starts in the first assistant
-message, at 687 prompt tokens and under 200 generated ones, below the first
-page boundary where the split length steps, and the 0.21.8 control arm with
-the tile off shows it too (up to four variants of an agent's first message
-in six runs). The four-lane cycle medians, 80.5 and 81.5 ms for Qwen3.8 and
-32.9 to 37.6 ms for Qwen3.6, sit inside the spread of the 0.21.8 candidate
-runs (73.2 and 90.6; 35.5 and 36.9); no same-session control was run.
+In situ, every combined-candidate switch on, exact four-agent Q5
+(`$V/splash-gap/attnverify/align/runs`). With the any-width switches of #825
+(hf2q `68d90b67` plus this change, mlx-native `807ac72`, binary `ec64fe57`):
+seven Qwen3.6 runs, all `CalibrationPass`, all with the same transcripts for
+all four agents (5,322 completion tokens), and two Qwen3.8 runs with
+identical transcripts (5,198). The same switches on the 0.21.8 tile gave two
+transcripts in eight Qwen3.6 runs (six and two, see above). At that rate
+seven equal runs would happen by chance about 13% of the time, so this
+supports, and does not prove, that the tile was the remaining source; the
+proof is the model-free tests. Against the 0.21.8 runs every agent's text
+first differs after its history has crossed 1,536 tokens, never before, as
+the changed bits of tokens in cut windows allow. The four-lane cycle medians
+are 31.6 to 33.9 ms for Qwen3.6 (33.1 to 35.0 on the 0.21.8 tile) and 68.9
+and 69.9 ms for Qwen3.8 (72.0 and 72.4), runs of different sessions.
+
+Without the any-width switches (hf2q `991abc2e`, mlx-native `b76b42b`, binary
+`0a23d8a5`, before #825 merged): two Qwen3.8 runs with identical transcripts
+(5,330 completion tokens). Of six Qwen3.6 runs five are `CalibrationPass`
+and one is `ClientFailed` (an agent left the six-step workflow; two of the
+six 0.21.8 candidate runs were `ClientFailed` too, one with this error); no
+two of the five have the same transcripts. That variation is the
+width-dependent route #825 removes, not the defect fixed here: it starts in
+the first assistant message, at 687 prompt tokens and under 200 generated
+ones, below the first page boundary where the split length steps, and the
+0.21.8 control arm with the tile off shows it too (up to four variants of an
+agent's first message in six runs). No same-session control with the 0.21.8
+tile was run for either set.
 
 Model free the route takes 0.051, 0.116 and 0.331 ms per Qwen3.8 layer at
 four lanes (0.033, 0.048, 0.103 ms at one) and 0.046, 0.083 and 0.195 ms per
