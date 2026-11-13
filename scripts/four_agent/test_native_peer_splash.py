@@ -701,11 +701,8 @@ class Campaign(unittest.TestCase):
         self.assertNotEqual(historical['verdict'], 'Unavailable')  # a campaign planned before Splash keeps its rule
         with self.assertRaises(ValueError):  # quality_campaign.CampaignError
             q3.build_plan(self.args('gemma4', '--splash-case', str(HERE / 'q5_cases' / 'splash-qwen38.json')), {}, 'gemma4')
-        plan, _ = q3.build_plan(self.args('qwen38', '--splash-unavailable-evidence', str(self.evidence)), {}, 'qwen38')
-        self.assertNotIn('splash', plan['measured_arms'])
-        self.assertEqual(plan['splash_unavailable_evidence'][0]['path'], str(self.evidence))
-        self.assertIs(plan['splash_required'], False)  # Qwen3.8 substitutes its mandatory mechanism gate
-        self.assertEqual(plan['qwen38_mechanism']['minimum'], 5.304)
+        with self.assertRaises(ValueError):  # a generic declaration is not a source-bound invalid sweep
+            q3.build_plan(self.args('qwen38', '--splash-unavailable-evidence', str(self.evidence)), {}, 'qwen38')
         plan, _ = q3.build_plan(self.args('qwen38', '--peer-unavailable-evidence', str(self.evidence)), {}, 'qwen38')
         self.assertNotIn('splash', plan['measured_arms'])
         self.assertNotIn('splash_required', plan)  # already Unavailable without the peer; no Splash gate asked

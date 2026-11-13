@@ -8,11 +8,26 @@ import unittest
 import q3_campaign
 import q3_mechanism as mechanism
 import q3_report
+import q3_splash_evidence as splash_evidence
+import native_peer_splash as sp
+import native_peer_splash_audit as splash_audit
+import splash_sweep
 import q5_calibration
 from test_native_peer_splash import splash_manifest
 from test_q3_campaign import FakeRunner, fake_identities
+from q3_fake_splash import invalid_sweep
 
 HERE = Path(__file__).resolve().parent
+
+
+
+def canonical_identities(plan):
+    ids = fake_identities(plan)
+    for arm in ids['arms'].values():
+        arm['artifact'].update(splash_evidence.ARTIFACT)
+    if 'qwen38_splash_substitution' in plan:
+        ids['splash_substitution_inputs'] = splash_evidence.current_inputs(plan['qwen38_splash_substitution'])
+    return ids
 
 
 class MechanismVerdict(unittest.TestCase):
@@ -25,14 +40,15 @@ class MechanismVerdict(unittest.TestCase):
         m = splash_manifest(arms=('stock', 'experiment', 'peer'))
         p = m['plan']
         p['splash_required'] = False
-        selection = self.root / 'invalid-splash.json'
-        selection.write_text(json.dumps({'schema': 'hf2q.splash-sweep-selection.v1', 'pass_floor': .75,
-                                         'choice': None, 'configurations': {'s0': {'valid': False}}}))
+        selection = invalid_sweep(self.root)
         p['splash_unavailable_evidence'] = [{'path': str(selection), 'sha256': mechanism.digest(selection)}]
         p['qwen38_mechanism'] = dict(mechanism.CONTRACT)
         p['design'].update(stock_margin_ratio=.95, peer_margin_ratio=1.)
         m['identities']['harness'] = {'git_commit': p['declared']['experiment']['commit']}
         case = json.loads((HERE / 'q5_cases/qwen38.json').read_text())
+        p['qwen38_splash_substitution'] = splash_evidence.freeze(p['splash_unavailable_evidence'], case)
+        for arm in m['identities']['arms'].values():
+            arm['artifact'].update(splash_evidence.ARTIFACT)
         base = self.root / 'case.json'
         base.write_text(json.dumps(case))
         p['arms']['experiment'].update(case=str(base), case_sha256=mechanism.digest(base))
@@ -71,6 +87,19 @@ class MechanismVerdict(unittest.TestCase):
                 self.assertEqual(v['mechanism']['accepted_rows'], rows * 5)
                 self.assertEqual(len(v['mechanism']['runs']), 5)
 
+    def test_exact_reviewed_peer_only_variants_preserve_full_report_win(self):
+        m = self.manifest()
+        selection = json.loads(Path(m['plan']['splash_unavailable_evidence'][0]['path']).read_text())
+        run = Path(next(iter(selection['configurations'].values()))['runs'][0])
+        path = run / 'client-approval.json'
+        approval = json.loads(path.read_text())
+        for name, group in splash_evidence.SOURCE_CONTINUITY_WHITELIST.items():
+            approval['sources'][str(HERE / name)] = next(value for value in group if value != mechanism.digest(HERE / name))
+        path.write_text(json.dumps(approval))
+        m['plan']['qwen38_splash_substitution'] = splash_evidence.freeze(
+            m['plan']['splash_unavailable_evidence'], json.loads(Path(m['plan']['arms']['experiment']['case']).read_text()))
+        self.assertEqual(self.verdict(m)['verdict'], 'Win')
+
     def test_below_floor_blocks_otherwise_winning_campaign(self):
         v = self.verdict(self.manifest(662))
         self.assertEqual(v['verdict'], 'Inconclusive')
@@ -80,7 +109,9 @@ class MechanismVerdict(unittest.TestCase):
     def test_every_position_required_and_source_case_binary_model_bound(self):
         for fault in ('missing-log', 'changed-log', 'missing-attempt', 'source', 'missing-source', 'missing-artifact',
                       'case', 'receipt', 'binary', 'artifact', 'workload', 'q5', 'zero', 'negative', 'nan',
-                      'fractional', 'duplicate', 'inconsistent', 'missing-splash', 'changed-splash', 'valid-splash'):
+                      'fractional', 'duplicate', 'inconsistent', 'missing-splash', 'changed-splash', 'valid-splash',
+                      'changed-splash-raw', 'missing-splash-raw', 'splash-source', 'splash-artifact', 'splash-workload',
+                      'splash-parity', 'splash-config', 'splash-request'):
             with self.subTest(fault=fault):
                 self.root = Path(self.tmp.name) / fault
                 self.root.mkdir()
@@ -109,10 +140,48 @@ class MechanismVerdict(unittest.TestCase):
                     bound = m['plan']['splash_unavailable_evidence'][0]
                     path = Path(bound['path'])
                     selection = json.loads(path.read_text())
-                    selection['choice'] = 's0'
-                    selection['configurations']['s0']['valid'] = True
+                    config = next(iter(selection['configurations']))
+                    selection['choice'] = {'config': config}
+                    selection['configurations'][config]['valid'] = True
                     path.write_text(json.dumps(selection))
                     bound['sha256'] = mechanism.digest(path)
+                elif fault in ('changed-splash-raw', 'missing-splash-raw', 'splash-source',
+                               'splash-artifact', 'splash-workload'):
+                    selection = json.loads(Path(m['plan']['splash_unavailable_evidence'][0]['path']).read_text())
+                    run = Path(next(iter(selection['configurations'].values()))['runs'][0])
+                    if fault.endswith('-raw'):
+                        raw = run / 'client/response.raw'
+                        if fault.startswith('changed'):
+                            raw.write_text('changed raw bytes despite the same invalid selection')
+                        else:
+                            raw.unlink()
+                    elif fault == 'splash-source':
+                        path = run / 'client-approval.json'
+                        value = json.loads(path.read_text())
+                        value['sources'][str(HERE / 'qwen_n4_live_smoke.py')] = 'f' * 64
+                        path.write_text(json.dumps(value))
+                    else:
+                        path = run / 'receipt.json'
+                        value = json.loads(path.read_text())
+                        if fault == 'splash-artifact':
+                            value['artifact']['sha256'] = 'f' * 64
+                        else:
+                            value['workload']['context_per_slot'] = 1
+                        path.write_text(json.dumps(value))
+                elif fault in ('splash-parity', 'splash-config', 'splash-request'):
+                    selection = json.loads(Path(m['plan']['splash_unavailable_evidence'][0]['path']).read_text())
+                    run = Path(next(iter(selection['configurations'].values()))['runs'][0])
+                    if fault == 'splash-parity':
+                        (run / splash_audit.PARITY_DIR / 'splash-prompt-parity-post-oracle.json').unlink()
+                    else:
+                        path = run / ('client/summary.json' if fault == 'splash-config'
+                                      else 'client/agent-0/turn-0/request.json')
+                        value = json.loads(path.read_text())
+                        if fault == 'splash-config':
+                            value['native_readiness']['config'] = sp.preset('s0', 'qwen38')
+                        else:
+                            value['max_completion_tokens'] = 1
+                        path.write_text(json.dumps(value))
                 elif fault == 'case':
                     Path(a['case']).write_text('{}')
                 elif fault == 'receipt':
@@ -158,16 +227,15 @@ class MechanismVerdict(unittest.TestCase):
         self.assertEqual(self.verdict(legacy)['verdict'], 'Unavailable')
         self.assertNotIn('mechanism', self.verdict(legacy))
 
-    def test_new_plan_requires_explicit_evidence_to_substitute(self):
+    def test_new_plan_rejects_unbound_evidence_and_keeps_qwen36_requirement(self):
         evidence = self.root / 'invalid-splash.json'
         evidence.write_text('{"finding":"no valid Qwen3.8 Splash arm"}')
         args = q3_campaign.parse_args(['--dry-run', '--family', 'qwen38'])
         plan, _ = q3_campaign.build_plan(args, {}, 'qwen38')
         self.assertTrue(plan['splash_required'])
         args.splash_unavailable_evidence = [str(evidence)]
-        plan, _ = q3_campaign.build_plan(args, {}, 'qwen38')
-        self.assertFalse(plan['splash_required'])
-        self.assertEqual(plan['qwen38_mechanism'], mechanism.CONTRACT)
+        with self.assertRaisesRegex(ValueError, 'invalid sweep'):
+            q3_campaign.build_plan(args, {}, 'qwen38')
         args.family = ['qwen36']
         plan, _ = q3_campaign.build_plan(args, {}, 'qwen36')
         self.assertTrue(plan['splash_required'])
@@ -205,9 +273,7 @@ class CanonicalDriverTelemetry(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.selection = self.root / 'selection.json'
-        self.selection.write_text(json.dumps({'schema': 'hf2q.splash-sweep-selection.v1', 'pass_floor': .75,
-                                              'choice': None, 'configurations': {'s0': {'valid': False}}}))
+        self.selection = invalid_sweep(self.root)
         self.nc = self.root / 'nc.json'
         self.nc.write_text('{}')
 
@@ -231,6 +297,10 @@ class CanonicalDriverTelemetry(unittest.TestCase):
         def emit(argv, environ, stdout, stderr):
             result = runner(argv, environ, stdout, stderr)
             case_path, output = Path(argv[3]), Path(argv[5])
+            receipt_path = output / 'receipt.json'
+            receipt = json.loads(receipt_path.read_text())
+            receipt['artifact'].update(splash_evidence.ARTIFACT)
+            receipt_path.write_text(json.dumps(receipt))
             if case_path.stem.endswith('-experiment'):
                 case = json.loads(case_path.read_text())
                 effective = q3_campaign.q5_case.build_plan(case, q5_calibration.builtins(output), environ)
@@ -252,7 +322,7 @@ class CanonicalDriverTelemetry(unittest.TestCase):
             return result
 
         driver = q3_campaign.Driver(plan, cases, self.root / 'campaign', {}, emit, lambda: 0,
-                                    lambda: fake_identities(plan))
+                                    lambda: canonical_identities(plan))
         manifest = driver.run()
         verdict = q3_report.compute_verdict(manifest)
         self.assertEqual(verdict['verdict'], 'Win', verdict['reasons'])
@@ -266,9 +336,9 @@ class CanonicalDriverTelemetry(unittest.TestCase):
             '--output', str(self.root / 'controls')])
         controls, control_cases = q3_campaign.build_plan(controls_args, {}, 'qwen38')
         self.assertEqual(controls['arms']['experiment']['overrides']['LOG_FILTER'], mechanism.DEFAULT_LOG_FILTER)
-        self.assertEqual(q3_campaign.q3_identity.launch_problems(controls, fake_identities(controls)), [])
+        self.assertEqual(q3_campaign.q3_identity.launch_problems(controls, canonical_identities(controls)), [])
         control_driver = q3_campaign.Driver(controls, control_cases, self.root / 'controls', {}, emit, lambda: 0,
-                                            lambda: fake_identities(controls))
+                                            lambda: canonical_identities(controls))
         self.assertEqual(q3_report.compute_verdict(control_driver.run())['verdict'], 'ControlsOnly')
         entry = next(e for e in manifest['stages'][0]['blocks'][0]['entries'] if e['arm'] == 'experiment')
         attempt = entry['attempts'][-1]
@@ -304,6 +374,75 @@ class CanonicalDriverTelemetry(unittest.TestCase):
         path.write_text(json.dumps(case))
         with self.assertRaisesRegex(ValueError, 'mechanism telemetry'):
             self.plan('--hf2q-case', str(path))
+
+    def test_junk_empty_and_valid_sweep_selections_refuse_during_planning(self):
+        original = json.loads(self.selection.read_text())
+        records = []
+        for row in original['configurations'].values():
+            for run in row['runs']:
+                record = splash_audit.run_record(run)
+                record.update(q5_verdict='CalibrationPass', audit='Pass', tasks_passed=4,
+                              prompt_parity='PassedByteIdentical', makespan_s=10.)
+                records.append(record)
+        valid_selection = splash_sweep.select(records)
+        self.assertIsNotNone(valid_selection['choice'])
+        for value in ('not-json', '', '{}', json.dumps(valid_selection)):
+            with self.subTest(value=value[:30]), self.assertRaises(ValueError):
+                self.selection.write_text(value)
+                self.plan()
+
+    def test_other_workload_and_artifact_cannot_inherit_the_exemption_before_launch(self):
+        plan, _ = self.plan()
+        ids = canonical_identities(plan)
+        ids['arms']['experiment']['artifact']['sha256'] = 'f' * 64
+        problems = q3_campaign.q3_identity.launch_problems(plan, ids)
+        self.assertTrue(any('substitution candidate artifact differs' in p for p in problems), problems)
+        case = json.loads((HERE / 'q5_cases/qwen38.json').read_text())
+        case['workload']['id'] += '-different'
+        path = self.root / 'other-workload.json'
+        path.write_text(json.dumps(case))
+        with self.assertRaisesRegex(ValueError, 'canonical Qwen3.8 n4 workload'):
+            self.plan('--hf2q-case', str(path))
+
+    def test_changed_raw_binding_is_rejected_before_launch_even_if_selection_stays_invalid(self):
+        plan, _ = self.plan()
+        selection = json.loads(self.selection.read_text())
+        run = Path(next(iter(selection['configurations'].values()))['runs'][0])
+        (run / 'client/response.raw').write_text('changed but still invalid')
+        problems = q3_campaign.q3_identity.launch_problems(plan, canonical_identities(plan))
+        self.assertTrue(any('raw evidence changed after freezing' in p for p in problems), problems)
+
+    def test_wrong_actual_request_cannot_plan_even_when_the_selection_is_still_invalid(self):
+        selection = json.loads(self.selection.read_text())
+        run = Path(next(iter(selection['configurations'].values()))['runs'][0])
+        path = run / 'client/agent-0/turn-0/request.json'
+        request = json.loads(path.read_text())
+        request['max_completion_tokens'] = 1
+        path.write_text(json.dumps(request))
+        with self.assertRaisesRegex(ValueError, 'raw initial request'):
+            self.plan()
+
+    def test_raw_mutation_stops_driver_before_the_next_position(self):
+        plan, cases = self.plan()
+        selected = json.loads(self.selection.read_text())
+        run = Path(next(iter(selected['configurations'].values()))['runs'][0])
+        runner = FakeRunner(lambda arm, workload, call: {'makespan': 100.})
+
+        def mutate(argv, environ, stdout, stderr):
+            result = runner(argv, environ, stdout, stderr)
+            receipt_path = Path(argv[5]) / 'receipt.json'
+            receipt = json.loads(receipt_path.read_text())
+            receipt['artifact'].update(splash_evidence.ARTIFACT)
+            receipt_path.write_text(json.dumps(receipt))
+            (run / 'client/response.raw').write_text('changed after the first position')
+            return result
+
+        driver = q3_campaign.Driver(plan, cases, self.root / 'campaign', {}, mutate, lambda: 0,
+                                    lambda: canonical_identities(plan))
+        manifest = driver.run()
+        self.assertEqual(manifest['status'], 'IdentityDrift')
+        self.assertEqual(len(runner.calls), 1)
+        self.assertTrue(any('splash_substitution_inputs' in p for p in manifest['identity_drift']))
 
 
 

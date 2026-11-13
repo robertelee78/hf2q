@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import q3_splash_evidence
 
 CONTRACT = {"version": 1, "minimum": 5.304,
             "metric": "accepted_plus_bonus_per_lane_cycle"}
@@ -121,28 +122,12 @@ def evaluate(manifest):
         result["binding"] = {"source_commit": source, "binary_sha256": frozen["binary"]["sha256"],
                              "artifact": frozen["artifact"], "workload": "n4",
                              "case_sha256": plan["arms"]["experiment"]["case_sha256"]}
-        if not plan.get("splash_required") and "splash" not in plan["measured_arms"]:
-            evidence = plan.get("splash_unavailable_evidence")
-            if not evidence:
-                raise ValueError("missing documented invalid-Splash selection evidence")
-            for bound in evidence:
-                if digest(bound["path"]) != bound["sha256"]:
-                    raise ValueError("invalid-Splash selection evidence changed")
-                selection = json.loads(Path(bound["path"]).read_text())
-                if not isinstance(selection, dict):
-                    raise ValueError("invalid-Splash selection evidence is not an object")
-                configurations = selection.get("configurations")
-                if (selection.get("schema") != "hf2q.splash-sweep-selection.v1"
-                        or selection.get("choice") is not None or selection.get("pass_floor") != 0.75
-                        or not isinstance(configurations, dict) or not configurations
-                        or any(not isinstance(row, dict) or row.get("valid") is not False
-                               for row in configurations.values())):
-                    raise ValueError("Splash evidence does not document an entirely invalid sweep")
-            result["splash_unavailable_evidence"] = evidence
         base_case = Path(plan["arms"]["experiment"]["case"])
         if digest(base_case) != plan["arms"]["experiment"]["case_sha256"]:
             raise ValueError("mechanism candidate case changed")
         expected_case = json.loads(base_case.read_text())
+        if not plan.get("splash_required") and "splash" not in plan["measured_arms"]:
+            result["splash_unavailable_evidence"] = q3_splash_evidence.check(plan, expected_case, frozen["artifact"])
         stage = next(s for s in manifest["stages"] if s["workload"] == "n4")
         for block in stage["blocks"]:
             for entry in block["entries"]:

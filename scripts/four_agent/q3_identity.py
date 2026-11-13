@@ -13,6 +13,7 @@ import q5_artifacts
 import q5_case
 import q5_host
 import quality_campaign as qc
+import q3_splash_evidence
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -75,6 +76,8 @@ def identities(plan, cases, environ):
     python = Path(sys.executable).resolve()
     return {"arms": arms, "harness": harness(), "python": {"path": str(python), "sha256": q5_artifacts.sha256(python)},
             "host": q5_host.host_identity(), "negative_control_receipt": plan.get("negative_control_receipt"),
+            **({"splash_substitution_inputs": q3_splash_evidence.current_inputs(plan["qwen38_splash_substitution"])}
+               if "qwen38_splash_substitution" in plan else {}),
             **({"stock_record": stock_record_files(plan["stock_record"])} if "stock_record" in plan else {})}
 
 
@@ -203,6 +206,12 @@ def launch_problems(plan, ids, output=None):
         problems.append("--qe-identity (the named QE session/host executing Q3) is required")
     if "negative_control_receipt" not in plan:
         problems.append("--negative-control-receipt is required")
+    if plan.get("qwen38_mechanism") and plan.get("splash_required") is False:
+        try:
+            q3_splash_evidence.check(plan, q5_case.loads(Path(plan["arms"]["experiment"]["case"]).read_bytes()),
+                                    ids["arms"]["experiment"]["artifact"])
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            problems.append(f"invalid-Splash substitution: {error}")
     record = plan.get("controls_of")
     if record is not None:
         drift = diff(record["identity"], controls_identity(plan, ids))

@@ -48,6 +48,7 @@ import q5_case
 import q5_host
 import quality_campaign as qc
 import q3_mechanism
+import q3_splash_evidence
 
 HERE = Path(__file__).resolve().parent
 SCHEMA = "hf2q.adr063.q3-campaign.v1"
@@ -353,6 +354,7 @@ def build_plan(args, environ, family):
         if splash_evidence:
             # ADR-063 Q4 substitutes the absolute mechanism gate only for Qwen3.8's
             # documented invalid Splash arm. Historical frozen plans keep their rule.
+            plan["qwen38_splash_substitution"] = q3_splash_evidence.freeze(splash_evidence, cases["experiment"])
             plan["splash_required"] = False
     elif family == "qwen38" and record is not None and record.get("qwen38_mechanism"):
         recorded_filter = record["identity"]["arms"]["experiment"]["overrides"].get("LOG_FILTER")
