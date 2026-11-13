@@ -131,7 +131,7 @@ families the GPU runs and holds the table of what each switch needs:
 | `HF2Q_QWEN_VERIFY_ATTN_TILE` | runs: every layer keeps the per-row chain (logged once) |
 | `HF2Q_QWEN_PREFILL_FOLD_CUE` | runs: two forwards, as without a routed prepared prefill |
 | `HF2Q_QWEN_VERIFY_MIXER_FUSED` | runs: the fused core is portable; its wave follows the prepared routes |
-| `HF2Q_DFLASH2_DRAFT_AF4_G64`, `HF2Q_DFLASH2_GPU_TARGET_TOKENS`, `HF2Q_DFLASH2_CONTEXT_FIRST`, `HF2Q_QWEN_VERIFY_REPLAY_REUSE`, `HF2Q_QWEN_MOE_BATCHED` | run: portable kernels or host-side only |
+| `HF2Q_DFLASH2_DRAFT_AF4_G64`, `HF2Q_DFLASH2_GPU_TARGET_TOKENS`, `HF2Q_DFLASH2_GPU_DECISIONS`, `HF2Q_DFLASH2_CONTEXT_FIRST`, `HF2Q_DFLASH2_DRAFT_PREFETCH`, `HF2Q_QWEN_VERIFY_REPLAY_REUSE`, `HF2Q_QWEN_MOE_BATCHED` | run: portable kernels or host-side only |
 
 A switch from the "cannot run" rows that the operator sets fails the model
 load, before any weight is uploaded, with the switch, the kernel family and
