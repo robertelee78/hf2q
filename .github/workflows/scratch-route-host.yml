@@ -1,0 +1,34 @@
+# Scratch: runs the route_host gates on the hosted runners against the
+# unreleased mlx-native branch fix/kernel-availability. Branch-only; never
+# merged.
+name: scratch route-host
+
+on:
+  push:
+    branches: [diag/kernelavail-hosted]
+
+permissions:
+  contents: read
+
+jobs:
+  route-host:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15, macos-26]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.89.0"
+      - name: Host
+        run: |
+          sw_vers
+          xcodebuild -version || true
+          system_profiler SPDisplaysDataType | head -20 || true
+      - name: route_host gates
+        run: cargo test --locked --bin hf2q --all-features route_host -- --test-threads=1 --nocapture

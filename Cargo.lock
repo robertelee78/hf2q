@@ -2545,8 +2545,7 @@ dependencies = [
 [[package]]
 name = "mlx-native"
 version = "0.21.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "caaf9677f9d3431594f8a3b300c9b322e2547a3f829329e3e44563af63ce2090"
+source = "git+https://github.com/robertelee78/mlx-native?branch=fix%2Fkernel-availability#2a9af3e44b735b4babce3a7b1a67889b443c3931"
 dependencies = [
  "block",
  "bytemuck",
@@ -4244,7 +4243,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
