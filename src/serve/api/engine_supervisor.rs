@@ -67,8 +67,10 @@ pub(super) type DeferredFlush = Box<dyn FnOnce() -> Result<()> + Send>;
 /// 3. the worker thread terminates, which destroys every other thread-local
 ///    it had; the teardown thread waits for that with a join;
 /// 4. the teardown thread runs the flush: buffers dropped in steps 1 to 3
-///    only staged their removal from the Metal residency set, and commands
-///    the worker committed may still hold them;
+///    only staged their removal from the Metal residency set, commands the
+///    worker committed may still hold them, and the kernel reclaims what
+///    user space released on its own time, so the flush ends by waiting for
+///    that (`resident_memory::wait_until_reclaimed`);
 /// 5. the reservation is released.
 ///
 /// A step that fails, panics or never returns leaves the reservation

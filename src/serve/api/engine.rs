@@ -1804,8 +1804,10 @@ pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
 /// every device the model encoded on is flushed: the dropped buffers only
 /// staged their removal from the device's residency set, and waiting for the
 /// commit also waits for the commands the worker committed on that device's
-/// queue. Only then is the reservation released; if a flush fails it never
-/// is.
+/// queue. The kernel reclaims the pages of released buffers on its own
+/// afterwards, so the teardown then waits until the process footprint has
+/// stopped falling (`resident_memory::wait_until_reclaimed`). Only then is
+/// the reservation released; if a flush or that wait fails it never is.
 fn model_worker_teardown(
     memory: Option<crate::serve::resident_memory::Reservation>,
     model_devices: Vec<mlx_native::MlxDevice>,
@@ -1818,9 +1820,11 @@ fn model_worker_teardown(
         // cache; a thread that never built one has none.
         devices.extend(Qwen35Model::take_thread_gpu_cache());
         Ok(Box::new(move || {
-            devices
-                .iter()
-                .try_for_each(flush_released_gpu_cache)
+            devices.iter().try_for_each(flush_released_gpu_cache)?;
+            drop(devices);
+            // User space has let go of everything; the kernel has not
+            // necessarily returned it yet.
+            crate::serve::resident_memory::wait_until_reclaimed()
         }) as super::engine_supervisor::DeferredFlush)
     })
 }

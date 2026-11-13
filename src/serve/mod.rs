@@ -4064,15 +4064,25 @@ fn load_engine_on_route(
             Some(device) => flush_released_gpu_cache(&device),
             None => Ok(()),
         };
-    if let Err(error) = cache_released {
-        let reason = format!("releasing the loading thread's GPU cache failed: {error:#}");
-        match reservation.take() {
-            // The load failed before a worker owned the model, and what
-            // this thread cached for it could not be flushed: its memory
-            // cannot be taken to be free.
-            Some(reservation) => reservation.strand(&reason),
-            None => tracing::error!(model = %path.display(), reason, "GPU cache not released"),
+    match (reservation.take(), cache_released) {
+        // The load failed before a worker owned the model: this thread
+        // dropped it. The reservation goes when the kernel has returned
+        // what the model held; if that cannot be established the memory
+        // cannot be taken to be free.
+        (Some(reservation), released) => {
+            if let Err(error) = released.and_then(|()| resident_memory::wait_until_reclaimed()) {
+                reservation.strand(&format!(
+                    "a load of {} failed and its memory could not be released: {error:#}",
+                    path.display()
+                ));
+            }
         }
+        (None, Ok(())) => {}
+        (None, Err(error)) => tracing::error!(
+            model = %path.display(),
+            error = %format!("{error:#}"),
+            "the loading thread's GPU cache was not released"
+        ),
     }
     engine
 }

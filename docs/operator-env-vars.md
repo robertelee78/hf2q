@@ -265,8 +265,12 @@ worker drops the model; it drops the GPU weight cache it built for it
 (uploaded copies and prepared planes); the thread terminates, which destroys
 every other thread-local cache it had; the cache's device is flushed, which
 commits the removals the dropped buffers staged in the Metal residency set
-and waits for the commands the worker had committed there; then the
-reservation goes. Evicting an engine or dropping its last handle releases
+and waits for the commands the worker had committed there; the teardown
+waits until the process footprint has stopped falling, because the kernel
+reclaims the pages of released buffers on its own, after user space has let
+go (measured on the Qwen3.6 gate artifact: 15 to 28 GiB of a 40 GiB engine
+were still charged to the process at that point and were gone 0.1 to 1 s
+later); then the reservation goes. Evicting an engine or dropping its last handle releases
 nothing: an engine whose worker is still tearing down, or is wedged inside
 Metal, is still counted, and a teardown step that fails leaves it counted
 until the process restarts (one ERROR line, `engine memory stays reserved

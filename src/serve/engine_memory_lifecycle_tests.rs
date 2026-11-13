@@ -4,7 +4,9 @@
 //! Loads a Qwen model through `serve::load_engine` on the default route,
 //! drops the engine as an eviction does (nobody stops or joins the worker),
 //! and reads the process's physical footprint at the moment the process
-//! ledger lets the reservation go. Run alone, on a release build:
+//! ledger lets the reservation go: by then the engine's memory must be back
+//! with the kernel, not merely released by user space. Run alone, on a
+//! release build:
 //!
 //! ```text
 //! HF2Q_ENGINE_LIFECYCLE_GGUF=/path/model.gguf cargo test --release --locked --bin hf2q -- \
@@ -64,6 +66,7 @@ fn a_real_engines_reservation_is_released_only_when_its_memory_is_free() {
     let ledger = resident_memory::process();
     assert_eq!(ledger.total(), 0, "run this test alone");
     let baseline = footprint_bytes();
+    let mut still_resident = Vec::new();
     for round in 1..=2 {
         let engine = load_engine(&path, &config).expect("load");
         let decision = engine.route_decision().expect("route decision");
@@ -88,33 +91,52 @@ fn a_real_engines_reservation_is_released_only_when_its_memory_is_free() {
         }
         let teardown = evicted.elapsed();
         let released = footprint_bytes();
-
+        // What the footprint does after the release: nothing more may come
+        // back, or the reservation went before the memory did.
+        let mut settled = released;
+        let mut later = Vec::new();
+        for wait_ms in [10_u64, 100, 1_000, 5_000] {
+            std::thread::sleep(Duration::from_millis(wait_ms));
+            let footprint = footprint_bytes();
+            settled = settled.min(footprint);
+            later.push(format!(
+                "+{}ms={:.2}",
+                evicted.elapsed().as_millis() - teardown.as_millis(),
+                footprint as f64 / GIB
+            ));
+        }
         let held = loaded.saturating_sub(baseline);
-        let left = released.saturating_sub(baseline);
+        let returned_late = released - settled;
         println!(
             "[LIFECYCLE] round={round} selected={} profile={} committed_gib={:.2} \
-             baseline_gib={:.2} loaded_gib={:.2} at_release_gib={:.2} held_gib={:.2} \
-             left_gib={:.2} teardown_ms={}",
+             loaded_gib={:.2} at_release_gib={:.2} after_release_gib=[{}] \
+             returned_after_release_gib={:.3} teardown_ms={}",
             decision["selected"],
             decision["profile"],
             committed as f64 / GIB,
-            baseline as f64 / GIB,
             loaded as f64 / GIB,
             released as f64 / GIB,
-            held as f64 / GIB,
-            left as f64 / GIB,
+            later.join(" "),
+            returned_late as f64 / GIB,
             teardown.as_millis()
         );
         assert!(
             held as f64 > 0.5 * std::fs::metadata(&path).expect("model").len() as f64,
             "round {round}: the loaded engine held only {held} bytes"
         );
-        // When the ledger says the memory is free, it is: what is left of
-        // the engine is a small fraction of what it held.
         assert!(
-            (left as f64) < 0.05 * held as f64,
-            "round {round}: {left} of {held} bytes were still resident when the reservation \
-             was released"
+            (released.saturating_sub(baseline) as f64) < 0.25 * held as f64,
+            "round {round}: most of the engine was never returned"
         );
+        // What stays after a teardown is the allocator's cache of freed host
+        // blocks (`Malloc Large (empty)` in vmmap), which this process can
+        // reuse. Nothing of the engine may come back after the release.
+        if returned_late > 256 << 20 {
+            still_resident.push(format!(
+                "round {round}: {returned_late} bytes came back after the reservation was \
+                 released"
+            ));
+        }
     }
+    assert!(still_resident.is_empty(), "{still_resident:#?}");
 }

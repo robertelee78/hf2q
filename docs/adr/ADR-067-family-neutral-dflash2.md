@@ -2414,8 +2414,11 @@ worker's teardown releases it (`WorkerTeardown`): the model is dropped, the
 thread's GPU weight cache is dropped, the thread terminates (a second
 thread joins it, so every thread-local it had is destroyed), the cache's
 device is flushed (the staged residency-set removals are committed and the
-commands committed on its queue are waited for), and then the reservation
-is released. An evicted engine whose worker is still tearing down or is
+commands committed on its queue are waited for), the teardown waits until
+the process footprint has stopped falling (the kernel reclaims released
+buffers asynchronously: up to 28 GiB of a 40 GiB engine were still charged
+to the process after the flush, for up to a second), and then the
+reservation is released. An evicted engine whose worker is still tearing down or is
 wedged stays counted, and a teardown step that fails strands the
 reservation for the life of the process; a load that fails after its worker
 started waits for that teardown before the prior-route retry, which
