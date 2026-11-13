@@ -33,6 +33,7 @@ const CANONICAL: JointStepOptions = JointStepOptions {
     pooled_outputs: false,
     verify_attention_tile: false,
     verify_mixer_fused: false,
+    dflash2: crate::inference::models::qwen35::joint_step_options::DFlash2VerifyOptions::OFF,
 };
 
 /// Joint arms of the trace: the production default first, then the
@@ -60,6 +61,7 @@ const JOINT_ARMS: [(JointDenseFfnRoute, JointStepOptions, &str); 4] = [
             pooled_outputs: false,
             verify_attention_tile: false,
             verify_mixer_fused: false,
+            dflash2: crate::inference::models::qwen35::joint_step_options::DFlash2VerifyOptions::OFF,
         },
         "joint_shared_ffn_mma",
     ),
@@ -70,6 +72,7 @@ const JOINT_ARMS: [(JointDenseFfnRoute, JointStepOptions, &str); 4] = [
             pooled_outputs: true,
             verify_attention_tile: false,
             verify_mixer_fused: false,
+            dflash2: crate::inference::models::qwen35::joint_step_options::DFlash2VerifyOptions::OFF,
         },
         "joint_shared_ffn_pooled",
     ),

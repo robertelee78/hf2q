@@ -36,6 +36,27 @@ pub(crate) struct JointStepOptions {
     /// ([`super::joint_mixer_fused`], Class A). Decode steps never take it
     /// and MTP verify rejects it.
     pub verify_mixer_fused: bool,
+    /// DFlash2 verify steps only: the cycle-tail choices.
+    pub dflash2: DFlash2VerifyOptions,
+}
+
+/// Choices of a DFlash2 verify step beyond its kernels' routes. Decode
+/// steps and MTP verify ignore them. All off by default.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DFlash2VerifyOptions {
+    /// The step's fresh layer outputs stay allocated until its commit
+    /// settles instead of being released behind the output head, so the
+    /// residency-set commit their release triggers is paid by a command
+    /// that is not between the head and the next draft (Class A: only when
+    /// the buffers are freed changes).
+    pub hold_layer_outputs: bool,
+}
+
+impl DFlash2VerifyOptions {
+    /// Every choice off.
+    pub(crate) const OFF: Self = Self {
+        hold_layer_outputs: false,
+    };
 }
 
 /// Parse an on/off switch named `name`; unset or blank means off.

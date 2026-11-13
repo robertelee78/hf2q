@@ -30,11 +30,11 @@ use super::*;
 use crate::inference::spec_decode::dflash2::config::DFlash2LayerType;
 use crate::inference::spec_decode::dflash2::schema::QWEN38_DFLASH2;
 
-const LANES: usize = 4;
+pub(super) const LANES: usize = 4;
 
 /// The smallest shape both draft routes take: 16 query heads over 4 KV
 /// heads of 128 and a 256-slot ring, so 40 eight-row commits wrap it.
-fn config() -> DFlash2Config {
+pub(super) fn config() -> DFlash2Config {
     DFlash2Config {
         draft_model_type: "qwen3".into(),
         hidden_size: 1_024,
@@ -62,7 +62,7 @@ fn config() -> DFlash2Config {
     }
 }
 
-fn runtime(device: &MlxDevice, staged: bool) -> DFlash2Runtime {
+pub(super) fn runtime(device: &MlxDevice, staged: bool) -> DFlash2Runtime {
     let config = config();
     let tensors = DFlash2ModelTensors::synthetic_af4_g64(device, &config, 5);
     let workspace = DFlash2Workspace::new(device, &config, LANES, staged).unwrap();
@@ -78,10 +78,14 @@ fn runtime(device: &MlxDevice, staged: bool) -> DFlash2Runtime {
             .collect(),
         verify_budget: DFlash2VerifyBudget::default(),
         gpu_target_tokens: false,
+        prefetched: None,
+        prefetch_counts: DraftPrefetchCounts::default(),
+        budget_epoch: 0,
+        context_positions: None,
     }
 }
 
-fn random(state: &mut u64) -> f32 {
+pub(super) fn random(state: &mut u64) -> f32 {
     *state = state
         .wrapping_mul(6_364_136_223_846_793_005)
         .wrapping_add(1_442_695_040_888_963_407);
@@ -107,7 +111,7 @@ fn stage_step(runtime: &mut DFlash2Runtime, state: &mut u64) {
     prepare_decode_positions(&mut runtime.workspace, &runtime.config, &positions).unwrap();
 }
 
-fn rings(runtime: &DFlash2Runtime) -> Vec<Vec<u16>> {
+pub(super) fn rings(runtime: &DFlash2Runtime) -> Vec<Vec<u16>> {
     runtime
         .workspace
         .ring_keys
@@ -118,7 +122,7 @@ fn rings(runtime: &DFlash2Runtime) -> Vec<Vec<u16>> {
 }
 
 /// One lane's elements of every ring.
-fn lane_rings(runtime: &DFlash2Runtime, lane: usize) -> Vec<Vec<u16>> {
+pub(super) fn lane_rings(runtime: &DFlash2Runtime, lane: usize) -> Vec<Vec<u16>> {
     let per_lane = runtime.config.num_key_value_heads
         * runtime.config.sliding_window
         * runtime.config.head_dim;
@@ -130,13 +134,13 @@ fn lane_rings(runtime: &DFlash2Runtime, lane: usize) -> Vec<Vec<u16>> {
 
 /// The stand-in for the target's replay commit: an unrelated command,
 /// committed and waited for while the context commit may still run.
-struct Replay {
+pub(super) struct Replay {
     source: MlxBuffer,
     sink: MlxBuffer,
 }
 
 impl Replay {
-    fn new(device: &MlxDevice) -> Self {
+    pub(super) fn new(device: &MlxDevice) -> Self {
         let mut source = device
             .alloc_buffer(4_096 * 4, DType::F32, vec![4_096])
             .unwrap();
@@ -147,7 +151,11 @@ impl Replay {
         Self { source, sink }
     }
 
-    fn run(&self, device: &MlxDevice, registry: &mut KernelRegistry) -> anyhow::Result<()> {
+    pub(super) fn run(
+        &self,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+    ) -> anyhow::Result<()> {
         let mut encoder = device.command_encoder()?;
         dispatch_copy_f32(
             &mut encoder,

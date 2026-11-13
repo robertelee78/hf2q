@@ -2,9 +2,11 @@
 
 use std::sync::Once;
 
-use crate::inference::models::qwen35::joint_projection::JointProjectionKernel;
-use crate::inference::models::qwen35::joint_step_options::JointStepOptions;
 use crate::inference::models::qwen35::joint_mixer_fused;
+use crate::inference::models::qwen35::joint_projection::JointProjectionKernel;
+use crate::inference::models::qwen35::joint_step_options::{
+    DFlash2VerifyOptions, JointStepOptions,
+};
 use crate::inference::models::qwen35::verify_attn_tile;
 use crate::serve::api::engine::qwen35_joint_decode::Qwen35JointDecodeConfig;
 use crate::serve::api::engine_qwen35::{
@@ -98,6 +100,13 @@ pub(super) fn run_qwen35_dflash2(
         return Qwen35DFlash2Run::NotEligible;
     }
     selected.sort_by_key(|handle| handle.slot_id);
+    // A slot still in prefill appends to its draft ring before the next
+    // DFlash2 step, which drops a draft committed ahead of that step: this
+    // step then leaves the draft to the next one.
+    let prefill_pending = slots
+        .iter()
+        .flatten()
+        .any(|(work, _, _)| matches!(work, Qwen35SlotWork::Prefill(_)));
 
     let mut lanes = Vec::with_capacity(selected.len());
     for handle in selected {
@@ -146,6 +155,18 @@ pub(super) fn run_qwen35_dflash2(
             .iter_mut()
             .map(|lane| &mut lane.state)
             .collect::<Vec<_>>();
+        // The tail switches, or the stock route in an "off" block of the
+        // within-run measurement diagnostic.
+        let tail_block = crate::serve::api::engine_qwen35::dflash2_tail_block_arm();
+        let tail_on = tail_block != Some(false);
+        let draft_prefetch = tail_on
+            && !prefill_pending
+            && crate::serve::api::engine_qwen35::dflash2_draft_prefetch();
+        let decisions = if tail_on {
+            crate::serve::api::engine_qwen35::dflash2_decision_route()
+        } else {
+            crate::serve::api::engine_qwen35::Qwen35DecisionRoute::HostLogits
+        };
         guard.model.run_dflash2_step(
             guard.kv.as_mut().expect("kv Some during loop"),
             &mut states,
@@ -157,7 +178,16 @@ pub(super) fn run_qwen35_dflash2(
                     pooled_outputs: config.step.pooled_outputs,
                     verify_attention_tile: verify_attn_tile::enabled(),
                     verify_mixer_fused: joint_mixer_fused::enabled(),
+                    dflash2: DFlash2VerifyOptions {
+                        // With the prefetch the next draft is committed
+                        // before the step's commit settles; the layer
+                        // outputs are released after it.
+                        hold_layer_outputs: draft_prefetch,
+                    },
                 },
+                draft_prefetch,
+                decisions,
+                tail_block,
             },
             supervisor,
             &|error| !supervisor.is_healthy() || is_fatal_command_buffer_error(error),
