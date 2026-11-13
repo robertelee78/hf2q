@@ -108,9 +108,10 @@ lives until the action's post step revokes it at the end of the publish job.
 In the hf2q.us repository, follow `docs/release-activation.md` → "Future
 releases" for the new version: take `install.sh` and
 `stable-aarch64-apple-darwin.json` from the exact versioned GitHub release,
-update the Apache redirect, the stable record, and the pinned hashes, run
-`npm run verify`, deploy, `apache2ctl configtest`, reload, and run the
-transport verifier.
+update the stable record and its pinned hashes, registry identity and evidence,
+run `npm run verify`, deploy the built site, and run the transport verifier.
+The version-agnostic `public/install.sh` bootstrap and Apache configuration
+stay unchanged during a normal release activation; no Apache reload is needed.
 
 ## Done
 
