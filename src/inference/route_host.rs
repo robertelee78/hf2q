@@ -62,6 +62,8 @@ pub(crate) enum Grammar {
     One,
     /// `1`, `on` or `true`, trimmed and in any case.
     OnOffTrue,
+    /// A valid prompt-prefill cadence that skips the per-layer host wait.
+    WaitLayers,
 }
 
 impl Grammar {
@@ -73,6 +75,10 @@ impl Grammar {
                 value.trim().to_ascii_lowercase().as_str(),
                 "1" | "on" | "true"
             ),
+            Self::WaitLayers => value
+                .trim()
+                .parse::<usize>()
+                .is_ok_and(|layers| (2..=8).contains(&layers)),
         }
     }
 }
@@ -100,7 +106,7 @@ const fn row(
     }
 }
 
-use Grammar::{OnOffTrue, One};
+use Grammar::{OnOffTrue, One, WaitLayers};
 
 /// Every fast-route switch of the Qwen DFlash2 route profile.
 #[rustfmt::skip]
@@ -122,6 +128,9 @@ pub(crate) const SWITCHES: &[SwitchRow] = &[
     row("HF2Q_QWEN_PREFILL_PREPARED",     OnOffTrue, &[RepackedGgufMm]),
     // Folds only inside a routed prepared prefill; two forwards otherwise.
     row("HF2Q_QWEN_PREFILL_FOLD_CUE",     OnOffTrue, &[]),
+    row("HF2Q_QWEN_PREFILL_JOINT",        OnOffTrue, &[]),
+    row("HF2Q_QWEN_PREFILL_WAIT_LAYERS",  WaitLayers,&[]),
+    row("HF2Q_QWEN_PREFILL_KEEP_FRESH",   OnOffTrue, &[]),
     // A portable fused core; its wave follows the prepared routes.
     row("HF2Q_QWEN_VERIFY_MIXER_FUSED",   One,       &[]),
     // Host-side storage and scheduling.

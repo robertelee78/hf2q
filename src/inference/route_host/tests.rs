@@ -213,6 +213,10 @@ fn route_host_refuses_an_explicit_switch_it_cannot_run_and_names_it() {
             let on = match grammar {
                 Grammar::One => one,
                 Grammar::OnOffTrue => on_off_true,
+                Grammar::WaitLayers => value
+                    .trim()
+                    .parse::<usize>()
+                    .is_ok_and(|layers| (2..=8).contains(&layers)),
             };
             let env = |asked: &str| (asked == name).then(|| value.to_owned());
             let result = host.require_explicit(&env);

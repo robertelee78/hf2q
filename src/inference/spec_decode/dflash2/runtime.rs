@@ -718,6 +718,23 @@ impl DFlash2Runtime {
         logical_start: usize,
         rows: std::ops::Range<usize>,
     ) -> Result<()> {
+        self.ingest_target_capture_runs(device, registry, capture, lane, logical_start, &[rows])
+    }
+
+    /// [`Self::ingest_target_capture_rows`] for rows that are not contiguous
+    /// in the capture: the runs `rows`, appended in order as one chunk. A
+    /// joint prefill forward holds a lane's shared prefix rows and its own
+    /// rows apart; the lane appends them exactly as its own forward's
+    /// capture, which holds them side by side.
+    pub fn ingest_target_capture_runs(
+        &mut self,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        capture: &DFlashCaptureSession,
+        lane: usize,
+        logical_start: usize,
+        rows: &[std::ops::Range<usize>],
+    ) -> Result<()> {
         ensure!(
             lane < self.workspace.max_lanes,
             "DFlash2 capture lane {lane} is out of range"
@@ -728,7 +745,7 @@ impl DFlash2Runtime {
             "DFlash2 capture starts at {logical_start}, lane {lane} is at {}",
             self.lane_lengths[lane]
         );
-        let appended = rows.len();
+        let appended: usize = rows.iter().map(|run| run.len()).sum();
         ingest_capture_lane_passes(
             device,
             registry,
@@ -1136,7 +1153,8 @@ impl DFlash2Runtime {
     }
 }
 
-/// Append capture rows `rows` to `lane`'s rings at `logical_start`.
+/// Append the capture rows of the runs `rows`, in order, to `lane`'s rings
+/// at `logical_start`.
 ///
 /// A decode commit carries `block_size` rows of every lane, so appending a
 /// prefill capture through it projects `block_size` rows per pass over the
@@ -1157,7 +1175,7 @@ pub(super) fn ingest_capture_lane_passes(
     capture: &DFlashCaptureSession,
     lane: usize,
     logical_start: usize,
-    rows: std::ops::Range<usize>,
+    rows: &[std::ops::Range<usize>],
 ) -> Result<()> {
     ensure!(
         capture.target_layer_ids == config.target_layer_ids,
@@ -1169,15 +1187,15 @@ pub(super) fn ingest_capture_lane_passes(
     let hidden = capture.hidden_size;
     let feature_width = config.fc_input_dim();
     ensure!(
-        rows.start <= rows.end
-            && rows.end <= capture.seq_len
+        rows.iter()
+            .all(|run| run.start <= run.end && run.end <= capture.seq_len)
             && layers * hidden == feature_width
             && capture.hidden_output.len() == layers * capture.seq_len * hidden,
         "DFlash2 capture rows {rows:?} of a {}-row, {layers}-layer, {hidden}-wide capture \
          do not fit the checkpoint's {feature_width}-wide context",
         capture.seq_len
     );
-    let appended = rows.len();
+    let appended: usize = rows.iter().map(|run| run.len()).sum();
     if appended == 0 {
         return Ok(());
     }
@@ -1200,7 +1218,7 @@ pub(super) fn ingest_capture_lane_passes(
     )?;
     {
         let staged = captured.as_mut_slice::<f32>()?;
-        for (index, row) in rows.clone().enumerate() {
+        for (index, row) in rows.iter().flat_map(|run| run.clone()).enumerate() {
             for layer in 0..layers {
                 let source = (layer * capture.seq_len + row) * hidden;
                 let destination = (index * layers + layer) * hidden;
@@ -1275,6 +1293,10 @@ mod context_commit_tests;
 #[cfg(test)]
 #[path = "draft_prefetch_tests.rs"]
 mod draft_prefetch_tests;
+
+#[cfg(test)]
+#[path = "joint_capture_tests.rs"]
+mod joint_capture_tests;
 
 #[cfg(test)]
 mod tests {

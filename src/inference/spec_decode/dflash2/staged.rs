@@ -1032,7 +1032,7 @@ mod tests {
                 &capture,
                 lane,
                 start,
-                0..rows,
+                &[0..rows],
             )
             .unwrap();
         } else {
@@ -1252,7 +1252,7 @@ mod tests {
                                 capture,
                                 lane,
                                 start,
-                                range,
+                                &[range],
                             )
                             .unwrap();
                         };

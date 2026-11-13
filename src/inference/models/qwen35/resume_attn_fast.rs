@@ -330,9 +330,11 @@ pub(crate) fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_fast(
     #[cfg(test)]
     FAST_ROUTE_CALLS.with(|calls| calls.set(calls.get() + 1));
     enc.commit_labeled("layer.full_attn.tq_bridge_resume");
-    // Release the submitted encoder so the native observer retains this
-    // command before the layer's next wait checks the queue.
-    drop(enc);
+    // Hand the submitted encoder over: a pipelined forward keeps it for
+    // its next host wait; otherwise it is released here, so the native
+    // observer retains this command before the layer's next wait checks
+    // the queue.
+    super::encoder_stage::retain_submitted(enc, "layer.full_attn.tq_bridge_resume");
     Ok(out)
 }
 
