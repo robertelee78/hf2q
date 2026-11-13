@@ -66,6 +66,21 @@ pub(crate) const QWEN_PREFILL_JOINT_ENV: &str = "HF2Q_QWEN_PREFILL_JOINT";
 /// copies cost more than the shared rows save.
 pub(crate) const MIN_SHARED_ROWS: usize = 32;
 
+/// A prompt-prefill MoE FFN call of more than this many rows computes each
+/// output row from that input row alone, with the same kernels whatever the
+/// row count (tensor-matmul router, quantized MM shared expert,
+/// expert-grouped `mm_id`; `moe_prefill_rows_tests`). At or below it the
+/// layer takes per-pair expert matvecs (`MM_ID_ROUTING_THRESHOLD`) and, at
+/// eight rows or fewer, the row-exact router matvec, whose bits differ.
+pub(crate) const MOE_ROW_EXACT_MIN_ROWS: u32 = 32;
+
+// The threshold covers every row-count switch of the prefill MoE FFN.
+const _: () = assert!(
+    MOE_ROW_EXACT_MIN_ROWS >= mlx_native::ops::quantized_matmul_id_ggml::MM_ID_ROUTING_THRESHOLD
+        && MOE_ROW_EXACT_MIN_ROWS
+            >= mlx_native::ops::dense_matvec_f32_rows::DENSE_MATVEC_F32_ROWS_MAX_ROWS
+);
+
 static ENABLED: LazyLock<bool> = LazyLock::new(|| {
     switch_from_process(QWEN_PREFILL_JOINT_ENV).unwrap_or_else(|error| {
         tracing::warn!(error, fallback = false, "invalid Qwen joint-prefill switch");
@@ -254,6 +269,12 @@ pub(crate) struct Segment {
 }
 
 impl Segment {
+    /// Whether the MoE FFN of the segment's own forward is row exact, so
+    /// that a call over more rows gives the segment's rows the same bits.
+    pub(crate) fn moe_row_exact(&self) -> bool {
+        self.rows > MOE_ROW_EXACT_MIN_ROWS
+    }
+
     /// `(segment row, forward rows)` of each part of the segment's output
     /// that the forward keeps.
     pub(crate) fn emitted(&self, shared_rows: u32) -> Vec<(u32, RowRun)> {

@@ -115,6 +115,8 @@ pub mod moe;
 pub(crate) mod moe_batched;
 #[cfg(test)]
 mod moe_batched_tests;
+#[cfg(test)]
+mod moe_prefill_rows_tests;
 mod moe_live_tiles;
 mod moe_live_tiles_fused;
 #[cfg(test)]
@@ -123,6 +125,7 @@ pub mod mtp;
 pub mod mtp_weights_load;
 pub(crate) mod prefill_fold;
 pub(crate) mod prefill_joint;
+pub(crate) mod prefill_keep_fresh;
 #[cfg(test)]
 mod prefill_joint_tests;
 #[cfg(test)]

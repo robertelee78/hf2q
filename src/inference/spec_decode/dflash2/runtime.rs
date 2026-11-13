@@ -929,6 +929,10 @@ pub(super) fn ingest_capture_lane_passes(
 mod context_commit_tests;
 
 #[cfg(test)]
+#[path = "joint_capture_tests.rs"]
+mod joint_capture_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::inference::models::qwen35::model::Qwen35Model;

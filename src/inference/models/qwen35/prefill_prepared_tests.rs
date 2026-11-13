@@ -921,6 +921,65 @@ fn a_prepared_chunk_capture_equals_the_wait_every_layer_capture() {
     });
 }
 
+/// `HF2Q_QWEN_PREFILL_WAIT_LAYERS` changes when the host waits and when a
+/// layer's command buffer is submitted, not what the GPU computes: a large
+/// fresh chunk and resumed ones, with target layers the host copies on and
+/// off a wait boundary, give the same logits, the same captured rows and the
+/// same slot at every setting.
+#[test]
+fn waiting_every_few_layers_leaves_the_bits_of_waiting_every_layer() {
+    use super::prefill_prepared::ForcedWaitLayers;
+    use crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession;
+    with_synthetic_model(|model| {
+        let hidden = model.cfg.hidden_size as usize;
+        let run = |wait_layers: usize, captured_layers: &[usize]| {
+            let _cadence = ForcedWaitLayers::set(wait_layers);
+            let _scope = PrefillScope::forced(true);
+            assert_eq!(super::prefill_prepared::wait_layers(), wait_layers);
+            let mut cache = cache(model);
+            let mut bits = Vec::new();
+            let mut start = 0usize;
+            for len in [97usize, 40, 33, 157, 5] {
+                let mut session =
+                    DFlashCaptureSession::new(captured_layers.to_vec(), len, hidden, false);
+                let (logits, _hidden) = model
+                    .forward_gpu_last_logits_with_hidden_dflash(
+                        &tokens(0, start, len),
+                        &positions_for_range(start as i32, len),
+                        &mut cache,
+                        Some(&mut session),
+                        SlotId(0),
+                    )
+                    .unwrap_or_else(|error| panic!("chunk start={start} n={len}: {error:#}"));
+                bits.extend(logits.iter().map(|value| value.to_bits()));
+                bits.extend(session.hidden_output.iter().map(|value| value.to_bits()));
+                start += len;
+            }
+            // Every row of a chunk without a capture reads the slot back.
+            let read_back = model
+                .forward_gpu(
+                    &tokens(0, start, 41),
+                    &positions_for_range(start as i32, 41),
+                    &mut cache,
+                    SlotId(0),
+                )
+                .expect("read-back chunk");
+            bits.extend(read_back.iter().map(|value| value.to_bits()));
+            bits
+        };
+        for captured_layers in [&[1usize, 4, 6, 7][..], &[0, 3][..], &[2][..]] {
+            let every_layer = run(1, captured_layers);
+            for wait_layers in [2, 3, 4, 8] {
+                assert!(
+                    run(wait_layers, captured_layers) == every_layer,
+                    "waiting every {wait_layers} layers changed bits (captured layers \
+                     {captured_layers:?})"
+                );
+            }
+        }
+    });
+}
+
 /// Real-artifact gate, run explicitly:
 /// `HF2Q_QWEN38_GGUF=… <test binary> qwen38_prepared_prefill_real_model_gate --ignored --nocapture --test-threads=1`
 ///

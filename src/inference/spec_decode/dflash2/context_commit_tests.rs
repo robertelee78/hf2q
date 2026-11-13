@@ -30,7 +30,7 @@ use super::*;
 use crate::inference::spec_decode::dflash2::config::DFlash2LayerType;
 use crate::inference::spec_decode::dflash2::schema::QWEN38_DFLASH2;
 
-const LANES: usize = 4;
+pub(super) const LANES: usize = 4;
 
 /// The smallest shape both draft routes take: 16 query heads over 4 KV
 /// heads of 128 and a 256-slot ring, so 40 eight-row commits wrap it.
@@ -62,7 +62,7 @@ fn config() -> DFlash2Config {
     }
 }
 
-fn runtime(device: &MlxDevice, staged: bool) -> DFlash2Runtime {
+pub(super) fn runtime(device: &MlxDevice, staged: bool) -> DFlash2Runtime {
     let config = config();
     let tensors = DFlash2ModelTensors::synthetic_af4_g64(device, &config, 5);
     let workspace = DFlash2Workspace::new(device, &config, LANES, staged).unwrap();
@@ -81,7 +81,7 @@ fn runtime(device: &MlxDevice, staged: bool) -> DFlash2Runtime {
     }
 }
 
-fn random(state: &mut u64) -> f32 {
+pub(super) fn random(state: &mut u64) -> f32 {
     *state = state
         .wrapping_mul(6_364_136_223_846_793_005)
         .wrapping_add(1_442_695_040_888_963_407);
@@ -107,7 +107,7 @@ fn stage_step(runtime: &mut DFlash2Runtime, state: &mut u64) {
     prepare_decode_positions(&mut runtime.workspace, &runtime.config, &positions).unwrap();
 }
 
-fn rings(runtime: &DFlash2Runtime) -> Vec<Vec<u16>> {
+pub(super) fn rings(runtime: &DFlash2Runtime) -> Vec<Vec<u16>> {
     runtime
         .workspace
         .ring_keys
