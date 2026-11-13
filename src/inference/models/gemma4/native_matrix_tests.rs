@@ -333,41 +333,62 @@ fn native_matrix_projection_dispatches_every_admitted_codec_and_width() {
                 vec![m as usize, rows],
             )
             .unwrap();
-        let mut registry = mlx_native::KernelRegistry::new();
-        let executor = mlx_native::GraphExecutor::new(device.clone());
-        let mut session = executor.begin().unwrap();
-        let route = crate::serve::forward_mlx_shared::dispatch_qmatmul_head_major_bf16(
-            &mut session,
-            &mut registry,
-            &device,
-            &head_major,
-            &scratch,
-            &weight,
-            &output,
-            m,
-            1,
-            cols,
-            crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-        )
-        .unwrap_or_else(|error| panic!("{dtype:?} production O-projection route failed: {error}"));
-        session.finish().unwrap();
-        let expected_route = if matches!(
-            dtype,
-            GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 | GgmlType::Q6_K
-        ) {
-            crate::serve::forward_mlx_shared::HeadMajorQmatmulRoute::DirectPerm021
-        } else {
-            crate::serve::forward_mlx_shared::HeadMajorQmatmulRoute::ActivationPermute
-        };
-        assert_eq!(route, expected_route, "{dtype:?} O-projection route drift");
-        assert!(
-            output
-                .as_slice::<f32>()
-                .unwrap()
-                .iter()
-                .all(|value| *value == 0.0),
-            "{dtype:?} production O-projection did not produce numeric zeros"
+        // On this device, and as a host whose runtime compiler has no
+        // `<metal_tensor>` header: there the direct kernel does not exist
+        // and a direct codec takes the activation-only fallback too.
+        for without_tensor_header in [false, true] {
+            let mut registry = mlx_native::KernelRegistry::new();
+            if without_tensor_header {
+                registry.simulate_missing_tensor_header().unwrap();
+            }
+            let direct_kernel = mlx_native::tensor_kernel_family_available(
+                &mut registry,
+                &device,
+                mlx_native::TensorKernelFamily::MmPerm021,
+            )
+            .unwrap();
+            assert!(!(without_tensor_header && direct_kernel));
+            let executor = mlx_native::GraphExecutor::new(device.clone());
+            let mut session = executor.begin().unwrap();
+            let route = crate::serve::forward_mlx_shared::dispatch_qmatmul_head_major_bf16(
+                &mut session,
+                &mut registry,
+                &device,
+                &head_major,
+                &scratch,
+                &weight,
+                &output,
+                m,
+                1,
+                cols,
+                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
+            )
+            .unwrap_or_else(|error| {
+                panic!("{dtype:?} production O-projection route failed: {error}")
+            });
+            session.finish().unwrap();
+            let expected_route = if direct_kernel
+                && matches!(
+                    dtype,
+                    GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 | GgmlType::Q6_K
+                ) {
+                crate::serve::forward_mlx_shared::HeadMajorQmatmulRoute::DirectPerm021
+            } else {
+                crate::serve::forward_mlx_shared::HeadMajorQmatmulRoute::ActivationPermute
+            };
+            assert_eq!(
+            route, expected_route,
+            "{dtype:?} O-projection route drift (without the tensor header: {without_tensor_header})"
         );
+            assert!(
+                output
+                    .as_slice::<f32>()
+                    .unwrap()
+                    .iter()
+                    .all(|value| *value == 0.0),
+                "{dtype:?} production O-projection did not produce numeric zeros"
+            );
+        }
     }
 }
 

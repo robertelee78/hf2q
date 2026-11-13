@@ -12,19 +12,27 @@
 //! selects one of those families cannot run.
 //!
 //! [`SWITCHES`] names, for every fast-route switch of the Qwen DFlash2 route
-//! profile, the tensor-only families it needs. The answers come from
-//! mlx-native's device-scoped queries (`tensor_kernel_family_available`),
-//! asked once per process by [`probe`]. Two consumers:
+//! profile, how its reader decides "on" and the tensor-only families its
+//! route needs. The answers come from mlx-native's device-scoped queries
+//! (`tensor_kernel_family_available`), asked once per process by [`probe`].
+//! Two consumers:
 //!
-//! - a model load calls [`require_explicit`]: a switch the operator set that
-//!   this host cannot run fails the load with the switch and the reason;
-//! - the admission points of the tensor-only routes ask [`runs`], so a
-//!   switch that is on for any other reason (a route profile) leaves its
-//!   route off on such a host and the stock route serves.
+//! - a model load calls [`require_explicit`]: a tensor-only switch the
+//!   operator set that this host cannot run fails the load with the switch
+//!   and the reason. A load that selects no such switch never fails here,
+//!   whatever the probe says;
+//! - the admission points of the prepared GGUF matmul ask [`runs`], so a
+//!   prepared-route switch that is on for any other reason (a route profile)
+//!   leaves its route off on such a host and the stock route serves. The
+//!   staged draft and the prepared MoE expert routes have no such point:
+//!   selected on such a host they fail the load with mlx-native's typed
+//!   error, and whoever selects them asks [`HostRoutes::switch`] first.
 //!
 //! A probe that fails for any reason other than a missing tensor API is an
-//! error, as it is in mlx-native: a shader or toolchain regression on a
-//! Metal 4 device must not look like an old Mac.
+//! error in mlx-native: a shader or toolchain regression on a Metal 4 device
+//! must not look like an old Mac. Here it fails the load of a model that
+//! selects a tensor-only switch, is logged for one that selects none, and
+//! is returned to a caller of [`probe`] to decide.
 
 use std::sync::OnceLock;
 
@@ -46,37 +54,83 @@ const FAMILIES: [TensorKernelFamily; 6] = [
     TensorKernelFamily::MmPerm021,
 ];
 
-/// Every fast-route switch and the tensor-only kernel families its route
-/// needs. An empty list is a route of portable kernels, or one that falls
-/// back by itself where a kernel is unavailable.
+/// How a switch's reader decides that the switch is on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Grammar {
+    /// Exactly `1`; any other value leaves the route off (or is refused by
+    /// the reader).
+    One,
+    /// `1`, `on` or `true`, trimmed and in any case.
+    OnOffTrue,
+}
+
+impl Grammar {
+    /// Whether `value` turns a switch of this grammar on.
+    pub(crate) fn is_on(self, value: &str) -> bool {
+        match self {
+            Self::One => value == "1",
+            Self::OnOffTrue => matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "on" | "true"
+            ),
+        }
+    }
+}
+
+/// One fast-route switch.
+pub(crate) struct SwitchRow {
+    pub(crate) name: &'static str,
+    /// The grammar of the switch's own reader.
+    pub(crate) grammar: Grammar,
+    /// Tensor-only kernel families the route needs. Empty for a route of
+    /// portable kernels and for one that falls back by itself where a
+    /// kernel is unavailable.
+    pub(crate) families: &'static [TensorKernelFamily],
+}
+
+const fn row(
+    name: &'static str,
+    grammar: Grammar,
+    families: &'static [TensorKernelFamily],
+) -> SwitchRow {
+    SwitchRow {
+        name,
+        grammar,
+        families,
+    }
+}
+
+use Grammar::{OnOffTrue, One};
+
+/// Every fast-route switch of the Qwen DFlash2 route profile.
 #[rustfmt::skip]
-pub(crate) const SWITCHES: &[(&str, &[TensorKernelFamily])] = &[
+pub(crate) const SWITCHES: &[SwitchRow] = &[
     // The AF4G64 register tile: portable simdgroup kernels.
-    ("HF2Q_DFLASH2_DRAFT_AF4_G64",      &[]),
+    row("HF2Q_DFLASH2_DRAFT_AF4_G64",     One,       &[]),
     // Staged projections, ring attention, and the prepared head tile.
-    ("HF2Q_DFLASH2_DRAFT_STAGED",       &[Dflash2Af4g64Staged, Dflash2RingAttention, RepackedGgufMm]),
+    row("HF2Q_DFLASH2_DRAFT_STAGED",      One,       &[Dflash2Af4g64Staged, Dflash2RingAttention, RepackedGgufMm]),
     // Token gather and selection kernels: portable.
-    ("HF2Q_DFLASH2_GPU_TARGET_TOKENS",  &[]),
-    ("HF2Q_REPACKED_GGUF_M32",          &[RepackedGgufMm]),
-    ("HF2Q_REPACKED_GGUF_M32_PROJ",     &[RepackedGgufMm]),
-    ("HF2Q_REPACKED_GGUF_M32_HEAD",     &[RepackedGgufMm]),
+    row("HF2Q_DFLASH2_GPU_TARGET_TOKENS", OnOffTrue, &[]),
+    row("HF2Q_REPACKED_GGUF_M32",         One,       &[RepackedGgufMm]),
+    row("HF2Q_REPACKED_GGUF_M32_PROJ",    One,       &[RepackedGgufMm]),
+    row("HF2Q_REPACKED_GGUF_M32_HEAD",    One,       &[RepackedGgufMm]),
     // Modifiers of the prepared routes: they select nothing else.
-    ("HF2Q_REPACKED_GGUF_ANY_WIDTH",    &[RepackedGgufMm]),
-    ("HF2Q_REPACKED_GGUF_SHARED_HEAD",  &[RepackedGgufMm]),
+    row("HF2Q_REPACKED_GGUF_ANY_WIDTH",   One,       &[RepackedGgufMm]),
+    row("HF2Q_REPACKED_GGUF_SHARED_HEAD", One,       &[RepackedGgufMm]),
     // The tile probes its pipelines per layer and keeps the per-row chain.
-    ("HF2Q_QWEN_VERIFY_ATTN_TILE",      &[]),
-    ("HF2Q_QWEN_PREFILL_PREPARED",      &[RepackedGgufMm]),
+    row("HF2Q_QWEN_VERIFY_ATTN_TILE",     One,       &[]),
+    row("HF2Q_QWEN_PREFILL_PREPARED",     OnOffTrue, &[RepackedGgufMm]),
     // Folds only inside a routed prepared prefill; two forwards otherwise.
-    ("HF2Q_QWEN_PREFILL_FOLD_CUE",      &[]),
+    row("HF2Q_QWEN_PREFILL_FOLD_CUE",     OnOffTrue, &[]),
     // A portable fused core; its wave follows the prepared routes.
-    ("HF2Q_QWEN_VERIFY_MIXER_FUSED",    &[]),
+    row("HF2Q_QWEN_VERIFY_MIXER_FUSED",   One,       &[]),
     // Host-side storage and scheduling.
-    ("HF2Q_QWEN_VERIFY_REPLAY_REUSE",   &[]),
-    ("HF2Q_DFLASH2_CONTEXT_FIRST",      &[]),
+    row("HF2Q_QWEN_VERIFY_REPLAY_REUSE",  One,       &[]),
+    row("HF2Q_DFLASH2_CONTEXT_FIRST",     One,       &[]),
     // Row-exact matvec, top-k and reduce kernels: portable.
-    ("HF2Q_QWEN_MOE_BATCHED",           &[]),
-    ("HF2Q_QWEN_MOE_STAGED_M8",         &[GroupedM8Experts]),
-    ("HF2Q_QWEN_MOE_LIVE_TILES",        &[GroupedM8Experts, MoeExpertTiles]),
+    row("HF2Q_QWEN_MOE_BATCHED",          OnOffTrue, &[]),
+    row("HF2Q_QWEN_MOE_STAGED_M8",        OnOffTrue, &[GroupedM8Experts]),
+    row("HF2Q_QWEN_MOE_LIVE_TILES",       OnOffTrue, &[GroupedM8Experts, MoeExpertTiles]),
 ];
 
 /// Whether this host can run a switch's route.
@@ -98,7 +152,7 @@ impl HostRoute {
             Self::Unavailable(family) => Some(format!(
                 "{} cannot run on this host: {}",
                 family.name(),
-                mlx_native::TENSOR_API_UNAVAILABLE
+                mlx_native::tensor_kernel_family_unavailable_reason()
             )),
         }
     }
@@ -140,26 +194,25 @@ impl HostRoutes {
     /// The answer for the switch `name`; `None` if [`SWITCHES`] has no such
     /// switch.
     pub(crate) fn switch(&self, name: &str) -> Option<HostRoute> {
-        let (_, families) = SWITCHES.iter().find(|(switch, _)| *switch == name)?;
-        Some(
-            families
-                .iter()
-                .find(|family| !self.runs(**family))
-                .map_or(HostRoute::Runs, |family| HostRoute::Unavailable(*family)),
-        )
+        SWITCHES
+            .iter()
+            .find(|row| row.name == name)
+            .map(|row| self.route(row))
     }
 
-    /// Fail if a switch that `env` turns on cannot run on this device.
+    fn route(&self, row: &SwitchRow) -> HostRoute {
+        row.families
+            .iter()
+            .find(|family| !self.runs(**family))
+            .map_or(HostRoute::Runs, |family| HostRoute::Unavailable(*family))
+    }
+
+    /// Fail if a switch that `env` turns on, by its reader's own grammar,
+    /// cannot run on this device.
     pub(crate) fn require_explicit(&self, env: &dyn Fn(&str) -> Option<String>) -> Result<()> {
-        for (name, _) in SWITCHES {
-            let on = env(name).is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "on" | "true"
-                )
-            });
-            if let (true, Some(route @ HostRoute::Unavailable(_))) = (on, self.switch(name)) {
-                bail!("{}", self.explicit_refusal(name, route));
+        for row in selected_tensor_only(env) {
+            if let route @ HostRoute::Unavailable(_) = self.route(row) {
+                bail!("{}", self.explicit_refusal(row.name, route));
             }
         }
         Ok(())
@@ -184,15 +237,59 @@ impl HostRoutes {
         } else {
             let off = SWITCHES
                 .iter()
-                .filter(|(name, _)| self.switch(name) != Some(HostRoute::Runs))
-                .map(|(name, _)| *name)
+                .filter(|row| self.route(row) != HostRoute::Runs)
+                .map(|row| row.name)
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "{}: {}; these switches cannot run and stay off: {off}",
+                "{}: {}; these switches cannot run: {off}",
                 self.device,
-                mlx_native::TENSOR_API_UNAVAILABLE
+                mlx_native::tensor_kernel_family_unavailable_reason()
             )
+        }
+    }
+}
+
+/// The tensor-only switches `env` turns on, each by its reader's grammar.
+fn selected_tensor_only(
+    env: &dyn Fn(&str) -> Option<String>,
+) -> impl Iterator<Item = &'static SwitchRow> + '_ {
+    SWITCHES.iter().filter(move |row| {
+        !row.families.is_empty() && env(row.name).is_some_and(|value| row.grammar.is_on(&value))
+    })
+}
+
+/// The load-time rule over one probe result: a tensor-only switch `env`
+/// turns on must be runnable, and a load that selects none never fails
+/// here, also when the probe itself failed.
+fn require_selected(
+    env: &dyn Fn(&str) -> Option<String>,
+    probe: impl FnOnce() -> Result<HostRoutes>,
+) -> Result<()> {
+    match probe() {
+        Ok(host) => host.require_explicit(env),
+        Err(error) => {
+            let selected = selected_tensor_only(env)
+                .map(|row| row.name)
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                // No optional route is asked for: the stock route does not
+                // depend on this probe.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        error = format!("{error:#}"),
+                        "fast-route host capability probe failed; no tensor-only switch is \
+                         selected, the stock route is unaffected"
+                    );
+                });
+                Ok(())
+            } else {
+                Err(error.context(format!(
+                    "{} selected, and the kernel families it needs could not be probed",
+                    selected.join(", ")
+                )))
+            }
         }
     }
 }
@@ -218,6 +315,16 @@ impl HostForTest {
         Self {
             previous: TEST_HOST.with(|cell| cell.replace(Some(host))),
         }
+    }
+
+    /// A host on which every family of [`FAMILIES`] runs, whatever this
+    /// process's device answers: for a test of an admission rule itself.
+    pub(crate) fn with_tensor_api() -> Self {
+        Self::set(HostRoutes {
+            device: "host with the Metal tensor API (test)".to_owned(),
+            registry_id: 0,
+            unavailable: Vec::new(),
+        })
     }
 
     /// A host without the Metal tensor API: no family of [`FAMILIES`] runs.
@@ -277,11 +384,13 @@ pub(crate) fn probe(device: &MlxDevice) -> Result<HostRoutes> {
     Ok(HOST.get_or_init(|| host).clone())
 }
 
-/// [`probe`], then fail if a switch the process environment turns on cannot
-/// run on `device`. Called where a model's weights are uploaded, before the
-/// upload is paid for.
+/// [`probe`], then fail if a tensor-only switch the process environment
+/// turns on cannot run on `device`. Called where a model's weights are
+/// uploaded, before the upload is paid for. A load that selects no
+/// tensor-only switch does not fail here: a probe error is then logged once
+/// and the stock route loads.
 pub(crate) fn require_explicit(device: &MlxDevice) -> Result<()> {
-    probe(device)?.require_explicit(&|name| std::env::var(name).ok())
+    require_selected(&|name| std::env::var(name).ok(), || probe(device))
 }
 
 /// Whether the tensor-only family `family` may be selected: `false` only

@@ -65,11 +65,7 @@ impl PrefillScope {
         Self::with_route(route)
     }
 
-    /// The route is taken only on a host whose GPU runs the prepared
-    /// kernels ([`super::gpu_ffn::prepared_mm_runs`]); elsewhere the scope
-    /// is open with the route off, and the cue fold with it.
     fn with_route(route: bool) -> Self {
-        let route = route && super::gpu_ffn::prepared_mm_runs();
         Self {
             previous: SCOPE.with(|cell| cell.replace(route)),
         }
@@ -198,7 +194,12 @@ fn shape_admitted(ggml_type: GgmlType, in_features: u32, out_features: u32) -> b
 
 /// Whether this product of a multi-row prefill chunk takes the prepared
 /// route: the scope is open with the route on, the weight is a raw GGML block
-/// matrix, and the prepared kernel serves its shape.
+/// matrix, the prepared kernel serves its shape, and this host's GPU runs
+/// the prepared kernels ([`super::gpu_ffn::prepared_mm_runs`]). The host is
+/// asked here, at every decision, not when the scope opens: a scope opened
+/// before the host was probed must not admit a product the host cannot run.
+/// The cue fold asks this for every shared product, so it keeps its two
+/// forwards on such a host.
 pub(crate) fn admits(
     rows: u32,
     weight: &MlxBuffer,
@@ -210,6 +211,7 @@ pub(crate) fn admits(
         && SCOPE.with(Cell::get)
         && weight.dtype() == DType::U8
         && shape_admitted(ggml_type, in_features, out_features)
+        && super::gpu_ffn::prepared_mm_runs()
 }
 
 #[cfg(test)]
@@ -311,6 +313,9 @@ mod tests {
 
     #[test]
     fn route_is_admitted_only_inside_a_routed_scope_for_prepared_shapes() {
+        use crate::inference::route_host::HostForTest;
+        // The rule itself, on a host that runs the prepared kernels.
+        let _host = HostForTest::with_tensor_api();
         let device = MlxDevice::new().expect("device");
         let blocks = device
             .alloc_buffer(64, DType::U8, vec![64])
@@ -351,6 +356,16 @@ mod tests {
                 assert!(!q4k(157), "an inner scope overrides");
             }
             assert!(q4k(157), "restored on drop");
+            // The host is asked at every decision: a scope that was opened
+            // with the route on admits nothing once the host is known not
+            // to run the prepared kernels.
+            {
+                let _incapable = HostForTest::without_tensor_api();
+                assert!(!q4k(157), "a host without the prepared kernels");
+                let _reopened = PrefillScope::forced(true);
+                assert!(!q4k(157), "whatever scope is opened there");
+            }
+            assert!(q4k(157), "the host is restored on drop");
         }
         assert!(!q4k(157), "closed");
     }
