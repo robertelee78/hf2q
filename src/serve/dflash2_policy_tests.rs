@@ -9,6 +9,7 @@ use crate::inference::spec_decode::dflash2::route_profile::{switch, SwitchSource
 use crate::inference::spec_decode::dflash2::schema::{
     QWEN36_DFLASH2, QWEN36_TARGET_GEOMETRY, QWEN38_DFLASH2, QWEN38_TARGET_GEOMETRY,
 };
+use crate::serve::resident_memory::Commitment;
 
 const GIB: u64 = 1 << 30;
 
@@ -121,6 +122,7 @@ fn restored(mut facts: TargetFacts, leaves: &[&str], ggml_type: GgmlType) -> Tar
 const ROOMY: HostFacts = HostFacts {
     physical_bytes: 128 * GIB,
     kv_budget_bytes: 48 * GIB,
+    resident_bytes: 0,
 };
 
 /// A drafter store with a fixed cache state, download outcome and binding
@@ -129,6 +131,7 @@ struct Store {
     cached: bool,
     download: std::result::Result<(), &'static str>,
     bind: std::result::Result<(), &'static str>,
+    explicit: std::result::Result<(), &'static str>,
     downloads: Cell<u32>,
 }
 
@@ -138,6 +141,7 @@ impl Store {
             cached: true,
             download: Err("the cache already holds the drafter"),
             bind: Ok(()),
+            explicit: Ok(()),
             downloads: Cell::new(0),
         }
     }
@@ -176,6 +180,10 @@ impl DrafterStore for Store {
             .map_err(str::to_owned)
     }
 
+    fn explicit_usable(&self, _: &Path, _: &Path) -> std::result::Result<(), String> {
+        self.explicit.map_err(str::to_owned)
+    }
+
     fn bind(
         &self,
         descriptor: &DFlash2CheckpointDescriptor,
@@ -204,6 +212,10 @@ impl DrafterStore for Untouched {
         _: &DFlash2CheckpointDescriptor,
     ) -> std::result::Result<(PathBuf, PathBuf), String> {
         panic!("the policy downloaded a drafter")
+    }
+
+    fn explicit_usable(&self, _: &Path, _: &Path) -> std::result::Result<(), String> {
+        panic!("the policy looked at explicit drafter paths")
     }
 
     fn bind(
@@ -547,7 +559,7 @@ fn a_checkpoint_the_adapter_check_does_not_bind_is_not_used() {
 }
 
 #[test]
-fn explicit_drafter_paths_win_and_are_used_only_together() {
+fn explicit_drafter_paths_win_when_both_name_a_file() {
     let both = [
         (DFLASH2_CONFIG_ENV, "/drafter/config.json"),
         (DFLASH2_WEIGHTS_ENV, "/drafter/model.safetensors"),
@@ -555,9 +567,10 @@ fn explicit_drafter_paths_win_and_are_used_only_together() {
     for policy in [None, Some("1")] {
         let mut pairs = both.to_vec();
         pairs.extend(policy.map(|value| (DFLASH2_ENV, value)));
-        // An explicit checkpoint that is not on disk is provisioning's to
-        // report: the policy neither looks in the cache nor binds it.
-        let selection = decided(&qwen38(), &pairs, &Untouched).expect("explicit");
+        let store = Store::cached();
+        let selection = decided(&qwen38(), &pairs, &store).expect("explicit");
+        assert_eq!(store.downloads.get(), 0);
+        assert!(selection.warnings.is_empty());
         let plan = selection.plan.expect("selected");
         assert_eq!(plan.source, DrafterSource::Explicit);
         assert_eq!(plan.config_path, PathBuf::from("/drafter/config.json"));
@@ -566,16 +579,66 @@ fn explicit_drafter_paths_win_and_are_used_only_together() {
             PathBuf::from("/drafter/model.safetensors")
         );
     }
-    let one = [(DFLASH2_CONFIG_ENV, "/drafter/config.json")];
-    let selection = decided(&qwen38(), &one, &Store::cached()).expect("auto");
-    assert_eq!(
-        selection.plan.as_ref().map(|plan| plan.source),
-        Some(DrafterSource::Cache)
-    );
-    assert_eq!(selection.warnings.len(), 1);
-    assert!(selection.warnings[0].contains("used only together"));
-    let error = decided(&qwen38(), &[one[0], (DFLASH2_ENV, "1")], &Store::cached()).unwrap_err();
-    assert!(error.to_string().contains("used only together"), "{error}");
+    // The kill switch does not read them, usable or not.
+    let mut pairs = both.to_vec();
+    pairs.push((DFLASH2_ENV, "0"));
+    assert_prior_route(&decided(&qwen38(), &pairs, &Untouched).expect("off"), &[]);
+}
+
+#[test]
+fn stale_or_incomplete_drafter_paths_never_stop_auto_and_always_stop_required() {
+    let stale = Store {
+        explicit: Err("HF2Q_DFLASH2_CONFIG=/gone/config.json is not a file"),
+        ..Store::cached()
+    };
+    let both = [
+        (DFLASH2_CONFIG_ENV, "/gone/config.json"),
+        (DFLASH2_WEIGHTS_ENV, "/gone/model.safetensors"),
+    ];
+    let cases: [(&[(&str, &str)], &str); 3] = [
+        (&both, "is not a file"),
+        (&both[..1], "used only together"),
+        (&both[1..], "used only together"),
+    ];
+    for (pairs, reason) in cases {
+        // Auto reports the pair and serves with the pinned drafter.
+        let selection = decided(&qwen38(), pairs, &stale).expect("auto never fails");
+        assert_eq!(
+            selection.plan.as_ref().map(|plan| plan.source),
+            Some(DrafterSource::Cache),
+            "{pairs:?}"
+        );
+        let [warning] = selection.warnings.as_slice() else {
+            panic!("one WARN line, got {:?}", selection.warnings);
+        };
+        assert!(warning.contains(reason), "{warning}");
+        assert!(
+            warning.contains("resolving the pinned drafter"),
+            "{warning}"
+        );
+        assert_eq!(selection.routes.profile(), Some(RouteProfile::Qwen38));
+
+        // With no pinned drafter to resolve either, auto keeps the prior
+        // route; it still does not fail.
+        let nothing = Store {
+            explicit: stale.explicit,
+            ..Store::empty(Err("HF_HUB_OFFLINE is set"))
+        };
+        let fallback = decided(&qwen38(), pairs, &nothing).expect("auto never fails");
+        assert_prior_route(&fallback, pairs);
+        assert_eq!(fallback.warnings.len(), 2);
+
+        // Required refuses the pair it was given.
+        let mut required = pairs.to_vec();
+        required.push((DFLASH2_ENV, "1"));
+        let error = decided(&qwen38(), &required, &stale).unwrap_err();
+        assert!(error.to_string().contains(reason), "{error}");
+
+        // The kill switch ignores it.
+        let mut kill = pairs.to_vec();
+        kill.push((DFLASH2_ENV, "0"));
+        assert_prior_route(&decided(&qwen38(), &kill, &Untouched).expect("off"), pairs);
+    }
 }
 
 #[test]
@@ -862,39 +925,71 @@ fn prepared_plane_bytes_follow_the_native_layout() {
 
 #[test]
 fn memory_rule_is_headroom_against_drafter_and_planes() {
-    let host = |physical_gib: u64, kv_gib: u64| HostFacts {
+    let host = |physical_gib: u64, kv_gib: u64, resident_gib: u64| HostFacts {
         physical_bytes: physical_gib * GIB,
         kv_budget_bytes: kv_gib * GIB,
+        resident_bytes: resident_gib * GIB,
     };
-    // headroom = 64 - 16 - 0 - 8 = 40 GiB.
-    let (verdict, headroom) = memory_verdict(host(64, 0), 16 * GIB, 4 * GIB, 16 * GIB);
+    // headroom = 64 - 0 - 16 - 0 - 8 = 40 GiB.
+    let (verdict, headroom) = memory_verdict(host(64, 0, 0), 16 * GIB, 4 * GIB, 16 * GIB, 0);
     assert_eq!(headroom, 40 * GIB);
     assert_eq!(verdict, MemoryVerdict::Full);
     // Exactly at the bound is admitted; one byte over is not.
     assert_eq!(
-        memory_verdict(host(64, 0), 16 * GIB, 4 * GIB, 36 * GIB).0,
+        memory_verdict(host(64, 0, 0), 16 * GIB, 4 * GIB, 36 * GIB, 0).0,
         MemoryVerdict::Full
     );
     assert_eq!(
-        memory_verdict(host(64, 0), 16 * GIB, 4 * GIB, 36 * GIB + 1).0,
+        memory_verdict(host(64, 0, 0), 16 * GIB, 4 * GIB, 36 * GIB + 1, 0).0,
         MemoryVerdict::DropPlanes
     );
     // The KV budget comes out of the headroom: 64 - 16 - 32 - 8 = 8 GiB.
-    let (verdict, headroom) = memory_verdict(host(64, 32), 16 * GIB, 4 * GIB, 16 * GIB);
+    let (verdict, headroom) = memory_verdict(host(64, 32, 0), 16 * GIB, 4 * GIB, 16 * GIB, 0);
     assert_eq!(headroom, 8 * GIB);
     assert_eq!(verdict, MemoryVerdict::DropPlanes);
+    // So does what resident engines have committed: 128 - 60 - 16 - 32 - 8.
+    let (verdict, headroom) = memory_verdict(host(128, 32, 60), 16 * GIB, 4 * GIB, 16 * GIB, 0);
+    assert_eq!(headroom, 12 * GIB);
+    assert_eq!(verdict, MemoryVerdict::DropPlanes);
     assert_eq!(
-        memory_verdict(host(64, 32), 16 * GIB, 8 * GIB, 0).0,
+        memory_verdict(host(128, 32, 52), 16 * GIB, 4 * GIB, 16 * GIB, 0).0,
         MemoryVerdict::Full
     );
     assert_eq!(
-        memory_verdict(host(64, 32), 16 * GIB, 8 * GIB + 1, 0).0,
+        memory_verdict(host(64, 32, 0), 16 * GIB, 8 * GIB, 0, 0).0,
+        MemoryVerdict::Full
+    );
+    assert_eq!(
+        memory_verdict(host(64, 32, 0), 16 * GIB, 8 * GIB + 1, 0, 0).0,
+        MemoryVerdict::NoDrafter
+    );
+    // What the drafter-only route still retains counts against the drafter.
+    assert_eq!(
+        memory_verdict(host(64, 32, 0), 16 * GIB, 7 * GIB, 16 * GIB, GIB).0,
+        MemoryVerdict::DropPlanes
+    );
+    assert_eq!(
+        memory_verdict(host(64, 32, 0), 16 * GIB, 7 * GIB, 16 * GIB, GIB + 1).0,
         MemoryVerdict::NoDrafter
     );
     // A machine smaller than the model has no headroom, not a wrapped one.
-    let (verdict, headroom) = memory_verdict(host(16, 48), 21 * GIB, GIB, 0);
+    let (verdict, headroom) = memory_verdict(host(16, 48, 64), 21 * GIB, GIB, 0, 0);
     assert_eq!(headroom, 0);
     assert_eq!(verdict, MemoryVerdict::NoDrafter);
+}
+
+/// A host with exactly `headroom` bytes left for `facts` once `resident`
+/// bytes of other engines are counted.
+fn host_with_headroom(facts: &TargetFacts, headroom: u64, resident: u64) -> HostFacts {
+    HostFacts {
+        physical_bytes: facts.model_file_bytes
+            + MEMORY_RESERVE_BYTES
+            + 4 * GIB
+            + resident
+            + headroom,
+        kv_budget_bytes: 4 * GIB,
+        resident_bytes: resident,
+    }
 }
 
 #[test]
@@ -905,14 +1000,10 @@ fn insufficient_memory_drops_the_planes_then_the_drafter() {
         &facts.tensors,
         &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
     );
-    let host_with_headroom = |headroom: u64| HostFacts {
-        physical_bytes: facts.model_file_bytes + MEMORY_RESERVE_BYTES + 4 * GIB + headroom,
-        kv_budget_bytes: 4 * GIB,
-    };
     let decide_on = |headroom: u64, pairs: &[(&str, &str)]| {
         decide(
             &facts,
-            host_with_headroom(headroom),
+            host_with_headroom(&facts, headroom, 0),
             &env(pairs),
             &Store::cached(),
             &|_| None,
@@ -925,9 +1016,21 @@ fn insufficient_memory_drops_the_planes_then_the_drafter() {
         full.memory,
         Some(MemoryEstimate {
             headroom_bytes: drafter + planes,
+            resident_bytes: 0,
             drafter_bytes: drafter,
             plane_bytes: planes,
+            scratch_bytes: 0,
         })
+    );
+    assert_eq!(
+        full.commitment,
+        Commitment {
+            model_file_bytes: facts.model_file_bytes,
+            kv_budget_bytes: 4 * GIB,
+            drafter_bytes: drafter,
+            plane_bytes: planes,
+            scratch_bytes: 0,
+        }
     );
 
     // One byte short: DFlash2 stays, every plane-carrying profile row goes,
@@ -967,14 +1070,18 @@ fn insufficient_memory_drops_the_planes_then_the_drafter() {
         .withheld_audit()
         .contains("HF2Q_REPACKED_GGUF_M32: its prepared planes do not fit in memory"));
     assert_eq!(dropped.memory.map(|memory| memory.plane_bytes), Some(0));
+    assert_eq!(dropped.commitment.plane_bytes, 0);
+    assert_eq!(dropped.commitment.drafter_bytes, drafter);
 
-    // An explicit plane switch is the operator's and stays.
-    let kept = decide_on(drafter, &[("HF2Q_REPACKED_GGUF_M32", "1")]).expect("drafter fits");
+    // An explicit plane switch is the operator's: it is never dropped, and
+    // its planes count against the drafter.
+    let ffn = plane_bytes(&facts.tensors, &[PlaneSet::DenseFfn]);
+    let forced: &[(&str, &str)] = &[("HF2Q_REPACKED_GGUF_M32", "1")];
+    let kept = decide_on(drafter + ffn, forced).expect("drafter and forced planes fit");
+    assert!(kept.selected());
     assert!(kept.routes.is_one(switch("HF2Q_REPACKED_GGUF_M32")));
-    assert_eq!(
-        kept.memory.map(|memory| memory.plane_bytes),
-        Some(plane_bytes(&facts.tensors, &[PlaneSet::DenseFfn]))
-    );
+    assert_eq!(kept.memory.map(|memory| memory.plane_bytes), Some(ffn));
+    assert_prior_route(&decide_on(drafter + ffn - 1, forced).expect("auto"), forced);
 
     // The drafter alone does not fit: auto keeps the prior route.
     let none = decide_on(drafter - 1, &[]).expect("auto never fails");
@@ -984,11 +1091,264 @@ fn insufficient_memory_drops_the_planes_then_the_drafter() {
         "{}",
         none.reason
     );
+    assert_eq!(none.commitment.total(), facts.model_file_bytes + 4 * GIB);
     // Required keeps the drafter, without the planes, and says so.
     let required = decide_on(drafter - 1, &[(DFLASH2_ENV, "1")]).expect("required");
     assert!(required.selected());
     assert!(required.routes.any_withheld());
     assert!(required.warnings.iter().any(|w| w.contains("does not fit")));
+}
+
+#[test]
+fn a_second_model_is_admitted_against_what_the_first_holds_resident() {
+    use crate::serve::resident_memory::Ledger;
+    // One host, sized so that one Qwen3.8 with its whole profile fits and
+    // leaves less than a second profile's planes.
+    let facts = qwen38();
+    let drafter = QWEN38_DFLASH2.weights_bytes;
+    let planes = plane_bytes(
+        &facts.tensors,
+        &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
+    );
+    let kv = 4 * GIB;
+    let one_engine = facts.model_file_bytes + kv + drafter + planes;
+    let physical = MEMORY_RESERVE_BYTES + 2 * one_engine - 1;
+    let ledger = Ledger::new();
+    let load = |pairs: &[(&str, &str)]| {
+        let selection = decide(
+            &facts,
+            HostFacts {
+                physical_bytes: physical,
+                kv_budget_bytes: kv,
+                resident_bytes: ledger.total(),
+            },
+            &env(pairs),
+            &Store::cached(),
+            &|_| None,
+        )
+        .expect("auto never fails");
+        let reservation = ledger.reserve(Path::new("/model.gguf"), selection.commitment);
+        (selection, reservation)
+    };
+
+    let (first, first_reservation) = load(&[]);
+    assert_eq!(first.profile_label(), "full");
+    assert_eq!(ledger.total(), one_engine);
+
+    // One byte short of a second whole profile: the second engine keeps the
+    // drafter and loses the planes, although alone it would get them all.
+    let (second, second_reservation) = load(&[]);
+    assert!(second.selected());
+    assert_eq!(second.profile_label(), "partial");
+    assert_eq!(
+        second.memory.map(|memory| memory.resident_bytes),
+        Some(one_engine)
+    );
+    assert!(
+        second.reason.contains("resident engines"),
+        "{}",
+        second.reason
+    );
+    assert_eq!(ledger.total(), 2 * one_engine - planes);
+
+    // A third finds no room for a drafter and keeps the prior route; its
+    // model file and KV budget are committed all the same.
+    let (third, third_reservation) = load(&[]);
+    assert_prior_route(&third, &[]);
+    assert_eq!(third.commitment.total(), facts.model_file_bytes + kv);
+    drop(third_reservation);
+
+    // The kill switch commits the model and its KV budget only.
+    let (kill, kill_reservation) = load(&[(DFLASH2_ENV, "0")]);
+    assert_eq!(kill.commitment.total(), facts.model_file_bytes + kv);
+    drop(kill_reservation);
+
+    // A load that fails on the DFlash2 route and is retried on the prior
+    // route amends its commitment.
+    second_reservation.amend(second.without_dflash2("test").commitment);
+    assert_eq!(ledger.total(), one_engine + facts.model_file_bytes + kv);
+    drop(second_reservation);
+
+    // Once the first engine is unloaded a new one gets the whole profile.
+    drop(first_reservation);
+    assert_eq!(ledger.total(), 0);
+    let (again, _reservation) = load(&[]);
+    assert_eq!(again.profile_label(), "full");
+}
+
+#[test]
+fn separate_prepared_heads_are_counted_unless_the_model_shares_one() {
+    let facts = qwen38();
+    let head = plane_bytes(&facts.tensors, &[PlaneSet::Head]);
+    assert_eq!(head, 1_052_876_800);
+    let drafter = QWEN38_DFLASH2.weights_bytes;
+    let other = plane_bytes(&facts.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections]);
+    let unshared: &[(&str, &str)] = &[("HF2Q_REPACKED_GGUF_SHARED_HEAD", "0")];
+    let planes_of = |facts: &TargetFacts, pairs: &[(&str, &str)]| {
+        let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(pairs));
+        routed_plane_bytes(facts, &routes)
+    };
+    // Shared: one head for the staged draft and the prepared target head.
+    assert_eq!(planes_of(&facts, &[]), other + head);
+    // Not shared: each consumer prepares its own.
+    assert_eq!(planes_of(&facts, unshared), other + 2 * head);
+    // One consumer, one head, shared or not.
+    for pairs in [
+        &[("HF2Q_REPACKED_GGUF_M32_HEAD", "0")][..],
+        &[
+            ("HF2Q_REPACKED_GGUF_M32_HEAD", "0"),
+            ("HF2Q_REPACKED_GGUF_SHARED_HEAD", "0"),
+        ][..],
+        &[("HF2Q_DFLASH2_DRAFT_STAGED", "0")][..],
+    ] {
+        assert_eq!(planes_of(&facts, pairs), other + head, "{pairs:?}");
+    }
+    // Below four lanes the staged draft does not project on the prepared
+    // tile and prepares no head.
+    let three_slots = TargetFacts {
+        slots: Some(3),
+        ..qwen38()
+    };
+    assert_eq!(planes_of(&three_slots, unshared), other + head);
+    assert_eq!(
+        planes_of(&three_slots, &[("HF2Q_REPACKED_GGUF_M32_HEAD", "0")]),
+        other
+    );
+
+    // At the memory boundary the second head decides, both ways.
+    let decide_on = |headroom: u64, pairs: &[(&str, &str)]| {
+        decide(
+            &facts,
+            host_with_headroom(&facts, headroom, 0),
+            &env(pairs),
+            &Store::cached(),
+            &|_| None,
+        )
+        .expect("auto")
+    };
+    let one_head = drafter + other + head;
+    assert_eq!(decide_on(one_head, &[]).profile_label(), "full");
+    assert_eq!(decide_on(one_head, unshared).profile_label(), "partial");
+    let both_heads = decide_on(one_head + head, unshared);
+    assert!(!both_heads.routes.any_withheld());
+    assert_eq!(both_heads.commitment.plane_bytes, other + 2 * head);
+    assert_eq!(
+        decide_on(one_head + head - 1, unshared)
+            .commitment
+            .plane_bytes,
+        0
+    );
+}
+
+#[test]
+fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
+    let bound = |facts: &TargetFacts, pairs: &[(&str, &str)]| {
+        route_upper_bound(facts, &env(pairs), &|_| None)
+    };
+    let dense = qwen38();
+    let planes = plane_bytes(
+        &dense.tensors,
+        &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
+    );
+    assert_eq!(bound(&dense, &[]), QWEN38_DFLASH2.weights_bytes + planes);
+    assert_eq!(bound(&dense, &[(DFLASH2_ENV, "1")]), bound(&dense, &[]));
+    assert_eq!(bound(&dense, &[(DFLASH2_ENV, "0")]), 0);
+    // With the prepared verify routes off the prepared prefill still
+    // prepares the FFN and projection planes, and the staged draft a head.
+    assert_eq!(
+        bound(&dense, &[("HF2Q_REPACKED_GGUF_M32", "0")]),
+        QWEN38_DFLASH2.weights_bytes + planes
+    );
+    assert_eq!(
+        bound(
+            &dense,
+            &[
+                ("HF2Q_REPACKED_GGUF_M32", "0"),
+                ("HF2Q_QWEN_PREFILL_PREPARED", "0"),
+                ("HF2Q_DFLASH2_DRAFT_STAGED", "0"),
+            ]
+        ),
+        QWEN38_DFLASH2.weights_bytes
+    );
+    // A target that does not qualify holds nothing beside its file.
+    let serial = TargetFacts {
+        slots: None,
+        ..qwen38()
+    };
+    assert_eq!(bound(&serial, &[]), 0);
+    // A host that cannot run the prepared kernels prepares no planes.
+    assert_eq!(
+        route_upper_bound(&dense, &env(&[]), &|name| {
+            (name != "HF2Q_DFLASH2_DRAFT_AF4_G64").then(|| "no tensor API".to_owned())
+        }),
+        QWEN38_DFLASH2.weights_bytes
+    );
+}
+
+#[test]
+fn the_published_decision_names_what_ran() {
+    let selection = decided(
+        &TargetFacts {
+            provenance: Provenance::External,
+            ..qwen38()
+        },
+        &[("HF2Q_QWEN_VERIFY_ATTN_TILE", "0")],
+        &Store::cached(),
+    )
+    .expect("auto");
+    let published = selection.published();
+    assert_eq!(published["policy"], "auto");
+    assert_eq!(published["selected"], true);
+    assert_eq!(published["descriptor"], QWEN38_DFLASH2.id);
+    assert_eq!(published["qualification"], "same_shapes");
+    assert_eq!(published["target_source"], "external");
+    assert_eq!(published["drafter_source"], "cache");
+    assert_eq!(published["profile"], "full");
+    let switches = published["switches"].as_object().expect("switches");
+    assert_eq!(switches.len(), SWITCHES.len());
+    assert_eq!(
+        switches["HF2Q_REPACKED_GGUF_M32"],
+        serde_json::json!({"value": "1", "source": "profile", "withheld": null})
+    );
+    assert_eq!(
+        switches["HF2Q_QWEN_VERIFY_ATTN_TILE"],
+        serde_json::json!({"value": "0", "source": "env", "withheld": null})
+    );
+    assert_eq!(
+        published["memory"]["drafter_bytes"],
+        QWEN38_DFLASH2.weights_bytes
+    );
+    assert_eq!(
+        published["memory"]["prepared_plane_bytes"],
+        selection.commitment.plane_bytes
+    );
+
+    let kill = decided(&qwen38(), &[(DFLASH2_ENV, "0")], &Untouched)
+        .expect("off")
+        .published();
+    assert_eq!(kill["policy"], "off");
+    assert_eq!(kill["selected"], false);
+    assert_eq!(kill["qualification"], serde_json::Value::Null);
+    assert_eq!(kill["profile"], "none");
+    assert_eq!(
+        kill["switches"]["HF2Q_REPACKED_GGUF_M32"]["source"],
+        "default"
+    );
+
+    let withheld = decide(&qwen38(), ROOMY, &env(&[]), &Store::cached(), &|name| {
+        (name == "HF2Q_REPACKED_GGUF_M32").then(|| "no tensor API".to_owned())
+    })
+    .expect("auto")
+    .published();
+    assert_eq!(withheld["profile"], "partial");
+    assert_eq!(
+        withheld["switches"]["HF2Q_REPACKED_GGUF_M32"],
+        serde_json::json!({
+            "value": null,
+            "source": "withheld",
+            "withheld": "this host cannot run it: no tensor API"
+        })
+    );
 }
 
 #[test]

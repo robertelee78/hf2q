@@ -1374,6 +1374,7 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
         inner: Arc::new(EngineInner {
             tx,
             supervisor: EngineSupervisor::new(),
+            memory_reservation: None,
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("synth-kv-bridge-test"),
             arch: LoadedArch::Gemma,
@@ -1433,6 +1434,7 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
         inner: Arc::new(EngineInner {
             tx,
             supervisor: EngineSupervisor::new(),
+            memory_reservation: None,
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("iter-215-test-model"),
             arch,
@@ -1509,6 +1511,7 @@ pub(crate) fn make_synthetic_engine_over_budget(
         inner: Arc::new(EngineInner {
             tx,
             supervisor: EngineSupervisor::new(),
+            memory_reservation: None,
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("a5d-over-budget-test-model"),
             arch,
@@ -1575,6 +1578,7 @@ pub(crate) fn make_synthetic_engine_aggregate_stream_pressure(arch: LoadedArch) 
         inner: Arc::new(EngineInner {
             tx,
             supervisor: EngineSupervisor::new(),
+            memory_reservation: None,
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("aggregate-stream-pressure-test-model"),
             arch,
@@ -1661,6 +1665,7 @@ pub(crate) fn make_synthetic_engine_that_panics(
         inner: Arc::new(EngineInner {
             tx,
             supervisor,
+            memory_reservation: None,
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("panic-test-model"),
             arch,
@@ -1750,6 +1755,7 @@ pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
         inner: Arc::new(EngineInner {
             tx,
             supervisor: EngineSupervisor::new(),
+            memory_reservation: None,
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("a5d-worker-error-test-model"),
             arch,
@@ -1788,6 +1794,11 @@ pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
 
 struct EngineInner {
     tx: mpsc::Sender<Request>,
+    /// What this engine holds of the host's memory, reserved by
+    /// `serve::load_engine` before the load and released when the engine is
+    /// dropped. It carries the route decision `/hf2q/v1/runtime` publishes.
+    /// `None` for an engine that was not loaded through `load_engine`.
+    memory_reservation: Option<crate::serve::resident_memory::Reservation>,
     /// Independent one-way health state for a worker that may remain alive
     /// while blocked forever inside Objective-C/Metal.
     supervisor: EngineSupervisor,
@@ -4392,6 +4403,7 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 tx,
                 supervisor,
+                memory_reservation: None,
                 worker_handle: Mutex::new(Some(worker_handle)),
                 info,
                 arch,
@@ -4996,6 +5008,7 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 tx,
                 supervisor,
+                memory_reservation: None,
                 worker_handle: Mutex::new(Some(worker_handle)),
                 info,
                 arch,
@@ -5262,6 +5275,28 @@ impl Engine {
     /// loading through a retained descriptor. The worker keeps the retained
     /// `/dev/fd` path as its byte authority; banners and APIs show the stable
     /// logical model location selected by the operator.
+    /// Attach the memory reservation `serve::load_engine` made for this
+    /// engine; it is released when the engine is dropped.
+    pub(crate) fn with_memory_reservation(
+        mut self,
+        reservation: crate::serve::resident_memory::Reservation,
+    ) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("newly loaded engine is uniquely owned before pool publication")
+            .memory_reservation = Some(reservation);
+        self
+    }
+
+    /// The route decision this engine was loaded with (ADR-067 D6), as
+    /// `/hf2q/v1/runtime` publishes it; `None` for an engine that was not
+    /// loaded through `serve::load_engine`.
+    pub(crate) fn route_decision(&self) -> Option<serde_json::Value> {
+        self.inner
+            .memory_reservation
+            .as_ref()
+            .and_then(crate::serve::resident_memory::Reservation::published)
+    }
+
     pub(crate) fn with_operator_model_path(mut self, logical_path: &Path) -> Self {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("newly loaded engine is uniquely owned before pool publication");
@@ -34852,6 +34887,7 @@ assistant:
             inner: Arc::new(EngineInner {
                 tx,
                 supervisor: EngineSupervisor::new(),
+                memory_reservation: None,
                 worker_handle: Mutex::new(Some(handle)),
                 info: synthetic_load_info("test-model"),
                 arch,
@@ -36740,6 +36776,7 @@ assistant:
             inner: Arc::new(EngineInner {
                 tx,
                 supervisor: EngineSupervisor::new(),
+                memory_reservation: None,
                 worker_handle: Mutex::new(Some(handle)),
                 info: synthetic_load_info("synth-kv"),
                 arch: LoadedArch::Gemma,

@@ -30,7 +30,7 @@ use mlx_native::GgmlType;
 use crate::core::provenance::Provenance;
 use crate::inference::spec_decode::dflash2::config::DFlash2TargetShape;
 use crate::inference::spec_decode::dflash2::route_profile::{
-    turns_on, PlaneSet, ResolvedRoutes, RouteProfile, SwitchRow, SWITCHES,
+    switch, turns_on, PlaneSet, ResolvedRoutes, RouteProfile, Switch, SwitchRow, SWITCHES,
 };
 use crate::inference::spec_decode::dflash2::schema::{
     DFlash2CheckpointDescriptor, DFlash2FamilyAdapter, QwenTargetGeometry,
@@ -38,6 +38,7 @@ use crate::inference::spec_decode::dflash2::schema::{
 };
 use crate::inference::spec_decode::dflash2::weights::DFlash2WeightsFile;
 use crate::serve::api::engine::EngineMode;
+use crate::serve::resident_memory::Commitment;
 
 /// The policy switch.
 pub(crate) const DFLASH2_ENV: &str = "HF2Q_DFLASH2";
@@ -129,6 +130,15 @@ pub(crate) enum QualifiedClass {
     SameShapes,
 }
 
+impl QualifiedClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PinnedPair => "pinned_pair",
+            Self::SameShapes => "same_shapes",
+        }
+    }
+}
+
 /// The drafter a model's worker provisions.
 #[derive(Clone, Debug)]
 pub(crate) struct DFlash2Plan {
@@ -167,42 +177,6 @@ pub(crate) struct TargetFacts {
     pub(crate) chunk_scan_prefill: bool,
 }
 
-/// SHA-256 over the tokenizer pre-type, vocabulary and merges of a GGUF:
-/// for each section its name, its entry count and every entry
-/// length-prefixed (all counts little-endian `u64`).
-pub(crate) fn tokenizer_identity(gguf: &GgufFile) -> Option<String> {
-    use mlx_native::gguf::MetadataValue;
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    let mut section = |name: &str, entries: &[&str]| {
-        hasher.update(name.as_bytes());
-        hasher.update((entries.len() as u64).to_le_bytes());
-        for entry in entries {
-            hasher.update((entry.len() as u64).to_le_bytes());
-            hasher.update(entry.as_bytes());
-        }
-    };
-    let strings = |key: &str| -> Option<Vec<&str>> {
-        match gguf.metadata(key)? {
-            MetadataValue::Array(values) => values
-                .iter()
-                .map(|value| match value {
-                    MetadataValue::String(text) => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect(),
-            _ => None,
-        }
-    };
-    section("pre", &[gguf.metadata_string("tokenizer.ggml.pre")?]);
-    section("tokens", &strings("tokenizer.ggml.tokens")?);
-    section(
-        "merges",
-        &strings("tokenizer.ggml.merges").unwrap_or_default(),
-    );
-    Some(hex::encode(hasher.finalize()))
-}
-
 /// The geometry of a Qwen target, from its GGUF header alone.
 pub(crate) fn read_geometry(gguf: &GgufFile) -> Option<QwenTargetGeometry> {
     let architecture = gguf.metadata_string("general.architecture")?;
@@ -232,7 +206,9 @@ pub(crate) fn read_geometry(gguf: &GgufFile) -> Option<QwenTargetGeometry> {
         embedding_shape: shape("token_embd.weight")?,
         // A target without `output.weight` ties its head to the embedding.
         head_shape: shape("output.weight").or_else(|| shape("token_embd.weight"))?,
-        tokenizer_sha256: tokenizer_identity(gguf)?.into(),
+        tokenizer_sha256: crate::inference::models::qwen35::tokenizer::tokenizer_identity(gguf)
+            .ok()?
+            .into(),
     })
 }
 
@@ -292,15 +268,19 @@ pub(crate) struct HostFacts {
     pub(crate) physical_bytes: u64,
     /// The configured aggregate KV budget; zero when none is configured.
     pub(crate) kv_budget_bytes: u64,
+    /// What the engines already resident in this process have committed
+    /// (`serve::resident_memory`).
+    pub(crate) resident_bytes: u64,
 }
 
 impl HostFacts {
-    pub(crate) fn read(kv_budget_bytes: Option<u64>) -> Self {
+    pub(crate) fn read(kv_budget_bytes: Option<u64>, resident_bytes: u64) -> Self {
         let mut system = sysinfo::System::new();
         system.refresh_memory();
         Self {
             physical_bytes: system.total_memory(),
             kv_budget_bytes: kv_budget_bytes.unwrap_or(0),
+            resident_bytes,
         }
     }
 }
@@ -316,6 +296,13 @@ pub(crate) trait DrafterStore {
         &self,
         descriptor: &DFlash2CheckpointDescriptor,
     ) -> std::result::Result<(PathBuf, PathBuf), String>;
+    /// Whether an explicitly named checkpoint can be used at all; the error
+    /// is why not (a path that is not a file).
+    fn explicit_usable(
+        &self,
+        config_path: &Path,
+        weights_path: &Path,
+    ) -> std::result::Result<(), String>;
     /// Bind the located checkpoint configuration to the target's shape with
     /// the check the target adapter itself runs
     /// ([`DFlash2Config::validate_target`], what
@@ -410,6 +397,22 @@ impl DrafterStore for HubDrafterStore {
         Ok((config, weights))
     }
 
+    fn explicit_usable(
+        &self,
+        config_path: &Path,
+        weights_path: &Path,
+    ) -> std::result::Result<(), String> {
+        for (name, path) in [
+            (DFLASH2_CONFIG_ENV, config_path),
+            (DFLASH2_WEIGHTS_ENV, weights_path),
+        ] {
+            if !path.is_file() {
+                return Err(format!("{name}={} is not a file", path.display()));
+            }
+        }
+        Ok(())
+    }
+
     fn bind(
         &self,
         descriptor: &DFlash2CheckpointDescriptor,
@@ -445,12 +448,17 @@ pub(crate) struct Selection {
     pub(crate) warnings: Vec<String>,
     /// Memory rule inputs and estimates, when the rule ran.
     pub(crate) memory: Option<MemoryEstimate>,
+    /// What an engine loaded on this selection holds resident.
+    pub(crate) commitment: Commitment,
+    /// The class that qualified the target, when one did.
+    pub(crate) class: Option<QualifiedClass>,
 }
 
 impl Selection {
     fn prior_route(
         request: PolicyRequest,
         facts: &TargetFacts,
+        host: HostFacts,
         reason: impl Into<String>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Self {
@@ -463,6 +471,12 @@ impl Selection {
             target_source: facts.source_identity(),
             warnings: Vec::new(),
             memory: None,
+            commitment: Commitment {
+                model_file_bytes: facts.model_file_bytes,
+                kv_budget_bytes: host.kv_budget_bytes,
+                ..Commitment::default()
+            },
+            class: None,
         }
     }
 
@@ -488,7 +502,49 @@ impl Selection {
             target_source: self.target_source.clone(),
             warnings: Vec::new(),
             memory: None,
+            commitment: Commitment {
+                model_file_bytes: self.commitment.model_file_bytes,
+                kv_budget_bytes: self.commitment.kv_budget_bytes,
+                ..Commitment::default()
+            },
+            class: self.class,
         }
+    }
+
+    /// The decision as `/hf2q/v1/runtime` publishes it
+    /// (`measurement_snapshot.active_controls.dflash2`), so that a gate
+    /// receipt binds the route that ran and not the environment that asked.
+    pub(crate) fn published(&self) -> serde_json::Value {
+        let switches: serde_json::Map<String, serde_json::Value> = self
+            .routes
+            .entries()
+            .map(|(name, value, source, withheld)| {
+                (
+                    name.to_owned(),
+                    serde_json::json!({"value": value, "source": source, "withheld": withheld}),
+                )
+            })
+            .collect();
+        serde_json::json!({
+            "policy": self.request.label(),
+            "selected": self.selected(),
+            "reason": self.reason,
+            "descriptor": self.descriptor.map(|descriptor| descriptor.id),
+            "qualification": self.plan.as_ref().map(|plan| plan.class.label()),
+            "target_source": self.target_source,
+            "drafter_source": self.plan.as_ref().map(|plan| plan.source.label()),
+            "profile": self.profile_label(),
+            "switches": switches,
+            "memory": {
+                "model_file_bytes": self.commitment.model_file_bytes,
+                "kv_budget_bytes": self.commitment.kv_budget_bytes,
+                "drafter_bytes": self.commitment.drafter_bytes,
+                "prepared_plane_bytes": self.commitment.plane_bytes,
+                "scratch_bytes": self.commitment.scratch_bytes,
+                "headroom_bytes": self.memory.map(|memory| memory.headroom_bytes),
+                "resident_bytes": self.memory.map(|memory| memory.resident_bytes),
+            },
+        })
     }
 
     /// `full`, `partial` (some profile values withheld) or `none`.
@@ -517,8 +573,10 @@ impl Selection {
             profile = self.profile_label(),
             withheld = %self.routes.withheld_audit(),
             memory_headroom_bytes = memory.headroom_bytes,
+            resident_bytes = memory.resident_bytes,
             drafter_bytes = memory.drafter_bytes,
             prepared_plane_bytes = memory.plane_bytes,
+            scratch_bytes = memory.scratch_bytes,
             switches = %self.routes.audit(),
             "DFlash2 policy resolved"
         );
@@ -780,15 +838,69 @@ pub(crate) fn plane_bytes(tensors: &[TensorFact], sets: &[PlaneSet]) -> u64 {
         .fold(0_u64, u64::saturating_add)
 }
 
+/// Bytes of the prepared planes `routes` keep resident on this target.
+///
+/// A plane set is prepared once however many switches read it, with one
+/// exception: the output head. The staged draft (at four lanes) and the
+/// prepared target head each prepare a copy of their own unless
+/// `HF2Q_REPACKED_GGUF_SHARED_HEAD` makes the model own one for both.
+pub(crate) fn routed_plane_bytes(facts: &TargetFacts, routes: &ResolvedRoutes) -> u64 {
+    const STAGED: Switch = switch("HF2Q_DFLASH2_DRAFT_STAGED");
+    const TARGET_HEAD: Switch = switch("HF2Q_REPACKED_GGUF_M32_HEAD");
+    const SHARED_HEAD: Switch = switch("HF2Q_REPACKED_GGUF_SHARED_HEAD");
+    let other: Vec<PlaneSet> = routes
+        .plane_sets()
+        .into_iter()
+        .filter(|set| *set != PlaneSet::Head)
+        .collect();
+    // The staged draft projects its vocabulary on the prepared tile only
+    // at 32 draft rows: four lanes.
+    let consumers = u64::from(routes.is_on(STAGED) && facts.slots == Some(4))
+        + u64::from(routes.is_on(TARGET_HEAD));
+    let copies = if routes.is_on(SHARED_HEAD) {
+        consumers.min(1)
+    } else {
+        consumers
+    };
+    plane_bytes(&facts.tensors, &other)
+        .saturating_add(plane_bytes(&facts.tensors, &[PlaneSet::Head]).saturating_mul(copies))
+}
+
+/// Bytes of scratch the kernels of the table switch `row` retain between
+/// steps on `descriptor`'s target, beyond what the prior route retains.
+///
+/// The one place a route's retained scratch enters memory admission: a
+/// switch whose kernels keep scratch resident gets its measured figure
+/// here, and the memory rule, the commitment and the published decision
+/// carry it. No current row retains any.
+pub(crate) fn switch_scratch_bytes(
+    _row: &SwitchRow,
+    _descriptor: &DFlash2CheckpointDescriptor,
+) -> u64 {
+    0
+}
+
+fn routed_scratch_bytes(routes: &ResolvedRoutes, descriptor: &DFlash2CheckpointDescriptor) -> u64 {
+    SWITCHES
+        .iter()
+        .filter(|row| routes.is_on(switch(row.name)))
+        .map(|row| switch_scratch_bytes(row, descriptor))
+        .fold(0, u64::saturating_add)
+}
+
 /// The memory rule's numbers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MemoryEstimate {
-    /// Physical memory minus the model file, the configured KV budget and
-    /// [`MEMORY_RESERVE_BYTES`].
+    /// Physical memory minus what resident engines have committed, the
+    /// model file, the configured KV budget and [`MEMORY_RESERVE_BYTES`].
     pub(crate) headroom_bytes: u64,
+    /// What the engines already resident have committed.
+    pub(crate) resident_bytes: u64,
     pub(crate) drafter_bytes: u64,
     /// Prepared planes of the routes as resolved.
     pub(crate) plane_bytes: u64,
+    /// Retained scratch of the routes as resolved.
+    pub(crate) scratch_bytes: u64,
 }
 
 /// What the memory rule allows.
@@ -802,23 +914,25 @@ pub(crate) enum MemoryVerdict {
     NoDrafter,
 }
 
-/// `headroom = physical - model file - KV budget - reserve`; the full profile
-/// needs `drafter + planes <= headroom`, the drafter alone `drafter <=
-/// headroom`.
+/// `headroom = physical - resident engines - model file - KV budget -
+/// reserve`; the full profile needs `drafter + planes + scratch <=
+/// headroom`, the drafter alone `drafter + its scratch <= headroom`.
 pub(crate) fn memory_verdict(
     host: HostFacts,
     model_file_bytes: u64,
     drafter_bytes: u64,
-    profile_plane_bytes: u64,
+    full_route_bytes: u64,
+    drafter_only_route_bytes: u64,
 ) -> (MemoryVerdict, u64) {
     let headroom = host
         .physical_bytes
+        .saturating_sub(host.resident_bytes)
         .saturating_sub(model_file_bytes)
         .saturating_sub(host.kv_budget_bytes)
         .saturating_sub(MEMORY_RESERVE_BYTES);
-    let verdict = if drafter_bytes.saturating_add(profile_plane_bytes) <= headroom {
+    let verdict = if drafter_bytes.saturating_add(full_route_bytes) <= headroom {
         MemoryVerdict::Full
-    } else if drafter_bytes <= headroom {
+    } else if drafter_bytes.saturating_add(drafter_only_route_bytes) <= headroom {
         MemoryVerdict::DropPlanes
     } else {
         MemoryVerdict::NoDrafter
@@ -868,6 +982,7 @@ pub(crate) fn decide(
         return Ok(Selection::prior_route(
             request,
             facts,
+            host,
             format!("{DFLASH2_ENV}=0 keeps the prior route"),
             env,
         ));
@@ -880,7 +995,7 @@ pub(crate) fn decide(
             bail!("{DFLASH2_ENV}=1 cannot be satisfied: {reason}")
         }
         Err(Unqualified::NotServed(reason)) | Err(Unqualified::Refused(reason)) => {
-            let mut prior = Selection::prior_route(request, facts, reason.clone(), env);
+            let mut prior = Selection::prior_route(request, facts, host, reason.clone(), env);
             if required {
                 prior
                     .warnings
@@ -890,78 +1005,93 @@ pub(crate) fn decide(
         }
     };
     let withdrawn = |reason: String, warnings: Vec<String>| {
-        let mut prior = Selection::prior_route(request, facts, reason, env);
+        let mut prior = Selection::prior_route(request, facts, host, reason, env);
         prior.descriptor = Some(descriptor);
+        prior.class = Some(class);
         prior.warnings = warnings;
         prior
     };
     let mut warnings = Vec::new();
 
-    let explicit = |name: &str| {
+    let named = |name: &str| {
         env(name)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
     };
-    let files = match (explicit(DFLASH2_CONFIG_ENV), explicit(DFLASH2_WEIGHTS_ENV)) {
-        (Some(config_path), Some(weights_path)) => DrafterFiles {
+    // An explicit checkpoint is used when both variables name a file. Under
+    // auto a stale or incomplete pair never prevents startup: it is reported
+    // and the pinned drafter is resolved instead.
+    let explicit = match (named(DFLASH2_CONFIG_ENV), named(DFLASH2_WEIGHTS_ENV)) {
+        (None, None) => None,
+        (Some(config_path), Some(weights_path)) => {
+            match store.explicit_usable(&config_path, &weights_path) {
+                Ok(()) => Some((config_path, weights_path)),
+                Err(reason) if required => {
+                    bail!("{DFLASH2_ENV}=1 cannot be satisfied: {reason}")
+                }
+                Err(reason) => {
+                    warnings.push(format!(
+                        "ignoring {DFLASH2_CONFIG_ENV} and {DFLASH2_WEIGHTS_ENV}: {reason}; \
+                         resolving the pinned drafter"
+                    ));
+                    None
+                }
+            }
+        }
+        _ => {
+            let message =
+                format!("{DFLASH2_CONFIG_ENV} and {DFLASH2_WEIGHTS_ENV} are used only together");
+            if required {
+                bail!("{DFLASH2_ENV}=1: {message}");
+            }
+            warnings.push(format!(
+                "{message}; ignoring the one that is set and resolving the pinned drafter"
+            ));
+            None
+        }
+    };
+    let files = match explicit {
+        Some((config_path, weights_path)) => DrafterFiles {
             config_path,
             weights_path,
             source: DrafterSource::Explicit,
         },
-        (config, weights) => {
-            if config.is_some() || weights.is_some() {
-                let message = format!(
-                    "{DFLASH2_CONFIG_ENV} and {DFLASH2_WEIGHTS_ENV} are used only together"
-                );
-                if required {
-                    bail!("{DFLASH2_ENV}=1: {message}");
-                }
-                warnings.push(format!(
-                    "{message}; ignoring the one that is set and resolving the pinned drafter"
-                ));
-            }
-            match store.cached(descriptor) {
-                Some((config_path, weights_path)) => DrafterFiles {
+        None => match store.cached(descriptor) {
+            Some((config_path, weights_path)) => DrafterFiles {
+                config_path,
+                weights_path,
+                source: DrafterSource::Cache,
+            },
+            None => match store.download(descriptor) {
+                Ok((config_path, weights_path)) => DrafterFiles {
                     config_path,
                     weights_path,
-                    source: DrafterSource::Cache,
+                    source: DrafterSource::Downloaded,
                 },
-                None => match store.download(descriptor) {
-                    Ok((config_path, weights_path)) => DrafterFiles {
-                        config_path,
-                        weights_path,
-                        source: DrafterSource::Downloaded,
-                    },
-                    Err(reason) if required => bail!(
-                        "{DFLASH2_ENV}=1 cannot be satisfied: DFlash2 drafter {}@{} is not in \
-                         the Hugging Face cache and could not be downloaded: {reason}",
-                        descriptor.repository,
-                        descriptor.revision
-                    ),
-                    Err(reason) => {
-                        warnings.push(format!(
-                            "DFlash2 drafter unavailable repository={} revision={} reason={reason}; \
-                             serving the prior route",
-                            descriptor.repository, descriptor.revision
-                        ));
-                        return Ok(withdrawn(
-                            format!("drafter unavailable: {reason}"),
-                            warnings,
-                        ));
-                    }
-                },
-            }
-        }
+                Err(reason) if required => bail!(
+                    "{DFLASH2_ENV}=1 cannot be satisfied: DFlash2 drafter {}@{} is not in the \
+                     Hugging Face cache and could not be downloaded: {reason}",
+                    descriptor.repository,
+                    descriptor.revision
+                ),
+                Err(reason) => {
+                    warnings.push(format!(
+                        "DFlash2 drafter unavailable repository={} revision={} reason={reason}; \
+                         serving the prior route",
+                        descriptor.repository, descriptor.revision
+                    ));
+                    return Ok(withdrawn(
+                        format!("drafter unavailable: {reason}"),
+                        warnings,
+                    ));
+                }
+            },
+        },
     };
 
     // The drafter is bound to this target by the adapter's own shape check,
-    // here on the header and again on the loaded model at provisioning. An
-    // explicit checkpoint that cannot be read is left to provisioning, which
-    // reports it as it always has.
-    if let (Some(geometry), true) = (
-        facts.geometry.as_ref(),
-        files.source != DrafterSource::Explicit || files.config_path.is_file(),
-    ) {
+    // here on the header and again on the loaded model at provisioning.
+    if let Some(geometry) = facts.geometry.as_ref() {
         let shape = DFlash2TargetShape {
             architecture: &facts.architecture,
             hidden_size: geometry.hidden_size as usize,
@@ -986,9 +1116,9 @@ pub(crate) fn decide(
         }
     }
 
-    // The profile is applied switch by switch: a row this artifact's storage
-    // does not admit keeps its own default, and the drafter serves with the
-    // rows that are left.
+    // The profile is applied switch by switch: a row this host cannot run,
+    // or this artifact's storage does not admit, keeps its own default, and
+    // the drafter serves with the rows that are left.
     let profile = RouteProfile::of(descriptor);
     let refusal = |row: &SwitchRow| {
         host_refusal(row.name)
@@ -996,17 +1126,32 @@ pub(crate) fn decide(
             .or_else(|| switch_refusal(facts, row))
     };
     let admitted = ResolvedRoutes::resolve(profile, &refusal, env);
-    let admitted_planes = plane_bytes(&facts.tensors, &admitted.plane_sets());
+    let dropped = ResolvedRoutes::resolve(
+        profile,
+        &|row| refusal(row).or_else(|| (!row.planes.is_empty()).then(|| MEMORY_REFUSAL.to_owned())),
+        env,
+    );
+    let route_bytes = |routes: &ResolvedRoutes| {
+        (
+            routed_plane_bytes(facts, routes),
+            routed_scratch_bytes(routes, descriptor),
+        )
+    };
+    let (admitted_planes, admitted_scratch) = route_bytes(&admitted);
+    let (dropped_planes, dropped_scratch) = route_bytes(&dropped);
     let (verdict, headroom) = memory_verdict(
         host,
         facts.model_file_bytes,
         descriptor.weights_bytes,
-        admitted_planes,
+        admitted_planes.saturating_add(admitted_scratch),
+        dropped_planes.saturating_add(dropped_scratch),
     );
     let formula = format!(
-        "headroom {} = physical {} - model file {} - KV budget {} - reserve {}",
+        "headroom {} = physical {} - resident engines {} - model file {} - KV budget {} - \
+         reserve {}",
         gib(headroom),
         gib(host.physical_bytes),
+        gib(host.resident_bytes),
         gib(facts.model_file_bytes),
         gib(host.kv_budget_bytes),
         gib(MEMORY_RESERVE_BYTES)
@@ -1017,8 +1162,19 @@ pub(crate) fn decide(
             format!("same architecture and shapes as {}", descriptor.id)
         }
     };
-    let (routes, reason) = match verdict {
-        MemoryVerdict::Full => (admitted, qualified),
+    let estimate = |plane_bytes, scratch_bytes| MemoryEstimate {
+        headroom_bytes: headroom,
+        resident_bytes: host.resident_bytes,
+        drafter_bytes: descriptor.weights_bytes,
+        plane_bytes,
+        scratch_bytes,
+    };
+    let (routes, reason, memory) = match verdict {
+        MemoryVerdict::Full => (
+            admitted,
+            qualified,
+            estimate(admitted_planes, admitted_scratch),
+        ),
         MemoryVerdict::NoDrafter if !required => {
             let mut prior = withdrawn(
                 format!(
@@ -1027,22 +1183,10 @@ pub(crate) fn decide(
                 ),
                 warnings,
             );
-            prior.memory = Some(MemoryEstimate {
-                headroom_bytes: headroom,
-                drafter_bytes: descriptor.weights_bytes,
-                plane_bytes: 0,
-            });
+            prior.memory = Some(estimate(0, 0));
             return Ok(prior);
         }
         MemoryVerdict::DropPlanes | MemoryVerdict::NoDrafter => {
-            let dropped = ResolvedRoutes::resolve(
-                profile,
-                &|row| {
-                    refusal(row)
-                        .or_else(|| (!row.planes.is_empty()).then(|| MEMORY_REFUSAL.to_owned()))
-                },
-                env,
-            );
             if verdict == MemoryVerdict::NoDrafter {
                 warnings.push(format!(
                     "{DFLASH2_ENV}=1 keeps the drafter ({}) although it does not fit: {formula}",
@@ -1057,13 +1201,9 @@ pub(crate) fn decide(
                     gib(admitted_planes),
                     gib(descriptor.weights_bytes)
                 ),
+                estimate(dropped_planes, dropped_scratch),
             )
         }
-    };
-    let memory = MemoryEstimate {
-        headroom_bytes: headroom,
-        drafter_bytes: descriptor.weights_bytes,
-        plane_bytes: plane_bytes(&facts.tensors, &routes.plane_sets()),
     };
     Ok(Selection {
         request,
@@ -1080,15 +1220,80 @@ pub(crate) fn decide(
         target_source: facts.source_identity(),
         warnings,
         memory: Some(memory),
+        commitment: Commitment {
+            model_file_bytes: facts.model_file_bytes,
+            kv_budget_bytes: host.kv_budget_bytes,
+            drafter_bytes: memory.drafter_bytes,
+            plane_bytes: memory.plane_bytes,
+            scratch_bytes: memory.scratch_bytes,
+        },
+        class: Some(class),
     })
 }
 
+/// Upper bound of what an engine loaded from `path` holds resident beside
+/// its KV budget: the model file and, when the target qualifies for a
+/// drafter, the drafter and every prepared plane and scratch byte its
+/// storage and this host admit. The hot-swap pool admits a load against
+/// this before the loader allocates anything. `config` is the engine
+/// configuration when the caller has one; without it the target is taken
+/// to be served SlotAware with four slots.
+pub(crate) fn admission_bytes(
+    path: &Path,
+    config: Option<&crate::serve::multi_model::EngineConfig>,
+) -> Option<u64> {
+    let gguf = GgufFile::open(path).ok()?;
+    let facts = TargetFacts::read(
+        &gguf,
+        path,
+        config.map_or(EngineMode::SlotAware { max_slots: 4 }, |config| {
+            config.engine_mode
+        }),
+        config.is_some_and(|config| config.dwq_overlay_path.is_some()),
+    );
+    let env = |name: &str| std::env::var(name).ok();
+    Some(facts.model_file_bytes.saturating_add(route_upper_bound(
+        &facts,
+        &env,
+        &host_switch_refusal,
+    )))
+}
+
+/// Drafter, plane and scratch bytes of the fullest route the policy could
+/// select for `facts`: no drafter lookup and no memory rule.
+pub(crate) fn route_upper_bound(
+    facts: &TargetFacts,
+    env: &dyn Fn(&str) -> Option<String>,
+    host_refusal: &dyn Fn(&str) -> Option<String>,
+) -> u64 {
+    if !matches!(
+        parse_policy(env(DFLASH2_ENV).as_deref()),
+        Ok(PolicyRequest::Auto | PolicyRequest::Required)
+    ) {
+        return 0;
+    }
+    let Ok((descriptor, _class)) = qualify(facts) else {
+        return 0;
+    };
+    let routes = ResolvedRoutes::resolve(
+        RouteProfile::of(descriptor),
+        &|row| host_refusal(row.name).or_else(|| switch_refusal(facts, row)),
+        env,
+    );
+    descriptor
+        .weights_bytes
+        .saturating_add(routed_plane_bytes(facts, &routes))
+        .saturating_add(routed_scratch_bytes(&routes, descriptor))
+}
+
 /// [`decide`] for the model at `path` on this host and process environment.
+/// `resident_bytes` is what the engines already resident have committed.
 pub(crate) fn resolve_for_load(
     path: &Path,
     engine_mode: EngineMode,
     kv_budget_bytes: Option<u64>,
     dwq_overlay: bool,
+    resident_bytes: u64,
 ) -> Result<Selection> {
     let facts = {
         let gguf = GgufFile::open(path)
@@ -1097,7 +1302,7 @@ pub(crate) fn resolve_for_load(
     };
     decide(
         &facts,
-        HostFacts::read(kv_budget_bytes),
+        HostFacts::read(kv_budget_bytes, resident_bytes),
         &|name| std::env::var(name).ok(),
         &HubDrafterStore,
         &host_switch_refusal,

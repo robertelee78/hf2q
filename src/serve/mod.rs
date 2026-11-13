@@ -10,6 +10,7 @@ pub mod cache;
 pub mod config;
 mod deepseek4_cli;
 pub(crate) mod dflash2_policy;
+pub(crate) mod resident_memory;
 pub(crate) mod discovery;
 pub mod encoder_worker_singleton;
 // forward_mlx removed — gemma4 moved to inference::models::gemma4 (ADR-038 §3.3)
@@ -3992,14 +3993,20 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     // any weight is read. Several profile switches are consumed while the
     // weights are uploaded, and a missing drafter is fetched here, ahead of
     // the large load.
+    // Memory-carrying routes are admitted against what the engines already
+    // resident have committed; this engine's commitment is reserved before
+    // it allocates and released if the load fails or when it is unloaded.
+    let ledger = resident_memory::process();
     let selection = dflash2_policy::resolve_for_load(
         path,
         config.engine_mode,
         config.kv_cache_budget_bytes,
         config.dwq_overlay_path.is_some(),
+        ledger.total(),
     )?;
     selection.log(path);
-    match load_engine_on_route(path, config, &selection) {
+    let reservation = ledger.reserve(path, selection.commitment);
+    let (engine, selection) = match load_engine_on_route(path, config, &selection) {
         Err(error) if selection.falls_back_on_load_error() => {
             // Auto never fails startup for a reason of its own making: a
             // load that fails with DFlash2 selected is repeated on the prior
@@ -4012,10 +4019,13 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
             let prior =
                 selection.without_dflash2(format!("the DFlash2 route failed to load: {error:#}"));
             prior.log(path);
-            load_engine_on_route(path, config, &prior)
+            reservation.amend(prior.commitment);
+            (load_engine_on_route(path, config, &prior)?, prior)
         }
-        result => result,
-    }
+        result => (result?, selection),
+    };
+    reservation.publish(selection.published());
+    Ok(engine.with_memory_reservation(reservation))
 }
 
 /// Load and spawn one engine on the route `selection` resolved.

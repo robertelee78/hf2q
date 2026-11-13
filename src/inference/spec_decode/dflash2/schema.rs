@@ -47,7 +47,8 @@ pub struct QwenTargetGeometry {
     pub embedding_shape: [usize; 2],
     /// The output head the adapter projects the vocabulary with.
     pub head_shape: [usize; 2],
-    /// `serve::dflash2_policy::tokenizer_identity` of the GGUF.
+    /// `qwen35::tokenizer::tokenizer_identity` of the GGUF: pre-type,
+    /// vocabulary, merges, the atomic special-token set and the special ids.
     pub tokenizer_sha256: Cow<'static, str>,
 }
 
@@ -94,7 +95,7 @@ impl QwenTargetGeometry {
 
 /// Tokenizer identity shared by the pinned Qwen3.8 and Qwen3.6 targets.
 const QWEN_TOKENIZER_SHA256: &str =
-    "3e172426350b3a93da38cbde7a914f98a2891edcbcfcdf09e6ed217dcb322ed9";
+    "9219f5ca3e34386f338e789852257bb7089819c8b4f82fa106ce2f28dfbbb2bd";
 
 /// Geometry of `Qwen/Qwen3.8-27B`.
 pub static QWEN38_TARGET_GEOMETRY: QwenTargetGeometry = QwenTargetGeometry {

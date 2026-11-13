@@ -833,6 +833,17 @@ pub trait ModelLoader<E>: Send + Sync {
     /// chat-template resolution, or warmup; the manager treats any error
     /// as a load-failure and does NOT admit a partial entry.
     fn load(&self, path: &Path, config: &EngineConfig) -> anyhow::Result<E>;
+
+    /// Bytes an engine loaded from `path` will hold resident beside its KV
+    /// budget, when the loader knows more than the file size: the model
+    /// file plus whatever its routes keep resident (a drafter, prepared
+    /// planes, retained scratch). The pool admits and accounts the load
+    /// with this figure before the loader allocates anything. `None` (the
+    /// default) is the GGUF file size. `config` is `None` when a plan is
+    /// asked for without one.
+    fn admission_bytes(&self, _path: &Path, _config: Option<&EngineConfig>) -> Option<u64> {
+        None
+    }
 }
 
 /// Production [`ModelLoader`] — delegates to
@@ -841,6 +852,10 @@ pub trait ModelLoader<E>: Send + Sync {
 pub struct DefaultModelLoader;
 
 impl ModelLoader<Engine> for DefaultModelLoader {
+    fn admission_bytes(&self, path: &Path, config: Option<&EngineConfig>) -> Option<u64> {
+        crate::serve::dflash2_policy::admission_bytes(path, config)
+    }
+
     fn load(&self, path: &Path, config: &EngineConfig) -> anyhow::Result<Engine> {
         let engine = crate::serve::load_engine(path, config)?;
         Ok(match config.operator_model_path.as_deref() {
@@ -1442,6 +1457,26 @@ impl<E> HotSwapManager<E> {
         })
     }
 
+    /// What the pool charges an engine loaded from `gguf_path`: the loader's
+    /// figure when it has one (the file plus what its routes keep resident),
+    /// never less than the GGUF file size.
+    fn resident_bytes_for(
+        &self,
+        gguf_path: &Path,
+        config: Option<&EngineConfig>,
+    ) -> Result<u64, HotSwapError> {
+        let file_bytes = std::fs::metadata(gguf_path)
+            .map_err(|source| HotSwapError::FileSize {
+                path: gguf_path.to_path_buf(),
+                source,
+            })?
+            .len();
+        Ok(self
+            .loader
+            .admission_bytes(gguf_path, config)
+            .map_or(file_bytes, |bytes| bytes.max(file_bytes)))
+    }
+
     /// Read the GGUF-size estimate and calculate admission without loading.
     pub fn plan_path(
         &self,
@@ -1449,12 +1484,7 @@ impl<E> HotSwapManager<E> {
         quant: QuantType,
         gguf_path: &Path,
     ) -> Result<AdmissionPlan, HotSwapError> {
-        let bytes_resident = std::fs::metadata(gguf_path)
-            .map_err(|source| HotSwapError::FileSize {
-                path: gguf_path.to_path_buf(),
-                source,
-            })?
-            .len();
+        let bytes_resident = self.resident_bytes_for(gguf_path, None)?;
         Ok(self.admission_plan(repo, quant, bytes_resident))
     }
 
@@ -1602,12 +1632,7 @@ impl<E> HotSwapManager<E> {
             return Ok(NonEvictingLoad::Resident(existing));
         }
 
-        let bytes_resident = std::fs::metadata(gguf_path)
-            .map_err(|source| HotSwapError::FileSize {
-                path: gguf_path.to_path_buf(),
-                source,
-            })?
-            .len();
+        let bytes_resident = self.resident_bytes_for(gguf_path, Some(config))?;
         let plan = self.admission_plan(repo, quant, bytes_resident);
         if !matches!(plan.outcome, AdmissionOutcome::FitsAlongside { .. }) {
             return Ok(NonEvictingLoad::Conflict(plan));
@@ -1718,12 +1743,7 @@ impl<E> HotSwapManager<E> {
         // fails fast without driving the loader (which would itself
         // bail at header-open time, but a clean upfront error is
         // better tracing).
-        let bytes_resident = std::fs::metadata(activation_path)
-            .map_err(|source| HotSwapError::FileSize {
-                path: gguf_path.to_path_buf(),
-                source,
-            })?
-            .len();
+        let bytes_resident = self.resident_bytes_for(activation_path, Some(config))?;
 
         let mut loader_config = config.clone();
         if activation_path != gguf_path {
@@ -2324,6 +2344,48 @@ mod tests {
         assert_eq!(loader.call_count(), 1, "conflict must precede loader");
         assert!(mgr.try_get("a/1", QuantType::Q4_K_M).is_some());
         assert!(mgr.try_get("b/2", QuantType::Q4_K_M).is_none());
+    }
+
+    /// A loader that knows its engines hold more than their file: the
+    /// second model's routes (a drafter, prepared planes) weigh 300 bytes.
+    struct RouteLoader;
+
+    impl ModelLoader<MockEngine> for RouteLoader {
+        fn load(&self, _path: &Path, _config: &EngineConfig) -> anyhow::Result<MockEngine> {
+            Ok(MockEngine { load_serial: 1 })
+        }
+
+        fn admission_bytes(&self, path: &Path, config: Option<&EngineConfig>) -> Option<u64> {
+            let file = std::fs::metadata(path).ok()?.len();
+            // A plan asked for without a configuration gets the same bound.
+            let _ = config;
+            Some(if file == 500 { file + 300 } else { file / 2 })
+        }
+    }
+
+    #[test]
+    fn admission_charges_what_the_loader_says_an_engine_holds_resident() {
+        let pool = LoadedPool::with_capacity_and_budget(2, 1_200);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, Arc::new(RouteLoader));
+        let first = synthetic_gguf(400);
+        let second = synthetic_gguf(500);
+        // Never less than the file, whatever the loader answers.
+        mgr.load_or_get("a/1", QuantType::Q4_K_M, first.path(), &empty_config())
+            .unwrap();
+        assert_eq!(mgr.pool_stats().total_resident_bytes, 400);
+        // 400 + 500 fits the 1,200-byte budget by file size; with the 300
+        // bytes its routes keep resident the second model does not fit
+        // beside the first, and the loader is not called.
+        let plan = mgr
+            .plan_path("b/2", QuantType::Q4_K_M, second.path())
+            .unwrap();
+        assert!(!matches!(plan.outcome, AdmissionOutcome::FitsAlongside { .. }));
+        let result = mgr
+            .load_or_get_non_evicting("b/2", QuantType::Q4_K_M, second.path(), &empty_config())
+            .unwrap();
+        assert!(matches!(result, NonEvictingLoad::Conflict(_)));
+        assert!(mgr.try_get("b/2", QuantType::Q4_K_M).is_none());
+        assert_eq!(mgr.pool_stats().total_resident_bytes, 400);
     }
 
     #[test]

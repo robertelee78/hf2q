@@ -321,6 +321,25 @@ impl ResolvedRoutes {
         self.ones & (1 << switch.0) != 0
     }
 
+    /// Whether the value of `switch` turns its route on (`1`, `on`, `true`).
+    pub(crate) fn is_on(&self, switch: Switch) -> bool {
+        turns_on(self.values[switch.0].as_deref())
+    }
+
+    /// Every switch as `(name, value, source, why withheld)`, in table order.
+    pub(crate) fn entries(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, Option<&str>, &'static str, Option<&str>)> {
+        SWITCHES.iter().enumerate().map(|(index, row)| {
+            (
+                row.name,
+                self.values[index].as_deref(),
+                self.sources[index].label(),
+                self.withheld[index].as_deref(),
+            )
+        })
+    }
+
     /// Plane sets of every row whose value turns its route on. A row is on
     /// when its value is `1`, `on` or `true`; the plane estimate is taken
     /// before a reader could reject another value.

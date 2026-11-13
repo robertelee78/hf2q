@@ -96,6 +96,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/hf2q_process_guard.sh"
+source "$SCRIPT_DIR/hf2q_dflash2_launcher_check.sh"
 
 MODEL="${MODEL:-/opt/hf2q/models/qwen3.6/APEX-Q5_K_M.gguf}"
 MMPROJ="${MMPROJ:-/opt/hf2q/models/qwen3.6/mmproj-qwen36-F16.gguf}"
@@ -147,21 +148,8 @@ esac
 # `DFlash2 policy resolved` log line records the decision. HF2Q_DFLASH2=0 is
 # the kill switch, HF2Q_DFLASH2=1 makes a missing drafter or an unqualified
 # target a startup error; both pass through from the caller's environment.
-if [[ -n "${HF2Q_DFLASH2:-}" ]]; then
-    case "$(printf '%s' "$HF2Q_DFLASH2" | tr '[:upper:]' '[:lower:]')" in
-        0|off|false|1|on|true) ;;
-        *)
-            echo "HF2Q_DFLASH2 must be 0/off/false or 1/on/true when set (got: $HF2Q_DFLASH2)" >&2
-            exit 3
-            ;;
-    esac
-fi
-for dflash2_path_var in HF2Q_DFLASH2_CONFIG HF2Q_DFLASH2_WEIGHTS; do
-    if [[ -n "${!dflash2_path_var:-}" && ! -f "${!dflash2_path_var}" ]]; then
-        echo "$dflash2_path_var is set but is not a file: ${!dflash2_path_var}" >&2
-        exit 3
-    fi
-done
+# Only what cannot depend on the policy is checked here: see the helper.
+hf2q_dflash2_launcher_check || exit 3
 # Refuse before loading the model when another service already owns the port.
 if command -v lsof >/dev/null 2>&1; then
     PORT_LISTENER="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"

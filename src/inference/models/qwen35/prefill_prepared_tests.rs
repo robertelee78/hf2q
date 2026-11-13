@@ -1241,3 +1241,22 @@ fn prefill_bits_change_only_when_the_route_profile_is_selected() {
         }
     });
 }
+
+/// A thread that primed the model's GPU cache only to provision something
+/// releases it: the cache is gone from that thread, releasing again is a
+/// no-op, and the model primes and computes the same bits afterwards.
+#[test]
+fn a_released_gpu_cache_is_gone_and_the_model_primes_again() {
+    with_synthetic_model(|model| {
+        let before = chunk_rows(model, &mut cache(model), 0, 0, 33, false);
+        model.release_gpu_cache().expect("release");
+        assert!(
+            model.with_gpu_cache_mut(|_device, _registry| Ok(())).is_err(),
+            "the released cache is still bound to this thread"
+        );
+        model.release_gpu_cache().expect("releasing nothing is a no-op");
+        model.ensure_gpu_cache_primed().expect("prime again");
+        let after = chunk_rows(model, &mut cache(model), 0, 0, 33, false);
+        assert!(before == after, "a re-primed cache changed bits");
+    });
+}
