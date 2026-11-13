@@ -15,7 +15,7 @@ import splash_sweep
 import q5_calibration
 from test_native_peer_splash import splash_manifest
 from test_q3_campaign import FakeRunner, fake_identities
-from q3_fake_splash import invalid_sweep
+from q3_fake_splash import invalid_sweep, mechanism_campaign, rebind_approval, reviewed_template_fixture
 
 HERE = Path(__file__).resolve().parent
 
@@ -35,42 +35,10 @@ class MechanismVerdict(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        reviewed_template_fixture(self)
 
     def manifest(self, rows=663, lanes=125):
-        m = splash_manifest(arms=('stock', 'experiment', 'peer'))
-        p = m['plan']
-        p['splash_required'] = False
-        selection = invalid_sweep(self.root)
-        p['splash_unavailable_evidence'] = [{'path': str(selection), 'sha256': mechanism.digest(selection)}]
-        p['qwen38_mechanism'] = dict(mechanism.CONTRACT)
-        p['design'].update(stock_margin_ratio=.95, peer_margin_ratio=1.)
-        m['identities']['harness'] = {'git_commit': p['declared']['experiment']['commit']}
-        case = json.loads((HERE / 'q5_cases/qwen38.json').read_text())
-        p['qwen38_splash_substitution'] = splash_evidence.freeze(p['splash_unavailable_evidence'], case)
-        for arm in m['identities']['arms'].values():
-            arm['artifact'].update(splash_evidence.ARTIFACT)
-        base = self.root / 'case.json'
-        base.write_text(json.dumps(case))
-        p['arms']['experiment'].update(case=str(base), case_sha256=mechanism.digest(base))
-        for block in m['stages'][0]['blocks']:
-            for e in block['entries']:
-                if e['arm'] != 'experiment':
-                    continue
-                root = self.root / e['name']
-                root.mkdir()
-                values = [rows // lanes + (i < rows % lanes) for i in range(lanes)]
-                text = ''.join(f'DEBUG progress: Qwen DFlash2 verified window slot=0 drafted=7 accepted={n}\n'
-                               for n in values)
-                (root / 'server.stderr').write_text(text)
-                receipt = {'schema': 'hf2q.q5.calibration-receipt.v1', 'family': 'qwen38',
-                           'binary': {'sha256': 'e' * 64}, 'artifact': m['identities']['arms']['experiment']['artifact'],
-                           'workload': case['workload'], 'case': {'path': str(base), 'sha256': mechanism.digest(base)},
-                           'verdict': {'verdict': 'CalibrationPass', 'reason': None}, 'cleanup_proven': True}
-                (root / 'receipt.json').write_text(json.dumps(receipt))
-                e['attempts'] = [{'output': str(root), 'case': str(base), 'outcome': 'Pass',
-                                  'receipt_sha256': mechanism.digest(root / 'receipt.json'),
-                                  'server_stderr_sha256': mechanism.digest(root / 'server.stderr')}]
-        return m
+        return mechanism_campaign(self.root, rows, lanes)
 
     def verdict(self, manifest):
         return q3_report.compute_verdict(manifest)
@@ -96,6 +64,7 @@ class MechanismVerdict(unittest.TestCase):
         for name, group in splash_evidence.SOURCE_CONTINUITY_WHITELIST.items():
             approval['sources'][str(HERE / name)] = next(value for value in group if value != mechanism.digest(HERE / name))
         path.write_text(json.dumps(approval))
+        rebind_approval(run)
         m['plan']['qwen38_splash_substitution'] = splash_evidence.freeze(
             m['plan']['splash_unavailable_evidence'], json.loads(Path(m['plan']['arms']['experiment']['case']).read_text()))
         self.assertEqual(self.verdict(m)['verdict'], 'Win')
@@ -273,6 +242,7 @@ class CanonicalDriverTelemetry(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        reviewed_template_fixture(self)
         self.selection = invalid_sweep(self.root)
         self.nc = self.root / 'nc.json'
         self.nc.write_text('{}')
