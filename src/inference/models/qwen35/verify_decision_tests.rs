@@ -292,11 +292,9 @@ fn digest(decisions: &[Option<JointRowDecision>], tile: &[f32]) -> u64 {
     for decision in decisions.iter().flatten() {
         mix(decision.outside_token);
         mix(decision.outside_logit.to_bits());
-        decision.history_tokens.iter().for_each(|&token| mix(token));
-        decision
-            .history_logits
-            .iter()
-            .for_each(|logit| mix(logit.to_bits()));
+        let (tokens, logits) = decision.history();
+        tokens.iter().for_each(|&token| mix(token));
+        logits.iter().for_each(|logit| mix(logit.to_bits()));
     }
     tile.iter().for_each(|value| mix(value.to_bits()));
     hash
@@ -330,9 +328,15 @@ fn check(
         };
         let decision = decision.as_ref().expect("a decided row has candidates");
         assert_eq!(
-            decision.history_tokens, history,
+            decision.history().0,
+            history,
             "row {row}: assembled history"
         );
+        // The gathered values are the head's, for every slot of a repeated
+        // token too.
+        for (&token, &logit) in decision.history().0.iter().zip(decision.history().1) {
+            assert_eq!(logit.to_bits(), original[token as usize].to_bits());
+        }
         for token in 0..vocab {
             let expected = if history.contains(&(token as u32)) {
                 MASKED.to_bits()
@@ -495,12 +499,8 @@ fn the_host_finish_is_the_samplers_arithmetic() {
     let mut masked = logits.clone();
     masked[5] = MASKED;
     masked[9] = MASKED;
-    let decision = JointRowDecision::for_test(
-        (0, -3.0),
-        history.clone(),
-        vec![-3.0e38, -2.0, -3.0e38],
-        row(&masked),
-    );
+    let decision =
+        JointRowDecision::for_test((0, -3.0), &history, &[-3.0e38, -2.0, -3.0e38], row(&masked));
     for penalty in [1.0, 1.3, 2.0] {
         let mut host = logits.clone();
         assert_eq!(
@@ -511,9 +511,9 @@ fn the_host_finish_is_the_samplers_arithmetic() {
     }
     assert!(bits(&decision.logits().unwrap()) == bits(&logits));
     // A masked argmax that is itself the mask value decides nothing.
-    let none = JointRowDecision::for_test((3, MASKED), vec![], vec![], row(&masked));
+    let none = JointRowDecision::for_test((3, MASKED), &[], &[], row(&masked));
     assert_eq!(none.greedy_token(&[], 1.05), None);
     // The kernel's sentinel for a non-finite row.
-    let invalid = JointRowDecision::for_test((u32::MAX, f32::NAN), vec![], vec![], row(&masked));
+    let invalid = JointRowDecision::for_test((u32::MAX, f32::NAN), &[], &[], row(&masked));
     assert_eq!(invalid.greedy_token(&[], 1.05), None);
 }

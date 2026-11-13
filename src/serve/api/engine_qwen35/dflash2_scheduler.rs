@@ -903,13 +903,16 @@ impl Qwen35LoadedModel {
         let (committed, pipelined_context) = if prefetch {
             // Prefetch: the context commit goes to the GPU first, reading
             // its own copy of the step's positions; the replay is committed
-            // behind it (they share nothing); then the next step's draft
-            // (the queue orders its ring reads after the context's ring
-            // writes). The step waits for its replay and its context commit
-            // while the draft runs on. The draft is committed last because a
-            // wait on a command returns only once every command committed
-            // before it has completed: behind the draft, the replay's wait
-            // would last until the draft's end.
+            // behind it (they share no resource, so they overlap); then the
+            // next step's draft, whose ring reads Metal orders behind the
+            // context commit's ring writes because the rings are tracked
+            // buffers bound directly to both commands
+            // (`submit_target_context_detached`). The step waits for its
+            // replay and its context commit while the draft runs on. The
+            // draft is committed last because a wait on a command returns
+            // only once every command committed before it has completed:
+            // behind the draft, the replay's wait would last until the
+            // draft's end.
             let submitted = self.model.with_gpu_cache_mut(|device, registry| {
                 runtime.submit_target_context_detached(device, registry, &retained)
             });

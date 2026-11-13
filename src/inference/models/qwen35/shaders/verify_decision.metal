@@ -77,8 +77,14 @@ kernel void qwen_verify_decision_gather(
 
 // Grid (slots, rows). Runs behind a barrier after the gather: every history
 // token's logit becomes the lowest finite float, so the row's argmax is the
-// argmax over the tokens outside the history. Duplicate tokens write the
-// same value.
+// argmax over the tokens outside the history. A token that fills several
+// slots of a row is written by one thread only, the one of its first slot:
+// every thread scans the earlier slots of its row (read-only, written by the
+// gather before the barrier) and returns when one of them holds its token,
+// so no logits cell has two writers. This is a conservative choice, not a
+// repair of an observed fault: several threads storing the same value to
+// one cell gave the same bits in every test and validation mode, but one
+// writer per cell does not rely on how a kernel's same-value stores resolve.
 kernel void qwen_verify_decision_mask(
     device float *logits [[buffer(0)]],
     device const uint *history_tokens [[buffer(1)]],
@@ -87,7 +93,10 @@ kernel void qwen_verify_decision_mask(
     const uint slot = position.x;
     const uint row = position.y;
     if (slot >= params.slots || row >= params.rows) return;
-    const uint token = history_tokens[row * params.slots + slot];
-    if (token < params.vocab)
-        logits[row * params.vocab + token] = as_type<float>(0xff7fffffu);
+    const uint base = row * params.slots;
+    const uint token = history_tokens[base + slot];
+    if (token >= params.vocab) return;
+    for (uint earlier = 0; earlier < slot; ++earlier)
+        if (history_tokens[base + earlier] == token) return;
+    logits[row * params.vocab + token] = as_type<float>(0xff7fffffu);
 }

@@ -13,7 +13,9 @@
 //!
 //! 1. gathers, per row, the logits of the row's history tokens (the lane's
 //!    repetition window after the window's earlier drafts were accepted),
-//! 2. masks those tokens in the logits with the lowest finite float, and
+//! 2. masks those tokens in the logits with the lowest finite float (one
+//!    writer per logits cell: a token that repeats in a row's history is
+//!    written by the thread of its first slot only), and
 //! 3. runs the stock argmax over the masked row,
 //!
 //! and the host finishes the decision from at most 65 candidates with the
@@ -259,8 +261,7 @@ impl EncodedDecisions {
             .history_logits
             .as_slice::<f32>()
             .map_err(|e| anyhow!("read Qwen verify decision history logits: {e}"))?[slots];
-        let used = tokens.iter().take_while(|&&token| token != UNUSED).count();
-        Ok(Some(JointRowDecision {
+        let mut decision = JointRowDecision {
             outside_token: self
                 .outside_tokens
                 .as_slice::<u32>()
@@ -269,10 +270,14 @@ impl EncodedDecisions {
                 .outside_logits
                 .as_slice::<f32>()
                 .map_err(|e| anyhow!("read Qwen verify decision argmax logits: {e}"))?[row],
-            history_tokens: tokens[..used].to_vec(),
-            history_logits: logits[..used].to_vec(),
+            history_tokens: [UNUSED; DECISION_SLOTS],
+            history_logits: [0.0; DECISION_SLOTS],
+            history_len: tokens.iter().take_while(|&&token| token != UNUSED).count(),
             row: logits_row,
-        }))
+        };
+        decision.history_tokens.copy_from_slice(tokens);
+        decision.history_logits.copy_from_slice(logits);
+        Ok(Some(decision))
     }
 }
 
@@ -284,9 +289,10 @@ pub(crate) struct JointRowDecision {
     outside_token: u32,
     outside_logit: f32,
     /// The row's history as the kernel assembled it, oldest first, and the
-    /// head's logit of each token.
-    history_tokens: Vec<u32>,
-    history_logits: Vec<f32>,
+    /// head's logit of each token: the first `history_len` slots.
+    history_tokens: [u32; DECISION_SLOTS],
+    history_logits: [f32; DECISION_SLOTS],
+    history_len: usize,
     /// The row's `[1, vocab]` logits, masked at the history tokens. A view
     /// of a pooled buffer: readable until the next joint forward.
     row: MlxBuffer,
@@ -305,38 +311,72 @@ impl JointRowDecision {
     /// its lowest index are the masked argmax; the sampler's result is the
     /// lowest token id among the largest of that value and the penalised
     /// history logits. The penalty and the selection below are the
-    /// sampler's functions applied to those candidates in token-id order.
+    /// sampler's functions applied to those candidates in token-id order,
+    /// held in fixed arrays (this function itself allocates nothing).
     pub(crate) fn greedy_token(&self, history: &[u32], penalty: f64) -> Option<u32> {
+        /// Candidates: every history slot and the token outside the history.
+        const CANDIDATES: usize = DECISION_SLOTS + 1;
+        /// Positions of the candidates, the "token ids" the penalty is
+        /// applied to in the compact row.
+        const POSITIONS: [u32; CANDIDATES] = {
+            let mut positions = [0; CANDIDATES];
+            let mut index = 0;
+            while index < CANDIDATES {
+                positions[index] = index as u32;
+                index += 1;
+            }
+            positions
+        };
         let vocab = self.row.element_count();
-        if self.history_tokens != history
+        let (history_tokens, history_logits) = self.history();
+        if history_tokens != history
             || self.outside_token as usize >= vocab
             || !self.outside_logit.is_finite()
             || self.outside_logit <= MASKED
         {
             return None;
         }
-        // Unique history tokens with their logits, in token-id order.
-        let mut candidates: Vec<(u32, f32)> = Vec::with_capacity(history.len() + 1);
-        for (&token, &logit) in self.history_tokens.iter().zip(&self.history_logits) {
+        // Unique history tokens with their logits, in token-id order (an
+        // insertion sort over at most 64 entries, on the stack).
+        let mut tokens = [0_u32; CANDIDATES];
+        let mut logits = [0.0_f32; CANDIDATES];
+        let mut count = 0;
+        for (&token, &logit) in history_tokens.iter().zip(history_logits) {
             if token as usize >= vocab || !logit.is_finite() || token == self.outside_token {
                 return None;
             }
-            candidates.push((token, logit));
+            let at = tokens[..count].partition_point(|&earlier| earlier < token);
+            if at < count && tokens[at] == token {
+                continue;
+            }
+            tokens.copy_within(at..count, at + 1);
+            logits.copy_within(at..count, at + 1);
+            tokens[at] = token;
+            logits[at] = logit;
+            count += 1;
         }
-        candidates.sort_unstable_by_key(|&(token, _)| token);
-        candidates.dedup_by_key(|&mut (token, _)| token);
-        let mut logits: Vec<f32> = candidates.iter().map(|&(_, logit)| logit).collect();
         if penalty != 1.0 && !history.is_empty() {
-            let ids: Vec<u32> = (0..logits.len() as u32).collect();
-            apply_repetition_penalty(&mut logits, &ids, penalty);
+            apply_repetition_penalty(&mut logits[..count], &POSITIONS[..count], penalty);
         }
-        let at = candidates.partition_point(|&(token, _)| token < self.outside_token);
-        candidates.insert(at, (self.outside_token, self.outside_logit));
-        logits.insert(at, self.outside_logit);
-        if logits.iter().any(|logit| logit.is_nan()) {
+        let at = tokens[..count].partition_point(|&token| token < self.outside_token);
+        tokens.copy_within(at..count, at + 1);
+        logits.copy_within(at..count, at + 1);
+        tokens[at] = self.outside_token;
+        logits[at] = self.outside_logit;
+        count += 1;
+        if logits[..count].iter().any(|logit| logit.is_nan()) {
             return None;
         }
-        Some(candidates[sample_greedy(&logits) as usize].0)
+        Some(tokens[sample_greedy(&logits[..count]) as usize])
+    }
+
+    /// The row's history as the kernel assembled it, oldest first, and the
+    /// head's logit of each of its tokens.
+    pub(crate) fn history(&self) -> (&[u32], &[f32]) {
+        (
+            &self.history_tokens[..self.history_len],
+            &self.history_logits[..self.history_len],
+        )
     }
 
     /// The row's logits as the head wrote them: the buffer's row with the
@@ -353,7 +393,8 @@ impl JointRowDecision {
 
     /// Undo the mask in a copy of the row.
     pub(super) fn restore(&self, logits: &mut [f32]) {
-        for (&token, &logit) in self.history_tokens.iter().zip(&self.history_logits) {
+        let (tokens, raw) = self.history();
+        for (&token, &logit) in tokens.iter().zip(raw) {
             if let Some(slot) = logits.get_mut(token as usize) {
                 *slot = logit;
             }
@@ -363,17 +404,21 @@ impl JointRowDecision {
     #[cfg(test)]
     pub(crate) fn for_test(
         outside: (u32, f32),
-        history_tokens: Vec<u32>,
-        history_logits: Vec<f32>,
+        history_tokens: &[u32],
+        history_logits: &[f32],
         row: MlxBuffer,
     ) -> Self {
-        Self {
+        let mut decision = Self {
             outside_token: outside.0,
             outside_logit: outside.1,
-            history_tokens,
-            history_logits,
+            history_tokens: [UNUSED; DECISION_SLOTS],
+            history_logits: [0.0; DECISION_SLOTS],
+            history_len: history_tokens.len(),
             row,
-        }
+        };
+        decision.history_tokens[..history_tokens.len()].copy_from_slice(history_tokens);
+        decision.history_logits[..history_logits.len()].copy_from_slice(history_logits);
+        decision
     }
 }
 

@@ -121,8 +121,9 @@ pub(crate) struct SubmittedContextCommit {
 }
 
 /// Every input of one draft command. Two drafts with equal inputs, issued
-/// over the same rings and verify-budget state, are the same command.
-#[derive(Clone, Debug, PartialEq)]
+/// over the same rings and verify-budget state, are the same command. Built
+/// only when a prefetched command is stored.
+#[derive(Clone, Debug)]
 struct DraftInputs {
     anchors: Vec<u32>,
     logical_positions: Vec<u32>,
@@ -137,6 +138,41 @@ struct DraftInputs {
     /// [`DFlash2Runtime::budget_epoch`] when the command was encoded: the
     /// GPU row selection of an adaptive target reads the verify budget.
     budget_epoch: u64,
+}
+
+impl DraftInputs {
+    /// Whether a draft call with these borrowed inputs is the command this
+    /// snapshot describes. Floats compare by bits. Allocates nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn matches(
+        &self,
+        anchors: &[u32],
+        logical_positions: &[u32],
+        temperatures: &[f32],
+        sampling_mask: u32,
+        maximum_verify_rows: &[u32],
+        target_lane_order: &[u32],
+        uniforms: &[f32],
+        wait: bool,
+        budget_epoch: u64,
+    ) -> bool {
+        let same_bits = |bits: &[u32], values: &[f32]| {
+            bits.len() == values.len()
+                && bits
+                    .iter()
+                    .zip(values)
+                    .all(|(bits, value)| *bits == value.to_bits())
+        };
+        self.wait == wait
+            && self.sampling_mask == sampling_mask
+            && self.budget_epoch == budget_epoch
+            && self.anchors == anchors
+            && self.logical_positions == logical_positions
+            && self.maximum_verify_rows == maximum_verify_rows
+            && self.target_lane_order == target_lane_order
+            && same_bits(&self.temperature_bits, temperatures)
+            && same_bits(&self.uniform_bits, uniforms)
+    }
 }
 
 /// A draft command committed ahead of the step that will use it
@@ -353,19 +389,24 @@ impl DFlash2Runtime {
             "DFlash2 draft positions {logical_positions:?} do not match lane contexts {:?}",
             self.lane_lengths
         );
-        let inputs = DraftInputs {
-            anchors: anchors.to_vec(),
-            logical_positions: logical_positions.to_vec(),
-            temperature_bits: temperatures.iter().map(|value| value.to_bits()).collect(),
-            sampling_mask,
-            maximum_verify_rows: maximum_verify_rows.to_vec(),
-            target_lane_order: target_lane_order.to_vec(),
-            uniform_bits: uniforms.iter().map(|value| value.to_bits()).collect(),
-            wait,
-            budget_epoch: self.budget_epoch,
-        };
+        // A draft that does not involve a prefetch (the stock route, and a
+        // step with nothing outstanding) allocates nothing here: the
+        // outstanding snapshot is compared with the borrowed inputs, and a
+        // snapshot is built only when a prefetched command is stored.
         if let Some(prefetched) = self.prefetched.take() {
-            if !prefetch && prefetched.inputs == inputs {
+            if !prefetch
+                && prefetched.inputs.matches(
+                    anchors,
+                    logical_positions,
+                    temperatures,
+                    sampling_mask,
+                    maximum_verify_rows,
+                    target_lane_order,
+                    uniforms,
+                    wait,
+                    self.budget_epoch,
+                )
+            {
                 // The command this call would encode is already on the
                 // queue, issued over the rings and budget this call sees.
                 self.prefetch_counts.adopted += 1;
@@ -444,6 +485,17 @@ impl DFlash2Runtime {
         }
         if prefetch {
             self.prefetch_counts.prefetched += 1;
+            let inputs = DraftInputs {
+                anchors: anchors.to_vec(),
+                logical_positions: logical_positions.to_vec(),
+                temperature_bits: temperatures.iter().map(|value| value.to_bits()).collect(),
+                sampling_mask,
+                maximum_verify_rows: maximum_verify_rows.to_vec(),
+                target_lane_order: target_lane_order.to_vec(),
+                uniform_bits: uniforms.iter().map(|value| value.to_bits()).collect(),
+                wait,
+                budget_epoch: self.budget_epoch,
+            };
             self.prefetched = Some(PrefetchedDraft { inputs, encoder });
         }
         Ok(())
@@ -737,9 +789,19 @@ impl DFlash2Runtime {
     /// written while it executes, and every lane's length moves past the
     /// rows it retains at once (the next draft is issued from those
     /// lengths). The rings are settled only when
-    /// [`Self::finish_target_context`] (with `advance` false) returns; the
-    /// draft command committed behind this one reads them on the GPU, where
-    /// the queue orders it after this command's writes.
+    /// [`Self::finish_target_context`] (with `advance` false) returns.
+    ///
+    /// What orders the draft committed behind this command after it is not
+    /// the queue as such (commands of one queue that share no resource
+    /// overlap; the replay beside this commit does): it is Metal's
+    /// dependency ordering of tracked resources. mlx-native allocates
+    /// buffers with `newBufferWithLength` and shared storage, whose hazard
+    /// tracking is the default tracked mode, and the draft rings (and the
+    /// workspace scratch) are bound directly to both commands, so on an
+    /// `MTLCommandQueue` the draft's reads of the rings are synchronized
+    /// behind this command's writes. A ring moved to an untracked heap or
+    /// reached through anything but a direct binding would lose that
+    /// ordering.
     ///
     /// If the step fails after this call, clear its lanes
     /// ([`Self::settle_submitted_step`]): their lengths have moved.

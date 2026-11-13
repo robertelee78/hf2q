@@ -2138,7 +2138,11 @@ decision:
   order). It submits the draft-context commit, which reads its own copy of
   the step's positions so the next positions can be written at once; commits
   the replay behind it; commits the next draft behind both; and only then
-  waits for the replay and the context commit. The next step's draft call
+  waits for the replay and the context commit. The draft's ring reads are
+  ordered behind the context commit's ring writes by Metal's synchronization
+  of tracked resources (the rings are default-tracked shared buffers bound
+  directly to both commands), not by the queue as such: the replay shares no
+  resource with either and overlaps them. The next step's draft call
   adopts the committed command when its inputs are exactly the prefetched
   ones and nothing wrote the rings in between; a lane that joined or left, a
   prefill ingest or a cleared lane makes it wait for the command, drop its
