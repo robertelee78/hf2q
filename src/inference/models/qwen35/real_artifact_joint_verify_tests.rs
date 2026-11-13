@@ -50,6 +50,7 @@ fn qwen38_joint_verify_matches_spec_off_bitwise() {
             pooled_outputs: true,
             verify_attention_tile: false,
             verify_mixer_fused: false,
+            dflash2: Default::default(),
         },
     };
     assert_eq!(model.joint_decode_mode(), Ok(arm.mode));

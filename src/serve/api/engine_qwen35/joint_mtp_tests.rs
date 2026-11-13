@@ -416,6 +416,7 @@ fn mma_forward() -> Qwen35JointMtpForward {
             pooled_outputs: true,
             verify_attention_tile: false,
             verify_mixer_fused: false,
+            dflash2: Default::default(),
         },
     }
 }

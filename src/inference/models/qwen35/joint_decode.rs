@@ -80,6 +80,9 @@ pub(crate) enum Qwen35JointOutput {
     LogitsAndHidden,
     /// GPU argmax plus the post-output-norm hidden row (a greedy MTP lane).
     GreedyTokenAndHidden,
+    /// The post-output-norm hidden row only. A DFlash2 verify row whose
+    /// decision comes from [`crate::inference::models::qwen35::verify_decision`] returns this.
+    Hidden,
 }
 
 impl Qwen35JointOutput {
@@ -92,7 +95,10 @@ impl Qwen35JointOutput {
     }
 
     fn wants_hidden(self) -> bool {
-        matches!(self, Self::LogitsAndHidden | Self::GreedyTokenAndHidden)
+        matches!(
+            self,
+            Self::LogitsAndHidden | Self::GreedyTokenAndHidden | Self::Hidden
+        )
     }
 }
 
@@ -112,6 +118,9 @@ pub(crate) struct Qwen35JointRowOutput {
     pub logits: Option<Vec<f32>>,
     /// `[1, hidden]` view of a durable buffer; outlives the decode pool.
     pub nextn_hidden: Option<MlxBuffer>,
+    /// Candidates of the row's greedy decision, when the step was asked for
+    /// them ([`crate::inference::models::qwen35::verify_decision`]).
+    pub decision: Option<crate::inference::models::qwen35::verify_decision::JointRowDecision>,
 }
 
 pub(super) type JointOutputHeadTail<'a> =
@@ -398,6 +407,8 @@ impl Qwen35Model {
                     None,
                     None,
                     None,
+                    None,
+                    None,
                 )
                 .map(|(outputs, _normed)| outputs)
             },
@@ -508,6 +519,8 @@ impl Qwen35Model {
         mut replay: Option<&mut DeltaNetReplay>,
         capture: Option<DFlash2TargetCapture<'_>>,
         mut output_tail: Option<&mut JointOutputHeadTail<'_>>,
+        held_outputs: Option<&mut Vec<MlxBuffer>>,
+        decision_histories: Option<&[Option<&[u32]>]>,
     ) -> Result<(Vec<Qwen35JointRowOutput>, MlxBuffer)> {
         let arena_setup = crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
         let cfg = &self.cfg;
@@ -1027,6 +1040,48 @@ impl Qwen35Model {
             logits
         };
         enc.memory_barrier();
+        // Decision candidates of host-sampled verify rows: per window with a
+        // base history, the history tokens' logits and the argmax outside
+        // them. They mask those rows' history tokens in `logits`; the
+        // readback below undoes it in every copy it hands out.
+        let decisions = match decision_histories {
+            Some(histories) => {
+                let host_tokens;
+                let row_tokens = match gpu_token_ids {
+                    Some(token_ids) => token_ids,
+                    None => {
+                        let mut pooled = decode_pool::pooled_alloc_buffer(
+                            device,
+                            tokens.len() * DType::U32.size_of(),
+                            DType::U32,
+                            vec![tokens.len()],
+                        )
+                        .map_err(|e| anyhow!("allocate Qwen joint decision tokens: {e}"))?;
+                        pooled
+                            .as_mut_slice::<u32>()
+                            .map_err(|e| anyhow!("map Qwen joint decision tokens: {e}"))?
+                            .copy_from_slice(&tokens);
+                        host_tokens = pooled;
+                        &host_tokens
+                    }
+                };
+                let encoded = crate::inference::models::qwen35::verify_decision::encode(
+                    &mut enc,
+                    registry,
+                    device,
+                    &logits,
+                    packing.windows,
+                    histories,
+                    row_tokens,
+                    rows.len(),
+                    vocab,
+                )
+                .context("Qwen joint verify decisions")?;
+                enc.memory_barrier();
+                Some(encoded)
+            }
+            None => None,
+        };
         let argmax = if rows.iter().any(|row| row.output.wants_argmax()) {
             let params = host_buffer(device, DType::U32, &[cfg.vocab_size], "argmax params")?;
             let indices = decode_pool::pooled_alloc_buffer(
@@ -1081,7 +1136,11 @@ impl Qwen35Model {
         enc.commit_and_wait_labeled(head_label)
             .map_err(|e| anyhow!("Qwen joint decode command buffer: {e}"))?;
         mlx_native::command_timeline::mark("joint.head_completed");
-        drop(retained);
+        match held_outputs {
+            // The caller releases them when its commit settles.
+            Some(held) => held.append(&mut retained),
+            None => drop(retained),
+        }
 
         let readback = crate::inference::stage_profile::CpuSpan::begin("logit_readback");
         let all_logits = logits
@@ -1101,10 +1160,19 @@ impl Qwen35Model {
                 } else {
                     None
                 };
-                let logits = input
-                    .output
-                    .wants_logits()
-                    .then(|| all_logits[row * vocab..(row + 1) * vocab].to_vec());
+                let decision = match decisions.as_ref() {
+                    Some(decisions) => {
+                        decisions.read(row, row_view(&logits, row, vec![1, vocab])?)?
+                    }
+                    None => None,
+                };
+                let logits = input.output.wants_logits().then(|| {
+                    let mut logits = all_logits[row * vocab..(row + 1) * vocab].to_vec();
+                    if let Some(decision) = decision.as_ref() {
+                        decision.restore(&mut logits);
+                    }
+                    logits
+                });
                 let nextn_hidden = input
                     .output
                     .wants_hidden()
@@ -1114,6 +1182,7 @@ impl Qwen35Model {
                     greedy_token,
                     logits,
                     nextn_hidden,
+                    decision,
                 })
             })
             .collect::<Result<Vec<_>>>();
