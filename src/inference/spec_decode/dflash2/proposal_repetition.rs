@@ -108,6 +108,18 @@ pub(super) fn encode(
         return Ok(());
     }
     for lane in 0..lanes {
+        if prior.active & (1 << lane) == 0 {
+            continue;
+        }
+        ensure!(
+            prior.counts[lane] as usize <= HISTORY_CAPACITY,
+            "draft repetition history count exceeds capacity"
+        );
+        let penalty = f32::from_bits(prior.penalties[lane]);
+        ensure!(
+            penalty.is_finite() && penalty > 0.0,
+            "invalid active draft repetition penalty"
+        );
         ensure!(
             prior.history[lane][..prior.counts[lane] as usize]
                 .iter()
@@ -217,6 +229,69 @@ mod tests {
             } else {
                 first_bits = Some(logits.as_slice::<u32>()?.to_vec());
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pod_prior_rejects_invalid_history_and_penalty_without_poisoning_the_encoder() -> Result<()> {
+        let _lock = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new()?;
+        let mut registry = KernelRegistry::new();
+        let mut logits = device.alloc_buffer(64 * 4, DType::F32, vec![1, 2, 32])?;
+        logits.as_mut_slice::<f32>()?.fill(1.0);
+        let mut valid = DraftRepetitionPrior::default();
+        valid.set_lane(0, 1.05, [1_u32].into_iter())?;
+        let mut encoder = device.command_encoder()?;
+        for (count, penalty) in [
+            (65_u32, 1.05_f32),
+            (1, f32::NAN),
+            (1, f32::INFINITY),
+            (1, 0.0),
+            (1, -1.0),
+        ] {
+            // Public POD construction bypasses the setter in safe Rust.
+            let mut bytes = bytemuck::bytes_of(&valid).to_vec();
+            let count_offset = std::mem::offset_of!(DraftRepetitionPrior, counts);
+            let penalty_offset = std::mem::offset_of!(DraftRepetitionPrior, penalties);
+            bytes[count_offset..count_offset + 4].copy_from_slice(&count.to_ne_bytes());
+            bytes[penalty_offset..penalty_offset + 4]
+                .copy_from_slice(&penalty.to_bits().to_ne_bytes());
+            let forged = bytemuck::pod_read_unaligned(&bytes);
+            assert!(encode(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &logits,
+                1,
+                2,
+                32,
+                &forged,
+            )
+            .is_err());
+        }
+        // Rejections must not enqueue corrupt writes or poison later work.
+        encode(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &logits,
+            1,
+            2,
+            32,
+            &valid,
+        )?;
+        encoder.commit_and_wait()?;
+        for (index, &actual) in logits.as_slice::<f32>()?.iter().enumerate() {
+            let expected = if index == 33 {
+                (1.0_f64 / f64::from(1.05_f32)) as f32
+            } else {
+                1.0
+            };
+            assert!(
+                (actual - expected).abs() <= 2.0e-6,
+                "logit {index}: {actual} != {expected}"
+            );
         }
         Ok(())
     }
