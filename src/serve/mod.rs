@@ -3994,19 +3994,23 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     // weights are uploaded, and a missing drafter is fetched here, ahead of
     // the large load.
     // Memory-carrying routes are admitted against what the engines already
-    // resident have committed; this engine's commitment is reserved before
-    // it allocates and released if the load fails or when it is unloaded.
+    // resident have committed. The decision and its reservation are one
+    // transaction, so two loads running at once cannot both decide against
+    // the same total.
     let ledger = resident_memory::process();
-    let selection = dflash2_policy::resolve_for_load(
-        path,
-        config.engine_mode,
-        config.kv_cache_budget_bytes,
-        config.dwq_overlay_path.is_some(),
-        ledger.total(),
-    )?;
+    let (selection, reservation) = ledger.admit(path, |resident_bytes| {
+        let selection = dflash2_policy::resolve_for_load(
+            path,
+            config.engine_mode,
+            config.kv_cache_budget_bytes,
+            config.dwq_overlay_path.is_some(),
+            resident_bytes,
+        )?;
+        let commitment = selection.commitment;
+        anyhow::Ok((selection, commitment))
+    })?;
     selection.log(path);
-    let reservation = ledger.reserve(path, selection.commitment);
-    let (engine, selection) = match load_engine_on_route(path, config, &selection) {
+    let (engine, selection) = match load_engine_on_route(path, config, &selection, reservation) {
         Err(error) if selection.falls_back_on_load_error() => {
             // Auto never fails startup for a reason of its own making: a
             // load that fails with DFlash2 selected is repeated on the prior
@@ -4019,20 +4023,32 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
             let prior =
                 selection.without_dflash2(format!("the DFlash2 route failed to load: {error:#}"));
             prior.log(path);
-            reservation.amend(prior.commitment);
-            (load_engine_on_route(path, config, &prior)?, prior)
+            // The failed attempt's reservation went with its model: it is
+            // gone if the model was dropped, and still counted if a worker
+            // that could not be stopped holds it. The retry reserves its
+            // own; the prior route is subject to no admission rule.
+            let reservation = ledger.reserve(path, prior.commitment);
+            (
+                load_engine_on_route(path, config, &prior, reservation)?,
+                prior,
+            )
         }
         result => (result?, selection),
     };
-    reservation.publish(selection.published());
-    Ok(engine.with_memory_reservation(reservation))
+    Ok(engine.with_route_decision(selection.published()))
 }
 
 /// Load and spawn one engine on the route `selection` resolved.
+///
+/// `reservation` is what the engine holds of the host's memory on that
+/// route. It stays with whoever owns the model: this call while it loads
+/// (an error drops the model, then the reservation), the worker thread once
+/// it is spawned.
 fn load_engine_on_route(
     path: &Path,
     config: &multi_model::EngineConfig,
     selection: &dflash2_policy::Selection,
+    reservation: resident_memory::Reservation,
 ) -> Result<api::engine::Engine> {
     // Bound for the load and the spawn: weight upload and worker
     // provisioning read the table switches on this thread.
@@ -4163,6 +4179,8 @@ fn load_engine_on_route(
              `hf2q info --model <GGUF>` to inspect static serve support."
         )
     })?;
+    // The worker owns the model from here on, and with it the reservation.
+    engine.hold_memory_until_worker_exit(reservation);
     load_info::emit_tracing(engine.info());
 
     if config.warmup_synchronously {
@@ -4189,9 +4207,20 @@ fn load_engine_on_route(
             .build()
             .context("build tokio runtime for synchronous engine warmup")?;
         let warmup_started = std::time::Instant::now();
-        warmup_rt
-            .block_on(engine.warmup())
-            .context("synchronous engine warmup")?;
+        if let Err(error) = warmup_rt.block_on(engine.warmup()) {
+            // The worker owns the model. Stop it and wait for it, so that a
+            // caller that loads again (the prior-route retry) does not load
+            // beside a model that is still resident. A worker that does not
+            // stop keeps its reservation.
+            if let Err(shutdown) = warmup_rt.block_on(engine.shutdown()) {
+                tracing::warn!(
+                    model = %path.display(),
+                    error = %format!("{shutdown:#}"),
+                    "engine worker did not stop after its warmup failed; its memory stays reserved"
+                );
+            }
+            return Err(error).context("synchronous engine warmup");
+        }
         tracing::info!(
             elapsed_ms = warmup_started.elapsed().as_millis() as u64,
             "Engine warmed up synchronously (pre-mmproj order — iter-103 fix)"

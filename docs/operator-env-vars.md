@@ -221,6 +221,23 @@ fails startup, under auto or `HF2Q_DFLASH2=1`. A switch
 set by hand is never withheld: on storage it does not admit it still refuses
 the load as it always has, and on a host that cannot run its kernels the
 server refuses to start, naming the switch, before the model is loaded.
+"Set on" is what the switch's own reader takes as on, here and everywhere a
+rule is settled before the reader runs (the planes a route keeps, the row
+another row requires): exactly `1` for the `HF2Q_DFLASH2_*` and
+`HF2Q_REPACKED_GGUF_*` rows and the two `HF2Q_QWEN_VERIFY_*` rows that take
+no other value, and `1`, `on` or `true` for `HF2Q_DFLASH2_GPU_TARGET_TOKENS`,
+`HF2Q_QWEN_PREFILL_*` and `HF2Q_QWEN_MOE_*` (the grammars of
+`src/inference/route_host.rs`). `HF2Q_REPACKED_GGUF_M32=on` therefore selects
+no kernel, prepares no plane and refuses no load.
+
+A MoE target qualifies under auto only when its batched MoE verification
+route is admitted, and admitted means what the loader will do with the
+artifact's storage, not what the switch says: the loader keeps a layer on the
+per-row route when its storage is not the batched route's, whoever turned
+`HF2Q_QWEN_MOE_BATCHED` on. Setting the switch by hand on such an artifact
+does not select the drafter under auto. `HF2Q_DFLASH2=1` is the override: it
+serves the drafter there with a WARN that the route is unqualified, and the
+staged expert rows stay off because they need the batched layer.
 
 **Memory rule.** Prepared planes are a second copy of the weights they cover,
 and the drafter is resident beside the target. Before selecting, the server
@@ -238,13 +255,24 @@ scratch  = what the kernels of those switches retain between steps
 where the KV budget is the configured `--kv-cache-budget` (zero when none is
 configured), the drafter is its file size, and *resident engines* is what
 every engine already loaded in this process has committed: its model file,
-KV budget, drafter, planes and scratch. Each load reserves its own
-commitment before it allocates, releases it if the load fails and when the
-engine is unloaded, and amends it when a load is retried on the prior
-route, so a second model is admitted against what the first holds. The
-hot-swap pool charges a load the same figure without the KV budget (model
-file, drafter, planes, scratch) instead of the GGUF file size, before the
-loader is called. A plane set is prepared once however many switches read
+KV budget, drafter, planes and scratch. The decision and the reservation of
+what it decided are one transaction, so two loads running at once, through
+one pool or through separate ones, are never both decided against the same
+total. A reservation belongs to whoever owns the model's buffers: the
+loading thread during the load, then the engine's worker thread, which
+releases it after it has dropped the model. Evicting an engine or dropping
+its last handle does not release it; an engine whose worker is still
+tearing down, or is wedged inside Metal, is still counted. A load that fails
+after its worker started stops the worker and waits for it before the load
+is retried on the prior route, and the retry reserves its own commitment.
+
+The planes of the model's own prepared routes are resident whatever the
+policy says: `HF2Q_DFLASH2=0 HF2Q_QWEN_PREFILL_PREPARED=1` prepares and keeps
+the dense FFN and projection planes, and that engine is committed, published
+and charged for them like any other. Only the staged draft's head needs a
+drafter. The hot-swap pool charges a load the same figure without the KV
+budget (model file, drafter, planes, scratch) instead of the GGUF file size,
+before the loader is called. A plane set is prepared once however many switches read
 it, except the output head: the staged draft (at four slots) and the
 prepared target head each keep a copy of their own when
 `HF2Q_REPACKED_GGUF_SHARED_HEAD=0` (1,052,876,800 bytes each on Qwen3.8).

@@ -2330,14 +2330,20 @@ not qualify the adapter.
   drop-back the operator rejected: nothing monitors acceptance, output or
   timing, no route changes after the load, and the rule carries no
   threshold. Same-base fine-tunes whose storage admits the fast graph keep
-  the automatic drafter.
+  the automatic drafter. Admitted is what the loader does with the storage,
+  not what the switch says: the loader keeps a layer whose router, gate
+  logit or shared expert is not in the batched route's storage on the
+  per-row route whoever turned `HF2Q_QWEN_MOE_BATCHED` on, so setting the
+  switch by hand on such an artifact does not qualify it.
 - **`0`: kill switch.** No drafter is located and no profile applies. Every
   switch of the route profile resolves from the environment alone, so the
   server runs what it ran before this policy, for every family.
 - **`1`: required.** A target in neither class, or a drafter that cannot be
   obtained or bound, fails startup. It accepts both classes, and it serves
   the drafter on a MoE target without its batched route, with a WARN line
-  that the route is unqualified and was measured slower.
+  that the route is unqualified and was measured slower. This is the only
+  override of the boundary. The staged expert rows stay withheld there: they
+  run inside the batched layer and would fail the load.
 
 This supersedes the earlier rule that admitted the exact source identity
 only (operator decision, 2026-11-12: fine-tunes of a qualified model get the
@@ -2383,7 +2389,13 @@ asks `inference::route_host` (the Metal tensor API is absent on macOS before
 26 and on GPUs outside the Metal 4 family) for every row before turning it
 on. A switch set on by hand on such a host fails startup with the host's
 text; a host that could not be asked at all keeps the prior route under
-auto and fails a required DFlash2.
+auto and fails a required DFlash2. Whether a value sets a switch on is
+decided by the grammar of that switch's own reader, which the host table
+records per row (exactly `1` for the prepared verify routes; `1`, `on` or
+`true` for the prepared prefill and the MoE routes). The same test settles
+the planes a route keeps and the row another row requires, so a value the
+reader leaves off (`HF2Q_REPACKED_GGUF_M32=on`) selects no kernel, counts no
+plane and never refuses the stock load it leaves.
 
 A memory rule runs before selection: headroom is physical memory minus what
 the engines already resident in the process have committed, the model file,
@@ -2392,10 +2404,19 @@ prepared planes the native layout's bytes for the weights they cover (two
 output heads when the shared head is off), and a route's retained scratch
 its declared figure (none today). When the planes do not fit, the
 plane-carrying rows are withheld and DFlash2 is kept if the drafter fits;
-otherwise the prior route is kept. Every `load_engine` call reserves its
-commitment in a process ledger (`serve::resident_memory`) before it
-allocates, releases it on failure and on unload, and the hot-swap pool
-charges the same figure instead of the GGUF file size.
+otherwise the prior route is kept. Every `load_engine` call decides against
+a process ledger (`serve::resident_memory`) and reserves what it decided in
+one transaction, before it allocates, so concurrent loads through one pool
+or several are never decided against the same total. The reservation is
+owned by whoever owns the model's buffers: the loading thread, then the
+worker thread, which releases it after it has dropped the model. An evicted
+engine whose worker is still tearing down or is wedged stays counted; a
+load that fails after its worker started stops and joins that worker before
+the prior-route retry, which reserves its own commitment. The planes of a
+prepared route the operator set are the model's own and are committed with
+or without a drafter, also beside `HF2Q_DFLASH2=0`; only the staged draft's
+head needs the drafter. The hot-swap pool charges the same figure instead of
+the GGUF file size.
 
 Measured peak process footprint of the default profile on the exact
 four-agent Q5: Qwen3.8 76.73 GB against 57.87 GB on the prior route (the rule

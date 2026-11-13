@@ -453,31 +453,67 @@ pub(crate) struct Selection {
     pub(crate) commitment: Commitment,
     /// The class that qualified the target, when one did.
     pub(crate) class: Option<QualifiedClass>,
+    /// This model without a drafter: what a load that gives the drafter up
+    /// is served on.
+    prior: PriorRoute,
+}
+
+/// The route of a model without a drafter: every switch from the process
+/// environment alone. A switch the operator set keeps its route whatever
+/// `HF2Q_DFLASH2` says, and the planes that route prepares are resident all
+/// the same, so they are part of the commitment.
+#[derive(Clone, Debug)]
+struct PriorRoute {
+    routes: Arc<ResolvedRoutes>,
+    commitment: Commitment,
+}
+
+impl PriorRoute {
+    fn of(facts: &TargetFacts, host: HostFacts, env: &dyn Fn(&str) -> Option<String>) -> Self {
+        let routes = ResolvedRoutes::resolve(None, &|_| None, env);
+        Self {
+            commitment: route_commitment(facts, host, &routes, None),
+            routes: Arc::new(routes),
+        }
+    }
+}
+
+/// What an engine of the target holds resident on `routes`, with the drafter
+/// of `drafter_bytes` when it has one.
+fn route_commitment(
+    facts: &TargetFacts,
+    host: HostFacts,
+    routes: &ResolvedRoutes,
+    drafter_bytes: Option<u64>,
+) -> Commitment {
+    Commitment {
+        model_file_bytes: facts.model_file_bytes,
+        kv_budget_bytes: host.kv_budget_bytes,
+        drafter_bytes: drafter_bytes.unwrap_or(0),
+        plane_bytes: routed_plane_bytes(facts, routes, drafter_bytes.is_some()),
+        scratch_bytes: routed_scratch_bytes(facts, routes),
+    }
 }
 
 impl Selection {
     fn prior_route(
         request: PolicyRequest,
         facts: &TargetFacts,
-        host: HostFacts,
+        prior: &PriorRoute,
         reason: impl Into<String>,
-        env: &dyn Fn(&str) -> Option<String>,
     ) -> Self {
         Self {
             request,
             plan: None,
-            routes: Arc::new(ResolvedRoutes::resolve(None, &|_| None, env)),
+            routes: Arc::clone(&prior.routes),
             reason: reason.into(),
             descriptor: None,
             target_source: facts.source_identity(),
             warnings: Vec::new(),
             memory: None,
-            commitment: Commitment {
-                model_file_bytes: facts.model_file_bytes,
-                kv_budget_bytes: host.kv_budget_bytes,
-                ..Commitment::default()
-            },
+            commitment: prior.commitment,
             class: None,
+            prior: prior.clone(),
         }
     }
 
@@ -492,23 +528,21 @@ impl Selection {
         self.request == PolicyRequest::Auto && self.selected()
     }
 
-    /// This selection with DFlash2 and the profile withdrawn.
+    /// This selection with DFlash2 and the profile withdrawn: the model on
+    /// the routes its environment alone selects, with their commitment.
     pub(crate) fn without_dflash2(&self, reason: impl Into<String>) -> Self {
         Self {
             request: self.request,
             plan: None,
-            routes: Arc::new(ResolvedRoutes::from_process_env()),
+            routes: Arc::clone(&self.prior.routes),
             reason: reason.into(),
             descriptor: self.descriptor,
             target_source: self.target_source.clone(),
             warnings: Vec::new(),
             memory: None,
-            commitment: Commitment {
-                model_file_bytes: self.commitment.model_file_bytes,
-                kv_budget_bytes: self.commitment.kv_budget_bytes,
-                ..Commitment::default()
-            },
+            commitment: self.prior.commitment,
             class: self.class,
+            prior: self.prior.clone(),
         }
     }
 
@@ -563,6 +597,9 @@ impl Selection {
             tracing::warn!(model = %model.display(), "{warning}");
         }
         let memory = self.memory.unwrap_or_default();
+        // What the engine holds on the routes as resolved: also the planes
+        // of a prepared route the operator set beside the kill switch.
+        let commitment = self.commitment;
         tracing::info!(
             model = %model.display(),
             policy = self.request.label(),
@@ -575,9 +612,9 @@ impl Selection {
             withheld = %self.routes.withheld_audit(),
             memory_headroom_bytes = memory.headroom_bytes,
             resident_bytes = memory.resident_bytes,
-            drafter_bytes = memory.drafter_bytes,
-            prepared_plane_bytes = memory.plane_bytes,
-            scratch_bytes = memory.scratch_bytes,
+            drafter_bytes = commitment.drafter_bytes,
+            prepared_plane_bytes = commitment.plane_bytes,
+            scratch_bytes = commitment.scratch_bytes,
             switches = %self.routes.audit(),
             "DFlash2 policy resolved"
         );
@@ -757,7 +794,12 @@ fn moe_staged_refusal(facts: &TargetFacts) -> Option<String> {
 pub(crate) fn switch_refusal(facts: &TargetFacts, row: &SwitchRow) -> Option<String> {
     match row.name {
         "HF2Q_QWEN_MOE_BATCHED" => return moe_batched_refusal(facts),
-        "HF2Q_QWEN_MOE_STAGED_M8" => return moe_staged_refusal(facts),
+        // The staged experts run inside the batched layer: they need the
+        // storage the batched route admits, not only its switch. A layer
+        // that keeps the per-row route fails a staged load.
+        "HF2Q_QWEN_MOE_STAGED_M8" => {
+            return moe_batched_refusal(facts).or_else(|| moe_staged_refusal(facts))
+        }
         "HF2Q_QWEN_PREFILL_PREPARED" if facts.chunk_scan_prefill => {
             return Some("the chunk-scan prefill investigation route is on".to_owned())
         }
@@ -840,12 +882,19 @@ pub(crate) fn plane_bytes(tensors: &[TensorFact], sets: &[PlaneSet]) -> u64 {
 }
 
 /// Bytes of the prepared planes `routes` keep resident on this target.
+/// `drafter` says whether a drafter is loaded beside the model.
 ///
-/// A plane set is prepared once however many switches read it, with one
-/// exception: the output head. The staged draft (at four lanes) and the
-/// prepared target head each prepare a copy of their own unless
-/// `HF2Q_REPACKED_GGUF_SHARED_HEAD` makes the model own one for both.
-pub(crate) fn routed_plane_bytes(facts: &TargetFacts, routes: &ResolvedRoutes) -> u64 {
+/// The model's own planes follow its switches alone: a prepared route the
+/// operator set keeps them with or without a drafter, also beside
+/// `HF2Q_DFLASH2=0`. A plane set is prepared once however many switches read
+/// it, with one exception: the output head. The staged draft (a drafter at
+/// four lanes) and the prepared target head each prepare a copy of their own
+/// unless `HF2Q_REPACKED_GGUF_SHARED_HEAD` makes the model own one for both.
+pub(crate) fn routed_plane_bytes(
+    facts: &TargetFacts,
+    routes: &ResolvedRoutes,
+    drafter: bool,
+) -> u64 {
     const STAGED: Switch = switch("HF2Q_DFLASH2_DRAFT_STAGED");
     const TARGET_HEAD: Switch = switch("HF2Q_REPACKED_GGUF_M32_HEAD");
     const SHARED_HEAD: Switch = switch("HF2Q_REPACKED_GGUF_SHARED_HEAD");
@@ -856,7 +905,7 @@ pub(crate) fn routed_plane_bytes(facts: &TargetFacts, routes: &ResolvedRoutes) -
         .collect();
     // The staged draft projects its vocabulary on the prepared tile only
     // at 32 draft rows: four lanes.
-    let consumers = u64::from(routes.is_on(STAGED) && facts.slots == Some(4))
+    let consumers = u64::from(drafter && routes.is_on(STAGED) && facts.slots == Some(4))
         + u64::from(routes.is_on(TARGET_HEAD));
     let copies = if routes.is_on(SHARED_HEAD) {
         consumers.min(1)
@@ -868,24 +917,23 @@ pub(crate) fn routed_plane_bytes(facts: &TargetFacts, routes: &ResolvedRoutes) -
 }
 
 /// Bytes of scratch the kernels of the table switch `row` retain between
-/// steps on `descriptor`'s target, beyond what the prior route retains.
+/// steps on the target `facts` describes, beyond what the stock route
+/// retains.
 ///
 /// The one place a route's retained scratch enters memory admission: a
 /// switch whose kernels keep scratch resident gets its measured figure
-/// here, and the memory rule, the commitment and the published decision
-/// carry it. No current row retains any.
-pub(crate) fn switch_scratch_bytes(
-    _row: &SwitchRow,
-    _descriptor: &DFlash2CheckpointDescriptor,
-) -> u64 {
+/// here, and the memory rule, the commitment, the pool's charge and the
+/// published decision carry it, with or without a drafter. No current row
+/// retains any.
+pub(crate) fn switch_scratch_bytes(_row: &SwitchRow, _facts: &TargetFacts) -> u64 {
     0
 }
 
-fn routed_scratch_bytes(routes: &ResolvedRoutes, descriptor: &DFlash2CheckpointDescriptor) -> u64 {
+fn routed_scratch_bytes(facts: &TargetFacts, routes: &ResolvedRoutes) -> u64 {
     SWITCHES
         .iter()
         .filter(|row| routes.is_on(switch(row.name)))
-        .map(|row| switch_scratch_bytes(row, descriptor))
+        .map(|row| switch_scratch_bytes(row, facts))
         .fold(0, u64::saturating_add)
 }
 
@@ -1009,21 +1057,23 @@ pub(crate) fn decide(
     let request = parse_policy(env(DFLASH2_ENV).as_deref()).map_err(anyhow::Error::msg)?;
     // A switch the operator set on is the operator's: it is never withheld,
     // so a host that cannot run its kernels refuses the load here, by name,
-    // instead of failing at the first dispatch.
+    // instead of failing at the first dispatch. "On" is what the switch's
+    // own reader takes as on: a value the reader leaves off selects no
+    // kernel and refuses nothing.
     for row in SWITCHES {
-        if turns_on(env(row.name).as_deref()) {
+        if turns_on(switch(row.name), env(row.name).as_deref()) {
             if let Some(refusal) = host_refusal(row.name) {
                 bail!("{}", refusal.explicit);
             }
         }
     }
+    let prior = PriorRoute::of(facts, host, env);
     if request == PolicyRequest::Off {
         return Ok(Selection::prior_route(
             request,
             facts,
-            host,
+            &prior,
             format!("{DFLASH2_ENV}=0 keeps the prior route"),
-            env,
         ));
     }
     let required = request == PolicyRequest::Required;
@@ -1034,21 +1084,21 @@ pub(crate) fn decide(
             bail!("{DFLASH2_ENV}=1 cannot be satisfied: {reason}")
         }
         Err(Unqualified::NotServed(reason)) | Err(Unqualified::Refused(reason)) => {
-            let mut prior = Selection::prior_route(request, facts, host, reason.clone(), env);
+            let mut selection = Selection::prior_route(request, facts, &prior, reason.clone());
             if required {
-                prior
+                selection
                     .warnings
                     .push(format!("{DFLASH2_ENV}=1 has no effect: {reason}"));
             }
-            return Ok(prior);
+            return Ok(selection);
         }
     };
     let withdrawn = |reason: String, warnings: Vec<String>| {
-        let mut prior = Selection::prior_route(request, facts, host, reason, env);
-        prior.descriptor = Some(descriptor);
-        prior.class = Some(class);
-        prior.warnings = warnings;
-        prior
+        let mut selection = Selection::prior_route(request, facts, &prior, reason);
+        selection.descriptor = Some(descriptor);
+        selection.class = Some(class);
+        selection.warnings = warnings;
+        selection
     };
     let mut warnings = Vec::new();
 
@@ -1174,25 +1224,35 @@ pub(crate) fn decide(
     // 39.46 s on the prior route. Nothing here watches acceptance or output
     // at run time, and no route is switched after the load. A required
     // DFlash2 keeps the drafter and is told the cost.
+    //
+    // Admitted means what the loader will do, not what the switch says: the
+    // loader keeps a layer on the per-row route when its storage is not the
+    // batched route's, whoever turned the switch on. So the storage is asked
+    // also when the operator set the switch by hand.
     const MOE_BATCHED: Switch = switch("HF2Q_QWEN_MOE_BATCHED");
-    if descriptor.family_adapter == DFlash2FamilyAdapter::QwenMoe && !admitted.is_on(MOE_BATCHED) {
-        let why = admitted
-            .entries()
-            .find(|(name, ..)| *name == "HF2Q_QWEN_MOE_BATCHED")
-            .and_then(|(_, _, _, withheld)| withheld.map(str::to_owned))
-            .unwrap_or_else(|| "it is switched off".to_owned());
-        let unqualified = format!(
-            "the batched MoE verification route is not admitted (HF2Q_QWEN_MOE_BATCHED is off: \
-             {why}), and DFlash2 verification on the per-row expert path is not a qualified \
-             fast path"
-        );
-        if !required {
-            return Ok(withdrawn(unqualified, warnings));
+    if descriptor.family_adapter == DFlash2FamilyAdapter::QwenMoe {
+        let not_admitted = match moe_batched_refusal(facts) {
+            Some(storage) if admitted.is_on(MOE_BATCHED) => Some(format!(
+                "HF2Q_QWEN_MOE_BATCHED is set, but the artifact's storage keeps the per-row \
+                 route: {storage}"
+            )),
+            Some(storage) => Some(format!("HF2Q_QWEN_MOE_BATCHED is off: {storage}")),
+            None if admitted.is_on(MOE_BATCHED) => None,
+            None => Some("HF2Q_QWEN_MOE_BATCHED is off: it is switched off".to_owned()),
+        };
+        if let Some(why) = not_admitted {
+            let unqualified = format!(
+                "the batched MoE verification route is not admitted ({why}), and DFlash2 \
+                 verification on the per-row expert path is not a qualified fast path"
+            );
+            if !required {
+                return Ok(withdrawn(unqualified, warnings));
+            }
+            warnings.push(format!(
+                "{DFLASH2_ENV}=1 serves DFlash2 on an unqualified route: {unqualified}; it was \
+                 measured slower than the prior route on such a target"
+            ));
         }
-        warnings.push(format!(
-            "{DFLASH2_ENV}=1 serves DFlash2 on an unqualified route: {unqualified}; it was \
-             measured slower than the prior route on such a target"
-        ));
     }
     let dropped = ResolvedRoutes::resolve(
         profile,
@@ -1201,8 +1261,8 @@ pub(crate) fn decide(
     );
     let route_bytes = |routes: &ResolvedRoutes| {
         (
-            routed_plane_bytes(facts, routes),
-            routed_scratch_bytes(routes, descriptor),
+            routed_plane_bytes(facts, routes, true),
+            routed_scratch_bytes(facts, routes),
         )
     };
     let (admitted_planes, admitted_scratch) = route_bytes(&admitted);
@@ -1244,15 +1304,15 @@ pub(crate) fn decide(
             estimate(admitted_planes, admitted_scratch),
         ),
         MemoryVerdict::NoDrafter if !required => {
-            let mut prior = withdrawn(
+            let mut selection = withdrawn(
                 format!(
                     "{qualified}; the drafter ({}) does not fit in memory: {formula}",
                     gib(descriptor.weights_bytes)
                 ),
                 warnings,
             );
-            prior.memory = Some(estimate(0, 0));
-            return Ok(prior);
+            selection.memory = Some(estimate(0, 0));
+            return Ok(selection);
         }
         MemoryVerdict::DropPlanes | MemoryVerdict::NoDrafter => {
             if verdict == MemoryVerdict::NoDrafter {
@@ -1273,6 +1333,7 @@ pub(crate) fn decide(
             )
         }
     };
+    let commitment = route_commitment(facts, host, &routes, Some(descriptor.weights_bytes));
     Ok(Selection {
         request,
         plan: Some(DFlash2Plan {
@@ -1288,21 +1349,17 @@ pub(crate) fn decide(
         target_source: facts.source_identity(),
         warnings,
         memory: Some(memory),
-        commitment: Commitment {
-            model_file_bytes: facts.model_file_bytes,
-            kv_budget_bytes: host.kv_budget_bytes,
-            drafter_bytes: memory.drafter_bytes,
-            plane_bytes: memory.plane_bytes,
-            scratch_bytes: memory.scratch_bytes,
-        },
+        commitment,
         class: Some(class),
+        prior,
     })
 }
 
 /// Upper bound of what an engine loaded from `path` holds resident beside
-/// its KV budget: the model file and, when the target qualifies for a
-/// drafter, the drafter and every prepared plane and scratch byte its
-/// storage and this host admit. The hot-swap pool admits a load against
+/// its KV budget: the model file, the planes and scratch of the routes its
+/// environment selects and, when the target qualifies for a drafter, the
+/// drafter and every prepared plane and scratch byte its storage and this
+/// host admit. The hot-swap pool admits a load against
 /// this before the loader allocates anything. `config` is the engine
 /// configuration when the caller has one; without it the target is taken
 /// to be served SlotAware with four slots.
@@ -1331,20 +1388,28 @@ pub(crate) fn admission_bytes(
 }
 
 /// Drafter, plane and scratch bytes of the fullest route the policy could
-/// select for `facts`: no drafter lookup and no memory rule.
+/// select for `facts`: no drafter lookup and no memory rule. Without a
+/// drafter (the kill switch, a target that does not qualify) that is the
+/// route the environment alone selects, whose planes are resident whatever
+/// the policy.
 pub(crate) fn route_upper_bound(
     facts: &TargetFacts,
     env: &dyn Fn(&str) -> Option<String>,
     host_refusal: &dyn Fn(&str) -> Option<HostRefusal>,
 ) -> u64 {
+    let route_bytes = |routes: &ResolvedRoutes, drafter: bool| {
+        routed_plane_bytes(facts, routes, drafter)
+            .saturating_add(routed_scratch_bytes(facts, routes))
+    };
+    let prior = route_bytes(&ResolvedRoutes::resolve(None, &|_| None, env), false);
     if !matches!(
         parse_policy(env(DFLASH2_ENV).as_deref()),
         Ok(PolicyRequest::Auto | PolicyRequest::Required)
     ) {
-        return 0;
+        return prior;
     }
     let Ok((descriptor, _class)) = qualify(facts) else {
-        return 0;
+        return prior;
     };
     let routes = ResolvedRoutes::resolve(
         RouteProfile::of(descriptor),
@@ -1357,8 +1422,8 @@ pub(crate) fn route_upper_bound(
     );
     descriptor
         .weights_bytes
-        .saturating_add(routed_plane_bytes(facts, &routes))
-        .saturating_add(routed_scratch_bytes(&routes, descriptor))
+        .saturating_add(route_bytes(&routes, true))
+        .max(prior)
 }
 
 /// [`decide`] for the model at `path` on this host and process environment.

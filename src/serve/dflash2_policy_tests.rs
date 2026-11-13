@@ -807,8 +807,7 @@ fn auto_qualifies_a_moe_target_only_with_its_batched_verification_route() {
         assert!(warning.contains("unqualified route"), "{warning}");
         assert!(warning.contains("slower than the prior route"), "{warning}");
     }
-    // The batched route switched off by hand is the same condition; switched
-    // on by hand it is the operator's, and the drafter is selected.
+    // The batched route switched off by hand is the same condition.
     let off = decided(
         &qwen36(),
         &[("HF2Q_QWEN_MOE_BATCHED", "0")],
@@ -817,12 +816,70 @@ fn auto_qualifies_a_moe_target_only_with_its_batched_verification_route() {
     .expect("auto");
     assert_prior_route(&off, &[("HF2Q_QWEN_MOE_BATCHED", "0")]);
     assert!(off.reason.contains("it is switched off"), "{}", off.reason);
-    let forced = decided(&apex, &[("HF2Q_QWEN_MOE_BATCHED", "1")], &Store::cached()).expect("auto");
+
+    // Switched on by hand it changes nothing about the storage: the loader
+    // keeps such a layer on the per-row route whoever set the switch, so
+    // auto still does not select the drafter. Each spelling the reader takes
+    // as on is covered.
+    for (facts, reason) in cases {
+        for value in ["1", "on", "true"] {
+            let forced: &[(&str, &str)] = &[("HF2Q_QWEN_MOE_BATCHED", value)];
+            let auto = decided(facts, forced, &Store::cached()).expect("auto never fails");
+            assert_prior_route(&auto, forced);
+            assert!(
+                auto.reason.contains(
+                    "HF2Q_QWEN_MOE_BATCHED is set, but the artifact's storage keeps the per-row \
+                     route"
+                ),
+                "{}",
+                auto.reason
+            );
+            assert!(auto.reason.contains(reason), "{}", auto.reason);
+        }
+        // Required with the switch forced is the warned override. The
+        // staged experts, which need the batched layer, stay off: on this
+        // storage they would fail the load.
+        let required = decided(
+            facts,
+            &[(DFLASH2_ENV, "1"), ("HF2Q_QWEN_MOE_BATCHED", "1")],
+            &Store::cached(),
+        )
+        .expect("required");
+        assert!(required.selected());
+        assert_eq!(
+            required.routes.source(switch("HF2Q_QWEN_MOE_BATCHED")),
+            SwitchSource::Env
+        );
+        assert!(withheld(&required, "HF2Q_QWEN_MOE_STAGED_M8"));
+        assert!(withheld(&required, "HF2Q_QWEN_MOE_LIVE_TILES"));
+        let audit = required.routes.withheld_audit();
+        assert!(audit.contains("HF2Q_QWEN_MOE_STAGED_M8: "), "{audit}");
+        assert!(audit.contains(reason), "{audit}");
+        assert!(
+            audit.contains("HF2Q_QWEN_MOE_LIVE_TILES: HF2Q_QWEN_MOE_STAGED_M8 is off"),
+            "{audit}"
+        );
+        assert!(!required.routes.plane_sets().contains(&PlaneSet::MoeExperts));
+        let [warning] = required.warnings.as_slice() else {
+            panic!("one cost warning, got {:?}", required.warnings);
+        };
+        assert!(warning.contains("unqualified route"), "{warning}");
+        assert!(warning.contains("is set, but"), "{warning}");
+    }
+    // On storage the batched route admits, the switch set by hand is what
+    // the profile sets anyway.
+    let forced = decided(
+        &qwen36(),
+        &[("HF2Q_QWEN_MOE_BATCHED", "1")],
+        &Store::cached(),
+    )
+    .expect("auto");
     assert!(forced.selected());
     assert_eq!(
         forced.routes.source(switch("HF2Q_QWEN_MOE_BATCHED")),
         SwitchSource::Env
     );
+    assert!(forced.routes.is_one(switch("HF2Q_QWEN_MOE_STAGED_M8")));
     // A dense target has no such condition.
     assert!(decided(&qwen38(), &[], &Store::cached())
         .expect("auto")
@@ -898,6 +955,30 @@ fn a_host_that_cannot_run_a_switch_keeps_it_off_or_refuses_it_by_name() {
     assert!(off.selected());
     let kill = on_host(&qwen38(), &[(DFLASH2_ENV, "0")]).expect("kill switch");
     assert_prior_route(&kill, &[]);
+
+    // "Set on" is what the switch's own reader takes as on. The prepared
+    // verify reader takes exactly `1`: `on` selects no kernel there, so the
+    // stock load it leaves is not refused, under any policy.
+    for value in ["on", "true", "ON", " 1"] {
+        for policy in [None, Some("0"), Some("1")] {
+            let mut pairs = vec![("HF2Q_REPACKED_GGUF_M32", value)];
+            pairs.extend(policy.map(|value| (DFLASH2_ENV, value)));
+            let selection = on_host(&qwen38(), &pairs)
+                .unwrap_or_else(|error| panic!("{pairs:?} refused: {error:#}"));
+            assert!(!selection.routes.is_on(switch("HF2Q_REPACKED_GGUF_M32")));
+            assert_eq!(
+                selection.routes.source(switch("HF2Q_REPACKED_GGUF_M32")),
+                SwitchSource::Env
+            );
+            assert!(!selection.routes.plane_sets().contains(&PlaneSet::DenseFfn));
+        }
+    }
+    assert!(on_host(&qwen38(), &[("HF2Q_REPACKED_GGUF_M32", "1")]).is_err());
+    // The prepared prefill reader also takes `on` and `true`.
+    for value in ["on", "true", " On "] {
+        let pairs = [(DFLASH2_ENV, "0"), ("HF2Q_QWEN_PREFILL_PREPARED", value)];
+        assert!(on_host(&qwen38(), &pairs).is_err(), "{value:?}");
+    }
 }
 
 #[test]
@@ -1397,17 +1478,119 @@ fn a_second_model_is_admitted_against_what_the_first_holds_resident() {
     assert_eq!(kill.commitment.total(), facts.model_file_bytes + kv);
     drop(kill_reservation);
 
-    // A load that fails on the DFlash2 route and is retried on the prior
-    // route amends its commitment.
-    second_reservation.amend(second.without_dflash2("test").commitment);
-    assert_eq!(ledger.total(), one_engine + facts.model_file_bytes + kv);
+    // A load that fails on the DFlash2 route is retried on the prior route
+    // with a reservation of its own. The failed attempt's reservation goes
+    // with its model; while a worker still holds that model, both count.
+    let retry = ledger.reserve(
+        Path::new("/model.gguf"),
+        second.without_dflash2("test").commitment,
+    );
+    assert_eq!(
+        ledger.total(),
+        2 * one_engine - planes + facts.model_file_bytes + kv
+    );
     drop(second_reservation);
+    assert_eq!(ledger.total(), one_engine + facts.model_file_bytes + kv);
+    drop(retry);
 
     // Once the first engine is unloaded a new one gets the whole profile.
     drop(first_reservation);
     assert_eq!(ledger.total(), 0);
     let (again, _reservation) = load(&[]);
     assert_eq!(again.profile_label(), "full");
+}
+
+#[test]
+fn planes_of_a_route_the_operator_set_are_committed_whatever_the_policy() {
+    let facts = qwen38();
+    let ffn = plane_bytes(&facts.tensors, &[PlaneSet::DenseFfn]);
+    let projections = plane_bytes(&facts.tensors, &[PlaneSet::Projections]);
+    let head = plane_bytes(&facts.tensors, &[PlaneSet::Head]);
+    let base = facts.model_file_bytes + ROOMY.kv_budget_bytes;
+    let committed = |selection: &Selection| {
+        assert_eq!(selection.commitment.drafter_bytes, 0);
+        assert_eq!(
+            selection.commitment.total() - base,
+            selection.commitment.plane_bytes
+        );
+        assert_eq!(
+            selection.published()["memory"]["prepared_plane_bytes"],
+            selection.commitment.plane_bytes
+        );
+        selection.commitment.plane_bytes
+    };
+
+    // The kill switch: the explicit prepared prefill prepares and keeps the
+    // FFN and projection planes, and the engine is committed for them.
+    let kill = |pairs: &[(&str, &str)]| {
+        let mut all = vec![(DFLASH2_ENV, "0")];
+        all.extend_from_slice(pairs);
+        let selection = decided(&facts, &all, &Untouched).expect("kill switch");
+        assert_prior_route(&selection, &all);
+        committed(&selection)
+    };
+    assert_eq!(kill(&[]), 0);
+    assert_eq!(
+        kill(&[("HF2Q_QWEN_PREFILL_PREPARED", "1")]),
+        ffn + projections
+    );
+    assert_eq!(
+        kill(&[("HF2Q_QWEN_PREFILL_PREPARED", "on")]),
+        ffn + projections
+    );
+    assert_eq!(kill(&[("HF2Q_REPACKED_GGUF_M32", "1")]), ffn);
+    assert_eq!(
+        kill(&[
+            ("HF2Q_REPACKED_GGUF_M32", "1"),
+            ("HF2Q_REPACKED_GGUF_M32_PROJ", "1"),
+            ("HF2Q_REPACKED_GGUF_M32_HEAD", "1"),
+        ]),
+        ffn + projections + head
+    );
+    // No drafter, no staged draft: its head is not prepared.
+    assert_eq!(kill(&[("HF2Q_DFLASH2_DRAFT_STAGED", "1")]), 0);
+    // A value the reader leaves off prepares nothing.
+    assert_eq!(kill(&[("HF2Q_REPACKED_GGUF_M32", "on")]), 0);
+
+    // A target that does not qualify, and one whose drafter is unavailable.
+    let prefill: &[(&str, &str)] = &[("HF2Q_QWEN_PREFILL_PREPARED", "1")];
+    let serial = TargetFacts {
+        slots: None,
+        ..qwen38()
+    };
+    let unserved = decided(&serial, prefill, &Untouched).expect("auto");
+    assert_prior_route(&unserved, prefill);
+    assert_eq!(committed(&unserved), ffn + projections);
+    let offline =
+        decided(&facts, prefill, &Store::empty(Err("HF_HUB_OFFLINE is set"))).expect("auto");
+    assert_prior_route(&offline, prefill);
+    assert_eq!(committed(&offline), ffn + projections);
+
+    // A drafter that does not fit: the prior route keeps the operator's
+    // planes.
+    let tight = decide(
+        &facts,
+        host_with_headroom(&facts, QWEN38_DFLASH2.weights_bytes - 1, 0),
+        &env(prefill),
+        &Store::cached(),
+        &|_| None,
+    )
+    .expect("auto");
+    assert_prior_route(&tight, prefill);
+    assert_eq!(tight.commitment.plane_bytes, ffn + projections);
+
+    // A load retried without the drafter: the profile's planes go, the
+    // operator's stay.
+    let selected = decided(&facts, prefill, &Store::cached()).expect("auto");
+    assert!(selected.selected());
+    assert_eq!(selected.commitment.plane_bytes, ffn + projections + head);
+    let retried = selected.without_dflash2("the DFlash2 route failed to load: test");
+    assert_prior_route(&retried, prefill);
+    assert_eq!(committed(&retried), ffn + projections);
+    let plain = decided(&facts, &[], &Store::cached())
+        .expect("auto")
+        .without_dflash2("test");
+    assert_eq!(committed(&plain), 0);
 }
 
 #[test]
@@ -1420,7 +1603,7 @@ fn separate_prepared_heads_are_counted_unless_the_model_shares_one() {
     let unshared: &[(&str, &str)] = &[("HF2Q_REPACKED_GGUF_SHARED_HEAD", "0")];
     let planes_of = |facts: &TargetFacts, pairs: &[(&str, &str)]| {
         let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(pairs));
-        routed_plane_bytes(facts, &routes)
+        routed_plane_bytes(facts, &routes, true)
     };
     // Shared: one head for the staged draft and the prepared target head.
     assert_eq!(planes_of(&facts, &[]), other + head);
@@ -1446,6 +1629,17 @@ fn separate_prepared_heads_are_counted_unless_the_model_shares_one() {
     assert_eq!(planes_of(&three_slots, unshared), other + head);
     assert_eq!(
         planes_of(&three_slots, &[("HF2Q_REPACKED_GGUF_M32_HEAD", "0")]),
+        other
+    );
+    // The staged draft is the drafter's: without a drafter only the model's
+    // own head consumer prepares one.
+    let without_drafter = |pairs: &[(&str, &str)]| {
+        let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(pairs));
+        routed_plane_bytes(&facts, &routes, false)
+    };
+    assert_eq!(without_drafter(unshared), other + head);
+    assert_eq!(
+        without_drafter(&[("HF2Q_REPACKED_GGUF_M32_HEAD", "0")]),
         other
     );
 
@@ -1487,6 +1681,37 @@ fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
     assert_eq!(bound(&dense, &[]), QWEN38_DFLASH2.weights_bytes + planes);
     assert_eq!(bound(&dense, &[(DFLASH2_ENV, "1")]), bound(&dense, &[]));
     assert_eq!(bound(&dense, &[(DFLASH2_ENV, "0")]), 0);
+    // A prepared route the operator set beside the kill switch keeps its
+    // planes resident, and the pool charges them.
+    let prefill_planes = plane_bytes(&dense.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections]);
+    assert_eq!(
+        bound(
+            &dense,
+            &[(DFLASH2_ENV, "0"), ("HF2Q_QWEN_PREFILL_PREPARED", "1")]
+        ),
+        prefill_planes
+    );
+    assert_eq!(
+        bound(
+            &dense,
+            &[
+                (DFLASH2_ENV, "0"),
+                ("HF2Q_REPACKED_GGUF_M32", "1"),
+                ("HF2Q_REPACKED_GGUF_M32_HEAD", "1"),
+                ("HF2Q_DFLASH2_DRAFT_STAGED", "1"),
+            ]
+        ),
+        plane_bytes(&dense.tensors, &[PlaneSet::DenseFfn, PlaneSet::Head]),
+        "no drafter, no staged draft head"
+    );
+    // A value the reader leaves off prepares nothing.
+    assert_eq!(
+        bound(
+            &dense,
+            &[(DFLASH2_ENV, "0"), ("HF2Q_REPACKED_GGUF_M32", "on")]
+        ),
+        0
+    );
     // With the prepared verify routes off the prepared prefill still
     // prepares the FFN and projection planes, and the staged draft a head.
     assert_eq!(
@@ -1504,12 +1729,17 @@ fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
         ),
         QWEN38_DFLASH2.weights_bytes
     );
-    // A target that does not qualify holds nothing beside its file.
+    // A target that does not qualify holds nothing beside its file, unless
+    // the operator set a prepared route.
     let serial = TargetFacts {
         slots: None,
         ..qwen38()
     };
     assert_eq!(bound(&serial, &[]), 0);
+    assert_eq!(
+        bound(&serial, &[("HF2Q_QWEN_PREFILL_PREPARED", "on")]),
+        prefill_planes
+    );
     // A host that cannot run the prepared kernels prepares no planes.
     assert_eq!(
         route_upper_bound(

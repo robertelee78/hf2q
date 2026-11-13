@@ -27,6 +27,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::{Arc, LazyLock};
 
 use super::schema::{DFlash2CheckpointDescriptor, QWEN36_DFLASH2, QWEN38_DFLASH2};
+use crate::inference::route_host::{self, Grammar};
 
 /// Prepared planes a switch keeps resident beside the GGUF weights. Each set
 /// is a second copy, in the prepared layout, of the named weights.
@@ -144,6 +145,38 @@ pub(crate) const fn switch(name: &str) -> Switch {
     panic!("switch is not in the DFlash2 route profile table")
 }
 
+/// How the reader of each switch decides that it is on: the grammar
+/// `inference::route_host` records for that reader. A switch without a row
+/// there fails the build.
+const GRAMMARS: [Grammar; SWITCH_COUNT] = {
+    let mut grammars = [Grammar::One; SWITCH_COUNT];
+    let mut index = 0;
+    while index < SWITCH_COUNT {
+        let mut host = 0;
+        loop {
+            assert!(
+                host < route_host::SWITCHES.len(),
+                "a route profile switch has no row in the host route table"
+            );
+            if same(route_host::SWITCHES[host].name, SWITCHES[index].name) {
+                grammars[index] = route_host::SWITCHES[host].grammar;
+                break;
+            }
+            host += 1;
+        }
+        index += 1;
+    }
+    grammars
+};
+
+/// Whether `value` turns `switch` on, as the switch's own reader decides it.
+/// Everything that is settled before a reader runs (host capability, the
+/// planes a route keeps, a row another row requires) asks this, so that it
+/// never treats as on a value the reader leaves off.
+pub(crate) fn turns_on(switch: Switch, value: Option<&str>) -> bool {
+    value.is_some_and(|value| GRAMMARS[switch.0].is_on(value))
+}
+
 /// Column of the table: the profile of one pinned Qwen descriptor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RouteProfile {
@@ -205,17 +238,6 @@ impl SwitchSource {
     }
 }
 
-/// Whether a raw switch value turns its route on, for the rules that are
-/// decided before a reader parses the value.
-pub(crate) fn turns_on(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "on" | "true"
-        )
-    })
-}
-
 /// Every table switch resolved for one model load.
 #[derive(Debug)]
 pub(crate) struct ResolvedRoutes {
@@ -226,6 +248,9 @@ pub(crate) struct ResolvedRoutes {
     withheld: [Option<String>; SWITCH_COUNT],
     /// Bit `i` is set when switch `i` resolved to exactly `1`.
     ones: u32,
+    /// Bit `i` is set when the value of switch `i` turns it on by its own
+    /// reader's grammar.
+    on: u32,
 }
 
 impl ResolvedRoutes {
@@ -242,6 +267,7 @@ impl ResolvedRoutes {
         let mut sources = [SwitchSource::Default; SWITCH_COUNT];
         let mut withheld: [Option<String>; SWITCH_COUNT] = std::array::from_fn(|_| None);
         let mut ones = 0;
+        let mut on = 0_u32;
         for (index, row) in SWITCHES.iter().enumerate() {
             let explicit = env(row.name).filter(|value| !value.trim().is_empty());
             let (value, source) = match (explicit, profile.and_then(|profile| profile.value(row))) {
@@ -250,7 +276,7 @@ impl ResolvedRoutes {
                 (None, Some(value)) => {
                     let unmet = row
                         .requires
-                        .filter(|required| !turns_on(values[switch(required).0].as_deref()));
+                        .filter(|required| on & (1 << switch(required).0) == 0);
                     let reason = match unmet {
                         Some(required) => Some(format!("{required} is off")),
                         None => withhold(row),
@@ -267,6 +293,9 @@ impl ResolvedRoutes {
             if value.as_deref() == Some("1") {
                 ones |= 1 << index;
             }
+            if turns_on(Switch(index), value.as_deref()) {
+                on |= 1 << index;
+            }
             values[index] = value;
             sources[index] = source;
         }
@@ -276,6 +305,7 @@ impl ResolvedRoutes {
             sources,
             withheld,
             ones,
+            on,
         }
     }
 
@@ -325,9 +355,10 @@ impl ResolvedRoutes {
         self.ones & (1 << switch.0) != 0
     }
 
-    /// Whether the value of `switch` turns its route on (`1`, `on`, `true`).
+    /// Whether the value of `switch` turns its route on, by the grammar of
+    /// the switch's own reader ([`turns_on`]).
     pub(crate) fn is_on(&self, switch: Switch) -> bool {
-        turns_on(self.values[switch.0].as_deref())
+        self.on & (1 << switch.0) != 0
     }
 
     /// Every switch as `(name, value, source, why withheld)`, in table order.
@@ -344,13 +375,12 @@ impl ResolvedRoutes {
         })
     }
 
-    /// Plane sets of every row whose value turns its route on. A row is on
-    /// when its value is `1`, `on` or `true`; the plane estimate is taken
-    /// before a reader could reject another value.
+    /// Plane sets of every row whose value turns its route on
+    /// ([`Self::is_on`]).
     pub(crate) fn plane_sets(&self) -> Vec<PlaneSet> {
         let mut sets = Vec::new();
         for (index, row) in SWITCHES.iter().enumerate() {
-            if turns_on(self.values[index].as_deref()) {
+            if self.is_on(Switch(index)) {
                 for set in row.planes {
                     if !sets.contains(set) {
                         sets.push(*set);
@@ -490,6 +520,65 @@ mod tests {
         assert!(!explicit.is_one(MOE_BATCHED), "`on` is not exactly 1");
         assert_eq!(explicit.value(PREFILL), None);
         assert_eq!(explicit.plane_sets(), vec![PlaneSet::DenseFfn]);
+    }
+
+    #[test]
+    fn a_switch_is_on_only_by_the_grammar_of_its_own_reader() {
+        // The prepared-route reader takes exactly `1`; the prefill and MoE
+        // readers also take `on` and `true`.
+        for (name, value, on) in [
+            ("HF2Q_REPACKED_GGUF_M32", "1", true),
+            ("HF2Q_REPACKED_GGUF_M32", "on", false),
+            ("HF2Q_REPACKED_GGUF_M32", "true", false),
+            ("HF2Q_REPACKED_GGUF_M32", " 1", false),
+            ("HF2Q_REPACKED_GGUF_M32", "0", false),
+            ("HF2Q_QWEN_PREFILL_PREPARED", "1", true),
+            ("HF2Q_QWEN_PREFILL_PREPARED", "on", true),
+            ("HF2Q_QWEN_PREFILL_PREPARED", " TRUE ", true),
+            ("HF2Q_QWEN_PREFILL_PREPARED", "0", false),
+            ("HF2Q_QWEN_MOE_BATCHED", "on", true),
+            ("HF2Q_QWEN_MOE_STAGED_M8", "yes", false),
+        ] {
+            assert_eq!(turns_on(switch(name), Some(value)), on, "{name}={value:?}");
+            let routes = ResolvedRoutes::resolve(None, &|_| None, &env(&[(name, value)]));
+            assert_eq!(routes.is_on(switch(name)), on, "{name}={value:?}");
+        }
+        assert!(!turns_on(M32, None));
+        // Every grammar is the host table's.
+        for (index, row) in SWITCHES.iter().enumerate() {
+            let host = route_host::SWITCHES
+                .iter()
+                .find(|host| host.name == row.name)
+                .expect("host row");
+            assert_eq!(GRAMMARS[index], host.grammar, "{}", row.name);
+        }
+        // A value the reader leaves off keeps no planes and satisfies no
+        // row that requires the switch.
+        let off = ResolvedRoutes::resolve(
+            Some(RouteProfile::Qwen38),
+            &|_| None,
+            &env(&[("HF2Q_REPACKED_GGUF_M32", "on")]),
+        );
+        assert!(!off.is_on(M32));
+        for name in [
+            "HF2Q_REPACKED_GGUF_M32_PROJ",
+            "HF2Q_REPACKED_GGUF_M32_HEAD",
+            "HF2Q_REPACKED_GGUF_ANY_WIDTH",
+        ] {
+            assert_eq!(off.source(switch(name)), SwitchSource::Withheld, "{name}");
+        }
+        let prefill = ResolvedRoutes::resolve(
+            None,
+            &|_| None,
+            &env(&[
+                ("HF2Q_QWEN_PREFILL_PREPARED", "on"),
+                ("HF2Q_REPACKED_GGUF_M32_HEAD", "true"),
+            ]),
+        );
+        assert_eq!(
+            prefill.plane_sets(),
+            vec![PlaneSet::DenseFfn, PlaneSet::Projections]
+        );
     }
 
     #[test]
