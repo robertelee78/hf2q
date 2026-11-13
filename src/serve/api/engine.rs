@@ -19074,6 +19074,13 @@ fn run_slot_aware_qwen35(
         }
     });
 
+    // HF2Q_QWEN_PREFILL_JOINT: the waiting slots' prefill chunks share one
+    // forward of at most the per-transaction row ceiling, so a joint
+    // transaction is never longer than one a single slot can already run.
+    let qwen_joint_prefill_rows = (n_slots > 1
+        && crate::inference::models::qwen35::prefill_joint::enabled())
+    .then_some(prefill_chunk_tokens as usize);
+
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {
             *g = sched.stats();
@@ -19486,7 +19493,7 @@ fn run_slot_aware_qwen35(
                 }
             }
             SchedulerStep::Prefill { handle, n_tokens } => {
-                if let Some(fatal) = advance_qwen35_prefill(
+                if let Some(fatal) = advance_qwen35_prefill_step(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
@@ -19497,6 +19504,7 @@ fn run_slot_aware_qwen35(
                     &scheduler_stats_snapshot,
                     handle,
                     n_tokens,
+                    qwen_joint_prefill_rows,
                     kv_bytes_per_token,
                     &supervisor,
                 ) {
@@ -19578,7 +19586,7 @@ fn run_slot_aware_qwen35(
                     );
                     break 'worker;
                 }
-                if let Some(fatal) = advance_qwen35_prefill(
+                if let Some(fatal) = advance_qwen35_prefill_step(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
@@ -19589,6 +19597,7 @@ fn run_slot_aware_qwen35(
                     &scheduler_stats_snapshot,
                     prefill,
                     n_prefill_tokens,
+                    qwen_joint_prefill_rows,
                     kv_bytes_per_token,
                     &supervisor,
                 ) {
@@ -20276,6 +20285,342 @@ fn advance_qwen35_prefill(
             .and_then(|kv| kv.sequence_len_for_slot(handle.slot_id).ok())
             .map(|n| n as usize),
     );
+    let fatal = settle_qwen35_prefill_advance(
+        guard,
+        scheduler,
+        slots,
+        retained_tokens,
+        prompt_caches,
+        prompt_anchors,
+        registration,
+        handle,
+        advance,
+        reply,
+        kv_bytes_per_token,
+        supervisor,
+    );
+    if fatal.is_some() {
+        return fatal;
+    }
+    if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
+        *snapshot = scheduler.stats();
+    }
+    None
+}
+
+/// One prefill step of the Qwen worker: with `joint_rows`, the chunks of
+/// every waiting slot that can share a forward run as one transaction of at
+/// most that many rows (`HF2Q_QWEN_PREFILL_JOINT`); otherwise, and whenever
+/// no second slot can join the scheduled one, the scheduled slot's own
+/// bounded prefill.
+#[allow(clippy::too_many_arguments)]
+fn advance_qwen35_prefill_step(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Qwen35Slot>],
+    retained_tokens: &mut [Qwen35RetainedPrefix],
+    prompt_caches: &mut [PromptCache],
+    prompt_anchors: &mut [Qwen35AnchorStore],
+    registration: Option<&super::registry::ModelRegistration>,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    handle: SlotHandle,
+    requested_tokens: u32,
+    joint_rows: Option<usize>,
+    kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
+) -> Option<Qwen35FatalFailure> {
+    if let Some(max_rows) = joint_rows {
+        if let Some(outcome) = advance_qwen35_prefill_joint(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_caches,
+            prompt_anchors,
+            registration,
+            scheduler_stats_snapshot,
+            handle,
+            max_rows,
+            kv_bytes_per_token,
+            supervisor,
+        ) {
+            return outcome;
+        }
+    }
+    advance_qwen35_prefill(
+        guard,
+        scheduler,
+        slots,
+        retained_tokens,
+        prompt_caches,
+        prompt_anchors,
+        registration,
+        scheduler_stats_snapshot,
+        handle,
+        requested_tokens,
+        kv_bytes_per_token,
+        supervisor,
+    )
+}
+
+/// Run the next prefill chunk of the scheduled slot `head` and of the slots
+/// waiting behind it as one joint forward. `None`: nothing was touched and
+/// the caller runs the head's own step (fewer than two slots can join, the
+/// head must run alone, or the prefill route is not exact for the model).
+/// `Some(outcome)`: the joint transaction ran; `outcome` is the worker
+/// fail-stop, if any.
+///
+/// Every admission check runs before a cache is touched. A lane's chunk is
+/// the chunk its own step would run, so which slots share a forward never
+/// changes how a prompt is cut.
+#[allow(clippy::too_many_arguments)]
+fn advance_qwen35_prefill_joint(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Qwen35Slot>],
+    retained_tokens: &mut [Qwen35RetainedPrefix],
+    prompt_caches: &mut [PromptCache],
+    prompt_anchors: &mut [Qwen35AnchorStore],
+    registration: Option<&super::registry::ModelRegistration>,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    head: SlotHandle,
+    max_rows: usize,
+    kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
+) -> Option<Option<Qwen35FatalFailure>> {
+    use super::engine_qwen35::{Qwen35JointPrefillAdvance, Qwen35PrefillLane, Qwen35PrefillAdvance};
+    let quanta = scheduler.prefill_quanta_fifo();
+    if quanta.len() < 2 || quanta[0].0 != head {
+        return None;
+    }
+    // Plan every waiting slot's chunk in place. The head must be joinable;
+    // a later slot that is not simply keeps waiting for its own step.
+    let mut candidates = Vec::with_capacity(quanta.len());
+    {
+        let kv = guard.kv.as_ref()?;
+        for (index, (handle, requested_tokens)) in quanta.iter().copied().enumerate() {
+            let slot_idx = handle.slot_id.0 as usize;
+            let planned = match slots.get(slot_idx).and_then(Option::as_ref) {
+                Some((Qwen35SlotWork::Prefill(state), reply, installed))
+                    if *installed == handle && !reply.client_closed() =>
+                {
+                    let quota_headroom = prompt_anchors[slot_idx].quota_headroom();
+                    state
+                        .plan_joint_chunk(
+                            guard.model,
+                            kv,
+                            qwen35_prefill_transaction_tokens(requested_tokens),
+                            quota_headroom,
+                        )
+                        .ok()
+                        .flatten()
+                        .map(|chunk| (handle, chunk, quota_headroom))
+                }
+                _ => None,
+            };
+            match planned {
+                Some(candidate) => candidates.push(candidate),
+                None if index == 0 => return None,
+                None => {}
+            }
+        }
+    }
+    if candidates.len() < 2 || !guard.model.prefill_joint_exact() {
+        return None;
+    }
+    let cohort = {
+        let shapes: Vec<_> = candidates
+            .iter()
+            .map(|(handle, chunk, _)| match slots[handle.slot_id.0 as usize].as_ref() {
+                Some((Qwen35SlotWork::Prefill(state), _, _)) => Some(state.joint_lane_shape(chunk)),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        super::engine_qwen35::qwen35_prefill_cohort(&shapes, max_rows, true)?
+    };
+    candidates.truncate(cohort.lanes);
+
+    // Checkpoint storage of the lanes that fold their cue, before any slot
+    // is touched: without it the scheduled slot runs its own step, which
+    // keeps the two forwards.
+    let mut fold_images = Vec::with_capacity(candidates.len());
+    {
+        let kv = guard.kv.as_ref()?;
+        for (handle, chunk, _) in &candidates {
+            fold_images.push(if chunk.folds_cue() {
+                match kv.boundary_anchor_image() {
+                    Ok(image) => Some(image),
+                    Err(error) => {
+                        tracing::warn!(
+                            slot = handle.slot_id.0,
+                            error = %format!("{error:#}"),
+                            "Qwen35 joint prefill skipped: checkpoint storage allocation failed"
+                        );
+                        return None;
+                    }
+                }
+            } else {
+                None
+            });
+        }
+    }
+
+    // Admitted: take the lanes' work out of their slots.
+    let mut lanes = Vec::with_capacity(candidates.len());
+    let mut replies = Vec::with_capacity(candidates.len());
+    for ((handle, chunk, anchor_quota_headroom), fold_image) in
+        candidates.into_iter().zip(fold_images)
+    {
+        match slots[handle.slot_id.0 as usize].take() {
+            Some((Qwen35SlotWork::Prefill(state), reply, _)) => {
+                lanes.push(Qwen35PrefillLane {
+                    state,
+                    chunk,
+                    fold_image,
+                    anchor_quota_headroom,
+                });
+                replies.push((handle, reply));
+            }
+            other => {
+                // Planned from this very slot a moment ago on this thread.
+                slots[handle.slot_id.0 as usize] = other;
+                return Some(Some(Qwen35FatalFailure {
+                    handle: None,
+                    reply: Qwen35FatalReply::None,
+                    error: anyhow::anyhow!(
+                        "Qwen35 joint prefill lost the planned work of slot {}",
+                        handle.slot_id.0
+                    ),
+                    kind: Qwen35WorkerFatalKind::Invariant,
+                }));
+            }
+        }
+    }
+    let handles: Vec<SlotHandle> = replies.iter().map(|(handle, _)| *handle).collect();
+    tracing::debug!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        lanes = handles.len(),
+        rows = cohort.rows,
+        shared_rows = cohort.shared_rows,
+        sharing = cohort.sharing.iter().filter(|shares| **shares).count(),
+        "Qwen35 joint prefill transaction"
+    );
+    let _native_invocation = scheduler.trace_transaction("qwen35", "bounded_prefill", &handles);
+    let advance = super::engine_qwen35::run_qwen35_joint_prefill(
+        lanes,
+        &cohort,
+        guard.model,
+        registration,
+        guard.kv.as_mut().expect("kv Some during loop"),
+        supervisor,
+    );
+    // What is left of a lane once it cannot be settled normally: its work,
+    // when it still has one, goes back into its slot for the fail-stop.
+    enum Unsettled {
+        Advance(Result<Qwen35PrefillAdvance>),
+        State(super::engine_qwen35::Qwen35PrefillState),
+    }
+    let mut results: Vec<Unsettled> = match advance {
+        Qwen35JointPrefillAdvance::Lanes(results) => results.into_iter().map(Unsettled::Advance).collect(),
+        Qwen35JointPrefillAdvance::Failed { error, states } => {
+            if !supervisor.is_healthy() || is_fatal_command_buffer_error(&error) {
+                // Fail-stop on the head's reply; the other lanes go back
+                // into their slots so the fail-stop fails them too.
+                let mut states = states.into_iter().map(Unsettled::State).collect::<Vec<_>>();
+                states[0] = Unsettled::Advance(Err(error));
+                states
+            } else {
+                // Every lane's slot is mid-transaction: each request fails
+                // and its slot is reset, as after its own failed forward.
+                let detail = format!("{error:#}");
+                let mut first = Some(error);
+                states
+                    .into_iter()
+                    .map(|_state| {
+                        Unsettled::Advance(Err(first.take().unwrap_or_else(|| {
+                            anyhow::anyhow!("Qwen35 joint prefill failed: {detail}")
+                        })))
+                    })
+                    .collect()
+            }
+        }
+    };
+    results.reverse();
+    replies.reverse();
+    let mut fatal = None;
+    while let (Some(result), Some((handle, reply))) = (results.pop(), replies.pop()) {
+        let slot_idx = handle.slot_id.0 as usize;
+        if fatal.is_some() {
+            // The worker is stopping: park what is left for the fail-stop.
+            match result {
+                Unsettled::State(state)
+                | Unsettled::Advance(Ok(Qwen35PrefillAdvance::Pending { state, .. })) => {
+                    slots[slot_idx] = Some((Qwen35SlotWork::Prefill(state), reply, handle));
+                }
+                Unsettled::Advance(Ok(Qwen35PrefillAdvance::Ready { state, .. })) => {
+                    slots[slot_idx] = Some((Qwen35SlotWork::Decode(state), reply, handle));
+                }
+                Unsettled::Advance(Err(error)) => {
+                    scheduler.release(handle);
+                    finish_qwen35_operator_request(handle, "failed");
+                    slot_fire_fatal(
+                        reply,
+                        &format!(
+                            "engine_unhealthy: Qwen worker stopped during a joint prefill: {error:#}"
+                        ),
+                    );
+                }
+            }
+            continue;
+        }
+        match result {
+            Unsettled::Advance(advance) => {
+                fatal = settle_qwen35_prefill_advance(
+                    guard,
+                    scheduler,
+                    slots,
+                    retained_tokens,
+                    prompt_caches,
+                    prompt_anchors,
+                    registration,
+                    handle,
+                    advance,
+                    reply,
+                    kv_bytes_per_token,
+                    supervisor,
+                );
+            }
+            Unsettled::State(state) => {
+                // Only produced behind a fatal head, handled above.
+                slots[slot_idx] = Some((Qwen35SlotWork::Prefill(state), reply, handle));
+            }
+        }
+    }
+    if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
+        *snapshot = scheduler.stats();
+    }
+    Some(fatal)
+}
+
+/// Settle one slot after a prefill transaction (its own, or its lane of a
+/// joint one): publish the advance, install a checkpoint, hand a finished
+/// prompt to decode, or reset the slot and fail the request.
+#[allow(clippy::too_many_arguments)]
+fn settle_qwen35_prefill_advance(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Qwen35Slot>],
+    retained_tokens: &mut [Qwen35RetainedPrefix],
+    prompt_caches: &mut [PromptCache],
+    prompt_anchors: &mut [Qwen35AnchorStore],
+    registration: Option<&super::registry::ModelRegistration>,
+    handle: SlotHandle,
+    advance: Result<super::engine_qwen35::Qwen35PrefillAdvance>,
+    mut reply: SlotReply,
+    kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
+) -> Option<Qwen35FatalFailure> {
+    let slot_idx = handle.slot_id.0 as usize;
     match advance {
         Ok(super::engine_qwen35::Qwen35PrefillAdvance::Pending {
             state,
@@ -20420,11 +20765,9 @@ fn advance_qwen35_prefill(
             slot_fire_done(reply, Err(error), false);
         }
     }
-    if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
-        *snapshot = scheduler.stats();
-    }
     None
 }
+
 
 fn log_qwen35_slot_decode_complete(
     result: &GenerationResult,

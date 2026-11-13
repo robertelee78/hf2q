@@ -30,16 +30,15 @@
 //! [`super::prefill_prepared::PrefillScope`] and only for models whose shared
 //! products all take the prepared kernel ([`Qwen35Model::prefill_fold_exact`]).
 //!
+//! The forward side is [`super::prefill_joint`]: a folded chunk is a joint
+//! prefill of one lane with a boundary. This module keeps the switch and the
+//! shapes the fold serves.
+//!
 //! [`Qwen35Model::prefill_fold_exact`]: super::model::Qwen35Model
 
-use std::cell::RefCell;
 use std::sync::LazyLock;
 
-use anyhow::{anyhow, ensure, Result};
-use mlx_native::{DType, MlxBuffer, MlxDevice};
-
 use super::joint_step_options::switch_from_process;
-use super::kv_cache::LaAnchorImage;
 
 /// Switch, default off: `1`/`on`/`true` folds the generation cue into the
 /// last content chunk of a bounded prompt prefill.
@@ -99,165 +98,6 @@ pub(crate) fn rows_admitted(prefix_rows: usize, cue_rows: usize) -> bool {
 pub(crate) fn rows_worth_folding(prefix_rows: usize, cue_rows: usize) -> bool {
     const SHORT_CHUNK_ROWS: usize = 32;
     prefix_rows > SHORT_CHUNK_ROWS || prefix_rows + cue_rows <= SHORT_CHUNK_ROWS
-}
-
-/// The boundary a folded forward captures.
-pub(crate) struct BoundaryFold {
-    /// Rows before the boundary (the content segment).
-    pub(crate) prefix_rows: u32,
-    /// Checkpoint image the DeltaNet layers write their boundary state into.
-    pub(crate) image: LaAnchorImage,
-}
-
-thread_local! {
-    static REQUEST: RefCell<Option<BoundaryFold>> = const { RefCell::new(None) };
-    static BOUNDARY_LOGITS: RefCell<Option<Vec<f32>>> = const { RefCell::new(None) };
-}
-
-/// Run `forward` with `request` armed for the next target forward on this
-/// thread and return its result with the boundary-row logits.
-///
-/// The forward must consume the request ([`take_request`]) and publish the
-/// boundary logits ([`publish_boundary_logits`]); anything else is an error,
-/// so a route that ignores the fold cannot pass for one that took it.
-pub(crate) fn with_request<R>(
-    request: BoundaryFold,
-    forward: impl FnOnce() -> Result<R>,
-) -> Result<(R, Vec<f32>)> {
-    REQUEST.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        ensure!(slot.is_none(), "a cue fold is already armed on this thread");
-        *slot = Some(request);
-        Ok(())
-    })?;
-    BOUNDARY_LOGITS.with(|cell| cell.borrow_mut().take());
-    let result = forward();
-    let unconsumed = REQUEST.with(|cell| cell.borrow_mut().take()).is_some();
-    let logits = BOUNDARY_LOGITS.with(|cell| cell.borrow_mut().take());
-    let result = result?;
-    ensure!(!unconsumed, "the target forward did not take the cue fold");
-    let logits =
-        logits.ok_or_else(|| anyhow!("the folded forward published no boundary logits"))?;
-    Ok((result, logits))
-}
-
-/// Take the armed fold for a forward of `seq_len` rows, if any.
-pub(crate) fn take_request(seq_len: u32) -> Result<Option<BoundaryFold>> {
-    let Some(request) = REQUEST.with(|cell| cell.borrow_mut().take()) else {
-        return Ok(None);
-    };
-    let cue_rows = seq_len.checked_sub(request.prefix_rows).ok_or_else(|| {
-        anyhow!(
-            "cue fold boundary {} beyond {seq_len} rows",
-            request.prefix_rows
-        )
-    })?;
-    ensure!(
-        rows_admitted(request.prefix_rows as usize, cue_rows as usize),
-        "cue fold of {} + {cue_rows} rows is outside the served shape",
-        request.prefix_rows
-    );
-    Ok(Some(request))
-}
-
-/// Hand the boundary-row logits of the folded forward back to its caller.
-pub(crate) fn publish_boundary_logits(logits: Vec<f32>) {
-    BOUNDARY_LOGITS.with(|cell| *cell.borrow_mut() = Some(logits));
-}
-
-/// Row range `[first, first + rows)` of a row-major buffer of `width`
-/// elements per row, as a view with exactly that many elements.
-pub(crate) fn row_view(buffer: &MlxBuffer, first: u32, rows: u32, width: usize) -> MlxBuffer {
-    let element_bytes = buffer.dtype().size_of();
-    buffer.slice_view(
-        (first as usize * width * element_bytes) as u64,
-        rows as usize * width,
-    )
-}
-
-/// The axis-major position rows `[first, first + rows)` of a forward's
-/// `[4, seq_len]` position table, as their own `[4, rows]` buffer.
-pub(crate) fn segment_positions(
-    device: &MlxDevice,
-    positions_flat: &[i32],
-    seq_len: u32,
-    first: u32,
-    rows: u32,
-) -> Result<MlxBuffer> {
-    let (seq, first, rows) = (seq_len as usize, first as usize, rows as usize);
-    ensure!(
-        positions_flat.len() == 4 * seq && first + rows <= seq,
-        "cue fold positions: {} entries for {seq} rows, segment {first}+{rows}",
-        positions_flat.len()
-    );
-    let mut buffer = device
-        .alloc_buffer(4 * rows * 4, DType::I32, vec![4 * rows])
-        .map_err(|error| anyhow!("alloc cue fold positions: {error}"))?;
-    let destination = buffer
-        .as_mut_slice::<i32>()
-        .map_err(|error| anyhow!("map cue fold positions: {error}"))?;
-    for axis in 0..4 {
-        destination[axis * rows..(axis + 1) * rows]
-            .copy_from_slice(&positions_flat[axis * seq + first..axis * seq + first + rows]);
-    }
-    Ok(buffer)
-}
-
-/// Per-forward scratch of the DeltaNet boundary split: the convolution state
-/// at the boundary in the slot layout, and the parameter blocks of the two
-/// segment dispatches (the arena's own blocks describe the whole chunk).
-pub struct DnBoundaryScratch {
-    pub(crate) conv_state: MlxBuffer,
-    pub(crate) ssm_params: [MlxBuffer; 2],
-    pub(crate) gdn_params: [MlxBuffer; 2],
-}
-
-impl DnBoundaryScratch {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        device: &MlxDevice,
-        segment_rows: [u32; 2],
-        n_k_heads: u32,
-        n_v_heads: u32,
-        d_k: u32,
-        d_v: u32,
-        k_width: u32,
-        n_seqs: u32,
-    ) -> Result<Self> {
-        let channels = 2 * n_k_heads * d_k + n_v_heads * d_v;
-        let conv_elements = channels as usize * (k_width as usize - 1);
-        let conv_state = device
-            .alloc_buffer(conv_elements * 4, DType::F32, vec![conv_elements])
-            .map_err(|error| anyhow!("alloc cue fold conv state: {error}"))?;
-        let params = |values: &[u32]| -> Result<MlxBuffer> {
-            let mut buffer = device
-                .alloc_buffer(values.len() * 4, DType::U32, vec![values.len()])
-                .map_err(|error| anyhow!("alloc cue fold params: {error}"))?;
-            buffer
-                .as_mut_slice::<u32>()
-                .map_err(|error| anyhow!("map cue fold params: {error}"))?
-                .copy_from_slice(values);
-            Ok(buffer)
-        };
-        let ssm = |rows: u32| params(&[channels, rows, n_seqs, k_width]);
-        let gdn = |rows: u32| params(&[d_k, d_v, n_k_heads, n_v_heads, rows, n_seqs, 0, 0, 0]);
-        Ok(Self {
-            conv_state,
-            ssm_params: [ssm(segment_rows[0])?, ssm(segment_rows[1])?],
-            gdn_params: [gdn(segment_rows[0])?, gdn(segment_rows[1])?],
-        })
-    }
-}
-
-/// One DeltaNet layer's boundary split.
-pub struct DnBoundarySplit<'a> {
-    /// Rows before the boundary.
-    pub(crate) prefix_rows: u32,
-    pub(crate) scratch: &'a DnBoundaryScratch,
-    /// This layer's recurrent state in the checkpoint image (slot layout).
-    pub(crate) recurrent: MlxBuffer,
-    /// This layer's convolution state in the checkpoint image (`[K-1, C]`).
-    pub(crate) conv_image: MlxBuffer,
 }
 
 #[cfg(test)]

@@ -122,6 +122,9 @@ mod moe_live_tiles_tests;
 pub mod mtp;
 pub mod mtp_weights_load;
 pub(crate) mod prefill_fold;
+pub(crate) mod prefill_joint;
+#[cfg(test)]
+mod prefill_joint_tests;
 #[cfg(test)]
 mod prefill_fold_tests;
 pub(crate) mod prefill_prepared;
