@@ -45,13 +45,85 @@ pub(crate) fn enabled() -> bool {
     *ENABLED
 }
 
+/// Layers between host waits of a prompt-prefill chunk of more than 32 rows,
+/// `1` (default) to `8`.
+///
+/// The layer loop of a large chunk waits for the GPU after every layer, which
+/// bounds how long a Metal fault goes unobserved; the GPU then idles while
+/// the host encodes the next layer. With a value above 1 a layer's command
+/// buffer is committed without a wait and the host waits once per that many
+/// layers, so the GPU runs a layer while the host encodes the next one. A
+/// layer whose output the host copies (a DFlash2 target layer, a calibration
+/// capture) still waits, and so does the last layer. The dispatches, their
+/// order and their operands do not change, so neither does any bit.
+pub(crate) const QWEN_PREFILL_WAIT_LAYERS_ENV: &str = "HF2Q_QWEN_PREFILL_WAIT_LAYERS";
+
+/// Longest stretch of layers a large prefill chunk may run without a wait:
+/// the cadence chunks of at most 32 rows already have.
+pub(crate) const MAX_WAIT_LAYERS: usize = 8;
+
+/// [`QWEN_PREFILL_WAIT_LAYERS_ENV`] as an operator wrote it: unset or blank
+/// is 1, anything outside `1..=MAX_WAIT_LAYERS` is an error.
+pub(crate) fn parse_wait_layers(raw: Option<&str>) -> Result<usize, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(1),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|layers| (1..=MAX_WAIT_LAYERS).contains(layers))
+            .ok_or_else(|| {
+                format!(
+                    "{QWEN_PREFILL_WAIT_LAYERS_ENV} must be 1..={MAX_WAIT_LAYERS}, got {value:?}"
+                )
+            }),
+    }
+}
+
+static WAIT_LAYERS: LazyLock<usize> = LazyLock::new(|| {
+    parse_wait_layers(std::env::var(QWEN_PREFILL_WAIT_LAYERS_ENV).ok().as_deref()).unwrap_or_else(
+        |error| {
+            tracing::warn!(error, fallback = 1, "invalid Qwen prefill wait-layers value");
+            1
+        },
+    )
+});
+
 thread_local! {
     static SCOPE: Cell<bool> = const { Cell::new(false) };
+    static WAIT: Cell<usize> = const { Cell::new(1) };
+    /// The wait cadence [`PrefillScope::forced`] opens its scopes with.
+    #[cfg(test)]
+    static FORCED_WAIT: Cell<usize> = const { Cell::new(1) };
+}
+
+/// While alive, the scopes [`PrefillScope::forced`] opens on this thread
+/// wait every `wait_layers` layers, so a gate written against the forced
+/// route can be repeated at another cadence.
+#[cfg(test)]
+pub(crate) struct ForcedWaitLayers {
+    previous: usize,
+}
+
+#[cfg(test)]
+impl ForcedWaitLayers {
+    pub(crate) fn set(wait_layers: usize) -> Self {
+        Self {
+            previous: FORCED_WAIT.with(|cell| cell.replace(wait_layers)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcedWaitLayers {
+    fn drop(&mut self) {
+        FORCED_WAIT.with(|cell| cell.set(self.previous));
+    }
 }
 
 /// Marks this thread's forward as a prompt-prefill chunk until dropped.
 pub(crate) struct PrefillScope {
     previous: bool,
+    previous_wait: usize,
 }
 
 impl PrefillScope {
@@ -59,20 +131,21 @@ impl PrefillScope {
     pub(crate) fn enter() -> Self {
         #[cfg(test)]
         if let Some(switches) = SwitchesForTest::current() {
-            return Self::with_route(switches.prepared);
+            return Self::with(switches.prepared, switches.wait_layers);
         }
-        Self::with_route(*ENABLED)
+        Self::with(*ENABLED, *WAIT_LAYERS)
     }
 
     /// Open the scope with the route forced on or off, whatever the switch.
     #[cfg(test)]
     pub(crate) fn forced(route: bool) -> Self {
-        Self::with_route(route)
+        Self::with(route, FORCED_WAIT.with(Cell::get))
     }
 
-    fn with_route(route: bool) -> Self {
+    fn with(route: bool, wait_layers: usize) -> Self {
         Self {
             previous: SCOPE.with(|cell| cell.replace(route)),
+            previous_wait: WAIT.with(|cell| cell.replace(wait_layers)),
         }
     }
 }
@@ -80,7 +153,46 @@ impl PrefillScope {
 impl Drop for PrefillScope {
     fn drop(&mut self) {
         SCOPE.with(|cell| cell.set(self.previous));
+        WAIT.with(|cell| cell.set(self.previous_wait));
     }
+}
+
+/// Layers between host waits for a chunk of more than 32 rows on this
+/// thread: the operator's value inside a prompt-prefill scope, 1 outside.
+pub(crate) fn wait_layers() -> usize {
+    WAIT.with(Cell::get)
+}
+
+thread_local! {
+    static SINGLE_COMMAND_LAYERS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// While alive, the layer builders of this thread's forward keep every
+/// stage of a layer in the encoder session's open command buffer instead of
+/// committing each stage on its own. The layer loop sets it for a forward
+/// that submits one command buffer per layer
+/// ([`QWEN_PREFILL_WAIT_LAYERS_ENV`] above 1).
+pub(crate) struct SingleCommandLayers {
+    previous: bool,
+}
+
+impl SingleCommandLayers {
+    pub(crate) fn set(on: bool) -> Self {
+        Self {
+            previous: SINGLE_COMMAND_LAYERS.with(|cell| cell.replace(on)),
+        }
+    }
+}
+
+impl Drop for SingleCommandLayers {
+    fn drop(&mut self) {
+        SINGLE_COMMAND_LAYERS.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Whether this thread's forward keeps a layer in one command buffer.
+pub(crate) fn single_command_layers() -> bool {
+    SINGLE_COMMAND_LAYERS.with(Cell::get)
 }
 
 /// The prompt-prefill switches of a SlotAware Qwen worker.
@@ -89,6 +201,10 @@ pub(crate) struct PrefillSwitches {
     pub(crate) prepared: bool,
     pub(crate) fold_cue: bool,
     pub(crate) joint: bool,
+    /// Layers between host waits of a chunk of more than 32 rows.
+    pub(crate) wait_layers: usize,
+    /// Whether a decoding worker keeps the prefill-only weights fresh.
+    pub(crate) keep_fresh: bool,
 }
 
 #[cfg(test)]
@@ -135,6 +251,8 @@ pub(crate) fn resolve_switches(
     prepared: Option<&str>,
     fold_cue: Option<&str>,
     joint: Option<&str>,
+    wait_layers: Option<&str>,
+    keep_fresh: Option<&str>,
     chunk_scan_prefill: bool,
 ) -> Result<PrefillSwitches, String> {
     use super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV;
@@ -143,6 +261,11 @@ pub(crate) fn resolve_switches(
         prepared: parse_switch(QWEN_PREFILL_PREPARED_ENV, prepared)?,
         fold_cue: parse_switch(QWEN_PREFILL_FOLD_CUE_ENV, fold_cue)?,
         joint: parse_switch(QWEN_PREFILL_JOINT_ENV, joint)?,
+        wait_layers: parse_wait_layers(wait_layers)?,
+        keep_fresh: parse_switch(
+            super::prefill_keep_fresh::QWEN_PREFILL_KEEP_FRESH_ENV,
+            keep_fresh,
+        )?,
     };
     if switches.prepared && chunk_scan_prefill {
         return Err(format!(
@@ -169,10 +292,20 @@ pub(crate) fn resolve_switches(
 pub(crate) fn switches_or_refusal(
     prepared: Option<&str>,
     fold_cue: Option<&str>,
+    joint: Option<&str>,
+    wait_layers: Option<&str>,
+    keep_fresh: Option<&str>,
     chunk_scan_prefill: bool,
 ) -> anyhow::Result<PrefillSwitches> {
-    resolve_switches(prepared, fold_cue, chunk_scan_prefill)
-        .map_err(|cause| anyhow::anyhow!("Qwen prompt prefill switches: {cause}"))
+    resolve_switches(
+        prepared,
+        fold_cue,
+        joint,
+        wait_layers,
+        keep_fresh,
+        chunk_scan_prefill,
+    )
+    .map_err(|cause| anyhow::anyhow!("Qwen prompt prefill switches: {cause}"))
 }
 
 /// The switches of this process, read strictly. Called before a Qwen model
@@ -183,6 +316,8 @@ pub(crate) fn switches_from_process() -> anyhow::Result<PrefillSwitches> {
         read(QWEN_PREFILL_PREPARED_ENV).as_deref(),
         read(super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV).as_deref(),
         read(super::prefill_joint::QWEN_PREFILL_JOINT_ENV).as_deref(),
+        read(QWEN_PREFILL_WAIT_LAYERS_ENV).as_deref(),
+        read(super::prefill_keep_fresh::QWEN_PREFILL_KEEP_FRESH_ENV).as_deref(),
         crate::debug::INVESTIGATION_ENV.chunk_scan_prefill,
     )
 }
@@ -197,6 +332,8 @@ pub(crate) fn validate_at_worker_start() -> anyhow::Result<PrefillSwitches> {
         prepared = switches.prepared,
         fold_cue = switches.fold_cue,
         joint = switches.joint,
+        wait_layers = switches.wait_layers,
+        keep_fresh = switches.keep_fresh,
         "Qwen prompt prefill configuration"
     );
     Ok(switches)
@@ -250,7 +387,9 @@ mod tests {
             Ok(PrefillSwitches {
                 prepared: false,
                 fold_cue: false,
-                joint: false
+                joint: false,
+                wait_layers: 1,
+                keep_fresh: false
             })
         );
         assert_eq!(
@@ -258,7 +397,9 @@ mod tests {
             Ok(PrefillSwitches {
                 prepared: true,
                 fold_cue: true,
-                joint: false
+                joint: false,
+                wait_layers: 1,
+                keep_fresh: false
             })
         );
         assert_eq!(
@@ -266,9 +407,31 @@ mod tests {
             Ok(PrefillSwitches {
                 prepared: true,
                 fold_cue: false,
-                joint: true
+                joint: true,
+                wait_layers: 4,
+                keep_fresh: true
             })
         );
+        // The keep-alive reads weights; it does not depend on a route.
+        assert_eq!(
+            resolve_switches(None, None, None, None, Some("on"), false).map(|s| s.keep_fresh),
+            Ok(true)
+        );
+        assert!(
+            resolve_switches(Some("1"), None, None, None, Some("250"), false).is_err(),
+            "invalid keep-fresh value"
+        );
+        // The wait cadence is a property of the layer loop, not of a route.
+        assert_eq!(
+            resolve_switches(None, None, None, Some("8"), None, false).map(|s| s.wait_layers),
+            Ok(8)
+        );
+        for invalid in ["0", "9", "on", "-1"] {
+            assert!(
+                resolve_switches(Some("1"), None, None, Some(invalid), None, false).is_err(),
+                "wait layers {invalid}"
+            );
+        }
         assert!(
             resolve_switches(None, None, Some("1"), None, None, false).is_err(),
             "joint without prepared"
@@ -328,6 +491,8 @@ mod tests {
             prepared: true,
             fold_cue: true,
             joint: false,
+            wait_layers: 1,
+            keep_fresh: false,
         };
         {
             let _switches = SwitchesForTest::set(on);
@@ -340,6 +505,31 @@ mod tests {
                 .expect("other thread");
         }
         assert_eq!(SwitchesForTest::current(), None);
+    }
+
+    #[test]
+    fn wait_layers_default_to_one_and_apply_only_inside_a_scope() {
+        assert_eq!(parse_wait_layers(None), Ok(1));
+        assert_eq!(parse_wait_layers(Some(" ")), Ok(1));
+        assert_eq!(parse_wait_layers(Some("4")), Ok(4));
+        assert_eq!(parse_wait_layers(Some("8")), Ok(8));
+        assert_eq!(wait_layers(), 1, "no scope");
+        {
+            let _scope = PrefillScope::forced(true);
+            assert_eq!(wait_layers(), 1, "a forced scope waits every layer");
+            {
+                let _cadence = ForcedWaitLayers::set(4);
+                assert_eq!(wait_layers(), 1, "an open scope keeps its cadence");
+                let _inner = PrefillScope::forced(true);
+                assert_eq!(wait_layers(), 4, "an inner scope overrides");
+            }
+            assert_eq!(wait_layers(), 1, "restored on drop");
+        }
+        assert_eq!(wait_layers(), 1, "closed");
+        {
+            let _cadence = ForcedWaitLayers::set(8);
+            assert_eq!(wait_layers(), 1, "the cadence applies inside a scope only");
+        }
     }
 
     #[test]

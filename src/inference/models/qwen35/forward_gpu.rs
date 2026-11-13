@@ -4444,6 +4444,50 @@ impl Qwen35Model {
         Ok(result)
     }
 
+    /// The weight buffers that only the prompt-prefill route reads while
+    /// the decode routes run on prepared copies of the same weights
+    /// ([`super::prefill_keep_fresh`]): the GGUF blocks of a MoE layer's
+    /// routed experts once their staged planes are prepared, the shared
+    /// expert's blocks once its live-tile planes are, and the GGUF output
+    /// head (the joint target step and the draft read its prepared planes).
+    pub(crate) fn prefill_only_weights(&self) -> Result<Vec<MlxBuffer>> {
+        GPU_CACHE.with(|cell| -> Result<Vec<MlxBuffer>> {
+            let guard = cell.borrow();
+            let cache = guard.as_ref().ok_or_else(|| {
+                anyhow!("prefill_only_weights: GPU_CACHE not initialized; call ensure_gpu_cache_primed first")
+            })?;
+            ensure!(
+                gpu_cache_matches_model(cache, self),
+                "prefill_only_weights: GPU_CACHE belongs to a different Qwen35Model"
+            );
+            let mut buffers = Vec::new();
+            for layer in &cache.layer_weights {
+                let (LayerWeightsGpu::FullAttn { ffn, .. } | LayerWeightsGpu::LinearAttn { ffn, .. }) =
+                    layer;
+                let FfnWeightsGpu::MoeQ(weights) = ffn else {
+                    continue;
+                };
+                let Some(prepared) = weights.prepared_m8.as_ref() else {
+                    continue;
+                };
+                buffers.extend([
+                    weights.expert_gate_q.clone(),
+                    weights.expert_up_q.clone(),
+                    weights.expert_down_q.clone(),
+                ]);
+                if prepared.live_tiles.is_some() && weights.dense_storage.is_native() {
+                    buffers.extend([
+                        weights.shared_gate.clone(),
+                        weights.shared_up.clone(),
+                        weights.shared_down.clone(),
+                    ]);
+                }
+            }
+            buffers.push(cache.output_head.lm_head.clone());
+            Ok(buffers)
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn loaded_candidate_executed_catalog(
         &self,
@@ -5271,12 +5315,48 @@ impl Qwen35Model {
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&k| k >= 1)
             .unwrap_or(8);
+        // `HF2Q_QWEN_PREFILL_WAIT_LAYERS` above 1: a text prompt-prefill
+        // forward submits each layer's command buffer as soon as it is
+        // encoded (`pipelined_layers` below), so the GPU runs it while the
+        // host encodes the next layer, and the host waits once per that many
+        // layers (a forward of at most 32 rows keeps its cadence of
+        // `HF2Q_FFN_TERMINAL_K_BATCH` layers). Forwards with a host-side
+        // reader or writer beyond the captured layers keep their waits.
+        let configured_wait_layers = if seq_len > 1
+            && soft_tokens.is_empty()
+            && deepstack.is_none()
+            && residual_capture.is_none()
+            && self.glp.is_none()
+            && !kv_cache.la_capture_active()
+            && !super::dump_bisect::is_enabled()
+            && dump_layer_n().is_none()
+            && dump_layer_activations_prefix().is_none()
+            && !super::execution_dispatch::dense_q_split_profile_enabled()
+        {
+            super::prefill_prepared::wait_layers()
+        } else {
+            1
+        };
+        let pipelined_layers = configured_wait_layers > 1;
+        let prefill_wait_layers = if seq_len > 32 {
+            configured_wait_layers
+        } else {
+            configured_ffn_terminal_k_batch
+        };
+        // One command buffer per layer: the layer builders carry their
+        // stages into the session's open command buffer, which the FFN
+        // terminal then submits.
+        let _single_command_layers = super::prefill_prepared::SingleCommandLayers::set(
+            pipelined_layers && encoder_session_enabled,
+        );
         let ffn_terminal_k_batch = if small_nextn_verifier {
             // Exact speculative verification is a fixed, short graph whose
             // scratch buffers are retained until the output-head drain. One
             // terminal layer boundary avoids seven redundant waits on Qwen3.8
             // while preserving dispatch order and arithmetic.
             layer_weights_gpu.len().max(1)
+        } else if pipelined_layers {
+            prefill_wait_layers
         } else {
             effective_ffn_terminal_k_batch(seq_len, configured_ffn_terminal_k_batch)
         };
@@ -6626,10 +6706,16 @@ impl Qwen35Model {
                             //   that achieves factor-2x CB-count reduction
                             //   (proven structurally by
                             //   /opt/mlx-native/tests/encoder_session_cb_count_smoke.rs).
-                            enc.carry_into_next_stage("layer.dense_ffn")
-                                .with_context(|| {
-                                    format!("carry DenseQ intra-K layer {layer_idx}")
-                                })?;
+                            let carried = if pipelined_layers {
+                                // Submit the layer now: the GPU runs it
+                                // while the host encodes the next one.
+                                enc.fence_or_commit("layer.dense_ffn")
+                            } else {
+                                enc.carry_into_next_stage("layer.dense_ffn")
+                            };
+                            carried.with_context(|| {
+                                format!("carry DenseQ intra-K layer {layer_idx}")
+                            })?;
                         }
                         out
                     };
@@ -6883,14 +6969,25 @@ impl Qwen35Model {
                         // keeping the CB open for the next layer's FA / DN
                         // helper to encode into the same persistent compute
                         // encoder.
-                        enc.carry_into_next_stage("layer.moe_ffn")
+                        let carried = if pipelined_layers {
+                            // Submit the layer now: the GPU runs it while
+                            // the host encodes the next one.
+                            enc.fence_or_commit("layer.moe_ffn")
+                        } else {
+                            enc.carry_into_next_stage("layer.moe_ffn")
+                        };
+                        carried
                             .with_context(|| format!("carry MoeQ intra-K layer {layer_idx}"))?;
                     }
                     out
                 }
             };
-            session_carry_pending =
-                encoder_session_enabled && seq_len > 1 && !is_k_boundary && any_fused_eligible;
+            // A pipelined layer was submitted, not carried.
+            session_carry_pending = encoder_session_enabled
+                && seq_len > 1
+                && !is_k_boundary
+                && any_fused_eligible
+                && !pipelined_layers;
 
             if let Some(t) = t_ffn_start {
                 total_ffn_us += t.elapsed().as_micros() as u64;

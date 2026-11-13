@@ -514,6 +514,73 @@ fn a_joint_prefill_is_repeatable() {
     });
 }
 
+/// `HF2Q_QWEN_PREFILL_WAIT_LAYERS`: a joint forward whose layers are
+/// submitted as they are encoded, with a host wait every few layers, leaves
+/// every lane what its own prefill with a wait after every layer leaves.
+#[test]
+fn a_joint_prefill_that_waits_every_few_layers_keeps_each_lanes_bits() {
+    use super::prefill_prepared::ForcedWaitLayers;
+    with_synthetic_model(|model| {
+        let resumed = [
+            Lane::new(0, &[], 720, 5),
+            Lane::new(1, &[33], 5, 0),
+            Lane::new(2, &[40], 157, 0),
+            Lane::new(3, &[], 33, 32),
+        ];
+        let first_prompts: Vec<Lane> = (0..4).map(|slot| Lane::cold(slot, 444, 720, 5)).collect();
+        for (lanes, shared_rows) in [(&resumed[..], 0), (&first_prompts[..], 444)] {
+            let alone: Vec<Outcome> = lanes.iter().map(|lane| solo(model, lane, true)).collect();
+            for wait_layers in [3, 8] {
+                let together = {
+                    let _cadence = ForcedWaitLayers::set(wait_layers);
+                    joint(model, lanes, shared_rows, true)
+                };
+                for ((lane, alone), together) in lanes.iter().zip(&alone).zip(&together) {
+                    let differences = alone.differences(together);
+                    assert!(
+                        differences.is_empty(),
+                        "{lane:?} in a joint prefill that waits every {wait_layers} layers \
+                         differs from its solo prefill in {differences:?}"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// `HF2Q_QWEN_PREFILL_KEEP_FRESH`: the keep-alive reads the weights only
+/// the prompt prefill reads (the output head of this dense model) into
+/// private scratch, at most once per interval, and changes no bit of a
+/// prefill around it.
+#[test]
+fn keeping_the_prefill_only_weights_fresh_changes_no_bit() {
+    use super::prefill_keep_fresh::INTERVAL;
+    use std::time::{Duration, Instant};
+    with_synthetic_model(|model| {
+        let listed = model.prefill_only_weights().expect("prefill-only weights");
+        assert_eq!(listed.len(), 1, "a dense model lists its output head only");
+        let lane = Lane::new(0, &[33], 97, 5);
+        let before = solo(model, &lane, true);
+        // Times no earlier test on this thread can have used.
+        let start = Instant::now() + Duration::from_secs(3_600);
+        let used = |at: Instant| {
+            model
+                .keep_prefill_weights_fresh_at(at)
+                .expect("keep the prefill-only weights fresh")
+        };
+        assert!(used(start), "the first use is due");
+        assert!(!used(start + INTERVAL / 2), "one use per interval");
+        assert!(used(start + INTERVAL));
+        assert!(used(start + 3 * INTERVAL));
+        let after = solo(model, &lane, true);
+        let differences = before.differences(&after);
+        assert!(
+            differences.is_empty(),
+            "the keep-alive changed {differences:?}"
+        );
+    });
+}
+
 /// After a shared prefill nothing of one lane is reachable from another:
 /// resetting a lane, prefilling another conversation into its slot and
 /// resetting it again leaves every byte the other lanes hold, and the lanes

@@ -125,6 +125,7 @@ pub mod mtp;
 pub mod mtp_weights_load;
 pub(crate) mod prefill_fold;
 pub(crate) mod prefill_joint;
+pub(crate) mod prefill_keep_fresh;
 #[cfg(test)]
 mod prefill_joint_tests;
 #[cfg(test)]
