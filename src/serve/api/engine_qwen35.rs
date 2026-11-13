@@ -5409,10 +5409,14 @@ impl Qwen35PrefillState {
         }
     }
 
-    /// Whether this request is the first prompt of a conversation and has
-    /// not run a forward yet: nothing cached, a freshly reset slot.
+    /// Whether this request is a text first prompt of a conversation that
+    /// has not run a forward yet (nothing cached, a freshly reset slot): the
+    /// kind of request that can share its prompt prefix with others.
     pub(crate) fn starts_cold(&self) -> bool {
-        self.cached_tokens == 0 && self.next_token_index == 0 && self.graft_len == 0
+        self.cached_tokens == 0
+            && self.next_token_index == 0
+            && self.graft_len == 0
+            && self.vision.is_none()
     }
 
     /// Account for a completed prefill forward over `chunk` (alone or as a
