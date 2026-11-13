@@ -1207,7 +1207,7 @@ mod tests {
                                 capture,
                                 lane,
                                 start,
-                                range,
+                                &[range],
                             )
                             .unwrap();
                         };
