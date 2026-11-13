@@ -19292,6 +19292,26 @@ fn run_slot_aware_qwen35(
                 }
                 Request::Warmup { reply } => {
                     let result = warmup_qwen35_once(guard.model, &supervisor);
+                    // The prompt-prefill route's first-use costs belong to
+                    // warmup too, while no request holds a slot.
+                    let untouched = scheduler.stats().admitted_total == 0
+                        && slots.iter().all(Option::is_none);
+                    let result = result.and_then(|()| {
+                        if !untouched {
+                            return Ok(());
+                        }
+                        let started = Instant::now();
+                        let kv = guard.kv.as_mut().expect("kv Some during loop");
+                        if supervised_qwen35_warmup(&supervisor, || {
+                            guard.model.warm_prefill_route(kv)
+                        })? {
+                            tracing::info!(
+                                "hf2q-engine Qwen35 prefill route warmup complete in {:.0}ms",
+                                started.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        Ok(())
+                    });
                     if !supervisor.is_healthy()
                         || result
                             .as_ref()

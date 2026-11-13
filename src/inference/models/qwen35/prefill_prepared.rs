@@ -40,6 +40,11 @@ static ENABLED: LazyLock<bool> = LazyLock::new(|| {
     })
 });
 
+/// Whether the operator switched the prepared prefill route on.
+pub(crate) fn enabled() -> bool {
+    *ENABLED
+}
+
 thread_local! {
     static SCOPE: Cell<bool> = const { Cell::new(false) };
 }
