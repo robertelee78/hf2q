@@ -8,7 +8,9 @@ import unittest
 import q3_campaign
 import q3_mechanism as mechanism
 import q3_report
+import q5_calibration
 from test_native_peer_splash import splash_manifest
+from test_q3_campaign import FakeRunner, fake_identities
 
 HERE = Path(__file__).resolve().parent
 
@@ -195,6 +197,114 @@ class MechanismVerdict(unittest.TestCase):
         self.assertEqual(verdict['verdict'], 'Win', verdict['reasons'])
         self.assertAlmostEqual(verdict['stock_record']['effects']['vs_stock']['ratio'], .8)
         self.assertNotIn('mechanism', verdict)
+
+class CanonicalDriverTelemetry(unittest.TestCase):
+    """Actual canonical case -> frozen override -> effective child env -> settle -> full report."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.selection = self.root / 'selection.json'
+        self.selection.write_text(json.dumps({'schema': 'hf2q.splash-sweep-selection.v1', 'pass_floor': .75,
+                                              'choice': None, 'configurations': {'s0': {'valid': False}}}))
+        self.nc = self.root / 'nc.json'
+        self.nc.write_text('{}')
+
+    def plan(self, *extra):
+        args = q3_campaign.parse_args(['--family', 'qwen38', '--stock-bin', '/bin/stock',
+                                      '--stock-commit', '1' * 40, '--experiment-bin', '/bin/experiment',
+                                      '--experiment-commit', 'c' * 40, '--qe-identity', 'qe-test',
+                                      '--negative-control-receipt', str(self.nc), '--workloads', 'n4',
+                                      '--output', str(self.root / 'campaign'),
+                                      '--splash-unavailable-evidence', str(self.selection), *extra])
+        return q3_campaign.build_plan(args, {}, 'qwen38')
+
+    def test_default_canonical_driver_emits_and_freezes_proof_then_detects_changed_log(self):
+        plan, cases = self.plan()
+        self.assertEqual(plan['arms']['experiment']['case'], str(HERE / 'q5_cases/qwen38.json'))
+        self.assertEqual(plan['arms']['experiment']['overrides']['LOG_FILTER'], mechanism.DEFAULT_LOG_FILTER)
+        self.assertNotIn('LOG_FILTER', plan['arms']['stock']['overrides'])
+        runner = FakeRunner(lambda arm, workload, call: {
+            'makespan': {'stock': 100., 'experiment': 80., 'peer': 90.}[arm]})
+
+        def emit(argv, environ, stdout, stderr):
+            result = runner(argv, environ, stdout, stderr)
+            case_path, output = Path(argv[3]), Path(argv[5])
+            if case_path.stem.endswith('-experiment'):
+                case = json.loads(case_path.read_text())
+                effective = q3_campaign.q5_case.build_plan(case, q5_calibration.builtins(output), environ)
+                env = q3_campaign.q5_case.child_env(environ, effective['serve']['env'])
+                self.assertEqual(env['LOG_FILTER'], mechanism.DEFAULT_LOG_FILTER)
+                self.assertNotIn('MLX_PROFILE_CB', env)
+                if mechanism.progress_enabled(env['LOG_FILTER']):
+                    (output / 'server.stderr').write_text(
+                        'DEBUG hf2q::serve::api::engine_qwen35::progress: Qwen DFlash2 stage timing '
+                        'active_lanes=1 selected_rows=8 accepted_rows=6\n'
+                        'DEBUG hf2q::serve::api::engine_qwen35::progress: Qwen DFlash2 verified window '
+                        'slot=0 drafted=7 accepted=6\n')
+                receipt_path = output / 'receipt.json'
+                receipt = json.loads(receipt_path.read_text())
+                receipt.update(schema='hf2q.q5.calibration-receipt.v1', family='qwen38',
+                               workload=case['workload'], case={'path': str(case_path),
+                                                              'sha256': mechanism.digest(case_path)})
+                receipt_path.write_text(json.dumps(receipt))
+            return result
+
+        driver = q3_campaign.Driver(plan, cases, self.root / 'campaign', {}, emit, lambda: 0,
+                                    lambda: fake_identities(plan))
+        manifest = driver.run()
+        verdict = q3_report.compute_verdict(manifest)
+        self.assertEqual(verdict['verdict'], 'Win', verdict['reasons'])
+        self.assertEqual((verdict['mechanism']['accepted_rows'], verdict['mechanism']['lane_cycles']), (30, 5))
+        q3_campaign.write_verdict(driver.out, manifest, [], None)
+        controls_args = q3_campaign.parse_args([
+            '--family', 'qwen38', '--stock-bin', '/bin/stock', '--stock-commit', '1' * 40,
+            '--experiment-bin', '/bin/experiment', '--experiment-commit', 'c' * 40,
+            '--qe-identity', 'qe-test', '--negative-control-receipt', str(self.nc),
+            '--controls-of', str(driver.out / 'verdict.json'), '--workloads', 'n1',
+            '--output', str(self.root / 'controls')])
+        controls, control_cases = q3_campaign.build_plan(controls_args, {}, 'qwen38')
+        self.assertEqual(controls['arms']['experiment']['overrides']['LOG_FILTER'], mechanism.DEFAULT_LOG_FILTER)
+        self.assertEqual(q3_campaign.q3_identity.launch_problems(controls, fake_identities(controls)), [])
+        control_driver = q3_campaign.Driver(controls, control_cases, self.root / 'controls', {}, emit, lambda: 0,
+                                            lambda: fake_identities(controls))
+        self.assertEqual(q3_report.compute_verdict(control_driver.run())['verdict'], 'ControlsOnly')
+        entry = next(e for e in manifest['stages'][0]['blocks'][0]['entries'] if e['arm'] == 'experiment')
+        attempt = entry['attempts'][-1]
+        log = Path(attempt['output']) / 'server.stderr'
+        self.assertEqual(attempt['server_stderr_sha256'], mechanism.digest(log))  # Driver.settle supplied it
+        log.write_text(log.read_text() + 'changed after settlement\n')
+        changed = q3_report.compute_verdict(manifest)
+        self.assertEqual(changed['verdict'], 'Inconclusive')
+        self.assertIn('mechanism server log changed', ' '.join(changed['reasons']))
+
+    def test_explicit_valid_filters_are_preserved_and_disabling_filters_refuse_before_driver(self):
+        for value in ('debug', 'DEBUG', 'hf2q', 'hf2q=DEBUG', 'debug,unrelated=warn,',
+                      'info,' + mechanism.PROGRESS_TARGET + '=trace',
+                      mechanism.PROGRESS_TARGET + '=debug,hf2q=error'):
+            with self.subTest(value=value):
+                plan, _ = self.plan('--experiment-var', 'LOG_FILTER=' + value)
+                self.assertEqual(plan['arms']['experiment']['overrides']['LOG_FILTER'], value)
+        for value in ('', 'info', 'hf2q=debug,' + mechanism.PROGRESS_TARGET + '=info'):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'mechanism telemetry'):
+                self.plan('--experiment-var', 'LOG_FILTER=' + value)
+        with self.assertRaisesRegex(ValueError, 'MLX_PROFILE_CB unset'):
+            self.plan('--experiment-var', 'NATIVE_PROFILE_CB=1')
+
+    def test_custom_case_filter_default_is_preserved_and_missing_forwarding_refuses(self):
+        path = self.root / 'custom-case.json'
+        case = json.loads((HERE / 'q5_cases/qwen38.json').read_text())
+        case['variables']['LOG_FILTER'] = 'debug,unrelated=error'
+        path.write_text(json.dumps(case))
+        plan, cases = self.plan('--hf2q-case', str(path))
+        self.assertNotIn('LOG_FILTER', plan['arms']['experiment']['overrides'])
+        self.assertEqual(cases['experiment']['variables']['LOG_FILTER'], 'debug,unrelated=error')
+        del case['serve']['env']['LOG_FILTER']
+        path.write_text(json.dumps(case))
+        with self.assertRaisesRegex(ValueError, 'mechanism telemetry'):
+            self.plan('--hf2q-case', str(path))
+
 
 
 if __name__ == '__main__':

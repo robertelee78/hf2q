@@ -137,6 +137,8 @@ def primary_of_record(path, family):
             "plan_sha256": manifest["plan_sha256"], "identities_sha256": manifest["identities_sha256"],
             "identity": q3_identity.controls_identity(manifest["plan"], manifest["identities"]),
             "harness": {"git_commit": harness["git_commit"], "sources": harness["sources"]},
+            **({"qwen38_mechanism": manifest["plan"]["qwen38_mechanism"]}
+               if "qwen38_mechanism" in manifest["plan"] else {}),
             # Only a primary planned under the policy carries it, so controls of an older record plan as before.
             **({"comparison_failure_policy": q3_stats.failure_policy(manifest["plan"])}
                if q3_stats.failure_policy(manifest["plan"]) is not None else {})}
@@ -347,10 +349,16 @@ def build_plan(args, environ, family):
         plan["splash_required"] = True
     if family == "qwen38" and record is None and not args.no_stock_arm:
         plan["qwen38_mechanism"] = dict(q3_mechanism.CONTRACT)
+        q3_mechanism.freeze_telemetry(cases["experiment"], arms["experiment"]["overrides"])
         if splash_evidence:
             # ADR-063 Q4 substitutes the absolute mechanism gate only for Qwen3.8's
             # documented invalid Splash arm. Historical frozen plans keep their rule.
             plan["splash_required"] = False
+    elif family == "qwen38" and record is not None and record.get("qwen38_mechanism"):
+        recorded_filter = record["identity"]["arms"]["experiment"]["overrides"].get("LOG_FILTER")
+        if recorded_filter is not None:
+            arms["experiment"]["overrides"].setdefault("LOG_FILTER", recorded_filter)
+        q3_mechanism.freeze_telemetry(cases["experiment"], arms["experiment"]["overrides"])
     return plan, cases
 
 

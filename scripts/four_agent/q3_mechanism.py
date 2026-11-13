@@ -11,6 +11,57 @@ import re
 CONTRACT = {"version": 1, "minimum": 5.304,
             "metric": "accepted_plus_bonus_per_lane_cycle"}
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+PROGRESS_TARGET = "hf2q::serve::api::engine_qwen35::progress"
+DEFAULT_LOG_FILTER = "hf2q=info,mlx_native=info," + PROGRESS_TARGET + "=debug"
+LEVELS = {"off": 0, "error": 1, "warn": 2, "info": 3, "debug": 4, "trace": 5,
+          **{str(i): i for i in range(6)}}
+
+
+def progress_enabled(value):
+    """Prove the progress target's level from unconditioned EnvFilter directives."""
+    best = (-1, -1)
+    for directive in value.split(","):
+        directive = directive.strip()
+        if not directive:
+            continue
+        target, sep, level = directive.rpartition("=")
+        if not sep:
+            target, level = ("", directive) if directive.lower() in LEVELS else (directive, "trace")
+        target, level = target.strip(), level.strip().lower()
+        prefix = target.split("[", 1)[0]
+        if not PROGRESS_TARGET.startswith(prefix):
+            continue
+        if level not in LEVELS:
+            return False
+        if "[" in target:
+            if LEVELS[level] < LEVELS["debug"]:
+                return False  # a conditional disabling directive cannot prove every window is logged
+            continue
+        if len(target) >= best[0]:
+            best = (len(target), LEVELS[level])
+    return best[1] >= LEVELS["debug"]
+
+
+def freeze_telemetry(case, overrides):
+    """Use the existing case override, not a route switch; reject an explicit telemetry-off case before any run."""
+    variables, explicit = case.get("variables", {}), case["serve"].get("env", {})
+    if explicit.get("LOG_FILTER") == "{LOG_FILTER}" and "LOG_FILTER" in variables:
+        if not variables["LOG_FILTER"]:
+            overrides.setdefault("LOG_FILTER", DEFAULT_LOG_FILTER)
+
+    def value(name):
+        text = explicit.get(name, "")
+        match = re.fullmatch(r"\{([A-Z0-9_]+)\}", text)
+        return overrides.get(match[1], variables.get(match[1])) if match else text
+
+    log_filter = value("LOG_FILTER")
+    if not isinstance(log_filter, str) or not progress_enabled(log_filter):
+        raise ValueError("Qwen3.8 mechanism telemetry requires the case to forward LOG_FILTER with "
+                         + PROGRESS_TARGET + "=debug (or trace); the effective filter disables or cannot prove it")
+    if value("MLX_PROFILE_CB"):
+        raise ValueError("Qwen3.8 mechanism timing requires MLX_PROFILE_CB unset")
+
+
 
 
 def digest(path):

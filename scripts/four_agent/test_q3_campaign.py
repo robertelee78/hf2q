@@ -311,6 +311,9 @@ class Harness(unittest.TestCase):
         # These generic driver fixtures represent legacy frozen campaigns. The
         # new source-bound Qwen3.8 mechanism contract has full-report tests.
         plan.pop("qwen38_mechanism", None)
+        # Historical default plans predate automatic mechanism logging as well.
+        if plan["arms"]["experiment"]["overrides"].get("LOG_FILTER") == q3.q3_mechanism.DEFAULT_LOG_FILTER:
+            plan["arms"]["experiment"]["overrides"].pop("LOG_FILTER")
         runner = FakeRunner(decide)
         identify = identify or (lambda: fake_identities(plan))
         return q3.Driver(plan, cases, self.out, {}, runner, thermal, identify), runner
