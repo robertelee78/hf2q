@@ -4305,6 +4305,9 @@ pub(crate) struct Qwen35JointPrefillPolicy {
     /// Wait of a first prompt for other first prompts while nothing else
     /// runs (zero: none).
     pub(crate) cold_gather: Duration,
+    /// A step with decoding and prefilling slots runs its prefill
+    /// transaction before its decode cycle.
+    pub(crate) prefill_first: bool,
 }
 
 impl Qwen35JointPrefillPolicy {
@@ -4329,6 +4332,7 @@ impl Qwen35JointPrefillPolicy {
             idle_rows: transaction_rows,
             decode_rows: QWEN35_JOINT_PREFILL_DECODE_ROWS.min(transaction_rows),
             cold_gather: QWEN35_JOINT_PREFILL_COLD_GATHER,
+            prefill_first: true,
         }
     }
 }
@@ -4372,7 +4376,17 @@ pub(crate) fn qwen35_prefill_cohort(
                 .zip(&sharing)
                 .map(|(lane, shares)| lane.tokens.len() - if *shares { shared_rows } else { 0 })
                 .sum::<usize>();
-        (rows <= max_rows).then_some(Qwen35PrefillCohort {
+        // A lane the cheap policy took for its shared rows must share the
+        // prefix the cohort settled on; otherwise it would run all its rows
+        // here, and a shorter cohort is tried.
+        let cheap = match join {
+            Qwen35PrefillJoin::Every => true,
+            Qwen35PrefillJoin::Cheap { small_rows } => candidates[1..lanes]
+                .iter()
+                .zip(&sharing[1..])
+                .all(|(lane, shares)| *shares || lane.tokens.len() <= small_rows),
+        };
+        (cheap && rows <= max_rows).then_some(Qwen35PrefillCohort {
             lanes,
             shared_rows,
             sharing,
@@ -11449,6 +11463,20 @@ mod tests {
         ];
         assert_eq!(lanes(&mixed, cheap), None);
         assert_eq!(lanes(&mixed, Qwen35PrefillJoin::Every), Some((3, 444 + 281 + 725 + 281, 444)));
+        // A lane that starts with fewer of the head's tokens than the cohort
+        // shares would run all its rows: the cohort stops before it.
+        let mut early = lane_tokens(2, 444, 725);
+        early[100] += 1;
+        let partial = [
+            lane_shape(&first[0], 720, true),
+            lane_shape(&first[1], 720, true),
+            lane_shape(&early, 720, true),
+        ];
+        assert_eq!(lanes(&partial, cheap), Some((2, 444 + 2 * 281, 444)));
+        assert_eq!(
+            lanes(&partial, Qwen35PrefillJoin::Every),
+            Some((3, 444 + 2 * 281 + 725, 444))
+        );
         // A common beginning shorter than one tile is not a shared prefix.
         let brief: Vec<Vec<u32>> = (0..2).map(|lane| lane_tokens(lane, 31, 200)).collect();
         let brief_shapes = [lane_shape(&brief[0], 200, true), lane_shape(&brief[1], 200, true)];
@@ -11472,6 +11500,7 @@ mod tests {
         );
         assert_eq!((dense.idle_rows, dense.decode_rows), (2_048, 512));
         assert_eq!(dense.cold_gather, Duration::from_millis(25));
+        assert!(dense.prefill_first);
         let moe = Qwen35JointPrefillPolicy::for_worker(true, 2_048);
         assert_eq!(moe.join, Qwen35PrefillJoin::Every);
         assert_eq!((moe.idle_rows, moe.decode_rows), (2_048, 512));

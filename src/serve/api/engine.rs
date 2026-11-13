@@ -19092,6 +19092,7 @@ fn run_slot_aware_qwen35(
             idle_rows = policy.idle_rows,
             decode_rows = policy.decode_rows,
             cold_gather_ms = policy.cold_gather.as_millis() as u64,
+            prefill_first = policy.prefill_first,
             "Qwen joint prompt prefill policy"
         );
         policy
@@ -19624,60 +19625,60 @@ fn run_slot_aware_qwen35(
                 n_prefill_tokens,
                 decode_handles,
             } => {
-                // Existing streams run before one bounded cold transaction.
-                // This ordering is the observable fairness contract: a newly
-                // admitted large tool prompt cannot make a decode-ready peer
-                // wait for its entire prefill.
-                if let Some(fatal) = decode_batch_qwen35(
-                    &mut guard,
-                    &mut scheduler,
-                    &mut slots,
-                    &mut retained_tokens,
-                    &mut prompt_caches,
-                    &mut prompt_anchors,
-                    registration.as_ref(),
-                    &decode_handles,
-                    kv_bytes_per_token,
-                    qwen_joint_decode,
-                    &supervisor,
-                ) {
-                    fail_qwen35_worker_after_gpu_fatal(
-                        &supervisor,
-                        &mut rx,
-                        &mut pending,
-                        &mut slots,
-                        &mut scheduler,
-                        &scheduler_stats_snapshot,
-                        fatal,
-                    );
-                    break 'worker;
-                }
-                if let Some(fatal) = advance_qwen35_prefill_step(
-                    &mut guard,
-                    &mut scheduler,
-                    &mut slots,
-                    &mut retained_tokens,
-                    &mut prompt_caches,
-                    &mut prompt_anchors,
-                    registration.as_ref(),
-                    &scheduler_stats_snapshot,
-                    prefill,
-                    n_prefill_tokens,
-                    // The streams that just ran wait for this transaction.
-                    qwen_joint_prefill.map(|policy| (policy.decode_rows, policy.join)),
-                    kv_bytes_per_token,
-                    &supervisor,
-                ) {
-                    fail_qwen35_worker_after_gpu_fatal(
-                        &supervisor,
-                        &mut rx,
-                        &mut pending,
-                        &mut slots,
-                        &mut scheduler,
-                        &scheduler_stats_snapshot,
-                        fatal,
-                    );
-                    break 'worker;
+                // Without the joint prefill policy, existing streams run
+                // before one bounded cold transaction. With it
+                // (`Qwen35JointPrefillPolicy::prefill_first`) the transaction
+                // runs first: a decoding slot's cycles and the transactions
+                // alternate either way, so its largest gap between tokens
+                // is one transaction plus one cycle in both orders, and the
+                // waiting request no longer spends a decode cycle of time
+                // to first token behind streams that lose nothing by it.
+                let prefill_first = qwen_joint_prefill.is_some_and(|policy| policy.prefill_first);
+                for decode_phase in [!prefill_first, prefill_first] {
+                    let fatal = if decode_phase {
+                        decode_batch_qwen35(
+                            &mut guard,
+                            &mut scheduler,
+                            &mut slots,
+                            &mut retained_tokens,
+                            &mut prompt_caches,
+                            &mut prompt_anchors,
+                            registration.as_ref(),
+                            &decode_handles,
+                            kv_bytes_per_token,
+                            qwen_joint_decode,
+                            &supervisor,
+                        )
+                    } else {
+                        advance_qwen35_prefill_step(
+                            &mut guard,
+                            &mut scheduler,
+                            &mut slots,
+                            &mut retained_tokens,
+                            &mut prompt_caches,
+                            &mut prompt_anchors,
+                            registration.as_ref(),
+                            &scheduler_stats_snapshot,
+                            prefill,
+                            n_prefill_tokens,
+                            // The decoding streams wait for this transaction.
+                            qwen_joint_prefill.map(|policy| (policy.decode_rows, policy.join)),
+                            kv_bytes_per_token,
+                            &supervisor,
+                        )
+                    };
+                    if let Some(fatal) = fatal {
+                        fail_qwen35_worker_after_gpu_fatal(
+                            &supervisor,
+                            &mut rx,
+                            &mut pending,
+                            &mut slots,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            fatal,
+                        );
+                        break 'worker;
+                    }
                 }
                 let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);

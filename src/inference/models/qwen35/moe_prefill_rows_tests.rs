@@ -174,6 +174,140 @@ fn gate(down_t: GgmlType, seed: u64) {
     }
 }
 
+/// The layer as a joint prefill forward runs it over `segments` (row counts,
+/// laid side by side): one call over every row, a barrier, then each
+/// segment of at most [`MOE_ROW_EXACT_MIN_ROWS`] rows again on its own
+/// scratch over its rows of that output, all in one command buffer. Returns
+/// the output rows.
+fn joint_forward_layer(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    weights: &MoeFfnWeightsGpuQ,
+    x: &[Vec<f32>],
+    residual: &[Vec<f32>],
+    segments: &[usize],
+) -> Vec<Vec<u32>> {
+    let shape = shape();
+    let n: usize = segments.iter().sum();
+    let all: Vec<usize> = (0..n).collect();
+    let x = packed(x, &all, device);
+    let residual = packed(residual, &all, device);
+    let arena = |rows: usize| {
+        super::MoeFfnArena::new(
+            device,
+            rows as u32,
+            shape.hidden_size,
+            shape.num_experts_per_tok,
+            shape.moe_intermediate_size,
+            shape.shared_intermediate_size,
+            shape.num_experts,
+        )
+        .expect("MoeFfnArena")
+    };
+    let mut forward_arena = arena(n);
+    let mut short_arenas: Vec<super::MoeFfnArena> = segments
+        .iter()
+        .filter(|&&rows| rows <= MOE_ROW_EXACT_MIN_ROWS as usize)
+        .map(|&rows| arena(rows))
+        .collect();
+    let out: MlxBuffer = device
+        .alloc_buffer(n * H * 4, DType::F32, vec![n, H])
+        .expect("output rows");
+    let mut enc = device
+        .command_encoder()
+        .map(crate::inference::native_observation::encoder)
+        .expect("encoder");
+    let mut all_rows = out.clone();
+    build_moe_ffn_layer_gpu_q_into_with_arena(
+        &mut enc,
+        device,
+        registry,
+        &x,
+        weights,
+        shape,
+        Some(&residual),
+        &mut forward_arena,
+        &mut all_rows,
+        0,
+    )
+    .expect("forward-wide MoE layer");
+    enc.memory_barrier();
+    let mut first = 0usize;
+    let mut short = short_arenas.iter_mut();
+    for &rows in segments {
+        if rows <= MOE_ROW_EXACT_MIN_ROWS as usize {
+            let view = |buffer: &MlxBuffer| {
+                super::prefill_joint::row_view(buffer, first as u32, rows as u32, H)
+                    .with_shape(vec![rows, H])
+                    .expect("segment rows")
+            };
+            let mut segment_out = view(&out);
+            build_moe_ffn_layer_gpu_q_into_with_arena(
+                &mut enc,
+                device,
+                registry,
+                &view(&x),
+                weights,
+                shape,
+                Some(&view(&residual)),
+                short.next().expect("short segment scratch"),
+                &mut segment_out,
+                0,
+            )
+            .expect("short segment MoE layer");
+        }
+        first += rows;
+    }
+    enc.commit_and_wait().expect("commit joint MoE layer");
+    out.as_slice::<u32>().expect("output bits")[..n * H]
+        .chunks(H)
+        .map(<[u32]>::to_vec)
+        .collect()
+}
+
+/// The joint prefill forward's MoE FFN: every segment, long or short, holds
+/// the rows of its own call, in forwards that mix both, that hold only long
+/// ones and only short ones.
+#[test]
+fn a_joint_forward_gives_every_segment_the_rows_of_its_own_moe_call() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let Ok(device) = MlxDevice::new() else {
+        return;
+    };
+    let mut registry = KernelRegistry::new();
+    let layer = Layer::random(GgmlType::Q6_K, 0x51A5_0003);
+    let experts = layer.gpu_experts(&device);
+    let weights = layer.gpu(&device, true, &experts);
+    let (x, residual) = rows(700, 0x5EED_0003);
+    let layouts: [&[usize]; 5] = [
+        // Folded cues behind resumed chunks, a short chunk between them.
+        &[157, 5, 31, 200, 5],
+        // A shared prefix and three tails with their cues.
+        &[160, 96, 5, 96, 5, 33, 5],
+        // Long segments only.
+        &[162, 162, 96],
+        // A long segment and a 32-row one (the last short row count).
+        &[33, 32, 2],
+        // One lane: a folded chunk.
+        &[266, 5],
+    ];
+    for segments in layouts {
+        let together =
+            joint_forward_layer(&device, &mut registry, &weights, &x, &residual, segments);
+        let mut first = 0usize;
+        for &segment_rows in segments {
+            let select: Vec<usize> = (first..first + segment_rows).collect();
+            let alone = layer_rows(&device, &mut registry, &weights, &x, &residual, &select);
+            assert!(
+                alone[..] == together[first..first + segment_rows],
+                "segment of {segment_rows} rows at {first} in a joint forward of {segments:?} \
+                 differs from its own call"
+            );
+            first += segment_rows;
+        }
+    }
+}
+
 #[test]
 fn a_prefill_moe_row_above_32_rows_does_not_depend_on_its_call_down_q6_k() {
     gate(GgmlType::Q6_K, 0x51A5_0001);
