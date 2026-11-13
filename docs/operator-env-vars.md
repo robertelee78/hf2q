@@ -424,6 +424,12 @@ buffer of the global path is accounted at its exact size
 | 200,000 | 781 MiB | 845 MiB |
 | 262,144 | 1,024 MiB | 1,088 MiB |
 
+The bound needs sessions that can be finished between sub-chunks. The
+development flag `HF2Q_GRAPH_OPT_PREFILL=1` records each prefill layer's
+session, which cannot be finished mid-layer, so under it the unset default
+serves vec-hybrid (logged at load, source `fallback`) and an explicit
+`tensor` refuses the model load.
+
 The vec-hybrid kill switch needs none of it. The splits and waits change no
 output bit (the kernel's results do not depend on where a chunk starts).
 They do not act on the release-gate workload (histories under 2,000

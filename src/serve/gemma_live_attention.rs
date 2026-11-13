@@ -156,8 +156,8 @@ pub(crate) struct LiveScratch<'e> {
     exec: &'e GraphExecutor,
     limits: TensorScratchLimits,
     /// False while the layer's session cannot be split (recorded graph
-    /// sessions of `HF2Q_GRAPH_OPT_PREFILL=1`): the route then accounts
-    /// without waiting.
+    /// sessions of `HF2Q_GRAPH_OPT_PREFILL=1`): an admission that would
+    /// need a wait is then an error, so the bound holds by refusal.
     can_wait: bool,
     held: u64,
     submitted: u64,
@@ -193,14 +193,27 @@ impl<'e> LiveScratch<'e> {
     }
 
     fn admit(&mut self, s: &mut GraphSession<'e>, bytes: u64, held: bool) -> Result<()> {
-        if self.can_wait
-            && self.submitted > 0
+        if self.submitted > 0
             && self
                 .held
                 .saturating_add(self.submitted)
                 .saturating_add(bytes)
                 > self.limits.budget_bytes
         {
+            // A recorded session cannot be finished mid-layer, so nothing
+            // submitted can be released: refuse rather than exceed the
+            // bound. Model load keeps the tensor route off recorded
+            // sessions (`admit_recorded_prefill`), so this is the invariant
+            // behind that guard, not a serving path.
+            anyhow::ensure!(
+                self.can_wait,
+                "live tensor attention would hold {} bytes of global-layer scratch (budget {}) in \
+                 a recorded prefill session ({GRAPH_OPT_PREFILL_ENV}=1), which cannot be drained",
+                self.held
+                    .saturating_add(self.submitted)
+                    .saturating_add(bytes),
+                self.limits.budget_bytes
+            );
             if crate::serve::gemma_prefill_catsplit::enabled() {
                 // Keep the warm-prefill split's attention time whole.
                 crate::serve::gemma_prefill_catsplit::boundary(
@@ -270,6 +283,10 @@ fn tensor_global_query_rows(kv_pad: usize, bq: usize, mask_bytes: u64) -> usize 
 }
 
 pub(crate) const WARM_TILED_ATTENTION_ENV: &str = "HF2Q_GEMMA_WARM_TILED_ATTENTION";
+/// Development flag that records each prefill layer's session for the
+/// fusion pass. A recorded session cannot be finished mid-layer, so the
+/// tensor route's scratch could not be drained under it.
+pub(crate) const GRAPH_OPT_PREFILL_ENV: &str = "HF2Q_GRAPH_OPT_PREFILL";
 /// Unset default: the tensor-API route of the Gemma 4 release gate (ADR-063
 /// Q4-GEMMA-ATTN, campaign `q4-gemma-release-gate-max40-v3`). The tiled F16
 /// route stays opt-in: under a four-agent cohort it moved a lane's decision
@@ -295,6 +312,29 @@ fn parse_warm_tiled_switch(
         value if is_kill_spelling(value) => Ok(Resolved::environment(WARM_ATTENTION_STOCK)),
         _ => Err(format!(
             "{WARM_TILED_ATTENTION_ENV} must be tensor, 1/on/true or 0/off/false/stock, got {raw:?}"
+        )),
+    }
+}
+
+/// Keeps the tensor route off recorded prefill sessions
+/// (`HF2Q_GRAPH_OPT_PREFILL=1`), where its global-layer scratch could not be
+/// bounded: the unset default serves vec-hybrid instead, and an explicit
+/// `tensor` is refused at load rather than silently replaced or left
+/// unbounded. Every other kernel and every non-recorded process is
+/// unchanged.
+fn admit_recorded_prefill(
+    resolved: Resolved<GemmaLiveKernel>,
+    recorded: bool,
+) -> std::result::Result<Resolved<GemmaLiveKernel>, String> {
+    if !recorded || resolved.value != GemmaLiveKernel::TensorF16 {
+        return Ok(resolved);
+    }
+    match resolved.source {
+        RouteSource::Default => Ok(Resolved::fallback(WARM_ATTENTION_STOCK)),
+        _ => Err(format!(
+            "{WARM_TILED_ATTENTION_ENV}=tensor is incompatible with {GRAPH_OPT_PREFILL_ENV}=1: a \
+             recorded prefill session cannot be drained, so the tensor route's scratch would \
+             not be bounded. Unset one of them"
         )),
     }
 }
@@ -377,6 +417,16 @@ pub(crate) fn warm_live_kernel_from_env(
 ) -> Result<Resolved<GemmaLiveKernel>> {
     let raw = std::env::var(WARM_TILED_ATTENTION_ENV).ok();
     let resolved = parse_warm_tiled_switch(raw.as_deref()).map_err(anyhow::Error::msg)?;
+    let recorded = std::env::var(GRAPH_OPT_PREFILL_ENV).as_deref() == Ok("1");
+    let unguarded = resolved;
+    let resolved = admit_recorded_prefill(resolved, recorded).map_err(anyhow::Error::msg)?;
+    if resolved != unguarded {
+        tracing::warn!(
+            kernel = ?resolved.value,
+            "Gemma warm live attention default is not used with HF2Q_GRAPH_OPT_PREFILL=1 \
+             (recorded prefill sessions cannot bound its scratch); using the stock kernel"
+        );
+    }
     let (kernel, probe) = admit_warm_kernel(resolved, || probe_tensor_route(registry, device))
         .map_err(anyhow::Error::msg)?;
     match &probe {
@@ -1875,6 +1925,19 @@ mod tests {
             lanes: &[(&HybridKvBuffers, usize, usize)],
             limits: TensorScratchLimits,
         ) -> (Vec<Vec<u32>>, LiveScratchStats) {
+            self.run(seed, lanes, limits, false).unwrap()
+        }
+
+        /// [`Self::forward`], optionally in a recorded session (the kind
+        /// `HF2Q_GRAPH_OPT_PREFILL=1` gives a prefill layer), which cannot
+        /// be finished mid-layer.
+        fn run(
+            &mut self,
+            seed: u64,
+            lanes: &[(&HybridKvBuffers, usize, usize)],
+            limits: TensorScratchLimits,
+            recorded: bool,
+        ) -> Result<(Vec<Vec<u32>>, LiveScratchStats)> {
             let total: usize = lanes.iter().map(|lane| lane.2).sum();
             let q = self.stream(seed, total, FX_NH);
             let k = self.stream(seed ^ 0x5151, total, FX_NKV);
@@ -1916,12 +1979,17 @@ mod tests {
                 })
                 .collect();
             set_test_tensor_scratch_limits(Some(limits));
-            {
+            let encoded = {
                 let (exec, reg) = self.ctx.split();
                 let dev = exec.device();
                 let mut scratch = LiveScratch::new(exec);
-                let mut session = exec.begin().unwrap();
-                encode_live_layer_attention(
+                scratch.set_can_wait(!recorded);
+                let mut session = if recorded {
+                    exec.begin_recorded().unwrap()
+                } else {
+                    exec.begin().unwrap()
+                };
+                let encoded = encode_live_layer_attention(
                     &mut session,
                     reg,
                     dev,
@@ -1929,11 +1997,19 @@ mod tests {
                     LiveRoute::resolve(TensorF16),
                     seqs,
                     &mut scratch,
-                )
-                .unwrap();
-                session.finish().unwrap();
-            }
+                );
+                match encoded {
+                    Ok(()) if recorded => session
+                        .finish_with_fusion(reg, dev.metal_device())
+                        .map(|_| ())
+                        .map_err(|e| anyhow::anyhow!("recorded finish: {e}")),
+                    Ok(()) => session.finish().map_err(|e| anyhow::anyhow!("finish: {e}")),
+                    Err(error) => Err(error),
+                }
+            };
             set_test_tensor_scratch_limits(None);
+            let stats = last_forward_scratch_stats();
+            encoded?;
             let bits: Vec<u32> = out
                 .as_slice::<f32>()
                 .unwrap()
@@ -1950,7 +2026,7 @@ mod tests {
                     lane
                 })
                 .collect();
-            (per_lane, last_forward_scratch_stats())
+            Ok((per_lane, stats))
         }
     }
 
@@ -2053,6 +2129,87 @@ mod tests {
         }
     }
 
+    /// `HF2Q_GRAPH_OPT_PREFILL=1` at load: the unset tensor default gives
+    /// way to vec-hybrid, an explicit `tensor` is refused with both switch
+    /// names, and nothing else changes.
+    #[test]
+    fn tensor_warm_route_stays_off_recorded_prefill_sessions() {
+        assert_eq!(
+            admit_recorded_prefill(Resolved::default_value(TensorF16), true),
+            Ok(Resolved::fallback(VecHybrid))
+        );
+        let refusal = admit_recorded_prefill(Resolved::environment(TensorF16), true).unwrap_err();
+        for needle in [
+            WARM_TILED_ATTENTION_ENV,
+            GRAPH_OPT_PREFILL_ENV,
+            "Unset one of them",
+        ] {
+            assert!(refusal.contains(needle), "{refusal}");
+        }
+        for resolved in [
+            Resolved::environment(TiledF16),
+            Resolved::environment(VecHybrid),
+            Resolved::fallback(VecHybrid),
+        ] {
+            assert_eq!(admit_recorded_prefill(resolved, true), Ok(resolved));
+        }
+        for resolved in [
+            Resolved::default_value(TensorF16),
+            Resolved::environment(TensorF16),
+            Resolved::environment(TiledF16),
+        ] {
+            assert_eq!(admit_recorded_prefill(resolved, false), Ok(resolved));
+        }
+    }
+
+    /// The tensor route inside a recorded session (reachable only by
+    /// building the forward by hand; model load keeps it off). Within the
+    /// budget it runs and gives the bits and cache bytes of the ordinary
+    /// session. Past the budget the forward is refused, with no wait, and
+    /// the accounted scratch at the refusal is exactly one dense K/V pair
+    /// plus one dispatch: the bound holds under recording too.
+    #[test]
+    fn recorded_session_tensor_scratch_is_exact_within_the_budget_and_refused_past_it() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        const HISTORY: usize = 200;
+        const SUFFIX: usize = 150;
+        let mut fx = GlobalFixture::new(DType::U8);
+        let caches = [fx.kv(), fx.kv(), fx.kv()];
+        for kv in &caches {
+            fx.forward(11, &[(kv, 0, HISTORY)], TensorScratchLimits::SERVING);
+        }
+        let lane = |kv| [(kv, HISTORY, SUFFIX)];
+        let (plain, _) = fx.forward(23, &lane(&caches[0]), TensorScratchLimits::SERVING);
+        let (recorded, stats) = fx
+            .run(23, &lane(&caches[1]), TensorScratchLimits::SERVING, true)
+            .expect("a recorded session within the budget runs");
+        assert_eq!(stats.waits, 0);
+        assert!(recorded == plain, "recorded session changed an output bit");
+        assert!(cache_bytes(&caches[1]) == cache_bytes(&caches[0]));
+
+        // Two threadgroups per sub-chunk and a one-byte budget: the second
+        // mask would need a wait, so the forward stops holding the pair and
+        // the first sub-chunk's mask and blk buffer (232 keys pad to 256).
+        let tight = TensorScratchLimits {
+            mask_bytes: tensor_mask_bytes(32, 384),
+            budget_bytes: 1,
+        };
+        let refusal = fx
+            .run(23, &lane(&caches[2]), tight, true)
+            .expect_err("a recorded session past the budget is refused");
+        assert!(
+            format!("{refusal:#}").contains(GRAPH_OPT_PREFILL_ENV),
+            "{refusal:#}"
+        );
+        let stats = last_forward_scratch_stats();
+        assert_eq!(stats.waits, 0);
+        assert_eq!(
+            stats.peak_bytes,
+            tensor_dense_kv_bytes(FX_NKV, FX_HD, HISTORY + SUFFIX, 0)
+                + tensor_dispatch_scratch_bytes(32, tensor_kv_pad(0, HISTORY + 32), 16).unwrap()
+        );
+    }
+
     /// The accounting holds a sequence's dense K/V while its sub-chunks run,
     /// counts dropped scratch as submitted until a wait, and waits only when
     /// the budget would be exceeded and something can be released.
@@ -2090,14 +2247,23 @@ mod tests {
         );
         // Peak: the pair plus one mask; the waits keep it from adding up.
         assert_eq!(scratch.stats.peak_bytes, 5_300);
-        // A recorded session cannot be split: account, never wait.
+        // A recorded session cannot be split: an admission that would need
+        // a wait is refused and changes nothing.
         scratch.set_can_wait(false);
         scratch.release(5_000);
-        scratch.admit(&mut session, 5_000, true).unwrap();
-        assert_eq!(scratch.stats.waits, 2);
-        // A layer boundary that waited releases everything submitted.
+        let refusal = scratch.admit(&mut session, 5_000, true).unwrap_err();
+        assert!(format!("{refusal:#}").contains(GRAPH_OPT_PREFILL_ENV));
+        assert_eq!(
+            (scratch.stats.waits, scratch.held, scratch.submitted),
+            (2, 0, 5_000)
+        );
+        assert_eq!(scratch.stats.peak_bytes, 5_300);
+        // A layer boundary that waited releases everything submitted, and
+        // one oversized pair with nothing submitted is admitted as before.
         scratch.layer_finished();
         assert_eq!(scratch.submitted, 0);
+        scratch.admit(&mut session, 5_000, true).unwrap();
+        assert_eq!((scratch.held, scratch.submitted), (5_000, 0));
         session.finish().unwrap();
     }
 
