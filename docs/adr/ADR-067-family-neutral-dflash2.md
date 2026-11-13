@@ -2116,6 +2116,115 @@ On Qwen3.8, where no valid Splash end-to-end run exists, prefill is 12.0 s
 of a 32.8 s run and the four-lane cycle is 60.2 ms against Splash's 50.6 ms
 profile.
 
+#### Cycle tail: draft prefetch and decision candidates
+
+After the stage work the four-lane Qwen3.8 cycle (59.7–60.1 ms begin to
+begin on the second combined candidate) spends 4.5–4.6 ms between the output
+head's GPU end and the GPU start of the next cycle's draft; Qwen3.6 spends
+2.9 ms of 28.3. Splash has 0.46 ms of GPU work there (acceptance and the
+draft-context update are dispatches of its one command). In hf2q's tail the
+host copies 32 rows of 248,320 logits out of the head's buffer (0.50 ms),
+samples them (0.77 ms; 0.48 on Qwen3.6), pays a residency-set commit for the
+step's released layer outputs (0.40 ms on Qwen3.8), and then runs the
+draft-context commit and the DeltaNet replay in front of the next draft.
+This workload always settles acceptance on the host: every request carries a
+repetition penalty, a thinking budget and the lazy tool grammar.
+
+Two Class A switches, off by default, remove the tail without changing a
+decision:
+
+- `HF2Q_DFLASH2_DRAFT_PREFETCH=1`. Once the plan exists the step knows every
+  input of the next step's draft (anchors, positions, row limits, lane
+  order). It submits the draft-context commit, which reads its own copy of
+  the step's positions so the next positions can be written at once; commits
+  the replay behind it; commits the next draft behind both; and only then
+  waits for the replay and the context commit. The next step's draft call
+  adopts the committed command when its inputs are exactly the prefetched
+  ones and nothing wrote the rings in between; a lane that joined or left, a
+  prefill ingest or a cleared lane makes it wait for the command, drop its
+  outputs and draft again. A step that runs while another slot is in prefill
+  does not prefetch. The order of the three commits matters: a wait on a
+  command buffer returns only when every command committed before it on the
+  queue has completed, so a replay committed behind the draft is waited for
+  until the draft ends (measured: the cycle then gains 1 ms instead of 4).
+  The step's layer outputs are released after the commit settles.
+- `HF2Q_DFLASH2_GPU_DECISIONS=1`. For a lane at temperature zero whose
+  sampler is a repetition penalty followed by an argmax, the penalty changes
+  at most 64 logits of a row. The output-head command gathers those logits
+  (the lane's repetition window after the window's earlier drafts, assembled
+  on the GPU from the lane's base window and the token tile), masks them and
+  runs the stock argmax over the row; the host finishes each decision from at
+  most 65 candidates with `apply_repetition_penalty` and `sample_greedy`
+  themselves and hands it to the same decision path a greedy lane uses
+  (forced thinking-budget tokens, grammar advance, tool trigger and terminal
+  handling are unchanged host code). The GPU copies and compares logits; it
+  performs no arithmetic on them. A row the candidates cannot decide (the
+  tool grammar is constraining it, a logit is not finite, the history is not
+  the one the kernel assembled) is sampled on the host from that row's own
+  logits, restored bit for bit; a request with logit bias, top-k, top-p,
+  min-p, a seed or logprobs keeps the host route for its whole window.
+  `check` runs both routes for every window and compares the plans.
+
+Rejected for this step: acceptance and the context commit inside the head's
+command (it needs the penalty multiply on the GPU and a second context commit
+for lanes the GPU cannot decide, for a further 0.2–0.35 ms), and a host-step
+spin (start latency only; mlx-native has no shared-event split).
+
+Gates. `draft_prefetch_tests`: on a synthetic checkpoint, both draft routes
+and both entry points, 40 steps past a ring wrap leave every draft output and
+the rings bitwise the stock order's with 39 of 40 prefetches adopted; five
+kinds of mismatching next step, a cleared lane and a prefill ingest each drop
+the command and redraft with the stock bits; a step that fails after its
+submissions leaves no prefetched draft and clears its lanes.
+`dflash2_submitted_commit_*`: one to four lanes at every accept count, stock
+and tiled attention, bitwise the waited commit. `verify_decision` tests: the
+kernels against `sampler_pure::sample_token` at vocabularies up to the served
+248,320 under penalties 1.0, 1.05, 1.3 and 0.8, with history tokens on top,
+exact ties on either side, signed zeros, duplicate history tokens and
+non-finite logits; identical digests plain, under shader validation, with the
+debug layer and from runtime source. `dflash2_scheduler::decision_tests`: 600
+verify windows with penalties, thinking-budget closes forced inside the
+window, the lazy grammar waiting, triggered inside the window and active,
+planned by both routes with equal plans.
+
+In situ, Qwen3.8 (the second combined candidate with and without the two
+switches, one binary, eight exact four-agent runs interleaved inside one
+measurement ticket, all passing with one transcript): the time from the
+head's GPU end to the next draft's GPU start falls from 4.63 to 1.00 ms and
+GPU idle per four-lane cycle from 2.7 to 0.5 ms; the four-lane cycle falls
+from 60.1 to 58.2–58.4 ms (−1.85 ms, 3.1%) and four-agent makespan from 33.0
+to 32.5 seconds (−1.5%); peak footprint is unchanged. Alternating the
+switches in blocks of 16 cycles inside one run gives −2.75 ms for both
+(se 0.35), −1.93 ms for the prefetch alone and −1.63 ms for the decision
+candidates alone. Less than the tail's 3.6 ms reaches the cycle for two
+reasons. The replay now runs beside the next draft and slows it by 0.8–1.0 ms
+(a cycle with no partially accepted lane is 56.5–57.4 ms head to head, one
+with four is 59.2–59.7 ms): the replay still costs about 1.3 ms per four-lane
+cycle, which folding the retained rows into the next step's DeltaNet kernel,
+as Splash does, would remove. And the GPU's performance state falls when its
+idle goes: the layer commands take 0.5 ms longer in whole runs with the
+switches, which the 16-cycle blocks do not show.
+
+Equal-clock comparison with Splash. Splash's `decode-profile` and the hf2q
+server were run in one ticket with a GPU performance-state sampler beside
+each. Splash's tool holds the GPU at its top state (1617 MHz mean in its
+fused four-lane cycles, 51.59 ms; 1620 MHz in its attributed cycles); the
+hf2q server ran at 1394 MHz (1342 MHz with the switches). Within an hf2q run
+each command class follows the frequency (16 layer commands: 10.3 +
+51,088 / MHz ms, r = 0.96), and fitted to 1620 MHz the layer commands take
+41.9 ms against Splash's 42.7 ms for the same stages, the draft 5.1 against
+5.5 and the head 2.0 against 2.0. The whole cycle fits to 53.6 ms without the
+switches and 51.7 ms with them, against Splash's 51.6: at equal clock the
+distance was the tail, and the switches close it. As served the cycle is
+58.2 ms, because the served GPU does not hold the top state; what holds it
+down under the serving workload (clients compiling on the CPU, prefill
+bursts, 21 commands and three waits per cycle) is not established. By stage
+at equal clock (one category profile scaled by the fit): hf2q is faster in
+the output projections (−1.6 ms) and the DeltaNet core (−0.5 ms) and slower
+in the FFN block's surrounding stages (+0.9 ms: casts, SiLU, reduce and
+residual as separate dispatches behind six barriers where Splash has two
+dispatches with epilogues) and on the attention side (+0.3 to +0.6 ms).
+
 ### D5: performance qualification
 
 Use the exact Q4 target GGUF, four-agent workload, prompts, sampling settings,
