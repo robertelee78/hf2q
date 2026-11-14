@@ -797,6 +797,7 @@ jobs:
           bash scripts/test_release_dependency_provenance_contract.sh
           bash scripts/test_release_gate_process_group_contract.sh
           bash scripts/test_cache_lifecycle_evidence_contract.sh
+          python3 -B -m unittest discover -s scripts -p 'test_cache_release_orchestrator.py'
           bash scripts/test_r2c_structured_output_receipt_contract.sh
           bash scripts/test_release_tag_recovery_contract.sh
           bash scripts/test_frictionless_diagnostics_contract.sh
