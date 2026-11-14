@@ -248,7 +248,8 @@ fn main() -> ExitCode {
     //   1. --log-level (explicit) overrides everything.
     //   2. -v/-vv/-vvv bumps verbosity.
     //   3. RUST_LOG env var.
-    //   4. Default: hf2q=warn (silent on the generate boot path).
+    //   4. Default: hf2q=warn (silent on the generate boot path); `serve`
+    //      also shows the model-load route audit line.
     // Log format (text/json) comes from --log-format (Decision #11).
     // Stderr writer: logs never touch stdout, keeping the generation
     // stream unpolluted. ANSI colors only when stderr is a TTY for
@@ -259,7 +260,8 @@ fn main() -> ExitCode {
         EnvFilter::new(format!("hf2q={lvl},mlx_native={lvl}", lvl = lvl.as_str()))
     } else {
         match cli.verbose {
-            0 => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("hf2q=warn")),
+            0 => EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(default_log_filter(&cli.command))),
             1 => EnvFilter::new("hf2q=info,mlx_native=info"),
             2 => EnvFilter::new("hf2q=debug,mlx_native=debug"),
             _ => EnvFilter::new("hf2q=trace,mlx_native=trace"),
@@ -327,6 +329,17 @@ fn emit_terminal_json_error(error: &AppError, exit_code: u8) {
         }
     });
     eprintln!("{diagnostic}");
+}
+
+/// Log filter when neither `--log-level`, `-v` nor `RUST_LOG` is given:
+/// warnings only. `serve` also shows the model-load audit of default-on
+/// routes (`hf2q::audit`, one line per load), so an operator sees which
+/// routes a default server runs without raising the verbosity.
+fn default_log_filter(command: &Command) -> &'static str {
+    match command {
+        Command::Serve(_) => "hf2q=warn,hf2q::audit=info",
+        _ => "hf2q=warn",
+    }
 }
 
 fn run(cli: Cli) -> Result<(), AppError> {
@@ -2316,5 +2329,24 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(run(serve), Err(AppError::Input(_))));
+    }
+
+    /// A default `hf2q serve` shows the model-load route audit line (target
+    /// `hf2q::audit`) without `-v`; other commands stay at warnings only.
+    #[test]
+    fn default_log_filter_shows_the_route_audit_on_serve_only() {
+        let serve = Cli::try_parse_from(["hf2q", "serve", "--model", "/m.gguf"]).unwrap();
+        assert_eq!(
+            default_log_filter(&serve.command),
+            "hf2q=warn,hf2q::audit=info"
+        );
+        assert_eq!(
+            crate::inference::models::route_default::AUDIT_TARGET,
+            "hf2q::audit"
+        );
+        let generate =
+            Cli::try_parse_from(["hf2q", "generate", "--model", "/m.gguf", "--prompt", "x"])
+                .unwrap();
+        assert_eq!(default_log_filter(&generate.command), "hf2q=warn");
     }
 }

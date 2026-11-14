@@ -593,7 +593,9 @@ qwen36_validate_power_snapshot_inventory() {
   }
   if ! (
     cd "$root" || exit 1
+    # Sealed phase copies are verified by the schema3 ledger, not live inventory.
     find . \
+      -path './.cache-release/raw' -prune -o \
       \( -name '*.power-events.baseline' \
         -o -name '*.power-events.final' \
         -o -name '*.power-events.new' \) \

@@ -55,7 +55,7 @@ fn spawn_engine(slots: u32) -> (Engine, usize) {
     let window = g.config.sliding_window;
     assert!(window > 0 && window <= 2048, "sliding window {window}");
     let engine =
-        Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: slots })
+        Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: slots }, &mut None)
             .expect("spawn SlotAware Gemma engine");
     (engine, window)
 }

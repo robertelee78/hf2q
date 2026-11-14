@@ -921,6 +921,65 @@ fn a_prepared_chunk_capture_equals_the_wait_every_layer_capture() {
     });
 }
 
+/// `HF2Q_QWEN_PREFILL_WAIT_LAYERS` changes when the host waits and when a
+/// layer's command buffer is submitted, not what the GPU computes: a large
+/// fresh chunk and resumed ones, with target layers the host copies on and
+/// off a wait boundary, give the same logits, the same captured rows and the
+/// same slot at every setting.
+#[test]
+fn waiting_every_few_layers_leaves_the_bits_of_waiting_every_layer() {
+    use super::prefill_prepared::ForcedWaitLayers;
+    use crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession;
+    with_synthetic_model(|model| {
+        let hidden = model.cfg.hidden_size as usize;
+        let run = |wait_layers: usize, captured_layers: &[usize]| {
+            let _cadence = ForcedWaitLayers::set(wait_layers);
+            let _scope = PrefillScope::forced(true);
+            assert_eq!(super::prefill_prepared::wait_layers(), wait_layers);
+            let mut cache = cache(model);
+            let mut bits = Vec::new();
+            let mut start = 0usize;
+            for len in [97usize, 40, 33, 157, 5] {
+                let mut session =
+                    DFlashCaptureSession::new(captured_layers.to_vec(), len, hidden, false);
+                let (logits, _hidden) = model
+                    .forward_gpu_last_logits_with_hidden_dflash(
+                        &tokens(0, start, len),
+                        &positions_for_range(start as i32, len),
+                        &mut cache,
+                        Some(&mut session),
+                        SlotId(0),
+                    )
+                    .unwrap_or_else(|error| panic!("chunk start={start} n={len}: {error:#}"));
+                bits.extend(logits.iter().map(|value| value.to_bits()));
+                bits.extend(session.hidden_output.iter().map(|value| value.to_bits()));
+                start += len;
+            }
+            // Every row of a chunk without a capture reads the slot back.
+            let read_back = model
+                .forward_gpu(
+                    &tokens(0, start, 41),
+                    &positions_for_range(start as i32, 41),
+                    &mut cache,
+                    SlotId(0),
+                )
+                .expect("read-back chunk");
+            bits.extend(read_back.iter().map(|value| value.to_bits()));
+            bits
+        };
+        for captured_layers in [&[1usize, 4, 6, 7][..], &[0, 3][..], &[2][..]] {
+            let every_layer = run(1, captured_layers);
+            for wait_layers in [2, 3, 4, 8] {
+                assert!(
+                    run(wait_layers, captured_layers) == every_layer,
+                    "waiting every {wait_layers} layers changed bits (captured layers \
+                     {captured_layers:?})"
+                );
+            }
+        }
+    });
+}
+
 /// Real-artifact gate, run explicitly:
 /// `HF2Q_QWEN38_GGUF=… <test binary> qwen38_prepared_prefill_real_model_gate --ignored --nocapture --test-threads=1`
 ///
@@ -1170,4 +1229,93 @@ fn qwen_prepared_vs_stock_on_served_prompts() {
             );
         }
     }
+}
+
+/// Every row's logits of one chunk through the scope the engine opens: the
+/// route is whatever this thread's resolved switches say.
+fn chunk_rows_as_served(model: &Qwen35Model, len: usize) -> Vec<u32> {
+    let _scope = PrefillScope::enter();
+    let logits = model
+        .forward_gpu(
+            &tokens(0, 0, len),
+            &positions_for_range(0, len),
+            &mut cache(model),
+            SlotId(0),
+        )
+        .expect("prefill chunk");
+    logits.iter().map(|value| value.to_bits()).collect()
+}
+
+/// ADR-067 D6: a load on which the DFlash2 policy selects nothing (the kill
+/// switch, or an artifact that is not a qualified pair) prefills with the
+/// kernels it had before the route profile existed, bit for bit; only a
+/// selected profile, or an explicit switch, moves it to the prepared route.
+#[test]
+fn prefill_bits_change_only_when_the_route_profile_is_selected() {
+    use crate::inference::spec_decode::dflash2::route_profile::{
+        bind, ResolvedRoutes, RouteProfile,
+    };
+    use std::sync::Arc;
+    let unset = |_: &str| None;
+    let routes = |profile, env: &dyn Fn(&str) -> Option<String>| {
+        Arc::new(ResolvedRoutes::resolve(profile, &|_| None, env))
+    };
+    with_synthetic_model(|model| {
+        let stock = chunk_rows(model, &mut cache(model), 0, 0, 33, false);
+        let prepared = chunk_rows(model, &mut cache(model), 0, 0, 33, true);
+        assert!(stock != prepared, "the two kernels must be told apart");
+        {
+            let _prior_route = bind(routes(None, &unset));
+            assert!(
+                chunk_rows_as_served(model, 33) == stock,
+                "without a selected profile the prefill left the stock kernels"
+            );
+        }
+        for profile in [RouteProfile::Qwen38, RouteProfile::Qwen36] {
+            let _selected = bind(routes(Some(profile), &unset));
+            assert!(
+                chunk_rows_as_served(model, 33) == prepared,
+                "{profile:?} did not select the prepared prefill"
+            );
+        }
+        {
+            let off = |name: &str| {
+                (name == "HF2Q_QWEN_PREFILL_PREPARED").then(|| "0".to_owned())
+            };
+            let _escape = bind(routes(Some(RouteProfile::Qwen38), &off));
+            assert!(
+                chunk_rows_as_served(model, 33) == stock,
+                "an explicit 0 did not override the profile"
+            );
+        }
+        {
+            let on = |name: &str| {
+                (name == "HF2Q_QWEN_PREFILL_PREPARED").then(|| "1".to_owned())
+            };
+            let _explicit = bind(routes(None, &on));
+            assert!(
+                chunk_rows_as_served(model, 33) == prepared,
+                "an explicit 1 did not select the prepared prefill"
+            );
+        }
+    });
+}
+
+/// A thread that primed the model's GPU cache only to provision something
+/// releases it: the cache is gone from that thread, releasing again is a
+/// no-op, and the model primes and computes the same bits afterwards.
+#[test]
+fn a_released_gpu_cache_is_gone_and_the_model_primes_again() {
+    with_synthetic_model(|model| {
+        let before = chunk_rows(model, &mut cache(model), 0, 0, 33, false);
+        model.release_gpu_cache().expect("release");
+        assert!(
+            model.with_gpu_cache_mut(|_device, _registry| Ok(())).is_err(),
+            "the released cache is still bound to this thread"
+        );
+        model.release_gpu_cache().expect("releasing nothing is a no-op");
+        model.ensure_gpu_cache_primed().expect("prime again");
+        let after = chunk_rows(model, &mut cache(model), 0, 0, 33, false);
+        assert!(before == after, "a re-primed cache changed bits");
+    });
 }

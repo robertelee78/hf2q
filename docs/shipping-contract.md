@@ -2,10 +2,10 @@
 
 > Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
 
-Release line described by this checkout: `v0.1.29`. Treat it as a release
+Release line described by this checkout: `v0.1.30`. Treat it as a release
 candidate until exact-artifact release proof establishes public availability.
 
-This document defines the public hf2q product surface for `v0.1.29`. It also defines
+This document defines the public hf2q product surface for `v0.1.30`. It also defines
 the policy each environment variable is classified under. Per-variable
 effects live in `docs/operator-env-vars.md`; this document sits one level above
 and defines *what is supported*.
@@ -39,6 +39,41 @@ family's graph, cache, or scheduler contract by approximation.
 Variants and operations absent from this matrix are unsupported and must fail
 closed rather than entering an approximately compatible loader, template,
 cache, or forward graph.
+
+### Default route of a DFlash2 target (ADR-067 D6)
+
+With no environment variable set, `hf2q serve` runs the fastest qualified
+route of the model it loads. For a Qwen target served SlotAware with one to
+four slots that is DFlash2 with the pinned descriptor's route profile, when
+the target is a pinned pair (produced by hf2q from the exact source of a
+pinned descriptor: Qwen3.8-27B, Qwen3.6-35B-A3B) or has that target's
+architecture and shapes (a fine-tune or another quantization of the same
+base, with or without hf2q provenance). The drafter is taken from the
+Hugging Face cache at its pinned revision, or downloaded into it and
+verified before the target is loaded; its identity checks do not depend on
+the class. The profile is applied switch by switch: a switch whose kernels
+do not admit the artifact's storage, or whose prepared planes do not fit in
+memory, keeps its own default and the drafter serves with the rest. A MoE
+target qualifies only when its batched MoE verification route is admitted
+for its storage (a static rule read from the header; the server never
+monitors acceptance or changes route after the load). Every other model
+(other shapes, another family, another scheduler, more slots) runs the route
+it ran before, bit for bit. Memory-carrying routes are admitted within what
+the host reports available at the load once every engine's commitment, the
+model file, the KV budget and 8 GiB are set aside, and a host that cannot
+run a route's kernels leaves that switch off; a release-gate run must therefore show
+`profile=full`, which its Q5 case checks. The default never fails startup
+on its own account: a drafter that cannot be obtained or bound, too little
+memory for the drafter, and a load that fails with DFlash2 selected each
+fall back to the prior route with the reason logged. One INFO line per load,
+`DFlash2 policy resolved`, and the `active_controls.dflash2` object of
+`/hf2q/v1/runtime` record the policy, the selection and the class
+that qualified the target, the descriptor, the target's own source identity,
+the drafter source, the withheld switches with their reasons and every
+switch with its value and source. `HF2Q_DFLASH2=0` is the kill switch for
+the whole bundle; each profile switch remains an individual escape hatch.
+The policy, the profile table and the memory formula are in
+`docs/operator-env-vars.md` (DFlash2).
 
 ### Repository model operands and managed local artifacts
 
@@ -141,7 +176,7 @@ without Hub traffic or full-payload hashing.
   pre-request turn anchor; poisoned or inconsistent state resets fully.
   The 0.1.7 release also pairs large automatic MoE gate/up
   projections through the routing-schedule primitive introduced in
-  `mlx-native 0.10.10` and retained by the pinned `mlx-native 0.11.2`.
+  `mlx-native 0.10.10` and retained by the registry-pinned `mlx-native` dependency.
   Decode-sized and forced diagnostic routes remain independent;
   native microbenchmarks do not replace the exact packed hf2q hardware gates.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
@@ -219,7 +254,7 @@ candidate MUST also prove that every generated dylib and the final hf2q
 Mach-O have a LINKEDIT string-pool offset aligned to eight bytes before any
 candidate is signed.
 Its dependency receipt binds the packed `Cargo.lock` and raw `cargo metadata`
-bytes, including the exact `mlx-native 0.11.2` crates.io source and checksum.
+bytes, including the exact registry-pinned `mlx-native` version, source and checksum.
 The protected release workflow rehashes and revalidates those downloaded raw
 files, then requires its newly packed `Cargo.lock` to be byte-identical before
 publishing.
@@ -294,11 +329,19 @@ good operator UX merely because a release script exports it.
 | `HF2Q_DECODE_MVN` | `0`, `1` | Exact-tree Q4_K/Q6_K multi-column matvec routing. The default is `1`; a Qwen3.8-identified model resolves `0` for itself at load because its K=3 verifier is qualified on the weight-amortized width-four route. The per-model policy is frozen into that model's kernel registries and the process environment is never written, so other models keep `1` regardless of load order. An explicit value is an operator override for every model in the process. |
 | `HF2Q_DECODE_MV_EXT` | `0`, `1` | Weight-amortized multi-column matvec routing. The default is `0`; a Qwen3.8-identified model resolves `1` for itself at load. K-quants route only at widths 4–8; legacy Q4_0/Q8_0 route at widths 2–8. Unlike the byte-exact default-on mvN route, `mul_mv_ext` is not bit-exact, so the default remains Qwen3.8-scoped and per model. An explicit value is an operator override for every model in the process. |
 | `HF2Q_QWEN_GQA_Q2` | `auto`/unset, `off`/`0`/`false`, `on`/`1`/`true` | Qwen3.8 long-context TQ-HB selector. Auto uses the bit-exact Q2 cooperative kernel only at KV length ≥8,192 and only for its hard D=256/GQA/no-mask geometry. Off is the supported escape hatch. On cannot bypass geometry checks. Invalid values fail safe to off. |
-| `HF2Q_DFLASH2_GPU_TARGET_TOKENS` | unset, `0`/`off`/`false`, `1`/`on`/`true` | DFlash2 proposal-to-target handoff. The pinned dense Qwen3.8 descriptor defaults on after a matched same-binary Q5 pair passed with identical workflows and final source. `0` restores staged host handoff. Other adapters default off; explicit `1` refuses checkpoint load until their dynamic-row transaction is qualified. Invalid values refuse load. |
+| `HF2Q_DFLASH2_GPU_TARGET_TOKENS` | unset, `0`/`off`/`false`, `1`/`on`/`true` | DFlash2 proposal-to-target handoff. The pinned dense Qwen3.8 descriptor defaults on after a matched same-binary Q5 pair passed with identical workflows and final source. `0` restores staged host handoff. The Qwen3.6 MoE descriptor defaults off and its route profile sets `1` when DFlash2 is selected; explicit `1` is admitted on both Qwen adapters. Gemma adapters default off and explicit `1` refuses checkpoint load until their dynamic-row transaction is qualified. A blank value is unset; other invalid values refuse load. |
+| `HF2Q_DFLASH2` | unset (auto), `0`/`off`/`false`, `1`/`on`/`true` | DFlash2 policy (Category 1 default route above). Unset selects DFlash2 and its route profile for a pinned pair or a target with a pinned target's architecture and shapes, and otherwise keeps the prior route; it never fails startup. `0` is the kill switch: no drafter and no profile, the prior promoted route. `1` requires DFlash2 and fails startup when the target is in neither class or the drafter cannot be obtained. Other values refuse startup. |
+| `HF2Q_DFLASH2_CONFIG`, `HF2Q_DFLASH2_WEIGHTS` | paths, unset | Explicit drafter checkpoint, used only when both are set; otherwise the pinned Hugging Face cache snapshot is used or downloaded. The identity checks are the same for either source. |
 | `HF2Q_GEMMA_FULL_INPUT_CHECKPOINT` | unset, `0`, `1` | Gemma 4 full-input checkpoint (ADR-063). Unset: on for Gemma Hybrid/TQ8 SlotAware 1–4 when the provisioned geometry holds two CPU anchor generations per slot inside the 1536 MiB quota; otherwise off without refusal. `0` is the kill switch. `1` forces it and refuses startup on an unsupported substrate. Other values refuse startup. Tool-result turns resume from the slot's checkpoint of the previous full input. See `docs/research/adr063-gemma-four-agent-reuse.md`. |
 | `HF2Q_GEMMA_JOINT_WARM_PREFILL` | unset/`1`/`on`/`true`, `0`/`off`/`false` | Gemma 4 joint warm prefill (ADR-063 Stage 1). Unset: same-step warm tool-turn suffixes (each longer than 32 tokens, cohort ≤4,096 rows) prefill in one transaction whose every lane is bitwise equal to its per-slot prefill. `0` is the kill switch (per-slot warm prefill). Invalid values warn and keep the default. See `docs/research/adr063-gemma-four-agent-reuse.md`. |
 | `HF2Q_GEMMA_JOINT_COLD_PREFILL` | unset/`1`/`on`/`true`, `0`/`off`/`false` | Gemma 4 joint cold prefill (ADR-063 Q4-GEMMA-COLD). Unset: simultaneous cold first turns with an exact pre-generation boundary of at least 33 tokens (all slots idle, two or more lanes, ≤4,096 rows) prefill in one transaction whose every lane is bitwise equal to its per-slot admission. `0` is the kill switch (per-slot admission). Invalid values warn and keep the default. See `docs/research/adr063-q4-gemma-cold-design.md`. |
-| `HF2Q_GEMMA_WARM_TILED_ATTENTION` | unset/`0`/`off`/`false`, `1`/`on`/`true` | Gemma 4 warm-prefill attention kernel (ADR-063 Stage 2). Unset: vec-hybrid warm attention (default since the 2026-11-01 quality gate). `1` opts in to tiled F16 flash attention, one sequence per dispatch, suffixes under 32 tokens keep vec-hybrid; joint cohorts stay bitwise equal to per-slot prefill, but the route changes warm-prefill decisions against the default (it changed the code written on the canonical four-agent task). Invalid values warn and keep the default. See `docs/research/adr063-gemma-four-agent-reuse.md`. |
+| `HF2Q_GEMMA_WARM_TILED_ATTENTION` | unset/`tensor`, `0`/`off`/`false`/`stock`, `1`/`on`/`true` | Gemma 4 warm-prefill attention kernel (ADR-063 Stage 2). Unset: the tensor-API flash attention of the Gemma 4 release gate (default since v0.1.30; one sequence per dispatch, suffixes under 32 tokens keep vec-hybrid, joint cohorts stay bitwise equal to per-slot prefill); on a device without the Metal tensor API unset falls back to vec-hybrid without refusal and an explicit `tensor` refuses the model load. Its global-layer scratch is bounded to the larger of 512 MiB and one sequence's dense K/V of one layer (4 KiB per key on 26B-A4B), plus one 64 MiB mask, for any lane count. `0` is the kill switch (vec-hybrid). `1` opts in to tiled F16 flash attention, which changed the code written on the canonical four-agent task. Other values refuse the model load. See `docs/research/adr063-gemma-four-agent-reuse.md`. |
+| `HF2Q_GEMMA_DECODE_ATTN_NE` | unset/`4`, `2`, `0`/`off`/`false`/`stock` | Gemma 4 decode attention head split of d256 layers (ADR-063 gap program). Unset: NE 4, the release-gate route (default since v0.1.30; numerics class B against stock, bitwise equal across the three decode paths). `0` is the kill switch (stock kernels). Other head dimensions keep stock. Other values refuse the model load. |
+| `HF2Q_GEMMA_DECODE_DENSE` | unset/`row_exact`, `stock`/`0`/`off`/`false`, `mma` | Gemma 4 decode dense kernel (ADR-063 Q4-GEMMA-DECODE). Unset: the row-exact few-row mat-vec of the release gate (default since v0.1.30) for the weights it admits; every other weight keeps its stock route. `stock` is the kill switch. Other values refuse the model load. |
+| `HF2Q_Q5_0_TENSOR_MM` | unset, `1`, `0`/`off`/`false`/`stock` | Q5_0 tensor matmul. Unset: on for a Gemma 4 model (default since v0.1.30, frozen into that model's registries), off for every other family (mlx-native's default). `1`: on for every family. `0` is the kill switch. Other values refuse a Gemma 4 model load. |
+| `HF2Q_DEEPSEEK_ROW_EXACT_MATVEC` | unset/`1`, `0` | DeepSeek-V4 row-exact few-row products (ADR-063 Q4-DS4-RACE; default since v0.1.30). Bitwise equal to the stock routes; a product the kernel does not reproduce keeps its stock route. `0` is the kill switch. Other values refuse the model load. |
+| `HF2Q_DEEPSEEK_TAIL_ROWS_STEP` | unset/`1`, `0` | DeepSeek-V4 rows steps over token-wise prompt work (default since v0.1.30). Bitwise equal to one-token steps; falls back to them while joint decode is unavailable. `0` is the kill switch. Other values refuse the model load. |
+| `HF2Q_DEEPSEEK_BATCHED_ATTN_CORES` | unset/`1`, `0` | DeepSeek-V4 batched joint attention cores (default since v0.1.30). Bitwise equal to the per-row cores; a layer with a row at position 0 keeps them. `0` is the kill switch. Other values refuse the model load. |
 | `HF2Q_BATCHED_PREFILL` | `0`/`false`/`off`, unset | Opt out of the default batched prefill path (Category 1) back to per-token `forward_prefill`. For parity diagnostics only — per-token is 14-45× slower than peer. Default-on since ADR-028 iter-344; decoupled from the `HF2Q_UNSAFE_EXPERIMENTS` ack at that iter. The remaining `sliding_wrap` long-sequence byte-parity gap is the operator-signed deferral (2026-04-16; see ADR-010), a coherence deferral — not a runtime error. |
 | `HF2Q_STREAMING_PHASE3` | `1`, unset | ADR-014 P7 iter-3 production wire-up. Routes all 4 Phase 3 quantize dispatch arms (K-quant codec direct / ImatrixAdaptive / StaticQuantizer / DwqK) and Phase 4.5 quality measurement through the streaming `LazyTensorMap` pipeline (`quantize_via_streaming_borrowed` + `measure_quality_streaming_lazy`). Output is byte-identical to the eager path — every wired arm has a per-arm byte-identity gate. Currently a TEST INTEGRATION channel, not a memory win (wedge clones bytes ~2× peak briefly); actual memory savings land when iter-3 wholesale surgery removes the upstream `materialize_all()` bridge. Default OFF; default behavior unchanged. |
 

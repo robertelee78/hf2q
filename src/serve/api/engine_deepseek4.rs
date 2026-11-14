@@ -2015,6 +2015,7 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
                 6_880,
             )),
             gemma_warm_attention_kernel: None,
+            default_routes: self.model.default_route_audit(),
         }
     }
 }

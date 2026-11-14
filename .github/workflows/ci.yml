@@ -580,6 +580,7 @@ jobs:
           cargo test --locked --bin hf2q --all-features convert::receipt::tests::
           cargo test --locked --bin hf2q --all-features tests::convert_source_classifier
           cargo test --locked --bin hf2q --all-features qwen38 -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features route_host -- --test-threads=1 --nocapture
           cargo test --locked --bin hf2q --all-features qwen_thinking_budget -- --test-threads=1
           cargo test --locked --bin hf2q --all-features gqa_q2_policy::tests -- --test-threads=1
           cargo test --locked --bin hf2q --all-features iter230_a2_lock_discipline -- --test-threads=1
@@ -796,6 +797,7 @@ jobs:
           bash scripts/test_release_dependency_provenance_contract.sh
           bash scripts/test_release_gate_process_group_contract.sh
           bash scripts/test_cache_lifecycle_evidence_contract.sh
+          python3 -B -m unittest discover -s scripts -p 'test_cache_release_orchestrator.py'
           bash scripts/test_r2c_structured_output_receipt_contract.sh
           bash scripts/test_release_tag_recovery_contract.sh
           bash scripts/test_frictionless_diagnostics_contract.sh

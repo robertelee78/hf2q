@@ -683,15 +683,23 @@ fn qwen_prefill_fold_real_model_gate() {
 
 #[test]
 fn a_request_no_forward_took_is_an_error_and_does_not_linger() {
-    use super::prefill_fold::{take_request, with_request, BoundaryFold};
+    use super::prefill_joint::{take_request, with_request, JointRequest, LaneBoundary, LaneRequest};
     with_synthetic_model(|model| {
         let image = cache(model)
             .boundary_anchor_image()
             .expect("checkpoint image");
         let outcome = with_request(
-            BoundaryFold {
-                prefix_rows: 4,
-                image,
+            JointRequest {
+                shared_rows: 0,
+                lanes: vec![LaneRequest {
+                    slot: SlotId(0),
+                    rows: 9,
+                    shares_prefix: false,
+                    boundary: Some(LaneBoundary {
+                        prefix_rows: 4,
+                        image,
+                    }),
+                }],
             },
             || Ok(()),
         );
@@ -699,7 +707,7 @@ fn a_request_no_forward_took_is_an_error_and_does_not_linger() {
             outcome.is_err(),
             "nothing took the fold or published logits"
         );
-        assert!(take_request(9).expect("no request left").is_none());
+        assert!(take_request(9, SLOTS).expect("no request left").is_none());
     });
 }
 
@@ -761,6 +769,129 @@ fn the_fold_is_not_taken_with_a_glp_vector_bound() {
         assert!(
             !model.prefill_fold_exact().expect("exactness"),
             "a model with a bound GLP vector still folds"
+        );
+    });
+}
+
+/// `HF2Q_MM_ID_ROUTING_THRESHOLD` moves the row count at which mlx-native
+/// changes the MoE FFN's kernel family, and with it the bits of segments
+/// between the two values: a MoE model then admits neither the fold nor a
+/// joint forward (each request keeps its own forwards, whose bits are its
+/// own by definition); a dense-FFN model has no such kernel and keeps both.
+#[test]
+fn a_moe_model_admits_no_fold_under_a_mm_id_threshold_override() {
+    let overridden = super::prefill_fold::UnfoldedRoutes {
+        moe_route_override: true,
+        ..Default::default()
+    };
+    assert!(!overridden.any(), "the override concerns MoE layers only");
+    with_synthetic_moe_model(|model| {
+        let _scope = PrefillScope::forced(true);
+        assert!(
+            model
+                .prefill_fold_exact_under(super::prefill_fold::UnfoldedRoutes::default())
+                .expect("exactness"),
+            "the synthetic MoE model does not fold at the stock threshold"
+        );
+        assert!(
+            !model.prefill_fold_exact_under(overridden).expect("exactness"),
+            "a MoE model still folds under a threshold override"
+        );
+    });
+    with_synthetic_model(|model| {
+        let _scope = PrefillScope::forced(true);
+        assert!(
+            model.prefill_fold_exact_under(overridden).expect("exactness"),
+            "a dense-FFN model stopped folding under a MoE threshold override"
+        );
+    });
+    // This process runs without the override: the production predicate
+    // reads the environment, never a default.
+    assert_eq!(
+        super::prefill_fold::moe_route_override(),
+        std::env::var_os("HF2Q_MM_ID_ROUTING_THRESHOLD").is_some()
+    );
+}
+
+/// The same refusal through the process environment, which is what a
+/// served worker reads: this test runs [`moe_fold_refusal_in_a_child`] in a
+/// fresh process of this test binary with `HF2Q_MM_ID_ROUTING_THRESHOLD=64`
+/// (the predicate and mlx-native both read the variable once per process).
+#[test]
+fn a_process_with_a_mm_id_threshold_override_admits_no_moe_fold() {
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "inference::models::qwen35::prefill_fold_tests::moe_fold_refusal_in_a_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("HF2Q_MM_ID_ROUTING_THRESHOLD", "64")
+        .env("P834_OVERRIDE_CHILD", "1")
+        .output()
+        .expect("run the child test process");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success() && text.contains("[OVERRIDE_CHILD] refused") && text.contains("1 passed"),
+        "the child process under the override did not refuse the MoE fold:\n{text}"
+    );
+}
+
+/// The child of [`a_process_with_a_mm_id_threshold_override_admits_no_moe_fold`];
+/// a no-op in an ordinary test run.
+#[test]
+fn moe_fold_refusal_in_a_child() {
+    if std::env::var_os("P834_OVERRIDE_CHILD").is_none() {
+        return;
+    }
+    assert!(
+        super::prefill_fold::moe_route_override(),
+        "the override is not visible to the predicate"
+    );
+    with_synthetic_moe_model(|model| {
+        let _scope = PrefillScope::forced(true);
+        assert!(model.unfolded_routes().moe_route_override);
+        assert!(
+            !model.prefill_fold_exact().expect("exactness"),
+            "a MoE model folds in a process with the threshold override"
+        );
+    });
+    with_synthetic_model(|model| {
+        let _scope = PrefillScope::forced(true);
+        assert!(
+            model.prefill_fold_exact().expect("exactness"),
+            "a dense-FFN model stopped folding in a process with the MoE threshold override"
+        );
+    });
+    eprintln!("[OVERRIDE_CHILD] refused");
+}
+
+/// `HF2Q_DENSE_Q_ARENA_RESET=0` keeps a forward's pooled scratch out for the
+/// whole forward. The fold and the joint forward pool per-segment scratch
+/// and run under pool caps that rely on the reset at a layer's host wait, so
+/// with the override neither is admitted (one predicate serves both); the
+/// model reports the override itself.
+#[test]
+fn the_fold_is_not_taken_without_the_layer_scratch_reset() {
+    no_fold_under(
+        "HF2Q_DENSE_Q_ARENA_RESET=0",
+        super::prefill_fold::UnfoldedRoutes {
+            scratch_reset_off: true,
+            ..Default::default()
+        },
+    );
+    with_synthetic_model(|model| {
+        let _scope = PrefillScope::forced(true);
+        assert!(model.prefill_fold_exact().expect("exactness"));
+        let _override = super::forward_gpu::NoScratchResetForTest::set();
+        assert!(model.unfolded_routes().scratch_reset_off);
+        assert!(
+            !model.prefill_fold_exact().expect("exactness"),
+            "a model without the layer scratch reset still folds"
         );
     });
 }
@@ -1039,7 +1170,7 @@ fn a_request_diverging_behind_a_folded_checkpoint_sees_the_two_forward_bytes() {
 /// The synthetic model with every dense FFN replaced by a quantized MoE FFN
 /// (four experts, two per row, a shared expert), so a prefill forward takes
 /// the MoE arm the fold builds once per segment.
-fn with_synthetic_moe_model(run: impl FnOnce(&Qwen35Model)) {
+pub(super) fn with_synthetic_moe_model(run: impl FnOnce(&Qwen35Model)) {
     use mlx_native::ops::quantized_matmul_ggml::GgmlType;
     use mlx_native::MlxDevice;
 

@@ -35,6 +35,7 @@ mod prefill_annotations;
 mod prefill_flash_attention;
 pub mod residency;
 pub mod rope;
+mod route_defaults;
 pub mod routing;
 mod row_matmul;
 mod rows_step;

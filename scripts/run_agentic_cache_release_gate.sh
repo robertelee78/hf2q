@@ -1,13 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Exact-artifact, one-model-at-a-time cache lifecycle release authority.
-# This wrapper is intentionally macOS/Apple-Silicon only. It continuously
-# binds the effective performance power policy, holds a caffeinate assertion,
-# runs the same user-shaped lifecycle fixture for DeepSeek, Gemma, and Qwen,
-# exercises structured output on those families plus Qwen3.8, and binds all
-# receipts to one packed crate and release binary. Battery execution is valid
-# only in High Power Mode; the cable itself is not a performance invariant.
+if [[ ${MLX_NATIVE_SKIP_METALLIB+x} ]]; then
+  echo "MLX_NATIVE_SKIP_METALLIB is forbidden for exact-artifact release builds" >&2
+  exit 2
+fi
+
+# Canonical exact-artifact cache release authority. The Python driver owns
+# scheduling and immutable attempts; this script alone produces the manifest.
+# Every public command delegates before any build or model side effects.
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+case "${1:-}" in
+  build|plan|finalize|run)
+    [[ $# == 1 ]] || { echo "unexpected release-gate arguments" >&2; exit 2; }
+    exec python3 "$script_dir/cache_release_orchestrator.py" \
+      --script "${BASH_SOURCE[0]}" "$@"
+    ;;
+  phase)
+    [[ $# == 2 ]] || { echo "phase requires exactly one phase ID" >&2; exit 2; }
+    exec python3 "$script_dir/cache_release_orchestrator.py" \
+      --script "${BASH_SOURCE[0]}" "$@"
+    ;;
+  _work)
+    [[ $# == 2 ]] || { echo "_work requires exactly one work ID" >&2; exit 2; }
+    work_id=$2
+    ;;
+  *)
+    echo "usage: $0 {build|plan|phase PHASE_ID|finalize|run}" >&2
+    exit 2
+    ;;
+esac
+OUT_ROOT=${OUT_ROOT:?OUT_ROOT must be a stable absolute evidence directory}
+[[ "$OUT_ROOT" == /* ]] || { echo "OUT_ROOT must be absolute" >&2; exit 2; }
+python3 "$script_dir/cache_release_orchestrator.py" authorize "$OUT_ROOT" "$work_id"
+cd "$script_dir/.."
+case "$work_id" in
+  build-probe|build-debug|build-release|build-lcp|build-fixtures|finalize|\
+  deepseek-cooperative|deepseek-decode|deepseek-wave1|deepseek-wave2|deepseek-process-a|\
+  gemma-process-a|gemma-process-b|gemma-parity-n4|gemma-parity-n8|\
+  gemma-parity-n8-seed-budget|gemma-parity-n8-tiny-hybrid|\
+  gemma-parity-n8-tiny-full-tq|gemma-parity-boundary-tail|gemma-parity-long-resume|\
+  qwen-process-a|qwen-process-b|qwen38-long-decode|qwen38-structured) ;;
+  *) echo "unknown internal work ID: $work_id" >&2; exit 2 ;;
+esac
 
 EXPECTED_SHA=${EXPECTED_SHA:?EXPECTED_SHA is required}
 EXPECTED_VERSION=${EXPECTED_VERSION:?EXPECTED_VERSION is required}
@@ -24,9 +59,8 @@ DEEPSEEK_MODEL_SHA256=${DEEPSEEK_MODEL_SHA256:?DEEPSEEK_MODEL_SHA256 is required
 GEMMA_MODEL_SHA256=${GEMMA_MODEL_SHA256:?GEMMA_MODEL_SHA256 is required}
 QWEN_MODEL_SHA256=${QWEN_MODEL_SHA256:?QWEN_MODEL_SHA256 is required}
 QWEN38_MODEL_SHA256=${QWEN38_MODEL_SHA256:?QWEN38_MODEL_SHA256 is required}
-OUT_ROOT=${OUT_ROOT:-$(mktemp -d /var/tmp/hf2q-cache-release.XXXXXX)}
+OUT_ROOT=${OUT_ROOT:?OUT_ROOT is required}
 HF2Q_MODEL_VERIFICATION_CACHE_DIR=${HF2Q_MODEL_VERIFICATION_CACHE_DIR:-$OUT_ROOT/model-verification-cache}
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Source-bound current identity; no independent stale receipt pin.
 RELEASE_NATIVE_IDENTITY=$(bash "$script_dir/verify_release_dependency_provenance.sh" identity)
 RELEASE_MLX_NATIVE_VERSION=$(jq -er .version <<<"$RELEASE_NATIVE_IDENTITY")
@@ -37,25 +71,21 @@ source "$script_dir/qwen36_watchdog_validate.sh"
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$script_dir/macos_thermal_guard.sh"
 
-if [[ ${MLX_NATIVE_SKIP_METALLIB+x} ]]; then
-  echo "MLX_NATIVE_SKIP_METALLIB is forbidden for exact-artifact release builds" >&2
-  exit 2
-fi
 if [[ ${HF2Q_THERMAL_SWIFTC_BIN+x} || ${HF2Q_THERMAL_PROBE_BIN+x} \
   || ${HF2Q_THERMAL_PROBE_SOURCE+x} ]]; then
   echo "thermal probe overrides are reserved for isolated contract tests" >&2
   exit 2
 fi
 readonly HF2Q_THERMAL_SWIFTC_BIN=/usr/bin/swiftc
-[[ -x "$HF2Q_THERMAL_SWIFTC_BIN" ]] || {
+if [[ "$work_id" == build-probe && ! -x "$HF2Q_THERMAL_SWIFTC_BIN" ]]; then
   echo "required system Swift compiler is unavailable: $HF2Q_THERMAL_SWIFTC_BIN" >&2
   exit 2
-}
+fi
 [[ -x /usr/bin/pgrep ]] || {
   echo "required model-runtime probe is unavailable: /usr/bin/pgrep" >&2
   exit 2
 }
-for command in awk caffeinate cargo cmp curl diff find grep jq lsof pmset rg sed shasum stat; do
+for command in awk caffeinate cmp curl diff find grep jq lsof pmset rg sed shasum stat; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
@@ -93,6 +123,7 @@ for digest in "$DEEPSEEK_MODEL_SHA256" "$GEMMA_MODEL_SHA256" \
   }
 done
 
+prepare_dependency_provenance() {
 mkdir -p "$OUT_ROOT"
 dependency_provenance_evidence="$OUT_ROOT/dependency-provenance"
 mkdir -p "$dependency_provenance_evidence"
@@ -110,6 +141,7 @@ bash "$script_dir/verify_release_dependency_provenance.sh" verify \
 dependency_provenance_receipt="$dependency_provenance_evidence/receipt.json"
 dependency_provenance_receipt_sha=$(shasum -a 256 \
   "$dependency_provenance_receipt" | awk '{print $1}')
+}
 parent_pid=$$
 server_pid=""
 power_pid=""
@@ -124,7 +156,7 @@ require_release_power_policy() {
   printf 'sample_utc=%s source=%s mode=%s mode_code=%s\n' \
     "$(date -u +%FT%TZ)" "$QWEN36_POWER_SOURCE" \
     "$QWEN36_POWER_MODE_NAME" "$QWEN36_POWER_MODE_CODE" \
-    >> "$OUT_ROOT/power.log"
+    >> "$power_dir/power.log"
 }
 
 initialize_release_power_policy() {
@@ -139,8 +171,8 @@ initialize_release_power_policy() {
 ensure_guard_health() {
   local assertions=""
   require_release_power_policy
-  [[ ! -e "$OUT_ROOT/power-policy-failure.txt" ]] || {
-    cat "$OUT_ROOT/power-policy-failure.txt" >&2
+  [[ ! -e "$power_dir/power-policy-failure.txt" ]] || {
+    cat "$power_dir/power-policy-failure.txt" >&2
     return 1
   }
   if [[ -z "$power_pid" ]] || ! kill -0 "$power_pid" 2>/dev/null; then
@@ -154,7 +186,7 @@ ensure_guard_health() {
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     assertions=$(pmset -g assertions)
     if rg -q "pid ${caffeinate_pid}\\(caffeinate\\):" <<<"$assertions"; then
-      printf '%s\n' "$assertions" > "$OUT_ROOT/power-assertions.current.txt"
+      printf '%s\n' "$assertions" > "$power_dir/power-assertions.current.txt"
       return 0
     fi
     sleep 1
@@ -210,24 +242,46 @@ cleanup() {
 on_exit() {
   local original_rc=$?
   trap - EXIT
+  if [[ -n "${power_dir:-}" && -n "$THERMAL_PROBE_BIN" ]]; then
+    pmset -g assertions >"$power_dir/power-assertions.after.txt" || original_rc=1
+    thermal_sample "$power_dir/thermal.log" "$work_id-end" || original_rc=1
+  fi
   if ! cleanup && (( original_rc == 0 )); then
     original_rc=1
   fi
   exit "$original_rc"
 }
+start_guards() {
 trap on_exit EXIT
 trap 'exit 1' INT TERM
 
-thermal_prepare_probe
-initialize_release_power_policy
-pmset -g assertions > "$OUT_ROOT/power-assertions.before.txt"
+if [[ "$work_id" == build-probe ]]; then
+  initialize_release_power_policy
+  jq -n --arg initial_source "$release_initial_power_source" \
+    --arg mode_name "$release_power_mode_name" \
+    --argjson mode_code "$release_power_mode_code" \
+    '{initial_source:$initial_source,mode_name:$mode_name,mode_code:$mode_code}' \
+    >"$OUT_ROOT/build/power-policy.json"
+else
+  release_initial_power_source=$(jq -er .initial_source "$OUT_ROOT/build/power-policy.json")
+  release_power_mode_code=$(jq -er .mode_code "$OUT_ROOT/build/power-policy.json")
+  release_power_mode_name=$(jq -er .mode_name "$OUT_ROOT/build/power-policy.json")
+  QWEN36_EXPECTED_POWER_MODE_CODE=$release_power_mode_code
+  export QWEN36_EXPECTED_POWER_MODE_CODE
+  require_release_power_policy
+fi
+pmset -g assertions > "$power_dir/power-assertions.before.txt"
+if [[ "$work_id" == build-probe ]]; then
+  cp "$power_dir/power-assertions.before.txt" "$OUT_ROOT/power-assertions.before.txt"
+fi
+thermal_sample "$power_dir/thermal.log" "$work_id-start"
 caffeinate -dimsu -w "$parent_pid" &
 caffeinate_pid=$!
 (
   while kill -0 "$parent_pid" 2>/dev/null; do
     if ! require_release_power_policy; then
       printf 'release power policy changed at %s\n' "$(date -u +%FT%TZ)" \
-        > "$OUT_ROOT/power-policy-failure.txt"
+        > "$power_dir/power-policy-failure.txt"
       kill -TERM "$parent_pid" 2>/dev/null || true
       exit 1
     fi
@@ -236,6 +290,7 @@ caffeinate_pid=$!
 ) &
 power_pid=$!
 ensure_guard_health
+}
 
 wait_ready() {
   local base_url=$1
@@ -335,8 +390,8 @@ start_server() {
   local model_sha256 model_verification_receipt
   local -a launcher_env
 
-  # Cargo parity tests later in this gate may relink package-local bin targets.
-  # Every model must execute the immutable copy sealed outside Cargo's target.
+  # Every phase executes only the immutable release binary sealed outside
+  # Cargo's target; native test harnesses are also prebuilt in the build ticket.
   assert_exact_binary
   ensure_guard_health
   case "$family" in
@@ -489,8 +544,7 @@ run_r2c_structured_outputs() {
     "$model_sha256"
 }
 
-binary_sha=$EXPECTED_BINARY_SHA256
-assert_exact_binary
+prepare_models_and_fixtures() {
 verify_model deepseek "$DEEPSEEK_MODEL" "$DEEPSEEK_MODEL_SHA256" deepseek4
 verify_model gemma "$GEMMA_MODEL" "$GEMMA_MODEL_SHA256" gemma4
 verify_model qwen "$QWEN_MODEL" "$QWEN_MODEL_SHA256" qwen35moe
@@ -549,8 +603,7 @@ for agent in 1 2 3 4; do
   HF2Q_DEEPSEEK4_AGENTIC_REQUEST_JSON="$request_path" \
   HF2Q_DEEPSEEK4_AGENTIC_PROMPT_CONTRACT="$agentic_prompt_contract" \
   HF2Q_DEEPSEEK4_AGENTIC_CONTRACT_RECEIPT="$provenance_path" \
-    cargo test --locked --bin hf2q \
-      release_agentic_fixture_preserve_order_contract -- \
+    "$debug_test_binary" release_agentic_fixture_preserve_order_contract \
       --ignored --test-threads=1 \
       >"$agentic_fixture_evidence/provenance-agent-$agent.log" 2>&1
 done
@@ -582,7 +635,39 @@ jq -e --slurpfile contract "$agentic_prompt_contract" \
   "$agentic_prompt_provenance.tmp" >/dev/null
 mv "$agentic_prompt_provenance.tmp" "$agentic_prompt_provenance"
 agentic_prompt_provenance_sha=$(sha256_file "$agentic_prompt_provenance")
+HF2Q_QWEN36_WATCHDOG_FIXTURE_MODEL="$QWEN_MODEL" \
+HF2Q_QWEN36_WATCHDOG_FIXTURE_OUTPUT="$OUT_ROOT/fixtures/public-347.json" \
+HF2Q_QWEN36_WATCHDOG_SHORT_FIXTURE_OUTPUT="$OUT_ROOT/fixtures/public-short.json" \
+  "$debug_test_binary" \
+    public_347_tool_fixture_renders_to_exact_87972_tokens \
+    --ignored --test-threads=1 >"$OUT_ROOT/fixtures/generator.log" 2>&1
+test "$(sha256_file "$OUT_ROOT/fixtures/public-347.json")" = \
+  "3558d4f4b251ed833ee7da1b037fa3f241a4309590d45930b525b690f543a31e"
+test "$(sha256_file "$OUT_ROOT/fixtures/public-short.json")" = \
+  "7aeddea35e6363c698ea0bcb4934b9f2cf1e0c48fb2045fa9db3272461e54004"
 
+# Fail fast on prompt-render/tokenizer drift before paying the cost of loading
+# the 100 GiB DeepSeek verifier. This request is byte-for-byte the first
+# request used by the four-agent wave below.
+deepseek_agentic_request="$OUT_ROOT/fixtures/deepseek-agentic-request.json"
+HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT="$deepseek_agentic_request" \
+RUN_ID=full-context-deepseek4-agent-1 \
+SENTINEL=HF2Q_DEEPSEEK4_AGENT_1_OK \
+EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
+TOOL_RESULT_PATH="$PWD/Cargo.toml" \
+AGENTIC_FIXTURE_ID=full-context-agentic-v1 EXPECTED_PROMPT_TOKENS=6684 \
+AGENTIC_CONTEXT_FIXTURE="$agentic_fixture" \
+AGENTIC_CONTEXT_FIXTURE_SHA256="$agentic_fixture_sha" \
+  scripts/test_deepseek4_agentic.sh
+HF2Q_DEEPSEEK4_GGUF="$DEEPSEEK_MODEL" \
+HF2Q_DEEPSEEK4_AGENTIC_REQUEST_JSON="$deepseek_agentic_request" \
+HF2Q_DEEPSEEK4_EXPECTED_PROMPT_TOKENS=6684 \
+  "$debug_test_binary" \
+    release_agentic_fixture_renders_to_expected_tokens \
+    --ignored --test-threads=1 >"$OUT_ROOT/fixtures/deepseek-prompt-preflight.log" 2>&1
+
+}
+set_cooperative_paths() {
 cooperative_dir="$OUT_ROOT/deepseek/cooperative-prefill"
 cooperative_raw="$cooperative_dir/raw.json"
 cooperative_log="$cooperative_dir/test.log"
@@ -590,21 +675,13 @@ cooperative_thermal_log="$cooperative_dir/thermal.log"
 cooperative_settle_log="$cooperative_dir/settle.log"
 cooperative_contention_log="$cooperative_dir/measurement-contention.log"
 cooperative_settle_contention_log="$cooperative_dir/settle-contention.log"
-cooperative_build_log="$cooperative_dir/build.jsonl"
 mkdir -p "$cooperative_dir"
-cargo test --release --locked --bin hf2q --no-run --message-format=json \
-  >"$cooperative_build_log"
-cooperative_test_binary=$(jq -rs '
-  [.[] | select(.reason == "compiler-artifact"
-    and .profile.test == true
-    and (.target.kind | index("bin")) != null
-    and .target.name == "hf2q") | .executable]
-  | map(select(type == "string" and length > 0)) | last // empty
-' "$cooperative_build_log")
-[[ -n "$cooperative_test_binary" && -x "$cooperative_test_binary" ]] || {
-  echo "failed to resolve the prebuilt hf2q release test binary" >&2
-  exit 1
 }
+
+work_deepseek_cooperative() {
+set_cooperative_paths
+# Stage the frozen build log only after fresh-output admission; never compile here.
+cp "$OUT_ROOT/build/release-bin.jsonl" "$cooperative_dir/build.jsonl"
 require_no_model_runtime
 thermal_wait_for_nominal "$cooperative_settle_log" \
   cooperative-prefill-settle 60 900 5 \
@@ -770,47 +847,17 @@ bash scripts/verify_deepseek4_cooperative_prefill_receipt.sh \
 sha256_file "$cooperative_dir/summary.json" \
   >"$cooperative_dir/summary.json.sha256"
 ensure_guard_health
+}
 
-# The warm-prefill proof above and the exact decode proof exercise distinct
-# transaction shapes. Reuse the already-built packed test binary and the
-# already-verified model identity; do not rescan the 107 GB artifact.
+work_deepseek_decode() {
 require_no_model_runtime
 bash scripts/run_deepseek4_decode_cohort_gate.sh \
   "$cooperative_test_binary" "$DEEPSEEK_MODEL" \
   "$OUT_ROOT/deepseek/decode-cohort" "$EXPECTED_SHA" \
   "$DEEPSEEK_MODEL_SHA256"
 ensure_guard_health
+}
 
-HF2Q_QWEN36_WATCHDOG_FIXTURE_MODEL="$QWEN_MODEL" \
-HF2Q_QWEN36_WATCHDOG_FIXTURE_OUTPUT="$OUT_ROOT/fixtures/public-347.json" \
-HF2Q_QWEN36_WATCHDOG_SHORT_FIXTURE_OUTPUT="$OUT_ROOT/fixtures/public-short.json" \
-  cargo test --locked --bin hf2q \
-    public_347_tool_fixture_renders_to_exact_87972_tokens -- \
-    --ignored --test-threads=1 >"$OUT_ROOT/fixtures/generator.log" 2>&1
-test "$(sha256_file "$OUT_ROOT/fixtures/public-347.json")" = \
-  "3558d4f4b251ed833ee7da1b037fa3f241a4309590d45930b525b690f543a31e"
-test "$(sha256_file "$OUT_ROOT/fixtures/public-short.json")" = \
-  "7aeddea35e6363c698ea0bcb4934b9f2cf1e0c48fb2045fa9db3272461e54004"
-
-# Fail fast on prompt-render/tokenizer drift before paying the cost of loading
-# the 100 GiB DeepSeek verifier. This request is byte-for-byte the first
-# request used by the four-agent wave below.
-deepseek_agentic_request="$OUT_ROOT/fixtures/deepseek-agentic-request.json"
-HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT="$deepseek_agentic_request" \
-RUN_ID=full-context-deepseek4-agent-1 \
-SENTINEL=HF2Q_DEEPSEEK4_AGENT_1_OK \
-EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
-TOOL_RESULT_PATH="$PWD/Cargo.toml" \
-AGENTIC_FIXTURE_ID=full-context-agentic-v1 EXPECTED_PROMPT_TOKENS=6684 \
-AGENTIC_CONTEXT_FIXTURE="$agentic_fixture" \
-AGENTIC_CONTEXT_FIXTURE_SHA256="$agentic_fixture_sha" \
-  scripts/test_deepseek4_agentic.sh
-HF2Q_DEEPSEEK4_GGUF="$DEEPSEEK_MODEL" \
-HF2Q_DEEPSEEK4_AGENTIC_REQUEST_JSON="$deepseek_agentic_request" \
-HF2Q_DEEPSEEK4_EXPECTED_PROMPT_TOKENS=6684 \
-  cargo test --locked --bin hf2q \
-    release_agentic_fixture_renders_to_expected_tokens -- \
-    --ignored --test-threads=1 >"$OUT_ROOT/fixtures/deepseek-prompt-preflight.log" 2>&1
 
 run_deepseek_wave() {
   local wave=$1
@@ -1107,12 +1154,7 @@ deepseek_unequal_span_cohorts() {
     END { print count + 0 }'
 }
 
-run_deepseek_release_gates() {
-  # Run calibrated performance waves on a thermally settled host before the
-  # 94K/119K functional workloads heat-soak the shared M5 runner.
-  run_deepseek_wave 1
-  run_deepseek_wave 2
-
+work_deepseek_process_a() {
   start_server deepseek process-a scripts/serve_deepseek4_opencode.sh \
     "$DEEPSEEK_MODEL" 18080 4 524288 8589934592
   BASE_URL="$current_url" MODEL="Deepseek v4 Flash 0731 Source" \
@@ -1143,7 +1185,7 @@ run_deepseek_release_gates() {
   finish_server_phase
 }
 
-run_qwen_release_gates() {
+work_qwen_process_a() {
   start_server qwen process-a scripts/serve_qwen36_opencode.sh \
     "$QWEN_MODEL" 18081 4
   BASE_URL="$current_url" SERVER_PID="$server_pid" SERVER_LOG="$current_log" \
@@ -1162,7 +1204,9 @@ run_qwen_release_gates() {
   run_lifecycle qwen 2800
   run_r2c_structured_outputs qwen
   finish_server_phase
+}
 
+work_qwen_process_b() {
   start_server qwen process-b scripts/serve_qwen36_opencode.sh \
     "$QWEN_MODEL" 18081 1
   BASE_URL="$current_url" SERVER_PID="$server_pid" SERVER_LOG="$current_log" \
@@ -1297,6 +1341,9 @@ run_qwen38_long_decode_release_gate() {
   bash scripts/verify_qwen38_long_decode_receipt.sh release "$out" \
     "$EXPECTED_SHA" "$CRATE_SHA256" "$binary_sha" "$QWEN38_MODEL_SHA256"
 
+}
+
+work_qwen38_structured() {
   start_server qwen38 structured-outputs scripts/serve_qwen38_opencode.sh \
     "$QWEN38_MODEL" 18083 1
   run_r2c_structured_outputs qwen38
@@ -1517,7 +1564,7 @@ write_gemma_transaction_receipt() {
   mv "$out.tmp" "$out"
 }
 
-run_gemma_release_gates() {
+work_gemma_process_a() {
   # The four-slot latency waves are calibration work, not soak work. Run them
   # first on one fresh server, after a nominal settle for each wave, and keep
   # thermal monitoring live through every cold/cached/tool-result turn. The
@@ -1576,7 +1623,9 @@ run_gemma_release_gates() {
     "$OUT_ROOT/gemma/heap-summary.json" >/dev/null
   finish_server_phase
   write_gemma_transaction_receipt four-slots "$current_log"
+}
 
+work_gemma_process_b() {
   start_server gemma process-b scripts/serve_gemma4_opencode.sh \
     "$GEMMA_MODEL" 18082 8
   # The experimental eight-slot correctness wave runs after the destructive
@@ -1585,48 +1634,68 @@ run_gemma_release_gates() {
   run_gemma_thermally_guarded_wave eight-slots 8
   finish_server_phase
   write_gemma_transaction_receipt eight-slots "$current_log"
+}
 
-  ensure_guard_health
-  mkdir -p "$OUT_ROOT/gemma/parity"
+work_gemma_parity_n4() {
   HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
-    cargo test --release --locked --bin hf2q slot_aware_n4_per_slot_parity_vs_serial -- \
+    "$cooperative_test_binary" slot_aware_n4_per_slot_parity_vs_serial \
       --test-threads=1 >"$OUT_ROOT/gemma/parity/n4.log" 2>&1
+}
+
+work_gemma_parity_n8() {
   HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
     HF2Q_CROSS_SLOT_ADMIT=1 HF2Q_ADMIT_COALESCE_US=25000 \
     HF2Q_GEMMA_N8_PARITY_MAX_TOKENS=24 \
     HF2Q_GEMMA_N8_PARITY_ROUNDS=25 \
-    cargo test --release --locked --bin hf2q slot_aware_n8_per_slot_parity_vs_serial -- \
+    "$cooperative_test_binary" slot_aware_n8_per_slot_parity_vs_serial \
       --test-threads=1 --nocapture >"$OUT_ROOT/gemma/parity/n8.log" 2>&1
+}
+
+work_gemma_parity_n8_seed_budget() {
   HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
     HF2Q_CROSS_SLOT_ADMIT=1 HF2Q_ADMIT_COALESCE_US=25000 \
     HF2Q_GEMMA_N8_PARITY_MAX_TOKENS=1 \
     HF2Q_GEMMA_N8_PARITY_ROUNDS=25 \
-    cargo test --release --locked --bin hf2q slot_aware_n8_per_slot_parity_vs_serial -- \
+    "$cooperative_test_binary" slot_aware_n8_per_slot_parity_vs_serial \
       --test-threads=1 --nocapture >"$OUT_ROOT/gemma/parity/n8-seed-budget.log" 2>&1
+}
+
+work_gemma_parity_n8_tiny_hybrid() {
   HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
     HF2Q_HYBRID_KV=1 HF2Q_USE_DENSE=0 HF2Q_TQ_CODEBOOK_BITS=8 \
     HF2Q_GEMMA_N8_EXPECTED_KV_REGIME=hybrid \
     HF2Q_GEMMA_N8_PREFILL_REPEATS=64 HF2Q_GEMMA_N8_RESUME_REPEATS=16 \
-    cargo test --release --locked --bin hf2q \
-      gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant -- \
+    "$cooperative_test_binary" \
+      gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant \
       --test-threads=1 --nocapture >"$OUT_ROOT/gemma/parity/n8-tiny-hybrid.log" 2>&1
+}
+
+work_gemma_parity_n8_tiny_full_tq() {
   HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
     HF2Q_HYBRID_KV=0 HF2Q_USE_DENSE=0 HF2Q_TQ_CODEBOOK_BITS=8 \
     HF2Q_GEMMA_N8_EXPECTED_KV_REGIME=full-tq \
     HF2Q_GEMMA_N8_PREFILL_REPEATS=64 \
     HF2Q_GEMMA_N8_RESUME_REPEATS=16 \
-    cargo test --release --locked --bin hf2q \
-      gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant -- \
+    "$cooperative_test_binary" \
+      gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant \
       --test-threads=1 --nocapture >"$OUT_ROOT/gemma/parity/n8-tiny-full-tq.log" 2>&1
+}
+
+work_gemma_parity_boundary_tail() {
   HF2Q_BYTE_EQUIV_E2E=1 HF2Q_BYTE_EQUIV_E2E_GGUF="$GEMMA_MODEL" \
-    cargo test --release --locked --bin hf2q \
-      gemma_fresh_and_reused_4096_8193_bounded_outputs_match -- \
+    "$cooperative_test_binary" \
+      gemma_fresh_and_reused_4096_8193_bounded_outputs_match \
       --test-threads=1 >"$OUT_ROOT/gemma/parity/boundary-tail.log" 2>&1
+}
+
+work_gemma_parity_long_resume() {
   HF2Q_KV_PERSIST_PHASE_D=1 HF2Q_KV_PERSIST_E2E_MODEL_PATH="$GEMMA_MODEL" \
-    cargo test --release --locked --test lcp_partial_prefill_byte_identity \
-      gemma_hybrid_long_resume_byte_identity -- --test-threads=1 \
+    "$integration_test_binary" \
+      gemma_hybrid_long_resume_byte_identity --test-threads=1 \
       >"$OUT_ROOT/gemma/parity/long-resume.log" 2>&1
-  ensure_guard_health
+}
+
+assemble_gemma_parity_summary() {
   jq -n --arg status pass \
     --arg n4_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/n4.log")" \
     --arg n8_sha256 "$(sha256_file "$OUT_ROOT/gemma/parity/n8.log")" \
@@ -1641,12 +1710,9 @@ run_gemma_release_gates() {
     "$OUT_ROOT/gemma/parity/summary.json" "$OUT_ROOT/gemma/parity"
 }
 
-# The 100 GiB DeepSeek artifact runs first. Every process fully exits before
-# another model is loaded, so this remains safe on a 128 GiB host.
-run_deepseek_release_gates
-run_gemma_release_gates
-run_qwen_release_gates
-run_qwen38_long_decode_release_gate
+work_finalize() {
+phase_ledger=$(python3 "$script_dir/cache_release_orchestrator.py" verify "$OUT_ROOT")
+assemble_gemma_parity_summary
 
 hf2q_release_verify_model "$DEEPSEEK_MODEL" "$DEEPSEEK_MODEL_SHA256" \
   "$OUT_ROOT/deepseek/model-verification.json"
@@ -1685,6 +1751,7 @@ qwen36_validate_cancellation_transaction_counts \
 bash scripts/verify_gemma4_parity_receipt.sh \
   "$OUT_ROOT/gemma/parity/summary.json" "$OUT_ROOT/gemma/parity"
 jq -n \
+  --argjson phase_ledger "$phase_ledger" \
   --arg status pass \
   --arg source_sha "$EXPECTED_SHA" \
   --arg version "$EXPECTED_VERSION" \
@@ -1782,7 +1849,8 @@ jq -n \
     error("required release receipt must contain exactly one JSON document")
   else {
     kind: "hf2q.cache-lifecycle-release-manifest",
-    schema_version: 2,
+    schema_version: 3,
+    phase_ledger: $phase_ledger,
     status: $status,
     source_sha: $source_sha,
     version: $version,
@@ -1880,3 +1948,214 @@ jq --arg mlx_native_version "$RELEASE_MLX_NATIVE_VERSION" --arg mlx_native_check
     == $mlx_native_checksum
 ' "$OUT_ROOT/manifest.json" >/dev/null
 jq . "$OUT_ROOT/manifest.json"
+}
+
+load_thermal_probe() {
+  local evidence
+  if [[ "$work_id" == build-* ]]; then
+    evidence=$(jq -ec . "$OUT_ROOT/build/thermal-probe.json")
+  else
+    evidence=$(jq -ec .thermal_probe "$OUT_ROOT/build/inventory.json")
+  fi
+  THERMAL_PROBE_BIN=$(jq -er .path <<<"$evidence")
+  THERMAL_PROBE_SOURCE=$(jq -er .source <<<"$evidence")
+  THERMAL_PROBE_COMPILER=$(jq -er .compiler <<<"$evidence")
+  THERMAL_PROBE_COMPILER_VERSION=$(jq -er .compiler_version <<<"$evidence")
+  THERMAL_PROBE_OWNED_DIR=""
+  [[ "$THERMAL_PROBE_BIN" == "$OUT_ROOT/build/macos-thermal-probe" \
+    && -x "$THERMAL_PROBE_BIN" && ! -L "$THERMAL_PROBE_BIN" ]]
+  test "$(sha256_file "$THERMAL_PROBE_BIN")" = "$(jq -er .sha256 <<<"$evidence")"
+  test "$(sha256_file "$THERMAL_PROBE_SOURCE")" = "$(jq -er .source_sha256 <<<"$evidence")"
+  test "$(sha256_file "$THERMAL_PROBE_COMPILER")" = "$(jq -er .compiler_sha256 <<<"$evidence")"
+}
+
+load_test_binary() {
+  local role=$1
+  local evidence path
+  if [[ "$work_id" == build-* ]]; then
+    evidence=$(jq -ec . "$OUT_ROOT/build/$role.json")
+  else
+    evidence=$(jq -ec --arg role "$role" \
+      '.test_binaries[] | select(.role == $role)' "$OUT_ROOT/build/inventory.json")
+  fi
+  path=$(jq -er .path <<<"$evidence")
+  [[ "$path" == "$OUT_ROOT/build/"* && -x "$path" && ! -L "$path" ]]
+  test "$(sha256_file "$path")" = "$(jq -er .sha256 <<<"$evidence")"
+  printf '%s\n' "$path"
+}
+
+load_fixture_identity() {
+  agentic_prompt_contract="$PWD/scripts/fixtures/deepseek4-agentic-prompt-contract-v2.json"
+  agentic_prompt_contract_sha=$(sha256_file "$agentic_prompt_contract")
+  agentic_fixture="$PWD/scripts/fixtures/deepseek4-agentic-repo-context.txt"
+  agentic_fixture_sha=$(jq -er '.repository_context.sha256' "$agentic_prompt_contract")
+  agentic_tool_result="$PWD/$(jq -er '.tool_result.path' "$agentic_prompt_contract")"
+  agentic_prompt_provenance="$OUT_ROOT/fixtures/deepseek4-agentic/prompt-provenance.json"
+  agentic_prompt_provenance_sha=$(sha256_file "$agentic_prompt_provenance")
+}
+
+work_build_probe() {
+  trap on_exit EXIT
+  trap 'exit 1' INT TERM
+  require_no_model_runtime
+  thermal_prepare_probe
+  cp "$THERMAL_PROBE_BIN" "$OUT_ROOT/build/macos-thermal-probe"
+  chmod 555 "$OUT_ROOT/build/macos-thermal-probe"
+  jq -n --arg path "$OUT_ROOT/build/macos-thermal-probe" \
+    --arg sha256 "$(sha256_file "$OUT_ROOT/build/macos-thermal-probe")" \
+    --arg source "$THERMAL_PROBE_SOURCE" \
+    --arg source_sha256 "$(sha256_file "$THERMAL_PROBE_SOURCE")" \
+    --arg compiler "$THERMAL_PROBE_COMPILER" \
+    --arg compiler_sha256 "$(sha256_file "$THERMAL_PROBE_COMPILER")" \
+    --arg compiler_version "$THERMAL_PROBE_COMPILER_VERSION" \
+    '{path:$path,sha256:$sha256,source:$source,source_sha256:$source_sha256,
+      compiler:$compiler,compiler_sha256:$compiler_sha256,compiler_version:$compiler_version}' \
+    >"$OUT_ROOT/build/thermal-probe.json"
+  thermal_cleanup_probe
+  load_thermal_probe
+  start_guards
+
+  # Source-bound release_gate_preflight.sh predicates, using the one persisted
+  # probe rather than compiling a second probe outside the build ticket.
+  local swap_used free_line free_pct
+  swap_used=$(sysctl -n vm.swapusage | sed -E 's/.*used = ([0-9.]+)M.*/\1/')
+  if awk -v s="$swap_used" 'BEGIN { exit !(s + 0 > 0.5) }'; then
+    echo "preflight: swap in use (${swap_used}M); reboot before running the gate" >&2
+    return 1
+  fi
+  free_line=$(memory_pressure -Q 2>/dev/null | tail -1)
+  free_pct=${free_line##*: }
+  free_pct=${free_pct%\%}
+  [[ "$free_pct" =~ ^[0-9]+$ ]] || {
+    echo "preflight: cannot read system-wide free memory percentage" >&2; return 1;
+  }
+  (( free_pct >= 90 )) || {
+    echo "preflight: free memory ${free_pct}% (< 90%); close applications or reboot" >&2
+    return 1
+  }
+  thermal_read_state
+  [[ "$THERMAL_STATE" == nominal || "$THERMAL_STATE" == fair ]] || {
+    echo "preflight: thermal state '$THERMAL_STATE'; let the machine cool before the gate" >&2
+    return 1
+  }
+  printf 'preflight: host clean (no runtimes, %sM swap, %s%% free, thermal %s)\n' \
+    "$swap_used" "$free_pct" "$THERMAL_STATE" >"$OUT_ROOT/build/preflight.log"
+  chmod 444 "$OUT_ROOT/build/thermal-probe.json" "$OUT_ROOT/build/power-policy.json"
+}
+
+build_test_binary() {
+  local role=$1
+  local destination=$2
+  local target_name=$3
+  shift 3
+  local build_log="$OUT_ROOT/build/$role.jsonl"
+  local executable
+  require_no_model_runtime
+  command -v cargo >/dev/null
+  cargo test --locked --no-run --message-format=json "$@" >"$build_log"
+  executable=$(jq -rs --arg target_name "$target_name" '
+    [.[] | select(.reason == "compiler-artifact" and .profile.test == true
+      and .target.name == $target_name) | .executable]
+    | map(select(type == "string" and length > 0)) | last // empty
+  ' "$build_log")
+  [[ -n "$executable" && -x "$executable" ]] || {
+    echo "failed to resolve prebuilt $role test executable" >&2; return 1;
+  }
+  cp "$executable" "$destination"
+  chmod 555 "$destination"
+  jq -n --arg role "$role" --arg path "$destination" \
+    --arg sha256 "$(sha256_file "$destination")" \
+    --arg build_log "$build_log" --arg build_log_sha256 "$(sha256_file "$build_log")" \
+    '{role:$role,path:$path,sha256:$sha256,build_log:$build_log,
+      build_log_sha256:$build_log_sha256}' >"$OUT_ROOT/build/$role.json"
+  chmod 444 "$build_log" "$OUT_ROOT/build/$role.json"
+}
+
+work_build_fixtures() {
+  require_no_model_runtime
+  prepare_dependency_provenance
+  debug_test_binary=$(load_test_binary debug-bin)
+  cooperative_test_binary=$(load_test_binary release-bin)
+  integration_test_binary=$(load_test_binary release-integration)
+  prepare_models_and_fixtures
+  local fixtures
+  fixtures=$(
+    find "$OUT_ROOT/fixtures" -type f -print | LC_ALL=C sort |
+    while IFS= read -r path; do
+      jq -n --arg path "$path" --arg sha256 "$(sha256_file "$path")" \
+        '{path:$path,sha256:$sha256}'
+    done | jq -s .
+  )
+  jq -n --slurpfile debug "$OUT_ROOT/build/debug-bin.json" \
+    --slurpfile release "$OUT_ROOT/build/release-bin.json" \
+    --slurpfile integration "$OUT_ROOT/build/release-integration.json" \
+    --slurpfile thermal_probe "$OUT_ROOT/build/thermal-probe.json" \
+    --argjson fixtures "$fixtures" \
+    --arg binary_path "$HF2Q_BIN" --arg binary_sha256 "$binary_sha" \
+    '{schema_version:1,test_binaries:[$debug[0],$release[0],$integration[0]],
+      thermal_probe:$thermal_probe[0],fixtures:$fixtures,
+      release_binary:{path:$binary_path,sha256:$binary_sha256}}' \
+    >"$OUT_ROOT/build/inventory.json"
+  chmod 444 "$OUT_ROOT/build/inventory.json"
+}
+
+# Only authenticated helper-owned tickets reach this dispatch. No model phase
+# prepares a compiler, builds a harness, or regenerates a fixture.
+export OUT_ROOT HF2Q_BIN HF2Q_MODEL_VERIFICATION_CACHE_DIR
+binary_sha=$EXPECTED_BINARY_SHA256
+assert_exact_binary
+dependency_provenance_evidence="$OUT_ROOT/dependency-provenance"
+dependency_provenance_receipt="$dependency_provenance_evidence/receipt.json"
+if [[ "$work_id" == build-* ]]; then
+  power_dir="$OUT_ROOT/build/$work_id"
+else
+  power_dir="$OUT_ROOT/phases/$work_id"
+fi
+mkdir -p "$OUT_ROOT/build" "$power_dir"
+if [[ "$work_id" == build-probe ]]; then
+  work_build_probe
+  exit
+fi
+load_thermal_probe
+start_guards
+case "$work_id" in
+  build-debug)
+    build_test_binary debug-bin "$OUT_ROOT/build/hf2q-debug-tests" hf2q --bin hf2q
+    exit ;;
+  build-release)
+    build_test_binary release-bin "$OUT_ROOT/build/hf2q-release-tests" hf2q --release --bin hf2q
+    exit ;;
+  build-lcp)
+    build_test_binary release-integration "$OUT_ROOT/build/lcp-partial-prefill-byte-identity-tests" \
+      lcp_partial_prefill_byte_identity --release --test lcp_partial_prefill_byte_identity
+    exit ;;
+  build-fixtures)
+    work_build_fixtures
+    exit ;;
+esac
+cooperative_test_binary=$(load_test_binary release-bin)
+integration_test_binary=$(load_test_binary release-integration)
+load_fixture_identity
+dependency_provenance_receipt_sha=$(sha256_file "$dependency_provenance_receipt")
+mkdir -p "$OUT_ROOT/gemma/parity"
+case "$work_id" in
+  deepseek-cooperative) work_deepseek_cooperative ;;
+  deepseek-decode) work_deepseek_decode ;;
+  deepseek-wave1) run_deepseek_wave 1 ;;
+  deepseek-wave2) run_deepseek_wave 2 ;;
+  deepseek-process-a) work_deepseek_process_a ;;
+  gemma-process-a) work_gemma_process_a ;;
+  gemma-process-b) work_gemma_process_b ;;
+  gemma-parity-n4) work_gemma_parity_n4 ;;
+  gemma-parity-n8) work_gemma_parity_n8 ;;
+  gemma-parity-n8-seed-budget) work_gemma_parity_n8_seed_budget ;;
+  gemma-parity-n8-tiny-hybrid) work_gemma_parity_n8_tiny_hybrid ;;
+  gemma-parity-n8-tiny-full-tq) work_gemma_parity_n8_tiny_full_tq ;;
+  gemma-parity-boundary-tail) work_gemma_parity_boundary_tail ;;
+  gemma-parity-long-resume) work_gemma_parity_long_resume ;;
+  qwen-process-a) work_qwen_process_a ;;
+  qwen-process-b) work_qwen_process_b ;;
+  qwen38-long-decode) run_qwen38_long_decode_release_gate ;;
+  qwen38-structured) work_qwen38_structured ;;
+  finalize) work_finalize ;;
+esac

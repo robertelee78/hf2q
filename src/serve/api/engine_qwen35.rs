@@ -28,6 +28,7 @@ use crate::inference::models::qwen35::prefill_prepared::PrefillScope;
 use crate::inference::spec_decode::cost_controller::SpeculationCostController;
 use crate::inference::spec_decode::dflash2::{
     adapters::QwenDFlash2Adapter,
+    route_profile,
     runtime::DFlash2Runtime,
     schema::{DFlash2CheckpointDescriptor, DFlash2FamilyAdapter, KNOWN_DFLASH2_CHECKPOINTS},
 };
@@ -249,9 +250,17 @@ pub struct Qwen35LoadedModel {
     /// preserves type information on the decode hot path and avoids a
     /// virtual cache interface in `EngineInner`.
     pub persistent_kv_cache: Option<HybridKvCache>,
-    /// Default-off DFlash2 runtime. Present only after exact checkpoint,
-    /// target-family and slot-width validation at worker provisioning.
+    /// DFlash2 runtime. Present only after exact checkpoint, target-family
+    /// and slot-width validation at worker provisioning.
     pub dflash2: Option<DFlash2Runtime>,
+    /// The drafter the DFlash2 policy selected for this model before its
+    /// weights were loaded (`serve::dflash2_policy`). `None` keeps DFlash2
+    /// off; provisioning consumes it.
+    pub dflash2_plan: Option<crate::serve::dflash2_policy::DFlash2Plan>,
+    /// Fast-route switches as resolved for this model at load: the process
+    /// environment, then the route profile the DFlash2 policy selected.
+    /// Provisioning and the worker thread bind them.
+    pub routes: Arc<route_profile::ResolvedRoutes>,
     /// Server-side MTP policy and per-conversation profitability state. The
     /// native runner owns no persistent speculative KV yet, so this state
     /// deliberately contains no cache tensors.
@@ -762,6 +771,8 @@ impl Qwen35LoadedModel {
             // (... n_seqs = max_slots, ...)`.
             persistent_kv_cache: None,
             dflash2: None,
+            dflash2_plan: None,
+            routes: route_profile::current(),
             // ADR-044 (2026-08-21) / ADR-063 D1: an unset
             // HF2Q_QWEN_SPECULATION is `auto` here (one slot); a SlotAware
             // worker re-resolves it at start, to `off` when it selected joint
@@ -1064,7 +1075,7 @@ impl Qwen35LoadedModel {
                  boundary — caller violated)"
             );
         }
-        let device = mlx_native::MlxDevice::new()
+        let device = crate::inference::device_settle::SettledDevice::new()
             .context("ADR-040 C2d: MlxDevice::new for Qwen35 multi-seq KV provisioning")?;
         // Every agent slot receives the complete model context. The Qwen KV
         // allocator reserves full-attention storage lazily, while scheduler
@@ -1105,33 +1116,35 @@ impl Qwen35LoadedModel {
         );
         self.persistent_kv_cache = Some(cache);
         self.provision_dflash2(max_slots as usize)?;
+        // Before provisioning reports success, and so before the model can
+        // be handed to a worker: a queue that cannot be settled fails the
+        // load here, on the thread that still holds the reservation.
+        device
+            .settle()
+            .context("settle the queue of the Qwen35 slot KV provisioning")?;
         Ok(())
     }
 
+    /// Provision the drafter the DFlash2 policy planned for this model. The
+    /// policy made every fallback decision before the weights were loaded;
+    /// from here each identity check fails the load, as it always has.
     fn provision_dflash2(&mut self, max_slots: usize) -> anyhow::Result<()> {
-        let enabled = match std::env::var("HF2Q_DFLASH2").ok().as_deref() {
-            None | Some("") | Some("0" | "off" | "false") => false,
-            Some("1" | "on" | "true") => true,
-            Some(value) => {
-                anyhow::bail!("HF2Q_DFLASH2 must be 1/on/true or 0/off/false, got {value:?}")
-            }
-        };
-        if !enabled {
+        let Some(plan) = self.dflash2_plan.take() else {
             self.dflash2 = None;
             return Ok(());
-        }
+        };
+        let _routes = route_profile::bind(Arc::clone(&self.routes));
         anyhow::ensure!(
             (1..=4).contains(&max_slots),
             "DFlash2 supports 1..=4 physical slots, got {max_slots}"
         );
-        let config_path = PathBuf::from(
-            std::env::var_os("HF2Q_DFLASH2_CONFIG")
-                .context("HF2Q_DFLASH2=1 requires HF2Q_DFLASH2_CONFIG")?,
-        );
-        let weights_path = PathBuf::from(
-            std::env::var_os("HF2Q_DFLASH2_WEIGHTS")
-                .context("HF2Q_DFLASH2=1 requires HF2Q_DFLASH2_WEIGHTS")?,
-        );
+        let crate::serve::dflash2_policy::DFlash2Plan {
+            descriptor: planned,
+            class,
+            config_path,
+            weights_path,
+            ..
+        } = plan;
         let config_bytes = std::fs::read(&config_path)
             .with_context(|| format!("read DFlash2 config {}", config_path.display()))?;
         let (descriptor, config) = KNOWN_DFLASH2_CHECKPOINTS
@@ -1149,7 +1162,18 @@ impl Qwen35LoadedModel {
                     .map(|config| (descriptor, config))
             })
             .context("DFlash2 config does not match a pinned Qwen checkpoint")?;
-        validate_dflash2_target_source(descriptor, &self.provenance)?;
+        anyhow::ensure!(
+            descriptor.id == planned.id,
+            "DFlash2 config is checkpoint {}, the policy selected {} for this target",
+            descriptor.id,
+            planned.id
+        );
+        // A pinned pair is bound by its source identity. A target admitted
+        // for having the pinned target's architecture and shapes is bound by
+        // the adapter below, which validates the loaded model itself.
+        if class == crate::serve::dflash2_policy::QualifiedClass::PinnedPair {
+            validate_dflash2_target_source(descriptor, &self.provenance)?;
+        }
         self.model.ensure_gpu_cache_primed()?;
         let runtime = self.model.with_gpu_cache_mut(|device, _registry| {
             let adapter = QwenDFlash2Adapter::new(&self.model, &config)?;
@@ -1161,7 +1185,14 @@ impl Qwen35LoadedModel {
                 &adapter,
                 max_slots,
             )
-        })?;
+        });
+        // This thread primed the model's GPU cache only to upload the
+        // drafter; the worker thread primes its own. Everything the cache
+        // created at upload (the staged MoE planes are 20 GB on Qwen3.6)
+        // would otherwise stay resident twice.
+        let released = self.model.release_gpu_cache();
+        let runtime = runtime?;
+        released?;
         tracing::info!(
             checkpoint = descriptor.id,
             lanes = max_slots,
@@ -1245,6 +1276,13 @@ impl Qwen35LoadedModel {
         self.model.prefill_fold_exact()
     }
 
+    /// Whether a joint prefill forward is exact for the loaded model: the
+    /// condition of the cue fold, since both run the row-independent
+    /// products once over rows of different segments.
+    pub(crate) fn prefill_joint_exact(&self) -> bool {
+        self.prefill_cue_fold_exact().unwrap_or(false)
+    }
+
     /// The last content chunk and the generation cue behind it as one
     /// target forward (`HF2Q_QWEN_PREFILL_FOLD_CUE`): `prefix_rows` content
     /// rows end at the stable prompt boundary, whose physical cursor is
@@ -1317,6 +1355,164 @@ impl Qwen35LoadedModel {
                 runtime.record_lane_tokens(lane, &tokens[rows])?;
             }
             Ok(folded)
+        })();
+        self.dflash2 = Some(runtime);
+        result
+    }
+
+    /// Run the prompt-prefill route once at worker warmup, so that the first
+    /// request does not pay for the first use of every weight on that route
+    /// (measured on the four-agent workload: 1.6 s of the first Qwen3.8
+    /// prefill and 0.36 s of the first Qwen3.6 one, which every request
+    /// waiting behind it pays too). A fresh chunk above one row tile and a
+    /// short resumed chunk on slot 0 take the forward a served prompt takes,
+    /// with the DFlash2 capture and ingest when a draft runtime is
+    /// provisioned. The slot and its draft lane are reset before and after,
+    /// also when a warm forward fails, so the slot serves its first request
+    /// as a fresh slot. Returns whether it ran: it is a no-op unless the
+    /// prepared prefill route is on. The caller guarantees that no request
+    /// has been admitted yet.
+    pub(crate) fn warm_prefill_route(&mut self, kv_cache: &mut HybridKvCache) -> Result<bool> {
+        use crate::inference::models::qwen35::prefill_prepared;
+        /// `(first row, rows)`: the fresh route, then the short resumed one.
+        const CHUNKS: [(usize, usize); 2] = [(0, 40), (40, 5)];
+        if !prefill_prepared::enabled() {
+            return Ok(false);
+        }
+        let slot = SlotId(0);
+        let vocab = self.vocab_size.max(1) as u32;
+        let tokens: Vec<u32> = (0..45u32).map(|index| (1_000 + index) % vocab).collect();
+        kv_cache
+            .reset_for_slot(slot)
+            .context("reset slot 0 before the prefill warmup")?;
+        self.clear_dflash2_lane(slot)?;
+        let warmed = (|| -> Result<()> {
+            for (start, rows) in CHUNKS {
+                let chunk = &tokens[start..start + rows];
+                let positions = prefill_positions_from(start, rows);
+                if self.dflash2_lane_matches(slot, start) {
+                    self.forward_dflash2_prefill_chunk(chunk, &positions, kv_cache, slot, start)?;
+                } else {
+                    let _prefill = PrefillScope::enter();
+                    self.model
+                        .forward_gpu_last_logits(chunk, &positions, kv_cache, slot)?;
+                }
+            }
+            Ok(())
+        })();
+        kv_cache
+            .reset_for_slot(slot)
+            .context("reset slot 0 after the prefill warmup")?;
+        self.clear_dflash2_lane(slot)?;
+        warmed.context("Qwen35 prompt-prefill warmup")?;
+        Ok(true)
+    }
+
+    /// The planned chunks of `lanes` as one joint target forward. With the
+    /// DFlash2 route every lane's draft lane receives its own rows through
+    /// the calls its own forward makes: the content rows, then the cue rows
+    /// of a folded chunk.
+    fn forward_prefill_joint(
+        &mut self,
+        lanes: &[Qwen35PrefillLane],
+        cohort: &Qwen35PrefillCohort,
+        kv_cache: &mut HybridKvCache,
+    ) -> Result<Vec<crate::inference::models::qwen35::forward_gpu::JointPrefillOutput>> {
+        use crate::inference::models::qwen35::forward_gpu::JointPrefillLane;
+        anyhow::ensure!(
+            lanes.len() == cohort.lanes && lanes.len() == cohort.sharing.len(),
+            "Qwen35 joint prefill: {} lanes for a cohort of {}",
+            lanes.len(),
+            cohort.lanes
+        );
+        let dflash2 = lanes
+            .first()
+            .context("Qwen35 joint prefill without a lane")?
+            .chunk
+            .dflash2_prefill;
+        anyhow::ensure!(
+            lanes.iter().all(|lane| {
+                lane.chunk.dflash2_prefill == dflash2
+                    && lane.state.graft_len == 0
+                    && lane.state.vision.is_none()
+            }),
+            "Qwen35 joint prefill lanes do not share one text forward route"
+        );
+        let tokens_of = |lane: &Qwen35PrefillLane| -> std::ops::Range<usize> {
+            lane.chunk.chunk_start..lane.chunk.end
+        };
+        let positions: Vec<Vec<i32>> = lanes
+            .iter()
+            .map(|lane| prefill_positions_from(lane.chunk.chunk_start, lane.chunk.rows()))
+            .collect();
+        let model_lanes: Vec<JointPrefillLane<'_>> = lanes
+            .iter()
+            .zip(&positions)
+            .zip(&cohort.sharing)
+            .map(|((lane, positions), shares_prefix)| JointPrefillLane {
+                slot_id: lane.state.slot_id,
+                tokens: &lane.state.prompt_tokens[tokens_of(lane)],
+                positions_flat: positions,
+                shares_prefix: *shares_prefix,
+                fold: lane
+                    .chunk
+                    .fold_prefix_rows
+                    .map(|prefix_rows| (prefix_rows, lane.chunk.boundary_end)),
+                image: lane.fold_image.clone(),
+            })
+            .collect();
+        if !dflash2 {
+            let _prefill = PrefillScope::enter();
+            return self.model.forward_gpu_last_logits_joint(
+                &model_lanes,
+                cohort.shared_rows,
+                kv_cache,
+                None,
+            );
+        }
+        let mut runtime = self
+            .dflash2
+            .take()
+            .context("DFlash2 prefill requested without a provisioned runtime")?;
+        let result = (|| {
+            let mut capture =
+                crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession::new(
+                    runtime.config.target_layer_ids.clone(),
+                    Qwen35Model::joint_prefill_rows(&model_lanes, cohort.shared_rows),
+                    self.model.cfg.hidden_size as usize,
+                    false,
+                );
+            let outputs = {
+                let _prefill = PrefillScope::enter();
+                self.model.forward_gpu_last_logits_joint(
+                    &model_lanes,
+                    cohort.shared_rows,
+                    kv_cache,
+                    Some(&mut capture),
+                )?
+            };
+            for (lane, output) in lanes.iter().zip(&outputs) {
+                let draft_lane = lane.state.slot_id.0 as usize;
+                let tokens = &lane.state.prompt_tokens[tokens_of(lane)];
+                let segments = match lane.chunk.fold_prefix_rows {
+                    Some(prefix_rows) => vec![0..prefix_rows, prefix_rows..tokens.len()],
+                    None => vec![0..tokens.len()],
+                };
+                for rows in segments {
+                    self.model.with_gpu_cache_mut(|device, registry| {
+                        runtime.ingest_target_capture_runs(
+                            device,
+                            registry,
+                            &capture,
+                            draft_lane,
+                            lane.chunk.chunk_start + rows.start,
+                            &output.forward_rows(rows.clone()),
+                        )
+                    })?;
+                    runtime.record_lane_tokens(draft_lane, &tokens[rows])?;
+                }
+            }
+            Ok(outputs)
         })();
         self.dflash2 = Some(runtime);
         result
@@ -1403,6 +1599,7 @@ impl LoadInfoBuilder for Qwen35LoadedModel {
             )),
             kv_fixed_bytes_per_slot_override: Some(load_info::qwen35_fixed_kv_bytes_per_slot(cfg)),
             gemma_warm_attention_kernel: None,
+            default_routes: Vec::new(),
         }
     }
 }
@@ -1834,6 +2031,74 @@ fn alloc_serial_kv_cache(
         .context("SerialFifo recovery capture preallocation")?;
     cache.clear_la_capture();
     Ok(cache)
+}
+
+/// A device a SerialFifo request creates for its own KV allocation,
+/// snapshots and restores. Its queue is settled under the engine's
+/// supervision when the request ends (`inference::device_settle`).
+///
+/// A request that succeeds calls [`Self::settle`] before it reports its
+/// result or `Done`, so a settle that fails is that request's error and a
+/// settle that never returns is a transaction the supervisor times out,
+/// like any other GPU call of the request. A request that fails or unwinds
+/// leaves the settle to the destructor, which runs it under the same
+/// supervision. A settle that fails or could not be attempted (the engine is
+/// already unhealthy) is recorded for the worker thread, whose teardown then
+/// keeps the model's memory reserved. It is attempted once.
+pub(super) struct RequestDevice<'s> {
+    device: MlxDevice,
+    supervisor: &'s EngineSupervisor,
+    settled: bool,
+}
+
+impl<'s> RequestDevice<'s> {
+    pub(super) fn new(supervisor: &'s EngineSupervisor) -> mlx_native::Result<Self> {
+        MlxDevice::new().map(|device| Self {
+            device,
+            supervisor,
+            settled: false,
+        })
+    }
+
+    /// Settle the queue now, as the last GPU step of a request that
+    /// succeeded.
+    pub(super) fn settle(mut self) -> Result<()> {
+        self.settle_supervised()
+    }
+
+    fn settle_supervised(&mut self) -> Result<()> {
+        self.settled = true;
+        let settled = supervised_gpu_call(self.supervisor, "qwen35_request_settle", || {
+            crate::inference::device_settle::settle(&self.device)
+        });
+        if let Err(error) = &settled {
+            crate::inference::device_settle::record_thread_unsettled(format!("{error:#}"));
+        }
+        settled.context("settle the request's command queue")
+    }
+}
+
+impl std::ops::Deref for RequestDevice<'_> {
+    type Target = MlxDevice;
+
+    fn deref(&self) -> &MlxDevice {
+        &self.device
+    }
+}
+
+impl Drop for RequestDevice<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            // The request is failing or unwinding: its own error is on its
+            // way, and this one is on the thread's record.
+            if let Err(error) = self.settle_supervised() {
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    "a failed request could not settle its command queue"
+                );
+            }
+        }
+    }
 }
 
 /// Allocate a fresh `HybridKvCache` sized for `prompt_len + max_tokens + 64`,
@@ -2444,8 +2709,8 @@ fn generate_qwen35_once_ordinary(
     let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
 
     let cache_alloc_start = Instant::now();
-    let device =
-        MlxDevice::new().map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate): {e}"))?;
+    let device = RequestDevice::new(supervisor)
+        .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate): {e}"))?;
     let (mut kv_cache, cache_reused) = take_serial_kv_cache(qwen, &device, prompt_len, max_tokens)?;
     tracing::info!(
         target: "hf2q::serve::api::engine_qwen35::progress",
@@ -3356,6 +3621,10 @@ fn generate_qwen35_once_ordinary(
 
     validate_grammar_terminal(grammar_runtime.as_ref(), params.grammar_kind, finish_reason)?;
 
+    // Before the result is reported: the request's queue is settled under
+    // the engine's supervision, and a failure is this request's failure.
+    device.settle()?;
+
     Ok(GenerationResult {
         text: content,
         reasoning_text,
@@ -3772,9 +4041,6 @@ pub fn generate_qwen35_once_slot_aware(
     let prefill_duration = prefill_start.elapsed();
 
     // ── Decode loop ───────────────────────────────────────────────────
-    let device = MlxDevice::new()
-        .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 slot-aware decode): {e}"))?;
-    let _ = &device; // sample_logits_qwen35 doesn't need the device handle
     let decode_start = Instant::now();
     let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
     generated_tokens.push(next_token);
@@ -3968,6 +4234,387 @@ pub(crate) enum Qwen35PrefillAdvance {
         advanced_tokens: usize,
         checkpoint: Option<Qwen35StablePromptCheckpoint>,
     },
+}
+
+/// The chunk one prefill transaction of a request runs (see
+/// `Qwen35PrefillState::plan_chunk`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Qwen35PrefillChunk {
+    /// First prompt token of the chunk.
+    chunk_start: usize,
+    /// Where the chunk's content ends: the stable prompt boundary when the
+    /// chunk reaches it, else the chunk's end.
+    boundary_end: usize,
+    /// One past the chunk's last prompt token (the prompt's end when the
+    /// chunk folds the generation cue).
+    end: usize,
+    /// Content rows before the stable boundary when the chunk folds the cue.
+    fold_prefix_rows: Option<usize>,
+    /// The forward captures the DFlash2 target layers into the draft lane.
+    dflash2_prefill: bool,
+    /// The forward is followed by the MTP prompt catch-up.
+    mtp_prefill: bool,
+}
+
+impl Qwen35PrefillChunk {
+    /// Rows of the chunk.
+    pub(crate) fn rows(&self) -> usize {
+        self.end - self.chunk_start
+    }
+
+    /// Whether the chunk folds the generation cue, and so needs checkpoint
+    /// storage before its forward.
+    pub(crate) fn folds_cue(&self) -> bool {
+        self.fold_prefix_rows.is_some()
+    }
+
+    /// Rows of the chunk's first segment: the content rows before a folded
+    /// cue, else all rows.
+    fn content_rows(&self) -> usize {
+        self.fold_prefix_rows.unwrap_or(self.rows())
+    }
+}
+
+/// What the lane selection of a joint prefill reads of one waiting request.
+pub(crate) struct Qwen35PrefillLaneShape<'a> {
+    /// The chunk's tokens.
+    pub(crate) tokens: &'a [u32],
+    /// Rows of the chunk's first segment.
+    pub(crate) content_rows: usize,
+    /// The chunk starts a prompt on a freshly reset, ungrafted slot.
+    pub(crate) cold: bool,
+    /// The chunk runs the DFlash2 capture route.
+    pub(crate) dflash2: bool,
+}
+
+/// The lanes of one joint prefill forward: the first `lanes` waiting
+/// requests in FIFO order, and the prompt prefix some of them share.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Qwen35PrefillCohort {
+    /// How many of the candidate lanes, from the head, run in the forward.
+    pub(crate) lanes: usize,
+    /// Rows the sharing lanes have in common (0 = nothing is shared).
+    pub(crate) shared_rows: usize,
+    /// Per lane: whether its chunk starts with the shared rows.
+    pub(crate) sharing: Vec<bool>,
+    /// Rows of the forward.
+    pub(crate) rows: usize,
+}
+
+/// Leading rows two lanes could share: both cold, the same tokens, and at
+/// least two content rows of its own left to each.
+fn qwen35_prefill_common_rows(
+    a: &Qwen35PrefillLaneShape<'_>,
+    b: &Qwen35PrefillLaneShape<'_>,
+) -> usize {
+    if !(a.cold && b.cold) {
+        return 0;
+    }
+    let cap = |lane: &Qwen35PrefillLaneShape<'_>| lane.content_rows.saturating_sub(2);
+    a.tokens
+        .iter()
+        .zip(b.tokens)
+        .take_while(|(x, y)| x == y)
+        .count()
+        .min(cap(a))
+        .min(cap(b))
+}
+
+/// The rows a set of lanes shares: the longest prefix worth sharing among
+/// the cold lanes, and who shares it.
+///
+/// Only a byte-identical token prefix of cold lanes is shared (same tokens
+/// at the same positions over an empty history compute the same rows), and
+/// every sharing lane keeps at least two rows of its own before its stable
+/// boundary. The first cold lane is the reference; a later cold lane shares
+/// if it starts with the chosen prefix. The prefix length is the one that
+/// saves the most rows: `(sharers - 1) * rows`.
+fn qwen35_prefill_shared_prefix(
+    lanes: &[Qwen35PrefillLaneShape<'_>],
+    share: bool,
+) -> (usize, Vec<bool>) {
+    use crate::inference::models::qwen35::prefill_joint::MIN_SHARED_ROWS;
+    let none = (0, vec![false; lanes.len()]);
+    let Some(reference) = lanes.iter().position(|lane| lane.cold).filter(|_| share) else {
+        return none;
+    };
+    // Per lane: how many leading rows it could share with the reference.
+    let common: Vec<usize> = lanes
+        .iter()
+        .enumerate()
+        .map(|(index, lane)| {
+            if index == reference {
+                return 0;
+            }
+            qwen35_prefill_common_rows(&lanes[reference], lane)
+        })
+        .collect();
+    let best = common
+        .iter()
+        .copied()
+        .filter(|&rows| rows >= MIN_SHARED_ROWS)
+        .max_by_key(|&rows| (common.iter().filter(|&&other| other >= rows).count() * rows, rows));
+    let Some(shared_rows) = best else {
+        return none;
+    };
+    let sharing = common
+        .iter()
+        .enumerate()
+        .map(|(index, &rows)| index == reference || rows >= shared_rows)
+        .collect();
+    (shared_rows, sharing)
+}
+
+/// Which waiting lanes a joint prefill forward takes behind its head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Qwen35PrefillJoin {
+    /// Every lane that fits the row budget.
+    Every,
+    /// A lane whose chunk has at most `small_rows` rows, or a cold lane
+    /// whose prompt starts with the head's: the lanes a forward carries for
+    /// much less than their own forward costs.
+    Cheap { small_rows: usize },
+}
+
+/// Rows of a lane that a dense-FFN model joins whatever else it carries:
+/// one row tile of the prepared projections. Such a chunk's own forward is
+/// one weight pass of every product; in a forward that runs anyway its rows
+/// fill tiles that are mostly paid for.
+pub(crate) const QWEN35_JOINT_PREFILL_SMALL_ROWS: usize = 32;
+
+/// Row ceiling of a joint prefill transaction while other slots decode. A
+/// decoding slot's next tokens wait for the whole transaction, so the
+/// ceiling is below the first prompt of the four-agent coding workload
+/// (about 700 rows), which a single slot's chunk already costs a decoder.
+pub(crate) const QWEN35_JOINT_PREFILL_DECODE_ROWS: usize = 512;
+
+/// How long the first prompt of a conversation waits for other first
+/// prompts while nothing else runs on the worker (the admission window the
+/// Gemma 4 worker gives its first cohort).
+pub(crate) const QWEN35_JOINT_PREFILL_COLD_GATHER: Duration = Duration::from_millis(25);
+
+/// The joint prefill policy of a multi-slot worker
+/// (`HF2Q_QWEN_PREFILL_JOINT=1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Qwen35JointPrefillPolicy {
+    pub(crate) join: Qwen35PrefillJoin,
+    /// Row ceiling of a joint transaction while no slot decodes: the
+    /// worker's per-transaction ceiling.
+    pub(crate) idle_rows: usize,
+    /// Row ceiling of a joint transaction while other slots decode.
+    pub(crate) decode_rows: usize,
+    /// Wait of a first prompt for other first prompts while nothing else
+    /// runs (zero: none).
+    pub(crate) cold_gather: Duration,
+    /// A step with decoding and prefilling slots runs its prefill
+    /// transaction before its decode cycle.
+    pub(crate) prefill_first: bool,
+}
+
+impl Qwen35JointPrefillPolicy {
+    /// The policy for a worker whose transactions carry at most
+    /// `transaction_rows` rows.
+    ///
+    /// A MoE model streams every expert stack once per forward of more than
+    /// 32 rows, whatever the row count, and a joint forward pays that once
+    /// for all its lanes, so every waiting lane joins. A dense-FFN model's
+    /// forward costs its rows (in 32-row tiles), so a lane joins only where
+    /// the forward carries it almost for free: a chunk of at most one tile,
+    /// or a first prompt that starts with the head's.
+    pub(crate) fn for_worker(moe: bool, transaction_rows: usize) -> Self {
+        Self {
+            join: if moe {
+                Qwen35PrefillJoin::Every
+            } else {
+                Qwen35PrefillJoin::Cheap {
+                    small_rows: QWEN35_JOINT_PREFILL_SMALL_ROWS,
+                }
+            },
+            idle_rows: transaction_rows,
+            decode_rows: QWEN35_JOINT_PREFILL_DECODE_ROWS.min(transaction_rows),
+            cold_gather: QWEN35_JOINT_PREFILL_COLD_GATHER,
+            prefill_first: true,
+        }
+    }
+}
+
+/// What a slot is to the first-prompt gather.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Qwen35GatherSlot {
+    /// No request.
+    Free,
+    /// A text first prompt that has not run a forward yet.
+    FirstPrompt,
+    /// Anything else: a decoding slot, a resumed or started prefill.
+    Busy,
+}
+
+/// Whether first prompts are still gathering for a joint prefill: at least
+/// one waits, a slot is still free for another, and nothing else runs on
+/// the worker (so nobody but the waiting first prompts is delayed).
+pub(crate) fn qwen35_first_prompts_may_gather(
+    slots: impl IntoIterator<Item = Qwen35GatherSlot>,
+) -> bool {
+    let (mut waiting, mut free) = (0usize, 0usize);
+    for slot in slots {
+        match slot {
+            Qwen35GatherSlot::Free => free += 1,
+            Qwen35GatherSlot::FirstPrompt => waiting += 1,
+            Qwen35GatherSlot::Busy => return false,
+        }
+    }
+    waiting > 0 && free > 0
+}
+
+/// Choose the lanes of a joint prefill forward among the waiting requests
+/// `candidates` (FIFO order, the head first): the longest run from the head
+/// that `join` admits and whose forward fits `max_rows` rows, `None` unless
+/// at least two lanes fit. Every lane runs the head's forward route. With
+/// `share`, cold lanes that start with the same tokens share those rows.
+pub(crate) fn qwen35_prefill_cohort(
+    candidates: &[Qwen35PrefillLaneShape<'_>],
+    max_rows: usize,
+    share: bool,
+    join: Qwen35PrefillJoin,
+) -> Option<Qwen35PrefillCohort> {
+    use crate::inference::models::qwen35::prefill_joint::MIN_SHARED_ROWS;
+    let head = candidates.first()?;
+    let compatible = candidates
+        .iter()
+        .take_while(|lane| lane.dflash2 == head.dflash2)
+        .count();
+    // The run ends at the first lane the policy leaves to its own step, so
+    // no lane is served ahead of an earlier one.
+    let admitted = match join {
+        Qwen35PrefillJoin::Every => compatible,
+        Qwen35PrefillJoin::Cheap { small_rows } => {
+            1 + candidates[1..compatible]
+                .iter()
+                .take_while(|lane| {
+                    lane.tokens.len() <= small_rows
+                        || (share && qwen35_prefill_common_rows(head, lane) >= MIN_SHARED_ROWS)
+                })
+                .count()
+        }
+    };
+    (2..=admitted).rev().find_map(|lanes| {
+        let (shared_rows, sharing) = qwen35_prefill_shared_prefix(&candidates[..lanes], share);
+        let rows = shared_rows
+            + candidates[..lanes]
+                .iter()
+                .zip(&sharing)
+                .map(|(lane, shares)| lane.tokens.len() - if *shares { shared_rows } else { 0 })
+                .sum::<usize>();
+        // A lane the cheap policy took for its shared rows must share the
+        // prefix the cohort settled on; otherwise it would run all its rows
+        // here, and a shorter cohort is tried.
+        let cheap = match join {
+            Qwen35PrefillJoin::Every => true,
+            Qwen35PrefillJoin::Cheap { small_rows } => candidates[1..lanes]
+                .iter()
+                .zip(&sharing[1..])
+                .all(|(lane, shares)| *shares || lane.tokens.len() <= small_rows),
+        };
+        (cheap && rows <= max_rows).then_some(Qwen35PrefillCohort {
+            lanes,
+            shared_rows,
+            sharing,
+            rows,
+        })
+    })
+}
+
+/// One lane of a joint prefill transaction: a waiting request and the chunk
+/// planned for it.
+pub(crate) struct Qwen35PrefillLane {
+    pub(crate) state: Qwen35PrefillState,
+    pub(crate) chunk: Qwen35PrefillChunk,
+    /// Checkpoint storage of a chunk that folds its cue, allocated before
+    /// the lane was admitted ([`Qwen35PrefillChunk::folds_cue`]).
+    pub(crate) fold_image: Option<LaAnchorImage>,
+    pub(crate) anchor_quota_headroom: Option<usize>,
+}
+
+/// What a joint prefill transaction did.
+pub(crate) enum Qwen35JointPrefillAdvance {
+    /// The forward ran: every lane's own outcome, in lane order, as its solo
+    /// transaction reports it.
+    Lanes(Vec<Result<Qwen35PrefillAdvance>>),
+    /// The forward failed. No lane advanced and every lane's slot is in the
+    /// middle of a transaction, as after a failed solo forward.
+    Failed {
+        error: anyhow::Error,
+        states: Vec<Qwen35PrefillState>,
+    },
+}
+
+/// Run the planned chunks of `lanes` as one joint prefill forward
+/// ([`crate::inference::models::qwen35::prefill_joint`]) and settle each
+/// lane as its own transaction would: cursors validated, request advanced,
+/// checkpoint taken, DFlash2 lane appended.
+pub(super) fn run_qwen35_joint_prefill(
+    lanes: Vec<Qwen35PrefillLane>,
+    cohort: &Qwen35PrefillCohort,
+    qwen: &mut Qwen35LoadedModel,
+    registration: Option<&ModelRegistration>,
+    kv_cache: &mut HybridKvCache,
+    supervisor: &EngineSupervisor,
+) -> Qwen35JointPrefillAdvance {
+    let started = Instant::now();
+    let _critical_path_spans: Vec<_> = lanes
+        .iter()
+        .map(|lane| {
+            critical_path::Span::prefill(
+                lane.state.slot_id,
+                lane.state.prompt_tokens.len(),
+                lane.chunk.chunk_start,
+                lane.chunk.end,
+            )
+        })
+        .collect();
+    let forward = (|| -> Result<Vec<_>> {
+        let lease = supervisor.arm("Qwen35 joint prefill", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
+        let outputs = qwen.forward_prefill_joint(&lanes, cohort, kv_cache);
+        lease.finish()?;
+        outputs.context("Qwen35Model::forward_gpu_last_logits_joint (slot-aware joint prefill)")
+    })();
+    let outputs = match forward {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            return Qwen35JointPrefillAdvance::Failed {
+                error,
+                states: lanes.into_iter().map(|lane| lane.state).collect(),
+            }
+        }
+    };
+    let elapsed = started.elapsed();
+    let joint = Some((lanes.len(), cohort.rows));
+    Qwen35JointPrefillAdvance::Lanes(
+        lanes
+            .into_iter()
+            .zip(outputs)
+            .map(|(lane, output)| {
+                let Qwen35PrefillLane {
+                    mut state,
+                    chunk,
+                    anchor_quota_headroom,
+                    ..
+                } = lane;
+                let (advanced, checkpoint) = state.finish_chunk(
+                    qwen,
+                    kv_cache,
+                    supervisor,
+                    anchor_quota_headroom,
+                    &chunk,
+                    &output.logits,
+                    output.boundary,
+                    elapsed,
+                    joint,
+                )?;
+                state.into_advance(qwen, registration, output.logits, None, advanced, checkpoint)
+            })
+            .collect(),
+    )
 }
 
 pub(crate) struct Qwen35StablePromptCheckpoint {
@@ -4391,17 +5038,17 @@ impl Qwen35PrefillState {
         })
     }
 
-    /// The content rows of this chunk and the checkpoint storage when the
-    /// chunk and the generation cue behind it run as one folded forward
-    /// (`HF2Q_QWEN_PREFILL_FOLD_CUE`), `None` for the two-forward path. The
-    /// fold applies when the chunk ends at the stable prompt boundary of a
-    /// text-only, ungrafted request on the DFlash2 or the plain target
-    /// route, both segments are multi-row, the boundary checkpoint fits its
-    /// quota and its storage can be allocated (the fold takes it inside the
-    /// forward), and the fold is exact for the loaded model and process.
-    /// Everything that keeps a request off the fold is decided here, before
-    /// the slot changes, so the request then runs its two forwards.
-    fn cue_fold_prefix_rows(
+    /// The content rows of this chunk when the chunk and the generation cue
+    /// behind it run as one folded forward (`HF2Q_QWEN_PREFILL_FOLD_CUE`),
+    /// `None` for the two-forward path. The fold applies when the chunk ends
+    /// at the stable prompt boundary of a text-only, ungrafted request on
+    /// the DFlash2 or the plain target route, both segments are multi-row,
+    /// the boundary checkpoint fits its quota, and the fold is exact for the
+    /// loaded model and process. The fold also needs its checkpoint storage
+    /// ([`Self::cue_fold_image`]: the fold takes the checkpoint inside the
+    /// forward). Everything that keeps a request off the fold is decided
+    /// before the slot changes, so the request then runs its two forwards.
+    fn cue_fold_rows(
         &self,
         qwen: &Qwen35LoadedModel,
         kv_cache: &HybridKvCache,
@@ -4409,7 +5056,7 @@ impl Qwen35PrefillState {
         dflash2_prefill: bool,
         mtp_prefill: bool,
         anchor_quota_headroom: Option<usize>,
-    ) -> Result<Option<(usize, LaAnchorImage)>> {
+    ) -> Result<Option<usize>> {
         use crate::inference::models::qwen35::prefill_fold;
         let prefix_rows = boundary_end - self.next_token_index;
         let cue_rows = self.prompt_tokens.len() - boundary_end;
@@ -4443,19 +5090,60 @@ impl Qwen35PrefillState {
         if !qwen.prefill_cue_fold_exact()? {
             return Ok(None);
         }
-        // Without checkpoint storage the two forwards run; their snapshot
-        // then fails or is skipped by the rule it always had.
+        Ok(Some(prefix_rows))
+    }
+
+    /// Checkpoint storage for a chunk planned with a cue fold. Without it
+    /// the plan loses its fold and the two forwards run; their snapshot then
+    /// fails or is skipped by the rule it always had.
+    fn cue_fold_image(
+        &self,
+        kv_cache: &HybridKvCache,
+        plan: &mut Qwen35PrefillChunk,
+    ) -> Option<LaAnchorImage> {
+        plan.fold_prefix_rows?;
         match kv_cache.boundary_anchor_image() {
-            Ok(image) => Ok(Some((prefix_rows, image))),
+            Ok(image) => Some(image),
             Err(error) => {
                 tracing::warn!(
                     slot = self.slot_id.0,
                     error = %format!("{error:#}"),
                     "Qwen35 cue fold skipped: checkpoint storage allocation failed"
                 );
-                Ok(None)
+                plan.fold_prefix_rows = None;
+                plan.end = plan.boundary_end;
+                None
             }
         }
+    }
+
+    /// [`Self::cue_fold_rows`] with the checkpoint storage the fold needs:
+    /// `None` when the chunk keeps its two forwards.
+    #[cfg(test)]
+    fn cue_fold_prefix_rows(
+        &self,
+        qwen: &Qwen35LoadedModel,
+        kv_cache: &HybridKvCache,
+        boundary_end: usize,
+        dflash2_prefill: bool,
+        mtp_prefill: bool,
+        anchor_quota_headroom: Option<usize>,
+    ) -> Result<Option<(usize, LaAnchorImage)>> {
+        let Some(prefix_rows) = self.cue_fold_rows(
+            qwen,
+            kv_cache,
+            boundary_end,
+            dflash2_prefill,
+            mtp_prefill,
+            anchor_quota_headroom,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(kv_cache
+            .boundary_anchor_image()
+            .ok()
+            .map(|image| (prefix_rows, image)))
     }
 
     pub(super) fn advance(
@@ -4467,19 +5155,7 @@ impl Qwen35PrefillState {
         supervisor: &EngineSupervisor,
         anchor_quota_headroom: Option<usize>,
     ) -> Result<Qwen35PrefillAdvance> {
-        // Preserve or safely rewind a resident draft ring only when its exact
-        // committed token prefix matches the target cache restored into this
-        // physical slot. Length alone is insufficient: a same-length
-        // conversation may have replaced the target cache while leaving
-        // unrelated draft state.
-        if self.next_token_index == self.cached_tokens
-            && !qwen.align_dflash2_lane_prefix(
-                self.slot_id,
-                &self.prompt_tokens[..self.cached_tokens],
-            )
-        {
-            qwen.clear_dflash2_lane(self.slot_id)?;
-        }
+        self.align_draft_lane(qwen)?;
         let (prefill_logits, mtp_hidden, advanced_tokens, checkpoint) = if let Some(logits) =
             self.cached_prefill_logits.take()
         {
@@ -4491,62 +5167,20 @@ impl Qwen35PrefillState {
             );
             (logits, None, 0, None)
         } else {
-            anyhow::ensure!(
-                max_chunk_tokens > 0,
-                "Qwen35PrefillState::advance requires a non-zero chunk"
-            );
-            kv_cache
-                .validate_sequence_len_for_slot(
-                    self.slot_id,
-                    self.graft_len + self.next_token_index,
-                )
-                .context("validate Qwen35 slot cursors before bounded prefill")?;
-            let boundary_end = qwen35_next_prefill_end(
-                self.next_token_index,
-                self.prompt_tokens.len(),
-                max_chunk_tokens,
-                self.stable_prompt_prefix_tokens,
-            );
-            anyhow::ensure!(
-                boundary_end > self.next_token_index,
-                "Qwen35 bounded prefill has no suffix without cached logits"
-            );
-            // ADR-059: a bound graft skips the catch-up because the MTP
-            // arena never receives the graft (see `classify_slot_request`).
-            let mtp_runtime = qwen.model.mtp.is_some() && kv_cache.mtp_slot.is_some();
-            let graft_bound = qwen.model.kv_graft.is_some();
-            let dflash2_prefill = self.vision.is_none()
-                && self.graft_len == 0
-                && qwen.dflash2_lane_matches(self.slot_id, self.next_token_index);
-            let mtp_prefill = (self.cached_tokens == 0 || self.mtp_pending_hidden.is_some())
-                && !self.speculation_unavailable
-                && (super::qwen35_speculation::prefill_mtp_catchup_allowed(
-                    qwen.speculation.policy(),
-                    is_qwen_server_speculation_exact_eligible(&self.params),
-                    self.vision.is_none(),
-                    mtp_runtime,
-                    graft_bound,
-                ) || shadow_draft::prefill_mtp_allowed(
-                    self.vision.is_none(),
-                    mtp_runtime,
-                    graft_bound,
-                ));
-            // Cue fold: a chunk that ends at the stable prompt boundary takes
-            // the generation cue behind it into the same forward, which
-            // captures the boundary checkpoint itself.
-            let fold = self.cue_fold_prefix_rows(
-                qwen,
-                kv_cache,
+            let mut plan =
+                self.plan_chunk(qwen, kv_cache, max_chunk_tokens, anchor_quota_headroom)?;
+            // The checkpoint storage is allocated before the fold is taken:
+            // without it the two forwards run.
+            let fold_image = self.cue_fold_image(kv_cache, &mut plan);
+            let Qwen35PrefillChunk {
                 boundary_end,
+                end,
+                fold_prefix_rows,
                 dflash2_prefill,
                 mtp_prefill,
-                anchor_quota_headroom,
-            )?;
-            let end = if fold.is_some() {
-                self.prompt_tokens.len()
-            } else {
-                boundary_end
-            };
+                ..
+            } = plan;
+            let fold = fold_prefix_rows.zip(fold_image);
             let chunk_start = self.next_token_index;
             let chunk = &self.prompt_tokens[self.next_token_index..end];
             let vision_chunk = self
@@ -4747,47 +5381,299 @@ impl Qwen35PrefillState {
             lease.finish()?;
             let logits = forward
                 .context("Qwen35Model::forward_gpu_last_logits (slot-aware bounded prefill)")?;
-            kv_cache
-                .validate_sequence_len_for_slot(self.slot_id, self.graft_len + end)
-                .context("validate Qwen35 slot cursors after bounded prefill")?;
-            tracing::info!(
-                slot = self.slot_id.0,
-                chunk_start,
-                chunk_end = end,
-                chunk_tokens = chunk.len(),
-                prompt_tokens = self.prompt_tokens.len(),
-                cue_tokens_folded = end - boundary_end,
-                elapsed_seconds = chunk_started.elapsed().as_secs_f64(),
-                "Qwen35 bounded prefill chunk complete"
-            );
-            let advanced = end - self.next_token_index;
-            self.next_token_index = end;
-            let checkpoint = if let Some((boundary_logits, boundary, wall)) = folded_boundary {
-                // The folded forward took the checkpoint at the stable
-                // boundary itself; its quota was decided before the fold. A
-                // checkpoint that could not be assembled is counted, and
-                // skipped or fatal, exactly as a failed snapshot between two
-                // forwards is.
-                anchor_store::record_anchor_snapshot(wall);
-                match boundary {
-                    Ok(kv) => {
-                        let spec = self
-                            .mtp_pending_hidden
-                            .as_ref()
-                            .map(|hidden| {
-                                qwen.model.with_gpu_cache_mut(|device, _registry| {
-                                    anchor_store::owned_spec_boundary(device, boundary_end, hidden)
-                                })
+            let (advanced, checkpoint) = self.finish_chunk(
+                qwen,
+                kv_cache,
+                supervisor,
+                anchor_quota_headroom,
+                &plan,
+                &logits,
+                folded_boundary,
+                chunk_started.elapsed(),
+                None,
+            )?;
+            (logits, mtp_hidden, advanced, checkpoint)
+        };
+
+        self.into_advance(
+            qwen,
+            registration,
+            prefill_logits,
+            mtp_hidden,
+            advanced_tokens,
+            checkpoint,
+        )
+    }
+
+    /// Preserve or safely rewind a resident draft ring only when its exact
+    /// committed token prefix matches the target cache restored into this
+    /// physical slot. Length alone is insufficient: a same-length
+    /// conversation may have replaced the target cache while leaving
+    /// unrelated draft state.
+    fn align_draft_lane(&self, qwen: &mut Qwen35LoadedModel) -> Result<()> {
+        if self.next_token_index == self.cached_tokens
+            && !qwen.align_dflash2_lane_prefix(
+                self.slot_id,
+                &self.prompt_tokens[..self.cached_tokens],
+            )
+        {
+            qwen.clear_dflash2_lane(self.slot_id)?;
+        }
+        Ok(())
+    }
+
+    /// The chunk this request's next prefill transaction runs: where it
+    /// ends, whether it folds the generation cue, and the forward route.
+    /// A pure function of this request and its slot, never of the other
+    /// slots, so a request's chunks are the same alone and in a joint
+    /// prefill.
+    fn plan_chunk(
+        &self,
+        qwen: &Qwen35LoadedModel,
+        kv_cache: &HybridKvCache,
+        max_chunk_tokens: usize,
+        anchor_quota_headroom: Option<usize>,
+    ) -> Result<Qwen35PrefillChunk> {
+        anyhow::ensure!(
+            max_chunk_tokens > 0,
+            "Qwen35PrefillState::advance requires a non-zero chunk"
+        );
+        kv_cache
+            .validate_sequence_len_for_slot(
+                self.slot_id,
+                self.graft_len + self.next_token_index,
+            )
+            .context("validate Qwen35 slot cursors before bounded prefill")?;
+        let boundary_end = qwen35_next_prefill_end(
+            self.next_token_index,
+            self.prompt_tokens.len(),
+            max_chunk_tokens,
+            self.stable_prompt_prefix_tokens,
+        );
+        anyhow::ensure!(
+            boundary_end > self.next_token_index,
+            "Qwen35 bounded prefill has no suffix without cached logits"
+        );
+        // ADR-059: a bound graft skips the catch-up because the MTP
+        // arena never receives the graft (see `classify_slot_request`).
+        let mtp_runtime = qwen.model.mtp.is_some() && kv_cache.mtp_slot.is_some();
+        let graft_bound = qwen.model.kv_graft.is_some();
+        let dflash2_prefill = self.vision.is_none()
+            && self.graft_len == 0
+            && qwen.dflash2_lane_matches(self.slot_id, self.next_token_index);
+        let mtp_prefill = (self.cached_tokens == 0 || self.mtp_pending_hidden.is_some())
+            && !self.speculation_unavailable
+            && (super::qwen35_speculation::prefill_mtp_catchup_allowed(
+                qwen.speculation.policy(),
+                is_qwen_server_speculation_exact_eligible(&self.params),
+                self.vision.is_none(),
+                mtp_runtime,
+                graft_bound,
+            ) || shadow_draft::prefill_mtp_allowed(
+                self.vision.is_none(),
+                mtp_runtime,
+                graft_bound,
+            ));
+        // Cue fold: a chunk that ends at the stable prompt boundary takes
+        // the generation cue behind it into the same forward, which
+        // captures the boundary checkpoint itself.
+        let fold_prefix_rows = self.cue_fold_rows(
+            qwen,
+            kv_cache,
+            boundary_end,
+            dflash2_prefill,
+            mtp_prefill,
+            anchor_quota_headroom,
+        )?;
+        let end = if fold_prefix_rows.is_some() {
+            self.prompt_tokens.len()
+        } else {
+            boundary_end
+        };
+        Ok(Qwen35PrefillChunk {
+            chunk_start: self.next_token_index,
+            boundary_end,
+            end,
+            fold_prefix_rows,
+            dflash2_prefill,
+            mtp_prefill,
+        })
+    }
+
+    /// This request's next chunk when it can run in a joint prefill forward
+    /// ([`crate::inference::models::qwen35::prefill_joint`]), `None` when it
+    /// must run alone: a full cache hit, a vision or grafted request, the
+    /// MTP catch-up route, a recovery capture, or a one-row segment.
+    pub(crate) fn plan_joint_chunk(
+        &self,
+        qwen: &mut Qwen35LoadedModel,
+        kv_cache: &HybridKvCache,
+        max_chunk_tokens: usize,
+        anchor_quota_headroom: Option<usize>,
+    ) -> Result<Option<Qwen35PrefillChunk>> {
+        if self.cached_prefill_logits.is_some()
+            || self.vision.is_some()
+            || self.graft_len != 0
+            || max_chunk_tokens == 0
+            || kv_cache.la_capture_active()
+            || crate::debug::INVESTIGATION_ENV.chunk_scan_prefill
+        {
+            return Ok(None);
+        }
+        self.align_draft_lane(qwen)?;
+        let chunk = self.plan_chunk(qwen, kv_cache, max_chunk_tokens, anchor_quota_headroom)?;
+        let admitted = (chunk.dflash2_prefill || !chunk.mtp_prefill) && chunk.content_rows() >= 2;
+        Ok(admitted.then_some(chunk))
+    }
+
+    /// What a joint prefill needs to know of this request's chunk to choose
+    /// its lanes and the prefix they share.
+    pub(crate) fn joint_lane_shape(&self, chunk: &Qwen35PrefillChunk) -> Qwen35PrefillLaneShape<'_> {
+        Qwen35PrefillLaneShape {
+            tokens: &self.prompt_tokens[chunk.chunk_start..chunk.end],
+            content_rows: chunk.content_rows(),
+            // A cold slot: `begin` reset it, and nothing has run since.
+            cold: self.cached_tokens == 0 && chunk.chunk_start == 0 && self.graft_len == 0,
+            dflash2: chunk.dflash2_prefill,
+        }
+    }
+
+    /// Whether this request is a text first prompt of a conversation that
+    /// has not run a forward yet (nothing cached, a freshly reset slot): the
+    /// kind of request that can share its prompt prefix with others.
+    pub(crate) fn starts_cold(&self) -> bool {
+        self.cached_tokens == 0
+            && self.next_token_index == 0
+            && self.graft_len == 0
+            && self.vision.is_none()
+    }
+
+    /// Account for a completed prefill forward over `chunk` (alone or as a
+    /// lane of a joint forward): validate the cursors, advance the request,
+    /// and take the stable-boundary checkpoint the chunk reached. Returns
+    /// the tokens advanced and the checkpoint.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_chunk(
+        &mut self,
+        qwen: &Qwen35LoadedModel,
+        kv_cache: &mut HybridKvCache,
+        supervisor: &EngineSupervisor,
+        anchor_quota_headroom: Option<usize>,
+        chunk: &Qwen35PrefillChunk,
+        logits: &[f32],
+        folded_boundary: Option<(Vec<f32>, Result<HybridKvSlotAnchor>, Duration)>,
+        elapsed: Duration,
+        joint: Option<(usize, usize)>,
+    ) -> Result<(usize, Option<Qwen35StablePromptCheckpoint>)> {
+        let (chunk_start, boundary_end, end) = (chunk.chunk_start, chunk.boundary_end, chunk.end);
+        let (joint_lanes, joint_rows) = joint.unwrap_or((1, end - chunk_start));
+        kv_cache
+            .validate_sequence_len_for_slot(self.slot_id, self.graft_len + end)
+            .context("validate Qwen35 slot cursors after bounded prefill")?;
+        tracing::info!(
+            slot = self.slot_id.0,
+            chunk_start,
+            chunk_end = end,
+            chunk_tokens = end - chunk_start,
+            prompt_tokens = self.prompt_tokens.len(),
+            cue_tokens_folded = end - boundary_end,
+            elapsed_seconds = elapsed.as_secs_f64(),
+            joint_lanes,
+            joint_rows,
+            "Qwen35 bounded prefill chunk complete"
+        );
+        let advanced = end - self.next_token_index;
+        self.next_token_index = end;
+        let checkpoint = if let Some((boundary_logits, boundary, wall)) = folded_boundary {
+            // The folded forward took the checkpoint at the stable
+            // boundary itself; its quota was decided before the fold. A
+            // checkpoint that could not be assembled is counted, and
+            // skipped or fatal, exactly as a failed snapshot between two
+            // forwards is.
+            anchor_store::record_anchor_snapshot(wall);
+            match boundary {
+                Ok(kv) => {
+                    let spec = self
+                        .mtp_pending_hidden
+                        .as_ref()
+                        .map(|hidden| {
+                            qwen.model.with_gpu_cache_mut(|device, _registry| {
+                                anchor_store::owned_spec_boundary(device, boundary_end, hidden)
                             })
-                            .transpose()?;
-                        Some(Qwen35StablePromptCheckpoint {
-                            prompt_tokens: self.prompt_tokens[..boundary_end].to_vec(),
-                            kv,
-                            prefill_logits: boundary_logits,
-                            vision_fingerprint: self.params.vision_fingerprint,
-                            spec,
                         })
-                    }
+                        .transpose()?;
+                    Some(Qwen35StablePromptCheckpoint {
+                        prompt_tokens: self.prompt_tokens[..boundary_end].to_vec(),
+                        kv,
+                        prefill_logits: boundary_logits,
+                        vision_fingerprint: self.params.vision_fingerprint,
+                        spec,
+                    })
+                }
+                Err(error)
+                    if !supervisor.is_healthy()
+                        || super::engine::is_fatal_command_buffer_error(&error) =>
+                {
+                    return Err(error.context("capture Qwen35 stable prompt boundary"));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        slot = self.slot_id.0,
+                        error = %error,
+                        "Qwen35 stable prompt checkpoint capture skipped"
+                    );
+                    None
+                }
+            }
+        } else if self.stable_prompt_prefix_tokens == Some(end) {
+            let spec = self
+                .mtp_pending_hidden
+                .as_ref()
+                .map(|hidden| {
+                    qwen.model.with_gpu_cache_mut(|device, _registry| {
+                        anchor_store::owned_spec_boundary(device, end, hidden)
+                    })
+                })
+                .transpose()?;
+            let hidden_bytes = spec
+                .as_ref()
+                .map_or(0, |boundary| boundary.pending_target_hidden.data_byte_len());
+            let non_payload_bytes =
+                anchor_store::anchor_non_payload_bytes(end, logits.len(), hidden_bytes)?;
+            let payload_bytes = kv_cache.slot_anchor_image_bytes()?;
+            let capture_bytes = payload_bytes
+                .checked_add(non_payload_bytes)
+                .context("Qwen anchor capture-byte estimate overflow")?;
+            if anchor_quota_headroom.is_some_and(|headroom| capture_bytes > headroom) {
+                anchor_store::record_anchor_capture_skipped_quota();
+                tracing::warn!(
+                    slot = self.slot_id.0,
+                    capture_bytes,
+                    anchor_quota_headroom,
+                    "Qwen35 stable prompt checkpoint capture skipped before allocation: quota"
+                );
+                None
+            } else {
+                let snapshot_started = Instant::now();
+                let snapshot = (|| -> Result<_> {
+                    let lease = supervisor
+                        .arm("Qwen35 anchor snapshot", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
+                    let kv = kv_cache.snapshot_slot_anchor(self.slot_id, self.graft_len + end);
+                    lease.finish()?;
+                    kv
+                })();
+                anchor_store::record_anchor_snapshot(snapshot_started.elapsed());
+                match snapshot {
+                    Ok(kv) => Some(Qwen35StablePromptCheckpoint {
+                        prompt_tokens: self.prompt_tokens[..end].to_vec(),
+                        // ADR-059: the anchor's boundary is the physical cursor;
+                        // plan/apply rewinds to it and the graft rows below it
+                        // remain intact under the append-only contract.
+                        kv,
+                        prefill_logits: logits.to_vec(),
+                        vision_fingerprint: self.params.vision_fingerprint,
+                        spec,
+                    }),
                     Err(error)
                         if !supervisor.is_healthy()
                             || super::engine::is_fatal_command_buffer_error(&error) =>
@@ -4803,77 +5689,24 @@ impl Qwen35PrefillState {
                         None
                     }
                 }
-            } else if self.stable_prompt_prefix_tokens == Some(end) {
-                let spec = self
-                    .mtp_pending_hidden
-                    .as_ref()
-                    .map(|hidden| {
-                        qwen.model.with_gpu_cache_mut(|device, _registry| {
-                            anchor_store::owned_spec_boundary(device, end, hidden)
-                        })
-                    })
-                    .transpose()?;
-                let hidden_bytes = spec
-                    .as_ref()
-                    .map_or(0, |boundary| boundary.pending_target_hidden.data_byte_len());
-                let non_payload_bytes =
-                    anchor_store::anchor_non_payload_bytes(end, logits.len(), hidden_bytes)?;
-                let payload_bytes = kv_cache.slot_anchor_image_bytes()?;
-                let capture_bytes = payload_bytes
-                    .checked_add(non_payload_bytes)
-                    .context("Qwen anchor capture-byte estimate overflow")?;
-                if anchor_quota_headroom.is_some_and(|headroom| capture_bytes > headroom) {
-                    anchor_store::record_anchor_capture_skipped_quota();
-                    tracing::warn!(
-                        slot = self.slot_id.0,
-                        capture_bytes,
-                        anchor_quota_headroom,
-                        "Qwen35 stable prompt checkpoint capture skipped before allocation: quota"
-                    );
-                    None
-                } else {
-                    let snapshot_started = Instant::now();
-                    let snapshot = (|| -> Result<_> {
-                        let lease = supervisor
-                            .arm("Qwen35 anchor snapshot", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
-                        let kv = kv_cache.snapshot_slot_anchor(self.slot_id, self.graft_len + end);
-                        lease.finish()?;
-                        kv
-                    })();
-                    anchor_store::record_anchor_snapshot(snapshot_started.elapsed());
-                    match snapshot {
-                        Ok(kv) => Some(Qwen35StablePromptCheckpoint {
-                            prompt_tokens: self.prompt_tokens[..end].to_vec(),
-                            // ADR-059: the anchor's boundary is the physical cursor;
-                            // plan/apply rewinds to it and the graft rows below it
-                            // remain intact under the append-only contract.
-                            kv,
-                            prefill_logits: logits.clone(),
-                            vision_fingerprint: self.params.vision_fingerprint,
-                            spec,
-                        }),
-                        Err(error)
-                            if !supervisor.is_healthy()
-                                || super::engine::is_fatal_command_buffer_error(&error) =>
-                        {
-                            return Err(error.context("capture Qwen35 stable prompt boundary"));
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                slot = self.slot_id.0,
-                                error = %error,
-                                "Qwen35 stable prompt checkpoint capture skipped"
-                            );
-                            None
-                        }
-                    }
-                }
-            } else {
-                None
-            };
-            (logits, mtp_hidden, advanced, checkpoint)
+            }
+        } else {
+            None
         };
+        Ok((advanced, checkpoint))
+    }
 
+    /// Hand the request on after a prefill transaction: still prefilling,
+    /// or ready to decode from the last row's logits.
+    fn into_advance(
+        mut self,
+        qwen: &mut Qwen35LoadedModel,
+        registration: Option<&ModelRegistration>,
+        prefill_logits: Vec<f32>,
+        mtp_hidden: Option<MlxBuffer>,
+        advanced_tokens: usize,
+        checkpoint: Option<Qwen35StablePromptCheckpoint>,
+    ) -> Result<Qwen35PrefillAdvance> {
         if self.next_token_index < self.prompt_tokens.len() {
             return Ok(Qwen35PrefillAdvance::Pending {
                 state: self,
@@ -4910,6 +5743,7 @@ impl Qwen35PrefillState {
             checkpoint,
         })
     }
+
 
     pub(crate) fn f2_forward_ready(&self) -> bool {
         self.next_token_index < self.prompt_tokens.len()
@@ -5092,6 +5926,9 @@ mod prefill_fold_scheduler_tests;
 #[cfg(test)]
 #[path = "engine_qwen35/round_slot_independence_tests.rs"]
 mod round_slot_independence_tests;
+#[cfg(test)]
+#[path = "engine_qwen35/request_device_tests.rs"]
+mod request_device_tests;
 #[path = "engine_qwen35/shadow_draft.rs"]
 mod shadow_draft;
 #[cfg(test)]
@@ -7137,16 +7974,6 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
 
     let is_greedy = is_greedy_eligible(params);
 
-    let device = match MlxDevice::new() {
-        Ok(d) => d,
-        Err(e) => {
-            send!(GenerationEvent::Error(format!(
-                "qwen35 stream slot-aware: MlxDevice::new failed: {e}"
-            )));
-            return;
-        }
-    };
-    let _ = &device; // sampling helpers don't need the device handle
 
     // Per-slot reset at entry — persistent cache may carry stale bytes
     // from a prior request on this slot.
@@ -7816,7 +8643,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
     };
     let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
 
-    let device = MlxDevice::new()
+    let device = RequestDevice::new(supervisor)
         .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate w/ soft tokens): {e}"))?;
     let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_len, max_tokens)?;
 
@@ -7994,6 +8821,10 @@ pub(super) fn generate_qwen35_once_with_soft_tokens(
         &generated_tokens,
     );
 
+    // Before the result is reported: the request's queue is settled under
+    // the engine's supervision, and a failure is this request's failure.
+    device.settle()?;
+
     Ok(GenerationResult {
         text: content,
         reasoning_text,
@@ -8067,7 +8898,7 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
     };
     let mut grammar_runtime = grammar_runtime_for_request(params, registration)?;
 
-    let device = MlxDevice::new()
+    let device = RequestDevice::new(supervisor)
         .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 vision generate): {e}"))?;
     let (mut kv_cache, cache_reused) = take_serial_kv_cache(qwen, &device, prompt_len, max_tokens)?;
 
@@ -8319,6 +9150,10 @@ pub(super) fn generate_qwen35_once_with_soft_tokens_and_deepstack(
         &generated_tokens,
     );
 
+    // Before the result is reported: the request's queue is settled under
+    // the engine's supervision, and a failure is this request's failure.
+    device.settle()?;
+
     Ok(GenerationResult {
         text: content,
         reasoning_text,
@@ -8510,7 +9345,7 @@ pub(super) fn generate_stream_qwen35_once_extended(
     }
 
     let cache_alloc_start = Instant::now();
-    let device = match MlxDevice::new() {
+    let device = match RequestDevice::new(supervisor) {
         Ok(d) => d,
         Err(e) => {
             return Err(e).context("Qwen35 SerialFifo streaming device initialization");
@@ -9627,6 +10462,11 @@ pub(super) fn generate_stream_qwen35_once_extended(
         "Qwen35 request complete"
     );
 
+    // Before `Done`: the request's queue is settled under the engine's
+    // supervision, and a failure is this request's failure.
+    device
+        .settle()
+        .context("Qwen35 SerialFifo streaming request")?;
     send!(GenerationEvent::Done {
         finish_reason,
         prompt_tokens: prompt_len,
@@ -9655,13 +10495,13 @@ pub(super) fn embed_qwen35(
         !prompt_tokens.is_empty(),
         "embed_qwen35: empty prompt_tokens"
     );
-    let device =
-        MlxDevice::new().map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 embed): {e}"))?;
+    let device = RequestDevice::new(supervisor)
+        .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 embed): {e}"))?;
     // For embeddings we don't need decode budget; pass max_tokens=0 to
     // size the cache to just the prompt.
     let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_tokens.len(), 0)?;
     let positions = prefill_positions_for(prompt_tokens.len());
-    supervised_gpu_call(supervisor, "qwen35_serial_embed", || {
+    let embedding = supervised_gpu_call(supervisor, "qwen35_serial_embed", || {
         qwen.model
             // ADR-040 Phase B4b (2026-05-24): embed-last is single-stream
             // chat-as-embedder; slot 0 preserves pre-B4b behaviour. The
@@ -9670,7 +10510,10 @@ pub(super) fn embed_qwen35(
             // can pass SlotId(N) directly.
             .forward_embed_last(prompt_tokens, &positions, &mut kv_cache, SlotId(0))
             .context("Qwen35Model::forward_embed_last")
-    })
+    })?;
+    drop(kv_cache);
+    device.settle()?;
+    Ok(embedding)
 }
 
 /// **ADR-040 iter-C2d-cont-kernel iter-3 (2026-05-30)** — slot-aware
@@ -10627,6 +11470,204 @@ mod tests {
         tool.observe_generated(&[11], true);
         assert!(tool.closed);
         assert_eq!(tool.next_forced_token(), None);
+    }
+
+    fn lane_shape(tokens: &[u32], content_rows: usize, cold: bool) -> Qwen35PrefillLaneShape<'_> {
+        Qwen35PrefillLaneShape {
+            tokens,
+            content_rows,
+            cold,
+            dflash2: true,
+        }
+    }
+
+    /// `rows` tokens: `common` from the shared prompt prefix, the rest the
+    /// lane's own.
+    fn lane_tokens(lane: u32, common: usize, rows: usize) -> Vec<u32> {
+        (0..rows)
+            .map(|row| if row < common { 7 + row as u32 } else { 100_000 * (lane + 1) + row as u32 })
+            .collect()
+    }
+
+    #[test]
+    fn joint_prefill_cohort_is_the_longest_fifo_run_that_fits_the_row_budget() {
+        let chunks: Vec<Vec<u32>> = (0..4).map(|lane| lane_tokens(lane, 0, 725)).collect();
+        let shapes: Vec<_> = chunks.iter().map(|tokens| lane_shape(tokens, 720, true)).collect();
+        // Nothing in common: 725 rows per lane.
+        let cohort = |max_rows| qwen35_prefill_cohort(&shapes, max_rows, true, Qwen35PrefillJoin::Every);
+        assert_eq!(cohort(4_096).map(|c| (c.lanes, c.rows, c.shared_rows)), Some((4, 2_900, 0)));
+        assert_eq!(cohort(2_048).map(|c| (c.lanes, c.rows, c.shared_rows)), Some((2, 1_450, 0)));
+        assert_eq!(cohort(1_449), None, "one lane is the solo step");
+        assert_eq!(qwen35_prefill_cohort(&shapes[..1], 4_096, true, Qwen35PrefillJoin::Every), None);
+        // A lane on another forward route ends the run.
+        let mut mixed: Vec<_> = chunks.iter().map(|tokens| lane_shape(tokens, 720, true)).collect();
+        mixed[2].dflash2 = false;
+        assert_eq!(qwen35_prefill_cohort(&mixed, 4_096, true, Qwen35PrefillJoin::Every).map(|c| c.lanes), Some(2));
+        mixed[1].dflash2 = false;
+        assert_eq!(qwen35_prefill_cohort(&mixed, 4_096, true, Qwen35PrefillJoin::Every), None);
+    }
+
+    #[test]
+    fn joint_prefill_shares_only_an_identical_prefix_of_cold_lanes() {
+        // The four-agent first turn: 444 of 725 tokens in common.
+        let chunks: Vec<Vec<u32>> = (0..4).map(|lane| lane_tokens(lane, 444, 725)).collect();
+        let shapes: Vec<_> = chunks.iter().map(|tokens| lane_shape(tokens, 720, true)).collect();
+        let cohort = qwen35_prefill_cohort(&shapes, 2_048, true, Qwen35PrefillJoin::Every).expect("cohort");
+        assert_eq!(
+            (cohort.lanes, cohort.shared_rows, cohort.rows),
+            (4, 444, 444 + 4 * 281)
+        );
+        assert_eq!(cohort.sharing, vec![true; 4]);
+        // Sharing is what lets all four fit the budget.
+        let unshared = qwen35_prefill_cohort(&shapes, 2_048, false, Qwen35PrefillJoin::Every).expect("cohort");
+        assert_eq!((unshared.lanes, unshared.shared_rows, unshared.rows), (2, 0, 1_450));
+
+        // A resumed lane never shares, whatever its tokens.
+        let mut warm: Vec<_> = chunks.iter().map(|tokens| lane_shape(tokens, 720, true)).collect();
+        warm[1].cold = false;
+        let cohort = qwen35_prefill_cohort(&warm, 4_096, true, Qwen35PrefillJoin::Every).expect("cohort");
+        assert_eq!(cohort.sharing, vec![true, false, true, true]);
+        assert_eq!(cohort.rows, 444 + 725 + 3 * 281);
+
+        // One differing token ends the common prefix there.
+        let mut other = chunks[1].clone();
+        other[100] += 1;
+        let differing = [lane_shape(&chunks[0], 720, true), lane_shape(&other, 720, true)];
+        let cohort = qwen35_prefill_cohort(&differing, 4_096, true, Qwen35PrefillJoin::Every).expect("cohort");
+        assert_eq!((cohort.shared_rows, cohort.sharing.clone()), (100, vec![true, true]));
+
+        // Every sharing lane keeps two content rows of its own: a lane whose
+        // content is the prefix itself caps it; a prefix under one row tile
+        // is not shared at all.
+        let short = [lane_shape(&chunks[0], 720, true), lane_shape(&chunks[1][..446], 446, true)];
+        let cohort = qwen35_prefill_cohort(&short, 4_096, true, Qwen35PrefillJoin::Every).expect("cohort");
+        assert_eq!(cohort.shared_rows, 444);
+        let shorter = [lane_shape(&chunks[0], 720, true), lane_shape(&chunks[1][..300], 300, true)];
+        let cohort = qwen35_prefill_cohort(&shorter, 4_096, true, Qwen35PrefillJoin::Every).expect("cohort");
+        assert_eq!(cohort.shared_rows, 298);
+        let tiny: Vec<Vec<u32>> = (0..2).map(|lane| lane_tokens(lane, 31, 200)).collect();
+        let tiny_shapes = [lane_shape(&tiny[0], 200, true), lane_shape(&tiny[1], 200, true)];
+        let cohort = qwen35_prefill_cohort(&tiny_shapes, 4_096, true, Qwen35PrefillJoin::Every).expect("cohort");
+        assert_eq!((cohort.shared_rows, cohort.rows), (0, 400));
+
+        // Two groups: the prefix that saves the most rows wins (two lanes
+        // sharing 444 rows save 444; three sharing 100 rows save 200).
+        let a = lane_tokens(0, 444, 725);
+        let b = lane_tokens(1, 444, 725);
+        let mut c = lane_tokens(2, 444, 725);
+        c[100] += 1;
+        let groups = [lane_shape(&a, 720, true), lane_shape(&b, 720, true), lane_shape(&c, 720, true)];
+        let cohort = qwen35_prefill_cohort(&groups, 4_096, true, Qwen35PrefillJoin::Every).expect("cohort");
+        assert_eq!((cohort.shared_rows, cohort.sharing.clone()), (444, vec![true, true, false]));
+    }
+
+    #[test]
+    fn joint_prefill_cheap_policy_joins_short_chunks_and_shared_first_prompts_only() {
+        let cheap = Qwen35PrefillJoin::Cheap { small_rows: 32 };
+        let lanes = |shapes: &[Qwen35PrefillLaneShape<'_>], join| {
+            qwen35_prefill_cohort(shapes, 2_048, true, join).map(|c| (c.lanes, c.rows, c.shared_rows))
+        };
+        // Resumed chunks of the four-agent workload: a 162-row head.
+        let rows: Vec<Vec<u32>> = [162usize, 162, 31, 5]
+            .iter()
+            .enumerate()
+            .map(|(lane, &rows)| lane_tokens(lane as u32, 0, rows))
+            .collect();
+        let resumed = |order: &[usize]| -> Vec<Qwen35PrefillLaneShape<'_>> {
+            order
+                .iter()
+                .map(|&lane| lane_shape(&rows[lane], rows[lane].len(), false))
+                .collect()
+        };
+        // A mid-size lane behind the head keeps its own step ...
+        assert_eq!(lanes(&resumed(&[0, 1, 2, 3]), cheap), None);
+        assert_eq!(lanes(&resumed(&[0, 1, 2, 3]), Qwen35PrefillJoin::Every), Some((4, 360, 0)));
+        // ... a chunk of at most one row tile joins, behind any head ...
+        assert_eq!(lanes(&resumed(&[0, 2, 3]), cheap), Some((3, 198, 0)));
+        assert_eq!(lanes(&resumed(&[3, 2]), cheap), Some((2, 36, 0)));
+        // ... and the run ends at the first lane that does not: no lane is
+        // served ahead of an earlier one.
+        assert_eq!(lanes(&resumed(&[0, 2, 1, 3]), cheap), Some((2, 193, 0)));
+        assert_eq!(lanes(&resumed(&[2, 0, 3]), cheap), None);
+        // 33 rows is past one tile.
+        let over = lane_tokens(7, 0, 33);
+        let pair = [lane_shape(&rows[0], 162, false), lane_shape(&over, 33, false)];
+        assert_eq!(lanes(&pair, cheap), None);
+
+        // First prompts: the ones that start with the head's join it.
+        let first: Vec<Vec<u32>> = (0..4).map(|lane| lane_tokens(lane, 444, 725)).collect();
+        let cold: Vec<_> = first.iter().map(|tokens| lane_shape(tokens, 720, true)).collect();
+        assert_eq!(lanes(&cold, cheap), Some((4, 444 + 4 * 281, 444)));
+        // A first prompt with another beginning does not, and ends the run.
+        let stranger = lane_tokens(9, 0, 725);
+        let mixed = [
+            lane_shape(&first[0], 720, true),
+            lane_shape(&stranger, 720, true),
+            lane_shape(&first[1], 720, true),
+        ];
+        assert_eq!(lanes(&mixed, cheap), None);
+        assert_eq!(lanes(&mixed, Qwen35PrefillJoin::Every), Some((3, 444 + 281 + 725 + 281, 444)));
+        // A lane that starts with fewer of the head's tokens than the cohort
+        // shares would run all its rows: the cohort stops before it.
+        let mut early = lane_tokens(2, 444, 725);
+        early[100] += 1;
+        let partial = [
+            lane_shape(&first[0], 720, true),
+            lane_shape(&first[1], 720, true),
+            lane_shape(&early, 720, true),
+        ];
+        assert_eq!(lanes(&partial, cheap), Some((2, 444 + 2 * 281, 444)));
+        assert_eq!(
+            lanes(&partial, Qwen35PrefillJoin::Every),
+            Some((3, 444 + 2 * 281 + 725, 444))
+        );
+        // A common beginning shorter than one tile is not a shared prefix.
+        let brief: Vec<Vec<u32>> = (0..2).map(|lane| lane_tokens(lane, 31, 200)).collect();
+        let brief_shapes = [lane_shape(&brief[0], 200, true), lane_shape(&brief[1], 200, true)];
+        assert_eq!(lanes(&brief_shapes, cheap), None);
+        // Without sharing, a shared beginning is no reason to join.
+        assert_eq!(
+            qwen35_prefill_cohort(&cold, 2_048, false, cheap),
+            None,
+            "first prompts join for their shared rows only"
+        );
+    }
+
+    #[test]
+    fn first_prompts_gather_only_while_a_slot_is_free_and_nothing_else_runs() {
+        use Qwen35GatherSlot::{Busy, FirstPrompt, Free};
+        let gather = |slots: &[Qwen35GatherSlot]| qwen35_first_prompts_may_gather(slots.iter().copied());
+        assert!(gather(&[FirstPrompt, Free, Free, Free]));
+        assert!(gather(&[Free, FirstPrompt, FirstPrompt, FirstPrompt]));
+        // Every slot holds a first prompt: nobody else can come.
+        assert!(!gather(&[FirstPrompt; 4]));
+        // An idle worker has nothing to gather.
+        assert!(!gather(&[Free; 4]));
+        // A decoding slot, or a prefill that is not a waiting first prompt,
+        // is never made to wait.
+        assert!(!gather(&[FirstPrompt, Busy, Free, Free]));
+        assert!(!gather(&[Busy, Free, Free, Free]));
+        assert!(!gather(&[]));
+    }
+
+    #[test]
+    fn joint_prefill_policy_follows_the_ffn_kind_and_bounds_a_transaction_beside_decoders() {
+        let dense = Qwen35JointPrefillPolicy::for_worker(false, 2_048);
+        assert_eq!(
+            dense.join,
+            Qwen35PrefillJoin::Cheap {
+                small_rows: QWEN35_JOINT_PREFILL_SMALL_ROWS
+            }
+        );
+        assert_eq!((dense.idle_rows, dense.decode_rows), (2_048, 512));
+        assert_eq!(dense.cold_gather, Duration::from_millis(25));
+        assert!(dense.prefill_first);
+        let moe = Qwen35JointPrefillPolicy::for_worker(true, 2_048);
+        assert_eq!(moe.join, Qwen35PrefillJoin::Every);
+        assert_eq!((moe.idle_rows, moe.decode_rows), (2_048, 512));
+        // A worker with a smaller transaction ceiling keeps it.
+        let small = Qwen35JointPrefillPolicy::for_worker(true, 256);
+        assert_eq!((small.idle_rows, small.decode_rows), (256, 256));
     }
 
     #[test]
@@ -12172,6 +13213,8 @@ mod tests {
             // construction shape; iter-2a always leaves this `None`.
             persistent_kv_cache: None,
             dflash2: None,
+            dflash2_plan: None,
+            routes: route_profile::current(),
             speculation: crate::serve::api::qwen35_speculation::QwenSpeculationController::new(
                 crate::serve::api::qwen35_speculation::QwenSpeculationPolicy::Off,
             ),

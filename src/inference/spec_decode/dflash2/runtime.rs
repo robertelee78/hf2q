@@ -13,6 +13,8 @@ use super::{
         dispatch_dflash2_context_commit, dispatch_dflash2_context_commit_at,
         dispatch_dflash2_forward, dispatch_dflash2_lane_ingest, prepare_decode_positions,
     },
+    route_profile,
+    proposal_repetition::{self, DraftRepetitionPrior},
     schema::{DFlash2CheckpointDescriptor, DFlash2FamilyAdapter},
     selector::dispatch_dflash2_selection,
     staged::{reads_prepared_head, resolve_staged_draft, DFLASH2_DRAFT_STAGED_ENV},
@@ -31,18 +33,18 @@ use mlx_native::{
 };
 
 const GPU_TARGET_TOKENS_ENV: &str = "HF2Q_DFLASH2_GPU_TARGET_TOKENS";
+const PROPOSAL_REPETITION_ENV: &str = "HF2Q_DFLASH2_PROPOSAL_REPETITION";
 
 fn resolve_gpu_target_tokens(
     descriptor: &DFlash2CheckpointDescriptor,
     raw: Option<&str>,
 ) -> Result<bool> {
-    let qualified = descriptor.family_adapter == DFlash2FamilyAdapter::QwenDense;
     let supported = matches!(
         descriptor.family_adapter,
         DFlash2FamilyAdapter::QwenDense | DFlash2FamilyAdapter::QwenMoe
     );
     match raw {
-        None => Ok(qualified),
+        None => Ok(false),
         Some("0" | "off" | "false") => Ok(false),
         Some("1" | "on" | "true") if supported => Ok(true),
         Some("1" | "on" | "true") => bail!(
@@ -138,6 +140,7 @@ struct DraftInputs {
     /// [`DFlash2Runtime::budget_epoch`] when the command was encoded: the
     /// GPU row selection of an adaptive target reads the verify budget.
     budget_epoch: u64,
+    repetition: Option<DraftRepetitionPrior>,
 }
 
 impl DraftInputs {
@@ -155,6 +158,7 @@ impl DraftInputs {
         uniforms: &[f32],
         wait: bool,
         budget_epoch: u64,
+        repetition: Option<&DraftRepetitionPrior>,
     ) -> bool {
         let same_bits = |bits: &[u32], values: &[f32]| {
             bits.len() == values.len()
@@ -166,6 +170,7 @@ impl DraftInputs {
         self.wait == wait
             && self.sampling_mask == sampling_mask
             && self.budget_epoch == budget_epoch
+            && self.repetition.as_ref() == repetition
             && self.anchors == anchors
             && self.logical_positions == logical_positions
             && self.maximum_verify_rows == maximum_verify_rows
@@ -204,6 +209,7 @@ pub struct DFlash2Runtime {
     lane_bindings: Vec<DFlash2LaneBinding>,
     verify_budget: DFlash2VerifyBudget,
     gpu_target_tokens: bool,
+    proposal_repetition_enabled: bool,
     /// The next step's draft, when the previous step committed it
     /// ([`Self::prefetch_draft`]). While it is `Some` the command may be
     /// executing: it reads the rings and writes the draft outputs of the
@@ -234,6 +240,21 @@ impl DFlash2Runtime {
         target: &T,
         lanes: usize,
     ) -> Result<Self> {
+        crate::inference::route_host::require_explicit(device)?;
+        const PRIOR: route_profile::Switch = route_profile::switch(PROPOSAL_REPETITION_ENV);
+        let proposal_repetition_enabled = route_profile::with_value(PRIOR, |raw| {
+            crate::inference::models::qwen35::joint_step_options::parse_switch(
+                PROPOSAL_REPETITION_ENV,
+                raw,
+            )
+        })
+        .map_err(anyhow::Error::msg)?;
+        ensure!(
+            !proposal_repetition_enabled
+                || descriptor.family_adapter == DFlash2FamilyAdapter::QwenDense,
+            "{PROPOSAL_REPETITION_ENV} is not supported for adapter {:?}",
+            descriptor.family_adapter
+        );
         let config_bytes = std::fs::read(config_path.as_ref())
             .with_context(|| format!("read DFlash2 config {}", config_path.as_ref().display()))?;
         let config = descriptor
@@ -251,21 +272,21 @@ impl DFlash2Runtime {
             .context("validate DFlash2 tensor manifest")?;
         let tensors = DFlash2ModelTensors::upload(device, &config, &weights)
             .context("upload DFlash2 tensors")?;
-        let staged = resolve_staged_draft(
-            std::env::var(DFLASH2_DRAFT_STAGED_ENV).ok().as_deref(),
-            &config,
-            &tensors,
-            lanes,
-        )?;
+        const STAGED: route_profile::Switch = route_profile::switch(DFLASH2_DRAFT_STAGED_ENV);
+        const GPU_TARGET_TOKENS: route_profile::Switch =
+            route_profile::switch(GPU_TARGET_TOKENS_ENV);
+        let staged = route_profile::with_value(STAGED, |raw| {
+            resolve_staged_draft(raw, &config, &tensors, lanes)
+        })?;
         let workspace = DFlash2Workspace::new(device, &config, lanes, staged)
             .context("allocate DFlash2 workspace")?;
-        let gpu_target_tokens = resolve_gpu_target_tokens(
-            descriptor,
-            std::env::var(GPU_TARGET_TOKENS_ENV).ok().as_deref(),
-        )?;
+        let gpu_target_tokens = route_profile::with_value(GPU_TARGET_TOKENS, |raw| {
+            resolve_gpu_target_tokens(descriptor, raw)
+        })?;
         tracing::info!(
             checkpoint = descriptor.id,
             gpu_target_tokens,
+            proposal_repetition_enabled,
             staged_draft = staged,
             "DFlash2 transaction policy resolved"
         );
@@ -281,6 +302,7 @@ impl DFlash2Runtime {
                 .collect(),
             verify_budget: DFlash2VerifyBudget::default(),
             gpu_target_tokens,
+            proposal_repetition_enabled,
             prefetched: None,
             prefetch_counts: DraftPrefetchCounts::default(),
             budget_epoch: 0,
@@ -290,6 +312,10 @@ impl DFlash2Runtime {
 
     pub(crate) fn gpu_target_tokens(&self) -> bool {
         self.gpu_target_tokens
+    }
+
+    pub(crate) fn proposal_repetition_enabled(&self) -> bool {
+        self.proposal_repetition_enabled
     }
 
     /// Execute one physical anchor-plus-seven-proposal graph for every slot
@@ -306,6 +332,7 @@ impl DFlash2Runtime {
         sampling_mask: u32,
         maximum_verify_rows: &[u32],
         uniforms: &[f32],
+        repetition: Option<&DraftRepetitionPrior>,
     ) -> Result<()> {
         let target_lane_order = (0..self.workspace.max_lanes as u32).collect::<Vec<_>>();
         self.run_draft_inner(
@@ -321,6 +348,7 @@ impl DFlash2Runtime {
             uniforms,
             true,
             false,
+            repetition,
         )
     }
 
@@ -341,6 +369,7 @@ impl DFlash2Runtime {
         maximum_verify_rows: &[u32],
         target_lane_order: &[u32],
         uniforms: &[f32],
+        repetition: Option<&DraftRepetitionPrior>,
     ) -> Result<()> {
         self.run_draft_inner(
             device,
@@ -355,6 +384,7 @@ impl DFlash2Runtime {
             uniforms,
             false,
             false,
+            repetition,
         )
     }
 
@@ -373,7 +403,13 @@ impl DFlash2Runtime {
         uniforms: &[f32],
         wait: bool,
         prefetch: bool,
+        repetition: Option<&DraftRepetitionPrior>,
     ) -> Result<()> {
+        let repetition = if self.proposal_repetition_enabled {
+            repetition
+        } else {
+            None
+        };
         let lanes = self.workspace.max_lanes;
         let proposals = self.config.proposal_tokens();
         ensure!(
@@ -405,6 +441,7 @@ impl DFlash2Runtime {
                     uniforms,
                     wait,
                     self.budget_epoch,
+                    repetition,
                 )
             {
                 // The command this call would encode is already on the
@@ -454,6 +491,18 @@ impl DFlash2Runtime {
             vocabulary_head,
             &mut self.workspace,
         )?;
+        if let Some(prior) = repetition {
+            proposal_repetition::encode(
+                &mut encoder,
+                registry,
+                device,
+                &self.workspace.logits,
+                lanes,
+                self.config.block_size,
+                self.config.vocab_size,
+                prior,
+            )?;
+        }
         let verify_model = if !wait && target.adaptive_verify_budget() {
             Some(self.verify_budget.model(target_lane_order.len())?)
         } else {
@@ -495,6 +544,7 @@ impl DFlash2Runtime {
                 uniform_bits: uniforms.iter().map(|value| value.to_bits()).collect(),
                 wait,
                 budget_epoch: self.budget_epoch,
+                repetition: repetition.copied(),
             };
             self.prefetched = Some(PrefetchedDraft { inputs, encoder });
         }
@@ -530,6 +580,7 @@ impl DFlash2Runtime {
         target_lane_order: &[u32],
         uniforms: &[f32],
         host_tokens: bool,
+        repetition: Option<&DraftRepetitionPrior>,
     ) -> Result<()> {
         let every_lane;
         let target_lane_order = if host_tokens {
@@ -551,6 +602,7 @@ impl DFlash2Runtime {
             uniforms,
             host_tokens,
             true,
+            repetition,
         )
     }
 
@@ -717,6 +769,23 @@ impl DFlash2Runtime {
         logical_start: usize,
         rows: std::ops::Range<usize>,
     ) -> Result<()> {
+        self.ingest_target_capture_runs(device, registry, capture, lane, logical_start, &[rows])
+    }
+
+    /// [`Self::ingest_target_capture_rows`] for rows that are not contiguous
+    /// in the capture: the runs `rows`, appended in order as one chunk. A
+    /// joint prefill forward holds a lane's shared prefix rows and its own
+    /// rows apart; the lane appends them exactly as its own forward's
+    /// capture, which holds them side by side.
+    pub fn ingest_target_capture_runs(
+        &mut self,
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        capture: &DFlashCaptureSession,
+        lane: usize,
+        logical_start: usize,
+        rows: &[std::ops::Range<usize>],
+    ) -> Result<()> {
         ensure!(
             lane < self.workspace.max_lanes,
             "DFlash2 capture lane {lane} is out of range"
@@ -727,7 +796,7 @@ impl DFlash2Runtime {
             "DFlash2 capture starts at {logical_start}, lane {lane} is at {}",
             self.lane_lengths[lane]
         );
-        let appended = rows.len();
+        let appended: usize = rows.iter().map(|run| run.len()).sum();
         ingest_capture_lane_passes(
             device,
             registry,
@@ -1135,7 +1204,8 @@ impl DFlash2Runtime {
     }
 }
 
-/// Append capture rows `rows` to `lane`'s rings at `logical_start`.
+/// Append the capture rows of the runs `rows`, in order, to `lane`'s rings
+/// at `logical_start`.
 ///
 /// A decode commit carries `block_size` rows of every lane, so appending a
 /// prefill capture through it projects `block_size` rows per pass over the
@@ -1156,7 +1226,7 @@ pub(super) fn ingest_capture_lane_passes(
     capture: &DFlashCaptureSession,
     lane: usize,
     logical_start: usize,
-    rows: std::ops::Range<usize>,
+    rows: &[std::ops::Range<usize>],
 ) -> Result<()> {
     ensure!(
         capture.target_layer_ids == config.target_layer_ids,
@@ -1168,15 +1238,15 @@ pub(super) fn ingest_capture_lane_passes(
     let hidden = capture.hidden_size;
     let feature_width = config.fc_input_dim();
     ensure!(
-        rows.start <= rows.end
-            && rows.end <= capture.seq_len
+        rows.iter()
+            .all(|run| run.start <= run.end && run.end <= capture.seq_len)
             && layers * hidden == feature_width
             && capture.hidden_output.len() == layers * capture.seq_len * hidden,
         "DFlash2 capture rows {rows:?} of a {}-row, {layers}-layer, {hidden}-wide capture \
          do not fit the checkpoint's {feature_width}-wide context",
         capture.seq_len
     );
-    let appended = rows.len();
+    let appended: usize = rows.iter().map(|run| run.len()).sum();
     if appended == 0 {
         return Ok(());
     }
@@ -1199,7 +1269,7 @@ pub(super) fn ingest_capture_lane_passes(
     )?;
     {
         let staged = captured.as_mut_slice::<f32>()?;
-        for (index, row) in rows.clone().enumerate() {
+        for (index, row) in rows.iter().flat_map(|run| run.clone()).enumerate() {
             for layer in 0..layers {
                 let source = (layer * capture.seq_len + row) * hidden;
                 let destination = (index * layers + layer) * hidden;
@@ -1276,6 +1346,10 @@ mod context_commit_tests;
 mod draft_prefetch_tests;
 
 #[cfg(test)]
+#[path = "joint_capture_tests.rs"]
+mod joint_capture_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::inference::models::qwen35::model::Qwen35Model;
@@ -1301,8 +1375,8 @@ mod tests {
     }
 
     #[test]
-    fn gpu_target_token_policy_defaults_for_qualified_dense_qwen() {
-        assert!(resolve_gpu_target_tokens(&QWEN38_DFLASH2, None).unwrap());
+    fn gpu_target_token_policy_respects_kill_switch_and_refuses_invalid_values() {
+        assert!(!resolve_gpu_target_tokens(&QWEN38_DFLASH2, None).unwrap());
         assert!(!resolve_gpu_target_tokens(&QWEN36_DFLASH2, None).unwrap());
         assert!(!resolve_gpu_target_tokens(&QWEN38_DFLASH2, Some("0")).unwrap());
         assert!(resolve_gpu_target_tokens(&QWEN36_DFLASH2, Some("1")).unwrap());
@@ -1390,6 +1464,7 @@ mod tests {
                     0,
                     &[8],
                     &[0.5; 7],
+                    None,
                 )?;
                 ensure!(
                     runtime
@@ -1570,17 +1645,15 @@ mod tests {
                         let lengths = runtime.lane_lengths().to_vec();
                         let positions: Vec<u32> =
                             lengths.iter().map(|length| *length as u32).collect();
-                        runtime.run_draft(
-                            device,
-                            registry,
-                            &adapter,
-                            &vec![1; lanes],
-                            &positions,
-                            &vec![0.0; lanes],
-                            0,
-                            &vec![8; lanes],
-                            &vec![0.5; lanes * proposals],
-                        )?;
+                        runtime.run_draft(device,
+                        registry,
+                        &adapter,
+                        &vec![1; lanes],
+                        &positions,
+                        &vec![0.0; lanes],
+                        0,
+                        &vec![8; lanes],
+                        &vec![0.5; lanes * proposals], None)?;
                         Ok((
                             after_chunks,
                             lengths,
@@ -1854,17 +1927,15 @@ mod tests {
                         );
                     }
 
-                    runtime.run_draft(
-                        device,
-                        registry,
-                        &adapter,
-                        &anchors,
-                        &positions,
-                        &vec![0.0; lanes],
-                        0,
-                        &vec![8; lanes],
-                        &vec![0.5; lanes * config.proposal_tokens()],
-                    )?;
+                    runtime.run_draft(device,
+                    registry,
+                    &adapter,
+                    &anchors,
+                    &positions,
+                    &vec![0.0; lanes],
+                    0,
+                    &vec![8; lanes],
+                    &vec![0.5; lanes * config.proposal_tokens()], None)?;
 
                     let expected_hidden = float_values(fixture.tensor("output.final_hidden")?);
                     let hidden_delta = max_abs(

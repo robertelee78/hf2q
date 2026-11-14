@@ -18,35 +18,117 @@
 //! and keep their kernels.
 
 use std::cell::Cell;
-use std::sync::LazyLock;
 
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType, MlxBuffer};
 
-use super::joint_step_options::{parse_switch, switch_from_process};
+use super::joint_step_options::parse_switch;
+use crate::inference::spec_decode::dflash2::route_profile;
 
-/// Switch, default off: `1`/`on`/`true` routes prompt-prefill chunks through
-/// the prepared row-tile MM.
+/// Switch: `1`/`on`/`true` routes prompt-prefill chunks through the prepared
+/// row-tile MM. On in the route profile of a qualified DFlash2 pair, off for
+/// every other artifact; an explicit value wins either way.
 pub(crate) const QWEN_PREFILL_PREPARED_ENV: &str = "HF2Q_QWEN_PREFILL_PREPARED";
 
-static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    switch_from_process(QWEN_PREFILL_PREPARED_ENV).unwrap_or_else(|error| {
-        tracing::warn!(
-            error,
-            fallback = false,
-            "invalid Qwen prepared-prefill switch"
-        );
-        false
+/// The switch as resolved for the model this thread serves. An invalid value
+/// warns once and keeps the route off.
+pub(crate) fn enabled() -> bool {
+    const SWITCH: route_profile::Switch = route_profile::switch(QWEN_PREFILL_PREPARED_ENV);
+    route_profile::with_value(SWITCH, |raw| parse_switch(QWEN_PREFILL_PREPARED_ENV, raw))
+        .unwrap_or_else(|error| {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    error,
+                    fallback = false,
+                    "invalid Qwen prepared-prefill switch"
+                );
+            });
+            false
+        })
+}
+
+/// Layers between host waits of a prompt-prefill chunk of more than 32 rows,
+/// `1` (default) to `8`.
+///
+/// The layer loop of a large chunk waits for the GPU after every layer, which
+/// bounds how long a Metal fault goes unobserved; the GPU then idles while
+/// the host encodes the next layer. With a value above 1 a layer's command
+/// buffer is committed without a wait and the host waits once per that many
+/// layers, so the GPU runs a layer while the host encodes the next one. A
+/// layer whose output the host copies (a DFlash2 target layer, a calibration
+/// capture) still waits, and so does the last layer. The dispatches, their
+/// order and their operands do not change, so neither does any bit.
+pub(crate) const QWEN_PREFILL_WAIT_LAYERS_ENV: &str = "HF2Q_QWEN_PREFILL_WAIT_LAYERS";
+
+/// Longest stretch of layers a large prefill chunk may run without a wait:
+/// the cadence chunks of at most 32 rows already have.
+pub(crate) const MAX_WAIT_LAYERS: usize = 8;
+
+/// [`QWEN_PREFILL_WAIT_LAYERS_ENV`] as an operator wrote it: unset or blank
+/// is 1, anything outside `1..=MAX_WAIT_LAYERS` is an error.
+pub(crate) fn parse_wait_layers(raw: Option<&str>) -> Result<usize, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(1),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|layers| (1..=MAX_WAIT_LAYERS).contains(layers))
+            .ok_or_else(|| {
+                format!(
+                    "{QWEN_PREFILL_WAIT_LAYERS_ENV} must be 1..={MAX_WAIT_LAYERS}, got {value:?}"
+                )
+            }),
+    }
+}
+
+fn resolved_wait_layers() -> usize {
+    const SWITCH: route_profile::Switch = route_profile::switch(QWEN_PREFILL_WAIT_LAYERS_ENV);
+    route_profile::with_value(SWITCH, parse_wait_layers).unwrap_or_else(|error| {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(error, fallback = 1, "invalid Qwen prefill wait-layers value");
+        });
+        1
     })
-});
+}
 
 thread_local! {
     static SCOPE: Cell<bool> = const { Cell::new(false) };
+    static WAIT: Cell<usize> = const { Cell::new(1) };
+    /// The wait cadence [`PrefillScope::forced`] opens its scopes with.
+    #[cfg(test)]
+    static FORCED_WAIT: Cell<usize> = const { Cell::new(1) };
+}
+
+/// While alive, the scopes [`PrefillScope::forced`] opens on this thread
+/// wait every `wait_layers` layers, so a gate written against the forced
+/// route can be repeated at another cadence.
+#[cfg(test)]
+pub(crate) struct ForcedWaitLayers {
+    previous: usize,
+}
+
+#[cfg(test)]
+impl ForcedWaitLayers {
+    pub(crate) fn set(wait_layers: usize) -> Self {
+        Self {
+            previous: FORCED_WAIT.with(|cell| cell.replace(wait_layers)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcedWaitLayers {
+    fn drop(&mut self) {
+        FORCED_WAIT.with(|cell| cell.set(self.previous));
+    }
 }
 
 /// Marks this thread's forward as a prompt-prefill chunk until dropped.
 pub(crate) struct PrefillScope {
     previous: bool,
+    previous_wait: usize,
 }
 
 impl PrefillScope {
@@ -54,20 +136,21 @@ impl PrefillScope {
     pub(crate) fn enter() -> Self {
         #[cfg(test)]
         if let Some(switches) = SwitchesForTest::current() {
-            return Self::with_route(switches.prepared);
+            return Self::with(switches.prepared, switches.wait_layers);
         }
-        Self::with_route(*ENABLED)
+        Self::with(enabled(), resolved_wait_layers())
     }
 
     /// Open the scope with the route forced on or off, whatever the switch.
     #[cfg(test)]
     pub(crate) fn forced(route: bool) -> Self {
-        Self::with_route(route)
+        Self::with(route, FORCED_WAIT.with(Cell::get))
     }
 
-    fn with_route(route: bool) -> Self {
+    fn with(route: bool, wait_layers: usize) -> Self {
         Self {
             previous: SCOPE.with(|cell| cell.replace(route)),
+            previous_wait: WAIT.with(|cell| cell.replace(wait_layers)),
         }
     }
 }
@@ -75,7 +158,328 @@ impl PrefillScope {
 impl Drop for PrefillScope {
     fn drop(&mut self) {
         SCOPE.with(|cell| cell.set(self.previous));
+        WAIT.with(|cell| cell.set(self.previous_wait));
     }
+}
+
+/// Pooled scratch a forward that skips host waits
+/// ([`QWEN_PREFILL_WAIT_LAYERS_ENV`] above 1) may have out when a layer
+/// ends without a wait. The worker's scratch pool takes its buffers back
+/// only at a host wait, so layers that do not wait accumulate theirs; a
+/// layer that ends with more than this out waits. This is a threshold, not
+/// a cap: the layer that crosses it has already allocated, so between two
+/// host waits up to this plus that one layer's scratch is out.
+pub(crate) const WAIT_LAYERS_WINDOW_SCRATCH_BYTES: usize = 1 << 30;
+
+/// Free bytes the pool keeps at a reset once a joint forward or a forward
+/// that skips host waits has run: above it the reset releases the free
+/// buffers.
+pub(crate) const PREFILL_RETAINED_SCRATCH_BYTES: usize = 2 << 30;
+
+/// What the pool may hold at any time while a joint forward or a forward
+/// that skips host waits runs, and until the reset after it. Checked before
+/// every pooled allocation ([`super::decode_pool::cap_pool`]): a request
+/// that could take the pool over it is served by a plain buffer that is
+/// released at the next host wait. A hard cap, so it holds for every model
+/// geometry, slot count, shared-prefix layout and sequence of forwards.
+pub(crate) const PREFILL_POOL_CAP_BYTES: usize =
+    PREFILL_RETAINED_SCRATCH_BYTES + WAIT_LAYERS_WINDOW_SCRATCH_BYTES;
+
+#[cfg(test)]
+thread_local! {
+    /// Test override: (window threshold, pool caps).
+    static SCRATCH_CAPS_FOR_TEST: Cell<Option<(usize, super::decode_pool::PoolCaps)>> =
+        const { Cell::new(None) };
+}
+
+/// [`WAIT_LAYERS_WINDOW_SCRATCH_BYTES`] (a test may lower it).
+pub(crate) fn window_scratch_threshold() -> usize {
+    #[cfg(test)]
+    if let Some((window, _)) = SCRATCH_CAPS_FOR_TEST.with(Cell::get) {
+        return window;
+    }
+    WAIT_LAYERS_WINDOW_SCRATCH_BYTES
+}
+
+/// The pool caps of a joint forward and of a forward that skips host waits
+/// (a test may lower them).
+pub(crate) fn prefill_pool_caps() -> super::decode_pool::PoolCaps {
+    #[cfg(test)]
+    if let Some((_, caps)) = SCRATCH_CAPS_FOR_TEST.with(Cell::get) {
+        return caps;
+    }
+    super::decode_pool::PoolCaps {
+        pool: PREFILL_POOL_CAP_BYTES,
+        retained: PREFILL_RETAINED_SCRATCH_BYTES,
+    }
+}
+
+/// Until dropped, this thread's forwards run under this window threshold
+/// and these pool caps instead of the constants.
+#[cfg(test)]
+pub(crate) struct ScratchCapsForTest {
+    previous: Option<(usize, super::decode_pool::PoolCaps)>,
+}
+
+#[cfg(test)]
+impl ScratchCapsForTest {
+    pub(crate) fn set(window: usize, retained: usize, pool: usize) -> Self {
+        let caps = super::decode_pool::PoolCaps { pool, retained };
+        Self {
+            previous: SCRATCH_CAPS_FOR_TEST.with(|cell| cell.replace(Some((window, caps)))),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScratchCapsForTest {
+    fn drop(&mut self) {
+        SCRATCH_CAPS_FOR_TEST.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Upper bound of the scratch one layer of a prompt-prefill forward on the
+/// prepared route requests from the worker's scratch pool (bucket bytes,
+/// whether the pool or a plain buffer serves them), for a forward of
+/// `forward_rows` rows over `lanes` slots.
+///
+/// Derived from the requests the prepared route makes (`pooled_alloc_buffer`
+/// call sites; a buffer of `n` bytes occupies the power of two it rounds up
+/// to, at most `2n`, which is exact for the single-call terms and the
+/// factor on the per-segment sums):
+/// - A DeltaNet layer runs its projections once over all rows `R`: the BF16
+///   copy of the normed input (`2Rh`), the fused alpha/beta logits
+///   (`4R·ab`, `ab` = 2·heads rounded up to 64), their two halves
+///   (`4R·heads` each), the BF16 copy of the gated values (`2R·z`,
+///   `z` = value heads × value head dim) and the output projection (`4Rh`).
+/// - A full-attention layer is built per slot and segment; a segment of `r`
+///   rows requests the BF16 input copy (`2rh`), the fused query/gate
+///   projection (`4r·2q`, `q` = heads × head dim), the BF16 copy of the gated
+///   attention output (`2rq`), the output projection (`4rh`) and the
+///   attention output (`4rq`); a segment of at most 32 rows on the direct TQ
+///   route adds its tile scratch (`4·32·32·heads·(head dim + 2)` at 32 rows)
+///   and two row-id lists. A lane's segments cover its own rows and its
+///   private copy of a shared prefix, at most `R` rows per lane, and at most
+///   two of them are short (a short content chunk and the cue). A forward
+///   with segments also requests the joined attention output (`4Rh`).
+/// - The dense FFN requests the BF16 copies of its input (`2Rh`) and of its
+///   hidden activations (`2Rm`); the MoE FFN the shared expert's output
+///   (`4rh`) per call: one call over the long segments' rows and one per
+///   short segment.
+/// - Outside the layers, in the same window: the token embedding when it is
+///   not gathered natively (`4Rh`) and, per slot, two output-head norm rows.
+///
+/// It holds for the prepared route (`HF2Q_QWEN_PREFILL_PREPARED`, every
+/// projection of the layer on the prepared kernel, per-forward arenas),
+/// which is the route joint forwards and the served profiles run; the
+/// legacy routes request other scratch and are not covered. The forward
+/// checks every layer against it and reports a layer that exceeds it
+/// (`decode_pool::note_layer_scratch`).
+pub(crate) fn prefill_layer_scratch_bound_bytes(
+    cfg: &super::Qwen35Config,
+    forward_rows: usize,
+    lanes: usize,
+) -> u64 {
+    let bucket = |bytes: u64| bytes.max(1).next_power_of_two();
+    let rows = forward_rows as u64;
+    let lanes = lanes.max(1) as u64;
+    let lane_rows = rows * lanes;
+    let h = u64::from(cfg.hidden_size);
+    let heads = u64::from(cfg.num_attention_heads);
+    let head_dim = u64::from(cfg.head_dim);
+    let q = heads * head_dim;
+    let value_heads = u64::from(cfg.linear_num_value_heads);
+    let z = value_heads * u64::from(cfg.linear_value_head_dim);
+    let ab = u64::from(super::prepared_projection::alpha_beta_rows(cfg.linear_num_value_heads));
+    let short_segments = 2 * lanes;
+    let attention = 2 * lane_rows * (2 * h + 8 * q + 2 * q + 4 * h + 4 * q)
+        + short_segments * (bucket(4 * 32 * 32 * heads * (head_dim + 2)) + 2 * bucket(4 * 32))
+        + bucket(4 * rows * h);
+    let delta_net = bucket(2 * rows * h)
+        + bucket(4 * rows * ab)
+        + 2 * bucket(4 * rows * value_heads)
+        + bucket(2 * rows * z)
+        + bucket(4 * rows * h);
+    let ffn = match cfg.intermediate_size {
+        Some(m) => bucket(2 * rows * h) + bucket(2 * rows * u64::from(m)),
+        None => 2 * 4 * h * (rows + 32 * short_segments),
+    };
+    let outside = bucket(4 * rows * h) + 2 * lanes * (bucket(4 * h) + bucket(8));
+    attention.max(delta_net) + ffn + outside
+}
+
+/// Upper bound of the per-forward buffers a joint forward of at most
+/// `forward_rows` rows over `slots` slots allocates beside the pool, on a
+/// cache of `kv_rows` rows per slot. A single slot's forward allocates one
+/// set of attention arenas for its rows; a joint forward allocates, for the
+/// life of the forward (plain device buffers, exact sizes):
+/// - per slot and segment of `r` rows the attention projection arena
+///   (`4r(h + 5q + 4kv)`: normed input, Q, gate, normed Q, rotated Q, gated
+///   output at `q` = heads × head dim; K, V, normed K, rotated K at
+///   `kv` = KV heads × head dim), the attention prefill arena
+///   (`r(6q + 8kv)`: three BF16 Q-sized and four KV-sized buffers) and the
+///   segment's positions (`16r`); a lane's segments cover at most all
+///   `forward_rows` rows (its own and its private copy of a shared prefix);
+/// - per slot one resume scratch for a resumed segment of more than 32
+///   rows: the dequantized history K and V in F32 and BF16
+///   (`12·kv` per attended row, at most `kv_rows`) and the F32 output
+///   (`4rq`);
+/// - per slot the gathered rows of a segment behind a shared prefix
+///   (`4rh`);
+/// - on a MoE model the forward-wide FFN arena and one per short segment
+///   (two per slot at most, 32 rows): per row `8k + 12k·m + 4k·h + 12·ms +
+///   4·experts + 4` with `k` experts per row;
+/// - the DeltaNet run scratch: one convolution and one recurrent state for
+///   the shared prefix and one convolution state per slot.
+/// The slots' stable-boundary checkpoints are not in this figure: each slot
+/// holds its own under the anchor store's quota with and without the switch.
+pub(crate) fn joint_arena_bound_bytes(
+    cfg: &super::Qwen35Config,
+    forward_rows: usize,
+    slots: usize,
+    kv_rows: usize,
+) -> u64 {
+    let rows = forward_rows as u64;
+    let slots = slots.max(1) as u64;
+    let lane_rows = rows * slots;
+    let h = u64::from(cfg.hidden_size);
+    let q = u64::from(cfg.num_attention_heads) * u64::from(cfg.head_dim);
+    let kv = u64::from(cfg.num_key_value_heads) * u64::from(cfg.head_dim);
+    let attention = lane_rows * (4 * (h + 5 * q + 4 * kv) + 6 * q + 8 * kv + 16);
+    let resume = slots * 12 * kv * kv_rows as u64 + 4 * q * lane_rows;
+    let gather = 4 * h * lane_rows;
+    let moe = cfg.moe.as_ref().map_or(0, |moe| {
+        let k = u64::from(moe.num_experts_per_tok);
+        let per_row = 8 * k
+            + 12 * k * u64::from(moe.moe_intermediate_size)
+            + 4 * k * h
+            + 12 * u64::from(moe.shared_expert_intermediate_size)
+            + 4 * u64::from(moe.num_experts)
+            + 4;
+        (rows + 2 * slots * 32) * per_row
+    });
+    let channels = 2 * u64::from(cfg.linear_num_key_heads) * u64::from(cfg.linear_key_head_dim)
+        + u64::from(cfg.linear_num_value_heads) * u64::from(cfg.linear_value_head_dim);
+    let conv_state = 4 * channels * u64::from(cfg.linear_conv_kernel_dim.saturating_sub(1));
+    let recurrent_state = 4
+        * u64::from(cfg.linear_key_head_dim)
+        * u64::from(cfg.linear_value_head_dim)
+        * u64::from(cfg.linear_num_value_heads);
+    let delta_net = (1 + slots) * conv_state + recurrent_state;
+    // Page rounding and the parameter blocks of at most 64 buffers per slot.
+    let slack = slots * 64 * 16 * 1024;
+    attention + resume + gather + moe + delta_net + slack
+}
+
+/// Upper bound of what a worker holds for `HF2Q_QWEN_PREFILL_JOINT`
+/// forwards of at most `forward_rows` rows over `slots` slots on a cache of
+/// `kv_rows` rows per slot: what the pool keeps at a reset
+/// ([`PREFILL_RETAINED_SCRATCH_BYTES`], enforced), one layer's requests
+/// ([`prefill_layer_scratch_bound_bytes`], derived) and the forward's own
+/// buffers ([`joint_arena_bound_bytes`], derived). Absolute: nothing of the
+/// default route is subtracted.
+pub(crate) fn joint_scratch_bound_bytes(
+    cfg: &super::Qwen35Config,
+    forward_rows: usize,
+    slots: usize,
+    kv_rows: usize,
+) -> u64 {
+    PREFILL_RETAINED_SCRATCH_BYTES as u64
+        + prefill_layer_scratch_bound_bytes(cfg, forward_rows, slots)
+        + joint_arena_bound_bytes(cfg, forward_rows, slots, kv_rows)
+}
+
+/// Upper bound of the scratch a worker holds for forwards of at most
+/// `forward_rows` rows over `lanes` slots under
+/// `HF2Q_QWEN_PREFILL_WAIT_LAYERS=wait_layers`: what the pool keeps at a
+/// reset, what a window may have out when its last layer starts
+/// ([`WAIT_LAYERS_WINDOW_SCRATCH_BYTES`], enforced) and that layer's
+/// requests (derived); 0 at the default cadence. A forward that skips host
+/// waits allocates no per-forward buffer a waiting forward does not. With
+/// the joint switch on as well, this figure with the joint forward's rows
+/// and slots plus [`joint_arena_bound_bytes`] covers both: the caps are one
+/// pool's, not one per switch.
+pub(crate) fn wait_layers_scratch_bound_bytes(
+    cfg: &super::Qwen35Config,
+    forward_rows: usize,
+    lanes: usize,
+    wait_layers: usize,
+) -> u64 {
+    if wait_layers > 1 {
+        (PREFILL_RETAINED_SCRATCH_BYTES + WAIT_LAYERS_WINDOW_SCRATCH_BYTES) as u64
+            + prefill_layer_scratch_bound_bytes(cfg, forward_rows, lanes)
+    } else {
+        0
+    }
+}
+
+/// What memory admission charges a worker for `HF2Q_QWEN_PREFILL_JOINT`
+/// (`joint`) and `HF2Q_QWEN_PREFILL_WAIT_LAYERS` (`wait_layers`) together:
+/// the two switches cap one pool, so their figures do not add.
+/// `forward_rows`: the worker's per-transaction row ceiling
+/// (`qwen35_slot_prefill_chunk_tokens(slots)` in the engine); `kv_rows`:
+/// the rows a slot's cache can hold (the resolved context length).
+/// - neither: 0;
+/// - joint alone: [`joint_scratch_bound_bytes`];
+/// - wait layers alone: [`wait_layers_scratch_bound_bytes`] for one lane (a
+///   forward without the joint switch serves one slot);
+/// - both: [`wait_layers_scratch_bound_bytes`] for the joint forward's slots
+///   plus [`joint_arena_bound_bytes`].
+pub(crate) fn prefill_switch_scratch_bound_bytes(
+    cfg: &super::Qwen35Config,
+    forward_rows: usize,
+    slots: usize,
+    kv_rows: usize,
+    joint: bool,
+    wait_layers: usize,
+) -> u64 {
+    match (joint, wait_layers > 1) {
+        (false, false) => 0,
+        (true, false) => joint_scratch_bound_bytes(cfg, forward_rows, slots, kv_rows),
+        (false, true) => wait_layers_scratch_bound_bytes(cfg, forward_rows, 1, wait_layers),
+        (true, true) => {
+            wait_layers_scratch_bound_bytes(cfg, forward_rows, slots, wait_layers)
+                + joint_arena_bound_bytes(cfg, forward_rows, slots, kv_rows)
+        }
+    }
+}
+
+/// Layers between host waits for a chunk of more than 32 rows on this
+/// thread: the operator's value inside a prompt-prefill scope, 1 outside.
+pub(crate) fn wait_layers() -> usize {
+    WAIT.with(Cell::get)
+}
+
+thread_local! {
+    static SINGLE_COMMAND_LAYERS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// While alive, the layer builders of this thread's forward keep every
+/// stage of a layer in the encoder session's open command buffer instead of
+/// committing each stage on its own. The layer loop sets it for a forward
+/// that submits one command buffer per layer
+/// ([`QWEN_PREFILL_WAIT_LAYERS_ENV`] above 1).
+pub(crate) struct SingleCommandLayers {
+    previous: bool,
+}
+
+impl SingleCommandLayers {
+    pub(crate) fn set(on: bool) -> Self {
+        Self {
+            previous: SINGLE_COMMAND_LAYERS.with(|cell| cell.replace(on)),
+        }
+    }
+}
+
+impl Drop for SingleCommandLayers {
+    fn drop(&mut self) {
+        SINGLE_COMMAND_LAYERS.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Whether this thread's forward keeps a layer in one command buffer.
+pub(crate) fn single_command_layers() -> bool {
+    SINGLE_COMMAND_LAYERS.with(Cell::get)
 }
 
 /// The prompt-prefill switches of a SlotAware Qwen worker.
@@ -83,6 +487,11 @@ impl Drop for PrefillScope {
 pub(crate) struct PrefillSwitches {
     pub(crate) prepared: bool,
     pub(crate) fold_cue: bool,
+    pub(crate) joint: bool,
+    /// Layers between host waits of a chunk of more than 32 rows.
+    pub(crate) wait_layers: usize,
+    /// Whether a decoding worker keeps the prefill-only weights fresh.
+    pub(crate) keep_fresh: bool,
 }
 
 #[cfg(test)]
@@ -123,16 +532,27 @@ impl Drop for SwitchesForTest {
 /// keep their promise. With the chunk-scan DeltaNet investigation route on,
 /// alpha and beta would stay on the stock kernel beside prepared qkv, gate
 /// and output, and a row's bits would depend on whether its chunk is a
-/// multiple of 64 rows. The cue fold is exact only on the prepared kernels.
+/// multiple of 64 rows. The cue fold and the joint prefill are exact only on
+/// the prepared kernels.
 pub(crate) fn resolve_switches(
     prepared: Option<&str>,
     fold_cue: Option<&str>,
+    joint: Option<&str>,
+    wait_layers: Option<&str>,
+    keep_fresh: Option<&str>,
     chunk_scan_prefill: bool,
 ) -> Result<PrefillSwitches, String> {
     use super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV;
+    use super::prefill_joint::QWEN_PREFILL_JOINT_ENV;
     let switches = PrefillSwitches {
         prepared: parse_switch(QWEN_PREFILL_PREPARED_ENV, prepared)?,
         fold_cue: parse_switch(QWEN_PREFILL_FOLD_CUE_ENV, fold_cue)?,
+        joint: parse_switch(QWEN_PREFILL_JOINT_ENV, joint)?,
+        wait_layers: parse_wait_layers(wait_layers)?,
+        keep_fresh: parse_switch(
+            super::prefill_keep_fresh::QWEN_PREFILL_KEEP_FRESH_ENV,
+            keep_fresh,
+        )?,
     };
     if switches.prepared && chunk_scan_prefill {
         return Err(format!(
@@ -145,6 +565,18 @@ pub(crate) fn resolve_switches(
             "{QWEN_PREFILL_FOLD_CUE_ENV} requires {QWEN_PREFILL_PREPARED_ENV}"
         ));
     }
+    if switches.joint && !switches.prepared {
+        return Err(format!(
+            "{QWEN_PREFILL_JOINT_ENV} requires {QWEN_PREFILL_PREPARED_ENV}"
+        ));
+    }
+    // A forward skips host waits only on the prepared route: its scratch
+    // bound is derived for that route alone.
+    if switches.wait_layers > 1 && !switches.prepared {
+        return Err(format!(
+            "{QWEN_PREFILL_WAIT_LAYERS_ENV} above 1 requires {QWEN_PREFILL_PREPARED_ENV}"
+        ));
+    }
     Ok(switches)
 }
 
@@ -154,19 +586,40 @@ pub(crate) fn resolve_switches(
 pub(crate) fn switches_or_refusal(
     prepared: Option<&str>,
     fold_cue: Option<&str>,
+    joint: Option<&str>,
+    wait_layers: Option<&str>,
+    keep_fresh: Option<&str>,
     chunk_scan_prefill: bool,
 ) -> anyhow::Result<PrefillSwitches> {
-    resolve_switches(prepared, fold_cue, chunk_scan_prefill)
-        .map_err(|cause| anyhow::anyhow!("Qwen prompt prefill switches: {cause}"))
+    resolve_switches(
+        prepared,
+        fold_cue,
+        joint,
+        wait_layers,
+        keep_fresh,
+        chunk_scan_prefill,
+    )
+    .map_err(|cause| anyhow::anyhow!("Qwen prompt prefill switches: {cause}"))
 }
 
-/// The switches of this process, read strictly. Called before a Qwen model
-/// is loaded, so a mistyped value is refused before the load is paid for.
+/// Whether this thread's forward runs in a prefill scope with the prepared
+/// route on.
+pub(crate) fn route_in_scope() -> bool {
+    SCOPE.with(Cell::get)
+}
+
+/// The switches as resolved for the model this thread loads or serves, read
+/// strictly. Called before a Qwen model is loaded, so a mistyped value is
+/// refused before the load is paid for.
 pub(crate) fn switches_from_process() -> anyhow::Result<PrefillSwitches> {
-    let read = |name: &str| std::env::var(name).ok();
+    let routes = route_profile::current();
+    let read = |name| routes.value(route_profile::switch(name));
     switches_or_refusal(
-        read(QWEN_PREFILL_PREPARED_ENV).as_deref(),
-        read(super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV).as_deref(),
+        read(QWEN_PREFILL_PREPARED_ENV),
+        read(super::prefill_fold::QWEN_PREFILL_FOLD_CUE_ENV),
+        read(super::prefill_joint::QWEN_PREFILL_JOINT_ENV),
+        read(QWEN_PREFILL_WAIT_LAYERS_ENV),
+        read(super::prefill_keep_fresh::QWEN_PREFILL_KEEP_FRESH_ENV),
         crate::debug::INVESTIGATION_ENV.chunk_scan_prefill,
     )
 }
@@ -180,6 +633,9 @@ pub(crate) fn validate_at_worker_start() -> anyhow::Result<PrefillSwitches> {
         target: "hf2q::serve::api::engine_qwen35::progress",
         prepared = switches.prepared,
         fold_cue = switches.fold_cue,
+        joint = switches.joint,
+        wait_layers = switches.wait_layers,
+        keep_fresh = switches.keep_fresh,
         "Qwen prompt prefill configuration"
     );
     Ok(switches)
@@ -194,7 +650,12 @@ fn shape_admitted(ggml_type: GgmlType, in_features: u32, out_features: u32) -> b
 
 /// Whether this product of a multi-row prefill chunk takes the prepared
 /// route: the scope is open with the route on, the weight is a raw GGML block
-/// matrix, and the prepared kernel serves its shape.
+/// matrix, the prepared kernel serves its shape, and this host's GPU runs
+/// the prepared kernels ([`super::gpu_ffn::prepared_mm_runs`]). The host is
+/// asked here, at every decision, not when the scope opens: a scope opened
+/// before the host was probed must not admit a product the host cannot run.
+/// The cue fold asks this for every shared product, so it keeps its two
+/// forwards on such a host.
 pub(crate) fn admits(
     rows: u32,
     weight: &MlxBuffer,
@@ -206,12 +667,12 @@ pub(crate) fn admits(
         && SCOPE.with(Cell::get)
         && weight.dtype() == DType::U8
         && shape_admitted(ggml_type, in_features, out_features)
+        && super::gpu_ffn::prepared_mm_runs()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::models::qwen35::joint_step_options::parse_switch;
     use mlx_native::MlxDevice;
 
     #[test]
@@ -226,20 +687,73 @@ mod tests {
 
     #[test]
     fn worker_start_rejects_invalid_values_and_combinations_that_break_a_promise() {
-        let resolve = |prepared, fold, chunk_scan| resolve_switches(prepared, fold, chunk_scan);
+        let resolve =
+            |prepared, fold, chunk_scan| resolve_switches(prepared, fold, None, None, None, chunk_scan);
         assert_eq!(
             resolve(None, None, false),
             Ok(PrefillSwitches {
                 prepared: false,
-                fold_cue: false
+                fold_cue: false,
+                joint: false,
+                wait_layers: 1,
+                keep_fresh: false
             })
         );
         assert_eq!(
             resolve(Some("1"), Some("on"), false),
             Ok(PrefillSwitches {
                 prepared: true,
-                fold_cue: true
+                fold_cue: true,
+                joint: false,
+                wait_layers: 1,
+                keep_fresh: false
             })
+        );
+        assert_eq!(
+            resolve_switches(Some("1"), None, Some("1"), Some("4"), Some("1"), false),
+            Ok(PrefillSwitches {
+                prepared: true,
+                fold_cue: false,
+                joint: true,
+                wait_layers: 4,
+                keep_fresh: true
+            })
+        );
+        // The keep-alive reads weights; it does not depend on a route.
+        assert_eq!(
+            resolve_switches(None, None, None, None, Some("on"), false).map(|s| s.keep_fresh),
+            Ok(true)
+        );
+        assert!(
+            resolve_switches(Some("1"), None, None, None, Some("250"), false).is_err(),
+            "invalid keep-fresh value"
+        );
+        // A forward skips host waits only on the prepared route.
+        assert_eq!(
+            resolve_switches(Some("1"), None, None, Some("8"), None, false).map(|s| s.wait_layers),
+            Ok(8)
+        );
+        assert_eq!(
+            resolve_switches(None, None, None, Some("1"), None, false).map(|s| s.wait_layers),
+            Ok(1)
+        );
+        assert!(
+            resolve_switches(None, None, None, Some("8"), None, false).is_err(),
+            "wait layers without prepared"
+        );
+        for invalid in ["0", "9", "on", "-1"] {
+            assert!(
+                resolve_switches(Some("1"), None, None, Some(invalid), None, false).is_err(),
+                "wait layers {invalid}"
+            );
+        }
+        assert!(
+            resolve_switches(None, None, Some("1"), None, None, false).is_err(),
+            "joint without prepared"
+        );
+        assert!(
+            resolve_switches(Some("1"), None, Some("lanes"), None, None, false).is_err(),
+            "invalid joint value"
         );
         // The stock route may run beside the chunk-scan investigation route.
         assert!(resolve(None, None, true).is_ok());
@@ -275,7 +789,7 @@ mod tests {
         ] {
             assert!(resolve(prepared, fold, chunk_scan).is_err(), "{what}");
             // What the spawn path prints is the outer message alone.
-            let printed = switches_or_refusal(prepared, fold, chunk_scan)
+            let printed = switches_or_refusal(prepared, fold, None, None, None, chunk_scan)
                 .expect_err(what)
                 .to_string();
             assert!(
@@ -291,6 +805,9 @@ mod tests {
         let on = PrefillSwitches {
             prepared: true,
             fold_cue: true,
+            joint: false,
+            wait_layers: 1,
+            keep_fresh: false,
         };
         {
             let _switches = SwitchesForTest::set(on);
@@ -306,7 +823,35 @@ mod tests {
     }
 
     #[test]
+    fn wait_layers_default_to_one_and_apply_only_inside_a_scope() {
+        assert_eq!(parse_wait_layers(None), Ok(1));
+        assert_eq!(parse_wait_layers(Some(" ")), Ok(1));
+        assert_eq!(parse_wait_layers(Some("4")), Ok(4));
+        assert_eq!(parse_wait_layers(Some("8")), Ok(8));
+        assert_eq!(wait_layers(), 1, "no scope");
+        {
+            let _scope = PrefillScope::forced(true);
+            assert_eq!(wait_layers(), 1, "a forced scope waits every layer");
+            {
+                let _cadence = ForcedWaitLayers::set(4);
+                assert_eq!(wait_layers(), 1, "an open scope keeps its cadence");
+                let _inner = PrefillScope::forced(true);
+                assert_eq!(wait_layers(), 4, "an inner scope overrides");
+            }
+            assert_eq!(wait_layers(), 1, "restored on drop");
+        }
+        assert_eq!(wait_layers(), 1, "closed");
+        {
+            let _cadence = ForcedWaitLayers::set(8);
+            assert_eq!(wait_layers(), 1, "the cadence applies inside a scope only");
+        }
+    }
+
+    #[test]
     fn route_is_admitted_only_inside_a_routed_scope_for_prepared_shapes() {
+        use crate::inference::route_host::HostForTest;
+        // The rule itself, on a host that runs the prepared kernels.
+        let _host = HostForTest::with_tensor_api();
         let device = MlxDevice::new().expect("device");
         let blocks = device
             .alloc_buffer(64, DType::U8, vec![64])
@@ -347,6 +892,16 @@ mod tests {
                 assert!(!q4k(157), "an inner scope overrides");
             }
             assert!(q4k(157), "restored on drop");
+            // The host is asked at every decision: a scope that was opened
+            // with the route on admits nothing once the host is known not
+            // to run the prepared kernels.
+            {
+                let _incapable = HostForTest::without_tensor_api();
+                assert!(!q4k(157), "a host without the prepared kernels");
+                let _reopened = PrefillScope::forced(true);
+                assert!(!q4k(157), "whatever scope is opened there");
+            }
+            assert!(q4k(157), "the host is restored on drop");
         }
         assert!(!q4k(157), "closed");
     }

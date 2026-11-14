@@ -56,6 +56,12 @@ struct Packet {
     /// Decode dense/lm-head kernel the process must resolve; absent = Stock.
     #[serde(default)]
     decode_dense_kernel: super::gemma_actual::DecodeDenseKernel,
+    /// Decode attention head split the loaded model must resolve; absent = Stock.
+    #[serde(default)]
+    decode_attn_ne: super::gemma_actual::DecodeAttnNe,
+    /// Q5_0 tensor matmul the model's registries must have frozen; absent = false.
+    #[serde(default)]
+    q5_0_tensor_mm: bool,
 }
 fn all128() -> Vec<usize> {
     vec![128]
@@ -359,7 +365,15 @@ fn q1_gemma_actual_stage_localizer() {
             .unwrap();
     let decode_dense_kernel = super::gemma_actual::require_decode_dense_kernel(
         packet.decode_dense_kernel,
-        crate::inference::models::gemma4::decode_dense::resolve().unwrap(),
+        crate::inference::models::gemma4::decode_dense::resolve().unwrap().value,
+    )
+    .unwrap();
+    let decode_attn_ne =
+        super::gemma_actual::require_decode_attn_ne(packet.decode_attn_ne, model.weights.decode_attn_ne)
+            .unwrap();
+    let q5_0_tensor_mm = super::gemma_actual::require_q5_0_tensor_mm(
+        packet.q5_0_tensor_mm,
+        model.ctx.ggml_routing_policy().q5_0_tensor_mm,
     )
     .unwrap();
     acquisition_scope
@@ -459,6 +473,7 @@ fn q1_gemma_actual_stage_localizer() {
     );
     let evidence = serde_json::json!({"schema":"hf2q.adr063.q1.stage-localizer.v1","packet_sha256":hash(&raw),"rerun_id":packet.rerun_id,
         "route":"GemmaActualHybridSlotAwareWithCheckedDiagnosticLayerSplits","prefill_chunks":packet.prefill_chunks,"warm_live_kernel":warm_live_kernel,"decode_dense_kernel":decode_dense_kernel,
+        "decode_attn_ne":decode_attn_ne,"q5_0_tensor_mm":q5_0_tensor_mm,
         "logical_lane":"slot0","declared_slots":4,
         "tokens":144,"records":trace.coverage.captured.len(),"whole_q1_qualified":false,
         "full_prefill_logits":"NotEstablishedByLastRowProductionHead","other_three_lane_execution":"NotClaimedBySingleLaneLocalizer",

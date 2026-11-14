@@ -63,6 +63,19 @@ impl GpuContext {
         Self::new_with_routing_policy(mlx_native::ggml_routing_policy_from_environment())
     }
 
+    /// [`Self::new`] for a Gemma 4 model: the environment policy with the
+    /// family's Q5_0 tensor-MM default
+    /// ([`crate::serve::gemma_prefill_moe::gemma4_routing_policy`]). Every
+    /// production Gemma 4 load uses it; other families keep [`Self::new`].
+    ///
+    /// # Errors
+    ///
+    /// An invalid `HF2Q_Q5_0_TENSOR_MM` value, or no Metal device.
+    pub fn new_for_gemma4() -> anyhow::Result<Self> {
+        let policy = crate::serve::gemma_prefill_moe::gemma4_routing_policy()?;
+        Ok(Self::new_with_routing_policy(policy)?)
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_routing_policy_for_test(
         routing_policy: GgmlRoutingPolicy,

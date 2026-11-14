@@ -12,8 +12,9 @@
 //! the inputs of the token-major one-token steps: each row's state and every
 //! cache byte equal `rows` successive `forward_verifier_one` calls.
 //!
-//! `HF2Q_DEEPSEEK_TAIL_ROWS_STEP` (read once at model load, default off)
-//! enables it in serving.
+//! Serving runs it by default (v0.1.30, the DeepSeek-V4 release-gate
+//! configuration); `HF2Q_DEEPSEEK_TAIL_ROWS_STEP=0` (read once at model load)
+//! is the kill switch.
 
 use anyhow::{ensure, Context, Result};
 use mlx_native::MlxBuffer;
@@ -23,11 +24,16 @@ use super::forward_support::{begin_decode_pool_token, end_decode_pool_token};
 use super::joint_decode::MAX_JOINT_DECODE_ROWS;
 use super::joint_decode_core::RowCaches;
 use super::Deepseek4Model;
+use crate::inference::models::route_default::Resolved;
 
 /// Serving switch for exact rows steps over token-wise prompt work.
+///
+/// `Default` is [`Self::Off`], the value fixtures build with; the serving
+/// default is [`Self::resolve`] of an unset switch ([`Self::On`]).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TailRowsStep {
-    /// One `forward_verifier_one` transaction per token-wise prompt token.
+    /// One `forward_verifier_one` transaction per token-wise prompt token,
+    /// as in every release through v0.1.29 (kill switch).
     #[default]
     Off,
     /// Token-wise prompt tokens run as rows steps of at most
@@ -40,19 +46,16 @@ impl TailRowsStep {
     /// Process switch read by [`Self::from_env`].
     pub const ENV: &'static str = "HF2Q_DEEPSEEK_TAIL_ROWS_STEP";
 
-    /// `HF2Q_DEEPSEEK_TAIL_ROWS_STEP`: `1` selects [`Self::On`], `0` or unset
-    /// [`Self::Off`]; anything else is an error.
-    pub fn from_env() -> Result<Self> {
+    /// `HF2Q_DEEPSEEK_TAIL_ROWS_STEP`: unset or `1` selects [`Self::On`]
+    /// (the release-gate route), `0` [`Self::Off`] (kill switch); anything
+    /// else is an error.
+    pub(crate) fn from_env() -> Result<Resolved<Self>> {
         Self::resolve(std::env::var_os(Self::ENV).as_deref())
     }
 
     /// Resolution rule of [`Self::from_env`].
-    pub fn resolve(value: Option<&std::ffi::OsStr>) -> Result<Self> {
-        match value.map(|value| value.to_str()) {
-            None | Some(Some("0")) => Ok(Self::Off),
-            Some(Some("1")) => Ok(Self::On),
-            Some(_) => anyhow::bail!("{} must be 0 or 1 (got {value:?})", Self::ENV),
-        }
+    pub(crate) fn resolve(value: Option<&std::ffi::OsStr>) -> Result<Resolved<Self>> {
+        super::route_defaults::resolve_zero_one(Self::ENV, value, Self::Off, Self::On)
     }
 }
 
@@ -167,19 +170,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn switch_parses_zero_one_and_unset_and_rejects_anything_else() {
-        assert_eq!(TailRowsStep::resolve(None).unwrap(), TailRowsStep::Off);
+    fn switch_defaults_on_and_parses_zero_one_and_rejects_anything_else() {
+        assert_eq!(
+            TailRowsStep::resolve(None).unwrap(),
+            Resolved::default_value(TailRowsStep::On)
+        );
         assert_eq!(
             TailRowsStep::resolve(Some(OsStr::new("0"))).unwrap(),
-            TailRowsStep::Off
+            Resolved::environment(TailRowsStep::Off)
         );
         assert_eq!(
             TailRowsStep::resolve(Some(OsStr::new("1"))).unwrap(),
-            TailRowsStep::On
+            Resolved::environment(TailRowsStep::On)
         );
         for bad in ["", "2", "on", "true", " 1"] {
             assert!(TailRowsStep::resolve(Some(OsStr::new(bad))).is_err(), "{bad:?}");
         }
+        // Fixtures build with the pre-promotion value.
         assert_eq!(TailRowsStep::default(), TailRowsStep::Off);
     }
 

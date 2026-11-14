@@ -425,7 +425,8 @@ fn run_two_regime_decode(
 
     // STEP 2 — load model.
     let tokenizer_path = super::find_tokenizer(model_path, None)?;
-    let mut ctx = gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
+    let mut ctx =
+        gpu::GpuContext::new_for_gemma4().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
     // ADR-022 P1.8 — prefer GGUF-self-sufficient config; see cmd_parity_check.

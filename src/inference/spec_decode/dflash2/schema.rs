@@ -2,6 +2,7 @@
 
 use super::config::{DFlash2Config, DFlash2ConfigError, DFlash2TargetShape};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DFlash2FamilyAdapter {
@@ -16,6 +17,133 @@ pub enum DFlash2ConfigSchema {
     FlatTransformersV1,
     NestedSpeculatorsV1,
 }
+
+/// Architecture, dimensions, bound tensor shapes and tokenizer identity of a
+/// Qwen target. A target with the geometry of a pinned descriptor's target
+/// is the same base model: a fine-tune or another quantization of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QwenTargetGeometry {
+    pub architecture: Cow<'static, str>,
+    pub hidden_size: u32,
+    /// Transformer blocks, the MTP block excluded.
+    pub layers: u32,
+    pub vocab_size: u32,
+    pub attention_heads: u32,
+    pub attention_kv_heads: u32,
+    pub head_dim: u32,
+    pub linear_key_heads: u32,
+    pub linear_value_heads: u32,
+    pub linear_key_head_dim: u32,
+    pub linear_value_head_dim: u32,
+    pub full_attention_interval: u32,
+    /// Dense FFN rows; zero for a MoE target.
+    pub intermediate_size: u32,
+    /// Zero for a dense target, as are the three fields below.
+    pub moe_experts: u32,
+    pub moe_top_k: u32,
+    pub moe_intermediate_size: u32,
+    pub moe_shared_intermediate_size: u32,
+    /// `token_embd.weight`, which the drafter's target adapter embeds with.
+    pub embedding_shape: [usize; 2],
+    /// The output head the adapter projects the vocabulary with.
+    pub head_shape: [usize; 2],
+    /// `qwen35::tokenizer::tokenizer_identity` of the GGUF: pre-type,
+    /// vocabulary, merges, the atomic special-token set and the special ids.
+    pub tokenizer_sha256: Cow<'static, str>,
+}
+
+impl QwenTargetGeometry {
+    /// The first field in which this geometry differs from `pinned`.
+    pub fn mismatch(&self, pinned: &Self) -> Option<String> {
+        macro_rules! compare {
+            ($($field:ident),+ $(,)?) => {
+                $(if self.$field != pinned.$field {
+                    return Some(format!(
+                        "{} {:?} != pinned {:?}",
+                        stringify!($field),
+                        self.$field,
+                        pinned.$field
+                    ));
+                })+
+            };
+        }
+        compare!(
+            architecture,
+            hidden_size,
+            layers,
+            vocab_size,
+            attention_heads,
+            attention_kv_heads,
+            head_dim,
+            linear_key_heads,
+            linear_value_heads,
+            linear_key_head_dim,
+            linear_value_head_dim,
+            full_attention_interval,
+            intermediate_size,
+            moe_experts,
+            moe_top_k,
+            moe_intermediate_size,
+            moe_shared_intermediate_size,
+            embedding_shape,
+            head_shape,
+            tokenizer_sha256,
+        );
+        None
+    }
+}
+
+/// Tokenizer identity shared by the pinned Qwen3.8 and Qwen3.6 targets.
+const QWEN_TOKENIZER_SHA256: &str =
+    "9219f5ca3e34386f338e789852257bb7089819c8b4f82fa106ce2f28dfbbb2bd";
+
+/// Geometry of `Qwen/Qwen3.8-27B`.
+pub static QWEN38_TARGET_GEOMETRY: QwenTargetGeometry = QwenTargetGeometry {
+    architecture: Cow::Borrowed("qwen35"),
+    hidden_size: 5_120,
+    layers: 64,
+    vocab_size: 248_320,
+    attention_heads: 24,
+    attention_kv_heads: 4,
+    head_dim: 256,
+    linear_key_heads: 16,
+    linear_value_heads: 48,
+    linear_key_head_dim: 128,
+    linear_value_head_dim: 128,
+    full_attention_interval: 4,
+    intermediate_size: 17_408,
+    moe_experts: 0,
+    moe_top_k: 0,
+    moe_intermediate_size: 0,
+    moe_shared_intermediate_size: 0,
+    embedding_shape: [248_320, 5_120],
+    head_shape: [248_320, 5_120],
+    tokenizer_sha256: Cow::Borrowed(QWEN_TOKENIZER_SHA256),
+};
+
+/// Geometry of `Qwen/Qwen3.6-35B-A3B`.
+pub static QWEN36_TARGET_GEOMETRY: QwenTargetGeometry = QwenTargetGeometry {
+    architecture: Cow::Borrowed("qwen35moe"),
+    hidden_size: 2_048,
+    layers: 40,
+    vocab_size: 248_320,
+    attention_heads: 16,
+    attention_kv_heads: 2,
+    head_dim: 256,
+    linear_key_heads: 16,
+    linear_value_heads: 32,
+    linear_key_head_dim: 128,
+    linear_value_head_dim: 128,
+    full_attention_interval: 4,
+    intermediate_size: 0,
+    moe_experts: 256,
+    moe_top_k: 8,
+    moe_intermediate_size: 512,
+    moe_shared_intermediate_size: 512,
+    embedding_shape: [248_320, 2_048],
+    head_shape: [248_320, 2_048],
+    tokenizer_sha256: Cow::Borrowed(QWEN_TOKENIZER_SHA256),
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DFlash2CheckpointDescriptor {
@@ -33,6 +161,10 @@ pub struct DFlash2CheckpointDescriptor {
     /// Canonical hf2q source-bundle identity of the exact target weights.
     /// `None` keeps production activation unavailable for this descriptor.
     pub target_source_sha256: Option<&'static str>,
+    /// Geometry of that target. A target with this geometry qualifies for
+    /// the drafter without the source identity; `None` admits pinned pairs
+    /// only.
+    pub target_geometry: Option<&'static QwenTargetGeometry>,
     pub target_hidden_size: usize,
     pub target_vocab_size: usize,
     pub target_layers: usize,
@@ -53,6 +185,7 @@ pub const QWEN38_DFLASH2: DFlash2CheckpointDescriptor = DFlash2CheckpointDescrip
     target_architecture: "qwen35",
     target_model: "Qwen/Qwen3.8-27B",
     target_source_sha256: Some("73ded708c49c2d0a47c790ce1d6181e848ac7591dab741de83dbb57218cc6873"),
+    target_geometry: Some(&QWEN38_TARGET_GEOMETRY),
     target_hidden_size: 5_120,
     target_vocab_size: 248_320,
     target_layers: 64,
@@ -73,6 +206,7 @@ pub const QWEN36_DFLASH2: DFlash2CheckpointDescriptor = DFlash2CheckpointDescrip
     target_architecture: "qwen35moe",
     target_model: "Qwen/Qwen3.6-35B-A3B",
     target_source_sha256: Some("851811f43867ae177636f0c536bb98c33731d992ce357831809a1eda5eb974ca"),
+    target_geometry: Some(&QWEN36_TARGET_GEOMETRY),
     target_hidden_size: 2_048,
     target_vocab_size: 248_320,
     target_layers: 40,
@@ -93,6 +227,7 @@ pub const GEMMA4_E2B_DFLASH2: DFlash2CheckpointDescriptor = DFlash2CheckpointDes
     target_architecture: "gemma4",
     target_model: "google/gemma-4-E2B-it",
     target_source_sha256: None,
+    target_geometry: None,
     target_hidden_size: 1_536,
     target_vocab_size: 262_144,
     target_layers: 35,
@@ -113,6 +248,7 @@ pub const GEMMA4_31B_DFLASH2: DFlash2CheckpointDescriptor = DFlash2CheckpointDes
     target_architecture: "gemma4",
     target_model: "google/gemma-4-31B-it",
     target_source_sha256: None,
+    target_geometry: None,
     target_hidden_size: 5_376,
     target_vocab_size: 262_144,
     target_layers: 60,

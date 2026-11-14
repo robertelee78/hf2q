@@ -1018,41 +1018,31 @@ fn row_exact_switch_equals_stock_under_non_nr2_q8_0_policies() {
     }
 }
 
-/// Resolution order: the runtime switch when set (`0`/`1` only), else the
-/// build-time default, which itself is Stock unless the build set it.
+/// Resolution: unset is the row-exact family (the release-gate default), `0`
+/// the stock family (kill switch), `1` row-exact; anything else is an error.
 #[test]
-fn matvec_switch_resolves_env_then_build_default_then_stock() {
+fn matvec_switch_defaults_to_row_exact_and_zero_restores_stock() {
+    use crate::inference::models::route_default::Resolved;
     use std::ffi::OsStr;
     use MatvecKernels::{RowExact, Stock};
-    for build_default in [Stock, RowExact] {
-        // Unset: the build default.
-        assert_eq!(
-            MatvecKernels::resolve(None, build_default).unwrap(),
-            build_default
+    assert_eq!(
+        MatvecKernels::resolve(None).unwrap(),
+        Resolved::default_value(RowExact)
+    );
+    assert_eq!(
+        MatvecKernels::resolve(Some(OsStr::new("0"))).unwrap(),
+        Resolved::environment(Stock)
+    );
+    assert_eq!(
+        MatvecKernels::resolve(Some(OsStr::new("1"))).unwrap(),
+        Resolved::environment(RowExact)
+    );
+    for bad in ["", "true", "2", "on"] {
+        assert!(
+            MatvecKernels::resolve(Some(OsStr::new(bad))).is_err(),
+            "{bad}"
         );
-        // Set: the runtime value wins over either build default.
-        assert_eq!(
-            MatvecKernels::resolve(Some(OsStr::new("0")), build_default).unwrap(),
-            Stock
-        );
-        assert_eq!(
-            MatvecKernels::resolve(Some(OsStr::new("1")), build_default).unwrap(),
-            RowExact
-        );
-        for bad in ["", "true", "2", "on"] {
-            assert!(
-                MatvecKernels::resolve(Some(OsStr::new(bad)), build_default).is_err(),
-                "{bad}"
-            );
-        }
     }
-    // The build default follows HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT of this
-    // build, and is Stock when the build did not set it.
-    let expected = match option_env!("HF2Q_DEEPSEEK_ROW_EXACT_MATVEC_DEFAULT") {
-        Some("1") => RowExact,
-        _ => Stock,
-    };
-    assert_eq!(MatvecKernels::BUILD_DEFAULT, expected);
-    // One line per binary for build receipts (two Q1 arms of one commit).
-    eprintln!("MATVEC_BUILD_DEFAULT {:?}", MatvecKernels::BUILD_DEFAULT);
+    // Fixtures build with the pre-promotion family.
+    assert_eq!(MatvecKernels::default(), Stock);
 }

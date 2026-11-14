@@ -397,6 +397,18 @@ qwen36_verify_power_snapshot_manifest \
   "$snapshot_root" "$snapshot_manifest" "${snapshot_prefixes[@]}"
 [[ "$(wc -l <"$snapshot_manifest" | tr -d ' ')" == 6 ]]
 
+# Immutable phase copies must not appear as extra live power-event files.
+sealed_power_root="$snapshot_root/.cache-release/raw/gemma-process-a/family-a"
+mkdir -p "$sealed_power_root"
+for extension in baseline final new; do
+  cp "$snapshot_root/family-a/caffeinate.log.power-events.$extension" \
+    "$sealed_power_root/caffeinate.log.power-events.$extension"
+done
+qwen36_write_power_snapshot_manifest \
+  "$snapshot_root" "$snapshot_manifest" "${snapshot_prefixes[@]}"
+qwen36_verify_power_snapshot_manifest \
+  "$snapshot_root" "$snapshot_manifest" "${snapshot_prefixes[@]}"
+
 # A producer that emits a complete-looking list and then fails must not be
 # accepted in Bash conditional contexts where `errexit` is suppressed.
 # shellcheck disable=SC2329

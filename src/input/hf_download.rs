@@ -3457,6 +3457,70 @@ pub(crate) fn download_file(
     result.map_err(|error| map_hub_download_error(error, repo_id, &format!("`{filename}`")))
 }
 
+/// Snapshot path of one file of a repository pinned at an exact revision,
+/// when the standard Hub cache already holds it. Path resolution only: the
+/// caller authenticates the bytes.
+pub(crate) fn cached_pinned_file(repository: &str, revision: &str, filename: &str) -> Option<PathBuf> {
+    validate_repo_filename(filename).ok()?;
+    HfModelReference::parse(repository, Some(revision)).ok()?;
+    let path = resolve_hf_cache_dir()
+        .join(hub_model_cache_folder(repository))
+        .join("snapshots")
+        .join(revision)
+        .join(filename);
+    path.is_file().then_some(path)
+}
+
+/// Download one file of a repository pinned at an exact revision into the
+/// standard Hub cache, publishing coalesced progress to the caller. Returns
+/// the snapshot path. `expected_bytes` gates the transfer on free disk
+/// space; the caller authenticates the bytes afterwards.
+pub(crate) fn download_pinned_file_with_progress(
+    repository: &str,
+    revision: &str,
+    filename: &str,
+    expected_bytes: Option<u64>,
+    progress: &mut dyn FnMut(HubTransferProgress),
+) -> Result<PathBuf, DownloadError> {
+    validate_repo_filename(filename)?;
+    HfModelReference::parse(repository, Some(revision))?;
+    let cache_dir = resolve_hf_cache_dir();
+    if let Some(bytes) = expected_bytes {
+        std::fs::create_dir_all(&cache_dir).map_err(download_failed)?;
+        check_exact_disk_preflight(
+            format!("pinned `{filename}` from {repository}"),
+            &cache_dir,
+            bytes,
+            None,
+        )?;
+    }
+    let api = build_hub_api(&cache_dir, true)?;
+    let repo = hub_model_repo(&api, repository);
+    let observer = HubDownloadObserver::new();
+    let handler = observer.progress();
+    let started = Instant::now();
+    let path = std::thread::scope(|scope| {
+        let transfer =
+            scope.spawn(|| download_file(&repo, repository, revision, filename, Some(handler)));
+        let mut publisher = HubTransferPublisher::new(started);
+        loop {
+            publisher.poll(&observer, progress);
+            if transfer.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let result = transfer.join().map_err(|_| DownloadError::DownloadFailed {
+            reason: "native Hugging Face download worker panicked".to_owned(),
+        })?;
+        publisher.poll(&observer, progress);
+        result
+    })?;
+    let mut snapshot = None;
+    bind_snapshot_parent(&mut snapshot, &path, filename, revision)?;
+    Ok(path)
+}
+
 pub(super) fn bind_snapshot_parent(
     selected: &mut Option<PathBuf>,
     local_file: &Path,

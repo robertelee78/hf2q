@@ -109,6 +109,7 @@ struct Draft {
     /// `None`: [`DFlash2Runtime::run_draft`]; `Some(order)`:
     /// [`DFlash2Runtime::run_draft_for_gpu_target`].
     gpu_order: Option<Vec<u32>>,
+    repetition: Option<DraftRepetitionPrior>,
 }
 
 const UNIFORMS: [f32; LANES * 7] = [0.5; LANES * 7];
@@ -144,6 +145,7 @@ fn draft(
                 0,
                 &draft.maximum_rows,
                 &UNIFORMS,
+                draft.repetition.as_ref(),
             )
             .unwrap(),
         Some(order) => {
@@ -159,6 +161,7 @@ fn draft(
                     &draft.maximum_rows,
                     order,
                     &UNIFORMS,
+                    draft.repetition.as_ref(),
                 )
                 .unwrap();
             // A command that reads a draft output is ordered behind the
@@ -248,6 +251,7 @@ fn commit_and_prefetch(
                 next.gpu_order.as_deref().unwrap_or(&[]),
                 &UNIFORMS,
                 next.gpu_order.is_none(),
+                next.repetition.as_ref(),
             )
             .unwrap();
         assert!(runtime.prefetch_outstanding());
@@ -267,6 +271,7 @@ fn step_draft(step: u32, gpu: bool) -> Draft {
         anchors: [1 + step % 60, 2 + (step * 7) % 61, 3 + (step * 11) % 59, 5],
         maximum_rows: [8, 8, 8, 8],
         gpu_order: gpu.then(|| vec![0, 1, 2, 3]),
+        repetition: None,
     }
 }
 
@@ -568,5 +573,63 @@ fn a_step_that_fails_after_its_submissions_leaves_no_prefetched_draft() {
             .commit_target_context(&device, &mut registry, &[8, 8, 0, 0])
             .unwrap();
         assert_eq!(runtime.lane_lengths, [8, 8, lengths[2], lengths[3]]);
+    }
+}
+
+#[test]
+fn changed_repetition_history_cannot_reuse_prefetched_logits() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().unwrap();
+    for staged in [false, true] {
+        for gpu in [false, true] {
+            let mut registry = KernelRegistry::new();
+            let mut stock = runtime(&device, staged);
+            let mut ahead = runtime(&device, staged);
+            stock.proposal_repetition_enabled = true;
+            ahead.proposal_repetition_enabled = true;
+            let target = Target::new(&device, &stock.config);
+            let replay = Replay::new(&device);
+            let mut guessed = step_draft(3, gpu);
+            let mut prior = DraftRepetitionPrior::default();
+            prior.set_lane(0, 1.5, [1_u32].into_iter()).unwrap();
+            guessed.repetition = Some(prior);
+            let mut real = guessed.clone();
+            prior.set_lane(0, 1.5, [2_u32].into_iter()).unwrap();
+            real.repetition = Some(prior);
+
+            let retained = [8, 5, 0, 2];
+            capture(&mut stock, &mut 43);
+            stock
+                .commit_target_context(&device, &mut registry, &retained)
+                .unwrap();
+            capture(&mut ahead, &mut 43);
+            let (_, context) = commit_and_prefetch(
+                &mut ahead,
+                &device,
+                &mut registry,
+                &target,
+                &replay,
+                &retained,
+                Some(&guessed),
+                &[0, 1, 2, 3],
+                false,
+            );
+            context.unwrap();
+            // Replay's explicit wait is behind the draft, so this internal
+            // buffer read is safe despite the public prefetch readback guard.
+            let stale_logits = ahead.workspace.logits.as_slice::<u32>().unwrap().to_vec();
+            let expected = draft(&mut stock, &device, &mut registry, &target, &real);
+            let expected_logits = stock.workspace.logits.as_slice::<u32>().unwrap().to_vec();
+            assert_ne!(
+                stale_logits, expected_logits,
+                "fixture must expose stale penalty output"
+            );
+            let actual = draft(&mut ahead, &device, &mut registry, &target, &real);
+            assert_eq!(actual, expected);
+            assert_eq!(
+                ahead.workspace.logits.as_slice::<u32>().unwrap(),
+                expected_logits
+            );
+        }
     }
 }

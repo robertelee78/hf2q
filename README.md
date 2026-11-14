@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.89+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF; full-model MLX-affine safetensors output is planned under [ADR-046](docs/adr/ADR-046-evidence-driven-apple-auto-quant.md). |
-| **Status** | This checkout describes the hf2q 0.1.29 release line and resolves published, checksum-pinned `mlx-native 0.18.0`. Treat 0.1.29 as a release candidate until the `v0.1.29` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | This checkout describes the hf2q 0.1.30 release candidate and resolves a published, checksum-pinned registry `mlx-native` dependency. Public availability requires the `v0.1.30` tag, signed GitHub artifact, crates.io bytes, and hf2q.us stable record to match the exact release source and proofs. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 curl -fsSL https://hf2q.us/install.sh | sh
@@ -845,13 +845,22 @@ resolving published `mlx-native 0.11.2`:
   before the long overlap/lifecycle soak, retain the default latency limits,
   and bind continuous Nominal thermal telemetry across every cold, cached,
   automatic-tool, and tool-result turn.
+  Invoke it with `run` and an executable `CACHE_RELEASE_HOSTQ` queue adapter;
+  the workflow reads that adapter from the same-named repository variable.
+  Five separate build tickets precede an immutable plan and eighteen serial
+  model phases, each bounded to 540 seconds including owned cleanup and evidence
+  sealing. Same-process cache and lifetime workloads remain indivisible.
+  `build`, `plan`, `phase PHASE_ID`, and `finalize` expose those same stages;
+  failed or interrupted attempts cannot be replayed into a passing manifest.
+  Schema 3 qualification includes the hidden `.cache-release` ledger and raw
+  snapshots. Bounded execution alone does not establish that a workload fits.
 
 The governing decisions and the old-failure-versus-final-artifact distinction
 are recorded in `docs/adr/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/adr/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.29 serving release
+#### Test the 0.1.30 serving release candidate
 
 Build and verify the exact checkout before loading a model:
 

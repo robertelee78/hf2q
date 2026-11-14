@@ -3041,6 +3041,7 @@ pub fn build_delta_net_layer(
                     .context("complete source-teacher Delta prefill ops1-3")?;
             } else {
                 enc.commit_labeled("layer.gdn.ops1-3");
+                super::encoder_stage::retain_submitted(enc, "layer.gdn.ops1-3");
             }
             (x_norm, qkv_conv, z)
         };
@@ -3118,6 +3119,7 @@ pub fn build_delta_net_layer(
                     .context("complete source-teacher Delta QKV split")?;
             } else {
                 enc.commit_labeled("layer.gdn.qkv_split");
+                super::encoder_stage::retain_submitted(enc, "layer.gdn.qkv_split");
             }
             (q_gpu, k_gpu, v_gpu)
         };
@@ -3538,6 +3540,7 @@ pub fn build_delta_net_layer(
                     .context("complete source-teacher Delta prefill ops5-9")?;
             } else {
                 enc.commit_labeled("layer.gdn.ops5-9");
+                super::encoder_stage::retain_submitted(enc, "layer.gdn.ops5-9");
             }
             output
         };
@@ -3610,10 +3613,12 @@ pub fn build_delta_net_layer_with_arena(
     // latest-turn recovery checkpoints and speculative verification.
     state_capture: Option<&MlxBuffer>,
     conv_state_capture: Option<&MlxBuffer>,
-    // Cue fold ([`super::prefill_fold`]): run the convolution and the
-    // recurrence as two dispatches split at this row, writing the state at
-    // the split into the checkpoint image. `None` on every other path.
-    boundary: Option<&super::prefill_fold::DnBoundarySplit<'_>>,
+    // Joint prefill and cue fold ([`super::prefill_joint`]): run the
+    // convolution and the recurrence as one dispatch per run of rows, each
+    // from and into its own state (a lane's slot state, a boundary
+    // checkpoint image, the shared-prefix scratch). `None` on every other
+    // path, which scans all rows from `state_in` into `state_out`.
+    runs: Option<&[super::prefill_joint::DnRun]>,
     // ADR-019 Phase 2 iter91: borrowed `&mut EncoderSession` for the
     // multi-stage chain.  `None` at env=0 (per-stage Plain CommandEncoder
     // shape, byte-identical to pre-iter91).  `Some(sess)` at env=1 — the
@@ -3623,7 +3628,7 @@ pub fn build_delta_net_layer_with_arena(
     // consumes the borrow via `as_deref_mut()`; the terminal
     // `fence_or_commit("layer.gdn.stage_a")` releases the borrow back to
     // the caller's `Option`.
-    layer_session: Option<&mut mlx_native::EncoderSession>,
+    mut layer_session: Option<&mut mlx_native::EncoderSession>,
     // ADR-040 Phase A2b-cont (2026-05-30) — per-slot identity. See the
     // sister docstring at `build_delta_net_layer` (`gpu_delta_net.rs`
     // around line 2205).  SlotId(0) is byte-equivalent to the
@@ -3636,15 +3641,26 @@ pub fn build_delta_net_layer_with_arena(
         seq_len > 1,
         "build_delta_net_layer_with_arena: seq_len must be > 1 (decode uses pooled path)"
     );
-    if let Some(split) = boundary {
+    // One command buffer per layer: with a session and the autoregressive
+    // recurrence, every stage of the layer is encoded into the session's
+    // open command buffer (the chunk-scan route commits and waits on a
+    // command of its own, so it keeps the staged commits).
+    let carry_stages = layer_session.is_some()
+        && super::prefill_prepared::single_command_layers()
+        && !chunk_path_eligible(seq_len, d_k);
+    if let Some(runs) = runs {
+        // A one-row dispatch is the decode kernel; the runs tile the rows.
         anyhow::ensure!(
-            split.prefix_rows >= 2
-                && seq_len - split.prefix_rows.min(seq_len) >= 2
+            !runs.is_empty()
+                && runs.iter().all(|run| run.rows >= 2)
+                && runs.iter().map(|run| u64::from(run.rows)).sum::<u64>() == u64::from(seq_len)
+                && runs
+                    .iter()
+                    .all(|run| u64::from(run.first) + u64::from(run.rows) <= u64::from(seq_len))
                 && state_capture.is_none()
                 && conv_state_capture.is_none(),
-            "DeltaNet boundary split of {} + {} rows with per-row capture {}",
-            split.prefix_rows,
-            seq_len.saturating_sub(split.prefix_rows),
+            "DeltaNet runs {:?} over {seq_len} rows with per-row capture {}",
+            runs.iter().map(|run| (run.first, run.rows)).collect::<Vec<_>>(),
             state_capture.is_some() || conv_state_capture.is_some()
         );
     }
@@ -3871,7 +3887,7 @@ pub fn build_delta_net_layer_with_arena(
         // `Option::take`-like consumption — there's only one
         // LayerEncoder::from_session_or_plain site in this function, so we
         // can move the Option directly without `as_deref_mut`.
-        let mut enc = LayerEncoder::from_session_or_plain(device, layer_session)
+        let mut enc = LayerEncoder::from_session_or_plain(device, layer_session.as_deref_mut())
             .context("enc gdn stage_a prefill (arena)")?;
         apply_pre_norm_into(
             enc.encoder(),
@@ -3899,65 +3915,63 @@ pub fn build_delta_net_layer_with_arena(
             n_v_heads,
         )?;
         enc.encoder().memory_barrier();
-        if let Some(split) = boundary {
-            // Two convolutions, as the two forwards run them: the prefix
-            // rows leave the state at the boundary in the scratch (slot
-            // layout), the cue rows start from it. The checkpoint image
-            // keeps the boundary state in its `[K-1, channels]` layout.
+        if let Some(runs) = runs {
+            // One convolution per run, as the runs' own forwards dispatch
+            // them: each reads the state its rows start from and leaves the
+            // state behind its last row. A boundary run's state is also
+            // kept in the checkpoint image's `[K-1, channels]` layout.
             let channels = qkv_channels as usize;
-            let cue_rows = seq_len - split.prefix_rows;
-            for (segment, (first, rows, state_in, state_out)) in [
-                (
-                    0,
-                    split.prefix_rows,
-                    conv_state_in,
-                    &split.scratch.conv_state,
-                ),
-                (
-                    split.prefix_rows,
-                    cue_rows,
-                    &split.scratch.conv_state,
-                    conv_state_out,
-                ),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                if segment == 1 {
-                    // The cue rows read the boundary state the prefix wrote.
+            for (index, run) in runs.iter().enumerate() {
+                if index > 0 {
+                    // A run may start from the state an earlier run wrote.
                     enc.encoder().memory_barrier();
                 }
                 dispatch_ssm_conv(
                     enc.encoder(),
                     registry,
                     device.metal_device(),
-                    &super::prefill_fold::row_view(&arena.qkv_raw_buf, first, rows, channels),
+                    &super::prefill_joint::row_view(
+                        &arena.qkv_raw_buf,
+                        run.first,
+                        run.rows,
+                        channels,
+                    ),
                     &weights.ssm_conv1d,
-                    state_in,
-                    state_out,
-                    &super::prefill_fold::row_view(&arena.qkv_conv_buf, first, rows, channels),
-                    &split.scratch.ssm_params[segment],
+                    &run.conv_in,
+                    &run.conv_out,
+                    &super::prefill_joint::row_view(
+                        &arena.qkv_conv_buf,
+                        run.first,
+                        run.rows,
+                        channels,
+                    ),
+                    &run.ssm_params,
                     SsmConvParams {
-                        n_tokens: rows,
+                        n_tokens: run.rows,
                         ..ssm_conv_params
                     },
                 )
-                .with_context(|| format!("dispatch_ssm_conv boundary segment {segment}"))?;
+                .with_context(|| format!("dispatch_ssm_conv run {index}"))?;
             }
-            mlx_native::ops::copy::dispatch_strided_copy_f32(
-                enc.encoder(),
-                registry,
-                device.metal_device(),
-                &split.scratch.conv_state,
-                &split.conv_image,
-                &mlx_native::ops::copy::StridedCopyParams {
-                    rows: k_width - 1,
-                    cols: qkv_channels,
-                    stride_row: 1,
-                    stride_col: k_width - 1,
-                },
-            )
-            .context("boundary conv state into the checkpoint image")?;
+            for run in runs {
+                let Some(image) = run.conv_image.as_ref() else {
+                    continue;
+                };
+                mlx_native::ops::copy::dispatch_strided_copy_f32(
+                    enc.encoder(),
+                    registry,
+                    device.metal_device(),
+                    &run.conv_out,
+                    image,
+                    &mlx_native::ops::copy::StridedCopyParams {
+                        rows: k_width - 1,
+                        cols: qkv_channels,
+                        stride_row: 1,
+                        stride_col: k_width - 1,
+                    },
+                )
+                .context("boundary conv state into the checkpoint image")?;
+            }
         } else if let Some(capture) = conv_state_capture {
             dispatch_ssm_conv_with_capture(
                 enc.encoder(),
@@ -4027,8 +4041,16 @@ pub fn build_delta_net_layer_with_arena(
         //   FIFO drain. THE primary STAGE_FENCE site on the Qwen3.6 27B-DWQ46
         //   DN-dominated path (≈30 DN layers per chunk-engaged pp4096
         //   prefill).
-        enc.fence_or_commit("layer.gdn.stage_a")
-            .context("fence/commit DN stage_a (arena)")?;
+        //
+        // One command buffer per layer ([`carry_layer_stages`]): the stage
+        // stays in the session's open command buffer and the recurrence
+        // stage below is encoded behind it.
+        if carry_stages {
+            enc.carry_into_next_stage("layer.gdn.stage_a")
+        } else {
+            enc.fence_or_commit("layer.gdn.stage_a")
+        }
+        .context("fence/commit DN stage_a (arena)")?;
     }
     let _ = (k_sp, q_sp, v_sp); // shape sanity; locals used above
 
@@ -4060,8 +4082,8 @@ pub fn build_delta_net_layer_with_arena(
 
     let output = if chunk_route {
         anyhow::ensure!(
-            state_capture.is_none() && conv_state_capture.is_none() && boundary.is_none(),
-            "DeltaNet arena capture and the boundary split are supported only by the autoregressive prefill route"
+            state_capture.is_none() && conv_state_capture.is_none() && runs.is_none(),
+            "DeltaNet arena capture and per-run scans are supported only by the autoregressive prefill route"
         );
         // ---- CHUNK PREFILL (3-encoder split) — arena variant ----
         {
@@ -4265,9 +4287,30 @@ pub fn build_delta_net_layer_with_arena(
         let _w5b8 = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::LayerAutoregOps5to9,
         );
-        let mut enc = device
-            .command_encoder().map(crate::inference::native_observation::encoder)
-            .context("enc ops5-9 prefill (arena)")?;
+        let mut carried_stage = if carry_stages {
+            Some(
+                LayerEncoder::from_session_or_plain(device, layer_session.as_deref_mut())
+                    .context("enc ops5-9 prefill (arena, carried)")?,
+            )
+        } else {
+            None
+        };
+        let mut own_command = if carry_stages {
+            None
+        } else {
+            Some(
+                device
+                    .command_encoder()
+                    .map(crate::inference::native_observation::encoder)
+                    .context("enc ops5-9 prefill (arena)")?,
+            )
+        };
+        let mut enc: &mut mlx_native::CommandEncoder =
+            match (carried_stage.as_mut(), own_command.as_mut()) {
+                (Some(stage), _) => stage.encoder(),
+                (None, Some(command)) => command,
+                (None, None) => unreachable!("one of the two encoders exists"),
+            };
         apply_l2_norm_per_head_into(
             &mut enc,
             registry,
@@ -4377,31 +4420,24 @@ pub fn build_delta_net_layer_with_arena(
         enc.memory_barrier();
         // Stage-4 unconditional NSG-decode kernel where supported.
         let decode_kernel_eligible = d_k % 32 == 0 && d_k <= 128;
-        if let Some(split) = boundary {
-            // Two scans, as the two forwards run them: the prefix rows leave
-            // the recurrent state at the boundary in the checkpoint image
-            // (slot layout), the cue rows start from it.
+        if let Some(runs) = runs {
+            // One scan per run, as the runs' own forwards dispatch them:
+            // each starts from its own recurrent state and leaves the state
+            // behind its last row.
             anyhow::ensure!(
                 decode_kernel_eligible,
-                "DeltaNet boundary split requires an NSG-compatible key dimension"
+                "DeltaNet per-run scans require an NSG-compatible key dimension"
             );
             let key_width = (n_k_heads * d_k) as usize;
             let value_width = (n_v_heads * d_v) as usize;
             let heads = n_v_heads as usize;
-            let cue_rows = seq_len - split.prefix_rows;
-            for (segment, (first, rows, segment_in, segment_out)) in [
-                (0, split.prefix_rows, state_in, &split.recurrent),
-                (split.prefix_rows, cue_rows, &split.recurrent, state_out),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                if segment == 1 {
-                    // The cue rows read the boundary state the prefix wrote.
+            for (index, run) in runs.iter().enumerate() {
+                if index > 0 {
+                    // A run may start from the state an earlier run wrote.
                     enc.memory_barrier();
                 }
                 let rows_of = |buffer: &MlxBuffer, width: usize| {
-                    super::prefill_fold::row_view(buffer, first, rows, width)
+                    super::prefill_joint::row_view(buffer, run.first, run.rows, width)
                 };
                 dispatch_gated_delta_net_decode(
                     &mut enc,
@@ -4412,16 +4448,16 @@ pub fn build_delta_net_layer_with_arena(
                     &rows_of(&arena.v_split_buf, value_width),
                     &rows_of(&arena.g_buf, heads),
                     &rows_of(&arena.beta_buf, heads),
-                    segment_in,
+                    &run.recurrent_in,
                     &rows_of(&arena.attn_out_buf, value_width),
-                    segment_out,
-                    &split.scratch.gdn_params[segment],
+                    &run.recurrent_out,
+                    &run.gdn_params,
                     GatedDeltaNetParams {
-                        n_tokens: rows,
+                        n_tokens: run.rows,
                         ..gdn_params
                     },
                 )
-                .with_context(|| format!("dispatch_gated_delta_net_decode boundary segment {segment}"))?;
+                .with_context(|| format!("dispatch_gated_delta_net_decode run {index}"))?;
             }
         } else if decode_kernel_eligible {
             if let Some(capture) = state_capture {
@@ -4510,7 +4546,16 @@ pub fn build_delta_net_layer_with_arena(
             z_channels,
             hidden_size,
         )?;
-        enc.commit_labeled("layer.gdn.ops5-9");
+        match (carried_stage, own_command) {
+            (Some(stage), _) => stage
+                .carry_into_next_stage("layer.gdn.ops5-9")
+                .context("carry DN ops5-9 (arena)")?,
+            (None, Some(mut command)) => {
+                command.commit_labeled("layer.gdn.ops5-9");
+                super::encoder_stage::retain_submitted(command, "layer.gdn.ops5-9");
+            }
+            (None, None) => unreachable!("one of the two encoders exists"),
+        }
         output
     };
 
@@ -7242,7 +7287,7 @@ mod tests {
             shape.rms_norm_eps,
             None, // recurrent capture disabled in parity fixture
             None, // convolution capture disabled in parity fixture
-            None, // no boundary split
+            None, // one scan over all rows
             // iter91: synthetic test exercises the per-stage Plain
             // CommandEncoder shape (env=0 equivalent) — pass None.
             None,

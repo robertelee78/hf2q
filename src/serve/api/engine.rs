@@ -61,7 +61,7 @@ use super::engine_qwen35::anchor_store::{
     record_anchor_restore_refused, record_anchor_snapshot, Qwen35Anchor as Qwen35PromptAnchor,
     Qwen35AnchorStore,
 };
-use super::engine_supervisor::{spawn_supervised_worker, EngineSupervisor};
+use super::engine_supervisor::{spawn_supervised_worker, EngineSupervisor, WorkerTeardown};
 
 const SLOT_AWARE_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
 // The preserved Gemma cold-prefill baseline is roughly 388 seconds for
@@ -1374,6 +1374,7 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
         inner: Arc::new(EngineInner {
             tx,
             supervisor: EngineSupervisor::new(),
+            route_decision: None,
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("synth-kv-bridge-test"),
             arch: LoadedArch::Gemma,
@@ -1433,6 +1434,7 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
         inner: Arc::new(EngineInner {
             tx,
             supervisor: EngineSupervisor::new(),
+            route_decision: None,
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("iter-215-test-model"),
             arch,
@@ -1509,6 +1511,7 @@ pub(crate) fn make_synthetic_engine_over_budget(
         inner: Arc::new(EngineInner {
             tx,
             supervisor: EngineSupervisor::new(),
+            route_decision: None,
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("a5d-over-budget-test-model"),
             arch,
@@ -1575,6 +1578,7 @@ pub(crate) fn make_synthetic_engine_aggregate_stream_pressure(arch: LoadedArch) 
         inner: Arc::new(EngineInner {
             tx,
             supervisor: EngineSupervisor::new(),
+            route_decision: None,
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("aggregate-stream-pressure-test-model"),
             arch,
@@ -1632,6 +1636,7 @@ pub(crate) fn make_synthetic_engine_that_panics(
     let handle = spawn_supervised_worker(
         "hf2q-engine-panic-test",
         supervisor.clone(),
+        WorkerTeardown::nothing(),
         move |_supervisor| {
             while let Some(req) = rx.blocking_recv() {
                 match req {
@@ -1661,6 +1666,7 @@ pub(crate) fn make_synthetic_engine_that_panics(
         inner: Arc::new(EngineInner {
             tx,
             supervisor,
+            route_decision: None,
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("panic-test-model"),
             arch,
@@ -1750,6 +1756,7 @@ pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
         inner: Arc::new(EngineInner {
             tx,
             supervisor: EngineSupervisor::new(),
+            route_decision: None,
             worker_handle: Mutex::new(Some(handle)),
             info: synthetic_load_info("a5d-worker-error-test-model"),
             arch,
@@ -1786,8 +1793,63 @@ pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
     }
 }
 
+/// The teardown of a worker thread that owns a loaded model
+/// ([`WorkerTeardown`]). `memory` is the model's reservation, when
+/// `serve::load_engine` made one; `model_devices` are the devices the model
+/// itself owns and encodes on ([`LoadedModel::owned_devices`]).
+///
+/// The reservation is released only when every queue the worker encoded on
+/// is settled (`inference::device_settle`):
+///
+/// - request-local devices were settled as each request ended; one that
+///   could not be is on the thread's record, and the teardown fails;
+/// - after the worker body has dropped the model, the thread drops the GPU
+///   weight cache it built for it (BF16 copies, prepared and staged planes:
+///   tens of GiB on the full Qwen routes);
+/// - once the thread has terminated, the model's own devices and the
+///   cache's device are settled: the dropped buffers only staged their
+///   removal from the residency set, and the forward pipeline commits most
+///   of its command buffers on those queues without waiting.
+///
+/// A step that fails leaves the reservation charged for good. The kernel
+/// reclaims the pages of released buffers afterwards, on its own; the
+/// teardown gives it time (`resident_memory::await_kernel_reclaim`) so that
+/// the loads waiting for this teardown read the host's available memory
+/// after it, but no claim rests on that.
+fn model_worker_teardown(
+    memory: Option<crate::serve::resident_memory::Reservation>,
+    model_devices: Vec<mlx_native::MlxDevice>,
+) -> WorkerTeardown {
+    use crate::inference::device_settle::{settle, take_thread_unsettled};
+    use crate::inference::models::qwen35::model::Qwen35Model;
+    WorkerTeardown::new(memory, move || {
+        let mut devices = model_devices;
+        // The Qwen forward encodes on the device of the thread's GPU weight
+        // cache; a thread that never built one has none.
+        devices.extend(Qwen35Model::take_thread_gpu_cache());
+        if let Some(reason) = take_thread_unsettled() {
+            anyhow::bail!("a command queue of a request could not be settled: {reason}");
+        }
+        Ok(Box::new(move || {
+            devices.iter().try_for_each(settle)?;
+            drop(devices);
+            if let Err(error) = crate::serve::resident_memory::await_kernel_reclaim() {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "the kernel was still reclaiming an engine's memory when its teardown ended"
+                );
+            }
+            Ok(())
+        }) as super::engine_supervisor::DeferredFlush)
+    })
+}
+
 struct EngineInner {
     tx: mpsc::Sender<Request>,
+    /// The route decision `serve::load_engine` loaded this engine with
+    /// (ADR-067 D6), as `/hf2q/v1/runtime` publishes it. `None` for an
+    /// engine that was not loaded through `load_engine`.
+    route_decision: Option<serde_json::Value>,
     /// Independent one-way health state for a worker that may remain alive
     /// while blocked forever inside Objective-C/Metal.
     supervisor: EngineSupervisor,
@@ -1972,6 +2034,7 @@ fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
         kv_bytes_per_token_override: None,
         kv_fixed_bytes_per_slot_override: None,
         gemma_warm_attention_kernel: None,
+        default_routes: Vec::new(),
     })
 }
 
@@ -2463,6 +2526,20 @@ pub struct GemmaLoadedModel {
 }
 
 impl LoadedModel {
+    /// The devices this model owns and encodes on, for the teardown of the
+    /// worker thread that will own it ([`model_worker_teardown`]): they are
+    /// flushed after the model is dropped. A Qwen3.5/3.6 model owns none;
+    /// its forward encodes on the device of the worker thread's GPU weight
+    /// cache, which the teardown takes from the thread.
+    fn owned_devices(&self) -> Vec<mlx_native::MlxDevice> {
+        match self {
+            Self::Gemma(g) => vec![g.ctx.device().clone()],
+            Self::Qwen35(_) => Vec::new(),
+            Self::Qwen3VlText(v) => vec![v.model.ctx.device().clone()],
+            Self::Deepseek4(d) => vec![d.model.ctx.device().clone()],
+        }
+    }
+
     /// Reject unsupported or not-yet-servable architectures using the same
     /// header-only dispatch contract before context metadata is interpreted.
     /// An unknown family has no trustworthy family-specific context key, so
@@ -3552,8 +3629,10 @@ impl GemmaLoadedModel {
             );
             t_phase = Instant::now();
         }
-        let mut ctx =
-            GpuContext::new().map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
+        // Gemma 4 freezes its own routing policy (Q5_0 tensor matmul on by
+        // default); no other family's registry sees it.
+        let mut ctx = GpuContext::new_for_gemma4()
+            .map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
         if load_timing {
             tracing::info!(
                 "[LOAD_TIMING] gpu_ctx_new={:.0}ms",
@@ -4089,6 +4168,7 @@ impl LoadInfoBuilder for GemmaLoadedModel {
                 &self.config,
             )),
             gemma_warm_attention_kernel: Some(self.weights.warm_live_kernel.wire_name()),
+            default_routes: self.weights.route_audit.clone(),
         }
     }
 }
@@ -4147,6 +4227,11 @@ impl Engine {
     /// the mpsc channel buffer; when full, handlers receive a `queue_full`
     /// error and map it to 429 + Retry-After (Decision #19).
     ///
+    /// `memory` is the reservation of what `loaded` holds of the host's
+    /// memory (`serve::resident_memory`), when the caller made one. The
+    /// worker thread owns the model, so it owns the reservation: the
+    /// worker's teardown alone releases it ([`model_worker_teardown`]).
+    ///
     /// # Panics
     /// If a Qwen pool profile is requested (including invalid/unacknowledged
     /// intent): use the fallible `spawn_with_mode` SlotAware API instead.
@@ -4154,6 +4239,7 @@ impl Engine {
         loaded: LoadedModel,
         queue_capacity: usize,
         kv_cache_budget_bytes: Option<u64>,
+        memory: Option<crate::serve::resident_memory::Reservation>,
     ) -> Self {
         assert!(
             matches!(
@@ -4365,9 +4451,11 @@ impl Engine {
         let worker_kv_bytes_per_token = initial_kv_bytes_per_token_cached;
         let worker_kv_fixed_bytes_per_slot = initial_kv_fixed_bytes_per_slot_cached;
         let supervisor = EngineSupervisor::new();
+        let model_devices = loaded.owned_devices();
         let worker_handle = spawn_supervised_worker(
             "hf2q-engine",
             supervisor.clone(),
+            model_worker_teardown(memory, model_devices),
             move |worker_supervisor| {
                 worker_run(
                     loaded,
@@ -4392,6 +4480,7 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 tx,
                 supervisor,
+                route_decision: None,
                 worker_handle: Mutex::new(Some(worker_handle)),
                 info,
                 arch,
@@ -4443,6 +4532,13 @@ impl Engine {
     /// iter-2 cliff visible at the type level: today you MUST handle the
     /// `Err` arm, and iter-2 makes both arms `Ok`.
     ///
+    /// `memory` is the reservation of what `loaded` holds of the host's
+    /// memory, when the caller made one. It is taken out when the worker
+    /// thread is created and released by that thread's teardown alone
+    /// ([`model_worker_teardown`]); a spawn that fails before a worker
+    /// exists leaves it with the caller, who still holds what the load
+    /// allocated on its thread.
+    ///
     /// # Errors
     ///
     /// Returns [`EngineSpawnError::ModeNotYetWired`] when called with
@@ -4453,6 +4549,7 @@ impl Engine {
         queue_capacity: usize,
         kv_cache_budget_bytes: Option<u64>,
         mode: EngineMode,
+        memory: &mut Option<crate::serve::resident_memory::Reservation>,
     ) -> std::result::Result<Self, EngineSpawnError> {
         gemma_full_input::validate_spawn(matches!(&loaded, LoadedModel::Gemma(_)), mode)
             .map_err(|cause| EngineSpawnError::GemmaFullInputCheckpoint { cause })?;
@@ -4495,7 +4592,8 @@ impl Engine {
                 // we go through the assignment for symmetry with iter-2's
                 // SlotAware path, which will store the requested
                 // max_slots on EngineInner.)
-                let mut engine = Self::spawn(loaded, queue_capacity, kv_cache_budget_bytes);
+                let mut engine =
+                    Self::spawn(loaded, queue_capacity, kv_cache_budget_bytes, memory.take());
                 // Safe: this is the only `Arc` to the freshly-spawned
                 // `EngineInner` at this point — `spawn` has not handed
                 // out any clones yet. `get_mut` returns `Some(&mut ...)`
@@ -4545,6 +4643,7 @@ impl Engine {
                     queue_capacity,
                     kv_cache_budget_bytes,
                     max_slots,
+                    memory,
                 )
             }
         }
@@ -4567,6 +4666,7 @@ impl Engine {
         queue_capacity: usize,
         kv_cache_budget_bytes: Option<u64>,
         max_slots: u32,
+        memory: &mut Option<crate::serve::resident_memory::Reservation>,
     ) -> std::result::Result<Self, EngineSpawnError> {
         match loaded {
             LoadedModel::Gemma(mut g) => {
@@ -4639,6 +4739,7 @@ impl Engine {
                     queue_capacity,
                     kv_cache_budget_bytes,
                     max_slots,
+                    memory.take(),
                 );
                 Ok(engine)
             }
@@ -4690,6 +4791,7 @@ impl Engine {
                     queue_capacity,
                     kv_cache_budget_bytes,
                     max_slots,
+                    memory.take(),
                 );
                 Ok(engine)
             }
@@ -4754,6 +4856,7 @@ impl Engine {
                     queue_capacity,
                     kv_cache_budget_bytes,
                     max_slots,
+                    memory.take(),
                 );
                 Ok(engine)
             }
@@ -4775,6 +4878,7 @@ impl Engine {
                     queue_capacity,
                     kv_cache_budget_bytes,
                     max_slots,
+                    memory.take(),
                 ))
             }
         }
@@ -4806,6 +4910,7 @@ impl Engine {
         queue_capacity: usize,
         kv_cache_budget_bytes: Option<u64>,
         max_slots: u32,
+        memory: Option<crate::serve::resident_memory::Reservation>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<Request>(queue_capacity.max(1));
 
@@ -4969,9 +5074,11 @@ impl Engine {
         let worker_kv_bytes_per_token = initial_kv_bytes_per_token_cached;
         let worker_kv_fixed_bytes_per_slot = initial_kv_fixed_bytes_per_slot_cached;
         let supervisor = EngineSupervisor::new();
+        let model_devices = loaded.owned_devices();
         let worker_handle = spawn_supervised_worker(
             "hf2q-engine-slotaware",
             supervisor.clone(),
+            model_worker_teardown(memory, model_devices),
             move |worker_supervisor| {
                 worker_run(
                     loaded,
@@ -4996,6 +5103,7 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 tx,
                 supervisor,
+                route_decision: None,
                 worker_handle: Mutex::new(Some(worker_handle)),
                 info,
                 arch,
@@ -5256,6 +5364,21 @@ impl Engine {
     /// Unified load snapshot for this engine.
     pub fn info(&self) -> &LoadInfo {
         &self.inner.info
+    }
+
+    /// Record the route decision this engine was loaded with.
+    pub(crate) fn with_route_decision(mut self, decision: serde_json::Value) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("newly loaded engine is uniquely owned before pool publication")
+            .route_decision = Some(decision);
+        self
+    }
+
+    /// The route decision this engine was loaded with (ADR-067 D6), as
+    /// `/hf2q/v1/runtime` publishes it; `None` for an engine that was not
+    /// loaded through `serve::load_engine`.
+    pub(crate) fn route_decision(&self) -> Option<serde_json::Value> {
+        self.inner.route_decision.clone()
     }
 
     /// Replace only the immutable operator-facing load snapshot path after
@@ -17815,7 +17938,12 @@ const QWEN35_SLOT_PREFILL_CHUNK_TOKENS: u32 = 2_048;
 /// retain the 2K fairness/safety quantum.
 const QWEN35_SINGLE_SLOT_PREFILL_CHUNK_CEILING: u32 = 4_096;
 
-fn qwen35_slot_prefill_chunk_tokens(n_slots: usize) -> u32 {
+/// The most rows one prompt-prefill transaction of a SlotAware Qwen worker
+/// carries: a pure function of the slot count (a phase-trace diagnostic may
+/// select another quantum; no served profile does). Memory admission sizes
+/// the prefill scratch bounds with it before the model is loaded
+/// (`prefill_prepared::prefill_switch_scratch_bound_bytes`).
+pub(crate) fn qwen35_slot_prefill_chunk_tokens(n_slots: usize) -> u32 {
     if n_slots == 1 {
         QWEN35_SINGLE_SLOT_PREFILL_CHUNK_CEILING
     } else {
@@ -19074,6 +19202,67 @@ fn run_slot_aware_qwen35(
         }
     });
 
+    // HF2Q_QWEN_PREFILL_JOINT: the waiting slots' prefill chunks share one
+    // forward of at most the per-transaction row ceiling (a quarter of it
+    // beside decoding slots). At equal rows a joint forward is not cheaper
+    // than a single slot's: four lanes of 2,048 rows together took
+    // 716-760 ms on Qwen3.6 against 590-645 ms for one 2,048-row lane
+    // (equal within 3% on Qwen3.8). Which lanes join follows the model's
+    // FFN kind (`Qwen35JointPrefillPolicy::for_worker`).
+    let qwen_joint_prefill = (n_slots > 1
+        && crate::inference::models::qwen35::prefill_joint::enabled())
+    .then(|| {
+        let policy = super::engine_qwen35::Qwen35JointPrefillPolicy::for_worker(
+            moe,
+            prefill_chunk_tokens as usize,
+        );
+        tracing::info!(
+            target: "hf2q::serve::api::engine_qwen35::progress",
+            join = ?policy.join,
+            idle_rows = policy.idle_rows,
+            decode_rows = policy.decode_rows,
+            cold_gather_ms = policy.cold_gather.as_millis() as u64,
+            prefill_first = policy.prefill_first,
+            "Qwen joint prompt prefill policy"
+        );
+        policy
+    });
+    // What the two prefill switches may hold in scratch on this worker
+    // (enforced pool caps plus the derived scratch of one layer at the
+    // transaction row ceiling): the figures memory admission charges them.
+    {
+        use crate::inference::models::qwen35::prefill_prepared as prepared;
+        let rows = prefill_chunk_tokens as usize;
+        let slots = n_slots as usize;
+        // A slot's cache holds at most the context length.
+        let kv_rows = guard
+            .model
+            .context_length
+            .unwrap_or(guard.model.model.cfg.max_position_embeddings as usize);
+        tracing::info!(
+            target: "hf2q::serve::api::engine_qwen35::progress",
+            transaction_rows = rows,
+            slots,
+            kv_rows,
+            layer_scratch_bound_bytes =
+                prepared::prefill_layer_scratch_bound_bytes(&guard.model.model.cfg, rows, slots),
+            joint_arena_bound_bytes =
+                prepared::joint_arena_bound_bytes(&guard.model.model.cfg, rows, slots, kv_rows),
+            // What the switches in force are charged, as one pool.
+            switch_scratch_bound_bytes = prepared::prefill_switch_scratch_bound_bytes(
+                &guard.model.model.cfg,
+                rows,
+                slots,
+                kv_rows,
+                qwen_joint_prefill.is_some(),
+                prepared::switches_from_process().map_or(1, |switches| switches.wait_layers),
+            ),
+            "Qwen prompt prefill scratch bounds"
+        );
+    }
+    // When the first prompts of a cohort started to gather (see STEP).
+    let mut cold_gather_deadline: Option<Instant> = None;
+
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {
             *g = sched.stats();
@@ -19285,6 +19474,26 @@ fn run_slot_aware_qwen35(
                 }
                 Request::Warmup { reply } => {
                     let result = warmup_qwen35_once(guard.model, &supervisor);
+                    // The prompt-prefill route's first-use costs belong to
+                    // warmup too, while no request holds a slot.
+                    let untouched = scheduler.stats().admitted_total == 0
+                        && slots.iter().all(Option::is_none);
+                    let result = result.and_then(|()| {
+                        if !untouched {
+                            return Ok(());
+                        }
+                        let started = Instant::now();
+                        let kv = guard.kv.as_mut().expect("kv Some during loop");
+                        if supervised_qwen35_warmup(&supervisor, || {
+                            guard.model.warm_prefill_route(kv)
+                        })? {
+                            tracing::info!(
+                                "hf2q-engine Qwen35 prefill route warmup complete in {:.0}ms",
+                                started.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        Ok(())
+                    });
                     if !supervisor.is_healthy()
                         || result
                             .as_ref()
@@ -19439,6 +19648,30 @@ fn run_slot_aware_qwen35(
             break 'worker;
         }
 
+        // HF2Q_QWEN_PREFILL_JOINT: first prompts gather. While nothing else
+        // runs on the worker and a slot is still free, the first prompt of a
+        // conversation waits a moment for other first prompts, so that
+        // agents started together prefill in one forward and share their
+        // common prompt prefix. Nobody but the waiting requests is delayed,
+        // and a cohort waits once: the window opens when its first request
+        // is admitted and is not reopened until no slot is prefilling.
+        if let Some(policy) = qwen_joint_prefill.filter(|_| !shutdown_requested) {
+            if qwen35_first_prompts_may_gather(&slots) {
+                let deadline = *cold_gather_deadline
+                    .get_or_insert_with(|| Instant::now() + policy.cold_gather);
+                if Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_micros(100));
+                    continue 'worker;
+                }
+            } else if !slots
+                .iter()
+                .flatten()
+                .any(|(work, _, _)| matches!(work, Qwen35SlotWork::Prefill(_)))
+            {
+                cold_gather_deadline = None;
+            }
+        }
+
         // ── STEP ─────────────────────────────────────────────────────
         let step = match scheduler.step() {
             Ok(s) => s,
@@ -19486,7 +19719,7 @@ fn run_slot_aware_qwen35(
                 }
             }
             SchedulerStep::Prefill { handle, n_tokens } => {
-                if let Some(fatal) = advance_qwen35_prefill(
+                if let Some(fatal) = advance_qwen35_prefill_step(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
@@ -19497,6 +19730,8 @@ fn run_slot_aware_qwen35(
                     &scheduler_stats_snapshot,
                     handle,
                     n_tokens,
+                    // Nothing decodes: the transaction ceiling.
+                    qwen_joint_prefill.map(|policy| (policy.idle_rows, policy.join)),
                     kv_bytes_per_token,
                     &supervisor,
                 ) {
@@ -19538,6 +19773,9 @@ fn run_slot_aware_qwen35(
                     );
                     break 'worker;
                 }
+                // A stretch of decode cycles uses none of the weights only
+                // the prompt prefill reads; keep them from ageing.
+                keep_qwen35_prefill_weights_fresh(&guard);
                 let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
                 crate::inference::models::gemma4::batched_body::host_phases::add(
@@ -19550,58 +19788,60 @@ fn run_slot_aware_qwen35(
                 n_prefill_tokens,
                 decode_handles,
             } => {
-                // Existing streams run before one bounded cold transaction.
-                // This ordering is the observable fairness contract: a newly
-                // admitted large tool prompt cannot make a decode-ready peer
-                // wait for its entire prefill.
-                if let Some(fatal) = decode_batch_qwen35(
-                    &mut guard,
-                    &mut scheduler,
-                    &mut slots,
-                    &mut retained_tokens,
-                    &mut prompt_caches,
-                    &mut prompt_anchors,
-                    registration.as_ref(),
-                    &decode_handles,
-                    kv_bytes_per_token,
-                    qwen_joint_decode,
-                    &supervisor,
-                ) {
-                    fail_qwen35_worker_after_gpu_fatal(
-                        &supervisor,
-                        &mut rx,
-                        &mut pending,
-                        &mut slots,
-                        &mut scheduler,
-                        &scheduler_stats_snapshot,
-                        fatal,
-                    );
-                    break 'worker;
-                }
-                if let Some(fatal) = advance_qwen35_prefill(
-                    &mut guard,
-                    &mut scheduler,
-                    &mut slots,
-                    &mut retained_tokens,
-                    &mut prompt_caches,
-                    &mut prompt_anchors,
-                    registration.as_ref(),
-                    &scheduler_stats_snapshot,
-                    prefill,
-                    n_prefill_tokens,
-                    kv_bytes_per_token,
-                    &supervisor,
-                ) {
-                    fail_qwen35_worker_after_gpu_fatal(
-                        &supervisor,
-                        &mut rx,
-                        &mut pending,
-                        &mut slots,
-                        &mut scheduler,
-                        &scheduler_stats_snapshot,
-                        fatal,
-                    );
-                    break 'worker;
+                // Without the joint prefill policy, existing streams run
+                // before one bounded cold transaction. With it
+                // (`Qwen35JointPrefillPolicy::prefill_first`) the transaction
+                // runs first: a decoding slot's cycles and the transactions
+                // alternate either way, so its largest gap between tokens
+                // is one transaction plus one cycle in both orders, and the
+                // waiting request no longer spends a decode cycle of time
+                // to first token behind streams that lose nothing by it.
+                let prefill_first = qwen_joint_prefill.is_some_and(|policy| policy.prefill_first);
+                for decode_phase in [!prefill_first, prefill_first] {
+                    let fatal = if decode_phase {
+                        decode_batch_qwen35(
+                            &mut guard,
+                            &mut scheduler,
+                            &mut slots,
+                            &mut retained_tokens,
+                            &mut prompt_caches,
+                            &mut prompt_anchors,
+                            registration.as_ref(),
+                            &decode_handles,
+                            kv_bytes_per_token,
+                            qwen_joint_decode,
+                            &supervisor,
+                        )
+                    } else {
+                        advance_qwen35_prefill_step(
+                            &mut guard,
+                            &mut scheduler,
+                            &mut slots,
+                            &mut retained_tokens,
+                            &mut prompt_caches,
+                            &mut prompt_anchors,
+                            registration.as_ref(),
+                            &scheduler_stats_snapshot,
+                            prefill,
+                            n_prefill_tokens,
+                            // The decoding streams wait for this transaction.
+                            qwen_joint_prefill.map(|policy| (policy.decode_rows, policy.join)),
+                            kv_bytes_per_token,
+                            &supervisor,
+                        )
+                    };
+                    if let Some(fatal) = fatal {
+                        fail_qwen35_worker_after_gpu_fatal(
+                            &supervisor,
+                            &mut rx,
+                            &mut pending,
+                            &mut slots,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            fatal,
+                        );
+                        break 'worker;
+                    }
                 }
                 let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
@@ -20276,6 +20516,357 @@ fn advance_qwen35_prefill(
             .and_then(|kv| kv.sequence_len_for_slot(handle.slot_id).ok())
             .map(|n| n as usize),
     );
+    let fatal = settle_qwen35_prefill_advance(
+        guard,
+        scheduler,
+        slots,
+        retained_tokens,
+        prompt_caches,
+        prompt_anchors,
+        registration,
+        handle,
+        advance,
+        reply,
+        kv_bytes_per_token,
+        supervisor,
+    );
+    if fatal.is_some() {
+        return fatal;
+    }
+    if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
+        *snapshot = scheduler.stats();
+    }
+    None
+}
+
+/// One prefill step of the Qwen worker: with `joint_rows`, the chunks of
+/// every waiting slot that can share a forward run as one transaction of at
+/// most that many rows (`HF2Q_QWEN_PREFILL_JOINT`); otherwise, and whenever
+/// no second slot can join the scheduled one, the scheduled slot's own
+/// bounded prefill.
+#[allow(clippy::too_many_arguments)]
+fn advance_qwen35_prefill_step(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Qwen35Slot>],
+    retained_tokens: &mut [Qwen35RetainedPrefix],
+    prompt_caches: &mut [PromptCache],
+    prompt_anchors: &mut [Qwen35AnchorStore],
+    registration: Option<&super::registry::ModelRegistration>,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    handle: SlotHandle,
+    requested_tokens: u32,
+    joint: Option<(usize, super::engine_qwen35::Qwen35PrefillJoin)>,
+    kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
+) -> Option<Qwen35FatalFailure> {
+    if let Some((max_rows, join)) = joint {
+        if let Some(outcome) = advance_qwen35_prefill_joint(
+            guard,
+            scheduler,
+            slots,
+            retained_tokens,
+            prompt_caches,
+            prompt_anchors,
+            registration,
+            scheduler_stats_snapshot,
+            handle,
+            max_rows,
+            join,
+            kv_bytes_per_token,
+            supervisor,
+        ) {
+            return outcome;
+        }
+    }
+    advance_qwen35_prefill(
+        guard,
+        scheduler,
+        slots,
+        retained_tokens,
+        prompt_caches,
+        prompt_anchors,
+        registration,
+        scheduler_stats_snapshot,
+        handle,
+        requested_tokens,
+        kv_bytes_per_token,
+        supervisor,
+    )
+}
+
+/// Whether first prompts are still gathering for a joint prefill
+/// ([`super::engine_qwen35::qwen35_first_prompts_may_gather`]).
+fn qwen35_first_prompts_may_gather(slots: &[Option<Qwen35Slot>]) -> bool {
+    use super::engine_qwen35::Qwen35GatherSlot;
+    super::engine_qwen35::qwen35_first_prompts_may_gather(slots.iter().map(|slot| match slot {
+        None => Qwen35GatherSlot::Free,
+        Some((Qwen35SlotWork::Prefill(state), _, _)) if state.starts_cold() => {
+            Qwen35GatherSlot::FirstPrompt
+        }
+        Some(_) => Qwen35GatherSlot::Busy,
+    }))
+}
+
+/// Run the next prefill chunk of the scheduled slot `head` and of the slots
+/// waiting behind it as one joint forward. `None`: nothing was touched and
+/// the caller runs the head's own step (fewer than two slots can join, the
+/// head must run alone, or the prefill route is not exact for the model).
+/// `Some(outcome)`: the joint transaction ran; `outcome` is the worker
+/// fail-stop, if any.
+///
+/// Every admission check runs before a cache is touched. A lane's chunk is
+/// the chunk its own step would run, so which slots share a forward never
+/// changes how a prompt is cut.
+#[allow(clippy::too_many_arguments)]
+fn advance_qwen35_prefill_joint(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Qwen35Slot>],
+    retained_tokens: &mut [Qwen35RetainedPrefix],
+    prompt_caches: &mut [PromptCache],
+    prompt_anchors: &mut [Qwen35AnchorStore],
+    registration: Option<&super::registry::ModelRegistration>,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    head: SlotHandle,
+    max_rows: usize,
+    join: super::engine_qwen35::Qwen35PrefillJoin,
+    kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
+) -> Option<Option<Qwen35FatalFailure>> {
+    use super::engine_qwen35::{Qwen35JointPrefillAdvance, Qwen35PrefillLane, Qwen35PrefillAdvance};
+    let quanta = scheduler.prefill_quanta_fifo();
+    if quanta.len() < 2 || quanta[0].0 != head {
+        return None;
+    }
+    // Plan every waiting slot's chunk in place. The head must be joinable;
+    // a later slot that is not simply keeps waiting for its own step.
+    let mut candidates = Vec::with_capacity(quanta.len());
+    {
+        let kv = guard.kv.as_ref()?;
+        for (index, (handle, requested_tokens)) in quanta.iter().copied().enumerate() {
+            let slot_idx = handle.slot_id.0 as usize;
+            let planned = match slots.get(slot_idx).and_then(Option::as_ref) {
+                Some((Qwen35SlotWork::Prefill(state), reply, installed))
+                    if *installed == handle && !reply.client_closed() =>
+                {
+                    let quota_headroom = prompt_anchors[slot_idx].quota_headroom();
+                    state
+                        .plan_joint_chunk(
+                            guard.model,
+                            kv,
+                            qwen35_prefill_transaction_tokens(requested_tokens),
+                            quota_headroom,
+                        )
+                        .ok()
+                        .flatten()
+                        .map(|chunk| (handle, chunk, quota_headroom))
+                }
+                _ => None,
+            };
+            match planned {
+                Some(candidate) => candidates.push(candidate),
+                None if index == 0 => return None,
+                None => {}
+            }
+        }
+    }
+    if candidates.len() < 2 || !guard.model.prefill_joint_exact() {
+        return None;
+    }
+    let cohort = {
+        let shapes: Vec<_> = candidates
+            .iter()
+            .map(|(handle, chunk, _)| match slots[handle.slot_id.0 as usize].as_ref() {
+                Some((Qwen35SlotWork::Prefill(state), _, _)) => Some(state.joint_lane_shape(chunk)),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        super::engine_qwen35::qwen35_prefill_cohort(&shapes, max_rows, true, join)?
+    };
+    candidates.truncate(cohort.lanes);
+
+    // Checkpoint storage of the lanes that fold their cue, before any slot
+    // is touched: without it the scheduled slot runs its own step, which
+    // keeps the two forwards.
+    let mut fold_images = Vec::with_capacity(candidates.len());
+    {
+        let kv = guard.kv.as_ref()?;
+        for (handle, chunk, _) in &candidates {
+            fold_images.push(if chunk.folds_cue() {
+                match kv.boundary_anchor_image() {
+                    Ok(image) => Some(image),
+                    Err(error) => {
+                        tracing::warn!(
+                            slot = handle.slot_id.0,
+                            error = %format!("{error:#}"),
+                            "Qwen35 joint prefill skipped: checkpoint storage allocation failed"
+                        );
+                        return None;
+                    }
+                }
+            } else {
+                None
+            });
+        }
+    }
+
+    // Admitted: take the lanes' work out of their slots.
+    let mut lanes = Vec::with_capacity(candidates.len());
+    let mut replies = Vec::with_capacity(candidates.len());
+    for ((handle, chunk, anchor_quota_headroom), fold_image) in
+        candidates.into_iter().zip(fold_images)
+    {
+        match slots[handle.slot_id.0 as usize].take() {
+            Some((Qwen35SlotWork::Prefill(state), reply, _)) => {
+                lanes.push(Qwen35PrefillLane {
+                    state,
+                    chunk,
+                    fold_image,
+                    anchor_quota_headroom,
+                });
+                replies.push((handle, reply));
+            }
+            other => {
+                // Planned from this very slot a moment ago on this thread.
+                slots[handle.slot_id.0 as usize] = other;
+                return Some(Some(Qwen35FatalFailure {
+                    handle: None,
+                    reply: Qwen35FatalReply::None,
+                    error: anyhow::anyhow!(
+                        "Qwen35 joint prefill lost the planned work of slot {}",
+                        handle.slot_id.0
+                    ),
+                    kind: Qwen35WorkerFatalKind::Invariant,
+                }));
+            }
+        }
+    }
+    let handles: Vec<SlotHandle> = replies.iter().map(|(handle, _)| *handle).collect();
+    tracing::debug!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        lanes = handles.len(),
+        rows = cohort.rows,
+        shared_rows = cohort.shared_rows,
+        sharing = cohort.sharing.iter().filter(|shares| **shares).count(),
+        "Qwen35 joint prefill transaction"
+    );
+    let _native_invocation = scheduler.trace_transaction("qwen35", "bounded_prefill", &handles);
+    let advance = super::engine_qwen35::run_qwen35_joint_prefill(
+        lanes,
+        &cohort,
+        guard.model,
+        registration,
+        guard.kv.as_mut().expect("kv Some during loop"),
+        supervisor,
+    );
+    // What is left of a lane once it cannot be settled normally: its work,
+    // when it still has one, goes back into its slot for the fail-stop.
+    enum Unsettled {
+        Advance(Result<Qwen35PrefillAdvance>),
+        State(super::engine_qwen35::Qwen35PrefillState),
+    }
+    let mut results: Vec<Unsettled> = match advance {
+        Qwen35JointPrefillAdvance::Lanes(results) => results.into_iter().map(Unsettled::Advance).collect(),
+        Qwen35JointPrefillAdvance::Failed { error, states } => {
+            if !supervisor.is_healthy() || is_fatal_command_buffer_error(&error) {
+                // Fail-stop on the head's reply; the other lanes go back
+                // into their slots so the fail-stop fails them too.
+                let mut states = states.into_iter().map(Unsettled::State).collect::<Vec<_>>();
+                states[0] = Unsettled::Advance(Err(error));
+                states
+            } else {
+                // Every lane's slot is mid-transaction: each request fails
+                // and its slot is reset, as after its own failed forward.
+                let detail = format!("{error:#}");
+                let mut first = Some(error);
+                states
+                    .into_iter()
+                    .map(|_state| {
+                        Unsettled::Advance(Err(first.take().unwrap_or_else(|| {
+                            anyhow::anyhow!("Qwen35 joint prefill failed: {detail}")
+                        })))
+                    })
+                    .collect()
+            }
+        }
+    };
+    results.reverse();
+    replies.reverse();
+    let mut fatal = None;
+    while let (Some(result), Some((handle, reply))) = (results.pop(), replies.pop()) {
+        let slot_idx = handle.slot_id.0 as usize;
+        if fatal.is_some() {
+            // The worker is stopping: park what is left for the fail-stop.
+            match result {
+                Unsettled::State(state)
+                | Unsettled::Advance(Ok(Qwen35PrefillAdvance::Pending { state, .. })) => {
+                    slots[slot_idx] = Some((Qwen35SlotWork::Prefill(state), reply, handle));
+                }
+                Unsettled::Advance(Ok(Qwen35PrefillAdvance::Ready { state, .. })) => {
+                    slots[slot_idx] = Some((Qwen35SlotWork::Decode(state), reply, handle));
+                }
+                Unsettled::Advance(Err(error)) => {
+                    scheduler.release(handle);
+                    finish_qwen35_operator_request(handle, "failed");
+                    slot_fire_fatal(
+                        reply,
+                        &format!(
+                            "engine_unhealthy: Qwen worker stopped during a joint prefill: {error:#}"
+                        ),
+                    );
+                }
+            }
+            continue;
+        }
+        match result {
+            Unsettled::Advance(advance) => {
+                fatal = settle_qwen35_prefill_advance(
+                    guard,
+                    scheduler,
+                    slots,
+                    retained_tokens,
+                    prompt_caches,
+                    prompt_anchors,
+                    registration,
+                    handle,
+                    advance,
+                    reply,
+                    kv_bytes_per_token,
+                    supervisor,
+                );
+            }
+            Unsettled::State(state) => {
+                // Only produced behind a fatal head, handled above.
+                slots[slot_idx] = Some((Qwen35SlotWork::Prefill(state), reply, handle));
+            }
+        }
+    }
+    if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
+        *snapshot = scheduler.stats();
+    }
+    Some(fatal)
+}
+
+/// Settle one slot after a prefill transaction (its own, or its lane of a
+/// joint one): publish the advance, install a checkpoint, hand a finished
+/// prompt to decode, or reset the slot and fail the request.
+#[allow(clippy::too_many_arguments)]
+fn settle_qwen35_prefill_advance(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Qwen35Slot>],
+    retained_tokens: &mut [Qwen35RetainedPrefix],
+    prompt_caches: &mut [PromptCache],
+    prompt_anchors: &mut [Qwen35AnchorStore],
+    registration: Option<&super::registry::ModelRegistration>,
+    handle: SlotHandle,
+    advance: Result<super::engine_qwen35::Qwen35PrefillAdvance>,
+    mut reply: SlotReply,
+    kv_bytes_per_token: u64,
+    supervisor: &EngineSupervisor,
+) -> Option<Qwen35FatalFailure> {
+    let slot_idx = handle.slot_id.0 as usize;
     match advance {
         Ok(super::engine_qwen35::Qwen35PrefillAdvance::Pending {
             state,
@@ -20420,11 +21011,9 @@ fn advance_qwen35_prefill(
             slot_fire_done(reply, Err(error), false);
         }
     }
-    if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
-        *snapshot = scheduler.stats();
-    }
     None
 }
+
 
 fn log_qwen35_slot_decode_complete(
     result: &GenerationResult,
@@ -20850,6 +21439,20 @@ fn embed_qwen35_inline(
     None
 }
 
+/// `HF2Q_QWEN_PREFILL_KEEP_FRESH`: between decode cycles, use the weights
+/// only the prompt prefill reads (at most one tiny command buffer per
+/// quarter second, committed without a wait). A failure is logged once and
+/// ends the keep-alive; it never fails a request.
+fn keep_qwen35_prefill_weights_fresh(guard: &Qwen35KvGuard<'_>) {
+    use crate::inference::models::qwen35::prefill_keep_fresh;
+    if !prefill_keep_fresh::enabled() {
+        return;
+    }
+    if let Err(error) = guard.model.model.keep_prefill_weights_fresh() {
+        tracing::warn!(error = %format!("{error:#}"), "Qwen35 prefill keep-fresh stopped");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_batch_qwen35(
     guard: &mut Qwen35KvGuard<'_>,
@@ -21252,6 +21855,11 @@ fn worker_run(
     let phase_trace_supervisor = supervisor.clone();
     let _phase_trace_worker =
         crate::serve::phase_trace::worker(move || phase_trace_supervisor.is_healthy());
+    // The worker reads the fast-route switches as its model resolved them at
+    // load, not as another model in this process did.
+    if let LoadedModel::Qwen35(q) = &loaded {
+        crate::inference::spec_decode::dflash2::route_profile::bind_thread(Arc::clone(&q.routes));
+    }
     tracing::info!(
         model = %loaded.model_id(),
         ?mode,
@@ -34847,6 +35455,7 @@ assistant:
             inner: Arc::new(EngineInner {
                 tx,
                 supervisor: EngineSupervisor::new(),
+                route_decision: None,
                 worker_handle: Mutex::new(Some(handle)),
                 info: synthetic_load_info("test-model"),
                 arch,
@@ -36420,6 +37029,8 @@ assistant:
             // production `Qwen35LoadedModel::load` site).
             persistent_kv_cache: None,
             dflash2: None,
+            dflash2_plan: None,
+            routes: crate::inference::spec_decode::dflash2::route_profile::current(),
             speculation: super::super::qwen35_speculation::QwenSpeculationController::new(
                 super::super::qwen35_speculation::QwenSpeculationPolicy::Off,
             ),
@@ -36733,6 +37344,7 @@ assistant:
             inner: Arc::new(EngineInner {
                 tx,
                 supervisor: EngineSupervisor::new(),
+                route_decision: None,
                 worker_handle: Mutex::new(Some(handle)),
                 info: synthetic_load_info("synth-kv"),
                 arch: LoadedArch::Gemma,
@@ -37082,12 +37694,13 @@ assistant:
         let queue_capacity: usize = 4;
         let kv_cache_budget_bytes: Option<u64> = None;
 
-        let engine_a = Engine::spawn(loaded_a, queue_capacity, kv_cache_budget_bytes);
+        let engine_a = Engine::spawn(loaded_a, queue_capacity, kv_cache_budget_bytes, None);
         let engine_b = Engine::spawn_with_mode(
             loaded_b,
             queue_capacity,
             kv_cache_budget_bytes,
             EngineMode::SerialFifo,
+            &mut None,
         )
         .expect(
             "ADR-040 iter-1.5 F1: EngineMode::SerialFifo MUST succeed at \
@@ -37671,7 +38284,7 @@ assistant:
         // F1 loop at N=1.
         let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
         let engine_slot =
-            Engine::spawn_with_mode(loaded_slot, 4, None, EngineMode::SlotAware { max_slots: 1 })
+            Engine::spawn_with_mode(loaded_slot, 4, None, EngineMode::SlotAware { max_slots: 1 }, &mut None)
                 .expect("spawn SlotAware{max_slots:1}");
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -37732,7 +38345,7 @@ assistant:
         // (1) My F1 loop via SlotAware{1}.
         let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
         let engine_slot =
-            Engine::spawn_with_mode(loaded_slot, 4, None, EngineMode::SlotAware { max_slots: 1 })
+            Engine::spawn_with_mode(loaded_slot, 4, None, EngineMode::SlotAware { max_slots: 1 }, &mut None)
                 .expect("spawn SlotAware{1}");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -38574,7 +39187,7 @@ assistant:
         // drive all generates concurrently on the multi-thread runtime.
         let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
         let engine_slot =
-            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 4 })
+            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 4 }, &mut None)
                 .expect("spawn SlotAware{max_slots:4}");
         let slot_results = rt.block_on(async {
             let mut handles = Vec::new();
@@ -38657,6 +39270,7 @@ assistant:
                 2,
                 None,
                 EngineMode::SlotAware { max_slots: 1 },
+                &mut None,
             )
             .expect("spawn fresh bounded Gemma engine");
             let result = rt
@@ -38678,6 +39292,7 @@ assistant:
             2,
             None,
             EngineMode::SlotAware { max_slots: 1 },
+            &mut None,
         )
         .expect("spawn bounded Gemma engine");
         let eager = rt
@@ -38793,7 +39408,7 @@ assistant:
             .expect("rt");
         let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
         let engine_slot =
-            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 4 })
+            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 4 }, &mut None)
                 .expect("spawn SlotAware{max_slots:4}");
         // STAGGER admission: HF2Q_FALSIFIER_STAGGER_MS>0 inserts an increasing
         // pre-generate delay per slot so each prefills SEPARATELY (slot 0 solo,
@@ -38965,6 +39580,7 @@ assistant:
                 8,
                 None,
                 EngineMode::SlotAware { max_slots: 8 },
+                &mut None,
             )
             .expect("spawn SlotAware{max_slots:8}");
             let slot_results: Vec<GenerationResult> = rt.block_on(async {
@@ -39124,7 +39740,7 @@ assistant:
         let serial = qwen35_serial_slot_aware_ref_at(&load_opts, &prompt, &params, 1, SlotId(0));
         let loaded = LoadedModel::load(&load_opts).expect("load qwen35 n1");
         let engine =
-            Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 8 })
+            Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 8 }, &mut None)
                 .expect("spawn qwen35 SlotAware n1");
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -39245,7 +39861,7 @@ assistant:
         // Concurrent SlotAware run at max_slots=8.
         let loaded_slot = LoadedModel::load(&load_opts).expect("load qwen35 slot");
         let engine_slot =
-            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 8 })
+            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 8 }, &mut None)
                 .expect("spawn qwen35 SlotAware{max_slots:8}");
         let slot_results: Vec<GenerationResult> = rt.block_on(async {
             let mut handles = Vec::new();
@@ -39353,7 +39969,7 @@ assistant:
 
         let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
         let engine_slot =
-            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 8 })
+            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 8 }, &mut None)
                 .expect("spawn SlotAware{max_slots:8}");
 
         let run_batch = |eng: &Engine| -> Vec<String> {
@@ -39728,7 +40344,7 @@ assistant:
         };
         let loaded = LoadedModel::load(&load_opts).expect("load e2e");
         let engine =
-            Engine::spawn_with_mode(loaded, 16, None, EngineMode::SlotAware { max_slots: 8 })
+            Engine::spawn_with_mode(loaded, 16, None, EngineMode::SlotAware { max_slots: 8 }, &mut None)
                 .expect("spawn SlotAware");
         let results: Vec<GenerationResult> = rt.block_on(async {
             let mut handles = Vec::new();
@@ -39773,7 +40389,7 @@ assistant:
             }
             let loaded = LoadedModel::load(&load_opts).expect("load ttft");
             let engine =
-                Engine::spawn_with_mode(loaded, 16, None, EngineMode::SlotAware { max_slots: 8 })
+                Engine::spawn_with_mode(loaded, 16, None, EngineMode::SlotAware { max_slots: 8 }, &mut None)
                     .expect("spawn ttft");
             // warm-up (pipeline bake) — not timed.
             let _ = rt.block_on(
@@ -40055,6 +40671,7 @@ assistant:
             EngineMode::SlotAware {
                 max_slots: n_streams as u32,
             },
+            &mut None,
         )
         .expect("spawn SlotAware");
         // ADR-040 iter-I contention probe: vary the probe's tokio worker count
@@ -40378,7 +40995,7 @@ assistant:
 
         let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
         let engine_slot =
-            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 4 })
+            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 4 }, &mut None)
                 .expect("spawn SlotAware{max_slots:4}");
         let slot_results: Vec<GenerationResult> = rt.block_on(async {
             let mut handles = Vec::new();
@@ -40816,12 +41433,13 @@ assistant:
         let queue_capacity: usize = 4;
         let kv_cache_budget_bytes: Option<u64> = None;
 
-        let engine_a = Engine::spawn(loaded_a, queue_capacity, kv_cache_budget_bytes);
+        let engine_a = Engine::spawn(loaded_a, queue_capacity, kv_cache_budget_bytes, None);
         let engine_b = Engine::spawn_with_mode(
             loaded_b,
             queue_capacity,
             kv_cache_budget_bytes,
             EngineMode::SerialFifo,
+            &mut None,
         )
         .expect(
             "ADR-040 iter-1.5 F1: EngineMode::SerialFifo MUST succeed at \
@@ -44651,28 +45269,6 @@ mod adr040_phase_c_iter1_engine_mode_tests {
         );
     }
 
-    /// Compile-time gate — `Engine::spawn_with_mode` exists with the
-    /// iter-1.5 `Result`-returning signature. If a future iter renames
-    /// the constructor, drops the `EngineMode` parameter, reorders args,
-    /// or reverts to the iter-1 infallible signature, this fails to
-    /// compile. The Result type is what makes the iter-1 Liskov
-    /// violation impossible to silently reintroduce — callers MUST handle
-    /// the `Err` arm today.
-    ///
-    /// The function is NOT called (would require a real `LoadedModel` +
-    /// GGUF on disk); the binding alone is the load-bearing assertion.
-    #[test]
-    fn spawn_with_mode_signature_returns_result() {
-        let _f: fn(
-            LoadedModel,
-            usize,
-            Option<u64>,
-            EngineMode,
-        ) -> std::result::Result<Engine, EngineSpawnError> = Engine::spawn_with_mode;
-        // SlotAware variant constructible at this iter (signature-only).
-        let _m: EngineMode = EngineMode::SlotAware { max_slots: 4 };
-    }
-
     /// ADR-040 iter-1.5 — `Engine::mode()` returns the mode stored on
     /// `EngineInner`, not a hardcoded default. This is the Liskov-honest
     /// version of the iter-1 accessor; iter-1's "always return
@@ -44707,19 +45303,6 @@ mod adr040_phase_c_iter1_engine_mode_tests {
         assert!(msg.contains("iter-2"), "msg: {}", msg);
     }
 
-    /// Signature-only pin: proves the existing 3-arg `Engine::spawn`
-    /// constructor signature has not changed since pre-ADR-040. This is
-    /// NOT a behaviour pin — the spawn body could be silently rewritten
-    /// without this test failing. Behavioural byte-equivalence is owned
-    /// by Phase C iter-2's live regression test (per ADR-040 §3.6
-    /// amended); F4 (renamed from
-    /// `engine_spawn_signature_unchanged_at_phase_c_iter_1` per Codex
-    /// `major_findings[3]` to make the signature-only nature of the
-    /// guard explicit in the test name).
-    #[test]
-    fn engine_spawn_3_arg_signature_compile_pin() {
-        let _spawn: fn(LoadedModel, usize, Option<u64>) -> Engine = Engine::spawn;
-    }
 }
 
 #[cfg(test)]
@@ -45494,25 +46077,6 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
         );
     }
 
-    /// **H21b (skip-mode)** — `Engine::spawn_with_mode` signature
-    /// compile pin extended for iter-C2c. The 4-arg signature is
-    /// unchanged from C1.5 (still `Result<Self, EngineSpawnError>`); the
-    /// load-bearing assertion is that the SlotAware arm can be
-    /// constructed at the type level (the iter-C2c spawn body
-    /// successfully accepts `EngineMode::SlotAware { max_slots: N }`
-    /// without a `match` exhaustiveness regression).
-    #[test]
-    fn h21b_spawn_with_mode_accepts_slot_aware_variant_at_type_level() {
-        let _f: fn(
-            LoadedModel,
-            usize,
-            Option<u64>,
-            EngineMode,
-        ) -> std::result::Result<Engine, EngineSpawnError> = Engine::spawn_with_mode;
-        // SlotAware variant constructible — needed for any C2c caller.
-        let _m: EngineMode = EngineMode::SlotAware { max_slots: 4 };
-    }
-
     /// **H21 (env-gated)** — `Engine::spawn_with_mode(.., EngineMode::
     /// SlotAware { max_slots: 4 })` returns `Ok(Engine)` for a real
     /// Gemma 4 GGUF (replaces the C2b `ModeNotYetWired` rejection).
@@ -45552,7 +46116,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             "H21 fixture: GGUF must load as LoadedModel::Gemma"
         );
         let engine =
-            Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 });
+            Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 }, &mut None);
         let engine = engine.unwrap_or_else(|e| {
             panic!(
                 "H21 FALSIFIED: spawn_with_mode(SlotAware) must return \
@@ -45714,7 +46278,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
         // does not provision — it never calls
         // `provision_multi_seq_kv_for_slot_aware`. Smoke-pin by
         // spawning via the 3-arg entry and observing max_slots=1.
-        let engine = Engine::spawn(LoadedModel::Gemma(g), 8, None);
+        let engine = Engine::spawn(LoadedModel::Gemma(g), 8, None, None);
         assert_eq!(
             engine.max_slots(),
             1,
@@ -45765,7 +46329,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
         };
         let loaded = LoadedModel::load(&opts).expect("H24: load Gemma 4 GGUF");
         let engine =
-            Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 })
+            Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 }, &mut None)
                 .expect("H24: spawn_with_mode(SlotAware) returns Ok for Gemma 4 at C2c");
         let stats = engine.scheduler_stats();
         assert_eq!(
@@ -59364,6 +59928,10 @@ mod gemma_cold_prefill_tests;
 #[cfg(test)]
 #[path = "engine_gemma_warm_batch_tests.rs"]
 mod gemma_warm_batch_tests;
+
+#[cfg(test)]
+#[path = "engine_gemma_warm_depth_tests.rs"]
+mod gemma_warm_depth_tests;
 
 #[cfg(test)]
 #[path = "engine_gemma_warm_batch_fault_tests.rs"]

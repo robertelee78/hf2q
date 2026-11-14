@@ -108,12 +108,162 @@ fn effective_ffn_terminal_k_batch(seq_len: u32, configured: usize) -> usize {
 /// has run. The layer loop calls this before a host copy of the residual
 /// stream whose producer was committed without a wait.
 fn wait_for_committed_gpu_work(device: &MlxDevice) -> Result<()> {
-    device
+    // A pipelined forward first waits for, and reads the status of, every
+    // command buffer it committed without a wait.
+    let settled = super::encoder_stage::settle_submitted();
+    let drained = device
         .command_encoder()
         .map(crate::inference::native_observation::encoder)
-        .context("host-read drain encoder")?
-        .commit_and_wait_labeled("qwen35.forward.host_read_drain")
-        .context("host-read drain")
+        .context("host-read drain encoder")
+        .and_then(|mut encoder| {
+            encoder
+                .commit_and_wait_labeled("qwen35.forward.host_read_drain")
+                .context("host-read drain")
+        });
+    settled.and(drained)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test failpoint: the layer at whose start a multi-row forward returns
+    /// an error, with whatever it committed before still running.
+    static FAIL_AT_LAYER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Until dropped, every multi-row forward on this thread fails at the start
+/// of `layer` (see `FAIL_AT_LAYER`).
+#[cfg(test)]
+pub(crate) struct FailForwardAtLayer;
+
+#[cfg(test)]
+impl FailForwardAtLayer {
+    pub(crate) fn set(layer: usize) -> Self {
+        FAIL_AT_LAYER.with(|cell| cell.set(Some(layer)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailForwardAtLayer {
+    fn drop(&mut self) {
+        FAIL_AT_LAYER.with(|cell| cell.set(None));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test stand-in for `HF2Q_DENSE_Q_ARENA_RESET=0` on this thread.
+    static NO_SCRATCH_RESET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Until dropped, this thread's forwards run as under
+/// `HF2Q_DENSE_Q_ARENA_RESET=0`: no scratch reset at a layer's host wait.
+#[cfg(test)]
+pub(crate) struct NoScratchResetForTest;
+
+#[cfg(test)]
+impl NoScratchResetForTest {
+    pub(crate) fn set() -> Self {
+        NO_SCRATCH_RESET.with(|cell| cell.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for NoScratchResetForTest {
+    fn drop(&mut self) {
+        NO_SCRATCH_RESET.with(|cell| cell.set(false));
+    }
+}
+
+/// Whether every layer of the model runs its prompt-prefill products on the
+/// prepared kernel in the open prefill scope: the condition under which a
+/// folded or joint forward is exact, and the route the per-layer scratch
+/// bound is derived for.
+fn prefill_layers_prepared(
+    layers: &[LayerWeightsGpu],
+    cfg: &Qwen35Config,
+    routes: super::prefill_fold::UnfoldedRoutes,
+) -> bool {
+    let shape = DeltaNetLayerShape::from_config(cfg);
+    layers.iter().all(|layer| {
+        let (ffn, linear) = match layer {
+            LayerWeightsGpu::FullAttn { ffn, .. } => (ffn, None),
+            LayerWeightsGpu::LinearAttn { attn, ffn } => (ffn, Some(attn)),
+        };
+        let ffn_exact = match ffn {
+            FfnWeightsGpu::DenseQ(weights) => {
+                super::gpu_ffn::dense_prefill_products_prepared(weights, 2)
+            }
+            FfnWeightsGpu::MoeQ(_) => !routes.moe_route_override,
+            FfnWeightsGpu::Dense(_) | FfnWeightsGpu::Moe(_) => false,
+        };
+        ffn_exact
+            && linear.is_none_or(|weights| {
+                shape.d_k % 32 == 0
+                    && shape.d_k <= 128
+                    && super::gpu_delta_net::prefill_products_prepared(
+                        weights,
+                        shape.hidden_size,
+                        shape.n_k_heads,
+                        shape.n_v_heads,
+                        shape.d_k,
+                        shape.d_v,
+                    )
+            })
+    })
+}
+
+/// Whether a multi-row forward takes its pooled scratch back at a layer's
+/// host wait. `HF2Q_DENSE_Q_ARENA_RESET=0` (a diagnostic) turns that off:
+/// scratch then stays out for the whole forward, so nothing that relies on
+/// the recycling may run: no fold, no joint forward, no skipped host wait,
+/// and with them no pool caps.
+pub(crate) fn layer_scratch_resets() -> bool {
+    #[cfg(test)]
+    if NO_SCRATCH_RESET.with(std::cell::Cell::get) {
+        return false;
+    }
+    super::execution_dispatch::dense_q_arena_reset_enabled()
+}
+
+/// Whether a forward that skips host waits has so much scratch out that the
+/// layer now ending must wait
+/// ([`super::prefill_prepared::WAIT_LAYERS_WINDOW_SCRATCH_BYTES`]): the pool
+/// takes its buffers back only at a host wait. Evaluated when the layer has
+/// allocated, so what is out exceeds the threshold by at most this layer's
+/// scratch.
+fn window_scratch_full(pipelined_layers: bool) -> bool {
+    pipelined_layers
+        && super::decode_pool::issued_bytes() > super::prefill_prepared::window_scratch_threshold()
+}
+
+/// Block until every command buffer a failed forward committed has run.
+/// The forward's kept command buffers were waited for one by one when its
+/// scope ended ([`super::encoder_stage::SubmittedCommands`]); this covers
+/// the stage command buffers it released at commit. A drain that fails is
+/// logged: the forward's own error is the one the caller gets.
+fn drain_after_failed_forward() {
+    let device = GPU_CACHE.with(|cell| {
+        cell.try_borrow()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|cache| cache.device.clone()))
+    });
+    let Some(device) = device else {
+        return;
+    };
+    let drained = device
+        .command_encoder()
+        .map(crate::inference::native_observation::encoder)
+        .context("failed-forward drain encoder")
+        .and_then(|mut encoder| {
+            encoder
+                .commit_and_wait_labeled("qwen35.forward.failed_drain")
+                .context("failed-forward drain")
+        });
+    if let Err(error) = drained {
+        tracing::warn!(error = %format!("{error:#}"), "Qwen forward: drain after a failed forward failed");
+    }
 }
 
 // ================================================================
@@ -317,6 +467,76 @@ pub(crate) struct FoldedPrefill {
     pub(crate) boundary_wall: std::time::Duration,
 }
 
+/// One slot's chunk in [`Qwen35Model::forward_gpu_last_logits_joint`].
+pub(crate) struct JointPrefillLane<'a> {
+    pub(crate) slot_id: SlotId,
+    /// The lane's chunk, shared prefix rows included.
+    pub(crate) tokens: &'a [u32],
+    /// The chunk's `[4, rows]` axis-major positions.
+    pub(crate) positions_flat: &'a [i32],
+    /// Whether the chunk's leading rows are the forward's shared prefix.
+    pub(crate) shares_prefix: bool,
+    /// A cue fold in this chunk: the content rows before the stable prompt
+    /// boundary, and the boundary's physical cursor.
+    pub(crate) fold: Option<(usize, usize)>,
+    /// Checkpoint storage the caller allocated for the fold before it chose
+    /// it ([`HybridKvCache::boundary_anchor_image`]); `None`: the forward
+    /// allocates it.
+    pub(crate) image: Option<super::kv_cache::LaAnchorImage>,
+}
+
+/// What [`Qwen35Model::forward_gpu_last_logits_joint`] returns for a lane.
+pub(crate) struct JointPrefillOutput {
+    /// Logits of the lane's last row.
+    pub(crate) logits: Vec<f32>,
+    /// The stable-boundary checkpoint of a lane that folded its cue: the
+    /// logits of its last content row, the slot state there, and the host
+    /// time spent assembling it. The checkpoint is a result of its own: the
+    /// forward has run and the slot holds both segments whether or not the
+    /// checkpoint could be assembled.
+    pub(crate) boundary: Option<(
+        Vec<f32>,
+        Result<super::kv_cache::HybridKvSlotAnchor>,
+        std::time::Duration,
+    )>,
+    /// The forward row of the lane's first own (unshared) row.
+    own_first: usize,
+    /// Leading rows of the lane's chunk that are the shared prefix rows
+    /// (forward rows `0..shared_rows`).
+    shared_rows: usize,
+}
+
+impl JointPrefillOutput {
+    /// A lane placed at `own_first` behind `shared_rows` shared rows, with
+    /// no logits: for tests of what reads a lane's rows out of a capture.
+    #[cfg(test)]
+    pub(crate) fn placed(own_first: usize, shared_rows: usize) -> Self {
+        Self {
+            logits: Vec::new(),
+            boundary: None,
+            own_first,
+            shared_rows,
+        }
+    }
+
+    /// The forward rows (the rows of the forward's capture) that hold the
+    /// lane's rows `rows`, in order.
+    pub(crate) fn forward_rows(&self, rows: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>> {
+        let mut runs = Vec::with_capacity(2);
+        if rows.start < self.shared_rows {
+            runs.push(rows.start..rows.end.min(self.shared_rows));
+        }
+        if rows.end > self.shared_rows {
+            let own = rows.start.max(self.shared_rows);
+            runs.push(
+                self.own_first + (own - self.shared_rows)
+                    ..self.own_first + (rows.end - self.shared_rows),
+            );
+        }
+        runs
+    }
+}
+
 /// One ADR-054 per-family calibration capture request (#300): read the
 /// complete post-layer residual `hidden` (the exact tensor the
 /// `residual_stream_post_layer` steering mutates at the layer-loop tail)
@@ -435,6 +655,8 @@ fn new_model_registry(model: &Qwen35Model) -> Result<KernelRegistry> {
     registry
         .freeze_ggml_routing_policy(model.ggml_routing_policy)
         .map_err(|error| anyhow!("freeze Qwen GGML routing policy: {error}"))?;
+    #[cfg(test)]
+    crate::inference::route_host::simulate_in(&mut registry)?;
     Ok(registry)
 }
 
@@ -1059,6 +1281,7 @@ pub(super) fn embed_tokens_gpu_into(
                 .context("native embedding completion")?;
         } else {
             enc.commit_labeled("qwen35.embedding.native");
+            super::encoder_stage::retain_submitted(enc, "qwen35.embedding.native");
         }
         return Ok(());
     }
@@ -1197,6 +1420,7 @@ pub(super) fn embed_token_ids_gpu_into(
         NativeEmbeddingRoute::F32 => unreachable!("rejected above"),
     }
     enc.commit_labeled("qwen35.embedding.gpu_token_ids");
+    super::encoder_stage::retain_submitted(enc, "qwen35.embedding.gpu_token_ids");
     Ok(())
 }
 
@@ -3594,6 +3818,8 @@ impl Qwen35Model {
             glp_bound: self.glp.is_some(),
             dump_bisect: super::dump_bisect::is_enabled(),
             dense_q_split_profile: super::execution_dispatch::dense_q_split_profile_enabled(),
+            moe_route_override: super::prefill_fold::moe_route_override(),
+            scratch_reset_off: !layer_scratch_resets(),
         }
     }
 
@@ -3601,8 +3827,13 @@ impl Qwen35Model {
     /// model in the open prefill scope: no route without a folded form is
     /// active, and every product a folded forward runs once over both
     /// segments takes the prepared row-tile MM, whose output row depends on
-    /// that input row alone. Full attention and the MoE FFN are built per
-    /// segment and need no such guarantee; an F32 FFN has none.
+    /// that input row alone. Full attention is built per segment and needs
+    /// no such guarantee. A quantized MoE FFN runs once over all rows of the
+    /// forward's segments of more than 32 rows
+    /// ([`super::prefill_joint::MOE_ROW_EXACT_MIN_ROWS`]), which is exact
+    /// only while mlx-native changes kernel family at that row count: with
+    /// `HF2Q_MM_ID_ROUTING_THRESHOLD` set, a MoE model keeps one forward
+    /// per segment and per slot. An F32 FFN has no prepared kernel.
     pub(crate) fn prefill_fold_exact(&self) -> Result<bool> {
         self.prefill_fold_exact_under(self.unfolded_routes())
     }
@@ -3616,7 +3847,6 @@ impl Qwen35Model {
             return Ok(false);
         }
         self.ensure_gpu_cache_primed()?;
-        let shape = DeltaNetLayerShape::from_config(&self.cfg);
         GPU_CACHE.with(|cell| -> Result<bool> {
             let guard = cell.borrow();
             let cache = guard
@@ -3626,32 +3856,7 @@ impl Qwen35Model {
                 gpu_cache_matches_model(cache, self),
                 "prefill_fold_exact: GPU_CACHE belongs to a different Qwen35Model"
             );
-            Ok(cache.layer_weights.iter().all(|layer| {
-                let (ffn, linear) = match layer {
-                    LayerWeightsGpu::FullAttn { ffn, .. } => (ffn, None),
-                    LayerWeightsGpu::LinearAttn { attn, ffn } => (ffn, Some(attn)),
-                };
-                let ffn_exact = match ffn {
-                    FfnWeightsGpu::DenseQ(weights) => {
-                        super::gpu_ffn::dense_prefill_products_prepared(weights, 2)
-                    }
-                    FfnWeightsGpu::MoeQ(_) => true,
-                    FfnWeightsGpu::Dense(_) | FfnWeightsGpu::Moe(_) => false,
-                };
-                ffn_exact
-                    && linear.is_none_or(|weights| {
-                        shape.d_k % 32 == 0
-                            && shape.d_k <= 128
-                            && super::gpu_delta_net::prefill_products_prepared(
-                                weights,
-                                shape.hidden_size,
-                                shape.n_k_heads,
-                                shape.n_v_heads,
-                                shape.d_k,
-                                shape.d_v,
-                            )
-                    })
-            }))
+            Ok(prefill_layers_prepared(&cache.layer_weights, &self.cfg, routes))
         })
     }
 
@@ -3687,33 +3892,211 @@ impl Qwen35Model {
             "cue fold of {prefix_rows} + {} rows is outside the served shape",
             tokens.len().saturating_sub(prefix_rows)
         );
-        let request = super::prefill_fold::BoundaryFold {
-            prefix_rows: prefix_rows as u32,
-            image: image.clone(),
-        };
-        let (logits, boundary_logits) =
-            super::prefill_fold::with_request(request, || match dflash_capture {
-                Some(capture) => self
-                    .forward_gpu_last_logits_with_hidden_dflash(
-                        tokens,
-                        positions_flat,
-                        kv_cache,
-                        Some(capture),
-                        slot_id,
-                    )
-                    .map(|(logits, _hidden)| logits),
-                None => self.forward_gpu_last_logits(tokens, positions_flat, kv_cache, slot_id),
-            })?;
-        let assembling = std::time::Instant::now();
-        let boundary = kv_cache
-            .slot_anchor_at_boundary(slot_id, boundary_len, image)
-            .context("cue fold checkpoint");
+        let mut lanes = self.forward_gpu_last_logits_joint(
+            &[JointPrefillLane {
+                slot_id,
+                tokens,
+                positions_flat,
+                shares_prefix: false,
+                fold: Some((prefix_rows, boundary_len)),
+                image: Some(image),
+            }],
+            0,
+            kv_cache,
+            dflash_capture,
+        )?;
+        let lane = lanes
+            .pop()
+            .ok_or_else(|| anyhow!("the folded forward returned no lane"))?;
+        let (boundary_logits, boundary, boundary_wall) = lane
+            .boundary
+            .ok_or_else(|| anyhow!("the folded forward returned no checkpoint"))?;
         Ok(FoldedPrefill {
-            logits,
+            logits: lane.logits,
             boundary_logits,
             boundary,
-            boundary_wall: assembling.elapsed(),
+            boundary_wall,
         })
+    }
+
+    /// Rows of the joint forward over `lanes` sharing `shared_rows` rows.
+    pub(crate) fn joint_prefill_rows(lanes: &[JointPrefillLane<'_>], shared_rows: usize) -> usize {
+        shared_rows
+            + lanes
+                .iter()
+                .map(|lane| lane.tokens.len() - if lane.shares_prefix { shared_rows } else { 0 })
+                .sum::<usize>()
+    }
+
+    /// One prompt-prefill forward over the pending chunks of several slots
+    /// ([`super::prefill_joint`]). Each lane's cache rows and cursors,
+    /// DeltaNet state, checkpoint, captured target-layer rows and logits
+    /// are what its own forward(s) over its chunk produce, bit for bit.
+    ///
+    /// The lanes marked `shares_prefix` start with the same `shared_rows`
+    /// tokens at the same positions on a cold slot (the caller has checked
+    /// the slots; the tokens and positions are compared here); those rows
+    /// are computed once. `dflash_capture` is a session over the forward's
+    /// [`Self::joint_prefill_rows`] rows; [`JointPrefillOutput::forward_rows`]
+    /// maps a lane's rows into it. The caller opens the prefill scope and
+    /// has checked [`Self::prefill_fold_exact`].
+    pub(crate) fn forward_gpu_last_logits_joint(
+        &self,
+        lanes: &[JointPrefillLane<'_>],
+        shared_rows: usize,
+        kv_cache: &mut HybridKvCache,
+        dflash_capture: Option<
+            &mut crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession,
+        >,
+    ) -> Result<Vec<JointPrefillOutput>> {
+        use super::prefill_joint::{JointRequest, LaneBoundary, LaneRequest};
+        ensure!(!lanes.is_empty(), "a joint prefill needs a lane");
+        for (index, lane) in lanes.iter().enumerate() {
+            ensure!(
+                lane.positions_flat.len() == 4 * lane.tokens.len(),
+                "joint prefill lane {index}: {} positions for {} rows",
+                lane.positions_flat.len(),
+                lane.tokens.len()
+            );
+            ensure!(
+                !lane.shares_prefix || (shared_rows > 0 && lane.tokens.len() > shared_rows),
+                "joint prefill lane {index}: {} rows cannot share a prefix of {shared_rows}",
+                lane.tokens.len()
+            );
+        }
+        // The shared rows are the first sharing lane's; every other sharing
+        // lane must start with the same tokens at the same positions.
+        let donor = lanes.iter().find(|lane| lane.shares_prefix);
+        ensure!(
+            donor.is_some() == (shared_rows > 0),
+            "joint prefill: a shared prefix of {shared_rows} rows and {} sharing lanes",
+            lanes.iter().filter(|lane| lane.shares_prefix).count()
+        );
+        fn shared_axis<'a>(lane: &JointPrefillLane<'a>, axis: usize, shared: usize) -> &'a [i32] {
+            let rows = lane.tokens.len();
+            &lane.positions_flat[axis * rows..axis * rows + shared]
+        }
+        let shared_positions =
+            |lane: &JointPrefillLane<'_>, axis: usize| shared_axis(lane, axis, shared_rows).to_vec();
+        if let Some(donor) = donor {
+            for (index, lane) in lanes.iter().enumerate() {
+                ensure!(
+                    !lane.shares_prefix
+                        || (lane.tokens[..shared_rows] == donor.tokens[..shared_rows]
+                            && (0..4).all(|axis| {
+                                shared_positions(lane, axis) == shared_positions(donor, axis)
+                            })),
+                    "joint prefill lane {index} does not start with the shared prefix"
+                );
+            }
+        }
+        let total = Self::joint_prefill_rows(lanes, shared_rows);
+        let own = |lane: &JointPrefillLane<'_>| if lane.shares_prefix { shared_rows } else { 0 };
+        let mut tokens = Vec::with_capacity(total);
+        if let Some(donor) = donor {
+            tokens.extend_from_slice(&donor.tokens[..shared_rows]);
+        }
+        for lane in lanes {
+            tokens.extend_from_slice(&lane.tokens[own(lane)..]);
+        }
+        let mut positions = Vec::with_capacity(4 * total);
+        for axis in 0..4 {
+            if let Some(donor) = donor {
+                positions.extend_from_slice(shared_axis(donor, axis, shared_rows));
+            }
+            for lane in lanes {
+                let rows = lane.tokens.len();
+                positions
+                    .extend_from_slice(&lane.positions_flat[axis * rows + own(lane)..(axis + 1) * rows]);
+            }
+        }
+        let mut images = Vec::with_capacity(lanes.len());
+        let mut request_lanes = Vec::with_capacity(lanes.len());
+        for lane in lanes {
+            let image = match (lane.fold, lane.image.as_ref()) {
+                (Some(_), Some(image)) => Some(image.clone()),
+                (Some(_), None) => Some(
+                    kv_cache
+                        .boundary_anchor_image()
+                        .context("joint prefill checkpoint image")?,
+                ),
+                (None, None) => None,
+                (None, Some(_)) => {
+                    return Err(anyhow!("joint prefill: checkpoint storage without a fold"))
+                }
+            };
+            request_lanes.push(LaneRequest {
+                slot: lane.slot_id,
+                rows: lane.tokens.len() as u32,
+                shares_prefix: lane.shares_prefix,
+                boundary: lane.fold.zip(image.clone()).map(|((prefix_rows, _), image)| {
+                    LaneBoundary {
+                        prefix_rows: prefix_rows as u32,
+                        image,
+                    }
+                }),
+            });
+            images.push(image);
+        }
+        let request = JointRequest {
+            shared_rows: shared_rows as u32,
+            lanes: request_lanes,
+        };
+        let first_slot = lanes[0].slot_id;
+        let (last_logits, lane_logits) = super::prefill_joint::with_request(request, || {
+            match dflash_capture {
+                Some(capture) => self
+                    .forward_gpu_last_logits_with_hidden_dflash(
+                        &tokens,
+                        &positions,
+                        kv_cache,
+                        Some(capture),
+                        first_slot,
+                    )
+                    .map(|(logits, _hidden)| logits),
+                None => self.forward_gpu_last_logits(&tokens, &positions, kv_cache, first_slot),
+            }
+        })?;
+        let mut last_logits = Some(last_logits);
+        let mut own_first = shared_rows;
+        let mut outputs = Vec::with_capacity(lanes.len());
+        let last_lane = lanes.len() - 1;
+        for (index, ((lane, logits), image)) in
+            lanes.iter().zip(lane_logits).zip(images).enumerate()
+        {
+            let boundary = match (lane.fold, image, logits.boundary) {
+                (Some((_, boundary_len)), Some(image), Some(boundary_logits)) => {
+                    let assembling = std::time::Instant::now();
+                    let anchor = kv_cache
+                        .slot_anchor_at_boundary(lane.slot_id, boundary_len, image)
+                        .context("joint prefill checkpoint");
+                    Some((boundary_logits, anchor, assembling.elapsed()))
+                }
+                (None, None, None) => None,
+                _ => return Err(anyhow!("joint prefill lane {index}: checkpoint mismatch")),
+            };
+            let logits = if index == last_lane {
+                last_logits
+                    .take()
+                    .ok_or_else(|| anyhow!("joint prefill: last-row logits are missing"))?
+            } else {
+                logits.last
+            };
+            ensure!(
+                logits.len() == self.cfg.vocab_size as usize,
+                "joint prefill lane {index}: {} logits",
+                logits.len()
+            );
+            let lane_shared = own(lane);
+            outputs.push(JointPrefillOutput {
+                logits,
+                boundary,
+                own_first,
+                shared_rows: lane_shared,
+            });
+            own_first += lane.tokens.len() - lane_shared;
+        }
+        Ok(outputs)
     }
 
     /// ADR-034 task #78 Step 3c.A.2 (2026-05-21) — embed tokens to a
@@ -4208,6 +4591,100 @@ impl Qwen35Model {
         Ok(result)
     }
 
+    /// Drop this thread's GPU cache if it belongs to this model, and return
+    /// its buffers to the system.
+    ///
+    /// The cache is per thread, and everything it creates at upload (BF16
+    /// copies, the staged MoE planes) exists once per cache. A thread that
+    /// primed it only to provision something, and then hands the model to
+    /// another thread, releases it here so those buffers are not resident
+    /// twice. Buffers the model itself owns are untouched.
+    ///
+    /// Dropping a buffer only stages its removal from the device's Metal
+    /// residency set; the set keeps the allocation until its next commit,
+    /// which a thread that encodes nothing further never issues. An empty
+    /// command buffer is therefore committed on the cache's device, which
+    /// flushes the staged removals.
+    pub fn release_gpu_cache(&self) -> Result<()> {
+        let released = GPU_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if cache
+                .as_ref()
+                .is_some_and(|cache| cache.model_ptr == self as *const _ as *const ())
+            {
+                cache.take()
+            } else {
+                None
+            }
+        });
+        let Some(cache) = released else {
+            return Ok(());
+        };
+        let device = cache.device.clone();
+        drop(cache);
+        // The cache is gone from the thread, so a settle that fails here
+        // would leave nothing for the thread's owner to find: it goes on the
+        // thread's record, whatever error the caller reports first.
+        crate::inference::device_settle::settle_or_record(&device)
+    }
+
+    /// Drop the GPU weight cache of this thread, whichever model it was
+    /// built for, and return the device it was built on. A thread that held
+    /// a model and is done with it (the worker thread at its end, the
+    /// loading thread once the model is with its worker) calls this; the
+    /// returned device still needs `device_settle::settle`, after
+    /// everything else that drops buffers of that model has run.
+    pub(crate) fn take_thread_gpu_cache() -> Option<MlxDevice> {
+        let cache = GPU_CACHE.with(|cell| cell.borrow_mut().take())?;
+        let device = cache.device.clone();
+        drop(cache);
+        Some(device)
+    }
+
+    /// The weight buffers that only the prompt-prefill route reads while
+    /// the decode routes run on prepared copies of the same weights
+    /// ([`super::prefill_keep_fresh`]): the GGUF blocks of a MoE layer's
+    /// routed experts once their staged planes are prepared, the shared
+    /// expert's blocks once its live-tile planes are, and the GGUF output
+    /// head (the joint target step and the draft read its prepared planes).
+    pub(crate) fn prefill_only_weights(&self) -> Result<Vec<MlxBuffer>> {
+        GPU_CACHE.with(|cell| -> Result<Vec<MlxBuffer>> {
+            let guard = cell.borrow();
+            let cache = guard.as_ref().ok_or_else(|| {
+                anyhow!("prefill_only_weights: GPU_CACHE not initialized; call ensure_gpu_cache_primed first")
+            })?;
+            ensure!(
+                gpu_cache_matches_model(cache, self),
+                "prefill_only_weights: GPU_CACHE belongs to a different Qwen35Model"
+            );
+            let mut buffers = Vec::new();
+            for layer in &cache.layer_weights {
+                let (LayerWeightsGpu::FullAttn { ffn, .. } | LayerWeightsGpu::LinearAttn { ffn, .. }) =
+                    layer;
+                let FfnWeightsGpu::MoeQ(weights) = ffn else {
+                    continue;
+                };
+                let Some(prepared) = weights.prepared_m8.as_ref() else {
+                    continue;
+                };
+                buffers.extend([
+                    weights.expert_gate_q.clone(),
+                    weights.expert_up_q.clone(),
+                    weights.expert_down_q.clone(),
+                ]);
+                if prepared.live_tiles.is_some() && weights.dense_storage.is_native() {
+                    buffers.extend([
+                        weights.shared_gate.clone(),
+                        weights.shared_up.clone(),
+                        weights.shared_down.clone(),
+                    ]);
+                }
+            }
+            buffers.push(cache.output_head.lm_head.clone());
+            Ok(buffers)
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn loaded_candidate_executed_catalog(
         &self,
@@ -4333,7 +4810,79 @@ impl Qwen35Model {
         Ok(captured)
     }
 
+    /// [`Self::forward_gpu_run`]; when it fails, the device queue is drained
+    /// before the error reaches the caller. A forward commits command
+    /// buffers without a wait (stages of a layer; whole layers with
+    /// `HF2Q_QWEN_PREFILL_WAIT_LAYERS` above 1) that write the slot's cache
+    /// rows and recurrent state, and the callers of a failed forward reset
+    /// and reuse its slots from the host: those writes must have landed
+    /// before the reset, or they land on the next conversation's state.
+    #[allow(clippy::too_many_arguments)]
     fn forward_gpu_impl(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        capture: Option<&mut LayerActivations>,
+        hidden_out: Option<&mut Option<MlxBuffer>>,
+        output_head_mode: OutputHeadMode,
+        soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+        deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
+        topk_out: Option<&mut Option<(Vec<u32>, Vec<f32>)>>,
+        nextn_hidden_out: Option<&mut Option<MlxBuffer>>,
+        logits_buffer_out: Option<&mut Option<MlxBuffer>>,
+        slot_id: SlotId,
+        residual_capture: Option<ResidualLayerCapture<'_>>,
+    ) -> Result<Vec<f32>> {
+        // Every command buffer a multi-row forward commits without a wait
+        // is kept from its first submission (the embedding) on, at every
+        // wait cadence.
+        let submitted = super::encoder_stage::SubmittedCommands::open(tokens.len() > 1);
+        let result = self.forward_gpu_run(
+            tokens,
+            positions_flat,
+            kv_cache,
+            capture,
+            hidden_out,
+            output_head_mode,
+            soft_tokens,
+            deepstack,
+            topk_out,
+            nextn_hidden_out,
+            logits_buffer_out,
+            slot_id,
+            residual_capture,
+        );
+        // Settle what the forward still keeps before either result leaves:
+        // the commands of its last window (a forward whose output head is
+        // fused into the last layer's command buffer waits for that one
+        // alone), and whatever a failed forward had committed. A failed
+        // command buffer is the forward's error even when the host saw
+        // another error or none: it is what the worker fail-stops on.
+        let settled = super::encoder_stage::settle_submitted()
+            .context("command buffers settled at the end of the forward");
+        drop(submitted);
+        let result = match (result, settled) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(gpu)) => Err(gpu),
+            (Err(host), Err(gpu)) => Err(gpu.context(format!(
+                "the forward had already failed on the host: {host:#}"
+            ))),
+        };
+        if result.is_err() {
+            drain_after_failed_forward();
+        }
+        // The queue is drained (the forward's last wait, the settle above
+        // and, after an error, the drain): the buffers served outside the
+        // pool have no user in flight. The reset that takes the pooled ones
+        // back is the next forward's or the next decode step's; the caps
+        // apply through it and end there.
+        super::decode_pool::release_overflow();
+        super::decode_pool::end_caps_at_next_reset();
+        result
+    }
+
+    fn forward_gpu_run(
         &self,
         tokens: &[u32],
         positions_flat: &[i32],
@@ -4442,10 +4991,11 @@ impl Qwen35Model {
         // accesses; durable nextn parents/rings are direct, not pool-issued.
         super::decode_pool::checked_reset_decode_pool()?;
         let seq_len = tokens.len() as u32;
-        // Cue fold ([`super::prefill_fold`]): this forward crosses the stable
-        // prompt boundary at `prefix_rows` and captures the checkpoint there.
-        let fold = super::prefill_fold::take_request(seq_len)?;
-        if fold.is_some() {
+        // Joint prefill ([`super::prefill_joint`]): this forward carries the
+        // chunks of one or more slots, each cut into the segments its own
+        // forwards would run (the cue fold is one lane with a boundary).
+        let joint = super::prefill_joint::take_request(seq_len, kv_cache.n_seqs)?;
+        if joint.is_some() {
             ensure!(
                 matches!(output_head_mode, OutputHeadMode::Last)
                     && soft_tokens.is_empty()
@@ -4456,7 +5006,7 @@ impl Qwen35Model {
                     && !kv_cache.la_capture_active()
                     && !super::dump_bisect::is_enabled()
                     && !super::execution_dispatch::dense_q_split_profile_enabled(),
-                "the cue fold serves the plain and the DFlash-capture prompt prefill only"
+                "a joint prefill serves the plain and the DFlash-capture prompt prefill only"
             );
         }
         // ---- ADR-019 Phase 2 iter91 Worker B (H2 production CB-count probe) ----
@@ -4677,10 +5227,10 @@ impl Qwen35Model {
         //
         // Skip when the model has no FullAttn layers: defensive — avoids a zero-
         // useful arena allocation when running DN-only models.
-        // A folded forward builds each full-attention layer per segment, on
+        // A joint forward builds each full-attention layer per segment, on
         // the segment scratch below, and has no use for chunk-sized scratch.
         let mut fa_arena: Option<super::FaPrefillArena> = if seq_len > 1
-            && fold.is_none()
+            && joint.is_none()
             && layer_weights_gpu
                 .iter()
                 .any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
@@ -4724,7 +5274,7 @@ impl Qwen35Model {
         // Skip when the model has no FullAttn layers: defensive — avoids a
         // zero-useful arena allocation when running DN-only models.
         let mut fa_proj_arena: Option<super::FaProjectionsArena> = if seq_len > 1
-            && fold.is_none()
+            && joint.is_none()
             && layer_weights_gpu
                 .iter()
                 .any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
@@ -4792,7 +5342,7 @@ impl Qwen35Model {
         // Memory footprint at 35B-A3B q4_0-flat pp4096 (h=5120, topk=8,
         // m_moe=512, m_sh=512): ~870 MB. Allocated once for the prefill;
         // M5 Max 128 GB unified memory keeps this well within budget.
-        let mut moe_ffn_arena: Option<super::MoeFfnArena> = if seq_len > 1 && fold.is_none() {
+        let mut moe_ffn_arena: Option<super::MoeFfnArena> = if seq_len > 1 && joint.is_none() {
             if let Some(moe) = cfg.moe.as_ref() {
                 Some(
                     super::MoeFfnArena::new(
@@ -4857,24 +5407,35 @@ impl Qwen35Model {
             None
         };
 
-        // ---- Cue fold: per-segment scratch ----
+        // ---- Joint prefill: per-segment scratch ----
         //
-        // The two segments of a folded forward run their row-mixing layers
-        // as the two forwards would: full attention and the MoE FFN on
-        // scratch sized for the segment, DeltaNet with the boundary state
-        // and the parameter blocks of its two dispatches.
-        let fold_segments: Option<[(u32, u32); 2]> = fold.as_ref().map(|fold| {
-            [
-                (0, fold.prefix_rows),
-                (fold.prefix_rows, seq_len - fold.prefix_rows),
-            ]
-        });
-        let mut fold_fa: Vec<(super::FaPrefillArena, super::FaProjectionsArena, MlxBuffer)> =
-            Vec::new();
-        let mut fold_moe: Vec<super::MoeFfnArena> = Vec::new();
-        let mut fold_dn: Option<super::prefill_fold::DnBoundaryScratch> = None;
+        // Every segment of every lane runs its row-mixing layers as its own
+        // forward would: full attention and the MoE FFN on scratch sized for
+        // the segment, DeltaNet with the states and the parameter blocks of
+        // its own dispatches. A segment whose rows are not contiguous in the
+        // forward (a shared prefix, then the lane's own rows) is built on a
+        // gathered copy of its rows.
+        struct JointSegmentScratch {
+            fa: Option<(super::FaPrefillArena, super::FaProjectionsArena, MlxBuffer)>,
+            /// MoE FFN scratch of a segment the layer is built for on its
+            /// own (`None` for a segment served by the forward-wide call).
+            moe: Option<super::MoeFfnArena>,
+            /// Gathered full-attention input rows of a segment whose rows
+            /// are not contiguous in the forward.
+            gather: Vec<MlxBuffer>,
+        }
+        let joint_segments: Vec<super::prefill_joint::Segment> = joint
+            .as_ref()
+            .map(|plan| plan.segments())
+            .unwrap_or_default();
+        let joint_shared_rows = joint.as_ref().map_or(0, |plan| plan.shared_rows);
+        let mut joint_scratch: Vec<JointSegmentScratch> = Vec::new();
+        let mut joint_dn: Option<super::prefill_joint::DnRunScratch> = None;
+        // MoE FFN scratch of the one call that serves every row-exact
+        // segment of the forward (see the layer loop).
+        let mut joint_moe_all: Option<super::MoeFfnArena> = None;
         ensure!(
-            fold.is_none()
+            joint.is_none()
                 || layer_weights_gpu.iter().all(|layer| {
                     matches!(
                         layer,
@@ -4887,72 +5448,108 @@ impl Qwen35Model {
                         }
                     )
                 }),
-            "the cue fold needs quantized FFN layers"
+            "a joint prefill needs quantized FFN layers"
         );
-        if let Some(segments) = fold_segments {
+        if let Some(plan) = joint.as_ref() {
             let has_full = layer_weights_gpu
                 .iter()
                 .any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }));
             let has_linear = layer_weights_gpu
                 .iter()
                 .any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }));
-            for (first, rows) in segments {
-                if has_full {
+            for segment in &joint_segments {
+                let fa = if has_full {
                     let shape = FullAttnShape::from_config(cfg);
-                    fold_fa.push((
+                    Some((
                         super::FaPrefillArena::new(
                             &device,
-                            rows,
+                            segment.rows,
                             shape.n_head,
                             shape.n_kv,
                             shape.head_dim,
                         )
-                        .context("alloc cue fold FaPrefillArena")?,
+                        .context("alloc joint prefill FaPrefillArena")?,
                         super::FaProjectionsArena::new(
                             &device,
-                            rows,
+                            segment.rows,
                             shape.hidden_size,
                             shape.n_head,
                             shape.n_kv,
                             shape.head_dim,
                             shape.rms_norm_eps,
                         )
-                        .context("alloc cue fold FaProjectionsArena")?,
-                        super::prefill_fold::segment_positions(
+                        .context("alloc joint prefill FaProjectionsArena")?,
+                        super::prefill_joint::segment_positions(
                             &device,
                             positions_flat,
                             seq_len,
-                            first,
-                            rows,
+                            &segment.runs,
                         )?,
-                    ));
+                    ))
+                } else {
+                    None
+                };
+                let moe = match cfg.moe.as_ref() {
+                    Some(moe) if !segment.moe_row_exact() => {
+                        ensure!(
+                            segment.runs.len() == 1,
+                            "joint prefill: a segment of {} rows behind a shared prefix",
+                            segment.rows
+                        );
+                        Some(
+                            super::MoeFfnArena::new(
+                                &device,
+                                segment.rows,
+                                h,
+                                moe.num_experts_per_tok,
+                                moe.moe_intermediate_size,
+                                moe.shared_expert_intermediate_size,
+                                moe.num_experts,
+                            )
+                            .context("alloc joint prefill MoeFfnArena")?,
+                        )
+                    }
+                    _ => None,
+                };
+                let mut gather = Vec::new();
+                if segment.runs.len() > 1 {
+                    gather.push(super::prefill_joint::rows_scratch(
+                        &device,
+                        segment.rows,
+                        h as usize,
+                    )?);
                 }
-                if let Some(moe) = cfg.moe.as_ref() {
-                    fold_moe.push(
+                joint_scratch.push(JointSegmentScratch { fa, moe, gather });
+            }
+            if let Some(moe) = cfg.moe.as_ref() {
+                if joint_segments.iter().any(|segment| segment.moe_row_exact()) {
+                    joint_moe_all = Some(
                         super::MoeFfnArena::new(
                             &device,
-                            rows,
+                            seq_len,
                             h,
                             moe.num_experts_per_tok,
                             moe.moe_intermediate_size,
                             moe.shared_expert_intermediate_size,
                             moe.num_experts,
                         )
-                        .context("alloc cue fold MoeFfnArena")?,
+                        .context("alloc joint prefill forward-wide MoeFfnArena")?,
                     );
                 }
             }
             if has_linear {
                 let dn_shape = DeltaNetLayerShape::from_config(cfg);
-                fold_dn = Some(super::prefill_fold::DnBoundaryScratch::new(
+                joint_dn = Some(super::prefill_joint::DnRunScratch::new(
                     &device,
-                    [segments[0].1, segments[1].1],
-                    dn_shape.n_k_heads,
-                    dn_shape.n_v_heads,
-                    dn_shape.d_k,
-                    dn_shape.d_v,
-                    dn_shape.conv_kernel,
-                    super::gpu_delta_net::FORWARD_DISPATCH_N_SEQS,
+                    plan,
+                    super::prefill_joint::DnDims {
+                        n_k_heads: dn_shape.n_k_heads,
+                        n_v_heads: dn_shape.n_v_heads,
+                        d_k: dn_shape.d_k,
+                        d_v: dn_shape.d_v,
+                        k_width: dn_shape.conv_kernel,
+                        n_seqs: super::gpu_delta_net::FORWARD_DISPATCH_N_SEQS,
+                    },
                 )?);
             }
         }
@@ -4987,12 +5584,88 @@ impl Qwen35Model {
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&k| k >= 1)
             .unwrap_or(8);
+        // `HF2Q_QWEN_PREFILL_WAIT_LAYERS` above 1: a text prompt-prefill
+        // forward submits each layer's command buffer as soon as it is
+        // encoded (`pipelined_layers` below), so the GPU runs it while the
+        // host encodes the next layer, and the host waits once per that many
+        // layers (a forward of at most 32 rows keeps its cadence of
+        // `HF2Q_FFN_TERMINAL_K_BATCH` layers). Forwards with a host-side
+        // reader or writer beyond the captured layers keep their waits.
+        let configured_wait_layers = if seq_len > 1
+            && soft_tokens.is_empty()
+            && deepstack.is_none()
+            && residual_capture.is_none()
+            && self.glp.is_none()
+            && !kv_cache.la_capture_active()
+            && !super::dump_bisect::is_enabled()
+            && dump_layer_n().is_none()
+            && dump_layer_activations_prefix().is_none()
+            && !super::execution_dispatch::dense_q_split_profile_enabled()
+        {
+            super::prefill_prepared::wait_layers()
+        } else {
+            1
+        };
+        // The growth-limited pool profile has its own quota and no release:
+        // a forward keeps its waits there.
+        // Without the scratch reset at a layer's host wait nothing bounds
+        // what skipped waits accumulate: such a forward keeps its waits too.
+        // And only on the prepared route with every layer's products on the
+        // prepared kernel: the route its scratch bound is derived for. A
+        // route switch that takes a forward off it (GLP, a dump, a profile)
+        // leaves the forward its waits.
+        let pipelined_layers = configured_wait_layers > 1
+            && super::decode_pool::default_pool()
+            && layer_scratch_resets()
+            && super::prefill_prepared::route_in_scope()
+            && {
+                let routes = self.unfolded_routes();
+                !routes.any() && prefill_layers_prepared(layer_weights_gpu, cfg, routes)
+            };
+        // A joint forward, and a forward that skips host waits, pool more
+        // scratch than a single slot's forward that waits at every layer.
+        // From here to the reset after this forward the pool is capped:
+        // checked before every pooled allocation, and its free buffers are
+        // released at a reset when they exceed the retained cap.
+        super::decode_pool::cap_pool(
+            (pipelined_layers || !joint_segments.is_empty())
+                .then(super::prefill_prepared::prefill_pool_caps),
+        );
+        // The scratch one layer of this forward may request, where the bound
+        // is derived: the prepared route.
+        let layer_scratch_bound = (seq_len > 1 && super::prefill_prepared::route_in_scope()).then(|| {
+            let mut slots: Vec<u32> = joint_segments.iter().map(|segment| segment.slot.0).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            super::prefill_prepared::prefill_layer_scratch_bound_bytes(
+                cfg,
+                seq_len as usize,
+                slots.len().max(1),
+            )
+        });
+        let prefill_wait_layers = if seq_len > 32 {
+            configured_wait_layers
+        } else {
+            configured_ffn_terminal_k_batch
+        };
+        // One command buffer per layer: the layer builders carry their
+        // stages into the session's open command buffer, which the FFN
+        // terminal then submits.
+        let _single_command_layers = super::prefill_prepared::SingleCommandLayers::set(
+            pipelined_layers && encoder_session_enabled,
+        );
+        // Such a forward's layer submits skip the shared-event fence and
+        // hand their command buffers to the forward's kept list
+        // (`encoder_stage::SubmittedCommands`, opened by `forward_gpu_impl`).
+        super::encoder_stage::set_pipelined(pipelined_layers);
         let ffn_terminal_k_batch = if small_nextn_verifier {
             // Exact speculative verification is a fixed, short graph whose
             // scratch buffers are retained until the output-head drain. One
             // terminal layer boundary avoids seven redundant waits on Qwen3.8
             // while preserving dispatch order and arithmetic.
             layer_weights_gpu.len().max(1)
+        } else if pipelined_layers {
+            prefill_wait_layers
         } else {
             effective_ffn_terminal_k_batch(seq_len, configured_ffn_terminal_k_batch)
         };
@@ -5405,6 +6078,11 @@ impl Qwen35Model {
         // encoder gate and the fold/apply sites below key on it.)
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             #[cfg(test)]
+            if seq_len > 1 && FAIL_AT_LAYER.with(std::cell::Cell::get) == Some(layer_idx) {
+                return Err(anyhow!("injected forward failure at layer {layer_idx}"));
+            }
+            let layer_scratch_before = super::decode_pool::issued_total();
+            #[cfg(test)]
             let q1_layer_before = if q1_target_layers.is_some() {
                 Some(q1_layer_metadata::state(kv_cache,layer_idx,slot_id)?)
             } else {None};
@@ -5427,7 +6105,7 @@ impl Qwen35Model {
                 || residual_capture
                     .as_ref()
                     .is_some_and(|cap| cap.layer == layer_idx);
-            let is_k_boundary = seq_len == 1
+            let mut is_k_boundary = seq_len == 1
                 || ffn_terminal_k_batch <= 1
                 || (layer_idx + 1) % ffn_terminal_k_batch == 0
                 || (layer_idx + 1) == n_layers
@@ -5474,11 +6152,10 @@ impl Qwen35Model {
                 None
             };
             let attn_out = match layer_gpu {
-                LayerWeightsGpu::FullAttn { attn, .. } if fold_segments.is_some() => {
-                    // Cue fold: the layer is built once per segment, with the
-                    // rows, cursor, positions and scratch that segment's own
-                    // forward has, and the two outputs are joined.
-                    let segments = fold_segments.unwrap_or_default();
+                LayerWeightsGpu::FullAttn { attn, .. } if joint.is_some() => {
+                    // Joint prefill: the layer is built once per segment,
+                    // with the rows, cursor, positions, slot and scratch that
+                    // segment's own forward has, and the outputs are joined.
                     let shape = FullAttnShape::from_config(cfg);
                     let full_attn_rank = match kv_cache.slot_index_for_layer(layer_idx as u32) {
                         Some(super::kv_cache::LayerSlot::Full(rank)) => rank as usize,
@@ -5491,20 +6168,59 @@ impl Qwen35Model {
                     };
                     let max_seq = kv_cache.max_seq_len;
                     let width = h as usize;
+                    ensure!(
+                        joint_scratch.len() == joint_segments.len(),
+                        "joint prefill: full-attention segment scratch is missing"
+                    );
                     let joined = super::decode_pool::pooled_alloc_buffer(
                         &device,
                         seq_len as usize * width * 4,
                         DType::F32,
                         vec![seq_len as usize, width],
                     )
-                    .map_err(|e| anyhow!("alloc cue fold attention output: {e}"))?;
-                    let mut outputs = Vec::with_capacity(segments.len());
-                    for ((first, rows), (arena, projections, positions)) in
-                        segments.into_iter().zip(fold_fa.iter_mut())
-                    {
-                        let x = super::prefill_fold::row_view(&hidden, first, rows, width)
-                            .with_shape(vec![rows as usize, width])
-                            .map_err(|e| anyhow!("cue fold attention input rows: {e}"))?;
+                    .map_err(|e| anyhow!("alloc joint prefill attention output: {e}"))?;
+                    if joint_scratch.iter().any(|scratch| !scratch.gather.is_empty()) {
+                        // A segment behind a shared prefix reads a private
+                        // copy of the shared rows followed by its own rows.
+                        let mut enc =
+                            LayerEncoder::from_session_or_plain(&device, layer_session.as_mut())
+                                .context("enc joint prefill attention gather")?;
+                        for (segment, scratch) in joint_segments.iter().zip(&joint_scratch) {
+                            if let Some(rows) = scratch.gather.first() {
+                                super::prefill_joint::gather_segment(
+                                    enc.encoder(),
+                                    &mut registry,
+                                    &device,
+                                    &hidden,
+                                    segment,
+                                    rows,
+                                    h,
+                                )
+                                .with_context(|| {
+                                    format!("joint prefill attention gather layer {layer_idx}")
+                                })?;
+                            }
+                        }
+                        enc.fence_or_commit("layer.full_attn.joint_gather")
+                            .context("commit joint prefill attention gather")?;
+                    }
+                    let mut outputs = Vec::with_capacity(joint_segments.len());
+                    for (segment, scratch) in joint_segments.iter().zip(joint_scratch.iter_mut()) {
+                        let x = match scratch.gather.first() {
+                            Some(rows) => rows.clone(),
+                            None => super::prefill_joint::row_view(
+                                &hidden,
+                                segment.runs[0].first,
+                                segment.rows,
+                                width,
+                            )
+                            .with_shape(vec![segment.rows as usize, width])
+                            .map_err(|e| anyhow!("joint prefill attention input rows: {e}"))?,
+                        };
+                        let (arena, projections, positions) = scratch
+                            .fa
+                            .as_mut()
+                            .ok_or_else(|| anyhow!("joint prefill: full-attention scratch is missing"))?;
                         let slot = &mut kv_cache.full_attn[full_attn_rank];
                         outputs.push(
                             build_gated_attn_layer(
@@ -5515,7 +6231,7 @@ impl Qwen35Model {
                                 attn,
                                 Some(slot),
                                 max_seq,
-                                rows,
+                                segment.rows,
                                 shape.hidden_size,
                                 shape.n_head,
                                 shape.n_kv,
@@ -5528,38 +6244,34 @@ impl Qwen35Model {
                                 Some(projections),
                                 Some(&mut attn_out_holds),
                                 layer_session.as_mut(),
-                                slot_id,
+                                segment.slot,
                             )
                             .with_context(|| {
-                                format!("full_attn layer {layer_idx} rows {first}+{rows}")
+                                format!(
+                                    "full_attn layer {layer_idx} slot {} rows {:?}",
+                                    segment.slot.0, segment.runs
+                                )
                             })?,
                         );
                     }
-                    ensure!(
-                        outputs.len() == segments.len(),
-                        "cue fold: full-attention segment scratch is missing"
-                    );
                     let mut enc =
                         LayerEncoder::from_session_or_plain(&device, layer_session.as_mut())
-                            .context("enc cue fold attention join")?;
-                    for ((first, rows), output) in segments.into_iter().zip(&outputs) {
-                        mlx_native::ops::copy::dispatch_strided_copy_f32(
+                            .context("enc joint prefill attention join")?;
+                    for (segment, output) in joint_segments.iter().zip(&outputs) {
+                        super::prefill_joint::scatter_segment(
                             enc.encoder(),
                             &mut registry,
-                            device.metal_device(),
+                            &device,
                             output,
-                            &super::prefill_fold::row_view(&joined, first, rows, width),
-                            &mlx_native::ops::copy::StridedCopyParams {
-                                rows,
-                                cols: h,
-                                stride_row: h,
-                                stride_col: 1,
-                            },
+                            segment,
+                            joint_shared_rows,
+                            &joined,
+                            h,
                         )
-                        .with_context(|| format!("cue fold attention join layer {layer_idx}"))?;
+                        .with_context(|| format!("joint prefill attention join layer {layer_idx}"))?;
                     }
                     enc.fence_or_commit("layer.full_attn.cue_fold_join")
-                        .context("commit cue fold attention join")?;
+                        .context("commit joint prefill attention join")?;
                     joined
                 }
                 LayerWeightsGpu::FullAttn { attn, .. } => {
@@ -5705,32 +6417,31 @@ impl Qwen35Model {
                     };
                     let state_capture_ref = state_capture_view.as_ref();
                     let conv_capture_ref = conv_capture_view.as_ref();
-                    // Cue fold: this layer's convolution and recurrence split
-                    // at the boundary, writing the state there into the
-                    // checkpoint image.
-                    let dn_boundary = match (fold.as_ref(), fold_dn.as_ref()) {
-                        (Some(fold), Some(scratch)) if linear_slot_idx != usize::MAX => {
-                            let views = fold
-                                .image
-                                .boundary_views(linear_slot_idx)
-                                .with_context(|| format!("cue fold image layer {layer_idx}"))?;
-                            Some(super::prefill_fold::DnBoundarySplit {
-                                prefix_rows: fold.prefix_rows,
-                                scratch,
-                                recurrent: views.recurrent,
-                                conv_image: views.conv,
-                            })
-                        }
+                    // Joint prefill: this layer's convolution and recurrence
+                    // run once per lane segment, each from and into that
+                    // lane's state (or its boundary checkpoint image).
+                    let dn_runs = match (joint.as_ref(), joint_dn.as_ref()) {
+                        (Some(plan), Some(scratch)) if linear_slot_idx != usize::MAX => Some(
+                            scratch
+                                .layer_runs(
+                                    plan,
+                                    &kv_cache.linear_attn[linear_slot_idx],
+                                    linear_slot_idx,
+                                )
+                                .with_context(|| {
+                                    format!("joint prefill DeltaNet runs layer {layer_idx}")
+                                })?,
+                        ),
                         (Some(_), _) => {
                             return Err(anyhow!(
-                                "cue fold: layer {layer_idx} has no DeltaNet cache slot"
+                                "joint prefill: layer {layer_idx} has no DeltaNet cache slot"
                             ))
                         }
                         (None, _) => None,
                     };
                     ensure!(
-                        dn_boundary.is_none() || dn_prefill_arena.is_some(),
-                        "cue fold: DeltaNet layer {layer_idx} has no prefill arena"
+                        dn_runs.is_none() || dn_prefill_arena.is_some(),
+                        "joint prefill: DeltaNet layer {layer_idx} has no prefill arena"
                     );
                     let out = if let Some(arena) = dn_prefill_arena.as_mut() {
                         build_delta_net_layer_with_arena(
@@ -5757,7 +6468,7 @@ impl Qwen35Model {
                             shape.rms_norm_eps,
                             state_capture_ref,
                             conv_capture_ref,
-                            dn_boundary.as_ref(),
+                            dn_runs.as_deref(),
                             // iter91: thread the borrowed session into the
                             // DN helper.  The DN helper has only one
                             // LayerEncoder site (stage_a) so it can
@@ -5828,7 +6539,14 @@ impl Qwen35Model {
 
                         // that corrupted every OTHER active slot at N>=2 concurrent).
 
-                        slot.swap_for_slot(slot_id);
+                        match joint.as_ref() {
+                            Some(plan) => {
+                                for lane in &plan.lanes {
+                                    slot.swap_for_slot(lane.slot);
+                                }
+                            }
+                            None => slot.swap_for_slot(slot_id),
+                        }
                     }
 
                     out
@@ -6246,7 +6964,10 @@ impl Qwen35Model {
                             enc.commit_unlabeled().with_context(|| {
                                 format!("commit fused-DenseQ decode layer {layer_idx}")
                             })?;
-                        } else if is_k_boundary {
+                        } else if {
+                            is_k_boundary |= window_scratch_full(pipelined_layers);
+                            is_k_boundary
+                        } {
                             // ADR-019 Phase 1: hold the LAST layer's
                             // FFN-terminal encoder open (skip commit_and_wait)
                             // so the output head can fold its dispatches into
@@ -6302,10 +7023,16 @@ impl Qwen35Model {
                             //   that achieves factor-2x CB-count reduction
                             //   (proven structurally by
                             //   /opt/mlx-native/tests/encoder_session_cb_count_smoke.rs).
-                            enc.carry_into_next_stage("layer.dense_ffn")
-                                .with_context(|| {
-                                    format!("carry DenseQ intra-K layer {layer_idx}")
-                                })?;
+                            let carried = if pipelined_layers {
+                                // Submit the layer now: the GPU runs it
+                                // while the host encodes the next one.
+                                enc.fence_or_commit("layer.dense_ffn")
+                            } else {
+                                enc.carry_into_next_stage("layer.dense_ffn")
+                            };
+                            carried.with_context(|| {
+                                format!("carry DenseQ intra-K layer {layer_idx}")
+                            })?;
                         }
                         out
                     };
@@ -6377,31 +7104,84 @@ impl Qwen35Model {
                     // the iter91 race for the MoE path that fired at
                     // q4_0-flat layer-15 in the iter91 H4 run.
                     let out = match (
-                        fold_segments,
+                        joint.as_ref(),
                         moe_ffn_arena.as_mut(),
                         moe_ffn_output_ring.as_mut(),
                     ) {
-                        (Some(segments), _, Some(ring)) => {
-                            // Cue fold: the MoE FFN picks its router and
-                            // shared-expert kernels by row count, so each
-                            // segment is built as its own forward builds it,
-                            // on its own scratch, into its rows of the ring.
+                        (Some(_), _, Some(ring)) => {
+                            // Joint prefill. Above
+                            // `prefill_joint::MOE_ROW_EXACT_MIN_ROWS` rows the
+                            // MoE FFN computes an output row from that input
+                            // row alone, with one kernel family whatever the
+                            // row count (`moe_prefill_rows_tests`). So one
+                            // call over every row of the forward gives each
+                            // segment of more than that many rows the bits
+                            // of its own call, and streams the expert stacks
+                            // once for all of them (and computes a shared
+                            // prefix once). A shorter segment (a folded cue,
+                            // a short resumed chunk) takes other kernels in
+                            // its own forward, so it is built on its own
+                            // scratch as that forward builds it, over the
+                            // rows the forward-wide call wrote for it.
                             ensure!(
-                                fold_moe.len() == segments.len(),
-                                "cue fold: MoE segment scratch is missing"
+                                joint_scratch.len() == joint_segments.len(),
+                                "joint prefill: MoE segment scratch is missing"
                             );
                             let width = h as usize;
-                            for ((first, rows), arena) in
-                                segments.into_iter().zip(fold_moe.iter_mut())
+                            let ring_slot = ring.slot_clone(layer_idx as u32);
+                            if let Some(arena) = joint_moe_all.as_mut() {
+                                let mut out_rows = ring_slot.clone();
+                                build_moe_ffn_layer_gpu_q_into_with_arena(
+                                    enc.encoder(),
+                                    &device,
+                                    &mut registry,
+                                    &ffn_input,
+                                    w_gpu,
+                                    shape,
+                                    fold_residual,
+                                    arena,
+                                    &mut out_rows,
+                                    layer_idx,
+                                )
+                                .with_context(|| {
+                                    format!("moe_ffn_q_into_with_arena joint layer {layer_idx}")
+                                })?;
+                                // The short segments below overwrite their
+                                // rows of this call's output.
+                                enc.encoder().memory_barrier();
+                            }
+                            for (segment, scratch) in
+                                joint_segments.iter().zip(joint_scratch.iter_mut())
                             {
+                                if segment.moe_row_exact() {
+                                    ensure!(
+                                        joint_moe_all.is_some(),
+                                        "joint prefill: the forward-wide MoE scratch is missing"
+                                    );
+                                    continue;
+                                }
+                                let arena = scratch
+                                    .moe
+                                    .as_mut()
+                                    .ok_or_else(|| anyhow!("joint prefill: MoE scratch is missing"))?;
+                                ensure!(
+                                    segment.runs.len() == 1,
+                                    "joint prefill: a short MoE segment is not contiguous"
+                                );
+                                let first = segment.runs[0].first;
                                 let rows_of = |buffer: &MlxBuffer| {
-                                    super::prefill_fold::row_view(buffer, first, rows, width)
-                                        .with_shape(vec![rows as usize, width])
-                                        .map_err(|e| anyhow!("cue fold MoE rows: {e}"))
+                                    super::prefill_joint::row_view(
+                                        buffer,
+                                        first,
+                                        segment.rows,
+                                        width,
+                                    )
+                                    .with_shape(vec![segment.rows as usize, width])
+                                    .map_err(|e| anyhow!("joint prefill MoE rows: {e}"))
                                 };
                                 let x = rows_of(&ffn_input)?;
                                 let residual = fold_residual.map(rows_of).transpose()?;
-                                let mut out_rows = rows_of(ring.slot_mut(layer_idx as u32))?;
+                                let mut out_rows = rows_of(&ring_slot)?;
                                 build_moe_ffn_layer_gpu_q_into_with_arena(
                                     enc.encoder(),
                                     &device,
@@ -6416,15 +7196,16 @@ impl Qwen35Model {
                                 )
                                 .with_context(|| {
                                     format!(
-                                        "moe_ffn_q_into_with_arena layer {layer_idx} rows {first}+{rows}"
+                                        "moe_ffn_q_into_with_arena layer {layer_idx} slot {} rows {:?}",
+                                        segment.slot.0, segment.runs
                                     )
                                 })?;
                             }
-                            ring.slot_clone(layer_idx as u32)
+                            ring_slot
                         }
                         (Some(_), _, None) => {
                             return Err(anyhow!(
-                                "cue fold: MoE output ring missing at layer {layer_idx}"
+                                "joint prefill: MoE output ring missing at layer {layer_idx}"
                             ))
                         }
                         (None, Some(arena), Some(ring)) => {
@@ -6462,7 +7243,10 @@ impl Qwen35Model {
                         enc.commit_unlabeled().with_context(|| {
                             format!("commit fused-MoeQ decode layer {layer_idx}")
                         })?;
-                    } else if is_k_boundary {
+                    } else if {
+                        is_k_boundary |= window_scratch_full(pipelined_layers);
+                        is_k_boundary
+                    } {
                         // ADR-019 Phase 1: see DenseQ fusion comment above.
                         // ADR-019 Phase 2 iter90 OQ2: phase1_fusion_env_eligible
                         // is gated on !LayerEncoder::env_enabled(); held branch
@@ -6505,14 +7289,25 @@ impl Qwen35Model {
                         // keeping the CB open for the next layer's FA / DN
                         // helper to encode into the same persistent compute
                         // encoder.
-                        enc.carry_into_next_stage("layer.moe_ffn")
+                        let carried = if pipelined_layers {
+                            // Submit the layer now: the GPU runs it while
+                            // the host encodes the next one.
+                            enc.fence_or_commit("layer.moe_ffn")
+                        } else {
+                            enc.carry_into_next_stage("layer.moe_ffn")
+                        };
+                        carried
                             .with_context(|| format!("carry MoeQ intra-K layer {layer_idx}"))?;
                     }
                     out
                 }
             };
-            session_carry_pending =
-                encoder_session_enabled && seq_len > 1 && !is_k_boundary && any_fused_eligible;
+            // A pipelined layer was submitted, not carried.
+            session_carry_pending = encoder_session_enabled
+                && seq_len > 1
+                && !is_k_boundary
+                && any_fused_eligible
+                && !pipelined_layers;
 
             if let Some(t) = t_ffn_start {
                 total_ffn_us += t.elapsed().as_micros() as u64;
@@ -6892,10 +7687,16 @@ impl Qwen35Model {
             // `reset_for_prefill_chunk` (next prefill chunk) reclaims the
             // pool — one prefill of held scratches is below the W-5b.14
             // 33 GB residency-quota ceiling for production fixtures.
+            if seq_len > 1 {
+                super::decode_pool::note_layer_scratch(
+                    super::decode_pool::issued_total() - layer_scratch_before,
+                    layer_scratch_bound,
+                );
+            }
             if seq_len > 1
                 && is_k_boundary
                 && last_layer_held_enc.is_none()
-                && super::execution_dispatch::dense_q_arena_reset_enabled()
+                && layer_scratch_resets()
             {
                 // Both requirements: successful K drain AND last access to
                 // issued scratch. Outer FA/DN/FFN arenas/params, positions,
@@ -7131,23 +7932,42 @@ impl Qwen35Model {
                 Vec::new()
             }
         };
-        if let Some(fold) = fold.as_ref() {
-            // The checkpoint's logits: the head over the last prefix row, as
-            // the prefix's own forward projects it. The head above drained
-            // every layer, so `hidden` is settled.
-            let boundary_logits = apply_output_head_gpu_last(
-                None,
-                &device,
-                &mut registry,
-                &hidden,
-                &output_head,
-                fold.prefix_rows,
-                h,
-                cfg.vocab_size,
-                eps,
-            )
-            .context("cue fold boundary logits")?;
-            super::prefill_fold::publish_boundary_logits(boundary_logits);
+        if let Some(plan) = joint.as_ref() {
+            // The other rows a lane's own forwards project: each earlier
+            // lane's last row, and the last content row of a lane that folds
+            // its cue (the checkpoint's logits). The head above drained every
+            // layer, so `hidden` is settled; the last lane's last row is the
+            // forward's own.
+            let last_lane = plan.lanes.len() - 1;
+            let mut lane_logits = Vec::with_capacity(plan.lanes.len());
+            for (index, lane) in plan.lanes.iter().enumerate() {
+                let mut head = |row: u32| {
+                    apply_output_head_gpu_last(
+                        None,
+                        &device,
+                        &mut registry,
+                        &hidden,
+                        &output_head,
+                        row + 1,
+                        h,
+                        cfg.vocab_size,
+                        eps,
+                    )
+                    .with_context(|| format!("joint prefill lane {index} logits of row {row}"))
+                };
+                let boundary = lane.boundary_row().map(&mut head).transpose()?;
+                let last = if index == last_lane {
+                    ensure!(
+                        lane.last_row() + 1 == seq_len,
+                        "joint prefill: the last lane does not end the forward"
+                    );
+                    Vec::new()
+                } else {
+                    head(lane.last_row())?
+                };
+                lane_logits.push(super::prefill_joint::LaneLogits { last, boundary });
+            }
+            super::prefill_joint::publish_logits(lane_logits);
         }
         if let Some(t) = t_output_head {
             eprintln!(
@@ -8627,6 +9447,9 @@ impl Qwen35Model {
         let qkv_channels = (2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
             + cfg.linear_num_value_heads * cfg.linear_value_head_dim)
             as usize;
+        // A fast-route switch the operator set that this host's GPU cannot
+        // run fails the load here, with the switch and the reason.
+        crate::inference::route_host::require_explicit(device)?;
         // Resolve the MoE expert switches before any upload: an invalid value
         // or combination fails the load here, not at the first decode step.
         let moe_expert_route = super::moe_batched::qwen_moe_expert_route()?;

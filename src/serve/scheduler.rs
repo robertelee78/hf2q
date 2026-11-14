@@ -1511,6 +1511,25 @@ impl InflightBatchedScheduler {
             .collect()
     }
 
+    /// Every in-flight prefill in admission/FIFO order with the chunk quantum
+    /// [`Scheduler::step`] would hand that slot were it the oldest: its
+    /// remaining tokens capped at the prefill chunk ceiling. The first entry
+    /// is the slot the current step selects. Read-only, like
+    /// [`Self::prefill_handles_fifo`]; a family worker uses it to run the
+    /// chunks of several waiting slots as one transaction.
+    pub(crate) fn prefill_quanta_fifo(&self) -> Vec<(SlotHandle, u32)> {
+        self.in_flight
+            .iter()
+            .filter_map(|slot| match slot.phase {
+                SlotPhase::Prefilling { tokens_remaining } => Some((
+                    slot.handle,
+                    tokens_remaining.min(self.prefill_chunk_tokens),
+                )),
+                SlotPhase::Decoding { .. } => None,
+            })
+            .collect()
+    }
+
     /// Driver callback: report `n_consumed` tokens of prefill were
     /// executed against `handle`. Stale handles, wrong-phase slots, and
     /// unknown handles are silent no-ops.

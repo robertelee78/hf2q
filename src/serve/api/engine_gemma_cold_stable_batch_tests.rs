@@ -980,7 +980,7 @@ fn installed_prefill(
 fn spawn(switch: &str) -> Engine {
     std::env::set_var(gemma_cold_batch::JOINT_COLD_PREFILL_ENV, switch);
     let loaded = LoadedModel::load(&load_options()).expect("load official Gemma GGUF");
-    Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 })
+    Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 }, &mut None)
         .expect("spawn SlotAware Gemma engine")
 }
 

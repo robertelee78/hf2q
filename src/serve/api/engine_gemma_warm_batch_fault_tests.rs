@@ -75,7 +75,7 @@ fn gemma_joint_warm_forward_fault_retries_each_lane_per_slot() {
     };
     let spawn = || {
         let loaded = LoadedModel::load(&load_options()).expect("load official Gemma GGUF");
-        Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 })
+        Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 }, &mut None)
             .expect("spawn SlotAware Gemma engine")
     };
     // Sends the four prompts in `order`; results come back in agent order.

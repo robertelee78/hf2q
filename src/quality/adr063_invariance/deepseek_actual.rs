@@ -4,14 +4,48 @@ use super::{capture,deepseek_cache::endpoint as cache_capture,deepseek_runner::{
     protocol::{Trajectory,Workload},receipt::*,store::{hash,Store}};
 use crate::inference::models::deepseek4::{Deepseek4Config,cache::Deepseek4CachePlan};
 use anyhow::{ensure,Context,Result};
-use serde::Deserialize;
+use serde::{Deserialize,Serialize};
 use std::{fs::OpenOptions,io::{Read,Write},os::unix::fs::OpenOptionsExt,path::PathBuf};
+/// DeepSeek-V4 few-row kernel family a packet declares (`HF2Q_DEEPSEEK_ROW_EXACT_MATVEC`).
+/// Absent = `Stock`, the family of the default binary through v0.1.29; `RowExact`
+/// (the default since v0.1.30) must be declared.
+#[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
+pub(super) enum MatvecKernels {#[default] Stock,RowExact}
+/// Rows steps over token-wise prompt work (`HF2Q_DEEPSEEK_TAIL_ROWS_STEP`); absent = `Off`.
+#[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
+pub(super) enum TailRowsStep {#[default] Off,On}
+/// Joint attention cores (`HF2Q_DEEPSEEK_BATCHED_ATTN_CORES`); absent = `PerRow`.
+#[derive(Clone,Copy,Debug,Default,Deserialize,Serialize,PartialEq,Eq)]
+pub(super) enum AttnCores {#[default] PerRow,Batched}
+/// The three default-on routes a packet declares; the supervisor exports the kill
+/// switch of each route the packet leaves at its retained value.
+pub(super) type Routes=(MatvecKernels,TailRowsStep,AttnCores);
+/// Refuses a loaded model whose resolved routes are not the packet's declared ones.
+pub(super) fn require_routes(declared:Routes,model:&crate::inference::models::deepseek4::Deepseek4Model)->Result<serde_json::Value> {
+    let audit=model.default_route_audit();
+    let value=|name:&str|->Result<serde_json::Value> {
+        let route=audit.iter().find(|route|route.name==name).with_context(||format!("model reports no {name} route"))?;
+        Ok(serde_json::Value::String(route.value.clone()))
+    };
+    let resolved:Routes=(serde_json::from_value(value("deepseek_row_exact_matvec")?)?,
+        serde_json::from_value(value("deepseek_tail_rows_step")?)?,
+        serde_json::from_value(value("deepseek_batched_attn_cores")?)?);
+    require_declared(declared,resolved)
+}
+pub(super) fn require_declared(declared:Routes,resolved:Routes)->Result<serde_json::Value> {
+    ensure!(resolved==declared,"resolved DeepSeek-V4 routes {resolved:?} differ from the packet's {declared:?} \
+        (absent = Stock/Off/PerRow: HF2Q_DEEPSEEK_ROW_EXACT_MATVEC=0, HF2Q_DEEPSEEK_TAIL_ROWS_STEP=0, HF2Q_DEEPSEEK_BATCHED_ATTN_CORES=0)");
+    Ok(serde_json::json!({"matvec_kernels":resolved.0,"tail_rows_step":resolved.1,"attn_cores":resolved.2}))
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Packet {
     execution_approved:bool,acquisition:super::acquisition::Binding,model:PathBuf,output:PathBuf,
     identity:Identity,workload:Workload,trajectory:Trajectory,configured_capacity:usize,
     configured_output_allowance:u64,requested_payload_limit:u64,
+    #[serde(default)] matvec_kernels:MatvecKernels,
+    #[serde(default)] tail_rows_step:TailRowsStep,
+    #[serde(default)] attn_cores:AttnCores,
 }
 pub(super) fn require_ordinary(t:Trajectory)->Result<()> {
     ensure!(!matches!(t,Trajectory::T5GenuineSpeculation|Trajectory::T6CancelRestore),
@@ -71,6 +105,7 @@ fn run()->Result<()> {
         packet.trajectory.label().into(),expected,packet.requested_payload_limit,records).map_err(anyhow::Error::msg)?;
     let _gpu=crate::inference::hf2q_gpu_test_lock();
     let mut model=crate::inference::models::deepseek4::Deepseek4Model::load_from_gguf(&gguf)?;
+    let routes=require_routes((packet.matvec_kernels,packet.tail_rows_step,packet.attn_cores),&model)?;
     scope.check_config(&packet.identity,&recipe(&model.cfg))?;
     store.bind_acquisition(scope.observed(model.ctx.executor.device(),&model as *const _ as usize as u64,1)?)
         .map_err(anyhow::Error::msg)?;
@@ -101,7 +136,7 @@ fn run()->Result<()> {
         Some(cache_capture::require_restore64_exact(&trace.coverage.captured))
     }else{None};
     let output=serde_json::json!({"schema":"hf2q.adr063.q1.endpoint-acquisition.v2","packet_sha256":hash(&raw),
-        "execution":execution,"trace_records":trace.coverage.captured.len(),"planned_capture_bytes":bytes,
+        "execution":execution,"routes":routes,"trace_records":trace.coverage.captured.len(),"planned_capture_bytes":bytes,
         "selected_context":262144,"output_allowance":8192,"logical_lanes":4,"four_cache_requested_bytes":four_caches,
         "cache_boundaries":boundaries(packet.trajectory),"full_active64_exact_restore":exact64,
         "window_order":"physical128-row ring with absolute logical boundary; not chronological reordering",

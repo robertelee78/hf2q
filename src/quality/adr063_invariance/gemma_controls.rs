@@ -178,10 +178,15 @@ fn q1_gemma_endpoint_expected_is_the_reviewed_t0_t2_extent() {
     }
 }
 #[test]
-fn q1_gemma_warm_kernel_defaults_to_shipped_vec_hybrid_and_refuses_undeclared_tiled() {
+fn q1_gemma_packet_kernels_default_to_the_retained_routes_and_refuse_undeclared_ones() {
     use crate::inference::models::gemma4::GemmaLiveKernel as K;
-    assert_eq!(crate::serve::gemma_live_attention::default_warm_live_kernel(),K::VecHybrid);
+    // The shipped default is the tensor route (v0.1.30); a packet without the
+    // field still means VecHybrid, the kernel of every retained Q1 run, so a
+    // default-route run must declare its kernel.
+    assert_eq!(crate::serve::gemma_live_attention::default_warm_live_kernel(),K::TensorF16);
     assert_eq!(WarmLiveKernel::default(),WarmLiveKernel::VecHybrid);
+    assert!(require_warm_kernel(WarmLiveKernel::default(),K::TensorF16).is_err());
+    assert_eq!(require_warm_kernel(WarmLiveKernel::TensorF16,K::TensorF16).unwrap(),WarmLiveKernel::TensorF16);
     assert_eq!(require_warm_kernel(WarmLiveKernel::VecHybrid,K::VecHybrid).unwrap(),WarmLiveKernel::VecHybrid);
     assert!(require_warm_kernel(WarmLiveKernel::VecHybrid,K::TiledF16).is_err());
     assert!(require_warm_kernel(WarmLiveKernel::TiledF16,K::VecHybrid).is_err());
@@ -195,11 +200,16 @@ fn q1_gemma_warm_kernel_defaults_to_shipped_vec_hybrid_and_refuses_undeclared_ti
         assert_eq!(require_decode_attn_ne(DecodeAttnNe::Ne4,N::Ne(4)).unwrap(),DecodeAttnNe::Ne4);
         assert_eq!(serde_json::to_value(DecodeAttnNe::Ne4).unwrap(),serde_json::json!("Ne4"));
     }
+    // Q5_0 tensor matmul: absent = false (retained runs); the shipped default (true) must be declared.
+    assert!(!require_q5_0_tensor_mm(false,false).unwrap());
+    assert!(require_q5_0_tensor_mm(true,true).unwrap());
+    assert!(require_q5_0_tensor_mm(false,true).is_err());
+    assert!(require_q5_0_tensor_mm(true,false).is_err());
     assert_eq!(serde_json::to_value(WarmLiveKernel::VecHybrid).unwrap(),serde_json::json!("VecHybrid"));
     assert!(serde_json::from_value::<WarmLiveKernel>(serde_json::json!("Tiled")).is_err());
 }
 #[test]
-fn q1_gemma_decode_dense_kernel_defaults_to_shipped_stock_and_refuses_undeclared_kernels() {
+fn q1_gemma_decode_dense_kernel_defaults_to_the_retained_stock_and_refuses_undeclared_kernels() {
     use crate::inference::models::gemma4::decode_dense::DecodeDenseKernel as K;
     assert_eq!(DecodeDenseKernel::default(),DecodeDenseKernel::Stock);
     let pairs=[(DecodeDenseKernel::Stock,K::Stock),(DecodeDenseKernel::RowExact,K::RowExact),

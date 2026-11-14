@@ -76,6 +76,7 @@ use mlx_native::ops::quantized_matmul_id_ggml::{
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
+use crate::inference::spec_decode::dflash2::route_profile;
 use crate::serve::forward_mlx_shared::MlxAffineMoeStack;
 
 use super::execution_dispatch::{
@@ -402,12 +403,8 @@ fn repacked_dense_m32_enabled() -> bool {
     if let Some(switches) = super::prepared_switch_override::current() {
         return switches.ffn;
     }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("HF2Q_REPACKED_GGUF_M32")
-            .map(|value| value == "1")
-            .unwrap_or(false)
-    })
+    const SWITCH: route_profile::Switch = route_profile::switch("HF2Q_REPACKED_GGUF_M32");
+    route_profile::is_one(SWITCH)
 }
 
 /// Whether the prepared route serves a DFlash2 target verify step at every
@@ -421,10 +418,8 @@ fn repacked_any_width_enabled() -> bool {
     if let Some(switches) = super::prepared_switch_override::current() {
         return switches.any_width;
     }
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("HF2Q_REPACKED_GGUF_ANY_WIDTH").as_deref() == Ok("1")
-    });
-    *ENABLED
+    const SWITCH: route_profile::Switch = route_profile::switch("HF2Q_REPACKED_GGUF_ANY_WIDTH");
+    route_profile::is_one(SWITCH)
 }
 
 /// Largest joint width the prepared route is admitted at.
@@ -442,6 +437,15 @@ fn repacked_dense_shape_eligible(params: &GgmlQuantizedMatmulParams, any_width: 
         && params.n % 64 == 0
         && params.k % 256 == 0
         && matches!(params.ggml_type, GgmlType::Q4_K | GgmlType::Q6_K)
+        && prepared_mm_runs()
+}
+
+/// Whether this host's GPU runs the prepared kernels at all
+/// ([`crate::inference::route_host`]): they exist only on the Metal tensor
+/// API. Every admission of a prepared product asks it, so a host without
+/// that API keeps the stock kernels whatever the switches say.
+pub(super) fn prepared_mm_runs() -> bool {
+    crate::inference::route_host::runs(mlx_native::TensorKernelFamily::RepackedGgufMm)
 }
 
 /// Whether a step may take the prepared route below 32 rows: the switch is
@@ -5932,6 +5936,9 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::joint_projection::{JointProjectionKernel, JointProjectionScope};
         use super::super::prepared_switch_override::{Override, PreparedSwitches};
+        use crate::inference::route_host::HostForTest;
+        // The rule itself, on a host that runs the prepared kernels.
+        let _host = HostForTest::with_tensor_api();
         let params = |m| GgmlQuantizedMatmulParams {
             m,
             n: 17_408,
@@ -5974,8 +5981,16 @@ mod tests {
                     "{m} after the scope"
                 );
             }
-            let _scope = verify(33);
-            assert!(!repacked_dense_m32_admits(&params(33)), "above 32 rows");
+            {
+                let _scope = verify(33);
+                assert!(!repacked_dense_m32_admits(&params(33)), "above 32 rows");
+            }
+            // A host that cannot run the prepared kernels admits nothing,
+            // whatever the switches and the scope say.
+            let _incapable = HostForTest::without_tensor_api();
+            let _scope = verify(32);
+            assert!(!repacked_dense_m32_admits(&params(32)), "incapable host");
+            assert!(!repacked_dense_m32_shape_admits(&params(32), true));
         }
         // The base switch gates everything.
         let _off = Override::set(PreparedSwitches {

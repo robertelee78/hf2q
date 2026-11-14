@@ -51,6 +51,9 @@ fn switches(fold_cue: bool) -> SwitchesForTest {
     SwitchesForTest::set(PrefillSwitches {
         prepared: true,
         fold_cue,
+        joint: false,
+        wait_layers: 1,
+        keep_fresh: false,
     })
 }
 
@@ -87,6 +90,8 @@ fn loaded(device: &MlxDevice) -> Box<Qwen35LoadedModel> {
         tq_kv_active: true,
         persistent_kv_cache: None,
         dflash2: None,
+        dflash2_plan: None,
+        routes: crate::inference::spec_decode::dflash2::route_profile::current(),
         speculation: crate::serve::api::qwen35_speculation::QwenSpeculationController::new(
             crate::serve::api::qwen35_speculation::QwenSpeculationPolicy::Off,
         ),
@@ -377,6 +382,9 @@ fn the_scheduler_keeps_two_forwards_where_the_fold_does_not_apply() {
     let _switches = SwitchesForTest::set(PrefillSwitches {
         prepared: false,
         fold_cue: true,
+        joint: false,
+        wait_layers: 1,
+        keep_fresh: false,
     });
     assert_eq!(folds(&qwen, &mut kv, 40, 5, false, None), None);
 }

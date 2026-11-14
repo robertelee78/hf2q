@@ -649,6 +649,34 @@ class ArgvAndCases(unittest.TestCase):
         self.assertEqual(on['serve']['env']['DECODE_DENSE'], 'row_exact')
         self.assertEqual(on['serve']['env']['DECODE_ATTN_NE'], '', 'arms are independent')
 
+    def test_gemma_case_kill_switch_arms_reach_the_launcher(self):
+        # v0.1.30: the empty defaults run the gate configuration (hf2q defaults); the
+        # kill-switch arm sets all four off values and nothing else.
+        case = q5_case.loads((HERE / 'q5_cases' / 'gemma4.json').read_bytes())
+        builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+        kill = q5_case.build_plan(case, builtins, {
+            **self.required(), 'HF2Q_Q5_GEMMA_DECODE_ATTN_NE': '0', 'HF2Q_Q5_GEMMA_DECODE_DENSE': 'stock',
+            'HF2Q_Q5_GEMMA_WARM_TILED_ATTENTION': '0', 'HF2Q_Q5_Q5_0_TENSOR_MM': '0'})
+        env = kill['serve']['env']
+        self.assertEqual((env['DECODE_ATTN_NE'], env['DECODE_DENSE'], env['WARM_TILED_ATTENTION'],
+                          env['Q5_0_TENSOR_MM']), ('0', 'stock', '0', '0'))
+        self.assertFalse([name for name in env if name.startswith('HF2Q_GEMMA_') or name == 'HF2Q_Q5_0_TENSOR_MM'])
+
+    def test_deepseek_cases_export_route_switches_only_for_an_explicit_arm(self):
+        switches = ('HF2Q_DEEPSEEK_ROW_EXACT_MATVEC', 'HF2Q_DEEPSEEK_TAIL_ROWS_STEP',
+                    'HF2Q_DEEPSEEK_BATCHED_ATTN_CORES')
+        for name in ('deepseek4.json', 'deepseek4-ds4file.json'):
+            case = q5_case.loads((HERE / 'q5_cases' / name).read_bytes())
+            builtins = {**self.builtins(), 'REPO': str(HERE.parent.parent)}
+            default = q5_case.build_plan(case, builtins, self.required())
+            child = q5_case.child_env({}, default['serve']['env'])
+            # Empty defaults export nothing: the server runs the hf2q defaults.
+            self.assertFalse([switch for switch in switches if switch in child], name)
+            kill = q5_case.build_plan(case, builtins, {
+                **self.required(), **{'HF2Q_Q5_' + switch[len('HF2Q_'):]: '0' for switch in switches}})
+            child = q5_case.child_env({}, kill['serve']['env'])
+            self.assertEqual([child.get(switch) for switch in switches], ['0', '0', '0'], name)
+
     def test_run_id_matches_client_identity_rule(self):
         for name in ('x', 'q5-qwen38-20261030T120000Z', 'a.b c' * 30):
             self.assertRegex(q5_calibration.run_id(name, 'f' * 32), r'^[A-Za-z0-9_-]{16,64}$')
