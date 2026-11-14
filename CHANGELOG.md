@@ -70,6 +70,7 @@ are recorded under Changed.
 ### Changed
 
 - Pin published mlx-native 0.22.0 for the required quantized-kernel, kept-command status and mapped-backing ownership fixes. Dependency provenance is bound to the registry crate and checksum, not a local Cargo patch.
+- Update transitive quinn-udp to 0.5.16 to fix RUSTSEC-2026-0538, a receive-loop denial of service after a truncated datagram on affected platforms.
 
 - ADR-067 D6: `HF2Q_DFLASH2` is a per-model three-state policy. Unset selects the pinned drafter and combined route profile for eligible Qwen3.8/Qwen3.6 targets; `0` restores the prior route and `1` requires a compatible drafter. Pinned-source pairs and same-architecture/shape fine-tunes are admitted explicitly; MoE auto-selection additionally requires supported batched-verification storage. There is no acceptance-based runtime drop-back. Drafters are verified from the pinned Hugging Face cache revision or downloaded before target weights load.
 - The single Qwen profile table includes staged/AF4 draft, GPU target tokens, prefetch, GPU decisions, prepared products, tiled verification, fused mixer, replay reuse, cue folding, joint prefill and deferred waits; Qwen3.8 additionally selects the history-aware proposal prior and Qwen3.6 selects the MoE routes and prefill keep-fresh. Explicit switch values win. Unsupported host/storage combinations or insufficient memory withhold implicit routes; release-gate readiness requires the complete profile, not a silently reduced configuration.
