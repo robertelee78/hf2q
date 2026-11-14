@@ -38,8 +38,10 @@ described in RFC 2119.
 
    Model files MAY be reused from the owner's managed directory
    (`~/.local/share/hf2q/models/`) by passing their absolute path.
-4. **Pick the models.** The default text and vision model is the guide pair:
-   `jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M` (GGUF plus its mmproj).
+4. **Pick the models.** The default text model is the guide's official
+   `Qwen/Qwen3.8-27B` Q4_K_M, prepared by the guide's native `hf2q convert`.
+   The guide is text-only. For J9, separately configure a compatible model
+   and matching vision projector; do not assume the guide loaded one.
    Record the exact GGUF path and SHA-256 for every model used.
 5. **Clean up.** Every server you start MUST be stopped before the next
    journey and at the end (`kill` the PID you recorded; confirm with `pgrep`).
@@ -160,25 +162,19 @@ rejections happen with a clear message; nothing hangs.
 
 ### J7 GLP
 
-Needs an artifact that matches the served checkpoint exactly. No GLP
-artifact is published for the guide's abliterated SFT checkpoint, so use the
-stock model and its published artifact:
+Use the guide's official Qwen3.8 model and exact immutable GLP file URL.
+The guide starts GLP at strength 1 together with GCD and PhantomKV;
+record the pinned URL and native binding output. Original model weights
+remain unchanged.
 
-```bash
-HOME=$QE_HOME HF_TOKEN=$(cat ~/.cache/huggingface/token) hf2q serve Qwen/Qwen3.8-27B:Q4_K_M \
-  --glp https://huggingface.co/msuiche/Qwen3.8-27B-abliterated-cyber-GLP-49/resolve/main/Qwen3.8-27B-abliterated-cyber-GLP-49-L10-58-a1.gguf
-```
+Stop the guide server before each comparison. Reuse its local model and
+the same GLP URL in a direct `hf2q serve` invocation; compare strength 1,
+`--glp-alpha 0.5`, and a baseline without `--glp`, holding all other
+settings and prompts fixed. The public guide does not require a gated
+checkpoint or saved Hugging Face token.
 
-That repository holds two vectors, so the bare repository name and bare
-`--glp` both stop with an "ambiguous GLP files" error by design; name one file
-by its full Hub URL. The repository is gated: accept its license on Hugging
-Face and run `hf auth login` in your normal shell first. hf2q looks for the
-saved token under `$HOME`, which `HOME=$QE_HOME` hides, so pass it in with
-`HF_TOKEN` as above; without it, startup fails with "Authentication failed".
-
-If no stock Q4_K_M is available, convert one first with `hf2q convert
-Qwen/Qwen3.8-27B --quant q4_k_m`. Chat with it; restart with `--glp-alpha 0.5`;
-then restart without `--glp`. A bind refusal against the abliterated SFT
+The upstream repository contains multiple vectors: name the exact file,
+not a bare repository or bare `--glp`. A bind refusal for a different
 checkpoint is expected behavior, not a finding.
 
 Pass: loads or fails with the documented typed error; outputs change when
@@ -195,8 +191,10 @@ Pass: each step does what it says; config and model data survive uninstall.
 
 ### J9 Vision
 
-With the guide's model server running, send a solid-red fixture through the
-API. `hf2q chat` has no image or attachment input, so record that gap:
+With a separately configured compatible vision model and matching projector
+serving on `127.0.0.1:8081`, send a solid-red fixture through the API.
+The guide's text-only server does not load a projector. `hf2q chat` has no
+image or attachment input, so record that gap:
 
 ```bash
 (

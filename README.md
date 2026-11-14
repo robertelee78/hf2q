@@ -38,9 +38,9 @@ export PATH="$HOME/.local/bin:$PATH"
 hf2q setup
 hf2q doctor
 
-# Reuse an exact local Q4_K_M when present; otherwise download and verify it,
-# start an owned local server, and open chat.
-hf2q chat jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M
+# Follow the getting-started guide to download and convert official Qwen3.8,
+# enable GLP/GCD/PhantomKV, and connect omp with four parallel workers:
+# https://hf2q.us/docs/getting-started/
 ```
 
 ---
@@ -544,11 +544,12 @@ it is not a fourth native effort tier. A supplied
 integer `seed` now drives a decode-step-indexed deterministic sampler; identical
 rendered prompts and sampling settings reproduce across worker threads.
 
-The Qwen3.8 onboarding path uses the published Q4_K_M artifact for
-`jenerallee78/Qwen3.8-27B-Abliterated-SFT`. Follow the
-[getting-started guide](docs/getting-started.md)
-for automatic model preparation, four-slot serving, chat, and parallel
-coding with omp.
+The Qwen3.8 onboarding path uses hf2q's native downloader and converter for
+the exact official `Qwen/Qwen3.8-27B` checkpoint required by its GLP vector.
+Follow the [getting-started guide](docs/getting-started.md) for four-slot
+serving with GLP, GCD, and PhantomKV, chat, and parallel coding with omp.
+Original model weights remain unchanged; the guide's text-only conversion
+does not load a vision projector.
 
 Native text conversion and serving are accepted. Vision is a separate
 candidate surface: hf2q converts the 333-tensor tower into a paired projector,

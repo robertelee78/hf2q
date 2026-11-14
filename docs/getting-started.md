@@ -1,12 +1,11 @@
 # Getting started: hf2q + omp
 
-Run Qwen3.8 locally, then code with [omp](https://omp.sh). One model server,
-four inference slots, parallel agents.
+Run official Qwen3.8 locally with GLP, GCD, and PhantomKV, then code with
+[omp](https://omp.sh). One model server, four inference slots, parallel agents.
 
-**Before you start:** Apple Silicon, macOS 14 or newer, and at least 20 GiB
-free for the roughly 17 GiB first download. The documented validation host
-has 128 GiB unified memory; this is not a minimum-memory guarantee. Four
-long conversations need more memory than one.
+**Before you start:** Apple Silicon, macOS 14 or newer, and 80 GiB free
+for the first source download and conversion. Validation used 128 GiB
+unified memory; four long conversations need more memory than one.
 
 ## 1. Install hf2q
 
@@ -24,15 +23,37 @@ Read any failures reported by `doctor` before continuing.
 
 ## 2. Start the model · terminal 1
 
+The first run downloads and converts the exact official checkpoint that
+matches the GLP vector. hf2q handles downloading and caching:
+
 ```bash
-hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M
+hf2q convert Qwen/Qwen3.8-27B \
+  --revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 \
+  --quant q4_k_m --text-only \
+  --output "$HOME/.local/share/hf2q/models/qwen3.8.gguf"
 ```
 
-hf2q downloads the compatible model if needed and reuses it on later starts.
+Download the small PhantomKV bank once:
+
+```bash
+curl -fL https://huggingface.co/jenerallee78/Qwen3.8-27B-hf2q-Q4_K_M/resolve/840dc4196706714939679630d137b04fb33c0c9f/Qwen3.8-27B-phantom-kv.gguf \
+  -o "$HOME/.local/share/hf2q/models/qwen3.8-phantom-kv.gguf"
+```
+
+Start the server. Reuse this command next time:
+
+```bash
+hf2q serve "$HOME/.local/share/hf2q/models/qwen3.8.gguf" \
+  --gcd \
+  --glp https://huggingface.co/msuiche/Qwen3.8-27B-abliterated-cyber-GLP-49/resolve/5f1be31cfde653f24fe74c71047433012b8ede9e/Qwen3.8-27B-abliterated-cyber-GLP-49-L10-58-a1.gguf \
+  --kv-graft "$HOME/.local/share/hf2q/models/qwen3.8-phantom-kv.gguf"
+```
+
+These runtime modifiers target refusal suppression without editing model
+weights. Omit the three flags for stock behavior. The setup is text-only.
+
 Wait until the server is listening on `127.0.0.1:8081`. Leave this terminal
 open.
-
-The four slots share model weights, not a divided context window.
 
 ## 3. Try a conversation · terminal 2
 
@@ -45,8 +66,6 @@ hf2q chat --url http://127.0.0.1:8081
 
 Ask “What is 12 × 13?” Wait for the answer, then type `/quit`.
 Keep terminal 1 running for the remaining steps.
-
-To inspect downloaded models later, use `hf2q serve list`.
 
 ## 4. Install omp
 
@@ -69,6 +88,10 @@ at four. Workers cannot spawn nested workers.
 Your default omp profile stays unchanged; changed hf2q-profile files are
 backed up.
 
+omp requests normal text so the default GCD prose grammar cannot block
+tools. Native tool-call grammar stays active; omp's free-form prose is
+not grammar-constrained.
+
 ## 6. Start coding
 
 From your project directory:
@@ -88,7 +111,7 @@ was delegated. Four is the request ceiling, not a promise that every task
 keeps every slot busy. omp includes web search and URL reading; no separate
 search-stack setup is needed.
 
-Next time, repeat step 2 in one terminal and run `omp-hf2q` in another.
+Next time, run the serve command in step 2, then `omp-hf2q` in another terminal.
 Stop the server with **Ctrl-C** in terminal 1.
 
 ## If something stops you
