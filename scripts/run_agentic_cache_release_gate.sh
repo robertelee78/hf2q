@@ -680,6 +680,8 @@ mkdir -p "$cooperative_dir"
 
 work_deepseek_cooperative() {
 set_cooperative_paths
+# Stage the frozen build log only after fresh-output admission; never compile here.
+cp "$OUT_ROOT/build/release-bin.jsonl" "$cooperative_dir/build.jsonl"
 require_no_model_runtime
 thermal_wait_for_nominal "$cooperative_settle_log" \
   cooperative-prefill-settle 60 900 5 \
@@ -2076,10 +2078,6 @@ work_build_fixtures() {
   cooperative_test_binary=$(load_test_binary release-bin)
   integration_test_binary=$(load_test_binary release-integration)
   prepare_models_and_fixtures
-  # Retain the original cooperative build receipt path, generated before any
-  # measurement; no phase can invoke Cargo or relink a test executable.
-  set_cooperative_paths
-  cp "$OUT_ROOT/build/release-bin.jsonl" "$cooperative_dir/build.jsonl"
   local fixtures
   fixtures=$(
     find "$OUT_ROOT/fixtures" -type f -print | LC_ALL=C sort |

@@ -261,6 +261,7 @@ jobs:
         with:
           name: cache-lifecycle-${{ inputs.commit_sha }}
           path: ${{ runner.temp }}/cache-lifecycle
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 30
 

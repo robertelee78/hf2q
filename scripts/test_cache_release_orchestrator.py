@@ -277,6 +277,12 @@ class PortableEvidenceTests(unittest.TestCase):
         receipt["end_sha256"] = gate.sha256(path)
         put(dispatch, receipt)
 
+    def test_credentials_cannot_be_frozen_into_public_evidence(self):
+        for name in ("CARGO_REGISTRY_TOKEN", "CARGO_REGISTRIES_PRIVATE_TOKEN", "HF2Q_API_KEY"):
+            with self.subTest(name=name), mock.patch.dict(os.environ, {name: "private-value"}, clear=True):
+                with self.assertRaises(gate.Refusal):
+                    gate.configuration()
+
     def test_complete_downloaded_root_needs_no_live_models_or_source(self):
         destination = Path(self.temp.name) / "relocated"
         self.root.rename(destination)

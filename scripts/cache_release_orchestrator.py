@@ -248,7 +248,11 @@ def configuration() -> dict:
     prefixes = ("HF2Q_", "MLX_", "CACHE_RELEASE_", "CARGO_", "RUST", "DEEPSEEK_", "GEMMA_", "QWEN_", "QWEN38_")
     omitted = {"CACHE_RELEASE_INTERNAL", "CACHE_RELEASE_INTERNAL_RECEIPT", "CACHE_RELEASE_WORK",
                "CACHE_RELEASE_HOSTQ", "CACHE_RELEASE_FIT_RECORD", "HF2Q_BIN"}
-    return {k: v for k, v in sorted(os.environ.items()) if k.startswith(prefixes) and k not in omitted}
+    values = {k: v for k, v in sorted(os.environ.items()) if k.startswith(prefixes) and k not in omitted}
+    credentials = re.compile(r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|CREDENTIALS?|API_KEY|ACCESS_KEY|PRIVATE_KEY)(?:_|$)")
+    require(not any(credentials.search(name) for name in values),
+            "credential-bearing environment is forbidden in release evidence")
+    return values
 
 
 def candidate_inputs(root: Path, check_signature: bool = False) -> dict:

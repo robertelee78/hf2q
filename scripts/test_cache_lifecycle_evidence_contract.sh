@@ -112,6 +112,7 @@ while IFS= read -r candidate; do
   fi
 done < <(find "$tampered_evidence/.cache-release" -type f -print)
 [[ -n "$evidence_file" ]]
+chmod u+w "$evidence_file"
 printf '\ntamper\n' >>"$evidence_file"
 expect_failure "$tampered_evidence" "$tmp/tampered-evidence-output"
 
