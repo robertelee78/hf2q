@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import q3_campaign
 import q3_mechanism as mechanism
@@ -16,6 +17,7 @@ import q5_calibration
 from test_native_peer_splash import splash_manifest
 from test_q3_campaign import FakeRunner, fake_identities
 from q3_fake_splash import invalid_sweep, mechanism_campaign, rebind_approval, reviewed_template_fixture
+from qwen38_n1_verdict import Invalid
 
 HERE = Path(__file__).resolve().parent
 
@@ -55,19 +57,29 @@ class MechanismVerdict(unittest.TestCase):
                 self.assertEqual(v['mechanism']['accepted_rows'], rows * 5)
                 self.assertEqual(len(v['mechanism']['runs']), 5)
 
-    def test_exact_reviewed_peer_only_variants_preserve_full_report_win(self):
+    def test_reviewed_source_variant_preserves_win_but_unreviewed_variant_is_refused(self):
         m = self.manifest()
         selection = json.loads(Path(m['plan']['splash_unavailable_evidence'][0]['path']).read_text())
         run = Path(next(iter(selection['configurations'].values()))['runs'][0])
         path = run / 'client-approval.json'
         approval = json.loads(path.read_text())
-        for name, group in splash_evidence.SOURCE_CONTINUITY_WHITELIST.items():
-            approval['sources'][name] = next(value for value in group if value != mechanism.digest(HERE / name))
-        path.write_text(json.dumps(approval))
-        rebind_approval(run)
-        m['plan']['qwen38_splash_substitution'] = splash_evidence.freeze(
-            m['plan']['splash_unavailable_evidence'], json.loads(Path(m['plan']['arms']['experiment']['case']).read_text()))
-        self.assertEqual(self.verdict(m)['verdict'], 'Win')
+        name = 'qwen_n4_live_smoke.py'
+        reviewed = '1' * 64
+        current = mechanism.digest(HERE / name)
+        with patch.dict(splash_evidence.SOURCE_CONTINUITY_WHITELIST,
+                        {name: frozenset((current, reviewed))}):
+            approval['sources'][name] = reviewed
+            path.write_text(json.dumps(approval))
+            rebind_approval(run)
+            case = json.loads(Path(m['plan']['arms']['experiment']['case']).read_text())
+            m['plan']['qwen38_splash_substitution'] = splash_evidence.freeze(
+                m['plan']['splash_unavailable_evidence'], case)
+            self.assertEqual(self.verdict(m)['verdict'], 'Win')
+            approval['sources'][name] = '2' * 64
+            path.write_text(json.dumps(approval))
+            rebind_approval(run)
+            with self.assertRaises(Invalid):
+                splash_evidence.freeze(m['plan']['splash_unavailable_evidence'], case)
 
     def test_below_floor_blocks_otherwise_winning_campaign(self):
         v = self.verdict(self.manifest(662))
