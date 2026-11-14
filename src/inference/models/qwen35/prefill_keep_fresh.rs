@@ -24,7 +24,6 @@ use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::copy::{dispatch_strided_copy_f32, StridedCopyParams};
 use mlx_native::{DType, MlxBuffer};
 
-use super::joint_step_options::parse_switch;
 use crate::inference::spec_decode::dflash2::route_profile;
 use super::model::Qwen35Model;
 
@@ -39,14 +38,8 @@ pub(crate) const INTERVAL: Duration = Duration::from_millis(250);
 /// Whether this model's resolved route selects the keep-alive.
 pub(crate) fn enabled() -> bool {
     const SWITCH: route_profile::Switch = route_profile::switch(QWEN_PREFILL_KEEP_FRESH_ENV);
-    route_profile::with_value(SWITCH, |raw| parse_switch(QWEN_PREFILL_KEEP_FRESH_ENV, raw))
-        .unwrap_or_else(|error| {
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                tracing::warn!(error, fallback = false, "invalid Qwen prefill keep-fresh switch");
-            });
-            false
-        })
+    // Startup validates the raw value; this per-tick read only needs its bit.
+    route_profile::is_on(SWITCH)
 }
 
 /// Whether a use is due at `now` after the previous one at `last`.
@@ -159,16 +152,6 @@ impl Qwen35Model {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::models::qwen35::joint_step_options::parse_switch;
-
-    #[test]
-    fn switch_is_off_unless_set_on() {
-        let parse = |raw| parse_switch(QWEN_PREFILL_KEEP_FRESH_ENV, raw);
-        assert_eq!(parse(None), Ok(false));
-        assert_eq!(parse(Some("1")), Ok(true));
-        assert_eq!(parse(Some("off")), Ok(false));
-        assert!(parse(Some("250")).is_err());
-    }
 
     #[test]
     fn a_use_is_due_at_first_and_then_once_per_interval() {

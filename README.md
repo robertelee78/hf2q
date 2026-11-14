@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.89+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF; full-model MLX-affine safetensors output is planned under [ADR-046](docs/adr/ADR-046-evidence-driven-apple-auto-quant.md). |
-| **Status** | This checkout describes the hf2q 0.1.29 release line and resolves published, checksum-pinned `mlx-native 0.18.0`. Treat 0.1.29 as a release candidate until the `v0.1.29` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | This checkout describes the hf2q 0.1.30 release candidate and resolves a published, checksum-pinned registry `mlx-native` dependency. Public availability requires the `v0.1.30` tag, signed GitHub artifact, crates.io bytes, and hf2q.us stable record to match the exact release source and proofs. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 curl -fsSL https://hf2q.us/install.sh | sh
@@ -851,7 +851,7 @@ are recorded in `docs/adr/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/adr/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.29 serving release
+#### Test the 0.1.30 serving release candidate
 
 Build and verify the exact checkout before loading a model:
 

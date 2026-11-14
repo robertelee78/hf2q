@@ -415,6 +415,8 @@ thread_local! {
     static BOUND: RefCell<Option<Arc<ResolvedRoutes>>> = const { RefCell::new(None) };
     /// The bound routes' exact-`1` bits, for readers on the dispatch path.
     static BOUND_ONES: Cell<Option<u32>> = const { Cell::new(None) };
+    /// Grammar-aware bits for boolean readers on the dispatch path.
+    static BOUND_ON: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 /// Preserve a set, invalid-Unicode value as invalid input, never as unset.
@@ -452,8 +454,15 @@ pub(crate) fn is_one(switch: Switch) -> bool {
     ones & (1 << switch.0) != 0
 }
 
+/// Whether the switch's grammar selects its route on this thread.
+pub(crate) fn is_on(switch: Switch) -> bool {
+    let on = BOUND_ON.with(Cell::get).unwrap_or_else(|| PROCESS.on);
+    on & (1 << switch.0) != 0
+}
+
 fn replace(routes: Option<Arc<ResolvedRoutes>>) -> Option<Arc<ResolvedRoutes>> {
     BOUND_ONES.with(|ones| ones.set(routes.as_ref().map(|routes| routes.ones)));
+    BOUND_ON.with(|on| on.set(routes.as_ref().map(|routes| routes.on)));
     BOUND.with(|bound| bound.replace(routes))
 }
 
@@ -730,10 +739,14 @@ mod tests {
 
     #[test]
     fn a_binding_is_per_thread_and_restored_on_drop() {
+        let keep_fresh =
+            crate::inference::models::qwen35::prefill_keep_fresh::QWEN_PREFILL_KEEP_FRESH_ENV;
+        let enabled = crate::inference::models::qwen35::prefill_keep_fresh::enabled;
+        let before = enabled();
         let bound = Arc::new(ResolvedRoutes::resolve(
             Some(RouteProfile::Qwen36),
             &|_| None,
-            &env(&[]),
+            &env(&[(keep_fresh, " TrUe ")]),
         ));
         let inner = Arc::new(ResolvedRoutes::resolve(None, &|_| None, &env(&[])));
         let unbound = || BOUND.with(|bound| bound.borrow().is_none());
@@ -741,18 +754,22 @@ mod tests {
             let _outer = bind(Arc::clone(&bound));
             assert!(is_one(MOE_BATCHED));
             assert!(with_value(MOE_BATCHED, |value| value == Some("1")));
+            assert!(enabled());
             assert_eq!(current().profile(), Some(RouteProfile::Qwen36));
             {
                 let _inner = bind(inner);
                 assert!(!is_one(MOE_BATCHED));
                 assert!(with_value(MOE_BATCHED, |value| value.is_none()));
+                assert!(!enabled());
             }
             assert!(is_one(MOE_BATCHED), "restored");
+            assert!(enabled(), "grammar-aware reader restored");
             // Another thread never sees this thread's binding.
             assert!(std::thread::spawn(unbound).join().expect("thread"));
         }
         assert!(unbound());
         assert_eq!(BOUND_ONES.with(Cell::get), None);
+        assert_eq!(enabled(), before, "process binding restored");
     }
 
     #[test]

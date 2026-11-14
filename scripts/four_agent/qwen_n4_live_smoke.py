@@ -401,6 +401,7 @@ def main():
     results, exits, cleanup = {}, {}, {}
     cohorts, agents = phase_cohorts(args.phase_plan), active_agents(args.phase_plan)
     started = time.monotonic()
+    native = None
     try:
         require(child.digest(args.approval) == args.approval_sha256, "coordinator approval hash")
         packet = loads(Path(args.approval).read_bytes())
@@ -456,7 +457,6 @@ def main():
                     and args.benchmark_profile is None,
                     "repair turns are Qwen hf2q/peer/Splash-qwen36 runs without a benchmark profile")
             summary["repair_turns"] = args.repair_turns
-        native = None
         if args.engine_kind in family_contract.ADAPTER_KINDS:  # the arm's registry, client modules and test
             from native_peers import adapter
             native = adapter(args.engine_kind)
@@ -599,8 +599,6 @@ def main():
                         "prefill_headstart_ns": stream_at - later["release_monotonic_ns"]})
                     next_cohort += 1
             time.sleep(0.05)
-        if native is not None and native.closing is not None:  # every agent finished: native closing facts
-            summary["native_closing"] = native.closing(args.base_url, output)
     except BaseException as exc:
         summary["status"], summary["error"] = "Failed", f"{type(exc).__name__}: {exc}"
     finally:
@@ -618,6 +616,14 @@ def main():
                     summary["error"] = str(exc)
         for stream in streams:
             stream.close()
+        if processes and native is not None and native.closing is not None:
+            try:
+                summary["native_closing"] = native.closing(args.base_url, output)
+            except BaseException as exc:
+                if summary["status"] == "Failed":
+                    summary["native_closing_error"] = f"{type(exc).__name__}: {exc}"
+                else:
+                    summary["status"], summary["error"] = "Failed", f"{type(exc).__name__}: {exc}"
         if summary["status"] != "Failed":
             try:
                 summary["status"] = aggregate(results, exits, cleanup, args.server_pid, run, args.engine_kind, args.family,

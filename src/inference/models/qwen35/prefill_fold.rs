@@ -36,12 +36,7 @@
 //!
 //! [`Qwen35Model::prefill_fold_exact`]: super::model::Qwen35Model
 
-
-use anyhow::{anyhow, ensure, Result};
-use mlx_native::{DType, MlxBuffer, MlxDevice};
-
 use super::joint_step_options::parse_switch;
-use super::kv_cache::LaAnchorImage;
 use crate::inference::spec_decode::dflash2::route_profile;
 
 /// Switch, default off: `1`/`on`/`true` folds the generation cue into the

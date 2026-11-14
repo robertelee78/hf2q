@@ -144,30 +144,43 @@ def parity_config(run_dir, template, output_dir=None):
     require(not any((p / '.git').exists() for p in (out.parent, *out.parent.parents)), 'output must be outside Git')
     out.mkdir(mode=0o700)
     turns = []
-    agent_receipts = [
-        (agent_summary.parent.name, json.loads(agent_summary.read_text())['turns'])
+    agent_receipts = {
+        agent_summary.parent.name: json.loads(agent_summary.read_text())['turns']
         for agent_summary in sorted((run / 'client').glob('agent-*/summary.json'))
-    ]
-    if not agent_receipts:
-        agents = summary.get('agents') or {}
-        require(isinstance(agents, dict), f'{run} client summary has no agent receipts')
-        agent_receipts = [
-            (agent, receipt['turns'])
-            for agent, receipt in sorted(agents.items())
-        ]
-    for agent, receipts in agent_receipts:
-        for receipt in receipts:
-            directory = run / 'client' / agent / f"turn-{receipt['turn']}"
-            raw = (directory / 'request.json').read_bytes()
-            require(digest(raw) == receipt['request_sha256'], f'{agent} turn {receipt["turn"]}: request archive changed')
-            canonical = sp.canonical(json.loads(raw), 'qwen')
-            path = out / f"{agent}-turn-{receipt['turn']}.canonical-request.json"
-            body = json.dumps(canonical, ensure_ascii=False, separators=(',', ':')).encode()
-            path.write_bytes(body)
-            rendered = directory / 'splash-apply-template.raw'
-            turns.append({'agent': agent, 'turn': receipt['turn'],
-                          'canonical_request': {'path': str(path), 'sha256': digest(body)},
-                          'splash_apply_template': {'path': str(rendered), 'sha256': digest(rendered.read_bytes())}})
+    }
+    agents = summary.get('agents') or {}
+    require(isinstance(agents, dict), f'{run} client summary has no agent receipts')
+    for agent, receipt in sorted(agents.items()):
+        agent_receipts.setdefault(agent, receipt['turns'])
+    receipts = {(agent, receipt['turn']): receipt
+                for agent, rows in agent_receipts.items() for receipt in rows}
+    observed = set()
+    for request_path in sorted((run / 'client').glob('agent-*/turn-*/request.json')):
+        directory = request_path.parent
+        agent = directory.parent.name
+        turn = int(directory.name.removeprefix('turn-'))
+        require(directory.name == f'turn-{turn}', f'{agent}: noncanonical turn directory')
+        raw = request_path.read_bytes()
+        request_sha = digest(raw)
+        receipt = receipts.get((agent, turn))
+        if receipt is not None:
+            require(request_sha == receipt['request_sha256'], f'{agent} turn {turn}: request archive changed')
+        for name in ('response-headers.json', 'receipt.json'):
+            record_path = directory / name
+            if record_path.exists():
+                record = json.loads(record_path.read_bytes())
+                require(isinstance(record, dict) and record.get('request_sha256') == request_sha,
+                        f'{agent} turn {turn}: {name} request archive changed or digest invalid')
+        canonical = sp.canonical(json.loads(raw), 'qwen')
+        path = out / f"{agent}-turn-{turn}.canonical-request.json"
+        body = json.dumps(canonical, ensure_ascii=False, separators=(',', ':')).encode()
+        path.write_bytes(body)
+        rendered = directory / 'splash-apply-template.raw'
+        turns.append({'agent': agent, 'turn': turn,
+                      'canonical_request': {'path': str(path), 'sha256': digest(body)},
+                      'splash_apply_template': {'path': str(rendered), 'sha256': digest(rendered.read_bytes())}})
+        observed.add((agent, turn))
+    require(receipts.keys() <= observed, f'{run} validated turn archive is missing')
     require(turns, f'{run} has no archived turns')
     config = {'architecture': ARCHITECTURES[q3],
               'template': {'path': str(Path(template).resolve()), 'sha256': digest(template_bytes)},

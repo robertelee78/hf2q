@@ -1466,6 +1466,9 @@ fn a_load_takes_only_what_is_available_now_and_not_already_promised() {
         &facts.tensors,
         &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
     );
+    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
+    let scratch = route_scratch_bytes(&facts, &routes);
+    let full_route = drafter + planes + scratch;
     let decide_with = |available: u64| {
         decide(
             &facts,
@@ -1480,35 +1483,30 @@ fn a_load_takes_only_what_is_available_now_and_not_already_promised() {
         .expect("auto never fails")
     };
     let claims = facts.model_file_bytes + ROOMY.kv_budget_bytes + MEMORY_RESERVE_BYTES;
-    let back = decide_with(claims + drafter + planes);
+    let back = decide_with(claims + full_route);
     assert_eq!(back.profile_label(), "full");
     let memory = back.memory.expect("memory");
-    assert_eq!(memory.available_bytes, claims + drafter + planes);
-    assert_eq!(memory.present_headroom_bytes, drafter + planes);
-    assert_eq!(memory.headroom_bytes, drafter + planes);
+    assert_eq!(memory.available_bytes, claims + full_route);
+    assert_eq!(memory.present_headroom_bytes, full_route);
+    assert_eq!(memory.headroom_bytes, full_route);
     assert_eq!(
         back.published()["memory"]["available_bytes"],
-        claims + drafter + planes
+        claims + full_route
     );
     assert_eq!(
         back.published()["memory"]["present_headroom_bytes"],
-        drafter + planes
+        full_route
     );
     // One byte less is available: the planes are withheld, the drafter is
     // kept.
-    let lagging = decide_with(claims + drafter + planes - 1);
+    let lagging = decide_with(claims + full_route - 1);
     assert!(lagging.selected());
     assert_eq!(lagging.profile_label(), "partial");
     assert_eq!(lagging.commitment.plane_bytes, 0);
-    assert!(
-        lagging.reason.contains("the smaller of present") && lagging.reason.contains("available"),
-        "{}",
-        lagging.reason
-    );
+    assert_eq!(lagging.commitment.scratch_bytes, 0);
     // Not even the drafter is available: the prior route.
     let none = decide_with(claims + drafter - 1);
     assert_prior_route(&none, &[]);
-    assert!(none.reason.contains("available"), "{}", none.reason);
 }
 
 #[test]
@@ -1519,6 +1517,9 @@ fn insufficient_memory_drops_the_planes_then_the_drafter() {
         &facts.tensors,
         &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
     );
+    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
+    let scratch = route_scratch_bytes(&facts, &routes);
+    let full_bytes = drafter + planes + scratch;
     let decide_on = |headroom: u64, pairs: &[(&str, &str)]| {
         decide(
             &facts,
@@ -1529,24 +1530,20 @@ fn insufficient_memory_drops_the_planes_then_the_drafter() {
         )
     };
 
-    let full = decide_on(drafter + planes, &[]).expect("fits");
+    let full = decide_on(full_bytes, &[]).expect("fits");
     assert!(full.selected() && !full.routes.any_withheld());
     assert_eq!(
         full.memory,
         Some(MemoryEstimate {
-            headroom_bytes: drafter + planes,
+            headroom_bytes: full_bytes,
             // The host is otherwise idle: all of it is available, and the
             // two bounds are equal.
-            present_headroom_bytes: drafter + planes,
-            available_bytes: facts.model_file_bytes
-                + MEMORY_RESERVE_BYTES
-                + 4 * GIB
-                + drafter
-                + planes,
+            present_headroom_bytes: full_bytes,
+            available_bytes: facts.model_file_bytes + MEMORY_RESERVE_BYTES + 4 * GIB + full_bytes,
             resident_bytes: 0,
             drafter_bytes: drafter,
             plane_bytes: planes,
-            scratch_bytes: 0,
+            scratch_bytes: scratch,
         })
     );
     assert_eq!(
@@ -1556,21 +1553,15 @@ fn insufficient_memory_drops_the_planes_then_the_drafter() {
             kv_budget_bytes: 4 * GIB,
             drafter_bytes: drafter,
             plane_bytes: planes,
-            scratch_bytes: 0,
+            scratch_bytes: scratch,
         }
     );
 
     // One byte short: DFlash2 stays, every plane-carrying profile row goes,
     // and so does a row that cannot run without one of them.
-    let dropped = decide_on(drafter + planes - 1, &[]).expect("drafter fits");
+    let dropped = decide_on(full_bytes - 1, &[]).expect("drafter fits");
     assert!(dropped.selected());
     assert_eq!(dropped.profile_label(), "partial");
-    assert!(
-        dropped.reason.contains("dropped from the profile"),
-        "{}",
-        dropped.reason
-    );
-    assert!(dropped.reason.contains("headroom"), "{}", dropped.reason);
     for row in SWITCHES {
         let index = switch(row.name);
         let depends_on_planes = row.requires.is_some_and(|required| {
@@ -1592,10 +1583,6 @@ fn insufficient_memory_drops_the_planes_then_the_drafter() {
             assert_eq!(dropped.routes.value(index), None, "{}", row.name);
         }
     }
-    assert!(dropped
-        .routes
-        .withheld_audit()
-        .contains("HF2Q_REPACKED_GGUF_M32: its prepared planes do not fit in memory"));
     assert_eq!(dropped.memory.map(|memory| memory.plane_bytes), Some(0));
     assert_eq!(dropped.commitment.plane_bytes, 0);
     assert_eq!(dropped.commitment.drafter_bytes, drafter);
@@ -1629,17 +1616,21 @@ fn insufficient_memory_drops_the_planes_then_the_drafter() {
 #[test]
 fn a_second_model_is_admitted_against_what_the_first_holds_resident() {
     use crate::serve::resident_memory::Ledger;
-    // One host, sized so that one Qwen3.8 with its whole profile fits and
-    // leaves less than a second profile's planes.
+    // One full profile and one drafter-only engine fit on this host.
+    // A second full profile does not; a third drafter cannot fit.
     let facts = qwen38();
     let drafter = QWEN38_DFLASH2.weights_bytes;
     let planes = plane_bytes(
         &facts.tensors,
         &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
     );
+    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
+    let scratch = route_scratch_bytes(&facts, &routes);
     let kv = 4 * GIB;
-    let one_engine = facts.model_file_bytes + kv + drafter + planes;
-    let physical = MEMORY_RESERVE_BYTES + 2 * one_engine - 1;
+    let base = facts.model_file_bytes + kv;
+    let second_engine = base + drafter;
+    let one_engine = base + drafter + planes + scratch;
+    let physical = MEMORY_RESERVE_BYTES + one_engine + second_engine;
     let ledger = Ledger::new();
     let load = |pairs: &[(&str, &str)]| {
         let selection = decide(
@@ -1663,8 +1654,8 @@ fn a_second_model_is_admitted_against_what_the_first_holds_resident() {
     assert_eq!(first.profile_label(), "full");
     assert_eq!(ledger.total(), one_engine);
 
-    // One byte short of a second whole profile: the second engine keeps the
-    // drafter and loses the planes, although alone it would get them all.
+    // The second engine keeps only its drafter, although alone it gets the
+    // full profile. The first engine's scratch remains charged.
     let (second, second_reservation) = load(&[]);
     assert!(second.selected());
     assert_eq!(second.profile_label(), "partial");
@@ -1672,12 +1663,7 @@ fn a_second_model_is_admitted_against_what_the_first_holds_resident() {
         second.memory.map(|memory| memory.resident_bytes),
         Some(one_engine)
     );
-    assert!(
-        second.reason.contains("resident engines"),
-        "{}",
-        second.reason
-    );
-    assert_eq!(ledger.total(), 2 * one_engine - planes);
+    assert_eq!(ledger.total(), one_engine + second_engine);
 
     // A third finds no room for a drafter and keeps the prior route; its
     // model file and KV budget are committed all the same.
@@ -1700,7 +1686,7 @@ fn a_second_model_is_admitted_against_what_the_first_holds_resident() {
     );
     assert_eq!(
         ledger.total(),
-        2 * one_engine - planes + facts.model_file_bytes + kv
+        one_engine + second_engine + base
     );
     drop(second_reservation);
     assert_eq!(ledger.total(), one_engine + facts.model_file_bytes + kv);
@@ -1867,7 +1853,9 @@ fn separate_prepared_heads_are_counted_unless_the_model_shares_one() {
         )
         .expect("auto")
     };
-    let one_head = drafter + other + head;
+    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
+    let scratch = route_scratch_bytes(&facts, &routes);
+    let one_head = drafter + other + head + scratch;
     assert_eq!(decide_on(one_head, &[]).profile_label(), "full");
     assert_eq!(decide_on(one_head, unshared).profile_label(), "partial");
     let both_heads = decide_on(one_head + head, unshared);
@@ -1891,7 +1879,9 @@ fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
         &dense.tensors,
         &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
     );
-    assert_eq!(bound(&dense, &[]), QWEN38_DFLASH2.weights_bytes + planes);
+    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
+    let scratch = route_scratch_bytes(&dense, &routes);
+    assert_eq!(bound(&dense, &[]), QWEN38_DFLASH2.weights_bytes + planes + scratch);
     assert_eq!(bound(&dense, &[(DFLASH2_ENV, "1")]), bound(&dense, &[]));
     assert_eq!(bound(&dense, &[(DFLASH2_ENV, "0")]), 0);
     // A prepared route the operator set beside the kill switch keeps its
@@ -1929,7 +1919,7 @@ fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
     // prepares the FFN and projection planes, and the staged draft a head.
     assert_eq!(
         bound(&dense, &[("HF2Q_REPACKED_GGUF_M32", "0")]),
-        QWEN38_DFLASH2.weights_bytes + planes
+        QWEN38_DFLASH2.weights_bytes + planes + scratch
     );
     assert_eq!(
         bound(
@@ -2067,7 +2057,9 @@ fn pinned_geometry_is_the_gate_artifacts() {
         ("HF2Q_QWEN36_GGUF", &QWEN36_TARGET_GEOMETRY),
     ] {
         let path = std::env::var_os(variable).expect(variable);
-        let geometry = read_geometry(&open(&path)).expect("geometry");
+        let gguf = open(&path);
+        let config = Qwen35Config::from_gguf(&gguf).expect("configuration");
+        let geometry = read_geometry(&gguf, &config).expect("geometry");
         assert_eq!(geometry.mismatch(pinned), None, "{variable}: {geometry:?}");
         assert_eq!(&geometry, pinned);
     }

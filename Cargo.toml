@@ -1,6 +1,6 @@
 [package]
 name = "hf2q"
-version = "0.1.29"
+version = "0.1.30"
 edition = "2021"
 rust-version = "1.89.0"
 build = "src/build_script.rs"
@@ -174,7 +174,7 @@ thiserror = "2"
 # direct packed Q5_K/Q6_K embedding gathers and deterministic lowest-index
 # argmax tie handling, native BF16 GGUF/dense/expert execution, and sticky
 # expert-ID validation and optional deduplicated pool checkpoints use the
-# published mlx-native 0.21.9 contract (optional measurement observers default off;
+# published mlx-native 0.22.0 contract (optional measurement observers default off;
 # compact expert-matmul tile schedule with schedule reuse, ADR-063 Q4-GEMMA-PREFILL-MOE;
 # tile-fastest mm_id, grouped GeGLU decode and GQA vec-hybrid attention, opt-in SIMD MoE top-k;
 # row-exact few-row mat-vecs, DeepSeek rows kernels, tensor prefill flash attention,
@@ -191,8 +191,10 @@ thiserror = "2"
 # window-independent splits, MoE expert live tiles and their fused stages, the
 # fused DeltaNet window with one-pass prepared products, and the opt-in
 # command-buffer timeline).
+# Includes typed capability refusals, settled-command ownership, weak mapped-backing
+# registrations, F32 K-quant scale quotients and width-independent Q5_K arithmetic.
 # Bounded same-file metadata diagnostics share its production mapping planner.
-mlx-native = "=0.21.9"
+mlx-native = "=0.22.0"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).

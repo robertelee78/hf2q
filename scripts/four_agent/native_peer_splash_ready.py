@@ -498,49 +498,71 @@ def token_sha256(tokens):
     return hashlib.sha256(','.join(str(t) for t in tokens).encode()).hexdigest()
 
 
-def render_proof(base, output, turns):
-    """Every turn's archived request re-rendered by /apply-template and encoded by /tokenize; the count must equal
-    usage.prompt_tokens. The rendered prompt is archived for the offline byte comparison with hf2q's rendering."""
-    port, rows = _port(base), []
-    for receipt in turns:
-        directory = Path(output) / f"turn-{receipt['turn']}"
-        raw = (directory / 'request.json').read_bytes()
-        require(hashlib.sha256(raw).hexdigest() == receipt['request_sha256'],
+def _render_request(port, directory, turn, receipt=None):
+    raw = (directory / 'request.json').read_bytes()
+    request_sha = hashlib.sha256(raw).hexdigest()
+    if receipt is not None:
+        require(request_sha == receipt['request_sha256'],
                 'Splash render proof: request archive differs from its receipt')
-        request = loads(raw)
-        rendered = fetch(port, '/apply-template', directory, 'splash-apply-template.raw',
-                         {k: request[k] for k in TEMPLATE_FIELDS}, RENDER_LIMIT, 60)
-        prompt = loads(rendered)
-        require(isinstance(prompt, dict) and set(prompt) == {'prompt'} and isinstance(prompt['prompt'], str),
-                'Splash /apply-template envelope')
-        encoded = fetch(port, '/tokenize', directory, 'splash-tokenize.raw',
-                        {'content': prompt['prompt'], 'add_special': False}, RENDER_LIMIT, 60)
-        doc = loads(encoded)
-        require(isinstance(doc, dict) and set(doc) == {'tokens'} and isinstance(doc['tokens'], list)
-                and all(type(t) is int and t >= 0 for t in doc['tokens']), 'Splash /tokenize envelope')
+    request = loads(raw)
+    rendered = fetch(port, '/apply-template', directory, 'splash-apply-template.raw',
+                     {k: request[k] for k in TEMPLATE_FIELDS}, RENDER_LIMIT, 60)
+    prompt = loads(rendered)
+    require(isinstance(prompt, dict) and set(prompt) == {'prompt'} and isinstance(prompt['prompt'], str),
+            'Splash /apply-template envelope')
+    encoded = fetch(port, '/tokenize', directory, 'splash-tokenize.raw',
+                    {'content': prompt['prompt'], 'add_special': False}, RENDER_LIMIT, 60)
+    doc = loads(encoded)
+    require(isinstance(doc, dict) and set(doc) == {'tokens'} and isinstance(doc['tokens'], list)
+            and all(type(t) is int and t >= 0 for t in doc['tokens']), 'Splash /tokenize envelope')
+    if receipt is not None:
         require(len(doc['tokens']) == receipt['usage']['prompt_tokens'],
                 'Splash rendered prompt token count differs from the turn usage.prompt_tokens')
-        rows.append({'turn': receipt['turn'], 'request_sha256': receipt['request_sha256'],
-                     'prompt_sha256': hashlib.sha256(prompt['prompt'].encode()).hexdigest(),
-                     'count': len(doc['tokens']), 'tokens_sha256': token_sha256(doc['tokens']),
-                     'apply_template_sha256': hashlib.sha256(rendered).hexdigest(),
-                     'tokenize_sha256': hashlib.sha256(encoded).hexdigest()})
+    return {'turn': turn, 'request_sha256': request_sha,
+            'prompt_sha256': hashlib.sha256(prompt['prompt'].encode()).hexdigest(),
+            'count': len(doc['tokens']), 'tokens_sha256': token_sha256(doc['tokens']),
+            'apply_template_sha256': hashlib.sha256(rendered).hexdigest(),
+            'tokenize_sha256': hashlib.sha256(encoded).hexdigest()}
+
+
+def render_proof(base, output, turns):
+    """Render every archived request; only validated receipts establish usage equality.
+
+    Failed/unvalidated turns are separate observations, never successful task receipts.
+    """
+    port, output = _port(base), Path(output)
+    rows = [_render_request(port, output / f"turn-{receipt['turn']}", receipt['turn'], receipt)
+            for receipt in turns]
+    validated = {receipt['turn'] for receipt in turns}
+    unvalidated = []
+    for path in sorted(output.glob('turn-*/request.json')):
+        turn = int(path.parent.name.removeprefix('turn-'))
+        require(path.parent.name == f'turn-{turn}', 'Splash render proof: noncanonical turn directory')
+        if turn not in validated:
+            unvalidated.append(_render_request(port, path.parent, turn))
     return {'status': 'Observed', 'endpoints': ['/apply-template', '/tokenize'], 'fields': list(TEMPLATE_FIELDS),
-            'turns': rows, 'timing': 'coordinator closing, after every agent finished: outside the makespan clock',
-            'hf2q_prompt_parity': 'PendingPostOracle: splash-apply-template.raw is compared byte for byte with hf2q\'s '
-                                  'rendering of the canonical request by the hf2q post-oracle '
-                                  '(splash_sweep.py parity-config, then splash_prompt_parity_post_oracle); a mismatch '
+            'turns': rows, 'unvalidated_turns': unvalidated,
+            'timing': 'coordinator closing, after every agent stopped: outside the makespan clock',
+            'hf2q_prompt_parity': 'PendingPostOracle: every archived splash-apply-template.raw must match hf2q '
+                                  'byte for byte through splash_prompt_parity_post_oracle; a mismatch '
                                   'makes the run Invalid'}
 
 
 def closing(base, output):
-    """Once every agent finished: render proofs, then /status (every request completed, none hidden) and the
-    cross-run state after the run."""
-    render, turns = {}, []
-    for summary in sorted(Path(output).glob('agent-*/summary.json')):
-        receipts = loads(summary.read_bytes())['turns']
-        render[summary.parent.name] = render_proof(base, summary.parent, receipts)
+    """After agents stop, capture every request before checking the strict successful-run status counters."""
+    render, turns, summary_errors = {}, [], []
+    for directory in sorted(Path(output).glob('agent-*')):
+        if not directory.is_dir():
+            continue
+        summary = directory / 'summary.json'
+        try:
+            receipts = loads(summary.read_bytes())['turns'] if summary.exists() else []
+        except Exception as exc:
+            summary_errors.append(f'{directory.name}: {type(exc).__name__}: {exc}')
+            receipts = []
+        render[directory.name] = render_proof(base, directory, receipts)
         turns += receipts
+    require(not summary_errors, 'Splash closing: unreadable agent summaries: ' + '; '.join(summary_errors))
     inputs = loads(Path(output, CLOSING_INPUTS).read_bytes())
     spec = native_spec({**inputs['spec'], 'port': str(inputs['spec']['port'])})
     status = validate_status(loads(fetch(_port(base), '/status', output, 'splash-status-final.raw')), spec,

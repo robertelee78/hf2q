@@ -562,6 +562,7 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
                     0,
                     &vec![8; lanes],
                     &vec![0.5; lanes * proposals],
+                    None,
                 )?;
                 Ok((
                     runtime.proposals()?.to_vec(),

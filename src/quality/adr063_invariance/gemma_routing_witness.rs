@@ -98,7 +98,11 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// attention independent of the window alignment, adds an opt-in command
 /// timeline, and rounds the stock norm's bound threadgroup memory up to 16
 /// bytes without changing its output.
-pub const WITNESS_NATIVE_VERSION: &str = "0.21.9";
+/// Re-reviewed 0.21.9 -> 0.22.0 (`adb54f8` -> `2bb248c`): the published archive's
+/// two witness op files and four selection shaders are byte-identical. Other
+/// K-quant arithmetic and command/mapping ownership changed; this is not global
+/// numeric-equivalence evidence. Model qualification must use the new pin.
+pub const WITNESS_NATIVE_VERSION: &str = "0.22.0";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {

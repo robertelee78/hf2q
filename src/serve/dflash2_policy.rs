@@ -32,7 +32,7 @@ use crate::inference::models::qwen35::Qwen35Config;
 use crate::inference::route_host::{self, HostRoute, HostRoutes};
 use crate::inference::spec_decode::dflash2::config::DFlash2TargetShape;
 use crate::inference::spec_decode::dflash2::route_profile::{
-    switch, turns_on, PlaneSet, ResolvedRoutes, RouteProfile, Switch, SwitchRow, SWITCHES,
+    self, switch, turns_on, PlaneSet, ResolvedRoutes, RouteProfile, Switch, SwitchRow, SWITCHES,
 };
 use crate::inference::spec_decode::dflash2::schema::{
     DFlash2CheckpointDescriptor, DFlash2FamilyAdapter, QwenTargetGeometry,
@@ -188,12 +188,7 @@ pub(crate) struct TargetFacts {
 }
 
 /// The geometry of a Qwen target, from its GGUF header alone.
-pub(crate) fn read_geometry(gguf: &GgufFile) -> Option<QwenTargetGeometry> {
-    let config = Qwen35Config::from_gguf(gguf).ok()?;
-    read_geometry_with_config(gguf, &config)
-}
-
-fn read_geometry_with_config(
+fn read_geometry(
     gguf: &GgufFile,
     config: &Qwen35Config,
 ) -> Option<QwenTargetGeometry> {
@@ -261,7 +256,7 @@ impl TargetFacts {
             .flatten();
         let geometry = qwen_config
             .as_ref()
-            .and_then(|config| read_geometry_with_config(gguf, config));
+            .and_then(|config| read_geometry(gguf, config));
         Self {
             provenance: crate::core::provenance::detect(gguf),
             slots: match engine_mode {

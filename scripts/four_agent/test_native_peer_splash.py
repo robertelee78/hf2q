@@ -581,6 +581,7 @@ class Sweep(unittest.TestCase):
                              hashlib.sha256(b'{"prompt":"<|im_start|>system"}').hexdigest())
 
     def test_parity_config_uses_embedded_agent_receipts_after_client_failure(self):
+        """Failed and interrupted turns without validated receipts still enter the real oracle config."""
         import hashlib
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -589,6 +590,15 @@ class Sweep(unittest.TestCase):
             turn.mkdir(parents=True)
             raw = json.dumps(native(0), separators=(',', ':')).encode()
             (turn / 'request.json').write_bytes(raw)
+            failed = run / 'client' / 'agent-0' / 'turn-1'
+            interrupted = run / 'client' / 'agent-1' / 'turn-0'
+            for directory, index in ((failed, 1), (interrupted, 0)):
+                directory.mkdir(parents=True)
+                (directory / 'request.json').write_text(json.dumps(native(index)))
+                (directory / 'splash-apply-template.raw').write_bytes(b'{"prompt":"unvalidated"}')
+                request_sha = hashlib.sha256((directory / 'request.json').read_bytes()).hexdigest()
+                for name in ('response-headers.json', 'receipt.json'):
+                    (directory / name).write_text(json.dumps({'request_sha256': request_sha}))
             (turn / 'splash-apply-template.raw').write_bytes(b'{"prompt":"rendered"}')
             agent = {'turns': [{'turn': 0, 'request_sha256': hashlib.sha256(raw).hexdigest()}]}
             (run / 'client' / 'summary.json').write_text(json.dumps({
@@ -603,7 +613,99 @@ class Sweep(unittest.TestCase):
                 'template_sha256': hashlib.sha256(template.read_bytes()).hexdigest(),
             }):
                 config = json.loads(splash_sweep.parity_config(run, template, root / 'parity').read_text())
-            self.assertEqual([(item['agent'], item['turn']) for item in config['turns']], [('agent-0', 0)])
+            self.assertEqual([(item['agent'], item['turn']) for item in config['turns']],
+                             [('agent-0', 0), ('agent-0', 1), ('agent-1', 0)])
+            for item in config['turns']:
+                directory = run / 'client' / item['agent'] / f"turn-{item['turn']}"
+                self.assertEqual(json.loads(Path(item['canonical_request']['path']).read_bytes()),
+                                 sp.canonical(json.loads((directory / 'request.json').read_bytes()), 'qwen'))
+            (failed / 'splash-apply-template.raw').unlink()
+            with mock.patch.dict(sp.ARTIFACTS['qwen38'], {
+                'template_sha256': hashlib.sha256(template.read_bytes()).hexdigest(),
+            }), self.assertRaises(FileNotFoundError):
+                splash_sweep.parity_config(run, template, root / 'missing-render')
+
+    def test_parity_config_checks_unvalidated_per_turn_digest_records(self):
+        import hashlib
+        for name in ('response-headers.json', 'receipt.json'):
+            for failure in ('changed-request', 'conflict', 'malformed'):
+                with self.subTest(name=name, failure=failure), tempfile.TemporaryDirectory() as root:
+                    root = Path(root)
+                    run = root / 'run'
+                    turn = run / 'client' / 'agent-0' / 'turn-0'
+                    turn.mkdir(parents=True)
+                    raw = json.dumps(native(0)).encode()
+                    request_sha = hashlib.sha256(raw).hexdigest()
+                    (turn / 'request.json').write_bytes(raw + (b'\n' if failure == 'changed-request' else b''))
+                    record = [] if failure == 'malformed' else {
+                        'request_sha256': '0' * 64 if failure == 'conflict' else request_sha}
+                    (turn / name).write_text(json.dumps(record))
+                    (turn / 'splash-apply-template.raw').write_bytes(b'{"prompt":"rendered"}')
+                    (run / 'client' / 'summary.json').write_text(json.dumps({
+                        'engine_kind': 'splash', 'native_readiness': {'q3_family': 'qwen38'},
+                        'status': 'Failed', 'agents': {}}))
+                    template = root / 'qwen38.template.jinja'
+                    template.write_text('reviewed')
+                    with mock.patch.dict(sp.ARTIFACTS['qwen38'], {
+                        'template_sha256': hashlib.sha256(template.read_bytes()).hexdigest(),
+                    }), self.assertRaises(Invalid):
+                        splash_sweep.parity_config(run, template, root / 'parity')
+
+    def test_render_proof_retains_unvalidated_requests_without_fabricated_usage(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            for turn in (0, 1):
+                directory = root / f'turn-{turn}'
+                directory.mkdir()
+                (directory / 'request.json').write_text(json.dumps(native(turn)))
+            raw = (root / 'turn-0' / 'request.json').read_bytes()
+            receipt = {'turn': 0, 'request_sha256': hashlib.sha256(raw).hexdigest(),
+                       'usage': {'prompt_tokens': 3}}
+
+            def fetch(_port, endpoint, directory, name, body=None, *args):
+                value = {'prompt': 'rendered'} if endpoint == '/apply-template' else {'tokens': [11, 22, 33]}
+                encoded = json.dumps(value).encode()
+                (directory / name).write_bytes(encoded)
+                return encoded
+
+            with mock.patch.object(ready, 'fetch', side_effect=fetch):
+                proof = ready.render_proof('http://127.0.0.1:18256/v1', root, [receipt])
+                self.assertEqual([row['turn'] for row in proof['turns']], [0])
+                self.assertEqual([row['turn'] for row in proof['unvalidated_turns']], [1])
+                self.assertEqual(proof['unvalidated_turns'][0]['request_sha256'],
+                                 hashlib.sha256((root / 'turn-1' / 'request.json').read_bytes()).hexdigest())
+                self.assertEqual(json.loads((root / 'turn-1' / 'splash-tokenize.raw').read_bytes()),
+                                 {'tokens': [11, 22, 33]})
+                self.assertNotIn('usage', proof['unvalidated_turns'][0])
+                receipt['usage']['prompt_tokens'] = 4
+                with self.assertRaises(Invalid):
+                    ready.render_proof('http://127.0.0.1:18256/v1', root, [receipt])
+
+    def test_closing_captures_interrupted_summaries_but_retains_integrity_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            for agent in ('agent-0', 'agent-1'):
+                directory = root / agent / 'turn-0'
+                directory.mkdir(parents=True)
+                (directory / 'request.json').write_text(json.dumps(native(0)))
+            (root / 'agent-0' / 'summary.json').write_text('{"turns": [')
+
+            def fetch(_port, endpoint, directory, name, body=None, *args):
+                value = {'prompt': 'rendered'} if endpoint == '/apply-template' else {'tokens': [11, 22, 33]}
+                encoded = json.dumps(value).encode()
+                (directory / name).write_bytes(encoded)
+                return encoded
+
+            with mock.patch.object(ready, 'fetch', side_effect=fetch), \
+                    self.assertRaises(Invalid):
+                ready.closing('http://127.0.0.1:18256/v1', root)
+            for agent in ('agent-0', 'agent-1'):
+                directory = root / agent / 'turn-0'
+                self.assertEqual(json.loads((directory / 'splash-apply-template.raw').read_bytes()),
+                                 {'prompt': 'rendered'})
+                self.assertEqual(json.loads((directory / 'splash-tokenize.raw').read_bytes()),
+                                 {'tokens': [11, 22, 33]})
 
 
 class Registry(unittest.TestCase):

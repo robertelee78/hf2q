@@ -2,10 +2,10 @@
 
 > Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
 
-Release line described by this checkout: `v0.1.29`. Treat it as a release
+Release line described by this checkout: `v0.1.30`. Treat it as a release
 candidate until exact-artifact release proof establishes public availability.
 
-This document defines the public hf2q product surface for `v0.1.29`. It also defines
+This document defines the public hf2q product surface for `v0.1.30`. It also defines
 the policy each environment variable is classified under. Per-variable
 effects live in `docs/operator-env-vars.md`; this document sits one level above
 and defines *what is supported*.
