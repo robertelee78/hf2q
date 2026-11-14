@@ -163,13 +163,9 @@ to a sibling checkout.
   to start below `disk_floor_gb + 10`.
 
 For the complete first-run path, use
-**[Getting started: hf2q + OpenCode + local web research](docs/getting-started.md)**.
-It installs the signed binary; downloads hf2q's checksum-pinned Q4_K_M text
-GGUF and its source-matched F16 vision projector for
-`jenerallee78/Qwen3.8-27B-Abliterated-SFT`; serves the multimodal pair in the
-foreground with one command; proves generation with `hf2q chat` plus one
-image request; and then connects a stock tool-enabled OpenCode agent, full
-Agentic Kit, and the local search/fetch/crawl/extract stack.
+**[Getting started: hf2q + omp](docs/getting-started.md)**.
+It installs hf2q, serves Qwen3.8 with four inference slots, checks a real
+conversation, and connects omp through an isolated local-model profile.
 
 `hf2q doctor` enumerates the runtime checks (hardware detection, disk
 space, optional RuVector backend); run it after `cargo install` if
@@ -548,14 +544,11 @@ it is not a fourth native effort tier. A supplied
 integer `seed` now drives a decode-step-indexed deterministic sampler; identical
 rendered prompts and sampling settings reproduce across worker threads.
 
-The qualified Qwen3.8 onboarding path uses the exact published, checksum-pinned
-text/projector pair for
+The Qwen3.8 onboarding path uses the published Q4_K_M artifact for
 `jenerallee78/Qwen3.8-27B-Abliterated-SFT`. Follow the
 [getting-started guide](docs/getting-started.md)
-for download, one-command multimodal serve, chat and image proof, OpenCode,
-Agentic Kit, and the local research stack. General source-conversion examples
-elsewhere in this repository are not a substitute for that qualified artifact
-pair.
+for automatic model preparation, four-slot serving, chat, and parallel
+coding with omp.
 
 Native text conversion and serving are accepted. Vision is a separate
 candidate surface: hf2q converts the 333-tensor tower into a paired projector,
@@ -1233,9 +1226,8 @@ catalog + smoke prompt before any forward-pass code lands.
 
 - `docs/RELEASING.md` — the release checklist: crate, GitHub Release, and
   hf2q.us, with the definition of a finished release.
-- `docs/getting-started.md` — canonical first-run path: verified Qwen3.8
-  pair, foreground serve, chat and vision proof, OpenCode, full Agentic Kit,
-  and the local research stack.
+- `docs/getting-started.md` — canonical first-run path: Qwen3.8, four-slot
+  foreground serving, chat, and parallel local coding with omp.
 - `docs/ARCHITECTURE.md` — source-grounded architecture map.
 - `docs/converting-a-model.md` — generic convert reference.
 - `docs/converting-qwen35.md` — Qwen 3.5/3.6 specifics.

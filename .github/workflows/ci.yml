@@ -715,7 +715,8 @@ jobs:
         run: |
           set -euo pipefail
           bash -n scripts/qwen36_watchdog_validate.sh \
-            scripts/test_getting_started_guide.sh \
+            scripts/test_opencode_web_stack_lifecycle.sh \
+            scripts/test_web_search_fetch_plugin.sh \
             scripts/test_shipping_contract.sh \
             scripts/serve_qwen38_opencode.sh \
             scripts/test_qwen36_prefill_watchdog.sh \
@@ -778,7 +779,8 @@ jobs:
             scripts/test_gemma4_long_short_overlap_contract.sh \
             scripts/run_agentic_cache_release_gate.sh
           bash scripts/test_qwen36_watchdog_harness_contract.sh
-          bash scripts/test_getting_started_guide.sh
+          bash scripts/test_opencode_web_stack_lifecycle.sh
+          bash scripts/test_web_search_fetch_plugin.sh
           bash scripts/test_shipping_contract.sh
           bash scripts/test_deepseek4_cached_suffix_contract.sh
           bash scripts/test_deepseek4_agentic_fixture_contract.sh

@@ -106,10 +106,10 @@ log).
 
 ### J3 Agentic coding
 
-Configure OpenCode as in `docs/getting-started.md` section 7 (back up the
-config first; restore it after). In a scratch git repo, ask for a small real
-task, for example: "Add a function `slugify(s)` to `util.py` with three
-tests, run the tests, and fix any failure."
+Follow the [getting-started guide](getting-started.md) to configure omp's
+isolated hf2q profile. Run `omp-hf2q` in a scratch git repo and ask for a
+small real task, for example: "Add a function `slugify(s)` to `util.py` with
+three tests, run the tests, and fix any failure."
 
 Pass: the transcript shows real tool calls with correct tools and arguments,
 the results are used, the task is completed, and follow-up turns reuse the
@@ -195,9 +195,26 @@ Pass: each step does what it says; config and model data survive uninstall.
 
 ### J9 Vision
 
-Run the red-image check from `docs/getting-started.md` section 5 against the
-served guide pair. `hf2q chat` has no image or attachment input, so vision is
-exercised through the API only; record that gap in the record.
+With the guide's model server running, send a solid-red fixture through the
+API. `hf2q chat` has no image or attachment input, so record that gap:
+
+```bash
+(
+RED_PNG="iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC"
+MODEL_ID="$(curl -fsS http://127.0.0.1:8081/v1/models |
+  jq -er '[.data[] | select(.loaded == true and .arch != null)] | .[0].id')"
+jq -n --arg model "$MODEL_ID" --arg image "data:image/png;base64,$RED_PNG" '{
+  model: $model,
+  messages: [{role: "user", content: [
+    {type: "text", text: "What is the dominant color? One word."},
+    {type: "image_url", image_url: {url: $image}}
+  ]}],
+  temperature: 0, max_tokens: 16, stream: false, hf2q_enable_thinking: false
+}' | curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+  -H 'Content-Type: application/json' --data-binary @- |
+  jq -er '.choices[0].message.content | test("\\bred\\b"; "i")'
+)
+```
 
 Pass: the reply says red.
 
@@ -208,7 +225,7 @@ path: `--gcd` (and the hidden `--uncensor` alias), `--gcd-schema`,
 `--gcd-schema-locked`, `--glp` with a local path, `--glp` with a Hub
 repository or `huggingface.co` file URL, bare `--glp` discovery,
 `--glp-alpha`, `--gcd --glp` together, `hf2q calibrate` (DeepSeek-V4 only),
-and returning to baseline; through chat, the API, and OpenCode; on Qwen
+and returning to baseline; through chat, the API, and omp; on Qwen
 3.5/3.6/3.8 and DeepSeek-V4 where the docs claim support.
 
 Expected, not findings: a GLP bind refusal for a mismatched checkpoint, site,

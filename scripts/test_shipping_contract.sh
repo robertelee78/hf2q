@@ -93,6 +93,4 @@ reject_literal "$deepseek_parity" 'HF2Q_BIN="$HF2Q_BIN" CONTEXT_LEN='
 require_literal "$release_check_workflow" 'description: "Decode tok/s floor for the perf-sanity gate (default: 100)."'
 require_literal "$release_check_workflow" 'default: "100"'
 
-bash "$repo_root/scripts/test_getting_started_guide.sh"
-
 echo "shipping-contract check passed for v${crate_version}"
