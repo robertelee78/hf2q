@@ -38,8 +38,10 @@ described in RFC 2119.
 
    Model files MAY be reused from the owner's managed directory
    (`~/.local/share/hf2q/models/`) by passing their absolute path.
-4. **Pick the models.** The default text and vision model is the guide pair:
-   `jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M` (GGUF plus its mmproj).
+4. **Pick the models.** The default text model is the guide's official
+   `Qwen/Qwen3.8-27B` Q4_K_M, prepared by the guide's native `hf2q convert`.
+   The guide is text-only. For J9, separately configure a compatible model
+   and matching vision projector; do not assume the guide loaded one.
    Record the exact GGUF path and SHA-256 for every model used.
 5. **Clean up.** Every server you start MUST be stopped before the next
    journey and at the end (`kill` the PID you recorded; confirm with `pgrep`).
@@ -106,10 +108,10 @@ log).
 
 ### J3 Agentic coding
 
-Configure OpenCode as in `docs/getting-started.md` section 7 (back up the
-config first; restore it after). In a scratch git repo, ask for a small real
-task, for example: "Add a function `slugify(s)` to `util.py` with three
-tests, run the tests, and fix any failure."
+Follow the [getting-started guide](getting-started.md) to configure omp's
+isolated hf2q profile. Run `omp-hf2q` in a scratch git repo and ask for a
+small real task, for example: "Add a function `slugify(s)` to `util.py` with
+three tests, run the tests, and fix any failure."
 
 Pass: the transcript shows real tool calls with correct tools and arguments,
 the results are used, the task is completed, and follow-up turns reuse the
@@ -160,25 +162,19 @@ rejections happen with a clear message; nothing hangs.
 
 ### J7 GLP
 
-Needs an artifact that matches the served checkpoint exactly. No GLP
-artifact is published for the guide's abliterated SFT checkpoint, so use the
-stock model and its published artifact:
+Use the guide's official Qwen3.8 model and exact immutable GLP file URL.
+The guide starts GLP at strength 1 together with GCD and PhantomKV;
+record the pinned URL and native binding output. Original model weights
+remain unchanged.
 
-```bash
-HOME=$QE_HOME HF_TOKEN=$(cat ~/.cache/huggingface/token) hf2q serve Qwen/Qwen3.8-27B:Q4_K_M \
-  --glp https://huggingface.co/msuiche/Qwen3.8-27B-abliterated-cyber-GLP-49/resolve/main/Qwen3.8-27B-abliterated-cyber-GLP-49-L10-58-a1.gguf
-```
+Stop the guide server before each comparison. Reuse its local model and
+the same GLP URL in a direct `hf2q serve` invocation; compare strength 1,
+`--glp-alpha 0.5`, and a baseline without `--glp`, holding all other
+settings and prompts fixed. The public guide does not require a gated
+checkpoint or saved Hugging Face token.
 
-That repository holds two vectors, so the bare repository name and bare
-`--glp` both stop with an "ambiguous GLP files" error by design; name one file
-by its full Hub URL. The repository is gated: accept its license on Hugging
-Face and run `hf auth login` in your normal shell first. hf2q looks for the
-saved token under `$HOME`, which `HOME=$QE_HOME` hides, so pass it in with
-`HF_TOKEN` as above; without it, startup fails with "Authentication failed".
-
-If no stock Q4_K_M is available, convert one first with `hf2q convert
-Qwen/Qwen3.8-27B --quant q4_k_m`. Chat with it; restart with `--glp-alpha 0.5`;
-then restart without `--glp`. A bind refusal against the abliterated SFT
+The upstream repository contains multiple vectors: name the exact file,
+not a bare repository or bare `--glp`. A bind refusal for a different
 checkpoint is expected behavior, not a finding.
 
 Pass: loads or fails with the documented typed error; outputs change when
@@ -195,9 +191,28 @@ Pass: each step does what it says; config and model data survive uninstall.
 
 ### J9 Vision
 
-Run the red-image check from `docs/getting-started.md` section 5 against the
-served guide pair. `hf2q chat` has no image or attachment input, so vision is
-exercised through the API only; record that gap in the record.
+With a separately configured compatible vision model and matching projector
+serving on `127.0.0.1:8081`, send a solid-red fixture through the API.
+The guide's text-only server does not load a projector. `hf2q chat` has no
+image or attachment input, so record that gap:
+
+```bash
+(
+RED_PNG="iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC"
+MODEL_ID="$(curl -fsS http://127.0.0.1:8081/v1/models |
+  jq -er '[.data[] | select(.loaded == true and .arch != null)] | .[0].id')"
+jq -n --arg model "$MODEL_ID" --arg image "data:image/png;base64,$RED_PNG" '{
+  model: $model,
+  messages: [{role: "user", content: [
+    {type: "text", text: "What is the dominant color? One word."},
+    {type: "image_url", image_url: {url: $image}}
+  ]}],
+  temperature: 0, max_tokens: 16, stream: false, hf2q_enable_thinking: false
+}' | curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+  -H 'Content-Type: application/json' --data-binary @- |
+  jq -er '.choices[0].message.content | test("\\bred\\b"; "i")'
+)
+```
 
 Pass: the reply says red.
 
@@ -208,7 +223,7 @@ path: `--gcd` (and the hidden `--uncensor` alias), `--gcd-schema`,
 `--gcd-schema-locked`, `--glp` with a local path, `--glp` with a Hub
 repository or `huggingface.co` file URL, bare `--glp` discovery,
 `--glp-alpha`, `--gcd --glp` together, `hf2q calibrate` (DeepSeek-V4 only),
-and returning to baseline; through chat, the API, and OpenCode; on Qwen
+and returning to baseline; through chat, the API, and omp; on Qwen
 3.5/3.6/3.8 and DeepSeek-V4 where the docs claim support.
 
 Expected, not findings: a GLP bind refusal for a mismatched checkpoint, site,

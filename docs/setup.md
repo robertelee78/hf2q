@@ -179,5 +179,5 @@ An invalid config fails before source download, model load, or listener bind.
 If setup records LAN binding (`0.0.0.0`), serve also requires `--auth-token` or
 `HF2Q_AUTH_TOKEN`; setup never stores the token.
 
-See [Getting started: hf2q + OpenCode + local web research](getting-started.md)
-for the complete tested workflow using these defaults.
+See [Getting started: hf2q + omp](getting-started.md)
+for the four-slot local coding workflow.
