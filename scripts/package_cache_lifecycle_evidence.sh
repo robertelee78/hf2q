@@ -13,6 +13,7 @@ candidate_run_id=$4
 crate_sha256=$5
 binary_sha256=$6
 output_dir=$7
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 
 fail() {
   echo "package cache lifecycle evidence: $*" >&2
@@ -24,7 +25,7 @@ file_bytes() {
   stat -f '%z' "$1" 2>/dev/null || stat -c '%s' "$1" 2>/dev/null
 }
 
-for command in awk cmp cp find gzip jq mktemp shasum stat tar touch tr wc; do
+for command in awk cmp cp find gzip jq mktemp python3 shasum stat tar touch tr wc; do
   command -v "$command" >/dev/null || fail "missing required command: $command"
 done
 [[ "$qualification_root" == /* && -d "$qualification_root" && ! -L "$qualification_root" ]] || \
@@ -54,11 +55,15 @@ jq -e --arg source_sha "$source_sha" --arg version "$version" \
   --arg candidate_run_id "$candidate_run_id" --arg crate_sha256 "$crate_sha256" \
   --arg binary_sha256 "$binary_sha256" '
     .kind == "hf2q.cache-lifecycle-release-manifest"
-    and .schema_version == 2 and .status == "pass"
+    and .schema_version == 3 and .status == "pass"
+    and (.phase_ledger | type == "object")
     and .source_sha == $source_sha and .version == $version
     and .standalone_candidate_run_id == $candidate_run_id
     and .crate_sha256 == $crate_sha256 and .binary_sha256 == $binary_sha256
   ' "$manifest" >/dev/null || fail "manifest identity differs from the release candidate"
+
+python3 "$script_dir/cache_release_orchestrator.py" consumer-verify \
+  "$qualification_root" "$manifest" >/dev/null || fail "qualification phase ledger is invalid"
 
 mkdir -m 0700 "$output_dir"
 stage=$(mktemp -d "${TMPDIR:-/tmp}/hf2q-qualification-asset.XXXXXX")

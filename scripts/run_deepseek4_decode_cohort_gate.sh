@@ -8,6 +8,9 @@ expected_source_sha=${4:?expected source SHA is required}
 expected_model_sha=${5:?expected model SHA-256 is required}
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+OUT_ROOT=${OUT_ROOT:?canonical release build evidence is required}
+python3 "$ROOT_DIR/scripts/cache_release_orchestrator.py" authorize \
+  "$OUT_ROOT" deepseek-decode
 # Source-bound current identity; no independent stale receipt pin.
 RELEASE_NATIVE_IDENTITY=$(bash "$ROOT_DIR/scripts/verify_release_dependency_provenance.sh" identity)
 RELEASE_MLX_NATIVE_VERSION=$(jq -er .version <<<"$RELEASE_NATIVE_IDENTITY")
@@ -119,7 +122,22 @@ phase_marker_matches() {
     ' "$marker" >/dev/null
 }
 
-thermal_prepare_probe
+# The authenticated canonical build owns compilation. Import persisted probe
+# identity after sourcing the guard; this process never owns the probe file.
+probe_inventory="$OUT_ROOT/build/inventory.json"
+THERMAL_PROBE_BIN=$(jq -er '.thermal_probe.path' "$probe_inventory")
+THERMAL_PROBE_SOURCE=$(jq -er '.thermal_probe.source' "$probe_inventory")
+THERMAL_PROBE_COMPILER=$(jq -er '.thermal_probe.compiler' "$probe_inventory")
+THERMAL_PROBE_COMPILER_VERSION=$(jq -er '.thermal_probe.compiler_version' "$probe_inventory")
+THERMAL_PROBE_OWNED_DIR=""
+[[ "$THERMAL_PROBE_BIN" == "$OUT_ROOT/build/macos-thermal-probe" \
+  && -x "$THERMAL_PROBE_BIN" && ! -L "$THERMAL_PROBE_BIN" ]]
+test "$(sha256_file "$THERMAL_PROBE_BIN")" = \
+  "$(jq -er '.thermal_probe.sha256' "$probe_inventory")"
+test "$(sha256_file "$THERMAL_PROBE_SOURCE")" = \
+  "$(jq -er '.thermal_probe.source_sha256' "$probe_inventory")"
+test "$(sha256_file "$THERMAL_PROBE_COMPILER")" = \
+  "$(jq -er '.thermal_probe.compiler_sha256' "$probe_inventory")"
 thermal_probe_source_sha=$(sha256_file "$THERMAL_PROBE_SOURCE")
 thermal_probe_compiler_sha=$(sha256_file "$THERMAL_PROBE_COMPILER")
 thermal_probe_binary_sha=$(sha256_file "$THERMAL_PROBE_BIN")

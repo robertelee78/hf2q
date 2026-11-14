@@ -32,6 +32,9 @@ readonly TRIAL_SETTLE_SECONDS=30
 readonly TRIAL_ORDER='off auto auto off'
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+OUT_ROOT=${OUT_ROOT:?canonical release build evidence is required}
+python3 "$script_dir/cache_release_orchestrator.py" authorize \
+  "$OUT_ROOT" qwen38-long-decode
 if [[ ${HF2Q_THERMAL_SWIFTC_BIN+x} || ${HF2Q_THERMAL_PROBE_BIN+x} \
   || ${HF2Q_THERMAL_PROBE_SOURCE+x} ]]; then
   echo "thermal probe overrides are reserved for isolated contract tests" >&2
@@ -246,7 +249,21 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 1' INT TERM
 
-thermal_prepare_probe
+# Probe generation belongs exclusively to the authenticated build ticket.
+probe_inventory="$OUT_ROOT/build/inventory.json"
+THERMAL_PROBE_BIN=$(jq -er '.thermal_probe.path' "$probe_inventory")
+THERMAL_PROBE_SOURCE=$(jq -er '.thermal_probe.source' "$probe_inventory")
+THERMAL_PROBE_COMPILER=$(jq -er '.thermal_probe.compiler' "$probe_inventory")
+THERMAL_PROBE_COMPILER_VERSION=$(jq -er '.thermal_probe.compiler_version' "$probe_inventory")
+THERMAL_PROBE_OWNED_DIR=""
+[[ "$THERMAL_PROBE_BIN" == "$OUT_ROOT/build/macos-thermal-probe" \
+  && -x "$THERMAL_PROBE_BIN" && ! -L "$THERMAL_PROBE_BIN" ]]
+test "$(sha256_file "$THERMAL_PROBE_BIN")" = \
+  "$(jq -er '.thermal_probe.sha256' "$probe_inventory")"
+test "$(sha256_file "$THERMAL_PROBE_SOURCE")" = \
+  "$(jq -er '.thermal_probe.source_sha256' "$probe_inventory")"
+test "$(sha256_file "$THERMAL_PROBE_COMPILER")" = \
+  "$(jq -er '.thermal_probe.compiler_sha256' "$probe_inventory")"
 thermal_probe_binary_sha=$(sha256_file "$THERMAL_PROBE_BIN")
 thermal_probe_source_sha=$(sha256_file "$THERMAL_PROBE_SOURCE")
 thermal_probe_compiler_sha=$(sha256_file "$THERMAL_PROBE_COMPILER")

@@ -35,7 +35,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: cache-lifecycle-${{ inputs.commit_sha }}
+  group: hf2q-cache-release-driver
   cancel-in-progress: false
 
 jobs:
@@ -47,6 +47,8 @@ jobs:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
       EXPECTED_VERSION: ${{ inputs.version }}
       EXPECTED_STANDALONE_CANDIDATE_RUN_ID: ${{ inputs.standalone_candidate_run_id }}
+      CACHE_RELEASE_HOSTQ: ${{ vars.CACHE_RELEASE_HOSTQ }}
+      OUT_ROOT: ${{ runner.temp }}/cache-lifecycle
       ACCEPTED_QWEN38_MODEL_SHA256: "1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a"
       CARGO_TERM_COLOR: always
     steps:
@@ -76,6 +78,9 @@ jobs:
           git merge-base --is-ancestor "$actual_sha" origin/main
           git diff --exit-code
 
+          test -n "$CACHE_RELEASE_HOSTQ"
+          test -x "$CACHE_RELEASE_HOSTQ"
+          [[ "$OUT_ROOT" == /* ]]
           for model in "$DEEPSEEK_MODEL_PATH" "$GEMMA_MODEL_PATH" \
             "$QWEN_MODEL_PATH" "$QWEN38_MODEL_PATH"; do
             [[ "$model" != *$'\n'* && "$model" != *$'\r'* ]]
@@ -204,7 +209,7 @@ jobs:
           bash "$trusted_verifier" verify \
             "$dependency_provenance_dir" "$package_root/Cargo.lock"
 
-          release_evidence="$RUNNER_TEMP/cache-lifecycle/standalone"
+          release_evidence="$OUT_ROOT/standalone"
           mkdir -p "$release_evidence"
           sealed_binary="$release_evidence/hf2q-aarch64-apple-darwin"
           "$package_root/scripts/seal_release_binary.sh" \
@@ -218,33 +223,24 @@ jobs:
             printf 'HF2Q_BIN=%s\n' "$sealed_binary"
             printf 'EXPECTED_BINARY_SHA256=%s\n' "$binary_sha"
             printf 'CRATE_SHA256=%s\n' "$crate_sha"
+            printf 'STANDALONE_CANDIDATE_PROOF=%s\n' "$release_evidence/proof.json"
+            printf 'STANDALONE_CANDIDATE_CRATE=%s\n' "$crate"
             printf 'DEPENDENCY_PROVENANCE_DIR=%s\n' "$dependency_provenance_dir"
           } >> "$GITHUB_ENV"
 
-      - name: Host preflight (fail fast on dirty machine state)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PACKAGE_ROOT"
-          # Same conditions the gate asserts mid-run (no model runtimes,
-          # zero swap, headroom for the ~115 GiB DeepSeek benchmark,
-          # nominal thermal) checked in seconds instead of 20-40 minutes
-          # in. See scripts/release_gate_preflight.sh for the contract.
-          scripts/release_gate_preflight.sh
-
       - name: Run guarded cross-family cache lifecycle gate
         shell: bash
-        env:
-          OUT_ROOT: ${{ runner.temp }}/cache-lifecycle
         run: |
           set -euo pipefail
           cd "$PACKAGE_ROOT"
-          exec scripts/run_release_gate_process_group.sh env \
+          exec env \
             EXPECTED_SHA="$EXPECTED_SHA" \
             EXPECTED_VERSION="$EXPECTED_VERSION" \
             STANDALONE_CANDIDATE_RUN_ID="$EXPECTED_STANDALONE_CANDIDATE_RUN_ID" \
             CRATE_SHA256="$CRATE_SHA256" \
             DEPENDENCY_PROVENANCE_DIR="$DEPENDENCY_PROVENANCE_DIR" \
+            STANDALONE_CANDIDATE_PROOF="$STANDALONE_CANDIDATE_PROOF" \
+            STANDALONE_CANDIDATE_CRATE="$STANDALONE_CANDIDATE_CRATE" \
             HF2Q_BIN="$HF2Q_BIN" \
             EXPECTED_BINARY_SHA256="$EXPECTED_BINARY_SHA256" \
             DEEPSEEK_MODEL="$DEEPSEEK_MODEL" \
@@ -257,7 +253,7 @@ jobs:
             QWEN38_MODEL_SHA256="$QWEN38_MODEL_SHA256" \
             HF2Q_MODEL_VERIFICATION_CACHE_DIR="$RUNNER_TOOL_CACHE/hf2q-model-verification" \
             OUT_ROOT="$OUT_ROOT" \
-            scripts/run_agentic_cache_release_gate.sh
+            scripts/run_agentic_cache_release_gate.sh run
 
       - name: Upload exact-artifact receipts and signed binary
         if: always()
