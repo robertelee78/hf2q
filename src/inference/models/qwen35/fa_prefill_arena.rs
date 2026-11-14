@@ -86,6 +86,10 @@ pub struct FaPrefillArena {
     /// layer and shared by the rest, so it lives through the forward's
     /// terminal wait like the buffers above. `None` otherwise.
     pub(crate) resume_tq: Option<super::resume_attn_fast::ResumeTqScratch>,
+    /// Optional K/V backing shared by all resumed segments of a joint
+    /// forward. Clones retain the same four allocations through its terminal
+    /// wait; each segment still owns its own `resume_tq` result.
+    pub(crate) shared_resume_kv: Option<super::resume_attn_fast::ResumeTqKvScratch>,
 }
 
 impl FaPrefillArena {
@@ -130,6 +134,7 @@ impl FaPrefillArena {
             n_kv_heads,
             head_dim,
             resume_tq: None,
+            shared_resume_kv: None,
         })
     }
 

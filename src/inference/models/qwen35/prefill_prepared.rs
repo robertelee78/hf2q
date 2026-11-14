@@ -308,31 +308,63 @@ pub(crate) fn prefill_layer_scratch_bound_bytes(
     attention.max(delta_net) + ffn + outside
 }
 
-/// Upper bound of the per-forward buffers a joint forward of at most
-/// `forward_rows` rows over `slots` slots allocates beside the pool, on a
-/// cache of `kv_rows` rows per slot. A single slot's forward allocates one
-/// set of attention arenas for its rows; a joint forward allocates, for the
-/// life of the forward (plain device buffers, exact sizes):
-/// - per slot and segment of `r` rows the attention projection arena
-///   (`4r(h + 5q + 4kv)`: normed input, Q, gate, normed Q, rotated Q, gated
-///   output at `q` = heads × head dim; K, V, normed K, rotated K at
-///   `kv` = KV heads × head dim), the attention prefill arena
-///   (`r(6q + 8kv)`: three BF16 Q-sized and four KV-sized buffers) and the
-///   segment's positions (`16r`); a lane's segments cover at most all
-///   `forward_rows` rows (its own and its private copy of a shared prefix);
-/// - per slot one resume scratch for a resumed segment of more than 32
-///   rows: the dequantized history K and V in F32 and BF16
-///   (`12·kv` per attended row, at most `kv_rows`) and the F32 output
-///   (`4rq`);
-/// - per slot the gathered rows of a segment behind a shared prefix
-///   (`4rh`);
-/// - on a MoE model the forward-wide FFN arena and one per short segment
-///   (two per slot at most, 32 rows): per row `8k + 12k·m + 4k·h + 12·ms +
-///   4·experts + 4` with `k` experts per row;
-/// - the DeltaNet run scratch: one convolution and one recurrent state for
-///   the shared prefix and one convolution state per slot.
-/// The slots' stable-boundary checkpoints are not in this figure: each slot
-/// holds its own under the anchor store's quota with and without the switch.
+/// Forward-wide device allocations beside the pool, including the arenas
+/// also used by a solo prefill. They remain live through the terminal wait;
+/// being common to the default route does not remove their absolute charge.
+fn common_arena_bound_bytes(cfg: &super::Qwen35Config, forward_rows: usize) -> u64 {
+    let rows = forward_rows as u64;
+    let h = u64::from(cfg.hidden_size);
+    // Positions, layer-boundary pair, and the output ring of each FFN kind.
+    let mut bytes = 16 * rows + 8 * rows * h;
+    if let Some(m) = cfg.intermediate_size {
+        // Three hidden activations, down projection, parameters, output ring.
+        bytes += 12 * rows * u64::from(m) + 12 * rows * h + 4;
+    }
+    if cfg.moe.is_some() {
+        bytes += 8 * rows * h;
+    }
+    if cfg.layer_types.contains(&super::Qwen35LayerKind::LinearAttention) {
+        let keys = u64::from(cfg.linear_num_key_heads) * u64::from(cfg.linear_key_head_dim);
+        let values = u64::from(cfg.linear_num_value_heads);
+        let dk = u64::from(cfg.linear_key_head_dim);
+        let dv = u64::from(cfg.linear_value_head_dim);
+        // All 23 DnPrefillArena roots, including projection and split outputs.
+        bytes += rows * (36 * keys + 24 * values * dv + 4 * h + 16 * values) + 92;
+        // All seven ChunkAllocsArena roots (allocated even off the chunk path).
+        bytes += rows * values * (12 * dk + 4 * dv + 4);
+        // The constructor accepts only multiples of 64. Its largest possible
+        // allocation below the transaction ceiling bounds every shorter chunk.
+        let chunk_rows = (forward_rows / 64 * 64) as u32;
+        if chunk_rows > 0 {
+            bytes += mlx_native::ops::chunk_gated_delta_rule::ChunkInternalArenaPlan::for_shape(
+                1,
+                chunk_rows,
+                cfg.linear_num_value_heads,
+                cfg.linear_num_value_heads,
+                cfg.linear_key_head_dim,
+                cfg.linear_value_head_dim,
+                64,
+            )
+            .map_or(0, |plan| plan.requested_bytes());
+        }
+    }
+    // Page rounding for at most 64 common roots, separate from segment roots.
+    bytes + 64 * 16 * 1024
+}
+
+/// Absolute bound of device buffers beside the pool for a joint forward
+/// (also bounds a solo forward with one slot).
+///
+/// Per-segment attention/projection/position/gather arenas cover at most
+/// `forward_rows` rows per slot, including private shared-prefix copies.
+/// Resumed TQ K/V backing is shared across segments in queue order (12 bytes
+/// per KV element). The fast-off bridge can overlap its pending old K/V
+/// removals (12 bytes) with the next F32 pair allocated before submission
+/// (8 bytes): charge 20 bytes per KV element at full cache capacity. Results
+/// remain per segment; transient BF16 Q/output buffers are charged too.
+/// Common arenas and plain attention results held across deferred waits are
+/// included, not subtracted as default-route scratch. Stable checkpoints
+/// remain under the anchor store's quota with and without the switch.
 pub(crate) fn joint_arena_bound_bytes(
     cfg: &super::Qwen35Config,
     forward_rows: usize,
@@ -346,7 +378,7 @@ pub(crate) fn joint_arena_bound_bytes(
     let q = u64::from(cfg.num_attention_heads) * u64::from(cfg.head_dim);
     let kv = u64::from(cfg.num_key_value_heads) * u64::from(cfg.head_dim);
     let attention = lane_rows * (4 * (h + 5 * q + 4 * kv) + 6 * q + 8 * kv + 16);
-    let resume = slots * 12 * kv * kv_rows as u64 + 4 * q * lane_rows;
+    let resume = 20 * kv * kv_rows as u64 + 4 * q * lane_rows + 6 * q * rows;
     let gather = 4 * h * lane_rows;
     let moe = cfg.moe.as_ref().map_or(0, |moe| {
         let k = u64::from(moe.num_experts_per_tok);
@@ -366,25 +398,34 @@ pub(crate) fn joint_arena_bound_bytes(
         * u64::from(cfg.linear_value_head_dim)
         * u64::from(cfg.linear_num_value_heads);
     let delta_net = (1 + slots) * conv_state + recurrent_state;
-    // Page rounding and the parameter blocks of at most 64 buffers per slot.
+    // Large forwards wait within MAX_WAIT_LAYERS; a short (<=32-row)
+    // forward can defer through every layer under the terminal-K override.
+    // Count even plain results not served by the capped scratch pool.
+    let held_rows = (MAX_WAIT_LAYERS as u64 * rows)
+        .max(32 * u64::from(cfg.num_hidden_layers));
+    let deferred_outputs = 4 * q * slots * held_rows;
+    // Last-row/boundary logits held on the host, plus the current device
+    // head result and normed row (heads run one row at a time).
+    let head = (2 * slots + 1) * 4 * u64::from(cfg.vocab_size) + 4 * h;
+    // Page rounding and parameter blocks of at most 64 segment roots per slot.
     let slack = slots * 64 * 16 * 1024;
-    attention + resume + gather + moe + delta_net + slack
+    attention + resume + gather + moe + delta_net + deferred_outputs + head + slack
+        + common_arena_bound_bytes(cfg, forward_rows)
 }
 
 /// Upper bound of what a worker holds for `HF2Q_QWEN_PREFILL_JOINT`
 /// forwards of at most `forward_rows` rows over `slots` slots on a cache of
-/// `kv_rows` rows per slot: what the pool keeps at a reset
-/// ([`PREFILL_RETAINED_SCRATCH_BYTES`], enforced), one layer's requests
-/// ([`prefill_layer_scratch_bound_bytes`], derived) and the forward's own
-/// buffers ([`joint_arena_bound_bytes`], derived). Absolute: nothing of the
-/// default route is subtracted.
+/// `kv_rows` rows per slot: what the pool keeps at a reset, its enforced
+/// window threshold, one layer's requests, and all forward-owned buffers.
+/// The threshold also covers short joint forwards that defer host waits.
+/// Absolute: nothing of the default route is subtracted.
 pub(crate) fn joint_scratch_bound_bytes(
     cfg: &super::Qwen35Config,
     forward_rows: usize,
     slots: usize,
     kv_rows: usize,
 ) -> u64 {
-    PREFILL_RETAINED_SCRATCH_BYTES as u64
+    (PREFILL_RETAINED_SCRATCH_BYTES + WAIT_LAYERS_WINDOW_SCRATCH_BYTES) as u64
         + prefill_layer_scratch_bound_bytes(cfg, forward_rows, slots)
         + joint_arena_bound_bytes(cfg, forward_rows, slots, kv_rows)
 }
@@ -394,11 +435,10 @@ pub(crate) fn joint_scratch_bound_bytes(
 /// `HF2Q_QWEN_PREFILL_WAIT_LAYERS=wait_layers`: what the pool keeps at a
 /// reset, what a window may have out when its last layer starts
 /// ([`WAIT_LAYERS_WINDOW_SCRATCH_BYTES`], enforced) and that layer's
-/// requests (derived); 0 at the default cadence. A forward that skips host
-/// waits allocates no per-forward buffer a waiting forward does not. With
-/// the joint switch on as well, this figure with the joint forward's rows
-/// and slots plus [`joint_arena_bound_bytes`] covers both: the caps are one
-/// pool's, not one per switch.
+/// requests (derived); 0 at the default cadence. These are the pool bytes
+/// only: [`prefill_switch_scratch_bound_bytes`] adds every forward-owned
+/// arena, including those a waiting forward also allocates. With both
+/// switches the caps are one pool's, not one per switch.
 pub(crate) fn wait_layers_scratch_bound_bytes(
     cfg: &super::Qwen35Config,
     forward_rows: usize,
@@ -421,10 +461,8 @@ pub(crate) fn wait_layers_scratch_bound_bytes(
 /// the rows a slot's cache can hold (the resolved context length).
 /// - neither: 0;
 /// - joint alone: [`joint_scratch_bound_bytes`];
-/// - wait layers alone: [`wait_layers_scratch_bound_bytes`] for one lane (a
-///   forward without the joint switch serves one slot);
-/// - both: [`wait_layers_scratch_bound_bytes`] for the joint forward's slots
-///   plus [`joint_arena_bound_bytes`].
+/// - wait layers alone: the one-lane pool bound plus its forward arenas;
+/// - both: the joint pool bound plus its forward arenas.
 pub(crate) fn prefill_switch_scratch_bound_bytes(
     cfg: &super::Qwen35Config,
     forward_rows: usize,
@@ -436,7 +474,10 @@ pub(crate) fn prefill_switch_scratch_bound_bytes(
     match (joint, wait_layers > 1) {
         (false, false) => 0,
         (true, false) => joint_scratch_bound_bytes(cfg, forward_rows, slots, kv_rows),
-        (false, true) => wait_layers_scratch_bound_bytes(cfg, forward_rows, 1, wait_layers),
+        (false, true) => {
+            wait_layers_scratch_bound_bytes(cfg, forward_rows, 1, wait_layers)
+                + joint_arena_bound_bytes(cfg, forward_rows, 1, kv_rows)
+        }
         (true, true) => {
             wait_layers_scratch_bound_bytes(cfg, forward_rows, slots, wait_layers)
                 + joint_arena_bound_bytes(cfg, forward_rows, slots, kv_rows)

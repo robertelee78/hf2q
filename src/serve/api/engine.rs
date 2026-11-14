@@ -17916,7 +17916,10 @@ enum Qwen35WorkerFatalKind {
 }
 
 pub(super) fn is_fatal_command_buffer_error(error: &anyhow::Error) -> bool {
+    use crate::inference::models::qwen35::gpu_full_attn::LegacyResumeCleanupFailure;
+
     crate::inference::models::qwen35::decode_pool::profile::unhealthy()
+        || error.downcast_ref::<LegacyResumeCleanupFailure>().is_some()
         || error.chain().any(|cause| {
             matches!(
                 cause.downcast_ref::<mlx_native::MlxError>(),
@@ -47227,6 +47230,30 @@ mod qwen35_bounded_prefill_watchdog_tests {
         assert!(!is_fatal_command_buffer_error(&anyhow::anyhow!(
             "ordinary request validation error"
         )));
+    }
+
+    #[test]
+    fn failed_legacy_cleanup_is_fatal_and_preserves_both_typed_errors() {
+        use crate::inference::models::qwen35::gpu_full_attn::LegacyResumeCleanupFailure;
+        use std::io;
+
+        let primary = anyhow::Error::new(io::Error::from(io::ErrorKind::InvalidInput));
+        assert!(!is_fatal_command_buffer_error(&primary));
+        let cleanup = anyhow::Error::new(io::Error::from(io::ErrorKind::Other));
+        let failure = primary.context(LegacyResumeCleanupFailure(cleanup));
+        assert!(is_fatal_command_buffer_error(&failure));
+        assert_eq!(
+            failure.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let cleanup = &failure
+            .downcast_ref::<LegacyResumeCleanupFailure>()
+            .unwrap()
+            .0;
+        assert_eq!(
+            cleanup.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::Other
+        );
     }
 
     #[test]

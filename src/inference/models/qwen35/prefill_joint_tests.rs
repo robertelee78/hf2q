@@ -548,6 +548,43 @@ fn a_joint_prefill_that_waits_every_few_layers_keeps_each_lanes_bits() {
     });
 }
 
+/// Every long resumed segment shares K/V temporaries, but never its result.
+/// Descending and ascending attended lengths catch stale tight-head strides;
+/// deferred waits exercise reuse while earlier slots' work is still queued.
+#[test]
+fn joint_resumed_segments_share_scratch_without_changing_any_lane() {
+    use super::prefill_prepared::ForcedWaitLayers;
+    with_synthetic_model(|model| {
+        let lanes = [
+            Lane::new(3, &[193], 77, 5),
+            Lane::new(0, &[33], 97, 0),
+            Lane::new(2, &[257], 40, 8),
+            Lane::new(1, &[64], 157, 32),
+        ];
+        let alone: Vec<Outcome> = lanes.iter().map(|lane| solo(model, lane, true)).collect();
+        for wait_layers in [1, 3, 8] {
+            let _cadence = ForcedWaitLayers::set(wait_layers);
+            for capture in [false, true] {
+                let together = joint(model, &lanes, 0, capture);
+                for ((lane, alone), together) in lanes.iter().zip(&alone).zip(&together) {
+                    if capture {
+                        assert!(
+                            alone.differences(together).is_empty(),
+                            "{lane:?}: shared resume scratch changed the solo result"
+                        );
+                    } else {
+                        let solo_plain = solo(model, lane, false);
+                        assert!(
+                            solo_plain.differences(together).is_empty(),
+                            "{lane:?}: shared resume scratch changed the uncaptured solo result"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// `HF2Q_QWEN_PREFILL_KEEP_FRESH`: the keep-alive reads the weights only
 /// the prompt prefill reads (the output head of this dense model) into
 /// private scratch, at most once per interval, and changes no bit of a
@@ -1562,6 +1599,45 @@ fn the_scratch_caps_bound_the_pool_and_change_no_bit() {
     });
 }
 
+/// Wait-layers 1 does not imply one layer per wait for short joint chunks:
+/// they retain the terminal-K cadence. The same overflow window must bound
+/// them, including a run that starts from an empty pool.
+#[test]
+fn joint_only_short_prefill_obeys_the_scratch_window() {
+    use super::decode_pool::{self, PoolCaps};
+    use super::prefill_prepared::{ForcedWaitLayers, ScratchCapsForTest};
+    with_synthetic_model(|model| {
+        let lanes = [
+            Lane::new(0, &[40], 5, 2),
+            Lane::new(1, &[33], 9, 0),
+        ];
+        let run = |window| {
+            let mut cache = cache(model);
+            for lane in &lanes {
+                let _scope = PrefillScope::forced(true);
+                prefill_history(model, &mut cache, lane);
+            }
+            decode_pool::checked_reset_decode_pool().expect("reset");
+            decode_pool::cap_pool(Some(PoolCaps { pool: usize::MAX, retained: 0 }));
+            decode_pool::end_caps_at_next_reset();
+            decode_pool::checked_reset_decode_pool().expect("empty pool");
+            let _caps = ScratchCapsForTest::set(window, usize::MAX, usize::MAX);
+            let _cadence = ForcedWaitLayers::set(1);
+            let result = joint_forward(model, &mut cache, &lanes, 0, false)
+                .expect("joint-only short forward");
+            decode_pool::checked_reset_decode_pool().expect("return scratch");
+            (result, decode_pool::free_bytes())
+        };
+        let (unlimited, accumulated) = run(usize::MAX);
+        let (bounded, one_layer) = run(0);
+        assert!(
+            one_layer < accumulated,
+            "joint-only short forward ignored the window: {one_layer} vs {accumulated}"
+        );
+        assert_eq!(unlimited, bounded, "a safety wait changed a lane's bits");
+    });
+}
+
 /// A pool that uncapped forwards left warm is trimmed when a capped forward
 /// puts its caps on, before that forward's first capped allocation: the pool
 /// never holds more free bytes than the retained cap while caps are in
@@ -1852,11 +1928,12 @@ fn the_joint_arena_bound_covers_the_arenas_a_segment_allocates() {
                 "{what}: the arenas of a {rows}-row segment hold {allocated} bytes, over the bound of {bound}"
             );
         }
-        // The attended history: twelve bytes per KV element and slot.
+        // One history charge, including old/new legacy residency overlap,
+        // independent of slot count.
         let kv = u64::from(cfg.num_key_value_heads) * u64::from(cfg.head_dim);
         assert_eq!(
             joint_arena_bound_bytes(cfg, 64, 3, 1000) - joint_arena_bound_bytes(cfg, 64, 3, 0),
-            3 * 12 * kv * 1000
+            20 * kv * 1000
         );
     };
     with_synthetic_model(|model| check(model, "dense FFN"));
@@ -1879,7 +1956,11 @@ fn the_switches_are_charged_as_one_pool() {
         };
         assert_eq!(charged(false, 1), 0);
         assert_eq!(charged(true, 1), joint_scratch_bound_bytes(cfg, rows, slots, kv_rows));
-        assert_eq!(charged(false, 8), wait_layers_scratch_bound_bytes(cfg, rows, 1, 8));
+        assert_eq!(
+            charged(false, 8),
+            wait_layers_scratch_bound_bytes(cfg, rows, 1, 8)
+                + joint_arena_bound_bytes(cfg, rows, 1, kv_rows)
+        );
         let both = charged(true, 8);
         assert_eq!(
             both,
@@ -2195,4 +2276,37 @@ fn qwen_prefill_wait_layers_memory_probe() {
             pool.as_ref().map_or("unavailable", |(kind, _, _)| *kind),
         );
     }
+}
+
+/// Fast-off is a supported route, not an admission escape hatch. Its direct
+/// bridge waits must retire private history scratch without changing any
+/// slot's logits, stable checkpoint, encoded KV, DeltaNet state or follow-up.
+#[test]
+fn legacy_resume_joint_prefill_keeps_every_lanes_output_and_state() {
+    use super::prefill_prepared::ForcedWaitLayers;
+    use super::resume_attn_fast::ForceResumeAttnRoute;
+    with_synthetic_model(|model| {
+        let lanes = [
+            Lane::new(3, &[193], 77, 5),
+            Lane::new(0, &[33], 97, 0),
+            Lane::new(2, &[257], 40, 8),
+            Lane::new(1, &[64], 157, 32),
+        ];
+        let reference: Vec<_> = {
+            let _fast = ForceResumeAttnRoute::new(true);
+            lanes.iter().map(|lane| solo(model, lane, true)).collect()
+        };
+        let _legacy = ForceResumeAttnRoute::new(false);
+        for wait_layers in [1, 8] {
+            let _cadence = ForcedWaitLayers::set(wait_layers);
+            let together = joint(model, &lanes, 0, true);
+            for ((lane, reference), actual) in lanes.iter().zip(&reference).zip(&together) {
+                let differences = reference.differences(actual);
+                assert!(
+                    differences.is_empty(),
+                    "legacy bridge at wait {wait_layers}: {lane:?} changed {differences:?}"
+                );
+            }
+        }
+    });
 }

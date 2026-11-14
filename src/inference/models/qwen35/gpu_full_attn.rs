@@ -79,6 +79,17 @@ use super::kv_cache::FullAttnKvSlot;
 // for `setBuffer:offset:atIndex:`).  See ADR-040 §6.1.5.
 use crate::serve::multi_seq_kv::SlotId;
 
+/// Cleanup could not prove a safe reuse boundary. Keep the primary error
+/// as its source while retaining the cleanup error for fail-stop handling.
+#[derive(Debug)]
+pub(crate) struct LegacyResumeCleanupFailure(pub(crate) anyhow::Error);
+
+impl std::fmt::Display for LegacyResumeCleanupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "legacy resume error cleanup also failed: {:#}", self.0)
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // ADR-040 Phase B4a-cont (2026-05-23) — per-slot K/V buffer slicing.
 // ──────────────────────────────────────────────────────────────────────
@@ -5444,17 +5455,15 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
     // terminal commit+wait, satisfying the unretained-reference lifetime
     // contract as well.
     enc.commit_labeled("layer.full_attn.tq_bridge_dequant");
-    // Hand the submitted encoder over: a pipelined forward keeps it for
-    // its next host wait; otherwise it is released here, so the native
-    // observer retains this command before the dense resume's wait checks
-    // the queue.
+    // Retain until the bridge's host wait below, then explicitly settle:
+    // a direct CommandEncoder wait does not clear the forward's kept list.
     super::encoder_stage::retain_submitted(enc, "layer.full_attn.tq_bridge_dequant");
 
     // Dispatch the same dense resume kernel against the tight temp
     // buffers. kv_capacity = kv_seq_len so the kernel's head-stride
     // math (kv_capacity * head_dim) matches the tight head-major
     // [n_kv_heads, kv_seq_len, head_dim] layout.
-    apply_flash_attn_prefill_seq_major_resume(
+    let bridge = apply_flash_attn_prefill_seq_major_resume(
         device,
         registry,
         q_seq_major,
@@ -5468,7 +5477,36 @@ pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
         n_kv_heads,
         head_dim,
     )
-    .context("apply_flash_attn_prefill_seq_major_resume (TQ-decoded path)")
+    .context("apply_flash_attn_prefill_seq_major_resume (TQ-decoded path)");
+    // Also drain on an early bridge error, before the F32 dequant roots
+    // leave this frame. Read every queued status and release its retained
+    // buffers now, rather than accumulating private K/V across slots/layers.
+    // An earlier submitted failure takes precedence over the bridge result.
+    let settled = super::encoder_stage::settle_submitted()
+        .context("settle TQ dequant commands at the legacy resume bridge wait");
+    let result = settled.and(bridge);
+    if let Err(error) = result {
+        // Settlement has completed every submitted user of these roots.
+        // Drop them (and the discarded bridge result above) before the
+        // cleanup commit: native buffer drops stage residency removals,
+        // so a completion wait alone does not publish their release.
+        drop(temp_k);
+        drop(temp_v);
+        let drained = device
+            .command_encoder()
+            .map(crate::inference::native_observation::encoder)
+            .context("legacy resume error cleanup encoder")
+            .and_then(|mut encoder| {
+                encoder
+                    .commit_and_wait_labeled("layer.full_attn.tq_bridge_error_drain")
+                    .context("legacy resume error cleanup drain")
+            });
+        return match drained {
+            Ok(()) => Err(error),
+            Err(drain) => Err(error.context(LegacyResumeCleanupFailure(drain))),
+        };
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]

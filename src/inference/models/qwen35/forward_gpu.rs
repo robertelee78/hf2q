@@ -227,14 +227,12 @@ pub(crate) fn layer_scratch_resets() -> bool {
     super::execution_dispatch::dense_q_arena_reset_enabled()
 }
 
-/// Whether a forward that skips host waits has so much scratch out that the
-/// layer now ending must wait
-/// ([`super::prefill_prepared::WAIT_LAYERS_WINDOW_SCRATCH_BYTES`]): the pool
-/// takes its buffers back only at a host wait. Evaluated when the layer has
-/// allocated, so what is out exceeds the threshold by at most this layer's
-/// scratch.
-fn window_scratch_full(pipelined_layers: bool) -> bool {
-    pipelined_layers
+/// Whether a capped forward has so much scratch out that this layer must
+/// wait. Joint forwards need this even at wait-layers 1: short chunks can
+/// defer their terminal-K wait. Evaluated after allocation, so overshoot is
+/// at most one layer's scratch.
+fn window_scratch_full(capped_forward: bool) -> bool {
+    capped_forward
         && super::decode_pool::issued_bytes() > super::prefill_prepared::window_scratch_threshold()
 }
 
@@ -5457,18 +5455,63 @@ impl Qwen35Model {
             let has_linear = layer_weights_gpu
                 .iter()
                 .any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }));
+            // Resumed segments run their bridges in queue order. Only their
+            // K/V dequant/cast temporaries alias; each segment's bridge result
+            // and projection output remain private until the attention join.
+            // Size once for the longest attended history in this forward,
+            // including every FA layer's cursor and the lane's content rows.
+            // The short folded cue uses direct TQ attention, not this bridge.
+            let mut resume_rows = 0;
+            if super::resume_attn_fast::resume_attn_fast_enabled() {
+                for lane in &plan.lanes {
+                    let content_rows = lane
+                        .boundary
+                        .as_ref()
+                        .map_or(lane.rows, |boundary| boundary.prefix_rows);
+                    if content_rows <= super::prefill_fold::MAX_CUE_ROWS as u32 {
+                        continue;
+                    }
+                    for slot in &kv_cache.full_attn {
+                        let cursor = slot.current_len[lane.slot.0 as usize];
+                        if cursor > 0 && slot.k.is_none() && slot.tq.is_some() {
+                            let attended = cursor
+                                .checked_add(content_rows)
+                                .ok_or_else(|| anyhow!("joint resume attention length overflow"))?;
+                            ensure!(
+                                attended <= kv_cache.max_seq_len,
+                                "joint resume attention exceeds cache capacity"
+                            );
+                            resume_rows = resume_rows.max(attended);
+                        }
+                    }
+                }
+            }
+            let shared_resume_kv = (resume_rows > 0)
+                .then(|| {
+                    super::resume_attn_fast::ResumeTqKvScratch::new(
+                        &device,
+                        resume_rows,
+                        cfg.num_key_value_heads,
+                        cfg.head_dim,
+                    )
+                })
+                .transpose()?;
             for segment in &joint_segments {
                 let fa = if has_full {
                     let shape = FullAttnShape::from_config(cfg);
                     Some((
-                        super::FaPrefillArena::new(
-                            &device,
-                            segment.rows,
-                            shape.n_head,
-                            shape.n_kv,
-                            shape.head_dim,
-                        )
-                        .context("alloc joint prefill FaPrefillArena")?,
+                        {
+                            let mut arena = super::FaPrefillArena::new(
+                                &device,
+                                segment.rows,
+                                shape.n_head,
+                                shape.n_kv,
+                                shape.head_dim,
+                            )
+                            .context("alloc joint prefill FaPrefillArena")?;
+                            arena.shared_resume_kv = shared_resume_kv.clone();
+                            arena
+                        },
                         super::FaProjectionsArena::new(
                             &device,
                             segment.rows,
@@ -6965,7 +7008,9 @@ impl Qwen35Model {
                                 format!("commit fused-DenseQ decode layer {layer_idx}")
                             })?;
                         } else if {
-                            is_k_boundary |= window_scratch_full(pipelined_layers);
+                            is_k_boundary |= window_scratch_full(
+                                pipelined_layers || !joint_segments.is_empty(),
+                            );
                             is_k_boundary
                         } {
                             // ADR-019 Phase 1: hold the LAST layer's
@@ -7244,7 +7289,9 @@ impl Qwen35Model {
                             format!("commit fused-MoeQ decode layer {layer_idx}")
                         })?;
                     } else if {
-                        is_k_boundary |= window_scratch_full(pipelined_layers);
+                        is_k_boundary |= window_scratch_full(
+                            pipelined_layers || !joint_segments.is_empty(),
+                        );
                         is_k_boundary
                     } {
                         // ADR-019 Phase 1: see DenseQ fusion comment above.

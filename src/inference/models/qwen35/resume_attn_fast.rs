@@ -13,8 +13,8 @@
 //! same dispatches in the same order on the same input bytes:
 //! - the BF16 Q and output buffers come from the prefill's
 //!   [`FaPrefillArena`], which resumed chunks allocate but did not use;
-//! - the K/V temps, their BF16 casts and the F32 result are allocated once
-//!   per prefill, by the first FA layer, in [`ResumeTqScratch`] on that arena;
+//! - K/V temps and casts are forward-owned, shared across joint segments;
+//!   each segment retains a separate F32 result in [`ResumeTqScratch`];
 //! - the dequant and the bridge share one command buffer (a memory barrier
 //!   replaces the command-buffer boundary), committed without a host wait.
 //!   The layer's ops6-7 consumes the result in queue order and keeps its own
@@ -114,23 +114,53 @@ pub(crate) fn fast_route_calls() -> u64 {
     FAST_ROUTE_CALLS.with(std::cell::Cell::get)
 }
 
-/// Route (c) buffers that depend on the attended length, plus the F32
-/// result, for one prefill. Same dtypes and shapes as the buffers route (c)
-/// allocates per layer.
+/// K/V backing shared by the resumed segments of one joint forward. Each
+/// dispatch writes a tight `[n_kv_heads, attended_rows, head_dim]` prefix;
+/// the allocation's capacity is not the head stride passed to the kernels.
+#[derive(Clone)]
+pub(crate) struct ResumeTqKvScratch {
+    capacity: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    temp_k: MlxBuffer,
+    temp_v: MlxBuffer,
+    k_bf16: MlxBuffer,
+    v_bf16: MlxBuffer,
+}
+
+impl ResumeTqKvScratch {
+    pub(crate) fn new(
+        device: &MlxDevice,
+        capacity: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+    ) -> Result<Self> {
+        let (kv, nkv, d) = (capacity as usize, n_kv_heads as usize, head_dim as usize);
+        let elements = nkv * kv * d;
+        let alloc = |bytes, dtype, shape, label| {
+            device
+                .alloc_buffer(bytes, dtype, shape)
+                .map_err(|e| anyhow!("ResumeTqKvScratch alloc {label}: {e}"))
+        };
+        Ok(Self {
+            capacity,
+            n_kv_heads,
+            head_dim,
+            temp_k: alloc(elements * 4, DType::F32, vec![nkv, kv, d], "temp_k")?,
+            temp_v: alloc(elements * 4, DType::F32, vec![nkv, kv, d], "temp_v")?,
+            k_bf16: alloc(elements * 2, DType::BF16, vec![1, nkv, kv, d], "k_bf16")?,
+            v_bf16: alloc(elements * 2, DType::BF16, vec![1, nkv, kv, d], "v_bf16")?,
+        })
+    }
+}
+
+/// One segment's result and shape, with private or forward-shared K/V
+/// backing. Results remain separate until the joint attention join reads
+/// every segment; only the K/V temporaries may alias.
 pub(crate) struct ResumeTqScratch {
     seq_len: u32,
     kv_seq_len: u32,
-    /// F32 `[n_kv_heads, kv_seq_len, head_dim]`: unrotated TQ dequant of K.
-    temp_k: MlxBuffer,
-    /// Same for V.
-    temp_v: MlxBuffer,
-    /// BF16 `[1, n_kv_heads, kv_seq_len, head_dim]`: cast of `temp_k`.
-    k_bf16: MlxBuffer,
-    /// Same for V.
-    v_bf16: MlxBuffer,
-    /// F32 `[seq_len, n_heads, head_dim]`: the route's result. Each FA layer
-    /// gets a clone; its ops6-7 consumes it before the next FA layer
-    /// rewrites it (queue order, plus that layer's host wait).
+    kv: ResumeTqKvScratch,
     out_seq: MlxBuffer,
 }
 
@@ -142,23 +172,27 @@ impl ResumeTqScratch {
         n_heads: u32,
         n_kv_heads: u32,
         head_dim: u32,
+        shared: Option<&ResumeTqKvScratch>,
     ) -> Result<Self> {
-        let (seq, kv) = (seq_len as usize, kv_seq_len as usize);
-        let (nh, nkv, d) = (n_heads as usize, n_kv_heads as usize, head_dim as usize);
-        let kv_elems = nkv * kv * d;
-        let alloc = |bytes: usize, dtype: DType, shape: Vec<usize>, label: &str| {
-            device
-                .alloc_buffer(bytes, dtype, shape)
-                .map_err(|e| anyhow!("ResumeTqScratch alloc {label}: {e}"))
+        let kv = if let Some(shared) = shared {
+            anyhow::ensure!(
+                kv_seq_len <= shared.capacity
+                    && n_kv_heads == shared.n_kv_heads
+                    && head_dim == shared.head_dim,
+                "resume shared K/V scratch does not cover the segment's shape"
+            );
+            shared.clone()
+        } else {
+            ResumeTqKvScratch::new(device, kv_seq_len, n_kv_heads, head_dim)?
         };
+        let (seq, nh, d) = (seq_len as usize, n_heads as usize, head_dim as usize);
         Ok(Self {
             seq_len,
             kv_seq_len,
-            temp_k: alloc(kv_elems * 4, DType::F32, vec![nkv, kv, d], "temp_k")?,
-            temp_v: alloc(kv_elems * 4, DType::F32, vec![nkv, kv, d], "temp_v")?,
-            k_bf16: alloc(kv_elems * 2, DType::BF16, vec![1, nkv, kv, d], "k_bf16")?,
-            v_bf16: alloc(kv_elems * 2, DType::BF16, vec![1, nkv, kv, d], "v_bf16")?,
-            out_seq: alloc(seq * nh * d * 4, DType::F32, vec![seq, nh, d], "out_seq")?,
+            kv,
+            out_seq: device
+                .alloc_buffer(seq * nh * d * 4, DType::F32, vec![seq, nh, d])
+                .map_err(|e| anyhow!("ResumeTqScratch alloc out_seq: {e}"))?,
         })
     }
 }
@@ -191,6 +225,7 @@ fn arena_buffers<'a>(
                 arena.n_heads,
                 arena.n_kv_heads,
                 arena.head_dim,
+                arena.shared_resume_kv.as_ref(),
             )?);
         }
     }
@@ -203,13 +238,13 @@ fn arena_buffers<'a>(
         FaResumeBridgeBuffers {
             q_bf16_seq: &arena.q_bf16_seq,
             q_bf16_hm: &arena.q_bf16_hm,
-            k_bf16: &scratch.k_bf16,
-            v_bf16: &scratch.v_bf16,
+            k_bf16: &scratch.kv.k_bf16,
+            v_bf16: &scratch.kv.v_bf16,
             out_bf16_hm: &arena.out_bf16_hm,
             out_seq: &scratch.out_seq,
         },
-        &scratch.temp_k,
-        &scratch.temp_v,
+        &scratch.kv.temp_k,
+        &scratch.kv.temp_v,
     ))
 }
 
@@ -244,6 +279,13 @@ pub(crate) fn encode_resume_via_tq_cache_fast(
     validate_flash_attn_prefill_resume_shape(seq_len, cur_len, kv_seq_len, kv_seq_len, head_dim)?;
     arena.validate_fits(seq_len, n_heads, n_kv_heads, head_dim)?;
     let (bufs, temp_k, temp_v) = arena_buffers(arena, device, seq_len, kv_seq_len)?;
+
+    // WAR: another segment may have read this forward-shared K/V backing.
+    // This also orders reuse if callers encode several segments into one
+    // concurrent encoder. Separate command buffers are submitted in queue
+    // order; every bridge finishes reading K/V before it commits. The
+    // per-segment Q, output and projection arenas never alias this backing.
+    enc.memory_barrier();
 
     for (is_k, temp) in [(true, temp_k), (false, temp_v)] {
         slot.dequant_seq_into_f32_unrotated_for_slot(
@@ -719,6 +761,120 @@ mod tests {
             .expect_err("a different kv_seq_len in one prefill must fail");
         drain(&fx.device);
         assert!(format!("{error:#}").contains("resume scratch"), "{error:#}");
+    }
+
+    /// Device allocation measurements are process-wide. Run this canary in
+    /// isolation with retained references, where kept dequant encoders really
+    /// own their large F32 K/V roots even after the GPU has completed.
+    #[test]
+    fn legacy_resume_bridge_releases_dequant_backing_at_its_wait() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "inference::models::qwen35::resume_attn_fast::tests::legacy_resume_bridge_lifetime_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("HF2Q_LEGACY_RESUME_LIFETIME_CHILD", "1")
+            .env("HF2Q_QWEN_RESUME_ATTN_FAST", "0")
+            .env("MLX_UNRETAINED_REFS", "0")
+            .output()
+            .expect("legacy resume lifetime child");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success()
+                && text.contains("[LEGACY_RESUME_LIFETIME]")
+                && text.contains("1 passed"),
+            "legacy bridge lifetime/state regression failed:\n{text}"
+        );
+    }
+
+    #[test]
+    fn legacy_resume_bridge_lifetime_child() {
+        if std::env::var_os("HF2Q_LEGACY_RESUME_LIFETIME_CHILD").is_none() {
+            return;
+        }
+        use crate::inference::models::qwen35::encoder_stage::{
+            self, FailSubmitted, SubmittedCommands,
+        };
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let (history, rows, layers) = (2048u32, 64u32, 2u32);
+        let total = history + rows;
+        let Some(mut fx) = Fixture::new(total, rows, layers, 71) else {
+            eprintln!("[LEGACY_RESUME_LIFETIME] skipped: Metal unavailable");
+            return;
+        };
+        let reference: Vec<_> = (0..layers as usize)
+            .map(|layer| fx.bridge(layer, history, rows))
+            .collect();
+        let qs: Vec<_> = (0..layers as usize).map(|layer| fx.upload_q(layer, rows)).collect();
+        let baseline = fx.device.metal_device().current_allocated_size();
+        // Keep the forward open across all eight calls. The old helper only
+        // released its private F32 K/V when this scope eventually dropped.
+        let _submitted = SubmittedCommands::open(true);
+        encoder_stage::set_pipelined(true);
+        let mut outputs = Vec::new();
+        let output_bytes = u64::from(rows) * u64::from(NH) * u64::from(HEAD_DIM) * 4;
+        let kv_bound = 12 * u64::from(NKV) * u64::from(HEAD_DIM) * u64::from(total);
+        // Same root-rounding allowance as admission, not a history-sized
+        // tolerance: eight leaked F32 pairs exceed this canary by >90 MiB.
+        let rounding = 64 * 16 * 1024;
+        let bound = kv_bound + 8 * output_bytes + rounding;
+        let mut peak_returned = 0;
+        for call in 0..8 {
+            let layer = call % layers as usize;
+            let out = fx.bridge_buf(layer, &qs[layer], history, rows);
+            assert_bitwise("legacy retained-reference bridge", &read(&out), &reference[layer]);
+            outputs.push(out);
+            let live = fx.device.metal_device().current_allocated_size().saturating_sub(baseline);
+            peak_returned = peak_returned.max(live);
+            assert!(
+                live <= bound,
+                "legacy bridge retained completed K/V: call {call}, {live} bytes > {bound}"
+            );
+        }
+        // A submitted failure must surface at this helper's own wait, before
+        // its caller drops arenas. Also exercise an early bridge validation
+        // error after dequant has already been submitted, and both together.
+        for (early_error, submitted_error) in [(false, true), (true, false), (true, true)] {
+            let before = fx.device.metal_device().current_allocated_size();
+            let point = submitted_error
+                .then(|| FailSubmitted::nth("layer.full_attn.tq_bridge_dequant", 0));
+            let result = apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot(
+                &fx.device,
+                &mut fx.registry,
+                &fx.cache.full_attn[0],
+                &qs[0],
+                rows,
+                history + u32::from(early_error),
+                total,
+                fx.capacity,
+                NH,
+                NKV,
+                HEAD_DIM,
+                SlotId(0),
+            );
+            let error = result.expect_err("legacy bridge must propagate its completed failure");
+            if let Some(point) = point.as_ref() {
+                assert_eq!(point.seen(), (true, 1));
+                assert!(format!("{error:#}").contains("committed without a wait failed"));
+            }
+            let after = fx.device.metal_device().current_allocated_size();
+            assert!(
+                after <= before + rounding,
+                "failed legacy bridge retained device roots: {before} -> {after}"
+            );
+        }
+        let recovered = fx.bridge_buf(0, &qs[0], history, rows);
+        assert_bitwise("bridge immediately after failed submissions", &read(&recovered), &reference[0]);
+        eprintln!(
+            "[LEGACY_RESUME_LIFETIME] eight calls, returned live peak {peak_returned} B <= {bound} B; \
+             output parity and early/submitted-error cleanup passed"
+        );
     }
 
     fn median(mut values: Vec<f64>) -> f64 {

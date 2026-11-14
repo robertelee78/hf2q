@@ -1399,6 +1399,75 @@ fn prefill_admission_charges_one_shared_pool_at_cache_capacity() {
 }
 
 #[test]
+fn canonical_qwen38_full_profile_fits_the_readiness_host_without_weakening_admission() {
+    let mut facts = qwen38();
+    facts.tensors.clear();
+    facts.tensors.push(tensor("output.weight", GgmlType::Q6_K, &[248_320, 5_120]));
+    // Actual gate artifact directory: 64 target blocks plus the MTP block,
+    // mixed down/QKV/V storage. Plane sizes do not depend on block order.
+    for block in 0..65 {
+        let name = |leaf: &str| format!("blk.{block}.{leaf}.weight");
+        facts.tensors.extend([
+            tensor(&name("ffn_gate"), GgmlType::Q4_K, &[17_408, 5_120]),
+            tensor(&name("ffn_up"), GgmlType::Q4_K, &[17_408, 5_120]),
+            tensor(
+                &name("ffn_down"),
+                if block < 32 { GgmlType::Q4_K } else { GgmlType::Q6_K },
+                &[5_120, 17_408],
+            ),
+        ]);
+        if block < 48 {
+            facts.tensors.extend([
+                tensor(
+                    &name("attn_qkv"),
+                    if block < 24 { GgmlType::Q4_K } else { GgmlType::Q6_K },
+                    &[10_240, 5_120],
+                ),
+                tensor(&name("attn_gate"), GgmlType::Q4_K, &[6_144, 5_120]),
+                tensor(&name("ssm_out"), GgmlType::Q4_K, &[5_120, 6_144]),
+                tensor(&name("ssm_alpha"), GgmlType::Q4_K, &[48, 5_120]),
+                tensor(&name("ssm_beta"), GgmlType::Q4_K, &[48, 5_120]),
+            ]);
+        } else {
+            facts.tensors.extend([
+                tensor(&name("attn_q"), GgmlType::Q4_K, &[12_288, 5_120]),
+                tensor(&name("attn_k"), GgmlType::Q4_K, &[1_024, 5_120]),
+                tensor(
+                    &name("attn_v"),
+                    if block < 56 { GgmlType::Q4_K } else { GgmlType::Q6_K },
+                    &[1_024, 5_120],
+                ),
+                tensor(&name("attn_output"), GgmlType::Q4_K, &[5_120, 6_144]),
+            ]);
+        }
+    }
+    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
+    assert_eq!(routed_plane_bytes(&facts, &routes, true), 16_087_490_560);
+    let host = HostFacts {
+        available_bytes: 117_435_940_864,
+        ..ROOMY
+    };
+    let full = decide(&facts, host, &env(&[]), &Store::cached(), &|_| None).expect("readiness host");
+    assert!(full.plan.is_some());
+    assert!(!full.routes.any_withheld(), "{}", full.routes.withheld_audit());
+    let memory = full.memory.expect("full memory charge");
+    assert_eq!(memory.headroom_bytes, 40_495_683_744);
+    assert!(memory.scratch_bytes > 12 * GIB, "common/live allocations must be charged");
+    let charge = memory.drafter_bytes + memory.plane_bytes + memory.scratch_bytes;
+    assert!(charge <= memory.headroom_bytes);
+    let exact = HostFacts {
+        available_bytes: host.available_bytes - (memory.headroom_bytes - charge),
+        ..host
+    };
+    let at_bound = decide(&facts, exact, &env(&[]), &Store::cached(), &|_| None).expect("exact");
+    assert!(!at_bound.routes.any_withheld());
+    let below = HostFacts { available_bytes: exact.available_bytes - 1, ..exact };
+    let refused = decide(&facts, below, &env(&[]), &Store::cached(), &|_| None).expect("one byte short");
+    assert!(refused.plan.is_some(), "the drafter alone still fits");
+    assert!(!refused.routes.is_on(switch("HF2Q_QWEN_PREFILL_JOINT")));
+}
+
+#[test]
 fn a_load_takes_only_what_is_available_now_and_not_already_promised() {
     let host = |available_gib: u64, kv_gib: u64, charged_gib: u64| HostFacts {
         physical_bytes: 128 * GIB,
