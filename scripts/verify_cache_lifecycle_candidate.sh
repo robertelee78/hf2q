@@ -22,7 +22,7 @@ fail() {
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 
-for command in awk find gh grep jq shasum tr wc; do
+for command in awk find gh grep jq python3 shasum tr wc; do
   command -v "$command" >/dev/null || fail "missing required command: $command"
 done
 for id in "$run_id" "$candidate_run_id"; do
@@ -70,7 +70,8 @@ jq -e --arg source_sha "$source_sha" --arg version "$version" \
   --arg candidate_run_id "$candidate_run_id" \
   --arg crate_sha256 "$crate_sha256" --arg binary_sha256 "$binary_sha256" '
     .kind == "hf2q.cache-lifecycle-release-manifest"
-    and .schema_version == 2
+    and .schema_version == 3
+    and (.phase_ledger | type == "object")
     and .status == "pass"
     and .source_sha == $source_sha
     and .version == $version
@@ -102,6 +103,10 @@ jq -e --arg source_sha "$source_sha" --arg version "$version" \
     and all(.families.deepseek,.families.gemma,.families.qwen,.families.qwen38;
       .status == "pass" and .structured_outputs.status == "pass")
   ' "$manifest" >/dev/null || fail "qualification manifest identity is invalid"
+
+python3 "$script_dir/cache_release_orchestrator.py" consumer-verify \
+  "$output_directory" "$manifest" >/dev/null || \
+  fail "qualification phase ledger is invalid"
 
 for family in deepseek gemma qwen qwen38; do
   receipt="$output_directory/$family/r2c-structured"
