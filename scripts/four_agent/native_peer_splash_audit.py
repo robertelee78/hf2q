@@ -20,8 +20,8 @@ from pathlib import Path
 import re
 import sys
 
-from native_peer_splash import ENGINE, MODEL_IDS, SPLASH_COMMIT
-from native_peer_splash_ready import token_sha256
+from native_peer_splash import ARTIFACTS, ENGINE, MODEL_IDS, SLOTS, SPLASH_COMMIT, canonical, request_controls
+from native_peer_splash_ready import sha256, token_sha256
 from qwen38_n1_verdict import Invalid, loads, require
 
 STAMP = r'^\d\d:\d\d:\d\d '
@@ -92,26 +92,131 @@ def audit_run(summary, client_dir, turns):
 PARITY_DIR = 'splash-prompt-parity'   # {run}/splash-prompt-parity: splash_sweep.py parity-config's default output
 
 
+def parity_inputs(run, source_hashes=None):
+    """Return the complete raw input set after checking the Rust oracle chain."""
+    from splash_sweep import ARCHITECTURES
+    directory = Path(run).resolve() / PARITY_DIR
+    config_path = directory / 'config.json'
+    result_path = directory / 'splash-prompt-parity-post-oracle.json'
+    config_bytes = config_path.read_bytes()
+    config, result = loads(config_bytes), loads(result_path.read_bytes())
+    require(isinstance(config, dict) and set(config) == {'architecture', 'template', 'turns', 'output'},
+            'closed prompt-parity configuration required')
+    families = [family for family, architecture in ARCHITECTURES.items()
+                if architecture == config['architecture']]
+    require(len(families) == 1 and Path(config['output']).resolve() == result_path,
+            'prompt-parity architecture/output mismatch')
+    family = families[0]
+    sources = {name + '_source_sha256': Path(__file__).resolve().parents[2] / 'src/serve/api' / filename
+               for name, filename in (('oracle', 'handlers_splash_prompt_parity_post_oracle_tests.rs'),
+                                      ('handler', 'handlers.rs'), ('renderer', 'engine.rs'))}
+    if source_hashes is None:
+        source_hashes = {key: sha256(path) for key, path in sources.items()}
+    require(isinstance(source_hashes, dict) and set(source_hashes) == set(sources)
+            and all(isinstance(value, str) and re.fullmatch('[0-9a-f]{64}', value)
+                    for value in source_hashes.values()), 'invalid prompt-parity source binding')
+    require(isinstance(result, dict) and set(result) == {
+        'schema', 'hf2q_prompt_parity', 'model_inference_performed', 'architecture',
+        'config_sha256', 'template_file_sha256', 'observations', *sources},
+        'closed prompt-parity oracle result required')
+    require(result['schema'] == 'hf2q.splash-prompt-parity-post-oracle.v1'
+            and result['hf2q_prompt_parity'] == 'PassedByteIdentical'
+            and result['model_inference_performed'] is False
+            and result['architecture'] == config['architecture']
+            and result['config_sha256'] == hashlib.sha256(config_bytes).hexdigest()
+            and all(result[key] == digest for key, digest in source_hashes.items()),
+            'prompt-parity oracle result/config/source mismatch')
+    files = {config_path, result_path}
+
+    def bound(spec, expected=None):
+        require(isinstance(spec, dict) and set(spec) == {'path', 'sha256'}
+                and isinstance(spec['path'], str) and Path(spec['path']).is_absolute()
+                and isinstance(spec['sha256'], str)
+                and re.fullmatch('[0-9a-f]{64}', spec['sha256']) is not None,
+                'malformed prompt-parity bound input')
+        path = Path(spec['path']).resolve()
+        require((expected is None or
+                 (path == expected.resolve() and path.parent == expected.parent.resolve()))
+                and sha256(path) == spec['sha256'], 'prompt-parity bound input path/hash mismatch')
+        files.add(path)
+        return path
+
+    bound(config['template'])
+    require(config['template']['sha256'] == result['template_file_sha256']
+            == ARTIFACTS[family]['template_sha256'], 'prompt-parity reviewed template mismatch')
+    root = directory.parent / 'client'
+    agents = {f'agent-{index}' for index in range(SLOTS)}
+    archived = set()
+    for pattern in ('agent-*/turn-*/receipt.json', 'agent-*/turn-*/response-headers.json'):
+        for path in root.glob(pattern):
+            require((path.parent / 'request.json').is_file(),
+                    'prompt-parity standalone response record has no actual request archive')
+    for path in root.glob('agent-*/turn-*/request.json'):
+        agent, turn_dir = path.parent.parent.name, path.parent.name
+        turn = int(turn_dir.removeprefix('turn-'))
+        require(agent in agents and turn >= 0 and turn_dir == f'turn-{turn}',
+                'noncanonical archived request directory')
+        archived.add((agent, turn))
+    turns, observations = config['turns'], result['observations']
+    require(isinstance(turns, list) and turns and isinstance(observations, list)
+            and len(turns) == len(observations), 'prompt-parity observation coverage mismatch')
+    seen = set()
+    for turn, observation in zip(turns, observations):
+        require(isinstance(turn, dict) and set(turn) == {
+            'agent', 'turn', 'canonical_request', 'splash_apply_template'}
+            and turn['agent'] in agents and type(turn['turn']) is int and turn['turn'] >= 0,
+            'malformed prompt-parity turn')
+        key = turn['agent'], turn['turn']
+        require(key not in seen, 'duplicate prompt-parity turn')
+        seen.add(key)
+        raw_directory = root / key[0] / f'turn-{key[1]}'
+        canonical_path = bound(turn['canonical_request'], directory / f'{key[0]}-turn-{key[1]}.canonical-request.json')
+        rendered_path = bound(turn['splash_apply_template'], raw_directory / 'splash-apply-template.raw')
+        request_path = raw_directory / 'request.json'
+        raw = request_path.read_bytes()
+        files.add(request_path)
+        request = loads(raw)
+        require(isinstance(request, dict) and request.get('model') == MODEL_IDS[family],
+                'prompt-parity actual request family mismatch')
+        canonical_request = canonical(request, 'qwen')
+        request_controls({key: value for key, value in canonical_request.items() if key != 'stream_options'}, 'qwen')
+        require(loads(canonical_path.read_bytes()) == canonical_request,
+                'prompt-parity canonical request differs from actual request')
+        raw_sha = hashlib.sha256(raw).hexdigest()
+        for name in ('response-headers.json', 'receipt.json'):
+            path = raw_directory / name
+            if path.exists():
+                record = loads(path.read_bytes())
+                require(isinstance(record, dict) and record.get('request_sha256') == raw_sha,
+                        'prompt-parity raw request digest record mismatch')
+                files.add(path)
+        rendered = loads(rendered_path.read_bytes())
+        require(isinstance(rendered, dict) and set(rendered) == {'prompt'}
+                and isinstance(rendered['prompt'], str) and rendered['prompt'],
+                'malformed native prompt rendering')
+        prompt = rendered['prompt'].encode()
+        expected = {'agent': key[0], 'turn': key[1],
+                    'canonical_request_sha256': sha256(canonical_path),
+                    'splash_apply_template_sha256': sha256(rendered_path),
+                    'prompt_sha256': hashlib.sha256(prompt).hexdigest(),
+                    'prompt_bytes': len(prompt), 'equal': True}
+        require(isinstance(observation, dict) and observation == expected
+                and observation['equal'] is True and type(observation['prompt_bytes']) is int,
+                'prompt-parity oracle observation mismatch')
+    require(seen == archived, 'prompt-parity oracle does not cover every actual archived request')
+    return files
+
+
 def prompt_parity(run):
-    """The hf2q prompt-parity post-oracle result of one run: PassedByteIdentical only when the oracle's output binds
-    the config beside it (config_sha256) and that config's Splash renderings are this run's; PendingPostOracle when
-    the oracle has not passed (a mismatch panics and writes no output); a reason string otherwise."""
-    directory = Path(run) / PARITY_DIR
-    config_path, result_path = directory / 'config.json', directory / 'splash-prompt-parity-post-oracle.json'
-    if not config_path.is_file() or not result_path.is_file():
+    """Parity does not make a failed/summaryless client run valid."""
+    directory = Path(run).resolve() / PARITY_DIR
+    if not all((directory / name).is_file()
+               for name in ('config.json', 'splash-prompt-parity-post-oracle.json')):
         return 'PendingPostOracle'
     try:
-        config, result = loads(config_path.read_bytes()), loads(result_path.read_bytes())
-    except (OSError, Invalid) as exc:
-        return f'unreadable prompt-parity record: {exc}'
-    if not (isinstance(result, dict) and result.get('schema') == 'hf2q.splash-prompt-parity-post-oracle.v1'
-            and result.get('hf2q_prompt_parity') == 'PassedByteIdentical'
-            and result.get('config_sha256') == hashlib.sha256(config_path.read_bytes()).hexdigest()):
-        return 'the prompt-parity result is not PassedByteIdentical for the config beside it'
-    turns = config.get('turns') if isinstance(config, dict) else None
-    root = Path(run).resolve() / 'client'
-    if not turns or not all(Path(t['splash_apply_template']['path']).resolve().is_relative_to(root) for t in turns):
-        return "the prompt-parity config does not bind this run's Splash renderings"
+        parity_inputs(run)
+    except (OSError, Invalid, KeyError, TypeError, ValueError, AttributeError) as exc:
+        return f'invalid prompt-parity evidence: {type(exc).__name__}: {exc}'
     return 'PassedByteIdentical'
 
 

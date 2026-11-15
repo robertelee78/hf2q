@@ -442,21 +442,18 @@ class Checks(unittest.TestCase):
             self.assertFalse(splash_sweep.select([record])['configurations'][S0]['valid'])
 
     def test_prompt_parity_needs_the_oracle_result_bound_to_its_config(self):
-        import hashlib
+        from test_splash_parity_coverage import bound, save, write_oracle_fixture
         with tempfile.TemporaryDirectory() as root:
-            run = Path(root) / 'run'
-            directory = run / audit.PARITY_DIR
-            directory.mkdir(parents=True)
-            config = json.dumps({'turns': [{'splash_apply_template': {
-                'path': str(run / 'client' / 'agent-0' / 'turn-0' / 'splash-apply-template.raw')}}]})
-            (directory / 'config.json').write_text(config)
-            self.assertEqual(audit.prompt_parity(run), 'PendingPostOracle')
-            result = {'schema': 'hf2q.splash-prompt-parity-post-oracle.v1', 'hf2q_prompt_parity': 'PassedByteIdentical',
-                      'config_sha256': hashlib.sha256(config.encode()).hexdigest()}
-            (directory / 'splash-prompt-parity-post-oracle.json').write_text(json.dumps(result))
-            self.assertEqual(audit.prompt_parity(run), 'PassedByteIdentical')
-            (directory / 'splash-prompt-parity-post-oracle.json').write_text(json.dumps({**result, 'config_sha256': 'x'}))
-            self.assertNotEqual(audit.prompt_parity(run), 'PassedByteIdentical')
+            fixture = write_oracle_fixture(root)
+            fixture['result_path'].unlink()
+            self.assertEqual(audit.prompt_parity(fixture['run']), 'PendingPostOracle')
+            save(fixture['result_path'], fixture['result'])
+            with mock.patch.dict(sp.ARTIFACTS['qwen38'], {
+                'template_sha256': bound(fixture['template'])['sha256'],
+            }):
+                self.assertEqual(audit.prompt_parity(fixture['run']), 'PassedByteIdentical')
+                save(fixture['result_path'], {**fixture['result'], 'config_sha256': '0' * 64})
+                self.assertNotEqual(audit.prompt_parity(fixture['run']), 'PassedByteIdentical')
 
 
 class Audit(unittest.TestCase):

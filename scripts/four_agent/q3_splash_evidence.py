@@ -98,67 +98,12 @@ def original_approval(run, receipt):
 
 
 def parity_inputs(run, source_hashes):
-    """Recheck the existing Rust oracle's complete input/observation chain, including failed turns."""
-    directory = run / audit.PARITY_DIR
-    config_path, result_path = directory / "config.json", directory / "splash-prompt-parity-post-oracle.json"
-    config, result = read(config_path), read(result_path)
-    require(set(config) == {"architecture", "template", "turns", "output"}
-            and config["architecture"] == "qwen35"
-            and Path(config["output"]).resolve() == result_path.resolve(),
-            "invalid-Splash parity oracle configuration mismatch")
-    require(set(result) == {"schema", "hf2q_prompt_parity", "model_inference_performed", "architecture",
-                            "config_sha256", "template_file_sha256", *ORACLE_SOURCES, "observations"}
-            and result["schema"] == "hf2q.splash-prompt-parity-post-oracle.v1"
-            and result["hf2q_prompt_parity"] == "PassedByteIdentical"
-            and result["model_inference_performed"] is False and result["architecture"] == "qwen35"
-            and result["config_sha256"] == ready.sha256(config_path)
-            and all(result[key] == sha for key, sha in source_hashes.items()),
-            "invalid-Splash parity oracle result/source binding mismatch")
-    files = {config_path, result_path}
-    def bound(spec, expected=None):
-        require(isinstance(spec, dict) and set(spec) == {"path", "sha256"}
-                and isinstance(spec["path"], str) and Path(spec["path"]).is_absolute()
-                and isinstance(spec["sha256"], str) and re.fullmatch("[0-9a-f]{64}", spec["sha256"]) is not None,
-                "invalid-Splash malformed parity bound input")
-        path = Path(spec["path"]).resolve()
-        require((expected is None or path == expected.resolve()) and ready.sha256(path) == spec["sha256"],
-                "invalid-Splash parity bound input path/hash mismatch")
-        files.add(path)
-        return path
-    template = bound(config["template"])
-    require(config["template"]["sha256"] == result["template_file_sha256"]
-            == sp.ARTIFACTS["qwen38"]["template_sha256"], "invalid-Splash parity reviewed template mismatch")
-    turns, observations = config["turns"], result["observations"]
-    require(isinstance(turns, list) and turns and isinstance(observations, list) and len(turns) == len(observations),
-            "invalid-Splash parity oracle observation coverage mismatch")
-    archived = {(p.parent.parent.name, int(p.parent.name.removeprefix("turn-")))
-                for p in (run / "client").glob("agent-*/turn-*/request.json")}
-    seen = set()
-    for turn, observation in zip(turns, observations):
-        require(isinstance(turn, dict) and set(turn) == {"agent", "turn", "canonical_request", "splash_apply_template"}
-                and turn["agent"] in n4.AGENTS and type(turn["turn"]) is int and turn["turn"] >= 0,
-                "invalid-Splash malformed parity turn")
-        key = turn["agent"], turn["turn"]
-        require(key not in seen, "invalid-Splash duplicate parity turn")
-        seen.add(key)
-        raw_directory = run / "client" / turn["agent"] / f"turn-{turn['turn']}"
-        canonical_path = bound(turn["canonical_request"], directory / f"{turn['agent']}-turn-{turn['turn']}.canonical-request.json")
-        rendered_path = bound(turn["splash_apply_template"], raw_directory / "splash-apply-template.raw")
-        request_path = raw_directory / "request.json"
-        require(read(canonical_path) == sp.canonical(read(request_path), "qwen"),
-                "invalid-Splash parity canonical request differs from actual archived request")
-        prompt = read(rendered_path)["prompt"]
-        require(isinstance(prompt, str) and prompt, "invalid-Splash parity rendered prompt missing")
-        expected = {"agent": key[0], "turn": key[1],
-                    "canonical_request_sha256": ready.sha256(canonical_path),
-                    "splash_apply_template_sha256": ready.sha256(rendered_path),
-                    "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-                    "prompt_bytes": len(prompt.encode()), "equal": True}
-        require(isinstance(observation, dict) and observation == expected
-                and observation["equal"] is True and type(observation["prompt_bytes"]) is int,
-                "invalid-Splash parity oracle observation mismatch")
-    require(seen == archived and {(agent, 0) for agent in n4.AGENTS} <= seen,
-            "invalid-Splash parity oracle does not cover every archived request, including failed turns")
+    """Apply Qwen3.8's narrower exemption only after the shared complete oracle check."""
+    files = audit.parity_inputs(run, source_hashes)
+    config = read(run / audit.PARITY_DIR / "config.json")
+    seen = {(turn["agent"], turn["turn"]) for turn in config["turns"]}
+    require(config["architecture"] == "qwen35" and {(agent, 0) for agent in n4.AGENTS} <= seen,
+            "invalid-Splash parity oracle does not cover the canonical Qwen3.8 cohort")
     return files
 
 

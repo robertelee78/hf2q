@@ -501,9 +501,6 @@ def token_sha256(tokens):
 def _render_request(port, directory, turn, receipt=None):
     raw = (directory / 'request.json').read_bytes()
     request_sha = hashlib.sha256(raw).hexdigest()
-    if receipt is not None:
-        require(request_sha == receipt['request_sha256'],
-                'Splash render proof: request archive differs from its receipt')
     request = loads(raw)
     rendered = fetch(port, '/apply-template', directory, 'splash-apply-template.raw',
                      {k: request[k] for k in TEMPLATE_FIELDS}, RENDER_LIMIT, 60)
@@ -516,6 +513,8 @@ def _render_request(port, directory, turn, receipt=None):
     require(isinstance(doc, dict) and set(doc) == {'tokens'} and isinstance(doc['tokens'], list)
             and all(type(t) is int and t >= 0 for t in doc['tokens']), 'Splash /tokenize envelope')
     if receipt is not None:
+        require(request_sha == receipt['request_sha256'],
+                'Splash render proof: request archive differs from its receipt')
         require(len(doc['tokens']) == receipt['usage']['prompt_tokens'],
                 'Splash rendered prompt token count differs from the turn usage.prompt_tokens')
     return {'turn': turn, 'request_sha256': request_sha,
@@ -531,15 +530,36 @@ def render_proof(base, output, turns):
     Failed/unvalidated turns are separate observations, never successful task receipts.
     """
     port, output = _port(base), Path(output)
-    rows = [_render_request(port, output / f"turn-{receipt['turn']}", receipt['turn'], receipt)
-            for receipt in turns]
-    validated = {receipt['turn'] for receipt in turns}
-    unvalidated = []
-    for path in sorted(output.glob('turn-*/request.json')):
-        turn = int(path.parent.name.removeprefix('turn-'))
-        require(path.parent.name == f'turn-{turn}', 'Splash render proof: noncanonical turn directory')
-        if turn not in validated:
-            unvalidated.append(_render_request(port, path.parent, turn))
+    rows, unvalidated, errors, receipts = [], [], [], {}
+    if not isinstance(turns, list):
+        errors.append('receipts: expected a list of validated turns')
+        turns = []
+    for index, receipt in enumerate(turns):
+        try:
+            require(isinstance(receipt, dict) and type(receipt.get('turn')) is int and receipt['turn'] >= 0,
+                    'Splash render proof: malformed turn receipt')
+            directory = output / f"turn-{receipt['turn']}"
+            require(directory not in receipts, 'Splash render proof: duplicate turn receipt')
+            receipts[directory] = receipt
+        except Exception as exc:
+            errors.append(f'receipt {index}: {type(exc).__name__}: {exc}')
+    directories = list(receipts)
+    directories += [path.parent for path in sorted(output.glob('turn-*/request.json'))
+                    if path.parent not in receipts]
+    for directory in directories:
+        turn = None
+        try:
+            turn = int(directory.name.removeprefix('turn-'))
+            require(turn >= 0 and directory.name == f'turn-{turn}', 'Splash render proof: noncanonical turn directory')
+        except Exception as exc:
+            errors.append(f'{directory.name}: {type(exc).__name__}: {exc}')
+        try:
+            receipt = receipts.get(directory)
+            row = _render_request(port, directory, turn, receipt)
+            (rows if receipt is not None else unvalidated).append(row)
+        except Exception as exc:
+            errors.append(f'{directory.name}: {type(exc).__name__}: {exc}')
+    require(not errors, 'Splash render proof: capture failed: ' + '; '.join(errors))
     return {'status': 'Observed', 'endpoints': ['/apply-template', '/tokenize'], 'fields': list(TEMPLATE_FIELDS),
             'turns': rows, 'unvalidated_turns': unvalidated,
             'timing': 'coordinator closing, after every agent stopped: outside the makespan clock',
@@ -550,19 +570,25 @@ def render_proof(base, output, turns):
 
 def closing(base, output):
     """After agents stop, capture every request before checking the strict successful-run status counters."""
-    render, turns, summary_errors = {}, [], []
+    render, turns, errors = {}, [], []
     for directory in sorted(Path(output).glob('agent-*')):
         if not directory.is_dir():
             continue
         summary = directory / 'summary.json'
         try:
-            receipts = loads(summary.read_bytes())['turns'] if summary.exists() else []
+            doc = loads(summary.read_bytes())
+            require(isinstance(doc, dict) and isinstance(doc.get('turns'), list),
+                    'Splash closing: malformed agent summary turns')
+            receipts = doc['turns']
         except Exception as exc:
-            summary_errors.append(f'{directory.name}: {type(exc).__name__}: {exc}')
+            errors.append(f'{directory.name} summary: {type(exc).__name__}: {exc}')
             receipts = []
-        render[directory.name] = render_proof(base, directory, receipts)
+        try:
+            render[directory.name] = render_proof(base, directory, receipts)
+        except Exception as exc:
+            errors.append(f'{directory.name} render: {type(exc).__name__}: {exc}')
         turns += receipts
-    require(not summary_errors, 'Splash closing: unreadable agent summaries: ' + '; '.join(summary_errors))
+    require(not errors, 'Splash closing: capture failed: ' + '; '.join(errors))
     inputs = loads(Path(output, CLOSING_INPUTS).read_bytes())
     spec = native_spec({**inputs['spec'], 'port': str(inputs['spec']['port'])})
     status = validate_status(loads(fetch(_port(base), '/status', output, 'splash-status-final.raw')), spec,

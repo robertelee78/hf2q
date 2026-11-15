@@ -481,10 +481,20 @@ bound ≤ 1.00) with every valid peer, the peer and Splash alike; Qwen3.8 follow
     on the `._*` files macOS writes there.
   - The run must add no draft pin to the shared HF cache (`refs/splash`); local sources carry none.
   - `/status` must report the configured KV format and cache dtype and no engine restart, at readiness and closing.
-- **Sweep.** After each settled sweep run, write `parity-config RUN --template FILE` (default output
-  `RUN/splash-prompt-parity`) and run hf2q's `splash_prompt_parity_post_oracle` on it. `select` counts a
-  configuration valid only when every run has a `PassedByteIdentical` result there. A run that stopped before the
-  client is an invalid row of its own.
+- **Sweep and failed-client evidence.** After every run that archived an actual request, including failed or
+  interrupted clients, write `parity-config RUN --template FILE` (default output `RUN/splash-prompt-parity`)
+  and run hf2q's `splash_prompt_parity_post_oracle` on it. Closing attempts every archived request and agent
+  before reporting ordinary capture errors; hash, usage, endpoint or summary failures still invalidate the run.
+  Keep the server available for closing's `/apply-template` and `/tokenize` captures. Missing native renderings
+  cannot be reconstructed or omitted to obtain a passing proof.
+  - If `client/summary.json` is absent, offline configuration requires the matching archived
+    `client/splash-closing-inputs.json` and original `splash/launch.json`, pinned identities, actual request
+    models and reviewed template. A present corrupt summary or incomplete/conflicting provenance is refused.
+  - The oracle consumer rechecks every actual request, standalone response record, canonical/native rendering,
+    template and source digest, and every observation. Subset, duplicate or stale proofs cannot qualify a run.
+    Qwen3.8's narrower invalid-Splash exemption still requires all four initial requests.
+  - Prompt parity never makes a failed or summaryless client valid. `select` retains its task, audit and memory
+    gates; a run stopped before the client is an invalid row of its own.
 - **Q3.** `--splash-case` defaults to `q5_cases/splash-<family>.json` for qwen38/qwen36. The arm runs only in the
   `n4` and `n1` stages (D7). `--splash-unavailable-evidence` declares Splash unavailable; the family verdict is
   then `Unavailable`, never a Win against the peer alone. A peer-unavailable campaign requires no Splash arm (its

@@ -33,7 +33,7 @@ import sys
 import native_peer_splash as sp
 import q3_stats
 import quality_campaign
-from qwen38_n1_verdict import require
+from qwen38_n1_verdict import loads, require
 
 HERE = Path(__file__).resolve().parent
 PASS_FLOOR = quality_campaign.POLICY["paired_min_pass_fraction"]
@@ -125,17 +125,153 @@ def select(records):
 ARCHITECTURES = {'qwen38': 'qwen35', 'qwen36': 'qwen35moe'}
 
 
+def _summaryless_family(run):
+    """Use archived launch/readiness facts only; never inspect the current model, build or host."""
+    import hashlib
+    import native_peer_splash_ready as ready
+    inputs = loads((run / 'client' / ready.CLOSING_INPUTS).read_bytes())
+    require(isinstance(inputs, dict) and set(inputs) == {'spec', 'server_pid', 'state_before'},
+            'Splash closing inputs are missing or malformed')
+    spec = ready.native_spec(inputs['spec'])
+    require(inputs['spec'] == spec and spec['run_dir'] == str(run / 'splash'),
+            'Splash closing inputs do not bind this run')
+    pid = inputs['server_pid']
+    require(type(pid) is int and pid > 0, 'Splash closing inputs require the original positive server PID')
+    launch = loads((run / 'splash' / 'launch.json').read_bytes())
+    require(isinstance(launch, dict) and launch.get('schema') == 'hf2q.splash-launch.v1'
+            and type(launch.get('pid')) is int and launch['pid'] == pid
+            and launch.get('spec') == {k: spec[k] for k in ready.LAUNCH_KEYS},
+            'Splash archived launch PID/spec differs from closing inputs')
+    before = inputs['state_before']
+    require(isinstance(before, dict) and set(before) == {
+        'ane_dir', 'ane_remembered', 'prefix_cache_namespaces', 'draft_pin_dir', 'draft_pins'},
+        'Splash archived state_before is malformed')
+    require(isinstance(before['ane_dir'], str) and Path(before['ane_dir']).is_absolute()
+            and before['draft_pin_dir'] == str(ready.pin_dir(spec['draft_dir']))
+            and isinstance(before['ane_remembered'], dict)
+            and all(isinstance(k, str) and isinstance(v, str) and ready.HEX64.fullmatch(v)
+                    for k, v in before['ane_remembered'].items())
+            and all(isinstance(before[k], list) and all(isinstance(v, str) for v in before[k])
+                    for k in ('prefix_cache_namespaces', 'draft_pins'))
+            and launch.get('state_before') == before, 'Splash archived launch state differs or is malformed')
+    q3 = spec['q3_family']
+    artifact = sp.ARTIFACTS[q3]
+    identity = launch.get('identity')
+    require(isinstance(identity, dict), 'Splash archived launch identity is missing')
+    expected = {
+        'source': {'commit': spec['commit'], 'describe': sp.SPLASH_DESCRIBE, 'build_id': spec['build_id'],
+                   'binary_sha256': spec['binary_sha256'], 'metallib_sha256': spec['metallib_sha256'],
+                   'host_step_sha256': spec['host_step_sha256'], 'requirements_sha256': sp.REQUIREMENTS_SHA256,
+                   'tracked_changes': 'none (git status --untracked-files=no)'},
+        'venv': {'venv': str(Path(spec['splash_dir']) / '.venv'), 'freeze_sha256': spec['venv_freeze_sha256']},
+        'draft': {'repo': artifact['draft_repo'], 'revision': artifact['draft_revision'], 'path': str(Path(spec['draft_dir'])),
+                  'config_sha256': artifact['draft_config_sha256'], 'weights_sha256': artifact['draft_weights_sha256']},
+        'model': {'path': spec['model'], 'sha256': spec['model_sha256'],
+                  'sha256_source': 'Splash model.json content digest (verify_assembly)'},
+    }
+    for section, fields in expected.items():
+        record = identity.get(section)
+        require(isinstance(record, dict) and all(record.get(k) == v for k, v in fields.items()),
+                f'Splash archived {section} identity differs from its pinned launch')
+    toolchain = identity['source'].get('toolchain')
+    require(isinstance(toolchain, dict) and toolchain.get('sha256') == spec['toolchain_sha256']
+            and isinstance(toolchain.get('versions'), dict)
+            and set(toolchain['versions']) == set(ready.TOOLCHAIN)
+            and all(isinstance(v, str) for v in toolchain['versions'].values()),
+            'Splash archived toolchain identity differs from its launch')
+    require(hashlib.sha256(json.dumps(toolchain['versions'], sort_keys=True).encode()).hexdigest()
+            == toolchain['sha256'], 'Splash archived toolchain digest is invalid')
+    assembly = launch.get('assembly')
+    require(isinstance(assembly, dict) and isinstance(assembly.get('path'), str),
+            'Splash archived assembly is missing')
+    assembly_path = Path(assembly['path'])
+    require(assembly_path.is_absolute() and assembly_path.parent == run / 'splash' / 'models' / '.resolved'
+            and assembly_path.name not in ('.', '..')
+            and assembly.get('family') == artifact['splash_family']
+            and assembly.get('target_digest') == spec['model_sha256']
+            and assembly.get('draft_digest') == artifact['draft_weights_sha256']
+            and assembly.get('template_digest') == artifact['template_sha256']
+            and isinstance(assembly.get('model_json_sha256'), str)
+            and ready.HEX64.fullmatch(assembly['model_json_sha256'])
+            and isinstance(assembly.get('linked_files'), list)
+            and all(isinstance(v, str) for v in assembly['linked_files'])
+            and 'tokenizer/chat_template.jinja' in assembly['linked_files'],
+            'Splash archived assembly paths/family/model/template differ from its launch')
+    require(launch.get('argv') == ready.server_argv(spec, assembly['path']),
+            'Splash archived server argv differs from its launch')
+    env = launch.get('env')
+    require(isinstance(env, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()),
+            'Splash archived server environment is malformed')
+    ready.check_environ({k: v for k, v in env.items() if k != 'PYTHONPATH'})
+    require(env.get('PYTHONPATH') == spec['splash_dir'], 'Splash archived PYTHONPATH differs from its launch')
+    return q3
+
+
+def _parity_receipts(client, summary):
+    """Validate both receipt sources, including conflicts hidden by a missing agent summary."""
+    receipts = {}
+    agents = summary.get('agents', {})
+    require(isinstance(agents, dict), 'Splash client summary has malformed agent receipts')
+    sources = [(path.parent.name, loads(path.read_bytes()))
+               for path in sorted(client.glob('agent-*/summary.json'))]
+    sources += list(agents.items())
+    # exchange() archives these before its caller can update an agent summary.
+    # A summaryless interruption must not hide a missing actual request.
+    for pattern in ('agent-*/turn-*/receipt.json', 'agent-*/turn-*/response-headers.json'):
+        for path in sorted(client.glob(pattern)):
+            require((path.parent / 'request.json').is_file(),
+                    f'{path.parent}: standalone response record has no actual request archive')
+    for agent, record in sources:
+        require(isinstance(agent, str) and agent.startswith('agent-') and agent[6:].isdecimal()
+                and agent == f'agent-{int(agent[6:])}', 'Splash noncanonical agent receipt')
+        require(isinstance(record, dict) and isinstance(record.get('turns'), list),
+                f'{agent}: malformed Splash agent receipts')
+        seen = set()
+        for row in record['turns']:
+            require(isinstance(row, dict) and type(row.get('turn')) is int and row['turn'] >= 0,
+                    f'{agent}: malformed Splash turn receipt')
+            key = agent, row['turn']
+            require(key not in seen, f'{agent}: duplicate Splash turn receipt')
+            seen.add(key)
+            require(key not in receipts or receipts[key] == row, f'{agent}: conflicting Splash turn receipts')
+            receipts[key] = row
+    return receipts
+
+
+def _parity_record(record, directory, turn, raw, digest):
+    require(isinstance(record, dict) and record.get('request_sha256') == digest(raw),
+            f'{directory}: request archive changed or digest invalid')
+    if 'turn' in record:
+        require(type(record['turn']) is int and record['turn'] == turn, f'{directory}: receipt turn differs')
+    for key, body in (('request_bytes', raw), ('response_bytes', None), ('response_sha256', None)):
+        if key not in record:
+            continue
+        if body is None:
+            body = (directory / 'response.bin').read_bytes()
+        if key.endswith('_bytes'):
+            require(type(record[key]) is int and record[key] == len(body), f'{directory}: {key} differs')
+        else:
+            require(record[key] == digest(body), f'{directory}: {key} differs')
+
+
 def parity_config(run_dir, template, output_dir=None):
-    """Oracle config (and the canonical request files it binds) for one settled Splash run. The default directory,
-    {run}/splash-prompt-parity, is where run_record (and so `select`) reads the oracle's result."""
+    """Bind every actual archived Splash request, including interrupted clients, to offline oracle inputs.
+    This is not a successful-run audit. The default directory is where run_record reads the oracle result."""
     import hashlib
     from native_peer_splash_audit import PARITY_DIR
     run = Path(run_dir).resolve()
     out = Path(output_dir).resolve() if output_dir is not None else run / PARITY_DIR
-    summary = json.loads((run / 'client' / 'summary.json').read_text())
-    ready = summary.get('native_readiness') or {}
-    q3 = ready.get('q3_family')
-    require(summary.get('engine_kind') == sp.ENGINE and q3 in sp.ARTIFACTS, f'{run} is not a settled Splash run')
+    client = run / 'client'
+    summary_path = client / 'summary.json'
+    if summary_path.exists() or summary_path.is_symlink():
+        summary = loads(summary_path.read_bytes())
+        require(isinstance(summary, dict) and summary.get('engine_kind') == sp.ENGINE
+                and isinstance(summary.get('native_readiness'), dict), f'{run} is not a Splash client summary')
+        q3 = summary['native_readiness'].get('q3_family')
+        require(isinstance(q3, str) and q3 in sp.ARTIFACTS, f'{run} has no pinned Splash family')
+    else:
+        summary = {}
+        q3 = _summaryless_family(run)
     template_bytes = Path(template).read_bytes()
     digest = lambda data: hashlib.sha256(data).hexdigest()
     require(digest(template_bytes) == sp.ARTIFACTS[q3]['template_sha256'],
@@ -144,34 +280,29 @@ def parity_config(run_dir, template, output_dir=None):
     require(not any((p / '.git').exists() for p in (out.parent, *out.parent.parents)), 'output must be outside Git')
     out.mkdir(mode=0o700)
     turns = []
-    agent_receipts = {
-        agent_summary.parent.name: json.loads(agent_summary.read_text())['turns']
-        for agent_summary in sorted((run / 'client').glob('agent-*/summary.json'))
-    }
-    agents = summary.get('agents') or {}
-    require(isinstance(agents, dict), f'{run} client summary has no agent receipts')
-    for agent, receipt in sorted(agents.items()):
-        agent_receipts.setdefault(agent, receipt['turns'])
-    receipts = {(agent, receipt['turn']): receipt
-                for agent, rows in agent_receipts.items() for receipt in rows}
+    receipts = _parity_receipts(client, summary)
     observed = set()
     for request_path in sorted((run / 'client').glob('agent-*/turn-*/request.json')):
         directory = request_path.parent
         agent = directory.parent.name
+        require(agent[6:].isdecimal() and agent == f'agent-{int(agent[6:])}',
+                f'{agent}: noncanonical agent directory')
         turn = int(directory.name.removeprefix('turn-'))
-        require(directory.name == f'turn-{turn}', f'{agent}: noncanonical turn directory')
+        require(turn >= 0 and directory.name == f'turn-{turn}', f'{agent}: noncanonical turn directory')
         raw = request_path.read_bytes()
-        request_sha = digest(raw)
         receipt = receipts.get((agent, turn))
         if receipt is not None:
-            require(request_sha == receipt['request_sha256'], f'{agent} turn {turn}: request archive changed')
+            _parity_record(receipt, directory, turn, raw, digest)
         for name in ('response-headers.json', 'receipt.json'):
             record_path = directory / name
             if record_path.exists():
-                record = json.loads(record_path.read_bytes())
-                require(isinstance(record, dict) and record.get('request_sha256') == request_sha,
-                        f'{agent} turn {turn}: {name} request archive changed or digest invalid')
-        canonical = sp.canonical(json.loads(raw), 'qwen')
+                _parity_record(loads(record_path.read_bytes()), directory, turn, raw, digest)
+        request = loads(raw)
+        require(isinstance(request, dict) and request.get('model') == sp.MODEL_IDS[q3],
+                f'{agent} turn {turn}: request model differs from the pinned Splash family')
+        canonical = sp.canonical(request, 'qwen')
+        # canonical() checks native fields; the forward adapter also checks shared generation/message controls.
+        sp.request_controls({k: v for k, v in canonical.items() if k != 'stream_options'}, 'qwen')
         path = out / f"{agent}-turn-{turn}.canonical-request.json"
         body = json.dumps(canonical, ensure_ascii=False, separators=(',', ':')).encode()
         path.write_bytes(body)
@@ -204,7 +335,7 @@ def main(argv=None):
     derive.add_argument('--out', type=Path, required=True)
     pick = sub.add_parser('select', help='validity and best configuration over settled sweep runs')
     pick.add_argument('runs', nargs='+', type=Path, help='q5 run directories of Splash sweep cases')
-    parity = sub.add_parser('parity-config', help='prompt-parity post-oracle config for one settled Splash run')
+    parity = sub.add_parser('parity-config', help='prompt-parity oracle inputs for an archived Splash run, including failed clients')
     parity.add_argument('run', type=Path, help='q5 run directory of a Splash case')
     parity.add_argument('--template', type=Path, required=True,
                         help='reviewed GGUF-embedded template (rendered-inputs-reviewed/<family>.template.jinja)')
