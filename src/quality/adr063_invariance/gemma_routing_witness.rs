@@ -102,7 +102,11 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// two witness op files and four selection shaders are byte-identical. Other
 /// K-quant arithmetic and command/mapping ownership changed; this is not global
 /// numeric-equivalence evidence. Model qualification must use the new pin.
-pub const WITNESS_NATIVE_VERSION: &str = "0.22.0";
+/// Re-reviewed 0.22.0 -> 0.22.2 (registry sources `2bb248c` -> `70a55f1`):
+/// the same two witness op files and four selection shaders are byte-identical.
+/// D128 attention and the GDN bank-split implementation changed; qualification
+/// of model arithmetic and serving must use the new pin, not inherited results.
+pub const WITNESS_NATIVE_VERSION: &str = "0.22.2";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {

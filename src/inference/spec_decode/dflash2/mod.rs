@@ -9,6 +9,8 @@ pub mod config;
 pub mod forward;
 #[cfg(test)]
 mod probe;
+#[cfg(test)]
+mod peer_boundary;
 pub(crate) mod route_profile;
 pub mod proposal_repetition;
 pub mod runtime;

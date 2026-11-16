@@ -175,6 +175,8 @@ def install_hf2q_attention_precision(model, reference):
 
 def selector_tables(model, hidden: torch.Tensor, logits: torch.Tensor, anchors: torch.Tensor):
     selector = model.candidate_selector
+    # Retain the frozen v2 table order. Consumers align by token ID, not
+    # incidental top-k columns; confidence follows the pinned selected path.
     unary, candidates = torch.topk(logits, selector.top_k, dim=-1, sorted=False)
     projected = selector.hidden_projection(hidden)
     batch, positions, top_k = candidates.shape
@@ -188,16 +190,29 @@ def selector_tables(model, hidden: torch.Tensor, logits: torch.Tensor, anchors: 
         context = predecessor * projected[:, position, None, :]
         edges[:, position] = torch.einsum("bpr,bsr->bps", context.float(), successor.float())
     path, _, _ = selector.select(hidden, logits, anchors, 0.0)
+    # Pinned CandidateSelector.select is sequential greedy, conditioning the
+    # next row on the selected TOKEN. It does not return greedy confidence.
+    # Derive max softmax at temperature 1 on those exact score tables; this
+    # is the native verify-budget confidence, not a sampling probability.
     confidence = []
-    predecessor_index = torch.zeros(batch, dtype=torch.long, device=hidden.device)
     for position in range(positions):
+        predecessor_index = (
+            torch.zeros(batch, dtype=torch.long, device=hidden.device)
+            if position == 0
+            else (candidates[:, position - 1] == path[:, position - 1, None])
+            .to(torch.int64).argmax(dim=-1)
+        )
+        selected_mask = candidates[:, position] == path[:, position, None]
+        if not torch.all(selected_mask.sum(dim=-1) == 1):
+            raise RuntimeError("pinned selector path is absent from its candidate table")
         score = unary[:, position] + edges[
             torch.arange(batch, device=hidden.device), position, predecessor_index
         ]
-        probability = torch.softmax(score.float(), dim=-1)
-        selected = torch.argmax(score, dim=-1)
-        confidence.append(probability.gather(-1, selected[:, None])[:, 0])
-        predecessor_index = selected
+        selected = selected_mask.to(torch.int64).argmax(dim=-1)
+        selected_score = score.gather(-1, selected[:, None])[:, 0]
+        if not torch.all(selected_score == score.max(dim=-1).values):
+            raise RuntimeError("pinned selector path is not greedy on its captured score table")
+        confidence.append(torch.softmax(score.float(), dim=-1).max(dim=-1).values)
     return {
         "selector_hidden": projected,
         "candidates": candidates,
@@ -215,6 +230,11 @@ def main() -> None:
     parser.add_argument("--gguf", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--gguf-sha256", required=True)
+    parser.add_argument("--descriptor-id", required=True)
+    parser.add_argument("--checkpoint-config-sha256", required=True)
+    parser.add_argument("--checkpoint-weights-sha256", required=True)
+    parser.add_argument("--target-source-sha256", required=True)
+    parser.add_argument("--hf2q-source", required=True, help="Exact capture source commit")
     parser.add_argument(
         "--case",
         choices=("short", "wrap", "multi", "restore", "single"),
@@ -228,6 +248,14 @@ def main() -> None:
     )
     parser.add_argument("--lane-offset", type=int, default=0)
     args = parser.parse_args()
+    # The frozen v2 inputs are immutable evidence. Capture into a NEW local
+    # ignored directory; never regenerate/relabel any pre-existing artifact.
+    if args.output.exists():
+        raise FileExistsError(f"refusing to replace reference evidence: {args.output}")
+    if len(args.hf2q_source) != 40 or any(
+        character not in "0123456789abcdef" for character in args.hf2q_source
+    ):
+        raise ValueError("--hf2q-source must be an exact lowercase commit SHA")
 
     if not torch.backends.mps.is_available():
         raise RuntimeError("DFlash2 reference fixtures require Apple MPS")
@@ -237,6 +265,16 @@ def main() -> None:
     for path in (config_path, weights_path, args.gguf):
         if not path.is_file():
             raise RuntimeError(f"required input is missing: {path}")
+    config_sha256 = digest(config_path)
+    weights_sha256 = digest(weights_path)
+    target_sha256 = digest(args.gguf)
+    for label, actual, expected in (
+        ("config", config_sha256, args.checkpoint_config_sha256),
+        ("weights", weights_sha256, args.checkpoint_weights_sha256),
+        ("target GGUF", target_sha256, args.gguf_sha256),
+    ):
+        if actual != expected:
+            raise RuntimeError(f"{label} SHA256 {actual} != declared {expected}")
 
     device = torch.device("mps")
     dtype = {
@@ -302,8 +340,9 @@ def main() -> None:
             past_key_values=cache,
             use_cache=True,
         )
-        reference._crop_to(cache, offset + context_rows)
         if args.case == "restore":
+            # Crop only when a subsequent forward consumes this cache.
+            reference._crop_to(cache, offset + context_rows)
             restore_hidden = deterministic_target_hidden(
                 batch, 3, target_width, 12, args.lane_offset, device, dtype
             )
@@ -316,7 +355,6 @@ def main() -> None:
                 past_key_values=cache,
                 use_cache=True,
             )
-            reference._crop_to(cache, 15)
             offset, context_rows = 12, 3
         proposal_hidden = final_hidden[:, 1:]
         logits = model.compute_logits(proposal_hidden, output_head)
@@ -346,6 +384,16 @@ def main() -> None:
             "selector_max_abs": 1.1,
             "candidate_min_overlap": 10,
             "path_min_agreement": 4,
+            # Predeclared D1 intermediate/selector contracts. These supplement,
+            # and never replace or widen, the frozen v2 output/path limits.
+            "convolution_relative_max_abs": 0.05,
+            "convolution_reference_scale_floor": 1.0,
+            "confidence_same_table_max_abs": 1.0e-5,
+            "edge_error_envelope": (
+                "sum(abs(pred*succ)*abs(native_hidden-reference_hidden))"
+                "+8*rank*f32_epsilon*max(1,sum(abs(pred*succ*native_hidden)"
+                "+abs(pred*succ*reference_hidden)))"
+            ),
         }
         if dtype == torch.float32
         else {"mode": "diagnostic_only"}
@@ -355,9 +403,16 @@ def main() -> None:
         "case": args.case,
         "reference_commit": REFERENCE_COMMIT,
         "reference_model_sha256": REFERENCE_MODEL_SHA256,
-        "checkpoint_config_sha256": digest(config_path),
-        "checkpoint_weights_sha256": digest(weights_path),
-        "target_gguf_sha256": args.gguf_sha256,
+        "checkpoint_config_sha256": config_sha256,
+        "checkpoint_weights_sha256": weights_sha256,
+        "target_gguf_sha256": target_sha256,
+        "descriptor_id": args.descriptor_id,
+        "target_source_sha256": args.target_source_sha256,
+        "hf2q_source": args.hf2q_source,
+        "producer_sha256": digest(Path(__file__)),
+        "oracle_contract": "hf2q.dflash2-aligned-oracle.v1",
+        "confidence_semantics": "max_softmax_temperature_1_conditioned_on_selected_token",
+        "confidence_provenance": "derived_from_pinned_select_candidate_ids_unary_edges_path",
         "attention_precision": "bfloat16" if dtype == torch.float32 else args.compute_dtype,
         "context_start": str(offset),
         "compute_dtype": args.compute_dtype,
