@@ -4,7 +4,7 @@
 - **Status:** Accepted; implementation authorized for the v0.1.30 program
 - **Decider:** Robert E. Lee (product owner), 2026-11-10
 - **Scope:** every enabled hf2q text-generation architecture; Qwen3.8 is the first qualified checkpoint
-- **Updated:** 2026-11-12 — correct the family binding of the retained Splash arm; preserve ADR-063's existing mechanism, stock, peer, quality and serving gates.
+- **Updated:** 2026-11-16 — record the published-native BF16 controls, complete peer native numeric control, audited served diagnostic and rejected command-grouping spike; preserve all qualification gates.
 
 ## Problem
 
@@ -31,7 +31,7 @@ The release contract and the product goal are separate:
 ## Source-bound mechanism
 
 The implementation reference is pinned Splash commit
-`031a25a6cc18eed83a99a9883de91dcaa272f160`, licensed Apache-2.0. The checkpoint
+`031a25a6125af2d7acf7096580afe56eb33d65bc`, licensed Apache-2.0. The checkpoint
 is pinned as `z-lab/Qwen3.8-27B-DFlash2` revision
 `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`, also Apache-2.0. The raw BF16
 checkpoint is 3,848,817,896 bytes and has 81 tensors.
@@ -276,6 +276,134 @@ Candidate overlap is at least `10/16` at every position. This proves bounded
 operational-precision parity for the forward, ring and coherent selector. D1
 remains open until aligned edge/confidence comparison and the Q4-workload
 acceptance gate are complete; these measurements do not promote the route.
+
+#### D1 fixture identity correction (2026-11-14)
+
+All five historical Qwen3.6 fixtures declare an unsupported target-file digest.
+The currently measured official Q4 artifact is
+`815a22cab21649948352c0eea6e9be0d9d15606e2024d86e7bdb71fb9df08220`.
+An independent reference replay on that artifact reproduced every original
+tensor payload byte: 53 tensors in each of short, wrap, isolated calibration
+and two-lane cases, and 54 in restore. The host was an Apple M5 Max with
+128 GiB RAM and macOS 27.2; the reference used PyTorch 2.11.0 and
+Transformers 5.5.0 with the pinned reference source and checkpoint.
+This establishes reproducibility under the measured artifact, not the
+unobservable identity of the artifact used by the historical capture.
+The original files remain immutable; their incorrect target metadata is not
+accepted or silently rewritten.
+
+Fresh captures measure target and checkpoint digests before model upload.
+Both families require a complete five-case manifest binding the producer,
+capture source, checkpoint, descriptor and actual target. Qwen3.6 additionally
+pins a canonical digest of every original tensor name, dtype, shape and data
+byte, excluding only metadata. Correcting artifact identity therefore cannot
+replace the calibration or holdout values. All geometry, precision, numeric
+limits, candidate-overlap and path-agreement requirements above remain unchanged.
+
+The first replay's 2,048-token case completed its forward but failed while
+cropping an otherwise unused terminal sliding cache. The producer now crops
+only before the restore case actually consumes that cache again. Repeating
+all five complete cases with that change reproduced the frozen tensor bytes;
+neither the sliding window nor the input extent was reduced.
+
+The canonical producer script is identified independently of the consumer:
+historical source `614781b037296ef0708cdc3286beb68e19322d78`, script SHA256
+`faaf6e739c24b301bc0d8ac07809734260897a0704b843bae9ced5c786791456`.
+The integrated producer must match those bytes; replacing the producer check
+with a special-case accepted digest is not a correction.
+
+These are reference-data and harness results, not closure of current Rust
+drafter parity, production AF4 parity, Q4 acceptance or release qualification.
+Neither recorded AF4 numerical failures nor the original limits are waived.
+
+#### Published precision contract and peer attribution (2026-11-15)
+
+The BF16-weight projection branch preserves the graph's F32 activation inputs
+with the four-row GEMV rather than rounding them through tensor MM. Published
+`mlx-native 0.22.2` also keeps D128 attention score scaling in F32. Its registry
+checksum is
+`88d0abf7f066386c1291d6d0972ddb3480956b8d6be3383e133643769c08702e`;
+the archive records native source
+`70a55f1395b959fbc29698f422ead1f6b319632c`. This is not a BF16-core production
+waiver: the packed AF4 path, actual-target quality, serving and RC gates remain
+separate. Prior test-binary passes do not qualify a new integrated serving binary.
+
+The canonical peer control binds the full revision printed above. Earlier
+documentation printed a different full revision with the same eight-character
+prefix; that prefix is not source-equivalence evidence. Historical measurements
+retain their own archived identities and are not silently rebound.
+
+The peer's unchanged scalar AF4/G64 preparation was compiled and applied to
+four complete original checkpoint matrices: layer-zero attention output and
+MLP kernel projections in both Qwen families. All twelve code, BF16-scale and
+BF16-bias digests match hf2q's recorded original RTN preparation, covering
+577,536 groups. The exact source capsule SHA256 is
+`6f50cf53b28b3f4aea8ef6350b445eef5ed6ea25933d614e48b36a63a5511987`.
+This rules out a different encoder for those matrices only; it does not prove
+the whole inventory, GPU arithmetic, model quality or speed.
+
+Both published native ring attention and its packed D128 path already use
+F32 probabilities. A probability-dtype rewrite is therefore not justified by
+source inspection. Attribution must instead capture the real consumer's
+operands, encoded route and outputs, replay common operands through the peer,
+and distinguish actual F32 consumer inputs from common BF16 replay inputs.
+Such observation is test-only and must preserve the ordinary consumer bytes.
+Peer-relative agreement supplements, never replaces, the unchanged D1 gate.
+
+The full-input activation-aware four-bit experiment was rejected at the first
+short-case layer-zero MLP boundary in all four family/grid variants. Its source
+and measured failures remain isolated research evidence in
+[the recorded verdict](https://github.com/robertelee78/hf2q/issues/370#issuecomment-6888701566);
+neither a lower projection SSE nor matched preparation bytes promotes that fit.
+
+#### Complete native control and published BF16 results (2026-11-16)
+
+The integrated published-0.22.2 test binary passed all ten original BF16
+numeric cases, with AF4 and staged draft disabled. This establishes the
+F32-input correction on the original five geometries for both families,
+not AF4 qualification. The compiled source manifest SHA256 is
+`6e79c2832b32bcc8749d1d1edbf20335c480cef1aa93084586d2882986754651`;
+test binary SHA256 is
+`5c18e8dd97312a54e45db4ae4a5d1e8463f6165e68715b851a3c72cfa47f0984`.
+
+Common-operand GPU controls independently checked attention and the two
+focal projections in each family. Attention BF16 outputs matched bytewise.
+Projection relative L2 errors were at most `2.566662e-6`, including one
+bytewise-equal F32 projection. These checks cover those operands and kernels,
+not all weights, the whole graph or end-to-end quality.
+
+A separate source-rebuilt control executed the peer's real checkpoint
+loader, native drafter, context prefill, decode, GGUF vocabulary head and
+greedy selection. All 90 production host translation units and unchanged
+production shaders are bound in its build provenance, SHA256
+`e9bd6c764222a655403173937974c99e13c39a9805e8e5714b4dea36c5d84946`.
+Fresh plain and add-only-observer processes produced identical complete
+weight inventories and all 28 ordinary output/state tensors.
+
+The complete native drafter also fails the unchanged original short-case
+raw-checkpoint numeric bounds:
+
+| Family | First rejecting boundary | Relative error | Original bound |
+| --- | --- | ---: | ---: |
+| Qwen3.6 | layer 0 MLP prepare | 0.11135377 | 0.05 |
+| Qwen3.8 | layer 0 attention finish | 0.06525414 | 0.05 |
+
+Native interfaces round supplied F32 semantic inputs once to RNE BF16.
+The reported attention finish is the widened actual BF16 fused sum minus
+the widened same-route incoming BF16 residual, not an unrounded internal
+projection. Raw storage and valid selector regions are retained; later
+geometries and remaining candidate/path contracts were not dispatched after
+the fatal short-case rejection. Independent reductions preserve the original
+F32 metric arithmetic and tolerances. Report SHA256 values are
+`870b4f965a3edf451e34a3d26292e87a7623f3b3e77deeaa8bd03e229e8fd974`
+and `48aefc1293d2af58cc701fee9572f310c0fad032732ee5d912b6677aab32db56`.
+
+The evidence distinguishes checkpoint approximation error from checked
+implementation fidelity. It does not replace the oracle, relax D1, approve
+BF16 production or qualify HF AF4. The source-bound control and limitations
+are also recorded in [the control receipt](https://github.com/robertelee78/hf2q/issues/370#issuecomment-6904680112).
+
+
 
 ### D2: 32-row target verifier
 
@@ -2276,6 +2404,74 @@ shader-validation and debug regressions; those runs do not establish binary
 equivalence to the measured pair. Production integration must use the single
 resolved profile table and repeat qualification on the final published
 dependency and default configuration.
+
+#### Peer-grounded served diagnostic and allocation investigation (2026-11-16)
+
+One fresh canonical Qwen3.6 N4 repair workload compared the integrated
+published-0.22.2 HF binary with the pinned native peer. Both used target
+artifact SHA256
+`815a22cab21649948352c0eea6e9be0d9d15606e2024d86e7bdb71fb9df08220`,
+four slots and context capacity 262,144. HF explicitly disabled AF4 and
+staged draft and resolved a partial prepared-route profile; this was a
+BF16 diagnostic, not the release default. Existing arm-specific penalties
+were unchanged.
+
+Both arms passed the actual task, unary/SSE, tool-result continuation,
+prefix reuse, width-four, raw response-lineage and Q5 safety audits.
+Independent review found all eight final patches correct. All 32 actual
+native requests passed the source-bound prompt-token oracle. Servers,
+samplers and listeners were cleaned up.
+
+| One audited run | Four-task makespan | Completion tokens | Cached prompt tokens |
+| --- | ---: | ---: | ---: |
+| HF BF16 diagnostic | 32.053057 s | 6,125 | 45,039 |
+| Native peer S0 | 14.926936 s | 6,202 | 47,360 |
+
+Different emitted text, request counts and GPU residency preclude a
+statistical release verdict or direct attribution of this elapsed gap.
+The passive sampler did not establish equal clocks. HF's CLI SHA256 is
+`26504f2f72d422b44bb2787c6f1643e5d4c4606b8c73bf484dfc5c1f46355f60`;
+the exact five-script measured harness snapshot SHA256 is
+`03d9cb17d4de4493e29f98290f3ec67660647d9bff0a4b1169133856255f8e0e`.
+
+Actual asynchronous HF GPU timestamps show a mean 35.569884 ms summed
+target-layer extent versus 1.438353 ms head extent across 252 B4 cycles.
+All 479 recorded cycles used 20 target-layer commands; timeline drops,
+invalid intervals and drain waits were zero. The longer host-to-head
+envelope is not an isolated head cost. Native's actual served counters
+likewise attribute most regular decode extent to target forward, but its
+pooled widths and command/event boundaries are not directly equivalent.
+
+A fresh same-source `HF2Q_PARTIAL_CHAIN_N=40` spike reduced target-layer
+command count from 20 to one in all 523 cycles. Its 289 B4 cycles averaged
+35.992553 ms target extent and 1.473848 ms head extent: no observed material
+stage improvement. The task, protocol and safety audits passed; the final
+independent patch audit passed. The initially incorrect private auditor
+required an admitted receipt for a calibration run; corrected offline
+analysis preserved both the original rejection and real calibration receipt.
+The spike is non-promotable, the default remains two layers per command,
+and the larger planned experiment was not dispatched. Different text and
+unaligned clocks do not establish a statistical regression either.
+
+Read-only inspection of the pinned peer found one queue-ordered prefill
+arena with page-local online attention, not full-history K/V expansion.
+Its actual planned shared prefill allocation is 633,651,200 bytes; its
+32.25 MiB attention partial/statistics workspace is context-independent.
+Its scalar INT8 cache is not HF TQ8 and cannot replace HF's commitments.
+
+HF's canonical full prepared profile has a source-derived incremental
+requirement of 35,096,953,072 bytes against 28,809,439,648 bytes headroom,
+a 6,287,513,424-byte deficit. This includes 12,673,674,304 bytes of joint
+prefill scratch, charged once, and 21,370,765,312 bytes of prepared planes.
+Four genuinely retained resumed-history workspaces account for 6 GiB.
+Shared queue-ordered storage is a concrete prospective mechanism, not an
+admission waiver. Allocation identity, last-reader ordering, immutable
+queued parameters, failure drains and bitwise follow-up state must be
+proved before reducing the bound. Merely combining buffers leaves too
+little margin and does not close other persistent prepared allocations.
+Context, aggregate rows, slots, KV budget, reserve and all numerical and
+quality gates remain unchanged.
+
 
 ### D5: performance qualification
 

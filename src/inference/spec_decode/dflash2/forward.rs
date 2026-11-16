@@ -8,7 +8,7 @@ use super::{
 };
 use crate::serve::forward_mlx_shared::MlxQWeight;
 use anyhow::{anyhow, Context, Result};
-use mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight;
+use mlx_native::ops::{dense_gemv_bf16::dense_gemv_bf16_f32_tiled4, repacked_gguf_mm::PreparedGgufWeight};
 use mlx_native::ops::{
     dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params},
     dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params},
@@ -148,7 +148,10 @@ fn project_bf16(
     input_width: usize,
     output_width: usize,
 ) -> Result<()> {
-    dense_matmul_bf16_f32_tensor(
+    // The accepted graph keeps projection inputs in F32. Tensor MM rounds
+    // them to BF16; the four-row GEMV preserves the input values while
+    // sharing each weight load across the rows.
+    dense_gemv_bf16_f32_tiled4(
         encoder,
         registry,
         device,
@@ -420,6 +423,40 @@ pub(super) fn dispatch_layer(
     workspace: &DFlash2Workspace,
     layer_index: usize,
 ) -> Result<()> {
+    dispatch_layer_inner(
+        encoder, registry, device, config, tensors, workspace, layer_index,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+}
+
+// Test-only snapshots observe the real forward, before scratch reuse. Neither
+// their buffers nor their copy dispatches exist in a production build.
+pub(super) fn dispatch_layer_inner(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    config: &DFlash2Config,
+    tensors: &DFlash2LayerTensors,
+    workspace: &DFlash2Workspace,
+    layer_index: usize,
+    #[cfg(test)] snapshots: Option<&[MlxBuffer; 6]>,
+    #[cfg(test)] boundary: Option<&super::peer_boundary::BoundaryCapture>,
+) -> Result<()> {
+    #[cfg(test)]
+    macro_rules! snapshot {
+        ($index:expr, $source:expr, $count:expr) => {
+            if let Some(buffers) = snapshots {
+                mlx_native::ops::copy::dispatch_copy_f32(
+                    encoder, registry, device.metal_device(), $source,
+                    &buffers[$index], 0, 0, $count,
+                )?;
+                encoder.memory_barrier();
+            }
+        };
+    }
     let rows = workspace.max_lanes * config.block_size;
     let hidden = config.hidden_size;
     let q_width = config.num_attention_heads * config.head_dim;
@@ -466,6 +503,11 @@ pub(super) fn dispatch_layer(
         DFlash2ConvolutionStage::Prepare,
     )?;
     encoder.memory_barrier();
+    #[cfg(test)]
+    {
+        snapshot!(0, &workspace.convolved, rows * hidden);
+        snapshot!(1, &workspace.dynamic, rows * 4 * groups);
+    }
 
     project(
         encoder,
@@ -521,6 +563,10 @@ pub(super) fn dispatch_layer(
     )?;
     encoder.memory_barrier();
     dispatch_attention(encoder, registry, device, config, workspace, layer_index)?;
+    #[cfg(test)]
+    if let Some(capture) = boundary {
+        capture.attention(encoder, registry, device, config, workspace, layer_index)?;
+    }
     match workspace
         .staged
         .as_ref()
@@ -552,6 +598,10 @@ pub(super) fn dispatch_layer(
         )?,
     }
     encoder.memory_barrier();
+    #[cfg(test)]
+    if let Some(capture) = boundary {
+        capture.projection(encoder, registry, device, workspace, false)?;
+    }
     dispatch_dflash2_dynamic_conv_f32(
         encoder,
         registry,
@@ -565,6 +615,8 @@ pub(super) fn dispatch_layer(
         DFlash2ConvolutionStage::Residual,
     )?;
     encoder.memory_barrier();
+    #[cfg(test)]
+    snapshot!(2, &workspace.residual, rows * hidden);
 
     norm(
         encoder,
@@ -591,6 +643,10 @@ pub(super) fn dispatch_layer(
         4 * groups,
     )?;
     encoder.memory_barrier();
+    #[cfg(test)]
+    if let Some(capture) = boundary {
+        capture.projection(encoder, registry, device, workspace, true)?;
+    }
     dispatch_dflash2_dynamic_conv_f32(
         encoder,
         registry,
@@ -604,6 +660,11 @@ pub(super) fn dispatch_layer(
         DFlash2ConvolutionStage::Prepare,
     )?;
     encoder.memory_barrier();
+    #[cfg(test)]
+    {
+        snapshot!(3, &workspace.convolved, rows * hidden);
+        snapshot!(4, &workspace.dynamic, rows * 4 * groups);
+    }
     dispatch_mlp(encoder, registry, device, config, tensors, workspace)?;
     encoder.memory_barrier();
     dispatch_dflash2_dynamic_conv_f32(
@@ -619,6 +680,8 @@ pub(super) fn dispatch_layer(
         DFlash2ConvolutionStage::Residual,
     )?;
     encoder.memory_barrier();
+    #[cfg(test)]
+    snapshot!(5, &workspace.hidden[next], rows * hidden);
     Ok(())
 }
 
