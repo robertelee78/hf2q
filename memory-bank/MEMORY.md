@@ -1,7 +1,7 @@
 ---
 schema: "agent-memory/v1"
 project-id: "479fefc0-3903-4e30-b7fd-877c69979b81"
-router-updated: "2026-11-13T05:52:21.664035+00:00"
+router-updated: "2026-11-16T02:39:00.273872+00:00"
 canonical-remote: "repo://github.com/robertelee78/hf2q"
 ---
 # Project memory
@@ -37,6 +37,8 @@ Router time describes this map, not every file's revision.
 | [history/events/17765631-9109-4d51-9315-a5f429234eba.md](<history/events/17765631-9109-4d51-9315-a5f429234eba.md>) | Admission history for the equal-clock measurement rule | repository | active | When auditing how the equal-clock measurement rule was recorded |
 | [topics/5bce2bcb-7148-42d5-8bd8-2dc5f57fd8e3.md](<topics/5bce2bcb-7148-42d5-8bd8-2dc5f57fd8e3.md>) | Kernels over the Metal tensor API need an availability check with two cases (no <metal_tensor> header before macOS 26; a GPU outside the Metal 4 family fails pipeline creation); hosted CI is such a device and runs only whitelisted test filters | repository | active | Before adding, selecting by default or testing a kernel that uses the Metal tensor API, and when a hosted CI job fails or passes on a GPU route |
 | [history/events/4b10d7dd-53f7-46fa-a3bf-54d543e4d001.md](<history/events/4b10d7dd-53f7-46fa-a3bf-54d543e4d001.md>) | Admission history for the Metal tensor availability rule | repository | active | When auditing how the Metal tensor availability rule was recorded |
+| [topics/50028ca7-da1b-4ab7-9000-a9624ba39e84.md](<topics/50028ca7-da1b-4ab7-9000-a9624ba39e84.md>) | Raw-checkpoint numeric rejection versus pinned peer implementation fidelity | repository | active | When diagnosing Qwen DFlash2 AF4 numeric failures or proposing a different oracle |
+| [history/events/35b42891-1170-4efb-9e9b-27632176ce93.md](<history/events/35b42891-1170-4efb-9e9b-27632176ce93.md>) | Evidence and admission history for the scoped peer native numeric control | repository | active | When reviewing the origin, constraints or later correction of this numerical finding |
 
 ## Omitted contexts
 
