@@ -449,8 +449,10 @@ Before implementation acceptance:
    intermediate. Preserve source labels and independently verified same-operand
    operator replay when arithmetic or reduction order differs.
 4. Carry forward the existing numerical acceptance limits without fitting new
-   ones to the candidate: input max-absolute 0.03; convolution/layer relative
-   max-absolute 0.05 with the existing reference floor and F32 reduction;
+   ones to the candidate: input max-absolute 0.03; convolution max-absolute
+   error divided by `max(1, reference_abs_max)` at most 0.05; layer
+   max-absolute error divided by `reference_abs_max` at most 0.05, without
+   the convolution floor. Preserve each check's existing F32 reductions;
    final-hidden max-absolute 2.5; logit max-absolute 2.0; selector-hidden
    max-absolute 1.1; top-16 overlap at least 10; seven-position path agreement
    at least four. These are preregistered conformance checks, not a proof of a
