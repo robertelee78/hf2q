@@ -1421,7 +1421,7 @@ verdict. Preserve the rejected source and observations; do not retry unchanged.
 Proof SHA256:
 `d25b0d6722324afb54cf4548dfb0ecce3329374bfe44f52b0309d12d1cc8396b`.
 
-##### Queue-scoped live-expert preparation: hypothesis only
+##### Queue-scoped live-expert preparation: rejected spike
 
 Keep the fast prepared decoder and investigate its ownership instead. A
 caller-owned fixed-capacity plane buffer can serve successive layers if the
@@ -1441,6 +1441,38 @@ Measure total live preparation plus the unchanged gate on the same five
 historical routing samples and forty-layer memory pattern. Repacks are inside
 candidate GPU timing. No HF cutover, retained-byte saving or fit/speed claim
 follows until this experiment and the complete canonical gates pass.
+
+The isolated native spike is preserved at
+`0bacebd1b870712cb50f12a5ed17b2079ad18438`; it is not an HF dependency or a
+published native release. The existing grouped-expert tests pass (six tests,
+one unrelated performance probe ignored). The new probe passes 720 Q4_K/Q6_K
+consumer cases and 200 historical-route layer cases: 31,051,776 compared
+elements, zero mismatches. It also checks split descriptors, thirteen
+pre-encoding rejections, five invalid layouts, eight no-write schedules and
+unselected-byte preservation. Successive weights reuse one root without a host
+wait between consumers and the next repack.
+
+The same five preregistered routing samples retain sixteen alternating pairs
+each. These are within-run comparisons; candidate timing includes compact
+scheduling, live preparation, gathering, projection and ordering barriers.
+
+| Captured cycle | Rows | Immutable-prepared gate GPU ms, forty layers | Live-prepared gate GPU ms, forty layers |
+| --- | ---: | ---: | ---: |
+| 0 | 8 | 3.151083 | 5.342125 |
+| 107 | 32 | 6.852000 | 15.571437 |
+| 214 | 32 | 5.439917 | 11.945625 |
+| 321 | 32 | 6.502875 | 14.529667 |
+| 428 | 16 | 3.649667 | 7.651208 |
+
+Reject HF cutover: queue-scoped repacking makes every selected gate workload
+slower. The candidate requests one 150,994,944-byte plane root instead of forty
+immutable gate-plane stacks totaling 6,039,797,760 bytes. Both arms coexist in
+this probe; these extents are not measured physical savings or proof of model
+fit. The result is gate-only, not complete MoE, verifier wall time or task
+quality. Rejected code did not proceed to shader-validation/debug acceptance
+modes or canonical N4. Preserve source and observations; do not retry unchanged.
+Proof SHA256:
+`a9434dba65052b9f6b28d4684b60020b23e2fd46609589083f033dedfadd1632`.
 
 ### D2: 32-row target verifier
 
