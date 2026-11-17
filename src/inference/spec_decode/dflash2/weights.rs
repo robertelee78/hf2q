@@ -137,6 +137,11 @@ pub fn expected_manifest(cfg: &DFlash2Config) -> Vec<DFlash2ExpectedTensor> {
     manifest
 }
 
+/// Required entries of the same manifest, without allocating names or shapes.
+pub(crate) fn required_tensor_count(cfg: &DFlash2Config) -> Option<usize> {
+    cfg.num_hidden_layers.checked_mul(15)?.checked_add(6)
+}
+
 /// Read-only mapped checkpoint owner. Views returned by [`Self::load`] cannot
 /// outlive the mapping.
 pub struct DFlash2WeightsFile {

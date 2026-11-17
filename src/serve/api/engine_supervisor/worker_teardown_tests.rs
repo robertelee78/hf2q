@@ -10,11 +10,9 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use super::{spawn_supervised_worker, DeferredFlush, EngineSupervisor, WorkerTeardown};
-use crate::inference::spec_decode::dflash2::route_profile::PlaneSet;
-use crate::inference::spec_decode::dflash2::schema::QWEN38_DFLASH2;
 use crate::serve::dflash2_policy::tests::{env, qwen38, Store};
 use crate::serve::dflash2_policy::{
-    decide, plane_bytes, HostFacts, Selection, TargetFacts, MEMORY_RESERVE_BYTES,
+    decide, route_upper_bound, HostFacts, Selection, TargetFacts, MEMORY_RESERVE_BYTES,
 };
 use crate::serve::resident_memory::{Ledger, Reservation};
 
@@ -37,15 +35,10 @@ impl Host {
 
     fn on(ledger: Arc<Ledger>) -> Self {
         let facts = qwen38();
-        let planes = plane_bytes(
-            &facts.tensors,
-            &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
-        );
-        let drafter = QWEN38_DFLASH2.weights_bytes;
-        let one_engine = facts.model_file_bytes + KV + drafter + planes;
+        let route = route_upper_bound(&facts, &env(&[]), &|_| None);
+        let one_engine = facts.model_file_bytes + KV + route;
         Self {
-            // Beside a resident engine: room for a second model, its KV
-            // budget and its drafter, one byte short of its planes.
+            // Beside a resident engine: one byte short of a second full route.
             physical: MEMORY_RESERVE_BYTES + 2 * one_engine - 1,
             one_engine,
             facts,

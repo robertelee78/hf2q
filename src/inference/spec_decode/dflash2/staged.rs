@@ -1,28 +1,27 @@
-//! The staged draft route (`HF2Q_DFLASH2_DRAFT_STAGED=1`).
+//! The auxiliary staged draft route (`HF2Q_DFLASH2_DRAFT_STAGED=1`).
 //!
-//! The default draft command multiplies AF4G64 planes on the register tile,
-//! copies every lane's ring window into a packed K/V tile before each layer's
-//! attention, and projects the vocabulary through the target's stock head
-//! kernel. This route keeps the same weights and graph and changes the three
-//! kernels: projections of at least [`STAGED_MIN_OUTPUTS`] outputs run the
-//! staged tile over BF16 rows (gate and up in one pass), attention reads the
-//! rings in place, and a width-32 head runs the prepared target tile.
+//! BF16 AF4 QKV and context prefill have independent source-matched producer
+//! profiles. This switch selects each remaining BF16 projection's source-owned
+//! decode plan and lets attention read the rings in place; at 32 rows the
+//! head runs the prepared target tile. Smaller original geometries retain the
+//! stock head (reported separately). Narrow decode grids use the register tile.
+//! Gate/up runs in one pass: both completed sums round to BF16 before SiLU,
+//! and the gated product lands directly in the down projection's BF16 input.
 
 use super::{
     config::DFlash2Config,
     tensors::{DFlash2ModelTensors, DFlash2Projection},
-    workspace::{allocate, DFlash2Workspace, DFlash2WorkspaceError},
+    workspace::{allocate, DFlash2Workspace, DFlash2WorkspaceError, WorkspaceGeometry},
 };
 use crate::inference::route_host;
 use crate::serve::forward_mlx_shared::MlxQWeight;
 use anyhow::{bail, ensure, Context, Result};
 use mlx_native::ops::{
     dflash2_af4g64_staged::{
-        dflash2_af4g64_staged_gate_up_partial_elements, dflash2_af4g64_staged_partial_elements,
-        dispatch_dflash2_af4g64_staged, dispatch_dflash2_af4g64_staged_gate_up,
+        dispatch_dflash2_af4g64_staged_with_precision,
+        dispatch_dflash2_af4g64_staged_gate_up_with_precision,
     },
     dflash2_ring_attention::{
-        dflash2_ring_attention_partial_elements, dflash2_ring_attention_supports,
         dispatch_dflash2_ring_attention, DFlash2RingAttentionBuffers, DFlash2RingAttentionParams,
         DFLASH2_RING_ATTENTION_CURRENT_VALUES,
     },
@@ -30,19 +29,48 @@ use mlx_native::ops::{
     repacked_gguf_mm::{
         dispatch_repacked_gguf_mm_bf16_input, prepare_repacked_gguf_weight, PreparedGgufWeight,
     },
+    ActivationPrecision,
 };
 use mlx_native::{
     CommandEncoder, DType, GgmlType, KernelRegistry, MlxBuffer, MlxDevice, TensorKernelFamily,
 };
 
+mod memory;
+use memory::StagedGeometry;
+
 pub const DFLASH2_DRAFT_STAGED_ENV: &str = "HF2Q_DFLASH2_DRAFT_STAGED";
 
-/// Narrower projections keep the register tile: a grid of fewer than one and
-/// a half 64-column threadgroups per core leaves the staged tile's cores idle
-/// (Splash `runtime/ops/LinearGguf.cpp:272-275`, `2 * (N / 64) * lanes <
-/// 3 * cores`). The bound is fixed at four lanes on 40 cores so that a
-/// projection's tile, and with it its bits, never depends on the lane count.
-pub const STAGED_MIN_OUTPUTS: usize = 960;
+// Count successful encodes, not requested switches. Fixture processes commit and
+// wait the observed command before interpreting these test-only route receipts.
+#[cfg(test)]
+thread_local! {
+    static DISPATCH_COUNTS: std::cell::Cell<[u32; 6]> = const { std::cell::Cell::new([0; 6]) };
+}
+
+#[cfg(test)]
+fn record_dispatch(kind: usize) {
+    DISPATCH_COUNTS.with(|counts| {
+        let mut value = counts.get();
+        value[kind] += 1;
+        counts.set(value);
+    });
+}
+
+#[cfg(test)]
+pub(super) fn record_qkv_dispatch() {
+    record_dispatch(4);
+}
+
+#[cfg(test)]
+pub(super) fn record_register_dispatch() {
+    record_dispatch(5);
+}
+
+#[cfg(test)]
+pub(super) fn take_dispatch_counts() -> [u32; 6] {
+    DISPATCH_COUNTS.with(|counts| counts.replace([0; 6]))
+}
+
 
 /// Rows the prepared target head tile takes.
 const PREPARED_HEAD_ROWS: usize = 32;
@@ -58,13 +86,6 @@ pub(super) fn reads_prepared_head(workspace: &DFlash2Workspace, config: &DFlash2
 /// 16- and 8-row tiles.
 const STAGED_TILE_ROWS: usize = 8;
 
-// The selector projection keeps the register tile and reads the F32 final
-// rows, so it may run beside the head, which reads their BF16 rounding.
-const _: () = assert!(mlx_native::DFLASH2_SELECTOR_RANK < STAGED_MIN_OUTPUTS);
-
-pub(super) fn staged_tile_takes(output_width: usize) -> bool {
-    output_width >= STAGED_MIN_OUTPUTS
-}
 
 /// Whether the checkpoint's shapes at `lanes` lanes fit the staged route.
 fn supports(config: &DFlash2Config, tensors: &DFlash2ModelTensors, lanes: usize) -> Result<()> {
@@ -85,11 +106,6 @@ fn supports(config: &DFlash2Config, tensors: &DFlash2ModelTensors, lanes: usize)
     ensure!(
         matches!(tensors.context_projection, DFlash2Projection::Af4G64 { .. }),
         "{DFLASH2_DRAFT_STAGED_ENV}=1 requires HF2Q_DFLASH2_DRAFT_AF4_G64=1"
-    );
-    ensure!(
-        staged_tile_takes(config.hidden_size),
-        "{DFLASH2_DRAFT_STAGED_ENV}=1 requires a draft hidden size of at least {STAGED_MIN_OUTPUTS}, got {}",
-        config.hidden_size
     );
     ensure!(
         tensors
@@ -138,7 +154,7 @@ pub struct DFlash2StagedScratch {
     /// BF16 `[rows, widest projection input]`: the rounded input of the
     /// projection being encoded.
     pub projection_input: MlxBuffer,
-    /// BF16 `[rows, intermediate]`: the gated MLP activation.
+    /// BF16 `[rows, intermediate]`: the gated product the down projection reads.
     pub gated: MlxBuffer,
     /// F32 run sums of a split projection.
     pub partials: MlxBuffer,
@@ -159,48 +175,22 @@ impl DFlash2StagedScratch {
         device: &MlxDevice,
         config: &DFlash2Config,
         lanes: usize,
+        workspace: &WorkspaceGeometry,
         bytes: &mut usize,
     ) -> Result<Self, DFlash2WorkspaceError> {
+        let geometry = StagedGeometry::new(config, lanes, workspace)?;
         let block = config.block_size;
-        let rows = lanes * block;
-        let hidden = config.hidden_size;
+        let rows = geometry.rows;
         let (q_heads, kv_heads, dim) = (
             config.num_attention_heads,
             config.num_key_value_heads,
             config.head_dim,
         );
-        let (query, key_value) = (q_heads * dim, kv_heads * dim);
+        let query = geometry.query;
         let intermediate = config.intermediate_size;
-        let widest_input = config
-            .fc_input_dim()
-            .max(hidden)
-            .max(query)
-            .max(intermediate);
-        let partial_elements = [
-            (config.dynamic_projection_width(), hidden),
-            (query + 2 * key_value, hidden),
-            (hidden, query),
-            (hidden, intermediate),
-            (hidden, config.fc_input_dim()),
-            (2 * key_value, hidden),
-        ]
-        .into_iter()
-        .map(|(n, k)| dflash2_af4g64_staged_partial_elements(rows as u32, n as u32, k as u32))
-        .chain([dflash2_af4g64_staged_gate_up_partial_elements(
-            rows as u32,
-            intermediate as u32,
-            hidden as u32,
-        )])
-        .max()
-        .unwrap_or(0)
-        .max(1);
-        let attention = if dflash2_ring_attention_supports(
-            q_heads,
-            kv_heads,
-            dim,
-            block,
-            config.sliding_window,
-        ) {
+        let widest_input = geometry.widest_input;
+        let partial_elements = geometry.partial_elements;
+        let attention = if let Some(attention_partial_elements) = geometry.attention_partial_elements {
             Some(DFlash2RingAttentionScratch {
                 queries: allocate(device, DType::BF16, &[lanes, q_heads, block, dim], bytes)?,
                 current_keys: allocate(device, DType::BF16, &[lanes, kv_heads, block, dim], bytes)?,
@@ -213,7 +203,7 @@ impl DFlash2StagedScratch {
                 partials: allocate(
                     device,
                     DType::F32,
-                    &[dflash2_ring_attention_partial_elements(lanes, kv_heads)?],
+                    &[attention_partial_elements],
                     bytes,
                 )?,
                 output: allocate(device, DType::BF16, &[rows, query], bytes)?,
@@ -271,11 +261,12 @@ impl DFlash2StagedScratch {
         metadata: &MlxBuffer,
         input: &MlxBuffer,
         output: &MlxBuffer,
-        rows: usize,
-        input_width: usize,
-        output_width: usize,
+        rows: u32,
+        input_width: u32,
+        output_width: u32,
+        precision: ActivationPrecision,
     ) -> Result<()> {
-        dispatch_dflash2_af4g64_staged(
+        dispatch_dflash2_af4g64_staged_with_precision(
             encoder,
             registry,
             device,
@@ -284,14 +275,18 @@ impl DFlash2StagedScratch {
             metadata,
             &self.partials,
             output,
-            u32::try_from(rows)?,
-            u32::try_from(output_width)?,
-            u32::try_from(input_width)?,
+            rows,
+            output_width,
+            input_width,
+            precision,
         )
-        .map_err(anyhow::Error::from)
+        .map_err(anyhow::Error::from)?;
+        #[cfg(test)]
+        record_dispatch(0);
+        Ok(())
     }
 
-    /// `gated = SiLU(projection_input x gate^T) * (projection_input x up^T)`.
+    /// Gate and up round separately before SiLU; the result is stored as BF16.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn gate_up(
         &self,
@@ -313,7 +308,7 @@ impl DFlash2StagedScratch {
         else {
             bail!("the staged gate/up pair requires AF4G64 planes");
         };
-        dispatch_dflash2_af4g64_staged_gate_up(
+        dispatch_dflash2_af4g64_staged_gate_up_with_precision(
             encoder,
             registry,
             device,
@@ -327,9 +322,13 @@ impl DFlash2StagedScratch {
             u32::try_from(rows)?,
             u32::try_from(output_width)?,
             u32::try_from(input_width)?,
-        )
-        .map_err(anyhow::Error::from)
+            ActivationPrecision::Bf16,
+        )?;
+        #[cfg(test)]
+        record_dispatch(1);
+        Ok(())
     }
+
 }
 
 /// Attention of the rotated current rows over layer `layer_index`'s rings.
@@ -366,7 +365,10 @@ pub(super) fn dispatch_ring_attention(
             window: u32::try_from(config.sliding_window)?,
         },
     )
-    .map_err(anyhow::Error::from)
+    .map_err(anyhow::Error::from)?;
+    #[cfg(test)]
+    record_dispatch(2);
+    Ok(())
 }
 
 /// Project `input` through the target's native head on the prepared tile.
@@ -398,6 +400,10 @@ pub(super) fn dispatch_prepared_head(
     let params = weight.matmul_params(u32::try_from(rows)?)?;
     if shared.is_none() && staged.head.is_none() {
         // Replaces a head that a command abandoned before its commit prepared.
+        // Its command was abandoned, so none of these planes are valid.
+        // Release that owner before allocating its replacement, not after the
+        // RHS finishes with two complete prepared heads live.
+        drop(staged.pending_head.take());
         staged.pending_head = Some(
             prepare_repacked_gguf_weight(encoder, registry, device, &weight.buffer, &params)
                 .context("prepare the DFlash2 vocabulary head")?,
@@ -417,6 +423,8 @@ pub(super) fn dispatch_prepared_head(
         output,
         &params,
     )?;
+    #[cfg(test)]
+    record_dispatch(3);
     Ok(true)
 }
 
@@ -522,11 +530,6 @@ mod tests {
             "{error}"
         );
 
-        let narrow = config(512);
-        let narrow_tensors = DFlash2ModelTensors::synthetic_af4_g64(&device, &narrow, 3);
-        let error = resolve_staged_draft(Some("1"), &narrow, &narrow_tensors, 4).unwrap_err();
-        assert!(error.to_string().contains("hidden size"), "{error}");
-        assert!(!resolve_staged_draft(Some("0"), &narrow, &narrow_tensors, 4).unwrap());
 
         tensors.layers[0].gate_up_halves = None;
         let error = resolve_staged_draft(Some("1"), &cfg, &tensors, 4).unwrap_err();

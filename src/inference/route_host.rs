@@ -111,8 +111,8 @@ use Grammar::{OnOffTrue, One, WaitLayers};
 /// Every fast-route switch of the Qwen DFlash2 route profile.
 #[rustfmt::skip]
 pub(crate) const SWITCHES: &[SwitchRow] = &[
-    // The AF4G64 register tile: portable simdgroup kernels.
-    row("HF2Q_DFLASH2_DRAFT_AF4_G64",     One,       &[]),
+    // AF4 precision requires tensor-API context/QKV producers even without the auxiliary staged route.
+    row("HF2Q_DFLASH2_DRAFT_AF4_G64",     One,       &[Dflash2Af4g64Staged]),
     // Staged projections, ring attention, and the prepared head tile.
     row("HF2Q_DFLASH2_DRAFT_STAGED",      One,       &[Dflash2Af4g64Staged, Dflash2RingAttention, RepackedGgufMm]),
     // Token gather and selection kernels: portable.

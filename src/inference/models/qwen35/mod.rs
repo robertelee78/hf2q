@@ -26,6 +26,7 @@ use anyhow::{anyhow, bail, Result};
 use mlx_native::gguf::{GgufFile, MetadataValue};
 
 pub mod activation_capture_real;
+pub(crate) mod carry_memory;
 pub mod chunk_allocs_arena;
 pub mod decode_pool;
 pub mod delta_net;
@@ -52,6 +53,7 @@ pub mod full_attn;
 pub mod gpu_delta_net;
 pub mod gpu_ffn;
 pub mod gpu_full_attn;
+pub(crate) mod prefill_memory;
 pub(super) mod gqa_q2_policy;
 pub mod in_memory_loader;
 pub use chunk_allocs_arena::ChunkAllocsArena;

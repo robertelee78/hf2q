@@ -1,33 +1,20 @@
     #[test]
     #[ignore = "requires pinned Qwen3.6 GGUF/checkpoint, HF2Q_QWEN36_DFLASH2_REFERENCE_FIXTURES, manifest and Apple Metal"]
     fn qwen36_fixture_suite_matches_pinned_reference() {
-        fixture_suite_matches_pinned_reference(&QWEN36_DFLASH2, "QWEN36", "qwen36", false);
+        fixture_suite_matches_pinned_reference(&QWEN36_DFLASH2, "QWEN36", "qwen36");
     }
 
     #[test]
     #[ignore = "requires pinned Qwen3.8 GGUF/checkpoint, HF2Q_QWEN38_DFLASH2_REFERENCE_FIXTURES, manifest and Apple Metal"]
     fn qwen38_fixture_suite_matches_pinned_reference() {
-        fixture_suite_matches_pinned_reference(&QWEN38_DFLASH2, "QWEN38", "qwen38", false);
+        fixture_suite_matches_pinned_reference(&QWEN38_DFLASH2, "QWEN38", "qwen38");
     }
 
-    // These are observation-transparency proofs, NOT reference-numeric acceptance.
-    #[test]
-    #[ignore = "requires pinned Qwen3.6 inputs, boundary packet/source manifests and Apple Metal"]
-    fn qwen36_peer_boundary_observation_is_byte_transparent() {
-        fixture_suite_matches_pinned_reference(&QWEN36_DFLASH2, "QWEN36", "qwen36", true);
-    }
-
-    #[test]
-    #[ignore = "requires pinned Qwen3.8 inputs, boundary packet/source manifests and Apple Metal"]
-    fn qwen38_peer_boundary_observation_is_byte_transparent() {
-        fixture_suite_matches_pinned_reference(&QWEN38_DFLASH2, "QWEN38", "qwen38", true);
-    }
 
     fn fixture_suite_matches_pinned_reference(
         descriptor: &'static DFlash2CheckpointDescriptor,
         family_env: &str,
         family: &str,
-        transparency_only: bool,
     ) {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let path = |suffix: &str| {
@@ -38,9 +25,6 @@
         let config_path = path("DFLASH2_CONFIG");
         let weights_path = path("DFLASH2_WEIGHTS");
         let fixture_directory = path("DFLASH2_REFERENCE_FIXTURES");
-        if transparency_only {
-            assert!(std::env::var_os("HF2Q_PEER_BOUNDARY_PACKET_OUT").is_some(), "transparency proof requires observation enabled");
-        }
         let target_sha256 = oracle_file_sha256(&gguf_path).expect("hash reference target GGUF");
         let manifest = oracle_manifest(&path("DFLASH2_REFERENCE_MANIFEST"))
             .expect("read source-bound complete reference manifest");
@@ -59,7 +43,6 @@
                 let target_hidden = model.cfg.hidden_size as usize;
 
                 for case in ["short", "wrap", "single", "multi", "restore"] {
-                    if transparency_only && case != "short" { continue; }
                     let case_file = if case == "single" { "single1" } else { case };
                     let file_name = format!("{family}-{case_file}-f32.safetensors");
                     let fixture_path = fixture_directory.join(&file_name);
@@ -203,19 +186,6 @@
                         &expected_noise,
                     );
                     for layer in 0..config.num_hidden_layers {
-                        let boundary = if case == "short" && layer == 0
-                            && std::env::var_os("HF2Q_PEER_BOUNDARY_PACKET_OUT").is_some() {
-                            Some(super::super::peer_boundary::BoundaryCapture::allocate(
-                                device, &config, &runtime.workspace, &runtime.tensors.layers[layer])?)
-                        } else { None };
-                        let unobserved = if transparency_only {
-                            let before = oracle_layer_snapshots(device, &config, lanes)?;
-                            let mut encoder = device.command_encoder()?;
-                            super::super::forward::dispatch_layer_inner(&mut encoder, registry, device,
-                                &config, &runtime.tensors.layers[layer], &runtime.workspace, layer, Some(&before), None)?;
-                            encoder.commit_and_wait()?;
-                            Some(super::super::peer_boundary::consumer_bytes(&runtime.workspace, &before)?)
-                        } else { None };
                         let mut encoder = device.command_encoder()?;
                         let snapshots = oracle_layer_snapshots(device, &config, lanes)?;
                         super::super::forward::dispatch_layer_inner(
@@ -227,25 +197,9 @@
                             &runtime.workspace,
                             layer,
                             Some(&snapshots),
-                            boundary.as_ref(),
                         )?;
                         encoder.commit_and_wait()?;
-                        if let Some(boundary) = boundary.as_ref() {
-                            let base = PathBuf::from(std::env::var_os("HF2Q_PEER_BOUNDARY_PACKET_OUT").context("packet output missing")?);
-                            std::fs::create_dir_all(&base)?;
-                            let identity = super::super::peer_boundary::identity(device, family, config.hidden_size,
-                                &fixture_bytes, &path("DFLASH2_REFERENCE_MANIFEST"), &manifest,
-                                descriptor.config_sha256, descriptor.weights_sha256, &target_sha256)?;
-                            boundary.export(&base.join(family), device, registry, &runtime.workspace,
-                                &runtime.tensors.layers[layer], identity)?;
-                        }
-                        if let Some(unobserved) = unobserved {
-                            let observed = super::super::peer_boundary::consumer_bytes(&runtime.workspace, &snapshots)?;
-                            ensure!(unobserved == observed, "{family}: observation/replay changed original consumer output bytes");
-                            eprintln!("BOUNDARY_TRANSPARENCY {family} original consumer output bytes match exactly (including convolution snapshots, layer output, attention, projections and persistent rings)");
-                            return Ok(());
-                        }
-                        // Keep original bounds; flush attribution data even if the first numeric gate fails.
+                        // Compare the real forward snapshots against the original bounds.
                         if layer == 0 {
                             ensure!(noise_delta <= 0.03,
                                 "{case} input embedding max_abs={noise_delta} exceeds 0.03");

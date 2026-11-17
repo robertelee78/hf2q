@@ -256,18 +256,30 @@ computes
 present  = memory available now - charged engines - model file bytes - KV budget - 8 GiB
 budget   = physical memory      - charged engines - model file bytes - KV budget - 8 GiB
 headroom = the smaller of present and budget
-planes   = sum over the covered Q4_K/Q6_K weights of the plane sets of every
-           switch that resolved on:
-           Q4_K: 16 bytes per 32 weights + 16 bytes per 256 weights
-           Q6_K: 24 bytes per 32 weights + 20 bytes per 256 weights
-scratch  = the additional shared-pool and route-transient bounds charged by route_scratch_bytes
+planes       = deduplicated native prepared-layout bytes for every resolved switch,
+               including required padding/partials and unshared head copies
+scratch      = the additional shared-pool and route-transient lifetime envelope
+drafter_run  = format-specific retained weights, workspaces and bounded runtime payloads
+drafter_load = the checked serial-upload/load peak, including the checkpoint mapping
+drafter      = max(drafter_run, max(0, drafter_load - scratch))
+required     = planes + max(scratch + drafter_run, drafter_load)
 ```
 
 where the KV budget is the configured `--kv-cache-budget` (zero when none is
-configured), the drafter is its file size, *charged engines* is what every
-engine of this process has committed (its model file, KV budget, drafter,
-planes and scratch, allocated or not), and *memory available now* is what
-the host reports free, inactive or purgeable at the decision.
+configured), *drafter* is the phase-overlap charge above rather than the
+checkpoint's file size, *charged engines* is what every engine of this
+process has committed (its model file, KV budget, drafter, planes and
+scratch, allocated or not), and *memory available now* is what the host
+reports free, inactive or purgeable at the decision.
+
+The drafter plan distinguishes retained roots from serial decode/upload peaks,
+counts fused views only through their owning allocations, and separates the
+2,048-row content-ingest ceiling from the possible 2,080-row folded capture.
+Workspace, ring, projection-partial and bounded metadata payloads are included.
+The checkpoint mapping extent is conservatively charged during load; it is
+not presented as a measured resident-set size. Unclosed driver/allocator and
+metadata owners are disclosed, not silently assigned zero or treated as
+physical-memory proof.
 
 What is available now is still owed to everything that has been promised
 memory and has not taken it: the incoming model's file and KV budget, and
@@ -335,11 +347,24 @@ before the loader is called. A plane set is prepared once however many switches 
 it, except the output head: the staged draft (at four slots) and the
 prepared target head each keep a copy of their own when
 `HF2Q_REPACKED_GGUF_SHARED_HEAD=0` (1,052,876,800 bytes each on Qwen3.8).
-`route_scratch_bytes` (`src/serve/dflash2_policy.rs`) sees all resolved routes
-together. Joint prefill and deferred waits charge their shared pool once at
-the combined absolute bound, plus joint arenas. Geometry comes from the
-parsed model header and history is bounded by cache capacity, not used rows.
-An unknown selected bound cannot be admitted as zero scratch.
+`route_scratch_bytes` (`src/serve/dflash2_policy.rs`) sees resolved routes
+together. Prepared solo, folded and aggregate-joint forwards use their maximum
+legal envelope at actual KV capacity, not only the currently scheduled rows.
+Queue-ordered segments share maximum-segment FA/projection roots; resumed
+attention has one F32 history staging root plus distinct BF16 K/V roots.
+Owners and immutable parameters survive their last checked reader, including
+error drains. The native pool and retained TLS high-water payload are charged
+once. An unknown selected bound cannot be admitted as zero scratch.
+
+Where MTP catch-up applies, the full target parent already exists during the
+forward: the envelope is retained carry plus that parent plus the larger of
+the forward-without-parent and catch-up-with-prior-pool phases. Shared and
+dedicated gather IDs remain live through all submitted consumers. Two baseline
+carry cells per slot do not cap historical owners: spill and anchor payloads
+are separately quota-accounted and the actual backing-identity union is
+checked. Before gathering, checked drain/reset enforces the retained-pool
+allowance. The ordinary legacy-target forward remains an incremental
+baseline, not an absolute-memory qualification of every legacy route.
 
 If `drafter + planes + scratch <= headroom` every admitted row applies.
 Otherwise every plane-carrying row is withheld and DFlash2 is kept when the

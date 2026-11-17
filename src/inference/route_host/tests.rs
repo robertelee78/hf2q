@@ -14,7 +14,8 @@ fn host(unavailable: &[TensorKernelFamily]) -> HostRoutes {
 }
 
 /// The switches whose route needs a tensor-only family.
-const TENSOR_ONLY: [&str; 9] = [
+const TENSOR_ONLY: [&str; 10] = [
+    "HF2Q_DFLASH2_DRAFT_AF4_G64",
     "HF2Q_DFLASH2_DRAFT_STAGED",
     "HF2Q_REPACKED_GGUF_M32",
     "HF2Q_REPACKED_GGUF_M32_PROJ",

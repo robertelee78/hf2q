@@ -174,7 +174,7 @@ thiserror = "2"
 # direct packed Q5_K/Q6_K embedding gathers and deterministic lowest-index
 # argmax tie handling, native BF16 GGUF/dense/expert execution, and sticky
 # expert-ID validation and optional deduplicated pool checkpoints use the
-# published mlx-native 0.22.2 contract (optional measurement observers default off;
+# published mlx-native 0.23.2 contract (optional measurement observers default off;
 # compact expert-matmul tile schedule with schedule reuse, ADR-063 Q4-GEMMA-PREFILL-MOE;
 # tile-fastest mm_id, grouped GeGLU decode and GQA vec-hybrid attention, opt-in SIMD MoE top-k;
 # row-exact few-row mat-vecs, DeepSeek rows kernels, tensor prefill flash attention,
@@ -195,7 +195,11 @@ thiserror = "2"
 # registrations, F32 K-quant scale quotients and width-independent Q5_K arithmetic.
 # Bounded same-file metadata diagnostics share its production mapping planner.
 # BF16 D128 draft attention applies score scaling in F32.
-mlx-native = "=0.22.2"
+# Explicit fused BF16 producer boundaries preserve the existing F32 paths.
+# Phase-specific BF16 AF4 producer profiles require precision-aware decode scratch.
+# Direct BF16 register inputs and the source-owned row-aware decode plan avoid widening scratch.
+# Source-ordered ordinary BF16 DFlash2 RMS preserves the peer's completed producer boundary.
+mlx-native = "=0.23.2"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).

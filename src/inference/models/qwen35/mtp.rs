@@ -815,7 +815,19 @@ impl MtpWeights {
         cfg: &Qwen35Config,
     ) -> Result<()> {
         let hidden_size = self.hidden_size as usize;
+        super::carry_memory::commit_catchup(cfg, tokens.len(), target_nextn, pending_target_hidden)?;
+        let plan = super::carry_memory::CatchupPlan::new(cfg, tokens.len(), self.embed_tokens.is_some());
+        let carry = super::carry_memory::CatchupScope::open(
+            plan,
+            &[target_nextn, shared_embed_rows, pending_target_hidden.unwrap_or(target_nextn)],
+        )?;
+        // Standalone calls own their phase. Serving starts both scopes before
+        // shared embedding and joins them here, never replacing its commands.
+        let _submitted = carry.owns_phase()
+            .then(|| super::encoder_stage::SubmittedCommands::open(true));
+        let encoded = (|| -> Result<()> {
         let embed_rows = self.embeddings_for_tokens(tokens, shared_embed_rows, device, registry)?;
+        super::carry_memory::keep_operand(&embed_rows);
         ensure!(
             hidden_size > 0,
             "MTP process_target_batch: hidden_size must be > 0"
@@ -862,6 +874,7 @@ impl MtpWeights {
                 vec![seq_len, hidden_size],
             )
             .map_err(|e| anyhow!("MTP alloc shifted target nextn: {e}"))?;
+        super::carry_memory::keep_operand(&shifted);
         let plan = shifted_nextn_copy_plan(seq_len, hidden_size, pending_target_hidden.is_some())?;
         let mut enc = device
             .command_encoder()
@@ -899,14 +912,11 @@ impl MtpWeights {
         } else {
             enc.commit();
         }
-        // Release the submitted copy now: the native observer retains a
-        // command for its checked drain only once the encoder drops, so an
-        // encoder held past the drain below stays unchecked until some later
-        // same-queue wait, or forever when this catch-up is the last GPU work.
-        drop(enc);
+        super::encoder_stage::retain_submitted(enc, "mtp.catchup.shifted_copy");
 
         let seq_len_u32 = u32::try_from(seq_len).context("MTP batch seq_len exceeds u32")?;
         let pos_buf = upload_i32(position_ids, device).context("MTP upload batch positions")?;
+        super::carry_memory::keep_operand(&pos_buf);
         let projected = self.project_embedding_and_hidden(
             &embed_rows,
             &shifted,
@@ -925,17 +935,20 @@ impl MtpWeights {
             registry,
             cfg,
         )?;
+            Ok(())
+        })();
 
-        // The KV-only projection/write chain submits without a wait. Drain
-        // before its temporary buffers drop; the MTP cursor and valid prefix
-        // are transactional on return.
-        let mut drain = device
-            .command_encoder()
-            .map(crate::inference::native_observation::encoder)
-            .context("MTP target-batch cache drain")?;
-        drain
-            .commit_and_wait_labeled("mtp.process_target_batch")
-            .context("MTP target-batch cache drain")?;
+        if carry.owns_phase() {
+            // Check every submitted buffer, also after an encoding failure.
+            super::encoder_stage::settle_submitted()
+                .context("MTP target-batch checked command drain")?;
+            encoded?;
+            carry.finish()?;
+        } else {
+            // The outer serving transaction must settle shared gather and all
+            // MTP stages together, including failures before this method ran.
+            encoded?;
+        }
         Ok(())
     }
 
@@ -969,6 +982,7 @@ impl MtpWeights {
                 h,
                 cfg.rms_norm_eps,
             )?;
+            super::carry_memory::keep_operand(&x_norm);
             enc.memory_barrier();
             let k_flat = apply_linear_projection_f32_with_ggml_type(
                 &mut enc,
@@ -981,6 +995,7 @@ impl MtpWeights {
                 h,
                 kv_total,
             )?;
+            super::carry_memory::keep_operand(&k_flat);
             let v_flat = apply_linear_projection_f32_with_ggml_type(
                 &mut enc,
                 registry,
@@ -992,6 +1007,7 @@ impl MtpWeights {
                 h,
                 kv_total,
             )?;
+            super::carry_memory::keep_operand(&v_flat);
             enc.memory_barrier();
             let k_normed = apply_q_or_k_per_head_rms_norm(
                 &mut enc,
@@ -1004,6 +1020,7 @@ impl MtpWeights {
                 cfg.head_dim,
                 cfg.rms_norm_eps,
             )?;
+            super::carry_memory::keep_operand(&k_normed);
             enc.memory_barrier();
             let k_rope = apply_imrope(
                 &mut enc,
@@ -1018,12 +1035,14 @@ impl MtpWeights {
                 cfg.rope_theta as f32,
                 cfg.mrope_section,
             )?;
+            super::carry_memory::keep_operand(&k_rope);
             if crate::inference::stage_profile::enabled() {
                 enc.commit_and_wait_labeled("adr065.mtp_catchup.kv_projections")
                     .context("profile MTP catch-up KV projections")?;
             } else {
                 enc.commit_labeled("mtp.kv_only_projections");
             }
+            super::encoder_stage::retain_submitted(enc, "mtp.kv_only_projections");
             (k_rope, v_flat)
         };
 
@@ -1071,6 +1090,7 @@ impl MtpWeights {
             h,
             1e-6,
         )?;
+        super::carry_memory::keep_operand(&embed_norm);
         let hidden_norm = rms_norm_with_weight(
             &mut enc,
             registry,
@@ -1081,6 +1101,7 @@ impl MtpWeights {
             h,
             1e-6,
         )?;
+        super::carry_memory::keep_operand(&hidden_norm);
         enc.memory_barrier();
         let concat = device
             .alloc_buffer(
@@ -1089,6 +1110,7 @@ impl MtpWeights {
                 vec![seq_len as usize, (2 * h) as usize],
             )
             .map_err(|e| anyhow!("MTP alloc eh_proj concat: {e}"))?;
+        super::carry_memory::keep_operand(&concat);
         mlx_native::ops::feature_concat::register(registry);
         mlx_native::ops::feature_concat::dispatch_feature_concat_f32(
             &mut enc,
@@ -1126,12 +1148,14 @@ impl MtpWeights {
             2 * h,
             h,
         )?;
+        super::carry_memory::keep_operand(&out);
         if crate::inference::stage_profile::enabled() {
             enc.commit_and_wait_labeled(profile_label)
                 .context("profile MTP embedding and hidden projection")?;
         } else {
             enc.commit();
         }
+        super::encoder_stage::retain_submitted(enc, "mtp.embedding_hidden_projection");
         Ok(out)
     }
 
@@ -1705,6 +1729,7 @@ fn rms_norm_with_weight(
     let mut params = device
         .alloc_buffer(8, DType::F32, vec![2])
         .map_err(|e| anyhow!("alloc rms_norm params: {e}"))?;
+    super::carry_memory::keep_operand(&params);
     {
         let s = params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
         s[0] = eps;

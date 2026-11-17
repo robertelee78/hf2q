@@ -326,6 +326,7 @@ pub fn append_kv_to_cache_without_attention(
     } else {
         enc.commit_labeled("mtp.kv_only_append");
     }
+    super::encoder_stage::retain_submitted(enc, "mtp.kv_only_append");
     slot.current_len[slot_idx] = new_len;
     Ok(())
 }
@@ -4713,22 +4714,22 @@ pub fn apply_flash_attn_prefill_seq_major(
     //
     // ADR-013 P21 S1: when fa_arena=Some, the 7 BF16 scratch buffers are
     // reused from the caller-owned FaPrefillArena (allocated once per
-    // prefill in forward_gpu_impl). Only out_seq (the F32 return value)
-    // is allocated per-call — it is moved into the caller's binding and
-    // does not drop at wrapper return (see queen plan A.5).
+    // prefill in forward_gpu_impl). Ordinary callers allocate out_seq per
+    // call; joint segments borrow a forward-owned result until its consumer
+    // finishes, before the next segment reuses it.
     let q_elems = seq * nh * d;
     let k_elems = seq * nkv * d;
     let v_elems = seq * nkv * d;
     let out_elems = seq * nh * d;
 
-    // out_seq is a per-call allocation: it is the function's return value
-    // and the caller takes ownership.  ADR-019 Phase 2 iter92: caller is
-    // expected to ARC-clone it into the K-batch hold-vec at forward_gpu
-    // level before the next FA layer's same-slot reuse can race the
-    // residency-rescission mid-flight CB.
-    let out_seq = device
-        .alloc_buffer(out_elems * 4, DType::F32, vec![seq, nh, d])
-        .map_err(|e| anyhow!("alloc out_seq: {e}"))?;
+    // Joint segments consume this result before reusing their forward-owned
+    // output. Ordinary callers keep the independent-result contract.
+    let out_seq = match fa_arena.as_ref().and_then(|arena| arena.shared_output.as_ref()) {
+        Some(output) => output.clone(),
+        None => device
+            .alloc_buffer(out_elems * 4, DType::F32, vec![seq, nh, d])
+            .map_err(|e| anyhow!("alloc out_seq: {e}"))?,
+    };
 
     if let Some(arena) = fa_arena {
         // ── Arena path: use caller-owned BF16 scratch buffers ────────────
@@ -5227,38 +5228,9 @@ pub(crate) fn encode_flash_attn_prefill_seq_major_resume(
     n_kv_heads: u32,
     head_dim: u32,
 ) -> Result<()> {
-    let seq = seq_len as usize;
-    let nh = n_heads as usize;
-    let nkv = n_kv_heads as usize;
-    let d = head_dim as usize;
-    let cap = kv_capacity as usize;
+    let kv_slot_elems = n_kv_heads as usize * kv_capacity as usize * head_dim as usize;
 
-    let q_elems = seq * nh * d;
-    let kv_slot_elems = nkv * cap * d;
-
-    // ── Step 1+2: Q F32 seq-major → BF16 seq-major → BF16 head-major ──
-    cast(
-        enc,
-        registry,
-        device.metal_device(),
-        q_seq_major,
-        bufs.q_bf16_seq,
-        q_elems,
-        CastDirection::F32ToBF16,
-    )
-    .context("FA resume bridge: cast Q F32→BF16")?;
-    enc.memory_barrier();
-    permute_021_bf16(
-        enc,
-        registry,
-        device.metal_device(),
-        bufs.q_bf16_seq,
-        bufs.q_bf16_hm,
-        seq,
-        nh,
-        d,
-    )
-    .context("FA resume bridge: permute_021 Q [seq, nh, d] → [nh, seq, d]")?;
+    encode_resume_query(enc, device, registry, q_seq_major, bufs, seq_len, n_heads, head_dim)?;
 
     // ── Step 3: cast slot K F32 head-major → BF16 head-major (in-layout) ──
     //
@@ -5292,6 +5264,77 @@ pub(crate) fn encode_flash_attn_prefill_seq_major_resume(
     .context("FA resume bridge: cast slot V F32→BF16")?;
     enc.memory_barrier();
 
+    encode_resume_attention(
+        enc, device, registry, bufs, seq_len, cur_len, kv_seq_len, kv_capacity,
+        n_heads, n_kv_heads, head_dim,
+    )
+}
+
+/// Resume bridge after K/V are already BF16. This lets TQ history reuse one
+/// F32 staging root while the ordinary F32 bridge keeps its dispatch order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_flash_attn_prefill_seq_major_resume_prepared(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_seq_major: &MlxBuffer,
+    bufs: &FaResumeBridgeBuffers<'_>,
+    seq_len: u32,
+    cur_len: u32,
+    kv_seq_len: u32,
+    kv_capacity: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) -> Result<()> {
+    encode_resume_query(enc, device, registry, q_seq_major, bufs, seq_len, n_heads, head_dim)?;
+    enc.memory_barrier();
+    encode_resume_attention(
+        enc, device, registry, bufs, seq_len, cur_len, kv_seq_len, kv_capacity,
+        n_heads, n_kv_heads, head_dim,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_resume_query(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_seq_major: &MlxBuffer,
+    bufs: &FaResumeBridgeBuffers<'_>,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+) -> Result<()> {
+    let (seq, nh, d) = (seq_len as usize, n_heads as usize, head_dim as usize);
+    cast(
+        enc, registry, device.metal_device(), q_seq_major, bufs.q_bf16_seq,
+        seq * nh * d, CastDirection::F32ToBF16,
+    )
+    .context("FA resume bridge: cast Q F32→BF16")?;
+    enc.memory_barrier();
+    permute_021_bf16(
+        enc, registry, device.metal_device(), bufs.q_bf16_seq, bufs.q_bf16_hm,
+        seq, nh, d,
+    )
+    .context("FA resume bridge: permute_021 Q [seq, nh, d] → [nh, seq, d]")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_resume_attention(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    bufs: &FaResumeBridgeBuffers<'_>,
+    seq_len: u32,
+    cur_len: u32,
+    kv_seq_len: u32,
+    kv_capacity: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) -> Result<()> {
+    let (seq, nh, d) = (seq_len as usize, n_heads as usize, head_dim as usize);
     // ── Step 5: dispatch the resume FA bf16 d256 kernel ──
     //   - q_offset_in_k = cur_len   (chunk Q starts at slot position cur_len)
     //   - kv_capacity   = slot stride (slot's allocated kv_capacity)
@@ -6809,6 +6852,11 @@ pub fn build_gated_attn_layer(
             // NOT take the use_fused_stage_ab branch).
             let mut enc = LayerEncoder::from_session_or_plain(device, layer_session.as_deref_mut())
                 .context("enc ops1-4")?;
+            if arena.shared {
+                // A preceding segment may still read these same roots in
+                // this concurrent encoder. Queue order alone is insufficient.
+                enc.encoder().memory_barrier();
+            }
 
             // Op 1: pre-attention RMSNorm → arena.x_norm_buf
             apply_pre_attn_rms_norm_into(
@@ -7064,23 +7112,21 @@ pub fn build_gated_attn_layer(
                 // correctness and profiling attribution.
                 enc.encoder().memory_barrier();
 
-                // `out_seq` (the FA bridge's F32 seq-major output) comes from
-                // the decode pool, like the resumed route's output: the pool
-                // keeps it alive until the reset that follows this layer's
-                // host wait, and both producers below write every element.
-                // A fresh device buffer here was zero-filled on the CPU for
-                // every layer while the GPU sat idle.
+                // Joint segments reuse one forward-owned result after its
+                // consumer. Other callers retain the pool's drain lifetime.
                 let seq = seq_len as usize;
                 let nh = n_heads as usize;
                 let d = head_dim as usize;
                 let out_elems = seq * nh * d;
-                let out_seq = super::decode_pool::pooled_alloc_buffer(
-                    device,
-                    out_elems * 4,
-                    DType::F32,
-                    vec![seq, nh, d],
-                )
-                .map_err(|e| anyhow!("alloc out_seq (fused stage_ab): {e}"))?;
+                let out_seq = match fa_pre.shared_output.as_ref() {
+                    Some(output) => output.clone(),
+                    None => super::decode_pool::pooled_alloc_buffer(
+                        device,
+                        out_elems * 4,
+                        DType::F32,
+                        vec![seq, nh, d],
+                    ).map_err(|e| anyhow!("alloc out_seq (fused stage_ab): {e}"))?,
+                };
                 // ADR-019 Phase 2 iter92 — push Arc-clone into K-batch hold-vec.
                 if let Some(hold) = out_seq_hold.as_deref_mut() {
                     hold.push(out_seq.clone());
@@ -11059,6 +11105,142 @@ mod tests {
              PASS at seq_len={seq_len}, shape h={}, nh={}, nkv={}, d={}",
             shape.hidden_size, nh, nkv, d,
         );
+    }
+
+    /// Exercise both shared-output consumers: the ordinary bridge wrapper and
+    /// the fused projection/bridge/gate layer. Compare against the same kernels
+    /// with separate roots, queue unequal segments without caller-side waits,
+    /// and retain every result and arena until all submitted commands settle.
+    #[test]
+    fn shared_fa_layers_match_separate_roots_for_unequal_queued_segments() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use super::super::{FaPrefillArena, FaProjectionsArena};
+        use super::super::encoder_stage::{settle_submitted, SubmittedCommands};
+
+        let Ok(device) = MlxDevice::new() else {
+            eprintln!("skipping shared FA parity: no Metal device");
+            return;
+        };
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::flash_attn_prefill::register(&mut registry);
+        let (h, nh, nkv, d) = (64u32, 4u32, 2u32, 256u32);
+        let cases = [33u32, 97, 3, 64];
+        let capacity = *cases.iter().max().expect("segments");
+        let mut seed = 0xA11A5u32;
+        let weights = layer_weights_f32(h as usize, nh as usize, nkv as usize, d as usize, &mut seed, &device);
+        let inputs: Vec<_> = cases.iter().map(|&rows| {
+            upload_f32(&mk_rand(&mut seed, rows as usize * h as usize, 0.5), &device)
+                .expect("segment input")
+        }).collect();
+        let positions: Vec<_> = cases.iter().map(|&rows| {
+            upload_positions(rows as usize, 0, &device)
+        }).collect();
+        let make_slot = || FullAttnKvSlot {
+            k: Some(alloc_kv_cache(nkv as usize, capacity as usize, d as usize, &device)),
+            v: Some(alloc_kv_cache(nkv as usize, capacity as usize, d as usize, &device)),
+            current_len: vec![0],
+            tq: None,
+        };
+
+        for fused in [false, true] {
+            let submitted = SubmittedCommands::open(true);
+            let _single_command = super::super::prefill_prepared::SingleCommandLayers::set(fused);
+            // With HF2Q_ENCODER_SESSION=1, all fused segments share one
+            // concurrent encoder, exercising the production projection WAR.
+            let mut session = if fused {
+                device.encoder_session().expect("optional encoder session")
+            } else {
+                None
+            };
+            let mut owner = FaPrefillArena::new(&device, capacity, nh, nkv, d).expect("FA roots");
+            owner.shared_output = Some(
+                device.alloc_buffer(
+                    capacity as usize * nh as usize * d as usize * 4,
+                    DType::F32,
+                    vec![capacity as usize, nh as usize, d as usize],
+                ).expect("shared result root"),
+            );
+            let projection_owner = FaProjectionsArena::new(
+                &device, capacity, h, nh, nkv, d, 1e-6,
+            ).expect("projection roots");
+            let mut shared: Vec<_> = cases.iter().map(|&rows| {
+                (
+                    owner.shared_rows(rows).expect("tight FA views"),
+                    projection_owner.shared_rows(&device, rows).expect("tight projection views"),
+                )
+            }).collect();
+            // Production drops these construction wrappers after making views.
+            drop(owner);
+            drop(projection_owner);
+            let mut separate: Vec<_> = cases.iter().map(|&rows| {
+                (
+                    FaPrefillArena::new(&device, rows, nh, nkv, d).expect("separate FA"),
+                    FaProjectionsArena::new(&device, rows, h, nh, nkv, d, 1e-6)
+                        .expect("separate projections"),
+                )
+            }).collect();
+            let mut shared_slots: Vec<_> = cases.iter().map(|_| make_slot()).collect();
+            let mut separate_slots: Vec<_> = cases.iter().map(|_| make_slot()).collect();
+            let mut holds = Vec::new();
+            let mut outputs = Vec::new();
+            for pass in 0..3 {
+                for (index, &rows) in cases.iter().enumerate() {
+                    let mut pair = Vec::new();
+                    for (arenas, slots) in [
+                        (&mut separate, &mut separate_slots),
+                        (&mut shared, &mut shared_slots),
+                    ] {
+                        slots[index].current_len[0] = 0;
+                        let (arena, projections) = &mut arenas[index];
+                        pair.push(build_gated_attn_layer(
+                            &device,
+                            &mut registry,
+                            &inputs[index],
+                            &positions[index],
+                            &weights,
+                            Some(&mut slots[index]),
+                            capacity,
+                            rows,
+                            h,
+                            nh,
+                            nkv,
+                            d,
+                            64,
+                            1e7,
+                            [11, 11, 10, 0],
+                            1e-6,
+                            Some(arena),
+                            if fused { Some(projections) } else { None },
+                            Some(&mut holds),
+                            session.as_mut(),
+                            SlotId(0),
+                        ).expect("queued full attention layer"));
+                    }
+                    outputs.push((pass, index, pair));
+                }
+            }
+            if let Some(session) = session.as_mut() {
+                LayerEncoder::Sessioned(session)
+                    .commit_and_wait_labeled_terminal("test.shared_fa.terminal")
+                    .expect("drain carried segment encoder");
+            }
+            settle_submitted().expect("check every queued layer command");
+            device.command_encoder().expect("terminal encoder")
+                .commit_and_wait().expect("terminal drain");
+            for (pass, index, pair) in outputs {
+                let expected = download_f32(&pair[0]).expect("separate result");
+                let actual = download_f32(&pair[1]).expect("shared result");
+                assert!(expected.iter().any(|&x| x != 0.0), "nonzero oracle");
+                assert_eq!(actual.len(), cases[index] as usize * h as usize);
+                for (element, (got, want)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        got.to_bits(), want.to_bits(),
+                        "fused={fused} pass={pass} segment={index} element={element}",
+                    );
+                }
+            }
+            drop(submitted);
+        }
     }
 
     // ADR-027 Phase B iter-33 (sub-sub-iter 23c-β.4) — parity tests

@@ -4864,6 +4864,14 @@ pub(crate) struct Qwen35PrefillState {
     prefill_started: Instant,
 }
 
+impl Qwen35PrefillState {
+    pub(crate) fn include_carry_owners(
+        &self, owners: &mut crate::inference::models::qwen35::carry_memory::CarryOwners,
+    ) {
+        if let Some(hidden) = self.mtp_pending_hidden.as_ref() { owners.include(hidden); }
+    }
+}
+
 fn qwen35_next_prefill_end(
     cursor: usize,
     prompt_len: usize,
@@ -5270,7 +5278,13 @@ impl Qwen35PrefillState {
                     ),
                     None,
                 )
-            } else if mtp_prefill {
+            } else if crate::inference::models::qwen35::carry_memory::uses_mtp(
+                dflash2_prefill, mtp_prefill,
+            ) {
+                let _carry_commitment =
+                    crate::inference::models::qwen35::carry_memory::commit_target(
+                        &qwen.model.cfg, chunk.len(),
+                    )?;
                 let target = {
                     let _prefill = PrefillScope::enter();
                     qwen.model.forward_gpu_last_logits_with_hidden(
@@ -5290,12 +5304,19 @@ impl Qwen35PrefillState {
                     ),
                     Ok((logits, target_nextn)) => {
                         let catchup = (|| -> Result<MlxBuffer> {
-                            let shared_embed_rows = qwen.model.embed_tokens_gpu(chunk)?;
+                            let catchup_owners =
+                                crate::inference::models::qwen35::carry_memory::CatchupTransaction::open(
+                                    &qwen.model.cfg, chunk.len(), &target_nextn,
+                                    self.mtp_pending_hidden.as_ref(),
+                                )?;
+                            let shared_embed_rows = catchup_owners.gather(
+                                || qwen.model.embed_tokens_gpu(chunk),
+                            )?;
                             let mtp =
                                 qwen.model.mtp.as_ref().context(
                                     "Qwen SlotAware MTP prompt catch-up weights missing",
-                                )?;
-                            qwen.model.with_gpu_cache_mut(|device, registry| {
+                                ).map_err(|error| catchup_owners.settle_error(error))?;
+                            let caught_up = qwen.model.with_gpu_cache_mut(|device, registry| {
                                 mtp.process_target_batch(
                                     chunk,
                                     self.mtp_pending_hidden.as_ref(),
@@ -5308,7 +5329,8 @@ impl Qwen35PrefillState {
                                     registry,
                                     &qwen.model.cfg,
                                 )
-                            })?;
+                            });
+                            catchup_owners.finish(caught_up)?;
                             kv_cache
                                 .validate_speculative_cursors_for_slot(self.slot_id, end)
                                 .context("Qwen SlotAware prompt target/MTP cursor equality")?;
@@ -5330,6 +5352,9 @@ impl Qwen35PrefillState {
                                 (Ok(logits), None)
                             }
                             Err(error) => {
+                                if crate::inference::models::qwen35::carry_memory::is_commitment_error(&error) {
+                                    return Err(error);
+                                }
                                 // Pool failures stay sticky even when helpers stringify
                                 // them; NEVER replay ordinary target after quota/identity
                                 // refusal or an unknown MTP transaction failure.
@@ -6661,6 +6686,12 @@ impl Qwen35DecodeState {
             .collect()
     }
 
+    pub(crate) fn include_carry_owners(
+        &self, owners: &mut crate::inference::models::qwen35::carry_memory::CarryOwners,
+    ) {
+        if let Some(mtp) = self.mtp.as_ref() { owners.include(&mtp.verifier_hidden); }
+    }
+
     /// Return model-semantic speculative state for an exactly published
     /// physical prefix. A verified queue means GPU state is intentionally
     /// ahead of the streamed ledger, so it can never be published.
@@ -7063,6 +7094,10 @@ impl Qwen35DecodeState {
         }
 
         let verify_rows = drafts.len() + 1;
+        let _carry_commitment =
+            crate::inference::models::qwen35::carry_memory::commit_target(
+                &qwen.model.cfg, verify_rows,
+            )?;
         if let Err(error) = qwen.model.with_gpu_cache_mut(|device, _registry| {
             kv_cache.ensure_la_capture(&qwen.model.cfg, device, verify_rows as u32)
         }) {
@@ -7122,7 +7157,14 @@ impl Qwen35DecodeState {
         }
 
         if let (Some(mtp_state), Some(prior_mtp_len)) = (self.mtp.as_ref(), prior_mtp_len) {
-            let shared_embed_rows = match qwen.model.embed_tokens_gpu(&verify_input) {
+            let catchup_owners =
+                crate::inference::models::qwen35::carry_memory::CatchupTransaction::open(
+                    &qwen.model.cfg, verify_input.len(), &verify_hidden,
+                    Some(&mtp_state.verifier_hidden),
+                )?;
+            let shared_embed_rows = match catchup_owners.gather(
+                || qwen.model.embed_tokens_gpu(&verify_input),
+            ) {
                 Ok(rows) => rows,
                 Err(error) => {
                     kv_cache.clear_la_capture();
@@ -7135,11 +7177,14 @@ impl Qwen35DecodeState {
             let mtp = match qwen.model.mtp.as_ref() {
                 Some(mtp) => mtp,
                 None => {
+                    let error = catchup_owners.settle_error(
+                        anyhow::anyhow!("Qwen history MTP state exists without weights"),
+                    );
                     kv_cache.clear_la_capture();
                     kv_cache
                         .reset_for_slot(self.slot_id)
                         .context("Qwen history missing-MTP reset")?;
-                    anyhow::bail!("Qwen history MTP state exists without weights");
+                    return Err(error);
                 }
             };
             let lease = match supervisor.arm(
@@ -7148,6 +7193,7 @@ impl Qwen35DecodeState {
             ) {
                 Ok(lease) => lease,
                 Err(error) => {
+                    let error = catchup_owners.settle_error(error);
                     kv_cache.clear_la_capture();
                     kv_cache
                         .reset_for_slot(self.slot_id)
@@ -7169,7 +7215,8 @@ impl Qwen35DecodeState {
                     &qwen.model.cfg,
                 )
             });
-            if let Err(error) = lease.finish().and(caught_up) {
+            let caught_up = catchup_owners.finish(caught_up);
+            if let Err(error) = caught_up.and(lease.finish()) {
                 kv_cache.clear_la_capture();
                 kv_cache.reset_for_slot(self.slot_id).with_context(|| {
                     format!("Qwen history MTP catch-up failed ({error:#}); fail-closed reset")
@@ -7406,6 +7453,8 @@ impl Qwen35DecodeState {
             "Qwen35 coherent ordinary target",
             QWEN35_WORKER_TRANSACTION_TIMEOUT,
         )?;
+        let _carry_commitment =
+            crate::inference::models::qwen35::carry_memory::commit_target(&qwen.model.cfg, 1)?;
         let forward = qwen.model.forward_gpu_with_nextn_hidden(
             &[next_token],
             &[next_pos; 4],
@@ -7497,7 +7546,13 @@ impl Qwen35DecodeState {
         } = target;
         #[cfg(test)]
         q1_speculation::first_fork::ordinary_pre_catchup(next_pos, &logits, &nextn_hidden)?;
-        let shared_embed = match qwen.model.embed_tokens_gpu(&[next_token]) {
+        let catchup_owners =
+            crate::inference::models::qwen35::carry_memory::CatchupTransaction::open(
+                &qwen.model.cfg, 1, &nextn_hidden, Some(&pending_hidden),
+            )?;
+        let shared_embed = match catchup_owners.gather(
+            || qwen.model.embed_tokens_gpu(&[next_token]),
+        ) {
             Ok(embed) => embed,
             Err(error) => {
                 return rollback_slot_mtp_error(
@@ -7513,12 +7568,15 @@ impl Qwen35DecodeState {
         let mtp = match qwen.model.mtp.as_ref() {
             Some(mtp) => mtp,
             None => {
+                let error = catchup_owners.settle_error(
+                    anyhow::anyhow!("Qwen coherent ordinary decode MTP weights missing"),
+                );
                 return rollback_slot_mtp_error(
                     kv_cache,
                     self.slot_id,
                     prior_target,
                     prior_mtp,
-                    anyhow::anyhow!("Qwen coherent ordinary decode MTP weights missing"),
+                    error,
                     "Qwen coherent ordinary MTP lookup",
                 );
             }
@@ -7529,6 +7587,7 @@ impl Qwen35DecodeState {
         ) {
             Ok(lease) => lease,
             Err(error) => {
+                let error = catchup_owners.settle_error(error);
                 return rollback_slot_mtp_error(
                     kv_cache,
                     self.slot_id,
@@ -7553,7 +7612,8 @@ impl Qwen35DecodeState {
                 &qwen.model.cfg,
             )
         });
-        if let Err(error) = lease.finish().and(caught_up) {
+        let caught_up = catchup_owners.finish(caught_up);
+        if let Err(error) = caught_up.and(lease.finish()) {
             return rollback_slot_mtp_error(
                 kv_cache,
                 self.slot_id,

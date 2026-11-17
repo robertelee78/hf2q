@@ -229,6 +229,63 @@ struct ContextPositions {
 }
 
 impl DFlash2Runtime {
+    /// Constructor-backed host payload geometry without constructing a runtime.
+    pub(super) fn metadata_memory(
+        config: &DFlash2Config,
+        lanes: usize,
+    ) -> std::result::Result<
+        super::runtime_memory::DFlash2RuntimeMetadataMemory,
+        super::runtime_memory::DFlash2RuntimeMemoryError,
+    > {
+        use super::runtime_memory::{add, mul, DFlash2RuntimeMemoryError, DFlash2RuntimeMetadataMemory};
+        let word = std::mem::size_of::<u32>();
+        let config_heap_bytes = add(
+            config.draft_model_type.len(),
+            add(
+                mul(config.target_layer_ids.len(), std::mem::size_of::<usize>())?,
+                mul(config.layer_types.len(), std::mem::size_of::<super::config::DFlash2LayerType>())?,
+            )?,
+        )?;
+        let lane_state_bytes = mul(lanes, add(
+            std::mem::size_of::<usize>(), std::mem::size_of::<DFlash2LaneBinding>(),
+        )?)?;
+        let lane_rebind_temporary_bytes = mul(config.sliding_window, word)?;
+        let lane_rewind_bytes = mul(lanes, lane_rebind_temporary_bytes)?;
+        let verify_budget_label_bytes = DFlash2VerifyBudget::label_payload_bytes()
+            .ok_or(DFlash2RuntimeMemoryError::Invalid("verify-budget label payload overflows"))?;
+        let weight_layer_array_bytes = mul(
+            config.num_hidden_layers, std::mem::size_of::<super::tensors::DFlash2LayerTensors>(),
+        )?;
+        let workspace_ring_array_bytes = mul(
+            mul(2, config.num_hidden_layers)?, std::mem::size_of::<MlxBuffer>(),
+        )?;
+        let runtime_inline_bytes = std::mem::size_of::<Self>();
+        let retained_bytes = add(
+            add(runtime_inline_bytes, config_heap_bytes)?,
+            add(
+                add(add(lane_state_bytes, lane_rewind_bytes)?, verify_budget_label_bytes)?,
+                add(weight_layer_array_bytes, workspace_ring_array_bytes)?,
+            )?,
+        )?;
+        // Five lane-width u32 snapshots and one lane*proposal uniform snapshot.
+        let prefetch_snapshot_bytes = mul(
+            add(mul(5, lanes)?, mul(lanes, config.proposal_tokens())?)?, word,
+        )?;
+        Ok(DFlash2RuntimeMetadataMemory {
+            runtime_inline_bytes,
+            config_heap_bytes,
+            lane_state_bytes,
+            lane_rewind_bytes,
+            verify_budget_label_bytes,
+            weight_layer_array_bytes,
+            workspace_ring_array_bytes,
+            retained_bytes,
+            prefetch_snapshot_bytes,
+            prefetch_host_lane_order_temporary_bytes: mul(lanes, word)?,
+            lane_rebind_temporary_bytes,
+        })
+    }
+
     /// Verify the immutable checkpoint identity before uploading any tensor.
     pub fn load_verified<T: DFlash2TargetFamily>(
         device: &MlxDevice,
@@ -1722,4 +1779,10 @@ mod tests {
 
     include!("reference_oracle_tests.rs");
     include!("reference_fixture_tests.rs");
+    include!("native_af4_manifest_tests.rs");
+    include!("native_af4_source_tests.rs");
+    include!("native_af4_weight_tests.rs");
+    include!("native_af4_state_tests.rs");
+    include!("native_af4_restore_tests.rs");
+    include!("native_af4_fixture_tests.rs");
 }

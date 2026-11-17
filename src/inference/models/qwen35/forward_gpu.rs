@@ -91,6 +91,18 @@ pub(crate) use joint_decode::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowO
 mod joint_verify;
 pub(crate) use joint_verify::{Qwen35JointVerify, Qwen35JointVerifyLane, Qwen35JointVerifyPending};
 
+/// Segment views own the shared attention roots until the outer checked drain,
+/// including when the layer loop returns an error before its terminal wait.
+struct JointSegmentScratch {
+    fa: Option<(super::FaPrefillArena, super::FaProjectionsArena, MlxBuffer)>,
+    /// MoE FFN scratch of a segment the layer is built for on its
+    /// own (`None` for a segment served by the forward-wide call).
+    moe: Option<super::MoeFfnArena>,
+    /// Gathered full-attention input rows of a segment whose rows
+    /// are not contiguous in the forward.
+    gather: Vec<MlxBuffer>,
+}
+
 /// Large Qwen prefills are intentionally drained at every layer boundary.
 /// K>1 is a decode/short-row throughput optimization; on a substantial
 /// prompt it widens the asynchronous error-observation window after a Metal
@@ -1263,6 +1275,7 @@ pub(super) fn embed_tokens_gpu_into(
                     .context("upload selected native F32 embedding rows");
             }
         }
+        super::carry_memory::keep_operand(&ids);
         #[cfg(test)]
         if let Some(snapshots)=q1_snapshots {
             snapshots.snapshot(&mut enc,output,0,crate::adr063_invariance::receipt::Stage::Input,
@@ -4838,6 +4851,9 @@ impl Qwen35Model {
         // is kept from its first submission (the embedding) on, at every
         // wait cadence.
         let submitted = super::encoder_stage::SubmittedCommands::open(tokens.len() > 1);
+        // Segment views retain the shared FA/projection/history roots through
+        // the checked settle below, including early errors from the layer loop.
+        let mut joint_scratch = Vec::new();
         let result = self.forward_gpu_run(
             tokens,
             positions_flat,
@@ -4852,6 +4868,7 @@ impl Qwen35Model {
             logits_buffer_out,
             slot_id,
             residual_capture,
+            &mut joint_scratch,
         );
         // Settle what the forward still keeps before either result leaves:
         // the commands of its last window (a forward whose output head is
@@ -4872,6 +4889,7 @@ impl Qwen35Model {
         if result.is_err() {
             drain_after_failed_forward();
         }
+        drop(joint_scratch);
         // The queue is drained (the forward's last wait, the settle above
         // and, after an error, the drain): the buffers served outside the
         // pool have no user in flight. The reset that takes the pooled ones
@@ -4912,6 +4930,7 @@ impl Qwen35Model {
         // every existing path — the read arm is gated on the target layer
         // and off otherwise.
         mut residual_capture: Option<ResidualLayerCapture<'_>>,
+        joint_scratch: &mut Vec<JointSegmentScratch>,
     ) -> Result<Vec<f32>> {
         let _native_input = crate::inference::native_observation::qwen_input(
             "qwen35.forward.actual_tokens",slot_id.0,tokens.len(),positions_flat);
@@ -5415,21 +5434,11 @@ impl Qwen35Model {
         // its own dispatches. A segment whose rows are not contiguous in the
         // forward (a shared prefix, then the lane's own rows) is built on a
         // gathered copy of its rows.
-        struct JointSegmentScratch {
-            fa: Option<(super::FaPrefillArena, super::FaProjectionsArena, MlxBuffer)>,
-            /// MoE FFN scratch of a segment the layer is built for on its
-            /// own (`None` for a segment served by the forward-wide call).
-            moe: Option<super::MoeFfnArena>,
-            /// Gathered full-attention input rows of a segment whose rows
-            /// are not contiguous in the forward.
-            gather: Vec<MlxBuffer>,
-        }
         let joint_segments: Vec<super::prefill_joint::Segment> = joint
             .as_ref()
             .map(|plan| plan.segments())
             .unwrap_or_default();
         let joint_shared_rows = joint.as_ref().map_or(0, |plan| plan.shared_rows);
-        let mut joint_scratch: Vec<JointSegmentScratch> = Vec::new();
         let mut joint_dn: Option<super::prefill_joint::DnRunScratch> = None;
         // MoE FFN scratch of the one call that serves every row-exact
         // segment of the forward (see the layer loop).
@@ -5457,28 +5466,78 @@ impl Qwen35Model {
             let has_linear = layer_weights_gpu
                 .iter()
                 .any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }));
+            // One set of large attention roots. Segment views retain tight
+            // shapes and immutable parameters; their GPU uses are queue-ordered.
+            let shared_fa = if has_full {
+                let shape = FullAttnShape::from_config(cfg);
+                let rows = joint_segments
+                    .iter()
+                    .map(|segment| segment.rows)
+                    .max()
+                    .context("joint prefill has no attention segments")?;
+                let mut arena = super::FaPrefillArena::new(
+                    &device, rows, shape.n_head, shape.n_kv, shape.head_dim,
+                )?;
+                let output_shape = vec![rows as usize, shape.n_head as usize, shape.head_dim as usize];
+                let output_bytes = output_shape.iter().try_fold(4usize, |bytes, &extent| {
+                    bytes.checked_mul(extent)
+                }).context("joint attention output size overflow")?;
+                arena.shared_output = Some(
+                    device.alloc_buffer(output_bytes, DType::F32, output_shape)
+                        .context("alloc shared joint attention output")?,
+                );
+                if shape.head_dim == 256
+                    && super::resume_attn_fast::resume_attn_fast_enabled()
+                {
+                    let mut history = 0;
+                    for lane in &plan.lanes {
+                        let content_rows = lane
+                            .boundary
+                            .as_ref()
+                            .map_or(lane.rows, |boundary| boundary.prefix_rows);
+                        if content_rows <= super::prefill_fold::MAX_CUE_ROWS as u32 {
+                            continue;
+                        }
+                        for slot in &kv_cache.full_attn {
+                            let cursor = *slot
+                                .current_len
+                                .get(lane.slot.0 as usize)
+                                .context("joint prefill attention slot is missing")?;
+                            if cursor > 0 && slot.k.is_none() && slot.tq.is_some() {
+                                let attended = cursor
+                                    .checked_add(content_rows)
+                                    .context("joint resume attention length overflow")?;
+                                ensure!(
+                                    attended <= kv_cache.max_seq_len,
+                                    "joint resume attention exceeds cache capacity"
+                                );
+                                history = history.max(attended);
+                            }
+                        }
+                    }
+                    if history > 0 {
+                        arena.shared_resume =
+                            Some(super::resume_attn_fast::ResumeTqWorkspace::new(
+                                &device, rows, history, shape.n_head, shape.n_kv, shape.head_dim,
+                                arena.shared_output.as_ref(),
+                            )?);
+                    }
+                }
+                Some((
+                    arena,
+                    super::FaProjectionsArena::new(
+                        &device, rows, shape.hidden_size, shape.n_head, shape.n_kv,
+                        shape.head_dim, shape.rms_norm_eps,
+                    )?,
+                ))
+            } else {
+                None
+            };
             for segment in &joint_segments {
-                let fa = if has_full {
-                    let shape = FullAttnShape::from_config(cfg);
+                let fa = if let Some((arena, projections)) = shared_fa.as_ref() {
                     Some((
-                        super::FaPrefillArena::new(
-                            &device,
-                            segment.rows,
-                            shape.n_head,
-                            shape.n_kv,
-                            shape.head_dim,
-                        )
-                        .context("alloc joint prefill FaPrefillArena")?,
-                        super::FaProjectionsArena::new(
-                            &device,
-                            segment.rows,
-                            shape.hidden_size,
-                            shape.n_head,
-                            shape.n_kv,
-                            shape.head_dim,
-                            shape.rms_norm_eps,
-                        )
-                        .context("alloc joint prefill FaProjectionsArena")?,
+                        arena.shared_rows(segment.rows)?,
+                        projections.shared_rows(&device, segment.rows)?,
                         super::prefill_joint::segment_positions(
                             &device,
                             positions_flat,
@@ -5641,6 +5700,10 @@ impl Qwen35Model {
                 cfg,
                 seq_len as usize,
                 slots.len().max(1),
+                joint.is_some()
+                    && cfg.head_dim == 256
+                    && super::resume_attn_fast::resume_attn_fast_enabled()
+                    && kv_cache.full_attn.iter().all(|slot| slot.k.is_none() && slot.tq.is_some()),
             )
         });
         let prefill_wait_layers = if seq_len > 32 {
@@ -6185,7 +6248,7 @@ impl Qwen35Model {
                         let mut enc =
                             LayerEncoder::from_session_or_plain(&device, layer_session.as_mut())
                                 .context("enc joint prefill attention gather")?;
-                        for (segment, scratch) in joint_segments.iter().zip(&joint_scratch) {
+                        for (segment, scratch) in joint_segments.iter().zip(joint_scratch.iter()) {
                             if let Some(rows) = scratch.gather.first() {
                                 super::prefill_joint::gather_segment(
                                     enc.encoder(),
@@ -9843,6 +9906,104 @@ mod tests {
         default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35Variant,
     };
     use mlx_native::MlxDevice;
+
+    #[test]
+    fn shared_prefill_roots_survive_unequal_segments_and_checked_error_drain() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use super::super::encoder_stage::FailSubmitted;
+        use super::super::prefill_prepared::{ForcedWaitLayers, PrefillScope};
+        use super::super::prefill_prepared_tests::observable_synthetic_model;
+        use super::super::spec_decode::positions_for_range;
+
+        let Ok(device) = MlxDevice::new() else {
+            eprintln!("skipping shared prefill error drain: no Metal device");
+            return;
+        };
+        let model = observable_synthetic_model(&device);
+        model.ensure_gpu_cache_primed().expect("prime synthetic model");
+        let _cadence = ForcedWaitLayers::set(8);
+        let _scope = PrefillScope::forced(true);
+        let make_cache = || HybridKvCache::new_with_options(
+            &model.cfg, &device, 256, 2, true,
+        ).expect("TQ cache");
+        let history = |cache: &mut HybridKvCache| {
+            for slot in 0..2u32 {
+                let tokens: Vec<_> = (0..40u32).map(|row| (slot * 131 + row * 37 + 11) % 512).collect();
+                model.forward_gpu_last_logits(
+                    &tokens, &positions_for_range(0, 40), cache, SlotId(slot),
+                ).expect("history");
+            }
+        };
+        let chunks: Vec<_> = [38usize, 65].into_iter().enumerate().map(|(slot, rows)| {
+            (
+                (40..40 + rows as u32).map(|row| (slot as u32 * 131 + row * 37 + 11) % 512)
+                    .collect::<Vec<_>>(),
+                positions_for_range(40, rows),
+            )
+        }).collect();
+        let lanes: Vec<_> = chunks.iter().enumerate().map(|(slot, (tokens, positions))| JointPrefillLane {
+            slot_id: SlotId(slot as u32),
+            tokens,
+            positions_flat: positions,
+            shares_prefix: false,
+            // Three unequal queued segments: 33 content, five cue, 65 content.
+            fold: (slot == 0).then_some((33, 73)),
+            image: None,
+        }).collect();
+        let mut reference_cache = make_cache();
+        history(&mut reference_cache);
+        let reference = model.forward_gpu_last_logits_joint(&lanes, 0, &mut reference_cache, None)
+            .expect("clean unequal-segment forward");
+
+        let continuation = |cache: &mut HybridKvCache, slot: usize| {
+            let next = [7u32, 19, 23, 41, 53];
+            let positions = positions_for_range(40 + chunks[slot].0.len() as i32, next.len());
+            model.forward_gpu_last_logits(&next, &positions, cache, SlotId(slot as u32))
+                .expect("cache continuation").iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+        };
+        let reference_next: Vec<_> = (0..2).map(|slot| continuation(&mut reference_cache, slot)).collect();
+        for fail_command in [false, true] {
+            let mut cache = make_cache();
+            history(&mut cache);
+            let failure = {
+                // Exercise an early host return and, separately, a queued
+                // attention command that fails at its checked drain.
+                let _host_failure = (!fail_command).then(|| FailForwardAtLayer::set(5));
+                let command_failure = fail_command.then(|| FailSubmitted::nth("layer.full_attn", 0));
+                let result = model.forward_gpu_last_logits_joint(&lanes, 0, &mut cache, None);
+                if let Some(point) = &command_failure {
+                    let (hit, seen) = point.seen();
+                    assert!(hit && seen > 0, "a queued attention command must be checked");
+                }
+                result.err().map(|error| format!("{error:#}")).expect("failed forward")
+            };
+            let expected_error = if fail_command {
+                "committed without a wait failed"
+            } else {
+                "injected forward failure"
+            };
+            assert!(failure.contains(expected_error), "{failure}");
+            for slot in 0..2u32 {
+                // The serving consumer can reset immediately after the error.
+                cache.reset_for_slot(SlotId(slot)).expect("reset failed lane");
+            }
+            history(&mut cache);
+            let retried = model.forward_gpu_last_logits_joint(&lanes, 0, &mut cache, None)
+                .expect("retry after checked error drain");
+            for (slot, (got, want)) in retried.iter().zip(&reference).enumerate() {
+                assert!(want.logits.iter().any(|&value| value != 0.0), "nonzero reference");
+                assert_eq!(
+                    got.logits.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                    want.logits.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                    "slot {slot}: retry must match a fresh unequal-segment forward",
+                );
+                assert_eq!(
+                    continuation(&mut cache, slot), reference_next[slot],
+                    "slot {slot}: no failed-forward write may land after reset",
+                );
+            }
+        }
+    }
 
     #[test]
     fn qwen38_native_embedding_route_table_is_the_dispatch_and_admission_authority() {

@@ -106,7 +106,21 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// the same two witness op files and four selection shaders are byte-identical.
 /// D128 attention and the GDN bank-split implementation changed; qualification
 /// of model arithmetic and serving must use the new pin, not inherited results.
-pub const WITNESS_NATIVE_VERSION: &str = "0.22.2";
+/// Re-reviewed 0.22.2 -> 0.23.0 (registry sources `70a55f1` -> `d036777`):
+/// both witness op files and all four selection shaders are byte-identical.
+/// AF4 producer precision/scratch and buffer-view contracts changed elsewhere;
+/// this preserves the witness protocol, not global numerical equivalence.
+/// Model arithmetic, memory and serving qualification must use the new pin.
+/// Re-reviewed 0.23.0 -> 0.23.1 (registry sources `d036777` -> `d365e35`):
+/// the same two witness ops and four selection shaders are byte-identical.
+/// Direct BF16 AF4 register inputs and the reference decode-plan getter are
+/// additive elsewhere. This preserves the witness protocol only; model,
+/// memory and serving qualification still require the exact new pin.
+/// Re-reviewed 0.23.1 -> 0.23.2 (registry sources `d365e35` -> `17781c1`):
+/// both witness ops and all four selection shaders are byte-identical. The
+/// additive ordinary DFlash2 RMS producer does not change this protocol;
+/// model, memory and serving qualification still require the exact new pin.
+pub const WITNESS_NATIVE_VERSION: &str = "0.23.2";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {

@@ -475,6 +475,13 @@ Before implementation acceptance:
    error bound. It does not require HF to adopt the peer's lossy saved-context
    storage and does not relax HF's own byte-exact crop/restore/continuation
    invariants.
+   Restore references must use the candidate's declared reconstruction input
+   policy. For HF's lossless captured-hidden rebuild, use fresh peer rings and
+   the same original captured hidden through the peer's production context
+   prefill operations. Do not compare that state to a lossy saved-window
+   reconstruction and call the difference an AF4 producer error. The peer's
+   actual compact-cache implementation remains the performance/quality
+   baseline; a matched numerical control does not replace that baseline.
 
 The implementation must declare its actual precision graph. Source inspection
 finds missing materialization boundaries in the existing HF AF4 path, notably
@@ -499,6 +506,546 @@ cache-lifecycle/signed-RC proof and all publication/update/rollback gates remain
 
 The two existing native short-case controls, four-matrix same-operand checks
 and single BF16 served pair do not satisfy this amended full-graph gate.
+
+##### Matched decode-profile control (2026-11-16; unmerged)
+
+The actual peer Q36 single/short graphs select staged M8/S4/spread1 for QKV
+and register R8 for attention output at every layer. On identical observed
+inputs and exhaustively identity-verified reconstructed AF4 planes, the
+candidate's staged reference32 law selects S2 for the 6144-by-2048 QKV shape.
+A private one-field reference8 control produces bitwise-identical 589,824
+BF16 QKV outputs and 2,359,296 actual F32 split partials across both cases and
+all six layers. Register attention output matches all 196,608 observed values.
+The weight payloads are reconstructed, not captured; expected IO and partials
+are direct captures. Operand manifest: `4815eafb96f22736035920c1b99ffc3c9bd3b349e0c543776f0d6a0dd0aac34e`.
+
+The public correction separates BF16 staged decode projection reference8 from
+legacy/F32, context-prefill and gate/up reference32. Precision-aware decode
+scratch sizing is required; a global law change is rejected. Five focused GPU
+tests cover actual operands, undersized scratch rejection, completed-reduction
+rounding, unchanged gate/up, and real-row prefill. Native source archive:
+`7a23bfa2f5930612c6bb120b06a2afc26ce23f4a627cd1e4f051776c6f9248e6`;
+component proof: `b7d3b5706dbdb584d3d221cdbec5988e0c2523a5a44fc060e0df5994c80dd0fa`.
+
+The private QKV-only source-matched graph passes the complete original Q36
+single-case test in fresh plain and observed processes. All 77 ordinary
+tensors and metadata are byte-transparent with observation enabled; 48
+internal tensors are captured. Independent F32 reduction passes all 58 saved
+boundaries without a layer-denominator floor. The preceding source passes 56:
+L5 attention preparation changes from 0.051948052 to 0.017316017 and MLP
+dynamics from 0.094748862 to 0.034246575, with the unchanged 0.05 limits.
+L0 QKV input/output are exact; later inputs differ, so this is not global
+bitwise equality. CPU attribution:
+`93a8eb8da8a458047834952caf902342d4c233cda317fb00046db38281c9577a`.
+
+The implementation chosen for qualification gives eligible AF4 BF16 QKV its
+declared decode producer independently of the auxiliary staged-route switch.
+Dense and narrow projections retain their existing route. The two original
+mode settings still exercise the auxiliary register/staged choices; mandatory
+QKV and auxiliary dispatches must be recorded and checked separately. Context
+FC/KV and QKV share the phase-exclusive packed-key scratch root, sized with
+checked products. Auxiliary staging no longer reserves unused context/QKV
+input or partial storage. AF4 now requires its tensor-only producer family:
+automatic profiles decline it on unsupported hosts, and explicit selection
+fails before weight upload through the existing host-admission table.
+
+Native 0.23.0 carries the changed BF16 caller scratch contract as a minor
+release, not unpublished prototype 0.22.5
+([native PR #174](https://github.com/robertelee78/mlx-native/pull/174)).
+Native 0.23.0 is now published on
+[GitHub](https://github.com/robertelee78/mlx-native/releases/tag/v0.23.0) and
+[crates.io](https://crates.io/crates/mlx-native/0.23.0). Both independently
+downloaded 6,500,959-byte packages match SHA256
+`ead23f73f1f74cae98e218410d119cf3d47d918acbf3d7b57880f2e9656c11fc`.
+The private case remains attribution, not acceptance of either original mode
+or a default-policy pass; all original two-family/geometries/modes and
+remaining release gates require their own current-source evidence.
+
+The integrated, explicitly unpublished prototype passes 25 focused workspace,
+asynchronous-context, staged, host-admission and policy tests with no skips.
+Its original Q36 single/auxiliary-register test also passes, records six
+committed QKV producer encodes and zero auxiliary staged encodes, and retains
+all 77 ordinary payloads bitwise from the source-matched control. HF source:
+`fa172e7353e9e5b7be12db34087bc85b4d4d7384933c88adfe9935ef88413880`;
+focused proof: `9eef2ebdd07d894dd75f5073c4ff48de7b29f96272285f13b54e3bd54fd47654`;
+one-case proof: `d99e9dc7fea211c0977b77aa6ffc61e3ae1795bae9560efcfefb2f68c20c2842`.
+These measurements use an explicit native path prototype, not the published
+registry dependency; they do not close the original complete matrix.
+
+The exact registry pin now builds with `--locked`, an initially empty Cargo
+home and target, and no overrides. Source, Cargo home and target are outside
+the user's home-directory Cargo configuration ancestry; the preceding attempt
+failed closed on that inherited configuration before Cargo resolution. The
+actual compiler artifact names registry `mlx-native@0.23.0`, and the freshly
+downloaded crate again matches the published checksum. HF source archive:
+`c88a9307f754e952a0b029c39e548e969634783086ad131c9dc844ca6d04f98f`;
+build proof: `db48e9741a22ae272ca5df348bcb5909132d45d1ed5ca2c9c5b0a4d8f6cc59d2`.
+This is clean-registry build evidence, not packed/signed-RC provenance.
+
+The complete original matrix stopped at its sixth case, without retry:
+Q36 single/register, short/register+staged and wrap/register+staged pass;
+single/staged rejects L5 MLP dynamics at 0.052511416 against the unchanged
+0.05 bound. Its actual route records six QKV, twelve auxiliary projection,
+six gate/up and six ring-attention encodes, with the stock head. Fourteen
+cases remain unrun, including all Q38 cases. Plan:
+`50ae7cbb946ee6cf053dc90a8661c2a98ae6bbbd2e221fe8b5a4dae7f3451aaf`;
+rejected actual payload:
+`4bfacd66599225e80ef27cc298a684a96a2b4251de774ba10bfe9efd8b42f46d`.
+The remaining staged discrepancy requires causal attribution against actual
+peer operators; neither this result nor the five passing cases closes D1.
+
+Independent CPU reduction confirms 58/58 saved numeric boundaries for the
+register case and 57/58 for staged; the latter's only rejection is the L5
+MLP-dynamic boundary above. A private one-role control changes only staged
+attention output to the actually observed R8 producer, preserving every
+original assertion and all other production mathematics. It still passes
+only 57/58 boundaries and worsens that error to 0.057077624. Its original
+route-coverage assertion correctly rejects the changed auxiliary count.
+Thus the attention-output association difference alone is not sufficient;
+this control must not land or be relabelled as staged-route acceptance.
+Control source: `e3c1c848683a7311079b126cf0ac59c32e5a0c2357cbbbe8db61ebed55ae921b`;
+CPU result: `d4ccd7f415d0547c138999b5e16bc3f5ecefaf1b1eec44512f73123c4ded333a`.
+Further attribution requires actual HF internal operands and graph-selected
+peer down/gate-up captures; standalone weight-plan inventory is not proof of
+the combined gate/up dispatch. No tolerance or production-route bypass is
+accepted from these measurements.
+
+The subsequent HF operand observation preserves the complete current ordinary
+inventory: all 78 payloads and metadata are exact to the rejected baseline.
+That inventory contains the 77 earlier common payloads plus the separately
+introduced QKV counter; no tensor is omitted. Seventy-two actual internal
+operands are captured by test-only raw-bit copies. L0 QKV input/output and
+the attention-output projection input exactly match direct peer captures;
+the auxiliary projection output differs at 26 BF16 values. The R8-only
+control removes all L0 attention-finish, MLP-prepare and MLP-dynamic
+differences, but nine L0 MLP-finish values still differ, and the later gate
+still rejects. This localizes the first association difference without
+mistaking it for the complete cause. HF observation source:
+`34dcf55ff180d26d4af3f3b5568cb412086f2558fdc0a4bc83a8ac9bf79945ad`;
+admission: `0a52b1f9186524768e5b75e7f5aba7ca356220bd7f9de7c043ca107b04275e4e`.
+
+A fresh paired peer build compiles all 90 original host translation units
+with unchanged shaders and preserves ordinary outputs and the full weight
+inventory byte-for-byte under observation. Actual selected arguments and
+dispatches now establish one-pass GateUp S2/spread1 and down R8 at all six
+layers. Gate/up/down packed weights are directly captured from their actual
+bindings, not reconstructed. GateUp F32 partials are retained post-dispatch,
+after the fused reducer; separate completed gate/up outputs are not
+materialized and are not claimed. Exported fixture:
+`26c4138267e2a359ce36be11ed2c0d03f7c390dcba0820e98a26441bbc348e9d`.
+These captures enable an identical-operand native replay; they do not
+themselves establish its result, D1 acceptance or release qualification.
+
+The identical-operand native replay executes all twelve captured records
+through eighteen real API calls. All 294,912 GateUp BF16 values and 1,179,648
+retained F32 partials are bitwise exact to the peer; all 98,304 register down
+values are exact. Forcing the staged down producer on those same operands
+changes 278 values. Source and all eighteen packed weight pairs are unchanged;
+this is a producer-selection distinction, not evidence for another GateUp
+arithmetic change. Replay source:
+`189ccecc3bf0d02f0641bfab0bf8d77d5610bea59882ee0255f81b6f01400926`;
+result: `27ec15de334938fc5be7e9712b50c4e11599e18d982b9c150443b8346e391801`.
+
+The next private graph control therefore uses the pinned peer's actual
+Apple10 narrow-grid criterion, `2 * (columns / 64) * lanes < 3 * cores`,
+with this measured host's 40 cores, before selecting an auxiliary producer.
+It is not a case-specific threshold or failure-triggered fallback. All
+original numeric/selector/state/BF16 assertions stay unchanged; any changed
+route-coverage assertion remains a rejection, not an acceptance waiver.
+An exact BF16-to-F32 bridge may use existing phase-exclusive storage solely
+for this control. It is not a landed allocation/performance design or
+permission to bypass the original complete matrix and release gates.
+
+The generic-grid private control completed all **58/58** saved numerical
+comparisons against the unchanged single-row Qwen3.6 reference. Layer-zero
+completed output was bitwise exact; the formerly rejected layer-five MLP
+dynamic relative error fell to **0.0022831049282103777**, below the unchanged
+0.05 limit. Its original forced-auxiliary-MPP route assertion still rejected
+the observed first-four counters `[0, 6, 6, 0]` and separate QKV count `6`.
+This is causal evidence, not original-matrix acceptance. The validated
+control proof is SHA-256
+`7019e363861ed400f053087755d95107fd7827aca60f6055ccb2b8521bf0c35c`.
+
+The permanent producer design removes that control's widening bridge rather
+than landing a conversion or allocating another activation root. An
+**unpublished native 0.23.1** additive candidate lets the existing
+BF16-output register API consume physical BF16 directly, preparing its existing
+table/sums with unchanged addition order. It also exposes the pinned
+40-core reference projection law; gate/up retains its own plan. Existing
+F32 preparation/arithmetic/scratch and F32-input precision contract are
+unchanged. The new BF16 branch validates the handle's logical data extent,
+not the containing Metal allocation. An unchanged consumer regression caught
+the latter error before the branch was fixed.
+
+On the corrected source archive SHA-256
+`601e18ba57b65a4788bbcc0e17ce5d590b2b2b6bd347dd271c9222e7d44fad90`,
+two focused GPU regressions passed (zero ignored), including nine real rows,
+completed-output ties/capture/replay, truncated logical input rejection and
+19 K-tail cases with a real downstream scalar consumer. The separate actual
+captured-operand replay executed all **12 records / 24 API calls**. All
+**294,912** gate/up output values, **1,179,648** retained F32 partial values
+and **98,304** direct-BF16 register Down values were bitwise exact to the
+actual peer captures. Direct BF16 and exactly widened F32 register inputs
+also matched each other bitwise. Forced MPP Down still differed at **278**
+values; no changed arithmetic or tolerance makes that route acceptable.
+All 42 saved payload sizes/hashes were independently verified; all cleanup
+receipts passed. Validated proof SHA-256:
+`7159af15bac929a9cd311f8faf14b9eb12f3b20915d768b9d68436be24b65cfb`.
+Register-internal partial counts remain unobserved: the typed diagnostic
+witness's constructor-written zero is explicitly rejected as evidence.
+
+This candidate must be reviewed/published and pinned exactly before final
+hf2q conformance. Route evidence must describe both actual source-selected
+register and MPP execution instead of the obsolete forced-MPP implementation
+count. The original twenty scenarios, numerical/selector/state/BF16 limits,
+both model families, memory, quality, performance and release gates remain
+required. Neither this operand proof nor the private 58/58 graph control
+qualifies those gates.
+
+The hf2q producer/workspace cutover subsequently passed its first real
+**private integration smoke** on the original Qwen3.6 single/staged fixture:
+one executed test, zero ignored, all **58 unchanged** numeric comparisons,
+actual own-score selector checks, persistent-state checks and the live
+crop/continuation path. The observed route counts are auxiliary MPP `0`,
+fused gate/up `6`, ring attention `6`, mandatory QKV MPP `6`,
+BF16-output register `24`, and the stock head. All **737,280** saved layer
+F32 values are finite and BF16-representable. The former rejection reports
+`0.002283105` against the same `0.05` bound.
+
+This smoke deliberately uses an **explicit Cargo CLI path override** to the
+exact pushed but unpublished native 0.23.1 source at
+`b903c98ba46c50f77be47c3c7d3bccf05f9cfa6e` (native PR #175), not an
+ignored configuration or a registry package. The first embedded manifest
+patch was correctly refused by the canonical-pin guard; the successful
+variant removes that noncanonical table, and neither that parser nor any
+release-provenance guard is changed. The real four-site hf2q dependency
+identity remains 0.23.0 until 0.23.1 is published and byte-verified.
+The obsolete F32-only diagnostic replay/observer is removed from the
+landing code; its historical captures remain bound to their frozen source.
+
+Private hf2q source archive SHA-256:
+`7120b3864ba2b69e6b0b981ec6f19aa35f3a3111f4c408ea91ac92d2c3e1f9cf`.
+Actual capture SHA-256:
+`c515269a824b9408de160941c08dd2911370b2247fe0208dcdb07fb4279d8026`.
+Validated private smoke proof SHA-256:
+`bb23d0e6241c8c734d801bd78ea225483912c587d863ee74c6f595b6cd19748b`.
+The guard-refusal receipt is retained. This proves the direct-BF16 producer
+integration for one private case, **not** the required published-registry
+twenty-case matrix, Qwen3.8/N4 closure, or any quality/performance/default/RC
+or release gate.
+
+Native **0.23.1 is now published**, after all six CI jobs passed and native
+PR #175 merged as `d365e350e5a2e72e8549c083cfac225466064111`.
+The exact merged macOS package and the workflow's independently reproduced
+Linux package agree with independent crates.io and GitHub downloads:
+**6,502,345 bytes**, SHA-256
+`1723e487562b43d3a57415c4eea715a857fde6cc0e77b90ec25deff05ed53a4e`.
+The public sparse-index checksum, release tag and embedded VCS identity
+match that package/commit. All 1,128 permanent source files match the
+measured pushed snapshot; no temporary diagnostic harness or model payload
+was landed. Published-byte proof SHA-256:
+`72f924663ee92e0ed860a216f20cea0477d9e373a96f73ad20604d7875e8a1f8`.
+
+The four-site hf2q identity now selects that exact registry dependency:
+manifest, lock/checksum, release-provenance constants and Gemma witness
+version. Both witness ops and all four selection shaders were independently
+re-reviewed byte-identical against the downloaded 0.23.0/0.23.1 registry
+archives; that preserves their protocol, not global numerical equivalence.
+The next qualification must use a fresh locked registry build and all
+twenty original scenarios. The prior private path-dependent pass is not
+substituted for any of them.
+
+##### Original-matrix restore rejection and causal control (2026-11-16)
+
+The fresh locked registry build selected published native 0.23.1 without a
+path/git override. Its source archive is
+`5ab6571066e6175df7fa9cc74871f7dd130c40145a4eac4bbf40874e90a56362`;
+test executable:
+`dab318ac82f5a242481183e5d3f1bb0dfa2fdbfccbc40f16cad77534d15e5fe6`.
+The original twenty-case campaign passed both routes for Qwen3.6 single,
+short, wrap and multi-lane, then rejected Qwen3.6 restore/register:
+layer-0 valid semantic keys **0.10177365 > 0.05**. Eleven scenarios were not
+run. All nine receipts, manifests, logs and 79-tensor outputs were
+independently hash-checked; all owned process groups were drained.
+Validated rejection proof:
+`6bc4ac2c1ab766bca93d2a123af349c80d61d3134543aaa3b0b502236b476116`.
+No unchanged numerical retry or qualification claim follows this failure.
+
+Saved-output localization found all newly appended rows 12–14 bit-identical
+for both K and V in every layer; only rebuilt rows 0–11 differed. The peer
+source computes live KV from uncompressed normalized context, but caches
+four-bit group-64 codes with FP16 scale/minimum. Its restore loads that
+lossy normalized context and bypasses context FC/hidden normalization
+(`DFlashDraft.cpp:155–225`, `prefill/draft_context.metal:48–105`).
+HF instead recomputes from the original captured hidden and requires its
+pre-clear/restored ring bytes to match exactly. Offline interpretation of
+the actual peer window reproduced all 384 stored parameter pairs and all
+24,576 codes; 23,474 reconstructed BF16 values differed from their original
+normalized inputs. This offline codec inspection alone was not a KV replay.
+
+A separate real-peer causal control then added only CPU copies of live
+rings immediately before the existing restore. All 90 linked production
+archive members matched the original source-bound objects; production
+host/shader arithmetic and original inputs were unchanged. All **30
+original plain-peer output tensors remained bit-identical**. The added
+pre-restore observations matched HF's restored rows **bit-for-bit for all
+147,456 K/V values across six layers**. The peer's own pre/post-lossy-restore
+comparison alone produced the failing layer-0 key error, and exceeded
+0.05 for every layer's keys and values. Control executable:
+`9ebd1c83269653564dbeb6d674a524d4db2b8ba911a6da7712f80ac4b61cc3cf`;
+validated control proof:
+`b149ada2ca580f1ad0071a1f6db1088a8add26b4a62ad5902d82e33c98d91ccd`.
+Its receipt proves checked cleanup. This is a diagnostic control, not a
+replacement golden, a release result, or evidence of physical memory/speed.
+
+The current restore comparison therefore conflicts with simultaneously
+preserving HF's exact uncompressed rebuild and expecting closeness to this
+peer's lossy restored representation. The original campaign remains
+**rejected**. Do not fit a wider limit, copy peer KV, silently substitute
+the control oracle, or introduce restore-only arithmetic to pass it.
+A decision is required before changing the preregistered reference or
+adopting a compact lossy product restore contract. All original numerical,
+selector, quality, performance, memory and publication gates otherwise
+remain in force.
+
+##### Approved matched lossless restore reference (2026-11-16)
+
+After a product-level explanation of the measured mismatch, the operator
+explicitly approved preserving HF's exact restore behavior and correcting
+the comparison. This authorizes a versioned reference-policy amendment,
+**not** wider limits, a new lossy HF cache, an erased failure, or release.
+
+Before another candidate run, produce and freeze a source-bound reference
+revision for both families and all five original geometries. Restore must
+re-execute the original twelve captured-hidden rows into fresh peer rings
+using the unchanged production `addContextPrefill` graph, then append the
+same three original rows and run that execution's ordinary draft graph.
+Keep complete outputs/state from this single lossless execution; do not
+splice pre-restore state into outputs of a different restore policy.
+Retain exact original F32 input payloads, their actual one-time BF16 input
+conversion, the original model/weight inventory and all numerical limits.
+
+The revision must label its lossless reconstruction policy, retain actual
+before/after-rebuild ring bytes and replay-input bytes, prove its own exact
+reconstruction, and preserve fresh plain/observed transparency and complete
+production host/shader source closure. Packed windows may remain diagnostic
+storage, but cannot be mislabeled as the consumed restore input. Reject an
+old-policy, missing-policy or incomplete bundle rather than falling back to
+the previous oracle. All twenty HF family/case/route scenarios remain
+mandatory. The failed lossy-reference campaign above stays rejected.
+
+This corrects numerical qualification only. It does not claim HF serving
+already provides cold restoration from a persistent normalized-context
+snapshot, nor does it qualify memory, actual peer performance, task quality,
+default promotion or publication.
+
+##### Matched-reference campaign: Qwen3.8 path rejection (unmerged)
+
+The approved `lossless-captured-hidden-rebuild-v1` reference is now frozen
+for all ten original family/geometries. Its original F32 inputs, metadata,
+tolerances, model/producer/peer/shader pins and geometry were checked against
+the earlier matrix. Actual BF16 replay and full before/after ring bytes
+match for twelve Qwen3.6 and ten Qwen3.8 K/V snapshot pairs; unused rows are
+zero and committed prefixes survive the three-row append. All ten capture
+receipts prove cleanup. Frozen matrix:
+`32a9c47cf1b4dea985255e84c6bb8c0ce54b056900e93ddcb4d40d4d458a81df`.
+This is reference integrity, not HF numerical acceptance.
+
+The registry-only native 0.23.1 HF candidate uses source archive
+`7fe0d4461e7dd2e835a6183b3cc94f83557e20e76dd51f650ae47d063a37d314`
+and executable
+`74a4cb0a4267553b4a0717ad604231aa6ee74af66d9932a4760e42302cce7166`.
+The unchanged twenty-case campaign passed **all ten Qwen3.6 cases**,
+including both restore modes, then rejected **Qwen3.8 short/register**:
+path agreement was below the unchanged **4/7** requirement. Its prepared
+logical AF4 weight planes, emitted continuous numerical comparisons and
+per-row candidate overlap checks passed. Final-hidden, logits and selector
+maximum errors were respectively **0.34375**, **0.33458233** and
+**0.13671875**, within their unchanged **2.5**, **2.0** and **1.1** limits.
+The failed case did not reach its later own-top-k, state-numeric or
+token-aligned edge/confidence comparisons; those are not claimed as passes.
+
+Nine cases remain unrun. All eleven executed receipts, manifests, stdout,
+stderr and real tensor files (858 recorded tensors) were independently
+hash-checked; every owned process group was drained. Validated rejection
+proof:
+`e932b61bd0ceab6070ecf97864f7e5db2d8fe4ee1aad87fc81861162814a5864`.
+The corrected restore reference therefore resolves the demonstrated
+Qwen3.6 restore mismatch but does **not** complete D1. Preserve this failure
+and localize the Qwen3.8 discrete-selection divergence against its actual
+peer tensors/source before changing a candidate. No unchanged retry,
+relaxed path gate, default promotion or release follows this result.
+
+##### Qwen3.8 RMS localization and isolated correction (unmerged)
+
+CPU reconstruction of the saved tables reproduces each implementation's
+conditional greedy path exactly. The HF/native paths agree at only **1/7**
+positions despite identical per-row sixteen-token candidate sets. The first
+divergence is proposal position one, after token 13; exchanging the saved edge
+scores does not exchange the paths, while exchanging unary logits does.
+All 88 old/new native non-restore tensor payloads remain byte-identical.
+Diagnostic proof:
+`ff316ad05d6c9bdb6e59f2ac0d9999ad74fc54c516aa0e91d53eda671a428b53`.
+
+A head-only GPU control preserves the actual eight-row stock Q6_K geometry.
+Replaying the saved HF hidden state reproduces all seven proposal-logit rows
+bitwise. Applying that same head to the native hidden state reduces the
+maximum native-logit discrepancy from **0.33458233** to **0.00257396698**.
+The large unary discrepancy is therefore upstream of the vocabulary head;
+this does not establish bitwise head equivalence or full-path acceptance.
+Validated control:
+`415397a1cfa61ed42f395d816748a73d8ca178e745b02995eb4c150d3a0d2048`.
+
+The original compiled RMS kernels, on identical recorded BF16 operands
+`[8, 5120]`, differ at only channels **918, 2609 and 3949** of row zero.
+Measured per-route normalized output plus that route's saved dynamic
+convolution coefficients reproduces all **40,960** prepare values exactly.
+The GPU inverse values themselves were not observed. This localizes a real
+producer mismatch: the generic float4 reduction is not the pinned peer's
+scalar-column/eight-ordered-partial reduction. Original control:
+`6fd9f01c72dc48e4c721460e83b171f208121a3716f83bef5f802b8b5cfcfa57`.
+
+An isolated additive native **0.23.2** candidate now implements that explicit
+source association and completed BF16 boundary without changing generic RMS,
+rounding inputs, or allocating conversion/scratch buffers. Checked width is
+bound inline; all F32 windows require sufficient logical extent and alignment.
+Independent API/arithmetic reviews found no remaining issue after the
+alignment check was added. Five focused tests pass, including **386,079**
+synthetic BF16 comparisons, view guards, invalid storage, and the unchanged
+generic RMS regressions. Its compiled Metal kernel matches the original
+peer's **40,960** recorded normalized values bitwise; ordinary/table/sum peer
+output bytes are unchanged. Only the three identified old-HF values change.
+Both owned runs prove cleanup. Validated isolated-fix proof:
+`198384cc1ed923a6ea01842c3b8dc518274c3a06d08914cf4e9da42234888abf`.
+
+These isolated proofs did not qualify the remaining producers, full paths,
+quality, memory or performance. The subsequent published integration below
+supersedes this candidate's publication status, not the retained rejected
+0.23.1 campaign or any original gate.
+
+The prepared integration distinguishes ordinary RMS from Q/K normalization before
+RoPE explicitly. Both peer head routes use 256 threads/eight partials and a
+BF16 intermediate before rotation, but their weighting does not share the
+ordinary producer's body-scoped `reassociate(off)` contract. No compiled head
+equivalence or measured head mismatch has been established. The source-proven
+correction therefore changes ordinary AF4 RMS only; Q/K and dense-checkpoint
+arithmetic remain unchanged. This is a producer-kind choice, not a
+width-dependent special case, and does not narrow the twenty-case gate.
+The consumer now uses the published registry-only 0.23.2 API for the four
+ordinary AF4 normalization producers. The three Q/K-before-RoPE call sites
+and dense-checkpoint normalization retain their existing arithmetic.
+
+##### Ordinary-RMS focal model probe (not release qualification)
+
+Native PR #176 merged at
+`17781c19d432aa4c5e112cf34458615ebd56e3c3` after all six CI checks passed on
+reviewed head `3365ea1330c5be3c6680da65263f855c9e0d6b89`. Primary native
+`main` was fast-forwarded. Exact-commit publication workflow `44006689307`
+subsequently completed successfully; publication evidence follows below.
+
+A private explicit-path build was rejected by HF's exact-registry build
+guard before any model test ran. The guard was not changed or waived.
+Preserved rejection:
+`9adbd42ad218eaac593d4dc8a4385536abbf3e34edf2f56de261970578ab806c`.
+
+To test the arithmetic hypothesis while publication runs, an isolated
+test-only adapter uses the published registry native **0.23.1** backend.
+Its ordinary RMS arithmetic body matches the reviewed kernel, but width
+travels through checked immutable F32 parameters and public buffer-only
+encoding, not native 0.23.2's inline-width host ABI. It registers once in
+the private fixture; Q/K-before-RoPE and dense arithmetic are unchanged.
+No prototype file or direct Metal dependency is part of the landing diff.
+
+On the original **Qwen3.8 short/register** fixture, the unchanged test now
+passes **7/7** path positions (required minimum **4/7**, original result
+**1/7**). First-layer attention prepare and dynamic coefficients have
+maximum error **0**. All original continuous, candidate/top-k, state,
+token-aligned edge and confidence checks finish and pass; all ten K/V
+state comparisons have relative maximum error zero. This does not mean
+all errors decrease: logits maximum error is **0.35388422**, versus
+**0.33458233** before, still below the unchanged **2.0** limit.
+
+The run retained 68 real tensors and proves owned cleanup. Validated focal
+proof:
+`58decceecebfea2b9676af9a9d5a29b06f36621bbfe6a1f4232e4101528ba2c8`.
+This is causal evidence for the ordinary producer correction, not
+native-0.23.2 integration, a full twenty-case pass, quality, memory,
+performance, default promotion or release acceptance. Keep the original
+rejection; the published-dependency campaign remains mandatory.
+
+##### Published ordinary-RMS integration: original matrices pass (2026-11-17)
+
+Native **0.23.2** is published at
+`17781c19d432aa4c5e112cf34458615ebd56e3c3`. Independently downloaded registry
+and GitHub crate bytes agree with the API, index and release checksum:
+`dfdacbbf13261442df6d91a160194d4aeda8d34d6db90f5f64cc72cecfebacc1`.
+Publication proof:
+`08fc4373bd35fcd3792976712eb78104d78551bc1de029f3086982ae57cf0bbb`.
+The source comparison against 0.23.1 changes only RMS registration and the
+additive ordinary-RMS host/shader implementation; it is not a blanket
+numerical-equivalence claim for every native operator.
+
+HF's actual published-API integration passes **all twenty original AF4
+cases**: both Qwen families, short/wrap/single/multi/restore, register and
+staged routes. Every original numerical, candidate/path, aligned-edge,
+confidence and valid-state check remains unchanged. The reference matrix
+is the approved same-input lossless rebuild, SHA256
+`32a9c47cf1b4dea985255e84c6bb8c0ce54b056900e93ddcb4d40d4d458a81df`;
+HF's restore behavior is unchanged. Every case proves owned cleanup.
+Validated conformance proof:
+`5884f7335caf0af9f8450b5b8992e9e7928c34301f1e465b403ce87ee5d1e5f7`.
+
+This is the native API, not the private buffer-only adapter. On the original
+Qwen3.8 short/register case, the saved actual path matches **7/7** native
+positions, with first attention prepare/dynamic maximum error zero, final
+hidden maximum error **0.328125**, logits **0.35388422**, and selector hidden
+**0.140625**. All ten valid K/V comparisons have relative maximum error zero.
+The original BF16-weight/F32-activation suites also pass **all ten original
+cases** on the same binary, with AF4 and staged draft explicitly disabled:
+`6df2af62259a09872e785a6ea76ebe5f0aeda5b48f7d510c3c3c7b0f0248ba6a`.
+
+Compiled source archive:
+`c71be7b2f9abc07b37f16a8db2d9e5fbdba46dc20d03a3b102bdab70fcc51507`.
+Test binary:
+`6815dd1cddc0685587643c4450d67f818b96f3ef64f4a4e8a09d85f3cedbd4f2`.
+The build and every model unit retain their source/input guards and cleanup
+receipts. Neither matrix replaces Q4-workload acceptance, quality, physical
+N4 memory, performance, D5/D6, or release-candidate qualification.
+
+##### Allocation-lifetime integration: focused proof, N4 still required
+
+Prepared prefill now shares one maximum-actual-segment FA/projection root set
+across queue-ordered segments. Resumed attention uses one F32 history staging
+root and separate BF16 K/V roots; tight views, immutable queued parameters and
+last-reader barriers preserve segment state. Owners survive checked success
+and error drains.
+
+Drafter admission counts format-specific retained/upload payloads, actual
+workspace roots and aliases, bounded capture/ingest and runtime metadata.
+Load and run peaks are composed by lifetime rather than adding noncoexisting
+buffers or using checkpoint file size as the resident charge. Prepared target
+envelopes cover every legal solo/folded/joint geometry and retained native/TLS
+high-water allocation; unknown selected bounds fail closed.
+
+MTP accounting includes the full target parent during the forward and catch-up,
+both shared and dedicated gather IDs, and the prior pool. Two baseline carry
+cells per slot are supplemented by separately quota-accounted spill/anchor
+owners, not assumed to bound every historical parent. Identity-unioned census
+checks and checked transaction drains retain replaced roots through step exit.
+A checked pre-gather pool boundary enforces the retained-pool allowance.
+The ordinary legacy-target forward remains an incremental baseline, not a
+new absolute-memory qualification.
+
+Focused consumer checks pass **81 executions / 79 unique tests**, including
+both concurrent-encoder variants and the explicitly executed pinned-artifact
+geometry test. Proof:
+`66da55d951b858b1d66385b726672b714f756549a50c04ba1197a5ccb445637a`.
+These synthetic Metal/allocation/admission/teardown checks do not establish
+canonical N4 physical peaks or a performance gain. Slots, context, KV budget,
+reserve, workload and all release gates remain unchanged.
+
+
+
 
 ### D2: 32-row target verifier
 

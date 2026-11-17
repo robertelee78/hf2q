@@ -1762,15 +1762,12 @@ fn without_the_layer_scratch_reset_a_forward_keeps_its_waits_and_runs_uncapped()
     });
 }
 
-/// `joint_arena_bound_bytes` against what the per-segment arenas of a joint
-/// forward really allocate: the attention prefill and projection arenas a
-/// lane's segment gets and, on a MoE model, a segment's FFN arena, built by
-/// the constructors the forward calls. (The resume scratch and the DeltaNet
-/// run scratch are derived from their constructors and not built here.)
+/// Shared attention and FFN payload calculators cover the actual arena
+/// constructors. History and deferred lifetimes have separate regressions.
 #[test]
 fn the_joint_arena_bound_covers_the_arenas_a_segment_allocates() {
     use super::full_attn::FullAttnShape;
-    use super::prefill_prepared::joint_arena_bound_bytes;
+    use super::prefill_memory::{attention_arena_bytes, ffn_arena_bytes};
     let check = |model: &Qwen35Model, what: &str| {
         let cfg = &model.cfg;
         let shape = FullAttnShape::from_config(cfg);
@@ -1846,50 +1843,19 @@ fn the_joint_arena_bound_covers_the_arenas_a_segment_allocates() {
                 })
                 .expect("arenas");
             // One slot, one segment of `rows` rows, no attended history.
-            let bound = joint_arena_bound_bytes(cfg, rows as usize, 1, 0);
+            let bound = attention_arena_bytes(cfg, rows as usize).unwrap()
+                + ffn_arena_bytes(cfg, rows as usize, 0).unwrap()
+                + 64 * 16 * 1024;
             assert!(
                 allocated <= bound,
                 "{what}: the arenas of a {rows}-row segment hold {allocated} bytes, over the bound of {bound}"
             );
         }
-        // The attended history: twelve bytes per KV element and slot.
-        let kv = u64::from(cfg.num_key_value_heads) * u64::from(cfg.head_dim);
-        assert_eq!(
-            joint_arena_bound_bytes(cfg, 64, 3, 1000) - joint_arena_bound_bytes(cfg, 64, 3, 0),
-            3 * 12 * kv * 1000
-        );
     };
     with_synthetic_model(|model| check(model, "dense FFN"));
     super::prefill_fold_tests::with_synthetic_moe_model(|model| check(model, "MoE FFN"));
 }
 
-/// The two switches cap one pool: what memory admission charges them
-/// together is not the sum of their figures.
-#[test]
-fn the_switches_are_charged_as_one_pool() {
-    use super::prefill_prepared::{
-        joint_arena_bound_bytes, joint_scratch_bound_bytes, prefill_switch_scratch_bound_bytes,
-        wait_layers_scratch_bound_bytes,
-    };
-    with_synthetic_model(|model| {
-        let cfg = &model.cfg;
-        let (rows, slots, kv_rows) = (2048, 4, 32_768);
-        let charged = |joint, wait| {
-            prefill_switch_scratch_bound_bytes(cfg, rows, slots, kv_rows, joint, wait)
-        };
-        assert_eq!(charged(false, 1), 0);
-        assert_eq!(charged(true, 1), joint_scratch_bound_bytes(cfg, rows, slots, kv_rows));
-        assert_eq!(charged(false, 8), wait_layers_scratch_bound_bytes(cfg, rows, 1, 8));
-        let both = charged(true, 8);
-        assert_eq!(
-            both,
-            wait_layers_scratch_bound_bytes(cfg, rows, slots, 8)
-                + joint_arena_bound_bytes(cfg, rows, slots, kv_rows)
-        );
-        assert!(both >= charged(true, 1) && both >= charged(false, 8));
-        assert!(both < charged(true, 1) + charged(false, 8), "the two figures were added");
-    });
-}
 
 /// One layer of a forward on the prepared route requests at most
 /// `prefill_layer_scratch_bound_bytes` of scratch for its shape: single-slot
@@ -1909,7 +1875,7 @@ fn a_layer_requests_no_more_scratch_than_its_derived_bound() {
             decode_pool::take_layer_scratch_peak();
             run();
             let peak = decode_pool::take_layer_scratch_peak();
-            let limit = bound(&model.cfg, rows, lanes);
+            let limit = bound(&model.cfg, rows, lanes, false);
             assert!(peak > 0, "{what}, {name}: the forward requested no scratch");
             assert!(
                 peak <= limit,
@@ -2013,7 +1979,7 @@ fn qwen_prefill_scratch_sites_probe() {
     eprintln!("[SCRATCH_SITES] layers {layers} hidden {hidden}");
     let report = |what: &str, rows: usize, lanes: usize, trace: Vec<(&'static str, u32, usize)>| {
         let peak = super::decode_pool::take_layer_scratch_peak();
-        let limit = super::prefill_prepared::prefill_layer_scratch_bound_bytes(&model.cfg, rows, lanes);
+        let limit = super::prefill_prepared::prefill_layer_scratch_bound_bytes(&model.cfg, rows, lanes, false);
         eprintln!(
             "[SCRATCH_SITES] {what}: largest layer {:.1} MiB, derived bound {:.1} MiB ({:.2}x)",
             peak as f64 / 1048576.0,

@@ -47,10 +47,9 @@ use plan::FaPrefillPlan;
 /// (no residency-set rescission race — see module-level doc for the full
 /// iter58b analysis).
 ///
-/// The 8th scratch (`out_seq`, the F32 return value of
-/// `apply_flash_attn_prefill_seq_major`) is intentionally NOT included in
-/// the arena — it is the function return value, consumed by the caller chain
-/// within the same prefill scope, and does not require arena lifetime.
+/// Joint segments also share the F32 attention result. Its consumer finishes
+/// before the next queue-ordered segment overwrites it; ordinary callers retain
+/// independently allocated results.
 pub struct FaPrefillArena {
     /// `[seq, nh, d]` BF16 — Q in seq-major layout.
     pub q_bf16_seq: MlxBuffer,
@@ -86,6 +85,10 @@ pub struct FaPrefillArena {
     /// layer and shared by the rest, so it lives through the forward's
     /// terminal wait like the buffers above. `None` otherwise.
     pub(crate) resume_tq: Option<super::resume_attn_fast::ResumeTqScratch>,
+    /// Joint segments share these roots, never their immutable shapes.
+    pub(crate) shared_resume: Option<super::resume_attn_fast::ResumeTqWorkspace>,
+    /// Queue-ordered joint result, shaped tightly for this segment.
+    pub(crate) shared_output: Option<MlxBuffer>,
 }
 
 impl FaPrefillArena {
@@ -130,6 +133,45 @@ impl FaPrefillArena {
             n_kv_heads,
             head_dim,
             resume_tq: None,
+            shared_resume: None,
+            shared_output: None,
+        })
+    }
+
+    /// Tight views of one forward-owned workspace for a queue-ordered segment.
+    /// Every previous reader must finish before the next segment overwrites it.
+    /// The views retain the backing allocations through the terminal drain.
+    pub(crate) fn shared_rows(&self, rows: u32) -> Result<Self> {
+        self.validate_fits(rows, self.n_heads, self.n_kv_heads, self.head_dim)?;
+        let [q_seq, q_hm, k_seq, k_hm, v_seq, v_hm, out_hm] =
+            FaPrefillPlan::new(rows, self.n_heads, self.n_kv_heads, self.head_dim)?.into_buffers();
+        let view = |buffer: &MlxBuffer, plan: plan::FaBufferPlan| {
+            buffer
+                .slice_view(0, plan.requested_bytes / plan.dtype.size_of())
+                .with_shape(plan.shape)
+                .map_err(|e| anyhow!("shared FA workspace {}: {e}", plan.label))
+        };
+        let shared_output = self.shared_output.as_ref().map(|buffer| {
+            buffer
+                .slice_view(0, rows as usize * self.n_heads as usize * self.head_dim as usize)
+                .with_shape(vec![rows as usize, self.n_heads as usize, self.head_dim as usize])
+                .map_err(|e| anyhow!("shared FA output: {e}"))
+        }).transpose()?;
+        Ok(Self {
+            q_bf16_seq: view(&self.q_bf16_seq, q_seq)?,
+            q_bf16_hm: view(&self.q_bf16_hm, q_hm)?,
+            k_bf16_seq: view(&self.k_bf16_seq, k_seq)?,
+            k_bf16_hm: view(&self.k_bf16_hm, k_hm)?,
+            v_bf16_seq: view(&self.v_bf16_seq, v_seq)?,
+            v_bf16_hm: view(&self.v_bf16_hm, v_hm)?,
+            out_bf16_hm: view(&self.out_bf16_hm, out_hm)?,
+            seq_capacity: rows,
+            n_heads: self.n_heads,
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            resume_tq: None,
+            shared_resume: self.shared_resume.clone(),
+            shared_output,
         })
     }
 

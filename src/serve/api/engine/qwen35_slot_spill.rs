@@ -66,6 +66,18 @@ pub(super) struct Qwen35SlotSpill {
 
 pub(super) type Qwen35SlotSpillStore = SlotSpillStore<Qwen35SlotSpill>;
 
+pub(super) fn include_carry_owners(
+    store: &Qwen35SlotSpillStore,
+    owners: &mut crate::inference::models::qwen35::carry_memory::CarryOwners,
+) {
+    for (_, entry) in store.newest_first() {
+        if let Some(spec) = entry.payload.retained.spec.as_ref() {
+            owners.include(&spec.pending_target_hidden);
+        }
+        entry.payload.anchor.include_carry_owners(owners);
+    }
+}
+
 /// The (retained, anchor) prefixes a conversation's ledger offers a request,
 /// filtered by vision compatibility exactly as slot affinity filters idle
 /// slots: a retained prefix is usable only beside an anchor with the

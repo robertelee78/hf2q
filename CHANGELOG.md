@@ -71,12 +71,14 @@ are recorded under Changed.
 
 ### Changed
 
-- Pin published mlx-native 0.22.0 for the required quantized-kernel, kept-command status and mapped-backing ownership fixes. Dependency provenance is bound to the registry crate and checksum, not a local Cargo patch.
+- Pin published mlx-native 0.23.2 and its verified registry checksum. Ordinary AF4 drafter RMS uses the source-ordered BF16 producer without conversion buffers; Q/K-before-RoPE and dense-checkpoint arithmetic stay unchanged. Both families pass all twenty original AF4 register/staged conformance cases and all ten original BF16 cases; these numerical results do not qualify workload acceptance, memory, performance or release defaults.
 - Update transitive quinn-udp to 0.5.16 to fix RUSTSEC-2026-0538, a receive-loop denial of service after a truncated datagram on affected platforms.
 
 - ADR-067 D6: `HF2Q_DFLASH2` is a per-model three-state policy. Unset selects the pinned drafter and combined route profile for eligible Qwen3.8/Qwen3.6 targets; `0` restores the prior route and `1` requires a compatible drafter. Pinned-source pairs and same-architecture/shape fine-tunes are admitted explicitly; MoE auto-selection additionally requires supported batched-verification storage. There is no acceptance-based runtime drop-back. Drafters are verified from the pinned Hugging Face cache revision or downloaded before target weights load.
 - The single Qwen profile table includes staged/AF4 draft, GPU target tokens, prefetch, GPU decisions, prepared products, tiled verification, fused mixer, replay reuse, cue folding, joint prefill and deferred waits; Qwen3.8 additionally selects the history-aware proposal prior and Qwen3.6 selects the MoE routes and prefill keep-fresh. Explicit switch values win. Unsupported host/storage combinations or insufficient memory withhold implicit routes; release-gate readiness requires the complete profile, not a silently reduced configuration.
-- Admission charges model, KV, drafter, prepared planes and the absolute additional scratch bound against both physical and currently available memory, including every outstanding engine commitment and an 8 GiB reserve. Joint prefill and deferred waits share one pool charge using parsed model geometry, slots, row ceiling and actual KV capacity. Reservations remain charged until successful supervised teardown and queue settlement; failed or wedged teardown stays charged until restart. Load audits and `/hf2q/v1/runtime` expose the selected routes, sources and memory decision.
+- Admission charges model, KV, format-specific drafter load/run peaks, native prepared layouts and the phase-aware additional allocation envelope against both physical and currently available memory, including every outstanding engine commitment and an unchanged 8 GiB reserve. Joint prefill and deferred waits share one pool charge using parsed geometry, legal row envelopes and actual KV capacity. Reservations remain charged until successful supervised teardown and queue settlement; failed or wedged teardown stays charged until restart. Load audits and `/hf2q/v1/runtime` expose routes, sources and memory decisions.
+- Queue-ordered Qwen prefill shares maximum-segment FA/projection roots and one F32 resumed-history staging root, with distinct BF16 K/V roots, immutable parameters and checked last-reader/error drains. Drafter workspace planning counts aliases once and preserves rectangular small-hidden attention geometry.
+- MTP catch-up keeps full target parents and shared/dedicated gather IDs alive through checked completion, charges replaced/historical owners by backing identity, and enforces the retained-pool boundary before gathering. Abandoned staged draft heads are dropped before allocating replacements. Focused checks pass 81 executions; canonical N4 physical-memory and release-performance qualification remain required.
 - A blank value of a route-profile switch now means unset. `HF2Q_DFLASH2` accepts its values case-insensitively. `HF2Q_DFLASH2=1` without the two path variables no longer fails; it resolves the pinned drafter. `HF2Q_DFLASH2=1` now also accepts a target with a pinned target's architecture and shapes.
 - Exclude repository-only agent memory and generated grammar-probe GGUF, grammar and result files at every directory depth from published crates. Runtime calibration data and the shipped grammar remain packaged.
 
@@ -158,6 +160,20 @@ are recorded under Changed.
 - Qwen MTP speculation: the solo K3 tick (`decode_tick_mtp_k3`) now runs as entry, draft, solo verify, verify-to-plan and a split commit (cursors, DeltaNet restore, settle, finish) in `engine_qwen35/k3_transaction.rs`, so a joint verify window (ADR-065 J4) can reuse the same transaction (ADR-065 J1, #512). Behaviour-preserving refactor: the canonical accept walk, every failure arm and its error context, the `HF2Q_MTP_PHASE_PROFILE` timers, the cost controller and the Q1 test-hook positions are unchanged.
 
 ### Fixed
+
+- DFlash2 AF4 uses explicit BF16 producer profiles: real-row context FC/KV
+  prefill and source-matched QKV decode, independently of the auxiliary
+  `HF2Q_DFLASH2_DRAFT_STAGED` switch. Auxiliary BF16 projections choose the
+  native source-owned, row-aware narrow-grid register/MPP plan; existing BF16
+  operands feed the register producer directly without a widening activation
+  buffer. F32 selector arithmetic is unchanged. Precision-aware decode scratch
+  shares the existing packed-key root with context projections; obsolete
+  auxiliary context/QKV reservations and the legacy F32 diagnostic replay are
+  removed. AF4 requires its tensor-only producer family even when auxiliary
+  staging is off: automatic policy withholds it on unsupported hosts, while
+  explicit selection fails before weight upload. Requires published mlx-native
+  0.23.1; the private single-case smoke does not replace the original full
+  matrix, model quality, memory, performance or release gates.
 
 - DFlash2 BF16-weight projections preserve F32 activation inputs instead of
   silently rounding them through tensor MM. The exact published native pin moves

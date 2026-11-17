@@ -180,6 +180,7 @@ pub struct FaProjectionsArena {
     pub n_kv: u32,
     /// The `head_dim` value the arena was allocated for.
     pub head_dim: u32,
+    pub(crate) shared: bool,
 }
 
 impl FaProjectionsArena {
@@ -326,6 +327,67 @@ impl FaProjectionsArena {
             n_head,
             n_kv,
             head_dim,
+            shared: false,
+        })
+    }
+
+    /// Share large projection scratch, retaining segment-specific immutable
+    /// element-count parameters. Callers must order all readers before reuse.
+    pub(crate) fn shared_rows(&self, device: &MlxDevice, rows: u32) -> Result<Self> {
+        if rows == 0 {
+            return Err(anyhow!("shared projection workspace needs nonzero rows"));
+        }
+        self.validate_fits(rows, self.hidden_size, self.n_head, self.n_kv, self.head_dim)?;
+        let (r, h, nh, nkv, d) = (
+            rows as usize,
+            self.hidden_size as usize,
+            self.n_head as usize,
+            self.n_kv as usize,
+            self.head_dim as usize,
+        );
+        let view = |buffer: &MlxBuffer, shape: Vec<usize>| {
+            let elements = shape.iter().product();
+            buffer
+                .slice_view(0, elements)
+                .with_shape(shape)
+                .map_err(|e| anyhow!("shared projection workspace view: {e}"))
+        };
+        // Never rewrite a count buffer referenced by an earlier queued segment.
+        let sigmoid_params_buf = if rows == self.seq_capacity {
+            self.sigmoid_params_buf.clone()
+        } else {
+            let count = rows
+                .checked_mul(self.n_head)
+                .and_then(|count| count.checked_mul(self.head_dim))
+                .ok_or_else(|| anyhow!("shared projection element count overflow"))?;
+            let mut buffer = device
+                .alloc_buffer(4, DType::U32, vec![1])
+                .map_err(|e| anyhow!("shared projection element count allocation: {e}"))?;
+            buffer
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow!("shared projection element count mapping: {e}"))?[0] = count;
+            buffer
+        };
+        Ok(Self {
+            x_norm_buf: view(&self.x_norm_buf, vec![r, h])?,
+            pre_norm_params_buf: self.pre_norm_params_buf.clone(),
+            q_proj_buf: view(&self.q_proj_buf, vec![r, nh * d])?,
+            k_proj_buf: view(&self.k_proj_buf, vec![r, nkv * d])?,
+            v_proj_buf: view(&self.v_proj_buf, vec![r, nkv * d])?,
+            gate_proj_buf: view(&self.gate_proj_buf, vec![r, nh * d])?,
+            q_normed_buf: view(&self.q_normed_buf, vec![r * nh, d])?,
+            k_normed_buf: view(&self.k_normed_buf, vec![r * nkv, d])?,
+            qk_rms_params_buf: self.qk_rms_params_buf.clone(),
+            q_rope_buf: view(&self.q_rope_buf, vec![r, nh, d])?,
+            k_rope_buf: view(&self.k_rope_buf, vec![r, nkv, d])?,
+            gated_buf: view(&self.gated_buf, vec![r * nh * d])?,
+            sigmoid_params_buf,
+            seq_capacity: rows,
+            hidden_size: self.hidden_size,
+            n_head: self.n_head,
+            n_kv: self.n_kv,
+            head_dim: self.head_dim,
+            shared: true,
         })
     }
 

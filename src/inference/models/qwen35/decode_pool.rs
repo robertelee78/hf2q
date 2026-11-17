@@ -86,6 +86,21 @@ pub(crate) fn worker_memory_snapshot() -> Result<(&'static str, mlx_native::Pool
     }).map_err(|_| "legacy worker TLS unavailable".to_string()).and_then(|r| r)
 }
 
+/// Carry/catch-up's prior pool owner, including direct spillover held until
+/// reset. `OVERFLOW` is disjoint from the native pool: the capped branch below
+/// makes a fresh device allocation, retains it, and returns BEFORE pool.alloc.
+/// Native free/issued/residency labels already overlap inside `retained`.
+pub(crate) fn worker_carry_pool_bytes() -> Result<u64, String> {
+    let native = worker_memory_snapshot()?.1.retained.bytes as u64;
+    OVERFLOW.try_with(|cell| {
+        let overflow = cell.try_borrow().map_err(|_| "carry overflow borrow busy".to_string())?;
+        overflow.iter().try_fold(native, |bytes, root| {
+            bytes.checked_add(root.byte_len() as u64)
+                .ok_or_else(|| "carry pool backing capacity overflow".to_string())
+        })
+    }).map_err(|_| "carry overflow TLS unavailable".to_string()).and_then(|result| result)
+}
+
 /// Allocate from the thread-local decode pool.
 ///
 /// API-compatible with `MlxDevice::alloc_buffer` so call sites in the
@@ -547,6 +562,24 @@ pub fn drop_id_mm_scratch() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn carry_pool_census_keeps_full_overflow_roots_without_summing_native_labels() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else { return };
+        // Exercise the real direct-overflow owner without changing pool caps
+        // or allocating a multi-GiB crossing request merely to reach it.
+        let previous = OVERFLOW.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        let native = worker_memory_snapshot().unwrap().1.retained.bytes as u64;
+        let root = device.alloc_buffer(3 * 32 * 4, DType::F32, vec![3, 32]).unwrap();
+        let bytes = root.byte_len() as u64;
+        OVERFLOW.with(|cell| cell.borrow_mut().push(root.clone()));
+        drop(root);
+        assert_eq!(worker_carry_pool_bytes().unwrap(), native + bytes);
+        release_overflow();
+        assert_eq!(worker_carry_pool_bytes().unwrap(), native);
+        OVERFLOW.with(|cell| *cell.borrow_mut() = previous);
+    }
 
     #[test]
     fn pool_resets_recycle_metal_buffers() {

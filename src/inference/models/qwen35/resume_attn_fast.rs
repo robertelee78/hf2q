@@ -9,14 +9,16 @@
 //! byte on the CPU and registers each buffer with the residency set, and the
 //! route ends in a host wait, so all of that is serial with the GPU.
 //!
-//! With `HF2Q_QWEN_RESUME_ATTN_FAST` on (the default), the route runs the
-//! same dispatches in the same order on the same input bytes:
+//! With `HF2Q_QWEN_RESUME_ATTN_FAST` on (the default), the route keeps the
+//! same per-tensor transforms and attention/output arithmetic:
 //! - the BF16 Q and output buffers come from the prefill's
-//!   [`FaPrefillArena`], which resumed chunks allocate but did not use;
-//! - the K/V temps, their BF16 casts and the F32 result are allocated once
-//!   per prefill, by the first FA layer, in [`ResumeTqScratch`] on that arena;
-//! - the dequant and the bridge share one command buffer (a memory barrier
-//!   replaces the command-buffer boundary), committed without a host wait.
+//!   [`FaPrefillArena`];
+//! - one F32 history staging root is dequantized and cast for K, then reused
+//!   for V, with separate BF16 K/V roots preserving both attention inputs;
+//! - joint segments borrow one forward-owned output and history workspace;
+//!   ordinary prefills lazily allocate their own [`ResumeTqScratch`];
+//! - barriers order dequant, cast, staging reuse and the BF16 bridge in one
+//!   command buffer, committed without a host wait.
 //!   The layer's ops6-7 consumes the result in queue order and keeps its own
 //!   wait.
 //!
@@ -33,16 +35,25 @@
 use std::sync::LazyLock;
 
 use anyhow::{anyhow, Context, Result};
-use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::ops::elementwise::{cast, CastDirection};
+use mlx_native::{CommandEncoder, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::gpu_full_attn::{
-    encode_flash_attn_prefill_seq_major_resume, validate_flash_attn_prefill_resume_shape,
+    encode_flash_attn_prefill_seq_major_resume_prepared, validate_flash_attn_prefill_resume_shape,
     FaResumeBridgeBuffers,
 };
 use super::joint_step_options::parse_switch;
 use super::kv_cache::FullAttnKvSlot;
 use super::FaPrefillArena;
 use crate::serve::multi_seq_kv::SlotId;
+
+mod workspace;
+pub(crate) use workspace::{ResumeTqScratch, ResumeTqWorkspace};
+
+#[cfg(test)]
+use super::gpu_full_attn::encode_flash_attn_prefill_seq_major_resume;
+#[cfg(test)]
+use mlx_native::DType;
 
 /// Kill switch, default on: unset, blank or `1`/`on`/`true` takes the fast
 /// route; `0`/`off`/`false` keeps route (c) as it was.
@@ -114,55 +125,6 @@ pub(crate) fn fast_route_calls() -> u64 {
     FAST_ROUTE_CALLS.with(std::cell::Cell::get)
 }
 
-/// Route (c) buffers that depend on the attended length, plus the F32
-/// result, for one prefill. Same dtypes and shapes as the buffers route (c)
-/// allocates per layer.
-pub(crate) struct ResumeTqScratch {
-    seq_len: u32,
-    kv_seq_len: u32,
-    /// F32 `[n_kv_heads, kv_seq_len, head_dim]`: unrotated TQ dequant of K.
-    temp_k: MlxBuffer,
-    /// Same for V.
-    temp_v: MlxBuffer,
-    /// BF16 `[1, n_kv_heads, kv_seq_len, head_dim]`: cast of `temp_k`.
-    k_bf16: MlxBuffer,
-    /// Same for V.
-    v_bf16: MlxBuffer,
-    /// F32 `[seq_len, n_heads, head_dim]`: the route's result. Each FA layer
-    /// gets a clone; its ops6-7 consumes it before the next FA layer
-    /// rewrites it (queue order, plus that layer's host wait).
-    out_seq: MlxBuffer,
-}
-
-impl ResumeTqScratch {
-    fn new(
-        device: &MlxDevice,
-        seq_len: u32,
-        kv_seq_len: u32,
-        n_heads: u32,
-        n_kv_heads: u32,
-        head_dim: u32,
-    ) -> Result<Self> {
-        let (seq, kv) = (seq_len as usize, kv_seq_len as usize);
-        let (nh, nkv, d) = (n_heads as usize, n_kv_heads as usize, head_dim as usize);
-        let kv_elems = nkv * kv * d;
-        let alloc = |bytes: usize, dtype: DType, shape: Vec<usize>, label: &str| {
-            device
-                .alloc_buffer(bytes, dtype, shape)
-                .map_err(|e| anyhow!("ResumeTqScratch alloc {label}: {e}"))
-        };
-        Ok(Self {
-            seq_len,
-            kv_seq_len,
-            temp_k: alloc(kv_elems * 4, DType::F32, vec![nkv, kv, d], "temp_k")?,
-            temp_v: alloc(kv_elems * 4, DType::F32, vec![nkv, kv, d], "temp_v")?,
-            k_bf16: alloc(kv_elems * 2, DType::BF16, vec![1, nkv, kv, d], "k_bf16")?,
-            v_bf16: alloc(kv_elems * 2, DType::BF16, vec![1, nkv, kv, d], "v_bf16")?,
-            out_seq: alloc(seq * nh * d * 4, DType::F32, vec![seq, nh, d], "out_seq")?,
-        })
-    }
-}
-
 /// The arena's buffers for one resumed layer, allocating the
 /// [`ResumeTqScratch`] on the prefill's first resumed FA layer. Every FA
 /// layer of one prefill attends the same `(seq_len, kv_seq_len)`; a
@@ -172,7 +134,7 @@ fn arena_buffers<'a>(
     device: &MlxDevice,
     seq_len: u32,
     kv_seq_len: u32,
-) -> Result<(FaResumeBridgeBuffers<'a>, &'a MlxBuffer, &'a MlxBuffer)> {
+) -> Result<(FaResumeBridgeBuffers<'a>, &'a MlxBuffer)> {
     match &arena.resume_tq {
         Some(scratch) if scratch.seq_len != seq_len || scratch.kv_seq_len != kv_seq_len => {
             return Err(anyhow!(
@@ -191,6 +153,7 @@ fn arena_buffers<'a>(
                 arena.n_heads,
                 arena.n_kv_heads,
                 arena.head_dim,
+                arena.shared_resume.as_ref(),
             )?);
         }
     }
@@ -208,8 +171,7 @@ fn arena_buffers<'a>(
             out_bf16_hm: &arena.out_bf16_hm,
             out_seq: &scratch.out_seq,
         },
-        &scratch.temp_k,
-        &scratch.temp_v,
+        &scratch.staging,
     ))
 }
 
@@ -243,9 +205,13 @@ pub(crate) fn encode_resume_via_tq_cache_fast(
     // Route (c) attends tight temps: kv_capacity = kv_seq_len.
     validate_flash_attn_prefill_resume_shape(seq_len, cur_len, kv_seq_len, kv_seq_len, head_dim)?;
     arena.validate_fits(seq_len, n_heads, n_kv_heads, head_dim)?;
-    let (bufs, temp_k, temp_v) = arena_buffers(arena, device, seq_len, kv_seq_len)?;
+    let (bufs, staging) = arena_buffers(arena, device, seq_len, kv_seq_len)?;
 
-    for (is_k, temp) in [(true, temp_k), (false, temp_v)] {
+    // WAR against the preceding segment, including a carried concurrent
+    // encoder. All roots remain owned until the forward's checked drain.
+    enc.memory_barrier();
+    let kv_elems = n_kv_heads as usize * kv_seq_len as usize * head_dim as usize;
+    for (is_k, destination) in [(true, bufs.k_bf16), (false, bufs.v_bf16)] {
         slot.dequant_seq_into_f32_unrotated_for_slot(
             is_k,
             kv_seq_len,
@@ -254,7 +220,7 @@ pub(crate) fn encode_resume_via_tq_cache_fast(
             n_kv_heads,
             head_dim,
             slot_id,
-            temp,
+            staging,
             enc,
             registry,
             device,
@@ -265,17 +231,25 @@ pub(crate) fn encode_resume_via_tq_cache_fast(
                 if is_k { "K" } else { "V" }
             )
         })?;
+        enc.memory_barrier();
+        cast(
+            enc,
+            registry,
+            device.metal_device(),
+            staging,
+            destination,
+            kv_elems,
+            CastDirection::F32ToBF16,
+        )
+        .context("cast resumed TQ history to BF16")?;
+        // The next dequant may overwrite staging only after this cast.
+        enc.memory_barrier();
     }
-    // Replaces route (c)'s command-buffer boundary: the bridge's K/V casts
-    // read what the undo just wrote.
-    enc.memory_barrier();
-    encode_flash_attn_prefill_seq_major_resume(
+    encode_flash_attn_prefill_seq_major_resume_prepared(
         enc,
         device,
         registry,
         q_seq_major,
-        temp_k,
-        temp_v,
         &bufs,
         seq_len,
         cur_len,
@@ -347,6 +321,7 @@ mod tests {
         dispatch_flash_attn_prefill_bf16_d256_resume, FlashAttnPrefillResumeParams,
     };
     use mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32;
+    use mlx_native::metal::foreign_types::ForeignType;
     use mlx_native::ops::transpose::{permute_021_bf16, permute_021_bf16_to_f32, permute_021_f32};
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -644,6 +619,131 @@ mod tests {
                     &bridge,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn shared_resume_workspace_preserves_unequal_queued_segments() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let cases = [(64u32, 33u32), (511, 127), (1000, 64), (2003, 512)];
+        let Some(mut fx) = Fixture::new(2515, 512, cases.len() as u32, 907) else {
+            return;
+        };
+        let expected: Vec<_> = cases
+            .iter()
+            .enumerate()
+            .map(|(layer, &(cursor, rows))| fx.bridge(layer, cursor, rows))
+            .collect();
+        let queries: Vec<_> = cases
+            .iter()
+            .enumerate()
+            .map(|(layer, &(_, rows))| fx.upload_q(layer, rows))
+            .collect();
+        let mut owner = fx.arena(512);
+        owner.shared_output = Some(
+            fx.device.alloc_buffer(
+                512 * NH as usize * D * 4,
+                DType::F32,
+                vec![512, NH as usize, D],
+            ).expect("shared attention output"),
+        );
+        owner.shared_resume = Some(
+            ResumeTqWorkspace::new(&fx.device, 512, 2515, NH, NKV, HEAD_DIM, owner.shared_output.as_ref())
+                .expect("shared resume workspace"),
+        );
+        let mut arenas: Vec<_> = cases
+            .iter()
+            .map(|&(_, rows)| owner.shared_rows(rows).expect("tight segment view"))
+            .collect();
+        // The segment views, not this construction wrapper, own the queued roots.
+        drop(owner);
+        let copies: Vec<_> = (0..3)
+            .flat_map(|_| {
+                cases.iter().map(|&(_, rows)| {
+                    fx.device
+                        .alloc_buffer(
+                            rows as usize * NH as usize * D * 4,
+                            DType::F32,
+                            vec![rows as usize, NH as usize, D],
+                        )
+                        .expect("queued consumer")
+                })
+            })
+            .collect();
+        let mut enc = fx.device.command_encoder().expect("shared segment encoder");
+        for pass in 0..3 {
+            for (layer, &(cursor, rows)) in cases.iter().enumerate() {
+                let output = encode_resume_via_tq_cache_fast(
+                    &mut enc,
+                    &fx.device,
+                    &mut fx.registry,
+                    &fx.cache.full_attn[layer],
+                    &queries[layer],
+                    rows,
+                    cursor,
+                    cursor + rows,
+                    fx.capacity,
+                    NH,
+                    NKV,
+                    HEAD_DIM,
+                    SlotId(0),
+                    &mut arenas[layer],
+                )
+                .expect("queued shared attention");
+                let scratch = arenas[layer].resume_tq.as_ref().expect("segment history views");
+                assert_eq!(
+                    scratch.out_seq.metal_buffer().as_ptr(),
+                    arenas[layer].shared_output.as_ref().expect("shared output").metal_buffer().as_ptr(),
+                    "history must borrow the attention result, not allocate another root",
+                );
+                assert_eq!(scratch.staging.byte_len(), 2515 * NKV as usize * D * 4);
+                assert_eq!(
+                    scratch.staging.data_byte_len(),
+                    (cursor + rows) as usize * NKV as usize * D * 4,
+                    "the F32 history view must have tight head strides",
+                );
+                assert_eq!(scratch.k_bf16.dtype(), DType::BF16);
+                assert_eq!(scratch.v_bf16.dtype(), DType::BF16);
+                assert_ne!(
+                    scratch.k_bf16.metal_buffer().as_ptr(),
+                    scratch.v_bf16.metal_buffer().as_ptr(),
+                    "K must survive the V dequant/cast in its own BF16 root",
+                );
+                if layer > 0 {
+                    let previous = arenas[layer - 1].resume_tq.as_ref().expect("previous segment");
+                    assert_eq!(
+                        scratch.staging.metal_buffer().as_ptr(),
+                        previous.staging.metal_buffer().as_ptr(),
+                        "segments must reuse one F32 history staging root",
+                    );
+                    assert_eq!(
+                        scratch.out_seq.metal_buffer().as_ptr(),
+                        previous.out_seq.metal_buffer().as_ptr(),
+                        "segment outputs must alias the one forward-owned result",
+                    );
+                }
+                enc.memory_barrier();
+                permute_021_f32(
+                    &mut enc,
+                    &mut fx.registry,
+                    fx.device.metal_device(),
+                    &output,
+                    &copies[pass * cases.len() + layer],
+                    1,
+                    rows as usize * NH as usize,
+                    D,
+                )
+                .expect("consume before workspace reuse");
+                // The next segment's WAR barrier must protect this consumer.
+            }
+        }
+        enc.commit_and_wait().expect("shared workspace terminal drain");
+        for (index, copy) in copies.iter().enumerate() {
+            assert_bitwise(
+                &format!("shared segment {index}"),
+                &read(copy),
+                &expected[index % cases.len()],
+            );
         }
     }
 

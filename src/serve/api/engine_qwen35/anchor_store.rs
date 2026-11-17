@@ -234,6 +234,16 @@ pub(in crate::serve::api) struct Qwen35AnchorStore {
 }
 
 impl Qwen35AnchorStore {
+    pub(crate) fn include_carry_owners(
+        &self, owners: &mut crate::inference::models::qwen35::carry_memory::CarryOwners,
+    ) {
+        for anchor in self.committed.iter().chain(self.pending.iter()) {
+            if let Some(spec) = anchor.spec.as_ref() {
+                owners.include(&spec.pending_target_hidden);
+            }
+        }
+    }
+
     pub fn new(keep: usize) -> Result<Self> {
         Self::new_for_slot(keep, None, 0)
     }
