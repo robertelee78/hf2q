@@ -1534,6 +1534,30 @@ rows above the existing MM threshold rather than substituting small decode
 chunks for prefill. Full MM equality still precedes performance measurements,
 all remaining MV/fused consumers, and model/cache/source lifetime changes.
 
+The full-MM arithmetic prerequisite also passes on isolated native source
+`f53eff73b64929a5636b07001dc0f3dbbcccf619`. Each of normal execution, Metal GPU
+validation and Metal GPU plus API validation passes 672 cases: 384 core cases,
+192 forced-half-tile cases and 96 invalid-ID/duplicate/sentinel poison cases.
+Rows are 33, 65, 128 and 257, with legal top-k values 1, 6 and 8; coverage
+includes classic/tensor, uniform/compact, shared/slotted and fresh/reused
+schedules. Both arms execute the actual captured dispatches and checked GPU
+completion. All eight raw and eight candidate MM kernel identities are observed.
+
+Across the three processes, 152,709,120 F32 comparisons produce zero differences,
+including exact legacy NaN-poison semantics; guards and retained source bytes
+are unchanged. Each process requests 12,280,112 fixture bytes, retaining both
+representations. The preregistration's initial arithmetic count was corrected
+to 672 before execution, without deleting or adding axes to fit that count.
+Proof SHA256:
+`e4ef8aebf8730333290c1b4235d75fcd68621234419866615bff594b1e26f881`.
+
+This is not a performance or ownership result. The appended kernels duplicate
+the existing reduction bodies solely to isolate prepared weight addressing;
+that duplication is not an accepted production design. Production-shape MM cost
+must be measured before expanding the cutover. The retained real route dumps
+contain only 8/16/24/32-row verification work, not naturally selected prefill
+MM, and must not be relabeled as a measured prefill workload.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
