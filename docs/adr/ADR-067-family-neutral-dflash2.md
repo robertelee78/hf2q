@@ -1313,6 +1313,134 @@ trusted native-0.23.2 verifier identity. Bind its reviewed constants to publishe
 failing cooperative-prefill receipt consumer then pass. Numerical matrices,
 complete N4 allocation lifetimes and matched peer qualification remain open.
 
+##### Raw expert storage spike: hypothesis, not acceptance
+
+The current artifact's routed expert repacks request 19,545,456,640 additional
+bytes, 93.82% of the published prepared-storage charge. Native retains both
+original source and prepared stacks. Shared-head multiplicity is already one;
+sharing it again cannot remove this owner. These are header/layout-derived
+requested bytes, not measured physical residency.
+
+The actual pinned Splash `031a25a6125af2d7acf7096580afe56eb33d65bc`
+also writes persistent expert planes (`GgufImage.cpp`, `GgufPreparation.cpp`)
+using bounded input staging. It is not evidence that this peer uses raw-GGUF
+MM-ID or that its complete live raw ownership is smaller. Existing native
+raw-block MM-ID uses F16 operands and is not equivalent to staged-M8 BF16;
+do not substitute that kernel or turn preparation off as a numerical shortcut.
+
+The bounded experiment binds raw Q4_K expert bytes at the current staged-M8
+boundary and preserves its BF16 decoding, sparse-row sums, tensor tile, route
+mask, gather and epilogues. Before any HF cutover, compare bits with the
+published prepared arithmetic at the production expert geometry across
+1/2/3/8/9/17/32 rows and sparse/dense schedules. Measure paired prepared/raw
+cost over forty distinct layer-sized stacks, not one repeatedly cached expert
+subset; report warm-up, ordering and every observation. Any cost regression is
+evidence, not a fit/performance claim. A failed spike stays isolated and does
+not land. Q6_K behavior, all numerical limits and final matched-peer,
+task-quality, memory and release gates remain unchanged.
+
+The host trace establishes no admission-arithmetic bug: sysinfo 0.32.1 captures
+free + inactive + purgeable - compressor pages before load, while Q5 records
+free + speculative + file-backed pages before server launch. Their baselines
+are neither the same formula nor the same snapshot. Retained samples omit the
+raw counters needed to attribute the observed availability change; do not
+change the admission formula, reserve or budgets on that evidence.
+
+The first isolated spike is retained at native
+`ee6f7d0871cea637b5580ca8948cda168cd3004e`, not merged or published.
+Its actual test passes 126 bitwise cases (5,308,416 compared elements) and six
+pre-encoding consumer rejections. Eighty alternating pairs over forty distinct
+production-shaped stacks measure this F32 gate projection, including schedule
+and BF16 gather:
+
+| Experiment | Representation | Median GPU milliseconds |
+| --- | --- | ---: |
+| Scalar-byte v1 | Prepared | 0.1513124735 |
+| Scalar-byte v1 | Raw | 0.1841041667 |
+| Packed-byte v2 | Prepared | 0.1513332827 |
+| Packed-byte v2 | Raw | 0.1814374991 |
+
+Raw v1 is 21.67% slower in this measurement; no HF cutover or full-model speed,
+memory-fit or peer-parity claim follows. All observations, including outliers,
+are retained. The outer runner's strict success-line matcher rejects the
+interleaved `--nocapture` JSON, while complete stdout proves one passed test,
+all cases and all pairs. Preserve that failed wrapper receipt; do not rerun or
+rewrite it as green. Validated observed-result proof SHA256:
+`eda046e6db595e72b81123ce4595390ea7ab4fee4fa35e3c7634d94c3fb1634c`.
+
+Reformulate the next bounded spike around the concrete load difference:
+the raw helper assembles metadata and quant quads from scalar bytes, while
+prepared decoding uses vector payload loads. Test packed-byte vector loads
+with byte alignment preserved, the same arithmetic and all original cases,
+plus odd expert-stride coverage. This is an instruction-load hypothesis, not
+an attributed cause of the measured regression. Send probe JSON to stderr so
+the unchanged strict success-line matcher sees the real test completion.
+Prepared-only live-tile entry points still reject raw handles; they must not
+be disabled or silently bypassed in any future HF cutover.
+
+The trusted-identity correction at HF
+`47ea878f309c711415df1f512706c0718108e03c` passes hosted CI run
+`44082656772`; this does not close canonical N4 or release qualification.
+
+Packed-byte v2 is preserved at native
+`2b787ffe4a877229c826b37a3186af7d215b64e9`. All 129 bitwise cases, six
+consumer rejections and the unchanged strict runner pass; the odd-stride
+cases cover sparse/tensor boundaries. The paired gate cost remains 19.89%
+above prepared. The scalar-load hypothesis does not close that gap. Proof:
+`7ccd229aef625239fa4afcf43771e328a9409430ffeed418377e8886f0ca7321`.
+
+Before choosing a memory/speed trade, use retained actual routing rather than
+extrapolating the repeated-eight-expert probe. The historical canonical
+four-agent Qwen3.6 capture contains 429 complete forty-layer cycles with
+8/16/24/32 rows, post-mask expert IDs and the same GGUF SHA256. Freeze its
+current retained bytes at
+`413c816611ea65276469a58cfd56d4663540e532b287e176c997c1f33c058835`.
+The old capture receipt names its output path but does not freeze the dump
+checksum at capture time; this is a historical corpus, not fresh qualification.
+Preregister cycles 0/107/214/321/428, preserve their masks, compare both
+representations on identical inputs, and time forty distinct gate layers in
+each command to avoid extrapolating tiny-command wake-up costs. This still
+measures a gate projection, not complete MoE, verifier wall time or task quality.
+
+The actual-routing experiment is preserved at native
+`271c37572093edca87ec5feab9e3af41f31477f3`. All 200 selected layer projections
+match bits across 19,660,800 elements; the strict runner and cleanup pass.
+
+| Captured cycle | Rows | Prepared gate GPU ms, forty layers | Raw gate GPU ms, forty layers |
+| --- | ---: | ---: | ---: |
+| 0 | 8 | 3.149542 | 4.418958 |
+| 107 | 32 | 6.722583 | 11.333375 |
+| 214 | 32 | 5.403604 | 8.842375 |
+| 321 | 32 | 6.494021 | 10.752229 |
+| 428 | 16 | 3.634271 | 6.188542 |
+
+Each row retains sixteen alternating pairs. Reject raw HF cutover: the
+prepared/raw gap persists on every preregistered routing sample. This is still
+gate-projection evidence, not a measured whole-model regression or memory-fit
+verdict. Preserve the rejected source and observations; do not retry unchanged.
+Proof SHA256:
+`d25b0d6722324afb54cf4548dfb0ecce3329374bfe44f52b0309d12d1cc8396b`.
+
+##### Queue-scoped live-expert preparation: hypothesis only
+
+Keep the fast prepared decoder and investigate its ownership instead. A
+caller-owned fixed-capacity plane buffer can serve successive layers if the
+queue orders every previous reader before the next repack. Prepare only
+experts present in the existing GPU compact schedule; preserve all BF16
+decoding, sparse sums, tensor tiles, masks, live-tile consumers and profile
+flags. The existing schedule orders descriptors by expert and splits counts
+above 32, so the repack must process only each expert's first descriptor,
+avoiding duplicate concurrent writes. Poisoned/empty schedules must not write.
+
+The bounded native-only spike supplies caller storage for Q4_K and Q6_K,
+reuses the existing schedule ownership key, and adds explicit write-after-read
+and producer/consumer barriers, not host waits. Compare reused storage against
+the immutable prepared reference, including back-to-back different weights,
+all-masked/invalid routes, unselected-byte preservation and both quant types.
+Measure total live preparation plus the unchanged gate on the same five
+historical routing samples and forty-layer memory pattern. Repacks are inside
+candidate GPU timing. No HF cutover, retained-byte saving or fit/speed claim
+follows until this experiment and the complete canonical gates pass.
 
 ### D2: 32-row target verifier
 

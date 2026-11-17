@@ -297,9 +297,9 @@ impl TargetFacts {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HostFacts {
     pub(crate) physical_bytes: u64,
-    /// What the host reports available now: free, inactive and purgeable
-    /// pages. Nobody holds these bytes, whatever the ledger says; what was
-    /// promised and not yet taken still comes out of them.
+    /// Availability estimate captured before load, including reclaimable pages.
+    /// On macOS, sysinfo uses free + inactive + purgeable - compressor pages.
+    /// Outstanding commitments are still subtracted before admission.
     pub(crate) available_bytes: u64,
     /// The configured aggregate KV budget; zero when none is configured.
     pub(crate) kv_budget_bytes: u64,
