@@ -1517,6 +1517,23 @@ original numerical, realistic multi-turn, quality and canonical release gates
 remain required. No HF cutover or admission-limit change follows from this
 hypothesis.
 
+The first numerical prerequisite passes on isolated native source
+`e764a56a82a6b820bec06386f7bdf3d4caf9279b`. Each of normal execution, Metal GPU
+validation and Metal GPU plus API validation passes all 48 cases and 5,111,808
+F16 comparisons. Across the three processes there are 15,335,424 comparisons,
+zero bit differences and no edge/canary failures. The complete requested
+fixture packet is 3,776,320 bytes; both representations remain alive. Driver
+diagnostics confirm the requested validation layers. Proof SHA256:
+`c487a708dd50587223d18dedefe76246222771a1a8395d8c327e7301c8464cc8`.
+
+This permits the next bounded experiment, not an ownership cutover: full
+classic/tensor MM results from prepared readers against the actual existing raw
+MM dispatch. Preserve uniform/compact scheduling, shared/slotted inputs, legal
+top-k values, schedule reuse and invalid-ID/duplicate poison semantics. Use
+rows above the existing MM threshold rather than substituting small decode
+chunks for prefill. Full MM equality still precedes performance measurements,
+all remaining MV/fused consumers, and model/cache/source lifetime changes.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
