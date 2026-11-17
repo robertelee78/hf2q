@@ -72,6 +72,7 @@ are recorded under Changed.
 ### Changed
 
 - Pin published mlx-native 0.23.3. Prepared GGUF weights retain immutable planes and share one fixed-capacity, model-owned execution root; head multiplicity no longer multiplies execution scratch. Couple short-TQ and pooled attention segment bounds. Default decode scratch changes devices only after checked reset, retiring the old residency domain without adding waits. Registry-backed consumer and real-checkpoint component checks pass; full-matrix, canonical N4 and release qualification remain required.
+- Bind the trusted release-dependency verifier to the reviewed published 0.23.3 version and checksum, matching the exact Cargo pin while retaining rejection of stale, substituted and local-path dependencies.
 - With published mlx-native 0.23.2, ordinary AF4 drafter RMS uses the source-ordered BF16 producer without conversion buffers; Q/K-before-RoPE and dense-checkpoint arithmetic stay unchanged. Both families passed all twenty original AF4 register/staged conformance cases and all ten original BF16 cases. These earlier numerical results do not qualify the changed 0.23.3 candidate, workload acceptance, memory, performance or release defaults.
 - Update transitive quinn-udp to 0.5.16 to fix RUSTSEC-2026-0538, a receive-loop denial of service after a truncated datagram on affected platforms.
 

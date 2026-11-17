@@ -1274,6 +1274,46 @@ Complete compiled source archive SHA256:
 This is not the fresh twenty-case AF4/ten-case BF16 matrix, physical-residency
 acceptance, task/protocol quality, peer performance or release promotion.
 
+##### Clean-crate e6e501 canonical N4: not qualified
+
+The clean `e6e501981f83cab8844fce3c3ae60a9ace1e1719` crate builds with
+registry native 0.23.3 and launches as `hf2q 0.1.30`. The unsigned calibration
+binary is not a protected release candidate. Crate SHA256:
+`dca326a1a47db5ec4c09a801a7021afe02a0faf72108fee5016693e6babb7638`.
+Production proof SHA256:
+`cf8f8043a0e0675afa1b7d84b0c8af672240f918a2e9a780438476b3b581a19c`.
+
+The same canonical four-slot, context-262144 case changes only `HF2Q_BIN`;
+KV budget, reserve, policy and every readiness/workload limit remain unchanged.
+Its complete full-route allocation bound is 24,241,035,143 bytes.
+
+| Observation | Available bytes | Additional headroom bytes | Selected profile |
+| --- | ---: | ---: | --- |
+| External control output | 106934370304 | 25092417952 | full |
+| APFS control output | 104797306880 | 22955354528 | partial |
+
+The first run passes every readiness check, but no client request starts:
+ExFAT rejects the coordinator's immutable approval publication (`os.link`,
+errno 45). An isolated Python probe proves the exact operation fails there and
+succeeds on APFS. Keep these small control records on APFS and bulk evidence
+external; do not replace atomic publication with an unsafe fallback.
+After changing only the control `--output` filesystem, readiness selects
+partial and stops before clients. One full readiness observation is therefore
+not stable admission or task/protocol/quality acceptance. The second observation
+is 1,285,680,615 bytes short; the availability variation is not a measured
+allocation saving. Do not retry the unchanged candidate until it happens to fit.
+Both supervisor layers prove cleanup. The fresh negative control passes with
+its recorded `killpg` permission error and successful identity-bound cleanup.
+Combined unqualified-outcome proof SHA256:
+`47892b45356bbc73ff1cef6746d3b7ffb662600ebf7b27f38108174607fd189c`.
+
+Hosted release build and tests pass, but script contracts expose the stale
+trusted native-0.23.2 verifier identity. Bind its reviewed constants to published
+0.23.3, not caller-selected metadata; the provenance contract and previously
+failing cooperative-prefill receipt consumer then pass. Numerical matrices,
+complete N4 allocation lifetimes and matched peer qualification remain open.
+
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
