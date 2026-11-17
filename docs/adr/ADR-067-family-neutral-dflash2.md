@@ -1558,6 +1558,63 @@ must be measured before expanding the cutover. The retained real route dumps
 contain only 8/16/24/32-row verification work, not naturally selected prefill
 MM, and must not be relabeled as a measured prefill workload.
 
+The production-shape cost prerequisite passes on isolated native source
+`6f5d84e35b3db5315ab65639f49a54fe1f56b5f5`. Two separate processes cover 40
+distinct synthetic banks each: Q4_K gate/up-shaped `N=512,K=2048`, and
+down-shaped `N=2048,K=512` with 20 Q4_K and 20 Q6_K banks. Both use 256 experts,
+top-k eight, rows 128/256, shared gate versus slotted down inputs, and unchanged
+production half-tile selection. Balanced and concentrated-eight routes are
+explicit synthetic bounds, not captured prefill distributions. Down format
+order is synthetic too; neither component is a complete FFN or model benchmark.
+
+All 32 cases pass exact output/guard/source checks: 2,516,582,400 F32 comparisons,
+zero differences. After two warmups per arm/case, 512 alternating pairs provide
+1,024 fresh 40-bank map-plus-MM command-buffer measurements. Times are checked
+GPU end-minus-start, without capture in the timed commands. The table gives
+median paired prepared/raw ratios; every cell passes the preregistered ≤1.05
+exploration limit, not a relaxation of final whole-model no-regression gates.
+
+| Rows | Synthetic routes | Arithmetic | Gate uniform | Gate compact | Down uniform | Down compact |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 128 | Balanced | Classic | 1.004792 | 1.003394 | 1.007016 | 1.013990 |
+| 128 | Balanced | Tensor | 0.927491 | 0.903755 | 0.931292 | 0.870602 |
+| 128 | Concentrated-eight | Classic | 1.038181 | 1.002868 | 0.964000 | 0.935954 |
+| 128 | Concentrated-eight | Tensor | 0.989073 | 0.942233 | 0.921675 | 0.868652 |
+| 256 | Balanced | Classic | 0.996799 | 1.000048 | 1.006368 | 1.006728 |
+| 256 | Balanced | Tensor | 0.930742 | 0.911860 | 0.933104 | 0.850323 |
+| 256 | Concentrated-eight | Classic | 1.028572 | 1.002042 | 0.983658 | 1.001962 |
+| 256 | Concentrated-eight | Tensor | 0.977279 | 0.928839 | 0.931603 | 0.933998 |
+
+Both processes run in the exclusive measurement lane with nominal thermals,
+unchanged AC mode and no swap growth. Requested fixtures are 12,520,657,280
+and 16,421,360,000 bytes, below the 20 GiB preregistered ceiling. Separate
+child-group supervision enforces a 64 GiB free-plus-cached floor and 24 GiB
+footprint cap. Earlier constructor/view-unit and self-sampling harness failures
+are retained, not counted as numerical or performance results. All original
+source/prepared owners coexist; no physical saving or final admission is proved.
+The complete per-pair data and checked receipts have proof SHA256:
+`64d9540fbcde213bda2c3b2cdfccd5fbc4c8bd66093597f22b786a92b1a45f87`.
+The checked-in `grouped_m8_prepared_mm_cost_spike` test target reproduces each
+component using `cargo test --release --locked --test
+grouped_m8_prepared_mm_cost_spike -- --ignored --exact
+grouped_m8_prepared_mm_gate_cost_spike --nocapture --test-threads=1`, replacing
+`gate` with `down` for the second, separate process.
+
+The next cutover must use typed model-owned Raw versus completed-prepared
+triplets, not hidden unused raw fields. Finalize after overlays/policies and
+before persistent KV/drafter/cache construction; cache rebuilds share the same
+canonical allocations. Native owns one batch preparation/completion boundary,
+with source/destination keepalives covering unresolved submissions, including
+unretained-reference mode. An arbitrary `commit_and_wait` error is not a
+completion certificate. Settle removals on the actual source-loading device.
+Keep unsupported codecs, explicit affine/imatrix/Q4_0 alternatives and MTP
+separate; preserve legacy arithmetic independently of storage and kill switches.
+Admission takes the conservative maximum of loading/preparation/provisioning/
+runtime phases, with no source-release credit before checked cleanup and no
+reserve, context, KV or slot reduction. Remaining consumers, nonduplicated
+production kernels, lifetime proof and the unchanged full canonical N4 gate
+still precede adoption.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
