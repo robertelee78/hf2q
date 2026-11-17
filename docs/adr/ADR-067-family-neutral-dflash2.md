@@ -1474,6 +1474,49 @@ modes or canonical N4. Preserve source and observations; do not retry unchanged.
 Proof SHA256:
 `a9434dba65052b9f6b28d4684b60020b23e2fd46609589083f033dedfadd1632`.
 
+##### Canonical prepared expert ownership: bounded hypothesis
+
+The pinned peer's resident-image loader has a different ownership model, not
+just a different decoder. `WeightSource.cpp` retains a file descriptor, requests
+`F_NOCACHE`, and reads with `pread`. `WeightImages` retains canonical images;
+`writeGgufImage` uses one at-most-32-MiB raw Metal staging buffer, whose repack
+submissions complete before reuse and whose final owner releases it. It does
+not retain a complete second raw expert representation on this path. Expert
+streaming is a separate optional mode, not evidence for this conclusion.
+
+HF's ordinary `load_tensor` instead creates copied raw Metal buffers. The
+loaded model, GPU caches and prepared handles retain shared owners of those
+buffers; prepared planes are additional allocations. Dropping only cache
+clones or native `_source` cannot release the loaded model's owners. Prompt,
+joint and resumed prefill still consume raw layouts; decode inactivity is not
+their final use. These are source facts, not measured physical reclamation or
+admission proof. Source-bound ownership/layout record SHA256:
+`11554435a6664dbe3804bb3ed224c9a1580926649344906d8588fc4bc9db9036`.
+
+Existing Q4_K/Q6_K preparation preserves all consumed block bits through integer
+permutation/repacking. Q6 adds two padding bytes per block, not a numerical
+conversion. Investigate a canonical prepared representation with address-only
+readers for legacy consumers. Do not replace legacy F16 staging with the staged
+BF16 decoder, change row regimes, reconstruct all raw stacks persistently, or
+infer a saving from merely removing one owner.
+
+First bound the uncertainty to the actual classic and tensor 16-value F16
+decoder tiles: both quant types, all sixteen `il` positions, block/tile/expert
+boundaries, nonzero buffer offsets and padded expert strides. Compare unchanged
+production raw decoders with prepared-address readers bit for bit, including
+signed scales, centered Q6 codes, cancellation, F16 rounding boundaries and the
+Q4 scale-before-division subnormal edge. Keep the full fixture packet below
+16 MiB; run normal, shader-validation and shader-validation-plus-debug modes.
+This first spike proves neither full MM/MV arithmetic nor performance.
+
+Only a successful bounded result permits full-consumer parity/performance
+experiments. A production cutover still needs every applicable legacy binding,
+capture/keep-fresh path, model/cache/thread handoff and separate MTP owner
+migrated, with completed-preparation and residency-safe source release. All
+original numerical, realistic multi-turn, quality and canonical release gates
+remain required. No HF cutover or admission-limit change follows from this
+hypothesis.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
