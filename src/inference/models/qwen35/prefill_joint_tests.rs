@@ -1768,6 +1768,7 @@ fn without_the_layer_scratch_reset_a_forward_keeps_its_waits_and_runs_uncapped()
 fn the_joint_arena_bound_covers_the_arenas_a_segment_allocates() {
     use super::full_attn::FullAttnShape;
     use super::prefill_memory::{attention_arena_bytes, ffn_arena_bytes};
+    use mlx_native::metal::foreign_types::ForeignType;
     let check = |model: &Qwen35Model, what: &str| {
         let cfg = &model.cfg;
         let shape = FullAttnShape::from_config(cfg);
@@ -1790,27 +1791,33 @@ fn the_joint_arena_bound_covers_the_arenas_a_segment_allocates() {
                         shape.head_dim,
                         shape.rms_norm_eps,
                     )?;
+                    // byte_len is owning Metal length, including for views.
+                    // Count each actual allocation once, independently of
+                    // constructor formulas or the number of logical fields.
+                    let owner = |buffer: &mlx_native::MlxBuffer| {
+                        (buffer.metal_buffer().as_ptr() as usize, buffer.byte_len())
+                    };
                     let mut buffers = vec![
-                        prefill.q_bf16_seq.byte_len(),
-                        prefill.q_bf16_hm.byte_len(),
-                        prefill.k_bf16_seq.byte_len(),
-                        prefill.k_bf16_hm.byte_len(),
-                        prefill.v_bf16_seq.byte_len(),
-                        prefill.v_bf16_hm.byte_len(),
-                        prefill.out_bf16_hm.byte_len(),
-                        projections.x_norm_buf.byte_len(),
-                        projections.pre_norm_params_buf.byte_len(),
-                        projections.q_proj_buf.byte_len(),
-                        projections.k_proj_buf.byte_len(),
-                        projections.v_proj_buf.byte_len(),
-                        projections.gate_proj_buf.byte_len(),
-                        projections.q_normed_buf.byte_len(),
-                        projections.k_normed_buf.byte_len(),
-                        projections.qk_rms_params_buf.byte_len(),
-                        projections.q_rope_buf.byte_len(),
-                        projections.k_rope_buf.byte_len(),
-                        projections.gated_buf.byte_len(),
-                        projections.sigmoid_params_buf.byte_len(),
+                        owner(&prefill.q_bf16_seq),
+                        owner(&prefill.q_bf16_hm),
+                        owner(&prefill.k_bf16_seq),
+                        owner(&prefill.k_bf16_hm),
+                        owner(&prefill.v_bf16_seq),
+                        owner(&prefill.v_bf16_hm),
+                        owner(&prefill.out_bf16_hm),
+                        owner(&projections.x_norm_buf),
+                        owner(&projections.pre_norm_params_buf),
+                        owner(&projections.q_proj_buf),
+                        owner(&projections.k_proj_buf),
+                        owner(&projections.v_proj_buf),
+                        owner(&projections.gate_proj_buf),
+                        owner(&projections.q_normed_buf),
+                        owner(&projections.k_normed_buf),
+                        owner(&projections.qk_rms_params_buf),
+                        owner(&projections.q_rope_buf),
+                        owner(&projections.k_rope_buf),
+                        owner(&projections.gated_buf),
+                        owner(&projections.sigmoid_params_buf),
                     ];
                     if let Some(moe) = cfg.moe.as_ref() {
                         let arena = super::MoeFfnArena::new(
@@ -1823,23 +1830,25 @@ fn the_joint_arena_bound_covers_the_arenas_a_segment_allocates() {
                             moe.num_experts,
                         )?;
                         buffers.extend([
-                            arena.ids_buf.byte_len(),
-                            arena.weights_buf.byte_len(),
-                            arena.gate_all_buf.byte_len(),
-                            arena.up_all_buf.byte_len(),
-                            arena.h_all_buf.byte_len(),
-                            arena.y_all_buf.byte_len(),
-                            arena.h_s_buf.byte_len(),
-                            arena.silu_params_buf.byte_len(),
-                            arena.silu_sh_params_buf.byte_len(),
-                            arena.dummy_residual_buf.byte_len(),
-                            arena.logits_buf.byte_len(),
-                            arena.sh_logit_buf.byte_len(),
-                            arena.a_s_buf.byte_len(),
-                            arena.b_s_buf.byte_len(),
+                            owner(&arena.ids_buf),
+                            owner(&arena.weights_buf),
+                            owner(&arena.gate_all_buf),
+                            owner(&arena.up_all_buf),
+                            owner(&arena.h_all_buf),
+                            owner(&arena.y_all_buf),
+                            owner(&arena.h_s_buf),
+                            owner(&arena.silu_params_buf),
+                            owner(&arena.silu_sh_params_buf),
+                            owner(&arena.dummy_residual_buf),
+                            owner(&arena.logits_buf),
+                            owner(&arena.sh_logit_buf),
+                            owner(&arena.a_s_buf),
+                            owner(&arena.b_s_buf),
                         ]);
                     }
-                    Ok(buffers.iter().sum::<usize>() as u64)
+                    buffers.sort_unstable_by_key(|&(identity, _)| identity);
+                    buffers.dedup_by_key(|&mut (identity, _)| identity);
+                    Ok(buffers.iter().map(|&(_, bytes)| bytes).sum::<usize>() as u64)
                 })
                 .expect("arenas");
             // One slot, one segment of `rows` rows, no attended history.

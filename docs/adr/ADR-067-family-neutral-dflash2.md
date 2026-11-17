@@ -1044,8 +1044,109 @@ These synthetic Metal/allocation/admission/teardown checks do not establish
 canonical N4 physical peaks or a performance gain. Slots, context, KV budget,
 reserve, workload and all release gates remain unchanged.
 
+##### Canonical N4 admission rejection and next allocation hypothesis
 
+The clean committed candidate `7bb3c81ea5748686cea5b86c12bd3eb9239641c5`
+passes hosted CI and the numerical matrices above, but its actual canonical
+Qwen3.6 N4 calibration **stopped before client launch**: readiness required
+`profile=full`; the loader correctly selected `partial`. The unsigned packed
+binary SHA256 is
+`5af7da654e40fbc31208b08aa338f661be9e325f9ad9b0757d5b0aea90453207`.
+Rejection proof:
+`d2a2a2fa2b200b25836045d60fb71554f8219459680a5c4b31f0f64f0e99bfe6`.
+Cleanup is proven; swap growth is zero. No task or performance result exists.
 
+The recorded header-derived pool commitment, reconciled with the actual
+allocator formulas, gives these requested-byte bounds, not measured residency:
+
+| Charge | Full profile | Partial profile |
+| --- | ---: | ---: |
+| Prepared planes | 21,613,556,736 | 0 |
+| Target scratch with carry | 6,146,595,416 | 1,375,871,056 |
+| Drafter run peak | 1,039,862,295 | 1,030,982,167 |
+| Total route requirement | 28,800,014,447 | 2,406,853,223 |
+
+Actual headroom is **24,372,128,160 bytes**, leaving a full-profile deficit
+of **4,427,886,287 bytes**. The full bound is finite, not an unsupported-shape
+sentinel. The dominant forward owners include a 3,456,143,616-byte pool
+envelope and 1,073,741,824 bytes of history workspace. The pool includes
+retained roots, an outstanding window and a crossing layer; its overflow
+owners cannot be discounted as though its nominal cap bounded all live bytes.
+HF already stores its selector codebooks in BF16. Its approximately 480-MB
+draft-weight payload must not be compared with the larger whole run peak.
+
+Source inspection of the pinned peer motivates bounded staging, not a cache
+substitution. The next implementation hypotheses are:
+
+- Stream the existing per-token F32 TQ dequantization and inverse FWHT through
+  caller-owned token-tile scratch, then populate the unchanged full-history
+  BF16 K/V destinations. Preserve exact F32-before-BF16 rounding, immutable
+  parameters and barriers before reuse; do not allocate new pooled temporaries
+  per tile or use the non-equivalent F16-before-rotation sibling.
+- Alias only dead FA and MoE intermediate regions after their final readers.
+  Keep simultaneous gate/up regions disjoint and preserve diagnostic readers,
+  logical view sizes and existing kernel arithmetic.
+- Do not allocate chunk-scan arenas when their actual route is disabled, and
+  exclude MTP tensors from target-layer plane accounting only where the loader
+  proves those planes are never prepared.
+
+These are prospective allocation reductions, not an admitted budget. Require
+bitwise consumer/state checks across tile boundaries, unequal queued segments
+and checked error drains, then recompute the complete envelope and run a
+changed candidate. None yet establishes closure of the entire deficit.
+Context, slots, KV budget, reserve, workload and all quality/performance gates
+remain fixed; the rejected candidate is not rerun unchanged or promoted.
+
+##### Tiled history and dead-owner integration: consumer proof
+
+The allocation changes above now have 106 passing executions of 104 distinct
+tests: 103 focused consumers, two repeated with encoder sessions enabled, and
+the original header-geometry test explicitly run against both pinned GGUFs.
+Two timing microbenchmarks remain intentionally unrun; these are not performance
+results. The 4097-token history test compares actual BF16 K/V and attention
+against full-range F32 dequantization/inverse-FWHT references, including the
+one-token tail. Unequal queued FA/MoE consumers and checked error drains pass.
+
+History owns two F32 tiles of at most 2048 tokens and full BF16 K/V. Cold FA
+sequence-major staging shares one root, gated output reuses dead Q, and MoE
+gate/up share disjoint down-output regions only when both fit. Existing
+arithmetic is unchanged; last-reader barriers precede each reuse. Chunk arenas
+are allocated only under the actual chunk-dispatch predicate. Separately loaded
+MTP blocks no longer receive nonexistent target-layer prepared-plane charges.
+
+At the same canonical 2048-row/four-lane geometry, requested-byte calculations
+give the following changes. These are not measured residency or N4 acceptance:
+
+| Owner | Before | After |
+| --- | ---: | ---: |
+| History workspace | 1,073,741,824 | 545,259,520 |
+| Shared attention | 293,601,280 | 255,852,544 |
+| FFN arenas | 280,913,004 | 205,415,532 |
+| Common arenas/rings | 689,438,988 | 437,256,284 |
+| Complete joint forward | 5,995,502,168 | 5,101,590,952 |
+
+The reduction is 893,911,216 bytes, excluding the separate MTP-plane correction.
+It does **not** close the original deficit: 3,533,975,071 bytes remain before
+that correction, at the recorded headroom. Pool retention/window/crossing-layer
+owners and per-weight native split scratch remain charged. No unchanged N4
+retry, threshold change, default promotion or release approval follows.
+
+The test binary SHA256 is
+`af86cb25a532f9a813274ad5477cdb205c3bdcd2d239b0223716e64579dd0b25`;
+the complete source archive is
+`794dc5069f3eac857e889093aa99873f6a1e7775f54a59d5b698d150b00d88a0`.
+Consumer proof `validated-consumer-proof.json` has SHA256
+`e281f6518c59ad4960ad8f6b279ef05efce303942a2238468e3e3d8b73115692`.
+
+Provenance correction: the former inventory helper excluded every directory
+named `models`, accidentally omitting 301 Rust model-source files. Historical
+source tarballs are therefore **not complete-source proof**; raw receipts,
+binaries and crates are unchanged. All 301 model sources in the historical
+clean crate match committed candidate `7bb3c81`; its corrected extracted
+inventory contains 1838 files, including 944 Rust files. This does not
+retroactively add missing guards to earlier private builds. The current build
+guards all 2338 source files. Correction receipt SHA256:
+`b9f666e87a8e7718ad681c58dbce9a56f578da2a6882d50ad6c790cf2d47e91d`.
 
 ### D2: 32-row target verifier
 

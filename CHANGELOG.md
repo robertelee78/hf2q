@@ -161,6 +161,8 @@ are recorded under Changed.
 
 ### Fixed
 
+- Qwen prepared prefill reduces live allocations without changing arithmetic: bounded F32 TQ history tiles before BF16 casting, dead FA/MoE root reuse with last-reader barriers, and no chunk-only arenas on the ordinary route. Admission no longer charges target-layer prepared planes for separately loaded native MTP blocks. Real Metal bitwise and checked-error consumer tests pass; full-profile canonical N4 admission and final quality/performance qualification remain required.
+
 - DFlash2 AF4 uses explicit BF16 producer profiles: real-row context FC/KV
   prefill and source-matched QKV decode, independently of the auxiliary
   `HF2Q_DFLASH2_DRAFT_STAGED` switch. Auxiliary BF16 projections choose the

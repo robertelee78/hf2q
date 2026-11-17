@@ -13,8 +13,8 @@
 //! same per-tensor transforms and attention/output arithmetic:
 //! - the BF16 Q and output buffers come from the prefill's
 //!   [`FaPrefillArena`];
-//! - one F32 history staging root is dequantized and cast for K, then reused
-//!   for V, with separate BF16 K/V roots preserving both attention inputs;
+//! - two F32 token tiles (at most 2048 rows each) dequantize and inverse-rotate
+//!   K/V before casting into unchanged full-history BF16 K/V roots;
 //! - joint segments borrow one forward-owned output and history workspace;
 //!   ordinary prefills lazily allocate their own [`ResumeTqScratch`];
 //! - barriers order dequant, cast, staging reuse and the BF16 bridge in one
@@ -48,7 +48,7 @@ use super::FaPrefillArena;
 use crate::serve::multi_seq_kv::SlotId;
 
 mod workspace;
-pub(crate) use workspace::{ResumeTqScratch, ResumeTqWorkspace};
+pub(crate) use workspace::{ResumeTqScratch, ResumeTqWorkspace, RESUME_TQ_HISTORY_TILE_ROWS};
 
 #[cfg(test)]
 use super::gpu_full_attn::encode_flash_attn_prefill_seq_major_resume;
@@ -134,7 +134,7 @@ fn arena_buffers<'a>(
     device: &MlxDevice,
     seq_len: u32,
     kv_seq_len: u32,
-) -> Result<(FaResumeBridgeBuffers<'a>, &'a MlxBuffer)> {
+) -> Result<(FaResumeBridgeBuffers<'a>, &'a MlxBuffer, &'a MlxBuffer)> {
     match &arena.resume_tq {
         Some(scratch) if scratch.seq_len != seq_len || scratch.kv_seq_len != kv_seq_len => {
             return Err(anyhow!(
@@ -171,7 +171,8 @@ fn arena_buffers<'a>(
             out_bf16_hm: &arena.out_bf16_hm,
             out_seq: &scratch.out_seq,
         },
-        &scratch.staging,
+        &scratch.k_f32_tile,
+        &scratch.v_f32_tile,
     ))
 }
 
@@ -205,44 +206,62 @@ pub(crate) fn encode_resume_via_tq_cache_fast(
     // Route (c) attends tight temps: kv_capacity = kv_seq_len.
     validate_flash_attn_prefill_resume_shape(seq_len, cur_len, kv_seq_len, kv_seq_len, head_dim)?;
     arena.validate_fits(seq_len, n_heads, n_kv_heads, head_dim)?;
-    let (bufs, staging) = arena_buffers(arena, device, seq_len, kv_seq_len)?;
+    let (bufs, k_tile, v_tile) = arena_buffers(arena, device, seq_len, kv_seq_len)?;
 
     // WAR against the preceding segment, including a carried concurrent
     // encoder. All roots remain owned until the forward's checked drain.
     enc.memory_barrier();
-    let kv_elems = n_kv_heads as usize * kv_seq_len as usize * head_dim as usize;
-    for (is_k, destination) in [(true, bufs.k_bf16), (false, bufs.v_bf16)] {
-        slot.dequant_seq_into_f32_unrotated_for_slot(
-            is_k,
-            kv_seq_len,
-            /*start_pos=*/ 0,
-            cache_capacity,
-            n_kv_heads,
-            head_dim,
-            slot_id,
-            staging,
-            enc,
-            registry,
-            device,
-        )
-        .with_context(|| {
-            format!(
-                "dequant {} seq → scratch F32 unrotated",
-                if is_k { "K" } else { "V" }
+    for start_pos in (0..kv_seq_len).step_by(RESUME_TQ_HISTORY_TILE_ROWS as usize) {
+        let n_tokens = (kv_seq_len - start_pos).min(RESUME_TQ_HISTORY_TILE_ROWS);
+        for (is_k, tile) in [(true, k_tile), (false, v_tile)] {
+            // Caller-owned roots, not allocating dequant helpers: pooled
+            // allocations in this loop would all survive until the next reset.
+            // The native dequant/FWHT params are immutable inline encoder bytes.
+            slot.dequant_seq_into_f32_unrotated_for_slot(
+                is_k,
+                n_tokens,
+                start_pos,
+                cache_capacity,
+                n_kv_heads,
+                head_dim,
+                slot_id,
+                tile,
+                enc,
+                registry,
+                device,
             )
-        })?;
+            .with_context(|| {
+                format!(
+                    "dequant {} history tile at {start_pos} ({n_tokens} rows) → F32 unrotated",
+                    if is_k { "K" } else { "V" }
+                )
+            })?;
+        }
         enc.memory_barrier();
-        cast(
-            enc,
-            registry,
-            device.metal_device(),
-            staging,
-            destination,
-            kv_elems,
-            CastDirection::F32ToBF16,
-        )
-        .context("cast resumed TQ history to BF16")?;
-        // The next dequant may overwrite staging only after this cast.
+        let head_elems = n_tokens as usize * head_dim as usize;
+        for (tile, destination) in [(k_tile, bufs.k_bf16), (v_tile, bufs.v_bf16)] {
+            for head in 0..n_kv_heads as usize {
+                // A short tail is packed tightly in the tile, while each
+                // destination head keeps the full segment's history stride.
+                let source = tile.slice_view((head * head_elems * 4) as u64, head_elems);
+                let dst_offset = (head * kv_seq_len as usize + start_pos as usize)
+                    * head_dim as usize * 2;
+                let destination = destination.slice_view(dst_offset as u64, head_elems);
+                cast(
+                    enc,
+                    registry,
+                    device.metal_device(),
+                    &source,
+                    &destination,
+                    head_elems,
+                    CastDirection::F32ToBF16,
+                )
+                .context("cast resumed TQ history tile to BF16")?;
+            }
+        }
+        // Both tiles' last readers are the casts above. Complete them before
+        // the next range overwrites the same F32 storage; also publishes K/V
+        // to the BF16 bridge after the final tile.
         enc.memory_barrier();
     }
     encode_flash_attn_prefill_seq_major_resume_prepared(
@@ -622,10 +641,85 @@ mod tests {
         }
     }
 
+    /// Inspect the actual BF16 attention inputs, not only the output. Three
+    /// history tiles end in a single-token tail, whose packed head offsets
+    /// differ from both the full tiles and the full-history destinations.
+    #[test]
+    fn tiled_resume_history_matches_full_range_bf16_bitwise_with_short_tail() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let (history, rows) = (4097u32, 77u32);
+        let Some(mut fx) = Fixture::new(history, rows, 1, 509) else {
+            return;
+        };
+        let cursor = history - rows;
+        let expected_output = fx.bridge(0, cursor, rows);
+        let elements = NKV as usize * history as usize * D;
+        let references = [true, false].map(|is_k| {
+            let mut enc = fx.device.command_encoder().expect("full-range reference encoder");
+            // This is the old full-range F32 dequant + inverse FWHT, followed
+            // by one contiguous cast. Do not use the tiled implementation as
+            // its own reference or round the rotated values through F16.
+            let full_f32 = fx.cache.full_attn[0]
+                .dequant_seq_to_temp_f32_unrotated_for_slot(
+                    is_k,
+                    history,
+                    0,
+                    fx.capacity,
+                    NKV,
+                    HEAD_DIM,
+                    SlotId(0),
+                    &mut enc,
+                    &mut fx.registry,
+                    &fx.device,
+                )
+                .expect("full-range F32 reference");
+            let bf16 = fx.device
+                .alloc_buffer(
+                    elements * 2,
+                    DType::BF16,
+                    vec![1, NKV as usize, history as usize, D],
+                )
+                .expect("full-range BF16 reference");
+            enc.memory_barrier();
+            cast(
+                &mut enc,
+                &mut fx.registry,
+                fx.device.metal_device(),
+                &full_f32,
+                &bf16,
+                elements,
+                CastDirection::F32ToBF16,
+            )
+            .expect("full-range reference cast");
+            enc.commit_and_wait().expect("full-range reference drain");
+            bf16
+        });
+        let q = fx.upload_q(0, rows);
+        let mut arena = fx.arena(rows);
+        let output = fx.fast(0, &q, cursor, rows, &mut arena).expect("tiled history");
+        drain(&fx.device);
+        let scratch = arena.resume_tq.as_ref().expect("history roots");
+        for ((name, got), expected) in [
+            ("K", &scratch.k_bf16),
+            ("V", &scratch.v_bf16),
+        ].into_iter().zip(&references) {
+            let expected = expected.as_slice::<u16>().expect("reference BF16 bits");
+            assert!(expected.iter().any(|&bits| bits != 0), "{name}: nonzero reference");
+            assert_eq!(
+                got.as_slice::<u16>().expect("tiled BF16 bits"),
+                expected,
+                "{name}: every head/row must match full-range F32-before-BF16",
+            );
+        }
+        assert_bitwise("three-tile attention", &read(&output), &expected_output);
+    }
+
     #[test]
     fn shared_resume_workspace_preserves_unequal_queued_segments() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let cases = [(64u32, 33u32), (511, 127), (1000, 64), (2003, 512)];
+        // Small → one-token tile tail → small → large, repeatedly queued
+        // without host waits. Each output is compared to the full-range bridge.
+        let cases = [(64u32, 33u32), (2016, 33), (511, 127), (1000, 64), (2003, 512)];
         let Some(mut fx) = Fixture::new(2515, 512, cases.len() as u32, 907) else {
             return;
         };
@@ -696,12 +790,19 @@ mod tests {
                     arenas[layer].shared_output.as_ref().expect("shared output").metal_buffer().as_ptr(),
                     "history must borrow the attention result, not allocate another root",
                 );
-                assert_eq!(scratch.staging.byte_len(), 2515 * NKV as usize * D * 4);
-                assert_eq!(
-                    scratch.staging.data_byte_len(),
-                    (cursor + rows) as usize * NKV as usize * D * 4,
-                    "the F32 history view must have tight head strides",
-                );
+                for tile in [&scratch.k_f32_tile, &scratch.v_f32_tile] {
+                    assert_eq!(
+                        tile.byte_len(),
+                        RESUME_TQ_HISTORY_TILE_ROWS as usize * NKV as usize * D * 4,
+                        "F32 owning roots must remain bounded, not full-history sized",
+                    );
+                    assert_eq!(
+                        tile.data_byte_len(),
+                        (cursor + rows).min(RESUME_TQ_HISTORY_TILE_ROWS) as usize
+                            * NKV as usize * D * 4,
+                        "the segment's tile view must fit its attended history",
+                    );
+                }
                 assert_eq!(scratch.k_bf16.dtype(), DType::BF16);
                 assert_eq!(scratch.v_bf16.dtype(), DType::BF16);
                 assert_ne!(
@@ -711,11 +812,16 @@ mod tests {
                 );
                 if layer > 0 {
                     let previous = arenas[layer - 1].resume_tq.as_ref().expect("previous segment");
-                    assert_eq!(
-                        scratch.staging.metal_buffer().as_ptr(),
-                        previous.staging.metal_buffer().as_ptr(),
-                        "segments must reuse one F32 history staging root",
-                    );
+                    for (tile, previous_tile) in [
+                        (&scratch.k_f32_tile, &previous.k_f32_tile),
+                        (&scratch.v_f32_tile, &previous.v_f32_tile),
+                    ] {
+                        assert_eq!(
+                            tile.metal_buffer().as_ptr(),
+                            previous_tile.metal_buffer().as_ptr(),
+                            "segments must reuse the two F32 token tiles",
+                        );
+                    }
                     assert_eq!(
                         scratch.out_seq.metal_buffer().as_ptr(),
                         previous.out_seq.metal_buffer().as_ptr(),
@@ -807,18 +913,47 @@ mod tests {
     #[test]
     fn resume_attn_fast_rejects_a_shape_change_within_a_prefill() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let rows = 64u32;
-        let Some(mut fx) = Fixture::new(3 * rows, rows, 1, 31) else {
+        use super::super::encoder_stage::{
+            settle_submitted, FailSubmitted, SubmittedCommands,
+        };
+        let (cursor, rows) = (2016u32, 33u32);
+        let Some(mut fx) = Fixture::new(cursor + 2 * rows, rows, 1, 31) else {
             return;
         };
+        let expected = fx.bridge(0, cursor, rows);
         let q = fx.upload_q(0, rows);
-        let mut arena = fx.arena(rows);
-        fx.fast(0, &q, rows, rows, &mut arena).expect("first layer");
-        let error = fx
-            .fast(0, &q, 2 * rows, rows, &mut arena)
-            .expect_err("a different kv_seq_len in one prefill must fail");
-        drain(&fx.device);
-        assert!(format!("{error:#}").contains("resume scratch"), "{error:#}");
+        for fail_command in [false, true] {
+            let mut arena = fx.arena(rows);
+            // Scope drops before the arena even if an assertion unwinds.
+            let _submitted = SubmittedCommands::open(true);
+            let failure = fail_command
+                .then(|| FailSubmitted::nth("layer.full_attn.tq_bridge_resume", 0));
+            let output = fx.fast(0, &q, cursor, rows, &mut arena).expect("first tiled layer");
+            let error = fx
+                .fast(0, &q, cursor + rows, rows, &mut arena)
+                .expect_err("a different kv_seq_len in one prefill must fail");
+            assert!(format!("{error:#}").contains("resume scratch"), "{error:#}");
+            let settled = settle_submitted();
+            if let Some(failure) = &failure {
+                let error = settled.expect_err("submitted tiled attention failure must be checked");
+                assert!(
+                    format!("{error:#}").contains("committed without a wait failed"),
+                    "{error:#}",
+                );
+                assert_eq!(failure.seen(), (true, 1));
+            } else {
+                settled.expect("checked drain after the host shape error");
+            }
+            drop(failure);
+            assert_bitwise(
+                "queued history survives a later host/checked error",
+                &read(&output),
+                &expected,
+            );
+            let retried = fx.fast(0, &q, cursor, rows, &mut arena).expect("reuse after drain");
+            settle_submitted().expect("checked retry drain");
+            assert_bitwise("history reuse after error drain", &read(&retried), &expected);
+        }
     }
 
     fn median(mut values: Vec<f64>) -> f64 {

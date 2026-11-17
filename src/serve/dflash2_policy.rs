@@ -927,9 +927,14 @@ fn plane_set_of(name: &str) -> Option<PlaneSet> {
 /// layout, including eagerly retained split-grid partials. Routed and shared
 /// MM-ID stacks are a DIFFERENT representation and keep their plane-only
 /// accounting. Alpha/beta share one padded matrix and one new raw source.
-pub(crate) fn plane_bytes(tensors: &[TensorFact], sets: &[PlaneSet]) -> u64 {
-    let tied_head = !tensors.iter().any(|tensor| tensor.name == "output.weight");
-    tensors.iter().map(|tensor| {
+pub(crate) fn plane_bytes<'a, I>(tensors: I, sets: &[PlaneSet]) -> u64
+where
+    I: IntoIterator<Item = &'a TensorFact>,
+    I::IntoIter: Clone,
+{
+    let tensors = tensors.into_iter();
+    let tied_head = !tensors.clone().any(|tensor| tensor.name == "output.weight");
+    tensors.clone().map(|tensor| {
         let set = if tied_head && tensor.name == "token_embd.weight" {
             Some(PlaneSet::Head)
         } else {
@@ -948,7 +953,7 @@ pub(crate) fn plane_bytes(tensors: &[TensorFact], sets: &[PlaneSet]) -> u64 {
             return 0;
         }
         if let Some(prefix) = tensor.name.strip_suffix("ssm_alpha.weight") {
-            let beta = tensors.iter().find(|other| {
+            let beta = tensors.clone().find(|other| {
                 other.name.strip_suffix("ssm_beta.weight") == Some(prefix)
             });
             if !beta.is_some_and(|beta| beta.ggml_type == tensor.ggml_type && beta.shape == tensor.shape) {
@@ -1008,8 +1013,18 @@ pub(crate) fn routed_plane_bytes(
     } else {
         consumers
     };
-    plane_bytes(&facts.tensors, &other)
-        .saturating_add(plane_bytes(&facts.tensors, &[PlaneSet::Head]).saturating_mul(copies))
+    // Target preparation walks model.layers only. MTP is loaded separately
+    // from native blocks and never receives these prepared target products.
+    // An unknown layer count cannot justify excluding any header weight.
+    let target_layers = facts.qwen_config.as_ref().map(|config| config.num_hidden_layers);
+    let tensors = facts.tensors.iter().filter(|tensor| {
+        let layer = tensor.name.strip_prefix("blk.")
+            .and_then(|name| name.split_once('.'))
+            .and_then(|(index, _)| index.parse::<u32>().ok());
+        !matches!((target_layers, layer), (Some(count), Some(index)) if index >= count)
+    });
+    plane_bytes(tensors.clone(), &other)
+        .saturating_add(plane_bytes(tensors, &[PlaneSet::Head]).saturating_mul(copies))
 }
 
 /// Worker content quantum; a folded cue is accounted separately by its owner.

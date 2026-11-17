@@ -101,13 +101,13 @@
 //! | `k_normed_buf` | F32 | seq*kv_total*4 = 8.4 MB |
 //! | `q_rope_buf` | F32 | seq*q_total*4 = 67.6 MB |
 //! | `k_rope_buf` | F32 | seq*kv_total*4 = 8.4 MB |
-//! | `gated_buf` | F32 | seq*q_total*4 = 67.6 MB |
+//! | `gated_buf` | F32 | aliases dead `q_proj_buf`, no additional allocation |
 //! | `pre_norm_params_buf` | F32 | 8 |
 //! | `qk_rms_params_buf` | F32 | 8 |
 //! | `sigmoid_params_buf` | U32 | 4 |
 //!
-//! Total ≈ 405 MB. Live for the entire prefill duration; M5 Max 128 GB
-//! unified memory keeps this well within budget.
+//! Owning payload: `4 * seq * (h + 4*q_total + 4*kv_total) + 20` bytes.
+//! Q's RMSNorm and diagnostic readers finish before sigmoid-gate reuses it.
 
 use anyhow::{anyhow, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
@@ -138,6 +138,7 @@ pub struct FaProjectionsArena {
 
     // ── Q/K/V/Gate projections (op2) ──────────────────────────────────────
     /// `[seq, n_head * head_dim]` F32 — Q projection output.
+    /// Reused by `gated_buf` only after Q normalization and diagnostic reads.
     pub q_proj_buf: MlxBuffer,
     /// `[seq, n_kv * head_dim]` F32 — K projection output.
     pub k_proj_buf: MlxBuffer,
@@ -164,6 +165,7 @@ pub struct FaProjectionsArena {
 
     // ── Sigmoid-gate multiply output + params (op6) ───────────────────────
     /// `[seq * n_head * head_dim]` F32 — sigmoid(gate) * attn_out.
+    /// Flat view of the dead Q projection root; never aliases live gate input.
     pub gated_buf: MlxBuffer,
     /// `[1]` U32 — sigmoid_mul element count = `seq * n_head * head_dim`.
     /// Written ONCE at arena construction; constant for the whole prefill.
@@ -266,10 +268,11 @@ impl FaProjectionsArena {
             .alloc_buffer(seq * kv_total * 4, DType::F32, vec![seq, nkv, d])
             .map_err(|e| anyhow!("FaProjectionsArena alloc k_rope_buf: {e}"))?;
 
-        // Sigmoid-gate multiply output is flat `[seq * q_total]` F32.
-        let gated_buf = device
-            .alloc_buffer(seq * q_total * 4, DType::F32, vec![seq * q_total])
-            .map_err(|e| anyhow!("FaProjectionsArena alloc gated_buf: {e}"))?;
+        // Q's per-head normalization and all diagnostic reads precede op6.
+        // The live gate projection stays separate; sigmoid_mul is not in-place.
+        let gated_buf = q_proj_buf
+            .with_shape(vec![seq * q_total])
+            .map_err(|e| anyhow!("FaProjectionsArena gated Q-root view: {e}"))?;
 
         // ── Small param buffers — written ONCE at arena construction ──
         // Pre-attn RMSNorm params: [eps, hidden_size as f32].

@@ -2,6 +2,9 @@
 use anyhow::{anyhow, ensure, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
+/// Bound only the F32 expansion; attention still reads the full BF16 history.
+pub(crate) const RESUME_TQ_HISTORY_TILE_ROWS: u32 = 2048;
+
 #[derive(Clone)]
 pub(crate) struct ResumeTqWorkspace {
     rows: u32,
@@ -9,7 +12,10 @@ pub(crate) struct ResumeTqWorkspace {
     heads: u32,
     kv_heads: u32,
     dim: u32,
-    staging: MlxBuffer,
+    // These four roots own the entire history workspace: two bounded F32
+    // tiles and full-capacity BF16 K/V. Segment views retain all four.
+    k_f32_tile: MlxBuffer,
+    v_f32_tile: MlxBuffer,
     k_bf16: MlxBuffer,
     v_bf16: MlxBuffer,
     out_seq: MlxBuffer,
@@ -33,6 +39,8 @@ impl ResumeTqWorkspace {
                 .ok_or_else(|| anyhow!("resumed attention workspace shape overflow"))
         };
         let kv = elements(history, kv_heads, dim)?;
+        let tile_rows = history.min(RESUME_TQ_HISTORY_TILE_ROWS);
+        let tile = elements(tile_rows, kv_heads, dim)?;
         let q = elements(rows, heads, dim)?;
         if let Some(output) = output {
             ensure!(
@@ -49,7 +57,8 @@ impl ResumeTqWorkspace {
         };
         Ok(Self {
             rows, history, heads, kv_heads, dim,
-            staging: alloc(kv, DType::F32, vec![kv_heads as usize, history as usize, dim as usize], "staging")?,
+            k_f32_tile: alloc(tile, DType::F32, vec![kv_heads as usize, tile_rows as usize, dim as usize], "K tile")?,
+            v_f32_tile: alloc(tile, DType::F32, vec![kv_heads as usize, tile_rows as usize, dim as usize], "V tile")?,
             k_bf16: alloc(kv, DType::BF16, vec![1, kv_heads as usize, history as usize, dim as usize], "K")?,
             v_bf16: alloc(kv, DType::BF16, vec![1, kv_heads as usize, history as usize, dim as usize], "V")?,
             out_seq: match output {
@@ -64,7 +73,8 @@ impl ResumeTqWorkspace {
 pub(crate) struct ResumeTqScratch {
     pub(super) seq_len: u32,
     pub(super) kv_seq_len: u32,
-    pub(super) staging: MlxBuffer,
+    pub(super) k_f32_tile: MlxBuffer,
+    pub(super) v_f32_tile: MlxBuffer,
     pub(super) k_bf16: MlxBuffer,
     pub(super) v_bf16: MlxBuffer,
     pub(super) out_seq: MlxBuffer,
@@ -93,13 +103,15 @@ impl ResumeTqScratch {
             "resume shared workspace does not cover the segment shape");
         let (r, k, nh, nkv, d) = (seq_len as usize, kv_seq_len as usize,
             n_heads as usize, n_kv_heads as usize, head_dim as usize);
+        let tile_rows = kv_seq_len.min(RESUME_TQ_HISTORY_TILE_ROWS) as usize;
         let view = |buffer: &MlxBuffer, shape: Vec<usize>| {
             buffer.slice_view(0, shape.iter().product()).with_shape(shape)
                 .map_err(|e| anyhow!("resumed attention workspace view: {e}"))
         };
         Ok(Self {
             seq_len, kv_seq_len,
-            staging: view(&workspace.staging, vec![nkv, k, d])?,
+            k_f32_tile: view(&workspace.k_f32_tile, vec![nkv, tile_rows, d])?,
+            v_f32_tile: view(&workspace.v_f32_tile, vec![nkv, tile_rows, d])?,
             k_bf16: view(&workspace.k_bf16, vec![1, nkv, k, d])?,
             v_bf16: view(&workspace.v_bf16, vec![1, nkv, k, d])?,
             out_seq: view(&workspace.out_seq, vec![r, nh, d])?,

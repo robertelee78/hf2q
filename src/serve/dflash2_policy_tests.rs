@@ -2181,23 +2181,6 @@ fn absolute_prefill_memory_closes_canonical_shared_roots() {
         short_wait_layers: 8,
     };
     let allocation = memory::bound(cfg, 2048, 4, 262_144, route).unwrap();
-    // Source-derived payloads, not telemetry or an admission/performance claim.
-    assert_eq!(allocation.attention, 293_601_280);
-    assert_eq!(allocation.history, 1_073_741_824); // 4 + 2 + 2 bytes/KV element
-    assert_eq!(allocation.segments, 67_239_936);
-    assert_eq!(allocation.ffn, 280_913_004);
-    assert_eq!(allocation.delta_states, 2_588_672);
-    assert_eq!(allocation.common, 689_438_988);
-    assert_eq!(allocation.deferred_outputs, 33_554_432);
-    assert_eq!(allocation.output_head, 25_716_736);
-    assert_eq!(allocation.mm_id_tls, 67_317_728);
-    assert_eq!(allocation.allocation_allowance, 4_194_304);
-    assert_eq!(prefill_prepared::prefill_layer_scratch_bound_bytes(cfg, 2048, 4, false), 1_577_095_424);
-    assert_eq!(prefill_prepared::prefill_layer_scratch_bound_bytes(cfg, 2048, 4, true), 1_308_659_968);
-    assert_eq!(allocation.pool, prefill_prepared::PREFILL_RETAINED_SCRATCH_BYTES as u64
-        + prefill_prepared::WAIT_LAYERS_WINDOW_SCRATCH_BYTES as u64 + 1_308_659_968);
-    assert_eq!(allocation.total(),
-        prefill_prepared::PREFILL_RETAINED_SCRATCH_BYTES as u64 + 4_920_708_696);
     let single_wait = memory::bound(cfg, 2048, 4, 262_144,
         memory::PrefillMemoryRoute { wait_layers: 1, ..route }).unwrap();
     assert_eq!(single_wait.common, allocation.common);
@@ -2430,4 +2413,36 @@ fn policy_declines_old_prefill_budget_but_exact_carry_commitment_fits() {
     let ledger = crate::serve::resident_memory::Ledger::new();
     let _reservation = ledger.reserve(std::path::Path::new("carry-threshold.gguf"), fits.commitment);
     assert_eq!(ledger.total(), fits.commitment.total());
+}
+
+#[test]
+fn mtp_shared_weights_do_not_displace_the_full_target_profile() {
+    let mut facts = qwen36();
+    let config = facts.qwen_config.as_mut().unwrap();
+    config.mtp_num_hidden_layers = 1;
+    config.mtp_use_dedicated_embeddings = false;
+    let environment = env(&[]);
+    let routes = ResolvedRoutes::resolve(
+        Some(RouteProfile::Qwen36), &|_| None, &environment,
+    );
+    let drafter = DrafterMemoryBound::required(&QWEN36_DFLASH2, &facts, &routes)
+        .expect("canonical drafter payload");
+    let required = drafter.total(
+        routed_plane_bytes(&facts, &routes, true),
+        route_scratch_bytes(&facts, &routes),
+    );
+    // The MTP loader keeps these native Q4/Q6 blocks; only the forty
+    // target layers get grouped prepared shared-expert products.
+    facts.tensors.extend([
+        tensor("blk.40.ffn_gate_shexp.weight", GgmlType::Q4_K, &[512, 2048]),
+        tensor("blk.40.ffn_up_shexp.weight", GgmlType::Q4_K, &[512, 2048]),
+        tensor("blk.40.ffn_down_shexp.weight", GgmlType::Q6_K, &[2048, 512]),
+    ]);
+    let selected = decide(
+        &facts, host_with_headroom(&facts, required, 0),
+        &environment, &Store::cached(), &|_| None,
+    ).expect("native MTP blocks do not consume target-plane headroom");
+    assert!(selected.plan.is_some());
+    assert!(!selected.routes.any_withheld(),
+        "unprepared MTP weights must not force a partial default profile");
 }

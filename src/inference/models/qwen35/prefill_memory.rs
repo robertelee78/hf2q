@@ -200,16 +200,17 @@ pub(crate) fn bound(
         );
     }
     if full {
-        // FaProjectionsArena's ten F32 arrays; FaPrefillArena's seven BF16
-        // arrays; one F32 attention result. Joint segment tight views share
-        // these roots. The single-lane route owns the same sized set.
+        // FA projections reuse dead Q for the gated result; the bridge shares
+        // sequence-major Q/K/V staging. Joint segment views borrow these
+        // owners and one F32 attention result, as does the single-lane route.
         result.attention = attention_arena_bytes(cfg, forward_rows)
             .ok_or("attention arena byte overflow")?;
         let shared_history = route.tq_only && route.resume_fast;
         result.history = if shared_history {
-            // ResumeTqWorkspace: ONE F32 staging, BF16 K and V. The F32
-            // output aliases the attention result for joint execution.
-            bytes(8 * kv * kv_rows as u128)?
+            // Full BF16 K/V plus two bounded F32 expansion tiles. Inverse
+            // FWHT remains F32; the result aliases joint attention output.
+            let tile_rows = kv_rows.min(super::resume_attn_fast::RESUME_TQ_HISTORY_TILE_ROWS as usize);
+            bytes(4 * kv * kv_rows as u128 + 8 * kv * tile_rows as u128)?
         } else {
             // Disabled fast bridge: tight F32 K/V plus BF16 K/V. F32-cache
             // resume needs only the BF16 pair, but may use the full capacity
@@ -239,23 +240,9 @@ pub(crate) fn bound(
     if linear {
         // DnPrefillArena::new's 16 row arrays and seven parameter roots.
         let dn = 4 * r * (2 * channels + 5 * a + 4 * z + h + 4 * nv) + 92;
-        // ChunkAllocsArena::new's seven arrays are eagerly allocated even
-        // when this exact transaction does not engage the chunk kernel.
-        let wrapper = r * (12 * nv * dk + 4 * nv * dv + 4 * nv);
-        // Native constructor's authoritative thirteen-root plan. Any chunk
-        // transaction <=R has at most floor(R/64)*64 rows. Unsupported
-        // dimensions do not engage the chunk path; no invented arena bytes.
-        let chunk_rows = forward_rows / 64 * 64;
-        let native = if chunk_rows > 0 && cfg.linear_key_head_dim == 128
-            && cfg.linear_value_head_dim <= 128
-        {
-            let t = u32::try_from(chunk_rows).map_err(|_| "chunk row capacity exceeds u32")?;
-            mlx_native::ops::chunk_gated_delta_rule::ChunkInternalArenaPlan::for_shape(
-                1, t, cfg.linear_num_value_heads, cfg.linear_num_value_heads,
-                cfg.linear_key_head_dim, cfg.linear_value_head_dim, 64,
-            ).map_err(|_| "native chunk arena allocation plan rejected geometry")?.requested_bytes() as u128
-        } else { 0 };
-        result.common = bytes(dn + wrapper + native)?;
+        // The closed prepared route excludes chunk scan. forward_gpu allocates
+        // its chunk-only arenas only when the actual chunk predicate admits it.
+        result.common = bytes(dn)?;
         if route.joint {
             // DnRunScratch: one prefix recurrent state, prefix convolution
             // state and one private boundary convolution state per lane.
@@ -390,7 +377,7 @@ pub(crate) fn attention_arena_bytes(cfg: &Qwen35Config, rows: usize) -> Option<u
     }
     let q = u128::from(cfg.num_attention_heads) * u128::from(cfg.head_dim);
     let kv = u128::from(cfg.num_key_value_heads) * u128::from(cfg.head_dim);
-    u64::try_from(rows as u128 * (4 * (h + 5 * q + 4 * kv) + 6 * q + 8 * kv + 4 * q)).ok()
+    u64::try_from(rows as u128 * (4 * (h + 4 * q + 4 * kv) + 6 * q + 4 * kv + 4 * q)).ok()
 }
 
 /// DenseFfnArena/MoeFfnArena payloads, including their small parameter roots.
@@ -403,8 +390,12 @@ pub(crate) fn ffn_arena_bytes(cfg: &Qwen35Config, rows: usize, short_segments: u
         (Some(m), _) => r * (12 * u128::from(m) + 4 * h) + 4,
         (None, Some(moe)) => {
             let k = u128::from(moe.num_experts_per_tok);
-            let per_row = 8 * k + 12 * k * u128::from(moe.moe_intermediate_size)
-                + 4 * k * h + 12 * u128::from(moe.shared_expert_intermediate_size)
+            let m = u128::from(moe.moe_intermediate_size);
+            // Gate/up reuse disjoint down-output regions iff both fit.
+            // The SiLU result remains independently owned in either route.
+            let expert = if h >= 2 * m { 4 * k * (h + m) } else { 4 * k * (h + 3 * m) };
+            let per_row = 8 * k + expert
+                + 12 * u128::from(moe.shared_expert_intermediate_size)
                 + 4 * u128::from(moe.num_experts) + 4;
             (r + 32 * extra) * per_row + 12 * (1 + extra)
         }

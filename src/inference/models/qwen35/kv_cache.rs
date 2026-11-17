@@ -922,6 +922,14 @@ impl FullAttnKvSlot {
     /// the barrier between them) leave the first
     /// `n_kv_heads · n_tokens · head_dim` elements of `dst` in the unrotated
     /// domain as `[n_kv_heads, n_tokens, head_dim]`.
+    ///
+    /// No tensor allocation is performed. A caller may reuse a bounded
+    /// `[n_kv_heads, tile_tokens, head_dim]` F32 tile across cache ranges;
+    /// `n_tokens` determines its tight head stride, including the short tail.
+    /// Both native dispatchers copy their per-range parameters into inline
+    /// encoder bytes, so queued ranges never share mutable parameter storage.
+    /// The caller must barrier after the tile's last reader before reusing it,
+    /// and retain its owning root through the checked success or error drain.
     #[allow(clippy::too_many_arguments)]
     pub fn dequant_seq_into_f32_unrotated_for_slot(
         &self,

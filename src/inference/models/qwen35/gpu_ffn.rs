@@ -4236,7 +4236,8 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             )?
         };
 
-        // Barrier C→D.
+        // Barrier C→D: gate/up are simultaneous, disjoint y_all regions when
+        // the arena geometry admits reuse; SiLU reads both into separate h_all.
         {
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnBarrierCD,
@@ -4265,7 +4266,8 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             // fused_moe_mm_id_on_pf: silu_mul applied in-kernel at Phase C.
         }
 
-        // Barrier D→E.
+        // Barrier D→E: finish every gate/up reader before down reuses y_all.
+        // This is not in-place SiLU: h_all remains a separate live down input.
         {
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnBarrierDE,
@@ -5577,6 +5579,136 @@ mod tests {
             }
         }
     }
+    /// Real router/gate/up/SiLU/down/reduce consumers, sharing only dead roots
+    /// across unequal queued rows, with no intermediate host waits.
+    #[test]
+    fn moe_arena_dead_root_reuse_matches_independent_queued_consumers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("Metal device unavailable");
+        let mut registry = KernelRegistry::new();
+        let mut seed = 0xDEA0_600Du32;
+        // Below the fit boundary, exactly at it, and with unused y slack.
+        for h in [256usize, 512, 768] {
+            let (ne, topk, m, ms) = (16usize, 8usize, 256usize, 256usize);
+            let shape = MoeFfnShape {
+                hidden_size: h as u32, num_experts: ne as u32,
+                num_experts_per_tok: topk as u32, moe_intermediate_size: m as u32,
+                shared_intermediate_size: ms as u32,
+            };
+            let gate = mk_rand(&mut seed, ne * m * h, 0.05);
+            let up = mk_rand(&mut seed, ne * m * h, 0.05);
+            let down = mk_rand(&mut seed, ne * h * m, 0.05);
+            let gate_q = quantized_expert_stack(&device, GgmlType::Q4_K, &gate, h);
+            let up_q = quantized_expert_stack(&device, GgmlType::Q4_K, &up, h);
+            for down_type in [GgmlType::Q4_K, GgmlType::Q6_K] {
+                let weights = MoeFfnWeightsGpuQ {
+                    router: upload_bf16_from_f32(&mk_rand(&mut seed, ne * h, 0.1), &device).unwrap(),
+                    expert_gate_q: gate_q.clone(), expert_up_q: up_q.clone(),
+                    expert_down_q: quantized_expert_stack(&device, down_type, &down, m),
+                    ggml_type_gate_up: GgmlType::Q4_K, ggml_type_down: down_type,
+                    expert_gate_stride: (m * h / 256 * GgmlType::Q4_K.block_bytes() as usize) as u64,
+                    expert_up_stride: (m * h / 256 * GgmlType::Q4_K.block_bytes() as usize) as u64,
+                    expert_down_stride: (h * m / 256 * down_type.block_bytes() as usize) as u64,
+                    num_experts: ne as u32,
+                    shared_gate_inp: upload_bf16_from_f32(&mk_rand(&mut seed, h, 0.1), &device).unwrap(),
+                    shared_gate: upload_bf16_from_f32(&mk_rand(&mut seed, ms * h, 0.05), &device).unwrap(),
+                    shared_up: upload_bf16_from_f32(&mk_rand(&mut seed, ms * h, 0.05), &device).unwrap(),
+                    shared_down: upload_bf16_from_f32(&mk_rand(&mut seed, h * ms, 0.05), &device).unwrap(),
+                    dense_storage: MoeDenseStorage::Bf16,
+                    expert_gate_affine: None, expert_up_affine: None,
+                    expert_down_affine: None, prepared_m8: None,
+                };
+                let cases = [5usize, 65, 7, 33, 5, 65];
+                let capacity = *cases.iter().max().unwrap();
+                let allocate = |rows: usize, columns: usize| {
+                    device.alloc_buffer(rows * columns * 4, DType::F32, vec![rows, columns])
+                        .expect("test F32 root")
+                };
+                let tight = |root: &MlxBuffer, rows: usize, columns: usize| {
+                    root.slice_view(0, rows * columns).with_shape(vec![rows, columns])
+                        .expect("tight expert view")
+                };
+                let new_arena = |rows: usize| {
+                    super::super::MoeFfnArena::new(
+                        &device, rows as u32, h as u32, topk as u32,
+                        m as u32, ms as u32, ne as u32,
+                    ).expect("test MoE arena")
+                };
+                let owner = new_arena(capacity);
+                let mut records: Vec<_> = cases.iter().map(|&seq| {
+                    let mut reference = new_arena(seq);
+                    // Retain actual gate/up values for an independent SiLU oracle.
+                    reference.gate_all_buf = allocate(seq * topk, m);
+                    reference.up_all_buf = allocate(seq * topk, m);
+                    let mut reused = new_arena(seq);
+                    reused.y_all_buf = tight(&owner.y_all_buf, seq * topk, h);
+                    reused.h_all_buf = tight(&owner.h_all_buf, seq * topk, m);
+                    reused.gate_all_buf = tight(&owner.gate_all_buf, seq * topk, m);
+                    // Nested views retain the constructor's capacity-based
+                    // offset, including separate roots when H < 2*I.
+                    reused.up_all_buf = tight(&owner.up_all_buf, seq * topk, m);
+                    (
+                        upload_f32(&mk_rand(&mut seed, seq * h, 0.4), &device).unwrap(),
+                        upload_f32(&mk_rand(&mut seed, seq * h, 0.2), &device).unwrap(),
+                        reference, reused, allocate(seq, h), allocate(seq, h),
+                    )
+                }).collect();
+                // Views alone must anchor the constructor's roots through drain.
+                drop(owner);
+                for per_call in [false, true] {
+                    let mut enc = device.command_encoder().expect("queued MoE encoder");
+                    FORCE_PER_CALL_EXPERT_SCHEDULE.with(|force| force.set(per_call));
+                    for (x, residual, reference, reused, expected, actual) in &mut records {
+                        for (arena, out) in [(reference, expected), (reused, actual)] {
+                            build_moe_ffn_layer_gpu_q_into_with_arena(
+                                &mut enc, &device, &mut registry, x, &weights, shape,
+                                Some(residual), arena, out, 0,
+                            ).expect("queued MoE consumer");
+                        }
+                    }
+                    FORCE_PER_CALL_EXPERT_SCHEDULE.with(|force| force.set(false));
+                    // A rejected call must leave all earlier queued readers
+                    // drainable, without adding a success-path host wait.
+                    let (x, residual, _, reused, _, actual) = records.last_mut().unwrap();
+                    let invalid = MoeFfnShape { shared_intermediate_size: (ms + 1) as u32, ..shape };
+                    assert!(build_moe_ffn_layer_gpu_q_into_with_arena(
+                        &mut enc, &device, &mut registry, x, &weights, invalid,
+                        Some(residual), reused, actual, 0,
+                    ).is_err());
+                    enc.commit_and_wait().expect("drain consumers after rejected call");
+                    for (index, (_, _, reference, reused, expected, actual)) in records.iter().enumerate() {
+                        let seq = cases[index];
+                        let case = format!("h={h} down={down_type:?} rows={seq} per_call={per_call}");
+                        assert_eq!(bits(actual, seq * h), bits(expected, seq * h), "{case}: output");
+                        assert_eq!(bits(&reused.ids_buf, seq * topk),
+                            bits(&reference.ids_buf, seq * topk), "{case}: expert ids");
+                        assert_eq!(bits(&reused.weights_buf, seq * topk),
+                            bits(&reference.weights_buf, seq * topk), "{case}: router weights");
+                        let gates = reference.gate_all_buf.as_slice::<f32>().unwrap();
+                        let ups = reference.up_all_buf.as_slice::<f32>().unwrap();
+                        let hidden = reference.h_all_buf.as_slice::<f32>().unwrap();
+                        assert!(gates.iter().any(|&g| g > 0.0) && gates.iter().any(|&g| g < 0.0));
+                        assert!(expected.as_slice::<f32>().unwrap().iter().any(|&v| v != 0.0));
+                        for ((&g, &u), &got) in gates.iter().zip(ups).zip(hidden) {
+                            let g = g as f64;
+                            let want = (g / (1.0 + (-g).exp())) * u as f64;
+                            assert!((got as f64 - want).abs() <= 2e-5 * (1.0 + want.abs()),
+                                "{case}: SiLU F64 oracle got={got} want={want}");
+                        }
+                    }
+                    // Earlier roots are dead; compare the final live consumer
+                    // state, not overwritten gate/up aliases.
+                    let (_, _, reference, reused, _, _) = records.last().unwrap();
+                    let rows = cases[cases.len() - 1] * topk;
+                    assert_eq!(bits(&reused.h_all_buf, rows * m),
+                        bits(&reference.h_all_buf, rows * m), "last SiLU output");
+                    assert_eq!(bits(&reused.y_all_buf, rows * h),
+                        bits(&reference.y_all_buf, rows * h), "last down output");
+                }
+            }
+        }
+    }
+
 
     /// Routes that cannot share one schedule keep the per-call route.
     #[test]

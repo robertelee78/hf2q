@@ -2416,7 +2416,7 @@ pub fn apply_sdpa_causal_from_seq_major(
 ///
 /// # F-fence preservation (ADR-019 §Risk Register)
 ///
-/// - F2 (residency-rescission, iter58b): all 7 BF16 scratches are arena-
+/// - F2 (residency-rescission, iter58b): all seven logical BF16 views are arena-
 ///   owned and live for the entire prefill (allocated at
 ///   `forward_gpu.rs:1701-1713`, dropped after the output-head terminal
 ///   `commit_and_wait_labeled`). `out_seq` is caller-owned and outlives
@@ -2433,10 +2433,12 @@ pub fn apply_sdpa_causal_from_seq_major(
 ///
 /// # Intra-encoder barriers
 ///
-/// All 5 `enc.memory_barrier()` calls present in the wrapper's arena path
-/// are reproduced here in identical positions:
+/// The five existing RAW barriers remain in place, with two WAR barriers
+/// ending each shared sequence-major staging reader before the next cast:
 ///   - after Q cast → before Q permute_021
+///   - after Q permute_021 → before K cast (shared staging WAR)
 ///   - after K cast → before K permute_021
+///   - after K permute_021 → before V cast (shared staging WAR)
 ///   - after V cast → before V permute_021
 ///   - after V permute_021 → before flash_attn_prefill_bf16_d256
 ///   - after flash_attn_prefill → before permute_021_bf16_to_f32
@@ -2516,6 +2518,8 @@ pub fn apply_flash_attn_prefill_seq_major_into(
         d,
     )
     .context("FA bridge: permute_021 Q [seq, nh, d] → [nh, seq, d]")?;
+    // WAR: K's cast reuses the staging root just read by Q's permutation.
+    enc.memory_barrier();
 
     // Step 3+4: K F32 seq-major → BF16 seq-major → BF16 head-major.
     cast(
@@ -2540,6 +2544,8 @@ pub fn apply_flash_attn_prefill_seq_major_into(
         d,
     )
     .context("FA bridge: permute_021 K [seq, nkv, d] → [nkv, seq, d]")?;
+    // WAR: V's cast reuses the staging root just read by K's permutation.
+    enc.memory_barrier();
 
     // Step 5+6: V F32 seq-major → BF16 seq-major → BF16 head-major.
     cast(
@@ -4712,9 +4718,9 @@ pub fn apply_flash_attn_prefill_seq_major(
     // Compare with the legacy CPU-permute path's ~200 MB CPU-side
     // permute scratch — net allocation pressure is similar.
     //
-    // ADR-013 P21 S1: when fa_arena=Some, the 7 BF16 scratch buffers are
-    // reused from the caller-owned FaPrefillArena (allocated once per
-    // prefill in forward_gpu_impl). Ordinary callers allocate out_seq per
+    // ADR-013 P21 S1: when fa_arena=Some, seven logical BF16 scratch views
+    // reuse five caller-owned roots (allocated once per prefill).
+    // Ordinary callers allocate out_seq per
     // call; joint segments borrow a forward-owned result until its consumer
     // finishes, before the next segment reuses it.
     let q_elems = seq * nh * d;
@@ -4736,7 +4742,7 @@ pub fn apply_flash_attn_prefill_seq_major(
         //
         // Wrapper preserves byte-identical behavior: opens its own encoder,
         // delegates encoding to `apply_flash_attn_prefill_seq_major_into`
-        // (which encodes 8 dispatches + 5 intra-encoder barriers but does
+        // (which encodes eight dispatches and seven intra-encoder barriers but does
         // NOT commit), then commits via `commit_labeled` exactly as before.
         //
         // ADR-019 Phase 2 iter89e2-E: the `_into` variant exists so a
@@ -7292,8 +7298,8 @@ pub fn build_gated_attn_layer(
                 // commit_labeled("layer.full_attn.stage_a") covering all 4 FA-layer
                 // ops (ops1-4 + kv_cache_write + fa.prefill_bridge + ops6-7).
                 //
-                // F2 invariant: Both arenas (FaPrefillArena 7 BF16 scratches,
-                // FaProjectionsArena 10 F32 scratches including gated_buf for
+                // F2 invariant: Both arenas (seven BF16 views over five roots,
+                // ten F32 views over nine roots, including gated/Q alias for
                 // ops6) plus persistent slot.k/slot.v plus the caller-owned
                 // out_seq outlive the deferred CB by design — forward_gpu_impl
                 // owns the arenas through the output-head terminal
@@ -7804,6 +7810,9 @@ pub fn build_gated_attn_layer(
         if fused_into_stage_a {
             enc.encoder().memory_barrier();
         }
+        // The Q projection root is dead here: RMSNorm's reader is before the
+        // ops3→4 barrier, and fa_q_flat diagnostics completed before op5.
+        // Only gated output aliases Q; gate_flat must remain live and disjoint.
         let gated = if let Some(arena) = fa_proj_arena
             .as_ref()
             .map(|a| &**a)
@@ -11173,11 +11182,25 @@ mod tests {
             drop(owner);
             drop(projection_owner);
             let mut separate: Vec<_> = cases.iter().map(|&rows| {
-                (
-                    FaPrefillArena::new(&device, rows, nh, nkv, d).expect("separate FA"),
-                    FaProjectionsArena::new(&device, rows, h, nh, nkv, d, 1e-6)
-                        .expect("separate projections"),
-                )
+                // Independent-root reference: the old staging and gated
+                // allocations, not another instance of the optimized aliases.
+                let mut prefill = FaPrefillArena::new(&device, rows, nh, nkv, d)
+                    .expect("separate FA");
+                let kv_elements = rows as usize * nkv as usize * d as usize;
+                for staging in [&mut prefill.k_bf16_seq, &mut prefill.v_bf16_seq] {
+                    *staging = device.alloc_buffer(
+                        kv_elements * 2, DType::BF16,
+                        vec![rows as usize, nkv as usize, d as usize],
+                    ).expect("independent KV staging");
+                }
+                let mut projections = FaProjectionsArena::new(
+                    &device, rows, h, nh, nkv, d, 1e-6,
+                ).expect("separate projections");
+                let q_elements = rows as usize * nh as usize * d as usize;
+                projections.gated_buf = device.alloc_buffer(
+                    q_elements * 4, DType::F32, vec![q_elements],
+                ).expect("independent gated output");
+                (prefill, projections)
             }).collect();
             let mut shared_slots: Vec<_> = cases.iter().map(|_| make_slot()).collect();
             let mut separate_slots: Vec<_> = cases.iter().map(|_| make_slot()).collect();

@@ -1,5 +1,5 @@
-//! Requested bytes for the existing seven direct FA bridge allocations.
-//! This is a constructor plan, not a physical memory bound or admission cap.
+//! Seven logical FA bridge views backed by five direct allocations.
+//! Requested bytes count owning roots, not view extents or physical residency.
 use anyhow::{anyhow, Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
@@ -82,8 +82,11 @@ impl FaPrefillPlan {
             FaBufferPlan::new(vec![1, nkv, seq, d], "v_bf16_hm")?,
             FaBufferPlan::new(vec![1, nh, seq, d], "out_bf16_hm")?,
         ];
-        let requested_bytes = buffers
-            .iter()
+        // Q's sequence-major root also backs the smaller K/V staging views.
+        // GQA validation above proves nh >= nkv. Final head-major Q/K/V
+        // and attention output remain independent allocations.
+        let requested_bytes = [&buffers[0], &buffers[1], &buffers[3], &buffers[5], &buffers[6]]
+            .into_iter()
             .try_fold(0usize, |sum, buffer| {
                 sum.checked_add(buffer.requested_bytes)
             })

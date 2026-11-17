@@ -41,25 +41,25 @@ use plan::FaPrefillPlan;
 /// Caller-owned scratch arena for the FA prefill bridge (ops1-4 + ops6-7)
 /// across all FA layers in a single prefill.
 ///
-/// Contains the 7 BF16 scratch buffers that `apply_flash_attn_prefill_seq_major`
-/// currently allocates function-locally. Lifting them to caller scope keeps
-/// them alive for the full prefill, making wrapper-terminal `commit()` safe
-/// (no residency-set rescission race — see module-level doc for the full
-/// iter58b analysis).
+/// Contains seven logical BF16 scratch views backed by five allocations.
+/// Q/K/V sequence-major staging shares the Q-sized root: each permutation
+/// finishes reading it before the next cast overwrites it. Head-major Q/K/V
+/// remain separate. All views retain their roots through the full prefill
+/// (no residency-set rescission race — see module-level doc).
 ///
 /// Joint segments also share the F32 attention result. Its consumer finishes
 /// before the next queue-ordered segment overwrites it; ordinary callers retain
 /// independently allocated results.
 pub struct FaPrefillArena {
-    /// `[seq, nh, d]` BF16 — Q in seq-major layout.
+    /// `[seq, nh, d]` BF16 — shared Q/K/V sequence-major staging root.
     pub q_bf16_seq: MlxBuffer,
     /// `[1, nh, seq, d]` BF16 — Q in head-major layout.
     pub q_bf16_hm: MlxBuffer,
-    /// `[seq, nkv, d]` BF16 — K in seq-major layout.
+    /// `[seq, nkv, d]` BF16 — tight view of Q staging, after Q permutation.
     pub k_bf16_seq: MlxBuffer,
     /// `[1, nkv, seq, d]` BF16 — K in head-major layout.
     pub k_bf16_hm: MlxBuffer,
-    /// `[seq, nkv, d]` BF16 — V in seq-major layout.
+    /// `[seq, nkv, d]` BF16 — tight view of Q staging, after K permutation.
     pub v_bf16_seq: MlxBuffer,
     /// `[1, nkv, seq, d]` BF16 — V in head-major layout.
     pub v_bf16_hm: MlxBuffer,
@@ -92,8 +92,7 @@ pub struct FaPrefillArena {
 }
 
 impl FaPrefillArena {
-    /// Allocate all 7 BF16 scratch buffers sized for a single prefill pass
-    /// with the given shape parameters.
+    /// Allocate five BF16 roots and seven logical views for one prefill.
     ///
     /// # Errors
     ///
@@ -114,9 +113,15 @@ impl FaPrefillArena {
             FaPrefillPlan::new(seq_capacity, n_heads, n_kv_heads, head_dim)?.into_buffers();
         let q_bf16_seq = q_bf16_seq.allocate(device)?;
         let q_bf16_hm = q_bf16_hm.allocate(device)?;
-        let k_bf16_seq = k_bf16_seq.allocate(device)?;
+        let k_bf16_seq = q_bf16_seq
+            .slice_view(0, k_bf16_seq.requested_bytes / k_bf16_seq.dtype.size_of())
+            .with_shape(k_bf16_seq.shape)
+            .map_err(|e| anyhow!("FaPrefillArena K staging view: {e}"))?;
         let k_bf16_hm = k_bf16_hm.allocate(device)?;
-        let v_bf16_seq = v_bf16_seq.allocate(device)?;
+        let v_bf16_seq = q_bf16_seq
+            .slice_view(0, v_bf16_seq.requested_bytes / v_bf16_seq.dtype.size_of())
+            .with_shape(v_bf16_seq.shape)
+            .map_err(|e| anyhow!("FaPrefillArena V staging view: {e}"))?;
         let v_bf16_hm = v_bf16_hm.allocate(device)?;
         let out_bf16_hm = out_bf16_hm.allocate(device)?;
 
@@ -252,9 +257,9 @@ mod tests {
         let k_bytes = seq * nkv * d * 2;
         assert_eq!(arena.q_bf16_seq.byte_len(), q_bytes, "q_bf16_seq byte_len");
         assert_eq!(arena.q_bf16_hm.byte_len(), q_bytes, "q_bf16_hm byte_len");
-        assert_eq!(arena.k_bf16_seq.byte_len(), k_bytes, "k_bf16_seq byte_len");
+        assert_eq!(arena.k_bf16_seq.data_byte_len(), k_bytes, "k_bf16_seq data_byte_len");
         assert_eq!(arena.k_bf16_hm.byte_len(), k_bytes, "k_bf16_hm byte_len");
-        assert_eq!(arena.v_bf16_seq.byte_len(), k_bytes, "v_bf16_seq byte_len");
+        assert_eq!(arena.v_bf16_seq.data_byte_len(), k_bytes, "v_bf16_seq data_byte_len");
         assert_eq!(arena.v_bf16_hm.byte_len(), k_bytes, "v_bf16_hm byte_len");
         assert_eq!(
             arena.out_bf16_hm.byte_len(),
