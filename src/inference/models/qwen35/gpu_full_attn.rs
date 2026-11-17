@@ -11295,6 +11295,7 @@ mod tests {
             eprintln!("skipping shared FA parity: no Metal device");
             return;
         };
+        let _scratch = super::super::prepared_scratch::ExecutionScratch::test_scope(&device);
         let mut registry = KernelRegistry::new();
         mlx_native::ops::flash_attn_prefill::register(&mut registry);
         let (h, nh, nkv, d) = (256u32, 4u32, 2u32, 256u32);

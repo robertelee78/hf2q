@@ -922,29 +922,45 @@ fn plane_set_of(name: &str) -> Option<PlaneSet> {
     }
 }
 
-/// Newly retained prepared storage, excluding borrowed GGUF source blocks.
-/// Dense/projection/head matrices use native's actual checked preparation
-/// layout, including eagerly retained split-grid partials. Routed and shared
-/// MM-ID stacks are a DIFFERENT representation and keep their plane-only
-/// accounting. Alpha/beta share one padded matrix and one new raw source.
-pub(crate) fn plane_bytes<'a, I>(tensors: I, sets: &[PlaneSet]) -> u64
+/// Retained prepared planes and the model cache's single execution root.
+/// The fixed execution capacity covers every compatible model matrix, not
+/// just the selected plane sets. Charge it once if a selected product can
+/// split; head multiplicity applies only to immutable planes. MM-ID storage
+/// is separate. Alpha/beta share one padded matrix and one new raw source.
+pub(crate) fn prepared_storage_bytes<'a, I>(tensors: I, sets: &[PlaneSet], head_copies: u64) -> u64
 where
     I: IntoIterator<Item = &'a TensorFact>,
     I::IntoIter: Clone,
 {
+    if !sets.iter().any(|set| *set != PlaneSet::Head || head_copies != 0) {
+        return 0;
+    }
+    let may_need_execution = sets.iter().any(|set| {
+        matches!(set, PlaneSet::DenseFfn | PlaneSet::Projections)
+            || (*set == PlaneSet::Head && head_copies != 0)
+    });
     let tensors = tensors.into_iter();
     let tied_head = !tensors.clone().any(|tensor| tensor.name == "output.weight");
-    tensors.clone().map(|tensor| {
+    let mut execution_maximum = 0;
+    let mut selected_execution = false;
+    let planes = tensors.clone().map(|tensor| {
         let set = if tied_head && tensor.name == "token_embd.weight" {
             Some(PlaneSet::Head)
         } else {
             plane_set_of(&tensor.name)
         };
-        let Some(set) = set.filter(|set| sets.contains(set)) else { return 0 };
+        let Some(set) = set else { return 0 };
+        let copies = if sets.contains(&set) {
+            if set == PlaneSet::Head { head_copies } else { 1 }
+        } else {
+            0
+        };
+        if copies == 0 && !may_need_execution { return 0; }
         if !k_quant(tensor.ggml_type) {
             return 0;
         }
         if matches!(set, PlaneSet::MoeExperts | PlaneSet::MoeShared) {
+            if copies == 0 { return 0; }
             return tensor.shape.iter().try_fold(1u64, |n, &d| n.checked_mul(d as u64))
                 .map_or(u64::MAX, |n| prepared_plane_bytes(tensor.ggml_type, n));
         }
@@ -952,7 +968,7 @@ where
         if tensor.name.ends_with(".ssm_beta.weight") {
             return 0;
         }
-        if let Some(prefix) = tensor.name.strip_suffix("ssm_alpha.weight") {
+        let (rows, source) = if let Some(prefix) = tensor.name.strip_suffix("ssm_alpha.weight") {
             let beta = tensors.clone().find(|other| {
                 other.name.strip_suffix("ssm_beta.weight") == Some(prefix)
             });
@@ -961,24 +977,45 @@ where
             }
             let Some(rows) = n.checked_mul(2).and_then(|n| n.checked_add(63)).map(|n| n / 64 * 64)
                 else { return u64::MAX };
-            let prepared = prepared_matrix_bytes(rows, *k, tensor.ggml_type);
             let source = (rows as u64).checked_mul(*k as u64 / 256)
                 .and_then(|n| n.checked_mul(u64::from(tensor.ggml_type.block_bytes())))
                 .unwrap_or(u64::MAX);
-            return prepared.saturating_add(source);
-        }
-        prepared_matrix_bytes(*n, *k, tensor.ggml_type)
-    }).fold(0, u64::saturating_add)
+            (rows, source)
+        } else {
+            (*n, 0)
+        };
+        let scratch = prepared_matrix_execution_bytes(rows, *k, tensor.ggml_type);
+        execution_maximum = execution_maximum.max(scratch);
+        selected_execution |= copies != 0 && scratch != 0;
+        if copies == 0 { return 0; }
+        prepared_matrix_bytes(rows, *k, tensor.ggml_type)
+            .saturating_add(source)
+            .saturating_mul(copies)
+    }).fold(0, u64::saturating_add);
+    planes.saturating_add(if selected_execution { execution_maximum } else { 0 })
 }
 
 fn prepared_matrix_bytes(n: usize, k: usize, ggml_type: GgmlType) -> u64 {
-    // Match the real preparation's shape gate. Ineligible weights keep the
-    // stock kernel and create no PreparedGgufWeight.
+    // Ineligible weights keep the stock kernel and retain no prepared planes.
     if n % 64 != 0 || k % 256 != 0 {
         return 0;
     }
     let (Ok(n), Ok(k)) = (u32::try_from(n), u32::try_from(k)) else { return u64::MAX };
-    mlx_native::ops::repacked_gguf_mm::repacked_gguf_weight_bytes(n, k, ggml_type)
+    mlx_native::ops::repacked_gguf_mm::repacked_gguf_weight_plane_bytes(n, k, ggml_type)
+        .map_or(u64::MAX, |bytes| bytes as u64)
+}
+
+fn prepared_matrix_execution_bytes(n: usize, k: usize, ggml_type: GgmlType) -> u64 {
+    if n % 64 != 0 || k % 256 != 0 {
+        return 0;
+    }
+    let (Ok(n), Ok(k)) = (u32::try_from(n), u32::try_from(k)) else { return u64::MAX };
+    use mlx_native::ops::repacked_gguf_mm::{
+        repacked_gguf_mm_scratch_bytes, RepackedGgufMmExecution,
+    };
+    // Auto(1) is the maximum grid tile: every grid call uses N*32*splits*4;
+    // larger serial and explicit OnePass products need no execution storage.
+    repacked_gguf_mm_scratch_bytes(n, k, ggml_type, 1, RepackedGgufMmExecution::Auto)
         .map_or(u64::MAX, |bytes| bytes as u64)
 }
 
@@ -991,6 +1028,8 @@ fn prepared_matrix_bytes(n: usize, k: usize, ggml_type: GgmlType) -> u64 {
 /// it, with one exception: the output head. The staged draft (a drafter at
 /// four lanes) and the prepared target head each prepare a copy of their own
 /// unless `HF2Q_REPACKED_GGUF_SHARED_HEAD` makes the model own one for both.
+/// Their dispatches share one model-cache execution root, even when head
+/// planes are private. Its capacity also covers unselected compatible weights.
 pub(crate) fn routed_plane_bytes(
     facts: &TargetFacts,
     routes: &ResolvedRoutes,
@@ -999,11 +1038,7 @@ pub(crate) fn routed_plane_bytes(
     const STAGED: Switch = switch("HF2Q_DFLASH2_DRAFT_STAGED");
     const TARGET_HEAD: Switch = switch("HF2Q_REPACKED_GGUF_M32_HEAD");
     const SHARED_HEAD: Switch = switch("HF2Q_REPACKED_GGUF_SHARED_HEAD");
-    let other: Vec<PlaneSet> = routes
-        .plane_sets()
-        .into_iter()
-        .filter(|set| *set != PlaneSet::Head)
-        .collect();
+    let mut sets = routes.plane_sets();
     // The staged draft projects its vocabulary on the prepared tile only
     // at 32 draft rows: four lanes.
     let consumers = u64::from(drafter && routes.is_on(STAGED) && facts.slots == Some(4))
@@ -1013,6 +1048,9 @@ pub(crate) fn routed_plane_bytes(
     } else {
         consumers
     };
+    if copies != 0 && !sets.contains(&PlaneSet::Head) {
+        sets.push(PlaneSet::Head);
+    }
     // Target preparation walks model.layers only. MTP is loaded separately
     // from native blocks and never receives these prepared target products.
     // An unknown layer count cannot justify excluding any header weight.
@@ -1023,8 +1061,7 @@ pub(crate) fn routed_plane_bytes(
             .and_then(|(index, _)| index.parse::<u32>().ok());
         !matches!((target_layers, layer), (Some(count), Some(index)) if index >= count)
     });
-    plane_bytes(tensors.clone(), &other)
-        .saturating_add(plane_bytes(tensors, &[PlaneSet::Head]).saturating_mul(copies))
+    prepared_storage_bytes(tensors, &sets, copies)
 }
 
 /// Worker content quantum; a folded cue is accounted separately by its owner.

@@ -1207,6 +1207,73 @@ This proves component correctness/liveness, not canonical context-262144 N4,
 full-profile admission, measured residency, protocol/quality/performance gates
 or release promotion. The recorded earlier deficit is not a new runtime fit.
 
+##### Clean-crate 92eb canonical N4: still withheld
+
+The actual clean crate at `92eb262636f1959b6d7492ee6a37485114252212`
+builds and reports CLI version 0.1.30 with published native 0.23.2. A fresh
+canonical negative control passes. The unchanged four-slot/context-262144
+N4 case again stops at readiness: required `full`, actual `partial`, before
+any client launches. Checked cleanup succeeds; no protocol, quality,
+performance or physical-memory acceptance follows.
+
+| Candidate | Full route commitment (bytes) | Observed headroom (bytes) | Deficit (bytes) |
+| --- | ---: | ---: | ---: |
+| 7bb3c81 | 28,800,014,447 | 24,372,128,160 | 4,427,886,287 |
+| 92eb262 | 24,574,777,335 | 24,247,069,088 | 327,708,247 |
+
+These are requested-byte commitments, not measured residency. The published
+pool commitment is `model_file_bytes + route_upper_bound`; subtracting the
+file reconstructs the full route here and exactly reconciles the earlier
+original total. KV budget, reserve, context, policy and gates are unchanged.
+Rejection proof SHA256:
+`e7e82122a40f6248e5af04f850531dea00d799a1805fd58e9293beafa07ba864`.
+Clean-crate production proof SHA256:
+`3183d5b878d619b7b7f085746ff09754ef59577f86609b5f2241a683f4975f60`.
+
+There is no unchanged-candidate retry. The next hypothesis replaces retained
+per-weight native split partials with one bounded model/device/queue-owned
+execution workspace and couples the legal two-segment pooled/short-TQ maxima
+instead of summing incompatible worst cases. This is not a fit or speed claim;
+actual allocation/lifetime, numerical and canonical N4 gates remain required.
+
+The source integration uses planes-only native handles and a lazy, fixed-size
+execution root retained by `ForwardGpuCache`. Its capacity covers all compatible
+model matrices, even when only a subset is prepared; admission charges that
+maximum once, independently of private/shared head-plane multiplicity. Split
+reducers have an explicit last-reader barrier; OnePass adds no barrier or wait.
+The coupled segment bound checks at most 32 short-segment candidates, including
+the separate one-row staging fallback, while preserving all other owner charges.
+Source review found one standalone parity fixture missing the new scope; it is
+corrected. Native 0.23.3 is published by the complete official workflow, with
+identical registry/GitHub crate SHA256
+`57af52ec0037246d5eb17973b0cacba5903fe517d88f72954fe22cdfb06c186f`;
+811 packaged files match the reviewed source. Publication proof SHA256:
+`ad51dc04d27755c9768d6ed24ce09d9c351b69c56a50d202f45fee7502b726b7`.
+Fresh full-matrix conformance and canonical N4 remain required.
+These source changes remain an experiment, not an accepted fit or speedup.
+
+##### Published 0.23.3 component proof
+
+| Consumer run | Passed | Ignored |
+| --- | ---: | ---: |
+| Focused numerical/ownership/admission | 134 | 5 |
+| Encoder-session execution | 12 | 0 |
+| Real Qwen3.6 first/follow-up checkpoint | 1 | 0 |
+
+The 147 executions cover 135 unique tests. The real case uses four slots and
+context 4096, not canonical context 262144. All checked process cleanups pass.
+The first registry-backed run exposed a retained default decode pool bound to
+the previous model's residency domain. The valid dense-to-MoE one-row-history
+scenario is retained: handoff now replaces native/auxiliary scratch ownership
+only after checked reset has retired issued uses, rejects an active-cycle
+device change, and preserves caps, monotone counters, waits and arithmetic.
+Component proof SHA256:
+`bdfe53e4b2ca8c25f448f12401d7b6d98d2bc3b7589baf35174a8a02b1666404`.
+Complete compiled source archive SHA256:
+`ef50af99eb3bcbda682726c61a3732e4ed5bad8e18dd5b58033fd8cbf95b9507`.
+This is not the fresh twenty-case AF4/ten-case BF16 matrix, physical-residency
+acceptance, task/protocol quality, peer performance or release promotion.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,

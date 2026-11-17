@@ -2544,9 +2544,9 @@ dependencies = [
 
 [[package]]
 name = "mlx-native"
-version = "0.23.2"
+version = "0.23.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfdacbbf13261442df6d91a160194d4aeda8d34d6db90f5f64cc72cecfebacc1"
+checksum = "57af52ec0037246d5eb17973b0cacba5903fe517d88f72954fe22cdfb06c186f"
 dependencies = [
  "block",
  "bytemuck",
@@ -3187,7 +3187,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

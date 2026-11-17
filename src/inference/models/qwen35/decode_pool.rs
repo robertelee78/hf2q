@@ -43,6 +43,7 @@
 //! lexical block, making the per-decode-token pattern safe by construction
 //! provided allocations stay inside `forward_gpu_greedy`'s call tree.
 
+mod device;
 pub mod profile;
 
 use std::cell::RefCell;
@@ -114,6 +115,7 @@ pub fn pooled_alloc_buffer(
     shape: Vec<usize>,
 ) -> std::result::Result<MlxBuffer, mlx_native::MlxError> {
     if let Some(result) = profile::alloc(device, byte_len, dtype, &shape) { return result; }
+    device::bind(device)?;
     // The pool hands out the power-of-two bucket the request rounds up to.
     let bucket = byte_len.max(1).next_power_of_two();
     ISSUED_BYTES.with(|issued| issued.set(issued.get() + bucket));

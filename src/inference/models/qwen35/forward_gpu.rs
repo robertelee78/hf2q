@@ -646,6 +646,8 @@ struct ForwardGpuCache {
     registry: KernelRegistry,
     layer_weights: Vec<LayerWeightsGpu>,
     output_head: OutputHeadGpu,
+    /// One bounded execution root, shared by target and drafter prepared MM.
+    prepared_scratch: std::rc::Rc<super::prepared_scratch::ExecutionScratch>,
     /// Pre-allocated decode buffers (reused every decode token).
     decode_bufs: Option<DecodeBuffers>,
 }
@@ -723,6 +725,78 @@ enum FfnWeightsGpu {
     Moe(MoeFfnWeightsGpu),
     /// Quantized MoE (production GGUF load path — no OOM).
     MoeQ(MoeFfnWeightsGpuQ),
+}
+
+/// Maximum native split tile over the cache's compatible raw weight products.
+/// Native split_grid_row_tiles is at least one: Auto at M=1 and M=32 both
+/// select Grid. A nonzero execution_scratch_bytes is always [splits,32,N]
+/// F32, independent of M/dtype; larger Grid calls need the same bytes and
+/// Serial/OnePass/one-split calls need zero.
+fn prepared_execution_scratch_bytes(
+    cfg: &Qwen35Config,
+    layers: &[LayerWeightsGpu],
+    head: &OutputHeadGpu,
+) -> Result<usize> {
+    use mlx_native::ops::repacked_gguf_mm::{
+        repacked_gguf_mm_scratch_bytes, RepackedGgufMmExecution,
+    };
+    let mut maximum = 0;
+    let mut include = |weight: &MlxBuffer, ggml_type: GgmlType, n: u32, k: u32| -> Result<()> {
+        if weight.dtype() == DType::U8 && n % 64 == 0 && k % 256 == 0
+            && matches!(ggml_type, GgmlType::Q4_K | GgmlType::Q6_K)
+        {
+            maximum = maximum.max(repacked_gguf_mm_scratch_bytes(
+                n, k, ggml_type, 1, RepackedGgufMmExecution::Auto,
+            )?);
+        }
+        Ok(())
+    };
+    let h = cfg.hidden_size;
+    let q = cfg.num_attention_heads.checked_mul(cfg.head_dim)
+        .context("prepared scratch attention Q geometry overflow")?;
+    let kv = cfg.num_key_value_heads.checked_mul(cfg.head_dim)
+        .context("prepared scratch attention KV geometry overflow")?;
+    let linear_k = cfg.linear_num_key_heads.checked_mul(cfg.linear_key_head_dim)
+        .context("prepared scratch linear K geometry overflow")?;
+    let linear_v = cfg.linear_num_value_heads.checked_mul(cfg.linear_value_head_dim)
+        .context("prepared scratch linear V geometry overflow")?;
+    let qkv = linear_k.checked_mul(2).and_then(|k| k.checked_add(linear_v))
+        .context("prepared scratch linear QKV geometry overflow")?;
+    for layer in layers {
+        let ffn = match layer {
+            LayerWeightsGpu::FullAttn { attn, ffn } => {
+                if let super::gpu_full_attn::FullAttnQGateWeightsGpu::Fused { weight, ggml_type } = &attn.q_gate {
+                    include(weight, *ggml_type, q.checked_mul(2)
+                        .context("prepared scratch fused Q/gate geometry overflow")?, h)?;
+                }
+                include(&attn.wk, attn.wk_ggml_type, kv, h)?;
+                include(&attn.wv, attn.wv_ggml_type, kv, h)?;
+                include(&attn.wo, attn.wo_ggml_type, h, q)?;
+                ffn
+            }
+            LayerWeightsGpu::LinearAttn { attn, ffn } => {
+                include(&attn.attn_qkv, attn.attn_qkv_ggml_type, qkv, h)?;
+                include(&attn.attn_gate, attn.attn_gate_ggml_type, linear_v, h)?;
+                include(&attn.ssm_out, attn.ssm_out_ggml_type, h, linear_v)?;
+                if attn.ssm_alpha_ggml_type == attn.ssm_beta_ggml_type
+                    && attn.ssm_beta.dtype() == DType::U8
+                {
+                    let ab = cfg.linear_num_value_heads.checked_mul(2)
+                        .and_then(|n| n.checked_add(63)).map(|n| n / 64 * 64)
+                        .context("prepared scratch alpha/beta geometry overflow")?;
+                    include(&attn.ssm_alpha, attn.ssm_alpha_ggml_type, ab, h)?;
+                }
+                ffn
+            }
+        };
+        if let FfnWeightsGpu::DenseQ(ffn) = ffn {
+            include(&ffn.gate_q, ffn.ggml_type_gate_up, ffn.intermediate_size, ffn.hidden_size)?;
+            include(&ffn.up_q, ffn.ggml_type_gate_up, ffn.intermediate_size, ffn.hidden_size)?;
+            include(&ffn.down_q, ffn.ggml_type_down, ffn.hidden_size, ffn.intermediate_size)?;
+        }
+    }
+    include(&head.lm_head, head.lm_head_ggml_type, cfg.vocab_size, h)?;
+    Ok(maximum)
 }
 
 #[cfg(test)]
@@ -4515,6 +4589,9 @@ impl Qwen35Model {
                 #[cfg(test)]
                 let trace_weight_slots =
                     self.loaded_candidate_trace_weight_slots(&layer_weights, &output_head)?;
+                let prepared_scratch = super::prepared_scratch::ExecutionScratch::new(
+                    &device, prepared_execution_scratch_bytes(&self.cfg, &layer_weights, &output_head)?,
+                );
                 *cache = Some(ForwardGpuCache {
                     model_ptr: self_ptr,
                     #[cfg(test)]
@@ -4527,6 +4604,7 @@ impl Qwen35Model {
                     registry,
                     layer_weights,
                     output_head,
+                    prepared_scratch,
                     decode_bufs: None,
                 });
             }
@@ -4559,6 +4637,7 @@ impl Qwen35Model {
                 gpu_cache_matches_model(cache, self),
                 "with_gpu_cache_mut: GPU_CACHE belongs to a different Qwen35Model"
             );
+            let _prepared_scratch = cache.prepared_scratch.enter(&cache.device)?;
             f(&cache.device, &mut cache.registry)
         })?;
         pool_operation.complete()?;
@@ -5081,6 +5160,12 @@ impl Qwen35Model {
         // timer span moves so prompt-evaluation timing excludes model
         // materialization. Verified by a three-repetition cold bench.
         self.ensure_gpu_cache_primed()?;
+        let _prepared_scratch = GPU_CACHE.with(|cell| -> Result<_> {
+            let guard = cell.borrow();
+            let cache = guard.as_ref().context("prepared scratch GPU cache not primed")?;
+            ensure!(gpu_cache_matches_model(cache, self), "prepared scratch GPU cache model mismatch");
+            cache.prepared_scratch.enter(&cache.device)
+        })?;
 
         // ---- Upload positions buffer ----
         // Positions change every call (new token index) so they cannot be cached.
@@ -8138,6 +8223,9 @@ impl Qwen35Model {
                 #[cfg(test)]
                 let trace_weight_slots =
                     self.loaded_candidate_trace_weight_slots(&layer_weights, &output_head)?;
+                let prepared_scratch = super::prepared_scratch::ExecutionScratch::new(
+                    &device, prepared_execution_scratch_bytes(&self.cfg, &layer_weights, &output_head)?,
+                );
                 *cache = Some(ForwardGpuCache {
                     model_ptr: self_ptr,
                     #[cfg(test)]
@@ -8150,6 +8238,7 @@ impl Qwen35Model {
                     registry,
                     layer_weights,
                     output_head,
+                    prepared_scratch,
                     decode_bufs: None, // initialized lazily on first call
                 });
             }

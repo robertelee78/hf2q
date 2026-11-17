@@ -353,9 +353,9 @@ impl DenseFfnWeightsGpu {
 ///   (Avoids the 129 GB OOM from the Q4_0→F32 round-trip in the old F32 path.)
 #[derive(Default)]
 pub(crate) struct PreparedDenseFfnGguf {
-    gate: std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
-    up: std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
-    down: std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
+    gate: super::prepared_projection::Planes,
+    up: super::prepared_projection::Planes,
+    down: super::prepared_projection::Planes,
 }
 
 pub struct DenseFfnWeightsGpuQ {
@@ -494,7 +494,7 @@ fn prepared_dense_ffn_planes<'a>(
     weights: &'a DenseFfnWeightsGpuQ,
     gate_up_params: &GgmlQuantizedMatmulParams,
     down_params: &GgmlQuantizedMatmulParams,
-) -> Result<[&'a mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight; 3]> {
+) -> Result<[&'a mlx_native::ops::repacked_gguf_mm::PreparedGgufWeightPlanes; 3]> {
     use super::prepared_projection::{ensure_planes, PlanesSource};
     let cells = &weights.repacked_m32;
     ensure_planes(
@@ -1792,7 +1792,7 @@ pub(super) fn build_dense_ffn_layer_gpu_q_prepared_m32(
     )
     .context("cast dense_q prepared input F32→BF16")?;
     enc.memory_barrier();
-    mlx_native::ops::repacked_gguf_mm::dispatch_repacked_gguf_mm_bf16_input(
+    super::prepared_scratch::dispatch(
         enc,
         registry,
         device,
@@ -1800,9 +1800,10 @@ pub(super) fn build_dense_ffn_layer_gpu_q_prepared_m32(
         gate,
         &gate_f32,
         gate_up_params,
+        mlx_native::ops::repacked_gguf_mm::RepackedGgufMmExecution::Auto,
     )
     .context("dense_q prepared gate projection")?;
-    mlx_native::ops::repacked_gguf_mm::dispatch_repacked_gguf_mm_bf16_input(
+    super::prepared_scratch::dispatch(
         enc,
         registry,
         device,
@@ -1810,6 +1811,7 @@ pub(super) fn build_dense_ffn_layer_gpu_q_prepared_m32(
         up,
         &up_f32,
         gate_up_params,
+        mlx_native::ops::repacked_gguf_mm::RepackedGgufMmExecution::Auto,
     )
     .context("dense_q prepared up projection")?;
     enc.memory_barrier();
@@ -1836,7 +1838,7 @@ pub(super) fn build_dense_ffn_layer_gpu_q_prepared_m32(
     )
     .context("cast dense_q prepared hidden F32→BF16")?;
     enc.memory_barrier();
-    mlx_native::ops::repacked_gguf_mm::dispatch_repacked_gguf_mm_bf16_input(
+    super::prepared_scratch::dispatch(
         enc,
         registry,
         device,
@@ -1844,6 +1846,7 @@ pub(super) fn build_dense_ffn_layer_gpu_q_prepared_m32(
         down,
         &down_out,
         down_params,
+        mlx_native::ops::repacked_gguf_mm::RepackedGgufMmExecution::Auto,
     )
     .context("dense_q prepared down projection")?;
 

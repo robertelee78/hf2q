@@ -8,7 +8,7 @@ use super::{
 };
 use crate::serve::forward_mlx_shared::MlxQWeight;
 use anyhow::{anyhow, Context, Result};
-use mlx_native::ops::{dense_gemv_bf16::dense_gemv_bf16_f32_tiled4, repacked_gguf_mm::PreparedGgufWeight};
+use mlx_native::ops::{dense_gemv_bf16::dense_gemv_bf16_f32_tiled4, repacked_gguf_mm::PreparedGgufWeightPlanes};
 use mlx_native::ops::{
     dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params},
     dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params},
@@ -888,7 +888,7 @@ pub enum DFlash2VocabularyHead<'a> {
     /// its own head. The staged route reads them instead of preparing a copy.
     SharedPrepared {
         weight: &'a MlxQWeight,
-        prepared: &'a PreparedGgufWeight,
+        prepared: &'a PreparedGgufWeightPlanes,
     },
 }
 

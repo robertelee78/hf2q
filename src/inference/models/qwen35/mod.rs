@@ -136,6 +136,7 @@ pub(crate) mod prefill_prepared;
 #[cfg(test)]
 pub(crate) mod prefill_prepared_tests;
 pub(crate) mod prepared_projection;
+pub(crate) mod prepared_scratch;
 #[cfg(test)]
 mod prepared_step_tests;
 #[cfg(test)]

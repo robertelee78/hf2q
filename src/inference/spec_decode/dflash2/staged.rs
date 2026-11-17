@@ -27,7 +27,7 @@ use mlx_native::ops::{
     },
     elementwise::dispatch_cast_f32_to_bf16_with_encoder,
     repacked_gguf_mm::{
-        dispatch_repacked_gguf_mm_bf16_input, prepare_repacked_gguf_weight, PreparedGgufWeight,
+        prepare_repacked_gguf_weight_planes, PreparedGgufWeightPlanes, RepackedGgufMmExecution,
     },
     ActivationPrecision,
 };
@@ -165,9 +165,9 @@ pub struct DFlash2StagedScratch {
     /// recorded by [`Self::command_committed`], once the command that repacks
     /// it has been committed: a command abandoned while it is encoded leaves
     /// no head whose planes were never written.
-    pub head: Option<PreparedGgufWeight>,
+    pub head: Option<PreparedGgufWeightPlanes>,
     /// The head the command being encoded repacks.
-    pending_head: Option<PreparedGgufWeight>,
+    pending_head: Option<PreparedGgufWeightPlanes>,
 }
 
 impl DFlash2StagedScratch {
@@ -384,7 +384,7 @@ pub(super) fn dispatch_prepared_head(
     device: &MlxDevice,
     staged: &mut DFlash2StagedScratch,
     weight: &MlxQWeight,
-    shared: Option<&PreparedGgufWeight>,
+    shared: Option<&PreparedGgufWeightPlanes>,
     input: &MlxBuffer,
     output: &MlxBuffer,
     rows: usize,
@@ -405,7 +405,7 @@ pub(super) fn dispatch_prepared_head(
         // RHS finishes with two complete prepared heads live.
         drop(staged.pending_head.take());
         staged.pending_head = Some(
-            prepare_repacked_gguf_weight(encoder, registry, device, &weight.buffer, &params)
+            prepare_repacked_gguf_weight_planes(encoder, registry, device, &weight.buffer, &params)
                 .context("prepare the DFlash2 vocabulary head")?,
         );
     }
@@ -414,7 +414,7 @@ pub(super) fn dispatch_prepared_head(
         .or(staged.pending_head.as_ref())
         .expect("prepared above");
     staged.round_input(encoder, registry, device, input, rows, weight.info.cols)?;
-    dispatch_repacked_gguf_mm_bf16_input(
+    crate::inference::models::qwen35::prepared_scratch::dispatch(
         encoder,
         registry,
         device,
@@ -422,6 +422,7 @@ pub(super) fn dispatch_prepared_head(
         prepared,
         output,
         &params,
+        RepackedGgufMmExecution::Auto,
     )?;
     #[cfg(test)]
     record_dispatch(3);
@@ -772,6 +773,7 @@ mod tests {
         head: DFlash2VocabularyHead<'_>,
         commit: bool,
     ) -> Vec<f32> {
+        let _scratch = crate::inference::models::qwen35::prepared_scratch::ExecutionScratch::test_scope(&fixture.device);
         // A forward overwrites its input rows; every call starts from the same.
         let mut state = 43_u64;
         for value in fixture.workspace.hidden[0].as_mut_slice::<f32>().unwrap() {
@@ -812,7 +814,7 @@ mod tests {
         let head = q4k_head(&shared.device, &shared.cfg);
         let params = head.matmul_params(32).unwrap();
         let mut encoder = shared.device.command_encoder().unwrap();
-        let prepared = prepare_repacked_gguf_weight(
+        let prepared = prepare_repacked_gguf_weight_planes(
             &mut encoder,
             &mut shared.registry,
             &shared.device,
@@ -848,7 +850,7 @@ mod tests {
     /// A target that counts how often it is asked for its shared head.
     struct CountingTarget<'a> {
         head: &'a MlxQWeight,
-        prepared: &'a PreparedGgufWeight,
+        prepared: &'a PreparedGgufWeightPlanes,
         asked: std::cell::Cell<usize>,
     }
 
@@ -878,7 +880,7 @@ mod tests {
             &self,
             _registry: &mut KernelRegistry,
             _device: &MlxDevice,
-        ) -> Result<Option<&PreparedGgufWeight>> {
+        ) -> Result<Option<&PreparedGgufWeightPlanes>> {
             self.asked.set(self.asked.get() + 1);
             Ok(Some(self.prepared))
         }
@@ -904,7 +906,7 @@ mod tests {
             let head = q4k_head(&fixture.device, &fixture.cfg);
             let params = head.matmul_params(32).unwrap();
             let mut encoder = fixture.device.command_encoder().unwrap();
-            let prepared = prepare_repacked_gguf_weight(
+            let prepared = prepare_repacked_gguf_weight_planes(
                 &mut encoder,
                 &mut fixture.registry,
                 &fixture.device,

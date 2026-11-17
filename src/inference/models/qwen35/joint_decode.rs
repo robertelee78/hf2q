@@ -481,6 +481,7 @@ impl Qwen35Model {
                 gpu_cache_matches_model(cache, self),
                 "Qwen joint decode: GPU cache belongs to a different Qwen model"
             );
+            let _prepared_scratch = cache.prepared_scratch.enter(&cache.device)?;
             let ForwardGpuCache {
                 device,
                 registry,

@@ -307,7 +307,7 @@ impl Qwen35Model {
         &self,
         registry: &mut mlx_native::KernelRegistry,
         device: &mlx_native::MlxDevice,
-    ) -> Result<Option<&mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>> {
+    ) -> Result<Option<&mlx_native::ops::repacked_gguf_mm::PreparedGgufWeightPlanes>> {
         let Some((head, _)) = self.resolved_native_output_head()? else {
             return Ok(None);
         };

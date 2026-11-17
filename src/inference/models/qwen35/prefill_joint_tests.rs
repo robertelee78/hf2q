@@ -1880,11 +1880,12 @@ fn a_layer_requests_no_more_scratch_than_its_derived_bound() {
     use super::prefill_prepared::prefill_layer_scratch_bound_bytes as bound;
     let check = |model: &Qwen35Model, what: &str| {
         let mut tightest = f64::INFINITY;
-        let mut probe = |name: &str, rows: usize, lanes: usize, run: &mut dyn FnMut()| {
+        let shared_result = super::resume_attn_fast::resume_attn_fast_enabled();
+        let mut probe = |name: &str, rows: usize, lanes: usize, shared: bool, run: &mut dyn FnMut()| {
             decode_pool::take_layer_scratch_peak();
             run();
             let peak = decode_pool::take_layer_scratch_peak();
-            let limit = bound(&model.cfg, rows, lanes, false);
+            let limit = bound(&model.cfg, rows, lanes, shared);
             assert!(peak > 0, "{what}, {name}: the forward requested no scratch");
             assert!(
                 peak <= limit,
@@ -1899,7 +1900,7 @@ fn a_layer_requests_no_more_scratch_than_its_derived_bound() {
             ("resumed chunk with a folded cue", Lane::new(0, &[155], 300, 5)),
             ("short resumed chunk", Lane::new(0, &[155], 20, 0)),
         ] {
-            probe(name, lane.rows(), 1, &mut || {
+            probe(name, lane.rows(), 1, false, &mut || {
                 solo(model, &lane, false);
             });
         }
@@ -1910,7 +1911,7 @@ fn a_layer_requests_no_more_scratch_than_its_derived_bound() {
             Lane::cold(3, 96, 150, 5),
         ];
         let rows: usize = 96 + shared.iter().map(|lane| lane.rows() - 96).sum::<usize>();
-        probe("joint, shared prefix", rows, 4, &mut || {
+        probe("joint, shared prefix", rows, 4, shared_result, &mut || {
             joint(model, &shared, 96, false);
         });
         let mixed = [
@@ -1919,9 +1920,43 @@ fn a_layer_requests_no_more_scratch_than_its_derived_bound() {
             Lane::new(2, &[110], 266, 5),
         ];
         let rows: usize = mixed.iter().map(Lane::rows).sum();
-        probe("joint, resumed lanes", rows, 3, &mut || {
+        probe("joint, resumed lanes", rows, 3, shared_result, &mut || {
             joint(model, &mixed, 0, false);
         });
+        // Observe only this pending forward, not its history or a follow-up
+        // with a different row count. These are real TQ consumers at both
+        // short/long endpoints and unequal content/cue tails.
+        for (content, cue) in [
+            (2, 2), (2, 31), (31, 32), (32, 32), (33, 32), (64, 32), (513, 31),
+        ] {
+            let lane = Lane::new(0, &[1], content, cue);
+            let mut cache = cache(model);
+            let _scope = PrefillScope::forced(true);
+            prefill_history(model, &mut cache, &lane);
+            probe("joint, coupled segment endpoints", lane.rows(), 1, shared_result, &mut || {
+                joint_forward(model, &mut cache, &[lane], 0, false)
+                    .expect("coupled endpoint forward");
+            });
+        }
+        for rows in [2048usize, 2080] {
+            // A private lane includes the whole shared prefix. In the 2080
+            // case its 2050-row content crosses the 2048-row bucket edge,
+            // despite only 2080 unique rows across the four lanes.
+            let common = rows - 48;
+            let lanes = [
+                Lane::cold(0, common, common + 18, 2),
+                Lane::cold(1, common, common + 10, 2),
+                Lane::cold(2, common, common + 6, 2),
+                Lane::cold(3, common, common + 6, 2),
+            ];
+            let mut cache = model.with_gpu_cache_mut(|device, _registry| {
+                HybridKvCache::new_with_options(&model.cfg, device, 4096, SLOTS, true)
+            }).expect("allocate served-capacity TQ cache");
+            probe("joint, private shared-prefix capacity edge", rows, 4, shared_result, &mut || {
+                joint_forward(model, &mut cache, &lanes, common, false)
+                    .expect("served-capacity coupled forward");
+            });
+        }
         assert!(
             tightest < 16.0,
             "{what}: the bound is at least {tightest:.1} times every layer's requests"

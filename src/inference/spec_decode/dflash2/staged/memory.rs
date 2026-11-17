@@ -82,7 +82,8 @@ impl StagedGeometry {
 }
 
 impl DFlash2StagedScratch {
-    /// Requested initial roots. Lazy/pending prepared heads are separate owners.
+    /// Requested initial roots. Lazy/pending heads retain immutable planes
+    /// only; prepared-MM execution scratch belongs to the target GPU cache.
     pub(crate) fn required_bytes(
         config: &DFlash2Config,
         lanes: usize,

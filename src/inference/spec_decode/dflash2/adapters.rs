@@ -14,7 +14,7 @@ use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::dflash2_attention_pack::{
     dispatch_dflash2_mask_rows_f32, DFlash2MaskRowsParams,
 };
-use mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight;
+use mlx_native::ops::repacked_gguf_mm::PreparedGgufWeightPlanes;
 use mlx_native::ops::ActivationPrecision;
 use mlx_native::{CommandEncoder, GgmlType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -44,7 +44,7 @@ pub trait DFlash2TargetFamily {
         &self,
         _registry: &mut KernelRegistry,
         _device: &MlxDevice,
-    ) -> Result<Option<&PreparedGgufWeight>> {
+    ) -> Result<Option<&PreparedGgufWeightPlanes>> {
         Ok(None)
     }
     fn embedding_scale(&self) -> f32;
@@ -134,7 +134,7 @@ impl DFlash2TargetFamily for QwenDFlash2Adapter<'_> {
         &self,
         registry: &mut KernelRegistry,
         device: &MlxDevice,
-    ) -> Result<Option<&PreparedGgufWeight>> {
+    ) -> Result<Option<&PreparedGgufWeightPlanes>> {
         self.model.shared_prepared_output_head(registry, device)
     }
 

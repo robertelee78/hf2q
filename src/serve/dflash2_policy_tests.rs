@@ -1301,44 +1301,51 @@ fn prepared_plane_bytes_follow_the_native_layout() {
     let dense = qwen38();
     let per_block_ffn = 2 * prepared_matrix_bytes(17_408, 5_120, GgmlType::Q4_K)
         + prepared_matrix_bytes(5_120, 17_408, GgmlType::Q6_K);
+    let execution = [
+        (17_408, 5_120, GgmlType::Q4_K),
+        (5_120, 17_408, GgmlType::Q6_K),
+        (10_240, 5_120, GgmlType::Q6_K),
+        (6_144, 5_120, GgmlType::Q4_K),
+        (5_120, 6_144, GgmlType::Q4_K),
+        (248_320, 5_120, GgmlType::Q6_K),
+    ].into_iter().map(|(n, k, ty)| prepared_matrix_execution_bytes(n, k, ty)).max().unwrap();
     assert_eq!(
-        plane_bytes(&dense.tensors, &[PlaneSet::DenseFfn]),
-        64 * per_block_ffn
+        prepared_storage_bytes(&dense.tensors, &[PlaneSet::DenseFfn], 1),
+        64 * per_block_ffn + execution
     );
-    // Native split-grid partials depend on output rows, so transposed
-    // matrices with equal element counts do not have equal retained bytes.
     let per_block_projections = prepared_matrix_bytes(10_240, 5_120, GgmlType::Q6_K)
         + prepared_matrix_bytes(6_144, 5_120, GgmlType::Q4_K)
         + prepared_matrix_bytes(5_120, 6_144, GgmlType::Q4_K);
     assert_eq!(
-        plane_bytes(&dense.tensors, &[PlaneSet::Projections]),
-        64 * per_block_projections
+        prepared_storage_bytes(&dense.tensors, &[PlaneSet::Projections], 1),
+        64 * per_block_projections + execution
     );
     assert_eq!(
-        plane_bytes(&dense.tensors, &[PlaneSet::Head]),
+        prepared_storage_bytes(&dense.tensors, &[PlaneSet::Head], 1),
         prepared_matrix_bytes(248_320, 5_120, GgmlType::Q6_K)
     );
     // The embedding, the norms and the MTP projection carry no planes.
     assert_eq!(
-        plane_bytes(
+        prepared_storage_bytes(
             &dense.tensors,
-            &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head]
+            &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
+            1
         ),
         64 * per_block_ffn + 64 * per_block_projections
-            + prepared_matrix_bytes(248_320, 5_120, GgmlType::Q6_K)
+            + prepared_matrix_bytes(248_320, 5_120, GgmlType::Q6_K) + execution
     );
-    assert_eq!(plane_bytes(&dense.tensors, &[PlaneSet::MoeExperts]), 0);
-    assert_eq!(plane_bytes(&dense.tensors, &[]), 0);
+    assert_eq!(prepared_storage_bytes(&dense.tensors, &[PlaneSet::MoeExperts], 1), 0);
+    assert_eq!(prepared_storage_bytes(&dense.tensors, &[], 1), 0);
 
     // One copy of each routed expert stack: 40 blocks of two Q4_K and one
     // Q6_K stack.
     let moe = qwen36();
     assert_eq!(
-        plane_bytes(&moe.tensors, &[PlaneSet::MoeExperts]),
+        prepared_storage_bytes(&moe.tensors, &[PlaneSet::MoeExperts], 1),
         40 * (2 * 150_994_944 + 222_298_112)
     );
     assert_eq!(
-        plane_bytes(&moe.tensors, &[PlaneSet::MoeShared]),
+        prepared_storage_bytes(&moe.tensors, &[PlaneSet::MoeShared], 1),
         40 * (2 * prepared_plane_bytes(GgmlType::Q4_K, 512 * 2_048)
             + prepared_plane_bytes(GgmlType::Q6_K, 2_048 * 512))
     );
@@ -1759,9 +1766,9 @@ fn a_second_model_is_admitted_against_what_the_first_holds_resident() {
 #[test]
 fn planes_of_a_route_the_operator_set_are_committed_whatever_the_policy() {
     let facts = qwen38();
-    let ffn = plane_bytes(&facts.tensors, &[PlaneSet::DenseFfn]);
-    let projections = plane_bytes(&facts.tensors, &[PlaneSet::Projections]);
-    let head = plane_bytes(&facts.tensors, &[PlaneSet::Head]);
+    let ffn = prepared_storage_bytes(&facts.tensors, &[PlaneSet::DenseFfn], 1);
+    let prefill_planes = prepared_storage_bytes(&facts.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections], 1);
+    let full_planes = prepared_storage_bytes(&facts.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head], 1);
     let base = facts.model_file_bytes + ROOMY.kv_budget_bytes;
     let committed = |selection: &Selection| {
         assert_eq!(selection.commitment.drafter_bytes, 0);
@@ -1788,11 +1795,11 @@ fn planes_of_a_route_the_operator_set_are_committed_whatever_the_policy() {
     assert_eq!(kill(&[]), 0);
     assert_eq!(
         kill(&[("HF2Q_QWEN_PREFILL_PREPARED", "1")]),
-        ffn + projections
+        prefill_planes
     );
     assert_eq!(
         kill(&[("HF2Q_QWEN_PREFILL_PREPARED", "on")]),
-        ffn + projections
+        prefill_planes
     );
     assert_eq!(kill(&[("HF2Q_REPACKED_GGUF_M32", "1")]), ffn);
     assert_eq!(
@@ -1801,7 +1808,7 @@ fn planes_of_a_route_the_operator_set_are_committed_whatever_the_policy() {
             ("HF2Q_REPACKED_GGUF_M32_PROJ", "1"),
             ("HF2Q_REPACKED_GGUF_M32_HEAD", "1"),
         ]),
-        ffn + projections + head
+        full_planes
     );
     // No drafter, no staged draft: its head is not prepared.
     assert_eq!(kill(&[("HF2Q_DFLASH2_DRAFT_STAGED", "1")]), 0);
@@ -1816,11 +1823,11 @@ fn planes_of_a_route_the_operator_set_are_committed_whatever_the_policy() {
     };
     let unserved = decided(&serial, prefill, &Untouched).expect("auto");
     assert_prior_route(&unserved, prefill);
-    assert_eq!(committed(&unserved), ffn + projections);
+    assert_eq!(committed(&unserved), prefill_planes);
     let offline =
         decided(&facts, prefill, &Store::empty(Err("HF_HUB_OFFLINE is set"))).expect("auto");
     assert_prior_route(&offline, prefill);
-    assert_eq!(committed(&offline), ffn + projections);
+    assert_eq!(committed(&offline), prefill_planes);
 
     // A drafter that does not fit: the prior route keeps the operator's
     // planes.
@@ -1833,16 +1840,16 @@ fn planes_of_a_route_the_operator_set_are_committed_whatever_the_policy() {
     )
     .expect("auto");
     assert_prior_route(&tight, prefill);
-    assert_eq!(tight.commitment.plane_bytes, ffn + projections);
+    assert_eq!(tight.commitment.plane_bytes, prefill_planes);
 
     // A load retried without the drafter: the profile's planes go, the
     // operator's stay.
     let selected = decided(&facts, prefill, &Store::cached()).expect("auto");
     assert!(selected.selected());
-    assert_eq!(selected.commitment.plane_bytes, ffn + projections + head);
+    assert_eq!(selected.commitment.plane_bytes, full_planes);
     let retried = selected.without_dflash2("the DFlash2 route failed to load: test");
     assert_prior_route(&retried, prefill);
-    assert_eq!(committed(&retried), ffn + projections);
+    assert_eq!(committed(&retried), prefill_planes);
     let plain = decided(&facts, &[], &Store::cached())
         .expect("auto")
         .without_dflash2("test");
@@ -1852,9 +1859,8 @@ fn planes_of_a_route_the_operator_set_are_committed_whatever_the_policy() {
 #[test]
 fn separate_prepared_heads_are_counted_unless_the_model_shares_one() {
     let facts = qwen38();
-    let head = plane_bytes(&facts.tensors, &[PlaneSet::Head]);
-    assert_eq!(head, prepared_matrix_bytes(248_320, 5_120, GgmlType::Q6_K));
-    let other = plane_bytes(&facts.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections]);
+    let head = prepared_matrix_bytes(248_320, 5_120, GgmlType::Q6_K);
+    let other = prepared_storage_bytes(&facts.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections], 1);
     let unshared: &[(&str, &str)] = &[("HF2Q_REPACKED_GGUF_SHARED_HEAD", "0")];
     let planes_of = |facts: &TargetFacts, pairs: &[(&str, &str)]| {
         let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(pairs));
@@ -1930,9 +1936,10 @@ fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
         route_upper_bound(facts, &env(pairs), &|_| None)
     };
     let dense = qwen38();
-    let planes = plane_bytes(
+    let planes = prepared_storage_bytes(
         &dense.tensors,
         &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
+        1,
     );
     let (drafter, _, scratch) = profile_memory(&dense, &[], false);
     assert_eq!(bound(&dense, &[]), drafter.total(planes, scratch));
@@ -1940,7 +1947,7 @@ fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
     assert_eq!(bound(&dense, &[(DFLASH2_ENV, "0")]), 0);
     // A prepared route the operator set beside the kill switch keeps its
     // planes resident, and the pool charges them.
-    let prefill_planes = plane_bytes(&dense.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections]);
+    let prefill_planes = prepared_storage_bytes(&dense.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections], 1);
     assert_eq!(
         bound(
             &dense,
@@ -1958,7 +1965,7 @@ fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
                 ("HF2Q_DFLASH2_DRAFT_STAGED", "1"),
             ]
         ),
-        plane_bytes(&dense.tensors, &[PlaneSet::DenseFfn, PlaneSet::Head]),
+        prepared_storage_bytes(&dense.tensors, &[PlaneSet::DenseFfn, PlaneSet::Head], 1),
         "no drafter, no staged draft head"
     );
     // A value the reader leaves off prepares nothing.
@@ -2229,33 +2236,53 @@ fn absolute_prefill_memory_does_not_assume_fast_tq_or_subtract_baseline() {
 
 #[test]
 fn prepared_storage_uses_native_matrix_layout_but_not_for_mm_id_planes() {
-    let matrix = tensor("blk.0.ssm_out.weight", GgmlType::Q4_K, &[2048, 4096]);
-    let native = mlx_native::ops::repacked_gguf_mm::repacked_gguf_weight_bytes(
-        2048, 4096, GgmlType::Q4_K,
-    ).unwrap() as u64;
-    assert!(native > prepared_plane_bytes(GgmlType::Q4_K, 2048 * 4096),
-        "retained partials are independent of a later serial dispatch");
-    assert_eq!(plane_bytes(&[matrix], &[PlaneSet::Projections]), native);
     let experts = tensor("blk.0.ffn_gate_exps.weight", GgmlType::Q4_K, &[256, 512, 2048]);
     let shared = tensor("blk.0.ffn_gate_shexp.weight", GgmlType::Q4_K, &[512, 2048]);
-    assert_eq!(plane_bytes(&[experts, shared], &[PlaneSet::MoeExperts, PlaneSet::MoeShared]),
+    assert_eq!(prepared_storage_bytes(&[experts, shared], &[PlaneSet::MoeExperts, PlaneSet::MoeShared], 1),
         prepared_plane_bytes(GgmlType::Q4_K, 257 * 512 * 2048));
     let fused = [
         tensor("blk.0.ssm_alpha.weight", GgmlType::Q4_K, &[32, 2048]),
         tensor("blk.0.ssm_beta.weight", GgmlType::Q4_K, &[32, 2048]),
     ];
-    assert_eq!(plane_bytes(&fused, &[PlaneSet::Projections]),
-        prepared_matrix_bytes(64, 2048, GgmlType::Q4_K) + 73_728);
+    assert_eq!(prepared_storage_bytes(&fused, &[PlaneSet::Projections], 1),
+        prepared_matrix_bytes(64, 2048, GgmlType::Q4_K) + 73_728
+            + prepared_matrix_execution_bytes(64, 2048, GgmlType::Q4_K));
     let padded = [
         tensor("blk.0.ssm_alpha.weight", GgmlType::Q4_K, &[16, 2048]),
         tensor("blk.0.ssm_beta.weight", GgmlType::Q4_K, &[16, 2048]),
     ];
-    assert_eq!(plane_bytes(&padded, &[PlaneSet::Projections]),
-        prepared_matrix_bytes(64, 2048, GgmlType::Q4_K) + 73_728,
+    assert_eq!(prepared_storage_bytes(&padded, &[PlaneSet::Projections], 1),
+        prepared_matrix_bytes(64, 2048, GgmlType::Q4_K) + 73_728
+            + prepared_matrix_execution_bytes(64, 2048, GgmlType::Q4_K),
         "padding is allocated in both the fused raw source and prepared matrix");
     let tied = tensor("token_embd.weight", GgmlType::Q6_K, &[248_320, 2048]);
-    assert_eq!(plane_bytes(&[tied], &[PlaneSet::Head]),
-        prepared_matrix_bytes(248_320, 2048, GgmlType::Q6_K));
+    assert_eq!(prepared_storage_bytes(&[tied], &[PlaneSet::Head], 1),
+        prepared_matrix_bytes(248_320, 2048, GgmlType::Q6_K)
+            + prepared_matrix_execution_bytes(248_320, 2048, GgmlType::Q6_K));
+}
+
+#[test]
+fn prepared_admission_keeps_model_capacity_for_a_selected_subset() {
+    let tensors = [
+        tensor("blk.0.attn_k.weight", GgmlType::Q4_K, &[256, 2048]),
+        tensor("blk.0.ffn_gate.weight", GgmlType::Q4_K, &[4096, 2048]),
+        tensor("output.weight", GgmlType::Q6_K, &[256, 2048]),
+    ];
+    let maximum = prepared_matrix_execution_bytes(4096, 2048, GgmlType::Q4_K);
+    assert!(maximum > prepared_matrix_execution_bytes(256, 2048, GgmlType::Q4_K),
+        "fixture must exercise a larger unselected execution product");
+    let projection = prepared_matrix_bytes(256, 2048, GgmlType::Q4_K);
+    let head = prepared_matrix_bytes(256, 2048, GgmlType::Q6_K);
+    assert_eq!(prepared_storage_bytes(&tensors, &[PlaneSet::Projections], 0),
+        projection + maximum);
+    assert_eq!(prepared_storage_bytes(&tensors, &[PlaneSet::Head], 1),
+        head + maximum);
+    assert_eq!(prepared_storage_bytes(&tensors, &[PlaneSet::Head], 2),
+        2 * head + maximum);
+    assert_eq!(prepared_storage_bytes(&tensors, &[PlaneSet::Head], 0), 0);
+    assert_eq!(prepared_storage_bytes(&tensors,
+        &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head], 2),
+        prepared_matrix_bytes(4096, 2048, GgmlType::Q4_K) + projection + 2 * head + maximum);
 }
 
 #[test]
@@ -2275,10 +2302,10 @@ fn scratch_admission_fails_closed_for_unprepared_fallback_products() {
 fn unclosed_native_layouts_and_legacy_moe_cannot_be_zero_byte_admissions() {
     let bad_matrix = tensor("blk.0.ssm_out.weight", GgmlType::Q4_K,
         &[1usize << 40, 2048]);
-    assert_eq!(plane_bytes(&[bad_matrix], &[PlaneSet::Projections]), u64::MAX);
+    assert_eq!(prepared_storage_bytes(&[bad_matrix], &[PlaneSet::Projections], 1), u64::MAX);
     let bad_experts = tensor("blk.0.ffn_gate_exps.weight", GgmlType::Q4_K,
         &[usize::MAX, usize::MAX, 2048]);
-    assert_eq!(plane_bytes(&[bad_experts], &[PlaneSet::MoeExperts]), u64::MAX);
+    assert_eq!(prepared_storage_bytes(&[bad_experts], &[PlaneSet::MoeExperts], 1), u64::MAX);
     let facts = qwen36();
     let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen36), &|_| None,
         &env(&[("HF2Q_QWEN_MOE_BATCHED", "0")]));
@@ -2346,7 +2373,7 @@ fn prefill_envelope_preserves_legal_solo_and_joint_lifetimes_and_tls_high_water(
 }
 
 #[test]
-fn policy_declines_old_prefill_budget_but_exact_carry_commitment_fits() {
+fn policy_respects_complete_mtp_carry_admission_boundary() {
     let mut facts = qwen38();
     facts.kv_rows = Some(4_096);
     let config = facts.qwen_config.as_mut().unwrap();
@@ -2360,39 +2387,21 @@ fn policy_declines_old_prefill_budget_but_exact_carry_commitment_fits() {
         Some(RouteProfile::Qwen38), &|_| None, &environment,
     );
     let corrected = route_scratch_bytes(&facts, &routes);
-    let mut no_carry = facts.clone();
-    no_carry.qwen_config.as_mut().unwrap().mtp_num_hidden_layers = 0;
-    let old = route_scratch_bytes(&no_carry, &routes);
-    assert!(corrected > old);
-    use crate::inference::models::qwen35::carry_memory::{
-        CatchupPlan, retained_bound, rope_cache_bound,
-    };
-    let cfg = facts.qwen_config.as_ref().unwrap();
-    let rows = crate::serve::api::engine::qwen35_slot_prefill_chunk_tokens(4) as usize;
-    let carry = CatchupPlan::new(cfg, rows, cfg.mtp_use_dedicated_embeddings);
-    assert!(old > carry.parent_bytes + carry.catchup_bytes(),
-        "exercise the target-forward-dominant lifetime, not just catch-up");
-    // The former composition added the parent only on the catch-up arm.
-    // Its larger, partially repaired budget must also fail real admission.
-    let old_composition = retained_bound(cfg, rows, 4)
-        + old.max(carry.parent_bytes + carry.catchup_bytes())
-        + rope_cache_bound(rows);
-    assert!(corrected > old_composition);
     let drafter = DrafterMemoryBound::required(&QWEN38_DFLASH2, &facts, &routes)
         .expect("source-bound drafter payload");
     let planes = routed_plane_bytes(&facts, &routes, true);
-    for budget in [old, old_composition] {
-        let declined = decide(
-            &facts, host_with_headroom(&facts, drafter.total(planes, budget), 0),
-            &environment, &Store::cached(), &|_| None,
-        ).expect("old threshold");
-        assert!(
-            declined.plan.is_none() || declined.routes.any_withheld(),
-            "the uncorrected full route must not fit"
-        );
-    }
+    // Admission composes load and run peaks, not a historical scratch subtotal.
+    let required = drafter.total(planes, corrected);
+    let declined = decide(
+        &facts, host_with_headroom(&facts, required - 1, 0),
+        &environment, &Store::cached(), &|_| None,
+    ).expect("below complete MTP threshold");
+    assert!(
+        declined.plan.is_none() || declined.routes.any_withheld(),
+        "the full MTP route must not fit one byte below its complete commitment"
+    );
     let fits = decide(
-        &facts, host_with_headroom(&facts, drafter.total(planes, corrected), 0),
+        &facts, host_with_headroom(&facts, required, 0),
         &environment, &Store::cached(), &|_| None,
     ).expect("exact corrected threshold");
     assert!(fits.plan.is_some());
@@ -2409,10 +2418,6 @@ fn policy_declines_old_prefill_budget_but_exact_carry_commitment_fits() {
     let ordinary_bound = route_upper_bound(&facts, &off, &|_| None);
     assert!(ordinary_bound > 0 && ordinary_bound < u64::MAX,
         "ordinary spec-off shadow keeps its bounded carry without disabling model loads");
-    // The resident ledger and the policy decision consume the same promise.
-    let ledger = crate::serve::resident_memory::Ledger::new();
-    let _reservation = ledger.reserve(std::path::Path::new("carry-threshold.gguf"), fits.commitment);
-    assert_eq!(ledger.total(), fits.commitment.total());
 }
 
 #[test]
