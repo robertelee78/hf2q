@@ -64,14 +64,12 @@ impl Lane {
     }
 }
 
-fn capture(rows: usize, width: usize, state: &mut u64) -> DFlashCaptureSession {
-    DFlashCaptureSession {
-        target_layer_ids: vec![0],
-        hidden_output: (0..rows * width).map(|_| 2.0 * random(state)).collect(),
-        per_position_argmaxes: None,
-        seq_len: rows,
-        hidden_size: width,
+fn capture(device: &MlxDevice, rows: usize, width: usize, state: &mut u64) -> DFlashCaptureSession {
+    let mut capture = DFlashCaptureSession::new_shared(device, vec![0], rows, width, false).unwrap();
+    for value in capture.hidden_output.iter_mut() {
+        *value = 2.0 * random(state);
     }
+    capture
 }
 
 /// The lanes' rings, cursors and bindings: `(rings, lengths, bound tokens,
@@ -101,7 +99,7 @@ fn joint_against_solo(staged: bool, shared: usize, lanes: &[Lane]) {
 
     // Each resumed lane's history, the same rows on both runtimes.
     for lane in lanes.iter().filter(|lane| lane.history > 0) {
-        let history = capture(lane.history, width, &mut seed);
+        let history = capture(&device, lane.history, width, &mut seed);
         let tokens: Vec<u32> = (0..lane.history).map(|row| (90_000 + row) as u32).collect();
         for runtime in [&mut together, &mut alone] {
             runtime
@@ -120,12 +118,12 @@ fn joint_against_solo(staged: bool, shared: usize, lanes: &[Lane]) {
         placed.push(JointPrefillOutput::placed(total, lane_shared));
         total += lane.rows - lane_shared;
     }
-    let forward = capture(total, width, &mut seed);
+    let forward = capture(&device, total, width, &mut seed);
 
     for (lane, output) in lanes.iter().zip(&placed) {
         let tokens = lane.tokens();
         // The lane's own capture: its rows of the forward, side by side.
-        let mut own = DFlashCaptureSession::new(vec![0], lane.rows, width, false);
+        let mut own = DFlashCaptureSession::new_shared(&device, vec![0], lane.rows, width, false).unwrap();
         for (index, row) in output
             .forward_rows(0..lane.rows)
             .into_iter()
@@ -385,12 +383,15 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
                 // The draft lanes see the reply rows too (the same rows on
                 // both runtimes: decode commits them in service).
                 let mut seed = 0xD0_u64 + slot as u64;
-                let reply_capture = capture(REPLY, config.fc_input_dim(), &mut seed);
-                let reply_capture = DFlashCaptureSession {
-                    target_layer_ids: layer_ids.clone(),
-                    hidden_size: hidden,
-                    ..reply_capture
-                };
+                let reply_capture = model.with_gpu_cache_mut(|device, _| {
+                    let mut capture = DFlashCaptureSession::new_shared(
+                        device, layer_ids.clone(), REPLY, hidden, false,
+                    )?;
+                    for value in capture.hidden_output.iter_mut() {
+                        *value = 2.0 * random(&mut seed);
+                    }
+                    Ok(capture)
+                }).unwrap();
                 model
                     .with_gpu_cache_mut(|device, registry| {
                         for runtime in [&mut together, &mut alone] {
@@ -431,7 +432,9 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
             })
             .collect();
         let total = Qwen35Model::joint_prefill_rows(&lanes, shared);
-        let mut joint_capture = DFlashCaptureSession::new(layer_ids.clone(), total, hidden, false);
+        let mut joint_capture = model.with_gpu_cache_mut(|device, _| {
+            DFlashCaptureSession::new_shared(device, layer_ids.clone(), total, hidden, false)
+        }).unwrap();
         let outputs = {
             let _scope = PrefillScope::forced(true);
             model
@@ -447,7 +450,9 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
             let (start, content) = shape[slot as usize];
             let rows = content + CUE;
             let (tokens, positions) = &chunks[slot as usize];
-            let mut solo_capture = DFlashCaptureSession::new(layer_ids.clone(), rows, hidden, false);
+            let mut solo_capture = model.with_gpu_cache_mut(|device, _| {
+                DFlashCaptureSession::new_shared(device, layer_ids.clone(), rows, hidden, false)
+            }).unwrap();
             {
                 let _scope = PrefillScope::forced(true);
                 let image = solo_caches[slot as usize]

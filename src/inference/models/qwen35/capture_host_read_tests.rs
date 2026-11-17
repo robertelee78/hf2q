@@ -89,7 +89,9 @@ fn dflash_capture(model: &Qwen35Model, history: usize, rows: usize) -> (Vec<u32>
             .expect("history prefill");
     }
     let hidden = model.cfg.hidden_size as usize;
-    let mut session = DFlashCaptureSession::new(TARGET_LAYERS.to_vec(), rows, hidden, false);
+    let mut session = model.with_gpu_cache_mut(|device, _| {
+        DFlashCaptureSession::new_shared(device, TARGET_LAYERS.to_vec(), rows, hidden, false)
+    }).expect("shared capture");
     let (logits, _hidden) = model
         .forward_gpu_last_logits_with_hidden_dflash(
             &tokens(history, rows),
@@ -152,6 +154,86 @@ fn short_chunk_target_layer_capture_equals_the_wait_every_layer_capture() {
                 );
             }
         }
+    });
+}
+
+#[test]
+fn shared_direct_capture_equals_independent_diagnostic_outputs_and_keeps_snapshots() {
+    with_synthetic_model(|model| {
+        let hidden = model.cfg.hidden_size as usize;
+        let layers = model.cfg.num_hidden_layers as usize;
+        for (history, rows) in [(0, 1), (0, 20), (20, 5), (17, 32), (0, 41)] {
+            let mut diagnostic_cache = cache(model);
+            let mut direct_cache = cache(model);
+            for cache in [&mut diagnostic_cache, &mut direct_cache] {
+                if history > 0 {
+                    model.forward_gpu_last_logits(
+                        &tokens(0, history), &positions_for_range(0, history), cache, SlotId(0),
+                    ).expect("history");
+                }
+            }
+            let mut diagnostic = LayerActivations {
+                layer_inputs: Vec::with_capacity(layers),
+                layer_outputs: Vec::with_capacity(layers),
+                num_layers: layers as u32,
+                seq_len: rows as u32,
+                hidden_size: hidden as u32,
+                target_layer_filter: Some(TARGET_LAYERS.to_vec()),
+            };
+            let input = tokens(history, rows);
+            let positions = positions_for_range(history as i32, rows);
+            let diagnostic_logits = model.forward_gpu_with_capture(
+                &input, &positions, &mut diagnostic_cache, &mut diagnostic,
+            ).expect("independent diagnostic capture");
+            diagnostic.validate().unwrap();
+            let mut direct = model.with_gpu_cache_mut(|device, _| {
+                DFlashCaptureSession::new_shared(device, TARGET_LAYERS.to_vec(), rows, hidden, false)
+            }).unwrap();
+            let (direct_logits, _) = model.forward_gpu_with_hidden_dflash(
+                &input, &positions, &mut direct_cache, Some(&mut direct), SlotId(0),
+            ).expect("shared direct capture");
+            assert_eq!(bits(&direct_logits), bits(&diagnostic_logits), "history={history}, rows={rows}");
+            let expected: Vec<u32> = TARGET_LAYERS.iter()
+                .flat_map(|layer| bits(&diagnostic.layer_outputs[*layer])).collect();
+            assert_eq!(bits(&direct.hidden_output), expected, "history={history}, rows={rows}");
+            let snapshot = direct.clone();
+            // Reuse the same production backing in another complete forward,
+            // then mutate it from the host after the checked return.
+            model.forward_gpu_with_hidden_dflash(
+                &tokens(history + 31, rows), &positions_for_range(0, rows),
+                &mut cache(model), Some(&mut direct), SlotId(0),
+            ).expect("capture backing reuse");
+            direct.hidden_output.fill(-3.0);
+            assert_eq!(bits(&snapshot.hidden_output), expected);
+        }
+    });
+}
+
+#[test]
+fn failed_direct_capture_drains_before_its_backing_is_reused() {
+    with_synthetic_model(|model| {
+        let rows = 20;
+        let hidden = model.cfg.hidden_size as usize;
+        let expected = dflash_capture(model, 0, rows);
+        let mut direct = model.with_gpu_cache_mut(|device, _| {
+            DFlashCaptureSession::new_shared(device, TARGET_LAYERS.to_vec(), rows, hidden, false)
+        }).unwrap();
+        let input = tokens(0, rows);
+        let positions = positions_for_range(0, rows);
+        {
+            let _fail = super::forward_gpu::FailForwardAtLayer::set(2);
+            let error = model.forward_gpu_last_logits_with_hidden_dflash(
+                &input, &positions, &mut cache(model), Some(&mut direct), SlotId(0),
+            ).expect_err("fail after the first selected output was copied");
+            assert!(format!("{error:#}").contains("injected forward failure"));
+        }
+        assert_eq!(bits(&direct.hidden_output[..rows * hidden]), expected.0[..rows * hidden]);
+        direct.hidden_output.fill(-7.0);
+        let (logits, _) = model.forward_gpu_last_logits_with_hidden_dflash(
+            &input, &positions, &mut cache(model), Some(&mut direct), SlotId(0),
+        ).expect("reuse after checked failure drain");
+        assert_eq!(bits(&direct.hidden_output), expected.0);
+        assert_eq!(bits(&logits), expected.1);
     });
 }
 
@@ -253,7 +335,9 @@ fn one_row_capture_of_the_last_layer_is_the_returned_residual() {
                 SlotId(0),
             )
             .expect("history prefill");
-        let mut session = DFlashCaptureSession::new((0..layers).collect(), 1, hidden, false);
+        let mut session = model.with_gpu_cache_mut(|device, _| {
+            DFlashCaptureSession::new_shared(device, (0..layers).collect(), 1, hidden, false)
+        }).expect("shared capture");
         let (_logits, residual) = model
             .forward_gpu_with_hidden_dflash(
                 &tokens(20, 1),

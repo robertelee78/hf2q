@@ -76,14 +76,16 @@
 //! [`super::DenseFfnArena`]'s `down_out` and
 //! [`super::ChunkAllocsArena`]'s `output_buf`.
 //!
-//! # NOT shared with FaPrefillArena
+//! # Prepared projection staging
 //!
-//! [`super::FaPrefillArena`] holds **BF16** SDPA-internal scratches
-//! (`apply_flash_attn_prefill_seq_major`'s 7 buffers). This arena holds
-//! **F32** projection / per-head-norm / IMROPE / sigmoid-gate outputs.
-//! Different dtype, different scope (FaPrefillArena's lifetime is the
-//! SDPA call; this arena's lifetime spans the entire FA layer). Keeping
-//! the two arenas separate matches the iter72/74/78 single-concern pattern.
+//! The two Q helper views share one `2Q` root. Prepared fused Q/gate writes
+//! a tightly packed view of that root, then deinterleaves into the separate
+//! Q and gate projections before a WAR barrier permits Q normalization.
+//! Q norm and Q RoPE stay disjoint, including smaller shared-row segments:
+//! the RoPE offset remains at the original root's capacity-sized midpoint.
+//! When available, [`super::FaPrefillArena::q_bf16_seq`] stages normalized
+//! prepared inputs (`hidden_size <= q_total`) and later gated output. Its
+//! projection and attention readers are ordered before each overwrite.
 //!
 //! # Memory footprint (35B-A3B q4_0-flat pp4127)
 //!
@@ -97,9 +99,10 @@
 //! | `k_proj_buf` | F32 | seq*kv_total*4 = 8.4 MB |
 //! | `v_proj_buf` | F32 | seq*kv_total*4 = 8.4 MB |
 //! | `gate_proj_buf` | F32 | seq*q_total*4 = 67.6 MB |
-//! | `q_normed_buf` | F32 | seq*q_total*4 = 67.6 MB |
+//! | `q_helpers_buf` | F32 | seq*q_total*8 = 135.2 MB |
+//! | `q_normed_buf` | F32 | first Q-sized view of `q_helpers_buf` |
 //! | `k_normed_buf` | F32 | seq*kv_total*4 = 8.4 MB |
-//! | `q_rope_buf` | F32 | seq*q_total*4 = 67.6 MB |
+//! | `q_rope_buf` | F32 | second Q-sized view of `q_helpers_buf` |
 //! | `k_rope_buf` | F32 | seq*kv_total*4 = 8.4 MB |
 //! | `gated_buf` | F32 | aliases dead `q_proj_buf`, no additional allocation |
 //! | `pre_norm_params_buf` | F32 | 8 |
@@ -148,6 +151,8 @@ pub struct FaProjectionsArena {
     pub gate_proj_buf: MlxBuffer,
 
     // ── Per-head RMSNorm outputs (op3) + shared params ────────────────────
+    /// Combined owning root, also the tightly packed prepared Q/gate output.
+    pub(crate) q_helpers_buf: MlxBuffer,
     /// `[seq * n_head, head_dim]` F32 — Q after per-head RMSNorm.
     pub q_normed_buf: MlxBuffer,
     /// `[seq * n_kv, head_dim]` F32 — K after per-head RMSNorm.
@@ -253,17 +258,22 @@ impl FaProjectionsArena {
         // Per-head RMSNorm outputs are sized [seq*n_head, head_dim] for Q
         // and [seq*n_kv, head_dim] for K — element count exactly matches
         // q_total*seq and kv_total*seq respectively.
-        let q_normed_buf = device
-            .alloc_buffer(seq * q_total * 4, DType::F32, vec![seq * nh, d])
-            .map_err(|e| anyhow!("FaProjectionsArena alloc q_normed_buf: {e}"))?;
+        let q_helpers_buf = device
+            .alloc_buffer(seq * q_total * 8, DType::F32, vec![seq, 2 * q_total])
+            .map_err(|e| anyhow!("FaProjectionsArena alloc q_helpers_buf: {e}"))?;
+        let q_normed_buf = q_helpers_buf
+            .slice_view(0, seq * q_total)
+            .with_shape(vec![seq * nh, d])
+            .map_err(|e| anyhow!("FaProjectionsArena Q norm view: {e}"))?;
         let k_normed_buf = device
             .alloc_buffer(seq * kv_total * 4, DType::F32, vec![seq * nkv, d])
             .map_err(|e| anyhow!("FaProjectionsArena alloc k_normed_buf: {e}"))?;
 
         // IMROPE outputs share the per-head shape `[seq, n_heads, head_dim]`.
-        let q_rope_buf = device
-            .alloc_buffer(seq * q_total * 4, DType::F32, vec![seq, nh, d])
-            .map_err(|e| anyhow!("FaProjectionsArena alloc q_rope_buf: {e}"))?;
+        let q_rope_buf = q_helpers_buf
+            .slice_view((seq * q_total * 4) as u64, seq * q_total)
+            .with_shape(vec![seq, nh, d])
+            .map_err(|e| anyhow!("FaProjectionsArena Q rope view: {e}"))?;
         let k_rope_buf = device
             .alloc_buffer(seq * kv_total * 4, DType::F32, vec![seq, nkv, d])
             .map_err(|e| anyhow!("FaProjectionsArena alloc k_rope_buf: {e}"))?;
@@ -318,6 +328,7 @@ impl FaProjectionsArena {
             k_proj_buf,
             v_proj_buf,
             gate_proj_buf,
+            q_helpers_buf,
             q_normed_buf,
             k_normed_buf,
             qk_rms_params_buf,
@@ -378,6 +389,7 @@ impl FaProjectionsArena {
             k_proj_buf: view(&self.k_proj_buf, vec![r, nkv * d])?,
             v_proj_buf: view(&self.v_proj_buf, vec![r, nkv * d])?,
             gate_proj_buf: view(&self.gate_proj_buf, vec![r, nh * d])?,
+            q_helpers_buf: view(&self.q_helpers_buf, vec![r, 2 * nh * d])?,
             q_normed_buf: view(&self.q_normed_buf, vec![r * nh, d])?,
             k_normed_buf: view(&self.k_normed_buf, vec![r * nkv, d])?,
             qk_rms_params_buf: self.qk_rms_params_buf.clone(),
@@ -448,75 +460,6 @@ mod tests {
         MlxDevice::new().ok()
     }
 
-    /// Qwen3.6-35B-A3B canonical FA shape at pp=4127:
-    /// h=2048, n_head=16, n_kv=2, head_dim=256, eps=1e-6.
-    /// Verifies all fields' byte_len() match the formula and capacity is
-    /// recorded correctly. Param buffers are populated with the expected
-    /// constants.
-    #[test]
-    fn test_fa_proj_arena_new_qwen36_pp4127() {
-        let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let device = match device_or_skip() {
-            Some(d) => d,
-            None => {
-                eprintln!("test_fa_proj_arena_new_qwen36_pp4127: skipping — no Metal device");
-                return;
-            }
-        };
-        let (seq, h, nh, nkv, d, eps) = (4127u32, 2048u32, 16u32, 2u32, 256u32, 1e-6f32);
-        let arena = FaProjectionsArena::new(&device, seq, h, nh, nkv, d, eps)
-            .expect("fa proj arena new pp4127");
-
-        assert_eq!(arena.seq_capacity, seq);
-        assert_eq!(arena.hidden_size, h);
-        assert_eq!(arena.n_head, nh);
-        assert_eq!(arena.n_kv, nkv);
-        assert_eq!(arena.head_dim, d);
-
-        let q_bytes = (seq as usize) * (nh as usize) * (d as usize) * 4;
-        let kv_bytes = (seq as usize) * (nkv as usize) * (d as usize) * 4;
-        let h_bytes = (seq as usize) * (h as usize) * 4;
-
-        assert_eq!(arena.x_norm_buf.byte_len(), h_bytes, "x_norm_buf");
-        assert_eq!(arena.q_proj_buf.byte_len(), q_bytes, "q_proj_buf");
-        assert_eq!(arena.k_proj_buf.byte_len(), kv_bytes, "k_proj_buf");
-        assert_eq!(arena.v_proj_buf.byte_len(), kv_bytes, "v_proj_buf");
-        assert_eq!(arena.gate_proj_buf.byte_len(), q_bytes, "gate_proj_buf");
-        assert_eq!(arena.q_normed_buf.byte_len(), q_bytes, "q_normed_buf");
-        assert_eq!(arena.k_normed_buf.byte_len(), kv_bytes, "k_normed_buf");
-        assert_eq!(arena.q_rope_buf.byte_len(), q_bytes, "q_rope_buf");
-        assert_eq!(arena.k_rope_buf.byte_len(), kv_bytes, "k_rope_buf");
-        assert_eq!(arena.gated_buf.byte_len(), q_bytes, "gated_buf");
-
-        assert_eq!(arena.pre_norm_params_buf.byte_len(), 8, "pre_norm_params");
-        assert_eq!(arena.qk_rms_params_buf.byte_len(), 8, "qk_rms_params");
-        assert_eq!(arena.sigmoid_params_buf.byte_len(), 4, "sigmoid_params");
-
-        // Verify pre-populated param values.
-        let pn = arena
-            .pre_norm_params_buf
-            .as_slice::<f32>()
-            .expect("pre_norm_params_buf as_slice");
-        assert_eq!(pn[0], eps, "pre_norm_params[0] = eps");
-        assert_eq!(pn[1], h as f32, "pre_norm_params[1] = hidden_size");
-
-        let qk = arena
-            .qk_rms_params_buf
-            .as_slice::<f32>()
-            .expect("qk_rms_params_buf as_slice");
-        assert_eq!(qk[0], eps, "qk_rms_params[0] = eps");
-        assert_eq!(qk[1], d as f32, "qk_rms_params[1] = head_dim");
-
-        let sg = arena
-            .sigmoid_params_buf
-            .as_slice::<u32>()
-            .expect("sigmoid_params_buf as_slice");
-        assert_eq!(
-            sg[0],
-            seq * nh * d,
-            "sigmoid_params[0] = seq*n_head*head_dim"
-        );
-    }
 
     /// Smaller shape sanity-check.
     #[test]

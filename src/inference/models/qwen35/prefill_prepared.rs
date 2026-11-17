@@ -169,12 +169,15 @@ impl Drop for PrefillScope {
 /// layer that ends with more than this out waits. This is a threshold, not
 /// a cap: the layer that crosses it has already allocated, so between two
 /// host waits up to this plus that one layer's scratch is out.
-pub(crate) const WAIT_LAYERS_WINDOW_SCRATCH_BYTES: usize = 1 << 30;
+pub(crate) const WAIT_LAYERS_WINDOW_SCRATCH_BYTES: usize = 1 << 27;
 
-/// Free bytes retained after a checked reset: keep one bounded wait window
-/// warm, rather than holding an additional two windows beside shared arenas.
-/// Above it the reset releases the free buffers.
-pub(crate) const PREFILL_RETAINED_SCRATCH_BYTES: usize = 1 << 30;
+/// Free bytes retained after a checked reset. At up to 2080 rows Qwen3.8's
+/// prepared dense-FFN BF16 hidden activation requests 2080 * 17408 * 2 =
+/// 72,417,280 bytes, requiring a 128 MiB bucket. FA Q/gate and BF16 staging
+/// now borrow their forward arenas instead of warming pooled roots. Keep one
+/// large prepared bucket/window warm; reset releases free buffers above it,
+/// not merely their accounting charge.
+pub(crate) const PREFILL_RETAINED_SCRATCH_BYTES: usize = 1 << 27;
 
 /// What the pool may hold at any time while a joint forward or a forward
 /// that skips host waits runs, and until the reset after it. Checked before
@@ -238,30 +241,54 @@ impl Drop for ScratchCapsForTest {
     }
 }
 
+/// Maximum sum of buckets for at most two nonempty segments with combined
+/// rows <= `rows`, for one allocation of `bytes_per_row` per segment.
+///
+/// Let T = rows*C and B = next_pow2(T). If neither payload exceeds B/2,
+/// their two buckets sum to <= B. Otherwise exactly one does, rounding to
+/// B. Its smallest possible row count is floor((B/2)/C)+1; assigning every
+/// remaining row to the other segment maximizes that segment's bucket.
+/// If no row remains, only the one-segment bucket B is possible. Monotone
+/// buckets also cover lanes with fewer than `rows` rows. Checked arithmetic
+/// rejects zero/overflow instead of inventing a smaller allocation bound.
+fn two_segment_bucket_bytes(rows: u128, bytes_per_row: u128) -> Option<u128> {
+    if rows == 0 || bytes_per_row == 0 {
+        return None;
+    }
+    let bucket = rows.checked_mul(bytes_per_row)?.checked_next_power_of_two()?;
+    let first = (bucket / 2 / bytes_per_row).checked_add(1)?;
+    if first < rows {
+        let tail = (rows - first).checked_mul(bytes_per_row)?.checked_next_power_of_two()?;
+        bucket.checked_add(tail)
+    } else {
+        Some(bucket)
+    }
+}
+
 /// Upper bound of the scratch one layer of a prompt-prefill forward on the
 /// prepared route requests from the worker's scratch pool (bucket bytes,
 /// whether the pool or a plain buffer serves them), for a forward of
 /// `forward_rows` rows over `lanes` slots.
 ///
 /// Derived from the requests the prepared route makes (`pooled_alloc_buffer`
-/// call sites; a buffer of `n` bytes occupies the power of two it rounds up
-/// to, at most `2n`, which is exact for the single-call terms and the
-/// factor on the per-segment sums):
+/// call sites; each request occupies its next-power-of-two bucket):
 /// - A DeltaNet layer runs its projections once over all rows `R`: the BF16
 ///   copy of the normed input (`2Rh`), the fused alpha/beta logits
 ///   (`4R·ab`, `ab` = 2·heads rounded up to 64), their two halves
 ///   (`4R·heads` each), the BF16 copy of the gated values (`2R·z`,
 ///   `z` = value heads × value head dim) and the output projection (`4Rh`).
-/// - A full-attention layer is built per slot and segment; a segment of `r`
-///   rows requests the BF16 input copy (`2rh`), the fused query/gate
-///   projection (`4r·2q`, `q` = heads × head dim), the BF16 copy of the gated
-///   attention output (`2rq`), the output projection (`4rh`) and the
-///   attention output (`4rq`); a segment of at most 32 rows on the direct TQ
-///   route adds its tile scratch (`4·32·32·heads·(head dim + 2)` at 32 rows)
-///   and two row-id lists. A lane's segments cover its own rows and its
-///   private copy of a shared prefix, at most `R` rows per lane, and at most
-///   two of them are short (a short content chunk and the cue). A forward
-///   with segments also requests the joined attention output (`4Rh`).
+/// - A full-attention layer's multi-row segments reuse the combined Q helper
+///   root for fused Q/gate and sequence staging for gated BF16 inputs. The
+///   normalized BF16 input also borrows staging when h <= q. The output
+///   projection (`4rh`) and an unshared attention result (`4rq`) remain pooled.
+///   A one-row segment bypasses the arenas, so charge its input/Q-gate/gated
+///   copies separately. Up to two <=32-row segments/lane add direct-TQ tile
+///   scratch (`4·32·32·heads·(head dim + 2)`) and two row-id lists.
+///   `PlanLane::segments` splits only at the optional content/cue boundary:
+///   combined rows, including a private shared-prefix copy, are <= R, since
+///   `plan` validates R = shared_rows + sum(each lane's own rows). Independent
+///   remaining pooled roots use `two_segment_bucket_bytes`; the segmented
+///   forward also owns its joined output (`4Rh`).
 /// - The dense FFN requests the BF16 copies of its input (`2Rh`) and of its
 ///   hidden activations (`2Rm`); the MoE FFN the shared expert's output
 ///   (`4rh`) per call: one call over the long segments' rows and one per
@@ -288,20 +315,23 @@ pub(crate) fn prefill_layer_scratch_bound_bytes(
     lanes: usize,
     shared_attention_result: bool,
 ) -> u64 {
-    if forward_rows > u32::MAX as usize || lanes > u32::MAX as usize {
+    if forward_rows == 0 || lanes == 0
+        || forward_rows > u32::MAX as usize || lanes > u32::MAX as usize
+    {
         return u64::MAX;
     }
-    let bucket = |bytes: u128| bytes.max(1).next_power_of_two();
+    let bucket = |bytes: u128| bytes.next_power_of_two();
     let rows = forward_rows as u128;
-    let lanes = lanes.max(1) as u128;
-    let lane_rows = rows * lanes;
+    let lanes = lanes as u128;
     let h = u128::from(cfg.hidden_size);
     let heads = u128::from(cfg.num_attention_heads);
     let head_dim = u128::from(cfg.head_dim);
     let q = heads * head_dim;
     let value_heads = u128::from(cfg.linear_num_value_heads);
     let z = value_heads * u128::from(cfg.linear_value_head_dim);
-    if q > u32::MAX as u128 || z > u32::MAX as u128 {
+    if h == 0 || q == 0 || z == 0 || cfg.intermediate_size == Some(0)
+        || q > u32::MAX as u128 || z > u32::MAX as u128
+    {
         return u64::MAX;
     }
     let ab = (2 * value_heads).div_ceil(64) * 64;
@@ -309,8 +339,26 @@ pub(crate) fn prefill_layer_scratch_bound_bytes(
     // A joint TQ-fast forward routes every >32-row result to its shared
     // root. Direct <=32-row results are plain, not pooled, and their held
     // lifetime is charged by prefill_memory::bound instead.
-    let attention_result = if shared_attention_result { 0 } else { 4 * q };
-    let attention = 2 * lane_rows * (2 * h + 8 * q + 2 * q + 4 * h + attention_result)
+    let Some(mut per_lane) = two_segment_bucket_bytes(rows, 4 * h) else {
+        return u64::MAX;
+    };
+    if h > q {
+        let Some(input) = two_segment_bucket_bytes(rows, 2 * h) else {
+            return u64::MAX;
+        };
+        per_lane += input;
+    }
+    // seq=1 bypasses the FA arenas; it can occur at either segment boundary.
+    let single_row_copies = bucket(8 * q) + bucket(2 * q)
+        + if h <= q { bucket(2 * h) } else { 0 };
+    if !shared_attention_result {
+        let Some(result) = two_segment_bucket_bytes(rows, 4 * q) else {
+            return u64::MAX;
+        };
+        per_lane += result;
+    }
+    let attention = lanes * per_lane
+        + short_segments * single_row_copies
         + short_segments * (bucket(4 * 32 * 32 * heads * (head_dim + 2)) + 2 * bucket(4 * 32))
         + bucket(4 * rows * h);
     let delta_net = bucket(2 * rows * h)
@@ -558,6 +606,94 @@ pub(crate) fn admits(
 mod tests {
     use super::*;
     use mlx_native::MlxDevice;
+
+    #[test]
+    fn layer_bucket_bound_rejects_zero_and_overflowing_native_geometry() {
+        let source: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/qwen38/config.json"
+        )).unwrap();
+        let cfg = super::super::source_config::qwen35_config_from_authenticated_source(&source).unwrap();
+        for (rows, lanes) in [(0, 1), (1, 0), (u32::MAX as usize + 1, 1), (1, u32::MAX as usize + 1)] {
+            assert_eq!(prefill_layer_scratch_bound_bytes(&cfg, rows, lanes, true), u64::MAX);
+        }
+        for field in 0..6 {
+            let mut invalid = cfg.clone();
+            match field {
+                0 => invalid.hidden_size = 0,
+                1 => invalid.num_attention_heads = 0,
+                2 => invalid.head_dim = 0,
+                3 => invalid.linear_num_value_heads = 0,
+                4 => invalid.intermediate_size = Some(0),
+                _ => invalid.num_attention_heads = u32::MAX,
+            }
+            assert_eq!(prefill_layer_scratch_bound_bytes(&invalid, 2080, 4, true), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn segment_bucket_bound_is_exact_for_every_split_and_rejects_invalid_sizes() {
+        for rows in 1..=130u128 {
+            for width in 1..=131u128 {
+                let whole = (rows * width).next_power_of_two();
+                let actual = (1..rows).map(|first| {
+                    (first * width).next_power_of_two()
+                        + ((rows - first) * width).next_power_of_two()
+                }).fold(whole, u128::max);
+                assert_eq!(two_segment_bucket_bytes(rows, width), Some(actual));
+            }
+        }
+        // Include the served capacities, with non-power-of-two row widths
+        // (Qwen3.8 h/q) as well as Qwen3.6's power-of-two widths.
+        for rows in [2048u128, 2080] {
+            for width in [4096, 8192, 10240, 12288, 16384, 20480, 24576, 32768, 49152] {
+                let actual = (1..rows).map(|first| {
+                    (first * width).next_power_of_two()
+                        + ((rows - first) * width).next_power_of_two()
+                }).max().unwrap();
+                assert_eq!(two_segment_bucket_bytes(rows, width), Some(actual));
+            }
+        }
+        for (rows, width) in [(0, 4), (4, 0), (u128::MAX, 2), (u128::MAX, 1)] {
+            assert_eq!(two_segment_bucket_bytes(rows, width), None);
+        }
+    }
+
+    #[test]
+    fn segment_bucket_bound_covers_real_unequal_tail_and_capacity_allocations() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else { return };
+        // The five pooled requests per attention segment: BF16 input,
+        // fused F32 Q/gate, BF16 gated values, F32 projection and (without
+        // shared output) F32 attention result. Exercise the native allocator,
+        // not a second copy of its bucket formula.
+        for (h, q) in [(2048usize, 16 * 256), (5120, 24 * 256)] {
+            for width in [2 * h, 8 * q, 2 * q, 4 * h, 4 * q] {
+                for rows in [38usize, 72, 2048, 2080] {
+                    let bucket = (rows * width).next_power_of_two();
+                    let first = bucket / 2 / width + 1;
+                    for split in [1, rows - 1, rows - 5, rows - 32, first.min(rows - 1)] {
+                        let mut pool = mlx_native::MlxBufferPool::new();
+                        let roots: Vec<_> = [split, rows - split].into_iter().map(|count| {
+                            pool.alloc(&device, count * width, DType::U8, vec![count * width])
+                                .expect("real segment allocation")
+                        }).collect();
+                        let actual: usize = roots.iter().map(MlxBuffer::byte_len).sum();
+                        let bound = two_segment_bucket_bytes(rows as u128, width as u128).unwrap();
+                        assert!(actual as u128 <= bound, "{rows} rows split at {split}, width {width}");
+                        assert_eq!(pool.memory_snapshot().unwrap().retained.bytes, actual);
+                        if split == first && first < rows {
+                            assert_eq!(actual as u128, bound, "extremal partition attains the bound");
+                        }
+                        drop(roots);
+                        pool.reset();
+                        assert_eq!(pool.free_bytes(), actual, "both segment roots remain owned");
+                        pool.clear();
+                        assert_eq!(pool.memory_snapshot().unwrap().retained.bytes, 0);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn switch_is_off_unless_set_on() {

@@ -13,7 +13,7 @@ fn af4_ingest(runtime: &mut DFlash2Runtime, device: &MlxDevice, registry: &mut K
     let hidden = c.fc_input_dim() / c.target_layer_ids.len();
     let layer_ids = c.target_layer_ids.clone();
     for lane in 0..lanes {
-        let capture = capture_lane(&target, lane, rows, hidden, &layer_ids);
+        let capture = capture_lane(device, &target, lane, rows, hidden, &layer_ids);
         runtime.ingest_target_capture(device, registry, &capture, lane, start)?;
         runtime.record_lane_tokens(lane, &(start..start + rows).map(|v| v as u32).collect::<Vec<_>>())?;
     }
@@ -144,7 +144,7 @@ fn af4_crop_continuation(runtime: &mut DFlash2Runtime, device: &MlxDevice, regis
             ensure!(runtime.align_lane_prefix(lane, &prefix), "unwrapped crop failed");
             ensure!(runtime.lane_lengths()[lane] == length - 1 && af4_ring_bits(runtime)? == original,
                 "crop changed physical KV bytes or wrong cursor");
-            let capture = capture_lane(&values, lane, rows, hidden, &layer_ids);
+            let capture = capture_lane(device, &values, lane, rows, hidden, &layer_ids);
             runtime.ingest_target_capture_rows(device, registry, &capture, lane, start + rows - 1, rows - 1..rows)?;
             runtime.record_lane_tokens(lane, &[(length - 1) as u32])?;
         }
@@ -152,7 +152,7 @@ fn af4_crop_continuation(runtime: &mut DFlash2Runtime, device: &MlxDevice, regis
             "crop/continuation changed own-route context bytes/cursors");
     }
     // Rejected context transaction must not modify any state or cursor.
-    let capture = capture_lane(&values, 0, rows, hidden, &layer_ids);
+    let capture = capture_lane(device, &values, 0, rows, hidden, &layer_ids);
     ensure!(runtime.ingest_target_capture(device, registry, &capture, 0, lengths[0] + 1).is_err(), "mispositioned context transaction accepted");
     ensure!(runtime.lane_lengths() == lengths.as_slice() && af4_ring_bits(runtime)? == original,
         "rejected context transaction modified bytes/cursors");

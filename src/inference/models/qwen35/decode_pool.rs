@@ -334,8 +334,10 @@ pub(crate) fn end_caps_at_next_reset() {
     CAPS_END_AT_RESET.with(|cell| cell.set(CAPS.with(std::cell::Cell::get).is_some()));
 }
 
-/// Release the buffers served outside the pool. The caller has drained the
-/// device queue: nothing in flight uses them.
+/// Release the pool's owners of buffers served outside it, after a checked
+/// drain of every submitted command (including the error path). This is not
+/// evidence that a backing was freed: any escaped carry/parent alias keeps
+/// its full backing charge in carry_memory, independently of this census.
 pub(crate) fn release_overflow() {
     OVERFLOW.with(|overflow| overflow.borrow_mut().clear());
 }
@@ -562,6 +564,129 @@ pub fn drop_id_mm_scratch() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_prepared_products_fit_the_retained_bucket_and_trim_a_larger_prior_scope() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else { return };
+        let source: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/qwen38/config.json"
+        )).unwrap();
+        let cfg = super::super::source_config::qwen35_config_from_authenticated_source(&source).unwrap();
+        let rows = 2080usize;
+        let h = cfg.hidden_size as usize;
+        let q = (cfg.num_attention_heads * cfg.head_dim) as usize;
+        let z = (cfg.linear_num_value_heads * cfg.linear_value_head_dim) as usize;
+        let ab = super::super::prepared_projection::alpha_beta_rows(cfg.linear_num_value_heads) as usize;
+        // Remaining actual pooled products. FA Q/gate and gated BF16 now
+        // borrow forward arenas; dense FFN's hidden BF16 copy is largest.
+        let largest = [2 * h, 4 * h, 4 * q, 2 * z, 4 * ab,
+            4 * cfg.linear_num_value_heads as usize,
+            2 * cfg.intermediate_size.unwrap() as usize]
+            .into_iter().max().unwrap() * rows;
+        let caps = super::super::prefill_prepared::prefill_pool_caps();
+        cap_pool(Some(PoolCaps { pool: 0, retained: 0 }));
+        checked_reset_decode_pool().unwrap();
+        cap_pool(None);
+        let first = pooled_alloc_buffer(&device, largest, DType::U8, vec![largest]).unwrap();
+        let second = pooled_alloc_buffer(&device, largest, DType::U8, vec![largest]).unwrap();
+        assert_eq!(first.byte_len(), caps.retained, "largest required product fits exactly one retained bucket");
+        assert!(largest > first.byte_len() / 2, "the next smaller power of two cannot retain it");
+        drop((first, second));
+        checked_reset_decode_pool().unwrap();
+        assert!(free_bytes() > caps.retained, "larger uncapped prior scope really stays warm");
+
+        // Like forward_gpu, issue the embedding before activating caps.
+        // Trimming must release only free roots, never that live operand.
+        let mut embedding = pooled_alloc_buffer(&device, 4096, DType::F32, vec![1024]).unwrap();
+        embedding.as_mut_slice::<f32>().unwrap().fill(3.25);
+        cap_pool(Some(caps));
+        assert_eq!(free_bytes(), 0, "warm oversized free owners are actually released");
+        assert_eq!(worker_memory_snapshot().unwrap().1.retained.bytes, embedding.byte_len());
+        let product = pooled_alloc_buffer(&device, largest, DType::U8, vec![largest]).unwrap();
+        assert_eq!(product.byte_len(), caps.retained);
+        assert!(
+            issued_bytes() > super::super::prefill_prepared::window_scratch_threshold(),
+            "this real canonical product plus embedding must trigger an earlier layer wait",
+        );
+        assert!(embedding.as_slice::<f32>().unwrap().iter().all(|&x| x == 3.25));
+        assert_eq!(worker_carry_pool_bytes().unwrap(), (embedding.byte_len() + product.byte_len()) as u64);
+        drop((embedding, product));
+        checked_reset_decode_pool().unwrap();
+        assert_eq!(free_bytes(), 0, "reset also trims a crossing free set");
+        cap_pool(None);
+    }
+
+    #[test]
+    fn overflow_roots_and_carry_aliases_survive_queued_success_and_checked_error_drains() {
+        use super::super::{carry_memory::CarryOwners, encoder_stage};
+        use mlx_native::ops::copy::dispatch_copy_f32;
+        use mlx_native::KernelRegistry;
+
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else { return };
+        cap_pool(Some(PoolCaps { pool: 0, retained: 0 }));
+        checked_reset_decode_pool().unwrap();
+        let mut registry = KernelRegistry::new();
+        for fail in [false, true] {
+            let submitted = encoder_stage::SubmittedCommands::open(true);
+            let failure = fail.then(|| encoder_stage::FailSubmitted::nth("test.overflow", 0));
+            let mut carry = CarryOwners::default();
+            let mut outputs = Vec::new();
+            let mut aliases = Vec::new();
+            let mut expected = Vec::new();
+            let mut owned_bytes = 0u64;
+            for count in [99usize, 65] {
+                let mut root = pooled_alloc_buffer(&device, count * 4, DType::F32, vec![count]).unwrap();
+                let values: Vec<_> = (0..count).map(|i| (i as f32 + count as f32) * 0.25).collect();
+                root.as_mut_slice::<f32>().unwrap().copy_from_slice(&values);
+                let alias = root.slice_view(7 * 4, 11);
+                assert_eq!(alias.data_byte_len(), 11 * 4);
+                carry.include(&alias);
+                carry.include(&root);
+                owned_bytes += root.byte_len() as u64;
+                let out = device.alloc_buffer(11 * 4, DType::F32, vec![11]).unwrap();
+                let mut enc = device.command_encoder().unwrap();
+                dispatch_copy_f32(
+                    &mut enc, &mut registry, device.metal_device(), &alias, &out, 0, 0, 11,
+                ).unwrap();
+                enc.commit_labeled("test.overflow");
+                encoder_stage::retain_submitted(enc, "test.overflow");
+                drop(root);
+                aliases.push(alias);
+                outputs.push(out);
+                expected.push(values[7..18].to_vec());
+            }
+            // OVERFLOW owns full plain roots while commands are queued;
+            // small logical aliases never shrink the charged backing.
+            assert_eq!(worker_carry_pool_bytes().unwrap(), owned_bytes);
+            assert_eq!(carry.bytes(), owned_bytes, "carry deduplicates aliases at full owning extent");
+            let drained = encoder_stage::settle_submitted();
+            assert_eq!(drained.is_err(), fail);
+            if let Some(point) = &failure {
+                assert_eq!(point.seen(), (true, 2), "the checked error still settles the later command");
+            }
+            for (out, want) in outputs.iter().zip(&expected) {
+                assert_eq!(out.as_slice::<f32>().unwrap(), want.as_slice());
+            }
+            drop(submitted);
+            assert_eq!(worker_carry_pool_bytes().unwrap(), owned_bytes, "drain alone does not erase owners");
+            checked_reset_decode_pool().unwrap();
+            assert_eq!(worker_carry_pool_bytes().unwrap(), 0);
+            assert_eq!(carry.bytes(), owned_bytes, "escaped aliases stay separately charged after pool reset");
+            // A later allocation must not overwrite a separately-owned
+            // overflow backing: plain spill roots are never recycled.
+            let mut next = pooled_alloc_buffer(&device, 99 * 4, DType::F32, vec![99]).unwrap();
+            next.as_mut_slice::<f32>().unwrap().fill(-19.0);
+            assert_eq!(carry.bytes(), owned_bytes);
+            for (alias, want) in aliases.iter().zip(&expected) {
+                assert_eq!(alias.as_slice::<f32>().unwrap(), want.as_slice());
+            }
+            drop((next, aliases, carry, outputs));
+            checked_reset_decode_pool().unwrap();
+        }
+        cap_pool(None);
+    }
 
     #[test]
     fn carry_pool_census_keeps_full_overflow_roots_without_summing_native_labels() {

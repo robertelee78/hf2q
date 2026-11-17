@@ -245,8 +245,8 @@ impl<'a> DFlashTarget for Qwen35DFlashTarget<'a> {
     ///
     /// **Step 3c.A wiring (cont. 39)**: when `self.dflash_capture` is
     /// `Some`, the call routes through `forward_gpu_with_hidden_dflash`
-    /// which post-processes the verifier's per-layer hidden states into
-    /// the session via the LayerActivations capture path. The session is
+    /// which streams the verifier's waited selected-layer hidden states
+    /// directly into the session-owned capture backing. The session is
     /// then consumed by the orchestrator's drafter input
     /// (`extract_drafter_concat`) on the next round.
     fn forward_decode_verify_batched(

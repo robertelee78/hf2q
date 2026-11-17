@@ -469,6 +469,45 @@ pub(crate) fn bf16_input(
     Ok(output)
 }
 
+/// Cast into caller-owned staging without allocating. The caller orders both
+/// prior readers of `output` and subsequent projection readers with barriers.
+pub(crate) fn bf16_input_into(
+    enc: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    rows: u32,
+    in_features: u32,
+) -> Result<MlxBuffer> {
+    let elements = (rows as usize)
+        .checked_mul(in_features as usize)
+        .context("prepared projection input element count overflow")?;
+    anyhow::ensure!(
+        elements != 0
+            && input.dtype() == DType::F32
+            && output.dtype() == DType::BF16
+            && input.element_count() >= elements
+            && output.element_count() >= elements,
+        "prepared projection input staging shape or dtype mismatch"
+    );
+    let output = output
+        .slice_view(0, elements)
+        .with_shape(vec![rows as usize, in_features as usize])
+        .context("shape prepared projection input staging")?;
+    cast(
+        enc,
+        registry,
+        device.metal_device(),
+        input,
+        &output,
+        elements,
+        CastDirection::F32ToBF16,
+    )
+    .context("cast prepared projection input F32→BF16 into staging")?;
+    Ok(output)
+}
+
 /// Whether [`normed_bf16_input`] serves activations of `in_features`
 /// columns on this device: the stock RMS norm would run its float4 kernel on
 /// them, whose bits the BF16-output kernel reproduces, and the kernel's

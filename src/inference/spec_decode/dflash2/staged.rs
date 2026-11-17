@@ -1008,15 +1008,13 @@ mod tests {
         assert_eq!(workspace.staged.is_some(), staged);
         let width = cfg.fc_input_dim();
         let mut state = 71_u64;
-        let capture = DFlashCaptureSession {
-            target_layer_ids: cfg.target_layer_ids.clone(),
-            hidden_output: (0..rows * width)
-                .map(|_| 2.0 * random(&mut state))
-                .collect(),
-            per_position_argmaxes: None,
-            seq_len: rows,
-            hidden_size: width / cfg.target_layer_ids.len(),
-        };
+        let mut capture = DFlashCaptureSession::new_shared(
+            &device, cfg.target_layer_ids.clone(), rows,
+            width / cfg.target_layer_ids.len(), false,
+        ).unwrap();
+        for value in capture.hidden_output.iter_mut() {
+            *value = 2.0 * random(&mut state);
+        }
         // The other lanes' rows hold whatever the last cycle left there.
         for value in workspace
             .captured_target_hidden
@@ -1224,15 +1222,12 @@ mod tests {
                     lengths[0] = 0;
                 }
                 Some((lane, rows)) => {
-                    let capture = DFlashCaptureSession {
-                        target_layer_ids: cfg.target_layer_ids.clone(),
-                        hidden_output: (0..layers * rows * hidden)
-                            .map(|_| 2.0 * random(&mut data_state))
-                            .collect(),
-                        per_position_argmaxes: None,
-                        seq_len: rows,
-                        hidden_size: hidden,
-                    };
+                    let mut capture = DFlashCaptureSession::new_shared(
+                        &device, cfg.target_layer_ids.clone(), rows, hidden, false,
+                    ).unwrap();
+                    for value in capture.hidden_output.iter_mut() {
+                        *value = 2.0 * random(&mut data_state);
+                    }
                     let start = lengths[lane] as usize;
                     let concatenated = extract_drafter_concat(
                         &capture.hidden_output,
@@ -1301,13 +1296,10 @@ mod tests {
                             lengths[lane] += rows as u32;
                         }
                         _ => {
-                            let row_major = DFlashCaptureSession {
-                                target_layer_ids: cfg.target_layer_ids.clone(),
-                                hidden_output: concatenated.clone(),
-                                per_position_argmaxes: None,
-                                seq_len: rows,
-                                hidden_size: hidden,
-                            };
+                            let mut row_major = DFlashCaptureSession::new_shared(
+                                &device, cfg.target_layer_ids.clone(), rows, hidden, false,
+                            ).unwrap();
+                            row_major.hidden_output.copy_from_slice(&concatenated);
                             lane_passes(&row_major, start, 0..rows);
                             lengths[lane] += rows as u32;
                         }

@@ -427,16 +427,14 @@ fn a_prefetch_that_does_not_match_the_next_step_is_dropped() {
 
         // A ring change between the steps: a cleared lane, a prefill ingest.
         let width = stock.config.fc_input_dim();
-        let ingest = DFlashCaptureSession {
-            target_layer_ids: stock.config.target_layer_ids.clone(),
-            hidden_output: {
-                let mut state = 47_u64;
-                (0..11 * width).map(|_| random(&mut state)).collect()
-            },
-            per_position_argmaxes: None,
-            seq_len: 11,
-            hidden_size: width / stock.config.target_layer_ids.len(),
-        };
+        let mut ingest = DFlashCaptureSession::new_shared(
+            &device, stock.config.target_layer_ids.clone(), 11,
+            width / stock.config.target_layer_ids.len(), false,
+        ).unwrap();
+        let mut state = 47_u64;
+        for value in ingest.hidden_output.iter_mut() {
+            *value = random(&mut state);
+        }
         for change in 0..2 {
             let retained = [3, 8, 8, 1];
             let next = step_draft(20 + change, true);

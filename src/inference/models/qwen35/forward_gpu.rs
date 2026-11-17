@@ -70,6 +70,7 @@ use super::kv_cache::HybridKvCache;
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
 use super::Qwen35Config;
 use crate::core::traits::activation_capture::LayerActivations;
+use crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession;
 // ADR-040 Phase B4a (2026-05-23) — multi-seq slot identity threaded
 // through the public prefill surface. `SlotId(0)` preserves byte-
 // equivalence with the pre-ADR-040 single-seq path; `SlotId(N>0)`
@@ -560,6 +561,27 @@ impl JointPrefillOutput {
 struct ResidualLayerCapture<'a> {
     layer: usize,
     out: &'a mut Vec<f32>,
+}
+
+/// Diagnostic captures retain both layer sides. DFlash captures stream only
+/// selected outputs into the session's final backing after the same checked
+/// capture boundaries, without accumulating diagnostic input/output Vecs.
+enum ForwardCapture<'a> {
+    Activations(&'a mut LayerActivations),
+    DFlash(&'a mut DFlashCaptureSession),
+}
+
+impl ForwardCapture<'_> {
+    fn is_target_layer(&self, layer: usize) -> bool {
+        match self {
+            Self::Activations(acts) => acts.is_target_layer(layer),
+            Self::DFlash(session) => session.capture_index_for(layer).is_some(),
+        }
+    }
+
+    fn captures_input(&self, layer: usize) -> bool {
+        matches!(self, Self::Activations(acts) if acts.is_target_layer(layer))
+    }
 }
 
 /// Pre-allocated decode buffers for `forward_gpu_greedy` (seq_len == 1).
@@ -3627,34 +3649,10 @@ impl Qwen35Model {
         Ok((logits, hidden))
     }
 
-    /// ADR-034 task #78 Step 3c.A (2026-05-21) — DFlash-aware variant of
-    /// [`Self::forward_gpu_with_hidden`].
-    ///
-    /// When `dflash_capture` is `Some`, allocates a [`LayerActivations`]
-    /// buffer, runs the forward with that buffer set, then post-processes
-    /// `layer_outputs[layer_idx]` into the session via `write_layer_slab`
-    /// for each `layer_idx` in `session.target_layer_ids`.
-    ///
-    /// **Design rationale (cont. 39)**: Qwen35Model::forward_gpu_impl
-    /// takes `&self` (immutable). The original "thread `&mut session` into
-    /// the layer loop" approach would have required either interior
-    /// mutability or refactoring 8+ &self call sites. Instead, we reuse
-    /// the existing ADR-012 P9b LayerActivations capture path (which
-    /// already calls `download_f32(&hidden)` with implicit GPU sync at
-    /// the end of each layer) and extract just the target slabs at the
-    /// end. The download_f32 path was production-tested for activation-
-    /// aware DWQ calibration so its GPU-sync correctness is already known
-    /// good.
-    ///
-    /// Memory cost: `2 * n_layers * seq_len * hidden_size * 4` bytes for
-    /// the scratch LayerActivations (the capture path inside
-    /// `forward_gpu_impl` populates BOTH `layer_inputs` and
-    /// `layer_outputs`; we only consume `layer_outputs` but pay for both).
-    /// For Qwen 3.6 27B (64 layers × 4 tokens × 5120 floats × 2) this is
-    /// ~10 MB per round — small relative to the model itself. For
-    /// seq_len=200 ≈ 500 MB; production DFlash uses K+1 ≤ 8 so this is
-    /// not a concern. If profiling later shows this matters, an
-    /// output-only capture mode can be added.
+    /// DFlash-aware selected-output capture. Each selected layer writes its
+    /// waited F32 residual directly into the session-owned final backing.
+    /// Diagnostic `LayerActivations` capture remains a separate explicit mode;
+    /// DFlash retains neither diagnostic input nor output slabs.
     ///
     /// When `dflash_capture` is `None`, behavior is byte-identical to
     /// [`Self::forward_gpu_with_hidden`].
@@ -3718,27 +3716,14 @@ impl Qwen35Model {
                 ));
             }
         }
-        // Allocate scratch LayerActivations. The capture path inside
-        // forward_gpu_impl pushes one Vec<f32> per layer into
-        // `layer_outputs` (length = seq_len * hidden_size), already
-        // GPU-synced via download_f32. With `target_layer_filter` set,
-        // only DFlash target layers actually get downloaded — non-target
-        // layers receive an empty Vec, saving ~10× memory + GPU→CPU
-        // bandwidth for typical drafter configs (4 of 64 layers).
-        let mut acts = LayerActivations {
-            num_layers: n_layers as u32,
-            seq_len: seq_len as u32,
-            hidden_size: hs as u32,
-            layer_inputs: Vec::with_capacity(n_layers),
-            layer_outputs: Vec::with_capacity(n_layers),
-            target_layer_filter: Some(session.target_layer_ids.clone()),
-        };
+        session.as_view().validate(seq_len, hs)
+            .context("forward_gpu_with_hidden_dflash: capture layout")?;
         let mut hidden_out = None;
         let logits = self.forward_gpu_impl(
             tokens,
             positions_flat,
             kv_cache,
-            Some(&mut acts),
+            Some(ForwardCapture::DFlash(session)),
             Some(&mut hidden_out),
             output_mode,
             &[],
@@ -3755,30 +3740,6 @@ impl Qwen35Model {
         let hidden = hidden_out.ok_or_else(|| {
             anyhow!("forward_gpu_with_hidden_dflash: hidden buffer was not captured")
         })?;
-        // Codex /cfa 2026-05-21 Suggestion #1: defensive `acts.validate()`
-        // here catches writer bugs (filter not honored, OOB index, etc.)
-        // with clear diagnostics before write_layer_slab dereferences
-        // potentially-empty slabs.
-        acts.validate()
-            .context("forward_gpu_with_hidden_dflash: LayerActivations validate")?;
-        // Post-process: copy target slabs out of `acts.layer_outputs`
-        // into the session's flat hidden_output buffer.
-        if acts.layer_outputs.len() != n_layers {
-            return Err(anyhow!(
-                "forward_gpu_with_hidden_dflash: expected layer_outputs.len()={} after forward, got {}",
-                n_layers,
-                acts.layer_outputs.len(),
-            ));
-        }
-        // Index loop avoids cloning session.target_layer_ids — the
-        // borrow checker accepts this because `acts.layer_outputs` and
-        // `session.target_layer_ids` are disjoint, and `write_layer_slab`
-        // takes only the capture_idx + slab (not the layer_ids).
-        for capture_idx in 0..session.target_layer_ids.len() {
-            let layer_idx = session.target_layer_ids[capture_idx];
-            let slab = &acts.layer_outputs[layer_idx];
-            session.write_layer_slab(capture_idx, slab)?;
-        }
         Ok((logits, hidden))
     }
 
@@ -4758,7 +4719,7 @@ impl Qwen35Model {
             tokens,
             positions_flat,
             kv_cache,
-            Some(out_activations),
+            Some(ForwardCapture::Activations(out_activations)),
             None,
             OutputHeadMode::All,
             &[],
@@ -4836,7 +4797,7 @@ impl Qwen35Model {
         tokens: &[u32],
         positions_flat: &[i32],
         kv_cache: &mut HybridKvCache,
-        capture: Option<&mut LayerActivations>,
+        capture: Option<ForwardCapture<'_>>,
         hidden_out: Option<&mut Option<MlxBuffer>>,
         output_head_mode: OutputHeadMode,
         soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
@@ -4905,7 +4866,7 @@ impl Qwen35Model {
         tokens: &[u32],
         positions_flat: &[i32],
         kv_cache: &mut HybridKvCache,
-        mut capture: Option<&mut LayerActivations>,
+        mut capture: Option<ForwardCapture<'_>>,
         mut hidden_out: Option<&mut Option<MlxBuffer>>,
         output_head_mode: OutputHeadMode,
         soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
@@ -6133,7 +6094,7 @@ impl Qwen35Model {
             // output goes to the other ring slot or to a fresh buffer.
             let captured_input = capture
                 .as_ref()
-                .is_some_and(|acts| acts.is_target_layer(layer_idx))
+                .is_some_and(|target| target.captures_input(layer_idx))
                 .then(|| hidden.clone());
             // K-boundary: last layer in the window OR final layer overall.
             // At K=1 every layer is a boundary (= current behaviour).
@@ -6143,7 +6104,8 @@ impl Qwen35Model {
             // FFN terminal must wait, or the copy reads the two-slot output
             // ring before the GPU has written this layer into it and
             // returns an earlier layer's residual stream.
-            let host_reads_layer = captured_input.is_some()
+            let host_reads_layer = capture.as_ref()
+                .is_some_and(|target| target.is_target_layer(layer_idx))
                 || residual_capture
                     .as_ref()
                     .is_some_and(|cap| cap.layer == layer_idx);
@@ -7596,34 +7558,40 @@ impl Qwen35Model {
             drop(_w5b22_dn_ffn_post_res);
             drop(_w5b22_dn_outer_total);
 
-            // ADR-012 P9b GPU capture path: download the residual entering
-            // and leaving this layer to CPU F32 if a capture target is
-            // bound (about 20 MB per layer and side at seq_len × hidden × 4
-            // bytes). Both are read here, after the boundary wait of this
-            // layer's FFN terminal; a one-row forward commits its layers
-            // without a wait, so it drains the queue first.
-            //
-            // ADR-034 task #78 Step 3c.A.4 (2026-05-21) — when
-            // `target_layer_filter` is set, only listed indices download;
-            // others push an empty Vec to preserve the
-            // `layer_inputs[i]`/`layer_outputs[i]` invariant (the DFlash
-            // capture reads a few of the layers).
-            if let Some(acts) = capture.as_mut() {
-                match captured_input {
-                    Some(input) => {
-                        if seq_len == 1 {
-                            wait_for_committed_gpu_work(device)
-                                .context("activation capture wait")?;
+            // Both capture modes read only after this selected layer's FFN
+            // terminal boundary wait. Single-row forwards retain their existing
+            // checked queue drain before the host copy.
+            if let Some(target) = capture.as_mut() {
+                match target {
+                    ForwardCapture::Activations(acts) => match captured_input {
+                        Some(input) => {
+                            if seq_len == 1 {
+                                wait_for_committed_gpu_work(device)
+                                    .context("activation capture wait")?;
+                            }
+                            acts.layer_inputs.push(
+                                download_f32(&input).context("capture layer_input download")?,
+                            );
+                            acts.layer_outputs.push(
+                                download_f32(&hidden).context("capture layer_output download")?,
+                            );
                         }
-                        acts.layer_inputs
-                            .push(download_f32(&input).context("capture layer_input download")?);
-                        acts.layer_outputs.push(
-                            download_f32(&hidden).context("capture layer_output download")?,
-                        );
-                    }
-                    None => {
-                        acts.layer_inputs.push(Vec::new());
-                        acts.layer_outputs.push(Vec::new());
+                        None => {
+                            acts.layer_inputs.push(Vec::new());
+                            acts.layer_outputs.push(Vec::new());
+                        }
+                    },
+                    ForwardCapture::DFlash(session) => {
+                        if let Some(index) = session.capture_index_for(layer_idx) {
+                            if seq_len == 1 {
+                                wait_for_committed_gpu_work(device)
+                                    .context("DFlash capture wait")?;
+                            }
+                            anyhow::ensure!(hidden.dtype() == DType::F32,
+                                "DFlash capture hidden dtype must be F32");
+                            session.write_layer_slab(index, hidden.as_slice::<f32>()?)
+                                .context("write waited DFlash capture layer")?;
+                        }
                     }
                 }
             }
@@ -7810,7 +7778,7 @@ impl Qwen35Model {
         ));
 
         // Stamp shape metadata onto the activation capture (ADR-012 P9b).
-        if let Some(ref mut acts) = capture {
+        if let Some(ForwardCapture::Activations(acts)) = capture.as_mut() {
             acts.num_layers = self.layers.len() as u32;
             acts.seq_len = seq_len;
             acts.hidden_size = h as u32;

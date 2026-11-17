@@ -1235,13 +1235,15 @@ impl Qwen35LoadedModel {
             .take()
             .context("DFlash2 prefill requested without a provisioned runtime")?;
         let result = (|| {
-            let mut capture =
-                crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession::new(
+            let mut capture = self.model.with_gpu_cache_mut(|device, _| {
+                crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession::new_shared(
+                    device,
                     runtime.config.target_layer_ids.clone(),
                     tokens.len(),
                     self.model.cfg.hidden_size as usize,
                     false,
-                );
+                )
+            })?;
             let (logits, _hidden) = {
                 let _prefill = PrefillScope::enter();
                 self.model.forward_gpu_last_logits_with_hidden_dflash(
@@ -1320,13 +1322,15 @@ impl Qwen35LoadedModel {
             .take()
             .context("DFlash2 prefill requested without a provisioned runtime")?;
         let result = (|| {
-            let mut capture =
-                crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession::new(
+            let mut capture = self.model.with_gpu_cache_mut(|device, _| {
+                crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession::new_shared(
+                    device,
                     runtime.config.target_layer_ids.clone(),
                     tokens.len(),
                     self.model.cfg.hidden_size as usize,
                     false,
-                );
+                )
+            })?;
             let folded = {
                 let _prefill = PrefillScope::enter();
                 self.model.forward_gpu_last_logits_folded(
@@ -1475,13 +1479,15 @@ impl Qwen35LoadedModel {
             .take()
             .context("DFlash2 prefill requested without a provisioned runtime")?;
         let result = (|| {
-            let mut capture =
-                crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession::new(
+            let mut capture = self.model.with_gpu_cache_mut(|device, _| {
+                crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession::new_shared(
+                    device,
                     runtime.config.target_layer_ids.clone(),
                     Qwen35Model::joint_prefill_rows(&model_lanes, cohort.shared_rows),
                     self.model.cfg.hidden_size as usize,
                     false,
-                );
+                )
+            })?;
             let outputs = {
                 let _prefill = PrefillScope::enter();
                 self.model.forward_gpu_last_logits_joint(

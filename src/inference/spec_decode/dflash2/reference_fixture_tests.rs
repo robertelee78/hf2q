@@ -124,6 +124,7 @@
                         let initial = float_values(initial_view);
                         for lane in 0..lanes {
                             let capture = capture_lane(
+                                device,
                                 &initial,
                                 lane,
                                 initial_rows,
@@ -135,6 +136,7 @@
                     }
                     for lane in 0..lanes {
                         let capture = capture_lane(
+                            device,
                             &target,
                             lane,
                             context_rows,

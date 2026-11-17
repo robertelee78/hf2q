@@ -1061,8 +1061,8 @@ allocator formulas, gives these requested-byte bounds, not measured residency:
 
 | Charge | Full profile | Partial profile |
 | --- | ---: | ---: |
-| Prepared planes | 21,613,556,736 | 0 |
-| Target scratch with carry | 6,146,595,416 | 1,375,871,056 |
+| Prepared planes | 21,614,608,384 | 0 |
+| Target scratch with carry | 6,145,543,768 | 1,375,871,056 |
 | Drafter run peak | 1,039,862,295 | 1,030,982,167 |
 | Total route requirement | 28,800,014,447 | 2,406,853,223 |
 
@@ -1147,6 +1147,65 @@ inventory contains 1838 files, including 944 Rust files. This does not
 retroactively add missing guards to earlier private builds. The current build
 guards all 2338 source files. Correction receipt SHA256:
 `b9f666e87a8e7718ad681c58dbce9a56f578da2a6882d50ad6c790cf2d47e91d`.
+
+Header-only inspection and the published native sizing API now reconcile the
+complete original requirement exactly. They correct the first decomposition:
+the MTP carry arm uses the no-fold target envelope, so its TLS charge is
+1,051,648 bytes smaller; prepared planes are larger by the same amount. Total
+requirement, headroom and original deficit are unchanged. Unprepared MTP
+planes contribute 546,668,544 bytes, including routed expert stacks, not just
+the 2,048,000-byte shared expert. Combined with the committed forward-owner
+reductions, the requested requirement becomes 27,359,434,687 bytes: still
+2,987,306,527 bytes above the recorded headroom. Retained target dense split
+partials contribute 236,912,640 bytes; the largest single weight needs
+2,097,152 bytes. These are actual-header sizing results, not a runtime fit.
+Reconciliation receipt SHA256:
+`ede5b6549ab8421e70140ab24e23414b4d9b12dc502b50066a3134eecf4e501b`.
+
+##### Shared capture, prepared staging and pool retention: component proof
+
+The next candidate removes real owners rather than discounting them:
+
+- Production DFlash2 capture writes selected, already-waited target outputs
+  directly into one shared F32 layer-major session. Diagnostic activation
+  capture retains its original behavior; snapshots remain deep host copies.
+  The removed diagnostic input/output CPU slabs were previously uncharged:
+  their removal repairs lifetime closure, not a subtraction from old admission.
+- GPU ingest gathers selected rows into the existing charged workspace tile,
+  preserving whole-lane passes, zero-padded tails, positions and ring commits.
+  It no longer allocates/uploads a full transposed capture. Temporary accounting
+  includes the padding scalar and the actual overlapping word-upload phases.
+- Prepared FA reuses one combined Q-helper root for fused Q/gate before its
+  normalization/RoPE consumers, and BF16 sequence staging for normalized and
+  gated inputs. Explicit barriers preserve last-reader ordering. Single-row and
+  insufficient-width fallbacks remain charged; non-D256 admission fails closed.
+- Retained free scratch and the checked-wait window are each 128 MiB; the
+  native pool cap is 256 MiB. A two-segment bucket bound covers unequal
+  content/cue splits. Checked drains still precede resets and overflow release.
+
+Review caught an unconditional pooled SDPA output allocated even when a branch
+returned another/shared result. The fix allocates only in actual output-writing
+branches. Its real-Metal regression requires unchanged monotone issued-byte
+accounting, shared-result identity and exact native-reference output/cursors.
+The independent prepared-input reference keeps the same attention route:
+removing its arena would change short-attention BF16 rounding.
+
+With published native 0.23.2, the complete 2339-file snapshot passes 74 test
+executions / 66 unique consumers, including eight carried-encoder cases. The
+real Qwen3.6 component uses four slots and context 4096: first-turn 1568 rows
+(444 shared), resumed-turn 674 rows, identical captures/rings/cursors/token
+bindings, then identical draft logits, proposals and verify rows. The legacy
+DFlash HF-cache smoke remains unrun; this explicitly exercises DFlash2 instead.
+Proof SHA256:
+`4915403cecb04a91b900287bcacf53d4a40c3a0bcce90b32c4bbb20640fd4cef`.
+Binary SHA256:
+`d0f6e8cf7e7120c42111d041661daf6593ef66e82c2d6421f212f1f120a602fd`.
+Complete source archive SHA256:
+`c1c1e674471a615a0553177f1941c25942ab577dd81319339cbd453b67f263ed`.
+
+This proves component correctness/liveness, not canonical context-262144 N4,
+full-profile admission, measured residency, protocol/quality/performance gates
+or release promotion. The recorded earlier deficit is not a new runtime fit.
 
 ### D2: 32-row target verifier
 

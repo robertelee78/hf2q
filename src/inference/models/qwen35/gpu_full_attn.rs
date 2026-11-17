@@ -1818,6 +1818,7 @@ fn project_attention_inputs_into_arena(
     n_kv_heads: u32,
     head_dim: u32,
     hidden_size: u32,
+    input_staging: Option<&MlxBuffer>,
 ) -> Result<()> {
     use super::{prefill_prepared, prepared_projection};
     let q_total = n_heads
@@ -1849,14 +1850,17 @@ fn project_attention_inputs_into_arena(
         kv_total,
     );
     let x_bf16 = if fused_q_gate.is_some() || k_prepared || v_prepared {
-        let x_bf16 = prepared_projection::bf16_input(
-            encoder,
-            registry,
-            device,
-            &arena.x_norm_buf,
-            seq_len,
-            hidden_size,
-        )?;
+        let x_bf16 = if let Some(staging) = input_staging.filter(|_| hidden_size <= q_total) {
+            // WAR: an earlier queued segment may still read sequence staging.
+            encoder.memory_barrier();
+            prepared_projection::bf16_input_into(
+                encoder, registry, device, &arena.x_norm_buf, staging, seq_len, hidden_size,
+            )?
+        } else {
+            prepared_projection::bf16_input(
+                encoder, registry, device, &arena.x_norm_buf, seq_len, hidden_size,
+            )?
+        };
         // The prepared projections read the BF16 copy this cast writes.
         encoder.memory_barrier();
         Some(x_bf16)
@@ -1865,7 +1869,11 @@ fn project_attention_inputs_into_arena(
     };
     match (x_bf16.as_ref(), fused_q_gate) {
         (Some(x_bf16), Some((weight, ggml_type))) => {
-            let fused = prepared_projection::project(
+            let fused = arena.q_helpers_buf
+                .slice_view(0, seq_len as usize * 2 * q_total as usize)
+                .with_shape(vec![seq_len as usize, 2 * q_total as usize])
+                .context("shape arena prepared Q/gate output")?;
+            prepared_projection::project_into(
                 encoder,
                 registry,
                 device,
@@ -1873,6 +1881,7 @@ fn project_attention_inputs_into_arena(
                 weight,
                 ggml_type,
                 &weights.prepared_m32.q_gate,
+                &fused,
                 seq_len,
                 hidden_size,
                 2 * q_total,
@@ -1888,6 +1897,8 @@ fn project_attention_inputs_into_arena(
                 n_heads,
                 head_dim,
             )?;
+            // WAR: deinterleave must finish before RMSNorm overwrites this root.
+            encoder.memory_barrier();
         }
         _ => apply_q_gate_projection_f32_into(
             encoder,
@@ -1973,6 +1984,7 @@ fn project_attention_output(
     seq_len: u32,
     q_total: u32,
     hidden_size: u32,
+    input_staging: Option<&MlxBuffer>,
 ) -> Result<MlxBuffer> {
     use super::{prefill_prepared, prepared_projection};
     if !prefill_prepared::admits(
@@ -1994,8 +2006,16 @@ fn project_attention_output(
             hidden_size,
         );
     }
-    let gated_bf16 =
-        prepared_projection::bf16_input(encoder, registry, device, gated, seq_len, q_total)?;
+    let gated_bf16 = if let Some(staging) = input_staging {
+        // WAR: attention's final sequence-staging readers precede this cast,
+        // including when a session keeps these stages in one encoder.
+        encoder.memory_barrier();
+        prepared_projection::bf16_input_into(
+            encoder, registry, device, gated, staging, seq_len, q_total,
+        )?
+    } else {
+        prepared_projection::bf16_input(encoder, registry, device, gated, seq_len, q_total)?
+    };
     // The prepared projection reads the BF16 copy this cast writes.
     encoder.memory_barrier();
     prepared_projection::project(
@@ -2495,6 +2515,9 @@ pub fn apply_flash_attn_prefill_seq_major_into(
         .validate_fits(seq_len, n_heads, n_kv_heads, head_dim)
         .context("FA bridge: arena validate_fits")?;
 
+    // WAR: prepared Q/K/V may have used this root as normalized-input
+    // staging earlier in the same encoder.
+    enc.memory_barrier();
     // Step 1+2: Q F32 seq-major → BF16 seq-major → BF16 head-major.
     cast(
         enc,
@@ -5802,15 +5825,19 @@ pub fn apply_sdpa_with_kv_cache(
     //   Single commit_and_wait for both K/V cache write + SDPA.
     //
     // For seq > 1 (prefill): CPU K/V permute is required for head-major layout.
-    let out_buf = super::decode_pool::pooled_alloc_buffer(
-        device,
-        nh * seq * d * 4,
-        DType::F32,
-        vec![1, nh, seq, d],
-    )
-    .map_err(|e| anyhow!("alloc sdpa kv-cache output: {e}"))?;
+    // Flash-prefill and resume helpers return their own result (possibly a
+    // shared arena view). Allocate a pooled output only for a branch that
+    // actually writes it; an unused root would violate the shared bound.
+    let allocate_output = || {
+        super::decode_pool::pooled_alloc_buffer(
+            device, nh * seq * d * 4, DType::F32, vec![1, nh, seq, d],
+        )
+        .map_err(|e| anyhow!("alloc sdpa kv-cache output: {e}"))
+    };
+    let out_buf;
 
     if seq == 1 && head_dim % 32 == 0 {
+        out_buf = allocate_output()?;
         // Decode fast path: fused GPU K/V cache write + SIMD SDPA.
         // Q layout for seq=1: [n_heads, head_dim] is identical in seq-major and head-major.
         // K/V source: [seq*n_kv_heads, head_dim] = [n_kv_heads, head_dim] for seq=1,
@@ -6201,6 +6228,7 @@ pub fn apply_sdpa_with_kv_cache(
             );
         }
         if vec_small_path_eligible {
+            let out_buf = allocate_output()?;
             let _w5b10_kernel = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaKernel,
             );
@@ -6231,22 +6259,9 @@ pub fn apply_sdpa_with_kv_cache(
             let q_hm = device
                 .alloc_buffer(seq * nh * d * 4, DType::F32, vec![nh, seq, d])
                 .map_err(|e| anyhow!("vec_small_path: alloc q_hm: {e}"))?;
-            // ── Reuse function-level out_buf ──
-            //
-            // Shader writes seq-major [seq, nh, d] (per
-            // flash_attn_vec.metal:314 rid = iq2 + iq1 * n_heads).
-            // The function-level out_buf was allocated via
-            // pooled_alloc_buffer at line ~2251 with the metadata shape
-            // `vec![1, nh, seq, d]` (a head-major annotation — flat byte
-            // count `nh * seq * d * 4` is what matters for the kernel
-            // write + downstream ops6_7 flat consumption). The vec
-            // kernel writes seq-major into the same byte extent, which
-            // is what all apply_sdpa_with_kv_cache paths contract to
-            // return (the fallback at line ~2756 explicitly permutes
-            // HEAD→SEQ before returning; new_path / resume_path return
-            // seq-major buffers from the prefill kernel). Codex /cfa
-            // 2026-05-21 confirmed the layout is correct + flagged this
-            // comment was previously misleading.
+            // The vec kernel writes seq-major into this flat output extent;
+            // the head-major metadata annotation is immaterial to the flat
+            // kernel writes and downstream gating.
             //
             // Tmp buffer sized for qL > 1.
             let tmp_bytes = flash_attn_vec_tmp_bytes_with_qL(n_heads, head_dim, seq_len);
@@ -6452,6 +6467,7 @@ pub fn apply_sdpa_with_kv_cache(
         //    (head_dim is always 256 and seq_len is always >= 16 in
         //    production) — kept for unit-test fixtures with smaller
         //    head_dim and for future model classes. ──
+        let out_buf = allocate_output()?;
         let q_gpu = {
             let _w5b9_q_dl_perm_ul = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaQDownloadPermuteUpload,
@@ -6819,6 +6835,16 @@ pub fn build_gated_attn_layer(
     // dispatch path is reached only by non-fused branches (decode, dump
     // bisect, head_dim != 256, cur_len != 0, missing arenas).
     let mut fa_arena = fa_arena;
+    // Retain the actual sequence root across the later arena ownership move.
+    // No-arena and decode paths keep their separately allocated inputs.
+    let prepared_input_staging = fa_arena.as_ref()
+        .filter(|_| seq_len > 1 && head_dim == 256)
+        .map(|arena| arena.q_bf16_seq.clone());
+    #[cfg(test)]
+    let prepared_input_staging = prepared_input_staging.filter(|_| {
+        !super::prepared_switch_override::current()
+            .is_some_and(|switches| switches.independent_fa_staging)
+    });
     let mut kv_cache_slot = kv_cache_slot;
     let mut attn_out_fused: Option<MlxBuffer> = None;
     // ADR-019 Phase 2 iter89e2-G: when use_fused_stage_ab fires AND ops6-7
@@ -6977,6 +7003,7 @@ pub fn build_gated_attn_layer(
                     n_kv_heads,
                     head_dim,
                     hidden_size,
+                    prepared_input_staging.as_ref(),
                 )?;
             }
             // Barrier: ops 3 read from q_proj/k_proj written above.
@@ -7880,6 +7907,7 @@ pub fn build_gated_attn_layer(
             seq_len,
             q_total,
             hidden_size,
+            prepared_input_staging.as_ref(),
         )?;
         // Decode fast path (seq=1): commit() without wait, and `out` is pooled.
         // The caller (forward_gpu) feeds `out` into dispatch_fused_residual_norm_f32
@@ -9068,6 +9096,92 @@ mod tests {
         };
         let seq_len = 4u32;
         (shape, weights, seq_len)
+    }
+
+    #[test]
+    fn queued_unequal_q_helpers_match_independent_consumers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use super::super::{prepared_projection, FaProjectionsArena};
+        let device = MlxDevice::new().expect("Metal device");
+        let mut registry = KernelRegistry::new();
+        let root = FaProjectionsArena::new(&device, 7, 64, 2, 1, 32, 1e-6).unwrap();
+        let norm_weight = upload_f32(&vec![1.0; 32], &device).unwrap();
+        let mut enc = device.command_encoder().unwrap();
+        let mut observed = Vec::new();
+        for rows in [7u32, 3, 5] {
+            let shared = root.shared_rows(&device, rows).unwrap();
+            let mut independent =
+                FaProjectionsArena::new(&device, rows, 64, 2, 1, 32, 1e-6).unwrap();
+            // Independent roots, not merely different views of the candidate.
+            independent.q_normed_buf = device
+                .alloc_buffer(rows as usize * 64 * 4, DType::F32, vec![rows as usize * 2, 32])
+                .unwrap();
+            independent.q_rope_buf = device
+                .alloc_buffer(rows as usize * 64 * 4, DType::F32, vec![rows as usize, 2, 32])
+                .unwrap();
+            let values: Vec<f32> = (0..rows as usize * 128)
+                .map(|i| ((i * 13 % 113) as f32 - 56.0) / 64.0)
+                .collect();
+            let source = upload_bf16_from_f32(&values, &device).unwrap();
+            let mut positions = device
+                .alloc_buffer(rows as usize * 4 * 4, DType::I32, vec![rows as usize * 4])
+                .unwrap();
+            for (i, value) in positions.as_mut_slice::<i32>().unwrap().iter_mut().enumerate() {
+                *value = (i / 4) as i32;
+            }
+            let mut pair = Vec::new();
+            for arena in [&shared, &independent] {
+                enc.memory_barrier();
+                cast(
+                    &mut enc, &mut registry, device.metal_device(), &source,
+                    &arena.q_helpers_buf, rows as usize * 128, CastDirection::BF16ToF32,
+                ).unwrap();
+                deinterleave_q_gate_f32_into(
+                    &mut enc, &mut registry, &device, arena.q_helpers_buf.clone(),
+                    &arena.q_proj_buf, &arena.gate_proj_buf, rows, 2, 32,
+                ).unwrap();
+                enc.memory_barrier();
+                apply_q_or_k_per_head_rms_norm_into(
+                    &mut enc, &mut registry, &device, &arena.q_proj_buf, &norm_weight,
+                    &arena.q_normed_buf, &arena.qk_rms_params_buf, rows, 2, 32,
+                ).unwrap();
+                enc.memory_barrier();
+                apply_imrope_into(
+                    &mut enc, &mut registry, &device, &arena.q_normed_buf,
+                    &arena.q_rope_buf, &positions, rows, 2, 32, 16, 10000.0, [4, 4, 0, 0],
+                ).unwrap();
+                enc.memory_barrier();
+                apply_sigmoid_gate_multiply_into(
+                    &mut enc, &mut registry, &device, &arena.q_rope_buf,
+                    &arena.gate_proj_buf, &arena.gated_buf, &arena.sigmoid_params_buf, rows * 64,
+                ).unwrap();
+                enc.memory_barrier();
+                let snapshot = device
+                    .alloc_buffer(rows as usize * 64 * 2, DType::BF16, vec![rows as usize, 64])
+                    .unwrap();
+                pair.push(prepared_projection::bf16_input_into(
+                    &mut enc, &mut registry, &device, &arena.gated_buf, &snapshot, rows, 64,
+                ).unwrap());
+            }
+            observed.push(pair);
+        }
+        // All segments are queued before any host read or reuse synchronization.
+        enc.commit_and_wait_labeled("test.queued_q_helpers").unwrap();
+        for pair in observed {
+            let actual = pair[0].as_slice::<half::bf16>().unwrap();
+            let expected = pair[1].as_slice::<half::bf16>().unwrap();
+            assert!(expected.iter().any(|value| value.to_f32() != 0.0));
+            assert_eq!(actual, expected);
+        }
+        let mut enc = device.command_encoder().unwrap();
+        assert!(prepared_projection::bf16_input_into(
+            &mut enc, &mut registry, &device, &root.q_proj_buf, &root.q_rope_buf, 3, 64,
+        ).is_err());
+        let short = device.alloc_buffer(2, DType::BF16, vec![1]).unwrap();
+        assert!(prepared_projection::bf16_input_into(
+            &mut enc, &mut registry, &device, &root.q_proj_buf, &short, 3, 64,
+        ).is_err());
+        enc.commit_and_wait_labeled("test.q_helpers_rejected_staging").unwrap();
     }
 
     fn assert_native_q4k_fused_q_gate_chain(seq_len: u32) {
@@ -11116,6 +11230,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shared_fresh_attention_uses_its_result_without_an_unused_pool_root() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use super::super::encoder_stage::{settle_submitted, SubmittedCommands};
+        use super::super::{decode_pool, FaPrefillArena};
+        let Ok(device) = MlxDevice::new() else {
+            eprintln!("shared attention allocation proof unavailable: no Metal device");
+            return;
+        };
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::flash_attn_prefill::register(&mut registry);
+        let _submitted = SubmittedCommands::open(true);
+        let (rows, capacity, heads, kv_heads, dim) = (33u32, 64u32, 4u32, 2u32, 256u32);
+        let mut seed = 0xACCAu32;
+        let q = upload_f32(&mk_rand(&mut seed, (rows * heads * dim) as usize, 0.1), &device).unwrap();
+        let k = upload_f32(&mk_rand(&mut seed, (rows * kv_heads * dim) as usize, 0.1), &device).unwrap();
+        let v = upload_f32(&mk_rand(&mut seed, (rows * kv_heads * dim) as usize, 0.1), &device).unwrap();
+        let slot = || FullAttnKvSlot {
+            k: Some(alloc_kv_cache(kv_heads as usize, capacity as usize, dim as usize, &device)),
+            v: Some(alloc_kv_cache(kv_heads as usize, capacity as usize, dim as usize, &device)),
+            current_len: vec![0],
+            tq: None,
+        };
+        let mut reference_slot = slot();
+        let expected = apply_sdpa_with_kv_cache(
+            &device, &mut registry, &q, &k, &v, &mut reference_slot,
+            rows, heads, kv_heads, dim, capacity, None, SlotId(0),
+        ).unwrap();
+        let mut owner = FaPrefillArena::new(&device, capacity, heads, kv_heads, dim).unwrap();
+        owner.shared_output = Some(device.alloc_buffer(
+            (capacity * heads * dim) as usize * 4, DType::F32,
+            vec![capacity as usize, heads as usize, dim as usize],
+        ).unwrap());
+        let mut arena = owner.shared_rows(rows).unwrap();
+        let result_root = arena.shared_output.as_ref().unwrap().contents_ptr();
+        let mut actual_slot = slot();
+        let issued_before = decode_pool::issued_total();
+        let actual = apply_sdpa_with_kv_cache(
+            &device, &mut registry, &q, &k, &v, &mut actual_slot,
+            rows, heads, kv_heads, dim, capacity, Some(&mut arena), SlotId(0),
+        ).unwrap();
+        assert_eq!(decode_pool::issued_total(), issued_before,
+            "a shared-result attention path must not request an unused pooled output");
+        assert_eq!(actual.contents_ptr(), result_root, "return the live arena result");
+        settle_submitted().unwrap();
+        assert_eq!(actual_slot.current_len, reference_slot.current_len);
+        assert!(download_f32(&actual).unwrap().iter().map(|x| x.to_bits())
+            .eq(download_f32(&expected).unwrap().iter().map(|x| x.to_bits())));
+    }
+
     /// Exercise both shared-output consumers: the ordinary bridge wrapper and
     /// the fused projection/bridge/gate layer. Compare against the same kernels
     /// with separate roots, queue unequal segments without caller-side waits,
@@ -11125,6 +11289,7 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::{FaPrefillArena, FaProjectionsArena};
         use super::super::encoder_stage::{settle_submitted, SubmittedCommands};
+        use mlx_native::ops::copy::{dispatch_strided_copy_f32, StridedCopyParams};
 
         let Ok(device) = MlxDevice::new() else {
             eprintln!("skipping shared FA parity: no Metal device");
@@ -11132,25 +11297,75 @@ mod tests {
         };
         let mut registry = KernelRegistry::new();
         mlx_native::ops::flash_attn_prefill::register(&mut registry);
-        let (h, nh, nkv, d) = (64u32, 4u32, 2u32, 256u32);
+        let (h, nh, nkv, d) = (256u32, 4u32, 2u32, 256u32);
         let cases = [33u32, 97, 3, 64];
         let capacity = *cases.iter().max().expect("segments");
         let mut seed = 0xA11A5u32;
-        let weights = layer_weights_f32(h as usize, nh as usize, nkv as usize, d as usize, &mut seed, &device);
+        let base_weights = layer_weights_f32(h as usize, nh as usize, nkv as usize, d as usize, &mut seed, &device);
         let inputs: Vec<_> = cases.iter().map(|&rows| {
             upload_f32(&mk_rand(&mut seed, rows as usize * h as usize, 0.5), &device)
                 .expect("segment input")
         }).collect();
-        let positions: Vec<_> = cases.iter().map(|&rows| {
-            upload_positions(rows as usize, 0, &device)
-        }).collect();
+        let positions: Vec<_> = (0..3).map(|pass| cases.iter().map(|&rows| {
+            upload_positions(rows as usize, pass * rows, &device)
+        }).collect::<Vec<_>>()).collect();
         let make_slot = || FullAttnKvSlot {
-            k: Some(alloc_kv_cache(nkv as usize, capacity as usize, d as usize, &device)),
-            v: Some(alloc_kv_cache(nkv as usize, capacity as usize, d as usize, &device)),
+            k: Some(alloc_kv_cache(nkv as usize, capacity as usize * 3, d as usize, &device)),
+            v: Some(alloc_kv_cache(nkv as usize, capacity as usize * 3, d as usize, &device)),
             current_len: vec![0],
             tq: None,
         };
 
+        use super::super::prepared_projection::{ensure_planes, PlanesSource};
+        for quant in [GgmlType::Q4_K, GgmlType::Q6_K] {
+            let quantize = |source: &MlxBuffer, columns: usize| {
+                let values = source.as_slice::<f32>().expect("source F32 weight");
+                let bytes = match quant {
+                    GgmlType::Q4_K => crate::quantize::ggml_quants::q4_k::quantize(values, columns, None),
+                    GgmlType::Q6_K => crate::quantize::ggml_quants::q6_k::quantize(values, columns, None),
+                    _ => unreachable!(),
+                };
+                let mut output = device.alloc_buffer(bytes.len(), DType::U8, vec![bytes.len()])
+                    .expect("raw prepared test weight");
+                output.as_mut_slice::<u8>().unwrap().copy_from_slice(&bytes);
+                output
+            };
+            let FullAttnQGateWeightsGpu::Fused { weight, .. } = &base_weights.q_gate else {
+                panic!("fixture requires fused Q/gate");
+            };
+            let weights = FullAttnWeightsGpu {
+                attn_norm: base_weights.attn_norm.clone(),
+                post_attn_norm: base_weights.post_attn_norm.clone(),
+                q_gate: FullAttnQGateWeightsGpu::Fused {
+                    weight: quantize(weight, h as usize), ggml_type: quant,
+                },
+                wk: quantize(&base_weights.wk, h as usize),
+                wk_ggml_type: quant,
+                wv: quantize(&base_weights.wv, h as usize),
+                wv_ggml_type: quant,
+                attn_q_norm: base_weights.attn_q_norm.clone(),
+                attn_k_norm: base_weights.attn_k_norm.clone(),
+                wo: quantize(&base_weights.wo, (nh * d) as usize),
+                wo_ggml_type: quant,
+                prepared_m32: Default::default(),
+            };
+            let FullAttnQGateWeightsGpu::Fused { weight, .. } = &weights.q_gate else { unreachable!() };
+            let plane_sources = [
+                (&weights.prepared_m32.q_gate, weight, h, 2 * nh * d),
+                (&weights.prepared_m32.k, &weights.wk, h, nkv * d),
+                (&weights.prepared_m32.v, &weights.wv, h, nkv * d),
+                (&weights.prepared_m32.out, &weights.wo, nh * d, h),
+            ];
+            ensure_planes(&mut registry, &device, &plane_sources.iter().map(|&(planes, weight, k, n)| {
+                PlanesSource { planes, weight, params: GgmlQuantizedMatmulParams { m: 1, n, k, ggml_type: quant } }
+            }).collect::<Vec<_>>()).expect("prepare every plane before queuing segments");
+            let _prepared = super::super::prefill_prepared::PrefillScope::forced(true);
+            for &rows in &cases {
+                for &(_, weight, k, n) in &plane_sources {
+                    assert!(super::super::prefill_prepared::admits(rows, weight, quant, k, n),
+                        "oracle must exercise prepared {quant:?} at {rows} rows");
+                }
+            }
         for fused in [false, true] {
             let submitted = SubmittedCommands::open(true);
             let _single_command = super::super::prefill_prepared::SingleCommandLayers::set(fused);
@@ -11200,6 +11415,12 @@ mod tests {
                 projections.gated_buf = device.alloc_buffer(
                     q_elements * 4, DType::F32, vec![q_elements],
                 ).expect("independent gated output");
+                projections.q_normed_buf = device.alloc_buffer(
+                    q_elements * 4, DType::F32, vec![rows as usize * nh as usize, d as usize],
+                ).expect("independent old Q normalization root");
+                projections.q_rope_buf = device.alloc_buffer(
+                    q_elements * 4, DType::F32, vec![rows as usize, nh as usize, d as usize],
+                ).expect("independent old Q RoPE root");
                 (prefill, projections)
             }).collect();
             let mut shared_slots: Vec<_> = cases.iter().map(|_| make_slot()).collect();
@@ -11209,20 +11430,28 @@ mod tests {
             for pass in 0..3 {
                 for (index, &rows) in cases.iter().enumerate() {
                     let mut pair = Vec::new();
-                    for (arenas, slots) in [
-                        (&mut separate, &mut separate_slots),
-                        (&mut shared, &mut shared_slots),
+                    let mut snapshot_pair = Vec::new();
+                    for (reference, arenas, slots) in [
+                        (true, &mut separate, &mut separate_slots),
+                        (false, &mut shared, &mut shared_slots),
                     ] {
-                        slots[index].current_len[0] = 0;
+                        assert_eq!(slots[index].current_len[0], pass * rows);
+                        let _staging = super::super::prepared_switch_override::Override::set(
+                            super::super::prepared_switch_override::PreparedSwitches {
+                                independent_fa_staging: reference,
+                                ..super::super::prepared_switch_override::current()
+                                    .unwrap_or_default()
+                            },
+                        );
                         let (arena, projections) = &mut arenas[index];
                         pair.push(build_gated_attn_layer(
                             &device,
                             &mut registry,
                             &inputs[index],
-                            &positions[index],
+                            &positions[pass as usize][index],
                             &weights,
                             Some(&mut slots[index]),
-                            capacity,
+                            capacity * 3,
                             rows,
                             h,
                             nh,
@@ -11232,14 +11461,50 @@ mod tests {
                             1e7,
                             [11, 11, 10, 0],
                             1e-6,
+                            // Keep the same attention route: no-arena short
+                            // attention has different BF16 rounding. Only the
+                            // reference's prepared input copies are independent.
                             Some(arena),
-                            if fused { Some(projections) } else { None },
+                            Some(&mut *projections),
                             Some(&mut holds),
                             session.as_mut(),
                             SlotId(0),
                         ).expect("queued full attention layer"));
+                        let mut snapshot_encoder = LayerEncoder::from_session_or_plain(
+                            &device, session.as_mut(),
+                        ).expect("queued diagnostic encoder");
+                        snapshot_encoder.encoder().memory_barrier();
+                        let mut snapshots = Vec::new();
+                        for source in [
+                            &projections.x_norm_buf,
+                            &projections.k_proj_buf,
+                            &projections.v_proj_buf,
+                            &projections.gate_proj_buf,
+                            &projections.q_normed_buf,
+                            &projections.k_normed_buf,
+                            &projections.q_rope_buf,
+                            &projections.k_rope_buf,
+                            &projections.gated_buf,
+                        ] {
+                            let elements = source.element_count();
+                            let snapshot = device.alloc_buffer(
+                                elements * 4, DType::F32, vec![elements],
+                            ).expect("independent intermediate snapshot");
+                            dispatch_strided_copy_f32(
+                                snapshot_encoder.encoder(), &mut registry, device.metal_device(),
+                                source, &snapshot,
+                                &StridedCopyParams {
+                                    rows: 1, cols: elements as u32,
+                                    stride_row: elements as u32, stride_col: 1,
+                                },
+                            ).expect("snapshot actual projection and attention consumers");
+                            snapshots.push(snapshot);
+                        }
+                        snapshot_encoder.carry_into_next_stage("test.shared_fa.snapshots")
+                            .expect("queue snapshots without draining the carried encoder");
+                        snapshot_pair.push(snapshots);
                     }
-                    outputs.push((pass, index, pair));
+                    outputs.push((pass, index, pair, snapshot_pair));
                 }
             }
             if let Some(session) = session.as_mut() {
@@ -11250,7 +11515,7 @@ mod tests {
             settle_submitted().expect("check every queued layer command");
             device.command_encoder().expect("terminal encoder")
                 .commit_and_wait().expect("terminal drain");
-            for (pass, index, pair) in outputs {
+            for (pass, index, pair, snapshot_pair) in outputs {
                 let expected = download_f32(&pair[0]).expect("separate result");
                 let actual = download_f32(&pair[1]).expect("shared result");
                 assert!(expected.iter().any(|&x| x != 0.0), "nonzero oracle");
@@ -11258,11 +11523,23 @@ mod tests {
                 for (element, (got, want)) in actual.iter().zip(&expected).enumerate() {
                     assert_eq!(
                         got.to_bits(), want.to_bits(),
-                        "fused={fused} pass={pass} segment={index} element={element}",
+                        "quant={quant:?} fused={fused} pass={pass} segment={index} element={element}",
+                    );
+                }
+                for (consumer, (reference, candidate)) in snapshot_pair[0].iter()
+                    .zip(&snapshot_pair[1]).enumerate()
+                {
+                    let expected = download_f32(reference).expect("reference intermediate");
+                    let actual = download_f32(candidate).expect("candidate intermediate");
+                    assert_eq!(
+                        actual.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                        expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                        "quant={quant:?} fused={fused} pass={pass} segment={index} consumer={consumer}",
                     );
                 }
             }
             drop(submitted);
+        }
         }
     }
 

@@ -60,18 +60,22 @@ pub struct DFlash2RuntimeMetadataMemory {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Production Qwen DFlash2 capture sessions request `with_argmaxes = false`
-/// and write directly into one final layer-major slab (no download/clone Vec).
+/// and write directly into one shared layer-major slab (no download/clone Vec).
 pub struct DFlash2CaptureIngestMemory {
     pub max_capture_rows: usize,
     pub max_ingest_rows: usize,
     pub padded_ingest_rows: usize,
     pub source_hidden_bytes: usize,
     pub source_layer_ids_bytes: usize,
+    /// The shared source buffer owns a rank-three shape Vec.
+    pub source_shape_bytes: usize,
     /// Absent in all three production DFlash2 capture constructors.
     pub source_argmax_bytes: usize,
     pub source_session_inline_bytes: usize,
     pub source_payload_bound_bytes: usize,
-    pub transpose_device_bytes: usize,
+    /// Only the immutable zero-padding scalar is newly allocated. The bounded
+    /// transpose tile is workspace.captured_target_hidden, charged as retained.
+    pub padding_scalar_device_bytes: usize,
     pub position_device_bytes: usize,
     /// Each of the write-position and commit-count buffers has this payload.
     pub group_word_device_bytes: usize,
@@ -80,7 +84,7 @@ pub struct DFlash2CaptureIngestMemory {
     /// Joint ingest holds up to two segment ranges and a two-range forward map.
     /// This is the maximum production range-Vec backing, not target output data.
     pub ingest_range_host_bound_bytes: usize,
-    /// Whole overlapping transpose + GPU word buffers + current host word Vec.
+    /// Overlapping zero scalar + GPU word buffers + current host word Vec.
     /// NOT `ingest_device_bytes + word_upload_host_temporary_peak_bytes`.
     pub ingest_temporary_peak_bytes: usize,
 }
@@ -108,17 +112,18 @@ impl DFlash2CaptureIngestMemory {
         let source_layer_ids_bytes = allocation(mul(
             config.target_layer_ids.len(), std::mem::size_of::<usize>(),
         )?)?;
+        let source_shape_bytes = allocation(mul(3, std::mem::size_of::<usize>())?)?;
         let source_argmax_bytes = 0;
         let source_session_inline_bytes = std::mem::size_of::<DFlashCaptureSession>();
         let source_payload_bound_bytes = add(
-            add(source_hidden_bytes, source_layer_ids_bytes)?,
+            add(add(source_hidden_bytes, source_layer_ids_bytes)?, source_shape_bytes)?,
             source_session_inline_bytes,
         )?;
-        let transpose_device_bytes = allocation(mul(mul(padded_ingest_rows, feature_width)?, 4)?)?;
+        let padding_scalar_device_bytes = if max_ingest_rows == 0 { 0 } else { 4 };
         let position_device_bytes = allocation(mul(padded_ingest_rows, 4)?)?;
         let group_word_device_bytes = allocation(mul(mul(passes, lanes)?, 4)?)?;
         let ingest_device_bytes = add(
-            transpose_device_bytes,
+            padding_scalar_device_bytes,
             add(position_device_bytes, mul(2, group_word_device_bytes)?)?,
         )?;
         let ingest_range_host_bound_bytes = if max_ingest_rows == 0 {
@@ -126,9 +131,11 @@ impl DFlash2CaptureIngestMemory {
         } else {
             mul(4, std::mem::size_of::<std::ops::Range<usize>>())?
         };
+        // The zero scalar is allocated only after all word uploads complete.
         let ingest_temporary_peak_bytes = add(
-            add(transpose_device_bytes, ingest_range_host_bound_bytes)?,
-            ingest_word_upload_peak(position_device_bytes, group_word_device_bytes)?,
+            ingest_range_host_bound_bytes,
+            ingest_word_upload_peak(position_device_bytes, group_word_device_bytes)?
+                .max(ingest_device_bytes),
         )?;
         Ok(Self {
             max_capture_rows,
@@ -136,10 +143,11 @@ impl DFlash2CaptureIngestMemory {
             padded_ingest_rows,
             source_hidden_bytes,
             source_layer_ids_bytes,
+            source_shape_bytes,
             source_argmax_bytes,
             source_session_inline_bytes,
             source_payload_bound_bytes,
-            transpose_device_bytes,
+            padding_scalar_device_bytes,
             position_device_bytes,
             group_word_device_bytes,
             ingest_device_bytes,
@@ -326,13 +334,11 @@ mod tests {
         assert_eq!(ingest.padded_ingest_rows, 2_048);
         assert_eq!(ingest.source_hidden_bytes, 212_992_000);
         assert_eq!(ingest.source_layer_ids_bytes, 5 * std::mem::size_of::<usize>());
-        assert_eq!(ingest.transpose_device_bytes, 209_715_200);
         assert_eq!(ingest.position_device_bytes, 8_192);
         assert_eq!(ingest.group_word_device_bytes, 1_024);
-        assert_eq!(ingest.ingest_device_bytes, 209_725_440);
         assert_eq!(
             ingest.ingest_temporary_peak_bytes,
-            209_731_584 + 4 * std::mem::size_of::<std::ops::Range<usize>>(),
+            16_384 + 4 * std::mem::size_of::<std::ops::Range<usize>>(),
         );
         assert_eq!(memory.metadata.prefetch_snapshot_bytes, 192);
         assert_eq!(memory.workspace.detached_context_positions_bytes, 144);
