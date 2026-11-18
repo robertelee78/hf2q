@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -31,6 +32,7 @@ STATE = ".cache-release"
 GLOBAL_LOCK = Path("/var/tmp/hf2q-cache-release-driver.lock")
 WALL_SECONDS = 540
 TERM_SECONDS = 520
+KILL_SECONDS = 525
 PHASES = (
     "deepseek-cooperative", "deepseek-decode", "deepseek-wave1", "deepseek-wave2",
     "deepseek-process-a", "gemma-process-a", "gemma-process-b", "gemma-parity-n4",
@@ -444,7 +446,7 @@ def kernel_process(pid: int) -> dict | None:
     if sys.platform.startswith("linux"):
         try:
             fields = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
-        except (FileNotFoundError, ProcessLookupError, PermissionError):
+        except (FileNotFoundError, ProcessLookupError):
             return None
         return {"ppid": int(fields[1]), "pgid": int(fields[2]), "birth": "linux-ticks:" + fields[19]}
     if sys.platform == "darwin":
@@ -463,8 +465,12 @@ def kernel_process(pid: int) -> dict | None:
             _BSD_PROCESS_INFO = ctypes, BSDInfo, proc_info
         ctypes, info_type, proc_info = _BSD_PROCESS_INFO
         info = info_type()
+        ctypes.set_errno(0)
         if proc_info(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
-            return None
+            error = ctypes.get_errno()
+            if error in (errno.ESRCH, errno.ENOENT):
+                return None
+            raise OSError(error or errno.EIO, f"cannot inspect kernel birth for process {pid}")
         return {"ppid": int(info.ids[4]), "pgid": int(info.group[1]),
                 "birth": f"darwin-timeval:{info.start_sec}:{info.start_usec}"}
     raise Refusal("owned process supervision requires macOS or Linux kernel identity")
@@ -478,45 +484,40 @@ def process_table() -> dict:
         if len(parts) != 9:
             continue
         pid = int(parts[0])
-        identity = kernel_process(pid)
+        try:
+            identity = kernel_process(pid)
+        except PermissionError:
+            # Foreign system processes may deny BSD identity inspection. Keep
+            # their discovery/command data; an unknown owned birth fails closed.
+            identity = {"ppid": int(parts[1]), "pgid": int(parts[2]), "birth": None}
         if identity is not None:
             result[pid] = {"pid": pid, **identity, "command": parts[8]}
     return result
 
 
-def cleanup_table() -> dict:
-    # An unavailable inspection tool cannot justify dropping the hostq lease.
-    while True:
-        try:
-            return process_table()
-        except (Refusal, OSError, ValueError, subprocess.SubprocessError):
-            time.sleep(0.05)
-
-
 def signal_owned(identity: dict, sig: int) -> bool:
-    while True:
-        try:
-            current = kernel_process(identity["pid"])
-            if current is None or current["birth"] != identity["birth"]:
-                return False
-            os.kill(identity["pid"], sig)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            # Fail closed, retaining the lease until owned cleanup is possible.
-            time.sleep(0.05)
+    current = kernel_process(identity["pid"])
+    if current is None or current["birth"] != identity["birth"]:
+        return False
+    try:
+        os.kill(identity["pid"], sig)
+        return True
+    except ProcessLookupError:
+        return False
 
 
 def process_identity(pid: int, table: dict | None = None) -> dict:
     row = (table if table is not None else process_table()).get(pid)
-    require(row is not None, f"process disappeared: {pid}")
+    require(row is not None and row["birth"] is not None, f"process identity unavailable: {pid}")
     return {"pid": pid, "birth": row["birth"]}
 
 
 def same_process(identity: dict, table: dict) -> bool:
     row = table.get(identity["pid"])
-    return row is not None and row["birth"] == identity["birth"]
+    if row is None:
+        return False
+    require(row["birth"] is not None, f"cannot prove owned process identity: {identity['pid']}")
+    return row["birth"] == identity["birth"]
 
 
 def listeners(pids: set[int]) -> list:
@@ -680,6 +681,7 @@ def track_owned(table: dict, child_pid: int, owned: dict, adopt_orphans: bool = 
             if session_owned or row["pgid"] == child_pid or row["ppid"] == child_pid or (
                     row["ppid"] in owned and same_process(owned[row["ppid"]], table)) or (
                     adopt_orphans and row["ppid"] == os.getpid()):
+                require(row["birth"] is not None, f"cannot identify owned descendant: {pid}")
                 owned[pid] = {"pid": pid, "birth": row["birth"]}
                 changed = True
     return {pid for pid, identity in owned.items() if same_process(identity, table)}
@@ -693,13 +695,11 @@ def reap_owned(owned: dict, direct_pid: int) -> None:
 
 
 
-def supervise(root: Path, work: str, script: Path, start: dict) -> int:
-    """Run only canonical work; never signal hostq or a foreign process."""
+def supervise(root: Path, work: str, script: Path, start: dict, began: int, mono: float) -> int:
+    """Run canonical work inside the independently watched lease worker."""
     ticket = attempt_path(root, work, "ticket")
-    began = time.time_ns()
-    mono = time.monotonic()
-    deadline = WALL_SECONDS if work in PHASES else 3600
-    term_at = TERM_SECONDS if work in PHASES else 3580
+    deadline = WALL_SECONDS
+    term_at = TERM_SECONDS
     exclusive(ticket, {"schema_version": SCHEMA, "work": work, "start_sha256": sha256(attempt_path(root, work, "start")),
                        "ticket_process": process_identity(os.getpid()), "began_ns": began,
                        "deadline_ns": began + deadline * 10**9, "term_after_seconds": term_at,
@@ -713,6 +713,7 @@ def supervise(root: Path, work: str, script: Path, start: dict) -> int:
     reason = ""
     sent_term = False
     sent_kill = False
+    term_identities = set()
     interrupted = False
     conflict_rows = []
     clean = False
@@ -730,6 +731,31 @@ def supervise(root: Path, work: str, script: Path, start: dict) -> int:
     def interrupt(_signum, _frame):
         nonlocal interrupted
         interrupted = True
+
+    def stop_owned(alive: set[int], kill: bool) -> None:
+        nonlocal sent_term, sent_kill
+        for pid in alive:
+            identity = owned[pid]
+            key = (pid, identity["birth"])
+            if key not in term_identities:
+                sent_term = signal_owned(identity, signal.SIGTERM) or sent_term
+                term_identities.add(key)
+            elif kill:
+                sent_kill = signal_owned(identity, signal.SIGKILL) or sent_kill
+
+    def finish_owned() -> None:
+        cleanup_at = time.monotonic()
+        while True:
+            child.poll()
+            table = process_table()
+            alive = track_owned(table, child.pid, owned, adopted)
+            if adopted:
+                reap_owned(owned, child.pid)
+            if child.returncode is not None and not alive:
+                return
+            stop_owned(alive, time.monotonic() - cleanup_at >= 5
+                       or time.monotonic() - mono >= KILL_SECONDS)
+            time.sleep(0.05)
 
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         old_handlers[sig] = signal.signal(sig, interrupt)
@@ -781,13 +807,9 @@ def supervise(root: Path, work: str, script: Path, start: dict) -> int:
                         reason = "TERM deadline reached"
                     elif conflict_rows:
                         reason = "compiler/runtime conflict appeared during model work"
-                    # Signal only individually tracked identities; no broad pgrep/killall.
-                    for pid in alive:
-                        if pid != os.getpid():
-                            sent_term = signal_owned(owned[pid], signal.SIGTERM) or sent_term
-                if cleanup_started is not None and (time.monotonic() - cleanup_started >= 5 or elapsed >= deadline - 5):
-                    for pid in alive:
-                        sent_kill = signal_owned(owned[pid], signal.SIGKILL) or sent_kill
+                if cleanup_started is not None:
+                    # Late-born descendants also receive TERM before KILL.
+                    stop_owned(alive, time.monotonic() - cleanup_started >= 5 or elapsed >= KILL_SECONDS)
                 if exit_code is not None and not alive:
                     rc = exit_code
                     break
@@ -796,24 +818,8 @@ def supervise(root: Path, work: str, script: Path, start: dict) -> int:
                     rc = child.poll() if child.poll() is not None else 124
                     break
                 time.sleep(0.2)
-            # KILL/reap only our direct child; descendants are also checked below.
-            if child.poll() is None:
-                child.kill()
-            child.wait()
-            # Do not release the hostq lease while an owned descendant remains,
-            # even on a failed/deadline attempt. Only tracked identities are killed.
-            while True:
-                table = cleanup_table()
-                live_owned = track_owned(table, child.pid, owned, adopted)
-                if adopted:
-                    reap_owned(owned, child.pid)
-                    table = cleanup_table()
-                    live_owned = {pid for pid in live_owned if same_process(owned[pid], table)}
-                if not live_owned:
-                    break
-                for pid in live_owned:
-                    sent_kill = signal_owned(owned[pid], signal.SIGKILL) or sent_kill
-                time.sleep(0.05)
+            # The guardian also watches this cleanup, including inspection failure.
+            finish_owned()
             child_ended_ns = time.time_ns()
             if telemetry is not None:
                 telemetry_sample(root, work, telemetry)
@@ -831,25 +837,9 @@ def supervise(root: Path, work: str, script: Path, start: dict) -> int:
     except (Refusal, OSError, subprocess.SubprocessError, KeyError, ValueError) as error:
         reason = str(error)
         if child is not None:
-            table = cleanup_table()
-            track_owned(table, child.pid, owned, adopted)
-            for identity in owned.values():
-                signal_owned(identity, signal.SIGKILL)
-            child.wait()
-            while True:
-                table = cleanup_table()
-                alive = track_owned(table, child.pid, owned, adopted)
-                if adopted:
-                    reap_owned(owned, child.pid)
-                    table = cleanup_table()
-                    alive = {pid for pid in alive if same_process(owned[pid], table)}
-                if not alive:
-                    break
-                for pid in alive:
-                    signal_owned(owned[pid], signal.SIGKILL)
-                time.sleep(0.05)
+            finish_owned()
             child_ended_ns = time.time_ns()
-        table = cleanup_table()
+        table = process_table()
         remaining = [ident for ident in owned.values() if same_process(ident, table)]
         remaining_listeners = listeners({ident["pid"] for ident in remaining})
         clean = not remaining and not remaining_listeners
@@ -887,6 +877,150 @@ def supervise(root: Path, work: str, script: Path, start: dict) -> int:
     return 0 if status == "pass" else 1
 
 
+def ticket_work(work: str, script_value: str | None, began: int, mono: float) -> int:
+    """All potentially blocking admission and sealing runs in this owned worker."""
+    root_text = os.environ["OUT_ROOT"]
+    require(Path(root_text).is_absolute(), "OUT_ROOT must be a stable absolute non-linked path")
+    root = Path(os.path.abspath(root_text))
+    require(not root.is_symlink(), "OUT_ROOT must be a stable absolute non-linked path")
+    os.environ["OUT_ROOT"] = str(root)
+    script = canonical_script(script_value)
+    start = authorize(root, work, launching_ticket=True)
+    return supervise(root, work, script, start, began, mono)
+
+
+def lease_entry(work: str, script_value: str | None) -> int:
+    """Watch the entire lease, including authorization, preflight and evidence I/O.
+
+    The guardian never hashes inputs or runs admission/telemetry/crypto itself.
+    The worker cannot reset its clock. Only proof of owned-process absence lets
+    this process return to hostq; unavailable proof strands the lease explicitly.
+    """
+    mono, began = time.monotonic(), time.time_ns()
+    interrupted = False
+
+    def interrupt(_signum, _frame):
+        nonlocal interrupted
+        interrupted = True
+
+    handlers = {sig: signal.signal(sig, interrupt) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    adopted = False
+    if sys.platform.startswith("linux"):
+        import ctypes
+        adopted = ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
+    reader, writer = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        # The guardian alone retains inherited hostq/global-lock descriptors.
+        # Block until it has recorded our kernel birth, before any work can fork.
+        import resource
+        os.close(writer)
+        os.setsid()
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+        maximum = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        if maximum == resource.RLIM_INFINITY:
+            maximum = os.sysconf("SC_OPEN_MAX")
+        os.closerange(3, reader)
+        os.closerange(reader + 1, maximum)
+        ready = os.read(reader, 1)
+        os.close(reader)
+        rc = 1
+        try:
+            if ready == b"x":
+                rc = ticket_work(work, script_value, began, mono)
+        except BaseException as error:
+            print(f"cache release refused: {error}", file=sys.stderr, flush=True)
+        os._exit(rc)
+    os.close(reader)
+    owned = {}
+    exit_code = None
+    stopping = None
+    failed = False
+    term_identities = set()
+    stranded = False
+    inspection_error = ""
+    try:
+        # The pipe prevents a short-lived preflight process escaping observation.
+        while not owned:
+            try:
+                identity = kernel_process(pid)
+                require(identity is not None, "cannot identify lease worker kernel birth")
+                owned[pid] = {"pid": pid, "birth": identity["birth"]}
+            except (Refusal, OSError, ValueError) as error:
+                inspection_error = str(error)
+                if time.monotonic() - mono >= TERM_SECONDS or interrupted:
+                    os.close(writer)
+                    writer = -1
+                    failed = True
+                    break
+                time.sleep(0.05)
+        if writer != -1:
+            try:
+                os.write(writer, b"x")
+            except OSError as error:
+                # A worker setup failure still needs owned reaping/proof.
+                failed, inspection_error = True, str(error)
+            finally:
+                os.close(writer)
+                writer = -1
+        while True:
+            elapsed = time.monotonic() - mono
+            alive = set()
+            inspected = False
+            try:
+                if exit_code is None:
+                    waited, status = os.waitpid(pid, os.WNOHANG)
+                    if waited:
+                        exit_code = os.waitstatus_to_exitcode(status)
+                reap_owned(owned, pid)
+                table = process_table()
+                alive = track_owned(table, pid, owned, adopted)
+                # Successful process inspection plus no owned identities proves
+                # no owned listener; while alive, listener inspection must work.
+                listeners(alive)
+                inspected = True
+                inspection_error = ""
+            except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
+                inspection_error = str(error)
+                failed = True
+            elapsed = time.monotonic() - mono
+            if inspected and exit_code is not None and not alive:
+                return 0 if exit_code == 0 and not failed and not interrupted and elapsed < TERM_SECONDS else 1
+            if stopping is None and (interrupted or elapsed >= TERM_SECONDS or failed or exit_code is not None):
+                stopping = time.monotonic()
+                failed = True
+                print(f"cache release {work}: stopping owned lease work "
+                      f"({inspection_error or 'interrupted, exited or TERM deadline'})",
+                      file=sys.stderr, flush=True)
+            if stopping is not None:
+                sig = signal.SIGKILL if elapsed >= KILL_SECONDS or time.monotonic() - stopping >= 5 else signal.SIGTERM
+                # Refresh ownership every iteration, including descendants born
+                # during TERM handling; never signal process groups or hostq.
+                for identity in list(owned.values()):
+                    try:
+                        key = (identity["pid"], identity["birth"])
+                        if key not in term_identities:
+                            signal_owned(identity, signal.SIGTERM)
+                            term_identities.add(key)
+                        elif sig == signal.SIGKILL:
+                            signal_owned(identity, sig)
+                    except (Refusal, OSError, ValueError) as error:
+                        inspection_error = str(error)
+            if elapsed >= WALL_SECONDS and not stranded:
+                stranded = True
+                print(f"cache release {work}: STRANDED / FAIL-CLOSED: owned cleanup absence "
+                      f"unproven ({inspection_error or 'owned processes remain'}); "
+                      "retaining hostq lease and driver lock; operator intervention required",
+                      file=sys.stderr, flush=True)
+            time.sleep(0.05)
+    finally:
+        if writer != -1:
+            os.close(writer)
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+
+
 def verify_record(root: Path, work: str, plan_sha: str | None, latest: dict) -> dict:
     start_path = attempt_path(root, work, "start")
     ticket_path = attempt_path(root, work, "ticket")
@@ -921,10 +1055,11 @@ def verify_record(root: Path, work: str, plan_sha: str | None, latest: dict) -> 
     require(ticket["deadline_ns"] - ticket["began_ns"] == ticket["wall_limit_seconds"] * 10**9
             and abs((end["ended_ns"] - end["began_ns"]) / 10**9 - end["elapsed_seconds"]) < 1,
             f"{work}: inconsistent elapsed/deadline evidence")
-    if work in PHASES:
-        require(ticket["hostq_class"] == "measure" and ticket["wall_limit_seconds"] == WALL_SECONDS
-                and ticket["term_after_seconds"] == TERM_SECONDS
-                and end["elapsed_seconds"] < WALL_SECONDS and not cleanup["kill_sent"], f"{work}: deadline or forced cleanup")
+    require(ticket["hostq_class"] == ("build" if work in BUILDS else "measure")
+            and ticket["wall_limit_seconds"] == WALL_SECONDS
+            and ticket["term_after_seconds"] == TERM_SECONDS
+            and end["elapsed_seconds"] < WALL_SECONDS and not cleanup["kill_sent"],
+            f"{work}: deadline or forced cleanup")
     coverage_check(work, end["artifacts"])
     verify_telemetry(root, work, end)
     for name, desc in end["artifacts"].items():
@@ -1276,9 +1411,8 @@ def dispatch(root: Path, work: str, script: Path) -> None:
                            "argv": ["bash", str(script), "_work", work]})
     env = dict(os.environ, CACHE_RELEASE_INTERNAL=token, CACHE_RELEASE_INTERNAL_RECEIPT=str(start_path))
     command = [sys.executable, str(Path(__file__).absolute()), "--script", str(script), "_ticket", work]
-    if work != "finalize":
-        command = [os.environ["CACHE_RELEASE_HOSTQ"], f"cache-release-{work}",
-                   "build" if work in BUILDS else "measure", "--", *command]
+    command = [os.environ["CACHE_RELEASE_HOSTQ"], f"cache-release-{work}",
+               "build" if work in BUILDS else "measure", "--", *command]
     log_path = root / STATE / "logs" / f"{work}.hostq.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     interrupted = False
@@ -1343,6 +1477,9 @@ def main(argv: list[str] | None = None) -> int:
     ticket = sub.add_parser("_ticket", help=argparse.SUPPRESS)
     ticket.add_argument("work", choices=(*BUILDS, "finalize", *PHASES))
     args = parser.parse_args(argv)
+    if args.mode == "_ticket":
+        # Nothing that reads paths, receipts, inputs or authority precedes this clock.
+        return lease_entry(args.work, args.script)
     try:
         if args.mode == "authorize":
             authorize(args.root.absolute(), args.work)
@@ -1362,9 +1499,6 @@ def main(argv: list[str] | None = None) -> int:
         require(not root.is_symlink(), "OUT_ROOT must be a stable absolute non-linked path")
         os.environ["OUT_ROOT"] = str(root)
         script = canonical_script(args.script)
-        if args.mode == "_ticket":
-            start = authorize(root, args.work, launching_ticket=True)
-            return supervise(root, args.work, script, start)
         configured_hostq = os.environ["CACHE_RELEASE_HOSTQ"]
         hostq = Path(shutil.which(configured_hostq) or configured_hostq).resolve(strict=True)
         require(hostq.is_file() and os.access(hostq, os.X_OK), "CACHE_RELEASE_HOSTQ must name an executable")
