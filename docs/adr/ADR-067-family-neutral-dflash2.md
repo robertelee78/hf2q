@@ -1867,6 +1867,23 @@ regression proof SHA256:
 Final clean packed-source conformance, canonical workload, quality, physical
 memory, matched performance and release gates remain mandatory.
 
+###### GPU-test serialization: retire the source-count pin (2026-11-18)
+
+Hosted test job `134931012051` at `0485d4de` rejected the FFN module's
+18 test attributes versus 17 lock-call source occurrences. The actual two
+shared-schedule tests both enter the same private helper, whose first
+statement acquires `hf2q_gpu_test_lock` before device creation. Language-server
+references confirm those are its only callers; neither acquires a second
+guard. Source counts cannot represent this valid per-invocation acquisition.
+
+Remove the implementation-text test and its explicit CI command, rather than
+adding a redundant lock, duplicating the GPU test body or changing a count.
+This supersedes only the July ADR-005 A2 acquisition-location/source-pin
+rule: a private shared test-entry helper may acquire first when its callers
+do not. Exactly-once serialization before Metal work, guard lifetime through
+checked completion, the non-reentrant mutex, and both existing runtime
+bitwise comparisons remain unchanged. The historical diary is retained.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
