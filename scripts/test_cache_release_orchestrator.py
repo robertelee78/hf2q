@@ -570,11 +570,13 @@ def isolated_lease_fixture(root: Path, scenario: str, work: str) -> None:
         phase_time = mock.Mock(wraps=time)
         phase_time.monotonic.side_effect = phase_monotonic
         patches.append(mock.patch.object(gate, "time", phase_time))
-    if scenario == "canonical-argv":
+    if scenario in ("canonical-argv", "sealing"):
         original_popen = subprocess.Popen
 
         def launch(argv, *args, **kwargs):
             if argv[:2] == ["bash", str(gate.canonical_script(None))]:
+                # Sealing must reach its injected block without running the
+                # unrelated shell workload and its unauthenticated helpers.
                 put(root / "launch-contract", {"argv": argv, "cwd": str(kwargs["cwd"]),
                                                 "work": kwargs["env"]["CACHE_RELEASE_WORK"]})
                 return original_popen([sys.executable, "-c", "print('model-free canonical launch observation')"],
@@ -582,7 +584,8 @@ def isolated_lease_fixture(root: Path, scenario: str, work: str) -> None:
             return original_popen(argv, *args, **kwargs)
 
         patches.append(mock.patch.object(subprocess, "Popen", side_effect=launch))
-        gate.WALL_SECONDS, gate.TERM_SECONDS, gate.KILL_SECONDS = 4, 2, 2.5
+        if scenario == "canonical-argv":
+            gate.WALL_SECONDS, gate.TERM_SECONDS, gate.KILL_SECONDS = 4, 2, 2.5
     if scenario == "stranded":
         original_table = gate.process_table
 
