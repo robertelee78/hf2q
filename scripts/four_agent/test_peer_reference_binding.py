@@ -1,4 +1,4 @@
-"""Model-free consumer proofs for explicit frozen latest-peer identity and MTP exercise."""
+"""Model-free proofs of frozen latest-peer identity and trained-draft exercise."""
 import copy
 import hashlib
 import json
@@ -84,6 +84,14 @@ class FrozenReference(unittest.TestCase):
         (turn / 'response.bin').write_bytes(raw)
         (turn / 'receipt.json').write_text(json.dumps({'stream': stream, 'response_sha256': digest(raw)}))
         return turn
+
+    def speculation_packet(self, selected):
+        reference = copy.deepcopy(self.reference)
+        reference['selected_speculation'] = selected
+        argv = reference['serve_argv']
+        argv[argv.index('--spec-type') + 1] = selected
+        argv[argv.index('--spec-draft-n-max') + 1] = '7' if selected == 'draft-dflash2' else '3'
+        return self.issue(reference)
 
     def test_actual_readiness_consumer_accepts_frozen_latest_mtp_binding(self):
         result = self.consume(self.packet)
@@ -172,7 +180,7 @@ class FrozenReference(unittest.TestCase):
             self.consume(packet)
 
     def test_selected_speculation_must_match_the_frozen_launch(self):
-        for selected in ('none', 'draft-simple', 'draft-dflash', True):
+        for selected in ('none', 'draft-dflash2', 'draft-simple', 'draft-dflash', True):
             packet = copy.deepcopy(self.packet)
             packet['peer_reference']['selected_speculation'] = selected
             with self.subTest(selected=selected), self.assertRaises(Invalid):
@@ -196,40 +204,52 @@ class FrozenReference(unittest.TestCase):
         with self.assertRaises(Invalid):
             self.consume()
 
-    def test_actual_unary_and_sse_response_counters_prove_mtp_exercise(self):
-        self.response(stream=False)
-        self.response(stream=True)
-        proof = fp.validate_speculation_proof(self.root, self.packet)
-        self.assertEqual((proof['drafted_tokens'], proof['accepted_tokens']), (18, 12))
-        for mode in ('unary', 'sse'):
-            self.assertEqual(proof['transports'][mode],
-                             {'responses': 1, 'drafted_tokens': 9, 'accepted_tokens': 6})
-        self.assertFalse(proof['sampler_metadata_is_launch_selection'])
+    def test_actual_unary_and_sse_counters_prove_trained_draft_exercise(self):
+        for selected in ('draft-mtp', 'draft-dflash2'):
+            with self.subTest(selected=selected):
+                packet = self.speculation_packet(selected)
+                self.response(stream=False)
+                self.response(stream=True)
+                proof = fp.validate_speculation_proof(self.root, packet)
+                self.assertEqual((proof['drafted_tokens'], proof['accepted_tokens']), (18, 12))
+                for mode in ('unary', 'sse'):
+                    self.assertEqual(proof['transports'][mode],
+                                     {'responses': 1, 'drafted_tokens': 9, 'accepted_tokens': 6})
+                self.assertFalse(proof['sampler_metadata_is_launch_selection'])
 
-    def test_loaded_but_unexercised_assistant_is_not_a_valid_mtp_proof(self):
-        self.consume(self.packet)
-        for stream in (False, True):
-            self.response(stream=not stream)
-            for drafted, accepted in ((0, 0), (9, 0)):
-                self.response(drafted, accepted, stream=stream)
-                with self.subTest(stream=stream, drafted=drafted, accepted=accepted), self.assertRaisesRegex(Invalid, 'not exercised'):
-                    fp.validate_speculation_proof(self.root, self.packet)
+    def test_loaded_but_unexercised_trained_draft_is_not_valid_proof(self):
+        for selected in ('draft-mtp', 'draft-dflash2'):
+            packet = self.speculation_packet(selected)
+            self.consume(packet)
+            for stream in (False, True):
+                self.response(stream=not stream)
+                for drafted, accepted in ((0, 0), (9, 0)):
+                    self.response(drafted, accepted, stream=stream)
+                    with self.subTest(selected=selected, stream=stream, drafted=drafted, accepted=accepted):
+                        with self.assertRaisesRegex(Invalid, 'not exercised'):
+                            fp.validate_speculation_proof(self.root, packet)
 
     def test_missing_counters_in_either_transport_cannot_be_hidden_by_the_other(self):
-        for stream in (False, True):
-            self.response(stream=not stream)
-            self.response(stream=stream, missing_timings=True)
-            with self.subTest(stream=stream), self.assertRaisesRegex(Invalid, 'lacks draft timing counters'):
-                fp.validate_speculation_proof(self.root, self.packet)
+        for selected in ('draft-mtp', 'draft-dflash2'):
+            packet = self.speculation_packet(selected)
+            for stream in (False, True):
+                self.response(stream=not stream)
+                self.response(stream=stream, missing_timings=True)
+                with self.subTest(selected=selected, stream=stream):
+                    with self.assertRaisesRegex(Invalid, 'lacks draft timing counters'):
+                        fp.validate_speculation_proof(self.root, packet)
 
     def test_changed_response_bytes_and_impossible_counters_refuse(self):
-        turn = self.response()
-        (turn / 'response.bin').write_bytes(b'{}')
-        with self.assertRaisesRegex(Invalid, 'response proof hash'):
-            fp.validate_speculation_proof(self.root, self.packet)
-        self.response(3, 4)
-        with self.assertRaisesRegex(Invalid, 'counters malformed'):
-            fp.validate_speculation_proof(self.root, self.packet)
+        for selected in ('draft-mtp', 'draft-dflash2'):
+            packet = self.speculation_packet(selected)
+            turn = self.response()
+            (turn / 'response.bin').write_bytes(b'{}')
+            with self.subTest(selected=selected):
+                with self.assertRaisesRegex(Invalid, 'response proof hash'):
+                    fp.validate_speculation_proof(self.root, packet)
+                self.response(3, 4)
+                with self.assertRaisesRegex(Invalid, 'counters malformed'):
+                    fp.validate_speculation_proof(self.root, packet)
 
     def test_declared_no_speculation_rejects_actual_draft_counters(self):
         reference = copy.deepcopy(self.reference)

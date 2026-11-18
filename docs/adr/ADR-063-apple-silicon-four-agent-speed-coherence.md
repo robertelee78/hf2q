@@ -81,6 +81,8 @@ Acceptance:
 
 - Declare peer matched-settings and peer-best-documented configurations. The mandatory latest-peer performance arm uses peer-best valid settings; speculation cannot be silently disabled to handicap it. Retain MTP tensors in the shared GGUF if any arm uses them and pin separate drafter weights.
 
+- Re-screen newly supported trained-draft drivers on the frozen current peer rather than inheriting a historical no-speculation/MTP winner. The observed `2cbfc3cf34f94c8ada67eb8766efe7374a3d2db6` implements `draft-dflash2`, absent from the retained November 13 peer, with explicit static support for the canonical Qwen3.8 target and trained `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` checkpoint. Its separate draft GGUF, source/config/tokenizer identities, actual supervised launch and current task/memory validity must be proven before selection. The reference consumer requires hashed actual unary and SSE replies with valid draft counters and nonzero drafted/accepted totals on both transports; loaded weights or sampler metadata alone are not proof of exercise. This is reference-only support, not a product fallback, a performance verdict or a relaxation of any Q3/Q5 gate.
+
 
 Repository ownership: hf2q owns the campaign identity manifest; record both repository commits, the published mlx-native version/checksum, downstream hf2q binary/package identity and native release receipts. Do not alter kernels or release either package in this inventory task.
 
