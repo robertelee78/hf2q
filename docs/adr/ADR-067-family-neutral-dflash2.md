@@ -1633,6 +1633,36 @@ wait errors remain covered by source-reviewed command-attached ownership, not
 unsafe GPU-fault injection. HF typed ownership, remaining legacy consumers,
 final publication/pin and all full-model gates remain pending.
 
+###### Legacy consumer integration: Q6 NR2 rejection (2026-11-18)
+
+The portable integer producer and source-retirement prerequisites pass, but the
+canonical legacy-consumer candidate is rejected, not adopted. Its preserved
+source inventory is
+`14d3ea1382fdb1ec033c419f52eaaa18a6d59629a8acb6966486ece740d60178`;
+the rejection packet is
+`e75fe9252a131dcbf241801e153cd48a144690b57f393aca952b338c570bf2dc`.
+Seven component positions pass, including F16 fragments and the independent
+original gate-MM digests. Auto-dispatch fails at a 512-word Q6_K NR2 projection:
+270 F32 words differ bitwise; 24 planned positions remain unrun.
+
+An independent capture against published-original native source
+`14cbfd4f1acc89ff38826953750b472a0b7428f4` executes 117 raw MV cases in each
+of two fresh artifact/runtime-source processes. All 117 output digests agree
+across compilation origins. Proof SHA256:
+`c228295d24d5695e665cc01a2f0fd4e119126dedfc1ad57f9f0f3304707a7373`.
+For the identical dense input, the rejected candidate's raw output matches
+original NR2 exactly, while its prepared output matches original stock Q6 MV
+exactly. The enabled NR2 contract must be preserved; switching to stock or
+loosening equality is not a correction.
+
+Optimized compiler IR retains the same floating-operation graph with fast-math
+permissions. A CPU model of 32 contraction/association policies and 120 guessed
+reduction trees reproduces neither full vector (best exact matches: 187/512
+NR2, 217/512 stock). That model is rejected. Actual Metal scalar/vector
+collective measurements precede any arithmetic change. No unchanged failing
+candidate retry, full-model fit, native publication, HF acceptance or release
+qualification is claimed.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
