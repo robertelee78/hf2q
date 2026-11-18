@@ -1663,6 +1663,42 @@ collective measurements precede any arithmetic change. No unchanged failing
 candidate retry, full-model fit, native publication, HF acceptance or release
 qualification is claimed.
 
+The subsequent byte-identical operand search recovers a unique full-vector
+program for each original path. Both NR2 row parities use scale-product order
+`2,0,1,3`; stock Q6 uses `0,2,1,3`. The first product rounds independently,
+then three FMAs accumulate the remaining products. Both paths use the same
+sequential FMA order for the four inner products and four K-block products.
+The original raw source and activation SHA256 values match before comparison.
+Proof SHA256:
+`b22c5e960779120a9fa205663513e2b996326166d6240f830361ba088de5427a`.
+The next spike makes NR2's measured ordering explicit in its shared raw/prepared
+core and checks independently frozen raw MV digests. This reconstruction alone
+does not accept the changed GPU implementation or any full-model gate.
+
+The explicit NR2 candidate matches the three original Q4 auto cases and three
+original Q6 NR2 auto cases, including both invalid-ID encodings, on raw and
+prepared storage. The new independent test then rejects prepared **stock** Q6
+at record 6; its current raw counterpart still matches the original. Rejection
+SHA256:
+`c32f4ae425a6fd36c5cb125797b933c217ef551ceeec3db5141d9a8156ae823c`.
+The measured stock order `0,2,1,3` must therefore also be explicit in its shared
+core before proceeding. The fixture and all remaining gates stay unchanged.
+
+The corrected stock/NR2 candidate passes all 35 source-bound component units:
+the existing 32 consumer/lifetime gates and the independent original MV corpus
+in ordinary, Shader Validation, and combined Shader/Metal API Validation modes.
+Each MV mode checks 117 cases and 1,049,088 F32 words per raw/prepared path.
+Original MM golden hashes and all predecessor workload/safety checks remain
+unchanged. Every receipt proves successful exact-test execution and cleanup.
+Complete component proof SHA256:
+`c27e4837aa3214618499f569724849b58c53557e791759db75a1e1e9c535803d`;
+source inventory SHA256:
+`ea99acd7cddc36dccf1d2b5f0b920b2ee813e2c212a9f8bb1175dee3cd81d0a3`.
+The source-free ownership API changes public consumer parameter types and
+opaque storage access, requiring native **0.24.0**, not a patch release.
+Publication, exact hf2q pinning and full-model N4 admission are still pending;
+this component result neither requalifies the rejected N4 run nor opens D6.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
