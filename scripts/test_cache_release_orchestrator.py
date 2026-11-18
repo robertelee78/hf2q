@@ -7,14 +7,20 @@ portable archive contract test. It writes manifest.json and its checksum.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 from pathlib import Path
 import subprocess
+import json
+import fcntl
+import signal
+import socket
 import sys
 import tarfile
 import tempfile
 import unittest
+import time
 from unittest import mock
 
 import cache_release_orchestrator as gate
@@ -38,7 +44,7 @@ def fixture_record(root: Path, work: str, plan_sha: str | None, previous: str | 
     start_path = gate.attempt_path(root, work, "start")
     ticket_path = gate.attempt_path(root, work, "ticket")
     end_path = gate.attempt_path(root, work, "end")
-    deadline = gate.WALL_SECONDS if work in gate.PHASES else 3600
+    deadline = gate.WALL_SECONDS
     start = {"schema_version": 3, "work": work, "out_root": str(root), "began_ns": when,
              "driver": {"pid": 900001, "birth": "synthetic test driver"},
              "capability_sha256": gate.digest_bytes(b"test-data-not-a-capability"),
@@ -49,7 +55,7 @@ def fixture_record(root: Path, work: str, plan_sha: str | None, previous: str | 
     ticket = {"schema_version": 3, "work": work, "start_sha256": gate.sha256(start_path),
               "ticket_process": {"pid": 900002, "birth": "synthetic test ticket"},
               "began_ns": when + 1, "deadline_ns": when + 1 + deadline * 10**9,
-              "term_after_seconds": gate.TERM_SECONDS if work in gate.PHASES else 3580,
+              "term_after_seconds": gate.TERM_SECONDS,
               "wall_limit_seconds": deadline, "hostq_class": "build" if work in gate.BUILDS else "measure"}
     gate.exclusive(ticket_path, ticket)
     log = root / gate.STATE / "logs" / f"{work}.child.log"
@@ -466,6 +472,39 @@ class ProcessOwnershipTests(unittest.TestCase):
         identity = {"pid": 10, "birth": "original"}
         self.assertFalse(gate.same_process(identity, {10: {"birth": "replacement"}}))
 
+    def test_signal_refuses_reused_kernel_birth(self):
+        with mock.patch.object(gate, "kernel_process", return_value={"birth": "replacement"}), \
+                mock.patch.object(os, "kill") as kill:
+            self.assertFalse(gate.signal_owned({"pid": 10, "birth": "original"}, signal.SIGKILL))
+            kill.assert_not_called()
+
+    def test_unavailable_kernel_birth_is_not_process_absence(self):
+        with mock.patch.object(gate, "kernel_process", side_effect=PermissionError("inspection denied")), \
+                mock.patch.object(os, "kill") as kill:
+            with self.assertRaises(PermissionError):
+                gate.signal_owned({"pid": 10, "birth": "original"}, signal.SIGKILL)
+            kill.assert_not_called()
+
+    def test_inaccessible_foreign_birth_preserves_conflicts_not_owned_absence(self):
+        output = ("1 0 1 Mon Jan 1 00:00:00 2026 /usr/bin/metal\n"
+                  "10 1 10 Mon Jan 1 00:00:00 2026 /usr/bin/python\n")
+
+        def identity(pid):
+            if pid == 1:
+                raise PermissionError("foreign system process")
+            return {"ppid": 1, "pgid": 10, "birth": "owned"}
+
+        with mock.patch.object(subprocess, "check_output", return_value=output), \
+                mock.patch.object(gate, "kernel_process", side_effect=identity):
+            table = gate.process_table()
+        with mock.patch.object(os, "getsid", side_effect=lambda pid: pid):
+            self.assertEqual(gate.track_owned(table, 10, {}), {10})
+            with self.assertRaisesRegex(gate.Refusal, "owned descendant"):
+                gate.track_owned(table, 1, {})
+        self.assertEqual([row["pid"] for row in gate.conflicts(gate.PHASES[0], table)], [1])
+        with self.assertRaisesRegex(gate.Refusal, "owned process identity"):
+            gate.same_process({"pid": 1, "birth": "previously owned"}, table)
+
     def test_actual_process_group_is_owned_and_reaped(self):
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
         try:
@@ -480,6 +519,279 @@ class ProcessOwnershipTests(unittest.TestCase):
                 process.kill()
                 process.wait()
 
+
+
+def isolated_lease_fixture(root: Path, scenario: str, work: str) -> None:
+    """Test-only short clocks and fault injection, in a disposable process."""
+    gate.WALL_SECONDS, gate.TERM_SECONDS, gate.KILL_SECONDS = 3, 0.8, 1.4
+    driver = gate.process_identity(os.getpid())
+    put(gate.attempt_path(root, work, "start"), {})
+    os.environ["OUT_ROOT"] = str(root)
+    patches = []
+
+    def hang(*_args, **_kwargs):
+        put(root / "entered", {"pid": os.getpid(), "birth": gate.kernel_process(os.getpid())["birth"]})
+        while True:
+            time.sleep(0.05)
+
+    def authorization(*_args, **_kwargs):
+        put(root / "authorization-entered", {"at_ns": time.time_ns()})
+        if scenario in ("authorization", "descendants"):
+            if scenario == "descendants":
+                subprocess.Popen([sys.executable, "-c", DESCENDANT_FIXTURE, str(root)], start_new_session=True)
+            return hang()
+        return {"plan_sha256": None, "driver": driver}
+
+    patches.append(mock.patch.object(gate, "authorize", side_effect=authorization))
+    # Admission is not the subject of these timeout injections; actual CLI
+    # rejection and live secret/lock lineage are exercised separately below.
+    if scenario != "conflicts":
+        patches.append(mock.patch.object(gate, "conflicts", return_value=[]))
+    target = {"canonical": "canonical_script", "inventory": "inventory", "conflicts": "conflicts",
+              "signature": "candidate_inputs", "telemetry": "telemetry_sample",
+              "sealing": "snapshot_artifacts"}.get(scenario)
+    if target:
+        patches.append(mock.patch.object(gate, target, side_effect=hang))
+    if scenario == "canonical-argv":
+        original_popen = subprocess.Popen
+
+        def launch(argv, *args, **kwargs):
+            if argv[:2] == ["bash", str(gate.canonical_script(None))]:
+                put(root / "launch-contract", {"argv": argv, "cwd": str(kwargs["cwd"]),
+                                                "work": kwargs["env"]["CACHE_RELEASE_WORK"]})
+                return original_popen([sys.executable, "-c", "print('model-free canonical launch observation')"],
+                                      *args, **kwargs)
+            return original_popen(argv, *args, **kwargs)
+
+        patches.append(mock.patch.object(subprocess, "Popen", side_effect=launch))
+        gate.WALL_SECONDS, gate.TERM_SECONDS, gate.KILL_SECONDS = 4, 2, 2.5
+    if scenario == "stranded":
+        original_table = gate.process_table
+
+        def unavailable_table():
+            if not (root / "inspection-restored").exists():
+                raise gate.Refusal("injected unavailable cleanup proof")
+            return original_table()
+
+        patches.append(mock.patch.object(gate, "process_table", side_effect=unavailable_table))
+    if scenario == "success":
+        gate.WALL_SECONDS, gate.TERM_SECONDS, gate.KILL_SECONDS = 4, 2, 2.5
+        probe_fd = os.open(root / "guardian-only-fd", os.O_RDWR | os.O_CREAT, 0o600)
+
+        def successful_work(_work, _script, _began, _mono):
+            try:
+                os.fstat(probe_fd)
+            except OSError:
+                put(root / "descriptor-closed", "worker did not inherit guardian descriptor\n")
+            else:
+                raise AssertionError("worker inherited guardian-only descriptor")
+            child = subprocess.Popen([sys.executable, "-c",
+                                      "import socket,time; from pathlib import Path; import sys; "
+                                      "s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); "
+                                      "Path(sys.argv[1]).write_text(str(s.getsockname()[1])); time.sleep(.2)",
+                                      str(root / "listener-port")])
+            put(root / "entered", {"pid": os.getpid(), "birth": gate.kernel_process(os.getpid())["birth"]})
+            child.wait(timeout=2)
+            return 0
+
+        patches.append(mock.patch.object(gate, "ticket_work", side_effect=successful_work))
+    lock_fd = os.open(root / "machine.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            result = gate.main(["_ticket", work])
+    finally:
+        os.close(lock_fd)
+        if scenario == "success":
+            os.close(probe_fd)
+    print(json.dumps({"result": result}), flush=True)
+
+
+DESCENDANT_FIXTURE = r"""
+import json, os, signal, socket, subprocess, sys, time
+from pathlib import Path
+root = Path(sys.argv[1])
+def record(name):
+    with (root / name).open("a") as f:
+        f.write(str(os.getpid()) + "\n")
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+listener.listen()
+(root / "listener-port").write_text(str(listener.getsockname()[1]))
+record("descendant-pids")
+spawned = False
+def term(*_):
+    global spawned
+    record("descendant-terms")
+    if not spawned:
+        spawned = True
+        subprocess.Popen([sys.executable, "-c", '''
+import os, signal, sys, time
+from pathlib import Path
+root = Path(sys.argv[1])
+(root / "descendant-pids").open("a").write(str(os.getpid()) + "\\n")
+def term(*_):
+    (root / "descendant-terms").open("a").write(str(os.getpid()) + "\\n")
+signal.signal(signal.SIGTERM, term)
+while True: time.sleep(.05)
+''', str(root)], start_new_session=True)
+signal.signal(signal.SIGTERM, term)
+while True: time.sleep(.05)
+"""
+
+
+class WholeLeaseTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def fixture(self, scenario, work="build-probe"):
+        command = [sys.executable, "-c",
+                   "import sys; from pathlib import Path; "
+                   "from test_cache_release_orchestrator import isolated_lease_fixture; "
+                   "isolated_lease_fixture(Path(sys.argv[1]), sys.argv[2], sys.argv[3])",
+                   str(self.root), scenario, work]
+        began = time.monotonic()
+        result = subprocess.run(command, cwd=Path(__file__).parent, text=True, capture_output=True, timeout=6)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["result"], 1)
+        self.assertLess(time.monotonic() - began, 4)
+        entered = gate.load(self.root / "entered")
+        self.assertFalse(gate.same_process(entered, gate.process_table()))
+        end = gate.attempt_path(self.root, work, "end")
+        if end.exists():
+            self.assertNotEqual(gate.load(end)["status"], "pass")
+        return result
+
+    def test_authorization_is_inside_build_lease(self):
+        self.fixture("authorization")
+        self.assertFalse(gate.attempt_path(self.root, "build-probe", "ticket").exists())
+
+    def test_finalize_authorization_has_the_same_finite_lease(self):
+        self.fixture("authorization", "finalize")
+
+    def test_path_resolution_is_inside_lease(self):
+        self.fixture("canonical")
+
+    def test_initial_inventory_is_inside_lease(self):
+        self.fixture("inventory")
+        ticket = gate.load(gate.attempt_path(self.root, "build-probe", "ticket"))
+        self.assertLessEqual(ticket["began_ns"], gate.load(self.root / "authorization-entered")["at_ns"],
+                             "authorization must not reset the lease clock")
+
+    def test_initial_conflict_scan_is_inside_lease(self):
+        self.fixture("conflicts")
+
+    def test_signed_candidate_check_is_inside_lease(self):
+        self.fixture("signature")
+
+    def test_initial_telemetry_is_inside_lease(self):
+        self.fixture("telemetry", gate.PHASES[0])
+
+    def test_evidence_sealing_is_inside_lease(self):
+        self.fixture("sealing", "build-debug")
+
+    def test_preflight_and_term_spawned_descendants_leave_no_listener(self):
+        foreign = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.fixture("descendants")
+            pids = {int(row) for row in (self.root / "descendant-pids").read_text().splitlines()}
+            terms = {int(row) for row in (self.root / "descendant-terms").read_text().splitlines()}
+            self.assertEqual(len(pids), 2, "TERM must spawn a late owned descendant")
+            self.assertEqual(terms, pids, "each descendant must receive TERM before KILL")
+            table = gate.process_table()
+            self.assertTrue(pids.isdisjoint(table), "owned descendants survived lease return")
+            port = int((self.root / "listener-port").read_text())
+            with socket.socket() as client:
+                self.assertNotEqual(client.connect_ex(("127.0.0.1", port)), 0)
+            self.assertIsNone(foreign.poll(), "foreign process must never be signaled")
+        finally:
+            foreign.terminate()
+            foreign.wait(timeout=3)
+
+    def test_actual_cli_rejects_unauthenticated_ticket_and_work(self):
+        environment = dict(os.environ, OUT_ROOT=str(self.root), CACHE_RELEASE_INTERNAL="1",
+                           CACHE_RELEASE_INTERNAL_RECEIPT=str(self.root / "forged.json"))
+        script = gate.canonical_script(None)
+        for command in ([sys.executable, str(Path(gate.__file__)), "_ticket", "build-probe"],
+                        ["bash", str(script), "_work", "build-probe"]):
+            with self.subTest(command=command):
+                result = subprocess.run(command, env=environment, text=True, capture_output=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("driver capability", result.stderr)
+                self.assertFalse((self.root / "build").exists())
+
+    def test_actual_cli_rejects_alternate_command_authority(self):
+        result = subprocess.run([sys.executable, str(Path(gate.__file__)), "--script", "/tmp/arbitrary.sh",
+                                 "_ticket", "build-probe"],
+                                env=dict(os.environ, OUT_ROOT=str(self.root)), text=True,
+                                capture_output=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("canonical workload", result.stderr)
+
+    def test_actual_cli_has_no_arbitrary_command_entry(self):
+        for arguments in (["_ticket", "echo"], ["_ticket", "build-probe", "echo"],
+                          ["--command", "echo", "_ticket", "build-probe"]):
+            result = subprocess.run([sys.executable, str(Path(gate.__file__)), *arguments],
+                                    env=dict(os.environ, OUT_ROOT=str(self.root)), text=True,
+                                    capture_output=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(gate.attempt_path(self.root, "build-probe", "ticket").exists())
+
+    def test_success_requires_owned_exit_and_closes_guardian_only_descriptors(self):
+        command = [sys.executable, "-c",
+                   "import sys; from pathlib import Path; "
+                   "from test_cache_release_orchestrator import isolated_lease_fixture; "
+                   "isolated_lease_fixture(Path(sys.argv[1]), 'success', 'build-probe')", str(self.root)]
+        result = subprocess.run(command, cwd=Path(__file__).parent, text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["result"], 0, result.stderr)
+        self.assertTrue((self.root / "descriptor-closed").exists())
+        self.assertFalse(gate.same_process(gate.load(self.root / "entered"), gate.process_table()))
+        with socket.socket() as client:
+            self.assertNotEqual(client.connect_ex(("127.0.0.1", int((self.root / "listener-port").read_text()))), 0)
+
+    def test_canonical_work_argv_and_environment_are_preserved(self):
+        command = [sys.executable, "-c",
+                   "import sys; from pathlib import Path; "
+                   "from test_cache_release_orchestrator import isolated_lease_fixture; "
+                   "isolated_lease_fixture(Path(sys.argv[1]), 'canonical-argv', 'build-debug')", str(self.root)]
+        result = subprocess.run(command, cwd=Path(__file__).parent, text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["result"], 0, result.stderr)
+        script = gate.canonical_script(None)
+        self.assertEqual(gate.load(self.root / "launch-contract"),
+                         {"argv": ["bash", str(script), "_work", "build-debug"],
+                          "cwd": str(script.parent.parent), "work": "build-debug"})
+
+    def test_stranded_proof_failure_retains_lock_and_never_reports_success(self):
+        command = [sys.executable, "-c",
+                   "import sys; from pathlib import Path; "
+                   "from test_cache_release_orchestrator import isolated_lease_fixture; "
+                   "isolated_lease_fixture(Path(sys.argv[1]), 'stranded', 'build-probe')", str(self.root)]
+        error_path = self.root / "guardian.stderr"
+        with error_path.open("w") as errors:
+            process = subprocess.Popen(command, cwd=Path(__file__).parent, text=True,
+                                       stdout=subprocess.PIPE, stderr=errors)
+            try:
+                until = time.monotonic() + 5
+                while "STRANDED / FAIL-CLOSED" not in error_path.read_text() and time.monotonic() < until:
+                    self.assertIsNone(process.poll(), error_path.read_text())
+                    time.sleep(0.02)
+                self.assertIn("STRANDED / FAIL-CLOSED", error_path.read_text())
+                self.assertIsNone(process.poll())
+                with mock.patch.object(gate, "GLOBAL_LOCK", self.root / "machine.lock"):
+                    with self.assertRaisesRegex(gate.Refusal, "another cache release driver"):
+                        with gate.driver_lock():
+                            self.fail("stranded guardian dropped its lock")
+            finally:
+                put(self.root / "inspection-restored", "operator restored inspection\n")
+                stdout, _ = process.communicate(timeout=3)
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(json.loads(stdout)["result"], 1)
 
 if __name__ == "__main__":
     unittest.main()

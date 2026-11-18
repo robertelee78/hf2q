@@ -842,12 +842,20 @@ resolving published `mlx-native 0.11.2`:
   Invoke it with `run` and an executable `CACHE_RELEASE_HOSTQ` queue adapter;
   the workflow reads that adapter from the same-named repository variable.
   Five separate build tickets precede an immutable plan and eighteen serial
-  model phases, each bounded to 540 seconds including owned cleanup and evidence
-  sealing. Same-process cache and lifetime workloads remain indivisible.
+  model phases. Every build, model phase, and finalization uses a hostq lease
+  with one 540-second clock started before path resolution or authorization.
+  An independent guardian owns preflight (including signature/hash/inventory
+  checks), canonical work, cleanup, and evidence sealing; authorization never
+  resets that clock. TERM starts at 520 seconds and KILL at 525, leaving
+  cleanup headroom. Same-process cache and lifetime workloads remain indivisible.
   `build`, `plan`, `phase PHASE_ID`, and `finalize` expose those same stages;
   failed or interrupted attempts cannot be replayed into a passing manifest.
   Schema 3 qualification includes the hidden `.cache-release` ledger and raw
   snapshots. Bounded execution alone does not establish that a workload fits.
+  An unavailable process/listener inspection or an unkillable owned process
+  cannot justify releasing a lease: the guardian reports `STRANDED / FAIL-CLOSED`
+  and retains hostq and the driver lock until absence is proven. This exceptional
+  safety hold is not a successful finite lease; it requires operator intervention.
 
 The governing decisions and the old-failure-versus-final-artifact distinction
 are recorded in `docs/adr/ADR-019-mlx-native-encoder-architecture.md`,
