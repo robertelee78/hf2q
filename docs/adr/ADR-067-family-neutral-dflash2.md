@@ -1884,6 +1884,73 @@ do not. Exactly-once serialization before Metal work, guard lifetime through
 checked completion, the non-reentrant mutex, and both existing runtime
 bitwise comparisons remain unchanged. The historical diary is retained.
 
+###### Clean packed 0.24.0 numerical and N4 evidence (2026-11-18)
+
+Checkpoint `c82ffd044560f3fb5ccbac699ccbf06e9691feba` was packaged cleanly
+with Cargo/Rust 1.89.0, resolved first from the extracted crate in an empty
+dedicated Cargo home, and built against the exact published registry
+mlx-native 0.24.0 checksum. The isolated dependency target was warm, not
+misrepresented as fresh. Actual crate SHA256:
+`89f4541fbe280a54961f407730eba52fbb52d2fb49433e9c61f88512546ad370`.
+
+All twenty original same-input AF4 register/staged cases and both original
+five-case BF16 suites pass, with unchanged fixtures, limits, selectors and
+state assertions. The AF4 peer revision `031a25a6` and BF16 reference source
+`614781b0` remain frozen. Numerical proof SHA256:
+`dc720696b2e7dfee6be784bc42c69350cce2e4fcb49fe2e144688d7498ec51af`.
+
+The actual packed production CLI completes the canonical Qwen3.6 coding N4
+with full automatic profile, four slots, 262144 context rows, 48 GiB KV and
+the unchanged 8 GiB reserve. All four final patches match independently
+reviewed source bytes, including the authorized repair path. All 51 samples
+have normal pressure; minimum free+cached is 56,098,439,168 bytes and swap
+growth is zero (baseline/max swap 3,544,187 bytes, not absolute zero).
+Server/client exit 0, owned cleanup and listener clearance are proven.
+Packed N4 proof SHA256:
+`667d0b3f3a11808de369905eebe6f66e191807b43000c711be52952aca029399`.
+
+The same canonical workload through the packed requested-root diagnostic
+has 48 covered records: 49,680 roots created, 49,679 released, no pending or
+denied roots, and one still-charged 256-byte immutable process-cache owner.
+Its attribution is a source-bound RoPE-cache owner-count inference, not an
+exposed per-root identity or physical-residency census. The optional unknown
+field is `null`, not relabelled zero. Requested-lifetime proof SHA256:
+`d4eaa5f64abbffd477a803e68d5e93ef15a7a711b41cacee0f757d7c0d75112d`.
+
+The packed real-checkpoint shared-capture test also passes at the canonical
+262144 joint capacity against its original independent solo references.
+Capture/ring/binding/proposal/logit and target-verification assertions remain
+unchanged. Bitwise proof SHA256:
+`1cdff7793c57c5b408c77680336a5de0d67e4993b001cecb859aa25a39c68efd`.
+
+Complete exact prefix replay now passes for both actual canonical N4 runs:
+30 production and 30 requested-lifetime wires, each 7/9/7/7 per agent.
+The new repair-aware post-oracle uses the actual `qwen35moe` registration,
+separate health/runtime/calibration records, hash-bound case and approvals,
+captured barrier/agent identities and every actual request/receipt directory.
+It neither truncates repairs to the dense seven-turn N1 contract nor invents
+readiness. Existing N1 acceptance/output remains unchanged; its two negative
+controls and two new grant/coverage controls pass. Its ignored real N1 archive
+test was not run for this N4 proof.
+
+The first metadata input was correctly rejected before any wire replay:
+the pinned upstream HF tokenizer JSON does not equal the production
+GGUF-only serving tokenizer. A tiny Rust metadata-only export invokes the
+unchanged production builder with serving truncation disabled; its normalized
+fingerprint matches the actual runtime's unchanged
+`b6af43455bcb7c7fdedcc5a45e14359fc21567b6f87e01fa822229c68871b711`.
+No weights or device are constructed. The engine-free oracle binary is a
+source-only Rust 1.89 test build, not a new packed model/release candidate;
+handler, renderer and measurement source digests match the actual C82 packed
+source. Complete prefix proof SHA256:
+`320aeb660466e7f5f330237ed6d1ecca24d94e249be7413b220b7ef48010e031`.
+
+These proofs do not qualify the earlier long-replay route differences,
+matched multi-run quality/performance, or signed release bytes. Failed
+prelaunch infrastructure attempts and rejected metadata remain retained;
+no reference, numerical limit, memory reserve, workload or safety gate was
+waived.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
