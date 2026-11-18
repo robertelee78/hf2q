@@ -1744,6 +1744,52 @@ This is one successful changed-source admission observation, not stable
 multi-run admission, a physical lifetime census, complete post-oracle prefix
 reuse, matched-reference performance, registry provenance or RC qualification.
 
+The next lifetime spike uses the existing native requested-root authority,
+installed in a fresh diagnostic test process before any native allocation.
+Its existing Shared and read-only NoCopy final-resource controls pass on this
+host; the Shared stdout-interleaving parser refusal is retained separately
+without rerunning the control (proof SHA256
+`f34a221b27b27ac108ba3a365bb4fd367713320969026bb712394d5a9f58ea35`).
+An isolated adapter will execute the real served command and unchanged N4
+case, require covered creation/live history and observe final requested-root
+closure after shutdown. This adds no production tracking or immutable native
+release edits. Requested extents, aliases, host footprint and physical
+residency remain distinct; unsupported coverage or retained roots cannot be
+reported as complete reclamation.
+
+The full diagnostic completes the coding workload with covered native
+history, but its zero-process-root postcondition fails: 49,978 roots were
+created, 49,977 released, and one 256-byte root remains beside one published
+process-cache entry. The test exits 101; the outer `CalibrationPass` is not
+accepted as lifetime success. Rejection proof SHA256:
+`8b2a9e7e05d686d0992a3c49df265ecaef09c4a02b307bd5d9179be36f1fc1a5`.
+Native `rope_freqs.rs` owns one distinct root per immutable process-lifetime
+cache entry and is the sole cache-publication caller. The revised hypothesis
+therefore checks non-process-cache root retirement against that source-bound
+owner inventory, retaining the observed global-cache bytes rather than
+pinning 256 as an expected value. Attribution remains an explicit count-based
+inference, not exposed individual root identity or physical reclamation.
+
+The revised diagnostic passes the unchanged N4 case and its exact lifecycle
+test, with 51 covered observations, 49,112 created roots, 49,111 final
+releases and the one observed 256-byte process-cache root retained. There is
+no pending requested roots, denial, unknown origin or legacy escape. Attribution of the
+remaining owner is the source-bound inference above, not a new byte golden.
+Proof SHA256:
+`0086d755956d6f3d78128a0318e31596689859db04404527636a581faafe5415`.
+
+The real-checkpoint shared-capture gate also passes after using served
+canonical expert finalization and 262144 joint context capacity against the
+original independent 4096-capacity solo references. All original rows, seeds
+and exact comparisons remain: first/resumed captures, draft rings, cursors,
+bindings, logits, proposals and verify rows are bitwise equal. All 22 served
+profile switches are bound; canonical full-model host safety reports no swap
+growth and proven cleanup. Proof SHA256:
+`be94837825a2b72a20debe7a7bb316ec91c89626d262befffa506e78fa7bcbe7`.
+These source-only proofs do not establish published dependency provenance,
+physical residency, complete post-oracle reuse, RC performance or release
+qualification; final published-byte validation remains mandatory.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
