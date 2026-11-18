@@ -1722,6 +1722,28 @@ the other 23 focused units retain their successful recorded executions.
 No dataset, seed, expected hash or tolerance was changed. This closes the
 component coverage gap, not registry provenance or full-model qualification.
 
+The next bounded source-only experiment measures this changed ownership
+candidate against the previously rejected canonical N4 case: four slots,
+262144 context per slot, 48 GiB KV, the full default profile and the same
+coding workload, admission reserve and safety rules. The hypothesis is that
+consuming the model's raw expert roles removes the duplicate retained
+allocation rather than weakening admission. The explicit unpublished
+0.24.0 source patch is recorded, not treated as registry provenance; even a
+passing admission/workload result cannot qualify the final release artifact.
+
+That source-only candidate passes all eight readiness checks with the full
+profile and completes the canonical four-agent unary/SSE coding workflow.
+Independent retained-artifact review passes all four agents; one exercises
+the authorized repair after an E0282 compile error, so it is not a
+first-attempt pass. Runtime accounting reports 19,503,513,600 raw expert bytes
+replaced by 19,545,456,640 canonical bytes. All 54 safety samples report normal
+pressure, swap growth is zero, and server/client cleanup and listener closure
+are proven. Proof SHA256:
+`3cf7951e7c43117e6b254ad9241d2cdfc44998df5481a1605b524de119826c68`.
+This is one successful changed-source admission observation, not stable
+multi-run admission, a physical lifetime census, complete post-oracle prefix
+reuse, matched-reference performance, registry provenance or RC qualification.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
