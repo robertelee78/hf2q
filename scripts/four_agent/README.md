@@ -1095,6 +1095,10 @@ then checks the hashed raw replies: each transport must provide valid draft
 counters and nonzero drafted/accepted totals across both unary and SSE.
 Loading a drafter or reporting sampler metadata does not qualify the arm.
 
+Resource-fork sidecars are excluded only when paired with an existing payload
+and identified by AppleDouble magic. A filename prefix alone cannot exempt an
+unlisted native library from identity checks.
+
 For a newly supported driver, freeze the exact eligible trained checkpoint and
 converted reference artifact, then prove current task/memory validity and
 include it in best-valid configuration selection. A historical no-speculation

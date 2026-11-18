@@ -202,6 +202,15 @@ def _supervised_launch(packet, base_url=None):
     return launch
 
 
+def is_appledouble_sidecar(path):
+    """Recognize resource-fork metadata, never a native library by name alone."""
+    path = Path(path)
+    if not path.name.startswith('._') or not path.with_name(path.name[2:]).is_file():
+        return False
+    with path.open('rb') as stream:
+        return stream.read(4) == b'\x00\x05\x16\x07'
+
+
 def _reference_identity(reference, build, supervised):
     require(isinstance(reference, dict) and set(reference) == {
         'identity_receipt', 'identity_sha256', 'source_commit', 'build_info',
@@ -238,7 +247,7 @@ def _reference_identity(reference, build, supervised):
     require(isinstance(libraries, dict) and libraries.get(identity['binary']) == binary_hash,
             'peer identity receipt must bind the executable and sibling libraries')
     siblings = {str(path) for path in Path(identity['binary']).parent.glob('*.dylib')
-                if path.is_file() and not path.is_symlink()}
+                if path.is_file() and not path.is_symlink() and not is_appledouble_sidecar(path)}
     require(siblings <= set(libraries), 'peer identity receipt omits actual sibling libraries')
     external = identity.get('external_dylibs_sha256', {})
     require(isinstance(external, dict), 'peer external library identity fields')

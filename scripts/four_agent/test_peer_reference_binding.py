@@ -93,6 +93,21 @@ class FrozenReference(unittest.TestCase):
         argv[argv.index('--spec-draft-n-max') + 1] = '7' if selected == 'draft-dflash2' else '3'
         return self.issue(reference)
 
+    def test_resource_fork_metadata_does_not_hide_unlisted_native_libraries(self):
+        sidecar = self.library.with_name('._' + self.library.name)
+        for selected in ('draft-mtp', 'draft-dflash2'):
+            with self.subTest(selected=selected):
+                packet = self.speculation_packet(selected)
+                self.response(stream=False)
+                self.response(stream=True)
+                expected = fp.validate_speculation_proof(self.root, packet)
+                sidecar.write_bytes(b'\x00\x05\x16\x07\x00\x02\x00\x00' + b'\0' * 18)
+                self.assertEqual(fp.validate_speculation_proof(self.root, packet), expected)
+                sidecar.write_bytes(b'\xcf\xfa\xed\xfe' + b'unlisted native library')
+                with self.assertRaisesRegex(Invalid, 'omits actual sibling'):
+                    fp.validate_speculation_proof(self.root, packet)
+                sidecar.unlink()
+
     def test_actual_readiness_consumer_accepts_frozen_latest_mtp_binding(self):
         result = self.consume(self.packet)
         self.assertEqual(result['source_revision'], COMMIT)
