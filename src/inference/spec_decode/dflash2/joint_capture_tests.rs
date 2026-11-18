@@ -64,14 +64,12 @@ impl Lane {
     }
 }
 
-fn capture(rows: usize, width: usize, state: &mut u64) -> DFlashCaptureSession {
-    DFlashCaptureSession {
-        target_layer_ids: vec![0],
-        hidden_output: (0..rows * width).map(|_| 2.0 * random(state)).collect(),
-        per_position_argmaxes: None,
-        seq_len: rows,
-        hidden_size: width,
+fn capture(device: &MlxDevice, rows: usize, width: usize, state: &mut u64) -> DFlashCaptureSession {
+    let mut capture = DFlashCaptureSession::new_shared(device, vec![0], rows, width, false).unwrap();
+    for value in capture.hidden_output.iter_mut() {
+        *value = 2.0 * random(state);
     }
+    capture
 }
 
 /// The lanes' rings, cursors and bindings: `(rings, lengths, bound tokens,
@@ -101,7 +99,7 @@ fn joint_against_solo(staged: bool, shared: usize, lanes: &[Lane]) {
 
     // Each resumed lane's history, the same rows on both runtimes.
     for lane in lanes.iter().filter(|lane| lane.history > 0) {
-        let history = capture(lane.history, width, &mut seed);
+        let history = capture(&device, lane.history, width, &mut seed);
         let tokens: Vec<u32> = (0..lane.history).map(|row| (90_000 + row) as u32).collect();
         for runtime in [&mut together, &mut alone] {
             runtime
@@ -120,12 +118,12 @@ fn joint_against_solo(staged: bool, shared: usize, lanes: &[Lane]) {
         placed.push(JointPrefillOutput::placed(total, lane_shared));
         total += lane.rows - lane_shared;
     }
-    let forward = capture(total, width, &mut seed);
+    let forward = capture(&device, total, width, &mut seed);
 
     for (lane, output) in lanes.iter().zip(&placed) {
         let tokens = lane.tokens();
         // The lane's own capture: its rows of the forward, side by side.
-        let mut own = DFlashCaptureSession::new(vec![0], lane.rows, width, false);
+        let mut own = DFlashCaptureSession::new_shared(&device, vec![0], lane.rows, width, false).unwrap();
         for (index, row) in output
             .forward_rows(0..lane.rows)
             .into_iter()
@@ -285,7 +283,8 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
     const REPLY: usize = 150;
     const LATER: [usize; 4] = [31, 157, 200, 266];
     const SLOTS: u32 = 4;
-    const CAPACITY: u32 = 4096;
+    const CAPACITY: u32 = 262144;
+    const SOLO_CAPACITY: u32 = 4096;
 
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let (gguf_path, descriptor) = match (
@@ -308,6 +307,9 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
     let mut progress = LoadProgress::new(false, 1, 0);
     let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load target");
     model.bind_ggml_routing_policy(policy);
+    let model = model
+        .finalize_canonical_experts()
+        .expect("finalize target experts before execution caches, as in serving");
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     let model = &model;
     let hidden = model.cfg.hidden_size as usize;
@@ -319,10 +321,10 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
     let tokens_of = |slot: u32, start: usize, rows: usize| -> Vec<u32> {
         (start..start + rows).map(|position| token(slot, position)).collect()
     };
-    let new_cache = || -> HybridKvCache {
+    let new_cache = |capacity: u32| -> HybridKvCache {
         model
             .with_gpu_cache_mut(|device, _registry| {
-                HybridKvCache::new_with_options(&model.cfg, device, CAPACITY, SLOTS, true)
+                HybridKvCache::new_with_options(&model.cfg, device, capacity, SLOTS, true)
             })
             .expect("allocate TQ cache")
     };
@@ -352,10 +354,11 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
         together.workspace.staged.is_some()
     );
 
-    // One cache holds the four slots of the joint path; each solo lane runs
-    // on a cache of its own, as its own prefill on empty peers.
-    let mut joint_cache = new_cache();
-    let mut solo_caches: Vec<HybridKvCache> = (0..SLOTS).map(|_| new_cache()).collect();
+    // The joint path has canonical context capacity. Independent solo
+    // references retain their original smaller roots; every test row fits.
+    let mut joint_cache = new_cache(CAPACITY);
+    let mut solo_caches: Vec<HybridKvCache> =
+        (0..SLOTS).map(|_| new_cache(SOLO_CAPACITY)).collect();
     // (name, shared rows, per slot: start, content rows)
     let first: Vec<(usize, usize)> = (0..SLOTS).map(|_| (0, CONTENT)).collect();
     let later: Vec<(usize, usize)> = LATER
@@ -385,12 +388,15 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
                 // The draft lanes see the reply rows too (the same rows on
                 // both runtimes: decode commits them in service).
                 let mut seed = 0xD0_u64 + slot as u64;
-                let reply_capture = capture(REPLY, config.fc_input_dim(), &mut seed);
-                let reply_capture = DFlashCaptureSession {
-                    target_layer_ids: layer_ids.clone(),
-                    hidden_size: hidden,
-                    ..reply_capture
-                };
+                let reply_capture = model.with_gpu_cache_mut(|device, _| {
+                    let mut capture = DFlashCaptureSession::new_shared(
+                        device, layer_ids.clone(), REPLY, hidden, false,
+                    )?;
+                    for value in capture.hidden_output.iter_mut() {
+                        *value = 2.0 * random(&mut seed);
+                    }
+                    Ok(capture)
+                }).unwrap();
                 model
                     .with_gpu_cache_mut(|device, registry| {
                         for runtime in [&mut together, &mut alone] {
@@ -431,7 +437,9 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
             })
             .collect();
         let total = Qwen35Model::joint_prefill_rows(&lanes, shared);
-        let mut joint_capture = DFlashCaptureSession::new(layer_ids.clone(), total, hidden, false);
+        let mut joint_capture = model.with_gpu_cache_mut(|device, _| {
+            DFlashCaptureSession::new_shared(device, layer_ids.clone(), total, hidden, false)
+        }).unwrap();
         let outputs = {
             let _scope = PrefillScope::forced(true);
             model
@@ -447,7 +455,9 @@ fn a_joint_lane_holds_the_capture_and_draft_rings_of_its_solo_prefill_on_the_rea
             let (start, content) = shape[slot as usize];
             let rows = content + CUE;
             let (tokens, positions) = &chunks[slot as usize];
-            let mut solo_capture = DFlashCaptureSession::new(layer_ids.clone(), rows, hidden, false);
+            let mut solo_capture = model.with_gpu_cache_mut(|device, _| {
+                DFlashCaptureSession::new_shared(device, layer_ids.clone(), rows, hidden, false)
+            }).unwrap();
             {
                 let _scope = PrefillScope::forced(true);
                 let image = solo_caches[slot as usize]

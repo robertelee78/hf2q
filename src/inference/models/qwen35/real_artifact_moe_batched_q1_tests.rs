@@ -105,7 +105,10 @@ fn qwen36_moe_route_q1_envelope_trace() {
     let gguf_path = std::env::var_os("HF2Q_QWEN36_GGUF").map(PathBuf::from).expect("HF2Q_QWEN36_GGUF");
     let gguf = mlx_native::gguf::GgufFile::open(&gguf_path).expect("open GGUF");
     let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
-    let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
+    let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+        .expect("load Qwen model")
+        .finalize_canonical_experts()
+        .expect("finalize experts before batched Q1 execution");
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     let route = model.moe_ffn_decode_route();
     let batched = super::moe_batched::parse_qwen_moe_batched(std::env::var("HF2Q_QWEN_MOE_BATCHED").ok().as_deref());

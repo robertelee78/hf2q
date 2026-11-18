@@ -26,6 +26,7 @@ use anyhow::{anyhow, bail, Result};
 use mlx_native::gguf::{GgufFile, MetadataValue};
 
 pub mod activation_capture_real;
+pub(crate) mod carry_memory;
 pub mod chunk_allocs_arena;
 pub mod decode_pool;
 pub mod delta_net;
@@ -46,12 +47,18 @@ pub(crate) mod execution_trace;
 pub mod fa_prefill_arena;
 pub mod fa_projections_arena;
 pub mod ffn;
+pub mod expert_storage;
+mod canonical_experts;
+mod gpu_expert_dispatch;
+#[cfg(test)]
+mod gpu_expert_test_support;
 pub mod forward_cpu;
 pub mod forward_gpu;
 pub mod full_attn;
 pub mod gpu_delta_net;
 pub mod gpu_ffn;
 pub mod gpu_full_attn;
+pub(crate) mod prefill_memory;
 pub(super) mod gqa_q2_policy;
 pub mod in_memory_loader;
 pub use chunk_allocs_arena::ChunkAllocsArena;
@@ -134,6 +141,7 @@ pub(crate) mod prefill_prepared;
 #[cfg(test)]
 pub(crate) mod prefill_prepared_tests;
 pub(crate) mod prepared_projection;
+pub(crate) mod prepared_scratch;
 #[cfg(test)]
 mod prepared_step_tests;
 #[cfg(test)]

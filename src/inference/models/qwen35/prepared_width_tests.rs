@@ -299,6 +299,7 @@ fn the_gpu_bf16_cast_rounds_to_nearest_even() {
 fn a_prepared_projection_row_has_one_value_at_every_width_and_cohort() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let device = MlxDevice::new().expect("device");
+    let _scratch = super::prepared_scratch::ExecutionScratch::test_scope(&device);
     let mut registry = KernelRegistry::new();
     // (type, outputs, inputs): one K run, split K, and a head-like wide one.
     for (ggml_type, n, k) in [
@@ -392,6 +393,7 @@ fn a_prepared_projection_row_has_one_value_at_every_width_and_cohort() {
 fn fused_alpha_beta_rows_have_one_value_at_every_width_and_cohort() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let device = MlxDevice::new().expect("device");
+    let _scratch = super::prepared_scratch::ExecutionScratch::test_scope(&device);
     let mut registry = KernelRegistry::new();
     let (heads, k) = (48_u32, 512_u32);
     let mut seed = 0xA1FA_u32;
@@ -553,6 +555,7 @@ fn dense_ffn_reference(
 fn a_prepared_dense_ffn_row_has_one_value_at_every_width_and_cohort() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let device = MlxDevice::new().expect("device");
+    let _scratch = super::prepared_scratch::ExecutionScratch::test_scope(&device);
     let mut registry = KernelRegistry::new();
     let (hidden, intermediate) = (512_u32, 1_024_u32);
     for (gate_up_type, down_type) in [
@@ -681,6 +684,7 @@ fn a_prepared_dense_ffn_row_has_one_value_at_every_width_and_cohort() {
 fn planes_are_published_only_after_their_own_command_buffer_completed() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let device = MlxDevice::new().expect("device");
+    let _scratch = super::prepared_scratch::ExecutionScratch::test_scope(&device);
     let mut registry = KernelRegistry::new();
     let (n, k, width) = (128_usize, 512_usize, 5_usize);
     let mut seed = 0xABA9_u32;
@@ -757,6 +761,7 @@ fn planes_are_published_only_after_their_own_command_buffer_completed() {
 fn ffn_and_alpha_beta_planes_survive_an_abandoned_encoder() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let device = MlxDevice::new().expect("device");
+    let _scratch = super::prepared_scratch::ExecutionScratch::test_scope(&device);
     let mut registry = KernelRegistry::new();
     let (hidden, intermediate, width) = (256_u32, 512_u32, 5_usize);
     let mut seed = 0xABAA_u32;
@@ -884,6 +889,7 @@ fn ffn_and_alpha_beta_planes_survive_an_abandoned_encoder() {
 fn the_shared_head_is_prepared_once_and_matches_a_consumers_own_planes() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let device = MlxDevice::new().expect("device");
+    let _scratch = super::prepared_scratch::ExecutionScratch::test_scope(&device);
     let mut registry = KernelRegistry::new();
     let (vocab, hidden) = (1_024_u32, 512_u32);
     let mut seed = 0x5EAD_u32;

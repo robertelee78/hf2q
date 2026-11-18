@@ -163,11 +163,9 @@ pub(super) fn build_moe_ffn_layer_tile_stages_into(
         "{QWEN_MOE_LIVE_TILES_ENV}=1 requires top-k 1/6/8, expert widths that are multiples of \
          256, Q4_K/Q6_K native expert stacks and no imatrix collector"
     );
-    let prepared = weights
-        .prepared_m8
-        .as_ref()
-        .context("live-tile expert planes were not prepared at model upload")?;
-    let live = prepared
+    let prepared = weights.experts.completed()
+        .context("live-tile route requires canonical completed expert planes")?;
+    let live = weights
         .live_tiles
         .as_ref()
         .context("the shared expert's live-tile planes were not prepared at model upload")?;

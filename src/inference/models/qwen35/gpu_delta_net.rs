@@ -184,7 +184,7 @@ pub const CHUNK_THRESHOLD: u32 = 64;
 ///   Qwen3.6 head_dim=256).
 ///
 /// All four must hold; any single failure routes to the autoregressive path.
-fn chunk_path_eligible(seq_len: u32, d_k: u32) -> bool {
+pub(super) fn chunk_path_eligible(seq_len: u32, d_k: u32) -> bool {
     super::execution_dispatch::chunk_scan_prefill_enabled(INVESTIGATION_ENV.chunk_scan_prefill)
         && seq_len > CHUNK_THRESHOLD
         && seq_len % mlx_native::ops::chunk_gated_delta_rule::FIXED_BT == 0

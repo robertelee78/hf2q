@@ -123,7 +123,9 @@ impl Qwen35Family {
         let mut progress =
             crate::serve::header::LoadProgress::new(false, 1, config.num_hidden_layers as usize);
         let model = Qwen35Model::load_from_gguf(gguf, &mut progress)
-            .context("load Qwen3.5/3.6/3.8 model for calibration")?;
+            .context("load Qwen3.5/3.6/3.8 model for calibration")?
+            .finalize_canonical_experts()
+            .context("finalize Qwen experts before calibration capture")?;
         let device = MlxDevice::new().context("MlxDevice for Qwen calibration")?;
 
         let chat_template = gguf

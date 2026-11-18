@@ -7,6 +7,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
+#[path = "handlers_prefix_post_oracle_n4_tests.rs"]
+mod n4;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct BoundFile {
@@ -200,6 +203,129 @@ fn prefix_acceptance_rejects_unstable_cue_and_bad_usage() {
     );
 }
 
+fn replay_qwen_prefix_turns(
+    tokenizer: &tokenizers::Tokenizer,
+    template: &str,
+    model_id: &Value,
+    registration: &registry::ModelRegistration,
+    turns: &[Turn],
+    summary_turns: Option<&[Value]>,
+) -> Vec<Value> {
+    if let Some(summary) = summary_turns {
+        assert_eq!(summary.len(), turns.len(), "every actual wire is required");
+    }
+    let mut previous_stable: Option<Vec<u32>> = None;
+    let mut observations = Vec::with_capacity(turns.len());
+    let mut prior_tools = None;
+    let mut prior_kwargs = None;
+    let mut prior_thinking = None;
+    for (index, turn) in turns.iter().enumerate() {
+        let wire = read(&turn.request);
+        let receipt_bytes = read(&turn.receipt);
+        let receipt: Value = serde_json::from_slice(&receipt_bytes).unwrap();
+        assert_eq!(receipt["turn"].as_u64(), Some(index as u64));
+        assert_eq!(receipt["http_status"], 200);
+        assert_eq!(receipt["request_sha256"], hash(&wire));
+        assert_eq!(receipt["request_bytes"].as_u64(), Some(wire.len() as u64));
+        if let Some(summary) = summary_turns {
+            assert_eq!(&receipt, &summary[index], "summary/actual receipt mismatch");
+        }
+        let request_value: Value = serde_json::from_slice(&wire).unwrap();
+        let allowed = [
+            "model",
+            "messages",
+            "tools",
+            "tool_choice",
+            "max_completion_tokens",
+            "logprobs",
+            "hf2q_overflow_policy",
+            "stream",
+            "stream_options",
+            "reasoning",
+            "reasoning_effort",
+            "thinking_token_budget",
+            "chat_template_kwargs",
+        ];
+        assert!(
+            request_value
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|k| allowed.contains(&k.as_str())),
+            "unhandled render/admission controls"
+        );
+        assert_eq!(request_value["hf2q_overflow_policy"], "reject");
+        assert_eq!(request_value["max_completion_tokens"], 8192);
+        assert_eq!(&request_value["model"], model_id);
+        assert_eq!(request_value["logprobs"], false);
+        let req = schema::ChatCompletionRequest::deserialize(&request_value).unwrap();
+        assert!(!req.messages.is_empty());
+        assert!(req
+            .messages
+            .iter()
+            .all(|m| m.content.as_ref().is_none_or(|c| c.image_urls().is_empty())));
+        let choice = grammar::request::validate_tool_request(&req).unwrap();
+        assert!(matches!(choice, schema::ToolChoiceValue::Auto));
+        let tools = req.tools.as_deref().expect("actual tool schemas required");
+        assert_eq!(tools.len(), 3);
+        registry::qwen35_tool_argument_wire_kinds(tools).unwrap();
+        let controls = reasoning_controls_from_request(&req).unwrap();
+        let thinking = resolve_api_enable_thinking(
+            controls.thinking_enabled_override(),
+            crate::serve::template_supports_enable_thinking(template),
+        );
+        let kwargs = resolve_api_template_kwargs(
+            Some(registration),
+            req.chat_template_kwargs.as_ref(),
+            controls.deepseek_reasoning_effort_tier(),
+        );
+        assert_eq!(
+            kwargs.as_ref().unwrap().get("preserve_thinking"),
+            Some(&Value::Bool(true))
+        );
+        if index > 0 {
+            assert_eq!(prior_tools.as_ref(), Some(&request_value["tools"]));
+            assert_eq!(prior_kwargs.as_ref(), Some(&kwargs));
+            assert_eq!(prior_thinking, Some(thinking));
+        } else {
+            prior_tools = Some(request_value["tools"].clone());
+            prior_kwargs = Some(kwargs.clone());
+            prior_thinking = Some(thinking);
+        }
+        let p = render_chat_prompt_or_400_with_generation_prompt(
+            template,
+            &req.messages,
+            Some(tools),
+            thinking,
+            kwargs.as_ref(),
+            true,
+        )
+        .unwrap();
+        let s = render_chat_prompt_or_400_with_generation_prompt(
+            template,
+            &req.messages,
+            Some(tools),
+            thinking,
+            kwargs.as_ref(),
+            false,
+        )
+        .unwrap();
+        let p_tokens = tokenize_http_prompt(tokenizer, &p).unwrap();
+        let s_tokens = tokenize_http_prompt(tokenizer, &s).unwrap();
+        assert!(p_tokens.len() <= 262144 - 8192, "no overflow rewrite admissible");
+        let cached = accept_prefix(
+            &p_tokens,
+            &s_tokens,
+            previous_stable.as_deref(),
+            &receipt["usage"],
+        )
+        .unwrap_or_else(|reason| panic!("turn {index}: {reason}"));
+        observations.push(json!({"turn":index,"request_sha256":hash(&wire),"receipt_sha256":hash(&receipt_bytes),"prompt_tokens":p_tokens.len(),"stable_tokens":s_tokens.len(),"excluded_generation_cue_tokens":p_tokens.len()-s_tokens.len(),"prior_stable_tokens":previous_stable.as_ref().map(Vec::len),"cached_tokens":cached,"prompt_token_ids_sha256":hash(&serde_json::to_vec(&p_tokens).unwrap()),"stable_token_ids_sha256":hash(&serde_json::to_vec(&s_tokens).unwrap()),"rendered_sha256":hash(p.as_bytes()),"enable_thinking":thinking,"resolved_kwargs":kwargs}));
+        previous_stable = Some(s_tokens);
+    }
+    observations
+}
+
 #[test]
 #[ignore = "post-unload archived wire replay only; requires HF2Q_PREFIX_POST_ORACLE_CONFIG"]
 fn qwen38_n1_exact_prefix_post_oracle() {
@@ -245,115 +371,14 @@ fn qwen38_n1_exact_prefix_post_oracle() {
     );
     assert_eq!(readiness["readyz"]["ready"], true);
     let registration = registry::find_for_architecture("qwen35").unwrap();
-    let mut previous_stable: Option<Vec<u32>> = None;
-    let mut observations = Vec::new();
-    let mut prior_tools = None;
-    let mut prior_kwargs = None;
-    let mut prior_thinking = None;
-    for (index, turn) in config.turns.iter().enumerate() {
-        let wire = read(&turn.request);
-        let receipt_bytes = read(&turn.receipt);
-        let receipt: Value = serde_json::from_slice(&receipt_bytes).unwrap();
-        assert_eq!(receipt["turn"].as_u64(), Some(index as u64));
-        assert_eq!(receipt["http_status"], 200);
-        assert_eq!(receipt["request_sha256"], hash(&wire));
-        assert_eq!(receipt["request_bytes"].as_u64(), Some(wire.len() as u64));
-        let request_value: Value = serde_json::from_slice(&wire).unwrap();
-        let allowed = [
-            "model",
-            "messages",
-            "tools",
-            "tool_choice",
-            "max_completion_tokens",
-            "logprobs",
-            "hf2q_overflow_policy",
-            "stream",
-            "stream_options",
-            "reasoning",
-            "reasoning_effort",
-            "thinking_token_budget",
-            "chat_template_kwargs",
-        ];
-        assert!(
-            request_value
-                .as_object()
-                .unwrap()
-                .keys()
-                .all(|k| allowed.contains(&k.as_str())),
-            "unhandled render/admission controls"
-        );
-        assert_eq!(request_value["hf2q_overflow_policy"], "reject");
-        assert_eq!(request_value["max_completion_tokens"], 8192);
-        assert_eq!(request_value["model"], snapshot["model_id"]);
-        assert_eq!(request_value["logprobs"], false);
-        let req: schema::ChatCompletionRequest =
-            serde_json::from_value(request_value.clone()).unwrap();
-        assert!(!req.messages.is_empty());
-        assert!(req
-            .messages
-            .iter()
-            .all(|m| m.content.as_ref().is_none_or(|c| c.image_urls().is_empty())));
-        let choice = grammar::request::validate_tool_request(&req).unwrap();
-        assert!(matches!(choice, schema::ToolChoiceValue::Auto));
-        let tools = req.tools.as_deref().expect("actual tool schemas required");
-        assert_eq!(tools.len(), 3);
-        registry::qwen35_tool_argument_wire_kinds(tools).unwrap();
-        let controls = reasoning_controls_from_request(&req).unwrap();
-        let thinking = resolve_api_enable_thinking(
-            controls.thinking_enabled_override(),
-            crate::serve::template_supports_enable_thinking(&template),
-        );
-        let kwargs = resolve_api_template_kwargs(
-            Some(&registration),
-            req.chat_template_kwargs.as_ref(),
-            controls.deepseek_reasoning_effort_tier(),
-        );
-        assert_eq!(
-            kwargs.as_ref().unwrap().get("preserve_thinking"),
-            Some(&Value::Bool(true))
-        );
-        if index > 0 {
-            assert_eq!(prior_tools.as_ref(), Some(&request_value["tools"]));
-            assert_eq!(prior_kwargs.as_ref(), Some(&kwargs));
-            assert_eq!(prior_thinking, Some(thinking));
-        }
-        prior_tools = Some(request_value["tools"].clone());
-        prior_kwargs = Some(kwargs.clone());
-        prior_thinking = Some(thinking);
-        let p = render_chat_prompt_or_400_with_generation_prompt(
-            &template,
-            &req.messages,
-            Some(tools),
-            thinking,
-            kwargs.as_ref(),
-            true,
-        )
-        .unwrap();
-        let s = render_chat_prompt_or_400_with_generation_prompt(
-            &template,
-            &req.messages,
-            Some(tools),
-            thinking,
-            kwargs.as_ref(),
-            false,
-        )
-        .unwrap();
-        let p_tokens = tokenize_http_prompt(&tokenizer, &p).unwrap();
-        let s_tokens = tokenize_http_prompt(&tokenizer, &s).unwrap();
-        assert!(
-            p_tokens.len() <= 262144 - 8192,
-            "no overflow rewrite admissible"
-        );
-        let cached = accept_prefix(
-            &p_tokens,
-            &s_tokens,
-            previous_stable.as_deref(),
-            &receipt["usage"],
-        )
-        .unwrap_or_else(|reason| panic!("turn {index}: {reason}"));
-        observations.push(json!({"turn":index,"request_sha256":hash(&wire),"receipt_sha256":hash(&receipt_bytes),"prompt_tokens":p_tokens.len(),"stable_tokens":s_tokens.len(),"excluded_generation_cue_tokens":p_tokens.len()-s_tokens.len(),"prior_stable_tokens":previous_stable.as_ref().map(Vec::len),"cached_tokens":cached,"prompt_token_ids_sha256":hash(&serde_json::to_vec(&p_tokens).unwrap()),"stable_token_ids_sha256":hash(&serde_json::to_vec(&s_tokens).unwrap()),"rendered_sha256":hash(p.as_bytes()),"enable_thinking":thinking,"resolved_kwargs":kwargs}));
-        previous_stable = Some(s_tokens);
-    }
+    let observations = replay_qwen_prefix_turns(
+        &tokenizer,
+        &template,
+        &snapshot["model_id"],
+        &registration,
+        &config.turns,
+        None,
+    );
     assert!(config.output.is_absolute());
     let parent = config.output.parent().unwrap().canonicalize().unwrap();
     assert!(

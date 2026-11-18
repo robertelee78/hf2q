@@ -294,7 +294,9 @@ fn q1_qwen_actual_stage_localizer() {
     let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
     let model =
         crate::inference::models::qwen35::model::Qwen35Model::load_from_gguf(&gguf, &mut progress)
-            .unwrap();
+            .unwrap()
+            .finalize_canonical_experts()
+            .expect("finalize experts before localizer caches");
     use crate::inference::models::qwen35::{
         dump_bisect, kv_cache::HybridKvCache, spec_decode::positions_for_range, Qwen35Variant,
     };

@@ -48,7 +48,8 @@ use mlx_native::{
 };
 
 use super::ffn::MoeFfnShape;
-use super::gpu_ffn::{MoeFfnWeightsGpuQ, PreparedMoeExpertsM8, PreparedMoeLiveTiles};
+use super::gpu_ffn::{MoeFfnWeightsGpuQ, PreparedMoeLiveTiles};
+use super::expert_storage::CompletedMoeExperts;
 use super::moe_batched::{
     pooled, DFlash2MoeRouteMask, MoeBatchedRouting, MoeDenseRole, MOE_BATCHED_MAX_ROWS,
     QWEN_MOE_LIVE_TILES_ENV,
@@ -57,7 +58,7 @@ use super::moe_live_tiles::{build_moe_ffn_layer_tile_stages_into, row_block, BLO
 
 /// The planes and step shape the fused expert stages take for a layer.
 fn fused_step<'a>(
-    prepared: &'a PreparedMoeExpertsM8,
+    prepared: &'a CompletedMoeExperts,
     live: &'a PreparedMoeLiveTiles,
     shape: MoeFfnShape,
     rows: u32,
@@ -89,8 +90,8 @@ pub(super) fn live_tile_layer_is_fused(
     weights: &MoeFfnWeightsGpuQ,
     shape: MoeFfnShape,
 ) -> Option<bool> {
-    let prepared = weights.prepared_m8.as_ref()?;
-    let live = prepared.live_tiles.as_ref()?;
+    let prepared = weights.experts.completed()?;
+    let live = weights.live_tiles.as_ref()?;
     let (planes, params) = fused_step(prepared, live, shape, MOE_BATCHED_MAX_ROWS as u32);
     Some(moe_tiles_fused_admits(&planes, &params).is_ok())
 }
@@ -181,11 +182,9 @@ pub(super) fn build_moe_ffn_layer_live_tiles_into(
         "{QWEN_MOE_LIVE_TILES_ENV}=1 requires top-k 1/6/8, expert widths that are multiples of \
          256, Q4_K/Q6_K native expert stacks and no imatrix collector"
     );
-    let prepared = weights
-        .prepared_m8
-        .as_ref()
-        .context("live-tile expert planes were not prepared at model upload")?;
-    let live = prepared
+    let prepared = weights.experts.completed()
+        .context("live-tile route requires canonical completed expert planes")?;
+    let live = weights
         .live_tiles
         .as_ref()
         .context("the shared expert's live-tile planes were not prepared at model upload")?;

@@ -103,10 +103,8 @@ impl Qwen35LayerWeights {
         }
     }
 
-    /// ADR-020 AC#5 Iter C2.4 — mutable accessor for the FFN slot, used
-    /// by `Qwen35Model::apply_dwq_overlay` to populate the
-    /// `MoeFfnWeightsQ::expert_*_affine` slots without re-allocating
-    /// the layer.
+    /// Mutable FFN access during loading. Expert overlays require a unique raw
+    /// owner; execution caches and completed storage are immutable.
     pub fn ffn_mut(&mut self) -> &mut Qwen35FfnWeights {
         match self {
             Qwen35LayerWeights::FullAttn { ffn, .. } => ffn,
@@ -181,6 +179,11 @@ pub struct Qwen35Model {
     /// model's identity with [`Self::bind_ggml_routing_policy`] before the
     /// first forward.
     pub(crate) ggml_routing_policy: mlx_native::GgmlRoutingPolicy,
+    /// The actual GGUF loading queue/residency set, retained across handoff.
+    pub(super) weight_device: Option<MlxDevice>,
+    /// Converted main experts, committed only after source-set retirement.
+    pub(super) canonical_expert_storage_bytes:
+        super::expert_storage::CanonicalExpertStorageBytes,
     /// Present only on the evidence-bearing copied-load path. Ordinary Qwen
     /// loading remains behaviorally unchanged until it opts into that path.
     #[cfg(test)]
@@ -195,6 +198,16 @@ pub(super) struct Qwen35LoadedCandidateIdentity {
 }
 
 impl Qwen35Model {
+    pub(crate) fn weight_device(&self) -> Option<&MlxDevice> {
+        self.weight_device.as_ref()
+    }
+
+    pub(crate) fn canonical_expert_storage_bytes(
+        &self,
+    ) -> super::expert_storage::CanonicalExpertStorageBytes {
+        self.canonical_expert_storage_bytes
+    }
+
     /// Parse only the [`Qwen35Config`] from a GGUF without allocating
     /// weights. Cheap — useful for introspection (e.g. `hf2q info`).
     pub fn load_config_only(gguf: &GgufFile) -> Result<Qwen35Config> {
@@ -239,6 +252,8 @@ impl Qwen35Model {
             glp: None,
             kv_graft: None,
             ggml_routing_policy: mlx_native::ggml_routing_policy_from_environment(),
+            weight_device: None,
+            canonical_expert_storage_bytes: Default::default(),
             #[cfg(test)]
             loaded_candidate_identity: None,
             cfg,
@@ -307,7 +322,7 @@ impl Qwen35Model {
         &self,
         registry: &mut mlx_native::KernelRegistry,
         device: &mlx_native::MlxDevice,
-    ) -> Result<Option<&mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>> {
+    ) -> Result<Option<&mlx_native::ops::repacked_gguf_mm::PreparedGgufWeightPlanes>> {
         let Some((head, _)) = self.resolved_native_output_head()? else {
             return Ok(None);
         };
@@ -525,6 +540,8 @@ impl Qwen35Model {
             glp: None,
             kv_graft: None,
             ggml_routing_policy: mlx_native::ggml_routing_policy_from_environment(),
+            weight_device: Some(device),
+            canonical_expert_storage_bytes: Default::default(),
             #[cfg(test)]
             loaded_candidate_identity: None,
         })
@@ -977,10 +994,15 @@ impl Qwen35Model {
             // Assign to the right MoE slot.
             let layer = &mut self.layers[layer_idx];
             if let Qwen35FfnWeights::MoeQ(moeq) = layer.ffn_mut() {
+                let experts = std::sync::Arc::get_mut(&mut moeq.experts)
+                    .and_then(super::expert_storage::MoeExpertStorage::raw_mut)
+                    .ok_or_else(|| anyhow!(
+                        "expert overlays require unshared raw storage; reload before replacing canonical experts"
+                    ))?;
                 match base {
-                    MoeBaseRole::Gate => moeq.expert_gate_affine = Some(stack),
-                    MoeBaseRole::Up => moeq.expert_up_affine = Some(stack),
-                    MoeBaseRole::Down => moeq.expert_down_affine = Some(stack),
+                    MoeBaseRole::Gate => experts.gate = super::expert_storage::RawExpertRole::Affine(stack),
+                    MoeBaseRole::Up => experts.up = super::expert_storage::RawExpertRole::Affine(stack),
+                    MoeBaseRole::Down => experts.down = super::expert_storage::RawExpertRole::Affine(stack),
                     MoeBaseRole::GateUp => {
                         tracing::warn!(
                             layer_idx,
@@ -2329,4 +2351,6 @@ mod tests {
         assert_eq!(m.num_linear_attn_layers(), 30);
         assert!(m.mtp.is_none(), "apex MTP stripped per 2026-04-23 dump");
     }
+
+    include!("canonical_expert_retirement_tests.rs");
 }

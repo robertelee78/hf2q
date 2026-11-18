@@ -21,18 +21,25 @@
 //! |---|---|---|
 //! | `serve::gpu::GpuContext` (the model owns it: Gemma, DeepSeek-V4, Qwen3-VL) | the forward of those families | the worker's teardown |
 //! | `qwen35::forward_gpu`, the thread's GPU weight cache (two entry points, one cache) | the Qwen forward, the drafter, every `with_gpu_cache_mut` user | the worker's teardown; on the loading thread, `serve::load_engine_on_route` |
-//! | `qwen35::model::Qwen35Model::load_from_gguf`; `engine_qwen35`: GLP bind, DWQ overlay | nobody: the load creates buffers on them and commits no command | must not be (below) |
+//! | `qwen35::model::Qwen35Model::load_from_gguf` | canonical main expert preparation/source retirement | finalization before KV/drafter; model-owned device at worker teardown |
+//! | `engine_qwen35`: GLP bind, DWQ overlay | nobody: the load creates buffers on them and commits no command | not needed |
 //! | `engine_qwen35`: slot KV provisioning | provisioning | [`SettledDevice`], before provisioning reports success |
 //! | `engine_qwen35`: the five SerialFifo request functions (unary, soft tokens, vision, stream, embed) | KV allocation, snapshots and restores of that request | `RequestDevice` (`engine_qwen35`), under the engine's supervision, before the request reports success |
 //! | `engine_qwen35` and `engine_qwen3vl` load info (`backend_chip`) | nobody: only the device's name is read | not needed |
 //!
-//! The weight-loading device must stay uncommitted. Its buffers map the GGUF
-//! file; one commit on that device makes them committed members of its
-//! residency set, and they then stay resident after every handle is gone
-//! (observed: with a settle added at the end of `load_from_gguf`, 20.4 GiB
-//! of a torn-down Qwen3.6 engine never came back; without it, 0.18 GiB
-//! were left). The same observation shows that nothing encodes on it: any
-//! command would have had that effect.
+//! Qwen retains the actual weight-loading device across worker handoff.
+//! Canonical main expert finalization completes preparation and retires source
+//! registrations before publishing source-free storage. The worker teardown
+//! settles that same device after the remaining model buffers are dropped;
+//! creating an unrelated device would not flush those staged removals.
+//!
+//! Earlier guidance recorded 20.4 GiB retained after committing the loading
+//! queue versus 0.18 GiB without that commit. That observation is historical,
+//! not a current-native reclamation claim. Native 0.23.3 uses per-storage
+//! registration ownership, weak pool identity and final-set
+//! `removeAllAllocations` plus `commit`. The completed-source witness checks
+//! mapped deallocation with the device, pool and unrelated sibling still alive;
+//! physical full-model reclamation remains a separate measured gate.
 //!
 //! The other creation sites belong to no text engine's reservation: the
 //! vision tower and its projector, the embedding models, the host probe of

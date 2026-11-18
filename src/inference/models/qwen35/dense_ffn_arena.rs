@@ -226,24 +226,23 @@ impl DenseFfnArena {
 ///   applied by the per-layer pool reset (gpu_ffn.rs:2189-2196,
 ///   "iter40 fix" comment) applies here.
 ///
-/// **Memory footprint at 35B-A3B q4_0-flat pp4096** (h=5120, n_experts=256,
-/// num_experts_per_tok=8, moe_intermediate_size=512, shared_intermediate=512):
-///   - total_rows = seq * topk = 4096 * 8 = 32768
-///   - gate_all + up_all + h_all = 3 × (32768 × 512 × 4) = 192 MB
-///   - y_all = 32768 × 5120 × 4 = 670 MB
-///   - h_s = seq × m_sh × 4 = 4096 × 512 × 4 = 8 MB
-///   - ids + weights = ~256 KB
-///   - silu_params + silu_sh_params = 8 bytes
-///   Total: ~870 MB. Live for the entire prefill duration; M5 Max 128 GB
-///   unified memory keeps this well within budget.
+/// Expert payload: with `R = seq * topk`, `I = moe_intermediate_size` and
+/// `H = hidden_size`, `h_all` owns `4*R*I` bytes and `y_all` owns `4*R*H`.
+/// When `H >= 2*I`, gate/up occupy disjoint `R*I`-element regions of y_all.
+/// C→D orders projections before SiLU; D→E ends both gate/up readers before
+/// down overwrites all y_all. `h_all` always remains a separate allocation.
+/// Otherwise gate/up retain their separate `4*R*I`-byte roots. No SiLU
+/// input/output alias or expert arithmetic changes are permitted.
 pub struct MoeFfnArena {
     /// `[total_rows]` U32 — top-k expert ids, total_rows = seq × topk.
     pub ids_buf: MlxBuffer,
     /// `[total_rows]` F32 — top-k expert weights.
     pub weights_buf: MlxBuffer,
     /// `[total_rows, m_moe]` F32 — concatenated expert gate projection.
+    /// May alias the first region of y_all until the Phase D reader finishes.
     pub gate_all_buf: MlxBuffer,
     /// `[total_rows, m_moe]` F32 — concatenated expert up projection.
+    /// May alias y_all's disjoint second region until Phase D finishes.
     pub up_all_buf: MlxBuffer,
     /// `[total_rows, m_moe]` F32 — silu(gate)*up intermediate.
     pub h_all_buf: MlxBuffer,
@@ -358,12 +357,6 @@ impl MoeFfnArena {
             .alloc_buffer(total_rows * 4, DType::F32, vec![total_rows])
             .map_err(|e| anyhow!("MoeFfnArena alloc weights_buf: {e}"))?;
         let gate_all_bytes = total_rows * m_moe * 4;
-        let gate_all_buf = device
-            .alloc_buffer(gate_all_bytes, DType::F32, vec![total_rows, m_moe])
-            .map_err(|e| anyhow!("MoeFfnArena alloc gate_all_buf: {e}"))?;
-        let up_all_buf = device
-            .alloc_buffer(gate_all_bytes, DType::F32, vec![total_rows, m_moe])
-            .map_err(|e| anyhow!("MoeFfnArena alloc up_all_buf: {e}"))?;
         let h_all_buf = device
             .alloc_buffer(gate_all_bytes, DType::F32, vec![total_rows, m_moe])
             .map_err(|e| anyhow!("MoeFfnArena alloc h_all_buf: {e}"))?;
@@ -371,6 +364,27 @@ impl MoeFfnArena {
         let y_all_buf = device
             .alloc_buffer(y_all_bytes, DType::F32, vec![total_rows, h])
             .map_err(|e| anyhow!("MoeFfnArena alloc y_all_buf: {e}"))?;
+        // Phase C's simultaneous gate/up outputs must never overlap. Use the
+        // down root only when it fits both complete, tightly shaped regions.
+        let (gate_all_buf, up_all_buf) = if m_moe <= h / 2 {
+            let gate_elements = total_rows * m_moe;
+            let gate = y_all_buf
+                .slice_view(0, gate_elements)
+                .with_shape(vec![total_rows, m_moe])
+                .map_err(|e| anyhow!("MoeFfnArena gate y-root view: {e}"))?;
+            let up = y_all_buf
+                .slice_view(gate_all_bytes as u64, gate_elements)
+                .with_shape(vec![total_rows, m_moe])
+                .map_err(|e| anyhow!("MoeFfnArena up y-root view: {e}"))?;
+            (gate, up)
+        } else {
+            let allocate = || {
+                device
+                    .alloc_buffer(gate_all_bytes, DType::F32, vec![total_rows, m_moe])
+                    .map_err(|e| anyhow!("MoeFfnArena alloc gate/up: {e}"))
+            };
+            (allocate()?, allocate()?)
+        };
         let h_s_bytes = seq * m_sh * 4;
         let h_s_buf = device
             .alloc_buffer(h_s_bytes, DType::F32, vec![seq, m_sh])
@@ -1052,11 +1066,11 @@ mod tests {
         let y_all_bytes = total_rows * (h as usize) * 4;
         let h_s_bytes = (seq as usize) * (m_sh as usize) * 4;
         assert_eq!(
-            arena.gate_all_buf.byte_len(),
+            arena.gate_all_buf.data_byte_len(),
             gate_all_bytes,
             "gate_all_buf"
         );
-        assert_eq!(arena.up_all_buf.byte_len(), gate_all_bytes, "up_all_buf");
+        assert_eq!(arena.up_all_buf.data_byte_len(), gate_all_bytes, "up_all_buf");
         assert_eq!(arena.h_all_buf.byte_len(), gate_all_bytes, "h_all_buf");
         assert_eq!(arena.y_all_buf.byte_len(), y_all_bytes, "y_all_buf");
         assert_eq!(arena.h_s_buf.byte_len(), h_s_bytes, "h_s_buf");

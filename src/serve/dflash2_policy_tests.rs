@@ -157,6 +157,197 @@ fn qwen36() -> TargetFacts {
     }
 }
 
+#[test]
+fn canonical_header_bound_counts_only_complete_main_expert_triplets() {
+    let facts = qwen36();
+    let bound = canonical_expert_storage_bound(&facts);
+    let blocks_per_role = 256u64 * 512 * 2048 / 256;
+    let layers = 40;
+    assert_eq!(bound.raw_bytes, layers * blocks_per_role * (144 + 144 + 210));
+    assert_eq!(bound.prepared_bytes, layers * blocks_per_role * (144 + 144 + 212));
+    assert_eq!(bound.startup_prepared_bytes, bound.prepared_bytes);
+    let mut with_mtp = facts.clone();
+    with_mtp.tensors.extend([
+        tensor("blk.40.ffn_gate_exps.weight", GgmlType::Q4_K, &[256, 512, 2048]),
+        tensor("blk.40.ffn_up_exps.weight", GgmlType::Q4_K, &[256, 512, 2048]),
+        tensor("blk.40.ffn_down_exps.weight", GgmlType::Q6_K, &[256, 2048, 512]),
+    ]);
+    assert_eq!(canonical_expert_storage_bound(&with_mtp), bound, "MTP is a separate raw domain");
+    let unsupported = restored(facts.clone(), &["blk.3.ffn_up_exps"], GgmlType::Q8_0);
+    let partial = canonical_expert_storage_bound(&unsupported);
+    assert_eq!(partial.raw_bytes, bound.raw_bytes / layers * (layers - 1));
+    assert_eq!(partial.prepared_bytes, bound.prepared_bytes / layers * (layers - 1));
+    let mut overlay = facts;
+    overlay.dwq_overlay = true;
+    assert_eq!(canonical_expert_storage_bound(&overlay), bound,
+        "an overlay cannot justify early credit; plain surviving triplets may convert");
+}
+
+#[test]
+fn unsupported_experts_preserve_raw_memory_commitment() {
+    let facts = restored(qwen36(), &["_exps"], GgmlType::Q8_0);
+    assert_eq!(canonical_expert_storage_bound(&facts), CanonicalCommitment::default());
+    let routes = ResolvedRoutes::resolve(None, &|_| None, &env(&[(DFLASH2_ENV, "0")]));
+    let commitment = route_commitment(&facts, ROOMY, &routes, None);
+    assert_eq!(
+        commitment.total(),
+        facts.model_file_bytes + ROOMY.kv_budget_bytes
+            + commitment.plane_bytes + commitment.scratch_bytes,
+    );
+}
+
+#[test]
+fn canonical_policy_retained_peak_respects_exact_present_and_aggregate_boundaries() {
+    let facts = qwen36();
+    let full = decided(&facts, &[], &Store::cached()).unwrap();
+    assert_eq!(full.profile_label(), "full");
+    let commitment = full.commitment;
+    let canonical = commitment.canonical;
+    let weights = facts.model_file_bytes + canonical.prepared_bytes - canonical.raw_bytes;
+    let others = commitment.plane_bytes - canonical.routed_prepared_bytes;
+    let expected = (facts.model_file_bytes + canonical.prepared_bytes).max(
+        weights + others + (canonical.boot_kv_bytes + canonical.drafter_load_bytes).max(
+            ROOMY.kv_budget_bytes.max(canonical.boot_kv_bytes)
+                + commitment.scratch_bytes + canonical.drafter_run_bytes,
+        ),
+    );
+    assert_eq!(commitment.total(), expected);
+    let resident = 3 * GIB;
+    let mut host = HostFacts {
+        physical_bytes: expected + MEMORY_RESERVE_BYTES + resident,
+        available_bytes: expected + MEMORY_RESERVE_BYTES + resident,
+        resident_bytes: resident,
+        ..ROOMY
+    };
+    let fits = decide(&facts, host, &env(&[]), &Store::cached(), &|_| None).unwrap();
+    assert_eq!(fits.profile_label(), "full");
+    host.available_bytes -= 1;
+    let short = decide(&facts, host, &env(&[]), &Store::cached(), &|_| None).unwrap();
+    assert_ne!(short.profile_label(), "full", "one byte of present shortage is not waived");
+    host.available_bytes += 1;
+    host.resident_bytes += 1;
+    let other_engine = decide(&facts, host, &env(&[]), &Store::cached(), &|_| None).unwrap();
+    assert_ne!(other_engine.profile_label(), "full", "every other instance remains charged");
+}
+
+#[test]
+fn canonical_policy_startup_raw_plus_prepared_peak_has_no_kv_or_drafter_credit() {
+    let mut facts = qwen36();
+    facts.kv_rows = Some(4096);
+    let host = HostFacts { kv_budget_bytes: 0, ..ROOMY };
+    let full = decide(&facts, host, &env(&[]), &Store::cached(), &|_| None).unwrap();
+    assert_eq!(full.profile_label(), "full");
+    let peak = full.commitment.startup_total();
+    assert_eq!(full.commitment.total(), peak, "this fixture is preparation-peak bound");
+    let exact = HostFacts {
+        physical_bytes: peak + MEMORY_RESERVE_BYTES,
+        available_bytes: peak + MEMORY_RESERVE_BYTES,
+        ..host
+    };
+    assert_eq!(decide(&facts, exact, &env(&[]), &Store::cached(), &|_| None)
+        .unwrap().profile_label(), "full");
+    let short = HostFacts { available_bytes: exact.available_bytes - 1, ..exact };
+    assert!(decide(&facts, short, &env(&[]), &Store::cached(), &|_| None)
+        .unwrap_err().to_string().contains("mandatory canonical expert phase does not fit"));
+}
+
+#[test]
+fn mandatory_canonical_prior_admission_checks_both_bounds_without_a_drafter() {
+    let mut facts = qwen36();
+    facts.kv_rows = Some(4096);
+    let host = HostFacts { kv_budget_bytes: 0, ..ROOMY };
+    let prior = decide(&facts, host, &env(&[(DFLASH2_ENV, "0")]), &Untouched, &|_| None)
+        .unwrap();
+    let required = prior.commitment.total();
+    let resident = GIB;
+    let exact = HostFacts {
+        physical_bytes: required + MEMORY_RESERVE_BYTES + resident,
+        available_bytes: required + MEMORY_RESERVE_BYTES + resident,
+        resident_bytes: resident,
+        ..host
+    };
+    let assert_boundary = |pairs: &[(&str, &str)], store: &dyn DrafterStore| {
+        let fits = decide(&facts, exact, &env(pairs), store, &|_| None).unwrap();
+        assert!(!fits.selected());
+        for short in [
+            HostFacts { available_bytes: exact.available_bytes - 1, ..exact },
+            HostFacts { physical_bytes: exact.physical_bytes - 1, ..exact },
+            HostFacts { resident_bytes: resident + 1, ..exact },
+        ] {
+            let error = decide(&facts, short, &env(pairs), store, &|_| None).unwrap_err();
+            assert!(error.to_string().contains("mandatory canonical expert phase does not fit"));
+        }
+    };
+    assert_boundary(&[(DFLASH2_ENV, "0")], &Untouched);
+    assert_boundary(&[], &Store::empty(Err("offline")));
+}
+
+#[test]
+fn auto_memory_fallback_cannot_bypass_mandatory_canonical_admission() {
+    let facts = qwen36();
+    // Pin the target routes identically with and without a drafter, so
+    // withdrawing DFlash2 removes only the drafter's positive lifetime.
+    let environment = |name: &str| {
+        if name == "HF2Q_QWEN_MOE_BATCHED" {
+            Some("1".to_owned())
+        } else if name == "HF2Q_QWEN_PREFILL_WAIT_LAYERS" {
+            Some("1".to_owned())
+        } else if SWITCHES.iter().any(|row| row.name == name) {
+            Some("0".to_owned())
+        } else {
+            None
+        }
+    };
+    let selected = decide(&facts, ROOMY, &environment, &Store::cached(), &|_| None).unwrap();
+    assert!(selected.selected());
+    let prior = selected.without_dflash2("no drafter headroom");
+    let exact = HostFacts {
+        physical_bytes: prior.commitment.total() + MEMORY_RESERVE_BYTES,
+        available_bytes: prior.commitment.total() + MEMORY_RESERVE_BYTES,
+        ..ROOMY
+    };
+    let fallback = decide(&facts, exact, &environment, &Store::cached(), &|_| None).unwrap();
+    assert!(!fallback.selected());
+    assert!(fallback.reason.contains("does not fit in memory"), "{}", fallback.reason);
+    for short in [
+        HostFacts { available_bytes: exact.available_bytes - 1, ..exact },
+        HostFacts { physical_bytes: exact.physical_bytes - 1, ..exact },
+    ] {
+        assert!(decide(&facts, short, &environment, &Store::cached(), &|_| None)
+            .unwrap_err().to_string().contains("mandatory canonical expert phase does not fit"));
+    }
+}
+
+#[test]
+fn canonical_prior_retry_is_refused_beside_a_stranded_attempt() {
+    use crate::serve::resident_memory::Ledger;
+    let selected = decided(&qwen36(), &[], &Store::cached()).unwrap();
+    let prior = selected.without_dflash2("failed drafter load");
+    let host = HostFacts {
+        physical_bytes: prior.commitment.total() + MEMORY_RESERVE_BYTES,
+        available_bytes: prior.commitment.total() + MEMORY_RESERVE_BYTES,
+        ..ROOMY
+    };
+    let ledger = Ledger::new();
+    let retry = |resident_bytes| {
+        prior.admit_mandatory_canonical(HostFacts { resident_bytes, ..host })?;
+        anyhow::Ok(((), prior.commitment))
+    };
+    let (_, reservation) = ledger.admit(Path::new("/retry.gguf"), retry).unwrap();
+    assert_eq!(ledger.total(), prior.commitment.total());
+    drop(reservation);
+    let stranded = ledger.reserve(Path::new("/failed.gguf"), Commitment {
+        model_file_bytes: 1, ..Commitment::default()
+    });
+    stranded.strand("source retirement could not be established");
+    assert!(ledger.admit(Path::new("/retry.gguf"), retry).is_err());
+    assert_eq!(ledger.total(), 1, "a rejected retry neither erases nor adds a reservation");
+    let probe_prior = unprobed_host(selected, Some("probe unavailable")).unwrap();
+    assert!(probe_prior.admit_mandatory_canonical(HostFacts {
+        resident_bytes: 1, ..host
+    }).is_err());
+}
+
 /// `facts` with every tensor whose name contains one of `leaves` stored as
 /// `ggml_type`.
 fn restored(mut facts: TargetFacts, leaves: &[&str], ggml_type: GgmlType) -> TargetFacts {
@@ -747,15 +938,41 @@ fn the_profile_is_applied_switch_by_switch_to_storage_it_does_not_admit() {
         assert_eq!(selection.memory.map(|memory| memory.plane_bytes), Some(0));
     }
 
-    // A weight kind with some admitted storage keeps its row: the kernels
-    // admit weight by weight.
+    // Mixed storage admits individual prepared matrices, but the legal Q5
+    // fallback has no closed pipelined-prefill bound. Keep the drafter and
+    // withdraw the plane-backed profile rather than claim full admission.
     let mixed = restored(
         qwen38(),
         &["blk.0.ffn_gate", "blk.0.ffn_up"],
         GgmlType::Q5_K,
     );
     let selection = decided(&mixed, &[], &Store::cached()).expect("auto");
-    assert!(!selection.routes.any_withheld());
+    assert!(selection.selected(), "{}", selection.reason);
+    for name in [
+        "HF2Q_REPACKED_GGUF_M32",
+        "HF2Q_QWEN_PREFILL_PREPARED",
+        "HF2Q_DFLASH2_DRAFT_STAGED",
+    ] {
+        assert!(withheld(&selection, name), "{name}");
+    }
+    let audit = selection.routes.withheld_audit();
+    assert!(audit.contains(MEMORY_REFUSAL), "{audit}");
+    assert!(!audit.contains("these weights are Q5_K"), "{audit}");
+    assert!(selection.routes.is_one(switch("HF2Q_DFLASH2_DRAFT_AF4_G64")));
+    let memory = selection.memory.expect("selected route has an admission bound");
+    assert_eq!(memory.plane_bytes, 0);
+    assert_eq!(memory.scratch_bytes, 0);
+    let partial_bound = route_upper_bound(&mixed, &env(&[]), &|_| None);
+    assert!(partial_bound < u64::MAX, "a refused full profile cannot poison its selectable fallback");
+    assert!(partial_bound >= selection.commitment.drafter_bytes);
+    let forced_unclosed = env(&[
+        (DFLASH2_ENV, "1"),
+        ("HF2Q_QWEN_PREFILL_PREPARED", "1"),
+        ("HF2Q_QWEN_PREFILL_JOINT", "1"),
+        ("HF2Q_QWEN_PREFILL_WAIT_LAYERS", "8"),
+    ]);
+    assert_eq!(route_upper_bound(&mixed, &forced_unclosed, &|_| None), u64::MAX,
+        "required cannot admit an unbounded operator-forced partial route");
 
     // A MoE target whose routed expert stacks the staged route does not
     // take keeps the batched route and the drafter.
@@ -815,11 +1032,12 @@ fn auto_qualifies_a_moe_target_only_with_its_batched_verification_route() {
         (
             &apex,
             "blk.0.ffn_gate_shexp.weight is Q5_K, not Q4_K or Q6_K",
+            true,
         ),
-        (&overlay, "DWQ overlay"),
-        (&f16_router, "blk.7.ffn_gate_inp.weight is F16, not F32"),
+        (&overlay, "DWQ overlay", false),
+        (&f16_router, "blk.7.ffn_gate_inp.weight is F16, not F32", false),
     ];
-    for (facts, reason) in cases {
+    for (facts, reason, keeps_staged) in cases {
         // Decided before any memory is counted; the drafter is not loaded.
         let auto = decided(facts, &[], &Store::cached()).expect("auto never fails");
         assert_prior_route(&auto, &[]);
@@ -831,8 +1049,8 @@ fn auto_qualifies_a_moe_target_only_with_its_batched_verification_route() {
         assert!(auto.reason.contains(reason), "{}", auto.reason);
         assert_eq!(auto.descriptor.map(|d| d.id), Some(QWEN36_DFLASH2.id));
 
-        // Required is the operator's choice: the drafter serves with every
-        // route the storage admits.
+        // Required keeps the drafter on an unqualified expert route. The
+        // overlay/legacy fallbacks still cannot claim bounded prefill planes.
         let required = decided(facts, &[(DFLASH2_ENV, "1")], &Store::cached()).expect("required");
         assert!(required.selected());
         for name in [
@@ -844,11 +1062,25 @@ fn auto_qualifies_a_moe_target_only_with_its_batched_verification_route() {
         }
         for name in [
             "HF2Q_DFLASH2_DRAFT_AF4_G64",
-            "HF2Q_DFLASH2_DRAFT_STAGED",
             "HF2Q_DFLASH2_GPU_TARGET_TOKENS",
             "HF2Q_QWEN_VERIFY_ATTN_TILE",
         ] {
             assert!(required.routes.is_one(switch(name)), "{name}");
+        }
+        assert_eq!(
+            required.routes.is_one(switch("HF2Q_DFLASH2_DRAFT_STAGED")),
+            keeps_staged,
+            "{reason}: {}",
+            required.reason,
+        );
+        if !keeps_staged {
+            let audit = required.routes.withheld_audit();
+            assert!(withheld(&required, "HF2Q_DFLASH2_DRAFT_STAGED"), "{audit}");
+            assert!(withheld(&required, "HF2Q_QWEN_PREFILL_PREPARED"), "{audit}");
+            assert!(audit.contains(MEMORY_REFUSAL), "{audit}");
+            let memory = required.memory.expect("required drafter remains accounted");
+            assert_eq!(memory.plane_bytes, 0);
+            assert_eq!(memory.scratch_bytes, 0);
         }
         assert!(required.routes.withheld_audit().contains(reason));
         let [warning] = required.warnings.as_slice() else {
@@ -871,7 +1103,7 @@ fn auto_qualifies_a_moe_target_only_with_its_batched_verification_route() {
     // keeps such a layer on the per-row route whoever set the switch, so
     // auto still does not select the drafter. Each spelling the reader takes
     // as on is covered.
-    for (facts, reason) in cases {
+    for (facts, reason, keeps_staged) in cases {
         for value in ["1", "on", "true"] {
             let forced: &[(&str, &str)] = &[("HF2Q_QWEN_MOE_BATCHED", value)];
             let auto = decided(facts, forced, &Store::cached()).expect("auto never fails");
@@ -910,6 +1142,18 @@ fn auto_qualifies_a_moe_target_only_with_its_batched_verification_route() {
             "{audit}"
         );
         assert!(!required.routes.plane_sets().contains(&PlaneSet::MoeExperts));
+        assert_eq!(
+            required.routes.is_one(switch("HF2Q_DFLASH2_DRAFT_STAGED")),
+            keeps_staged,
+            "forcing a switch cannot certify legacy storage: {reason}: {}",
+            required.reason,
+        );
+        if !keeps_staged {
+            assert!(audit.contains(MEMORY_REFUSAL), "{audit}");
+            let memory = required.memory.expect("forced drafter remains accounted");
+            assert_eq!(memory.plane_bytes, 0);
+            assert_eq!(memory.scratch_bytes, 0);
+        }
         let [warning] = required.warnings.as_slice() else {
             panic!("one cost warning, got {:?}", required.warnings);
         };
@@ -1057,6 +1301,7 @@ fn the_host_probe_answers_for_every_table_switch() {
             .expect("nothing fails startup");
             assert!(selection.selected());
             for name in [
+                "HF2Q_DFLASH2_DRAFT_AF4_G64",
                 "HF2Q_DFLASH2_DRAFT_STAGED",
                 "HF2Q_REPACKED_GGUF_M32",
                 "HF2Q_REPACKED_GGUF_M32_PROJ",
@@ -1073,7 +1318,6 @@ fn the_host_probe_answers_for_every_table_switch() {
                 assert_eq!(withheld(&selection, name), moe, "{name}");
             }
             for name in [
-                "HF2Q_DFLASH2_DRAFT_AF4_G64",
                 "HF2Q_DFLASH2_CONTEXT_FIRST",
                 "HF2Q_QWEN_VERIFY_ATTN_TILE",
                 "HF2Q_QWEN_VERIFY_MIXER_FUSED",
@@ -1143,10 +1387,8 @@ fn the_host_probe_answers_for_every_table_switch() {
     let unknown: std::result::Result<HostRoutes, String> = Err("no Metal device".to_owned());
     assert!(host_switch_refusal(&unknown, "HF2Q_REPACKED_GGUF_M32")
         .is_some_and(|refusal| refusal.reason.contains("could not be established")));
-    assert_eq!(
-        host_switch_refusal(&unknown, "HF2Q_DFLASH2_DRAFT_AF4_G64"),
-        None
-    );
+    assert!(host_switch_refusal(&unknown, "HF2Q_DFLASH2_DRAFT_AF4_G64")
+        .is_some_and(|refusal| refusal.reason.contains("could not be established")));
     assert_eq!(host_switch_refusal(&unknown, "HF2Q_NOT_A_SWITCH"), None);
 }
 
@@ -1248,41 +1490,53 @@ fn prepared_plane_bytes_follow_the_native_layout() {
     }
 
     let dense = qwen38();
-    let per_block_ffn = 2 * 50_135_040 + 73_809_920;
+    let per_block_ffn = 2 * prepared_matrix_bytes(17_408, 5_120, GgmlType::Q4_K)
+        + prepared_matrix_bytes(5_120, 17_408, GgmlType::Q6_K);
+    let execution = [
+        (17_408, 5_120, GgmlType::Q4_K),
+        (5_120, 17_408, GgmlType::Q6_K),
+        (10_240, 5_120, GgmlType::Q6_K),
+        (6_144, 5_120, GgmlType::Q4_K),
+        (5_120, 6_144, GgmlType::Q4_K),
+        (248_320, 5_120, GgmlType::Q6_K),
+    ].into_iter().map(|(n, k, ty)| prepared_matrix_execution_bytes(n, k, ty)).max().unwrap();
     assert_eq!(
-        plane_bytes(&dense.tensors, &[PlaneSet::DenseFfn]),
-        64 * per_block_ffn
+        prepared_storage_bytes(&dense.tensors, &[PlaneSet::DenseFfn], 1),
+        64 * per_block_ffn + execution
     );
-    let per_block_projections = prepared_plane_bytes(GgmlType::Q6_K, 10_240 * 5_120)
-        + 2 * prepared_plane_bytes(GgmlType::Q4_K, 6_144 * 5_120);
+    let per_block_projections = prepared_matrix_bytes(10_240, 5_120, GgmlType::Q6_K)
+        + prepared_matrix_bytes(6_144, 5_120, GgmlType::Q4_K)
+        + prepared_matrix_bytes(5_120, 6_144, GgmlType::Q4_K);
     assert_eq!(
-        plane_bytes(&dense.tensors, &[PlaneSet::Projections]),
-        64 * per_block_projections
+        prepared_storage_bytes(&dense.tensors, &[PlaneSet::Projections], 1),
+        64 * per_block_projections + execution
     );
     assert_eq!(
-        plane_bytes(&dense.tensors, &[PlaneSet::Head]),
-        1_052_876_800
+        prepared_storage_bytes(&dense.tensors, &[PlaneSet::Head], 1),
+        prepared_matrix_bytes(248_320, 5_120, GgmlType::Q6_K)
     );
     // The embedding, the norms and the MTP projection carry no planes.
     assert_eq!(
-        plane_bytes(
+        prepared_storage_bytes(
             &dense.tensors,
-            &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head]
+            &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
+            1
         ),
-        64 * per_block_ffn + 64 * per_block_projections + 1_052_876_800
+        64 * per_block_ffn + 64 * per_block_projections
+            + prepared_matrix_bytes(248_320, 5_120, GgmlType::Q6_K) + execution
     );
-    assert_eq!(plane_bytes(&dense.tensors, &[PlaneSet::MoeExperts]), 0);
-    assert_eq!(plane_bytes(&dense.tensors, &[]), 0);
+    assert_eq!(prepared_storage_bytes(&dense.tensors, &[PlaneSet::MoeExperts], 1), 0);
+    assert_eq!(prepared_storage_bytes(&dense.tensors, &[], 1), 0);
 
     // One copy of each routed expert stack: 40 blocks of two Q4_K and one
     // Q6_K stack.
     let moe = qwen36();
     assert_eq!(
-        plane_bytes(&moe.tensors, &[PlaneSet::MoeExperts]),
+        prepared_storage_bytes(&moe.tensors, &[PlaneSet::MoeExperts], 1),
         40 * (2 * 150_994_944 + 222_298_112)
     );
     assert_eq!(
-        plane_bytes(&moe.tensors, &[PlaneSet::MoeShared]),
+        prepared_storage_bytes(&moe.tensors, &[PlaneSet::MoeShared], 1),
         40 * (2 * prepared_plane_bytes(GgmlType::Q4_K, 512 * 2_048)
             + prepared_plane_bytes(GgmlType::Q6_K, 2_048 * 512))
     );
@@ -1298,57 +1552,77 @@ fn memory_rule_is_headroom_against_drafter_and_planes() {
         kv_budget_bytes: kv_gib * GIB,
         resident_bytes: resident_gib * GIB,
     };
-    let memory_verdict = |host, model, drafter, full, drafter_only| {
-        let (verdict, headroom) = super::memory_verdict(host, model, drafter, full, drafter_only);
+    let memory_verdict = |host, model, full, drafter_only| {
+        let (verdict, headroom) = super::memory_verdict(host, model, full, drafter_only);
         assert!(headroom.budget_bytes <= headroom.present_bytes);
         (verdict, headroom.bytes())
     };
     // headroom = 64 - 0 - 16 - 0 - 8 = 40 GiB.
-    let (verdict, headroom) = memory_verdict(host(64, 0, 0), 16 * GIB, 4 * GIB, 16 * GIB, 0);
+    let (verdict, headroom) = memory_verdict(host(64, 0, 0), 16 * GIB, 20 * GIB, 4 * GIB);
     assert_eq!(headroom, 40 * GIB);
     assert_eq!(verdict, MemoryVerdict::Full);
     // Exactly at the bound is admitted; one byte over is not.
     assert_eq!(
-        memory_verdict(host(64, 0, 0), 16 * GIB, 4 * GIB, 36 * GIB, 0).0,
+        memory_verdict(host(64, 0, 0), 16 * GIB, 40 * GIB, 4 * GIB).0,
         MemoryVerdict::Full
     );
     assert_eq!(
-        memory_verdict(host(64, 0, 0), 16 * GIB, 4 * GIB, 36 * GIB + 1, 0).0,
+        memory_verdict(host(64, 0, 0), 16 * GIB, 40 * GIB + 1, 4 * GIB).0,
         MemoryVerdict::DropPlanes
     );
     // The KV budget comes out of the headroom: 64 - 16 - 32 - 8 = 8 GiB.
-    let (verdict, headroom) = memory_verdict(host(64, 32, 0), 16 * GIB, 4 * GIB, 16 * GIB, 0);
+    let (verdict, headroom) = memory_verdict(host(64, 32, 0), 16 * GIB, 20 * GIB, 4 * GIB);
     assert_eq!(headroom, 8 * GIB);
     assert_eq!(verdict, MemoryVerdict::DropPlanes);
     // So does what resident engines have committed: 128 - 60 - 16 - 32 - 8.
-    let (verdict, headroom) = memory_verdict(host(128, 32, 60), 16 * GIB, 4 * GIB, 16 * GIB, 0);
+    let (verdict, headroom) = memory_verdict(host(128, 32, 60), 16 * GIB, 20 * GIB, 4 * GIB);
     assert_eq!(headroom, 12 * GIB);
     assert_eq!(verdict, MemoryVerdict::DropPlanes);
     assert_eq!(
-        memory_verdict(host(128, 32, 52), 16 * GIB, 4 * GIB, 16 * GIB, 0).0,
+        memory_verdict(host(128, 32, 52), 16 * GIB, 20 * GIB, 4 * GIB).0,
         MemoryVerdict::Full
     );
     assert_eq!(
-        memory_verdict(host(64, 32, 0), 16 * GIB, 8 * GIB, 0, 0).0,
+        memory_verdict(host(64, 32, 0), 16 * GIB, 8 * GIB, 8 * GIB).0,
         MemoryVerdict::Full
     );
     assert_eq!(
-        memory_verdict(host(64, 32, 0), 16 * GIB, 8 * GIB + 1, 0, 0).0,
+        memory_verdict(host(64, 32, 0), 16 * GIB, 8 * GIB + 1, 8 * GIB + 1).0,
         MemoryVerdict::NoDrafter
     );
     // What the drafter-only route still retains counts against the drafter.
     assert_eq!(
-        memory_verdict(host(64, 32, 0), 16 * GIB, 7 * GIB, 16 * GIB, GIB).0,
+        memory_verdict(host(64, 32, 0), 16 * GIB, 23 * GIB, 8 * GIB).0,
         MemoryVerdict::DropPlanes
     );
     assert_eq!(
-        memory_verdict(host(64, 32, 0), 16 * GIB, 7 * GIB, 16 * GIB, GIB + 1).0,
+        memory_verdict(host(64, 32, 0), 16 * GIB, 23 * GIB, 8 * GIB + 1).0,
         MemoryVerdict::NoDrafter
     );
     // A machine smaller than the model has no headroom, not a wrapped one.
-    let (verdict, headroom) = memory_verdict(host(16, 48, 64), 21 * GIB, GIB, 0, 0);
+    let (verdict, headroom) = memory_verdict(host(16, 48, 64), 21 * GIB, GIB, GIB);
     assert_eq!(headroom, 0);
     assert_eq!(verdict, MemoryVerdict::NoDrafter);
+}
+
+fn profile_memory(
+    facts: &TargetFacts,
+    pairs: &[(&str, &str)],
+    without_planes: bool,
+) -> (DrafterMemoryBound, u64, u64) {
+    let (descriptor, _) = qualify(facts).unwrap_or_else(|_| panic!("unqualified fixture"));
+    let routes = ResolvedRoutes::resolve(
+        RouteProfile::of(descriptor),
+        &|row| {
+            (without_planes && !row.planes.is_empty()).then(|| MEMORY_REFUSAL.to_owned())
+        },
+        &env(pairs),
+    );
+    (
+        DrafterMemoryBound::required(descriptor, facts, &routes).expect("allocation geometry"),
+        routed_plane_bytes(facts, &routes, true),
+        route_scratch_bytes(facts, &routes),
+    )
 }
 
 /// An otherwise idle host with exactly `headroom` bytes of budget left for
@@ -1368,18 +1642,8 @@ fn host_with_headroom(facts: &TargetFacts, headroom: u64, resident: u64) -> Host
 fn prefill_admission_charges_one_shared_pool_at_cache_capacity() {
     let mut facts = qwen38();
     facts.kv_rows = Some(1_024);
-    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
-    let scratch =
-        crate::inference::models::qwen35::prefill_prepared::prefill_switch_scratch_bound_bytes(
-            facts.qwen_config.as_ref().expect("geometry"),
-            crate::serve::api::engine::qwen35_slot_prefill_chunk_tokens(4) as usize,
-            4,
-            1_024,
-            true,
-            8,
-        );
-    let headroom =
-        QWEN38_DFLASH2.weights_bytes + routed_plane_bytes(&facts, &routes, true) + scratch;
+    let (drafter, planes, scratch) = profile_memory(&facts, &[], false);
+    let headroom = drafter.total(planes, scratch);
     let host = host_with_headroom(&facts, headroom, 0);
     let small = decide(&facts, host, &env(&[]), &Store::cached(), &|_| None).expect("small cache");
     assert!(small.plan.is_some());
@@ -1407,7 +1671,7 @@ fn a_load_takes_only_what_is_available_now_and_not_already_promised() {
         resident_bytes: charged_gib * GIB,
     };
     let headroom =
-        |host: HostFacts, model_gib: u64| memory_verdict(host, model_gib * GIB, 0, 0, 0).1;
+        |host: HostFacts, model_gib: u64| memory_verdict(host, model_gib * GIB, 0, 0).1;
     // The counterexample the first form of the present bound allowed: 34 GiB
     // are held by others (94 available of 128), nothing is charged, the
     // model is 16 GiB with a 48 GiB KV budget. What is available must still
@@ -1424,7 +1688,7 @@ fn a_load_takes_only_what_is_available_now_and_not_already_promised() {
         "what the load may take, the promises and the reserve fit the host exactly"
     );
     let verdict =
-        |routes_gib: u64| memory_verdict(host(94, 48, 0), 16 * GIB, 4 * GIB, routes_gib * GIB, 0).0;
+        |routes_gib: u64| memory_verdict(host(94, 48, 0), 16 * GIB, (4 + routes_gib) * GIB, 4 * GIB).0;
     assert_eq!(verdict(18), MemoryVerdict::Full);
     assert_eq!(verdict(19), MemoryVerdict::DropPlanes);
     assert_eq!(
@@ -1439,7 +1703,7 @@ fn a_load_takes_only_what_is_available_now_and_not_already_promised() {
     // nothing).
     assert_eq!(headroom(host(44, 32, 0), 16).bytes(), 0);
     assert_eq!(
-        memory_verdict(host(44, 32, 0), 16 * GIB, 4 * GIB, 16 * GIB, 0).0,
+        memory_verdict(host(44, 32, 0), 16 * GIB, 20 * GIB, 4 * GIB).0,
         MemoryVerdict::NoDrafter
     );
 
@@ -1461,14 +1725,10 @@ fn a_load_takes_only_what_is_available_now_and_not_already_promised() {
     // holds it, or another process took it). The budget says the whole
     // profile fits; the load does not get bytes nobody has.
     let facts = qwen38();
-    let drafter = QWEN38_DFLASH2.weights_bytes;
-    let planes = plane_bytes(
-        &facts.tensors,
-        &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
-    );
-    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
-    let scratch = route_scratch_bytes(&facts, &routes);
-    let full_route = drafter + planes + scratch;
+    let (full_drafter, planes, scratch) = profile_memory(&facts, &[], false);
+    let (plain_drafter, plain_planes, plain_scratch) = profile_memory(&facts, &[], true);
+    let drafter = plain_drafter.total(plain_planes, plain_scratch);
+    let full_route = full_drafter.total(planes, scratch);
     let decide_with = |available: u64| {
         decide(
             &facts,
@@ -1512,14 +1772,11 @@ fn a_load_takes_only_what_is_available_now_and_not_already_promised() {
 #[test]
 fn insufficient_memory_drops_the_planes_then_the_drafter() {
     let facts = qwen38();
-    let drafter = QWEN38_DFLASH2.weights_bytes;
-    let planes = plane_bytes(
-        &facts.tensors,
-        &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
-    );
-    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
-    let scratch = route_scratch_bytes(&facts, &routes);
-    let full_bytes = drafter + planes + scratch;
+    let (full_drafter, planes, scratch) = profile_memory(&facts, &[], false);
+    let (plain_drafter, plain_planes, plain_scratch) = profile_memory(&facts, &[], true);
+    let drafter = plain_drafter.total(plain_planes, plain_scratch);
+    let full_charge = full_drafter.charge(scratch);
+    let full_bytes = full_drafter.total(planes, scratch);
     let decide_on = |headroom: u64, pairs: &[(&str, &str)]| {
         decide(
             &facts,
@@ -1541,7 +1798,9 @@ fn insufficient_memory_drops_the_planes_then_the_drafter() {
             present_headroom_bytes: full_bytes,
             available_bytes: facts.model_file_bytes + MEMORY_RESERVE_BYTES + 4 * GIB + full_bytes,
             resident_bytes: 0,
-            drafter_bytes: drafter,
+            drafter_bytes: full_charge,
+            drafter_load_bytes: full_drafter.load_bytes,
+            drafter_run_bytes: full_drafter.run_bytes,
             plane_bytes: planes,
             scratch_bytes: scratch,
         })
@@ -1551,9 +1810,10 @@ fn insufficient_memory_drops_the_planes_then_the_drafter() {
         Commitment {
             model_file_bytes: facts.model_file_bytes,
             kv_budget_bytes: 4 * GIB,
-            drafter_bytes: drafter,
+            drafter_bytes: full_charge,
             plane_bytes: planes,
             scratch_bytes: scratch,
+            canonical: CanonicalCommitment::default(),
         }
     );
 
@@ -1585,17 +1845,18 @@ fn insufficient_memory_drops_the_planes_then_the_drafter() {
     }
     assert_eq!(dropped.memory.map(|memory| memory.plane_bytes), Some(0));
     assert_eq!(dropped.commitment.plane_bytes, 0);
-    assert_eq!(dropped.commitment.drafter_bytes, drafter);
+    assert_eq!(dropped.commitment.drafter_bytes, plain_drafter.charge(plain_scratch));
 
     // An explicit plane switch is the operator's: it is never dropped, and
     // its planes count against the drafter.
-    let ffn = plane_bytes(&facts.tensors, &[PlaneSet::DenseFfn]);
     let forced: &[(&str, &str)] = &[("HF2Q_REPACKED_GGUF_M32", "1")];
-    let kept = decide_on(drafter + ffn, forced).expect("drafter and forced planes fit");
+    let (forced_drafter, ffn, forced_scratch) = profile_memory(&facts, forced, true);
+    let forced_bytes = forced_drafter.total(ffn, forced_scratch);
+    let kept = decide_on(forced_bytes, forced).expect("drafter and forced planes fit");
     assert!(kept.selected());
     assert!(kept.routes.is_one(switch("HF2Q_REPACKED_GGUF_M32")));
     assert_eq!(kept.memory.map(|memory| memory.plane_bytes), Some(ffn));
-    assert_prior_route(&decide_on(drafter + ffn - 1, forced).expect("auto"), forced);
+    assert_prior_route(&decide_on(forced_bytes - 1, forced).expect("auto"), forced);
 
     // The drafter alone does not fit: auto keeps the prior route.
     let none = decide_on(drafter - 1, &[]).expect("auto never fails");
@@ -1619,17 +1880,12 @@ fn a_second_model_is_admitted_against_what_the_first_holds_resident() {
     // One full profile and one drafter-only engine fit on this host.
     // A second full profile does not; a third drafter cannot fit.
     let facts = qwen38();
-    let drafter = QWEN38_DFLASH2.weights_bytes;
-    let planes = plane_bytes(
-        &facts.tensors,
-        &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
-    );
-    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
-    let scratch = route_scratch_bytes(&facts, &routes);
+    let (full_drafter, planes, scratch) = profile_memory(&facts, &[], false);
+    let (plain_drafter, plain_planes, plain_scratch) = profile_memory(&facts, &[], true);
     let kv = 4 * GIB;
     let base = facts.model_file_bytes + kv;
-    let second_engine = base + drafter;
-    let one_engine = base + drafter + planes + scratch;
+    let second_engine = base + plain_drafter.total(plain_planes, plain_scratch);
+    let one_engine = base + full_drafter.total(planes, scratch);
     let physical = MEMORY_RESERVE_BYTES + one_engine + second_engine;
     let ledger = Ledger::new();
     let load = |pairs: &[(&str, &str)]| {
@@ -1702,9 +1958,9 @@ fn a_second_model_is_admitted_against_what_the_first_holds_resident() {
 #[test]
 fn planes_of_a_route_the_operator_set_are_committed_whatever_the_policy() {
     let facts = qwen38();
-    let ffn = plane_bytes(&facts.tensors, &[PlaneSet::DenseFfn]);
-    let projections = plane_bytes(&facts.tensors, &[PlaneSet::Projections]);
-    let head = plane_bytes(&facts.tensors, &[PlaneSet::Head]);
+    let ffn = prepared_storage_bytes(&facts.tensors, &[PlaneSet::DenseFfn], 1);
+    let prefill_planes = prepared_storage_bytes(&facts.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections], 1);
+    let full_planes = prepared_storage_bytes(&facts.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head], 1);
     let base = facts.model_file_bytes + ROOMY.kv_budget_bytes;
     let committed = |selection: &Selection| {
         assert_eq!(selection.commitment.drafter_bytes, 0);
@@ -1731,11 +1987,11 @@ fn planes_of_a_route_the_operator_set_are_committed_whatever_the_policy() {
     assert_eq!(kill(&[]), 0);
     assert_eq!(
         kill(&[("HF2Q_QWEN_PREFILL_PREPARED", "1")]),
-        ffn + projections
+        prefill_planes
     );
     assert_eq!(
         kill(&[("HF2Q_QWEN_PREFILL_PREPARED", "on")]),
-        ffn + projections
+        prefill_planes
     );
     assert_eq!(kill(&[("HF2Q_REPACKED_GGUF_M32", "1")]), ffn);
     assert_eq!(
@@ -1744,7 +2000,7 @@ fn planes_of_a_route_the_operator_set_are_committed_whatever_the_policy() {
             ("HF2Q_REPACKED_GGUF_M32_PROJ", "1"),
             ("HF2Q_REPACKED_GGUF_M32_HEAD", "1"),
         ]),
-        ffn + projections + head
+        full_planes
     );
     // No drafter, no staged draft: its head is not prepared.
     assert_eq!(kill(&[("HF2Q_DFLASH2_DRAFT_STAGED", "1")]), 0);
@@ -1759,33 +2015,33 @@ fn planes_of_a_route_the_operator_set_are_committed_whatever_the_policy() {
     };
     let unserved = decided(&serial, prefill, &Untouched).expect("auto");
     assert_prior_route(&unserved, prefill);
-    assert_eq!(committed(&unserved), ffn + projections);
+    assert_eq!(committed(&unserved), prefill_planes);
     let offline =
         decided(&facts, prefill, &Store::empty(Err("HF_HUB_OFFLINE is set"))).expect("auto");
     assert_prior_route(&offline, prefill);
-    assert_eq!(committed(&offline), ffn + projections);
+    assert_eq!(committed(&offline), prefill_planes);
 
     // A drafter that does not fit: the prior route keeps the operator's
     // planes.
     let tight = decide(
         &facts,
-        host_with_headroom(&facts, QWEN38_DFLASH2.weights_bytes - 1, 0),
+        host_with_headroom(&facts, profile_memory(&facts, prefill, true).0.run_bytes - 1, 0),
         &env(prefill),
         &Store::cached(),
         &|_| None,
     )
     .expect("auto");
     assert_prior_route(&tight, prefill);
-    assert_eq!(tight.commitment.plane_bytes, ffn + projections);
+    assert_eq!(tight.commitment.plane_bytes, prefill_planes);
 
     // A load retried without the drafter: the profile's planes go, the
     // operator's stay.
     let selected = decided(&facts, prefill, &Store::cached()).expect("auto");
     assert!(selected.selected());
-    assert_eq!(selected.commitment.plane_bytes, ffn + projections + head);
+    assert_eq!(selected.commitment.plane_bytes, full_planes);
     let retried = selected.without_dflash2("the DFlash2 route failed to load: test");
     assert_prior_route(&retried, prefill);
-    assert_eq!(committed(&retried), ffn + projections);
+    assert_eq!(committed(&retried), prefill_planes);
     let plain = decided(&facts, &[], &Store::cached())
         .expect("auto")
         .without_dflash2("test");
@@ -1795,10 +2051,8 @@ fn planes_of_a_route_the_operator_set_are_committed_whatever_the_policy() {
 #[test]
 fn separate_prepared_heads_are_counted_unless_the_model_shares_one() {
     let facts = qwen38();
-    let head = plane_bytes(&facts.tensors, &[PlaneSet::Head]);
-    assert_eq!(head, 1_052_876_800);
-    let drafter = QWEN38_DFLASH2.weights_bytes;
-    let other = plane_bytes(&facts.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections]);
+    let head = prepared_matrix_bytes(248_320, 5_120, GgmlType::Q6_K);
+    let other = prepared_storage_bytes(&facts.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections], 1);
     let unshared: &[(&str, &str)] = &[("HF2Q_REPACKED_GGUF_SHARED_HEAD", "0")];
     let planes_of = |facts: &TargetFacts, pairs: &[(&str, &str)]| {
         let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(pairs));
@@ -1853,9 +2107,8 @@ fn separate_prepared_heads_are_counted_unless_the_model_shares_one() {
         )
         .expect("auto")
     };
-    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
-    let scratch = route_scratch_bytes(&facts, &routes);
-    let one_head = drafter + other + head + scratch;
+    let (drafter, _, scratch) = profile_memory(&facts, &[], false);
+    let one_head = drafter.total(other + head, scratch);
     assert_eq!(decide_on(one_head, &[]).profile_label(), "full");
     assert_eq!(decide_on(one_head, unshared).profile_label(), "partial");
     let both_heads = decide_on(one_head + head, unshared);
@@ -1875,18 +2128,18 @@ fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
         route_upper_bound(facts, &env(pairs), &|_| None)
     };
     let dense = qwen38();
-    let planes = plane_bytes(
+    let planes = prepared_storage_bytes(
         &dense.tensors,
         &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head],
+        1,
     );
-    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen38), &|_| None, &env(&[]));
-    let scratch = route_scratch_bytes(&dense, &routes);
-    assert_eq!(bound(&dense, &[]), QWEN38_DFLASH2.weights_bytes + planes + scratch);
+    let (drafter, _, scratch) = profile_memory(&dense, &[], false);
+    assert_eq!(bound(&dense, &[]), drafter.total(planes, scratch));
     assert_eq!(bound(&dense, &[(DFLASH2_ENV, "1")]), bound(&dense, &[]));
     assert_eq!(bound(&dense, &[(DFLASH2_ENV, "0")]), 0);
     // A prepared route the operator set beside the kill switch keeps its
     // planes resident, and the pool charges them.
-    let prefill_planes = plane_bytes(&dense.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections]);
+    let prefill_planes = prepared_storage_bytes(&dense.tensors, &[PlaneSet::DenseFfn, PlaneSet::Projections], 1);
     assert_eq!(
         bound(
             &dense,
@@ -1904,7 +2157,7 @@ fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
                 ("HF2Q_DFLASH2_DRAFT_STAGED", "1"),
             ]
         ),
-        plane_bytes(&dense.tensors, &[PlaneSet::DenseFfn, PlaneSet::Head]),
+        prepared_storage_bytes(&dense.tensors, &[PlaneSet::DenseFfn, PlaneSet::Head], 1),
         "no drafter, no staged draft head"
     );
     // A value the reader leaves off prepares nothing.
@@ -1919,7 +2172,7 @@ fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
     // prepares the FFN and projection planes, and the staged draft a head.
     assert_eq!(
         bound(&dense, &[("HF2Q_REPACKED_GGUF_M32", "0")]),
-        QWEN38_DFLASH2.weights_bytes + planes + scratch
+        drafter.total(planes, scratch)
     );
     assert_eq!(
         bound(
@@ -1930,7 +2183,15 @@ fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
                 ("HF2Q_DFLASH2_DRAFT_STAGED", "0"),
             ]
         ),
-        QWEN38_DFLASH2.weights_bytes
+        {
+            let pairs = &[
+                ("HF2Q_REPACKED_GGUF_M32", "0"),
+                ("HF2Q_QWEN_PREFILL_PREPARED", "0"),
+                ("HF2Q_DFLASH2_DRAFT_STAGED", "0"),
+            ];
+            let (drafter, planes, scratch) = profile_memory(&dense, pairs, false);
+            drafter.total(planes, scratch)
+        }
     );
     // A target that does not qualify holds nothing beside its file, unless
     // the operator set a prepared route.
@@ -1957,7 +2218,24 @@ fn the_pool_bound_is_the_fullest_route_the_policy_could_select() {
                 "no tensor API"
             )
         ),
-        QWEN38_DFLASH2.weights_bytes
+        {
+            let routes = ResolvedRoutes::resolve(
+                Some(RouteProfile::Qwen38),
+                &|row| {
+                    [
+                        "HF2Q_DFLASH2_DRAFT_STAGED",
+                        "HF2Q_REPACKED_GGUF_M32",
+                        "HF2Q_QWEN_PREFILL_PREPARED",
+                    ]
+                    .contains(&row.name)
+                    .then(|| "no tensor API".to_owned())
+                },
+                &env(&[]),
+            );
+            DrafterMemoryBound::required(&QWEN38_DFLASH2, &dense, &routes)
+                .expect("allocation geometry")
+                .total(routed_plane_bytes(&dense, &routes, true), route_scratch_bytes(&dense, &routes))
+        }
     );
 }
 
@@ -1992,7 +2270,7 @@ fn the_published_decision_names_what_ran() {
     );
     assert_eq!(
         published["memory"]["drafter_bytes"],
-        QWEN38_DFLASH2.weights_bytes
+        selection.commitment.drafter_bytes
     );
     assert_eq!(
         published["memory"]["prepared_plane_bytes"],
@@ -2090,4 +2368,283 @@ fn pinned_geometry_is_the_gate_artifacts() {
             selection.reason
         );
     }
+}
+
+#[test]
+fn absolute_prefill_memory_closes_canonical_shared_roots() {
+    use crate::inference::models::qwen35::{prefill_memory as memory, prefill_prepared};
+    let facts = qwen36();
+    let cfg = facts.qwen_config.as_ref().unwrap();
+    let route = memory::PrefillMemoryRoute {
+        joint: true, wait_layers: 8, prepared: true, tq_only: true, resume_fast: true,
+        short_wait_layers: 8,
+    };
+    let allocation = memory::bound(cfg, 2048, 4, 262_144, route).unwrap();
+    let single_wait = memory::bound(cfg, 2048, 4, 262_144,
+        memory::PrefillMemoryRoute { wait_layers: 1, ..route }).unwrap();
+    assert_eq!(single_wait.common, allocation.common);
+    assert_eq!(single_wait.deferred_outputs, allocation.deferred_outputs);
+    assert!(single_wait.pool >= prefill_prepared::PREFILL_RETAINED_SCRATCH_BYTES as u64
+        + 8 * prefill_prepared::prefill_layer_scratch_bound_bytes(cfg, 32, 4, true),
+        "short forwards keep their independent eight-layer cadence");
+    let wider = memory::bound(cfg, 2048, 8, 262_144, route).unwrap();
+    assert_eq!(allocation.attention, wider.attention, "segment views share roots");
+    assert_eq!(allocation.history, wider.history, "one sequential history workspace");
+    assert!(wider.segments > allocation.segments);
+}
+
+#[test]
+fn absolute_prefill_memory_does_not_assume_fast_tq_or_subtract_baseline() {
+    use crate::inference::models::qwen35::prefill_memory as memory;
+    let facts = qwen36();
+    let cfg = facts.qwen_config.as_ref().unwrap();
+    let route = memory::PrefillMemoryRoute {
+        joint: true, wait_layers: 8, prepared: true, tq_only: true, resume_fast: true,
+        short_wait_layers: 8,
+    };
+    let fast = memory::bound(cfg, 2048, 4, 262_144, route).unwrap();
+    for legacy in [
+        memory::PrefillMemoryRoute { tq_only: false, ..route },
+        memory::PrefillMemoryRoute { resume_fast: false, ..route },
+    ] {
+        let legacy = memory::bound(cfg, 2048, 4, 262_144, legacy).unwrap();
+        assert_eq!(legacy.history, 4 * (12 * 512 * 262_144 + 10 * 2048 * 4096));
+        assert_eq!(legacy.deferred_outputs, 4 * 4096 * 2048 * 4 * 8);
+        assert!(legacy.total() > fast.total());
+        assert_eq!(legacy.common, fast.common);
+    }
+    let solo = memory::bound(cfg, 2048, 4, 262_144,
+        memory::PrefillMemoryRoute { joint: false, ..route }).unwrap();
+    assert!(solo.common > 0 && solo.history > 0, "wait-only still owns common arenas/history");
+    assert!(solo.deferred_outputs > 0, "plain single-lane outputs survive until a checked wait");
+    assert!(memory::bound(cfg, 2048, 4, 262_144,
+        memory::PrefillMemoryRoute { prepared: false, ..route }).is_err());
+    let mut unsupported = cfg.clone();
+    unsupported.head_dim = 128;
+    assert!(memory::bound(&unsupported, 2048, 4, 262_144, route).is_err());
+    assert!(memory::bound(cfg, usize::MAX, 4, 262_144, route).is_err());
+    assert!(memory::bound(cfg, 2048, usize::MAX, 262_144, route).is_err());
+}
+
+#[test]
+fn prepared_storage_uses_native_matrix_layout_but_not_for_mm_id_planes() {
+    let experts = tensor("blk.0.ffn_gate_exps.weight", GgmlType::Q4_K, &[256, 512, 2048]);
+    let shared = tensor("blk.0.ffn_gate_shexp.weight", GgmlType::Q4_K, &[512, 2048]);
+    assert_eq!(prepared_storage_bytes(&[experts, shared], &[PlaneSet::MoeExperts, PlaneSet::MoeShared], 1),
+        prepared_plane_bytes(GgmlType::Q4_K, 257 * 512 * 2048));
+    let fused = [
+        tensor("blk.0.ssm_alpha.weight", GgmlType::Q4_K, &[32, 2048]),
+        tensor("blk.0.ssm_beta.weight", GgmlType::Q4_K, &[32, 2048]),
+    ];
+    assert_eq!(prepared_storage_bytes(&fused, &[PlaneSet::Projections], 1),
+        prepared_matrix_bytes(64, 2048, GgmlType::Q4_K) + 73_728
+            + prepared_matrix_execution_bytes(64, 2048, GgmlType::Q4_K));
+    let padded = [
+        tensor("blk.0.ssm_alpha.weight", GgmlType::Q4_K, &[16, 2048]),
+        tensor("blk.0.ssm_beta.weight", GgmlType::Q4_K, &[16, 2048]),
+    ];
+    assert_eq!(prepared_storage_bytes(&padded, &[PlaneSet::Projections], 1),
+        prepared_matrix_bytes(64, 2048, GgmlType::Q4_K) + 73_728
+            + prepared_matrix_execution_bytes(64, 2048, GgmlType::Q4_K),
+        "padding is allocated in both the fused raw source and prepared matrix");
+    let tied = tensor("token_embd.weight", GgmlType::Q6_K, &[248_320, 2048]);
+    assert_eq!(prepared_storage_bytes(&[tied], &[PlaneSet::Head], 1),
+        prepared_matrix_bytes(248_320, 2048, GgmlType::Q6_K)
+            + prepared_matrix_execution_bytes(248_320, 2048, GgmlType::Q6_K));
+}
+
+#[test]
+fn prepared_admission_keeps_model_capacity_for_a_selected_subset() {
+    let tensors = [
+        tensor("blk.0.attn_k.weight", GgmlType::Q4_K, &[256, 2048]),
+        tensor("blk.0.ffn_gate.weight", GgmlType::Q4_K, &[4096, 2048]),
+        tensor("output.weight", GgmlType::Q6_K, &[256, 2048]),
+    ];
+    let maximum = prepared_matrix_execution_bytes(4096, 2048, GgmlType::Q4_K);
+    assert!(maximum > prepared_matrix_execution_bytes(256, 2048, GgmlType::Q4_K),
+        "fixture must exercise a larger unselected execution product");
+    let projection = prepared_matrix_bytes(256, 2048, GgmlType::Q4_K);
+    let head = prepared_matrix_bytes(256, 2048, GgmlType::Q6_K);
+    assert_eq!(prepared_storage_bytes(&tensors, &[PlaneSet::Projections], 0),
+        projection + maximum);
+    assert_eq!(prepared_storage_bytes(&tensors, &[PlaneSet::Head], 1),
+        head + maximum);
+    assert_eq!(prepared_storage_bytes(&tensors, &[PlaneSet::Head], 2),
+        2 * head + maximum);
+    assert_eq!(prepared_storage_bytes(&tensors, &[PlaneSet::Head], 0), 0);
+    assert_eq!(prepared_storage_bytes(&tensors,
+        &[PlaneSet::DenseFfn, PlaneSet::Projections, PlaneSet::Head], 2),
+        prepared_matrix_bytes(4096, 2048, GgmlType::Q4_K) + projection + 2 * head + maximum);
+}
+
+#[test]
+fn scratch_admission_fails_closed_for_unprepared_fallback_products() {
+    let mut facts = qwen36();
+    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen36), &|_| None, &env(&[]));
+    facts.tensors.iter_mut().find(|tensor| tensor.name == "blk.0.attn_qkv.weight")
+        .unwrap().ggml_type = GgmlType::Q8_0;
+    assert_eq!(route_scratch_bytes(&facts, &routes), u64::MAX);
+    let mut cfg = facts.qwen_config.take().unwrap();
+    cfg.head_dim = 128;
+    facts.qwen_config = Some(cfg);
+    assert_eq!(route_scratch_bytes(&facts, &routes), u64::MAX);
+}
+
+#[test]
+fn unclosed_native_layouts_and_legacy_moe_cannot_be_zero_byte_admissions() {
+    let bad_matrix = tensor("blk.0.ssm_out.weight", GgmlType::Q4_K,
+        &[1usize << 40, 2048]);
+    assert_eq!(prepared_storage_bytes(&[bad_matrix], &[PlaneSet::Projections], 1), u64::MAX);
+    let bad_experts = tensor("blk.0.ffn_gate_exps.weight", GgmlType::Q4_K,
+        &[usize::MAX, usize::MAX, 2048]);
+    assert_eq!(prepared_storage_bytes(&[bad_experts], &[PlaneSet::MoeExperts], 1), u64::MAX);
+    let facts = qwen36();
+    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen36), &|_| None,
+        &env(&[("HF2Q_QWEN_MOE_BATCHED", "0")]));
+    assert_eq!(route_scratch_bytes(&facts, &routes), u64::MAX,
+        "legacy upload's expanded shared weights have no native-route closure");
+    let mut mismatched = qwen36();
+    mismatched.tensors.extend([
+        tensor("blk.0.ssm_alpha.weight", GgmlType::Q4_K, &[32, 2048]),
+        tensor("blk.0.ssm_beta.weight", GgmlType::Q6_K, &[32, 2048]),
+    ]);
+    let routes = ResolvedRoutes::resolve(Some(RouteProfile::Qwen36), &|_| None, &env(&[]));
+    assert_eq!(route_scratch_bytes(&mismatched, &routes), u64::MAX,
+        "a fused pair must actually admit, not just have its switch enabled");
+}
+
+#[test]
+fn prefill_envelope_preserves_legal_solo_and_joint_lifetimes_and_tls_high_water() {
+    use crate::inference::models::qwen35::{prefill_fold, prefill_memory as memory};
+    let facts = qwen36();
+    let cfg = facts.qwen_config.as_ref().unwrap();
+    let rows = crate::serve::api::engine::qwen35_slot_prefill_chunk_tokens(4) as usize;
+    let folded_rows = rows.checked_add(prefill_fold::MAX_CUE_ROWS).unwrap();
+    assert_eq!((rows, folded_rows), (2048, 2080));
+    let route = memory::PrefillMemoryRoute {
+        joint: true, wait_layers: 8, short_wait_layers: 8,
+        prepared: true, tq_only: true, resume_fast: true,
+    };
+    let joint = memory::bound(cfg, rows, 4, 262_144, route).unwrap();
+    let ordinary = memory::bound(cfg, rows, 1, 262_144,
+        memory::PrefillMemoryRoute { joint: false, ..route }).unwrap();
+    // A cue fold calls forward_gpu_last_logits_joint with ONE lane.
+    let folded = memory::bound(cfg, folded_rows, 1, 262_144, route).unwrap();
+    assert!(ordinary.deferred_outputs > folded.deferred_outputs);
+    assert!(folded.common > ordinary.common, "2080-row rings/arenas are fresh direct roots");
+    assert_eq!(folded.mm_id_tls, 68_369_376,
+        "R*topK tokens, then native x8; live shared expert ids remain short-route bounded");
+    assert!(folded.mm_id_tls > joint.mm_id_tls);
+    let envelope = memory::envelope(cfg, rows, 4, 262_144, route, true).unwrap();
+    let mut expected = 0;
+    for mut candidate in [joint, ordinary, folded] {
+        // A previous legal solo request can leave this high-water retained
+        // while a later joint forward owns its own complete local arenas.
+        candidate.mm_id_tls = folded.mm_id_tls;
+        expected = expected.max(candidate.total());
+    }
+    assert_eq!(envelope.total(), expected);
+    assert_eq!(envelope.mm_id_tls, folded.mm_id_tls);
+    assert_eq!(envelope.total(), joint.total() + 1_051_648,
+        "canonical joint remains the peak, but must retain the solo TLS high-water");
+    let no_fold = memory::envelope(cfg, rows, 4, 262_144, route, false).unwrap();
+    assert_eq!(no_fold.total(), joint.total().max(ordinary.total()));
+    let solo_route = memory::PrefillMemoryRoute { joint: false, ..route };
+    let solo = memory::envelope(cfg, rows, 4, 262_144, solo_route, true).unwrap();
+    let mut ordinary = ordinary;
+    ordinary.mm_id_tls = folded.mm_id_tls;
+    assert_eq!(solo.total(), ordinary.total().max(folded.total()),
+        "disabling aggregate joint does not disable its legal one-lane folded form");
+    assert!(memory::envelope(cfg, usize::MAX, 4, 262_144, route, true).is_err());
+    assert!(memory::envelope(cfg, u32::MAX as usize, 4, 262_144, route, true).is_err());
+    assert!(memory::envelope(cfg, rows, usize::MAX, 262_144,
+        memory::PrefillMemoryRoute { joint: false, ..route }, true).is_err());
+    assert!(memory::envelope(cfg, rows, 4, 262_144,
+        memory::PrefillMemoryRoute { wait_layers: 1, ..route }, true).is_err(),
+        "uncapped ordinary solo fallback must not borrow the joint pool's cap");
+}
+
+#[test]
+fn policy_respects_complete_mtp_carry_admission_boundary() {
+    let mut facts = qwen38();
+    facts.kv_rows = Some(4_096);
+    let config = facts.qwen_config.as_mut().unwrap();
+    config.mtp_num_hidden_layers = 1;
+    config.mtp_use_dedicated_embeddings = false;
+    let environment = env(&[
+        ("HF2Q_QWEN_SPECULATION", "off"),
+        ("HF2Q_ADR065_SHADOW_DRAFT", "1"),
+    ]);
+    let routes = ResolvedRoutes::resolve(
+        Some(RouteProfile::Qwen38), &|_| None, &environment,
+    );
+    let corrected = route_scratch_bytes(&facts, &routes);
+    let drafter = DrafterMemoryBound::required(&QWEN38_DFLASH2, &facts, &routes)
+        .expect("source-bound drafter payload");
+    let planes = routed_plane_bytes(&facts, &routes, true);
+    // Admission composes load and run peaks, not a historical scratch subtotal.
+    let required = drafter.total(planes, corrected);
+    let declined = decide(
+        &facts, host_with_headroom(&facts, required - 1, 0),
+        &environment, &Store::cached(), &|_| None,
+    ).expect("below complete MTP threshold");
+    assert!(
+        declined.plan.is_none() || declined.routes.any_withheld(),
+        "the full MTP route must not fit one byte below its complete commitment"
+    );
+    let fits = decide(
+        &facts, host_with_headroom(&facts, required, 0),
+        &environment, &Store::cached(), &|_| None,
+    ).expect("exact corrected threshold");
+    assert!(fits.plan.is_some());
+    assert!(!fits.routes.any_withheld());
+    assert_eq!(fits.commitment.scratch_bytes, corrected);
+    let pool_bound = route_upper_bound(&facts, &environment, &|_| None);
+    assert!(pool_bound < u64::MAX, "a finite full MTP route must reach model admission");
+    assert!(pool_bound >= drafter.total(planes, corrected));
+    let off = env(&[
+        (DFLASH2_ENV, "0"),
+        ("HF2Q_QWEN_SPECULATION", "off"),
+        ("HF2Q_ADR065_SHADOW_DRAFT", "1"),
+    ]);
+    let ordinary_bound = route_upper_bound(&facts, &off, &|_| None);
+    assert!(ordinary_bound > 0 && ordinary_bound < u64::MAX,
+        "ordinary spec-off shadow keeps its bounded carry without disabling model loads");
+}
+
+#[test]
+fn mtp_shared_weights_do_not_displace_the_full_target_profile() {
+    let mut facts = qwen36();
+    let config = facts.qwen_config.as_mut().unwrap();
+    config.mtp_num_hidden_layers = 1;
+    config.mtp_use_dedicated_embeddings = false;
+    let environment = env(&[]);
+    let routes = ResolvedRoutes::resolve(
+        Some(RouteProfile::Qwen36), &|_| None, &environment,
+    );
+    let drafter = DrafterMemoryBound::required(&QWEN36_DFLASH2, &facts, &routes)
+        .expect("canonical drafter payload");
+    let required = route_required_bytes(
+        &facts, host_with_headroom(&facts, 0, 0), &routes, Some(drafter),
+    );
+    // The MTP loader keeps these native Q4/Q6 blocks; only the forty
+    // target layers get grouped prepared shared-expert products.
+    facts.tensors.extend([
+        tensor("blk.40.ffn_gate_shexp.weight", GgmlType::Q4_K, &[512, 2048]),
+        tensor("blk.40.ffn_up_shexp.weight", GgmlType::Q4_K, &[512, 2048]),
+        tensor("blk.40.ffn_down_shexp.weight", GgmlType::Q6_K, &[2048, 512]),
+    ]);
+    let selected = decide(
+        &facts, host_with_headroom(&facts, required, 0),
+        &environment, &Store::cached(), &|_| None,
+    ).expect("native MTP blocks do not consume target-plane headroom");
+    assert!(selected.plan.is_some());
+    assert!(!selected.routes.any_withheld(),
+        "unprepared MTP weights must not force a partial default profile");
+    let short = decide(
+        &facts, host_with_headroom(&facts, required - 1, 0),
+        &environment, &Store::cached(), &|_| None,
+    ).expect("one byte below the complete canonical/MTP phase peak");
+    assert!(short.plan.is_none() || short.routes.any_withheld(),
+        "raw MTP is separate, but its live boot KV still participates in the peak");
 }

@@ -552,6 +552,24 @@ def isolated_lease_fixture(root: Path, scenario: str, work: str) -> None:
               "sealing": "snapshot_artifacts"}.get(scenario)
     if target:
         patches.append(mock.patch.object(gate, target, side_effect=hang))
+    if target or scenario in ("authorization", "descendants"):
+        # Start the injected clock when the blocked phase is actually reached,
+        # not while a contended runner is still scheduling worker setup. The
+        # real outer subprocess timeout still catches a phase outside the lease.
+        phase_started = None
+        real_monotonic = time.monotonic
+
+        def phase_monotonic():
+            nonlocal phase_started
+            if phase_started is None:
+                if not (root / "entered").exists():
+                    return 0.0
+                phase_started = real_monotonic()
+            return real_monotonic() - phase_started
+
+        phase_time = mock.Mock(wraps=time)
+        phase_time.monotonic.side_effect = phase_monotonic
+        patches.append(mock.patch.object(gate, "time", phase_time))
     if scenario == "canonical-argv":
         original_popen = subprocess.Popen
 
@@ -657,8 +675,9 @@ class WholeLeaseTests(unittest.TestCase):
         began = time.monotonic()
         result = subprocess.run(command, cwd=Path(__file__).parent, text=True, capture_output=True, timeout=6)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["result"], 1)
-        self.assertLess(time.monotonic() - began, 4)
+        self.assertEqual(json.loads(result.stdout)["result"], 1, result.stderr)
+        self.assertLess(time.monotonic() - began, 4, result.stderr)
+        self.assertTrue((self.root / "entered").exists(), result.stderr)
         entered = gate.load(self.root / "entered")
         self.assertFalse(gate.same_process(entered, gate.process_table()))
         end = gate.attempt_path(self.root, work, "end")

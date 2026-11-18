@@ -796,6 +796,36 @@ A floor-only family (for example DeepSeek-V4) omits the three `--reference-*` op
 - **Binding.** The case's `client.approval.set.repair_turns` must equal the client option. `q5_case.repair_turns` refuses a mismatch and any family other than `qwen36`. The client admits the grant for engine kinds hf2q, peer and Splash (design decision D9), Splash only with `family_controls.q3_family` `qwen36` (`coding_family.repair_allowed`); ds4, TensorFold and oMLX are refused. The coordinator copies the grant into each agent approval, the child checks it, and agent and coordinator summaries record `repair_turns`. `aggregate` and the Q2 run audit replay every request through the same `Workflow`; on Splash the arm's audit module binds every repaired request to a Done line and its render proof. `quality_campaign.py` and `q3_campaign.py` refuse arms with different grants. The option combines with `--instance`, `--request-setup` and `--phase-plan`, but not with `--benchmark-profile`.
 - **Cases.** `q5_cases/qwen36-repair1.json`, `peer-qwen36-repair1.json` and `splash-qwen36-repair1.json` are `qwen36.json`, `peer-qwen36.json` and `splash-qwen36.json` plus the grant. They pin `MODEL_SHA256` to the hf2q-converted GGUF (`815a22ca…`).
 
+### Exact archived Qwen N4 prefix proof
+
+After unloading the owned server, replay every archived wire with the production
+renderer and tokenizer without constructing a model or device:
+
+```bash
+HF2Q_N4_PREFIX_POST_ORACLE_CONFIG="$CONFIG" cargo test --release --locked --bin hf2q \
+  serve::api::handlers::prefix_post_oracle_tests::n4::qwen_n4_exact_prefix_post_oracle \
+  -- --exact --ignored
+```
+
+The closed config names `tokenizer`, `template`, `health`, `runtime`,
+`calibration` and `summary` as `{path, sha256}` records, with absolute paths
+and full raw-file SHA256s. Set `template_source` to `GgufEmbedded`; `agents`
+maps each of `agent-0` through `agent-3` to every ordered `{request, receipt}`
+pair of bound-file records. `output` must be a new file outside a checkout.
+The tokenizer JSON must come from the actual GGUF-only serving builder with
+truncation disabled, not an assumed-equivalent upstream HF JSON. Both semantic
+fingerprints must match the captured runtime without repinning them.
+
+The oracle binds calibration to the actual server, summary and readiness
+documents; follows its hash-bound case and coordinator approval; verifies each
+captured barrier and agent approval; and rejects duplicated initial histories.
+Missing repair grants mean zero, not malformed/null values. All seven canonical
+turns, or all nine turns when an authorized repair is used, are covered against
+the actual directories, summary and raw receipts for each of the four agents. A
+`PassedExactAllArchivedWires` result proves exact prefix/usage acceptance, not
+patch quality, model performance or release qualification. The existing dense
+seven-turn N1 oracle remains separate and unchanged.
+
 ## Three-arm speed campaign (ADR-063 Q3)
 
 `q3_campaign.py` runs the per-family Q3 comparison: stock hf2q (`--stock-bin`, the released binary), experiment hf2q (`--experiment-bin`) and the peer's best valid configuration (`q5_cases/peer-<family>.json`); for Qwen3.8 and Qwen3.6 also Splash's best valid configuration (`--splash-case`, default `q5_cases/splash-<family>.json`; see "Splash peer of record"). A labeled matched-settings peer diagnostic (`--peer-matched-case`) is optional. Every run is one `q5_calibration.py` runtime, run one at a time. The design, estimator, verdict rules and root commands are in [docs/research/adr063-q3-campaign.md](../../docs/research/adr063-q3-campaign.md).

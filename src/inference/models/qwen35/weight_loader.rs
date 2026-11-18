@@ -29,12 +29,14 @@ use mlx_native::gguf::{GgufFile, TensorInfo};
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType as MlxDType, MlxBuffer, MlxDevice};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::ir::lazy::{LazyTensor, LazyTensorMap};
 use crate::ir::{DType as IrDType, TensorRef};
 
 use super::delta_net::DeltaNetLayerWeights;
 use super::ffn::{DenseFfnWeights, MoeFfnWeights};
+use super::expert_storage::MoeExpertStorage;
 use super::full_attn::FullAttnLayerWeights;
 use super::gpu_delta_net::DeltaNetWeightsGpu;
 use super::gpu_full_attn::{upload_f32_weight, FullAttnQGateWeightsGpu, FullAttnWeightsGpu};
@@ -55,18 +57,13 @@ use super::{
 /// quantization. Small tensors (router, shared-expert) are f32 vecs, unless
 /// `native_dense` holds them in GGUF storage (`HF2Q_QWEN_MOE_BATCHED=1`).
 ///
-/// This struct is the bridge between GGUF disk bytes and
-/// `MoeFfnWeightsGpuQ`: it holds the raw Metal buffers that `GgufFile::load_tensor`
-/// produced, plus the f32 scalars needed for routing and shared-expert computation.
+/// The loaded model and execution caches share one immutable expert-storage
+/// owner. Router/shared-expert values retain their existing representation.
 pub struct MoeFfnWeightsQ {
     /// Router: `[num_experts, hidden_size]` F32. Empty when `native_dense` is set.
     pub router: Vec<f32>,
-    /// Stacked expert gate_proj: raw GGML blocks, dtype U8 on Metal.
-    pub expert_gate_q: MlxBuffer,
-    /// Stacked expert up_proj: raw GGML blocks, dtype U8 on Metal.
-    pub expert_up_q: MlxBuffer,
-    /// Stacked expert down_proj: raw GGML blocks, dtype U8 on Metal.
-    pub expert_down_q: MlxBuffer,
+    /// Exactly one raw/affine or completed-prepared routed triplet.
+    pub experts: Arc<MoeExpertStorage>,
     /// GGML quantization type for the gate and up expert buffers (must match).
     /// In the apex GGUF these are Q5_K.
     pub ggml_type_gate_up: GgmlType,
@@ -84,15 +81,6 @@ pub struct MoeFfnWeightsQ {
     /// Router and shared-expert weights in their GGUF storage, for the
     /// batched MoE decode route. `None` keeps the f32 vecs above.
     pub native_dense: Option<MoeNativeDenseQ>,
-    /// ADR-020 AC#5 Iter C2.4 — DWQ-overlay mlx-affine expert stacks
-    /// (packed-U32 weight + BF16 scales + BF16 biases).  When `Some`,
-    /// the corresponding `expert_*_q` buffer above stays
-    /// resident-but-unused; gpu_ffn dispatch sites gate on these
-    /// `Option`s and route to `mlx_native::quantized_matmul_id_into`.
-    /// Qwen35 splits gate + up (no fused gate_up like Gemma 4).
-    pub expert_gate_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
-    pub expert_up_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
-    pub expert_down_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
 }
 
 /// A MoE layer's router, shared-expert gate logit and shared-expert SwiGLU
@@ -958,9 +946,11 @@ fn load_lazy_moe_ffn_quantized(
     let p = format!("blk.{}", layer_idx);
     Ok(MoeFfnWeightsQ {
         router: load_lazy_f32(lookup, &format!("{p}.ffn_gate_inp.weight"))?,
-        expert_gate_q: load_lazy_expert_q8_0(lookup, &format!("{p}.ffn_gate_exps.weight"), device)?,
-        expert_up_q: load_lazy_expert_q8_0(lookup, &format!("{p}.ffn_up_exps.weight"), device)?,
-        expert_down_q: load_lazy_expert_q8_0(lookup, &format!("{p}.ffn_down_exps.weight"), device)?,
+        experts: Arc::new(MoeExpertStorage::from_ggml(
+            load_lazy_expert_q8_0(lookup, &format!("{p}.ffn_gate_exps.weight"), device)?,
+            load_lazy_expert_q8_0(lookup, &format!("{p}.ffn_up_exps.weight"), device)?,
+            load_lazy_expert_q8_0(lookup, &format!("{p}.ffn_down_exps.weight"), device)?,
+        )),
         ggml_type_gate_up: GgmlType::Q8_0,
         ggml_type_down: GgmlType::Q8_0,
         shared_gate_logit: load_lazy_f32(lookup, &format!("{p}.ffn_gate_inp_shexp.weight"))?,
@@ -968,9 +958,6 @@ fn load_lazy_moe_ffn_quantized(
         shared_up: load_lazy_f32(lookup, &format!("{p}.ffn_up_shexp.weight"))?,
         shared_down: load_lazy_f32(lookup, &format!("{p}.ffn_down_shexp.weight"))?,
         native_dense: None,
-        expert_gate_affine: None,
-        expert_up_affine: None,
-        expert_down_affine: None,
     })
 }
 
@@ -1048,6 +1035,8 @@ impl Qwen35Model {
             glp: None,
             kv_graft: None,
             ggml_routing_policy: mlx_native::ggml_routing_policy_from_environment(),
+            weight_device: Some(device),
+            canonical_expert_storage_bytes: Default::default(),
             #[cfg(test)]
             loaded_candidate_identity: None,
         })
@@ -1416,9 +1405,7 @@ pub fn load_moe_ffn_quantized(
 
     Ok(MoeFfnWeightsQ {
         router,
-        expert_gate_q,
-        expert_up_q,
-        expert_down_q,
+        experts: Arc::new(MoeExpertStorage::from_ggml(expert_gate_q, expert_up_q, expert_down_q)),
         ggml_type_gate_up,
         ggml_type_down,
         shared_gate_logit,
@@ -1426,9 +1413,6 @@ pub fn load_moe_ffn_quantized(
         shared_up,
         shared_down,
         native_dense,
-        expert_gate_affine: None,
-        expert_up_affine: None,
-        expert_down_affine: None,
     })
 }
 
@@ -2035,8 +2019,12 @@ mod tests {
         };
         assert_eq!(moe.ggml_type_gate_up, GgmlType::Q8_0);
         assert_eq!(moe.ggml_type_down, GgmlType::Q8_0);
-        assert_eq!(moe.expert_gate_q.dtype(), mlx_native::DType::U8);
-        let gate_bytes = moe.expert_gate_q.as_slice::<u8>().expect("gate bytes");
+        let super::super::expert_storage::ExpertRoleRef::Ggml(gate) =
+            moe.experts.role(super::super::expert_storage::ExpertRole::Gate) else {
+                panic!("Q8_0 loading must retain its raw expert representation");
+            };
+        assert_eq!(gate.dtype(), mlx_native::DType::U8);
+        let gate_bytes = gate.as_slice::<u8>().expect("gate bytes");
         assert_eq!(gate_bytes.len(), (2 * 16 * 32 / 32) * 34);
     }
 
@@ -2165,25 +2153,24 @@ mod tests {
                 assert_eq!(m.router.len(), expected_router_len);
                 let router_finite = m.router.iter().all(|v| v.is_finite());
                 assert!(router_finite, "router has non-finite values");
-                // Expert tensors are GGML blocks on the device — assert
-                // dtype is U8 (block bytes) and byte count is non-zero.
-                assert_eq!(
-                    m.expert_gate_q.dtype(),
-                    mlx_native::DType::U8,
-                    "expert_gate_q must be raw GGML blocks (U8)"
-                );
-                assert!(
-                    m.expert_gate_q.element_count() > 0,
-                    "expert_gate_q must have non-zero byte count"
-                );
-                assert!(
-                    m.expert_up_q.element_count() > 0,
-                    "expert_up_q must have non-zero byte count"
-                );
-                assert!(
-                    m.expert_down_q.element_count() > 0,
-                    "expert_down_q must have non-zero byte count"
-                );
+                let moe_cfg = cfg.moe.as_ref().expect("MoE config");
+                use super::super::expert_storage::{ExpertRole, ExpertRoleRef};
+                for (role, rows, columns, ty) in [
+                    (ExpertRole::Gate, moe_cfg.moe_intermediate_size, cfg.hidden_size,
+                        m.ggml_type_gate_up),
+                    (ExpertRole::Up, moe_cfg.moe_intermediate_size, cfg.hidden_size,
+                        m.ggml_type_gate_up),
+                    (ExpertRole::Down, cfg.hidden_size, moe_cfg.moe_intermediate_size,
+                        m.ggml_type_down),
+                ] {
+                    let ExpertRoleRef::Ggml(buffer) = m.experts.role(role) else {
+                        panic!("unfinalized GGUF loader must retain raw expert blocks");
+                    };
+                    assert_eq!(buffer.dtype(), mlx_native::DType::U8);
+                    let expected = moe_cfg.num_experts as usize * rows as usize
+                        * (columns / ty.block_values()) as usize * ty.block_bytes() as usize;
+                    assert_eq!(buffer.data_byte_len(), expected);
+                }
             }
             _ => panic!(
                 "expected MoE FFN (Moe or MoeQ), got {}",

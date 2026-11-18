@@ -39,21 +39,14 @@ pub(crate) mod anchor_contract;
 /// violations of that rule against each other, cross-module, while
 /// leaving CPU tests fully parallel.
 ///
-/// Guarded modules: ALL GPU-kernel-executing test modules — 40 files,
-/// enumerated authoritatively in `iter230_a2_lock_discipline`
-/// (models::qwen35::gpu_full_attn), which pins that every test in each
-/// enumerated module acquires this lock first-statement. Extend BOTH
-/// the guards and that list on any new GPU-family sweep failure (the
-/// AC-A3 loop-until-dry rule). The initial 4-family scope was
-/// insufficient — unguarded GPU tests in other modules (eagle3
-/// forward, vit, forward_gpu) kept corrupting guarded ones.
+/// Every GPU-kernel-executing test must hold this guard before creating or
+/// encoding Metal work. The initial four-family scope was insufficient:
+/// unguarded tests in other modules kept corrupting guarded ones.
 ///
-/// Rules (pinned by `iter230_a2_lock_discipline` in qwen35::gpu_full_attn):
-/// - acquire EXACTLY ONCE, as the FIRST statement of the `#[test]` fn:
-///   `let _gpu = crate::inference::hf2q_gpu_test_lock();`
-/// - helpers never acquire (the mutex is non-reentrant);
-/// - guarded tests only submit synchronous GPU work (`commit_and_wait`),
-///   so no work outlives the guard.
+/// Acquire exactly once per test invocation. A private shared test-entry
+/// helper may acquire as its first statement if its callers do not acquire;
+/// the mutex is non-reentrant. Keep the guard alive through checked completion
+/// of all submitted GPU work. CPU-only tests need no GPU guard.
 ///
 /// Poison-tolerant by design: a panicked GPU test must not cascade
 /// poison-unwrap failures through the rest of the suite. Limitation

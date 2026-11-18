@@ -192,9 +192,9 @@ impl Layer {
         };
         MoeFfnWeightsGpuQ {
             router,
-            expert_gate_q: experts[0].clone(),
-            expert_up_q: experts[1].clone(),
-            expert_down_q: experts[2].clone(),
+            experts: std::sync::Arc::new(super::expert_storage::MoeExpertStorage::from_ggml(
+                experts[0].clone(), experts[1].clone(), experts[2].clone(),
+            )),
             ggml_type_gate_up: GgmlType::Q4_K,
             ggml_type_down: self.down_t,
             expert_gate_stride: stride(GgmlType::Q4_K, MI, H),
@@ -206,10 +206,7 @@ impl Layer {
             shared_up,
             shared_down,
             dense_storage,
-            expert_gate_affine: None,
-            expert_up_affine: None,
-            expert_down_affine: None,
-            prepared_m8: None,
+            live_tiles: None,
         }
     }
 }

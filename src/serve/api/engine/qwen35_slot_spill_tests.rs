@@ -234,6 +234,53 @@ fn seat_conversation(
 }
 
 #[test]
+fn copied_spill_and_live_prefix_share_full_parent_until_the_final_owner_releases() {
+    use crate::inference::models::qwen35::carry_memory::CarryOwners;
+    use crate::serve::api::engine_qwen35::Qwen35SpecPrefixBoundary;
+    use mlx_native::DType;
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let Ok(device) = MlxDevice::new() else { return };
+    let mut cache = HybridKvCache::new_with_options(&tiny_cfg(), &device, 32, 2, true).unwrap();
+    let (mut retained, mut anchors) = seat_conversation(
+        &mut cache, SlotId(0), &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 6, 1,
+    );
+    let parent = device.alloc_buffer(8 * 64 * 4, DType::F32, vec![8, 64]).unwrap();
+    let backing_bytes = parent.byte_len() as u64;
+    // Different slots/windows of one padded joint parent, not logical rows.
+    let active = parent.slice_view(7 * 64 * 4, 64);
+    retained.spec = Some(Qwen35SpecPrefixBoundary {
+        token_count: 10, pending_target_hidden: parent.slice_view(64 * 4, 64),
+    });
+    drop(parent);
+    let mut store = Qwen35SlotSpillStore::new(1 << 30, 8);
+    super::spill_qwen35_victim(
+        &cache, &mut store, SlotId(0), &mut retained, &mut anchors, VictimSpill::Copy,
+    );
+    assert_eq!(store.len(), 1);
+    assert!(store.resident_bytes() > backing_bytes, "full host KV/ledger payload stays charged");
+    let mut joined = CarryOwners::default();
+    joined.include(&active);
+    joined.include(&retained.spec.as_ref().unwrap().pending_target_hidden);
+    super::include_carry_owners(&store, &mut joined);
+    assert_eq!(joined.bytes(), backing_bytes);
+    let replacement = device.alloc_buffer(3 * 64 * 4, DType::F32, vec![3, 64]).unwrap();
+    retained.spec = Some(Qwen35SpecPrefixBoundary {
+        token_count: 10, pending_target_hidden: replacement.slice_view(2 * 64 * 4, 64),
+    });
+    drop(active);
+    drop(joined);
+    let mut replaced = CarryOwners::default();
+    replaced.include(&retained.spec.as_ref().unwrap().pending_target_hidden);
+    super::include_carry_owners(&store, &mut replaced);
+    assert_eq!(replaced.bytes(), backing_bytes + replacement.byte_len() as u64);
+    drop(replaced);
+    drop(store);
+    let mut remaining = CarryOwners::default();
+    remaining.include(&retained.spec.as_ref().unwrap().pending_target_hidden);
+    assert_eq!(remaining.bytes(), replacement.byte_len() as u64);
+}
+
+#[test]
 fn reclaimed_conversation_is_spilled_then_restored_bitwise_into_its_granted_slot() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let device = MlxDevice::new().expect("Metal device");

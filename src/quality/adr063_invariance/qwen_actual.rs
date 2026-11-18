@@ -93,7 +93,9 @@ fn q1_qwen_actual_endpoint_trace() {
     let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
     let model =
         crate::inference::models::qwen35::model::Qwen35Model::load_from_gguf(&gguf, &mut progress)
-            .unwrap();
+            .unwrap()
+            .finalize_canonical_experts()
+            .expect("finalize experts before endpoint acquisition caches");
     assert_eq!(model.cfg.vocab_size, packet.workload.vocab_size);
     acquisition_scope
         .check_config(

@@ -134,6 +134,9 @@ fn qwen36_dflash2_verify_moe_route_replay() {
     model.bind_ggml_routing_policy(super::routing_policy::resolve_qwen_ggml_routing_policy(
         &gguf_path,
     ));
+    let model = model
+        .finalize_canonical_experts()
+        .expect("finalize bound experts before replay cache construction");
     // The upload's INFO lines on stderr: the live-tile route logs how many
     // layers run its fused expert stages and how many run stage by stage.
     let load_log = tracing_subscriber::fmt()

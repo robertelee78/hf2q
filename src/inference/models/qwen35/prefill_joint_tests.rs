@@ -797,6 +797,9 @@ fn qwen_prefill_joint_real_model_gate() {
     let mut progress = LoadProgress::new(false, 1, 0);
     let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
     model.bind_ggml_routing_policy(policy);
+    let model = model
+        .finalize_canonical_experts()
+        .expect("finalize bound experts before joint prefill caches");
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     let hidden = model.cfg.hidden_size as usize;
     let vocab = model.cfg.vocab_size;
@@ -1762,15 +1765,13 @@ fn without_the_layer_scratch_reset_a_forward_keeps_its_waits_and_runs_uncapped()
     });
 }
 
-/// `joint_arena_bound_bytes` against what the per-segment arenas of a joint
-/// forward really allocate: the attention prefill and projection arenas a
-/// lane's segment gets and, on a MoE model, a segment's FFN arena, built by
-/// the constructors the forward calls. (The resume scratch and the DeltaNet
-/// run scratch are derived from their constructors and not built here.)
+/// Shared attention and FFN payload calculators cover the actual arena
+/// constructors. History and deferred lifetimes have separate regressions.
 #[test]
 fn the_joint_arena_bound_covers_the_arenas_a_segment_allocates() {
     use super::full_attn::FullAttnShape;
-    use super::prefill_prepared::joint_arena_bound_bytes;
+    use super::prefill_memory::{attention_arena_bytes, ffn_arena_bytes};
+    use mlx_native::metal::foreign_types::ForeignType;
     let check = |model: &Qwen35Model, what: &str| {
         let cfg = &model.cfg;
         let shape = FullAttnShape::from_config(cfg);
@@ -1793,27 +1794,33 @@ fn the_joint_arena_bound_covers_the_arenas_a_segment_allocates() {
                         shape.head_dim,
                         shape.rms_norm_eps,
                     )?;
+                    // byte_len is owning Metal length, including for views.
+                    // Count each actual allocation once, independently of
+                    // constructor formulas or the number of logical fields.
+                    let owner = |buffer: &mlx_native::MlxBuffer| {
+                        (buffer.metal_buffer().as_ptr() as usize, buffer.byte_len())
+                    };
                     let mut buffers = vec![
-                        prefill.q_bf16_seq.byte_len(),
-                        prefill.q_bf16_hm.byte_len(),
-                        prefill.k_bf16_seq.byte_len(),
-                        prefill.k_bf16_hm.byte_len(),
-                        prefill.v_bf16_seq.byte_len(),
-                        prefill.v_bf16_hm.byte_len(),
-                        prefill.out_bf16_hm.byte_len(),
-                        projections.x_norm_buf.byte_len(),
-                        projections.pre_norm_params_buf.byte_len(),
-                        projections.q_proj_buf.byte_len(),
-                        projections.k_proj_buf.byte_len(),
-                        projections.v_proj_buf.byte_len(),
-                        projections.gate_proj_buf.byte_len(),
-                        projections.q_normed_buf.byte_len(),
-                        projections.k_normed_buf.byte_len(),
-                        projections.qk_rms_params_buf.byte_len(),
-                        projections.q_rope_buf.byte_len(),
-                        projections.k_rope_buf.byte_len(),
-                        projections.gated_buf.byte_len(),
-                        projections.sigmoid_params_buf.byte_len(),
+                        owner(&prefill.q_bf16_seq),
+                        owner(&prefill.q_bf16_hm),
+                        owner(&prefill.k_bf16_seq),
+                        owner(&prefill.k_bf16_hm),
+                        owner(&prefill.v_bf16_seq),
+                        owner(&prefill.v_bf16_hm),
+                        owner(&prefill.out_bf16_hm),
+                        owner(&projections.x_norm_buf),
+                        owner(&projections.pre_norm_params_buf),
+                        owner(&projections.q_proj_buf),
+                        owner(&projections.k_proj_buf),
+                        owner(&projections.v_proj_buf),
+                        owner(&projections.gate_proj_buf),
+                        owner(&projections.q_normed_buf),
+                        owner(&projections.k_normed_buf),
+                        owner(&projections.qk_rms_params_buf),
+                        owner(&projections.q_rope_buf),
+                        owner(&projections.k_rope_buf),
+                        owner(&projections.gated_buf),
+                        owner(&projections.sigmoid_params_buf),
                     ];
                     if let Some(moe) = cfg.moe.as_ref() {
                         let arena = super::MoeFfnArena::new(
@@ -1826,70 +1833,41 @@ fn the_joint_arena_bound_covers_the_arenas_a_segment_allocates() {
                             moe.num_experts,
                         )?;
                         buffers.extend([
-                            arena.ids_buf.byte_len(),
-                            arena.weights_buf.byte_len(),
-                            arena.gate_all_buf.byte_len(),
-                            arena.up_all_buf.byte_len(),
-                            arena.h_all_buf.byte_len(),
-                            arena.y_all_buf.byte_len(),
-                            arena.h_s_buf.byte_len(),
-                            arena.silu_params_buf.byte_len(),
-                            arena.silu_sh_params_buf.byte_len(),
-                            arena.dummy_residual_buf.byte_len(),
-                            arena.logits_buf.byte_len(),
-                            arena.sh_logit_buf.byte_len(),
-                            arena.a_s_buf.byte_len(),
-                            arena.b_s_buf.byte_len(),
+                            owner(&arena.ids_buf),
+                            owner(&arena.weights_buf),
+                            owner(&arena.gate_all_buf),
+                            owner(&arena.up_all_buf),
+                            owner(&arena.h_all_buf),
+                            owner(&arena.y_all_buf),
+                            owner(&arena.h_s_buf),
+                            owner(&arena.silu_params_buf),
+                            owner(&arena.silu_sh_params_buf),
+                            owner(&arena.dummy_residual_buf),
+                            owner(&arena.logits_buf),
+                            owner(&arena.sh_logit_buf),
+                            owner(&arena.a_s_buf),
+                            owner(&arena.b_s_buf),
                         ]);
                     }
-                    Ok(buffers.iter().sum::<usize>() as u64)
+                    buffers.sort_unstable_by_key(|&(identity, _)| identity);
+                    buffers.dedup_by_key(|&mut (identity, _)| identity);
+                    Ok(buffers.iter().map(|&(_, bytes)| bytes).sum::<usize>() as u64)
                 })
                 .expect("arenas");
             // One slot, one segment of `rows` rows, no attended history.
-            let bound = joint_arena_bound_bytes(cfg, rows as usize, 1, 0);
+            let bound = attention_arena_bytes(cfg, rows as usize).unwrap()
+                + ffn_arena_bytes(cfg, rows as usize, 0).unwrap()
+                + 64 * 16 * 1024;
             assert!(
                 allocated <= bound,
                 "{what}: the arenas of a {rows}-row segment hold {allocated} bytes, over the bound of {bound}"
             );
         }
-        // The attended history: twelve bytes per KV element and slot.
-        let kv = u64::from(cfg.num_key_value_heads) * u64::from(cfg.head_dim);
-        assert_eq!(
-            joint_arena_bound_bytes(cfg, 64, 3, 1000) - joint_arena_bound_bytes(cfg, 64, 3, 0),
-            3 * 12 * kv * 1000
-        );
     };
     with_synthetic_model(|model| check(model, "dense FFN"));
     super::prefill_fold_tests::with_synthetic_moe_model(|model| check(model, "MoE FFN"));
 }
 
-/// The two switches cap one pool: what memory admission charges them
-/// together is not the sum of their figures.
-#[test]
-fn the_switches_are_charged_as_one_pool() {
-    use super::prefill_prepared::{
-        joint_arena_bound_bytes, joint_scratch_bound_bytes, prefill_switch_scratch_bound_bytes,
-        wait_layers_scratch_bound_bytes,
-    };
-    with_synthetic_model(|model| {
-        let cfg = &model.cfg;
-        let (rows, slots, kv_rows) = (2048, 4, 32_768);
-        let charged = |joint, wait| {
-            prefill_switch_scratch_bound_bytes(cfg, rows, slots, kv_rows, joint, wait)
-        };
-        assert_eq!(charged(false, 1), 0);
-        assert_eq!(charged(true, 1), joint_scratch_bound_bytes(cfg, rows, slots, kv_rows));
-        assert_eq!(charged(false, 8), wait_layers_scratch_bound_bytes(cfg, rows, 1, 8));
-        let both = charged(true, 8);
-        assert_eq!(
-            both,
-            wait_layers_scratch_bound_bytes(cfg, rows, slots, 8)
-                + joint_arena_bound_bytes(cfg, rows, slots, kv_rows)
-        );
-        assert!(both >= charged(true, 1) && both >= charged(false, 8));
-        assert!(both < charged(true, 1) + charged(false, 8), "the two figures were added");
-    });
-}
 
 /// One layer of a forward on the prepared route requests at most
 /// `prefill_layer_scratch_bound_bytes` of scratch for its shape: single-slot
@@ -1905,11 +1883,12 @@ fn a_layer_requests_no_more_scratch_than_its_derived_bound() {
     use super::prefill_prepared::prefill_layer_scratch_bound_bytes as bound;
     let check = |model: &Qwen35Model, what: &str| {
         let mut tightest = f64::INFINITY;
-        let mut probe = |name: &str, rows: usize, lanes: usize, run: &mut dyn FnMut()| {
+        let shared_result = super::resume_attn_fast::resume_attn_fast_enabled();
+        let mut probe = |name: &str, rows: usize, lanes: usize, shared: bool, run: &mut dyn FnMut()| {
             decode_pool::take_layer_scratch_peak();
             run();
             let peak = decode_pool::take_layer_scratch_peak();
-            let limit = bound(&model.cfg, rows, lanes);
+            let limit = bound(&model.cfg, rows, lanes, shared);
             assert!(peak > 0, "{what}, {name}: the forward requested no scratch");
             assert!(
                 peak <= limit,
@@ -1924,7 +1903,7 @@ fn a_layer_requests_no_more_scratch_than_its_derived_bound() {
             ("resumed chunk with a folded cue", Lane::new(0, &[155], 300, 5)),
             ("short resumed chunk", Lane::new(0, &[155], 20, 0)),
         ] {
-            probe(name, lane.rows(), 1, &mut || {
+            probe(name, lane.rows(), 1, false, &mut || {
                 solo(model, &lane, false);
             });
         }
@@ -1935,7 +1914,7 @@ fn a_layer_requests_no_more_scratch_than_its_derived_bound() {
             Lane::cold(3, 96, 150, 5),
         ];
         let rows: usize = 96 + shared.iter().map(|lane| lane.rows() - 96).sum::<usize>();
-        probe("joint, shared prefix", rows, 4, &mut || {
+        probe("joint, shared prefix", rows, 4, shared_result, &mut || {
             joint(model, &shared, 96, false);
         });
         let mixed = [
@@ -1944,9 +1923,43 @@ fn a_layer_requests_no_more_scratch_than_its_derived_bound() {
             Lane::new(2, &[110], 266, 5),
         ];
         let rows: usize = mixed.iter().map(Lane::rows).sum();
-        probe("joint, resumed lanes", rows, 3, &mut || {
+        probe("joint, resumed lanes", rows, 3, shared_result, &mut || {
             joint(model, &mixed, 0, false);
         });
+        // Observe only this pending forward, not its history or a follow-up
+        // with a different row count. These are real TQ consumers at both
+        // short/long endpoints and unequal content/cue tails.
+        for (content, cue) in [
+            (2, 2), (2, 31), (31, 32), (32, 32), (33, 32), (64, 32), (513, 31),
+        ] {
+            let lane = Lane::new(0, &[1], content, cue);
+            let mut cache = cache(model);
+            let _scope = PrefillScope::forced(true);
+            prefill_history(model, &mut cache, &lane);
+            probe("joint, coupled segment endpoints", lane.rows(), 1, shared_result, &mut || {
+                joint_forward(model, &mut cache, &[lane], 0, false)
+                    .expect("coupled endpoint forward");
+            });
+        }
+        for rows in [2048usize, 2080] {
+            // A private lane includes the whole shared prefix. In the 2080
+            // case its 2050-row content crosses the 2048-row bucket edge,
+            // despite only 2080 unique rows across the four lanes.
+            let common = rows - 48;
+            let lanes = [
+                Lane::cold(0, common, common + 18, 2),
+                Lane::cold(1, common, common + 10, 2),
+                Lane::cold(2, common, common + 6, 2),
+                Lane::cold(3, common, common + 6, 2),
+            ];
+            let mut cache = model.with_gpu_cache_mut(|device, _registry| {
+                HybridKvCache::new_with_options(&model.cfg, device, 4096, SLOTS, true)
+            }).expect("allocate served-capacity TQ cache");
+            probe("joint, private shared-prefix capacity edge", rows, 4, shared_result, &mut || {
+                joint_forward(model, &mut cache, &lanes, common, false)
+                    .expect("served-capacity coupled forward");
+            });
+        }
         assert!(
             tightest < 16.0,
             "{what}: the bound is at least {tightest:.1} times every layer's requests"
@@ -1997,6 +2010,9 @@ fn qwen_prefill_scratch_sites_probe() {
     let mut progress = LoadProgress::new(false, 1, 0);
     let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
     model.bind_ggml_routing_policy(policy);
+    let model = model
+        .finalize_canonical_experts()
+        .expect("finalize bound experts before scratch observation");
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     let vocab = model.cfg.vocab_size;
     let layers = model.layers.len();
@@ -2013,7 +2029,7 @@ fn qwen_prefill_scratch_sites_probe() {
     eprintln!("[SCRATCH_SITES] layers {layers} hidden {hidden}");
     let report = |what: &str, rows: usize, lanes: usize, trace: Vec<(&'static str, u32, usize)>| {
         let peak = super::decode_pool::take_layer_scratch_peak();
-        let limit = super::prefill_prepared::prefill_layer_scratch_bound_bytes(&model.cfg, rows, lanes);
+        let limit = super::prefill_prepared::prefill_layer_scratch_bound_bytes(&model.cfg, rows, lanes, false);
         eprintln!(
             "[SCRATCH_SITES] {what}: largest layer {:.1} MiB, derived bound {:.1} MiB ({:.2}x)",
             peak as f64 / 1048576.0,
@@ -2147,6 +2163,9 @@ fn qwen_prefill_wait_layers_memory_probe() {
     let mut progress = LoadProgress::new(false, 1, 0);
     let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
     model.bind_ggml_routing_policy(policy);
+    let model = model
+        .finalize_canonical_experts()
+        .expect("finalize bound experts before wait-cadence caches");
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     let vocab = model.cfg.vocab_size;
     let mut cache = model

@@ -17,6 +17,15 @@
 //! scratch), allocated or not. *Available now* is what the host reports
 //! free, inactive or purgeable at the decision.
 //!
+//! Canonical main experts have disjoint ownership phases: raw+prepared before
+//! KV/drafter/cache provisioning, then source-free weights with boot KV/drafter
+//! load, then weights with the unchanged KV promise and execution scratch.
+//! Admission reserves their maximum. Only checked producer completion and
+//! source-registration retirement let `promote_canonical` replace that startup
+//! charge with the actual retained bound. The file floor, other weights and MTP
+//! are never credited away; kernel page reclamation is still governed by the
+//! unchanged host-present bound below.
+//!
 //! Why every term is in the present bound. What is available now is still
 //! owed, later, to everything that has been promised memory and has not
 //! taken it: the incoming model's file and its KV budget, and the part of
@@ -101,11 +110,35 @@ pub(crate) struct Commitment {
     pub(crate) plane_bytes: u64,
     /// Scratch the fast routes retain between steps.
     pub(crate) scratch_bytes: u64,
+    /// Header-bound phase plan; replaced only by checked source-free promotion.
+    pub(crate) canonical: CanonicalCommitment,
+}
+
+/// Main expert conversion is disjoint from KV/drafter/cache materialization.
+/// These are allocation ownership bounds, not a claim of physical reclamation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CanonicalCommitment {
+    pub(crate) raw_bytes: u64,
+    pub(crate) prepared_bytes: u64,
+    /// Header upper bound retained for startup diagnostics after promotion.
+    pub(crate) startup_prepared_bytes: u64,
+    /// Main expert planes already included in `Commitment::plane_bytes`.
+    pub(crate) routed_prepared_bytes: u64,
+    pub(crate) boot_kv_bytes: u64,
+    pub(crate) drafter_load_bytes: u64,
+    pub(crate) drafter_run_bytes: u64,
 }
 
 impl Commitment {
-    /// Sum of every component.
+    /// Peak of the disjoint raw preparation and source-free retained phases.
     pub(crate) fn total(&self) -> u64 {
+        if self.canonical.startup_prepared_bytes == 0 {
+            return self.raw_total();
+        }
+        self.startup_total().max(self.retained_total())
+    }
+
+    fn raw_total(&self) -> u64 {
         [
             self.model_file_bytes,
             self.kv_budget_bytes,
@@ -116,12 +149,37 @@ impl Commitment {
         .into_iter()
         .fold(0, u64::saturating_add)
     }
+
+    pub(crate) fn startup_total(&self) -> u64 {
+        self.model_file_bytes.saturating_add(self.canonical.startup_prepared_bytes)
+    }
+
+    pub(crate) fn retained_total(&self) -> u64 {
+        let canonical = self.canonical;
+        if canonical.startup_prepared_bytes == 0 {
+            return self.raw_total();
+        }
+        // Retire only the converted source allocation. Preserve the file
+        // floor and all non-main products, including the separate MTP domain.
+        let weights = self.model_file_bytes.max(
+            self.model_file_bytes.saturating_sub(canonical.raw_bytes)
+                .saturating_add(canonical.prepared_bytes),
+        );
+        let other_planes = self.plane_bytes.saturating_sub(canonical.routed_prepared_bytes);
+        let load = canonical.boot_kv_bytes.saturating_add(canonical.drafter_load_bytes);
+        let run = self.kv_budget_bytes.max(canonical.boot_kv_bytes).saturating_add(self.scratch_bytes)
+            .saturating_add(canonical.drafter_run_bytes);
+        weights.saturating_add(other_planes).saturating_add(load.max(run))
+    }
 }
 
 struct Entry {
     /// The model the engine was loaded from, for diagnostics.
     model: PathBuf,
     commitment: Commitment,
+    /// No retained-state credit until the producer has completed and its
+    /// source registrations have actually been retired.
+    canonical_promoted: bool,
     /// The thread that owns the model has begun to tear it down.
     tearing_down: bool,
     /// The reservation's owner has let go of it.
@@ -132,6 +190,16 @@ struct Entry {
     /// The commitment is never released: a teardown or a loading cleanup
     /// failed.
     stranded: bool,
+}
+
+impl Entry {
+    fn charged_bytes(&self) -> u64 {
+        if self.canonical_promoted {
+            self.commitment.retained_total()
+        } else {
+            self.commitment.total()
+        }
+    }
 }
 
 #[derive(Default)]
@@ -149,7 +217,7 @@ impl Entries {
     fn total(&self) -> u64 {
         self.reserved
             .values()
-            .map(|entry| entry.commitment.total())
+            .map(Entry::charged_bytes)
             .fold(0, u64::saturating_add)
     }
 
@@ -161,6 +229,7 @@ impl Entries {
             Entry {
                 model: model.to_path_buf(),
                 commitment,
+                canonical_promoted: false,
                 tearing_down: false,
                 owner_released: false,
                 loading_claim: false,
@@ -205,7 +274,7 @@ impl Entries {
         if !std::mem::replace(&mut entry.stranded, true) {
             tracing::error!(
                 model = %entry.model.display(),
-                bytes = entry.commitment.total(),
+                bytes = entry.charged_bytes(),
                 reason,
                 "engine memory stays reserved until the process restarts"
             );
@@ -252,9 +321,9 @@ impl Ledger {
         self.entries().total()
     }
 
-    /// Reserve `commitment` for the engine being loaded from `model`,
-    /// whatever is resident: a route that is not subject to an admission
-    /// rule.
+    /// Inject a resident commitment for ledger tests. Production loads must
+    /// enter through `admit`; no unconditional reservation bypass is exposed.
+    #[cfg(test)]
     pub(crate) fn reserve(self: &Arc<Self>, model: &Path, commitment: Commitment) -> Reservation {
         Reservation {
             id: self.entries().insert(model, commitment),
@@ -372,6 +441,45 @@ impl Reservation {
             id: self.id,
             concluded: false,
         }
+    }
+
+    /// Accept only the completed producer's actual metadata, before KV,
+    /// drafter or GPU-cache provisioning. A mismatch leaves the full startup
+    /// charge intact; callers fail the load rather than borrowing early credit.
+    pub(crate) fn promote_canonical(
+        &self,
+        raw_bytes: u64,
+        prepared_bytes: u64,
+    ) -> anyhow::Result<Commitment> {
+        let mut entries = self.ledger.entries();
+        let entry = entries.reserved.get_mut(&self.id)
+            .ok_or_else(|| anyhow::anyhow!("canonical reservation no longer exists"))?;
+        anyhow::ensure!(
+            !entry.stranded && !entry.owner_released && !entry.tearing_down,
+            "canonical reservation is not owned by an active load"
+        );
+        anyhow::ensure!(!entry.canonical_promoted, "canonical reservation already promoted");
+        let planned = entry.commitment;
+        let expected = planned.canonical;
+        anyhow::ensure!(
+            raw_bytes <= expected.raw_bytes
+                && prepared_bytes <= expected.prepared_bytes
+                && prepared_bytes >= raw_bytes
+                && prepared_bytes - raw_bytes
+                    <= expected.prepared_bytes.saturating_sub(expected.raw_bytes)
+                && (raw_bytes != 0 || prepared_bytes == 0),
+            "completed canonical expert bytes exceed the admitted header bound"
+        );
+        let mut completed = planned;
+        completed.canonical.raw_bytes = raw_bytes;
+        completed.canonical.prepared_bytes = prepared_bytes;
+        anyhow::ensure!(
+            completed.retained_total() <= planned.total(),
+            "completed canonical retained ownership exceeds the startup reservation"
+        );
+        entry.commitment = completed;
+        entry.canonical_promoted = true;
+        Ok(completed)
     }
 
     /// Keep the commitment charged for the rest of the process: the teardown
@@ -602,6 +710,7 @@ mod tests {
             drafter_bytes: GIB,
             plane_bytes: planes_gib * GIB,
             scratch_bytes: 0,
+            canonical: CanonicalCommitment::default(),
         }
     }
 
@@ -942,6 +1051,123 @@ mod tests {
         assert_eq!(ledger.total(), commitment(16, 10).total());
     }
 
+    fn canonical_commitment() -> Commitment {
+        Commitment {
+            model_file_bytes: 100,
+            kv_budget_bytes: 40,
+            drafter_bytes: 10,
+            plane_bytes: 90,
+            scratch_bytes: 20,
+            canonical: CanonicalCommitment {
+                raw_bytes: 80,
+                prepared_bytes: 82,
+                startup_prepared_bytes: 82,
+                routed_prepared_bytes: 82,
+                boot_kv_bytes: 12,
+                drafter_load_bytes: 30,
+                drafter_run_bytes: 10,
+            },
+        }
+    }
+
+    #[test]
+    fn canonical_phase_peak_is_maximum_not_raw_prepared_kv_sum() {
+        let mut commitment = canonical_commitment();
+        assert_eq!(commitment.startup_total(), 182);
+        assert_eq!(commitment.retained_total(), 180);
+        assert_eq!(commitment.total(), 182);
+        commitment.kv_budget_bytes = 80;
+        assert_eq!(commitment.retained_total(), 220);
+        assert_eq!(commitment.total(), 220);
+        commitment.canonical.boot_kv_bytes = 90;
+        assert_eq!(commitment.total(), 230, "boot KV and drafter load coexist");
+        commitment.canonical.drafter_run_bytes = 100;
+        assert_eq!(commitment.total(), 320, "boot allocations remain live during run");
+    }
+
+    #[test]
+    fn canonical_promotion_changes_only_its_instance_after_checked_metadata() {
+        let ledger = Ledger::new();
+        let first = ledger.reserve(Path::new("/a.gguf"), canonical_commitment());
+        let second = ledger.reserve(Path::new("/b.gguf"), canonical_commitment());
+        assert_eq!(ledger.total(), 364, "both startup peaks remain charged");
+        first.promote_canonical(80, 82).unwrap();
+        assert_eq!(ledger.total(), 362);
+        assert_eq!(charged_now(&ledger), 362, "aggregate admission sees the transition");
+        second.promote_canonical(40, 41).unwrap();
+        assert_eq!(ledger.total(), 359, "a partial affine overlay converts only plain triplets");
+        drop(first);
+        assert_eq!(ledger.total(), 179);
+        drop(second);
+        assert_eq!(ledger.total(), 0);
+    }
+
+    #[test]
+    fn failed_or_stranded_canonical_promotion_never_releases_startup_charge() {
+        let ledger = Ledger::new();
+        let failed = ledger.reserve(Path::new("/a.gguf"), canonical_commitment());
+        assert!(failed.promote_canonical(81, 83).is_err());
+        assert_eq!(ledger.total(), 182);
+        failed.strand("producer completion/source retirement failed");
+        assert_eq!(charged_now(&ledger), 182);
+
+        let completed = ledger.reserve(Path::new("/b.gguf"), canonical_commitment());
+        let claim = completed.loading_claim();
+        completed.promote_canonical(80, 82).unwrap();
+        completed.strand("worker cleanup failed after source-free promotion");
+        conclude_load(None, claim, Ok(()));
+        assert_eq!(ledger.total(), 362, "failed cleanup keeps the actual retained ownership charged");
+    }
+
+    #[test]
+    fn unsupported_overlay_keeps_raw_accounting_after_zero_conversion_completion() {
+        let ledger = Ledger::new();
+        let mut planned = canonical_commitment();
+        planned.plane_bytes = 0;
+        planned.canonical.routed_prepared_bytes = 0;
+        let held = ledger.reserve(Path::new("/affine.gguf"), planned);
+        assert_eq!(ledger.total(), 182, "header preparation upper bound is charged until completion");
+        let completed = held.promote_canonical(0, 0).unwrap();
+        assert_eq!(completed.retained_total(), 170, "unsupported raw ownership keeps the old component sum");
+        assert_eq!(ledger.total(), 170);
+    }
+
+    #[test]
+    fn zero_and_subset_conversion_preserve_load_dominated_phase_plan() {
+        let ledger = Ledger::new();
+        let mut planned = canonical_commitment();
+        planned.plane_bytes = 0;
+        planned.canonical.routed_prepared_bytes = 0;
+        planned.canonical.drafter_load_bytes = 160;
+        planned.drafter_bytes = 140;
+        assert_eq!(planned.total(), 274);
+        for (raw, prepared, retained) in [(0, 0, 272), (40, 41, 273), (80, 82, 274)] {
+            let reservation = ledger.reserve(Path::new("/load-dominated.gguf"), planned);
+            assert_eq!(ledger.total(), 274);
+            let completed = reservation.promote_canonical(raw, prepared).unwrap();
+            assert_eq!(completed.retained_total(), retained);
+            assert_eq!(ledger.total(), retained);
+            drop(reservation);
+            assert_eq!(ledger.total(), 0);
+        }
+        let reservation = ledger.reserve(Path::new("/unplanned-growth.gguf"), planned);
+        assert!(reservation.promote_canonical(80, 83).is_err());
+        assert_eq!(ledger.total(), 274, "growth is refused, not clamped to the startup bound");
+    }
+
+    #[test]
+    fn zero_conversion_preserves_raw_components_and_the_file_floor() {
+        let raw = commitment(16, 10);
+        assert_eq!(raw.total(), raw.retained_total());
+        let ledger = Ledger::new();
+        let held = ledger.reserve(Path::new("/unsupported.gguf"), raw);
+        assert_eq!(held.promote_canonical(0, 0).unwrap(), raw);
+        assert_eq!(ledger.total(), raw.total());
+        let mut smaller_planes = canonical_commitment();
+        smaller_planes.canonical.prepared_bytes = 80;
+        assert_eq!(smaller_planes.retained_total(), 178, "the model-file floor is unchanged");
+    }
+
     #[test]
     fn a_commitment_sums_its_components_without_wrapping() {
         let all = Commitment {
@@ -950,6 +1176,7 @@ mod tests {
             drafter_bytes: 3,
             plane_bytes: 4,
             scratch_bytes: 5,
+            canonical: CanonicalCommitment::default(),
         };
         assert_eq!(all.total(), 15);
         let huge = Commitment {

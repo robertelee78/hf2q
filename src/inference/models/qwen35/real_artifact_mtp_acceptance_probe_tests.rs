@@ -565,7 +565,9 @@ fn load_serving_model(path: &Path) -> Result<Qwen35Model> {
     model.bind_ggml_routing_policy(super::routing_policy::resolve_qwen_ggml_routing_policy(
         path,
     ));
-    Ok(model)
+    model
+        .finalize_canonical_experts()
+        .context("finalize bound main experts before MTP probe caches")
 }
 
 fn mtp_cursor(cache: &HybridKvCache, slot: SlotId) -> Result<usize> {

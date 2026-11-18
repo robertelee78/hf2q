@@ -63,6 +63,7 @@ use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 use super::decode_pool::pooled_alloc_buffer;
 use super::execution_dispatch::quantized_matmul_ggml;
 use super::ffn::MoeFfnShape;
+use super::expert_storage::{ExpertRole, ExpertRoleRef};
 use super::gpu_ffn::MoeFfnWeightsGpuQ;
 use crate::inference::spec_decode::dflash2::route_profile;
 
@@ -143,11 +144,6 @@ pub(crate) fn qwen_moe_expert_route() -> Result<MoeExpertRoute> {
         })
     })
     .map_err(|error| anyhow::anyhow!("{error}"))
-}
-
-/// Whether the live-tile route is selected.
-pub(crate) fn qwen_moe_live_tiles_requested() -> Result<bool> {
-    Ok(qwen_moe_expert_route()? == MoeExpertRoute::LiveTiles)
 }
 
 /// Widest row count one batched MoE layer accepts: the DFlash2 target width.
@@ -329,7 +325,7 @@ fn dispatch_expert_mv(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     input: &MlxBuffer,
-    weight: &MlxBuffer,
+    weight: ExpertRoleRef<'_>,
     ids: &MlxBuffer,
     output: &MlxBuffer,
     params: &GgmlQuantizedMatmulIdParams,
@@ -337,6 +333,30 @@ fn dispatch_expert_mv(
     layer: usize,
     masked: bool,
 ) -> Result<()> {
+    if let ExpertRoleRef::Prepared(planes) = weight {
+        ensure!(!crate::quantize::imatrix::is_active(), "canonical expert storage cannot collect imatrix inputs");
+        use mlx_native::ops::quantized_matmul_id_ggml as native;
+        let routing = registry.ggml_routing_policy().copied()
+            .unwrap_or_else(mlx_native::ggml_routing_policy_from_environment);
+        let dispatched = match (params.ggml_type, masked) {
+            (GgmlType::Q4_K, false) => native::quantized_matmul_id_ggml_prepared_mv_q4_k_nr2(
+                enc, registry, device, input, planes, ids, output, params,
+            ),
+            (GgmlType::Q4_K, true) => native::quantized_matmul_id_ggml_prepared_mv_q4_k_nr2_masked(
+                enc, registry, device, input, planes, ids, output, params,
+            ),
+            (_, false) => native::quantized_matmul_id_ggml_prepared_mv_with_policy(
+                enc, registry, device, input, planes, ids, output, params, &routing,
+            ),
+            (_, true) => native::quantized_matmul_id_ggml_prepared_mv_masked_with_policy(
+                enc, registry, device, input, planes, ids, output, params, &routing,
+            ),
+        };
+        return dispatched.map_err(|e| anyhow!("{tag} prepared mul_mv_id: {e}"));
+    }
+    let ExpertRoleRef::Ggml(weight) = weight else {
+        bail!("{tag}: forced expert matvec does not support affine storage");
+    };
     crate::quantize::imatrix::intercept_qmatmul_id_with_hint(
         crate::quantize::imatrix::ImatrixHint::Layered { tag, layer },
         params.n_tokens as usize,
@@ -451,9 +471,7 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_route_into(
         "batched MoE layer {layer_idx} requires native router/shared-expert storage"
     );
     ensure!(
-        weights.expert_gate_affine.is_none()
-            && weights.expert_up_affine.is_none()
-            && weights.expert_down_affine.is_none(),
+        !weights.experts.has_affine(),
         "batched MoE layer {layer_idx} does not support DWQ affine expert overlays"
     );
     if route == MoeExpertRoute::LiveTiles {
@@ -476,10 +494,8 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_route_into(
     }
     let prepared_m8 = if staged_m8 {
         Some(
-            weights
-                .prepared_m8
-                .as_ref()
-                .context("staged M8 expert planes were not prepared at model upload")?,
+            weights.experts.completed()
+                .context("staged M8 route requires canonical completed expert planes")?,
         )
     } else {
         None
@@ -715,7 +731,7 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_route_into(
             registry,
             device,
             x,
-            &weights.expert_gate_q,
+            weights.experts.role(ExpertRole::Gate),
             &ids,
             &gate_all,
             &gate_params,
@@ -728,7 +744,7 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_route_into(
             registry,
             device,
             x,
-            &weights.expert_up_q,
+            weights.experts.role(ExpertRole::Up),
             &ids,
             &up_all,
             &up_params,
@@ -815,7 +831,7 @@ pub(crate) fn build_moe_ffn_layer_gpu_batched_route_into(
             registry,
             device,
             &h_all,
-            &weights.expert_down_q,
+            weights.experts.role(ExpertRole::Down),
             &ids,
             &y_all,
             &down_params,

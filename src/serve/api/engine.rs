@@ -1844,12 +1844,17 @@ fn model_worker_teardown(
     })
 }
 
+struct LoadedRouteDecision {
+    published: serde_json::Value,
+    commitment: crate::serve::resident_memory::Commitment,
+}
+
 struct EngineInner {
     tx: mpsc::Sender<Request>,
     /// The route decision `serve::load_engine` loaded this engine with
     /// (ADR-067 D6), as `/hf2q/v1/runtime` publishes it. `None` for an
     /// engine that was not loaded through `load_engine`.
-    route_decision: Option<serde_json::Value>,
+    route_decision: Option<LoadedRouteDecision>,
     /// Independent one-way health state for a worker that may remain alive
     /// while blocked forever inside Objective-C/Metal.
     supervisor: EngineSupervisor,
@@ -2528,13 +2533,14 @@ pub struct GemmaLoadedModel {
 impl LoadedModel {
     /// The devices this model owns and encodes on, for the teardown of the
     /// worker thread that will own it ([`model_worker_teardown`]): they are
-    /// flushed after the model is dropped. A Qwen3.5/3.6 model owns none;
-    /// its forward encodes on the device of the worker thread's GPU weight
-    /// cache, which the teardown takes from the thread.
+    /// flushed after the model is dropped. Qwen owns the actual GGUF loader
+    /// device as well as encoding through the worker's separate GPU cache.
     fn owned_devices(&self) -> Vec<mlx_native::MlxDevice> {
         match self {
             Self::Gemma(g) => vec![g.ctx.device().clone()],
-            Self::Qwen35(_) => Vec::new(),
+            Self::Qwen35(q) => q.model.weight_device()
+                .map(|device| vec![device.clone()])
+                .unwrap_or_default(),
             Self::Qwen3VlText(v) => vec![v.model.ctx.device().clone()],
             Self::Deepseek4(d) => vec![d.model.ctx.device().clone()],
         }
@@ -5367,10 +5373,14 @@ impl Engine {
     }
 
     /// Record the route decision this engine was loaded with.
-    pub(crate) fn with_route_decision(mut self, decision: serde_json::Value) -> Self {
+    pub(crate) fn with_route_decision(
+        mut self,
+        decision: serde_json::Value,
+        commitment: crate::serve::resident_memory::Commitment,
+    ) -> Self {
         Arc::get_mut(&mut self.inner)
             .expect("newly loaded engine is uniquely owned before pool publication")
-            .route_decision = Some(decision);
+            .route_decision = Some(LoadedRouteDecision { published: decision, commitment });
         self
     }
 
@@ -5378,7 +5388,16 @@ impl Engine {
     /// `/hf2q/v1/runtime` publishes it; `None` for an engine that was not
     /// loaded through `serve::load_engine`.
     pub(crate) fn route_decision(&self) -> Option<serde_json::Value> {
-        self.inner.route_decision.clone()
+        self.inner.route_decision.as_ref().map(|decision| decision.published.clone())
+    }
+
+    /// Completed canonical ownership beside the pool's separately governed KV
+    /// budget. Non-converted routes keep their existing admission accounting.
+    pub(crate) fn canonical_retained_admission_bytes(&self) -> Option<u64> {
+        let commitment = self.inner.route_decision.as_ref()?.commitment;
+        (commitment.canonical.startup_prepared_bytes != 0).then(|| {
+            commitment.retained_total().saturating_sub(commitment.kv_budget_bytes)
+        })
     }
 
     /// Replace only the immutable operator-facing load snapshot path after
@@ -17917,6 +17936,7 @@ enum Qwen35WorkerFatalKind {
 
 pub(super) fn is_fatal_command_buffer_error(error: &anyhow::Error) -> bool {
     crate::inference::models::qwen35::decode_pool::profile::unhealthy()
+        || crate::inference::models::qwen35::carry_memory::is_commitment_error(error)
         || error.chain().any(|cause| {
             matches!(
                 cause.downcast_ref::<mlx_native::MlxError>(),
@@ -19227,39 +19247,6 @@ fn run_slot_aware_qwen35(
         );
         policy
     });
-    // What the two prefill switches may hold in scratch on this worker
-    // (enforced pool caps plus the derived scratch of one layer at the
-    // transaction row ceiling): the figures memory admission charges them.
-    {
-        use crate::inference::models::qwen35::prefill_prepared as prepared;
-        let rows = prefill_chunk_tokens as usize;
-        let slots = n_slots as usize;
-        // A slot's cache holds at most the context length.
-        let kv_rows = guard
-            .model
-            .context_length
-            .unwrap_or(guard.model.model.cfg.max_position_embeddings as usize);
-        tracing::info!(
-            target: "hf2q::serve::api::engine_qwen35::progress",
-            transaction_rows = rows,
-            slots,
-            kv_rows,
-            layer_scratch_bound_bytes =
-                prepared::prefill_layer_scratch_bound_bytes(&guard.model.model.cfg, rows, slots),
-            joint_arena_bound_bytes =
-                prepared::joint_arena_bound_bytes(&guard.model.model.cfg, rows, slots, kv_rows),
-            // What the switches in force are charged, as one pool.
-            switch_scratch_bound_bytes = prepared::prefill_switch_scratch_bound_bytes(
-                &guard.model.model.cfg,
-                rows,
-                slots,
-                kv_rows,
-                qwen_joint_prefill.is_some(),
-                prepared::switches_from_process().map_or(1, |switches| switches.wait_layers),
-            ),
-            "Qwen prompt prefill scratch bounds"
-        );
-    }
     // When the first prompts of a cohort started to gather (see STEP).
     let mut cold_gather_deadline: Option<Instant> = None;
 
@@ -19694,6 +19681,39 @@ fn run_slot_aware_qwen35(
             }
         };
         f2_work_state::qwen(&scheduler, &slots);
+        // Census the real owners before taking any state out of its slot.
+        // The scope retains old parents through every replacement and checked
+        // command drain of this scheduler transaction. Spill/anchor quotas stay
+        // separate; their shared GPU roots join this union only once.
+        let _carry_owners = {
+            use crate::inference::models::qwen35::carry_memory::{
+                CarryOwners, CatchupPlan, WorkerScope, retained_bound,
+            };
+            let mut owners = CarryOwners::default();
+            for (work, _, _) in slots.iter().flatten() {
+                match work {
+                    Qwen35SlotWork::Prefill(state) => state.include_carry_owners(&mut owners),
+                    Qwen35SlotWork::Decode(state) => state.include_carry_owners(&mut owners),
+                }
+            }
+            for retained in &retained_tokens {
+                if let Some(spec) = retained.spec.as_ref() {
+                    owners.include(&spec.pending_target_hidden);
+                }
+            }
+            for anchors in &prompt_anchors { anchors.include_carry_owners(&mut owners); }
+            qwen35_slot_spill::include_carry_owners(&slot_spills, &mut owners);
+            let quota_bound = prompt_anchors.iter().fold(
+                slot_spills.resident_bytes(),
+                |bytes, anchors| bytes.saturating_add(anchors.owned_bytes() as u64),
+            );
+            let cfg = &guard.model.model.cfg;
+            let rows = prefill_chunk_tokens as usize;
+            let retained = retained_bound(cfg, rows, n_slots).saturating_add(quota_bound);
+            let phase = CatchupPlan::new(cfg, rows, cfg.mtp_use_dedicated_embeddings)
+                .compose(0, retained, 0);
+            WorkerScope::open(owners, retained, phase)
+        };
         match step {
             SchedulerStep::Idle => {
                 if shutdown_requested {

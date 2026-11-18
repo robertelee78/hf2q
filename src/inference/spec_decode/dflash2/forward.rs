@@ -2,23 +2,30 @@
 
 use super::{
     config::DFlash2Config,
-    staged::{dispatch_prepared_head, dispatch_ring_attention, staged_tile_takes},
+    staged::{dispatch_prepared_head, dispatch_ring_attention},
     tensors::{DFlash2LayerTensors, DFlash2ModelTensors, DFlash2Projection},
     workspace::DFlash2Workspace,
 };
 use crate::serve::forward_mlx_shared::MlxQWeight;
 use anyhow::{anyhow, Context, Result};
-use mlx_native::ops::{dense_gemv_bf16::dense_gemv_bf16_f32_tiled4, repacked_gguf_mm::PreparedGgufWeight};
+use mlx_native::ops::{dense_gemv_bf16::dense_gemv_bf16_f32_tiled4, repacked_gguf_mm::PreparedGgufWeightPlanes};
 use mlx_native::ops::{
     dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params},
     dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params},
+    dflash2_af4g64_staged::{
+        dflash2_af4g64_decode_uses_register,
+        dispatch_dflash2_af4g64_prefill_with_precision,
+        dispatch_dflash2_af4g64_staged_with_precision,
+    },
     dflash2_attention_pack::{
         dispatch_dflash2_attention_mask_bf16, dispatch_dflash2_commit_kv_bf16,
         dispatch_dflash2_pack_attention_bf16, DFlash2AttentionPackParams,
     },
     dflash2_dynamic_conv::{
-        dispatch_dflash2_dynamic_conv_f32, DFlash2ConvolutionStage, DFlash2DynamicConvParams,
+        dispatch_dflash2_dynamic_conv_f32_with_precision, DFlash2ConvolutionStage,
+        DFlash2DynamicConvParams,
     },
+    dflash2_rms_norm::dispatch_dflash2_rms_norm_bf16,
     elementwise::{dispatch_cast_f32_to_bf16_with_encoder, scalar_mul_f32},
     flash_attn_prefill::{
         dispatch_flash_attn_prefill_bf16_d128, dispatch_flash_attn_prefill_bf16_d256,
@@ -27,19 +34,21 @@ use mlx_native::ops::{
     q_gate_deinterleave::{dispatch_q_gate_deinterleave_f32, QGateDeinterleaveParams},
     qkv_split::{dispatch_qkv_split_f32, QkvSplitParams},
     qmm_affine::{
-        dispatch_qmm_affine_t_packed_simd4_b4, dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16,
+        dispatch_qmm_affine_t_packed_simd4_b4,
+        dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision,
     },
     quantized_matmul_ggml::{dispatch_mm_v2_f16, quantized_matmul_ggml},
-    rms_norm::dispatch_rms_norm,
+    rms_norm::dispatch_rms_norm_with_precision,
     rope::dispatch_rope_neox_f32,
     silu_mul::dispatch_silu_mul,
     softcap::dispatch_softcap,
     transpose::permute_021_bf16_to_f32,
+    ActivationPrecision,
 };
-use mlx_native::{CommandEncoder, GgmlType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{CommandEncoder, DType, GgmlType, KernelRegistry, MlxBuffer, MlxDevice};
 
-/// Project F32 rows. On the staged route a projection the staged tile takes
-/// reads their BF16 rounding.
+/// AF4 operands are BF16. Select whether its producer or an existing typed
+/// consumer owns output rounding. Dense checkpoint diagnostics remain F32.
 fn project(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -51,26 +60,8 @@ fn project(
     rows: usize,
     input_width: usize,
     output_width: usize,
+    af4_output_precision: ActivationPrecision,
 ) -> Result<()> {
-    if let (Some(staged), DFlash2Projection::Af4G64 { .. }) =
-        (workspace.staged.as_ref(), projection)
-    {
-        if staged_tile_takes(output_width) {
-            staged.round_input(encoder, registry, device, input, rows, input_width)?;
-            return project_rounded(
-                encoder,
-                registry,
-                device,
-                workspace,
-                projection,
-                &staged.projection_input,
-                output,
-                rows,
-                input_width,
-                output_width,
-            );
-        }
-    }
     match projection {
         DFlash2Projection::Dense { weight } => project_bf16(
             encoder,
@@ -84,7 +75,28 @@ fn project(
             output_width,
         ),
         DFlash2Projection::Af4G64 { weights, metadata } => {
-            dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16(
+            let (m, n, k) = (
+                u32::try_from(rows)?,
+                u32::try_from(output_width)?,
+                u32::try_from(input_width)?,
+            );
+            if let Some(staged) = workspace.staged.as_ref() {
+                if af4_output_precision == ActivationPrecision::Bf16
+                    && !dflash2_af4g64_decode_uses_register(m, n)
+                {
+                    let prepared = if input.dtype() == DType::F32 {
+                        staged.round_input(encoder, registry, device, input, rows, input_width)?;
+                        &staged.projection_input
+                    } else {
+                        input
+                    };
+                    return staged.project(
+                        encoder, registry, device, weights, metadata, prepared, output,
+                        m, k, n, af4_output_precision,
+                    );
+                }
+            }
+            dispatch_qmm_affine_t_packed_simd4_b4_gs64_bf16_with_precision(
                 encoder,
                 registry,
                 device.metal_device(),
@@ -94,48 +106,21 @@ fn project(
                 weights,
                 metadata,
                 output,
-                u32::try_from(rows)?,
-                u32::try_from(output_width)?,
-                u32::try_from(input_width)?,
+                m,
+                n,
+                k,
+                af4_output_precision,
             )
-            .map_err(anyhow::Error::from)
+            .map_err(anyhow::Error::from)?;
+            #[cfg(test)]
+            if af4_output_precision == ActivationPrecision::Bf16 {
+                super::staged::record_register_dispatch();
+            }
+            Ok(())
         }
     }
 }
 
-/// Project BF16 rows on the staged tile.
-fn project_rounded(
-    encoder: &mut CommandEncoder,
-    registry: &mut KernelRegistry,
-    device: &MlxDevice,
-    workspace: &DFlash2Workspace,
-    projection: &DFlash2Projection,
-    input: &MlxBuffer,
-    output: &MlxBuffer,
-    rows: usize,
-    input_width: usize,
-    output_width: usize,
-) -> Result<()> {
-    let (Some(staged), DFlash2Projection::Af4G64 { weights, metadata }) =
-        (workspace.staged.as_ref(), projection)
-    else {
-        return Err(anyhow!(
-            "DFlash2 BF16 projection rows require the staged AF4G64 route"
-        ));
-    };
-    staged.project(
-        encoder,
-        registry,
-        device,
-        weights,
-        metadata,
-        input,
-        output,
-        rows,
-        input_width,
-        output_width,
-    )
-}
 
 fn project_bf16(
     encoder: &mut CommandEncoder,
@@ -169,6 +154,59 @@ fn project_bf16(
     .map_err(anyhow::Error::from)
 }
 
+/// Context FC/KV alone use the peer's prefill K walk, on either decode route.
+/// AF4 input is contiguous BF16 in `af4_table`; Dense retains its F32 input.
+#[allow(clippy::too_many_arguments)]
+fn project_context(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    workspace: &DFlash2Workspace,
+    projection: &DFlash2Projection,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    rows: usize,
+    input_width: usize,
+    output_width: usize,
+) -> Result<()> {
+    match projection {
+        DFlash2Projection::Dense { weight } => project_bf16(
+            encoder,
+            registry,
+            device,
+            weight,
+            input,
+            output,
+            rows,
+            input_width,
+            output_width,
+        ),
+        DFlash2Projection::Af4G64 { weights, metadata } => {
+            dispatch_dflash2_af4g64_prefill_with_precision(
+                encoder,
+                registry,
+                device,
+                input,
+                weights,
+                metadata,
+                &workspace.context_partials,
+                output,
+                u32::try_from(rows)?,
+                u32::try_from(output_width)?,
+                u32::try_from(input_width)?,
+                ActivationPrecision::Bf16,
+            )
+            .map_err(anyhow::Error::from)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NormProducer {
+    Ordinary,
+    BeforeRope,
+}
+
 fn norm(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -179,8 +217,27 @@ fn norm(
     params: &MlxBuffer,
     rows: usize,
     width: usize,
+    af4: bool,
+    producer: NormProducer,
 ) -> Result<()> {
-    dispatch_rms_norm(
+    // The measured correction is the ordinary RMS producer. The peer's fused
+    // Q/K+RoPE weighting has a different compiler-association contract; retain
+    // its existing HF arithmetic until that producer is independently proved.
+    if af4 && matches!(producer, NormProducer::Ordinary) {
+        return dispatch_dflash2_rms_norm_bf16(
+            encoder,
+            registry,
+            device.metal_device(),
+            input,
+            weight,
+            output,
+            params,
+            u32::try_from(rows)?,
+            u32::try_from(width)?,
+        )
+        .map_err(anyhow::Error::from);
+    }
+    dispatch_rms_norm_with_precision(
         encoder,
         registry,
         device.metal_device(),
@@ -190,6 +247,7 @@ fn norm(
         params,
         u32::try_from(rows)?,
         u32::try_from(width)?,
+        if af4 { ActivationPrecision::Bf16 } else { ActivationPrecision::F32 },
     )
     .map_err(anyhow::Error::from)
 }
@@ -427,8 +485,6 @@ pub(super) fn dispatch_layer(
         encoder, registry, device, config, tensors, workspace, layer_index,
         #[cfg(test)]
         None,
-        #[cfg(test)]
-        None,
     )
 }
 
@@ -443,7 +499,6 @@ pub(super) fn dispatch_layer_inner(
     workspace: &DFlash2Workspace,
     layer_index: usize,
     #[cfg(test)] snapshots: Option<&[MlxBuffer; 6]>,
-    #[cfg(test)] boundary: Option<&super::peer_boundary::BoundaryCapture>,
 ) -> Result<()> {
     #[cfg(test)]
     macro_rules! snapshot {
@@ -464,6 +519,8 @@ pub(super) fn dispatch_layer_inner(
     let groups = config.hidden_size / config.conv_group_size;
     let current = layer_index & 1;
     let next = current ^ 1;
+    let af4 = matches!(&tensors.attention_dynamic, DFlash2Projection::Af4G64 { .. });
+    let precision = if af4 { ActivationPrecision::Bf16 } else { ActivationPrecision::F32 };
 
     norm(
         encoder,
@@ -475,6 +532,8 @@ pub(super) fn dispatch_layer_inner(
         &workspace.norm_params,
         rows,
         hidden,
+        af4,
+        NormProducer::Ordinary,
     )?;
     encoder.memory_barrier();
     project(
@@ -488,9 +547,10 @@ pub(super) fn dispatch_layer_inner(
         rows,
         hidden,
         4 * groups,
+        ActivationPrecision::Bf16,
     )?;
     encoder.memory_barrier();
-    dispatch_dflash2_dynamic_conv_f32(
+    dispatch_dflash2_dynamic_conv_f32_with_precision(
         encoder,
         registry,
         device,
@@ -501,6 +561,7 @@ pub(super) fn dispatch_layer_inner(
         &workspace.convolved,
         convolution_params(config, workspace.max_lanes),
         DFlash2ConvolutionStage::Prepare,
+        precision,
     )?;
     encoder.memory_barrier();
     #[cfg(test)]
@@ -509,18 +570,56 @@ pub(super) fn dispatch_layer_inner(
         snapshot!(1, &workspace.dynamic, rows * 4 * groups);
     }
 
-    project(
-        encoder,
-        registry,
-        device,
-        workspace,
-        &tensors.qkv_projection,
-        &workspace.convolved,
-        &workspace.qkv,
-        rows,
-        hidden,
-        q_width + 2 * kv_width,
-    )?;
+    // QKV's BF16 producer uses the source-matched decode profile, independently
+    // of the auxiliary staged-route switch. Narrow and dense projections retain
+    // their existing route.
+    match &tensors.qkv_projection {
+        DFlash2Projection::Af4G64 { weights, metadata }
+            if rows % 8 == 0 && !dflash2_af4g64_decode_uses_register(
+                u32::try_from(rows)?,
+                u32::try_from(q_width + 2 * kv_width)?,
+            ) =>
+        {
+            dispatch_cast_f32_to_bf16_with_encoder(
+                encoder,
+                registry,
+                device.metal_device(),
+                &workspace.convolved,
+                &workspace.af4_table,
+                u32::try_from(rows * hidden)?,
+            )?;
+            encoder.memory_barrier();
+            dispatch_dflash2_af4g64_staged_with_precision(
+                encoder,
+                registry,
+                device,
+                &workspace.af4_table,
+                weights,
+                metadata,
+                &workspace.context_partials,
+                &workspace.qkv,
+                u32::try_from(rows)?,
+                u32::try_from(q_width + 2 * kv_width)?,
+                u32::try_from(hidden)?,
+                ActivationPrecision::Bf16,
+            )?;
+            #[cfg(test)]
+            super::staged::record_qkv_dispatch();
+        }
+        _ => project(
+            encoder,
+            registry,
+            device,
+            workspace,
+            &tensors.qkv_projection,
+            &workspace.convolved,
+            &workspace.qkv,
+            rows,
+            hidden,
+            q_width + 2 * kv_width,
+            ActivationPrecision::Bf16,
+        )?,
+    }
     encoder.memory_barrier();
     dispatch_qkv_split_f32(
         encoder,
@@ -548,6 +647,8 @@ pub(super) fn dispatch_layer_inner(
         &workspace.head_norm_params,
         rows * config.num_attention_heads,
         config.head_dim,
+        af4,
+        NormProducer::BeforeRope,
     )?;
     encoder.memory_barrier();
     norm(
@@ -560,19 +661,17 @@ pub(super) fn dispatch_layer_inner(
         &workspace.head_norm_params,
         rows * config.num_key_value_heads,
         config.head_dim,
+        af4,
+        NormProducer::BeforeRope,
     )?;
     encoder.memory_barrier();
     dispatch_attention(encoder, registry, device, config, workspace, layer_index)?;
-    #[cfg(test)]
-    if let Some(capture) = boundary {
-        capture.attention(encoder, registry, device, config, workspace, layer_index)?;
-    }
     match workspace
         .staged
         .as_ref()
         .and_then(|staged| staged.attention.as_ref())
     {
-        Some(scratch) => project_rounded(
+        Some(scratch) => project(
             encoder,
             registry,
             device,
@@ -583,6 +682,7 @@ pub(super) fn dispatch_layer_inner(
             rows,
             q_width,
             hidden,
+            ActivationPrecision::Bf16,
         )?,
         None => project(
             encoder,
@@ -595,14 +695,11 @@ pub(super) fn dispatch_layer_inner(
             rows,
             q_width,
             hidden,
+            ActivationPrecision::Bf16,
         )?,
     }
     encoder.memory_barrier();
-    #[cfg(test)]
-    if let Some(capture) = boundary {
-        capture.projection(encoder, registry, device, workspace, false)?;
-    }
-    dispatch_dflash2_dynamic_conv_f32(
+    dispatch_dflash2_dynamic_conv_f32_with_precision(
         encoder,
         registry,
         device,
@@ -613,6 +710,7 @@ pub(super) fn dispatch_layer_inner(
         &workspace.residual,
         convolution_params(config, workspace.max_lanes),
         DFlash2ConvolutionStage::Residual,
+        precision,
     )?;
     encoder.memory_barrier();
     #[cfg(test)]
@@ -628,6 +726,8 @@ pub(super) fn dispatch_layer_inner(
         &workspace.norm_params,
         rows,
         hidden,
+        af4,
+        NormProducer::Ordinary,
     )?;
     encoder.memory_barrier();
     project(
@@ -641,13 +741,10 @@ pub(super) fn dispatch_layer_inner(
         rows,
         hidden,
         4 * groups,
+        ActivationPrecision::Bf16,
     )?;
     encoder.memory_barrier();
-    #[cfg(test)]
-    if let Some(capture) = boundary {
-        capture.projection(encoder, registry, device, workspace, true)?;
-    }
-    dispatch_dflash2_dynamic_conv_f32(
+    dispatch_dflash2_dynamic_conv_f32_with_precision(
         encoder,
         registry,
         device,
@@ -658,6 +755,7 @@ pub(super) fn dispatch_layer_inner(
         &workspace.convolved,
         convolution_params(config, workspace.max_lanes),
         DFlash2ConvolutionStage::Prepare,
+        precision,
     )?;
     encoder.memory_barrier();
     #[cfg(test)]
@@ -667,7 +765,7 @@ pub(super) fn dispatch_layer_inner(
     }
     dispatch_mlp(encoder, registry, device, config, tensors, workspace)?;
     encoder.memory_barrier();
-    dispatch_dflash2_dynamic_conv_f32(
+    dispatch_dflash2_dynamic_conv_f32_with_precision(
         encoder,
         registry,
         device,
@@ -678,6 +776,7 @@ pub(super) fn dispatch_layer_inner(
         &workspace.hidden[next],
         convolution_params(config, workspace.max_lanes),
         DFlash2ConvolutionStage::Residual,
+        precision,
     )?;
     encoder.memory_barrier();
     #[cfg(test)]
@@ -685,9 +784,8 @@ pub(super) fn dispatch_layer_inner(
     Ok(())
 }
 
-/// `projected = down(SiLU(gate(convolved)) * up(convolved))`. The staged
-/// route runs gate and up in one pass into BF16 rows the down projection
-/// reads in place.
+/// `projected = down(SiLU(gate(convolved)) * up(convolved))`. The staged pair
+/// rounds each full projection before SiLU and stores the product as BF16.
 fn dispatch_mlp(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -702,25 +800,10 @@ fn dispatch_mlp(
     if let (Some(staged), Some(halves)) =
         (workspace.staged.as_ref(), tensors.gate_up_halves.as_ref())
     {
-        staged.round_input(
-            encoder,
-            registry,
-            device,
-            &workspace.convolved,
-            rows,
-            hidden,
-        )?;
-        staged.gate_up(
-            encoder,
-            registry,
-            device,
-            halves,
-            rows,
-            hidden,
-            intermediate,
-        )?;
+        staged.round_input(encoder, registry, device, &workspace.convolved, rows, hidden)?;
+        staged.gate_up(encoder, registry, device, halves, rows, hidden, intermediate)?;
         encoder.memory_barrier();
-        return project_rounded(
+        return project(
             encoder,
             registry,
             device,
@@ -731,6 +814,7 @@ fn dispatch_mlp(
             rows,
             intermediate,
             hidden,
+            ActivationPrecision::Bf16,
         );
     }
     project(
@@ -744,6 +828,7 @@ fn dispatch_mlp(
         rows,
         hidden,
         2 * intermediate,
+        ActivationPrecision::Bf16,
     )?;
     encoder.memory_barrier();
     let fused_gate_up = workspace
@@ -776,6 +861,8 @@ fn dispatch_mlp(
         (rows * intermediate) as u32,
     )?;
     encoder.memory_barrier();
+    // The AF4 down projection's required BF16 operand preparation owns the
+    // SiLU-product boundary; no separate rounding pass is needed.
     project(
         encoder,
         registry,
@@ -787,6 +874,7 @@ fn dispatch_mlp(
         rows,
         intermediate,
         hidden,
+        ActivationPrecision::Bf16,
     )
 }
 
@@ -800,7 +888,7 @@ pub enum DFlash2VocabularyHead<'a> {
     /// its own head. The staged route reads them instead of preparing a copy.
     SharedPrepared {
         weight: &'a MlxQWeight,
-        prepared: &'a PreparedGgufWeight,
+        prepared: &'a PreparedGgufWeightPlanes,
     },
 }
 
@@ -946,12 +1034,26 @@ pub fn dispatch_dflash2_forward(
     if tensors.layers.len() != config.num_hidden_layers {
         return Err(anyhow!("DFlash2 layer tensor count mismatch"));
     }
-    let rows = workspace.max_lanes * config.block_size;
     encoder.memory_barrier();
     for (index, layer) in tensors.layers.iter().enumerate() {
         dispatch_layer(encoder, registry, device, config, layer, workspace, index)
             .with_context(|| format!("DFlash2 layer {index}"))?;
     }
+    dispatch_dflash2_finish(encoder, registry, device, config, tensors, vocabulary_head, workspace)
+}
+
+// Shared final consumer boundary also lets conformance tests snapshot each real
+// layer before scratch reuse, then finish that SAME forward without replaying it.
+pub(super) fn dispatch_dflash2_finish(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    config: &DFlash2Config,
+    tensors: &DFlash2ModelTensors,
+    vocabulary_head: DFlash2VocabularyHead<'_>,
+    workspace: &mut DFlash2Workspace,
+) -> Result<()> {
+    let rows = workspace.max_lanes * config.block_size;
 
     norm(
         encoder,
@@ -963,6 +1065,8 @@ pub fn dispatch_dflash2_forward(
         &workspace.norm_params,
         rows,
         config.hidden_size,
+        matches!(&tensors.context_projection, DFlash2Projection::Af4G64 { .. }),
+        NormProducer::Ordinary,
     )?;
     encoder.memory_barrier();
     let prepared = match (&vocabulary_head, workspace.staged.as_mut()) {
@@ -1014,6 +1118,8 @@ pub fn dispatch_dflash2_forward(
         rows,
         config.hidden_size,
         config.selector_rank,
+        // The existing selector BF16 cast below is its only consumer boundary.
+        ActivationPrecision::F32,
     )?;
     encoder.memory_barrier();
     if let Some(multiplier) = config.output_multiplier {
@@ -1187,13 +1293,37 @@ fn dispatch_context_rows(
     rings: ContextRings<'_>,
 ) -> Result<()> {
     let rows = workspace.max_lanes * config.block_size;
-    project(
+    // Context and decode are separate scratch phases. The padded AF4 table
+    // holds at least rows * max_projection_input BF16 values; no decoder
+    // prepare reads its old contents, and the next prepare overwrites them.
+    // Cast rather than modifying captured rows, which remain caller-owned.
+    let context_input = if matches!(
+        &tensors.context_projection,
+        DFlash2Projection::Af4G64 { .. }
+    ) {
+        dispatch_cast_f32_to_bf16_with_encoder(
+            encoder,
+            registry,
+            device.metal_device(),
+            captured,
+            &workspace.af4_table,
+            u32::try_from(
+                rows.checked_mul(config.fc_input_dim())
+                    .context("context FC elements overflow")?,
+            )?,
+        )?;
+        encoder.memory_barrier();
+        &workspace.af4_table
+    } else {
+        captured
+    };
+    project_context(
         encoder,
         registry,
         device,
         workspace,
         &tensors.context_projection,
-        captured,
+        context_input,
         &workspace.hidden[0],
         rows,
         config.fc_input_dim(),
@@ -1210,53 +1340,48 @@ fn dispatch_context_rows(
         &workspace.norm_params,
         rows,
         config.hidden_size,
+        matches!(&tensors.context_projection, DFlash2Projection::Af4G64 { .. }),
+        NormProducer::Ordinary,
     )?;
     encoder.memory_barrier();
     let pack = attention_params(config, workspace.max_lanes);
     let kv_width = config.num_key_value_heads * config.head_dim;
-    // Every layer's key and value projection reads the same normalized rows;
-    // the staged route rounds them once.
-    let rounded = match workspace.staged.as_ref() {
-        Some(staged) if staged_tile_takes(2 * kv_width) => {
-            staged.round_input(
-                encoder,
-                registry,
-                device,
-                &workspace.normalized,
-                rows,
-                config.hidden_size,
-            )?;
-            Some(&staged.projection_input)
-        }
-        _ => None,
-    };
+    // All AF4 context KV layers consume these same normalized BF16 rows.
+    // FC has finished reading the table before it is reused here; projections,
+    // norms, RoPE and ring commits do not overwrite it inside the layer loop.
+    if tensors.layers.iter().any(|layer| {
+        matches!(&layer.context_kv_projection, DFlash2Projection::Af4G64 { .. })
+    }) {
+        dispatch_cast_f32_to_bf16_with_encoder(
+            encoder,
+            registry,
+            device.metal_device(),
+            &workspace.normalized,
+            &workspace.af4_table,
+            u32::try_from(
+                rows.checked_mul(config.hidden_size)
+                    .context("context KV elements overflow")?,
+            )?,
+        )?;
+        encoder.memory_barrier();
+    }
     for (index, layer) in tensors.layers.iter().enumerate() {
-        match rounded {
-            Some(input) => project_rounded(
-                encoder,
-                registry,
-                device,
-                workspace,
-                &layer.context_kv_projection,
-                input,
-                &workspace.qkv,
-                rows,
-                config.hidden_size,
-                2 * kv_width,
-            )?,
-            None => project(
-                encoder,
-                registry,
-                device,
-                workspace,
-                &layer.context_kv_projection,
-                &workspace.normalized,
-                &workspace.qkv,
-                rows,
-                config.hidden_size,
-                2 * kv_width,
-            )?,
-        }
+        let input = match &layer.context_kv_projection {
+            DFlash2Projection::Af4G64 { .. } => &workspace.af4_table,
+            DFlash2Projection::Dense { .. } => &workspace.normalized,
+        };
+        project_context(
+            encoder,
+            registry,
+            device,
+            workspace,
+            &layer.context_kv_projection,
+            input,
+            &workspace.qkv,
+            rows,
+            config.hidden_size,
+            2 * kv_width,
+        )?;
         encoder.memory_barrier();
         let fused_kv = workspace
             .qkv
@@ -1288,6 +1413,8 @@ fn dispatch_context_rows(
             &workspace.head_norm_params,
             rows * config.num_key_value_heads,
             config.head_dim,
+            matches!(&tensors.context_projection, DFlash2Projection::Af4G64 { .. }),
+            NormProducer::BeforeRope,
         )?;
         encoder.memory_barrier();
         dispatch_rope_neox_f32(

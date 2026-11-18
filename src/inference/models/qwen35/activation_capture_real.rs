@@ -211,14 +211,16 @@ impl RealActivationCapture {
         // tool; per-layer `\r` overwrites would mangle the test stderr
         // output. Mirrors the SERVE-side silent-progress pattern.
         let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
-        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).map_err(|e| {
-            // `{e:#}` displays the anyhow context chain on one line so the
-            // inner cause (e.g. specific tensor name + shape) is visible.
-            RealActivationCaptureError::Load {
-                path: model_gguf.display().to_string(),
-                reason: format!("Qwen35Model::load_from_gguf: {e:#}"),
-            }
-        })?;
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .and_then(Qwen35Model::finalize_canonical_experts)
+            .map_err(|e| {
+                // `{e:#}` displays the anyhow context chain on one line so the
+                // inner cause (e.g. specific tensor name + shape) is visible.
+                RealActivationCaptureError::Load {
+                    path: model_gguf.display().to_string(),
+                    reason: format!("Qwen35Model::load_from_gguf: {e:#}"),
+                }
+            })?;
         Ok(Self {
             inner: RealCaptureBackend::Loaded(model),
         })
@@ -232,12 +234,14 @@ impl RealActivationCapture {
         model: &LazyTensorMap,
         _tokenizer: &Tokenizer,
     ) -> std::result::Result<Self, RealActivationCaptureError> {
-        let loaded = Qwen35Model::load_from_lazy_tensor_map(model).map_err(|e| {
-            RealActivationCaptureError::Load {
-                path: "<lazy-tensor-map>".to_string(),
-                reason: format!("Qwen35Model::load_from_lazy_tensor_map: {e:#}"),
-            }
-        })?;
+        let loaded = Qwen35Model::load_from_lazy_tensor_map(model)
+            .and_then(Qwen35Model::finalize_canonical_experts)
+            .map_err(|e| {
+                RealActivationCaptureError::Load {
+                    path: "<lazy-tensor-map>".to_string(),
+                    reason: format!("Qwen35Model::load_from_lazy_tensor_map: {e:#}"),
+                }
+            })?;
         Ok(Self {
             inner: RealCaptureBackend::Loaded(loaded),
         })

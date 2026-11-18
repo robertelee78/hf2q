@@ -167,6 +167,7 @@ fn prepared_products_stay_within_the_k_scaled_bound_of_an_f64_reference() {
     let Ok(device) = MlxDevice::new() else {
         return;
     };
+    let _scratch = super::prepared_scratch::ExecutionScratch::test_scope(&device);
     let mut registry = KernelRegistry::new();
     let mut seed = 0x9E37_79B9_u32;
     let mut worst = 0.0f64;
@@ -244,6 +245,7 @@ fn fused_alpha_beta_stays_within_the_bounds_of_an_f64_reference() {
     let Ok(device) = MlxDevice::new() else {
         return;
     };
+    let _scratch = super::prepared_scratch::ExecutionScratch::test_scope(&device);
     let mut registry = KernelRegistry::new();
     let mut seed = 0x8230_0004_u32;
     for (ggml_type, heads, k) in [
@@ -1128,6 +1130,9 @@ fn qwen_prepared_vs_stock_on_served_prompts() {
     let mut progress = LoadProgress::new(false, 1, 0);
     let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
     model.bind_ggml_routing_policy(policy);
+    let model = model
+        .finalize_canonical_experts()
+        .expect("finalize bound experts before prepared prefill caches");
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     let hidden = model.cfg.hidden_size as usize;
     let layers = model.layers.len();

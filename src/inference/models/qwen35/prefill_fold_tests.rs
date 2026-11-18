@@ -486,6 +486,9 @@ fn qwen_prefill_fold_real_model_gate() {
     let mut progress = LoadProgress::new(false, 1, 0);
     let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
     model.bind_ggml_routing_policy(policy);
+    let model = model
+        .finalize_canonical_experts()
+        .expect("finalize bound experts before folded prefill caches");
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     let hidden = model.cfg.hidden_size as usize;
     let chunk_tokens = |start: usize, len: usize| -> Vec<u32> {
@@ -1206,9 +1209,11 @@ pub(super) fn with_synthetic_moe_model(run: impl FnOnce(&Qwen35Model)) {
     for layer in &mut model.layers {
         *layer.ffn_mut() = Qwen35FfnWeights::MoeQ(MoeFfnWeightsQ {
             router: random_f32(&mut seed, EXPERTS * hidden),
-            expert_gate_q: stack(GgmlType::Q4_K, EXPERT_ROWS, hidden, &mut seed),
-            expert_up_q: stack(GgmlType::Q4_K, EXPERT_ROWS, hidden, &mut seed),
-            expert_down_q: stack(GgmlType::Q6_K, hidden, EXPERT_ROWS, &mut seed),
+            experts: std::sync::Arc::new(super::expert_storage::MoeExpertStorage::from_ggml(
+                stack(GgmlType::Q4_K, EXPERT_ROWS, hidden, &mut seed),
+                stack(GgmlType::Q4_K, EXPERT_ROWS, hidden, &mut seed),
+                stack(GgmlType::Q6_K, hidden, EXPERT_ROWS, &mut seed),
+            )),
             ggml_type_gate_up: GgmlType::Q4_K,
             ggml_type_down: GgmlType::Q6_K,
             shared_gate_logit: random_f32(&mut seed, hidden),
@@ -1216,9 +1221,6 @@ pub(super) fn with_synthetic_moe_model(run: impl FnOnce(&Qwen35Model)) {
             shared_up: small(&mut seed, SHARED_ROWS * hidden),
             shared_down: small(&mut seed, hidden * SHARED_ROWS),
             native_dense: None,
-            expert_gate_affine: None,
-            expert_up_affine: None,
-            expert_down_affine: None,
         });
     }
     model.cfg.variant = Qwen35Variant::Moe;
@@ -1258,9 +1260,13 @@ fn a_folded_prefill_through_moe_layers_leaves_what_the_two_forwards_leave() {
         let Qwen35FfnWeights::MoeQ(last) = model.layers.last().expect("layers").ffn() else {
             panic!("the fixture's last layer has no MoE FFN");
         };
-        xor_quants(&last.expert_down_q, GgmlType::Q6_K);
+        let super::expert_storage::ExpertRoleRef::Ggml(down) =
+            last.experts.role(super::expert_storage::ExpertRole::Down) else {
+                panic!("the mutable synthetic fixture requires raw expert weights");
+            };
+        xor_quants(down, GgmlType::Q6_K);
         let flipped = prefill(model, Path::TwoForwards, 0, &[], 40, 5, false, 0);
-        xor_quants(&last.expert_down_q, GgmlType::Q6_K);
+        xor_quants(down, GgmlType::Q6_K);
         assert!(
             flipped.logits != reference.logits,
             "the MoE expert weights do not reach the logits"
