@@ -1699,6 +1699,29 @@ opaque storage access, requiring native **0.24.0**, not a patch release.
 Publication, exact hf2q pinning and full-model N4 admission are still pending;
 this component result neither requalifies the rejected N4 run nor opens D6.
 
+A non-qualifying hf2q compile against the exact unpublished native source then
+passes locked all-targets/all-features checking. It finds and fixes the lazy
+loader's omitted originating-device/accounting fields and removes obsolete
+production reservation/selector paths. Focused execution accepts 24 units,
+including canonical cache rebuild/masking under all three validation modes.
+One existing Q4 F64 test reports a genuinely excluded near-tie row and is not
+accepted as complete coverage. Partial proof SHA256:
+`a6bf1d0dbf9a0b45f5a84226a439ed7ee4af6fcb9f37abc5c590d3411f4d1207`.
+The next reference-test spike removes its unconditional near-tie exclusion
+while preserving all 32 original rows, seeds, exact expert-ID checks and
+numerical bounds. Only a fully passing strengthened test can replace that
+partial result. The explicit command-line Cargo source patch remains
+experimental and must be absent from landed registry-provenance validation.
+
+The strengthened Q6 and Q4 reference tests both pass all 32 original rows,
+including the formerly excluded Q4 row, with exact expert IDs and unchanged
+numerical bounds. Complete-reference proof SHA256:
+`9e6185316fadcda35101f394b4a221bc92ae59083f9d5b2c21e078475dbcd25d`.
+Those two checks replace only the partial/zero-counter reference receipts;
+the other 23 focused units retain their successful recorded executions.
+No dataset, seed, expected hash or tolerance was changed. This closes the
+component coverage gap, not registry provenance or full-model qualification.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
