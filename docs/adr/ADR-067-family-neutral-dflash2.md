@@ -1831,6 +1831,42 @@ The existing configured conformance entrypoint now checks descriptor
 provenance against that independently frozen binding before model execution.
 No reference, fixture payload, numerical limit or expected output changes.
 
+Independent ownership review rejected two remaining integration paths:
+direct-loading capture/diagnostic callers could reach staged consumers before
+canonical finalization, and zero-promotion overlays bypassed source-queue
+retirement. Execution constructors now finalize after their last policy/overlay
+binding and before cache/KV construction; raw-only loader inspection fixtures
+remain raw. An outer consuming transaction now checks the originating queue
+on every successful early exit as well as conversion, and drops failed inner
+models before its cleanup guard settles or records failure. No cache-local
+repacking or route fallback is restored.
+
+The corrected registry-only source builds its complete release libtest in
+97.725 seconds (binary SHA256
+`3adf6f9feb49205d2b899357fcb3e921b0241bd798ed12912415396da6e576e4`).
+The fresh-process zero-promotion regression passes: one distinct replaced
+native root retires while the model, originating device and sibling roots
+remain alive. The actual matvec, staged-M8 and live-tile routes each execute
+all 2,048 original rows across four lanes and 64 verify windows on identical
+archived coding-transcript inputs, with normal pressure, zero swap growth
+and proven cleanup.
+
+The replay comparison is diagnostic, not numerical-equivalence or quality
+acceptance. Against the matvec control:
+
+| Route | Sampled-logit relative RMS | Argmax flips | Flips outside 0.1 reference margin | Largest flipped reference margin |
+|---|---:|---:|---:|---:|
+| Staged M8 | 0.08623 | 38 | 21 | 4.709740 |
+| Live tiles | 0.08746 | 32 | 21 | 4.709740 |
+
+The cause and release-quality implications of these long-replay differences
+are not established. No rows, reference, numerical limit or expected output
+was changed, and no speedup or quality verdict is inferred. Loader/retirement
+regression proof SHA256:
+`8d24aaa407f573629c368646286cbeba0535043a046c65d77d6bbc0542dcfdab`.
+Final clean packed-source conformance, canonical workload, quality, physical
+memory, matched performance and release gates remain mandatory.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,

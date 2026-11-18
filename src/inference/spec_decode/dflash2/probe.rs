@@ -319,7 +319,10 @@ fn dflash2_draft_command_dispatch_probe() {
 
     let gguf = mlx_native::gguf::GgufFile::open(&gguf_path).expect("open target GGUF");
     let mut progress = LoadProgress::new(false, 1, 0);
-    let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load target");
+    let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+        .expect("load target")
+        .finalize_canonical_experts()
+        .expect("finalize experts before the command probe");
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     let descriptor: &'static DFlash2CheckpointDescriptor = if model.cfg.moe.is_some() {
         &QWEN36_DFLASH2

@@ -84,6 +84,9 @@ pub(super) fn load(env: &str, routing: GateRouting) -> Qwen35Model {
     let mut progress = LoadProgress::new(false, 1, 0);
     let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
     model.bind_ggml_routing_policy(policy);
+    let model = model
+        .finalize_canonical_experts()
+        .expect("finalize bound experts before joint execution caches");
     model
         .ensure_gpu_cache_primed()
         .expect("prime GPU cache before allocating caches");

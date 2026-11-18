@@ -1541,7 +1541,10 @@ mod tests {
         );
         let gguf = mlx_native::gguf::GgufFile::open(&gguf_path).expect("open Qwen3.6 GGUF");
         let mut progress = LoadProgress::new(false, 1, 0);
-        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen3.6");
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .expect("load Qwen3.6")
+            .finalize_canonical_experts()
+            .expect("finalize experts before the real draft cycle");
         model
             .ensure_gpu_cache_primed()
             .expect("prime Qwen3.6 GPU cache");
@@ -1671,7 +1674,10 @@ mod tests {
             PathBuf::from(std::env::var_os("HF2Q_DFLASH2_WEIGHTS").expect("HF2Q_DFLASH2_WEIGHTS"));
         let gguf = mlx_native::gguf::GgufFile::open(&gguf_path).expect("open target GGUF");
         let mut progress = LoadProgress::new(false, 1, 0);
-        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load target");
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .expect("load target")
+            .finalize_canonical_experts()
+            .expect("finalize experts before shared capture caches");
         model.ensure_gpu_cache_primed().expect("prime GPU cache");
 
         const CHUNKS: [usize; 4] = [5, 31, 157, 720];

@@ -1802,6 +1802,9 @@ mod tests {
             );
             model.bind_ggml_routing_policy(policy);
         }
+        let model = model
+            .finalize_canonical_experts()
+            .expect("finalize bound experts before speculative execution");
         use crate::inference::models::qwen35::gpu_full_attn::FullAttnQGateWeightsGpu;
         use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35LayerWeights};
         use crate::inference::models::qwen35::mtp::MtpFfnWeightsGpu;

@@ -50,7 +50,25 @@ fn eligible(weights: &MoeFfnWeightsQ) -> bool {
 impl Qwen35Model {
     /// Finalize eligible main experts after overlays/policies and before any
     /// execution-cache, persistent-KV or drafter allocation. MTP is not visited.
+    /// Retire overlay-replaced sources on their loading queue even when no
+    /// expert triplet is eligible for preparation.
     pub(crate) fn finalize_canonical_experts(self) -> Result<Self> {
+        let mut queue = self.weight_device.as_ref().map(|device| PreparationQueue {
+            device: device.clone(),
+            settled: false,
+        });
+        let model = self.prepare_canonical_experts(queue.as_mut())?;
+        // Overlay replacements also stage source-residency removals when
+        // no triplet is eligible. Publish neither path before checked retirement.
+        if let Some(queue) = queue.as_mut() {
+            queue.settle().context(
+                "retire consumed or overlay-replaced weights from their source residency set",
+            )?;
+        }
+        Ok(model)
+    }
+
+    fn prepare_canonical_experts(self, queue: Option<&mut PreparationQueue>) -> Result<Self> {
         if crate::quantize::imatrix::is_active() {
             return Ok(self);
         }
@@ -72,12 +90,10 @@ impl Qwen35Model {
             }
         }
         if count == 0 { return Ok(self); }
-        let mut queue = PreparationQueue {
-            device: self.weight_device.as_ref()
-                .context("canonical main experts require their actual weight-loading device")?.clone(),
-            settled: false,
-        };
-        self.consume_canonical_experts(&mut queue, count)
+        let queue = queue.context(
+            "canonical main experts require their actual weight-loading device",
+        )?;
+        self.consume_canonical_experts(queue, count)
     }
 
     fn consume_canonical_experts(self, queue: &mut PreparationQueue, count: usize) -> Result<Self> {
@@ -100,11 +116,6 @@ impl Qwen35Model {
             sum.checked_add(planes.storage_bytes() as u64)
                 .context("canonical prepared byte count overflow")
         })?;
-        // The native producer has completed and its command-attached sources
-        // have dropped. Commit their staged removals on the SAME source set;
-        // other allocations here are this model's still-live weights, not a
-        // foreign cache's pending additions. No retirement credit precedes this.
-        queue.settle().context("retire consumed main experts from their source residency set")?;
         let mut completed = completed.into_iter();
         let layers = drafts.into_iter().map(|draft| draft.finish(&mut completed))
             .collect::<Result<Vec<_>>>()?;

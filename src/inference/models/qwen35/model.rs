@@ -2351,4 +2351,6 @@ mod tests {
         assert_eq!(m.num_linear_attn_layers(), 30);
         assert!(m.mtp.is_none(), "apex MTP stripped per 2026-04-23 dump");
     }
+
+    include!("canonical_expert_retirement_tests.rs");
 }

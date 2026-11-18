@@ -31,7 +31,10 @@
 
         let gguf = mlx_native::gguf::GgufFile::open(&gguf_path).expect("open reference target GGUF");
         let mut progress = LoadProgress::new(false, 1, 0);
-        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load reference target");
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .expect("load reference target")
+            .finalize_canonical_experts()
+            .expect("finalize target experts before reference caches");
         model
             .ensure_gpu_cache_primed()
             .expect("prime reference target GPU cache");

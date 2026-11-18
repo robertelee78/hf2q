@@ -312,6 +312,9 @@ pub(crate) fn load_no_dwq_qwen35_candidate(
             conversion.receipt().receipt_sha256.clone(),
             Arc::clone(&catalog),
         ))?;
+        let model = model
+            .finalize_canonical_experts()
+            .context("finalize authenticated Qwen experts before execution")?;
         Ok::<_, anyhow::Error>(LoadedQwenCandidateState { model, catalog })
     })?;
     Ok(NoDwqQwen35LoadedCandidate { loaded, execution })

@@ -11382,7 +11382,10 @@ mod tests {
         let device = MlxDevice::new().expect("metal");
         let gguf = GgufFile::open(&path).expect("open gguf");
         let mut progress = LoadProgress::new(false, 1, 0);
-        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load");
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .expect("load")
+            .finalize_canonical_experts()
+            .expect("finalize experts before split-prefill execution");
         let tok = build_tokenizer_from_gguf(&gguf).expect("build tokenizer");
 
         // Tokenize a prompt that yields > 1 token (split point K must

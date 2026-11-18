@@ -797,6 +797,9 @@ fn qwen_prefill_joint_real_model_gate() {
     let mut progress = LoadProgress::new(false, 1, 0);
     let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
     model.bind_ggml_routing_policy(policy);
+    let model = model
+        .finalize_canonical_experts()
+        .expect("finalize bound experts before joint prefill caches");
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     let hidden = model.cfg.hidden_size as usize;
     let vocab = model.cfg.vocab_size;
@@ -2007,6 +2010,9 @@ fn qwen_prefill_scratch_sites_probe() {
     let mut progress = LoadProgress::new(false, 1, 0);
     let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
     model.bind_ggml_routing_policy(policy);
+    let model = model
+        .finalize_canonical_experts()
+        .expect("finalize bound experts before scratch observation");
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     let vocab = model.cfg.vocab_size;
     let layers = model.layers.len();
@@ -2157,6 +2163,9 @@ fn qwen_prefill_wait_layers_memory_probe() {
     let mut progress = LoadProgress::new(false, 1, 0);
     let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
     model.bind_ggml_routing_policy(policy);
+    let model = model
+        .finalize_canonical_experts()
+        .expect("finalize bound experts before wait-cadence caches");
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     let vocab = model.cfg.vocab_size;
     let mut cache = model

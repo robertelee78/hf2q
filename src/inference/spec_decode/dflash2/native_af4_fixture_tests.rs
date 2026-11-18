@@ -214,7 +214,10 @@ fn native_af4_reference_fixture_conforms() {
         .into_iter().map(u32::try_from).collect::<Result<Vec<_>, _>>().expect("lossless anchor conversion");
     let gguf = mlx_native::gguf::GgufFile::open(&gguf_path).expect("open actual target GGUF");
     let mut progress = LoadProgress::new(false, 1, 0);
-    let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load actual target");
+    let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+        .expect("load actual target")
+        .finalize_canonical_experts()
+        .expect("finalize actual target experts before conformance caches");
     model.ensure_gpu_cache_primed().expect("prime actual target GPU cache");
     model.with_gpu_cache_mut(|device, registry| {
         let adapter = QwenDFlash2Adapter::new(&model, &config)?;

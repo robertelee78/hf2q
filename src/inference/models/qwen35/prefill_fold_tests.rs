@@ -486,6 +486,9 @@ fn qwen_prefill_fold_real_model_gate() {
     let mut progress = LoadProgress::new(false, 1, 0);
     let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen model");
     model.bind_ggml_routing_policy(policy);
+    let model = model
+        .finalize_canonical_experts()
+        .expect("finalize bound experts before folded prefill caches");
     model.ensure_gpu_cache_primed().expect("prime GPU cache");
     let hidden = model.cfg.hidden_size as usize;
     let chunk_tokens = |start: usize, len: usize| -> Vec<u32> {
