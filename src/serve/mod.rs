@@ -4002,13 +4002,13 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     // transaction, so two loads running at once cannot both decide against
     // the same total.
     let ledger = resident_memory::process();
-    let (selection, reservation) = ledger.admit(path, |resident_bytes| {
+    let (mut selection, reservation) = ledger.admit(path, |resident_bytes| {
         let selection = dflash2_policy::resolve_for_load(path, config, resident_bytes)?;
         let commitment = selection.commitment;
         anyhow::Ok((selection, commitment))
     })?;
     selection.log(path);
-    let (engine, selection) = match load_engine_on_route(path, config, &selection, reservation) {
+    let (engine, selection) = match load_engine_on_route(path, config, &mut selection, reservation) {
         Err(error) if selection.falls_back_on_load_error() => {
             // Auto never fails startup for a reason of its own making: a
             // load that fails with DFlash2 selected is repeated on the prior
@@ -4018,22 +4018,28 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
                 error = %format!("{error:#}"),
                 "DFlash2 route failed to load; loading the prior route"
             );
-            let prior =
+            let mut prior =
                 selection.without_dflash2(format!("the DFlash2 route failed to load: {error:#}"));
             prior.log(path);
             // The failed attempt's reservation went with its model: it is
             // gone if the model was dropped, and still counted if a worker
-            // that could not be stopped holds it. The retry reserves its
-            // own; the prior route is subject to no admission rule.
-            let reservation = ledger.reserve(path, prior.commitment);
+            // that could not be stopped holds it. The retry is a fresh
+            // admission against both current host bounds and every stranded
+            // or still-live reservation, not an unconditional prior waiver.
+            let (_, reservation) = ledger.admit(path, |resident_bytes| {
+                prior.admit_mandatory_canonical(dflash2_policy::HostFacts::read(
+                    config.kv_cache_budget_bytes, resident_bytes,
+                ))?;
+                anyhow::Ok(((), prior.commitment))
+            })?;
             (
-                load_engine_on_route(path, config, &prior, reservation)?,
+                load_engine_on_route(path, config, &mut prior, reservation)?,
                 prior,
             )
         }
         result => (result?, selection),
     };
-    Ok(engine.with_route_decision(selection.published()))
+    Ok(engine.with_route_decision(selection.published(), selection.commitment))
 }
 
 /// Load and spawn one engine on the route `selection` resolved.
@@ -4044,7 +4050,7 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
 fn load_engine_on_route(
     path: &Path,
     config: &multi_model::EngineConfig,
-    selection: &dflash2_policy::Selection,
+    selection: &mut dflash2_policy::Selection,
     reservation: resident_memory::Reservation,
 ) -> Result<api::engine::Engine> {
     use crate::inference::device_settle::{settle_or_record, take_thread_unsettled};
@@ -4082,7 +4088,7 @@ fn load_engine_on_route(
 fn load_and_spawn_on_route(
     path: &Path,
     config: &multi_model::EngineConfig,
-    selection: &dflash2_policy::Selection,
+    selection: &mut dflash2_policy::Selection,
     reservation: &mut Option<resident_memory::Reservation>,
 ) -> Result<api::engine::Engine> {
     // Bound for the load and the spawn: weight upload and worker
@@ -4151,6 +4157,22 @@ fn load_and_spawn_on_route(
         &load_opts,
         Some(resolved_context.effective_tokens),
     )?;
+    if let api::engine::LoadedModel::Qwen35(q) = &loaded {
+        let bytes = q.model.canonical_expert_storage_bytes();
+        if let Some(reservation) = reservation.as_ref() {
+            match reservation.promote_canonical(bytes.raw_bytes, bytes.prepared_bytes) {
+                Ok(completed) => selection.commitment = completed,
+                Err(error) => {
+                    let device = q.model.weight_device().cloned();
+                    drop(loaded);
+                    if let Some(device) = device {
+                        let _ = crate::inference::device_settle::settle_or_record(&device);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
     if model_id_uses_filename_fallback {
         if let Some(logical_path) = config.operator_model_path.as_deref() {
             loaded.apply_operator_model_id(logical_path);
@@ -4201,6 +4223,12 @@ fn load_and_spawn_on_route(
     // which `spawn_with_mode` delegates byte-for-byte to the legacy
     // 3-arg `Engine::spawn` per iter-1.5 F1 (engine.rs:2723-2748) — so
     // the absent-config path stays byte-equivalent per ADR-040 §3.6.
+    // A rejected spawn drops `loaded` on this thread, before any worker can
+    // own its loader device. Retain that actual device to flush its removals.
+    let weight_device = match &loaded {
+        api::engine::LoadedModel::Qwen35(q) => q.model.weight_device().cloned(),
+        _ => None,
+    };
     let engine = api::engine::Engine::spawn_with_mode(
         loaded,
         config.queue_capacity,
@@ -4212,6 +4240,19 @@ fn load_and_spawn_on_route(
         reservation,
     )
     .map_err(|e| {
+        if reservation.is_some() {
+            // Before a worker exists, provisioning may have primed this
+            // thread's cache with aliases of the model's remaining weights.
+            // Drop those before flushing the actual loader registration set.
+            if let Some(device) =
+                crate::inference::models::qwen35::model::Qwen35Model::take_thread_gpu_cache()
+            {
+                let _ = crate::inference::device_settle::settle_or_record(&device);
+            }
+            if let Some(device) = &weight_device {
+                let _ = crate::inference::device_settle::settle_or_record(device);
+            }
+        }
         anyhow::anyhow!(
             "Engine::spawn_with_mode rejected the requested scheduler: {e}. \
              Select `--scheduler fifo-serial` for the single-slot path or use \

@@ -844,6 +844,13 @@ pub trait ModelLoader<E>: Send + Sync {
     fn admission_bytes(&self, _path: &Path, _config: Option<&EngineConfig>) -> Option<u64> {
         None
     }
+
+    /// Source-free retained ownership after a successful load, when startup
+    /// had a disjoint preparation peak. `None` preserves the admitted charge.
+    /// A result must not exceed the startup bound and never lowers the file floor.
+    fn retained_bytes(&self, _engine: &E) -> Option<u64> {
+        None
+    }
 }
 
 /// Production [`ModelLoader`] — delegates to
@@ -854,6 +861,10 @@ pub struct DefaultModelLoader;
 impl ModelLoader<Engine> for DefaultModelLoader {
     fn admission_bytes(&self, path: &Path, config: Option<&EngineConfig>) -> Option<u64> {
         crate::serve::dflash2_policy::admission_bytes(path, config)
+    }
+
+    fn retained_bytes(&self, engine: &Engine) -> Option<u64> {
+        engine.canonical_retained_admission_bytes()
     }
 
     fn load(&self, path: &Path, config: &EngineConfig) -> anyhow::Result<Engine> {
@@ -1477,6 +1488,27 @@ impl<E> HotSwapManager<E> {
             .map_or(file_bytes, |bytes| bytes.max(file_bytes)))
     }
 
+    fn retained_bytes_for(
+        &self,
+        path: &Path,
+        engine: &E,
+        startup_bytes: u64,
+    ) -> Result<u64, HotSwapError> {
+        let Some(retained) = self.loader.retained_bytes(engine) else {
+            return Ok(startup_bytes);
+        };
+        let file_bytes = std::fs::metadata(path)
+            .map_err(|source| HotSwapError::FileSize { path: path.to_path_buf(), source })?
+            .len();
+        let retained = retained.max(file_bytes);
+        if retained > startup_bytes {
+            return Err(HotSwapError::LoaderFailed(anyhow::anyhow!(
+                "retained model ownership {retained} exceeds admitted startup bound {startup_bytes}"
+            )));
+        }
+        Ok(retained)
+    }
+
     /// Read the GGUF-size estimate and calculate admission without loading.
     pub fn plan_path(
         &self,
@@ -1642,6 +1674,7 @@ impl<E> HotSwapManager<E> {
             .loader
             .load(gguf_path, config)
             .map_err(HotSwapError::LoaderFailed)?;
+        let bytes_resident = self.retained_bytes_for(gguf_path, &engine, bytes_resident)?;
         let loaded_engine = Arc::new(LoadedEngine {
             engine,
             repo: repo.to_string(),
@@ -1693,20 +1726,18 @@ impl<E> HotSwapManager<E> {
 
     /// Return the engine for `(repo, quant)`, loading + admitting if
     /// not already pooled.  On a hit: promotes to MRU and returns the
-    /// existing `Arc<LoadedEngine<E>>` clone.  On a miss: invokes the
-    /// loader (may take seconds), reads the GGUF file size for byte
-    /// accounting, admits the new entry to the pool (which may evict
-    /// LRU entries), inserts into the engines map, and returns the
-    /// fresh Arc.
+    /// existing `Arc<LoadedEngine<E>>` clone. On a miss, admit the startup
+    /// bound and evict its exact LRU victims before invoking the loader.
+    /// Publish the validated retained charge only after the load succeeds.
     ///
     /// **Errors.**
     ///
     /// - [`HotSwapError::FileSize`] when the GGUF cannot be `metadata`'d.
     /// - [`HotSwapError::LoaderFailed`] when the loader returns an
-    ///   error.  Pool + engines map are untouched on loader failure.
-    /// - [`HotSwapError::PoolRefused`] when the pool refuses admission
-    ///   (oversized handle, zero capacity).  Loader still ran; the
-    ///   engine produced is dropped immediately to free GPU buffers.
+    ///   error. No incoming entry is published; startup victims already
+    ///   evicted to make the attempt safe cannot be restored.
+    /// - [`HotSwapError::PoolRefused`] when startup cannot fit even after
+    ///   eviction (oversized handle or zero capacity). The loader never runs.
     pub fn load_or_get(
         &mut self,
         repo: &str,
@@ -1744,6 +1775,22 @@ impl<E> HotSwapManager<E> {
         // bail at header-open time, but a clean upfront error is
         // better tracing).
         let bytes_resident = self.resident_bytes_for(activation_path, Some(config))?;
+        let startup = self.admission_plan(repo, quant, bytes_resident);
+        match startup.outcome {
+            AdmissionOutcome::Impossible { reason } => {
+                return Err(HotSwapError::PoolRefused(reason));
+            }
+            AdmissionOutcome::WouldEvict { victims, .. } => {
+                let summaries: Vec<_> = self.iter_loaded().filter(|entry| {
+                    victims.iter().any(|victim| victim.repo_id == entry.pool_key)
+                }).collect();
+                let prepared = self.prepare_evictions(startup.revision, &summaries)
+                    .map_err(|error| HotSwapError::LoaderFailed(error.into()))?;
+                self.commit_prepared(prepared)
+                    .map_err(|error| HotSwapError::LoaderFailed(error.into()))?;
+            }
+            _ => {}
+        }
 
         let mut loader_config = config.clone();
         if activation_path != gguf_path {
@@ -1762,6 +1809,7 @@ impl<E> HotSwapManager<E> {
             .loader
             .load(activation_path, &loader_config)
             .map_err(HotSwapError::LoaderFailed)?;
+        let bytes_resident = self.retained_bytes_for(activation_path, &engine, bytes_resident)?;
 
         let loaded_engine = Arc::new(LoadedEngine {
             engine,
@@ -1784,9 +1832,8 @@ impl<E> HotSwapManager<E> {
             },
         });
 
-        // Admit to the pool.  May evict LRU entries; we drop the
-        // corresponding engine map entries here so the freed Arcs
-        // release.
+        // Startup victims have already left. Retained ownership was checked
+        // against that startup bound, so publication needs no new evictions.
         let handle = LoadedHandle {
             repo_id: k.clone(),
             quant: quant.as_str().to_string(),
@@ -1794,58 +1841,8 @@ impl<E> HotSwapManager<E> {
             bytes_resident,
         };
 
-        let evicted = match self.pool.insert(handle) {
-            Ok(evicted) => evicted,
-            Err(e) => {
-                // Pool refused — drop the freshly-loaded engine
-                // immediately to free its GPU buffers.  No state
-                // mutation visible to the caller.
-                drop(loaded_engine);
-                return Err(HotSwapError::PoolRefused(e));
-            }
-        };
-
-        for victim in evicted {
-            // Eviction-hook trigger (iter-212 / AC 5471).  Fire
-            // `pre_evict` per evictee BEFORE dropping the manager's Arc
-            // from `engines`, so the spiller observes a live Arc.  An
-            // `Error(...)` outcome MUST NOT block eviction — the spill
-            // is best-effort.
-            if let Some(arc) = self.engines.get(&victim.repo_id).cloned() {
-                let outcome = self.spiller.pre_evict(&victim, &arc);
-                // ADR-005 Phase 4 reopen iter-213 (AC 5472): record
-                // outcome to
-                // `hf2q_pool_kv_spills_total{repo,quant,outcome=...}`.
-                // Per-call, NOT per-block: EnqueuedBlocks(N) increments
-                // the success row by 1 regardless of N.  The victim's
-                // `repo_id` is the pool key (`format!("{repo}@{quant}")`);
-                // we re-parse it back into (repo, quant) below.  The
-                // pool key shape is enforced by `pool_key()`; both halves
-                // are non-empty by construction.
-                if let Some(counters) = self.kv_counters.as_ref() {
-                    if let Some((victim_repo, victim_quant)) =
-                        unpack_pool_key(&victim.repo_id, &victim.quant)
-                    {
-                        counters.record_spill(&victim_repo, victim_quant, outcome);
-                    }
-                }
-            }
-            // Drop the manager's Arc — in-flight requests holding their
-            // own clones keep the engine alive until they release; the
-            // pool slot is already free.
-            self.engines.remove(&victim.repo_id);
-            // ADR-017 Closure iter-7 (2026-05-04): drop the spiller's
-            // per-family hook AFTER engines.remove. Symmetric with the
-            // explicit `evict()` path. victim.repo_id is the pool-key
-            // form `{repo}@{quant}`; unpack via the same helper that
-            // the metrics path uses so the spiller's bare-repo
-            // registration key is matched.
-            if let Some((victim_repo, victim_quant)) =
-                unpack_pool_key(&victim.repo_id, &victim.quant)
-            {
-                self.spiller.drop_family(&victim_repo, victim_quant);
-            }
-        }
+        let evicted = self.pool.insert(handle).map_err(HotSwapError::PoolRefused)?;
+        debug_assert!(evicted.is_empty(), "retained publication exceeded its startup plan");
 
         // Admission-hook trigger (iter-212 / AC 5471).  Fire
         // `post_admit` AFTER `loader.load()` returns and BEFORE the
@@ -2388,6 +2385,159 @@ mod tests {
         assert_eq!(mgr.pool_stats().total_resident_bytes, 400);
     }
 
+    struct PhaseLoader {
+        retained: u64,
+        fail: bool,
+    }
+
+    impl ModelLoader<MockEngine> for PhaseLoader {
+        fn load(&self, _path: &Path, _config: &EngineConfig) -> anyhow::Result<MockEngine> {
+            anyhow::ensure!(!self.fail, "checked canonical promotion failed");
+            Ok(MockEngine { load_serial: 1 })
+        }
+
+        fn admission_bytes(&self, _path: &Path, _config: Option<&EngineConfig>) -> Option<u64> {
+            Some(300)
+        }
+
+        fn retained_bytes(&self, _engine: &MockEngine) -> Option<u64> {
+            Some(self.retained)
+        }
+    }
+
+    #[test]
+    fn canonical_pool_admits_startup_peak_then_charges_each_completed_retained_owner() {
+        let pool = LoadedPool::with_capacity_and_budget(3, 500);
+        let mut manager = HotSwapManager::<MockEngine>::new(
+            pool, Arc::new(PhaseLoader { retained: 200, fail: false }),
+        );
+        let file = synthetic_gguf(100);
+        let first = manager.load_or_get_non_evicting(
+            "a/1", QuantType::Q4_K_M, file.path(), &empty_config(),
+        ).unwrap();
+        assert!(matches!(first, NonEvictingLoad::Loaded(_)));
+        assert_eq!(manager.pool_stats().total_resident_bytes, 200);
+        let second = manager.load_or_get_non_evicting(
+            "b/2", QuantType::Q4_K_M, file.path(), &empty_config(),
+        ).unwrap();
+        assert!(matches!(second, NonEvictingLoad::Loaded(_)));
+        assert_eq!(manager.pool_stats().total_resident_bytes, 400);
+        let third = manager.load_or_get_non_evicting(
+            "c/3", QuantType::Q4_K_M, file.path(), &empty_config(),
+        ).unwrap();
+        assert!(matches!(third, NonEvictingLoad::Conflict(_)));
+        assert_eq!(manager.pool_stats().total_resident_bytes, 400);
+    }
+
+    #[test]
+    fn canonical_pool_failed_or_over_bound_promotion_publishes_no_owner() {
+        let file = synthetic_gguf(100);
+        for loader in [
+            PhaseLoader { retained: 200, fail: true },
+            PhaseLoader { retained: 301, fail: false },
+        ] {
+            let pool = LoadedPool::with_capacity_and_budget(2, 500);
+            let mut manager = HotSwapManager::<MockEngine>::new(pool, Arc::new(loader));
+            assert!(manager.load_or_get(
+                "a/1", QuantType::Q4_K_M, file.path(), &empty_config(),
+            ).is_err());
+            assert_eq!(manager.pool_stats().total_resident_bytes, 0);
+        }
+        let pool = LoadedPool::with_capacity_and_budget(2, 500);
+        let mut manager = HotSwapManager::<MockEngine>::new(
+            pool, Arc::new(PhaseLoader { retained: 1, fail: false }),
+        );
+        let loaded = manager.load_or_get(
+            "a/1", QuantType::Q4_K_M, file.path(), &empty_config(),
+        ).unwrap();
+        assert_eq!(loaded.bytes_resident, 100, "source-free metadata never lowers the file floor");
+    }
+
+    #[test]
+    fn ordinary_pool_refuses_startup_that_only_retained_ownership_would_fit() {
+        let file = synthetic_gguf(100);
+        for fail in [false, true] {
+            let pool = LoadedPool::with_capacity_and_budget(2, 250);
+            let mut manager = HotSwapManager::<MockEngine>::new(
+                pool, Arc::new(PhaseLoader { retained: 200, fail }),
+            );
+            let error = manager.load_or_get(
+                "a/1", QuantType::Q4_K_M, file.path(), &empty_config(),
+            ).unwrap_err();
+            assert!(matches!(error, HotSwapError::PoolRefused(PoolError::OversizedHandle {
+                handle_bytes: 300, budget_bytes: 250, ..
+            })), "startup must be refused before even a failing loader runs");
+            assert_eq!(manager.pool_stats().total_resident_bytes, 0);
+            assert_eq!(manager.pool_stats().loaded_count, 0);
+            assert!(matches!(manager.load_or_get_non_evicting(
+                "a/1", QuantType::Q4_K_M, file.path(), &empty_config(),
+            ).unwrap(), NonEvictingLoad::Conflict(_)));
+        }
+    }
+
+    #[test]
+    fn ordinary_pool_releases_startup_victims_before_loading_then_publishes_retained() {
+        struct ObservingLoader {
+            calls: std::sync::atomic::AtomicU64,
+            victim: std::sync::Mutex<Option<std::sync::Weak<LoadedEngine<MockEngine>>>>,
+        }
+        impl ModelLoader<MockEngine> for ObservingLoader {
+            fn load(&self, _path: &Path, _config: &EngineConfig) -> anyhow::Result<MockEngine> {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if let Some(victim) = self.victim.lock().unwrap().as_ref() {
+                    assert!(victim.upgrade().is_none(), "startup victim still owned by the pool at load");
+                }
+                Ok(MockEngine { load_serial: call })
+            }
+            fn admission_bytes(&self, _path: &Path, _config: Option<&EngineConfig>) -> Option<u64> {
+                Some(300)
+            }
+            fn retained_bytes(&self, _engine: &MockEngine) -> Option<u64> {
+                Some(200)
+            }
+        }
+        let loader = Arc::new(ObservingLoader {
+            calls: std::sync::atomic::AtomicU64::new(0),
+            victim: std::sync::Mutex::new(None),
+        });
+        let pool = LoadedPool::with_capacity_and_budget(2, 400);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let file = synthetic_gguf(100);
+        let first = manager.load_or_get(
+            "a/1", QuantType::Q4_K_M, file.path(), &empty_config(),
+        ).unwrap();
+        *loader.victim.lock().unwrap() = Some(Arc::downgrade(&first));
+        drop(first);
+        let second = manager.load_or_get(
+            "b/2", QuantType::Q4_K_M, file.path(), &empty_config(),
+        ).unwrap();
+        assert_eq!(second.bytes_resident, 200);
+        assert!(manager.try_get("a/1", QuantType::Q4_K_M).is_none());
+        assert_eq!(manager.pool_stats().loaded_count, 1);
+        assert_eq!(manager.pool_stats().total_resident_bytes, 200);
+        assert_eq!(loader.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn failed_ordinary_load_does_not_restore_evicted_startup_owners() {
+        let loader = Arc::new(MockLoader::fail_on(2));
+        let pool = LoadedPool::with_capacity_and_budget(2, 400);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let file = synthetic_gguf(300);
+        drop(manager.load_or_get(
+            "a/1", QuantType::Q4_K_M, file.path(), &empty_config(),
+        ).unwrap());
+        let error = manager.load_or_get(
+            "b/2", QuantType::Q4_K_M, file.path(), &empty_config(),
+        ).unwrap_err();
+        assert!(matches!(error, HotSwapError::LoaderFailed(_)));
+        assert_eq!(loader.call_count(), 2);
+        assert!(manager.try_get("a/1", QuantType::Q4_K_M).is_none());
+        assert!(manager.try_get("b/2", QuantType::Q4_K_M).is_none());
+        assert_eq!(manager.pool_stats().loaded_count, 0);
+        assert_eq!(manager.pool_stats().total_resident_bytes, 0);
+    }
+
     #[test]
     fn prepared_eviction_is_revision_and_generation_bound() {
         let loader = Arc::new(MockLoader::new());
@@ -2526,7 +2676,7 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(loader.call_count(), 1);
+        assert_eq!(loader.call_count(), 0, "oversized startup is refused before loading retained bytes");
         assert_eq!(manager.pool_stats().loaded_count, 0);
         assert_eq!(manager.pool_stats().total_resident_bytes, 0);
         assert!(
@@ -2615,12 +2765,8 @@ mod tests {
 
     #[test]
     fn hotswap_errors_when_no_evictable_fits() {
-        // Budget 500, GGUF file 1500 → oversized handle even with
-        // empty pool.  Loader still runs (the manager invokes it
-        // before the pool admission attempt by design — the alternative
-        // would be to file-stat first, but file size IS the byte
-        // estimate so we already do that).  Verify the engine is
-        // dropped (`Arc::strong_count == 0` after the error).
+        // Budget 500, GGUF file 1500: startup cannot fit even in an empty
+        // pool. Refuse before invoking the expensive loader.
         let loader = Arc::new(MockLoader::new());
         let pool = LoadedPool::with_capacity_and_budget(3, 500);
         let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader.clone());
@@ -2642,8 +2788,7 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
-        // Loader was invoked (engine produced + dropped).
-        assert_eq!(loader.call_count(), 1);
+        assert_eq!(loader.call_count(), 0, "startup refusal precedes loader invocation");
         // Manager state is unchanged.
         assert_eq!(mgr.pool_stats().loaded_count, 0);
         assert!(mgr.try_get("big/1", QuantType::Q4_K_M).is_none());
@@ -3179,11 +3324,9 @@ mod tests {
             Arc::ptr_eq(&arc_b, &arc_b_after),
             "B's Arc identity must be preserved across refused oversized load"
         );
-        // Loader was invoked once for the oversized attempt (the
-        // manager admits the file-stat + load before pool insert);
-        // the freshly-produced engine drops on PoolRefused.
-        // Total calls: 2 (a, b admits) + 1 (huge attempt) = 3.
-        assert_eq!(loader.call_count(), 3);
+        // Only A and B loaded; impossible startup is refused before loading
+        // and without disturbing either existing owner.
+        assert_eq!(loader.call_count(), 2);
     }
 
     /// W-B1 test 3/4: a `load_or_get` cache hit promotes the entry to

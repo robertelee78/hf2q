@@ -12,6 +12,10 @@
 #[path = "quality/adr063_invariance/mod.rs"]
 pub(crate) mod adr063_invariance;
 
+#[cfg(test)]
+#[path = "quality/native_lifetime_probe.rs"]
+mod native_lifetime_probe;
+
 pub mod arch;
 pub mod backends;
 mod calibrate;

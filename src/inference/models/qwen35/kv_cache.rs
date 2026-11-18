@@ -922,6 +922,14 @@ impl FullAttnKvSlot {
     /// the barrier between them) leave the first
     /// `n_kv_heads · n_tokens · head_dim` elements of `dst` in the unrotated
     /// domain as `[n_kv_heads, n_tokens, head_dim]`.
+    ///
+    /// No tensor allocation is performed. A caller may reuse a bounded
+    /// `[n_kv_heads, tile_tokens, head_dim]` F32 tile across cache ranges;
+    /// `n_tokens` determines its tight head stride, including the short tail.
+    /// Both native dispatchers copy their per-range parameters into inline
+    /// encoder bytes, so queued ranges never share mutable parameter storage.
+    /// The caller must barrier after the tile's last reader before reusing it,
+    /// and retain its owning root through the checked success or error drain.
     #[allow(clippy::too_many_arguments)]
     pub fn dequant_seq_into_f32_unrotated_for_slot(
         &self,
@@ -2066,6 +2074,21 @@ impl HybridKvCache {
         // cursor advances. Recurrent DeltaNet state remains semantic-zero.
         cache.reset_all_buffers();
         Ok(cache)
+    }
+
+    /// Requested payload of the exact boot allocation plan, including MTP.
+    /// This deliberately counts overwrite-only full-attention roots too:
+    /// allocation ownership is not a physical-residency/reclamation assertion.
+    pub(crate) fn initial_cache_payload_bytes(
+        cfg: &Qwen35Config,
+        max_seq_len: u32,
+        n_seqs: u32,
+        tq_kv_active: bool,
+    ) -> Result<u64> {
+        let plan = HybridCacheAllocationPlan::new(
+            cfg, max_seq_len, n_seqs, tq_kv_active, true,
+        )?;
+        u64::try_from(plan.total_bytes).context("boot KV payload exceeds u64")
     }
 
     fn allocate_with_profile(

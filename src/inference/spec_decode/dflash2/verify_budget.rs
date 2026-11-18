@@ -98,6 +98,11 @@ impl Default for DFlash2VerifyBudget {
 }
 
 impl DFlash2VerifyBudget {
+    /// Requested backing payload of the bounded label ring in `default`.
+    pub(super) fn label_payload_bytes() -> Option<usize> {
+        MAX_LABELS.checked_mul(std::mem::size_of::<Label>())
+    }
+
     pub(crate) fn model(&self, lanes: usize) -> Result<VerifyRowsModel> {
         ensure!(
             (1..=DFLASH2_MAX_LANES).contains(&lanes),

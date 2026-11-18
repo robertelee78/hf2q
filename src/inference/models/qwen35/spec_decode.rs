@@ -421,6 +421,9 @@ impl<'a> SpecDecode<'a> {
         // through the active `self.slot_id` (was hard-coded SlotId(0)
         // per the B4a / B4d deferral block at the file header).
         let slot_id = self.slot_id;
+        let _carry_commitment = super::carry_memory::commit_target(
+            &self.verifier.cfg, prompt.len(),
+        )?;
         let (prefill_logits, prefill_hidden) = self
             .verifier
             .forward_gpu_with_nextn_hidden(prompt, &prefill_positions, &mut self.kv_cache, slot_id)
@@ -529,6 +532,9 @@ impl<'a> SpecDecode<'a> {
                 spec_k < 2,
                 "HF2Q_SPEC_DECODE_K={spec_k} is disabled: Qwen K>=2 target/hidden/cache parity is not qualified; use K=1"
             );
+            let _carry_commitment = super::carry_memory::commit_target(
+                &self.verifier.cfg, spec_k.max(1) + 1,
+            )?;
 
             if spec_k >= 2 {
                 // ADR-034 task #91 Step 4 (2026-05-21) — K=N path supports MH

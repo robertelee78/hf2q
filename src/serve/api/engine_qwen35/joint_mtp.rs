@@ -310,15 +310,23 @@ impl Qwen35DecodeState {
             .as_ref()
             .context("Qwen joint MTP catch-up weights missing")?;
         let accepted_tokens = &tokens[..accepted];
-        let shared_embed = qwen
-            .model
+        let _carry_commitment =
+            crate::inference::models::qwen35::carry_memory::commit_target(
+                &qwen.model.cfg, accepted,
+            )?;
+        let catchup_owners =
+            crate::inference::models::qwen35::carry_memory::CatchupTransaction::open(
+                &qwen.model.cfg, accepted, hidden_rows, Some(&window.verifier_hidden),
+            )?;
+        let shared_embed = catchup_owners.gather(|| qwen.model
             .embed_tokens_gpu(accepted_tokens)
-            .context("Qwen joint MTP catch-up embeddings")?;
-        let target_rows = rows_view(hidden_rows, 0, accepted, hidden_size as usize)?;
+            .context("Qwen joint MTP catch-up embeddings"))?;
+        let target_rows = rows_view(hidden_rows, 0, accepted, hidden_size as usize)
+            .map_err(|error| catchup_owners.settle_error(error))?;
         let lease = supervisor.arm(
             "Qwen35 joint MTP catch-up",
             QWEN35_WORKER_TRANSACTION_TIMEOUT,
-        )?;
+        ).map_err(|error| catchup_owners.settle_error(error))?;
         let caught_up = qwen.model.with_gpu_cache_mut(|device, registry| {
             mtp.process_target_batch(
                 accepted_tokens,
@@ -333,9 +341,9 @@ impl Qwen35DecodeState {
                 &qwen.model.cfg,
             )
         });
-        lease
-            .finish()
-            .and(caught_up)
+        let caught_up = catchup_owners.finish(caught_up);
+        caught_up
+            .and(lease.finish())
             .context("Qwen joint MTP catch-up")?;
         kv_cache
             .validate_speculative_cursors_for_slot(self.slot_id, window.prior as usize + accepted)
@@ -478,6 +486,11 @@ impl Qwen35LoadedModel {
         options: JointStepOptions,
         supervisor: &EngineSupervisor,
     ) -> Result<Qwen35JointVerify> {
+        let rows = lanes.iter().try_fold(0usize, |rows, lane| {
+            rows.checked_add(lane.tokens.len()).context("joint carry rows overflow")
+        })?;
+        let _carry_commitment =
+            crate::inference::models::qwen35::carry_memory::commit_target(&self.model.cfg, rows)?;
         let lease = supervisor.arm("Qwen35 joint MTP verify", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
         let verify = self
             .model

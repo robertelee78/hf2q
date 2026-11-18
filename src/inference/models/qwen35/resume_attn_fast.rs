@@ -9,14 +9,16 @@
 //! byte on the CPU and registers each buffer with the residency set, and the
 //! route ends in a host wait, so all of that is serial with the GPU.
 //!
-//! With `HF2Q_QWEN_RESUME_ATTN_FAST` on (the default), the route runs the
-//! same dispatches in the same order on the same input bytes:
+//! With `HF2Q_QWEN_RESUME_ATTN_FAST` on (the default), the route keeps the
+//! same per-tensor transforms and attention/output arithmetic:
 //! - the BF16 Q and output buffers come from the prefill's
-//!   [`FaPrefillArena`], which resumed chunks allocate but did not use;
-//! - the K/V temps, their BF16 casts and the F32 result are allocated once
-//!   per prefill, by the first FA layer, in [`ResumeTqScratch`] on that arena;
-//! - the dequant and the bridge share one command buffer (a memory barrier
-//!   replaces the command-buffer boundary), committed without a host wait.
+//!   [`FaPrefillArena`];
+//! - two F32 token tiles (at most 2048 rows each) dequantize and inverse-rotate
+//!   K/V before casting into unchanged full-history BF16 K/V roots;
+//! - joint segments borrow one forward-owned output and history workspace;
+//!   ordinary prefills lazily allocate their own [`ResumeTqScratch`];
+//! - barriers order dequant, cast, staging reuse and the BF16 bridge in one
+//!   command buffer, committed without a host wait.
 //!   The layer's ops6-7 consumes the result in queue order and keeps its own
 //!   wait.
 //!
@@ -33,16 +35,25 @@
 use std::sync::LazyLock;
 
 use anyhow::{anyhow, Context, Result};
-use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::ops::elementwise::{cast, CastDirection};
+use mlx_native::{CommandEncoder, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::gpu_full_attn::{
-    encode_flash_attn_prefill_seq_major_resume, validate_flash_attn_prefill_resume_shape,
+    encode_flash_attn_prefill_seq_major_resume_prepared, validate_flash_attn_prefill_resume_shape,
     FaResumeBridgeBuffers,
 };
 use super::joint_step_options::parse_switch;
 use super::kv_cache::FullAttnKvSlot;
 use super::FaPrefillArena;
 use crate::serve::multi_seq_kv::SlotId;
+
+mod workspace;
+pub(crate) use workspace::{ResumeTqScratch, ResumeTqWorkspace, RESUME_TQ_HISTORY_TILE_ROWS};
+
+#[cfg(test)]
+use super::gpu_full_attn::encode_flash_attn_prefill_seq_major_resume;
+#[cfg(test)]
+use mlx_native::DType;
 
 /// Kill switch, default on: unset, blank or `1`/`on`/`true` takes the fast
 /// route; `0`/`off`/`false` keeps route (c) as it was.
@@ -114,55 +125,6 @@ pub(crate) fn fast_route_calls() -> u64 {
     FAST_ROUTE_CALLS.with(std::cell::Cell::get)
 }
 
-/// Route (c) buffers that depend on the attended length, plus the F32
-/// result, for one prefill. Same dtypes and shapes as the buffers route (c)
-/// allocates per layer.
-pub(crate) struct ResumeTqScratch {
-    seq_len: u32,
-    kv_seq_len: u32,
-    /// F32 `[n_kv_heads, kv_seq_len, head_dim]`: unrotated TQ dequant of K.
-    temp_k: MlxBuffer,
-    /// Same for V.
-    temp_v: MlxBuffer,
-    /// BF16 `[1, n_kv_heads, kv_seq_len, head_dim]`: cast of `temp_k`.
-    k_bf16: MlxBuffer,
-    /// Same for V.
-    v_bf16: MlxBuffer,
-    /// F32 `[seq_len, n_heads, head_dim]`: the route's result. Each FA layer
-    /// gets a clone; its ops6-7 consumes it before the next FA layer
-    /// rewrites it (queue order, plus that layer's host wait).
-    out_seq: MlxBuffer,
-}
-
-impl ResumeTqScratch {
-    fn new(
-        device: &MlxDevice,
-        seq_len: u32,
-        kv_seq_len: u32,
-        n_heads: u32,
-        n_kv_heads: u32,
-        head_dim: u32,
-    ) -> Result<Self> {
-        let (seq, kv) = (seq_len as usize, kv_seq_len as usize);
-        let (nh, nkv, d) = (n_heads as usize, n_kv_heads as usize, head_dim as usize);
-        let kv_elems = nkv * kv * d;
-        let alloc = |bytes: usize, dtype: DType, shape: Vec<usize>, label: &str| {
-            device
-                .alloc_buffer(bytes, dtype, shape)
-                .map_err(|e| anyhow!("ResumeTqScratch alloc {label}: {e}"))
-        };
-        Ok(Self {
-            seq_len,
-            kv_seq_len,
-            temp_k: alloc(kv_elems * 4, DType::F32, vec![nkv, kv, d], "temp_k")?,
-            temp_v: alloc(kv_elems * 4, DType::F32, vec![nkv, kv, d], "temp_v")?,
-            k_bf16: alloc(kv_elems * 2, DType::BF16, vec![1, nkv, kv, d], "k_bf16")?,
-            v_bf16: alloc(kv_elems * 2, DType::BF16, vec![1, nkv, kv, d], "v_bf16")?,
-            out_seq: alloc(seq * nh * d * 4, DType::F32, vec![seq, nh, d], "out_seq")?,
-        })
-    }
-}
-
 /// The arena's buffers for one resumed layer, allocating the
 /// [`ResumeTqScratch`] on the prefill's first resumed FA layer. Every FA
 /// layer of one prefill attends the same `(seq_len, kv_seq_len)`; a
@@ -191,6 +153,7 @@ fn arena_buffers<'a>(
                 arena.n_heads,
                 arena.n_kv_heads,
                 arena.head_dim,
+                arena.shared_resume.as_ref(),
             )?);
         }
     }
@@ -208,8 +171,8 @@ fn arena_buffers<'a>(
             out_bf16_hm: &arena.out_bf16_hm,
             out_seq: &scratch.out_seq,
         },
-        &scratch.temp_k,
-        &scratch.temp_v,
+        &scratch.k_f32_tile,
+        &scratch.v_f32_tile,
     ))
 }
 
@@ -243,39 +206,69 @@ pub(crate) fn encode_resume_via_tq_cache_fast(
     // Route (c) attends tight temps: kv_capacity = kv_seq_len.
     validate_flash_attn_prefill_resume_shape(seq_len, cur_len, kv_seq_len, kv_seq_len, head_dim)?;
     arena.validate_fits(seq_len, n_heads, n_kv_heads, head_dim)?;
-    let (bufs, temp_k, temp_v) = arena_buffers(arena, device, seq_len, kv_seq_len)?;
+    let (bufs, k_tile, v_tile) = arena_buffers(arena, device, seq_len, kv_seq_len)?;
 
-    for (is_k, temp) in [(true, temp_k), (false, temp_v)] {
-        slot.dequant_seq_into_f32_unrotated_for_slot(
-            is_k,
-            kv_seq_len,
-            /*start_pos=*/ 0,
-            cache_capacity,
-            n_kv_heads,
-            head_dim,
-            slot_id,
-            temp,
-            enc,
-            registry,
-            device,
-        )
-        .with_context(|| {
-            format!(
-                "dequant {} seq → scratch F32 unrotated",
-                if is_k { "K" } else { "V" }
-            )
-        })?;
-    }
-    // Replaces route (c)'s command-buffer boundary: the bridge's K/V casts
-    // read what the undo just wrote.
+    // WAR against the preceding segment, including a carried concurrent
+    // encoder. All roots remain owned until the forward's checked drain.
     enc.memory_barrier();
-    encode_flash_attn_prefill_seq_major_resume(
+    for start_pos in (0..kv_seq_len).step_by(RESUME_TQ_HISTORY_TILE_ROWS as usize) {
+        let n_tokens = (kv_seq_len - start_pos).min(RESUME_TQ_HISTORY_TILE_ROWS);
+        for (is_k, tile) in [(true, k_tile), (false, v_tile)] {
+            // Caller-owned roots, not allocating dequant helpers: pooled
+            // allocations in this loop would all survive until the next reset.
+            // The native dequant/FWHT params are immutable inline encoder bytes.
+            slot.dequant_seq_into_f32_unrotated_for_slot(
+                is_k,
+                n_tokens,
+                start_pos,
+                cache_capacity,
+                n_kv_heads,
+                head_dim,
+                slot_id,
+                tile,
+                enc,
+                registry,
+                device,
+            )
+            .with_context(|| {
+                format!(
+                    "dequant {} history tile at {start_pos} ({n_tokens} rows) → F32 unrotated",
+                    if is_k { "K" } else { "V" }
+                )
+            })?;
+        }
+        enc.memory_barrier();
+        let head_elems = n_tokens as usize * head_dim as usize;
+        for (tile, destination) in [(k_tile, bufs.k_bf16), (v_tile, bufs.v_bf16)] {
+            for head in 0..n_kv_heads as usize {
+                // A short tail is packed tightly in the tile, while each
+                // destination head keeps the full segment's history stride.
+                let source = tile.slice_view((head * head_elems * 4) as u64, head_elems);
+                let dst_offset = (head * kv_seq_len as usize + start_pos as usize)
+                    * head_dim as usize * 2;
+                let destination = destination.slice_view(dst_offset as u64, head_elems);
+                cast(
+                    enc,
+                    registry,
+                    device.metal_device(),
+                    &source,
+                    &destination,
+                    head_elems,
+                    CastDirection::F32ToBF16,
+                )
+                .context("cast resumed TQ history tile to BF16")?;
+            }
+        }
+        // Both tiles' last readers are the casts above. Complete them before
+        // the next range overwrites the same F32 storage; also publishes K/V
+        // to the BF16 bridge after the final tile.
+        enc.memory_barrier();
+    }
+    encode_flash_attn_prefill_seq_major_resume_prepared(
         enc,
         device,
         registry,
         q_seq_major,
-        temp_k,
-        temp_v,
         &bufs,
         seq_len,
         cur_len,
@@ -347,6 +340,7 @@ mod tests {
         dispatch_flash_attn_prefill_bf16_d256_resume, FlashAttnPrefillResumeParams,
     };
     use mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32;
+    use mlx_native::metal::foreign_types::ForeignType;
     use mlx_native::ops::transpose::{permute_021_bf16, permute_021_bf16_to_f32, permute_021_f32};
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -647,6 +641,218 @@ mod tests {
         }
     }
 
+    /// Inspect the actual BF16 attention inputs, not only the output. Three
+    /// history tiles end in a single-token tail, whose packed head offsets
+    /// differ from both the full tiles and the full-history destinations.
+    #[test]
+    fn tiled_resume_history_matches_full_range_bf16_bitwise_with_short_tail() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let (history, rows) = (4097u32, 77u32);
+        let Some(mut fx) = Fixture::new(history, rows, 1, 509) else {
+            return;
+        };
+        let cursor = history - rows;
+        let expected_output = fx.bridge(0, cursor, rows);
+        let elements = NKV as usize * history as usize * D;
+        let references = [true, false].map(|is_k| {
+            let mut enc = fx.device.command_encoder().expect("full-range reference encoder");
+            // This is the old full-range F32 dequant + inverse FWHT, followed
+            // by one contiguous cast. Do not use the tiled implementation as
+            // its own reference or round the rotated values through F16.
+            let full_f32 = fx.cache.full_attn[0]
+                .dequant_seq_to_temp_f32_unrotated_for_slot(
+                    is_k,
+                    history,
+                    0,
+                    fx.capacity,
+                    NKV,
+                    HEAD_DIM,
+                    SlotId(0),
+                    &mut enc,
+                    &mut fx.registry,
+                    &fx.device,
+                )
+                .expect("full-range F32 reference");
+            let bf16 = fx.device
+                .alloc_buffer(
+                    elements * 2,
+                    DType::BF16,
+                    vec![1, NKV as usize, history as usize, D],
+                )
+                .expect("full-range BF16 reference");
+            enc.memory_barrier();
+            cast(
+                &mut enc,
+                &mut fx.registry,
+                fx.device.metal_device(),
+                &full_f32,
+                &bf16,
+                elements,
+                CastDirection::F32ToBF16,
+            )
+            .expect("full-range reference cast");
+            enc.commit_and_wait().expect("full-range reference drain");
+            bf16
+        });
+        let q = fx.upload_q(0, rows);
+        let mut arena = fx.arena(rows);
+        let output = fx.fast(0, &q, cursor, rows, &mut arena).expect("tiled history");
+        drain(&fx.device);
+        let scratch = arena.resume_tq.as_ref().expect("history roots");
+        for ((name, got), expected) in [
+            ("K", &scratch.k_bf16),
+            ("V", &scratch.v_bf16),
+        ].into_iter().zip(&references) {
+            let expected = expected.as_slice::<u16>().expect("reference BF16 bits");
+            assert!(expected.iter().any(|&bits| bits != 0), "{name}: nonzero reference");
+            assert_eq!(
+                got.as_slice::<u16>().expect("tiled BF16 bits"),
+                expected,
+                "{name}: every head/row must match full-range F32-before-BF16",
+            );
+        }
+        assert_bitwise("three-tile attention", &read(&output), &expected_output);
+    }
+
+    #[test]
+    fn shared_resume_workspace_preserves_unequal_queued_segments() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        // Small → one-token tile tail → small → large, repeatedly queued
+        // without host waits. Each output is compared to the full-range bridge.
+        let cases = [(64u32, 33u32), (2016, 33), (511, 127), (1000, 64), (2003, 512)];
+        let Some(mut fx) = Fixture::new(2515, 512, cases.len() as u32, 907) else {
+            return;
+        };
+        let expected: Vec<_> = cases
+            .iter()
+            .enumerate()
+            .map(|(layer, &(cursor, rows))| fx.bridge(layer, cursor, rows))
+            .collect();
+        let queries: Vec<_> = cases
+            .iter()
+            .enumerate()
+            .map(|(layer, &(_, rows))| fx.upload_q(layer, rows))
+            .collect();
+        let mut owner = fx.arena(512);
+        owner.shared_output = Some(
+            fx.device.alloc_buffer(
+                512 * NH as usize * D * 4,
+                DType::F32,
+                vec![512, NH as usize, D],
+            ).expect("shared attention output"),
+        );
+        owner.shared_resume = Some(
+            ResumeTqWorkspace::new(&fx.device, 512, 2515, NH, NKV, HEAD_DIM, owner.shared_output.as_ref())
+                .expect("shared resume workspace"),
+        );
+        let mut arenas: Vec<_> = cases
+            .iter()
+            .map(|&(_, rows)| owner.shared_rows(rows).expect("tight segment view"))
+            .collect();
+        // The segment views, not this construction wrapper, own the queued roots.
+        drop(owner);
+        let copies: Vec<_> = (0..3)
+            .flat_map(|_| {
+                cases.iter().map(|&(_, rows)| {
+                    fx.device
+                        .alloc_buffer(
+                            rows as usize * NH as usize * D * 4,
+                            DType::F32,
+                            vec![rows as usize, NH as usize, D],
+                        )
+                        .expect("queued consumer")
+                })
+            })
+            .collect();
+        let mut enc = fx.device.command_encoder().expect("shared segment encoder");
+        for pass in 0..3 {
+            for (layer, &(cursor, rows)) in cases.iter().enumerate() {
+                let output = encode_resume_via_tq_cache_fast(
+                    &mut enc,
+                    &fx.device,
+                    &mut fx.registry,
+                    &fx.cache.full_attn[layer],
+                    &queries[layer],
+                    rows,
+                    cursor,
+                    cursor + rows,
+                    fx.capacity,
+                    NH,
+                    NKV,
+                    HEAD_DIM,
+                    SlotId(0),
+                    &mut arenas[layer],
+                )
+                .expect("queued shared attention");
+                let scratch = arenas[layer].resume_tq.as_ref().expect("segment history views");
+                assert_eq!(
+                    scratch.out_seq.metal_buffer().as_ptr(),
+                    arenas[layer].shared_output.as_ref().expect("shared output").metal_buffer().as_ptr(),
+                    "history must borrow the attention result, not allocate another root",
+                );
+                for tile in [&scratch.k_f32_tile, &scratch.v_f32_tile] {
+                    assert_eq!(
+                        tile.byte_len(),
+                        RESUME_TQ_HISTORY_TILE_ROWS as usize * NKV as usize * D * 4,
+                        "F32 owning roots must remain bounded, not full-history sized",
+                    );
+                    assert_eq!(
+                        tile.data_byte_len(),
+                        (cursor + rows).min(RESUME_TQ_HISTORY_TILE_ROWS) as usize
+                            * NKV as usize * D * 4,
+                        "the segment's tile view must fit its attended history",
+                    );
+                }
+                assert_eq!(scratch.k_bf16.dtype(), DType::BF16);
+                assert_eq!(scratch.v_bf16.dtype(), DType::BF16);
+                assert_ne!(
+                    scratch.k_bf16.metal_buffer().as_ptr(),
+                    scratch.v_bf16.metal_buffer().as_ptr(),
+                    "K must survive the V dequant/cast in its own BF16 root",
+                );
+                if layer > 0 {
+                    let previous = arenas[layer - 1].resume_tq.as_ref().expect("previous segment");
+                    for (tile, previous_tile) in [
+                        (&scratch.k_f32_tile, &previous.k_f32_tile),
+                        (&scratch.v_f32_tile, &previous.v_f32_tile),
+                    ] {
+                        assert_eq!(
+                            tile.metal_buffer().as_ptr(),
+                            previous_tile.metal_buffer().as_ptr(),
+                            "segments must reuse the two F32 token tiles",
+                        );
+                    }
+                    assert_eq!(
+                        scratch.out_seq.metal_buffer().as_ptr(),
+                        previous.out_seq.metal_buffer().as_ptr(),
+                        "segment outputs must alias the one forward-owned result",
+                    );
+                }
+                enc.memory_barrier();
+                permute_021_f32(
+                    &mut enc,
+                    &mut fx.registry,
+                    fx.device.metal_device(),
+                    &output,
+                    &copies[pass * cases.len() + layer],
+                    1,
+                    rows as usize * NH as usize,
+                    D,
+                )
+                .expect("consume before workspace reuse");
+                // The next segment's WAR barrier must protect this consumer.
+            }
+        }
+        enc.commit_and_wait().expect("shared workspace terminal drain");
+        for (index, copy) in copies.iter().enumerate() {
+            assert_bitwise(
+                &format!("shared segment {index}"),
+                &read(copy),
+                &expected[index % cases.len()],
+            );
+        }
+    }
+
     /// One chunk's 16 FA layers through one arena, with no host wait between
     /// layers: each layer's result is consumed by a queued GPU copy (the
     /// role of ops6-7) before the next layer rewrites the shared scratch.
@@ -707,18 +913,47 @@ mod tests {
     #[test]
     fn resume_attn_fast_rejects_a_shape_change_within_a_prefill() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        let rows = 64u32;
-        let Some(mut fx) = Fixture::new(3 * rows, rows, 1, 31) else {
+        use super::super::encoder_stage::{
+            settle_submitted, FailSubmitted, SubmittedCommands,
+        };
+        let (cursor, rows) = (2016u32, 33u32);
+        let Some(mut fx) = Fixture::new(cursor + 2 * rows, rows, 1, 31) else {
             return;
         };
+        let expected = fx.bridge(0, cursor, rows);
         let q = fx.upload_q(0, rows);
-        let mut arena = fx.arena(rows);
-        fx.fast(0, &q, rows, rows, &mut arena).expect("first layer");
-        let error = fx
-            .fast(0, &q, 2 * rows, rows, &mut arena)
-            .expect_err("a different kv_seq_len in one prefill must fail");
-        drain(&fx.device);
-        assert!(format!("{error:#}").contains("resume scratch"), "{error:#}");
+        for fail_command in [false, true] {
+            let mut arena = fx.arena(rows);
+            // Scope drops before the arena even if an assertion unwinds.
+            let _submitted = SubmittedCommands::open(true);
+            let failure = fail_command
+                .then(|| FailSubmitted::nth("layer.full_attn.tq_bridge_resume", 0));
+            let output = fx.fast(0, &q, cursor, rows, &mut arena).expect("first tiled layer");
+            let error = fx
+                .fast(0, &q, cursor + rows, rows, &mut arena)
+                .expect_err("a different kv_seq_len in one prefill must fail");
+            assert!(format!("{error:#}").contains("resume scratch"), "{error:#}");
+            let settled = settle_submitted();
+            if let Some(failure) = &failure {
+                let error = settled.expect_err("submitted tiled attention failure must be checked");
+                assert!(
+                    format!("{error:#}").contains("committed without a wait failed"),
+                    "{error:#}",
+                );
+                assert_eq!(failure.seen(), (true, 1));
+            } else {
+                settled.expect("checked drain after the host shape error");
+            }
+            drop(failure);
+            assert_bitwise(
+                "queued history survives a later host/checked error",
+                &read(&output),
+                &expected,
+            );
+            let retried = fx.fast(0, &q, cursor, rows, &mut arena).expect("reuse after drain");
+            settle_submitted().expect("checked retry drain");
+            assert_bitwise("history reuse after error drain", &read(&retried), &expected);
+        }
     }
 
     fn median(mut values: Vec<f64>) -> f64 {

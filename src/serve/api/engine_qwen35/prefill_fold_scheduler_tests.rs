@@ -347,6 +347,9 @@ fn the_scheduler_keeps_two_forwards_where_the_fold_does_not_apply() {
         assert_eq!(folds(&qwen, &mut kv, 40, 33, false, None), None);
         // The MTP catch-up prefill, and a checkpoint over its quota.
         assert_eq!(folds(&qwen, &mut kv, 40, 5, true, None), None);
+        assert_eq!(crate::serve::api::engine::qwen35_slot_prefill_chunk_tokens(4), 2_048);
+        // MTP cannot take the extra folded cue: its N4 parent ceiling is the
+        // content quantum, not 2080 rows per slot.
         assert_eq!(folds(&qwen, &mut kv, 40, 5, false, Some(0)), None);
         assert_eq!(
             folds(&qwen, &mut kv, 40, 5, false, Some(usize::MAX)),
@@ -387,4 +390,43 @@ fn the_scheduler_keeps_two_forwards_where_the_fold_does_not_apply() {
         keep_fresh: false,
     });
     assert_eq!(folds(&qwen, &mut kv, 40, 5, false, None), None);
+}
+
+#[test]
+fn active_prefill_and_retained_prefix_keep_two_distinct_parents_not_two_rows() {
+    use crate::inference::models::qwen35::carry_memory::CarryOwners;
+    use mlx_native::DType;
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let Ok(device) = MlxDevice::new() else { return };
+    let qwen = loaded(&device);
+    let mut kv = new_cache(&qwen);
+    let prompt = tokens(1, 0..20);
+    let mut state = begin(&qwen, &mut kv, &prompt, None, 0);
+    let h = qwen.hidden_size;
+    let old = device.alloc_buffer(8 * h * 4, DType::F32, vec![8, h]).unwrap();
+    let next = device.alloc_buffer(3 * h * 4, DType::F32, vec![3, h]).unwrap();
+    let old_bytes = old.byte_len() as u64;
+    let new_bytes = next.byte_len() as u64;
+    let prefix = super::Qwen35SpecPrefixBoundary {
+        token_count: 8, pending_target_hidden: old.slice_view((7 * h * 4) as u64, h),
+    };
+    state.mtp_pending_hidden = Some(old.slice_view((7 * h * 4) as u64, h));
+    drop(old);
+    let mut owners = CarryOwners::default();
+    state.include_carry_owners(&mut owners);
+    owners.include(&prefix.pending_target_hidden);
+    assert_eq!(owners.bytes(), old_bytes, "active/prefix aliases share a backing");
+    state.mtp_pending_hidden = Some(next.slice_view((2 * h * 4) as u64, h));
+    state.include_carry_owners(&mut owners);
+    assert_eq!(owners.bytes(), old_bytes + new_bytes, "replacement overlaps the retained old parent");
+    drop(owners);
+    let mut remaining = CarryOwners::default();
+    state.include_carry_owners(&mut remaining);
+    remaining.include(&prefix.pending_target_hidden);
+    assert_eq!(remaining.bytes(), old_bytes + new_bytes);
+    drop(prefix);
+    drop(remaining);
+    let mut active = CarryOwners::default();
+    state.include_carry_owners(&mut active);
+    assert_eq!(active.bytes(), new_bytes);
 }

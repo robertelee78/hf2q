@@ -293,6 +293,10 @@ where
         self.inner.admission_bytes(path, config)
     }
 
+    fn retained_bytes(&self, engine: &E) -> Option<u64> {
+        self.inner.retained_bytes(engine)
+    }
+
     fn load(&self, path: &Path, config: &EngineConfig) -> Result<E> {
         // 1. Drive the inner loader. Propagate errors verbatim — the
         //    wrapper does NOT bind on failure (per Hypothesis 2 in the
@@ -563,6 +567,31 @@ mod tests {
         assert_eq!(inner.load_count(), 1);
         // No pending bind ⇒ no bind fired.
         assert_eq!(mock_hook.bind_count(), 0);
+    }
+
+    #[test]
+    fn loader_wrapper_preserves_completed_phase_accounting() {
+        struct PhaseLoader;
+        impl ModelLoader<TestEngine> for PhaseLoader {
+            fn load(&self, _path: &Path, _config: &EngineConfig) -> Result<TestEngine> {
+                Ok(TestEngine { marker: 200 })
+            }
+
+            fn admission_bytes(&self, _path: &Path, _config: Option<&EngineConfig>) -> Option<u64> {
+                Some(300)
+            }
+
+            fn retained_bytes(&self, engine: &TestEngine) -> Option<u64> {
+                Some(u64::from(engine.marker))
+            }
+        }
+        let wrapper = LoaderWrapper::new(
+            Arc::new(PhaseLoader), Arc::new(KvPersistRegistry::new()),
+        );
+        let (path, config) = dummy_path_and_config();
+        assert_eq!(wrapper.admission_bytes(&path, Some(&config)), Some(300));
+        let engine = wrapper.load(&path, &config).unwrap();
+        assert_eq!(wrapper.retained_bytes(&engine), Some(200));
     }
 
     // ===== Test 2 ==========================================================

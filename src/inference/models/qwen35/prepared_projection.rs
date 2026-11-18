@@ -16,8 +16,7 @@ use mlx_native::ops::copy::{dispatch_strided_copy_f32, StridedCopyParams};
 use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::repacked_gguf_mm::{
-    dispatch_repacked_gguf_mm_bf16_input, dispatch_repacked_gguf_mm_bf16_input_one_pass,
-    prepare_repacked_gguf_weight, PreparedGgufWeight,
+    prepare_repacked_gguf_weight_planes, PreparedGgufWeightPlanes, RepackedGgufMmExecution,
 };
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -25,7 +24,7 @@ use super::decode_pool::pooled_alloc_buffer;
 use crate::inference::spec_decode::dflash2::route_profile;
 
 /// Load-once prepared planes of one projection weight.
-pub(crate) type Planes = OnceLock<PreparedGgufWeight>;
+pub(crate) type Planes = OnceLock<PreparedGgufWeightPlanes>;
 
 /// How a prepared product is issued. Both give the same bits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,9 +32,8 @@ pub(crate) enum Pass {
     /// The weight's own schedule: with several K splits a split-grid pass, a
     /// memory barrier and a reduce pass.
     Scheduled,
-    /// One kernel pass and no barrier
-    /// (`dispatch_repacked_gguf_mm_bf16_input_one_pass`): for the products of
-    /// one activation that are issued together and fill the GPU jointly.
+    /// One kernel pass and no barrier: for the products of one activation
+    /// that are issued together and fill the GPU jointly.
     One,
 }
 
@@ -99,7 +97,7 @@ fn shared_head_enabled() -> bool {
 #[derive(Default)]
 pub(crate) struct SharedHead {
     /// The source blocks' address and the planes prepared from them.
-    prepared: OnceLock<(usize, PreparedGgufWeight)>,
+    prepared: OnceLock<(usize, PreparedGgufWeightPlanes)>,
 }
 
 impl SharedHead {
@@ -134,13 +132,13 @@ impl SharedHead {
         ggml_type: GgmlType,
         in_features: u32,
         out_features: u32,
-    ) -> Result<&PreparedGgufWeight> {
+    ) -> Result<&PreparedGgufWeightPlanes> {
         let source = weight.contents_ptr() as usize + weight.byte_offset() as usize;
         if self.prepared.get().is_none() {
             let mut enc = device
                 .command_encoder()
                 .map_err(|error| anyhow!("shared output head encoder: {error}"))?;
-            let prepared = prepare_repacked_gguf_weight(
+            let prepared = prepare_repacked_gguf_weight_planes(
                 &mut enc,
                 registry,
                 device,
@@ -197,7 +195,7 @@ pub(crate) fn ensure_planes(
     let mut prepared = Vec::with_capacity(sources.len());
     for source in sources {
         if source.planes.get().is_none() {
-            let planes = prepare_repacked_gguf_weight(
+            let planes = prepare_repacked_gguf_weight_planes(
                 &mut enc,
                 registry,
                 device,
@@ -469,6 +467,45 @@ pub(crate) fn bf16_input(
     Ok(output)
 }
 
+/// Cast into caller-owned staging without allocating. The caller orders both
+/// prior readers of `output` and subsequent projection readers with barriers.
+pub(crate) fn bf16_input_into(
+    enc: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    rows: u32,
+    in_features: u32,
+) -> Result<MlxBuffer> {
+    let elements = (rows as usize)
+        .checked_mul(in_features as usize)
+        .context("prepared projection input element count overflow")?;
+    anyhow::ensure!(
+        elements != 0
+            && input.dtype() == DType::F32
+            && output.dtype() == DType::BF16
+            && input.element_count() >= elements
+            && output.element_count() >= elements,
+        "prepared projection input staging shape or dtype mismatch"
+    );
+    let output = output
+        .slice_view(0, elements)
+        .with_shape(vec![rows as usize, in_features as usize])
+        .context("shape prepared projection input staging")?;
+    cast(
+        enc,
+        registry,
+        device.metal_device(),
+        input,
+        &output,
+        elements,
+        CastDirection::F32ToBF16,
+    )
+    .context("cast prepared projection input F32→BF16 into staging")?;
+    Ok(output)
+}
+
 /// Whether [`normed_bf16_input`] serves activations of `in_features`
 /// columns on this device: the stock RMS norm would run its float4 kernel on
 /// them, whose bits the BF16-output kernel reproduces, and the kernel's
@@ -631,7 +668,7 @@ pub(crate) fn project_prepared(
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     input_bf16: &MlxBuffer,
-    prepared: &PreparedGgufWeight,
+    prepared: &PreparedGgufWeightPlanes,
     ggml_type: GgmlType,
     rows: u32,
     in_features: u32,
@@ -644,7 +681,7 @@ pub(crate) fn project_prepared(
         vec![rows as usize, out_features as usize],
     )
     .map_err(|error| anyhow!("allocate prepared projection output: {error}"))?;
-    dispatch_repacked_gguf_mm_bf16_input(
+    super::prepared_scratch::dispatch(
         enc,
         registry,
         device,
@@ -652,6 +689,7 @@ pub(crate) fn project_prepared(
         prepared,
         &output,
         &params(rows, ggml_type, in_features, out_features),
+        RepackedGgufMmExecution::Auto,
     )
     .context("dispatch prepared GGUF projection")?;
     Ok(output)
@@ -718,13 +756,12 @@ pub(crate) fn project_into_pass(
     let prepared = planes
         .get()
         .context("prepared projection GGUF weight was not retained")?;
-    match pass {
-        Pass::Scheduled => dispatch_repacked_gguf_mm_bf16_input(
-            enc, registry, device, input_bf16, prepared, output, &params,
-        ),
-        Pass::One => dispatch_repacked_gguf_mm_bf16_input_one_pass(
-            enc, registry, device, input_bf16, prepared, output, &params,
-        ),
-    }
+    super::prepared_scratch::dispatch(
+        enc, registry, device, input_bf16, prepared, output, &params,
+        match pass {
+            Pass::Scheduled => RepackedGgufMmExecution::Auto,
+            Pass::One => RepackedGgufMmExecution::OnePass,
+        },
+    )
     .context("dispatch prepared GGUF projection")
 }

@@ -23,6 +23,9 @@ pub(crate) struct PreparedSwitches {
     pub any_width: bool,
     /// `HF2Q_REPACKED_GGUF_SHARED_HEAD`.
     pub shared_head: bool,
+    /// Oracle only: allocate BF16 projection inputs separately while keeping
+    /// the same attention kernel, precision and command schedule.
+    pub independent_fa_staging: bool,
 }
 
 impl PreparedSwitches {
@@ -33,6 +36,7 @@ impl PreparedSwitches {
         head: false,
         any_width: false,
         shared_head: false,
+        independent_fa_staging: false,
     };
     /// The prepared FFN, projections and head at 32 rows only.
     pub(crate) const WIDTH_32: Self = Self {
@@ -41,6 +45,7 @@ impl PreparedSwitches {
         head: true,
         any_width: false,
         shared_head: false,
+        independent_fa_staging: false,
     };
     /// Every switch on.
     pub(crate) const ALL: Self = Self {
@@ -49,6 +54,7 @@ impl PreparedSwitches {
         head: true,
         any_width: true,
         shared_head: true,
+        independent_fa_staging: false,
     };
 }
 

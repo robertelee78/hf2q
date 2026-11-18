@@ -27,19 +27,83 @@
 //! `[capture_layer, token, dim]` → `[token, capture_layer, dim]`
 //! before feeding to `dispatch_dflash_fc`.
 //!
-//! The permute is a one-time per-step cost; for our shapes
-//! (num_capture_layers=6, seq_len ≤ block_size + ctx_chunk ≈ 16,
-//! hidden_size=2816) the buffer is small (~270KB).
-//!
-//! ## Why a flat slice (not a Vec<Vec<f32>>)
-//!
-//! - Single contiguous allocation = one upload to GPU
-//! - Caller controls allocation; the capture can write into a
-//!   pre-allocated pool buffer to avoid per-call alloc
-//! - Easy to pass to forward_prefill_batched via &mut [f32]
+//! Legacy callers permute on the host. Production DFlash2 captures use one
+//! shared Metal allocation; ingest gathers each existing projection pass into
+//! the caller's retained row tile without a second full capture-sized upload.
+//! CPU capture writes are framed by the target's checked capture waits.
 
 use super::config::DFlashConfig;
 use anyhow::{anyhow, Result};
+use mlx_native::{DType, MlxBuffer, MlxDevice};
+use std::ops::{Deref, DerefMut};
+
+/// Capture storage has one owner. Shared production captures expose the same
+/// allocation to checked GPU copies and to the target's waited CPU capture hook.
+/// Cloning always takes a deep host snapshot, never a mutable Metal alias.
+#[derive(Debug)]
+pub struct CaptureHiddenStorage(CaptureHiddenBacking);
+
+#[derive(Debug)]
+enum CaptureHiddenBacking {
+    Host(Vec<f32>),
+    Shared(MlxBuffer),
+}
+
+impl Default for CaptureHiddenStorage {
+    fn default() -> Self {
+        Self::from(Vec::new())
+    }
+}
+
+impl From<Vec<f32>> for CaptureHiddenStorage {
+    fn from(values: Vec<f32>) -> Self {
+        Self(CaptureHiddenBacking::Host(values))
+    }
+}
+
+impl Clone for CaptureHiddenStorage {
+    fn clone(&self) -> Self {
+        Self::from(self.to_vec())
+    }
+}
+
+impl Deref for CaptureHiddenStorage {
+    type Target = [f32];
+
+    fn deref(&self) -> &[f32] {
+        match &self.0 {
+            CaptureHiddenBacking::Host(values) => values,
+            CaptureHiddenBacking::Shared(buffer) => {
+                // Only new_shared constructs this variant, with F32 storage,
+                // checked dimensions and validated CPU access. Capture writes
+                // occur after the target's existing checked capture waits;
+                // ingest only reads it and completes before returning.
+                buffer.as_slice::<f32>().expect("validated shared capture")
+            }
+        }
+    }
+}
+
+impl DerefMut for CaptureHiddenStorage {
+    fn deref_mut(&mut self) -> &mut [f32] {
+        match &mut self.0 {
+            CaptureHiddenBacking::Host(values) => values,
+            CaptureHiddenBacking::Shared(buffer) => {
+                buffer.as_mut_slice::<f32>().expect("validated shared capture")
+            }
+        }
+    }
+}
+
+impl CaptureHiddenStorage {
+    /// Shared handles never escape the capture/ingest implementation.
+    pub(crate) fn shared_buffer(&self) -> Result<&MlxBuffer> {
+        match &self.0 {
+            CaptureHiddenBacking::Shared(buffer) => Ok(buffer),
+            CaptureHiddenBacking::Host(_) => Err(anyhow!("DFlash2 ingest requires shared capture storage")),
+        }
+    }
+}
 
 /// Strict shape descriptor + flat buffer for target hidden capture.
 ///
@@ -91,7 +155,7 @@ pub fn trim_capture_to(
             new_buf[dst..dst + hs].copy_from_slice(&session.hidden_output[src..src + hs]);
         }
     }
-    session.hidden_output = new_buf;
+    session.hidden_output = new_buf.into();
     session.seq_len = new_seq_len;
     if let Some(pa) = session.per_position_argmaxes.as_mut() {
         pa.truncate(new_seq_len);
@@ -103,7 +167,9 @@ impl<'a> PrefillCapture<'a> {
     /// hidden_size + num_capture_layers. Cheap check at call boundary
     /// to avoid silent buffer overruns deep in the layer loop.
     pub fn validate(&self, seq_len: usize, hidden_size: usize) -> Result<()> {
-        let expected = self.target_layer_ids.len() * seq_len * hidden_size;
+        let expected = self.target_layer_ids.len().checked_mul(seq_len)
+            .and_then(|count| count.checked_mul(hidden_size))
+            .ok_or_else(|| anyhow!("PrefillCapture: shape overflow"))?;
         if self.hidden_output.len() != expected {
             return Err(anyhow!(
                 "PrefillCapture: hidden_output len {} != target_layer_ids({}) * seq_len({}) * hidden_size({}) = {}",
@@ -160,15 +226,18 @@ impl<'a> PrefillCapture<'a> {
         seq_len: usize,
         hidden_size: usize,
     ) -> Result<()> {
-        let slab_len = seq_len * hidden_size;
+        let slab_len = seq_len.checked_mul(hidden_size)
+            .ok_or_else(|| anyhow!("PrefillCapture::write_layer_slab: shape overflow"))?;
         if pf_hidden_data.len() != slab_len {
             return Err(anyhow!(
                 "PrefillCapture::write_layer_slab: pf_hidden_data len {} != seq_len({}) * hidden_size({}) = {}",
                 pf_hidden_data.len(), seq_len, hidden_size, slab_len
             ));
         }
-        let start = Self::offset_for(capture_layer_idx, 0, seq_len, hidden_size);
-        let end = start + slab_len;
+        let start = capture_layer_idx.checked_mul(slab_len)
+            .ok_or_else(|| anyhow!("PrefillCapture::write_layer_slab: offset overflow"))?;
+        let end = start.checked_add(slab_len)
+            .ok_or_else(|| anyhow!("PrefillCapture::write_layer_slab: end overflow"))?;
         if end > self.hidden_output.len() {
             return Err(anyhow!(
                 "PrefillCapture::write_layer_slab: write out of bounds (start {}, end {}, buf {})",
@@ -303,10 +372,9 @@ pub fn extract_final_layer_slab(
     Ok(hidden_output[start..end].to_vec())
 }
 
-/// Owned variant of `PrefillCapture` for installation as an
-/// `MlxModelWeights` field. Avoids the lifetime parameter (Vec-backed)
-/// so the capture session can live across the forward call without
-/// borrow-checker gymnastics.
+/// Owned variant of `PrefillCapture` for installation as a model field.
+/// Host fixtures and legacy callers own a Vec; production DFlash2 captures
+/// own one shared Metal allocation with direct CPU slice access.
 ///
 /// Set `seq_len` and `hidden_size` at install time so the layer-loop
 /// hook can compute offsets without re-deriving them. The
@@ -314,7 +382,7 @@ pub fn extract_final_layer_slab(
 #[derive(Debug, Default, Clone)]
 pub struct DFlashCaptureSession {
     pub target_layer_ids: Vec<usize>,
-    pub hidden_output: Vec<f32>,
+    pub hidden_output: CaptureHiddenStorage,
     pub per_position_argmaxes: Option<Vec<u32>>,
     /// Cached so the hook doesn't need to re-derive.
     pub seq_len: usize,
@@ -339,11 +407,45 @@ impl DFlashCaptureSession {
         };
         Self {
             target_layer_ids,
-            hidden_output,
+            hidden_output: hidden_output.into(),
             per_position_argmaxes,
             seq_len,
             hidden_size,
         }
+    }
+
+    /// Allocate the single production layer-major capture backing. Normal CPU
+    /// capture writes use the target's existing checked waits; GPU ingest is a
+    /// read-only consumer and drains its single submission before returning.
+    pub fn new_shared(
+        device: &MlxDevice,
+        target_layer_ids: Vec<usize>,
+        seq_len: usize,
+        hidden_size: usize,
+        with_argmaxes: bool,
+    ) -> Result<Self> {
+        let elements = target_layer_ids.len().checked_mul(seq_len)
+            .and_then(|count| count.checked_mul(hidden_size))
+            .ok_or_else(|| anyhow!("shared capture shape overflow"))?;
+        let bytes = elements.checked_mul(std::mem::size_of::<f32>())
+            .filter(|bytes| *bytes <= isize::MAX as usize)
+            .ok_or_else(|| anyhow!("shared capture byte length overflow"))?;
+        anyhow::ensure!(elements > 0, "shared capture dimensions must be nonzero");
+        let buffer = device.alloc_buffer(
+            bytes, DType::F32, vec![target_layer_ids.len(), seq_len, hidden_size],
+        )?;
+        anyhow::ensure!(
+            buffer.dtype() == DType::F32 && buffer.byte_offset() == 0
+                && buffer.data_byte_len() == bytes,
+            "invalid shared capture allocation"
+        );
+        Ok(Self {
+            target_layer_ids,
+            hidden_output: CaptureHiddenStorage(CaptureHiddenBacking::Shared(buffer)),
+            per_position_argmaxes: with_argmaxes.then(|| vec![0; seq_len]),
+            seq_len,
+            hidden_size,
+        })
     }
 
     /// Find the capture index (0..num_capture_layers) for a given
@@ -362,24 +464,9 @@ impl DFlashCaptureSession {
         capture_layer_idx: usize,
         pf_hidden_data: &[f32],
     ) -> Result<()> {
-        let slab_len = self.seq_len * self.hidden_size;
-        if pf_hidden_data.len() != slab_len {
-            return Err(anyhow!(
-                "DFlashCaptureSession::write_layer_slab: pf_hidden_data len {} != seq_len({}) * hidden_size({}) = {}",
-                pf_hidden_data.len(), self.seq_len, self.hidden_size, slab_len
-            ));
-        }
-        let start =
-            PrefillCapture::offset_for(capture_layer_idx, 0, self.seq_len, self.hidden_size);
-        let end = start + slab_len;
-        if end > self.hidden_output.len() {
-            return Err(anyhow!(
-                "DFlashCaptureSession::write_layer_slab: write out of bounds (start {}, end {}, buf {})",
-                start, end, self.hidden_output.len()
-            ));
-        }
-        self.hidden_output[start..end].copy_from_slice(pf_hidden_data);
-        Ok(())
+        let seq_len = self.seq_len;
+        let hidden_size = self.hidden_size;
+        self.as_view().write_layer_slab(capture_layer_idx, pf_hidden_data, seq_len, hidden_size)
     }
 
     /// Convenience: borrow as a `PrefillCapture` view for consumers
@@ -448,7 +535,7 @@ pub fn append_capture_positions(
     }
     Ok(DFlashCaptureSession {
         target_layer_ids: prior.target_layer_ids.clone(),
-        hidden_output: new_hidden,
+        hidden_output: new_hidden.into(),
         per_position_argmaxes: None,
         seq_len: new_seq,
         hidden_size: hs,
@@ -459,6 +546,42 @@ pub fn append_capture_positions(
 mod tests {
     use super::*;
     use crate::inference::spec_decode::dflash::config::DFlashConfig;
+
+    #[test]
+    fn shared_capture_snapshots_are_deep_and_preserve_every_float_bit() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().unwrap();
+        for shared in [false, true] {
+            let mut capture = if shared {
+                DFlashCaptureSession::new_shared(&device, vec![1, 3], 3, 4, true).unwrap()
+            } else {
+                DFlashCaptureSession::new(vec![1, 3], 3, 4, true)
+            };
+            let expected: Vec<u32> = (0..24).map(|index| match index % 4 {
+                0 => 0x8000_0000,
+                1 => 0x7fc0_0000 + index as u32,
+                _ => (index as f32 * 0.125).to_bits(),
+            }).collect();
+            for (value, bits) in capture.hidden_output.iter_mut().zip(&expected) {
+                *value = f32::from_bits(*bits);
+            }
+            capture.per_position_argmaxes.as_mut().unwrap().copy_from_slice(&[2, 7, 11]);
+            let mut snapshot = capture.clone();
+            capture.write_layer_slab(0, &[9.0; 12]).unwrap();
+            capture.per_position_argmaxes.as_mut().unwrap()[0] = 31;
+            capture.target_layer_ids[0] = 0;
+            assert_eq!(snapshot.hidden_output.iter().map(|value| value.to_bits()).collect::<Vec<_>>(), expected);
+            assert_eq!(snapshot.per_position_argmaxes.as_deref(), Some(&[2, 7, 11][..]));
+            assert_eq!(snapshot.target_layer_ids, [1, 3]);
+            snapshot.hidden_output[23] = -5.0;
+            assert_eq!(capture.hidden_output[23].to_bits(), expected[23]);
+            let before = capture.hidden_output.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+            assert!(capture.write_layer_slab(2, &[0.0; 12]).is_err());
+            assert_eq!(capture.hidden_output.iter().map(|value| value.to_bits()).collect::<Vec<_>>(), before);
+        }
+        assert!(DFlashCaptureSession::new_shared(&device, vec![0, 1], usize::MAX, 2, false).is_err());
+        assert!(DFlashCaptureSession::new_shared(&device, vec![0], 0, 2, false).is_err());
+    }
 
     fn gemma4_cfg() -> DFlashConfig {
         DFlashConfig::from_json_str(super::super::config::tests::GEMMA4_26B_A4B_DFLASH_CONFIG)

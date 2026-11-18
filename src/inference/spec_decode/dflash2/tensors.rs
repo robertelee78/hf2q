@@ -7,6 +7,10 @@ use half::bf16;
 use mlx_native::{DType, MlxBuffer, MlxDevice, MlxError};
 use safetensors::tensor::TensorView;
 
+#[path = "tensor_memory.rs"]
+mod tensor_memory;
+pub use tensor_memory::DFlash2WeightMemory;
+
 pub const DFLASH2_DRAFT_AF4_G64_ENV: &str = "HF2Q_DFLASH2_DRAFT_AF4_G64";
 
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +21,8 @@ pub enum DFlash2TensorsError {
     Mlx(#[from] MlxError),
     #[error("DFlash2 projection quantization: {0}")]
     Quantization(String),
+    #[error("DFlash2 weight memory sizing: {0}")]
+    Memory(String),
 }
 
 pub enum DFlash2Projection {
@@ -36,10 +42,21 @@ impl DFlash2Projection {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ProjectionFormat {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionFormat {
     Bf16,
     Af4G64,
+}
+
+impl ProjectionFormat {
+    pub fn selected() -> Self {
+        const AF4_G64: route_profile::Switch = route_profile::switch(DFLASH2_DRAFT_AF4_G64_ENV);
+        if route_profile::is_one(AF4_G64) {
+            Self::Af4G64
+        } else {
+            Self::Bf16
+        }
+    }
 }
 
 pub struct DFlash2LayerTensors {
@@ -241,12 +258,11 @@ fn upload_fused_projection(
             .checked_add(view_rows)
             .ok_or_else(|| DFlash2TensorsError::Quantization("fused rows overflow".into()))?;
     }
+    let geometry = tensor_memory::ProjectionMemory::new(rows, columns, format)?;
 
     if matches!(format, ProjectionFormat::Af4G64) {
-        let groups = rows
-            .checked_mul(columns / 64)
-            .ok_or_else(|| DFlash2TensorsError::Quantization("AF4G64 groups overflow".into()))?;
-        let mut code_words = Vec::with_capacity(groups * 8);
+        let groups = geometry.groups;
+        let mut code_words = Vec::with_capacity(geometry.code_words);
         let mut scale_bits = Vec::with_capacity(groups);
         let mut bias_bits = Vec::with_capacity(groups);
         for view in views {
@@ -273,7 +289,7 @@ fn upload_fused_projection(
         return Ok(DFlash2Projection::Af4G64 { weights, metadata });
     }
 
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(geometry.retained_bytes);
     for view in views {
         bytes.extend_from_slice(view.data());
     }
@@ -370,12 +386,17 @@ impl DFlash2ModelTensors {
         config: &DFlash2Config,
         weights: &DFlash2Weights<'_>,
     ) -> Result<Self, DFlash2TensorsError> {
-        const AF4_G64: route_profile::Switch = route_profile::switch(DFLASH2_DRAFT_AF4_G64_ENV);
-        let format = if route_profile::is_one(AF4_G64) {
-            ProjectionFormat::Af4G64
-        } else {
-            ProjectionFormat::Bf16
-        };
+        Self::upload_with_format(device, config, weights, ProjectionFormat::selected())
+    }
+
+    /// Upload the representation already selected for preallocation accounting.
+    pub fn upload_with_format(
+        device: &MlxDevice,
+        config: &DFlash2Config,
+        weights: &DFlash2Weights<'_>,
+        format: ProjectionFormat,
+    ) -> Result<Self, DFlash2TensorsError> {
+        Self::weight_memory(config, format, weights.tensor(OPTIONAL_MASK_EMBEDDING).is_some())?;
         let context_projection = upload_projection(device, tensor(weights, "fc.weight")?, format)?;
         let hidden_norm = upload_norm_f32(device, tensor(weights, "hidden_norm.weight")?)?;
         let final_norm = upload_norm_f32(device, tensor(weights, "norm.weight")?)?;

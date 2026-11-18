@@ -46,28 +46,26 @@ fn live_tile_weights(
     registry: &mut KernelRegistry,
     layer: &Layer,
 ) -> MoeFfnWeightsGpuQ {
-    let mut weights = layer.gpu(device, true, &layer.gpu_experts(device));
-    prepare_live_tile_planes(device, registry, &mut weights);
-    weights
+    let weights = layer.gpu(device, true, &layer.gpu_experts(device));
+    prepare_live_tile_planes(device, registry, weights)
 }
 
 /// Prepare the expert planes and the shared expert's planes of `weights`.
 fn prepare_live_tile_planes(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
-    weights: &mut MoeFfnWeightsGpuQ,
-) {
+    weights: MoeFfnWeightsGpuQ,
+) -> MoeFfnWeightsGpuQ {
+    let mut weights = super::gpu_expert_test_support::complete_experts(weights, shape(), device, registry);
     let mut enc = device.command_encoder().expect("prepare encoder");
-    weights
-        .prepare_grouped_m8(&mut enc, registry, device, H as u32, MI as u32, MSH as u32)
-        .expect("prepare expert planes");
     // The process switch is unset in tests: prepare the live-tile state directly.
     let live_tiles = weights
         .prepare_live_tiles(&mut enc, registry, device, H as u32, MSH as u32)
         .expect("prepare shared expert planes");
     enc.commit_and_wait_labeled("test.qwen.moe_live_tiles.prepare")
         .expect("commit preparation");
-    weights.prepared_m8.as_mut().expect("prepared").live_tiles = Some(live_tiles);
+    weights.live_tiles = Some(live_tiles);
+    weights
 }
 
 /// One live-tile layer over the rows `select` (in that order). `verify_rows`
@@ -366,7 +364,7 @@ fn live_tile_route_runs_a_refused_layer_stage_by_stage() {
         shared_gate_up: GgmlType::Q4_K,
         shared_down: GgmlType::Q4_K,
     };
-    prepare_live_tile_planes(&device, &mut registry, &mut weights);
+    let weights = prepare_live_tile_planes(&device, &mut registry, weights);
     assert_eq!(
         super::moe_live_tiles_fused::live_tile_layer_is_fused(&weights, shape()),
         Some(false),
@@ -586,9 +584,8 @@ fn rows_are_independent(down_t: GgmlType, seed: u64) {
          (register path {})",
         steps.len(),
         weights
-            .prepared_m8
+            .live_tiles
             .as_ref()
-            .and_then(|prepared| prepared.live_tiles.as_ref())
             .expect("prepared")
             .column_tile
     );
@@ -673,9 +670,6 @@ fn expert_reference(
 
 fn matches_f64_reference(down_t: GgmlType, seed: u64) {
     const ROWS: usize = 32;
-    /// Rows whose F64 logit gap among the top 9 is below this may select
-    /// other experts under FP32 rounding.
-    const TIE_GAP: f64 = 1e-4;
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let device = MlxDevice::new().expect("device");
     let mut registry = KernelRegistry::new();
@@ -692,15 +686,10 @@ fn matches_f64_reference(down_t: GgmlType, seed: u64) {
     // FP32 stages (routing weights, shared gate, reduce): the batched
     // route's envelope per unit of accumulated magnitude.
     let dense = 8.0 * (H + MSH) as f64 * F32_ULP;
-    let (mut worst, mut squared_error, mut squared_norm, mut near_ties) =
-        (0.0f64, 0.0f64, 0.0f64, 0);
+    let (mut worst, mut squared_error, mut squared_norm) = (0.0f64, 0.0f64, 0.0f64);
     for row in 0..ROWS {
         let xf: Vec<f64> = x[row].iter().map(|&v| f64::from(v)).collect();
-        let (ids, route_weights, gap) = top_k_f64(&router_logits_f64(&layer.router, &x[row]));
-        if gap < TIE_GAP {
-            near_ties += 1;
-            continue;
-        }
+        let (ids, route_weights, _) = top_k_f64(&router_logits_f64(&layer.router, &x[row]));
         let gpu_ids: Vec<usize> = gpu[row].ids.iter().map(|&id| id as usize).collect();
         assert_eq!(
             gpu_ids, ids,
@@ -744,9 +733,8 @@ fn matches_f64_reference(down_t: GgmlType, seed: u64) {
             squared_norm += (out[i] - f64::from(residual[row][i])).powi(2);
         }
     }
-    assert!(near_ties < ROWS, "every row is a near tie");
     eprintln!(
-        "moe_live_tiles {down_t:?} vs F64: {ROWS} rows ({near_ties} near-tie rows skipped), ids identical, \
+        "moe_live_tiles {down_t:?} vs F64: all {ROWS} rows checked, exact expert ids, \
          relative RMS error of the FFN term {:.3e}, worst error/bound {worst:.3}",
         (squared_error / squared_norm).sqrt()
     );
@@ -845,4 +833,80 @@ fn expert_switch_combinations_resolve_or_fail_closed() {
     assert_eq!(MoeExpertRoute::Matvec.label(), "matvec");
     assert_eq!(MoeExpertRoute::StagedM8.label(), "staged_m8");
     assert_eq!(MoeExpertRoute::LiveTiles.label(), "live_tiles");
+}
+
+/// Canonical storage preserves forced-MV/NR2 arithmetic and masking, and every
+/// cache incarnation borrows the loaded model's same source-free owner.
+#[test]
+fn canonical_matvec_matches_raw_through_cache_rebuild_and_masking() {
+    use std::sync::Arc;
+    use super::weight_loader::{MoeFfnWeightsQ, MoeNativeDenseQ};
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().expect("device");
+    let (x, residual) = rows(32, 0xcac4_e013);
+    for (down_t, q6_nr2) in [(GgmlType::Q4_K, false), (GgmlType::Q6_K, false), (GgmlType::Q6_K, true)] {
+        let mut registry = KernelRegistry::new();
+        let mut policy = mlx_native::GgmlRoutingPolicy::default();
+        policy.expert_q6k_mv_nr2 = q6_nr2;
+        registry.freeze_ggml_routing_policy(policy).expect("freeze model-bound routing");
+        let layer = Layer::random(down_t, 0xcac4_e030);
+        let raw = layer.gpu(&device, true, &layer.gpu_experts(&device));
+        let canonical = super::gpu_expert_test_support::complete_experts(
+            layer.gpu(&device, true, &layer.gpu_experts(&device)),
+            shape(), &device, &mut registry,
+        );
+        let loaded = MoeFfnWeightsQ {
+            experts: canonical.experts,
+            ggml_type_gate_up: canonical.ggml_type_gate_up,
+            ggml_type_down: canonical.ggml_type_down,
+            router: Vec::new(), shared_gate_logit: Vec::new(),
+            shared_gate: Vec::new(), shared_up: Vec::new(), shared_down: Vec::new(),
+            native_dense: Some(MoeNativeDenseQ {
+                router: canonical.router, shared_gate_inp: canonical.shared_gate_inp,
+                shared_gate: canonical.shared_gate, shared_up: canonical.shared_up,
+                shared_down: canonical.shared_down,
+                ggml_type_shared_gate_up: GgmlType::Q4_K, ggml_type_shared_down: down_t,
+            }),
+        };
+        let make_cache = || MoeFfnWeightsGpuQ::from_quantized(
+            &loaded, NE as u32, MI as u32, H as u32, &device,
+        ).expect("cache borrows canonical storage");
+        let cache = make_cache();
+        assert!(Arc::ptr_eq(&cache.experts, &loaded.experts));
+        assert!(cache.experts.completed().is_some());
+        drop(cache);
+        assert_eq!(Arc::strong_count(&loaded.experts), 1);
+        let cache = make_cache();
+        assert!(Arc::ptr_eq(&cache.experts, &loaded.experts));
+        for width in [1, 8, 32] {
+            let select: Vec<usize> = (0..width).collect();
+            let expected = run_route(
+                &device, &mut registry, &raw, &x, &residual, &select, None, MoeExpertRoute::Matvec,
+            );
+            let actual = run_route(
+                &device, &mut registry, &cache, &x, &residual, &select, None, MoeExpertRoute::Matvec,
+            );
+            for row in 0..width {
+                assert_row(&actual[row], &expected[row], &format!("{down_t:?} width {width} row {row}"));
+            }
+        }
+        let select: Vec<usize> = (0..32).collect();
+        let verify = [5, 8, 1, 3];
+        let expected = run_route(
+            &device, &mut registry, &raw, &x, &residual, &select, Some(&verify), MoeExpertRoute::Matvec,
+        );
+        let actual = run_route(
+            &device, &mut registry, &cache, &x, &residual, &select, Some(&verify), MoeExpertRoute::Matvec,
+        );
+        for row in 0..32 {
+            assert_row(&actual[row], &expected[row], &format!("{down_t:?} masked row {row}"));
+        }
+        let mut enc = device.command_encoder().expect("encoder");
+        let input = packed(&x, &[0], &device);
+        let mut output = device.alloc_buffer(H * 4, DType::F32, vec![1, H]).expect("output");
+        assert!(build_moe_ffn_layer_gpu_batched_route_into(
+            &mut enc, &device, &mut registry, &input, &raw, shape(), None, &mut output,
+            1, 0, None, MoeExpertRoute::StagedM8,
+        ).is_err(), "a staged request must not fall back to raw matvec");
+    }
 }

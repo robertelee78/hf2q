@@ -264,6 +264,10 @@ impl Qwen35LoadedModel {
         options: JointStepOptions,
         supervisor: &EngineSupervisor,
     ) -> Result<Vec<Qwen35JointRowOutput>> {
+        let _carry_commitment =
+            crate::inference::models::qwen35::carry_memory::commit_target(
+                &self.model.cfg, rows.len(),
+            )?;
         let lease = supervisor.arm("Qwen35 joint decode", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
         let forward = self
             .model

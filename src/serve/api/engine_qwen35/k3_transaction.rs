@@ -270,6 +270,10 @@ impl Qwen35DecodeState {
         supervisor: &EngineSupervisor,
         draft: &K3Draft,
     ) -> Result<K3VerifyRows> {
+        let _carry_commitment =
+            crate::inference::models::qwen35::carry_memory::commit_target(
+                &qwen.model.cfg, K3_VERIFY_ROWS,
+            )?;
         let verify_lease = match supervisor.arm(
             "Qwen35 SlotAware MTP K3 verify",
             QWEN35_WORKER_TRANSACTION_TIMEOUT,
@@ -361,8 +365,14 @@ impl Qwen35DecodeState {
             return Err(error);
         }
 
+        let catchup_owners =
+            crate::inference::models::qwen35::carry_memory::CatchupTransaction::open(
+                &qwen.model.cfg, K3_VERIFY_ROWS, &verify_hidden, Some(initial_hidden),
+            )?;
         let embed_started = Instant::now();
-        let shared_embed_rows = match qwen.model.embed_tokens_gpu(&draft.verify_input) {
+        let shared_embed_rows = match catchup_owners.gather(
+            || qwen.model.embed_tokens_gpu(&draft.verify_input),
+        ) {
             Ok(rows) => rows,
             Err(error) => {
                 kv_cache.clear_la_capture();
@@ -379,6 +389,7 @@ impl Qwen35DecodeState {
         ) {
             Ok(lease) => lease,
             Err(error) => {
+                let error = catchup_owners.settle_error(error);
                 kv_cache.clear_la_capture();
                 kv_cache
                     .reset_for_slot(self.slot_id)
@@ -401,8 +412,9 @@ impl Qwen35DecodeState {
                 &qwen.model.cfg,
             )
         });
+        let caught_up = catchup_owners.finish(caught_up);
         let catchup_supervision = catchup_lease.finish();
-        if let Err(error) = catchup_supervision.and(caught_up) {
+        if let Err(error) = caught_up.and(catchup_supervision) {
             kv_cache.clear_la_capture();
             kv_cache.reset_for_slot(self.slot_id).with_context(|| {
                 format!("Qwen SlotAware MTP K3 catch-up failed ({error:#}); fail-closed reset")

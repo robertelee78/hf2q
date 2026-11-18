@@ -90,6 +90,12 @@ fn production_cache_plan_f1_header_totals_and_consumed_roots() {
             ),
             (full, linear, total, roots)
         );
+        assert_eq!(
+            super::super::HybridKvCache::initial_cache_payload_bytes(&cfg, 262144, 4, true)
+                .unwrap(),
+            total as u64,
+            "admission consumes the allocator's complete boot payload, including MTP",
+        );
         assert_eq!(plan.conv_channels, if q38 { 10240 } else { 8192 });
         let mut consumed = Vec::new();
         let values = plan
@@ -133,6 +139,13 @@ fn production_cache_plan_f1_header_totals_and_consumed_roots() {
             (cap_bytes, cap_roots)
         );
     }
+}
+
+#[test]
+fn admission_boot_kv_payload_rejects_invalid_geometry() {
+    let cfg = header_config(false);
+    assert!(super::super::HybridKvCache::initial_cache_payload_bytes(&cfg, 0, 4, true).is_err());
+    assert!(super::super::HybridKvCache::initial_cache_payload_bytes(&cfg, 262144, 0, true).is_err());
 }
 #[test]
 fn production_cache_plan_f32_no_mtp_and_single_mtp_semantics() {

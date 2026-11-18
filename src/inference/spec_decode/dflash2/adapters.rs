@@ -14,7 +14,8 @@ use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::dflash2_attention_pack::{
     dispatch_dflash2_mask_rows_f32, DFlash2MaskRowsParams,
 };
-use mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight;
+use mlx_native::ops::repacked_gguf_mm::PreparedGgufWeightPlanes;
+use mlx_native::ops::ActivationPrecision;
 use mlx_native::{CommandEncoder, GgmlType, KernelRegistry, MlxBuffer, MlxDevice};
 
 /// Family-neutral target hidden-capture destination for one packed verify.
@@ -43,7 +44,7 @@ pub trait DFlash2TargetFamily {
         &self,
         _registry: &mut KernelRegistry,
         _device: &MlxDevice,
-    ) -> Result<Option<&PreparedGgufWeight>> {
+    ) -> Result<Option<&PreparedGgufWeightPlanes>> {
         Ok(None)
     }
     fn embedding_scale(&self) -> f32;
@@ -133,7 +134,7 @@ impl DFlash2TargetFamily for QwenDFlash2Adapter<'_> {
         &self,
         registry: &mut KernelRegistry,
         device: &MlxDevice,
-    ) -> Result<Option<&PreparedGgufWeight>> {
+    ) -> Result<Option<&PreparedGgufWeightPlanes>> {
         self.model.shared_prepared_output_head(registry, device)
     }
 
@@ -195,6 +196,7 @@ fn dispatch_embedding_rows(
     token_ids: &mlx_native::MlxBuffer,
     output: &mlx_native::MlxBuffer,
     rows: usize,
+    precision: ActivationPrecision,
 ) -> Result<()> {
     ensure!(
         weight.affine.is_none(),
@@ -203,7 +205,7 @@ fn dispatch_embedding_rows(
     let vocab_size = weight.info.rows;
     let embed_dim = weight.info.cols;
     match weight.info.ggml_dtype {
-        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => mlx_native::embedding_gather_dense(
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => mlx_native::ops::embedding_dense::embedding_gather_dense_with_precision(
             encoder,
             registry,
             device,
@@ -215,8 +217,9 @@ fn dispatch_embedding_rows(
                 embed_dim,
                 n_tokens: rows,
             },
+            precision,
         )?,
-        GgmlType::Q4_0 => mlx_native::embedding_gather_q4_0(
+        GgmlType::Q4_0 => mlx_native::ops::embedding_q4_0::embedding_gather_q4_0_with_precision(
             encoder,
             registry,
             device,
@@ -228,8 +231,9 @@ fn dispatch_embedding_rows(
                 embed_dim,
                 n_tokens: rows,
             },
+            precision,
         )?,
-        GgmlType::Q5_0 => mlx_native::embedding_gather_q5_0(
+        GgmlType::Q5_0 => mlx_native::ops::embedding_q5_0::embedding_gather_q5_0_with_precision(
             encoder,
             registry,
             device,
@@ -241,8 +245,9 @@ fn dispatch_embedding_rows(
                 embed_dim,
                 n_tokens: rows,
             },
+            precision,
         )?,
-        GgmlType::Q2_K => mlx_native::embedding_gather_q2_k(
+        GgmlType::Q2_K => mlx_native::ops::embedding_q2_k::embedding_gather_q2_k_with_precision(
             encoder,
             registry,
             device,
@@ -254,8 +259,9 @@ fn dispatch_embedding_rows(
                 embed_dim,
                 n_tokens: rows,
             },
+            precision,
         )?,
-        GgmlType::Q4_K => mlx_native::embedding_gather_q4_k(
+        GgmlType::Q4_K => mlx_native::ops::embedding_q4_k::embedding_gather_q4_k_with_precision(
             encoder,
             registry,
             device,
@@ -267,8 +273,9 @@ fn dispatch_embedding_rows(
                 embed_dim,
                 n_tokens: rows,
             },
+            precision,
         )?,
-        GgmlType::Q5_K => mlx_native::embedding_gather_q5_k(
+        GgmlType::Q5_K => mlx_native::ops::embedding_kquant::embedding_gather_q5_k_with_precision(
             encoder,
             registry,
             device,
@@ -280,8 +287,9 @@ fn dispatch_embedding_rows(
                 embed_dim,
                 n_tokens: rows,
             },
+            precision,
         )?,
-        GgmlType::Q6_K => mlx_native::embedding_gather_q6_k(
+        GgmlType::Q6_K => mlx_native::ops::embedding_kquant::embedding_gather_q6_k_with_precision(
             encoder,
             registry,
             device,
@@ -293,8 +301,9 @@ fn dispatch_embedding_rows(
                 embed_dim,
                 n_tokens: rows,
             },
+            precision,
         )?,
-        GgmlType::Q8_0 => mlx_native::embedding_gather_q8_0(
+        GgmlType::Q8_0 => mlx_native::ops::embedding_q8_0::embedding_gather_q8_0_with_precision(
             encoder,
             registry,
             device,
@@ -306,6 +315,7 @@ fn dispatch_embedding_rows(
                 embed_dim,
                 n_tokens: rows,
             },
+            precision,
         )?,
         other => return Err(anyhow!("DFlash2 embedding does not support {other:?}")),
     }
@@ -352,6 +362,16 @@ pub fn dispatch_dflash2_input<T: DFlash2TargetFamily>(
         config.hidden_size
     );
     let rows = workspace.max_lanes * config.block_size;
+    let scale = adapter.embedding_scale();
+    let precision = if matches!(
+        &tensors.context_projection, super::tensors::DFlash2Projection::Af4G64 { .. }
+    ) {
+        ActivationPrecision::Bf16
+    } else {
+        ActivationPrecision::F32
+    };
+    // Only the last writer rounds retained rows. A nonunit scale must consume
+    // the unrounded gather; the optional mask writes exact stored BF16 values.
     dispatch_embedding_rows(
         encoder,
         registry,
@@ -360,11 +380,11 @@ pub fn dispatch_dflash2_input<T: DFlash2TargetFamily>(
         &workspace.row_tokens,
         &workspace.hidden[0],
         rows,
+        if scale == 1.0 { precision } else { ActivationPrecision::F32 },
     )?;
     encoder.memory_barrier();
-    let scale = adapter.embedding_scale();
     if scale != 1.0 {
-        mlx_native::ops::elementwise::scalar_mul_f32(
+        mlx_native::ops::elementwise::scalar_mul_f32_with_precision(
             encoder,
             registry,
             device.metal_device(),
@@ -372,6 +392,7 @@ pub fn dispatch_dflash2_input<T: DFlash2TargetFamily>(
             &workspace.hidden[0],
             rows * config.hidden_size,
             scale,
+            precision,
         )?;
         encoder.memory_barrier();
     }

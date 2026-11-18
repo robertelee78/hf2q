@@ -33,7 +33,11 @@ pub(super) fn enabled() -> bool {
 }
 
 pub(super) fn prefill_mtp_allowed(text_only: bool, mtp_runtime: bool, graft_bound: bool) -> bool {
-    enabled() && text_only && mtp_runtime && !graft_bound
+    prefill_mtp_route(enabled(), text_only, mtp_runtime, graft_bound)
+}
+
+fn prefill_mtp_route(enabled: bool, text_only: bool, mtp_runtime: bool, graft_bound: bool) -> bool {
+    enabled && text_only && mtp_runtime && !graft_bound
 }
 
 #[derive(Clone, Copy)]
@@ -303,6 +307,21 @@ pub(super) fn state_for_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speculation_off_shadow_route_keeps_carry_unless_this_transaction_uses_dflash2() {
+        use crate::serve::api::qwen35_speculation::prefill_mtp_catchup_allowed;
+        let ordinary = prefill_mtp_catchup_allowed(
+            QwenSpeculationPolicy::Off, true, true, true, false,
+        );
+        assert!(!ordinary);
+        let shadow = prefill_mtp_route(true, true, true, false);
+        assert!(shadow, "spec-off is the legal shadow route");
+        assert!(crate::inference::models::qwen35::carry_memory::uses_mtp(false, ordinary || shadow));
+        assert!(!crate::inference::models::qwen35::carry_memory::uses_mtp(true, ordinary || shadow));
+        assert!(!prefill_mtp_route(true, true, true, true));
+        assert!(!prefill_mtp_route(true, false, true, false));
+    }
 
     #[test]
     fn context_buckets_have_stable_boundaries() {

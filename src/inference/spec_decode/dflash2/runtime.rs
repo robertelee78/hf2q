@@ -24,6 +24,7 @@ use super::{
 use crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession;
 use anyhow::{bail, ensure, Context, Result};
 use mlx_native::{
+    ops::copy::{dispatch_strided_copy_f32, StridedCopyParams},
     ops::dflash2_selector::{
         dispatch_dflash2_accept_greedy, DFlash2GreedyAcceptanceParams, DFLASH2_MAX_LANES,
     },
@@ -229,6 +230,63 @@ struct ContextPositions {
 }
 
 impl DFlash2Runtime {
+    /// Constructor-backed host payload geometry without constructing a runtime.
+    pub(super) fn metadata_memory(
+        config: &DFlash2Config,
+        lanes: usize,
+    ) -> std::result::Result<
+        super::runtime_memory::DFlash2RuntimeMetadataMemory,
+        super::runtime_memory::DFlash2RuntimeMemoryError,
+    > {
+        use super::runtime_memory::{add, mul, DFlash2RuntimeMemoryError, DFlash2RuntimeMetadataMemory};
+        let word = std::mem::size_of::<u32>();
+        let config_heap_bytes = add(
+            config.draft_model_type.len(),
+            add(
+                mul(config.target_layer_ids.len(), std::mem::size_of::<usize>())?,
+                mul(config.layer_types.len(), std::mem::size_of::<super::config::DFlash2LayerType>())?,
+            )?,
+        )?;
+        let lane_state_bytes = mul(lanes, add(
+            std::mem::size_of::<usize>(), std::mem::size_of::<DFlash2LaneBinding>(),
+        )?)?;
+        let lane_rebind_temporary_bytes = mul(config.sliding_window, word)?;
+        let lane_rewind_bytes = mul(lanes, lane_rebind_temporary_bytes)?;
+        let verify_budget_label_bytes = DFlash2VerifyBudget::label_payload_bytes()
+            .ok_or(DFlash2RuntimeMemoryError::Invalid("verify-budget label payload overflows"))?;
+        let weight_layer_array_bytes = mul(
+            config.num_hidden_layers, std::mem::size_of::<super::tensors::DFlash2LayerTensors>(),
+        )?;
+        let workspace_ring_array_bytes = mul(
+            mul(2, config.num_hidden_layers)?, std::mem::size_of::<MlxBuffer>(),
+        )?;
+        let runtime_inline_bytes = std::mem::size_of::<Self>();
+        let retained_bytes = add(
+            add(runtime_inline_bytes, config_heap_bytes)?,
+            add(
+                add(add(lane_state_bytes, lane_rewind_bytes)?, verify_budget_label_bytes)?,
+                add(weight_layer_array_bytes, workspace_ring_array_bytes)?,
+            )?,
+        )?;
+        // Five lane-width u32 snapshots and one lane*proposal uniform snapshot.
+        let prefetch_snapshot_bytes = mul(
+            add(mul(5, lanes)?, mul(lanes, config.proposal_tokens())?)?, word,
+        )?;
+        Ok(DFlash2RuntimeMetadataMemory {
+            runtime_inline_bytes,
+            config_heap_bytes,
+            lane_state_bytes,
+            lane_rewind_bytes,
+            verify_budget_label_bytes,
+            weight_layer_array_bytes,
+            workspace_ring_array_bytes,
+            retained_bytes,
+            prefetch_snapshot_bytes,
+            prefetch_host_lane_order_temporary_bytes: mul(lanes, word)?,
+            lane_rebind_temporary_bytes,
+        })
+    }
+
     /// Verify the immutable checkpoint identity before uploading any tensor.
     pub fn load_verified<T: DFlash2TargetFamily>(
         device: &MlxDevice,
@@ -731,9 +789,9 @@ impl DFlash2Runtime {
 
     /// Append a target prefill capture to one physical draft-ring lane.
     ///
-    /// The capture is CPU layer-major. The rows are converted to the
-    /// draft's row-major layout as they are staged and appended in lane
-    /// passes, one command buffer for the chunk
+    /// The capture's single shared layer-major backing is GPU-gathered into
+    /// the existing caller-owned row tile and appended in lane passes, one
+    /// command buffer for the chunk
     /// ([`ingest_capture_lane_passes`]); the ring bytes are those of the
     /// block commits made after target verification.
     pub fn ingest_target_capture(
@@ -794,7 +852,10 @@ impl DFlash2Runtime {
             "DFlash2 capture starts at {logical_start}, lane {lane} is at {}",
             self.lane_lengths[lane]
         );
-        let appended: usize = rows.iter().map(|run| run.len()).sum();
+        let appended = rows.iter().try_fold(0usize, |total, run| {
+            ensure!(run.start <= run.end, "invalid DFlash2 capture run {run:?}");
+            total.checked_add(run.end - run.start).context("DFlash2 capture row count overflow")
+        })?;
         ingest_capture_lane_passes(
             device,
             registry,
@@ -1210,9 +1271,10 @@ impl DFlash2Runtime {
 /// draft's context weights. Here each pass carries the workspace's whole row
 /// capacity (`max_lanes * block_size` rows) of the one lane
 /// ([`dispatch_dflash2_lane_ingest`]), and the passes of a chunk share one
-/// command buffer: their inputs are staged in buffers of their own, so no
-/// pass waits for the host. The projections, norms and RoPE run over the
-/// same row count as a decode commit, and the ring bytes are those of
+/// command buffer: GPU gathers reuse the workspace capture tile after its
+/// last reader, without host uploads or waits between passes.
+/// The projections, norms and RoPE retain the same row count as a decode
+/// commit, and the ring bytes are those of
 /// `block_size`-row commits (`lane_passes_write_the_rings_of_block_commits`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn ingest_capture_lane_passes(
@@ -1234,48 +1296,59 @@ pub(super) fn ingest_capture_lane_passes(
     );
     let layers = capture.target_layer_ids.len();
     let hidden = capture.hidden_size;
-    let feature_width = config.fc_input_dim();
+    let feature_width = layers.checked_mul(hidden).context("capture feature width overflow")?;
+    let capture_elements = feature_width.checked_mul(capture.seq_len)
+        .context("capture element count overflow")?;
     ensure!(
         rows.iter()
             .all(|run| run.start <= run.end && run.end <= capture.seq_len)
-            && layers * hidden == feature_width
-            && capture.hidden_output.len() == layers * capture.seq_len * hidden,
+            && feature_width == config.fc_input_dim()
+            && capture.hidden_output.len() == capture_elements,
         "DFlash2 capture rows {rows:?} of a {}-row, {layers}-layer, {hidden}-wide capture \
          do not fit the checkpoint's {feature_width}-wide context",
         capture.seq_len
     );
-    let appended: usize = rows.iter().map(|run| run.len()).sum();
+    ensure!(lane < workspace.max_lanes, "DFlash2 capture lane {lane} is out of range");
+    let appended = rows.iter().try_fold(0usize, |total, run| {
+        total.checked_add(run.len()).context("DFlash2 capture row count overflow")
+    })?;
     if appended == 0 {
         return Ok(());
     }
     let block = config.block_size;
     let groups = workspace.max_lanes;
-    let pass_rows = groups * block;
+    let pass_rows = groups.checked_mul(block).filter(|rows| *rows > 0)
+        .context("invalid DFlash2 capture pass rows")?;
     let passes = appended.div_ceil(pass_rows);
-    let staged_rows = passes * pass_rows;
+    let staged_rows = passes.checked_mul(pass_rows).context("capture padded rows overflow")?;
     ensure!(
-        u32::try_from(logical_start + staged_rows).is_ok(),
+        logical_start.checked_add(staged_rows).and_then(|end| u32::try_from(end).ok()).is_some(),
         "DFlash2 context position exceeds u32"
     );
-
-    // The rows in the draft's `[row][layer][hidden]` layout; the capture is
-    // layer-major. Rows past the capture's end stay zero and are not committed.
-    let mut captured = device.alloc_buffer(
-        staged_rows * feature_width * std::mem::size_of::<f32>(),
-        mlx_native::DType::F32,
-        vec![staged_rows, feature_width],
-    )?;
-    {
-        let staged = captured.as_mut_slice::<f32>()?;
-        for (index, row) in rows.iter().flat_map(|run| run.clone()).enumerate() {
-            for layer in 0..layers {
-                let source = (layer * capture.seq_len + row) * hidden;
-                let destination = (index * layers + layer) * hidden;
-                staged[destination..destination + hidden]
-                    .copy_from_slice(&capture.hidden_output[source..source + hidden]);
-            }
-        }
-    }
+    let source = capture.hidden_output.shared_buffer()?;
+    let captured = &workspace.captured_target_hidden;
+    let tile_elements = pass_rows.checked_mul(feature_width).context("capture tile overflow")?;
+    let source_bytes = capture_elements.checked_mul(4).context("capture source bytes overflow")?;
+    let tile_bytes = tile_elements.checked_mul(4).context("capture tile bytes overflow")?;
+    ensure!(
+        source.dtype() == mlx_native::DType::F32
+            && source.shape() == [layers, capture.seq_len, hidden]
+            && source.byte_offset() == 0 && source.data_byte_len() == source_bytes
+            && captured.dtype() == mlx_native::DType::F32
+            && captured.shape() == [pass_rows, feature_width]
+            && captured.data_byte_len() == tile_bytes,
+        "invalid DFlash2 shared capture or caller-owned transpose tile"
+    );
+    let copy = StridedCopyParams {
+        rows: u32::try_from(layers)?,
+        cols: u32::try_from(hidden)?,
+        stride_row: u32::try_from(capture.seq_len.checked_mul(hidden)
+            .context("capture layer stride overflow")?)?,
+        stride_col: 1,
+    };
+    // Native shader offsets are u32 as well as the dimensions/strides.
+    u32::try_from(capture_elements)?;
+    u32::try_from(tile_elements)?;
     let words = |values: &[u32]| -> Result<MlxBuffer> {
         let mut buffer = device.alloc_buffer(
             std::mem::size_of_val(values),
@@ -1303,12 +1376,51 @@ pub(super) fn ingest_capture_lane_passes(
             .map(|first| appended.saturating_sub(first).min(block) as u32)
             .collect::<Vec<_>>(),
     )?;
+    // An immutable scalar supplies exact +0 padding on the GPU. The tile
+    // itself is already retained/charged by the workspace, not allocated here.
+    let zero = if appended % pass_rows == 0 {
+        None
+    } else {
+        let mut zero = device.alloc_buffer(4, mlx_native::DType::F32, vec![1])?;
+        zero.as_mut_slice::<f32>()?[0] = 0.0;
+        Some(zero)
+    };
 
     let mut encoder = device
         .command_encoder()
         .context("create DFlash2 capture ingest encoder")?;
     let word = std::mem::size_of::<u32>();
+    let mut selected = rows.iter().flat_map(|run| run.clone());
     for pass in 0..passes {
+        // The previous pass's context projection (and its ring writes) must
+        // finish before this shared workspace tile or its scratch is reused.
+        encoder.memory_barrier();
+        let count = (appended - pass * pass_rows).min(pass_rows);
+        for index in 0..count {
+            let row = selected.next().context("missing selected capture row")?;
+            let offset = row * hidden;
+            dispatch_strided_copy_f32(
+                &mut encoder, registry, device.metal_device(),
+                &source.slice_view((offset * 4) as u64, capture_elements - offset),
+                &captured.slice_view((index * feature_width * 4) as u64, feature_width),
+                &copy,
+            ).with_context(|| format!("gather DFlash2 capture pass {pass}, row {index}"))?;
+        }
+        if count < pass_rows {
+            dispatch_strided_copy_f32(
+                &mut encoder, registry, device.metal_device(),
+                zero.as_ref().context("missing capture padding scalar")?,
+                &captured.slice_view((count * feature_width * 4) as u64,
+                    (pass_rows - count) * feature_width),
+                &StridedCopyParams {
+                    rows: 1,
+                    cols: u32::try_from((pass_rows - count) * feature_width)?,
+                    stride_row: 0,
+                    stride_col: 0,
+                },
+            ).context("zero DFlash2 capture pass padding")?;
+        }
+        encoder.memory_barrier();
         dispatch_dflash2_lane_ingest(
             &mut encoder,
             registry,
@@ -1317,12 +1429,7 @@ pub(super) fn ingest_capture_lane_passes(
             tensors,
             workspace,
             lane,
-            &captured
-                .slice_view(
-                    (pass * pass_rows * feature_width * std::mem::size_of::<f32>()) as u64,
-                    pass_rows * feature_width,
-                )
-                .with_shape(vec![pass_rows, feature_width])?,
+            captured,
             &positions.slice_view((pass * pass_rows * word) as u64, pass_rows),
             &write_positions.slice_view((pass * groups * word) as u64, groups),
             &commit_counts.slice_view((pass * groups * word) as u64, groups),
@@ -1346,6 +1453,10 @@ mod draft_prefetch_tests;
 #[cfg(test)]
 #[path = "joint_capture_tests.rs"]
 mod joint_capture_tests;
+
+#[cfg(test)]
+#[path = "shared_capture_ingest_tests.rs"]
+mod shared_capture_ingest_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1614,13 +1725,14 @@ mod tests {
                         let mut state = 0x5EED_u64;
                         for &rows in &chunks {
                             for lane in 0..lanes {
-                                let mut capture = DFlashCaptureSession::new(
+                                let mut capture = DFlashCaptureSession::new_shared(
+                                    device,
                                     runtime.config.target_layer_ids.clone(),
                                     rows,
                                     hidden,
                                     false,
-                                );
-                                for value in &mut capture.hidden_output {
+                                )?;
+                                for value in capture.hidden_output.iter_mut() {
                                     *value = 4.0 * random(&mut state);
                                 }
                                 let start = runtime.lane_lengths()[lane];
@@ -1701,6 +1813,7 @@ mod tests {
     }
 
     fn capture_lane(
+        device: &MlxDevice,
         values: &[f32],
         lane: usize,
         rows: usize,
@@ -1708,7 +1821,9 @@ mod tests {
         layer_ids: &[usize],
     ) -> DFlashCaptureSession {
         let layers = layer_ids.len();
-        let mut capture = DFlashCaptureSession::new(layer_ids.to_vec(), rows, hidden, false);
+        let mut capture = DFlashCaptureSession::new_shared(
+            device, layer_ids.to_vec(), rows, hidden, false,
+        ).expect("shared fixture capture");
         for row in 0..rows {
             for layer in 0..layers {
                 let source = ((lane * rows + row) * layers + layer) * hidden;
@@ -1722,4 +1837,10 @@ mod tests {
 
     include!("reference_oracle_tests.rs");
     include!("reference_fixture_tests.rs");
+    include!("native_af4_manifest_tests.rs");
+    include!("native_af4_source_tests.rs");
+    include!("native_af4_weight_tests.rs");
+    include!("native_af4_state_tests.rs");
+    include!("native_af4_restore_tests.rs");
+    include!("native_af4_fixture_tests.rs");
 }

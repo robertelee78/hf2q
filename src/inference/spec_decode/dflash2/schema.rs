@@ -4,6 +4,9 @@ use super::config::{DFlash2Config, DFlash2ConfigError, DFlash2TargetShape};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 
+#[path = "checkpoint_configs.rs"]
+mod checkpoint_configs;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DFlash2FamilyAdapter {
     QwenDense,
@@ -190,7 +193,7 @@ pub const QWEN38_DFLASH2: DFlash2CheckpointDescriptor = DFlash2CheckpointDescrip
     target_vocab_size: 248_320,
     target_layers: 64,
     reference_repository: "splash",
-    reference_revision: "031a25a6cc18eed83a99a9883de91dcaa272f160",
+    reference_revision: "031a25a6125af2d7acf7096580afe56eb33d65bc",
 };
 
 pub const QWEN36_DFLASH2: DFlash2CheckpointDescriptor = DFlash2CheckpointDescriptor {
@@ -211,7 +214,7 @@ pub const QWEN36_DFLASH2: DFlash2CheckpointDescriptor = DFlash2CheckpointDescrip
     target_vocab_size: 248_320,
     target_layers: 40,
     reference_repository: "splash",
-    reference_revision: "031a25a6cc18eed83a99a9883de91dcaa272f160",
+    reference_revision: "031a25a6125af2d7acf7096580afe56eb33d65bc",
 };
 
 pub const GEMMA4_E2B_DFLASH2: DFlash2CheckpointDescriptor = DFlash2CheckpointDescriptor {
@@ -300,6 +303,33 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 impl DFlash2CheckpointDescriptor {
+    /// Exact cached checkpoint geometry for pre-load planning, without IO.
+    pub fn allocation_config(&self) -> Result<&'static DFlash2Config, DFlash2SchemaError> {
+        static QWEN36: std::sync::OnceLock<DFlash2Config> = std::sync::OnceLock::new();
+        static QWEN38: std::sync::OnceLock<DFlash2Config> = std::sync::OnceLock::new();
+        let bytes = self.allocation_config_bytes()?;
+        let cache = if self == &QWEN36_DFLASH2 { &QWEN36 } else { &QWEN38 };
+        if let Some(config) = cache.get() {
+            return Ok(config);
+        }
+        let config = self.parse_config(bytes)?;
+        Ok(cache.get_or_init(|| config))
+    }
+
+    pub(crate) fn allocation_config_bytes(&self) -> Result<&'static [u8], DFlash2SchemaError> {
+        if self == &QWEN36_DFLASH2 {
+            Ok(checkpoint_configs::QWEN36_CONFIG_JSON)
+        } else if self == &QWEN38_DFLASH2 {
+            Ok(checkpoint_configs::QWEN38_CONFIG_JSON)
+        } else {
+            Err(DFlash2SchemaError::Identity {
+                artifact: "allocation config descriptor",
+                actual: format!("{}@{}", self.repository, self.revision),
+                expected: "canonical Qwen3.6 or Qwen3.8 DFlash2 descriptor".into(),
+            })
+        }
+    }
+
     pub fn parse_config(&self, bytes: &[u8]) -> Result<DFlash2Config, DFlash2SchemaError> {
         let actual = sha256(bytes);
         if actual != self.config_sha256 {
@@ -367,6 +397,34 @@ impl DFlash2CheckpointDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_allocation_config_descriptors_fail_closed() {
+        let mut revision = QWEN36_DFLASH2;
+        revision.revision = "main";
+        let mut identity = QWEN36_DFLASH2;
+        identity.config_sha256 = QWEN38_DFLASH2.config_sha256;
+        let mut family = QWEN36_DFLASH2;
+        family.family_adapter = DFlash2FamilyAdapter::QwenDense;
+        let mut geometry = QWEN36_DFLASH2;
+        geometry.target_hidden_size = QWEN38_DFLASH2.target_hidden_size;
+        for descriptor in [
+            GEMMA4_E2B_DFLASH2,
+            GEMMA4_31B_DFLASH2,
+            revision,
+            identity,
+            family,
+            geometry,
+        ] {
+            assert!(matches!(
+                descriptor.allocation_config(),
+                Err(DFlash2SchemaError::Identity {
+                    artifact: "allocation config descriptor",
+                    ..
+                })
+            ));
+        }
+    }
 
     #[test]
     fn unknown_revision_is_fail_closed() {

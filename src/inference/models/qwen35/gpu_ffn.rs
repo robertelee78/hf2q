@@ -60,6 +60,11 @@
 //! P9b complete: both paths wired, parity tests pass.
 
 use anyhow::{anyhow, Context, Result};
+use std::sync::Arc;
+use super::expert_storage::{ExpertRole, ExpertRoleRef, MoeExpertStorage};
+use super::gpu_expert_dispatch::{
+    dispatch_moe_id_routed, dispatch_expert_pair, dispatch_expert_slotted, dispatch_expert_fused,
+};
 use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
@@ -68,16 +73,14 @@ use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    prepare_quantized_matmul_id_ggml_grouped_m8, quantized_matmul_id_ggml_pooled,
-    quantized_matmul_id_ggml_pooled_pair,
-    quantized_matmul_id_ggml_pooled_slotted_reusing_schedule, GgmlQuantizedMatmulIdParams,
+    prepare_quantized_matmul_id_ggml_grouped_m8,
+    GgmlQuantizedMatmulIdParams,
     PreparedGroupedM8Experts, MM_ID_ROUTING_THRESHOLD,
 };
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use crate::inference::spec_decode::dflash2::route_profile;
-use crate::serve::forward_mlx_shared::MlxAffineMoeStack;
 
 use super::execution_dispatch::{
     dense_gate_up_fusion_enabled, dense_q_arena_reset_enabled, dispatch_fused_gate_up_silu_iq4_nl,
@@ -85,142 +88,6 @@ use super::execution_dispatch::{
     dispatch_fused_gate_up_silu_q8_0, quantized_matmul_ggml,
 };
 
-/// ADR-020 AC#5 Iter C2.4 #4 — single-call dispatch wrapper that routes
-/// per-MoE-role expert matmuls between the legacy GGML pooled path
-/// (default) and the new mlx-affine packed-U32 kernel path (active
-/// when a DWQ overlay populated the `expert_*_affine` slot).
-///
-/// On the affine path, calls `mlx_native::quantized_matmul_id_into`
-/// directly (writes into the caller's pre-allocated output buffer; no
-/// scratch arena needed since the affine kernel doesn't use one).
-///
-/// On the legacy path, threads through the existing
-/// `decode_pool::with_id_mm_scratch` pool so the `IdMmScratch`
-/// allocations stay reused across decode steps.
-///
-/// The decision is per-call (not per-layer) so the operator can
-/// produce partial overlays that override only some roles per layer
-/// — e.g. if a DWQ training landed `ffn_gate.{e}` for some layers
-/// but not `ffn_up.{e}`, the up dispatch gracefully falls back to
-/// the legacy GGML buffer for that layer.  The contiguous-experts
-/// guard in `Qwen35Model::apply_dwq_overlay` keeps each role bucket
-/// self-consistent (all-or-nothing per role per layer).
-#[allow(clippy::too_many_arguments)]
-fn dispatch_moe_id_routed(
-    enc: &mut mlx_native::CommandEncoder,
-    registry: &mut KernelRegistry,
-    device: &MlxDevice,
-    input: &MlxBuffer,
-    legacy_weight: &MlxBuffer,
-    affine: Option<&MlxAffineMoeStack>,
-    ids: &MlxBuffer,
-    output: &MlxBuffer,
-    legacy_params: &GgmlQuantizedMatmulIdParams,
-    pool_slot: super::decode_pool::MmIdSlot,
-    pool_n_experts: u32,
-    pool_rows: u32,
-    label: &str,
-    // ADR-033 §Pi Phase B Stage 3b.2 — imatrix intercept hint
-    // (Layered{tag,layer} for GGML-quant MoE expert tensors, or None
-    // to skip the intercept for paths where MoE imatrix collection
-    // isn't applicable). The affine-stack branch below is NOT
-    // intercepted yet — affine MoE GGUFs are a separate format and
-    // their imatrix wiring lands in Stage 3b.3 when an operator
-    // ships imatrix-aware DWQ. Per [[feedback-no-stub-2026-05-19]]
-    // we accept the gap as documented scope, not as a silent
-    // fallback.
-    imatrix_hint: crate::quantize::imatrix::ImatrixHint<'_>,
-) -> anyhow::Result<()> {
-    if let Some(stack) = affine {
-        // Affine path: kernel writes into `output` directly.  M/N/K
-        // come from legacy_params (truth source for shape — the
-        // affine stack carries n/k for shape validation only).
-        debug_assert_eq!(
-            stack.n as u32, legacy_params.n,
-            "{label}: affine stack n ({}) != legacy_params.n ({})",
-            stack.n, legacy_params.n
-        );
-        debug_assert_eq!(
-            stack.k as u32, legacy_params.k,
-            "{label}: affine stack k ({}) != legacy_params.k ({})",
-            stack.k, legacy_params.k
-        );
-        let m = legacy_params.n_tokens;
-        mlx_native::quantized_matmul_id_into(
-            enc,
-            registry,
-            device,
-            input,
-            &stack.weight,
-            &stack.scales,
-            &stack.biases,
-            ids,
-            output,
-            &mlx_native::QuantizedMatmulIdParams {
-                m,
-                k: legacy_params.k,
-                n: legacy_params.n,
-                group_size: stack.group_size,
-                bits: stack.bits,
-                n_expert_used: legacy_params.top_k,
-                num_experts: legacy_params.n_experts,
-            },
-        )
-        .map_err(|e| anyhow!("{label} qmatmul_id_into (affine): {e}"))
-    } else {
-        // ADR-033 §Pi Phase B Stage 3b.2 — imatrix intercept BEFORE
-        // the GGML-quant MoE-id dispatch. Captures the per-token
-        // shared input + per-token routed expert IDs and fires
-        // `record_moe` for each (token, expert) pair. No-op when no
-        // collector installed (production decode/serve path).
-        crate::quantize::imatrix::intercept_qmatmul_id_with_hint(
-            imatrix_hint,
-            legacy_params.n_tokens as usize,
-            legacy_params.top_k as usize,
-            legacy_params.k as usize,
-            || {
-                // `commit_wait_and_rotate` syncs the input buffer
-                // (so we can safely read F32 host-side) AND rotates
-                // to a fresh CB so the matmul dispatch below doesn't
-                // hit the Metal `MTLCommandBufferStatusCommitted`
-                // assertion at `setCurrentCommandEncoder:` line 323.
-                if let Err(e) = enc.commit_wait_and_rotate() {
-                    eprintln!(
-                        "[hf2q imatrix moe intercept ({label})] commit_wait_and_rotate failed: {e}"
-                    );
-                    return None;
-                }
-                input.as_slice::<f32>().ok().map(|sl| sl.to_vec())
-            },
-            || ids.as_slice::<u32>().ok().map(|sl| sl.to_vec()),
-        )
-        .map_err(|e| anyhow!("imatrix moe intercept ({label}): {e}"))?;
-
-        // Legacy path: pooled scratch + GGML kernel.  Same body as
-        // pre-Iter C2.4 #4 (preserved for byte-identity on non-overlay
-        // serves).
-        super::decode_pool::with_id_mm_scratch(
-            pool_slot,
-            device,
-            pool_n_experts,
-            pool_rows,
-            |scratch| {
-                quantized_matmul_id_ggml_pooled(
-                    enc,
-                    registry,
-                    device,
-                    input,
-                    legacy_weight,
-                    ids,
-                    output,
-                    scratch,
-                    legacy_params,
-                )
-            },
-        )
-        .map_err(|e| anyhow!("{label} qmatmul_id_pooled: {e}"))
-    }
-}
 
 #[cfg(test)]
 thread_local! {
@@ -286,8 +153,8 @@ fn moe_prefill_shares_expert_schedule(
         && matches!(shape.num_experts_per_tok, 1 | 6 | 8)
         && shape.hidden_size >= 32
         && shape.moe_intermediate_size >= 32
-        && weights.expert_gate_affine.is_none()
-        && weights.expert_up_affine.is_none()
+        && !matches!(weights.experts.role(ExpertRole::Gate), ExpertRoleRef::Affine(_))
+        && !matches!(weights.experts.role(ExpertRole::Up), ExpertRoleRef::Affine(_))
         && weights.expert_gate_stride == weights.expert_up_stride
         && std::env::var_os("HF2Q_MM_ID_ROUTING_THRESHOLD").is_none()
         && !crate::quantize::imatrix::is_active();
@@ -301,7 +168,7 @@ fn moe_prefill_shares_expert_schedule(
 use super::ffn::{DenseFfnShape, DenseFfnWeights, MoeFfnShape, MoeFfnWeights};
 use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32, upload_f32_weight};
 use super::moe_batched::{
-    build_moe_ffn_layer_gpu_batched_into, encode_native_dense_proj, MoeDenseRole,
+    encode_native_dense_proj, MoeDenseRole,
 };
 pub use super::moe_batched::MoeDenseStorage;
 use super::weight_loader::{DenseFfnWeightsQ, MoeFfnWeightsQ};
@@ -353,9 +220,9 @@ impl DenseFfnWeightsGpu {
 ///   (Avoids the 129 GB OOM from the Q4_0→F32 round-trip in the old F32 path.)
 #[derive(Default)]
 pub(crate) struct PreparedDenseFfnGguf {
-    gate: std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
-    up: std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
-    down: std::sync::OnceLock<mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight>,
+    gate: super::prepared_projection::Planes,
+    up: super::prepared_projection::Planes,
+    down: super::prepared_projection::Planes,
 }
 
 pub struct DenseFfnWeightsGpuQ {
@@ -494,7 +361,7 @@ fn prepared_dense_ffn_planes<'a>(
     weights: &'a DenseFfnWeightsGpuQ,
     gate_up_params: &GgmlQuantizedMatmulParams,
     down_params: &GgmlQuantizedMatmulParams,
-) -> Result<[&'a mlx_native::ops::repacked_gguf_mm::PreparedGgufWeight; 3]> {
+) -> Result<[&'a mlx_native::ops::repacked_gguf_mm::PreparedGgufWeightPlanes; 3]> {
     use super::prepared_projection::{ensure_planes, PlanesSource};
     let cells = &weights.repacked_m32;
     ensure_planes(
@@ -574,36 +441,6 @@ impl MoeFfnWeightsGpu {
 // Quantized MoE GPU weight container (production path)
 // ================================================================
 
-/// Quantized GPU weight container for a Qwen3.5-MoE FFN layer.
-///
-/// Expert weights (`gate`, `up`, `down`) are stored as raw GGML blocks (U8
-/// dtype) — the same bytes that came off disk.  The Metal
-/// `quantized_matmul_id_ggml` kernel dequantizes on-the-fly during the
-/// matrix multiply, so no F32 expansion is required.
-///
-/// In the apex GGUF: gate/up are Q5_K and down is Q6_K — each with their
-/// own quant type, block geometry, and byte stride.
-///
-/// # Memory savings vs `MoeFfnWeightsGpu`
-///
-/// For the 35B apex GGUF (256 experts, hidden=2048, moe_intermediate=512):
-///   F32 path: 256 × 512 × 2048 × 3 × 4 bytes = 3.2 GB per layer
-///   Q5_K+Q6_K path: ~0.78 GB per layer
-///   Savings per layer: ~2.4 GB; across 40 MoE layers: ~96 GB
-///
-/// Router (`[num_experts, hidden]`) and shared-expert weights are small. With
-/// [`MoeDenseStorage::Bf16`] they are dequantized at load and uploaded as
-/// BF16; with [`MoeDenseStorage::Native`] (`HF2Q_QWEN_MOE_BATCHED=1`) they
-/// keep their GGUF storage (router and shared gate logit F32, shared
-/// gate/up/down raw GGML blocks) and decode runs the batched route.
-pub(crate) struct PreparedMoeExpertsM8 {
-    pub gate: PreparedGroupedM8Experts,
-    pub up: PreparedGroupedM8Experts,
-    pub down: PreparedGroupedM8Experts,
-    /// Present under [`super::moe_batched::QWEN_MOE_LIVE_TILES_ENV`].
-    pub live_tiles: Option<PreparedMoeLiveTiles>,
-}
-
 /// What the live-tile route ([`super::moe_live_tiles`]) needs beyond the
 /// routed experts' planes.
 pub(crate) struct PreparedMoeLiveTiles {
@@ -614,15 +451,14 @@ pub(crate) struct PreparedMoeLiveTiles {
     pub column_tile: bool,
 }
 
+/// Quantized MoE execution weights. Routed experts share the model's single
+/// raw/affine or source-free canonical storage; cache construction never repacks
+/// them. Router/shared storage and all arithmetic route policies are independent.
 pub struct MoeFfnWeightsGpuQ {
     /// Router projection: `[num_experts, hidden_size]` (BF16 or native F32).
     pub router: MlxBuffer,
-    /// Stacked expert gate projections, raw GGML blocks.
-    pub expert_gate_q: MlxBuffer,
-    /// Stacked expert up projections, raw GGML blocks.
-    pub expert_up_q: MlxBuffer,
-    /// Stacked expert down projections, raw GGML blocks.
-    pub expert_down_q: MlxBuffer,
+    /// The model's single routed-expert owner, shared without repacking.
+    pub experts: Arc<MoeExpertStorage>,
     /// GGML quantization type for gate/up expert weight buffers.
     pub ggml_type_gate_up: GgmlType,
     /// GGML quantization type for down expert weight buffers (may differ).
@@ -643,18 +479,8 @@ pub struct MoeFfnWeightsGpuQ {
     pub shared_down: MlxBuffer,
     /// Storage of the five router / shared-expert buffers above.
     pub dense_storage: MoeDenseStorage,
-    /// ADR-020 AC#5 Iter C2.4 #4 — DWQ-overlay mlx-affine expert
-    /// stacks (cloned from the originating `MoeFfnWeightsQ` after the
-    /// overlay was applied at load time).  When `Some`, the matching
-    /// `expert_*_q` buffer above stays resident-but-unused; the
-    /// `dispatch_moe_id_routed` helper at the top of this module
-    /// gates on these `Option`s and routes per-role.
-    pub expert_gate_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
-    pub expert_up_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
-    pub expert_down_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
-    /// Prepared quantized planes for the staged-M8 DFlash2 expert route.
-    /// Present only under its explicit experimental switch.
-    pub(crate) prepared_m8: Option<PreparedMoeExpertsM8>,
+    /// Genuinely separate shared-expert live-tile products.
+    pub(crate) live_tiles: Option<PreparedMoeLiveTiles>,
 }
 
 fn ggml_type_stride(t: GgmlType, rows: usize, cols: usize) -> Result<u64> {
@@ -705,6 +531,11 @@ impl MoeFfnWeightsGpuQ {
         )
         .context("down stride")?;
 
+        anyhow::ensure!(
+            !w.experts.has_affine() || w.native_dense.is_none(),
+            "{} does not support DWQ affine expert overlays; unset it to load this artifact",
+            super::moe_batched::QWEN_MOE_BATCHED_ENV
+        );
         let (router, shared_gate_inp, shared_gate, shared_up, shared_down, dense_storage) =
             match &w.native_dense {
                 Some(native) => (
@@ -736,9 +567,7 @@ impl MoeFfnWeightsGpuQ {
 
         Ok(Self {
             router,
-            expert_gate_q: w.expert_gate_q.clone(),
-            expert_up_q: w.expert_up_q.clone(),
-            expert_down_q: w.expert_down_q.clone(),
+            experts: Arc::clone(&w.experts),
             ggml_type_gate_up,
             ggml_type_down,
             expert_gate_stride: gate_stride,
@@ -750,114 +579,8 @@ impl MoeFfnWeightsGpuQ {
             shared_up,
             shared_down,
             dense_storage,
-            expert_gate_affine: None,
-            expert_up_affine: None,
-            expert_down_affine: None,
-            prepared_m8: None,
+            live_tiles: None,
         })
-    }
-
-    /// ADR-020 AC#5 Iter C2.4 #4 — attach DWQ-overlay affine stacks
-    /// post-construction.  Called from `forward_gpu.rs` immediately
-    /// after `from_quantized` when the originating `MoeFfnWeightsQ`
-    /// has populated `expert_*_affine` slots (from
-    /// `Qwen35Model::apply_dwq_overlay`).  Cheap clone — `MlxBuffer`
-    /// is internally Arc-wrapped (no GPU copy).
-    ///
-    /// Native router/shared-expert storage (the batched decode route) has no
-    /// affine expert path; attaching an overlay to it is an error.
-    pub fn attach_affine_overlay(
-        &mut self,
-        gate: Option<&crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
-        up: Option<&crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
-        down: Option<&crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
-    ) -> Result<()> {
-        anyhow::ensure!(
-            !self.dense_storage.is_native() || (gate.is_none() && up.is_none() && down.is_none()),
-            "{} does not support DWQ affine expert overlays; unset it to load this artifact",
-            super::moe_batched::QWEN_MOE_BATCHED_ENV
-        );
-        self.expert_gate_affine = gate.cloned();
-        self.expert_up_affine = up.cloned();
-        self.expert_down_affine = down.cloned();
-        Ok(())
-    }
-
-    pub(crate) fn prepare_grouped_m8(
-        &mut self,
-        encoder: &mut CommandEncoder,
-        registry: &mut KernelRegistry,
-        device: &MlxDevice,
-        hidden_size: u32,
-        moe_intermediate_size: u32,
-        shared_intermediate_size: u32,
-    ) -> Result<()> {
-        anyhow::ensure!(
-            self.dense_storage.is_native()
-                && self.expert_gate_affine.is_none()
-                && self.expert_up_affine.is_none()
-                && self.expert_down_affine.is_none(),
-            "staged M8 preparation requires native expert stacks without affine overlays"
-        );
-        let live_tiles = if super::moe_batched::qwen_moe_live_tiles_requested()? {
-            Some(self.prepare_live_tiles(
-                encoder,
-                registry,
-                device,
-                hidden_size,
-                shared_intermediate_size,
-            )?)
-        } else {
-            None
-        };
-        let gate_params = GgmlQuantizedMatmulIdParams {
-            n_tokens: 1,
-            top_k: 1,
-            n: moe_intermediate_size,
-            k: hidden_size,
-            n_experts: self.num_experts,
-            expert_stride: self.expert_gate_stride,
-            ggml_type: self.ggml_type_gate_up,
-        };
-        let up_params = GgmlQuantizedMatmulIdParams {
-            expert_stride: self.expert_up_stride,
-            ..gate_params
-        };
-        let down_params = GgmlQuantizedMatmulIdParams {
-            n: hidden_size,
-            k: moe_intermediate_size,
-            expert_stride: self.expert_down_stride,
-            ggml_type: self.ggml_type_down,
-            ..gate_params
-        };
-        self.prepared_m8 = Some(PreparedMoeExpertsM8 {
-            gate: prepare_quantized_matmul_id_ggml_grouped_m8(
-                encoder,
-                registry,
-                device,
-                &self.expert_gate_q,
-                &gate_params,
-            )
-            .context("prepare gate expert M8 planes")?,
-            up: prepare_quantized_matmul_id_ggml_grouped_m8(
-                encoder,
-                registry,
-                device,
-                &self.expert_up_q,
-                &up_params,
-            )
-            .context("prepare up expert M8 planes")?,
-            down: prepare_quantized_matmul_id_ggml_grouped_m8(
-                encoder,
-                registry,
-                device,
-                &self.expert_down_q,
-                &down_params,
-            )
-            .context("prepare down expert M8 planes")?,
-            live_tiles,
-        });
-        Ok(())
     }
 
     /// The shared expert's one-expert planes and this device's register-path
@@ -1792,7 +1515,7 @@ pub(super) fn build_dense_ffn_layer_gpu_q_prepared_m32(
     )
     .context("cast dense_q prepared input F32→BF16")?;
     enc.memory_barrier();
-    mlx_native::ops::repacked_gguf_mm::dispatch_repacked_gguf_mm_bf16_input(
+    super::prepared_scratch::dispatch(
         enc,
         registry,
         device,
@@ -1800,9 +1523,10 @@ pub(super) fn build_dense_ffn_layer_gpu_q_prepared_m32(
         gate,
         &gate_f32,
         gate_up_params,
+        mlx_native::ops::repacked_gguf_mm::RepackedGgufMmExecution::Auto,
     )
     .context("dense_q prepared gate projection")?;
-    mlx_native::ops::repacked_gguf_mm::dispatch_repacked_gguf_mm_bf16_input(
+    super::prepared_scratch::dispatch(
         enc,
         registry,
         device,
@@ -1810,6 +1534,7 @@ pub(super) fn build_dense_ffn_layer_gpu_q_prepared_m32(
         up,
         &up_f32,
         gate_up_params,
+        mlx_native::ops::repacked_gguf_mm::RepackedGgufMmExecution::Auto,
     )
     .context("dense_q prepared up projection")?;
     enc.memory_barrier();
@@ -1836,7 +1561,7 @@ pub(super) fn build_dense_ffn_layer_gpu_q_prepared_m32(
     )
     .context("cast dense_q prepared hidden F32→BF16")?;
     enc.memory_barrier();
-    mlx_native::ops::repacked_gguf_mm::dispatch_repacked_gguf_mm_bf16_input(
+    super::prepared_scratch::dispatch(
         enc,
         registry,
         device,
@@ -1844,6 +1569,7 @@ pub(super) fn build_dense_ffn_layer_gpu_q_prepared_m32(
         down,
         &down_out,
         down_params,
+        mlx_native::ops::repacked_gguf_mm::RepackedGgufMmExecution::Auto,
     )
     .context("dense_q prepared down projection")?;
 
@@ -3290,6 +3016,33 @@ pub fn build_moe_ffn_layer_gpu_q_into(
     // no layer context (test-only path) passes 0.
     layer_idx: usize,
 ) -> Result<MlxBuffer> {
+    build_moe_ffn_layer_gpu_q_domain_into(
+        enc, device, registry, x, weights, shape, add_residual, layer_idx,
+        None,
+    )
+}
+
+/// MTP is a separate raw expert domain, never the main model's staged route.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_moe_ffn_layer_gpu_q_raw_into(
+    enc: &mut CommandEncoder, device: &MlxDevice, registry: &mut KernelRegistry,
+    x: &MlxBuffer, weights: &MoeFfnWeightsGpuQ, shape: MoeFfnShape,
+    add_residual: Option<&MlxBuffer>, layer_idx: usize,
+) -> Result<MlxBuffer> {
+    anyhow::ensure!(matches!(&*weights.experts, MoeExpertStorage::Raw(_)), "MTP requires its separate raw expert domain");
+    build_moe_ffn_layer_gpu_q_domain_into(
+        enc, device, registry, x, weights, shape, add_residual, layer_idx,
+        Some(super::moe_batched::MoeExpertRoute::Matvec),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_moe_ffn_layer_gpu_q_domain_into(
+    enc: &mut CommandEncoder, device: &MlxDevice, registry: &mut KernelRegistry,
+    x: &MlxBuffer, weights: &MoeFfnWeightsGpuQ, shape: MoeFfnShape,
+    add_residual: Option<&MlxBuffer>, layer_idx: usize,
+    route: Option<super::moe_batched::MoeExpertRoute>,
+) -> Result<MlxBuffer> {
     let h = shape.hidden_size as usize;
     let _ne = shape.num_experts as usize;
     let topk = shape.num_experts_per_tok as usize;
@@ -3308,7 +3061,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
     if seq_len == 1 && weights.dense_storage.is_native() {
         let mut out = super::decode_pool::pooled_alloc_buffer(device, h * 4, DType::F32, vec![1, h])
             .map_err(|e| anyhow!("alloc batched moe output (pooled, decode): {e}"))?;
-        build_moe_ffn_layer_gpu_batched_into(
+        super::moe_batched::build_moe_ffn_layer_gpu_batched_route_into(
             enc,
             device,
             registry,
@@ -3320,6 +3073,10 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             1,
             layer_idx,
             None,
+            match route {
+                Some(route) => route,
+                None => super::moe_batched::qwen_moe_expert_route()?,
+            },
         )?;
         return Ok(out);
     }
@@ -3631,8 +3388,8 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 weights.ggml_type_gate_up,
                 mlx_native::ops::quantized_matmul_ggml::GgmlType::Q6_K
             )
-            && weights.expert_gate_affine.is_none()
-            && weights.expert_up_affine.is_none()
+            && !matches!(weights.experts.role(ExpertRole::Gate), ExpertRoleRef::Affine(_))
+            && !matches!(weights.experts.role(ExpertRole::Up), ExpertRoleRef::Affine(_))
             && (shape.num_experts_per_tok == 1 || shape.num_experts_per_tok == 8);
         let fused_moe_mm_id_on = fused_moe_mm_id_eligible
             && std::env::var("HF2Q_FUSED_MOE_GATE_UP_MM_ID").as_deref() == Ok("1");
@@ -3646,37 +3403,17 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 // imatrix intercept: skip — collection happens on
                 // unfused path; fused path is opt-in for perf-only
                 // serving (no imatrix capture mode interaction).
-                let fused_dispatch_params =
-                    mlx_native::ops::quantized_matmul_id_ggml::GgmlIdMmDispatchParams {
-                        n_tokens: seq_len,
-                        top_k: shape.num_experts_per_tok,
-                        n: m_moe32,
-                        k: h32,
-                        n_experts: ne32,
-                        expert_stride: weights.expert_gate_stride,
-                        ggml_type: weights.ggml_type_gate_up,
-                    };
                 super::decode_pool::with_id_mm_scratch(
                     super::decode_pool::MmIdSlot::Gate,
                     device,
                     ne32,
                     seq_len * shape.num_experts_per_tok,
                     |scratch| {
-                        // The legacy map0 inside the fused kernel writes the
-                        // scratch: take it through the key-invalidating accessor.
-                        let (htpe, hids) = scratch.buffers_mut();
-                        mlx_native::ops::quantized_matmul_id_ggml::dispatch_id_mm_fused_gate_up_silu_for_test(
-                            enc,
-                            registry,
-                            device,
-                            x,
-                            &weights.expert_gate_q,
-                            &weights.expert_up_q,
-                            &ids_buf,
-                            htpe,
-                            hids,
-                            &h_all_buf, // direct fused output — skip up_all
-                            &fused_dispatch_params,
+                        dispatch_expert_fused(
+                            enc, registry, device, x,
+                            weights.experts.role(ExpertRole::Gate),
+                            weights.experts.role(ExpertRole::Up),
+                            &ids_buf, &h_all_buf, scratch, &gate_params,
                         )
                     },
                 )
@@ -3687,8 +3424,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                     registry,
                     device,
                     x,
-                    &weights.expert_gate_q,
-                    weights.expert_gate_affine.as_ref(),
+                    weights.experts.role(ExpertRole::Gate),
                     &ids_buf,
                     &mut gate_all_buf,
                     &gate_params,
@@ -3706,8 +3442,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                     registry,
                     device,
                     x,
-                    &weights.expert_up_q,
-                    weights.expert_up_affine.as_ref(),
+                    weights.experts.role(ExpertRole::Up),
                     &ids_buf,
                     &mut up_all_buf,
                     &up_params,
@@ -3813,8 +3548,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 registry,
                 device,
                 &h_all_buf,
-                &weights.expert_down_q,
-                weights.expert_down_affine.as_ref(),
+                weights.experts.role(ExpertRole::Down),
                 &ids_buf,
                 &mut y_all_buf,
                 &down_params,
@@ -4110,8 +3844,8 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 weights.ggml_type_gate_up,
                 mlx_native::ops::quantized_matmul_ggml::GgmlType::Q6_K
             )
-            && weights.expert_gate_affine.is_none()
-            && weights.expert_up_affine.is_none()
+            && !matches!(weights.experts.role(ExpertRole::Gate), ExpertRoleRef::Affine(_))
+            && !matches!(weights.experts.role(ExpertRole::Up), ExpertRoleRef::Affine(_))
             && (shape.num_experts_per_tok == 1 || shape.num_experts_per_tok == 8);
         let fused_moe_mm_id_on_pf = fused_moe_mm_id_eligible_pf
             && std::env::var("HF2Q_FUSED_MOE_GATE_UP_MM_ID").as_deref() == Ok("1");
@@ -4123,37 +3857,17 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 super::wave5b8_profile::SectionKind::FfnPhaseCGateUpSharedDown,
             );
             if fused_moe_mm_id_on_pf {
-                let fused_dispatch_params =
-                    mlx_native::ops::quantized_matmul_id_ggml::GgmlIdMmDispatchParams {
-                        n_tokens: seq_len,
-                        top_k: shape.num_experts_per_tok,
-                        n: m_moe32,
-                        k: h32,
-                        n_experts: ne32,
-                        expert_stride: weights.expert_gate_stride,
-                        ggml_type: weights.ggml_type_gate_up,
-                    };
                 super::decode_pool::with_id_mm_scratch(
                     super::decode_pool::MmIdSlot::Gate,
                     device,
                     ne32,
                     seq_len * shape.num_experts_per_tok,
                     |scratch| {
-                        // The legacy map0 inside the fused kernel writes the
-                        // scratch: take it through the key-invalidating accessor.
-                        let (htpe, hids) = scratch.buffers_mut();
-                        mlx_native::ops::quantized_matmul_id_ggml::dispatch_id_mm_fused_gate_up_silu_for_test(
-                            enc,
-                            registry,
-                            device,
-                            x,
-                            &weights.expert_gate_q,
-                            &weights.expert_up_q,
-                            &arena.ids_buf,
-                            htpe,
-                            hids,
-                            &arena.h_all_buf, // direct fused output
-                            &fused_dispatch_params,
+                        dispatch_expert_fused(
+                            enc, registry, device, x,
+                            weights.experts.role(ExpertRole::Gate),
+                            weights.experts.role(ExpertRole::Up),
+                            &arena.ids_buf, &arena.h_all_buf, scratch, &gate_params,
                         )
                     },
                 )
@@ -4167,13 +3881,13 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                     ne32,
                     seq_len * shape.num_experts_per_tok,
                     |scratch| {
-                        quantized_matmul_id_ggml_pooled_pair(
+                        dispatch_expert_pair(
                             enc,
                             registry,
                             device,
                             x,
-                            &weights.expert_gate_q,
-                            &weights.expert_up_q,
+                            weights.experts.role(ExpertRole::Gate),
+                            weights.experts.role(ExpertRole::Up),
                             &arena.ids_buf,
                             &arena.gate_all_buf,
                             &arena.up_all_buf,
@@ -4189,8 +3903,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                     registry,
                     device,
                     x,
-                    &weights.expert_gate_q,
-                    weights.expert_gate_affine.as_ref(),
+                    weights.experts.role(ExpertRole::Gate),
                     &arena.ids_buf,
                     &mut arena.gate_all_buf,
                     &gate_params,
@@ -4208,8 +3921,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                     registry,
                     device,
                     x,
-                    &weights.expert_up_q,
-                    weights.expert_up_affine.as_ref(),
+                    weights.experts.role(ExpertRole::Up),
                     &arena.ids_buf,
                     &mut arena.up_all_buf,
                     &up_params,
@@ -4236,7 +3948,8 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             )?
         };
 
-        // Barrier C→D.
+        // Barrier C→D: gate/up are simultaneous, disjoint y_all regions when
+        // the arena geometry admits reuse; SiLU reads both into separate h_all.
         {
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnBarrierCD,
@@ -4265,7 +3978,8 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             // fused_moe_mm_id_on_pf: silu_mul applied in-kernel at Phase C.
         }
 
-        // Barrier D→E.
+        // Barrier D→E: finish every gate/up reader before down reuses y_all.
+        // This is not in-place SiLU: h_all remains a separate live down input.
         {
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnBarrierDE,
@@ -4287,7 +4001,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseEDown,
             );
-            if shared_schedule && weights.expert_down_affine.is_none() {
+            if shared_schedule && !matches!(weights.experts.role(ExpertRole::Down), ExpertRoleRef::Affine(_)) {
                 // P1: `h_all` is `[seq_len, top_k, m_moe]`, so the slotted
                 // call over gate/up's `[seq_len, top_k]` ids reuses their
                 // schedule; bitwise equal to the flattened top_k = 1 call.
@@ -4302,12 +4016,12 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                     ne32,
                     seq_len * shape.num_experts_per_tok,
                     |scratch| {
-                        quantized_matmul_id_ggml_pooled_slotted_reusing_schedule(
+                        dispatch_expert_slotted(
                             enc,
                             registry,
                             device,
                             &arena.h_all_buf,
-                            &weights.expert_down_q,
+                            weights.experts.role(ExpertRole::Down),
                             &arena.ids_buf,
                             &arena.y_all_buf,
                             scratch,
@@ -4324,8 +4038,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                     registry,
                     device,
                     &arena.h_all_buf,
-                    &weights.expert_down_q,
-                    weights.expert_down_affine.as_ref(),
+                    weights.experts.role(ExpertRole::Down),
                     &arena.ids_buf,
                     &mut arena.y_all_buf,
                     &down_params,
@@ -5277,9 +4990,7 @@ mod tests {
 
         let weights_q = MoeFfnWeightsGpuQ {
             router: upload_f32(&router_f32, &device).expect("router"),
-            expert_gate_q: expert_gate_buf,
-            expert_up_q: expert_up_buf,
-            expert_down_q: expert_down_buf,
+            experts: Arc::new(MoeExpertStorage::from_ggml(expert_gate_buf, expert_up_buf, expert_down_buf)),
             ggml_type_gate_up: ggml_type,
             ggml_type_down: ggml_type,
             expert_gate_stride: gate_stride,
@@ -5291,10 +5002,7 @@ mod tests {
             shared_up: upload_f32(&shared_up_f32, &device).expect("sh_up"),
             shared_down: upload_f32(&shared_down_f32, &device).expect("sh_down"),
             dense_storage: MoeDenseStorage::Bf16,
-            expert_gate_affine: None,
-            expert_up_affine: None,
-            expert_down_affine: None,
-            prepared_m8: None,
+            live_tiles: None,
         };
 
         let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
@@ -5447,6 +5155,15 @@ mod tests {
     /// the shared route is deterministic across repeated runs.
     #[test]
     fn moe_prefill_shared_expert_schedule_bitwise_matches_per_call_schedule() {
+        shared_expert_schedule_matches_per_call(false);
+    }
+
+    #[test]
+    fn canonical_moe_prefill_shared_schedule_bitwise_matches_per_call_schedule() {
+        shared_expert_schedule_matches_per_call(true);
+    }
+
+    fn shared_expert_schedule_matches_per_call(canonical: bool) {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("Metal device unavailable");
         let mut registry = KernelRegistry::new();
@@ -5477,9 +5194,7 @@ mod tests {
         for down_type in [GgmlType::Q6_K, GgmlType::Q4_K] {
             let weights = MoeFfnWeightsGpuQ {
                 router: upload_bf16_from_f32(&router, &device).expect("router"),
-                expert_gate_q: gate_q.clone(),
-                expert_up_q: up_q.clone(),
-                expert_down_q: quantized_expert_stack(&device, down_type, &down, m),
+                experts: Arc::new(MoeExpertStorage::from_ggml(gate_q.clone(), up_q.clone(), quantized_expert_stack(&device, down_type, &down, m))),
                 ggml_type_gate_up: GgmlType::Q4_K,
                 ggml_type_down: down_type,
                 expert_gate_stride: gate_up_stride,
@@ -5492,11 +5207,11 @@ mod tests {
                 shared_up: upload_bf16_from_f32(&shared_up, &device).expect("sh_up"),
                 shared_down: upload_bf16_from_f32(&shared_down, &device).expect("sh_down"),
                 dense_storage: MoeDenseStorage::Bf16,
-                expert_gate_affine: None,
-                expert_up_affine: None,
-                expert_down_affine: None,
-                prepared_m8: None,
+                live_tiles: None,
             };
+            let weights = if canonical {
+                super::super::gpu_expert_test_support::complete_experts(weights, shape, &device, &mut registry)
+            } else { weights };
             for seq in [33usize, 85, 157, 512] {
                 for collapsed in [false, true] {
                     let x_host = if collapsed {
@@ -5577,6 +5292,137 @@ mod tests {
             }
         }
     }
+    /// Real router/gate/up/SiLU/down/reduce consumers, sharing only dead roots
+    /// across unequal queued rows, with no intermediate host waits.
+    #[test]
+    fn moe_arena_dead_root_reuse_matches_independent_queued_consumers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("Metal device unavailable");
+        let mut registry = KernelRegistry::new();
+        let mut seed = 0xDEA0_600Du32;
+        // Below the fit boundary, exactly at it, and with unused y slack.
+        for h in [256usize, 512, 768] {
+            let (ne, topk, m, ms) = (16usize, 8usize, 256usize, 256usize);
+            let shape = MoeFfnShape {
+                hidden_size: h as u32, num_experts: ne as u32,
+                num_experts_per_tok: topk as u32, moe_intermediate_size: m as u32,
+                shared_intermediate_size: ms as u32,
+            };
+            let gate = mk_rand(&mut seed, ne * m * h, 0.05);
+            let up = mk_rand(&mut seed, ne * m * h, 0.05);
+            let down = mk_rand(&mut seed, ne * h * m, 0.05);
+            let gate_q = quantized_expert_stack(&device, GgmlType::Q4_K, &gate, h);
+            let up_q = quantized_expert_stack(&device, GgmlType::Q4_K, &up, h);
+            for down_type in [GgmlType::Q4_K, GgmlType::Q6_K] {
+                let weights = MoeFfnWeightsGpuQ {
+                    router: upload_bf16_from_f32(&mk_rand(&mut seed, ne * h, 0.1), &device).unwrap(),
+                    experts: Arc::new(MoeExpertStorage::from_ggml(
+                        gate_q.clone(), up_q.clone(),
+                        quantized_expert_stack(&device, down_type, &down, m),
+                    )),
+                    ggml_type_gate_up: GgmlType::Q4_K, ggml_type_down: down_type,
+                    expert_gate_stride: (m * h / 256 * GgmlType::Q4_K.block_bytes() as usize) as u64,
+                    expert_up_stride: (m * h / 256 * GgmlType::Q4_K.block_bytes() as usize) as u64,
+                    expert_down_stride: (h * m / 256 * down_type.block_bytes() as usize) as u64,
+                    num_experts: ne as u32,
+                    shared_gate_inp: upload_bf16_from_f32(&mk_rand(&mut seed, h, 0.1), &device).unwrap(),
+                    shared_gate: upload_bf16_from_f32(&mk_rand(&mut seed, ms * h, 0.05), &device).unwrap(),
+                    shared_up: upload_bf16_from_f32(&mk_rand(&mut seed, ms * h, 0.05), &device).unwrap(),
+                    shared_down: upload_bf16_from_f32(&mk_rand(&mut seed, h * ms, 0.05), &device).unwrap(),
+                    dense_storage: MoeDenseStorage::Bf16,
+                    live_tiles: None,
+                };
+                let cases = [5usize, 65, 7, 33, 5, 65];
+                let capacity = *cases.iter().max().unwrap();
+                let allocate = |rows: usize, columns: usize| {
+                    device.alloc_buffer(rows * columns * 4, DType::F32, vec![rows, columns])
+                        .expect("test F32 root")
+                };
+                let tight = |root: &MlxBuffer, rows: usize, columns: usize| {
+                    root.slice_view(0, rows * columns).with_shape(vec![rows, columns])
+                        .expect("tight expert view")
+                };
+                let new_arena = |rows: usize| {
+                    super::super::MoeFfnArena::new(
+                        &device, rows as u32, h as u32, topk as u32,
+                        m as u32, ms as u32, ne as u32,
+                    ).expect("test MoE arena")
+                };
+                let owner = new_arena(capacity);
+                let mut records: Vec<_> = cases.iter().map(|&seq| {
+                    let mut reference = new_arena(seq);
+                    // Retain actual gate/up values for an independent SiLU oracle.
+                    reference.gate_all_buf = allocate(seq * topk, m);
+                    reference.up_all_buf = allocate(seq * topk, m);
+                    let mut reused = new_arena(seq);
+                    reused.y_all_buf = tight(&owner.y_all_buf, seq * topk, h);
+                    reused.h_all_buf = tight(&owner.h_all_buf, seq * topk, m);
+                    reused.gate_all_buf = tight(&owner.gate_all_buf, seq * topk, m);
+                    // Nested views retain the constructor's capacity-based
+                    // offset, including separate roots when H < 2*I.
+                    reused.up_all_buf = tight(&owner.up_all_buf, seq * topk, m);
+                    (
+                        upload_f32(&mk_rand(&mut seed, seq * h, 0.4), &device).unwrap(),
+                        upload_f32(&mk_rand(&mut seed, seq * h, 0.2), &device).unwrap(),
+                        reference, reused, allocate(seq, h), allocate(seq, h),
+                    )
+                }).collect();
+                // Views alone must anchor the constructor's roots through drain.
+                drop(owner);
+                for per_call in [false, true] {
+                    let mut enc = device.command_encoder().expect("queued MoE encoder");
+                    FORCE_PER_CALL_EXPERT_SCHEDULE.with(|force| force.set(per_call));
+                    for (x, residual, reference, reused, expected, actual) in &mut records {
+                        for (arena, out) in [(reference, expected), (reused, actual)] {
+                            build_moe_ffn_layer_gpu_q_into_with_arena(
+                                &mut enc, &device, &mut registry, x, &weights, shape,
+                                Some(residual), arena, out, 0,
+                            ).expect("queued MoE consumer");
+                        }
+                    }
+                    FORCE_PER_CALL_EXPERT_SCHEDULE.with(|force| force.set(false));
+                    // A rejected call must leave all earlier queued readers
+                    // drainable, without adding a success-path host wait.
+                    let (x, residual, _, reused, _, actual) = records.last_mut().unwrap();
+                    let invalid = MoeFfnShape { shared_intermediate_size: (ms + 1) as u32, ..shape };
+                    assert!(build_moe_ffn_layer_gpu_q_into_with_arena(
+                        &mut enc, &device, &mut registry, x, &weights, invalid,
+                        Some(residual), reused, actual, 0,
+                    ).is_err());
+                    enc.commit_and_wait().expect("drain consumers after rejected call");
+                    for (index, (_, _, reference, reused, expected, actual)) in records.iter().enumerate() {
+                        let seq = cases[index];
+                        let case = format!("h={h} down={down_type:?} rows={seq} per_call={per_call}");
+                        assert_eq!(bits(actual, seq * h), bits(expected, seq * h), "{case}: output");
+                        assert_eq!(bits(&reused.ids_buf, seq * topk),
+                            bits(&reference.ids_buf, seq * topk), "{case}: expert ids");
+                        assert_eq!(bits(&reused.weights_buf, seq * topk),
+                            bits(&reference.weights_buf, seq * topk), "{case}: router weights");
+                        let gates = reference.gate_all_buf.as_slice::<f32>().unwrap();
+                        let ups = reference.up_all_buf.as_slice::<f32>().unwrap();
+                        let hidden = reference.h_all_buf.as_slice::<f32>().unwrap();
+                        assert!(gates.iter().any(|&g| g > 0.0) && gates.iter().any(|&g| g < 0.0));
+                        assert!(expected.as_slice::<f32>().unwrap().iter().any(|&v| v != 0.0));
+                        for ((&g, &u), &got) in gates.iter().zip(ups).zip(hidden) {
+                            let g = g as f64;
+                            let want = (g / (1.0 + (-g).exp())) * u as f64;
+                            assert!((got as f64 - want).abs() <= 2e-5 * (1.0 + want.abs()),
+                                "{case}: SiLU F64 oracle got={got} want={want}");
+                        }
+                    }
+                    // Earlier roots are dead; compare the final live consumer
+                    // state, not overwritten gate/up aliases.
+                    let (_, _, reference, reused, _, _) = records.last().unwrap();
+                    let rows = cases[cases.len() - 1] * topk;
+                    assert_eq!(bits(&reused.h_all_buf, rows * m),
+                        bits(&reference.h_all_buf, rows * m), "last SiLU output");
+                    assert_eq!(bits(&reused.y_all_buf, rows * h),
+                        bits(&reference.y_all_buf, rows * h), "last down output");
+                }
+            }
+        }
+    }
+
 
     /// Routes that cannot share one schedule keep the per-call route.
     #[test]
@@ -5593,9 +5439,7 @@ mod tests {
         let stub = |len: usize| device.alloc_buffer(len, DType::U8, vec![len]).expect("buf");
         let weights = MoeFfnWeightsGpuQ {
             router: stub(4),
-            expert_gate_q: stub(4),
-            expert_up_q: stub(4),
-            expert_down_q: stub(4),
+            experts: Arc::new(MoeExpertStorage::from_ggml(stub(4), stub(4), stub(4))),
             ggml_type_gate_up: GgmlType::Q4_K,
             ggml_type_down: GgmlType::Q6_K,
             expert_gate_stride: 144,
@@ -5607,10 +5451,7 @@ mod tests {
             shared_up: stub(4),
             shared_down: stub(4),
             dense_storage: MoeDenseStorage::Bf16,
-            expert_gate_affine: None,
-            expert_up_affine: None,
-            expert_down_affine: None,
-            prepared_m8: None,
+            live_tiles: None,
         };
         let threshold = MM_ID_ROUTING_THRESHOLD;
         assert!(moe_prefill_shares_expert_schedule(
@@ -5725,9 +5566,7 @@ mod tests {
         let weights = MoeFfnWeightsGpuQ {
             router: upload_bf16_from_f32(&mk_rand(&mut seed, ne * h, 0.05), &device)
                 .expect("router"),
-            expert_gate_q,
-            expert_up_q,
-            expert_down_q,
+            experts: Arc::new(MoeExpertStorage::from_ggml(expert_gate_q, expert_up_q, expert_down_q)),
             ggml_type_gate_up: GgmlType::Q4_K,
             ggml_type_down: GgmlType::Q6_K,
             expert_gate_stride: gate_up_stride,
@@ -5743,10 +5582,7 @@ mod tests {
             shared_down: upload_bf16_from_f32(&mk_rand(&mut seed, h * m, 0.05), &device)
                 .expect("sh_down"),
             dense_storage: MoeDenseStorage::Bf16,
-            expert_gate_affine: None,
-            expert_up_affine: None,
-            expert_down_affine: None,
-            prepared_m8: None,
+            live_tiles: None,
         };
         const REPS: usize = 15;
         for seq in [85usize, 157, 271, 512, 682] {

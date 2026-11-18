@@ -556,6 +556,261 @@ fn prompt_catchup_aligns_target_and_mtp_cursors() {
 }
 
 #[test]
+fn catchup_real_roots_pool_retention_and_every_submitted_command_are_checked() {
+    use super::super::carry_memory::{self, CarryOwners, CatchupPlan, WorkerScope};
+    use super::super::decode_pool;
+    use super::super::encoder_stage::FailSubmitted;
+    use mlx_native::DType;
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let Some(device) = try_device() else { return };
+    for dedicated in [false, true] {
+        for tq in [false, true] {
+            let mut cfg = tiny_cfg(1);
+            cfg.mtp_use_dedicated_embeddings = dedicated;
+            cfg.head_dim = 256;
+            cfg.rotary_dim = 256;
+            cfg.mrope_section = [64; 4];
+            let mut tensors = tiny_tensors();
+            for tensor in &mut tensors {
+                match tensor.name {
+                    "blk.2.attn_q.weight" | "blk.2.attn_k.weight" | "blk.2.attn_v.weight" => {
+                        tensor.dims = vec![32, 256];
+                        tensor.data = zeros(32 * 256);
+                    }
+                    "blk.2.attn_output.weight" => {
+                        tensor.dims = vec![256, 32];
+                        tensor.data = zeros(256 * 32);
+                    }
+                    "blk.2.attn_q_norm.weight" | "blk.2.attn_k_norm.weight" => {
+                        tensor.dims = vec![256];
+                        tensor.data = ones(256);
+                    }
+                    _ => {}
+                }
+            }
+            if !dedicated {
+                tensors.retain(|tensor| tensor.name != "blk.2.nextn.embed_tokens.weight");
+                tensors.push(TestTensor {
+                    name: "token_embd.weight", dims: vec![32, 64], data: zeros(32 * 64),
+                });
+            }
+            let path = std::env::temp_dir().join(format!(
+                "mtp_carry_{}_{}_{}.gguf", std::process::id(), dedicated, tq,
+            ));
+            write_gguf(&path, &tensors);
+            let gguf = GgufFile::open(&path).unwrap();
+            let mtp = load_mtp_weights_if_present(&gguf, &cfg, &device).unwrap().unwrap();
+            let old_parent = device.alloc_buffer(8 * 32 * 4, DType::F32, vec![8, 32]).unwrap();
+            let old_row = old_parent.slice_view(7 * 32 * 4, 32);
+            drop(old_parent);
+            let mut owners = CarryOwners::default();
+            owners.include(&old_row);
+            let retained = owners.bytes();
+            let plan = CatchupPlan::new(&cfg, 3, dedicated);
+            // The real serving pre-allocation check must fail one byte below
+            // the promise, without issuing a target allocation/command.
+            {
+                let _worker = WorkerScope::open(
+                    owners, retained, plan.compose(0, retained, 0) - 1,
+                );
+                assert!(carry_memory::commit_target(&cfg, 3).is_err());
+            }
+            // Each submitted stage can fail independently; the final drain
+            // still checks all four, including stages behind that failure.
+            for fail in 0..=4 {
+                let _pooled_outputs = decode_pool::StepPooledOutputs::enter(fail % 2 == 0);
+                decode_pool::checked_reset_decode_pool().unwrap();
+                let mut owners = CarryOwners::default();
+                owners.include(&old_row);
+                let _worker = WorkerScope::open(
+                    owners, retained, plan.compose(0, retained, 0),
+                );
+                carry_memory::commit_target(&cfg, 3).expect("exact phase promise");
+                let target = upload_f32(&vec![0.25; 3 * 32], &device).unwrap();
+                let shared = upload_f32(&vec![0.0; 3 * 32], &device).unwrap();
+                let mut cache = HybridKvCache::new_with_options(&cfg, &device, 16, 1, tq).unwrap();
+                let mut registry = KernelRegistry::new();
+                let injected = FailSubmitted::nth("mtp.", fail);
+                let result = mtp.process_target_batch(
+                    &[0, 1, 2], Some(&old_row), &target, &shared, &mut cache,
+                    crate::serve::multi_seq_kv::SlotId(0),
+                    &[0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2],
+                    &device, &mut registry, &cfg,
+                );
+                assert_eq!(injected.seen(), (fail < 4, 4));
+                if fail < 4 {
+                    assert!(result.is_err(), "submitted command {fail} must surface");
+                } else {
+                    result.expect("all submitted stages checked");
+                    let (actual, promised) = carry_memory::last_phase().unwrap();
+                    assert!(actual <= promised);
+                    assert!(actual > retained + target.byte_len() as u64 + shared.byte_len() as u64);
+                    assert_eq!(cache.mtp_slot.as_ref().unwrap().current_len[0], 3);
+                }
+                let pool = decode_pool::worker_memory_snapshot().unwrap().1;
+                assert!(pool.retained.bytes > 0, "pooled norm/rotation roots remain owned");
+            }
+            decode_pool::checked_reset_decode_pool().unwrap();
+            assert!(decode_pool::worker_memory_snapshot().unwrap().1.retained.bytes > 0);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+}
+
+#[test]
+fn quantized_dedicated_catchup_keeps_token_ids_at_power_of_two_geometry() {
+    use super::super::carry_memory::{self, CarryOwners, CatchupPlan, WorkerScope};
+    use super::super::decode_pool::{checked_reset_decode_pool, StepPooledOutputs};
+    use super::super::encoder_stage::FailSubmitted;
+    use super::super::prefill_prepared::ScratchCapsForTest;
+    use super::super::in_memory_loader::quantize_f32_to_q8_0_buffer;
+    use crate::serve::forward_mlx_shared::MlxQWeight;
+    use crate::serve::gpu::QuantWeightInfo;
+    use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let Some(device) = try_device() else { return };
+    assert!(!matches!(std::env::var("MLX_UNRETAINED_REFS").as_deref(), Ok("1")),
+        "this regression exercises the normal asynchronous retained-reference route");
+    const ROWS: usize = 64;
+    const HIDDEN: usize = 256;
+    let mut cfg = tiny_cfg(1);
+    cfg.hidden_size = HIDDEN as u32;
+    cfg.head_dim = HIDDEN as u32;
+    cfg.rotary_dim = HIDDEN as u32;
+    cfg.mrope_section = [64; 4];
+    cfg.intermediate_size = Some(HIDDEN as u32);
+    let mut tensors = tiny_tensors();
+    for tensor in &mut tensors {
+        tensor.dims = match tensor.name {
+            "blk.2.nextn.eh_proj.weight" => vec![2 * HIDDEN as u64, HIDDEN as u64],
+            "blk.2.nextn.embed_tokens.weight" | "blk.2.nextn.shared_head_head.weight" => {
+                vec![HIDDEN as u64, cfg.vocab_size as u64]
+            }
+            _ if tensor.dims.len() == 1 => vec![HIDDEN as u64],
+            _ => vec![HIDDEN as u64, HIDDEN as u64],
+        };
+        let elements = tensor.dims.iter().map(|dim| *dim as usize).product();
+        tensor.data = vec![tensor.data[0]; elements];
+    }
+    let path = std::env::temp_dir().join(format!(
+        "mtp_quantized_dedicated_carry_{}.gguf", std::process::id(),
+    ));
+    write_gguf(&path, &tensors);
+    let gguf = GgufFile::open(&path).unwrap();
+    let mut mtp = load_mtp_weights_if_present(&gguf, &cfg, &device).unwrap().unwrap();
+    let table = (0..cfg.vocab_size as usize * HIDDEN)
+        .map(|index| 0.125 + (index % HIDDEN) as f32 / 1024.0)
+        .collect::<Vec<_>>();
+    // A real native Q8_0 table: the consumer must dispatch the asynchronous
+    // gather, not the existing F32 host-row upload fixture.
+    mtp.embed_tokens = Some(MlxQWeight {
+        buffer: quantize_f32_to_q8_0_buffer(
+            &table, vec![cfg.vocab_size as usize, HIDDEN], &device,
+        ).unwrap(),
+        info: QuantWeightInfo {
+            ggml_dtype: GgmlType::Q8_0, rows: cfg.vocab_size as usize, cols: HIDDEN,
+        },
+        affine: None,
+        f16_shadow: None,
+        decode_record_q6k_m1: std::sync::OnceLock::new(),
+    });
+    let _pooled_outputs = StepPooledOutputs::enter(true);
+    let row_bytes = ROWS * HIDDEN * 4;
+    assert!(row_bytes.is_power_of_two(), "no projection bucket-rounding slack");
+    assert_eq!(cfg.num_key_value_heads * cfg.head_dim, HIDDEN as u32);
+    let plan = CatchupPlan::new(&cfg, ROWS, true);
+    let tokens = (0..ROWS as u32).collect::<Vec<_>>();
+    let positions = super::super::spec_decode::positions_for_range(0, ROWS);
+    let _caps = ScratchCapsForTest::set(1 << 20, 1 << 10, 1 << 20);
+    for case in 0..4 {
+        checked_reset_decode_pool().unwrap();
+        // Leave a genuinely issued warm root, not merely free capacity.
+        // The serving boundary must reclaim it before the first gather.
+        super::super::decode_pool::cap_pool(None);
+        let warm = super::super::decode_pool::pooled_alloc_buffer(
+            &device, 1 << 20, mlx_native::DType::U8, vec![1 << 20],
+        ).unwrap();
+        drop(warm);
+        assert!(super::super::decode_pool::worker_carry_pool_bytes().unwrap() >= 1 << 20);
+        let _worker = WorkerScope::open(
+            CarryOwners::default(), 0, plan.compose(0, 0, 0),
+        );
+        carry_memory::commit_target(&cfg, ROWS).expect("prospective quantized catch-up promise");
+        let target = upload_f32(&vec![0.25; ROWS * HIDDEN], &device).unwrap();
+        assert_eq!(target.byte_len(), row_bytes);
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, 96, 1, true).unwrap();
+        let mut registry = KernelRegistry::new();
+        let transaction = carry_memory::CatchupTransaction::open(
+            &cfg, ROWS, &target, None,
+        ).unwrap();
+        assert!(super::super::decode_pool::worker_carry_pool_bytes().unwrap() <= 1 << 10,
+            "checked target boundary trims issued warm roots to the enforced prior-pool limit");
+        let checked = FailSubmitted::nth("", if case == 0 { usize::MAX } else { 0 });
+        let gathered = transaction.gather(|| {
+            let mut shared = device.alloc_buffer(
+                row_bytes, mlx_native::DType::F32, vec![ROWS, HIDDEN],
+            )?;
+            // The production shared-embedding producer, with a real native
+            // Q8_0 table and real asynchronous gather command, not an upload.
+            super::super::forward_gpu::embed_tokens_gpu_into(
+                &tokens, &[], mtp.embed_tokens.as_ref(), cfg.vocab_size,
+                cfg.hidden_size, &device, &mut registry, &mut shared, None,
+            )?;
+            if case == 3 {
+                anyhow::bail!("injected host failure after shared gather submission");
+            }
+            Ok(shared)
+        });
+        if case == 3 {
+            let error = gathered.err().expect("producer error must check its submitted gather");
+            assert_eq!(checked.seen(), (true, 1));
+            assert!(format!("{error:#}").contains("injected failure of qwen35.embedding.native"));
+            drop(transaction);
+            continue;
+        }
+        let shared = gathered.expect("shared quantized gather submitted asynchronously");
+        assert_eq!(shared.byte_len(), row_bytes);
+        if case == 2 {
+            let error = transaction.finish::<()>(Err(anyhow::anyhow!(
+                "injected admission failure before MTP catch-up",
+            ))).expect_err("early host failure must surface the submitted gather failure");
+            assert_eq!(checked.seen(), (true, 1));
+            assert!(format!("{error:#}").contains("injected failure of qwen35.embedding.native"));
+            drop(transaction);
+            continue;
+        }
+        let encoded = mtp.process_target_batch(
+            &tokens, None, &target, &shared, &mut cache,
+            crate::serve::multi_seq_kv::SlotId(0), &positions,
+            &device, &mut registry, &cfg,
+        );
+        assert_eq!(checked.seen(), (false, 0),
+            "joining MTP must not replace or prematurely settle shared commands");
+        let result = transaction.finish(encoded);
+        assert_eq!(checked.seen(), (case == 1, 6),
+            "one checked drain covers shared/dedicated gathers and all four MTP stages");
+        if case == 1 {
+            let error = result.expect_err("the first shared gather failure must propagate");
+            assert!(format!("{error:#}").contains("injected failure of qwen35.embedding.native"));
+        } else {
+            result.expect("shared and dedicated quantized gathers plus KV-only catch-up");
+            assert_eq!(cache.mtp_slot.as_ref().unwrap().current_len[0], ROWS as u32);
+        }
+        drop(transaction);
+        // Requires the parent-owned hook after native route selection (the
+        // F32 early-return path must not retain an inactive ID root):
+        // super::carry_memory::keep_operand(&ids).
+        let ids = (ROWS * std::mem::size_of::<u32>()) as u64;
+        assert_eq!(carry_memory::last_phase_token_id_bytes(), Some(2 * ids));
+        let (actual, promised) = carry_memory::last_phase().unwrap();
+        assert!(actual <= promised);
+        assert!(actual > promised - ids,
+            "exact buckets cannot hide even one omitted command-owned token-ID root");
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn mtp_kv_only_append_matches_full_attention_cache_prefix() {
     let Some(device) = try_device() else { return };
     let tmp = std::env::temp_dir().join(format!("mtp_kv_only_{}.gguf", std::process::id()));
