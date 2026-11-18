@@ -4357,3 +4357,37 @@ for Qwen3.6, whose retained Splash arm is valid. It does not turn those
 Qwen3.6 runs into a valid Qwen3.8 denominator or supersede Qwen3.8's existing
 mechanism substitution; the absolute mechanism, stock and other peer gates
 remain unchanged.
+
+## 2026-11-18: bounded assembled-candidate feasibility checkpoint
+
+The clean packed C82/native0.24 CLI ran one frozen canonical Qwen3.8 N4
+checkpoint, with no candidate retry. Runtime selected the complete automatic
+pinned-pair profile; four slots, 262144 context, 48 GiB KV and the unchanged
+8 GiB reserve were retained. Profiling was absent. The unchanged mechanism
+reducer reported:
+
+| Necessary mechanism gate | Required | Observed |
+| --- | --- | --- |
+| Accepted-plus-bonus tokens per lane-cycle | >= 5.304 | 6337 / 1177 = 5.384027187765506 |
+
+Independent source/tool-evidence reviewers passed all four final patches.
+Exact production-renderer prefix replay passed all 28 actual wires without
+another model load. All 85 pressure samples were normal, swap growth was zero
+and owned cleanup was proven. Retained local evidence
+`qwen38-native0240-feasibility-one-v1/decision.json`, SHA-256
+`756da3775b4ca1b99537abdcd62f3a053f04929a05f66559295884f652225a46`,
+records **GO_TO_MATCHED_QUALIFICATION_ONLY**, not release acceptance.
+Its contract binds the exact target, drafter, CLI, request and runtime bytes.
+This is not complete 24-task quality, matched stock/peer performance, D5/D6,
+signed-byte qualification or permission to publish. CI success cannot replace
+those gates; no speculative kernel work is justified by this necessary pass.
+
+Separately, PR857's executed script-contract failure exposed a missing
+injected-phase marker. The fixture-only correction waits for phase entry
+before advancing its accelerated clock and retains an independent real
+six-second subprocess timeout. Production clocks and limits are unchanged.
+All 15 whole-lease tests passed; conflict/sealing controls with 1.2 seconds
+of worker setup, longer than the injected 0.8-second TERM interval, both
+entered the intended phase, proved owned-worker absence and refused success.
+Exact-head CI must still execute successfully before landing.
+
