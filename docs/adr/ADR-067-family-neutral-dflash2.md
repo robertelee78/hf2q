@@ -1615,6 +1615,24 @@ reserve, context, KV or slot reduction. Remaining consumers, nonduplicated
 production kernels, lifetime proof and the unchanged full canonical N4 gate
 still precede adoption.
 
+The native ownership prerequisite now passes on isolated source
+`99f94ae778f6a9a8d9ee036fc239fba0f00c25f3`. Three focused hardware tests each
+pass in fresh retained and unretained-reference processes. They witness mixed
+Q6_K/Q4_K/Q6_K batch ordering, mapped source expiry before real integer-reference
+projections, reusable shared completed clones, legitimate asynchronous source
+retention, and seven invalid-later-request cleanup cases followed by successful
+recovery. Each test retires only its dedicated source registrations/device
+before checking the mapped backing's Weak lifetime. All six processes complete
+with proven owned cleanup, nominal thermals and no swap growth.
+
+Proof SHA256:
+`8b1806fb1c202f164fe6eb45bdd6df4280618b2d07afa338238a110cc77942b2`.
+This proves the mapped public-import lifetime boundary, not the production GGUF
+loader, physical page reclamation or canonical N4 fit. Unexpected nonterminal
+wait errors remain covered by source-reviewed command-attached ownership, not
+unsafe GPU-fault injection. HF typed ownership, remaining legacy consumers,
+final publication/pin and all full-model gates remain pending.
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
