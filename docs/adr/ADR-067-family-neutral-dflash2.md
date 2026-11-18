@@ -1951,6 +1951,32 @@ prelaunch infrastructure attempts and rejected metadata remain retained;
 no reference, numerical limit, memory reserve, workload or safety gate was
 waived.
 
+###### Pre-canonical full-route control (2026-11-18)
+
+A fresh build of committed pre-canonical main `7d2e12c5`, with its exact
+registry mlx-native 0.22.2 and Rust/Cargo 1.89.0, binds all 2367 tracked source
+files, including 293 nested inference-model files, and all 808 native archive
+members. The proposed historical 0.23.2 binary was not used: its retained
+archive omitted nested model sources and could not reconstruct that control.
+
+The fresh control executes all three original matvec/staged/live replays,
+each four lanes × 64 windows × eight rows, with unchanged inputs, switches
+and safety. All 14/15/14 samples have normal pressure and zero swap growth
+from the 3,544,187-byte baseline; each owned process group is cleaned up.
+Its staged/live routes reproduce the earlier 38/32 argmax differences from
+matvec, including 21 per route outside the reference's 0.1-logit margin.
+
+Compared route-for-route with the retained current-native 0.24 diagnostics,
+all 2048 rows have zero argmax flips, zero sampled-logit error and zero
+compared logit shifts. The measured cross-route differences therefore predate
+canonical ownership; no new cutover drift is observed in this slice.
+This is a pre-canonical bundle control, not a stock 0.1.29 comparison or
+single-variable native attribution. It does not prove cross-route equivalence,
+full-vocabulary/state parity, quality, performance or release acceptance.
+Complete source/build/raw-stream/safety/comparison proof SHA256:
+`dbbb1ff418df24bc28d08bb4b27293be402796d5b322d12f4df5a5ee9a9b46e2`.
+
+
 ### D2: 32-row target verifier
 
 - Extend the ADR-065 verifier to four independent windows of one to eight rows,
