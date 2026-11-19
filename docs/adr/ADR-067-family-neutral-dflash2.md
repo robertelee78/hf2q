@@ -4391,3 +4391,46 @@ of worker setup, longer than the injected 0.8-second TERM interval, both
 entered the intended phase, proved owned-worker absence and refused success.
 Exact-head CI must still execute successfully before landing.
 
+## 2026-11-18: post-reboot Qwen3.8 reference correctness disposition
+
+The fixed fresh Splash sweep completed all eight configurations twice on the
+same `cf0eb010…c30d7` target, full four-slot/262144-context workload and pinned
+`031a25a6` runtime. The current macOS 27.3 host fingerprint was captured and
+verified against the unchanged runtime bytes; confinement was actually
+re-executed against the native Darwin tool observer landed in PR859.
+Runtime assemblies remained on APFS, not the exFAT bulk-evidence volume.
+
+All 16 whole runs failed the coding-task gate. Canceled sibling lanes are
+not 64 independent task failures, and partial lane completion is not a
+successful N4 run. Every one of the 386 actual requests retained its native
+render, including failed/canceled requests without terminal receipts. The
+preregistered exact Rust oracle executed one real passed test per run and
+proved byte-identical production-renderer parity for all 386 requests.
+Every run proved owned cleanup, normal sampled pressure and zero observed
+swap **growth** from the nonzero 3,082,813-byte baseline. No workload,
+precision, source identity, safety threshold or quality criterion was relaxed.
+
+The reviewed source-bound consumer accepted all eight configurations as
+invalid and selected no timing denominator. Evidence bundle
+`splash-q38-current-os-fullwire-sweep-v1/complete-post-oracle` retains the
+executed receipts and complete-population manifest; `selection.json` has
+SHA-256 `2b2d8e3f8e3926ec1147963d8bae2942e0e1e228a523d67ed7c3ec9472b51e63`
+and `substitution-binding.json` has
+`0473f46a9555fa247f14da3af3f57b484d5697135c0b210fec2d88c556ab58fc`.
+The original failures and the earlier separate 26-request feasibility proof
+remain intact; the final 386-request proofs were actual new Rust executions,
+not copied or relabelled evidence.
+
+Separately, current upstream `2cbfc3cf` with the trained `50307d4c` BF16
+DFlash2 drafter completed all four coding tasks, all 28 unary/SSE replies
+and independent final-patch review. Its original strict catalog rejection
+remains preserved; a separately bound offline consumer replay resolved the
+catalog/imported-source distinction without another model load. This makes
+that configuration available for fresh finite best-valid reference selection,
+not selected, fastest, statistically matched or release-qualified.
+
+The Qwen3.8 absolute mechanism floor remains 5.304; stock and every valid
+same-artifact peer still require the D5 confidence bounds. Qwen3.6's valid
+Splash comparison, D6 default/kill-switch behavior, exact RC all-family and
+cache-lifecycle gates, and actual update/rollback/publication remain open.
+
