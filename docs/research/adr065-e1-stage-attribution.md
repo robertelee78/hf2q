@@ -1,6 +1,6 @@
 # ADR-065 E1: complete-round stage attribution
 
-Status: complete (2026-11-09). Issue: #504.
+Status: diagnostic implemented; historical unprofiled-distortion qualification withdrawn (2026-11-19). Issue: #504.
 
 ## Diagnostic contract
 
@@ -12,7 +12,7 @@ Status: complete (2026-11-09). Issue: #504.
 
 Each record uses schema `hf2q.adr065.stage-profile-round.v1` and identifies family, route and active width. GPU command buffers are reduced into projections, DeltaNet conv, DeltaNet GDN, KV write, attention, FFN/MoE, head, MTP draft and MTP catch-up. CPU spans cover logit readback, host selection, rollback and per-row arena setup. Host gap is the non-negative round remainder after known GPU and CPU time. DeepSeek decode-scratch release and reallocation events are pending counters consumed by the next complete-round record, so events between rounds are not lost.
 
-Unrecognized native labels remain `unknown`, are retained by raw label, and are excluded from every decision rule. `scripts/four_agent/adr065_stage_profile.py` validates Q5 verdicts, cleanup, artifact and binary identities, profile controls, the closed record schema, and canonical transcript equality before reducing any data.
+Unrecognized native labels remain `unknown`, are retained by raw label, and are excluded from every decision rule. `scripts/four_agent/adr065_stage_profile.py` validates Q5 verdicts, cleanup, artifact and binary identities, profile controls, the closed record schema, and canonical transcript equality before reducing any data. Wall controls reject native command-buffer profiling records and nonempty `MLX_PROFILE_CB`. Empty planned settings require exact matching supervisor/case producer sources and replayed omission from the child environment; an empty receipt field alone does not prove profiling was disabled.
 
 Qwen solo K3 performs multiple target forwards in one round. While the E1 guard is active it owns the native profile table across those forwards; the legacy per-forward diagnostic therefore does not reset the table. This preserves MTP draft and catch-up in one complete-round split.
 
@@ -36,7 +36,7 @@ Qwen solo K3 performs multiple target forwards in one round. While the E1 guard 
 
 Each Q5 arm used the official artifact, four slots, context 262144 per slot, the canonical 28-turn coding workload, the retained negative control and family approval template. Candidate control and profile used the same binary. The reference arm used the previous-default binary. Gemma candidate control/profile both set `HF2Q_FUSE_LMHEAD=0` so head work remained independently attributable; its previous-default reference retained the default setting.
 
-## Retained Q5 result and observer distortion
+## Historical Q5 result; unprofiled distortion not qualified
 
 All nine Q5 arms returned `CalibrationPass` and proved owned-process and listener cleanup. For each family, the wall-control transcript and previous-default transcript were `ExactTranscripts`: 28 same-request groups, 28 turn positions and zero different outputs.
 
@@ -46,7 +46,7 @@ All nine Q5 arms returned `CalibrationPass` and proved owned-process and listene
 | DeepSeek-V4 | 100.761924 s | 231.759982 s | 2.3001× | 77.112 ms | 185.078 ms | 2.4001× | 0% |
 | Gemma 4 | 12.586108 s | 61.458296 s | 4.8830× | 18.516 ms | 117.303 ms | 6.3351× | 0% |
 
-The native observer is intentionally diagnostic, not a production timing path. Its complete-round distortion is large, especially for Gemma; stage totals MUST NOT be used as unprofiled latency. Wall controls provide the undistorted complete-round denominator.
+These ratios are retained historical observations, **not** measurements of overhead against unprofiled serving. All three wall receipts contain an empty `MLX_PROFILE_CB` from the supervisor before empty controls were omitted. The Qwen wall log contains `[CB_PROFILE:...]` records; lack of those records in another family does not establish an unprofiled execution. The current analyzer rejects all three historical controls as unproven unprofiled denominators. Raw receipts, logs, stage totals and transcript-equality evidence remain unchanged. Fresh matched clean wall/profile controls are required before claiming quantified distortion; profiled stage totals MUST NOT be used as unprofiled latency.
 
 ### Width-four stage totals
 
@@ -84,27 +84,33 @@ Known stages cover 92.77% of solo-round wall time. Unknown is 7.23%, dominated b
 
 Excluded attempts are not pooled: initial exploratory Qwen arms; the first DeepSeek reference stopped before load because another process exceeded the host gate; the first Gemma reference was `PreflightRefused` because the operator-supplied digest contradicted the artifact receipt; and two Qwen K3 commands selected zero tests because they targeted the library instead of the binary test harness. None loaded a model or contributed measurements.
 
-## Reproduction
+## Historical recipe and denial replay
 
-Run one model at a time. Each Q5 case binds the paths and hashes above through `HF2Q_Q5_*` variables.
+`$E1` identifies immutable archived evidence, not a destination for new runs.
+The original nine-arm recipe used the exact binaries, artifacts and Q5 cases
+above, with `ADR065_STAGE_PROFILE=wall` / `NATIVE_PROFILE_CB=""` for each wall
+arm and `ADR065_STAGE_PROFILE=1` / `NATIVE_PROFILE_CB=1` for each profile arm.
+Those empty settings were exported by the historical supervisor. Do not rerun
+into the archived directories or regenerate its report.
+
+The original solo diagnostic command was:
 
 ```sh
-python3 scripts/four_agent/q5_calibration.py scripts/four_agent/q5_cases/qwen38.json \
-  --output "$E1/qwen38-final-wall" --negative-control-receipt "$NC/receipt.json"
-# Repeat with ADR065_STAGE_PROFILE=1, NATIVE_PROFILE_CB=1 for the profile arm,
-# and with the previous-default binary and profiling unset for the reference.
-# Repeat the same three-arm protocol for deepseek4.json and gemma4.json.
 
 HF2Q_QWEN38_GGUF="$QWEN_GGUF" \
 HF2Q_ADR065_STAGE_PROFILE=1 MLX_PROFILE_CB=1 \
   cargo test --release --locked --bin hf2q \
   qwen38_slot_aware_speculation_auto_matches_off -- \
   --ignored --nocapture --test-threads=1
+```
 
+
+Replay the original combined inputs with the current analyzer only to verify
+denial; this loads no model, exits nonzero and writes no replacement report:
+
+```sh
 python3 scripts/four_agent/adr065_stage_profile.py \
   --pair qwen38 "$E1/qwen38-final-wall" "$E1/qwen38-final-profile" "$E1/qwen38-reference" \
   --pair deepseek4 "$E1/deepseek4-caeca1b2-wall" "$E1/deepseek4-caeca1b2-profile" "$E1/deepseek4-reference-02" \
-  --pair gemma4 "$E1/gemma4-caeca1b2-wall" "$E1/gemma4-caeca1b2-profile" "$E1/gemma4-reference-02" \
-  --solo-profile qwen38 "$E1/qwen38-k3-profile.log" \
-  --output "$E1/stage-profile-report.json"
+  --pair gemma4 "$E1/gemma4-caeca1b2-wall" "$E1/gemma4-caeca1b2-profile" "$E1/gemma4-reference-02"
 ```

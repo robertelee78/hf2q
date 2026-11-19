@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- ADR-065 E1 analysis rejects native-profiled wall controls and requires source-proven omission for empty profiling settings. Historical profile/wall ratios do not qualify unprofiled observer distortion; raw diagnostics and exact-transcript evidence are retained.
+
 ## [0.1.30]
 
 Historical experiment measurements below identify their own baselines and

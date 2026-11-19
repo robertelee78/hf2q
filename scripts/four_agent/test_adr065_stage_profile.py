@@ -65,6 +65,8 @@ class StageProfileTests(unittest.TestCase):
         env = {"HF2Q_ADR065_STAGE_PROFILE": mode}
         if mode == "1":
             env["MLX_PROFILE_CB"] = "1"
+        elif mode == "wall":
+            env["MLX_PROFILE_CB"] = ""
         receipt = {
             "verdict": {"verdict": "CalibrationPass"},
             "family": "qwen38",
@@ -73,12 +75,49 @@ class StageProfileTests(unittest.TestCase):
             "binary": {"sha256": "binary"},
             "client": {"summary_path": str(client)},
             "serve_env": env,
+            "supervisor_sources": {
+                name: stage.sha256(HERE / name)
+                for name in ("q5_case.py", "q5_calibration.py")
+            },
         }
         (run / "receipt.json").write_text(json.dumps(receipt))
         (run / "server.stderr").write_text("".join(
             stage.PREFIX + json.dumps(value) + "\n" for value in records
         ))
         return run
+
+    def test_native_profiled_wall_cannot_supply_distortion_denominator(self):
+        native_line = (
+            "[CB_PROFILE:forward_gpu seq_len=5 layers=64] "
+            "total=14.87ms across 7 labels:\n"
+        )
+        cases = (
+            ("", "before", True), ("", "after", True),
+            ("1", None, True), ("0", None, True), ("", None, False),
+        )
+        for flag, placement, known_producer in cases:
+            with self.subTest(flag=flag, placement=placement, known_producer=known_producer), \
+                    tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                control = self.make_run(root, "control", "wall", [record("wall", 100)])
+                profile = self.make_run(
+                    root, "profile", "1",
+                    [record("profile", 200, cpu={"host_gap": {"count": 1, "cpu_ns": 1}})],
+                )
+                reference = self.make_run(root, "reference", "off", [])
+                receipt_path = control / "receipt.json"
+                receipt = json.loads(receipt_path.read_text())
+                receipt["serve_env"]["MLX_PROFILE_CB"] = flag
+                if not known_producer:
+                    receipt["supervisor_sources"] = {}
+                receipt_path.write_text(json.dumps(receipt))
+                log = control / "server.stderr"
+                if placement == "before":
+                    log.write_text(native_line + log.read_text())
+                elif placement == "after":
+                    log.write_text(log.read_text() + native_line)
+                with self.assertRaisesRegex(ValueError, "native command-buffer profiling"):
+                    stage.analyze_pair("qwen38", control, profile, reference)
 
     def test_pair_reports_distortion_and_excludes_unknown(self):
         with tempfile.TemporaryDirectory() as tmp:
