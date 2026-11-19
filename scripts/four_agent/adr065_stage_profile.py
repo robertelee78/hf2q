@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from q1_decision_policy import transcripts
+import q5_case
 
 PREFIX = "[ADR065_STAGE_PROFILE_JSON] "
 SCHEMA = "hf2q.adr065.stage-profile-round.v1"
@@ -50,7 +51,10 @@ def validate_receipt(run, receipt):
 
 def parse_records(path):
     records = []
+    native_profiled = False
     for line in Path(path).read_text(errors="replace").splitlines():
+        if line.startswith("[CB_PROFILE"):
+            native_profiled = True
         if not line.startswith(PREFIX):
             continue
         record = json.loads(line[len(PREFIX):])
@@ -98,6 +102,8 @@ def parse_records(path):
         records.append(record)
     if not records:
         raise ValueError(f"{path}: no {PREFIX.strip()} records")
+    if native_profiled and any(record["mode"] == "wall" for record in records):
+        raise ValueError(f"{path}: wall control contains native command-buffer profiling")
     return records
 
 
@@ -133,6 +139,27 @@ def reduce_group(records):
     }
 
 
+def _validate_wall_native_control(family, receipt):
+    env = receipt.get("serve_env", {})
+    if "MLX_PROFILE_CB" not in env:
+        return
+    if env["MLX_PROFILE_CB"] != "":
+        raise ValueError(f"{family}: wall control enables native command-buffer profiling")
+    # Empty planned controls were exported by older supervisors. Interpret them
+    # only with the exact producer whose omission semantics we can replay.
+    for name in ("q5_case.py", "q5_calibration.py"):
+        if receipt.get("supervisor_sources", {}).get(name) != sha256(Path(__file__).parent / name):
+            raise ValueError(
+                f"{family}: wall control cannot prove native command-buffer profiling "
+                f"is disabled: producer source mismatch for {name}"
+            )
+    if (
+        "MLX_PROFILE_CB" in q5_case.PASSTHROUGH
+        or "MLX_PROFILE_CB" in q5_case.child_env({}, env)
+    ):
+        raise ValueError(f"{family}: wall control exports native command-buffer profiling")
+
+
 def analyze_pair(family, control_dir, profile_dir, reference_dir):
     c_run, c_receipt, c_summary, c_summary_path = run_files(control_dir)
     p_run, p_receipt, p_summary, p_summary_path = run_files(profile_dir)
@@ -153,6 +180,7 @@ def analyze_pair(family, control_dir, profile_dir, reference_dir):
     p_env = p_receipt.get("serve_env", {})
     if c_env.get("HF2Q_ADR065_STAGE_PROFILE") != "wall":
         raise ValueError(f"{family}: control is not wall mode")
+    _validate_wall_native_control(family, c_receipt)
     if p_env.get("HF2Q_ADR065_STAGE_PROFILE") != "1" or p_env.get("MLX_PROFILE_CB") != "1":
         raise ValueError(f"{family}: profile controls are incomplete")
     control = parse_records(c_run / "server.stderr")
