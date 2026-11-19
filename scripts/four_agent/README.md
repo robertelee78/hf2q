@@ -129,6 +129,13 @@ Every family run has a `run_kind`:
    - The run then verifies that the groups are empty, the children have been reaped and the port has no listener.
    - It takes one more host sample to record memory recovery.
 
+Host-observation helpers inherit a blocked SIGTERM mask so an orderly group stop
+does not destroy an in-flight `ps`, memory or listener query. The spawning thread's
+mask is restored immediately; server/client signal handling is unchanged. Helpers
+stay in the owned process group, retain their short timeouts and remain killable
+by SIGKILL. Real observation errors are still recorded and rejected; this does not
+qualify or rewrite a previously failed sample.
+
 **Footprint source.**
 - The primary source is `/usr/bin/footprint -p PID -f bytes --noCategories` (`phys_footprint`).
 - If that fails for a member, that member's `ps` RSS is used instead. The sample is then labeled `ps-rss-fallback`, and `samples.footprint_sources` counts both kinds.

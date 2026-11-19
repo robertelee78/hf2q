@@ -5,6 +5,7 @@ short timeout. Parsers reject output they do not fully understand instead of
 returning partial numbers; a failed observation is a blind sample, never zero.
 """
 import re
+import signal
 import subprocess
 import time
 
@@ -112,9 +113,37 @@ def parse_ps(text):
     return rows
 
 
+def _observe_command(argv, timeout):
+    # A controlled group stop must not kill the in-flight observer before it
+    # records the final sample. Keep it in the owned group, still killable by
+    # SIGKILL, and restore the calling thread's mask immediately after spawn.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        raise
+    with child:
+        try:
+            # Unmasking may deliver a pending signal whose handler raises.
+            # Establish ownership cleanup before allowing that delivery.
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+            stdout, stderr = child.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.communicate()
+            raise
+        except BaseException:
+            child.kill()
+            child.wait()
+            raise
+    return subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
+
+
 def run(argv, timeout=2.0):
     try:
-        proc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        proc = _observe_command(argv, timeout)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ObservationError(f'{argv[0]}: {error!r}') from error
     if proc.returncode != 0:
@@ -164,8 +193,7 @@ def host_identity():
 def listeners(port):
     """PIDs listening on TCP port (lsof exits 1 with no output when none)."""
     try:
-        proc = subprocess.run([LSOF, '-nP', f'-iTCP:{port}', '-sTCP:LISTEN', '-t'], stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=3.0)
+        proc = _observe_command([LSOF, '-nP', f'-iTCP:{port}', '-sTCP:LISTEN', '-t'], 3.0)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ObservationError(f'lsof: {error!r}') from error
     if proc.returncode not in (0, 1):
