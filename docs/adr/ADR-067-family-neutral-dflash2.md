@@ -4434,3 +4434,51 @@ same-artifact peer still require the D5 confidence bounds. Qwen3.6's valid
 Splash comparison, D6 default/kill-switch behavior, exact RC all-family and
 cache-lifecycle gates, and actual update/rollback/publication remain open.
 
+## 2026-11-18: completed current-source reference selection
+
+Fresh selection on upstream `2cbfc3cf` retained every attempted configuration
+and all source-bound failures. Seven admitted configurations completed all
+21 interleaved initial timed N4 runs, without ordinary-task retries. Actual
+final source bytes matched independently reviewed correct patches; warmup
+timing was excluded. The initially fastest trained DFlash2 setting did not
+complete fresh confirmation: K0 and B1024 aborted in upstream
+`common_memory::seq_rm` (`common/common.cpp:1634`), while the fresh baseline
+warmup grew swap by 262144 bytes and was rejected by the unchanged zero-growth
+rule. Initial successful timings do not replace failed confirmation.
+
+The next eligible setting in the same frozen current-source ranking was
+`ngram-mod`. All twelve fresh confirmation runs passed: a discarded workload
+warmup and three actual timed positions in each envelope, with complete
+four-agent tools/unary/SSE, accepted actual patch bytes, normal pressure,
+zero positive per-run swap growth and proven owned cleanup.
+
+| Confirmation envelope | Three-run median own-output N4 makespan (s) |
+| --- | ---: |
+| baseline8192 | 113.487927 |
+| K0 | 114.385499 |
+| B1024 | 113.647474 |
+
+The selected reference is therefore `ngram-mod`, baseline8192, batch2048,
+ubatch512, with the upstream `LLAMA_KV_ROWS_DISABLE=1` setting. Four slots,
+262144 context per slot, pool1048576, F16 K/V, full GPU and all original
+sampling/workload controls remain unchanged. Evidence
+`current-peer-qwen38-finite-selection-v1/confirmed-reference-v2.json`,
+SHA-256 `dd1ec4942a74ca7667a865c91afca2b663a7b919db7a7e880aa69391e3e46d2a`,
+binds the exact selected case, source, executable identity, every retained
+selection/confirmation proof and preceding negative decisions.
+
+Current smaller MTP loads failed startup pressure/swap gates; the smallest
+gather-off M1 also grew swap before client launch. Heavier MTP configurations
+were withheld on explicitly source-bound current-host safety inference,
+not reported as executed failures or universally impossible fits. No
+pre-reboot exclusion was inherited. The configured prompt-cache quota is
+not an eagerly resident eight-GiB allocation, so removing it cannot be
+assumed to remove that startup charge.
+
+This completes reference selection, not an hf2q performance or release win.
+The last recorded host swap was 62390272 bytes: zero *growth* in passing runs
+does not satisfy DeepSeek's separate absolute 0.5-MiB admission limit.
+That prerequisite, the 5.304 mechanism floor, stock/valid-peer confidence
+bounds, Qwen3.6 Splash parity, D5/D6 and exact signed-byte all-family
+qualification remain unchanged and unwaived.
+

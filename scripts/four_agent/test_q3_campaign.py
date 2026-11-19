@@ -13,6 +13,7 @@ import math
 import os
 import re
 import shutil
+import signal
 from pathlib import Path
 import tempfile
 import unittest
@@ -1456,6 +1457,36 @@ class Metrics(unittest.TestCase):
         failed = self.receipt(client={"exit_code": 1})
         self.assertEqual(c(failed, self.summary("Failed"), False)[:2], ("Fail", "task"))
         self.assertEqual(c(failed, self.summary("Failed"), True)[:2], ("Fail", "out_of_memory"))
+
+    def test_server_abort_winning_the_client_exit_race_is_not_a_task_retry(self):
+        receipt = self.receipt(client={"exit_code": 1}, server={"exit_code": -signal.SIGABRT},
+                               verdict={"verdict": "ClientFailed"})
+        outcome, kind, _ = q3_metrics.classify(receipt, self.summary("Failed"), False)
+        self.assertEqual((outcome, kind), ("Fail", "server_exited"))
+        self.assertIsNone(q3_stats.rerun_decision(FailurePolicy.POLICY, "peer", outcome, kind, 0))
+        self.assertEqual(q3_metrics.classify(receipt, self.summary("Failed"), True)[:2],
+                         ("Fail", "out_of_memory"))
+
+    def test_server_failure_cannot_pass_or_be_resumed_as_an_unreleased_client(self):
+        for code in (1, -signal.SIGABRT, -signal.SIGSEGV):
+            with self.subTest(code=code):
+                receipt = self.receipt(server={"exit_code": code})
+                self.assertEqual(q3_metrics.classify(receipt, self.summary(), False)[:2],
+                                 ("Fail", "server_exited"))
+                self.assertEqual(q3_metrics.classify(receipt, self.summary(released=False), False)[:2],
+                                 ("NotStarted", "load_failure"))
+                self.assertEqual(q3_metrics.classify({**receipt, "client": None}, None, False)[:2],
+                                 ("NotStarted", "load_failure"))
+
+    def test_owned_server_shutdown_preserves_real_client_outcomes(self):
+        for code in (0, -signal.SIGINT, -signal.SIGTERM, -signal.SIGKILL):
+            with self.subTest(code=code):
+                receipt = self.receipt(server={"exit_code": code})
+                self.assertEqual(q3_metrics.classify(receipt, self.summary(), False)[:2], ("Pass", None))
+                receipt["client"]["exit_code"] = 1
+                outcome, kind, _ = q3_metrics.classify(receipt, self.summary("Failed"), False)
+                self.assertEqual((outcome, kind), ("Fail", "task"))
+                self.assertEqual(q3_stats.rerun_decision(FailurePolicy.POLICY, "peer", outcome, kind, 0), "rerun")
 
     def test_oom_marker_found_across_read_chunks(self):
         with tempfile.TemporaryDirectory() as tmp:

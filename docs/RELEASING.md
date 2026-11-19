@@ -67,6 +67,19 @@ The self-hosted model qualification job is off by default and runs only if
 the owner asks for it (`-f skip_qualification=false`). QE is ad hoc
 (ADR-061 D2); it never gates a release.
 
+For v0.1.30 the owner explicitly requires model qualification. The two-argument
+`release.sh` dispatch does not set that input, so use the existing explicit
+workflow interface with `-f skip_qualification=false`, then use
+`release.sh --resume <run-id>` to watch the same run. Do not dispatch this
+release with qualification skipped.
+
+Keep the protected `crates-publish` approval pending until the exact signed
+candidate has also passed the ADR-063/ADR-067 four-family quality, performance,
+default/kill-switch and serving gates. The cache-lifecycle workflow is not a
+substitute for those campaign verdicts. Reuse that run's immutable candidate
+bytes; a fresh dispatch signs different bytes and requires fresh qualification.
+The ad hoc QE playbook remains separate from these owner-requested gates.
+
 The workflow builds the candidate (without secrets), then checks the
 crates.io and Apple credentials at the start of the protected sign job,
 before it touches the candidate. It then signs, notarizes, tags, publishes
