@@ -174,6 +174,8 @@ are recorded under Changed.
 
 ### Fixed
 
+- Q5 host-observation helpers now survive an orderly group SIGTERM long enough to return their real observation, while remaining in the owned group with unchanged timeout/SIGKILL cleanup. The calling thread's signal mask is restored immediately. This prevents a memory stop from manufacturing a sampler error by killing its own `ps` query; genuine errors and all memory/qualification gates are unchanged.
+
 - Qwen prepared prefill reduces live allocations without changing arithmetic: bounded F32 TQ history tiles before BF16 casting, dead FA/MoE root reuse with last-reader barriers, and no chunk-only arenas on the ordinary route. Admission no longer charges target-layer prepared planes for separately loaded native MTP blocks. Real Metal bitwise and checked-error consumer tests pass; full-profile canonical N4 admission and final quality/performance qualification remain required.
 
 - DFlash2 AF4 uses explicit BF16 producer profiles: real-row context FC/KV
