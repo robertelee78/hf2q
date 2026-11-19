@@ -174,6 +174,20 @@ def served_template_matches(served, family):
     return any(hashlib.sha256(text.encode()).hexdigest() == pin for text in (served, served + '\n'))
 
 
+# Frozen current peer common/speculative.cpp:72-85,3186-3323. These are
+# launch-driver names, not /props sampler metadata: server-context.cpp:5613
+# copies sampling alone into a fresh task_params, whose speculative type is none.
+# Admission still binds the exact source/build/executable and supervised argv;
+# accepting a name never establishes a matching checkpoint or runtime validity.
+TRAINED_SPECULATION = frozenset({
+    'draft-simple', 'draft-eagle3', 'draft-mtp', 'draft-dflash',
+    'draft-dspark', 'draft-dflash2', 'draft-lilicorr',
+})
+SPECULATION_TYPES = TRAINED_SPECULATION | {
+    'none', 'ngram-simple', 'ngram-map-k', 'ngram-map-k4v', 'ngram-mod', 'ngram-cache',
+}
+
+
 def _selected_speculation(reference):
     require(isinstance(reference, dict), 'peer reference binding required')
     argv = reference.get('serve_argv')
@@ -182,7 +196,7 @@ def _selected_speculation(reference):
     require(argv.count('--spec-type') == 1 and argv.index('--spec-type') + 1 < len(argv),
             'peer reference requires one explicit speculation setting')
     selected = argv[argv.index('--spec-type') + 1]
-    require(selected in ('none', 'draft-mtp', 'draft-dflash2', 'ngram-simple', 'ngram-mod') and
+    require(selected in SPECULATION_TYPES and
             reference.get('selected_speculation') == selected,
             'peer reference speculation differs from the frozen launch selection')
     return selected
@@ -291,7 +305,9 @@ def validate_speculation_proof(output, packet):
             frames = [json.loads(raw)]
         timings = [frame['timings'] for frame in frames if isinstance(frame, dict) and
                    isinstance(frame.get('timings'), dict)]
-        if selected in ('draft-mtp', 'draft-dflash2'):
+        # server-common.cpp:146-166 emits these counters for every exercised
+        # driver; server-context.cpp:4940-4950 counts actually accepted drafts.
+        if selected in TRAINED_SPECULATION:
             require(bool(timings) and {'draft_n', 'draft_n_accepted'} <= set(timings[-1]),
                     f'peer {selected} {mode} response lacks draft timing counters')
         if not timings:
@@ -303,7 +319,7 @@ def validate_speculation_proof(output, packet):
         transports[mode]['responses'] += 1
         transports[mode]['drafted_tokens'] += n
         transports[mode]['accepted_tokens'] += a
-    if selected in ('draft-mtp', 'draft-dflash2'):
+    if selected in TRAINED_SPECULATION:
         for mode, proof in transports.items():
             require(all(value > 0 for value in proof.values()),
                     f'declared peer {selected} was not exercised with nonzero drafted/accepted tokens on {mode}')
