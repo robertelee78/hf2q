@@ -17,6 +17,10 @@ from test_family_peer import MODEL, TEMPLATE, ready
 
 COMMIT = '5676dfbe01e7ebe0387913680eee0ed39bf4a363'
 BUILD = 'b12352-5676dfbe0'
+# Explicit expected contract, independent of the consumer's enum constants.
+TRAINED = ('draft-simple', 'draft-eagle3', 'draft-mtp', 'draft-dflash',
+           'draft-dspark', 'draft-dflash2', 'draft-lilicorr')
+NGRAM = ('ngram-simple', 'ngram-map-k', 'ngram-map-k4v', 'ngram-mod', 'ngram-cache')
 
 
 def digest(raw):
@@ -95,7 +99,7 @@ class FrozenReference(unittest.TestCase):
 
     def test_resource_fork_metadata_does_not_hide_unlisted_native_libraries(self):
         sidecar = self.library.with_name('._' + self.library.name)
-        for selected in ('draft-mtp', 'draft-dflash2'):
+        for selected in TRAINED:
             with self.subTest(selected=selected):
                 packet = self.speculation_packet(selected)
                 self.response(stream=False)
@@ -220,7 +224,7 @@ class FrozenReference(unittest.TestCase):
             self.consume()
 
     def test_actual_unary_and_sse_counters_prove_trained_draft_exercise(self):
-        for selected in ('draft-mtp', 'draft-dflash2'):
+        for selected in TRAINED:
             with self.subTest(selected=selected):
                 packet = self.speculation_packet(selected)
                 self.response(stream=False)
@@ -233,7 +237,7 @@ class FrozenReference(unittest.TestCase):
                 self.assertFalse(proof['sampler_metadata_is_launch_selection'])
 
     def test_loaded_but_unexercised_trained_draft_is_not_valid_proof(self):
-        for selected in ('draft-mtp', 'draft-dflash2'):
+        for selected in TRAINED:
             packet = self.speculation_packet(selected)
             self.consume(packet)
             for stream in (False, True):
@@ -245,7 +249,7 @@ class FrozenReference(unittest.TestCase):
                             fp.validate_speculation_proof(self.root, packet)
 
     def test_missing_counters_in_either_transport_cannot_be_hidden_by_the_other(self):
-        for selected in ('draft-mtp', 'draft-dflash2'):
+        for selected in TRAINED:
             packet = self.speculation_packet(selected)
             for stream in (False, True):
                 self.response(stream=not stream)
@@ -255,16 +259,108 @@ class FrozenReference(unittest.TestCase):
                         fp.validate_speculation_proof(self.root, packet)
 
     def test_changed_response_bytes_and_impossible_counters_refuse(self):
-        for selected in ('draft-mtp', 'draft-dflash2'):
+        for selected in TRAINED:
             packet = self.speculation_packet(selected)
             turn = self.response()
             (turn / 'response.bin').write_bytes(b'{}')
             with self.subTest(selected=selected):
                 with self.assertRaisesRegex(Invalid, 'response proof hash'):
                     fp.validate_speculation_proof(self.root, packet)
-                self.response(3, 4)
-                with self.assertRaisesRegex(Invalid, 'counters malformed'):
-                    fp.validate_speculation_proof(self.root, packet)
+                for stream in (False, True):
+                    self.response(stream=not stream)
+                    for drafted, accepted in ((3, 4), (-1, 0), (3, -1), (True, 1), (3, False),
+                                              (3.0, 1), (3, 1.0), ('3', 1), (3, None)):
+                        self.response(drafted, accepted, stream=stream)
+                        with self.subTest(selected=selected, stream=stream, drafted=drafted, accepted=accepted):
+                            with self.assertRaisesRegex(Invalid, 'counters malformed'):
+                                fp.validate_speculation_proof(self.root, packet)
+
+    def test_all_current_ngram_drivers_keep_source_bound_readiness_without_trained_counter_requirement(self):
+        for selected in NGRAM:
+            with self.subTest(selected=selected):
+                packet = self.speculation_packet(selected)
+                result = self.consume(packet)
+                self.assertEqual(result['selected_speculation'], selected)
+                self.response(stream=False, missing_timings=True)
+                self.response(stream=True, missing_timings=True)
+                proof = fp.validate_speculation_proof(self.root, packet)
+                self.assertEqual((proof['drafted_tokens'], proof['accepted_tokens']), (0, 0))
+
+    def test_all_trained_drivers_require_both_transports_even_when_other_transport_is_valid(self):
+        for selected in TRAINED:
+            packet = self.speculation_packet(selected)
+            for stream in (False, True):
+                other = self.root / 'agent-0' / ('turn-0' if stream else 'turn-1')
+                if other.exists():
+                    for path in other.iterdir():
+                        path.unlink()
+                    other.rmdir()
+                self.response(stream=stream)
+                with self.subTest(selected=selected, stream=stream):
+                    with self.assertRaisesRegex(Invalid, 'not exercised'):
+                        fp.validate_speculation_proof(self.root, packet)
+
+    def test_unknown_selected_driver_refuses_even_with_consistent_supervisor_and_positive_counters(self):
+        packet = self.speculation_packet('draft-unknown')
+        self.response(stream=False)
+        self.response(stream=True)
+        with self.assertRaisesRegex(Invalid, 'frozen launch selection'):
+            self.consume(packet)
+        with self.assertRaisesRegex(Invalid, 'frozen launch selection'):
+            fp.validate_speculation_proof(self.root, packet)
+
+    def test_new_trained_drivers_keep_source_and_supervised_argv_refusals(self):
+        for selected in TRAINED:
+            packet = self.speculation_packet(selected)
+            self.response(stream=False)
+            self.response(stream=True)
+            for change in ('source', 'launch'):
+                bad = copy.deepcopy(packet)
+                if change == 'source':
+                    bad['peer_reference']['source_commit'] = 'f' * 40
+                else:
+                    bad['peer_supervised_launch']['serve_argv'][-1] = '99'
+                with self.subTest(selected=selected, change=change), self.assertRaises(Invalid):
+                    fp.validate_speculation_proof(self.root, bad)
+
+    def test_trained_timing_object_must_contain_both_counters_on_each_transport(self):
+        for selected in TRAINED:
+            packet = self.speculation_packet(selected)
+            for stream in (False, True):
+                self.response(stream=not stream)
+                for missing in ('draft_n', 'draft_n_accepted'):
+                    turn = self.response(stream=stream)
+                    timings = {'draft_n': 9, 'draft_n_accepted': 6}
+                    del timings[missing]
+                    raw = json.dumps({'timings': timings}).encode()
+                    if stream:
+                        raw = b'data: ' + raw + b'\n\ndata: [DONE]\n\n'
+                    (turn / 'response.bin').write_bytes(raw)
+                    (turn / 'receipt.json').write_text(json.dumps(
+                        {'stream': stream, 'response_sha256': digest(raw)}))
+                    with self.subTest(selected=selected, stream=stream, missing=missing):
+                        with self.assertRaisesRegex(Invalid, 'lacks draft timing counters'):
+                            fp.validate_speculation_proof(self.root, packet)
+
+    def test_current_drivers_preserve_both_families_matched_readiness(self):
+        for selected in TRAINED + NGRAM:
+            packet = self.speculation_packet(selected)
+            for family in ('gemma4', 'deepseek4'):
+                health, props, slots = ready(family, build_info=BUILD)
+                props['chat_template'] = TEMPLATE[family]
+                with self.subTest(selected=selected, family=family):
+                    result = fp.validate_readiness(health, props, slots, MODEL[family], family,
+                        packet['peer_reference'], packet['peer_supervised_launch'])
+                    self.assertEqual(result['selected_speculation'], selected)
+                    self.assertEqual(result['sampling'], fp.SAMPLING[family])
+                    self.assertEqual(result['context_per_slot'], 262144)
+                    self.assertEqual(result['logical_slots'], 4)
+                    # /props is sampler metadata, not the supervised driver.
+                    self.assertEqual(props['default_generation_settings']['params']['speculative.types'], 'none')
+                    props['default_generation_settings']['params']['temperature'] = 0.8
+                    with self.assertRaisesRegex(Invalid, 'sampling settings differ'):
+                        fp.validate_readiness(health, props, slots, MODEL[family], family,
+                            packet['peer_reference'], packet['peer_supervised_launch'])
 
     def test_declared_no_speculation_rejects_actual_draft_counters(self):
         reference = copy.deepcopy(self.reference)
