@@ -56,6 +56,23 @@ An operator supervisor may preserve that rejected observation and request a fres
 reading within its existing attempt/deadline limits. It must not retry a valid
 low-memory or pressure reading, and an interrupted campaign remains incomplete.
 
+## Owned tool observation
+
+The coding client's `qwen38_n1_process.py` requests tool RSS observations every
+20 ms and rejects a gap above 250 ms or owned RSS above 512 MiB. On Darwin it
+enumerates PIDs through `libproc` and reads each accessible process's RSS,
+parent/group and microsecond kernel start identity in one atomic task/BSD query.
+This avoids a new global `ps` process on every poll. Protected foreign discovery
+is retained with explicit unknown RSS/identity; an owned unknown cannot become
+zero usage, absence or successful cleanup. Other platforms keep their existing
+snapshot path. Tool deadlines and file/output quotas are unchanged.
+
+Sandbox capability proofs bind the exact helper source and host/compiler/SDK
+identities. Refresh the actual confinement proof and derived approvals after a
+helper or OS binary changes; do not patch an old proof's hashes. Before loading
+weights, freeze and verify those host inputs as well as the case and executable.
+A case dry run checks paths and expansion, not current confinement capability.
+
 ## Q5 per-family calibration (ADR-063 Q5)
 
 `q5_calibration.py` runs one supervised four-agent workload per family and writes a receipt. It follows the measured-admission Q5 text: the host must be running only this workload. The receipt records the host baseline, the host-level and process peaks, the deltas, the effective Free+cached floor with its inputs, and the cleanup. Live stops end the run before memory runs out. The supervisor never retries, never picks a favorable sample and makes no speed claim. Every receipt says `independent_review_required: true`.

@@ -55,6 +55,18 @@ class CleanupTests(unittest.TestCase):
     def test_live_descendant_fatal(self):
         self.assertFalse(self.cleanup(final={12346: (12345, 12345, 1, "descendant")})["verified"])
 
+    def test_unknown_owned_rss_is_not_zero_or_absence(self):
+        result = self.cleanup(final={12345: (1, 12345, None, "same-start")})
+        self.assertFalse(result["verified"])
+        self.assertFalse(result["final_observation"]["available"])
+        self.assertTrue(any("metrics unknown" in error for error in result["errors"]))
+
+    def test_unknown_foreign_metrics_do_not_become_owned(self):
+        rows = {12345: (1, 12345, 10, "same-start"),
+                99999: (1, 99999, None, None)}
+        self.assertEqual(process.tree(rows, 12345, {}), {12345})
+        self.assertIsNone(rows[99999][2])
+
     def test_reap_failure_fatal(self):
         self.assertFalse(self.cleanup(reap_error=subprocess.TimeoutExpired("child", 1))["verified"])
 

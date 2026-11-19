@@ -8,6 +8,7 @@ import selectors
 import signal
 import stat
 import subprocess
+import sys
 import time
 
 from qwen38_n1_verdict import Invalid, require
@@ -18,6 +19,7 @@ TARGET_LIMIT = 128 * 1024 * 1024
 TOOL_LIMIT = 64 * 1024
 WRITABLE_LIMIT = TARGET_LIMIT + 1024 * 1024
 FILE_COUNT_LIMIT = 4096
+_DARWIN_METRICS = None
 PROOF_CASES = {"compile_allowed", "compile_source_write_denied", "compile_outside_write_denied",
                "compile_network_denied", "compile_outside_read_denied", "runtime_allowed", "runtime_source_write_denied",
                "runtime_test_write_denied", "runtime_outside_write_denied",
@@ -106,8 +108,82 @@ def directory_bytes(path, limit=TARGET_LIMIT):
     return total
 
 
+def _darwin_snapshot():
+    """Atomic BSD lineage/start identity and task RSS; no observer subprocess."""
+    global _DARWIN_METRICS
+    if _DARWIN_METRICS is None:
+        import ctypes
+
+        class BSD(ctypes.Structure):
+            _fields_ = [("ids", ctypes.c_uint32 * 12), ("comm", ctypes.c_char * 16),
+                        ("name", ctypes.c_char * 32), ("group", ctypes.c_uint32 * 6),
+                        ("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64)]
+
+        class Task(ctypes.Structure):
+            _fields_ = [("sizes_and_times", ctypes.c_uint64 * 6), ("counters", ctypes.c_int32 * 12)]
+
+        class TaskAll(ctypes.Structure):
+            _fields_ = [("bsd", BSD), ("task", Task)]
+
+        class Short(ctypes.Structure):
+            _fields_ = [("ids", ctypes.c_uint32 * 4), ("comm", ctypes.c_char * 16),
+                        ("credentials", ctypes.c_uint32 * 8)]
+
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        listing, info = lib.proc_listallpids, lib.proc_pidinfo
+        listing.argtypes, listing.restype = [ctypes.c_void_p, ctypes.c_int], ctypes.c_int
+        info.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        info.restype = ctypes.c_int
+        _DARWIN_METRICS = ctypes, TaskAll, Short, listing, info
+    ctypes, task_type, short_type, listing, info = _DARWIN_METRICS
+
+    def inspect(pid, flavor, record):
+        ctypes.set_errno(0)
+        size = ctypes.sizeof(record)
+        if info(pid, flavor, 0, ctypes.byref(record), size) == size:
+            return True
+        error = ctypes.get_errno()
+        if error in (errno.ESRCH, errno.ENOENT):
+            return False
+        raise OSError(error or errno.EIO, f"tool process inspection failed: {pid}")
+
+    count = listing(None, 0)
+    require(count > 0, "process inventory unavailable")
+    capacity = count + 64
+    for _ in range(4):
+        require(capacity * ctypes.sizeof(ctypes.c_int) < 4 * 1024 * 1024, "process inventory envelope")
+        pids = (ctypes.c_int * capacity)()
+        count = listing(pids, ctypes.sizeof(pids))
+        require(count > 0, "process inventory unavailable")
+        if count < capacity:
+            break
+        capacity *= 2
+    else:
+        raise Invalid("process inventory unstable; no truncated observation")
+    rows = {}
+    record, short = task_type(), short_type()
+    for index in range(count):
+        pid = int(pids[index])
+        if pid <= 0:
+            continue
+        try:
+            if not inspect(pid, 2, record):  # PROC_PIDTASKALLINFO
+                continue
+        except PermissionError:
+            if inspect(pid, 13, short):  # Retain protected discovery, never invent zero RSS.
+                rows[pid] = (int(short.ids[1]), int(short.ids[2]), None, None)
+            continue
+        require(record.bsd.ids[3] == pid, "kernel process identity mismatch")
+        bsd = record.bsd
+        rows[pid] = (int(bsd.ids[4]), int(bsd.group[1]), int(record.task.sizes_and_times[1]),
+                     f"darwin-timeval:{bsd.start_sec}:{bsd.start_usec}")
+    return rows
+
+
 def process_snapshot():
     # No model/device queries; process RSS is an observed limit, not a hard kernel reservation.
+    if sys.platform == "darwin":
+        return _darwin_snapshot()
     result = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,pgid=,rss=,lstart="],
                             capture_output=True, timeout=2, check=True)
     require(len(result.stdout) < 4 * 1024 * 1024, "process inventory envelope")
@@ -130,6 +206,9 @@ def tree(rows, leader, known):
         changed = not new <= owned
         owned |= new
     require(all(rows[p][1] == leader for p in owned if p in rows), "tool descendant escaped group")
+    require(all(type(rows[p][2]) is int and rows[p][2] >= 0 and
+                isinstance(rows[p][3], str) and rows[p][3] for p in owned if p in rows),
+            "tool process metrics unknown")
     return owned
 
 
