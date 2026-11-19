@@ -5,6 +5,7 @@ server.stderr, readiness documents, client/summary.json with every agent's turn 
 Definitions are in docs/research/adr063-q3-campaign.md ("Per-run metrics").
 """
 import json
+import signal
 from pathlib import Path
 
 from q1_decision_policy import nearest_rank
@@ -54,16 +55,25 @@ def classify(receipt, summary, oom):
     if receipt is None:
         return "Invalid", None, "Q5 receipt missing"
     verdict, stop = receipt.get("verdict") or {}, receipt.get("stop")
+    server_exit = (receipt.get("server") or {}).get("exit_code")
+    # Q5 normally stops the server after the client. Those owned shutdown
+    # signals are not evidence that a client failure came from the server.
+    server_failed = type(server_exit) is int and server_exit not in (
+        0, -signal.SIGINT, -signal.SIGTERM, -signal.SIGKILL)
     if receipt.get("client") is None:
         if verdict.get("verdict") == "PreflightRefused":
             return "NotStarted", "preflight", f"preflight refused: {verdict.get('reason')}"
         if stop is not None and stop.get("reason") in LOAD_FAILURE_STOPS:
             kind = "out_of_memory" if oom else "load_failure"
             return "NotStarted", "load_failure", f"{kind}: {stop['reason']}: {stop.get('detail')}"
+        if server_failed:
+            return "NotStarted", "load_failure", f"server exit {server_exit} before client launch"
         return "NotStarted", "other", f"no client launched: {verdict.get('verdict')}: {verdict.get('reason')}"
     if summary is None:
         return "Invalid", None, "client launched but wrote no summary"
     if summary.get("barrier", {}).get("status") != "Released":
+        if server_failed:
+            return "NotStarted", "load_failure", f"server exit {server_exit} before client release"
         return "NotStarted", "before_release", "client ended before the four-agent release: " + str(summary.get("error"))
     if receipt.get("supervisor_error"):
         return "Invalid", None, "supervisor error after the task started: " + receipt["supervisor_error"]
@@ -74,6 +84,8 @@ def classify(receipt, summary, oom):
         if reason in ARM_FAILURE_STOPS:
             return "Fail", "out_of_memory" if oom else reason, f"supervisor stop {reason}"
         return "Invalid", None, f"supervisor stop {reason} after the task started"
+    if server_failed:
+        return "Fail", "out_of_memory" if oom else "server_exited", f"server exit {server_exit}"
     if receipt["client"].get("exit_code") == 0 and summary.get("status") == SUCCESS:
         return "Pass", None, None
     return "Fail", "out_of_memory" if oom else "task", str(summary.get("error"))
