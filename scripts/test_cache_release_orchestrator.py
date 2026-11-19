@@ -505,6 +505,57 @@ class ProcessOwnershipTests(unittest.TestCase):
         with self.assertRaisesRegex(gate.Refusal, "owned process identity"):
             gate.same_process({"pid": 1, "birth": "previously owned"}, table)
 
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin setuid inspector")
+    def test_owned_setuid_inspector_remains_identifiable_and_signalable(self):
+        reader, writer = os.pipe()
+        process = None
+        try:
+            # Fill stdout before exec so ps cannot exit before inspection.
+            os.set_blocking(writer, False)
+            try:
+                while True:
+                    os.write(writer, b"x" * 4096)
+            except BlockingIOError:
+                pass
+            os.set_blocking(writer, True)
+            process = subprocess.Popen(["/bin/ps", "-axo", "pid=,ppid=,pgid=,lstart=,comm="],
+                                       stdout=writer, stderr=subprocess.DEVNULL, start_new_session=True)
+            os.close(writer)
+            writer = None
+            os.kill(process.pid, signal.SIGSTOP)
+            row = gate.kernel_process(process.pid)
+            self.assertIsNotNone(row)
+            identity = {"pid": process.pid, "birth": row["birth"]}
+            owned = {}
+            self.assertIn(process.pid, gate.track_owned(gate.process_table(), process.pid, owned))
+            self.assertTrue(gate.signal_owned(identity, signal.SIGKILL))
+            self.assertEqual(process.wait(timeout=2), -signal.SIGKILL)
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            if writer is not None:
+                os.close(writer)
+            os.close(reader)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin split identity queries")
+    def test_pid_recycling_between_lineage_queries_is_refused(self):
+        gate.kernel_process(os.getpid())
+        ctypes, short_type, unique_type, _query = gate._BSD_PROCESS_INFO
+        identities = iter((100, 101))
+
+        def recycled(pid, flavor, _arg, buffer, size):
+            if flavor == 17:
+                ctypes.cast(buffer, ctypes.POINTER(unique_type)).contents.uniqueid = next(identities)
+            else:
+                ctypes.cast(buffer, ctypes.POINTER(short_type)).contents.pid = pid
+            return size
+
+        with mock.patch.object(gate, "_BSD_PROCESS_INFO",
+                               (ctypes, short_type, unique_type, recycled)):
+            with self.assertRaisesRegex(gate.Refusal, "identity changed during inspection"):
+                gate.kernel_process(123)
+
     def test_actual_process_group_is_owned_and_reaped(self):
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
         try:
@@ -570,11 +621,13 @@ def isolated_lease_fixture(root: Path, scenario: str, work: str) -> None:
         phase_time = mock.Mock(wraps=time)
         phase_time.monotonic.side_effect = phase_monotonic
         patches.append(mock.patch.object(gate, "time", phase_time))
-    if scenario == "canonical-argv":
+    if scenario in ("canonical-argv", "sealing"):
         original_popen = subprocess.Popen
 
         def launch(argv, *args, **kwargs):
             if argv[:2] == ["bash", str(gate.canonical_script(None))]:
+                # Sealing must reach its injected block without running the
+                # unrelated shell workload and its unauthenticated helpers.
                 put(root / "launch-contract", {"argv": argv, "cwd": str(kwargs["cwd"]),
                                                 "work": kwargs["env"]["CACHE_RELEASE_WORK"]})
                 return original_popen([sys.executable, "-c", "print('model-free canonical launch observation')"],
@@ -582,7 +635,8 @@ def isolated_lease_fixture(root: Path, scenario: str, work: str) -> None:
             return original_popen(argv, *args, **kwargs)
 
         patches.append(mock.patch.object(subprocess, "Popen", side_effect=launch))
-        gate.WALL_SECONDS, gate.TERM_SECONDS, gate.KILL_SECONDS = 4, 2, 2.5
+        if scenario == "canonical-argv":
+            gate.WALL_SECONDS, gate.TERM_SECONDS, gate.KILL_SECONDS = 4, 2, 2.5
     if scenario == "stranded":
         original_table = gate.process_table
 

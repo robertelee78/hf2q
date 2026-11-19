@@ -1085,3 +1085,23 @@ Model-free controls are in `test_cancel_smoke.py`. A loopback fake server stream
 - a missing trace;
 - a divergent control (reported, not gated);
 - that the case argv matches the CLI.
+
+## Frozen upstream trained-draft reference bindings
+
+`family_peer.py` accepts explicitly source-bound `draft-mtp` and
+`draft-dflash2` reference launches. Both require the actual supervised
+executable/argv/PID/endpoint and frozen binary/library identity. The coordinator
+then checks the hashed raw replies: each transport must provide valid draft
+counters and nonzero drafted/accepted totals across both unary and SSE.
+Loading a drafter or reporting sampler metadata does not qualify the arm.
+
+Resource-fork sidecars are excluded only when paired with an existing payload
+and identified by AppleDouble magic. A filename prefix alone cannot exempt an
+unlisted native library from identity checks.
+
+For a newly supported driver, freeze the exact eligible trained checkpoint and
+converted reference artifact, then prove current task/memory validity and
+include it in best-valid configuration selection. A historical no-speculation
+winner is not automatically current best. These are benchmark-only adapters;
+they do not activate external inference in hf2q or establish release parity.
+

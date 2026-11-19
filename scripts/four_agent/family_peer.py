@@ -182,7 +182,7 @@ def _selected_speculation(reference):
     require(argv.count('--spec-type') == 1 and argv.index('--spec-type') + 1 < len(argv),
             'peer reference requires one explicit speculation setting')
     selected = argv[argv.index('--spec-type') + 1]
-    require(selected in ('none', 'draft-mtp', 'ngram-simple', 'ngram-mod') and
+    require(selected in ('none', 'draft-mtp', 'draft-dflash2', 'ngram-simple', 'ngram-mod') and
             reference.get('selected_speculation') == selected,
             'peer reference speculation differs from the frozen launch selection')
     return selected
@@ -200,6 +200,15 @@ def _supervised_launch(packet, base_url=None):
             (base_url is None or launch['base_url'] == base_url),
             'peer supervised PID/endpoint binding differs')
     return launch
+
+
+def is_appledouble_sidecar(path):
+    """Recognize resource-fork metadata, never a native library by name alone."""
+    path = Path(path)
+    if not path.name.startswith('._') or not path.with_name(path.name[2:]).is_file():
+        return False
+    with path.open('rb') as stream:
+        return stream.read(4) == b'\x00\x05\x16\x07'
 
 
 def _reference_identity(reference, build, supervised):
@@ -238,7 +247,7 @@ def _reference_identity(reference, build, supervised):
     require(isinstance(libraries, dict) and libraries.get(identity['binary']) == binary_hash,
             'peer identity receipt must bind the executable and sibling libraries')
     siblings = {str(path) for path in Path(identity['binary']).parent.glob('*.dylib')
-                if path.is_file() and not path.is_symlink()}
+                if path.is_file() and not path.is_symlink() and not is_appledouble_sidecar(path)}
     require(siblings <= set(libraries), 'peer identity receipt omits actual sibling libraries')
     external = identity.get('external_dylibs_sha256', {})
     require(isinstance(external, dict), 'peer external library identity fields')
@@ -259,7 +268,7 @@ def _reference_identity(reference, build, supervised):
 
 
 def validate_speculation_proof(output, packet):
-    """Check actual retained replies, never /props sampler metadata, for MTP exercise."""
+    """Require actual unary/SSE draft exercise, never just sampler metadata."""
     reference = packet.get('peer_reference')
     if reference is None:
         return None
@@ -282,9 +291,9 @@ def validate_speculation_proof(output, packet):
             frames = [json.loads(raw)]
         timings = [frame['timings'] for frame in frames if isinstance(frame, dict) and
                    isinstance(frame.get('timings'), dict)]
-        if selected == 'draft-mtp':
+        if selected in ('draft-mtp', 'draft-dflash2'):
             require(bool(timings) and {'draft_n', 'draft_n_accepted'} <= set(timings[-1]),
-                    f'peer MTP {mode} response lacks draft timing counters')
+                    f'peer {selected} {mode} response lacks draft timing counters')
         if not timings:
             continue
         latest = timings[-1]
@@ -294,10 +303,10 @@ def validate_speculation_proof(output, packet):
         transports[mode]['responses'] += 1
         transports[mode]['drafted_tokens'] += n
         transports[mode]['accepted_tokens'] += a
-    if selected == 'draft-mtp':
+    if selected in ('draft-mtp', 'draft-dflash2'):
         for mode, proof in transports.items():
             require(all(value > 0 for value in proof.values()),
-                    f'declared peer MTP was not exercised with nonzero drafted/accepted tokens on {mode}')
+                    f'declared peer {selected} was not exercised with nonzero drafted/accepted tokens on {mode}')
     drafted = sum(proof['drafted_tokens'] for proof in transports.values())
     accepted = sum(proof['accepted_tokens'] for proof in transports.values())
     if selected == 'none':
