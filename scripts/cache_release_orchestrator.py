@@ -442,7 +442,7 @@ _BSD_PROCESS_INFO = None
 
 
 def kernel_process(pid: int) -> dict | None:
-    """Use kernel start identity, not second-resolution ps dates, for signals."""
+    """Use kernel lifetime identity, not second-resolution ps dates, for signals."""
     if sys.platform.startswith("linux"):
         try:
             fields = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
@@ -454,25 +454,45 @@ def kernel_process(pid: int) -> dict | None:
         if _BSD_PROCESS_INFO is None:
             import ctypes
 
-            class BSDInfo(ctypes.Structure):
-                _fields_ = [("ids", ctypes.c_uint32 * 12), ("comm", ctypes.c_char * 16),
-                            ("name", ctypes.c_char * 32), ("group", ctypes.c_uint32 * 6),
-                            ("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64)]
+            class ShortInfo(ctypes.Structure):
+                _fields_ = [("pid", ctypes.c_uint32), ("ppid", ctypes.c_uint32),
+                            ("pgid", ctypes.c_uint32), ("status", ctypes.c_uint32),
+                            ("comm", ctypes.c_char * 16), ("credentials", ctypes.c_uint32 * 8)]
+
+            class UniqueInfo(ctypes.Structure):
+                _fields_ = [("uuid", ctypes.c_uint8 * 16), ("uniqueid", ctypes.c_uint64),
+                            ("parent_uniqueid", ctypes.c_uint64), ("versions", ctypes.c_int32 * 2),
+                            ("reserved", ctypes.c_uint64 * 2)]
 
             proc_info = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pidinfo
             proc_info.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
             proc_info.restype = ctypes.c_int
-            _BSD_PROCESS_INFO = ctypes, BSDInfo, proc_info
-        ctypes, info_type, proc_info = _BSD_PROCESS_INFO
-        info = info_type()
-        ctypes.set_errno(0)
-        if proc_info(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
+            _BSD_PROCESS_INFO = ctypes, ShortInfo, UniqueInfo, proc_info
+        ctypes, short_type, unique_type, proc_info = _BSD_PROCESS_INFO
+
+        def inspect(flavor, info):
+            ctypes.set_errno(0)
+            if proc_info(pid, flavor, 0, ctypes.byref(info), ctypes.sizeof(info)) == ctypes.sizeof(info):
+                return True
             error = ctypes.get_errno()
             if error in (errno.ESRCH, errno.ENOENT):
-                return None
-            raise OSError(error or errno.EIO, f"cannot inspect kernel birth for process {pid}")
-        return {"ppid": int(info.ids[4]), "pgid": int(info.group[1]),
-                "birth": f"darwin-timeval:{info.start_sec}:{info.start_usec}"}
+                return False
+            raise OSError(error or errno.EIO, f"cannot inspect kernel identity for process {pid}")
+
+        # Unlike full BSD info, these XNU flavors do not require matching the
+        # effective UID: our own setuid /bin/ps inspector must remain observable.
+        # The lifetime unique ID is not a date or executable UUID. Bracket the
+        # lineage read so PID recycling cannot join two different processes.
+        unique, info = unique_type(), short_type()
+        if not inspect(17, unique):  # PROC_PIDUNIQIDENTIFIERINFO, 56-byte API
+            return None
+        birth = unique.uniqueid
+        if not inspect(13, info) or not inspect(17, unique):  # PROC_PIDT_SHORTBSDINFO
+            return None
+        require(info.pid == pid and unique.uniqueid == birth,
+                f"process identity changed during inspection: {pid}")
+        return {"ppid": int(info.ppid), "pgid": int(info.pgid),
+                "birth": f"darwin-unique:{birth}"}
     raise Refusal("owned process supervision requires macOS or Linux kernel identity")
 
 
