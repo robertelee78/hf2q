@@ -44,11 +44,23 @@ class NativeToolMetrics(unittest.TestCase):
 
     @unittest.skipIf(os.geteuid() == 0, "root can inspect foreign tasks")
     def test_protected_discovery_is_retained_but_not_faked_as_zero(self):
-        rows = process.process_snapshot()
-        self.assertIn(1, rows)
-        self.assertIsNone(rows[1][2])
-        self.assertIsNone(rows[1][3])
-        self.assertNotIn(1, process.tree(rows, os.getpid(), {}))
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            rows = process.process_snapshot()
+            self.assertIn(1, rows)
+            self.assertIsNone(rows[1][2])
+            self.assertIsNone(rows[1][3])
+            self.assertNotIn(1, process.tree(rows, child.pid, {}))
+        finally:
+            child.stdin.close()
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=2)
 
 
 if __name__ == "__main__":
