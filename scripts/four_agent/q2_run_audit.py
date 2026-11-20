@@ -122,6 +122,78 @@ def archived(path, sha256, size, what):
     return data
 
 
+
+def argv_value(argv, name):
+    require(type(argv) is list and all(type(value) is str for value in argv) and
+            argv.count(name) == 1 and argv.index(name) + 1 < len(argv),
+            "one bound command argument required: " + name)
+    return argv[argv.index(name) + 1]
+
+
+def authenticated_cache_control(receipt, client_dir, summary, phase_plan, engine_kind):
+    control = summary.get("c2_cache_control")
+    if control is None:
+        return None
+    require(engine_kind == "hf2q" and summary.get("family") == "qwen" and phase_plan is None and
+            summary.get("workload_variant", {}).get("id") == "divergent-edit-v1",
+            "C2 cache context outside its dedicated edited-history cohort")
+    require(type(receipt) is dict, "C2 cache context requires the actual outer receipt")
+    client = Path(client_dir).resolve()
+    command = receipt.get("client_argv")
+    approval = Path(argv_value(command, "--approval"))
+    require(approval.resolve() == client.parent / "client-approval.json" and
+            Path(argv_value(command, "--output")).resolve() == client and
+            argv_value(command, "--server-pid") == str(summary["server_pid"]),
+            "C2 coordinator approval/output/server command join")
+    packet = loads(archived(approval, argv_value(command, "--approval-sha256"),
+                            approval.stat().st_size, "coordinator approval"))
+    require(packet.get("approved") is True and
+            packet.get("schema") == coordinator.family_contract.schema("qwen", "coordinator-approval", 4) and
+            packet.get("server_pid") == summary["server_pid"] and
+            packet.get("run_id") == summary["run_id"] and
+            packet.get("base_url") == argv_value(command, "--base-url") and
+            packet.get("model") == argv_value(command, "--model") and
+            "c2_cache_control" not in packet and
+            "c2_cache_control" not in packet.get("agent_template", {}),
+            "authenticated C2 coordinator identity/capability")
+    variant = coding_long_context.select(summary["workload_variant"]["id"])
+    sources = packet.get("sources")
+    names = set(coordinator.MODULES) | set(variant.modules)
+    require(type(sources) is dict and names <= sources.keys() and all(
+        type(name) is str and Path(name).name == name and
+        coordinator.child.digest(Path(__file__).with_name(name)) == digest
+        for name, digest in sources.items()), "C2 cache-context source packet")
+    from c2_observation import activation, checked_cache_control, check_startup_identity, regular_evidence
+    log = argv_value(command, "--c2-server-log")
+    require(Path(log).resolve() == client.parent / "server.stderr" and control["server_log"] == log and
+            Path(control["startup_log"]["path"]).resolve() == client / "c2-startup.log",
+            "C2 startup evidence must belong to the actual cohort")
+    activation(packet, log, "qwen", engine_kind, phase_plan)
+    checked_cache_control(control, summary["server_pid"], summary["run_id"])
+    with regular_evidence(log) as stream:
+        check_startup_identity(control, stream)
+    for name in coordinator.AGENTS:
+        child_command = loads((client / f"{name}.command.json").read_bytes())["argv"]
+        path = client / f"{name}.approval.json"
+        digest = argv_value(child_command, "--approval-sha256")
+        require(Path(argv_value(child_command, "--approval")).resolve() == path and
+                summary["barrier"]["ready"][name]["approval_sha256"] == digest,
+                "C2 child command/ready approval join")
+        child_packet = loads(archived(path, digest, path.stat().st_size, "agent approval"))
+        require(loads((client / name / "approval-copy.json").read_bytes()) == child_packet and
+                child_packet.get("schema") == coordinator.family_contract.schema("qwen", "agent-approval", 4) and
+                child_packet.get("agent_id") == name and child_packet.get("run_id") == summary["run_id"] and
+                child_packet.get("server_pid") == summary["server_pid"] and
+                child_packet.get("base_url") == packet["base_url"] and child_packet.get("model") == packet["model"] and
+                child_packet.get("sources") == sources and
+                child_packet.get("c2_observation_sources") == packet.get("c2_observation_sources") and
+                child_packet.get("c2_cache_control") == control and
+                summary["agents"][name].get("c2_cache_control") == control,
+                "C2 coordinator/approved child/copy/result context join")
+        coordinator.agent_cache_control(child_packet, variant, "qwen", engine_kind,
+                                        summary["run_id"], summary["server_pid"])
+    return control
+
 def response_id(raw, stream):
     if not stream:
         return loads(raw)["id"]
@@ -136,12 +208,13 @@ def ordered_within(stamps, low, high):
             and all(a <= b for a, b in zip(stamps, stamps[1:])))
 
 
-def audit_agent(directory, name, result, family, engine, response_ids):
+def audit_agent(directory, name, result, family, engine, response_ids, cache_control=None):
     """Replay one agent's archived exchanges (seven, plus two per repair cycle); returns its turn receipts."""
     turns, tools = result["turns"], result["tools"]
     foreign = [f"coding agent {other}, workload {coordinator.WORKLOAD_ID}"
                for other in coordinator.AGENTS if other != name]
     seen, messages, model, previous_terminal = set(), None, None, None
+    require(result.get("c2_cache_control") == cache_control, "agent C2 cache context differs from outer authority")
     repair = result.get("repair_turns") or 0
     protocol = Workflow(repair) if repair else None
     metadata = result.get("workload_variant")
@@ -163,18 +236,21 @@ def audit_agent(directory, name, result, family, engine, response_ids):
         request_wire(request, request_raw, family, engine, result.get("request_setup"))
         model = request["model"] if model is None else model
         require(request["model"] == model, "model identity changed between turns")
+        edit = None
         if turn == 0:
             initial = json.dumps(request["messages"], ensure_ascii=False, separators=(",", ":")).encode()
             require(hashlib.sha256(initial).hexdigest() == result.get("initial_messages_sha256"),
                     "stale lineage: first request is not this agent's initial transcript")
         else:
             if variant is not None:
-                variant.before_request(messages, turn)
+                edit = variant.before_request(messages, turn)
             require(request["messages"] == messages, "stale lineage: request history does not extend the validated transcript")
         semantic, progress = [], []
         message, call, stats = replay_response(response_raw, request, turn, seen, engine, semantic,
                                                progress_frames=progress,
-                                               assistant_policy=None if protocol is None else protocol.policy)
+                                               assistant_policy=None if protocol is None else protocol.policy,
+                                               cache_miss_allowed=coordinator.edit_cache_miss_allowed(
+                                                   cache_control, variant, turn, edit))
         require(receipt.get("usage") == stats, "receipt usage differs from the raw response (usage/cache accounting)")
         rid = response_id(response_raw, request["stream"])
         require(rid not in response_ids, f"stale lineage: response id of {name} turn {turn} repeats {response_ids.get(rid)}")
@@ -270,7 +346,7 @@ def cohort_releases(summary, phase_plan, cohorts, results):
     return clocks
 
 
-def audit_run(client_dir, summary, phase_plan, engine_kind, require_width):
+def audit_run(client_dir, summary, phase_plan, engine_kind, require_width, *, receipt=None):
     """Raises ValueError with the rejection reason; returns the observed progress report."""
     require(summary.get("status") == SUCCESS, "client did not claim four-agent success")
     require_clock(summary)
@@ -282,10 +358,12 @@ def audit_run(client_dir, summary, phase_plan, engine_kind, require_width):
     cleanup = summary["client_cleanup"]
     for name in agents:
         checked_cleanup(cleanup[name])
+    cache_control = authenticated_cache_control(receipt, client_dir, summary, phase_plan, engine_kind)
     require(coordinator.aggregate(results, summary["exits"], {n: cleanup[n]["verified"] for n in agents},
                                   summary["server_pid"], summary["run_id"], engine_kind, family,
                                   summary.get("instance"), phase_plan, summary.get("workload_variant"),
-                                  summary.get("request_setup"), summary.get("repair_turns") or 0) == summary["status"],
+                                  summary.get("request_setup"), summary.get("repair_turns") or 0,
+                                  cache_control=cache_control) == summary["status"],
             "result scoring disagrees with the claimed status")
     releases = cohort_releases(summary, phase_plan, cohorts, results)
     response_ids, turns = {}, {}
@@ -294,7 +372,8 @@ def audit_run(client_dir, summary, phase_plan, engine_kind, require_width):
             result = results[name]
             require_clock(result["barrier"])
             require(result["barrier"]["release_monotonic_ns"] == releases[index], "agent did not observe its cohort release")
-            turns[name] = audit_agent(Path(client_dir) / name, name, result, family, engine_kind, response_ids)
+            turns[name] = audit_agent(Path(client_dir) / name, name, result, family, engine_kind,
+                                      response_ids, cache_control=cache_control)
             require(turns[name][0]["send_monotonic_ns"] >= releases[index], "agent request before its cohort release")
             require(type(result.get("task_completed_monotonic_ns")) is int and
                     result["task_completed_monotonic_ns"] >= turns[name][-1]["validated_terminal_monotonic_ns"],
@@ -326,7 +405,7 @@ def check_run(receipt, client_dir, summary, phase_plan, engine_kind, require_wid
     """(report, None) for an audited run, (None, reason) for one whose evidence contradicts the claimed Pass."""
     try:
         audit_receipt(receipt)
-        return audit_run(client_dir, summary, phase_plan, engine_kind, require_width), None
+        return audit_run(client_dir, summary, phase_plan, engine_kind, require_width, receipt=receipt), None
     except ValueError as error:
         return None, f"run audit: {error}"
     except (KeyError, TypeError, IndexError, AttributeError, OSError) as error:

@@ -445,6 +445,8 @@ The new `scripts/four_agent/coding_divergent_edit.py` follows the `coding_long_c
 
 At turns 3 and 5 of every agent, the client applies a deterministic context edit before sending. It truncates the tool-result message of turn `t−2` to its first 16 lines plus a fixed elision marker. That divergence point lies inside turn `t−1`'s prompt: below the latest anchor (turn `t−1`) and above the turn-`t−2` anchor. Under K = 4 the deepest valid anchor is turn `t−2`; under K = 1 the turn is cold.
 
+The live client and raw replay bind this distinction to the actual startup declaration and approved cohort, not the requested environment or a cache-skip flag. Only a real edit applied to the current request under observed K = 1 permits a cache miss; K = 4, ordinary follow-ups and repair tails retain positive-reuse checks. Raw replay independently reapplies the pinned transform and checks exact request lineage. A K1 cold response is not a K4 reuse, numerical, task-quality or performance pass.
+
 `estimate` reports per-turn wire bytes. The variant must compose with `--instance` so the paired quality gate can run on it (`quality_campaign.py` currently refuses variants, at line 126).
 
 ### 8.3 Divergent-turn worst-slot semantic TTFT (frozen limit 1)

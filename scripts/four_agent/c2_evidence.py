@@ -109,6 +109,8 @@ def client_observation(run, summary):
             record.get("run_id") == summary.get("run_id") and record.get("server_pid") == summary.get("server_pid") and
             record.get("collector_sha256") == observation.sha(HERE / "c2_observation.py"),
             "C2 observation identity/source/status mismatch")
+    require(record.get("c2_cache_control") == summary.get("c2_cache_control"),
+            "C2 startup/dispatch observation context differs")
     before = observation.metrics((client / "c2-before.prom").read_text())
     after = observation.metrics((client / "c2-after.prom").read_text())
     require(record.get("before") == before and record.get("after") == after, "C2 metric snapshot contradiction")
@@ -137,20 +139,16 @@ def client_observation(run, summary):
 
 
 def configured_depth(run):
-    rows = []
-    with (Path(run) / "server.stderr").open(encoding="utf-8", errors="replace") as stream:
-        for raw in stream:
-            line = observation.ANSI.sub("", raw)
-            if "Qwen35 multi-depth anchor store configured" in line:
-                values = re.findall(r"\banchor_depth=([0-9]+)(?=\s|$)", line)
-                require(len(values) == 1, "malformed resolved C2 worker depth")
-                rows.append(int(values[0]))
-    require(len(rows) == 1, "exactly one resolved C2 worker configuration required")
-    return rows[0]
+    with observation.regular_evidence(Path(run) / "server.stderr") as stream:
+        return observation.scan_anchor_config(stream)[0]
 
 
 def run_evidence(run, receipt, summary, depth, kind):
     require(configured_depth(run) == depth, "C2 requested depth differs from actual worker depth")
+    if kind == "divergent":
+        require(type(summary.get("c2_cache_control")) is dict and
+                summary["c2_cache_control"].get("anchor_depth") == depth,
+                "C2 divergent run requires its actual observed arm context")
     audit, failure = q2_run_audit.check_run(receipt, Path(run) / "client", summary, None, "hf2q", require_width=True)
     require(failure is None, "C2 raw client audit failed: " + str(failure))
     eligibility, routes = client_observation(run, summary)

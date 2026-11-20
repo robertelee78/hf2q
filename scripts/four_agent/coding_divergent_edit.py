@@ -58,10 +58,13 @@ class Variant:
         require(type(content) is str, "divergent edit target tool content must be text")
         lines = content.splitlines()
         edited = "\n".join(lines[:KEEP_LINES] + [self.marker])
+        original, updated = content.encode(), edited.encode()
         message["content"] = edited
         return {"turn": turn, "target_turn": target_turn, "message_index": index,
-                "original_bytes": len(content.encode()), "edited_bytes": len(edited.encode()),
-                "original_lines": len(lines), "kept_lines": min(len(lines), KEEP_LINES)}
+                "original_bytes": len(original), "edited_bytes": len(updated),
+                "original_lines": len(lines), "kept_lines": min(len(lines), KEEP_LINES),
+                "original_sha256": hashlib.sha256(original).hexdigest(),
+                "edited_sha256": hashlib.sha256(updated).hexdigest()}
 
 
 def select(name=ID, path=FIXTURE):

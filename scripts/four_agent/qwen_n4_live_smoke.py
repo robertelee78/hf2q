@@ -105,6 +105,38 @@ def workload_variant(packet, name):
     return variant
 
 
+def agent_cache_control(packet, variant, family, engine_kind, run_id, server_pid):
+    """Validate the coordinator-observed capability, never a child skip flag."""
+    control = packet.get("c2_cache_control")
+    if control is None:
+        require(packet.get("c2_observation_sources") is None, "C2 cache capability without observed context")
+        return None
+    require(family == "qwen" and engine_kind == "hf2q" and variant is not None and
+            variant.id == "divergent-edit-v1", "C2 cold control requires the pinned Qwen history edit")
+    require(packet.get("c2_observation_sources") ==
+            {"c2_observation.py": child.digest(Path(__file__).with_name("c2_observation.py"))},
+            "C2 cache-control source binding")
+    from c2_observation import checked_cache_control
+    return checked_cache_control(control, server_pid, run_id)
+
+
+def edit_cache_miss_allowed(control, variant, turn, edit):
+    """Only a checked K1 control's current, real history edit may go cold."""
+    if control is None:
+        return False
+    require(variant is not None and variant.id == "divergent-edit-v1" and
+            type(control.get("anchor_depth")) is int and control["anchor_depth"] in (1, 4),
+            "observed C2 history-edit control required")
+    if edit is None:
+        return False
+    require(type(edit) is dict and edit.get("turn") == turn and turn in (3, 5) and
+            edit.get("target_turn") == turn - 2 and
+            all(type(edit.get(key)) is str and re.fullmatch(r"[0-9a-f]{64}", edit[key])
+                for key in ("original_sha256", "edited_sha256")),
+            "current pinned history mutation required")
+    return control["anchor_depth"] == 1 and edit["original_sha256"] != edit["edited_sha256"]
+
+
 def preflight(base):
     return (set(base) - {"ctx262144_slots1_verified", "cpu_owned_io_3g_tool2g_client128m",
                          "profile24g_ack_verified"}) | {
@@ -275,7 +307,7 @@ def wait_stream_release(directory, cohort, run, token, pid):
 
 
 def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwen", instance_record=None,
-              phase_plan=None, variant_record=None, request_setup=None, repair_turns=0):
+              phase_plan=None, variant_record=None, request_setup=None, repair_turns=0, cache_control=None):
     """`instance_record` is the coordinator's {"id", "table_sha256"}; None for the canonical task.
     `phase_plan` selects the active agents and each agent's cohort; None is all four together.
     `variant_record` is the coordinator's workload variant {"id", "fixture_sha256"}; None for the canonical files.
@@ -309,6 +341,7 @@ def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwe
                 "aggregate prompt identity")
         require(result.get("instance") == instance_record, "aggregate task instance")
         require(result.get("workload_variant") == variant_record, "aggregate workload variant")
+        require(result.get("c2_cache_control") == cache_control, "aggregate observed C2 cache control")
         require(result.get("request_setup") == request_setup, "aggregate request setup")
         require(result.get("phase") == agent_phase(phase_plan, agent), "aggregate phase cohort")
         require(result.get("final_source_sha256") == result.get("observed_final_source_sha256")
@@ -405,9 +438,13 @@ def main():
     started = time.monotonic()
     native = None
     c2_observer = None
+    cache_control = None
     try:
         require(child.digest(args.approval) == args.approval_sha256, "coordinator approval hash")
         packet = loads(Path(args.approval).read_bytes())
+        require("c2_cache_control" not in packet and
+                "c2_cache_control" not in packet.get("agent_template", {}),
+                "C2 cache control is coordinator-derived")
         require(packet.get("schema") == family_contract.schema(args.family, "coordinator-approval", 4) and
                 packet.get("profile") == family_contract.profile(args.family, 4) and packet.get("approved") is True, "N4 approval")
         family_contract.validate_binding(packet, args.family, 4)
@@ -486,6 +523,9 @@ def main():
         template = packet.get("agent_template", {})
         validate_preflight(template.get("preflight"), PREFLIGHT, args.engine_kind, args.family, args.request_setup)
         summary["run_id"] = run
+        if args.c2_server_log is not None and variant is not None and variant.id == "divergent-edit-v1":
+            cache_control = c2_observation.cache_control(args.c2_server_log, output, args.server_pid, run)
+            summary["c2_cache_control"] = cache_control
         if args.phase_plan is not None:
             summary["phase"] = {"plan": args.phase_plan, "cohorts": [list(c) for c in cohorts], "releases": []}
         barrier = output / "barrier"
@@ -503,6 +543,9 @@ def main():
                        "model": args.model, "approved": True, **({} if workload is None else workload.binding()),
                        **({} if variant is None else variant.binding()),
                        **({"repair_turns": args.repair_turns} if args.repair_turns else {})}
+            if cache_control is not None:
+                binding.update(c2_cache_control=cache_control,
+                               c2_observation_sources=packet["c2_observation_sources"])
             approval_path = output / f"{agent}.approval.json"
             save_new(approval_path, binding)
             command = agent_command(args, module_dir, agent, path, approval_path, barrier, run, token)
@@ -528,7 +571,8 @@ def main():
             time.sleep(0.02)
         release = barrier_release(records, run, args.server_pid, token, hashes, args.instance, agents)
         if args.c2_server_log is not None:
-            c2_observer = c2_observation.Observation(args.base_url, args.c2_server_log, output, run, args.server_pid)
+            c2_observer = c2_observation.Observation(args.base_url, args.c2_server_log, output, run,
+                                                   args.server_pid, cache_control=cache_control)
         require(not INTERRUPTED, "interrupted before shared release")
         if args.phase_plan is not None:
             release.update(phase_plan=args.phase_plan, cohort=1)
@@ -639,7 +683,7 @@ def main():
             try:
                 summary["status"] = aggregate(results, exits, cleanup, args.server_pid, run, args.engine_kind, args.family,
                                               summary.get("instance"), args.phase_plan, summary.get("workload_variant"),
-                                              args.request_setup, args.repair_turns)
+                                              args.request_setup, args.repair_turns, cache_control=cache_control)
                 if (args.engine_kind == "peer" and packet.get("peer_reference") is not None
                         and summary["status"] == "FourAgentProtocolCompleteAwaitingIndependentReview"):
                     from family_peer import validate_speculation_proof

@@ -105,10 +105,11 @@ class TraceFile:
 
 
 def replay_response(raw, request, turn, seen, engine, semantic_frames=None, *, assistant_policy=None,
-                    progress_frames=None):
+                    progress_frames=None, cache_miss_allowed=False):
     """Use mature actual parser; framing is identical to exchange, not a new oracle.
     `progress_frames` collects frames that grew reasoning or semantic output (exchange's progress events)."""
     policy = {} if assistant_policy is None else {"assistant_policy": assistant_policy}
+    policy["cache_miss_allowed"] = cache_miss_allowed
     if not request["stream"]:
         return unary(raw, request["model"], turn, seen, engine, **policy)
     parser = SSE(request["model"], turn, seen, engine, **policy)

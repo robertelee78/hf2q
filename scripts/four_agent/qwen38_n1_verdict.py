@@ -97,7 +97,10 @@ def wire(request, family="qwen", setup=None):
     return result
 
 
-def usage(value, turn, engine_kind="hf2q"):
+def usage(value, turn, engine_kind="hf2q", *, cache_miss_allowed=False):
+    require(type(cache_miss_allowed) is bool and
+            (not cache_miss_allowed or (engine_kind == "hf2q" and turn > 0)),
+            "cold-edit control requires an hf2q follow-up")
     if engine_kind not in ("hf2q", "peer"):
         from native_peers import adapter
         return adapter(engine_kind).usage(value, turn)
@@ -112,7 +115,8 @@ def usage(value, turn, engine_kind="hf2q"):
     cached = integer(value.get("prompt_tokens_details", {}).get("cached_tokens"),
                      "cached tokens", prompt)
     require(prompt + 8192 <= 262144, "context plus full output exceeds context")
-    require(cached == 0 if turn == 0 else cached > 0, "prefix reuse not proven")
+    require(cached == 0 if turn == 0 else cached > 0 or cache_miss_allowed,
+            "prefix reuse not proven")
     return value
 
 
@@ -160,7 +164,8 @@ def assistant_step(message, finish, expected, seen_ids):
     return cid, name, args
 
 
-def unary(raw, model, turn, seen, engine_kind="hf2q", *, assistant_policy=None):
+def unary(raw, model, turn, seen, engine_kind="hf2q", *, assistant_policy=None,
+          cache_miss_allowed=False):
     obj = loads(raw)
     require(isinstance(obj, dict) and "error" not in obj, "API error")
     if engine_kind not in ("hf2q", "peer"):
@@ -173,7 +178,7 @@ def unary(raw, model, turn, seen, engine_kind="hf2q", *, assistant_policy=None):
     message = choices[0].get("message")
     policy = assistant if assistant_policy is None else assistant_policy
     call = policy(message, choices[0].get("finish_reason"), turn, seen)
-    stats = usage(obj.get("usage"), turn, engine_kind)
+    stats = usage(obj.get("usage"), turn, engine_kind, cache_miss_allowed=cache_miss_allowed)
     output_budget(stats, choices[0].get("finish_reason"))
     return message, call, stats
 
@@ -186,8 +191,10 @@ def output_budget(stats, finish):
 
 class SSE:
     """Consume every complete SSE data frame, including usage and terminal marker."""
-    def __init__(self, model, turn, seen, engine_kind="hf2q", *, assistant_policy=None):
+    def __init__(self, model, turn, seen, engine_kind="hf2q", *, assistant_policy=None,
+                 cache_miss_allowed=False):
         self.engine_kind = engine_kind
+        self.cache_miss_allowed = cache_miss_allowed
         self.native_frame = None
         if engine_kind not in ("hf2q", "peer"):
             from native_peers import adapter
@@ -222,7 +229,8 @@ class SSE:
         require(isinstance(choices, list), "SSE choices")
         if not choices:
             require(self.finish is not None and self.stats is None, "misordered usage")
-            self.stats = usage(obj.get("usage"), self.turn, self.engine_kind)
+            self.stats = usage(obj.get("usage"), self.turn, self.engine_kind,
+                               cache_miss_allowed=self.cache_miss_allowed)
             return False
         require(self.finish is None and len(choices) == 1 and choices[0].get("index") == 0,
                 "duplicate/postfinish choice")
@@ -255,7 +263,8 @@ class SSE:
             self.finish = choice["finish_reason"]
         if obj.get("usage") is not None:
             require(self.finish is not None and self.stats is None, "usage before/duplicate finish")
-            self.stats = usage(obj["usage"], self.turn, self.engine_kind)
+            self.stats = usage(obj["usage"], self.turn, self.engine_kind,
+                               cache_miss_allowed=self.cache_miss_allowed)
         return semantic
 
     def result(self):
