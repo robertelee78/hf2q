@@ -29,6 +29,7 @@ import hashlib
 import itertools
 import json
 from pathlib import Path
+import coding_long_context
 
 from f2_semantic import semantic_timing_v3
 from q2_certify import checked_cleanup, replay_response, request_wire, require_clock
@@ -143,6 +144,12 @@ def audit_agent(directory, name, result, family, engine, response_ids):
     seen, messages, model, previous_terminal = set(), None, None, None
     repair = result.get("repair_turns") or 0
     protocol = Workflow(repair) if repair else None
+    metadata = result.get("workload_variant")
+    variant = None
+    if metadata is not None:
+        require(isinstance(metadata, dict), "malformed workload variant")
+        variant = coding_long_context.select(metadata.get("id"))
+        require(metadata == variant.record(), "workload variant configuration differs from pinned transform")
     require(len(tools) <= max_tools(repair) and len(turns) == len(tools) + 1, "turn/tool count")
     for turn, receipt in enumerate(turns):
         require_clock(receipt)
@@ -161,6 +168,8 @@ def audit_agent(directory, name, result, family, engine, response_ids):
             require(hashlib.sha256(initial).hexdigest() == result.get("initial_messages_sha256"),
                     "stale lineage: first request is not this agent's initial transcript")
         else:
+            if variant is not None:
+                variant.before_request(messages, turn)
             require(request["messages"] == messages, "stale lineage: request history does not extend the validated transcript")
         semantic, progress = [], []
         message, call, stats = replay_response(response_raw, request, turn, seen, engine, semantic,

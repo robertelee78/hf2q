@@ -312,6 +312,8 @@ impl Qwen35DecodeState {
         #[cfg(test)]
         q1_speculation::first_fork::verifier_pre_catchup(draft.entry.next_pos, &logits, &hidden)?;
         let verify_elapsed = verify_started.elapsed();
+        #[cfg(test)]
+        super::anchor_exactness_tests::trace::route(self.slot_id, "K3-actual-solo-verify-checked");
         Ok(K3VerifyRows {
             logits,
             hidden,
@@ -596,6 +598,8 @@ impl Qwen35DecodeState {
             return Err(error);
         }
         let committed = self.k3_commit_finish(qwen, kv_cache, plan)?;
+        #[cfg(test)]
+        super::anchor_exactness_tests::trace::route(self.slot_id, "K3-actual-solo-completed");
         Ok(K3SoloCommit {
             committed,
             state_elapsed,

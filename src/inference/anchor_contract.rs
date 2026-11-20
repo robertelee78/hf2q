@@ -154,6 +154,10 @@ pub(crate) fn physical_cursor(
 }
 
 impl Store {
+    #[cfg(test)]
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
     pub fn new(
         identity: Identity,
         keep: usize,
@@ -314,8 +318,10 @@ impl Store {
         prefix_digest: &[u8; 32],
         required: &[Component],
     ) -> Result<RestoreTicket, &'static str> {
+        // A checked capture has ended before publication becomes pending.
+        // Rule 4 excludes live construction, not an unpublished payload:
+        // pending itself remains unavailable because it is not committed.
         if self.poisoned
-            || self.pending.is_some()
             || self.constructing.is_some()
             || identity != &self.identity
             || self.invalid.contains(&id)

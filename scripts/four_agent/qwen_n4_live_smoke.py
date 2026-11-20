@@ -382,6 +382,8 @@ def main():
     parser.add_argument("--repair-turns", type=int, choices=(0, 1), default=0,
                         help="repair cycles after a failed run_tests (Qwen3.6 operator decision 2026-11-03), "
                              "bound by the approval's repair_turns; omit for the canonical six-step protocol")
+    parser.add_argument("--c2-server-log",
+                        help="C2-only owned stderr path; separately source-bound in coordinator approval")
     args = parser.parse_args()
     family_contract.validate_selection(args.family, args.engine_kind, 4)
     from qwen38_n1_smoke import new_output, PREFLIGHT
@@ -402,6 +404,7 @@ def main():
     cohorts, agents = phase_cohorts(args.phase_plan), active_agents(args.phase_plan)
     started = time.monotonic()
     native = None
+    c2_observer = None
     try:
         require(child.digest(args.approval) == args.approval_sha256, "coordinator approval hash")
         packet = loads(Path(args.approval).read_bytes())
@@ -457,6 +460,12 @@ def main():
                     and args.benchmark_profile is None,
                     "repair turns are Qwen hf2q/peer/Splash-qwen36 runs without a benchmark profile")
             summary["repair_turns"] = args.repair_turns
+        if args.c2_server_log is not None:
+            import c2_observation
+            c2_observation.activation(packet, args.c2_server_log, args.family, args.engine_kind, args.phase_plan)
+        else:
+            require(packet.get("c2_server_log") is None and packet.get("c2_observation_sources") is None,
+                    "C2 observation approval requires explicit CLI activation")
         if args.engine_kind in family_contract.ADAPTER_KINDS:  # the arm's registry, client modules and test
             from native_peers import adapter
             native = adapter(args.engine_kind)
@@ -518,6 +527,8 @@ def main():
                             "ready output/approval mismatch")
             time.sleep(0.02)
         release = barrier_release(records, run, args.server_pid, token, hashes, args.instance, agents)
+        if args.c2_server_log is not None:
+            c2_observer = c2_observation.Observation(args.base_url, args.c2_server_log, output, run, args.server_pid)
         require(not INTERRUPTED, "interrupted before shared release")
         if args.phase_plan is not None:
             release.update(phase_plan=args.phase_plan, cohort=1)
@@ -652,6 +663,13 @@ def main():
                 summary["benchmark_metrics"] = cohort_score(results)
             except BaseException as exc:
                 summary["status"], summary["error"] = "Failed", str(exc)
+        if c2_observer is not None:
+            try:
+                summary["c2_observation"] = c2_observer.finish()
+                summary["c2_observation"]["sha256"] = child.digest(summary["c2_observation"]["path"])
+            except BaseException as exc:
+                summary["status"] = "Failed"
+                summary["c2_observation_error"] = f"{type(exc).__name__}: {exc}"
         (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 0 if summary["status"] == "FourAgentProtocolCompleteAwaitingIndependentReview" else 1
 

@@ -1,0 +1,134 @@
+{
+  "schema": "hf2q.q5.calibration-case.v1",
+  "family": "qwen36",
+  "notes": [
+    "ADR-063 C2 D5 cancellation/retry arm: qwen36, K=1. Real predecessor requests complete before the unchanged four-stream cancellation protocol; only the owned victim is retried, then the original no-cancel control cohort runs.",
+    "RECORDED_CLIENT must be a successful declared workload recording for the identical artifact/configuration; Qwen3.6 requires repair_turns=1 source workload. WARMUP_TURN names the recorded predecessor of TURN. No tool execution or repair behavior is invented by the replay client.",
+    "Requires one actual cancellation-recovery event in the unique acknowledged cancel interval, complete idle anchor ownership gauges, and retry first semantic SSE-token time. Missing or ambiguous evidence fails closed.",
+    "Speculation and DFlash2 retain the canonical launcher policy; this case does not relabel default DFlash2 as spec-off. Root binds actual resolved routes in campaign evidence."
+  ],
+  "workload": {
+    "id": "adr063-c2-cancel-qwen36-k1-n4-ctx262144",
+    "slots": 4,
+    "context_per_slot": 262144,
+    "client": "scripts/four_agent/cancel_smoke.py run --family qwen36 --c2-anchor-depth 1",
+    "anchors_per_slot": 1,
+    "anchor_bytes_per_slot_max": 135056384,
+    "speculation_capture_bytes": 0
+  },
+  "variables": {
+    "HF2Q_BIN": "{REPO}/target/release/hf2q",
+    "MODEL": "{REPO}/models/qwen36-stock-adr063/Qwen3.6-35B-A3B-vanilla-Q4_K_M.gguf",
+    "MODEL_SHA256": "815a22cab21649948352c0eea6e9be0d9d15606e2024d86e7bdb71fb9df08220",
+    "MODEL_ID": "Qwen3.6 35B A3B",
+    "PORT": "18236",
+    "RECORDED_CLIENT": null,
+    "TURN": "2",
+    "CANCEL_AGENT": "0",
+    "CANCEL_AFTER_EVENTS": "16",
+    "LOG_FILTER": "hf2q=info,mlx_native=info,hf2q::serve::api::engine_qwen35::progress=debug",
+    "DFLASH2_POLICY": "",
+    "DFLASH2_DESCRIPTOR": "",
+    "DFLASH2_QUALIFICATION": "",
+    "DFLASH2_PROFILE": "",
+    "WARMUP_TURN": "1"
+  },
+  "binary": "{HF2Q_BIN}",
+  "artifact": {
+    "path": "{MODEL}",
+    "sha256": "{MODEL_SHA256}"
+  },
+  "port": "{PORT}",
+  "serve": {
+    "argv": [
+      "/bin/bash",
+      "{REPO}/scripts/serve_qwen36_opencode.sh"
+    ],
+    "env": {
+      "MODEL": "{MODEL}",
+      "VISION_MODE": "off",
+      "KV_CACHE_BUDGET_BYTES": "51539607552",
+      "REP_PENALTY": "1.05",
+      "THINKING_TOKEN_BUDGET": "2048",
+      "TOOL_THINKING_TOKEN_BUDGET": "512",
+      "MAX_SLOTS": "4",
+      "HOST": "127.0.0.1",
+      "PORT": "{PORT}",
+      "HF2Q_BIN": "{HF2Q_BIN}",
+      "HF2Q_QWEN_ANCHOR_DEPTH": "1",
+      "HF2Q_QWEN_ANCHOR_BYTES_PER_SLOT_MAX": "135056384",
+      "LOG_FILTER": "{LOG_FILTER}"
+    }
+  },
+  "readiness": {
+    "url": "http://127.0.0.1:{PORT}/readyz",
+    "field": "ready",
+    "equals": true,
+    "timeout_seconds": 900,
+    "record": [
+      "http://127.0.0.1:{PORT}/health",
+      "http://127.0.0.1:{PORT}/hf2q/v1/runtime"
+    ],
+    "checks": [
+      {
+        "url": "http://127.0.0.1:{PORT}/health",
+        "field": "model",
+        "equals": "{MODEL_ID}"
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/health",
+        "field": "context_length",
+        "equals": 262144
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "serve.max_slots",
+        "equals": 4
+      },
+      {
+        "url": "http://127.0.0.1:{PORT}/hf2q/v1/runtime",
+        "field": "measurement_snapshot.active_controls.vision_projector",
+        "equals": false
+      }
+    ]
+  },
+  "client": {
+    "argv": [
+      "{PYTHON}",
+      "-E",
+      "-s",
+      "-B",
+      "{REPO}/scripts/four_agent/cancel_smoke.py",
+      "run",
+      "--base-url",
+      "http://127.0.0.1:{PORT}/v1",
+      "--model",
+      "{MODEL_ID}",
+      "--family",
+      "qwen36",
+      "--requests",
+      "{RECORDED_CLIENT}",
+      "--turn",
+      "{TURN}",
+      "--cancel-agent",
+      "{CANCEL_AGENT}",
+      "--cancel-after-events",
+      "{CANCEL_AFTER_EVENTS}",
+      "--server-log",
+      "{OUT}/server.stderr",
+      "--server-pid",
+      "{SERVER_PID}",
+      "--output",
+      "{OUT}/client",
+      "--c2-anchor-depth",
+      "1",
+      "--warmup-turn",
+      "{WARMUP_TURN}"
+    ],
+    "env": {},
+    "summary": "{OUT}/client/summary.json",
+    "success_status": "CancelSmokePass",
+    "timeout_seconds": 3600
+  },
+  "policy": {}
+}

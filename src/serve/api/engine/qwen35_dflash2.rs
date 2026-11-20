@@ -40,6 +40,36 @@ fn reinstall(slots: &mut [Option<Qwen35Slot>], lanes: impl IntoIterator<Item = L
     }
 }
 
+/// The serving route resolver, shared with real-artifact exactness acquisition.
+pub(in crate::serve::api) fn resolved_dflash2_forward(
+    config: Qwen35JointDecodeConfig,
+    prefill_pending: bool,
+) -> Qwen35DFlash2Forward {
+    let tail_block = crate::serve::api::engine_qwen35::dflash2_tail_block_arm();
+    let tail_on = tail_block != Some(false);
+    let draft_prefetch = tail_on && !prefill_pending
+        && crate::serve::api::engine_qwen35::dflash2_draft_prefetch();
+    let decisions = if tail_on {
+        crate::serve::api::engine_qwen35::dflash2_decision_route()
+    } else {
+        crate::serve::api::engine_qwen35::Qwen35DecisionRoute::HostLogits
+    };
+    Qwen35DFlash2Forward {
+        mode: config.mode,
+        dense_ffn: config.dense_ffn,
+        options: JointStepOptions {
+            projection: JointProjectionKernel::Canonical,
+            pooled_outputs: config.step.pooled_outputs,
+            verify_attention_tile: verify_attn_tile::enabled(),
+            verify_mixer_fused: joint_mixer_fused::enabled(),
+            dflash2: DFlash2VerifyOptions { hold_layer_outputs: draft_prefetch },
+        },
+        draft_prefetch,
+        decisions,
+        tail_block,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_qwen35_dflash2(
     guard: &mut Qwen35KvGuard<'_>,
@@ -50,6 +80,7 @@ pub(super) fn run_qwen35_dflash2(
     prompt_anchors: &mut [Qwen35AnchorStore],
     registration: Option<&ModelRegistration>,
     handles: &[SlotHandle],
+    decode_ready_lanes: usize,
     kv_bytes_per_token: u64,
     config: Option<Qwen35JointDecodeConfig>,
     supervisor: &EngineSupervisor,
@@ -81,6 +112,9 @@ pub(super) fn run_qwen35_dflash2(
                     return false;
                 };
                 if *installed != handle || reply.client_closed() {
+                    return false;
+                }
+                if prompt_anchors[handle.slot_id.0 as usize].open_transaction().is_some() {
                     return false;
                 }
                 let slot = handle.slot_id.0 as usize;
@@ -145,6 +179,14 @@ pub(super) fn run_qwen35_dflash2(
             "Qwen DFlash2 decode engaged"
         );
     });
+    tracing::debug!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        lanes = lanes.len(),
+        serial = serial.len(),
+        turn_lanes = handles.len(),
+        path = "joint",
+        "Qwen DFlash2 decode turn"
+    );
     let step = {
         let _native_invocation = scheduler.trace_transaction(
             "qwen35",
@@ -155,40 +197,10 @@ pub(super) fn run_qwen35_dflash2(
             .iter_mut()
             .map(|lane| &mut lane.state)
             .collect::<Vec<_>>();
-        // The tail switches, or the stock route in an "off" block of the
-        // within-run measurement diagnostic.
-        let tail_block = crate::serve::api::engine_qwen35::dflash2_tail_block_arm();
-        let tail_on = tail_block != Some(false);
-        let draft_prefetch = tail_on
-            && !prefill_pending
-            && crate::serve::api::engine_qwen35::dflash2_draft_prefetch();
-        let decisions = if tail_on {
-            crate::serve::api::engine_qwen35::dflash2_decision_route()
-        } else {
-            crate::serve::api::engine_qwen35::Qwen35DecisionRoute::HostLogits
-        };
         guard.model.run_dflash2_step(
             guard.kv.as_mut().expect("kv Some during loop"),
             &mut states,
-            Qwen35DFlash2Forward {
-                mode: config.mode,
-                dense_ffn: config.dense_ffn,
-                options: JointStepOptions {
-                    projection: JointProjectionKernel::Canonical,
-                    pooled_outputs: config.step.pooled_outputs,
-                    verify_attention_tile: verify_attn_tile::enabled(),
-                    verify_mixer_fused: joint_mixer_fused::enabled(),
-                    dflash2: DFlash2VerifyOptions {
-                        // With the prefetch the next draft is committed
-                        // before the step's commit settles; the layer
-                        // outputs are released after it.
-                        hold_layer_outputs: draft_prefetch,
-                    },
-                },
-                draft_prefetch,
-                decisions,
-                tail_block,
-            },
+            resolved_dflash2_forward(config, prefill_pending),
             supervisor,
             &|error| !supervisor.is_healthy() || is_fatal_command_buffer_error(error),
         )
@@ -207,6 +219,9 @@ pub(super) fn run_qwen35_dflash2(
             });
         }
     };
+    super::qwen35_joint_decode::record_c2_decode_lane_steps(
+        decode_ready_lanes, ticks.iter().filter(|tick| tick.is_ok()).count(), 0, "dflash2", "joint",
+    );
 
     let mut owned = lanes.into_iter().zip(ticks);
     while let Some((lane, tick)) = owned.next() {

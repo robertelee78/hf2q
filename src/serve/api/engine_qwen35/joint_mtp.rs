@@ -792,7 +792,7 @@ pub(in crate::serve::api) fn run_joint_mtp_step(
                             state.finish_joint_tick(qwen, kv_cache, supervisor, lane.target, output)
                         }
                         (Qwen35JointMtpRole::Window(window), Verified::Window { plan, tokens }) => {
-                            state
+                            let tick = state
                                 .settle_joint_mtp_window(
                                     qwen,
                                     kv_cache,
@@ -802,7 +802,13 @@ pub(in crate::serve::api) fn run_joint_mtp_step(
                                     hidden_rows,
                                     plan,
                                 )
-                                .and_then(|()| state.joint_mtp_drain_tick(qwen))
+                                .and_then(|()| state.joint_mtp_drain_tick(qwen));
+                            #[cfg(test)]
+                            if tick.is_ok() && !drafts[index].is_empty() {
+                                super::anchor_exactness_tests::trace::route(
+                                    state.slot_id, "JointMTP-actual-window-completed");
+                            }
+                            tick
                         }
                         (_, Verified::Failed(error)) => Err(error),
                         _ => Err(anyhow::anyhow!("Qwen joint MTP lane role changed")),

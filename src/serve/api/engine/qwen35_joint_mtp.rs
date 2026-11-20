@@ -38,6 +38,7 @@ pub(super) fn run_qwen35_joint_mtp_group(
     group: Vec<SlotHandle>,
     serial_lanes: usize,
     turn_lanes: usize,
+    decode_ready_lanes: usize,
     kv_bytes_per_token: u64,
     config: Qwen35JointDecodeConfig,
     supervisor: &EngineSupervisor,
@@ -108,6 +109,9 @@ pub(super) fn run_qwen35_joint_mtp_group(
             });
         }
     };
+    super::record_c2_decode_lane_steps(
+        decode_ready_lanes, ticks.iter().filter(|tick| tick.is_ok()).count(), 0, "mtp", "joint",
+    );
 
     let mut owned = lanes.into_iter().zip(ticks);
     while let Some((lane, tick)) = owned.next() {

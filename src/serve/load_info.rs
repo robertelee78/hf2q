@@ -1825,6 +1825,8 @@ mod tests {
             }),
         };
         let loaded = Qwen35LoadedModel {
+            #[cfg(test)]
+            c2_model_witness: std::sync::Arc::new(()),
             model: Qwen35Model::empty_from_cfg(cfg),
             tokenizer: tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             chat_template: "{{ messages }}".to_string(),

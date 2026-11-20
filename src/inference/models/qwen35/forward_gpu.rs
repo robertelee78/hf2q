@@ -92,6 +92,10 @@ pub(crate) use joint_decode::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowO
 mod joint_verify;
 pub(crate) use joint_verify::{Qwen35JointVerify, Qwen35JointVerifyLane, Qwen35JointVerifyPending};
 
+#[cfg(test)]
+#[path = "native_head_observer.rs"]
+mod native_head_observer;
+
 /// Segment views own the shared attention roots until the outer checked drain,
 /// including when the layer loop returns an error before its terminal wait.
 struct JointSegmentScratch {
@@ -1900,6 +1904,8 @@ fn apply_output_head_gpu_into_buf_and_normed(
     };
     enc.commit_and_wait_labeled(label)
         .context("commit output_head fused norm+lm_head")?;
+    #[cfg(test)]
+    native_head_observer::completed(&normed)?;
 
     // Optional: dump output-norm stats to stderr.
     if dump_layer_n().is_some() {
@@ -2193,6 +2199,8 @@ fn apply_output_head_gpu_last_with_nextn_hidden(
     .context("lm_head projection from final nextn row")?;
     enc.commit_and_wait_labeled("output_head.nextn_norm_last_lm_head")
         .context("commit output_head nextn norm + last lm_head")?;
+    #[cfg(test)]
+    native_head_observer::completed(&last_normed)?;
 
     Ok((
         download_f32(&logits).context("download nextn final logits")?,
@@ -7890,6 +7898,12 @@ impl Qwen35Model {
                     .context("commit fallback for held last-layer encoder")?;
             }
         }
+        #[cfg(test)]
+        let c2_head = if matches!(output_head_mode, OutputHeadMode::All | OutputHeadMode::Last) {
+            native_head_observer::Scope::begin()?
+        } else {
+            None
+        };
         let logits = match output_head_mode {
             OutputHeadMode::All => {
                 if let Some(out) = nextn_hidden_out.as_mut() {
@@ -8016,6 +8030,25 @@ impl Qwen35Model {
                 Vec::new()
             }
         };
+        #[cfg(test)]
+        let c2_normed = c2_head.as_ref().map(|scope| scope.take()).transpose()?;
+        #[cfg(test)]
+        if let Some(normed) = c2_normed.as_ref().filter(|_| joint.is_none()) {
+            let values = match logits_buffer_out.as_ref().and_then(|out| out.as_ref()) {
+                Some(buffer) => buffer.as_logical_slice::<f32>()?,
+                None => logits.as_slice(),
+            };
+            ensure!(
+                values.len() % cfg.vocab_size as usize == 0
+                    && normed.len() == values.len() / cfg.vocab_size as usize * h as usize,
+                "native output-head logits and normalized hidden row extents differ"
+            );
+            crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::forward(
+                slot_id, usize::try_from(positions_flat[0])?, tokens,
+                if matches!(output_head_mode, OutputHeadMode::All) { "serial-All" } else { "serial-Last" },
+                values, cfg.vocab_size as usize, Some(normed), h as usize,
+            )?;
+        }
         if let Some(plan) = joint.as_ref() {
             // The other rows a lane's own forwards project: each earlier
             // lane's last row, and the last content row of a lane that folds
@@ -8040,6 +8073,14 @@ impl Qwen35Model {
                     .with_context(|| format!("joint prefill lane {index} logits of row {row}"))
                 };
                 let boundary = lane.boundary_row().map(&mut head).transpose()?;
+                #[cfg(test)]
+                if let (Some(scope), Some(boundary)) = (c2_head.as_ref(), boundary.as_ref()) {
+                    let normed = scope.take()?;
+                    let prefix = lane.boundary.as_ref().context("native prefill boundary")?.prefix_rows;
+                    native_head_observer::lane(lane, 0, prefix, tokens, positions_flat,
+                        "joint-prefill-boundary-Last", boundary, cfg.vocab_size as usize,
+                        &normed, h as usize)?;
+                }
                 let last = if index == last_lane {
                     ensure!(
                         lane.last_row() + 1 == seq_len,
@@ -8049,6 +8090,18 @@ impl Qwen35Model {
                 } else {
                     head(lane.last_row())?
                 };
+                #[cfg(test)]
+                if let Some(scope) = c2_head.as_ref() {
+                    let observed = (index != last_lane).then(|| scope.take()).transpose()?;
+                    let normed = observed.as_ref().or(c2_normed.as_ref())
+                        .context("native final prefill head rows")?;
+                    let values = if index == last_lane { &logits } else { &last };
+                    // The final row belongs to the complete lane transaction,
+                    // not merely its cue suffix when a boundary was folded.
+                    native_head_observer::lane(lane, 0, lane.rows, tokens,
+                        positions_flat, "joint-prefill-Last", values, cfg.vocab_size as usize,
+                        normed, h as usize)?;
+                }
                 lane_logits.push(super::prefill_joint::LaneLogits { last, boundary });
             }
             super::prefill_joint::publish_logits(lane_logits);
@@ -9513,6 +9566,16 @@ impl Qwen35Model {
             )
             .context("apply_output_head_gpu_greedy")?
         };
+        #[cfg(test)]
+        if crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::enabled() {
+            crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::gpu_argmax(
+                slot_id, usize::try_from(positions_flat[0])?, token_id);
+            crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::forward(
+                slot_id, usize::try_from(positions_flat[0])?, tokens, "serial-GPU-greedy",
+                decode_bufs.logits_buf.as_logical_slice::<f32>()?, cfg.vocab_size as usize,
+                Some(decode_bufs.norm_out_buf.as_logical_slice::<f32>()?), h as usize,
+            )?;
+        }
         if let Some(t) = t_output_head {
             eprintln!(
                 "[GREEDY_PROFILE] output_head={:.1}ms",

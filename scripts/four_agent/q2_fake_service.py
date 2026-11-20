@@ -418,8 +418,7 @@ class StubTools:
         (self.fixture / "src").mkdir(parents=True)
         self.files = {"src/ports.rs": "pub fn parse_port(s: &str) -> u16 { s.parse().unwrap() }\n" if workload is None
                       else workload.initial,
-                      "tests/ports.rs": "#[test] fn ports() {}\n" if variant is None
-                      else variant.immutable["tests/ports.rs"]}
+                      "tests/ports.rs": getattr(variant, "immutable", {}).get("tests/ports.rs", "#[test] fn ports() {}\n")}
         self.receipts = []
         self.save()
 
@@ -489,6 +488,8 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
     tools, seen = StubTools(out, workload, selected, fail_first_test=bool(repair_turns)), set()
     protocol = Workflow(repair_turns) if repair_turns else None
     for turn in range(max_tools(repair_turns) + 1):
+        if selected is not None:
+            selected.before_request(messages, turn)
         request = build_request(model, messages, schemas, turn, family, engine_kind)
         turn_out = out / f"turn-{turn}"
         turn_out.mkdir()
