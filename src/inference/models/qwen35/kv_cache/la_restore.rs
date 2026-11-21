@@ -70,6 +70,26 @@ impl LaAnchorImage {
         self.storage.byte_len() == self.storage.data_byte_len()
     }
 
+    /// Root identity, not equal image bytes. Each handle retains the owner
+    /// for the entire comparison, so native IDs/Metal objects cannot be reused.
+    pub(crate) fn shares_owner_with(&self, other: &Self) -> bool {
+        match (self.storage.root_origin_snapshot(), other.storage.root_origin_snapshot()) {
+            (mlx_native::RootOriginSnapshot::KnownNative { id: left, .. },
+             mlx_native::RootOriginSnapshot::KnownNative { id: right, .. }) => left == right,
+            _ => std::ptr::eq(&**self.storage.metal_buffer(), &**other.storage.metal_buffer()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_invalid_last_layer(&self) -> Result<Self> {
+        let mut invalid = self.clone();
+        let last = invalid.layers.last_mut().context("anchor preflight test requires a linear layer")?;
+        // Earlier layers and the allocation are intact. The final real
+        // source-view preflight must reject this out-of-range nonempty span.
+        last.recurrent_offset = self.storage.data_byte_len();
+        Ok(invalid)
+    }
+
     /// Linear-attention layers this image holds.
     pub(crate) fn layer_count(&self) -> usize {
         self.layers.len()
@@ -122,6 +142,21 @@ pub(crate) struct LaAnchorRestorePlan {
     cursors: Vec<u32>,
     mtp_cursor: Option<u32>,
     copies: LaRestorePlan,
+    #[cfg(test)]
+    fail_after_encode: bool,
+    #[cfg(test)]
+    fail_after_commit: bool,
+}
+
+#[cfg(test)]
+impl LaAnchorRestorePlan {
+    pub(crate) fn test_fail_after_encode(&mut self) {
+        self.fail_after_encode = true;
+    }
+
+    pub(crate) fn test_fail_after_commit(&mut self) {
+        self.fail_after_commit = true;
+    }
 }
 
 struct ConvCopy {
@@ -576,12 +611,18 @@ impl HybridKvCache {
             cursors: cursors.to_vec(),
             mtp_cursor,
             copies: LaRestorePlan { copies },
+            #[cfg(test)]
+            fail_after_encode: false,
+            #[cfg(test)]
+            fail_after_commit: false,
         })
     }
 
     pub(crate) fn apply_anchor_restore(&mut self, mut plan: LaAnchorRestorePlan) -> Result<()> {
         match self.la_restore_route {
             LaRestoreRoute::Host => {
+                #[cfg(test)]
+                anyhow::ensure!(!plan.fail_after_commit, "post-commit test fault requires GPU restore route");
                 for copy in &mut plan.copies.copies {
                     let source = copy
                         .conv
@@ -612,6 +653,10 @@ impl HybridKvCache {
                         .context("apply_anchor_restore: map recurrent destination")?;
                     destination.copy_from_slice(source);
                 }
+                #[cfg(test)]
+                if plan.fail_after_encode {
+                    anyhow::bail!("injected host anchor restore failure after copies");
+                }
             }
             LaRestoreRoute::Gpu => {
                 let mut encoder = self
@@ -619,9 +664,23 @@ impl HybridKvCache {
                     .command_encoder()
                     .context("apply_anchor_restore: create command encoder")?;
                 self.encode_la_restore(&mut encoder, &plan.copies)?;
+                #[cfg(test)]
+                if plan.fail_after_encode {
+                    // Native 0.24.0 CommandEncoder::drop ends encoders and
+                    // releases the unsubmitted CB; it never commits. This
+                    // discards actual encoded restore copies before any write.
+                    drop(encoder);
+                    anyhow::bail!("injected anchor restore encode failure before commit");
+                }
                 encoder
                     .commit_and_wait_labeled("qwen35.anchor_restore")
                     .context("apply_anchor_restore: GPU restore")?;
+                #[cfg(test)]
+                if plan.fail_after_commit {
+                    return Err(anyhow::Error::new(mlx_native::MlxError::CommandBufferError(
+                        "injected anchor failure after completed commit".into(),
+                    )).context("complete Qwen anchor restore"));
+                }
             }
         }
         let slot_index = plan.slot.0 as usize;

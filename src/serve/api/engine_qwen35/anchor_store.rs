@@ -10,6 +10,10 @@ use crate::inference::models::qwen35::kv_cache::HybridKvSlotAnchor;
 
 use super::Qwen35SpecPrefixBoundary;
 
+#[cfg(test)]
+#[path = "anchor_store/c1_differential_tests.rs"]
+mod c1_differential_tests;
+
 #[derive(Clone)]
 pub(in crate::serve::api) struct Qwen35Anchor {
     pub id: u64,
@@ -99,14 +103,34 @@ impl AnchorOwnedBytes {
             .saturating_add(self.metadata)
     }
 
-    fn add_anchor(&mut self, anchor: &Qwen35Anchor) {
-        let add = anchor.owned();
+    fn add(&mut self, add: Self) {
         self.payload_image = self.payload_image.saturating_add(add.payload_image);
         self.logits = self.logits.saturating_add(add.logits);
         self.hidden = self.hidden.saturating_add(add.hidden);
         self.tokens = self.tokens.saturating_add(add.tokens);
         self.metadata = self.metadata.saturating_add(add.metadata);
     }
+}
+
+fn incremental_owned(anchor: &Qwen35Anchor, earlier: &[Qwen35Anchor]) -> AnchorOwnedBytes {
+    let mut owned = anchor.owned();
+    if earlier.iter().any(|old| anchor.kv.shares_payload_owner_with(&old.kv)) {
+        owned.payload_image = 0;
+    }
+    if let Some(spec) = &anchor.spec {
+        let hidden = &spec.pending_target_hidden;
+        if earlier.iter().filter_map(|old| old.spec.as_ref()).any(|old| {
+            let previous = &old.pending_target_hidden;
+            match (hidden.root_origin_snapshot(), previous.root_origin_snapshot()) {
+                (mlx_native::RootOriginSnapshot::KnownNative { id: left, .. },
+                 mlx_native::RootOriginSnapshot::KnownNative { id: right, .. }) => left == right,
+                _ => std::ptr::eq(&**hidden.metal_buffer(), &**previous.metal_buffer()),
+            }
+        }) {
+            owned.hidden = 0;
+        }
+    }
+    owned
 }
 
 pub(in crate::serve::api) fn anchor_non_payload_bytes(
@@ -157,7 +181,9 @@ pub(in crate::serve::api) struct Qwen35AnchorTelemetry {
     pub committed: AtomicU64,
     pub equality_hits: AtomicU64,
     pub restore_refused: AtomicU64,
+    pub restore_refusals_by_reason: [AtomicU64; 5],
     pub tombstoned_cursor: AtomicU64,
+    pub tombstoned_cold_reset: AtomicU64,
     pub evicted: AtomicU64,
     pub restores_by_rank: [AtomicU64; 8],
     pub snapshot_count: AtomicU64,
@@ -173,7 +199,9 @@ pub(in crate::serve::api) static ANCHOR_TELEMETRY: Qwen35AnchorTelemetry = Qwen3
     committed: AtomicU64::new(0),
     equality_hits: AtomicU64::new(0),
     restore_refused: AtomicU64::new(0),
+    restore_refusals_by_reason: [const { AtomicU64::new(0) }; 5],
     tombstoned_cursor: AtomicU64::new(0),
+    tombstoned_cold_reset: AtomicU64::new(0),
     evicted: AtomicU64::new(0),
     restores_by_rank: [const { AtomicU64::new(0) }; 8],
     snapshot_count: AtomicU64::new(0),
@@ -206,6 +234,8 @@ pub(in crate::serve::api) fn record_anchor_restore_refused() {
     ANCHOR_TELEMETRY
         .restore_refused
         .fetch_add(1, Ordering::Relaxed);
+    ANCHOR_TELEMETRY.restore_refusals_by_reason[AnchorRestoreRefusal::Validation as usize]
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 pub(in crate::serve::api) fn record_anchor_equality_hit() {
@@ -218,6 +248,83 @@ pub(in crate::serve::api) struct AnchorTicket {
     origin: u64,
     epoch: u64,
     anchor_id: u64,
+    operation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::serve::api) enum AnchorRestoreRefusal {
+    Poisoned,
+    Transaction,
+    Unavailable,
+    Stale,
+    Validation,
+}
+
+impl AnchorRestoreRefusal {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Poisoned => "poisoned",
+            Self::Transaction => "transaction",
+            Self::Unavailable => "unavailable",
+            Self::Stale => "stale",
+            Self::Validation => "validation",
+        }
+    }
+
+    fn counted(self) -> anyhow::Error {
+        ANCHOR_TELEMETRY.restore_refused.fetch_add(1, Ordering::Relaxed);
+        ANCHOR_TELEMETRY.restore_refusals_by_reason[self as usize].fetch_add(1, Ordering::Relaxed);
+        self.into()
+    }
+}
+
+impl std::fmt::Display for AnchorRestoreRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Qwen anchor restore refused: {}", self.label())
+    }
+}
+impl std::error::Error for AnchorRestoreRefusal {}
+
+/// Keep construction tickets live across prefill's possible boundary snapshots.
+/// The owning worker is synchronous; no caller can publish a pending anchor
+/// until every ticket in this scope has closed. Uses the scheduled handle slice
+/// rather than allocating a second ticket/owner collection.
+pub(in crate::serve::api) fn capture_during_prefill<T>(
+    stores: &mut [Qwen35AnchorStore],
+    handles: &[crate::serve::scheduler::SlotHandle],
+    run: impl FnOnce() -> T,
+) -> Result<T> {
+    for (opened, handle) in handles.iter().enumerate() {
+        if let Err(error) = stores[handle.slot_id.0 as usize].begin_capture() {
+            for earlier in &handles[..opened] {
+                let store = &mut stores[earlier.slot_id.0 as usize];
+                let (_, ticket) = store.transaction.expect("opened by this scope");
+                store.finish_capture(ticket)?;
+            }
+            return Err(error);
+        }
+    }
+    let result = run();
+    for handle in handles {
+        let store = &mut stores[handle.slot_id.0 as usize];
+        let (_, ticket) = store.transaction.expect("prefill construction retains its ticket");
+        store.finish_capture(ticket)?;
+    }
+    Ok(result)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::serve::api) enum AnchorTransaction {
+    Capture,
+    Restore,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::serve::api) enum AnchorRestoreFault {
+    Preflight,
+    Encode,
+    PostCommit,
 }
 
 #[derive(Clone)]
@@ -231,6 +338,13 @@ pub(in crate::serve::api) struct Qwen35AnchorStore {
     poisoned: bool,
     committed: Vec<Qwen35Anchor>,
     pending: Option<Qwen35Anchor>,
+    transaction: Option<(AnchorTransaction, AnchorTicket)>,
+    restore_rank: Option<usize>,
+    next_operation: u64,
+    #[cfg(test)]
+    pub restore_fault: Option<AnchorRestoreFault>,
+    #[cfg(test)]
+    pub pruning_disabled: bool,
 }
 
 impl Qwen35AnchorStore {
@@ -275,6 +389,13 @@ impl Qwen35AnchorStore {
             poisoned: false,
             committed: Vec::new(),
             pending: None,
+            transaction: None,
+            restore_rank: None,
+            next_operation: 1,
+            #[cfg(test)]
+            restore_fault: None,
+            #[cfg(test)]
+            pruning_disabled: false,
         };
         store.publish_gauge();
         Ok(store)
@@ -307,6 +428,41 @@ impl Qwen35AnchorStore {
         self.pending.as_ref()
     }
 
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    pub fn open_transaction(&self) -> Option<AnchorTransaction> {
+        self.transaction.map(|(kind, _)| kind)
+    }
+
+    pub fn begin_capture(&mut self) -> Result<AnchorTicket> {
+        anyhow::ensure!(!self.poisoned && self.transaction.is_none(),
+            "Qwen anchor capture blocked by open transaction or poison");
+        let ticket = AnchorTicket {
+            origin: self.origin, epoch: self.epoch, anchor_id: 0,
+            operation: self.next_operation,
+        };
+        self.next_operation = self.next_operation.checked_add(1).expect("Qwen anchor operation overflow");
+        self.transaction = Some((AnchorTransaction::Capture, ticket));
+        Ok(ticket)
+    }
+
+    pub fn finish_capture(&mut self, ticket: AnchorTicket) -> Result<()> {
+        anyhow::ensure!(self.transaction == Some((AnchorTransaction::Capture, ticket)),
+            "stale Qwen anchor capture ticket");
+        self.transaction = None;
+        Ok(())
+    }
+
+    pub fn abort_transaction(&mut self, ticket: AnchorTicket) -> Result<()> {
+        anyhow::ensure!(self.transaction.is_some_and(|(_, open)| open == ticket),
+            "stale Qwen anchor transaction ticket");
+        self.transaction = None;
+        self.restore_rank = None;
+        Ok(())
+    }
     pub fn deepest(&self) -> Option<&Qwen35Anchor> {
         self.committed.last()
     }
@@ -345,6 +501,7 @@ impl Qwen35AnchorStore {
     }
 
     pub fn stage(&mut self, request: u64, mut anchor: Qwen35Anchor) -> Result<u64> {
+        anyhow::ensure!(self.transaction.is_none(), "cannot stage during an open Qwen anchor transaction");
         if self.poisoned {
             return Err(anyhow!("Qwen anchor store is poisoned"));
         }
@@ -372,7 +529,7 @@ impl Qwen35AnchorStore {
         let projected = self
             .committed_owned()
             .total()
-            .checked_add(anchor.owned_bytes())
+            .checked_add(incremental_owned(&anchor, &self.committed).total())
             .ok_or_else(|| anyhow!("Qwen anchor owned-byte quota arithmetic overflow"))?;
         if self.quota_bytes.is_some_and(|quota| projected > quota) {
             ANCHOR_TELEMETRY
@@ -398,6 +555,7 @@ impl Qwen35AnchorStore {
     }
 
     pub fn commit(&mut self, request: u64) -> Result<bool> {
+        anyhow::ensure!(self.transaction.is_none(), "cannot commit during an open Qwen anchor transaction");
         let Some(anchor) = self.pending.take() else {
             return Ok(false);
         };
@@ -438,6 +596,8 @@ impl Qwen35AnchorStore {
     }
 
     pub fn on_cursor_set(&mut self, cursor: usize) {
+        #[cfg(test)]
+        if self.pruning_disabled { return; }
         let before = self.committed.len() + usize::from(self.pending.is_some());
         self.committed
             .retain(|anchor| anchor.kv.prompt_len() <= cursor);
@@ -455,34 +615,41 @@ impl Qwen35AnchorStore {
         self.changed();
     }
 
-    pub fn ticket(&self, anchor_id: u64) -> Result<AnchorTicket> {
-        if self.poisoned || self.pending.is_some() {
-            record_anchor_restore_refused();
-            return Err(anyhow!("Qwen anchor restore blocked by store state"));
+    pub fn ticket(&mut self, anchor_id: u64) -> Result<AnchorTicket> {
+        if self.poisoned {
+            return Err(AnchorRestoreRefusal::Poisoned.counted());
+        }
+        if self.transaction.is_some() {
+            return Err(AnchorRestoreRefusal::Transaction.counted());
         }
         if self.anchor(anchor_id).is_none() {
-            record_anchor_restore_refused();
-            return Err(anyhow!("Qwen anchor {anchor_id} is not committed"));
+            return Err(AnchorRestoreRefusal::Unavailable.counted());
         }
-        Ok(AnchorTicket {
+        let ticket = AnchorTicket {
             origin: self.origin,
             epoch: self.epoch,
             anchor_id,
-        })
+            operation: self.next_operation,
+        };
+        self.transaction = Some((AnchorTransaction::Restore, ticket));
+        self.next_operation = self.next_operation.checked_add(1).expect("Qwen anchor operation overflow");
+        Ok(ticket)
     }
 
     pub fn validate_ticket(&self, ticket: AnchorTicket) -> Result<&Qwen35Anchor> {
-        if self.poisoned || ticket.origin != self.origin || ticket.epoch != self.epoch {
-            record_anchor_restore_refused();
-            return Err(anyhow!("stale Qwen anchor restore ticket"));
+        if self.poisoned {
+            return Err(AnchorRestoreRefusal::Poisoned.counted());
         }
-        self.anchor(ticket.anchor_id).ok_or_else(|| {
-            record_anchor_restore_refused();
-            anyhow!("Qwen anchor {} was retired", ticket.anchor_id)
-        })
+        if ticket.origin != self.origin || ticket.epoch != self.epoch
+            || self.transaction != Some((AnchorTransaction::Restore, ticket)) {
+            return Err(AnchorRestoreRefusal::Stale.counted());
+        }
+        self.anchor(ticket.anchor_id).ok_or_else(|| AnchorRestoreRefusal::Unavailable.counted())
     }
 
     pub fn before_restore(&mut self, ticket: AnchorTicket) -> Result<()> {
+        anyhow::ensure!(self.transaction == Some((AnchorTransaction::Restore, ticket)),
+            "Qwen anchor restore ticket is not open");
         self.validate_ticket(ticket)?;
         let rank = self
             .committed
@@ -493,24 +660,49 @@ impl Qwen35AnchorStore {
         let depth = self
             .anchor(ticket.anchor_id)
             .expect("validated anchor")
-            .prompt_tokens
-            .len();
+            .kv
+            .prompt_len();
+        // C2 Phase B discards any unpublished request payload, including an
+        // ancestor whose live rows happen not to overlap the ensuing writes.
+        let pending = usize::from(self.pending.take().is_some());
         self.on_cursor_set(depth);
-        ANCHOR_TELEMETRY.restores_by_rank[rank].fetch_add(1, Ordering::Relaxed);
+        if pending != 0 {
+            ANCHOR_TELEMETRY.tombstoned_cursor.fetch_add(pending as u64, Ordering::Relaxed);
+            self.changed();
+        }
+        self.restore_rank = Some(rank);
         Ok(())
     }
 
+
+    pub fn finish_restore(&mut self, ticket: AnchorTicket, success: bool) -> Result<usize> {
+        anyhow::ensure!(self.transaction == Some((AnchorTransaction::Restore, ticket)),
+            "stale Qwen anchor restore completion");
+        let rank = self.restore_rank.take().ok_or_else(|| anyhow!("Qwen restore never entered Phase B"))?;
+        self.transaction = None;
+        if success {
+            ANCHOR_TELEMETRY.restores_by_rank[rank].fetch_add(1, Ordering::Relaxed);
+            self.changed();
+        }
+        Ok(rank)
+    }
     pub fn poison_and_clear(&mut self) {
         self.committed.clear();
         self.pending = None;
+        self.transaction = None;
+        self.restore_rank = None;
         self.poisoned = true;
         self.changed();
     }
 
     pub fn reset(&mut self) {
+        let removed = self.committed.len() + usize::from(self.pending.is_some());
+        ANCHOR_TELEMETRY.tombstoned_cold_reset.fetch_add(removed as u64, Ordering::Relaxed);
         self.committed.clear();
         self.pending = None;
         self.poisoned = false;
+        self.transaction = None;
+        self.restore_rank = None;
         self.origin = next_origin();
         self.epoch = 0;
         self.publish_gauge();
@@ -518,18 +710,15 @@ impl Qwen35AnchorStore {
 
     pub fn committed_owned(&self) -> AnchorOwnedBytes {
         let mut owned = AnchorOwnedBytes::default();
-        for anchor in &self.committed {
-            owned.add_anchor(anchor);
+        for (index, anchor) in self.committed.iter().enumerate() {
+            owned.add(incremental_owned(anchor, &self.committed[..index]));
         }
         owned
     }
 
     pub fn pending_owned(&self) -> AnchorOwnedBytes {
-        let mut owned = AnchorOwnedBytes::default();
-        if let Some(anchor) = &self.pending {
-            owned.add_anchor(anchor);
-        }
-        owned
+        self.pending.as_ref().map_or_else(AnchorOwnedBytes::default,
+            |anchor| incremental_owned(anchor, &self.committed))
     }
 
     pub fn owned_bytes(&self) -> usize {
@@ -559,6 +748,123 @@ impl Qwen35AnchorStore {
             pending: self.pending_owned(),
         };
     }
+}
+
+/// Admission and cancellation share the same atomic restore and failure path.
+pub(in crate::serve::api) fn restore_committed_anchor(
+    kv: &mut crate::inference::models::qwen35::kv_cache::HybridKvCache,
+    slot: crate::serve::multi_seq_kv::SlotId,
+    store: &mut Qwen35AnchorStore,
+    anchor_id: u64,
+    supervisor: &crate::serve::api::engine_supervisor::EngineSupervisor,
+) -> Result<usize> {
+    use anyhow::Context;
+    let ticket = store.ticket(anchor_id)?;
+    let mut mutating = false;
+    let started = std::time::Instant::now();
+    let result = (|| {
+        let anchor = store.validate_ticket(ticket)?;
+        #[cfg(test)]
+        if store.restore_fault == Some(AnchorRestoreFault::Preflight) {
+            let invalid = anchor.kv.test_with_invalid_last_layer()?;
+            kv.plan_slot_anchor_restore(slot, &invalid)?;
+            anyhow::bail!("last-layer preflight fault was not refused");
+        }
+        let plan = kv.plan_slot_anchor_restore(slot, &anchor.kv)?;
+        #[cfg(test)]
+        let plan = {
+            let mut plan = plan;
+            match store.restore_fault {
+                Some(AnchorRestoreFault::Encode) => plan.test_fail_after_encode(),
+                Some(AnchorRestoreFault::PostCommit) => plan.test_fail_after_commit(),
+                _ => {}
+            }
+            plan
+        };
+        store.before_restore(ticket)?;
+        mutating = true;
+        let lease = supervisor.arm(
+            "Qwen35 anchor restore", super::QWEN35_WORKER_TRANSACTION_TIMEOUT,
+        )?;
+        let applied = kv.apply_slot_anchor_restore(plan);
+        let completed = lease.finish();
+        // Do not mask the typed GPU failure with a watchdog completion error.
+        applied.context("apply Qwen anchor restore")?;
+        completed?;
+        store.finish_restore(ticket, true)
+    })();
+    record_anchor_restore(started.elapsed());
+    if result.is_err() {
+        if store.open_transaction().is_some() {
+            store.abort_transaction(ticket)?;
+        }
+        record_anchor_restore_refused();
+        if mutating {
+            store.poison_and_clear();
+        }
+    }
+    result
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::serve::api) enum AnchorRecovery {
+    Preserved { tokens: usize },
+    Restored { rank: usize, tokens: usize },
+    Reset,
+}
+
+/// The owning cancellation state transition, also used by real-artifact tests.
+pub(in crate::serve::api) fn recover_cancelled_prefix(
+    kv: &mut crate::inference::models::qwen35::kv_cache::HybridKvCache,
+    slot: crate::serve::multi_seq_kv::SlotId,
+    request: u64,
+    store: &mut Qwen35AnchorStore,
+    tokens: &mut Vec<u32>,
+    spec: &mut Option<Qwen35SpecPrefixBoundary>,
+    preserve: bool,
+    supervisor: &crate::serve::api::engine_supervisor::EngineSupervisor,
+) -> Result<AnchorRecovery> {
+    use anyhow::Context;
+    store.discard_pending(request);
+    let live = kv.sequence_len_for_slot(slot)? as usize;
+    let graft = kv.graft_region_for_slot(slot)? as usize;
+    let physical_tokens = graft.checked_add(tokens.len()).context("Qwen recovery cursor overflow")?;
+    if preserve && !tokens.is_empty() && live == physical_tokens {
+        kv.validate_sequence_len_for_slot(slot, physical_tokens)?;
+        if spec.as_ref().is_some_and(|boundary| boundary.token_count != tokens.len()
+            || kv.validate_speculative_cursors_for_slot(slot, physical_tokens).is_err()) {
+            *spec = None;
+        }
+        return Ok(AnchorRecovery::Preserved { tokens: tokens.len() });
+    }
+    if let Some(id) = store.committed().iter().rev()
+        .find(|anchor| anchor.kv.prompt_len() <= live && !anchor.prompt_tokens.is_empty())
+        .map(|anchor| anchor.id)
+    {
+        match restore_committed_anchor(kv, slot, store, id, supervisor) {
+            Ok(rank) => {
+                let anchor = store.anchor(id).expect("successful restore retains selected anchor");
+                tokens.clone_from(&anchor.prompt_tokens);
+                *spec = anchor.spec.clone().filter(|boundary|
+                    boundary.token_count == tokens.len()
+                    && kv.validate_speculative_cursors_for_slot(slot, anchor.kv.prompt_len()).is_ok());
+                return Ok(AnchorRecovery::Restored { rank, tokens: tokens.len() });
+            }
+            Err(error) if !supervisor.is_healthy()
+                || crate::serve::api::engine::is_fatal_command_buffer_error(&error) => {
+                return Err(error.context("Qwen cancellation checkpoint restore"));
+            }
+            Err(error) => {
+                tracing::warn!(slot = slot.0, error = %error,
+                    "Qwen cancellation checkpoint unavailable; resetting slot");
+            }
+        }
+    }
+    kv.reset_for_slot(slot).context("reset Qwen slot after cancellation")?;
+    tokens.clear();
+    *spec = None;
+    store.reset();
+    Ok(AnchorRecovery::Reset)
 }
 
 pub(in crate::serve::api) fn configured_anchor_depth() -> Result<usize> {
@@ -631,6 +937,54 @@ mod tests {
     }
 
     #[test]
+    fn anchor_cpu_nonzero_aliases_are_charged_once_across_publication() {
+        let owner: std::sync::Arc<[u8]> = vec![7u8; 4096].into();
+        let mut first = anchor(2, 1, 7);
+        first.kv = HybridKvSlotAnchor::test_with_payload_owner(2, owner.clone());
+        let mut second = anchor(4, 2, 7);
+        second.kv = HybridKvSlotAnchor::test_with_payload_owner(4, owner.clone());
+        let mut store = Qwen35AnchorStore::new(4).unwrap();
+        store.stage(1, first).unwrap();
+        assert_eq!(store.pending_owned().payload_image, 4096);
+        store.commit(1).unwrap();
+        store.stage(2, second).unwrap();
+        assert_eq!(store.committed_owned().payload_image, 4096);
+        assert_eq!(store.pending_owned().payload_image, 0);
+        assert_eq!(std::sync::Arc::strong_count(&owner), 3);
+        store.commit(2).unwrap();
+        assert_eq!(store.committed_owned().payload_image, 4096);
+        let mut third = anchor(6, 3, 7);
+        third.kv = HybridKvSlotAnchor::test_with_payload_owner(6, vec![7u8; 4096].into());
+        store.stage(3, third).unwrap();
+        assert_eq!(store.pending_owned().payload_image, 4096, "equal bytes are not shared ownership");
+        store.discard_pending(3);
+        store.on_cursor_set(2);
+        assert_eq!(store.committed_owned().payload_image, 4096);
+        assert_eq!(std::sync::Arc::strong_count(&owner), 2);
+        store.poison_and_clear();
+        assert_eq!(store.owned_bytes(), 0);
+        assert_eq!(std::sync::Arc::strong_count(&owner), 1);
+    }
+
+    #[test]
+    fn anchor_capture_scope_closes_before_success_or_error_publication() {
+        use crate::serve::{multi_seq_kv::SlotId, scheduler::SlotHandle};
+        let handle = SlotHandle { slot_id: SlotId(0), generation: 1 };
+        let mut stores = [Qwen35AnchorStore::new(4).unwrap()];
+        let failure: Result<()> = capture_during_prefill(&mut stores, &[handle],
+            || Err(anyhow!("snapshot encode refused"))).unwrap();
+        assert!(failure.is_err());
+        assert_eq!(stores[0].open_transaction(), None);
+        let success = capture_during_prefill(&mut stores, &[handle], || 17).unwrap();
+        assert_eq!(success, 17);
+        assert_eq!(stores[0].open_transaction(), None);
+        let capture = stores[0].begin_capture().unwrap();
+        assert!(capture_during_prefill(&mut stores, &[handle], || 0).is_err());
+        assert_eq!(stores[0].open_transaction(), Some(AnchorTransaction::Capture));
+        stores[0].finish_capture(capture).unwrap();
+    }
+
+    #[test]
     fn pending_is_invisible_and_commit_keeps_deepest_bound() {
         let mut store = Qwen35AnchorStore::new(2).unwrap();
         for (request, depth) in [(1, 2), (2, 4), (3, 6)] {
@@ -675,8 +1029,69 @@ mod tests {
         let id = store.stage(1, anchor(2, 1, 7)).unwrap();
         store.commit(1).unwrap();
         let ticket = store.ticket(id).unwrap();
+        store.abort_transaction(ticket).unwrap();
         store.stage(2, anchor(4, 2, 7)).unwrap();
         assert!(store.validate_ticket(ticket).is_err());
+    }
+
+    #[test]
+    fn anchor_transactions_are_closed_and_pending_publication_is_not_a_ticket() {
+        let mut store = Qwen35AnchorStore::new(4).unwrap();
+        let capture = store.begin_capture().unwrap();
+        assert_eq!(store.open_transaction(), Some(AnchorTransaction::Capture));
+        assert!(store.begin_capture().is_err());
+        store.finish_capture(capture).unwrap();
+        let next = store.begin_capture().unwrap();
+        assert!(store.finish_capture(capture).is_err(), "old capture cannot close a new operation");
+        store.finish_capture(next).unwrap();
+        let id = store.stage(1, anchor(2, 1, 7)).unwrap();
+        assert_eq!(store.open_transaction(), None);
+        store.commit(1).unwrap();
+        assert!(!store.commit(1).unwrap());
+        let restore = store.ticket(id).unwrap();
+        store.before_restore(restore).unwrap();
+        store.finish_restore(restore, true).unwrap();
+        assert!(store.finish_restore(restore, true).is_err());
+        assert_eq!(store.open_transaction(), None);
+        store.poison_and_clear();
+        assert!(store.is_poisoned());
+        assert!(store.begin_capture().is_err());
+        assert!(store.ticket(id).is_err());
+        assert_eq!(store.owned_bytes(), 0);
+        store.reset();
+        assert!(!store.is_poisoned());
+        let capture = store.begin_capture().unwrap();
+        store.abort_transaction(capture).unwrap();
+    }
+
+    #[test]
+    fn anchor_u8_real_open_tickets_refuse_joint_admission_nonvacuously() {
+        use crate::serve::api::engine::qwen35_joint_decode::{
+            joint_anchor_admission, record_joint_ineligible, JOINT_TELEMETRY,
+        };
+        use crate::serve::scheduler::SlotHandle;
+        use crate::serve::multi_seq_kv::SlotId;
+        let handle = SlotHandle { slot_id: SlotId(0), generation: 1 };
+        let mut stores = [Qwen35AnchorStore::new(4).unwrap()];
+        let capture = stores[0].begin_capture().unwrap();
+        let before = JOINT_TELEMETRY.anchor_capture.load(Ordering::Relaxed);
+        let reason = joint_anchor_admission(&[handle], &stores).unwrap();
+        assert_eq!(reason.label(), "anchor_capture");
+        record_joint_ineligible(&reason);
+        assert_eq!(JOINT_TELEMETRY.anchor_capture.load(Ordering::Relaxed), before + 1);
+        stores[0].finish_capture(capture).unwrap();
+        let id = stores[0].stage(1, anchor(2, 1, 7)).unwrap();
+        assert!(joint_anchor_admission(&[handle], &stores).is_none(), "pending is not open capture");
+        stores[0].commit(1).unwrap();
+        let restore = stores[0].ticket(id).unwrap();
+        let before = JOINT_TELEMETRY.anchor_restore.load(Ordering::Relaxed);
+        let reason = joint_anchor_admission(&[handle], &stores).unwrap();
+        assert_eq!(reason.label(), "anchor_restore");
+        record_joint_ineligible(&reason);
+        assert_eq!(JOINT_TELEMETRY.anchor_restore.load(Ordering::Relaxed), before + 1);
+        stores[0].before_restore(restore).unwrap();
+        stores[0].finish_restore(restore, true).unwrap();
+        assert!(joint_anchor_admission(&[handle], &stores).is_none());
     }
 
     #[test]

@@ -403,8 +403,11 @@ impl Qwen35DecodeState {
         // Diagnostic: the candidates' plan beside the host sampler's over
         // the full logits. The host sampler's is the one used.
         let drafts = &tokens[1..];
-        let candidate =
-            self.plan_dflash2_rows(qwen, window, drafts, &mut rows, DecisionRoute::Candidates);
+        let candidate = {
+            #[cfg(test)]
+            let _comparison = super::anchor_exactness_tests::trace::Comparison::begin();
+            self.plan_dflash2_rows(qwen, window, drafts, &mut rows, DecisionRoute::Candidates)
+        };
         let mut host =
             self.plan_dflash2_rows(qwen, window, drafts, &mut rows, DecisionRoute::HostLogits)?;
         match candidate {
@@ -461,6 +464,14 @@ impl Qwen35LoadedModel {
             is_fatal,
         );
         self.dflash2 = Some(runtime);
+        #[cfg(test)]
+        if let Ok(outcomes) = &result {
+            for (state, outcome) in states.iter().zip(outcomes) {
+                if outcome.is_ok() {
+                    super::anchor_exactness_tests::trace::route(state.slot_id, "DFlash2-actual-runner-completed");
+                }
+            }
+        }
         result
     }
 

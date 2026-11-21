@@ -11,6 +11,9 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
+#[cfg(test)]
+#[path = "acquisition/c2.rs"]
+pub(crate) mod c2;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileIdentity {
@@ -41,7 +44,7 @@ fn same_opened_file(expected: &FileIdentity, observed: &FileIdentity) -> Result<
     ensure!(expected == observed, "opened model FD identity changed");
     Ok(())
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileBinding {
     pub path: PathBuf,
@@ -67,6 +70,27 @@ struct Review {
     schema: String,
     verdict: String,
     composition_sha256: String,
+}
+
+pub(crate) fn reviewed_model_identity(binding: &Binding, identity: &Identity) -> Result<FileIdentity> {
+    let composition: Composition =
+        serde_json::from_slice(&checked_file(&binding.composition, 1024 * 1024)?)?;
+    let review: Review =
+        serde_json::from_slice(&checked_file(&binding.independent_review, 65536)?)?;
+    ensure!(
+        composition.schema == "hf2q.q1.acquisition-composition.v1"
+            && review.schema == "hf2q.q1.acquisition-review.v1"
+            && review.verdict == "Accepted"
+            && review.composition_sha256 == binding.composition.sha256,
+        "independent acquisition composition is unverified"
+    );
+    ensure!(
+        composition.comparison_key == ComparisonKey::from(identity),
+        "composition immutable comparison key mismatch"
+    );
+    let content = checked_file(&composition.full_content_receipt, 16 * 1024 * 1024)?;
+    full_content_receipt_has_model(&content, &identity.model_sha256)?;
+    Ok(composition.model_file)
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -177,8 +201,10 @@ pub(crate) fn full_content_receipt_has_model(bytes: &[u8], model_sha: &str) -> R
     );
     Ok(())
 }
-pub(crate) fn executable_digest() -> Result<String> {
-    let mut file = File::open(std::env::current_exe()?)?;
+pub(crate) fn file_digest(path: &Path) -> Result<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)?;
+    ensure!(file.metadata()?.is_file(), "digest source is not a regular file");
     let mut digest = Sha256::new();
     let mut page = [0u8; 65536];
     loop {
@@ -189,6 +215,9 @@ pub(crate) fn executable_digest() -> Result<String> {
         digest.update(&page[..n]);
     }
     Ok(hex::encode(digest.finalize()))
+}
+pub(crate) fn executable_digest() -> Result<String> {
+    file_digest(&std::env::current_exe()?)
 }
 struct Active {
     file: File,
@@ -221,24 +250,7 @@ impl Scope {
         Self::begin_bound(binding,identity,model,output,packet)
     }
     fn begin_bound(binding:&Binding,identity:&Identity,model:&Path,output:&Path,packet:&[u8])->Result<Self>{
-        let composition: Composition =
-            serde_json::from_slice(&checked_file(&binding.composition, 1024 * 1024)?)?;
-        let review: Review =
-            serde_json::from_slice(&checked_file(&binding.independent_review, 65536)?)?;
-        ensure!(
-            composition.schema == "hf2q.q1.acquisition-composition.v1"
-                && review.schema == "hf2q.q1.acquisition-review.v1"
-                && review.verdict == "Accepted"
-                && review.composition_sha256 == binding.composition.sha256,
-            "independent acquisition composition is unverified"
-        );
-        ensure!(
-            composition.comparison_key == ComparisonKey::from(identity),
-            "composition immutable comparison key mismatch"
-        );
-        let historical_full_content_receipt =
-            checked_file(&composition.full_content_receipt, 16 * 1024 * 1024)?;
-        full_content_receipt_has_model(&historical_full_content_receipt, &identity.model_sha256)?;
+        let reviewed_model = reviewed_model_identity(binding, identity)?;
         ensure!(
             option_env!("HF2Q_BUILD_GIT_SHA") == Some(identity.source_commit.as_str()),
             "compiled source stamp absent/wrong"
@@ -250,7 +262,7 @@ impl Scope {
         );
         let file = File::open(model)?;
         let opened = FileIdentity::observed(&file)?;
-        same_opened_file(&composition.model_file, &opened)?;
+        same_opened_file(&reviewed_model, &opened)?;
         ensure!(
             output.is_absolute()
                 && output.parent().context("output parent")?.canonicalize()?

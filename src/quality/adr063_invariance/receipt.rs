@@ -93,6 +93,18 @@ fn hex(s: &str, n: usize) -> bool {
 }
 impl Identity {
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_native(env!("HF2Q_MLX_NATIVE_VERSION"))
+    }
+    /// Authority for the immutable original C2 producer, not a runtime identity.
+    pub(crate) fn validate_c2_historical(&self) -> Result<(), String> {
+        if self.source_commit != "51a3923fafbe46e4a18c22c5fdc24ce20a46593c"
+            || self.native_checksum != "2a804cf31840059e548c763be935be6b6b75563add645556311130a61ed525fd"
+        {
+            return Err("invalid historical C2 producer identity".into());
+        }
+        self.validate_native("0.18.0")
+    }
+    fn validate_native(&self, native_version: &str) -> Result<(), String> {
         if !hex(&self.source_commit, 40)
             || ![
                 &self.binary_sha256,
@@ -105,7 +117,7 @@ impl Identity {
             ]
             .iter()
             .all(|s| hex(s, 64))
-            || self.native_version != env!("HF2Q_MLX_NATIVE_VERSION")
+            || self.native_version != native_version
         {
             return Err("invalid complete diagnostic identity".into());
         }

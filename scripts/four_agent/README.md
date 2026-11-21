@@ -761,6 +761,41 @@ messages, live fixture files, tools, scoring, and all other turns are unchanged.
   one-repair-turn workload. Their `-divergent` derivatives preserve that
   workload, carry the variant binding, and calibrate separately.
 
+### C2 observation and statistical components
+
+`c2_campaign.py case` derives K1/K4 append or divergent cases from the canonical
+Qwen3.8 case or Qwen3.6 repair-one case. Both keep four slots and the full declared
+context. Choose the route explicitly: `legacy-off`, `legacy-mtp-auto`, or
+`current-default`; speculative cases require source-derived capture bytes rather
+than an estimated default. Every case needs a separate, source-matched Q5
+calibration before hardware execution.
+
+The opt-in `--c2-server-log` collector requires the coordinator approval's exact
+log path and collector hash. It retains HTTP `/metrics` snapshots and the original
+server-log byte slice around the owned cohort. Actual joint and serial lane steps
+count only turns with at least two decode-ready lanes. Missing counters, altered
+logs, unobserved routes, disabled telemetry, profiling, and contradictory route
+controls cannot supply passing evidence.
+The settled-run auditor replays the declared, pinned divergent transform before
+checking transcript continuity; an additional history edit is still refused.
+Campaign attempts pass their own arm's fresh calibration into Q5 admission and
+retain its actual admission decision and live footprint cap.
+
+`c2_metrics.divergent_metrics(summary)` selects original edited turns 3 and 5,
+maximizing within each slot before taking the worst slot.
+`c2_metrics.append_metrics(summary)` includes every executed tool interval,
+including an exercised repair tail; a missing interval is an error.
+`c2_stats.campaign(kind, blocks)` consumes complete paired Williams blocks and
+applies the original 5–20-block first-stop, timing, eligibility, anchor-refusal,
+and fresh-calibration footprint rules. Slots and turns are not independent samples.
+
+`c2_campaign.py plan` freezes the cases and calibration references.
+Its `Driver` requires the release controller's owned runner; this CLI does not
+launch unmanaged models. `evaluate DIRECTORY` replays retained raw observations
+and statistics. A component `Pass` is **not** C2 qualification: real-artifact
+exactness, complete transcripts, task quality, cancellation, independent review,
+and the original release gates remain separate requirements.
+
 ## Task-quality campaign (ADR-063 Q1 §3.5)
 
 The canonical four-agent prompts are identical on every run, so repeated cohorts are one sample per agent. The Q1 policy (`hf2q.q1.numeric-policy.v1`) therefore judges task quality over at least 24 distinct, paired task instances.

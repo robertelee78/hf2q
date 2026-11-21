@@ -84,6 +84,8 @@ fn toy_cfg() -> Qwen35Config {
 /// vocabulary size, EOS ids, tokenizer fragments and speculation policy.
 pub(super) fn loaded_model(policy: QwenSpeculationPolicy) -> Qwen35LoadedModel {
     Qwen35LoadedModel {
+        #[cfg(test)]
+        c2_model_witness: std::sync::Arc::new(()),
         model: Qwen35Model::empty_from_cfg(toy_cfg()),
         tokenizer: tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default()),
         chat_template: String::new(),

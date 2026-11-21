@@ -36,7 +36,7 @@ use super::{control, handlers};
 pub fn build_router(state: AppState) -> Router {
     let cors = cors_layer(&state.config.cors_allowed_origins);
 
-    Router::new()
+    let router = Router::new()
         .route("/health", get(handlers::health))
         .route("/readyz", get(handlers::readyz))
         .route("/metrics", get(handlers::metrics))
@@ -70,7 +70,11 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(request_cancellation_layer))
         .layer(axum::middleware::from_fn(request_id_layer))
         .layer(cors)
-        .with_state(state)
+        .with_state(state);
+    #[cfg(test)]
+    let router = router.layer(axum::middleware::from_fn(
+        super::engine_qwen35::anchor_exactness_tests::fresh_http::middleware));
+    router
 }
 
 // ---------------------------------------------------------------------------
