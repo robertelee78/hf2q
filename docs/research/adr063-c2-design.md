@@ -484,6 +484,38 @@ The live client and raw replay bind this distinction to the actual startup decla
 
 A reviewer distinct from the implementer reproduces the §7.2 matrix verdicts and the §8.3 paired TTFT effect from the raw receipts with the checked-in commands.
 
+### 8.8 Fresh-reference configuration metadata (test executable only)
+
+The ignored entry
+`serve::api::engine_qwen35::anchor_exactness_tests::config_recipe_export::qwen_c2_native_config_recipe_export`
+reads `HF2Q_C2_CONFIG_RECIPE_PACKET`. Its closed packet binds the schema
+`hf2q.c2.native-config-recipe-packet.v1`, family, absolute model path, opened-file
+identity, full-content receipt, complete K4 case, expected exporter executable
+SHA-256 and new absolute output directory. Receipt and case bindings contain
+their paths and SHA-256 values; the output must be outside Git.
+
+`model-config.json` and `recipe.json` contain the native compact Serde bytes
+without appended newlines. The acquisition `config_sha256` is the SHA-256 of
+`recipe.json`; its model-config field hashes `model-config.json`. The exporter
+and loaded fresh-HTTP path share the same seven-field recipe factory. Neither
+a Debug-config hash nor a broader architecture/argv/environment document is
+this identity.
+
+This equivalence applies to the two pinned vanilla artifacts and fixed OFF/K4
+route: their intrinsic context is 262144 and tokenizer/output-head vocabulary
+sizes agree. Other artifacts require independent review of loaded versus header
+configuration, including serving-context and vocabulary reconciliation.
+
+The published native parser reads the retained FD without buffered payload
+read-ahead, with explicit 32 MiB read and 128 MiB declared-allocation budgets,
+catalog/string/array/depth limits and observed counters. Declared reservations
+are not a physical-memory bound. Export performs no model/device/context
+creation, inference or acquisition attestation and cannot qualify C2.
+The committed Rust/Cargo manifest, actual test-image build and digest, metadata
+packets, acquisition review and diagnostic calibration/replay keys must still
+be bound independently. Existing production calibrations remain evidence for
+their original production executable, not the new test image.
+
 ## 9. Risks and non-goals
 
 | ID | Risk | Mitigation |

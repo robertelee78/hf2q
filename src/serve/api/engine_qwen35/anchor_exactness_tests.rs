@@ -50,6 +50,8 @@ pub(crate) mod fresh_http;
 mod fresh_prefix;
 #[path = "anchor_exactness/fresh_admission.rs"]
 mod fresh_admission;
+#[path = "anchor_exactness/config_recipe_export.rs"]
+mod config_recipe_export;
 
 const Q38: &str = "cf0eb0103c1ffe7b3702670aa794a669bafbe328b95e892268305dd87c2c30d7";
 const Q36: &str = "815a22cab21649948352c0eea6e9be0d9d15606e2024d86e7bdb71fb9df08220";

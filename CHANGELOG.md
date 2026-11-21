@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Test-only C2 fresh-reference metadata export derives the exact native compact-Serde model configuration and acquisition recipe from bounded, retained-FD GGUF header reads. It creates no model or device and does not attest acquisition, registration or qualification; configuration identity no longer needs an approximate external fingerprint.
+
 ### Fixed
 
 - ADR-065 E1 analysis rejects native-profiled wall controls and requires source-proven omission for empty profiling settings. Historical profile/wall ratios do not qualify unprofiled observer distortion; raw diagnostics and exact-transcript evidence are retained.

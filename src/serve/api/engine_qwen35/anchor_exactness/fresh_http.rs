@@ -154,13 +154,21 @@ pub(crate) fn prepared(headers:&axum::http::HeaderMap,req:&ChatCompletionRequest
         registration_architecture:run.architecture.clone(),cached_tokens:None,transactions:Vec::new()});
     params.c2_ticket=Some(ticket);Ok(())
 }
+
+pub(super) fn config_recipe<'a>(
+    family: Family, route: &'a str, actual_model_config_sha256: String,
+) -> acquisition::ConfigRecipe<'a> {
+    acquisition::ConfigRecipe { family, capacity: 262144, slots: 4,
+        output_allowance: 8192, cache_mode: "TQ", route, actual_model_config_sha256 }
+}
+
 pub(crate) fn model_loaded(model:&Qwen35LoadedModel,architecture:&str)->Result<()> {
     let mut global=lock();let run=global.as_mut().context("fresh capture absent")?;
     ensure!(run.worker.is_none()&&model.model.kv_graft.is_none()&&model.tq_kv_active,"single vanilla TQ model required");
     let route=format!("C2-fresh-fixed-HTTP-{:?};quota={}",run.packet.route,std::env::var("HF2Q_QWEN_ANCHOR_BYTES_PER_SLOT_MAX")?);
-    run.worker=Some(acquisition::Scope::c2_loaded_binding(&run.packet.identity,&acquisition::ConfigRecipe{family:run.packet.family,
-        capacity:262144,slots:4,output_allowance:8192,cache_mode:"TQ",route:&route,
-        actual_model_config_sha256:hash(&serde_json::to_vec(&model.model.cfg)?)},model.c2_model_witness.clone())?);
+    run.worker=Some(acquisition::Scope::c2_loaded_binding(&run.packet.identity,
+        &config_recipe(run.packet.family,&route,hash(&serde_json::to_vec(&model.model.cfg)?)),
+        model.c2_model_witness.clone())?);
     run.architecture=architecture.into();Ok(())
 }
 pub(crate) fn admitted(model:&Qwen35LoadedModel,cache:&HybridKvCache,slot:SlotId,prompt:&[u32],cached:usize,params:&SamplingParams)->Result<()> {
