@@ -409,6 +409,7 @@ impl Qwen35Model {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .map(|(outputs, _normed)| outputs)
             },
@@ -522,6 +523,7 @@ impl Qwen35Model {
         mut output_tail: Option<&mut JointOutputHeadTail<'_>>,
         held_outputs: Option<&mut Vec<MlxBuffer>>,
         decision_histories: Option<&[Option<&[u32]>]>,
+        host_work: Option<&mut dyn FnMut()>,
     ) -> Result<(Vec<Qwen35JointRowOutput>, MlxBuffer)> {
         let arena_setup = crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
         let cfg = &self.cfg;
@@ -1146,8 +1148,32 @@ impl Qwen35Model {
         } else {
             "qwen35.joint_decode.output_head"
         };
-        enc.commit_and_wait_labeled(head_label)
-            .map_err(|e| anyhow!("Qwen joint decode command buffer: {e}"))?;
+        if let Some(host_work) = host_work {
+            if mlx_native::kernel_profile::is_enabled()
+                || mlx_native::kernel_profile::is_dispatch_enabled()
+            {
+                // The native async labeled commit cannot preserve dispatch-only
+                // samples or return profile-resolution errors. Keep the checked
+                // synchronous profiling path, explicitly without overlap.
+                enc.commit_and_wait_labeled(head_label)
+                    .map_err(|e| anyhow!("Qwen joint decode command buffer: {e}"))?;
+                mlx_native::command_timeline::mark("joint.head_profile_sync_no_overlap");
+                mlx_native::command_timeline::mark("joint.host_work_begin");
+                host_work();
+                mlx_native::command_timeline::mark("joint.host_work_end");
+            } else {
+                enc.commit_labeled(head_label);
+                mlx_native::command_timeline::mark("joint.head_submitted");
+                mlx_native::command_timeline::mark("joint.host_work_begin");
+                host_work();
+                mlx_native::command_timeline::mark("joint.host_work_end");
+                enc.wait_until_completed()
+                    .map_err(|e| anyhow!("Qwen joint decode command buffer: {e}"))?;
+            }
+        } else {
+            enc.commit_and_wait_labeled(head_label)
+                .map_err(|e| anyhow!("Qwen joint decode command buffer: {e}"))?;
+        }
         mlx_native::command_timeline::mark("joint.head_completed");
         match held_outputs {
             // The caller releases them when its commit settles.

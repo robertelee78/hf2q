@@ -221,7 +221,7 @@ fn qwen36_dflash2_verify_moe_route_replay() {
                 })
                 .collect();
             let Qwen35JointVerify { rows, pending, .. } = model
-                .forward_gpu_dflash2_verify(&lanes, &mut cache, mode, dense_ffn, options, None)
+                .forward_gpu_dflash2_verify(&lanes, &mut cache, mode, dense_ffn, options, None, None)
                 .unwrap_or_else(|error| panic!("segment {segment} step {step}: {error:#}"));
             for (lane, (outputs, stream)) in rows.iter().zip(&streams).enumerate() {
                 for (row, output) in outputs.iter().enumerate() {

@@ -164,6 +164,7 @@ pub(super) fn dflash2_verify(
             arm.dense_ffn,
             arm.options,
             Some(capture),
+            None,
         ),
         Tokens::GpuPoisonedPadding => model.forward_gpu_dflash2_verify_from_gpu_tokens(
             &lanes,
@@ -173,6 +174,7 @@ pub(super) fn dflash2_verify(
             arm.dense_ffn,
             arm.options,
             Some(capture),
+            None,
             None,
         ),
     }
