@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Test-only C2 fresh-reference metadata export derives the exact native compact-Serde model configuration and acquisition recipe from bounded, retained-FD GGUF header reads. It creates no model or device and does not attest acquisition, registration or qualification; configuration identity no longer needs an approximate external fingerprint.
+- Qwen DFlash2 can prepare bounded, lane-local proposal grammar transitions between target submission and checked completion, consuming them only on the matching canonical prefix. The canonical sampler and semantic observation order are unchanged; draft producers remain owned until checked before CPU access. Profiling-forced synchronous execution is explicitly not overlap. Focused semantic and synthetic-Metal checks pass; measured overlap, real serving and release qualification remain required.
 
 ### Fixed
 

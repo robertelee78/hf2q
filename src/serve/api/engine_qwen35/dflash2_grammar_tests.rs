@@ -1,0 +1,263 @@
+//! Deterministic, weightless consumer semantics; no Metal dispatch or models.
+use std::sync::Arc;
+use std::time::Duration;
+
+use ahash::AHashMap;
+use tokenizers::decoders::byte_level::ByteLevel;
+use tokenizers::models::bpe::BPE;
+use tokenizers::Tokenizer;
+
+use super::*;
+use super::super::{
+    plan_qwen35_verified_block, Qwen35CanonicalDecision, Qwen35DecisionSource,
+    Qwen35SpecSemanticState, Qwen35ThinkingBudgetState,
+};
+use super::super::speculation_qualification_tests::loaded_model;
+use crate::serve::api::engine::SamplingParams;
+use crate::serve::api::grammar::parse;
+use crate::serve::api::qwen35_speculation::QwenSpeculationPolicy;
+use crate::serve::api::registry::{ToolCallSplitter, QWEN35};
+use crate::serve::api::token_text::token_bytes_table;
+use crate::serve::multi_seq_kv::SlotId;
+
+const SEED: u32 = 0;
+const A: u32 = 1;
+const B: u32 = 2;
+const C: u32 = 3;
+const X: u32 = 4;
+const OPEN: u32 = 5;
+const MERGED: u32 = 6;
+const OPEN_LEFT: u32 = 7;
+const OPEN_RIGHT: u32 = 8;
+const LEAD: u32 = 9;
+const CONT: u32 = 10;
+const CONT_OPEN: u32 = 11;
+const EMPTY: u32 = 15;
+const EOS: u32 = 63;
+
+fn model() -> Qwen35LoadedModel {
+    let pieces = [
+        (SEED, "p"), (A, "a"), (B, "b"), (C, "c"), (X, "x"),
+        (OPEN, "<tool_call>"), (MERGED, "<tool_call>a"),
+        (OPEN_LEFT, "<tool_"), (OPEN_RIGHT, "call>"),
+        // GPT-2 byte-level pieces: C3 A9 is the UTF-8 encoding of é.
+        (LEAD, "\u{00c3}"), (CONT, "\u{00a9}"),
+        (CONT_OPEN, "\u{00a9}<tool_call>"),
+    ];
+    let vocab: AHashMap<String, u32> = pieces.into_iter()
+        .map(|(id, piece)| (piece.to_string(), id)).collect();
+    let bpe = BPE::builder().vocab_and_merges(vocab, Vec::new())
+        .build().expect("byte-level fixture");
+    let mut tokenizer = Tokenizer::new(bpe);
+    tokenizer.with_decoder(Some(ByteLevel::default()));
+    let mut qwen = loaded_model(QwenSpeculationPolicy::Off);
+    qwen.tokenizer = tokenizer;
+    qwen
+}
+
+fn state(qwen: &Qwen35LoadedModel, first: u32, grammar: &str) -> Qwen35DecodeState {
+    let mut logits = vec![-100.0; qwen.vocab_size];
+    logits[first as usize] = 20.0;
+    let mut state = Qwen35DecodeState::from_prefill_logits(
+        qwen, vec![SEED], SamplingParams { max_tokens: 64, ..SamplingParams::default() },
+        None, SlotId(0), 0, &logits, Duration::ZERO, 1, None,
+    ).expect("seed decode state");
+    let grammar = parse(grammar).expect("fixture grammar");
+    let root = grammar.rule_id("root").unwrap();
+    state.params.grammar = Some(grammar.clone());
+    state.params.token_bytes = Some(Arc::new(token_bytes_table(&qwen.tokenizer, qwen.vocab_size)));
+    state.grammar_runtime = Some(GrammarRuntime::new(grammar, root).unwrap());
+    state
+}
+
+fn choose(
+    semantic: &mut Qwen35SpecSemanticState,
+    qwen: &Qwen35LoadedModel,
+    params: &SamplingParams,
+    preferred: u32,
+    prepared: Option<&mut PreparedDFlash2Grammar>,
+) -> Qwen35CanonicalDecision {
+    let mut logits = vec![-100.0; qwen.vocab_size];
+    logits[preferred as usize] = 20.0;
+    semantic.select_and_observe_from(
+        qwen, params, Qwen35DecisionSource::Logits(&mut logits), prepared,
+    ).expect("canonical decision")
+}
+
+/// Compare actual canonical decisions and committed text/history/router state,
+/// including decisions AFTER an early mismatch. Preparation cannot mutate the
+/// source: the real ordinary commit path below remains an independent oracle.
+fn sequence(
+    qwen: &Qwen35LoadedModel,
+    state: &mut Qwen35DecodeState,
+    drafts: &[u32],
+    decisions: &[(u32, u32)],
+    expected_text: &str,
+) {
+    let mut ordinary = Qwen35SpecSemanticState::from_decode(state);
+    let mut projected = ordinary.clone();
+    let mut prepared = state.prepare_dflash2_grammar(qwen, drafts).expect("prepare");
+    for &(preferred, expected) in decisions {
+        let left = choose(&mut ordinary, qwen, &state.params, preferred, None);
+        let right = choose(&mut projected, qwen, &state.params, preferred, prepared.as_mut());
+        assert_eq!(left, right);
+        assert_eq!(right.token, expected);
+        assert_eq!(right.terminal, expected == EOS);
+        let tick = state.commit_ordinary_target_token(qwen, expected, Duration::ZERO)
+            .expect("ordinary output commit");
+        let tick = state.complete_tick(tick);
+        assert_eq!(tick.finished, expected == EOS);
+        assert_eq!(projected.generated_tokens, state.generated_tokens);
+        assert_eq!(projected.sampling_history, state.sampling_history);
+    }
+    assert_eq!(state.decoded_text, expected_text);
+    assert_eq!(projected.text_decoder.clone().finish(), ordinary.text_decoder.clone().finish());
+    assert_eq!(
+        projected.tool_splitter.clone().and_then(|mut splitter| splitter.finish()),
+        state.tool_splitter.clone().and_then(|mut splitter| splitter.finish()),
+    );
+    assert_eq!(
+        projected.tool_splitter.as_ref().map(ToolCallSplitter::in_tool_call),
+        state.tool_splitter.as_ref().map(ToolCallSplitter::in_tool_call),
+    );
+}
+
+#[test]
+fn ranked_canonical_window_and_retained_prefix_are_unchanged() {
+    let qwen = model();
+    let state = state(&qwen, SEED, "root ::= \"abc\"\n");
+    let mut ordinary = Qwen35SpecSemanticState::from_decode(&state);
+    let mut projected = ordinary.clone();
+    let mut prepared = state.prepare_dflash2_grammar(&qwen, &[A, B, C]).unwrap();
+    let decide = |semantic: &mut Qwen35SpecSemanticState, row: usize,
+                      prepared: Option<&mut PreparedDFlash2Grammar>| {
+        let mut logits = vec![-100.0; qwen.vocab_size];
+        // The top logit is invalid; the unchanged ranked-validity sampler
+        // must still make the grammar-valid canonical choice on every row.
+        logits[X as usize] = 30.0;
+        logits[[A, B, C, EOS][row] as usize] = 20.0;
+        semantic.select_and_observe_from(
+            &qwen, &state.params, Qwen35DecisionSource::Logits(&mut logits), prepared,
+        )
+    };
+    let left = plan_qwen35_verified_block(&[A, B, C], |row| decide(&mut ordinary, row, None)).unwrap();
+    let right = plan_qwen35_verified_block(&[A, B, C], |row| decide(&mut projected, row, prepared.as_mut())).unwrap();
+    assert_eq!(left, right);
+    assert_eq!(right.output.into_iter().collect::<Vec<_>>(), vec![A, B, C]);
+    assert!(right.terminal_after_pending);
+    assert_eq!((right.matched_drafts, right.valid_input_tokens, right.carry_hidden_row), (3, 4, 3));
+    assert_eq!(state.generated_tokens, vec![SEED]);
+}
+
+#[test]
+fn mismatch_and_invalid_proposals_do_not_poison_later_decisions() {
+    let qwen = model();
+    let mut mismatch = state(&qwen, SEED, "root ::= \"abc\" | \"acb\"\n");
+    sequence(&qwen, &mut mismatch, &[A, B, C],
+        &[(A, A), (C, C), (B, B), (EOS, EOS)], "pacb");
+    for invalid in [X, EMPTY, EOS] {
+        let mut truncated = state(&qwen, SEED, "root ::= \"abc\"\n");
+        sequence(&qwen, &mut truncated, &[A, invalid, C],
+            &[(A, A), (B, B), (C, C), (EOS, EOS)], "pabc");
+    }
+}
+
+#[test]
+fn eos_before_acceptance_and_after_acceptance_preserves_ledger() {
+    let qwen = model();
+    let mut incomplete = state(&qwen, SEED, "root ::= \"a\"\n");
+    sequence(&qwen, &mut incomplete, &[EOS], &[(A, A), (EOS, EOS)], "pa");
+    let mut accepted = state(&qwen, SEED, "root ::= \"a\"\n");
+    sequence(&qwen, &mut accepted, &[A, EOS, X], &[(A, A), (EOS, EOS)], "pa");
+    let mut optional = state(&qwen, SEED, "root ::= \"a\"\n");
+    optional.grammar_runtime.as_mut().unwrap().set_lazy_trigger(b"<tool_call>");
+    sequence(&qwen, &mut optional, &[EOS], &[(EOS, EOS)], "p");
+}
+
+#[test]
+fn lazy_split_and_same_token_marker_body_follow_native_acceptance() {
+    let qwen = model();
+    for drafts in [vec![MERGED, B, EOS], vec![OPEN_LEFT, OPEN_RIGHT, A, B, EOS]] {
+        let mut state = state(&qwen, SEED, "root ::= \"ab\"\n");
+        state.grammar_runtime.as_mut().unwrap().set_lazy_trigger(b"<tool_call>");
+        state.tool_splitter = ToolCallSplitter::from_registration(&QWEN35);
+        let decisions: Vec<_> = drafts.iter().map(|&token| (token, token)).collect();
+        sequence(&qwen, &mut state, &drafts, &decisions, "p<tool_call>ab");
+    }
+}
+
+#[test]
+fn partial_utf8_and_decoder_driven_tool_trigger_are_not_replayed() {
+    let qwen = model();
+    let mut utf8 = state(&qwen, SEED, "root ::= \"éa\"\n");
+    // EOS after an incomplete character truncates only the projection.
+    sequence(&qwen, &mut utf8, &[LEAD, EOS],
+        &[(LEAD, LEAD), (CONT, CONT), (A, A), (EOS, EOS)], "péa");
+    let mut split = state(&qwen, LEAD, "root ::= \"a\"\n");
+    split.grammar_runtime.as_mut().unwrap().set_awaiting_trigger(true);
+    split.tool_splitter = ToolCallSplitter::from_registration(&QWEN35);
+    sequence(&qwen, &mut split, &[CONT_OPEN, A, EOS],
+        &[(CONT_OPEN, CONT_OPEN), (A, A), (EOS, EOS)], "é<tool_call>a");
+}
+
+#[test]
+fn forced_token_matches_or_discards_the_hypothetical_prefix() {
+    let qwen = model();
+    for drafts in [vec![A, C, X], vec![B, C, A]] {
+        let mut state = state(&qwen, SEED, "root ::= \"acx\" | \"bca\"\n");
+        state.params.reasoning_forced_open = true;
+        state.params.thinking_token_budget = Some(1);
+        state.params.reasoning_end_tokens = Some(Arc::new(vec![B]));
+        state.params.reasoning_close_tokens = Some(Arc::new(vec![B]));
+        state.thinking_budget = Qwen35ThinkingBudgetState::from_params(&state.params);
+        state.thinking_budget.as_mut().unwrap().observe_generated(&state.generated_tokens, false);
+        sequence(&qwen, &mut state, &drafts,
+            &[(A, B), (C, C), (A, A), (EOS, EOS)], "pbca");
+    }
+}
+
+#[test]
+fn projections_and_diagnostic_clones_are_isolated() {
+    let qwen = model();
+    let lane = state(&qwen, SEED, "root ::= \"abc\" | \"acb\"\n");
+    let mut prepared = lane.prepare_dflash2_grammar(&qwen, &[A, B, C]).unwrap().unwrap();
+    let mut diagnostic = prepared.clone();
+    let mut left = Qwen35SpecSemanticState::from_decode(&lane);
+    let mut right = left.clone();
+    for token in [A, B, C, EOS] {
+        let decision = choose(&mut left, &qwen, &lane.params, token, Some(&mut prepared));
+        assert_eq!(decision.token, token);
+    }
+    // Consuming one projection did not consume its diagnostic sibling.
+    for token in [A, B, C, EOS] {
+        assert_eq!(choose(&mut right, &qwen, &lane.params, token, Some(&mut diagnostic)).token, token);
+    }
+    let mut peer = state(&qwen, SEED, "root ::= \"acb\"\n");
+    peer.slot_id = SlotId(1);
+    sequence(&qwen, &mut peer, &[A, C, B], &[(A, A), (C, C), (B, B), (EOS, EOS)], "pacb");
+    let mut untouched = Qwen35SpecSemanticState::from_decode(&lane);
+    assert_eq!(choose(&mut untouched, &qwen, &lane.params, A, None).token, A);
+    assert_eq!(choose(&mut untouched, &qwen, &lane.params, C, None).token, C);
+}
+
+#[test]
+fn authoritative_metadata_errors_are_not_grammar_misses() {
+    let qwen = model();
+    let mut state = state(&qwen, SEED, "root ::= \"a\"\n");
+    assert!(state.prepare_dflash2_grammar(&qwen, &[qwen.vocab_size as u32])
+        .err().unwrap().to_string().contains("outside the authoritative vocabulary"));
+    assert!(state.prepare_dflash2_grammar(&qwen, &[A; 8])
+        .err().unwrap().to_string().contains("exceeds seven"));
+    state.params.token_bytes = None;
+    assert!(state.prepare_dflash2_grammar(&qwen, &[A])
+        .err().unwrap().to_string().contains("requires authoritative token bytes"));
+    state.params.token_bytes = Some(Arc::new(vec![b"a".to_vec()]));
+    assert!(state.prepare_dflash2_grammar(&qwen, &[A])
+        .err().unwrap().to_string().contains("table length"));
+    state.grammar_runtime = None;
+    state.params.grammar = None;
+    state.params.token_bytes = None;
+    assert!(state.prepare_dflash2_grammar(&qwen, &[A]).unwrap().is_none());
+    assert_eq!(choose(&mut Qwen35SpecSemanticState::from_decode(&state),
+        &qwen, &state.params, X, None).token, X);
+}

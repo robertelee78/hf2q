@@ -4,7 +4,7 @@
 - **Status:** Accepted; implementation authorized for the v0.1.30 program
 - **Decider:** Robert E. Lee (product owner), 2026-11-10
 - **Scope:** every enabled hf2q text-generation architecture; Qwen3.8 is the first qualified checkpoint
-- **Updated:** 2026-11-16 — separate BF16 checkpoint accuracy from complete native-AF4 conformance; retain task quality, transactional state, memory, stock/peer performance and RC requirements.
+- **Updated:** 2026-11-22 — add the D4 grammar-projection/submission candidate and focused proof; measured overlap, realistic serving and release qualification remain open.
 
 ## Problem
 
@@ -2015,6 +2015,54 @@ Complete source/build/raw-stream/safety/comparison proof SHA256:
   than inferring it from command count.
 - Add decode-debt scheduling only as a separately attributed experiment after
   D1-D3 pass. It must not obscure drafter/verifier attribution.
+
+#### D4 grammar-projection candidate (2026-11-22)
+
+The Qwen DFlash2 scheduler now supplies useful grammar work to the target's
+output-head submission boundary. At most seven actual proposals per lane are
+simulated without sampling or mutating the live output ledger, repetition
+history, RNG or thinking budget. A matching canonical prefix moves its prepared
+post-accept, pre-tool-trigger grammar snapshots into the ordinary semantic path;
+a mismatch discards the remainder, and a grammar-invalid proposal truncates the
+projection. Real decoder, tool-trigger and budget observation retain their
+existing order. The canonical greedy ranked-validity and probabilistic full-mask
+samplers are unchanged.
+
+The asynchronous draft command, including an adopted prefetch, stays owned until
+its actual checked completion before CPU proposal access. Same-queue submission
+order alone does not authorize an early host read. The target invokes borrowed
+host work after submission and before checked completion/readback; preparation
+errors are retained until that boundary. Grammar-free steps allocate or copy no
+projection state and keep the existing target completion path. Both native
+command-buffer and dispatch profiling preserve the checked synchronous path and
+emit an explicit no-overlap marker instead of pretending to measure overlap.
+This uses published `mlx-native 0.24.0`, without a local patch.
+
+A source-bound dirty integration snapshot passed 20 focused checks:
+eight grammar/semantic edge cases, eight existing window/candidate plan cases,
+and four real synthetic-Metal producer/prefetch cases. The latter read through
+the checked producer API rather than an artificial later-command flush. The
+initial unused-mutable test-binding compilation failure is retained separately.
+The source review found no concrete defect in either the semantic or
+submission/ownership slice. Evidence namespace:
+`d4-grammar-overlap-implementation-v1/focused-tests-v2`.
+
+Reproduce these focused contracts with locked dependencies:
+
+```sh
+cargo test --release --locked --bin hf2q dflash2_grammar
+cargo test --release --locked --bin hf2q dflash2_scheduler
+cargo test --release --locked --bin hf2q draft_prefetch
+```
+
+These checks are not D4 acceptance. Actual useful CPU/GPU interval overlap,
+full-cycle overhead, realistic unary/SSE/tool-result continuation and
+cancellation/rollback on the exact candidate remain required. Callback invocation
+or command counts do not establish overlap. The current peer also synchronizes
+before grammar sampling; this candidate is not evidence that peer grammar
+overlap explains a measured speed gap. No D0-D6, C2, quality, fairness, memory,
+performance, default-promotion or release gate is waived.
+
 
 #### D2-D4 implementation-candidate status
 
