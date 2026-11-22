@@ -4,7 +4,7 @@
 - **Status:** Accepted; implementation authorized for the v0.1.30 program
 - **Decider:** Robert E. Lee (product owner), 2026-11-10
 - **Scope:** every enabled hf2q text-generation architecture; Qwen3.8 is the first qualified checkpoint
-- **Updated:** 2026-11-22 — add the D4 grammar-projection/submission candidate and focused proof; measured overlap, realistic serving and release qualification remain open.
+- **Updated:** 2026-11-22 — record the first source-bound full-profile D4 cohort and distinct registered-head/post-hoc verification-body interval results; D4 qualification and release remain open.
 
 ## Problem
 
@@ -2062,6 +2062,59 @@ or command counts do not establish overlap. The current peer also synchronizes
 before grammar sampling; this candidate is not evidence that peer grammar
 overlap explains a measured speed gap. No D0-D6, C2, quality, fairness, memory,
 performance, default-promotion or release gate is waived.
+
+#### D4 first real cohort and measurement scopes (2026-11-22)
+
+The single corrected-eligibility diagnostic used production image
+`5c4c114bce45f242b28aea06d42571bc7ac4c65e` and harness
+`5b00230f9bbf8b48b63e0d4bc36ee0a8ec4dff28`, with published
+`mlx-native 0.24.0` on the 128 GiB M5 Max. The existing Qwen3.8 27B artifact
+SHA256 was `cf0eb0103c1ffe7b3702670aa794a669bafbe328b95e892268305dd87c2c30d7`;
+the pinned drafter was `qwen38-27b-dflash2-50307d4c`. The unchanged canonical
+cohort used four slots, context 262144 per slot, a 48 GiB shared KV budget,
+vision off, TQ defaults, auto/pinned-pair/full selection, output cap 8192,
+repetition penalty 1.05 as f32, and thinking/tool-thinking budgets 2048/512.
+The registered 28-request unary/SSE/tool cohort completed with
+`CalibrationPass`, strict/raw replay and native cleanup proven, normal pressure
+and zero swap growth. Client protocol completion still awaits independent task
+quality review; it is not model, D4 or release qualification.
+
+The registered consumer selected **only the output-head GPU interval**. All
+328 closed records were valid, but none overlapped the source-defined useful
+grammar span. In every cycle CPU grammar work ended before that head started.
+The registered head-window hypothesis is therefore not proved. Its result and
+the consumed one-attempt/no-retry budget remain unchanged.
+
+An explicitly **post-hoc** analysis of the same immutable bytes instead
+intersected the union of exact-labelled embedding/joint-layer/output-head GPU
+commands committed inside the verifier phase. It found intersections in
+327/328 cycles, totaling 16.185 ms against 16.217 ms of recorded grammar spans.
+This uses actual interval unions, never the envelope across GPU gaps, and never
+counts the separate native `kernel_start`/`kernel_end` fields as GPU execution.
+Source review confirms these layer command buffers belong to the target
+verifier, and submission does not mean immediate GPU execution. The request
+bytes and serving source establish installed request-local lazy tool grammars;
+server-default `grammar.active: false` does not describe their activation.
+However, these clocks do not count actual nonempty proposal preparation,
+active-versus-awaiting grammar work, successful transitions or matching-prefix
+consumption. Before claiming useful consumed grammar overlap, retain those
+per-lane/per-cycle counts at the preparation and `take_transition` consumer
+sites, distinguishing hypothetical planning from live output observation.
+Ordinary-path runtime semantic comparison remains independent evidence.
+This exploration cannot relabel the failed registered head test, establish a
+speedup, or waive any qualification gate. No extra model run or comparison arm
+was authorized by changing scope. No native API change is justified by these
+intervals alone.
+
+Retained evidence namespace: `d4-grammar-overlap-implementation-v1/runtime-t2-v1`.
+`head-window-result.json` SHA256:
+`e5f53a2e29c56ca0fb6dde6de8e8a62f9c983d70c4d304ab1c4ae2128bbec96c`.
+Original timeline SHA256:
+`591f8f0c742c53f0b05b095801ea9fe9ab3ade29e25b4eba3d4df48668e0e53a`.
+The report, registration, source/image/descriptor bindings and original
+receipts are retained; they are not committed model artifacts. All earlier
+readiness failures and stopped comparison attempts remain failures/stopped.
+
 
 
 #### D2-D4 implementation-candidate status
