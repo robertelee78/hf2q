@@ -238,6 +238,7 @@ def _work(record, marks, clock, gpu):
     require(type(work) is list and len(work) == 4, "four physical grammar work slots")
     observed = {slot for slot, value in enumerate(work) if value is not None}
     require(observed == set(lanes), "work slots must match observed lane spans exactly")
+    require(len(observed) <= record["active_lanes"], "observed work exceeds active lanes")
     require(bool(observed) == bool(clock["grammar"]), "work slots must match grammar callback presence")
     groups = {state: {outcome: [] for outcome in OUTCOMES} for state in ("active", "awaiting_trigger")}
     actual_proposals = attempts = 0
@@ -287,6 +288,8 @@ def _work(record, marks, clock, gpu):
         attempts += len(attempted)
         lane_rows.append({"slot": slot, "actual_proposals": count, "attempts": len(attempted),
                           "awaiting_trigger_at_start": value["awaiting_trigger_at_start"]})
+    require(actual_proposals <= record["selected_rows"] - record["active_lanes"],
+            "actual proposals exceed selected rows after lane anchors")
     measured = {}
     for state, outcomes in groups.items():
         measured[state] = {
@@ -311,6 +314,7 @@ def _cycle(record, scope, previous):
     require(type(record) is dict and record.get("finished") is True, "finished cycle object required")
     require(integer(record.get("active_lanes"), 4) and record["active_lanes"] > 0
             and integer(record.get("selected_rows"), 32) and record["selected_rows"] >= record["active_lanes"]
+            and record["selected_rows"] <= 8 * record["active_lanes"]
             and integer(record.get("accepted_rows"), record["selected_rows"])
             and type(record.get("gpu_acceptance")) is bool, "typed bounded cycle summary")
     require(integer(record.get("dropped_commands")) and record["dropped_commands"] == 0

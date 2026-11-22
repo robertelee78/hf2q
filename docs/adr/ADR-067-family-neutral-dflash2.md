@@ -2149,7 +2149,7 @@ another transition. Clock spans do not prove uninterrupted CPU residency or GPU
 occupancy. The recorder perturbs diagnostics; it does not measure unprofiled
 speedup. Grammar-free preparation still returns before projection/state copying.
 
-Focused source-bound checks passed: 11 grammar semantics/work-disposition tests,
+Initial focused checks passed: 11 grammar semantics/work-disposition tests,
 8 existing scheduler-plan regressions, and 25 strict consumer tests. Both CLI
 scopes also accepted the unchanged 328-cycle T2 bytes as interval-only evidence
 with all useful-work metadata missing; neither supplied consumed-work evidence
@@ -2157,6 +2157,17 @@ nor changed the rejected head verdict. Native test ownership/cleanup and source
 checks passed without retaining a lease. A fresh registered real capture,
 ordinary-path runtime semantic comparison and full-cycle overhead/quality gates
 remain required. No new model run or native dependency change is implied.
+
+Independent source review then found two diagnostic contract defects: an
+all-anchor grammar cohort was gated out of zero-work observation, and the
+consumer accepted work totals contradicting active-lane/selected-row capacity.
+Both were repaired without changing disabled or grammar-free preparation.
+The focused scheduler suite passed 9 tests, including the anchor-only regression;
+the strict consumer passed 28 tests, including each contradictory-budget case.
+Both source findings were closed on review. The first repair test build's
+unused mutable fixture binding failed compilation; its receipt is preserved,
+the binding was corrected without suppressing warnings, and no test/model pass
+was inferred from that failure. These source repairs authorize no model trial.
 
 
 

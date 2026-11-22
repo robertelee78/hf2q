@@ -750,7 +750,7 @@ impl Qwen35LoadedModel {
                     .then_some(states[index].sampling_history.as_slice())
             })
             .collect::<Vec<_>>();
-        let prepare_needed = grammar_overlap::needed(states, &verifying, &tokens);
+        let prepare_needed = grammar_overlap::needed(states, &verifying, &tokens, timeline_on);
         let mut prepared_grammars: Option<grammar_overlap::PreparedBySlot> =
             prepare_needed.then(|| std::array::from_fn(|_| Ok(None)));
         let mut prepare_result = None;
@@ -1389,6 +1389,32 @@ mod tests {
         .expect("seed decode state");
         state.history_lookup = None;
         state
+    }
+
+    #[test]
+    fn anchor_only_grammar_window_is_observed_without_enabling_ordinary_preparation() {
+        let qwen = loaded_model(QwenSpeculationPolicy::Off);
+        let mut state = decode_state(&qwen, 2);
+        let grammar = crate::serve::api::grammar::parse("root ::= \"a\"\n").unwrap();
+        let root = grammar.rule_id("root").unwrap();
+        state.grammar_runtime =
+            Some(crate::serve::api::grammar::GrammarRuntime::new(grammar, root).unwrap());
+        state.params.token_bytes = Some(std::sync::Arc::new(
+            crate::serve::api::token_text::token_bytes_table(&qwen.tokenizer, qwen.vocab_size),
+        ));
+        let states = [&mut state];
+        let anchor_only = [Some(vec![8])];
+        assert!(!grammar_overlap::needed(&states, &[0], &anchor_only, false));
+        assert!(grammar_overlap::needed(&states, &[0], &anchor_only, true));
+        let work = states[0].prepare_dflash2_grammar(&qwen, &[], true)
+            .unwrap().unwrap().work().unwrap();
+        assert_eq!(work.actual_proposals, 0);
+        assert!(work.attempts.iter().all(Option::is_none));
+        assert!(grammar_overlap::needed(&states, &[0], &[Some(vec![8, 9])], false));
+        states[0].grammar_runtime = None;
+        for collect_work in [false, true] {
+            assert!(!grammar_overlap::needed(&states, &[0], &anchor_only, collect_work));
+        }
     }
 
     fn greedy(token: u32) -> Qwen35JointRowOutput {

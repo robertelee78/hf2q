@@ -20,10 +20,12 @@ pub(super) fn needed(
     states: &[&mut Qwen35DecodeState],
     verifying: &[usize],
     tokens: &[Option<Vec<u32>>],
+    collect_work: bool,
 ) -> bool {
     verifying.iter().any(|&index| {
         states[index].grammar_runtime.is_some()
-            && tokens[index].as_ref().is_some_and(|tokens| tokens.len() > 1)
+            && (collect_work
+                || tokens[index].as_ref().is_some_and(|tokens| tokens.len() > 1))
     })
 }
 

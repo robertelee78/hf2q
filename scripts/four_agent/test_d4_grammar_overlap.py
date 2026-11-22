@@ -97,6 +97,23 @@ class GrammarOverlapTests(unittest.TestCase):
         self.assertEqual(work["active_consumed_overlap_seconds"], 0.5)
         self.assertEqual(work["by_state_and_outcome"]["active"]["planning_consumed"]["attempts"], 1)
 
+    def test_actual_proposals_fit_selected_rows_after_anchors(self):
+        record = cycle()
+        record.update(active_lanes=1, selected_rows=1, accepted_rows=1)
+        self.rejected(record)
+        record.update(selected_rows=2, accepted_rows=2)
+        self.assertTrue(self.work(record)["active_consumed_overlap_observed"])
+
+    def test_observed_grammar_lanes_do_not_exceed_active_lanes(self):
+        record = cycle([lane([attempt()]), lane([attempt()]), None, None])
+        record.update(active_lanes=1, selected_rows=8, accepted_rows=2)
+        self.rejected(record)
+
+    def test_selected_rows_do_not_exceed_per_lane_capacity(self):
+        record = cycle()
+        record.update(active_lanes=1, selected_rows=9, accepted_rows=1)
+        self.rejected(record)
+
     def test_global_callback_and_envelope_gap_are_not_consumed_overlap(self):
         record = cycle(head=(5.25, 5.75))
         record["commands"].append(command(overlap.HEAD, 3.3, (7.25, 7.75)))
