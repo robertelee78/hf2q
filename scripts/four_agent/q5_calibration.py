@@ -499,6 +499,7 @@ def main(argv=None):
     run_kind = 'negative-control' if args.negative_control else 'admitted' if args.admission_receipt else 'calibration'
     receipt = {'schema': RECEIPT_SCHEMA, 'mode': 'negative-control' if args.negative_control else 'calibration',
                'run_kind': run_kind, 'family': plan['family'], 'workload': plan['workload'], 'policy': plan['policy'],
+               'run_identity': {'run_id': base['RUN_ID'], 'nonce32': base['NONCE32']},
                'started_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                'host': q5_host.host_identity(), 'serve_argv': plan['serve']['argv'], 'serve_env': plan['serve']['env'],
                'served_model': plan.get('served_model'),

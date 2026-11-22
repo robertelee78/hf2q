@@ -1,4 +1,5 @@
 """Q5 calibration supervisor controls: synthetic samples/rows/cases only; no host commands or launches."""
+import hashlib
 import json
 import math
 import os
@@ -6,6 +7,7 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
+from unittest import mock
 
 import q5_admission
 import q5_artifacts
@@ -680,6 +682,38 @@ class ArgvAndCases(unittest.TestCase):
     def test_run_id_matches_client_identity_rule(self):
         for name in ('x', 'q5-qwen38-20261030T120000Z', 'a.b c' * 30):
             self.assertRegex(q5_calibration.run_id(name, 'f' * 32), r'^[A-Za-z0-9_-]{16,64}$')
+
+    def test_pre_client_failure_keeps_the_exact_plan_replayable_without_approval(self):
+        case, env = self.case(), self.required()
+        with tempfile.TemporaryDirectory() as tmp:
+            case_path, out = Path(tmp) / 'case.json', Path(tmp) / 'run'
+            case_path.write_text(json.dumps(case))
+            nc_path = Path(tmp) / 'negative-control.json'
+            nc_path.write_text('{}')
+            with (mock.patch.dict(os.environ, env, clear=True),
+                  mock.patch.object(q5_calibration.secrets, 'token_hex', return_value='e' * 32),
+                  mock.patch.object(q5_calibration.q5_artifacts, 'file_checks', return_value={'fixture': True}),
+                  mock.patch.object(q5_calibration.q5_admission, 'negative_control_latency', return_value=NC_LATENCY),
+                  mock.patch.object(q5_calibration.q5_host, 'host_identity', return_value={}),
+                  mock.patch.object(q5_calibration, 'identities'),
+                  mock.patch.object(q5_calibration, 'supervise', side_effect=RuntimeError('before client approval')),
+                  mock.patch.object(q5_calibration, 'finish')):
+                exit_code = q5_calibration.main([
+                    str(case_path), '--output', str(out), '--negative-control-receipt', str(nc_path)])
+            receipt = json.loads((out / 'receipt.json').read_text())
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(receipt['verdict']['verdict'], 'SupervisorError')
+            self.assertFalse((out / 'client-approval.json').exists())
+            identity = receipt['run_identity']
+            base = {'REPO': str(q5_calibration.REPO), 'OUT': str(out),
+                    'PYTHON': q5_calibration.sys.executable,
+                    'PYTHON_SHA256': q5_calibration.sha256(Path(q5_calibration.sys.executable).resolve()),
+                    'RUN_ID': identity['run_id'], 'NONCE32': identity['nonce32']}
+            replay = q5_case.build_plan(case, base, env)
+            digest = lambda plan: hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
+            self.assertEqual(digest(replay), receipt['plan_sha256'])
+            tampered = q5_case.build_plan(case, {**base, 'NONCE32': 'f' * 32}, env)
+            self.assertNotEqual(digest(tampered), receipt['plan_sha256'])
 
 
 class Parsers(unittest.TestCase):

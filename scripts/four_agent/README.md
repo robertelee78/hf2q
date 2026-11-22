@@ -203,6 +203,12 @@ Placeholders are written `{NAME}` and are filled from three sources:
 - `env(1)` and shell `-c` strings are refused. A shell is accepted only when its first argument is an absolute script path; the family launchers are run as `/bin/bash <repo>/scripts/serve_<family>_opencode.sh`.
 - `client.approval.set` overwrites keys of the operator's approval template after launch. A value that is exactly one placeholder keeps its type, so `server_pid` stays an integer. `{"sha256_of": [paths]}` becomes a `{basename: sha256}` map.
 
+The supervisor receipt records `run_identity` (`run_id`, `nonce32`) even when
+readiness fails before client approval exists. Together with the pinned case,
+interpreter and environment, it permits exact `plan_sha256` replay without
+fabricating an approval packet. This identity is not proof of client execution
+or a passing run; stop, sampling and cleanup evidence still require validation.
+
 The example cases follow the existing runners:
 - They use the canonical launchers with explicit text-only, four-slot settings.
 - They use the checked-in four-agent client `qwen_n4_live_smoke.py`, with `--family qwen`, `gemma4` or `deepseek4`.
