@@ -891,6 +891,29 @@ the actual directories, summary and raw receipts for each of the four agents. A
 patch quality, model performance or release qualification. The existing dense
 seven-turn N1 oracle remains separate and unchanged.
 
+### DFlash2 grammar overlap diagnostic
+
+`HF2Q_DFLASH2_CYCLE_TIMELINE` captures actual proposal work per physical slot
+(`hf2q.dflash2.grammar_work.v1`). Repeated lane-contained proposal spans join
+awaiting/active grammar state to final invalid, prepared, planning-consumed or
+divergence-discarded outcomes. Consumption means matching hypothetical planning,
+not advancement of the live output ledger.
+
+```bash
+python3 scripts/four_agent/d4_grammar_overlap.py "$TRACE" \
+  --expected-sha256 "$ORIGINAL_SHA256" --scope target-verifier-body
+```
+
+Use `--scope head` for the output head alone. Declare the scope before a new
+model experiment; choosing another scope afterward cannot rescue a failed
+registered head test. The analyzer uses actual GPU interval unions, not the
+envelope across gaps or CPU-driver `kernel_start/end` fields. Only each active,
+actually consumed transition's own preparation span supplies useful-work
+interval evidence. Old captures without work metadata stay interval-only.
+Malformed or incomplete captures fail closed. Source/binary/model bindings,
+registration, ordinary-path runtime parity and unprofiled quality/performance
+remain separate requirements; the instrumented recorder is not zero-overhead.
+
 ## Three-arm speed campaign (ADR-063 Q3)
 
 `q3_campaign.py` runs the per-family Q3 comparison: stock hf2q (`--stock-bin`, the released binary), experiment hf2q (`--experiment-bin`) and the peer's best valid configuration (`q5_cases/peer-<family>.json`); for Qwen3.8 and Qwen3.6 also Splash's best valid configuration (`--splash-case`, default `q5_cases/splash-<family>.json`; see "Splash peer of record"). A labeled matched-settings peer diagnostic (`--peer-matched-case`) is optional. Every run is one `q5_calibration.py` runtime, run one at a time. The design, estimator, verdict rules and root commands are in [docs/research/adr063-q3-campaign.md](../../docs/research/adr063-q3-campaign.md).

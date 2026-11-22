@@ -9,6 +9,13 @@ use anyhow::{Context, Result};
 
 pub(super) type PreparedBySlot = [Result<Option<PreparedDFlash2Grammar>>; 4];
 
+const SLOT_MARKS: [(&str, &str); 4] = [
+    ("grammar.slot0.simulate_begin", "grammar.slot0.simulate_end"),
+    ("grammar.slot1.simulate_begin", "grammar.slot1.simulate_end"),
+    ("grammar.slot2.simulate_begin", "grammar.slot2.simulate_end"),
+    ("grammar.slot3.simulate_begin", "grammar.slot3.simulate_end"),
+];
+
 pub(super) fn needed(
     states: &[&mut Qwen35DecodeState],
     verifying: &[usize],
@@ -30,6 +37,7 @@ pub(super) fn prepare(
     tokens: &[Option<Vec<u32>>],
     gpu_target_tokens: bool,
     prepared: &mut PreparedBySlot,
+    collect_work: bool,
 ) -> Result<()> {
     // These accessors check the actual retained draft producer, not merely
     // same-queue order or a promise that the later target will complete.
@@ -48,6 +56,9 @@ pub(super) fn prepare(
         let output = prepared
             .get_mut(slot)
             .context("DFlash2 grammar slot outside the four-lane profile")?;
+        if collect_work {
+            mlx_native::command_timeline::mark(SLOT_MARKS[slot].0);
+        }
         // A malformed lane is rejected only after the target's checked wait;
         // other lanes still receive their own independent preparation result.
         *output = (|| {
@@ -71,11 +82,14 @@ pub(super) fn prepare(
                     .get(1..)
                     .context("DFlash2 grammar anchor")?
             };
-            if drafts.is_empty() {
+            if drafts.is_empty() && !collect_work {
                 return Ok(None);
             }
-            state.prepare_dflash2_grammar(qwen, drafts)
+            state.prepare_dflash2_grammar(qwen, drafts, collect_work)
         })();
+        if collect_work {
+            mlx_native::command_timeline::mark(SLOT_MARKS[slot].1);
+        }
     }
     mlx_native::command_timeline::mark("grammar.simulate_end");
     Ok(())

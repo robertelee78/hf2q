@@ -200,6 +200,7 @@ struct Qwen35DFlash2Plan {
     /// but took the host sampler over their own logits.
     candidate_rows: usize,
     fallback_rows: usize,
+    grammar_work: Option<super::dflash2_grammar::DFlash2GrammarWork>,
 }
 
 impl Qwen35DFlash2Plan {
@@ -393,10 +394,12 @@ impl Qwen35DecodeState {
         } else {
             plan_qwen35_verified_block(drafts, &mut canonical_at)?
         };
+        drop(canonical_at);
         Ok(Qwen35DFlash2Plan {
             plan,
             candidate_rows,
             fallback_rows,
+            grammar_work: prepared.as_deref().and_then(PreparedDFlash2Grammar::work),
         })
     }
 
@@ -751,6 +754,7 @@ impl Qwen35LoadedModel {
         let mut prepared_grammars: Option<grammar_overlap::PreparedBySlot> =
             prepare_needed.then(|| std::array::from_fn(|_| Ok(None)));
         let mut prepare_result = None;
+        let mut grammar_work = timeline_on.then(|| [None; 4]);
         let mut prepare_grammar = || {
             prepare_result = Some(grammar_overlap::prepare(
                 self,
@@ -761,6 +765,7 @@ impl Qwen35LoadedModel {
                 &tokens,
                 gpu_target_tokens,
                 prepared_grammars.as_mut().expect("enabled grammar preparation"),
+                timeline_on,
             ));
         };
         let host_work = if prepare_needed {
@@ -908,9 +913,14 @@ impl Qwen35LoadedModel {
                         prepared,
                     )
                 })
-                .map(|plan| Verified::Window {
-                    plan,
-                    tokens: lane_tokens,
+                .map(|mut plan| {
+                    if let Some(work) = grammar_work.as_mut() {
+                        work[slot] = plan.grammar_work.take();
+                    }
+                    Verified::Window {
+                        plan,
+                        tokens: lane_tokens,
+                    }
                 })
                 .unwrap_or_else(Verified::Failed);
             accepted.push(match &step {
@@ -1179,6 +1189,7 @@ impl Qwen35LoadedModel {
                 selected_rows: selected_rows.unwrap_or_default(),
                 accepted_rows: accepted.iter().sum::<usize>(),
                 gpu_acceptance,
+                grammar_work: grammar_work.expect("enabled grammar timeline"),
             });
         }
 

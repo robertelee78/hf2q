@@ -96,7 +96,7 @@ fn sequence(
 ) {
     let mut ordinary = Qwen35SpecSemanticState::from_decode(state);
     let mut projected = ordinary.clone();
-    let mut prepared = state.prepare_dflash2_grammar(qwen, drafts).expect("prepare");
+    let mut prepared = state.prepare_dflash2_grammar(qwen, drafts, false).expect("prepare");
     for &(preferred, expected) in decisions {
         let left = choose(&mut ordinary, qwen, &state.params, preferred, None);
         let right = choose(&mut projected, qwen, &state.params, preferred, prepared.as_mut());
@@ -128,7 +128,7 @@ fn ranked_canonical_window_and_retained_prefix_are_unchanged() {
     let state = state(&qwen, SEED, "root ::= \"abc\"\n");
     let mut ordinary = Qwen35SpecSemanticState::from_decode(&state);
     let mut projected = ordinary.clone();
-    let mut prepared = state.prepare_dflash2_grammar(&qwen, &[A, B, C]).unwrap();
+    let mut prepared = state.prepare_dflash2_grammar(&qwen, &[A, B, C], false).unwrap();
     let decide = |semantic: &mut Qwen35SpecSemanticState, row: usize,
                       prepared: Option<&mut PreparedDFlash2Grammar>| {
         let mut logits = vec![-100.0; qwen.vocab_size];
@@ -220,7 +220,7 @@ fn forced_token_matches_or_discards_the_hypothetical_prefix() {
 fn projections_and_diagnostic_clones_are_isolated() {
     let qwen = model();
     let lane = state(&qwen, SEED, "root ::= \"abc\" | \"acb\"\n");
-    let mut prepared = lane.prepare_dflash2_grammar(&qwen, &[A, B, C]).unwrap().unwrap();
+    let mut prepared = lane.prepare_dflash2_grammar(&qwen, &[A, B, C], false).unwrap().unwrap();
     let mut diagnostic = prepared.clone();
     let mut left = Qwen35SpecSemanticState::from_decode(&lane);
     let mut right = left.clone();
@@ -244,20 +244,111 @@ fn projections_and_diagnostic_clones_are_isolated() {
 fn authoritative_metadata_errors_are_not_grammar_misses() {
     let qwen = model();
     let mut state = state(&qwen, SEED, "root ::= \"a\"\n");
-    assert!(state.prepare_dflash2_grammar(&qwen, &[qwen.vocab_size as u32])
+    assert!(state.prepare_dflash2_grammar(&qwen, &[qwen.vocab_size as u32], false)
         .err().unwrap().to_string().contains("outside the authoritative vocabulary"));
-    assert!(state.prepare_dflash2_grammar(&qwen, &[A; 8])
+    assert!(state.prepare_dflash2_grammar(&qwen, &[A; 8], false)
         .err().unwrap().to_string().contains("exceeds seven"));
     state.params.token_bytes = None;
-    assert!(state.prepare_dflash2_grammar(&qwen, &[A])
+    assert!(state.prepare_dflash2_grammar(&qwen, &[A], false)
         .err().unwrap().to_string().contains("requires authoritative token bytes"));
     state.params.token_bytes = Some(Arc::new(vec![b"a".to_vec()]));
-    assert!(state.prepare_dflash2_grammar(&qwen, &[A])
+    assert!(state.prepare_dflash2_grammar(&qwen, &[A], false)
         .err().unwrap().to_string().contains("table length"));
     state.grammar_runtime = None;
     state.params.grammar = None;
     state.params.token_bytes = None;
-    assert!(state.prepare_dflash2_grammar(&qwen, &[A]).unwrap().is_none());
+    for collect_work in [false, true] {
+        assert!(state.prepare_dflash2_grammar(&qwen, &[A], collect_work).unwrap().is_none());
+    }
     assert_eq!(choose(&mut Qwen35SpecSemanticState::from_decode(&state),
         &qwen, &state.params, X, None).token, X);
+}
+
+#[test]
+fn work_tracks_matching_prefix_consumption_and_discard_without_clone_leakage() {
+    use DFlash2GrammarOutcome::{DivergenceDiscarded, PlanningConsumed, Prepared};
+    let qwen = model();
+    let state = state(&qwen, SEED, "root ::= \"abc\" | \"acb\"\n");
+    let mut prepared = state.prepare_dflash2_grammar(&qwen, &[A, B, C], true)
+        .unwrap().unwrap();
+    let mut diagnostic = prepared.clone();
+    let mut semantic = Qwen35SpecSemanticState::from_decode(&state);
+    for token in [A, C, B] {
+        assert_eq!(choose(&mut semantic, &qwen, &state.params, token,
+            Some(&mut prepared)).token, token);
+    }
+    let work = prepared.work().unwrap();
+    assert_eq!(work.actual_proposals, 3);
+    assert_eq!(work.attempts.iter().flatten().map(|attempt| attempt.outcome)
+        .collect::<Vec<_>>(), [PlanningConsumed, DivergenceDiscarded, DivergenceDiscarded]);
+    assert!(diagnostic.work().unwrap().attempts.iter().flatten()
+        .all(|attempt| attempt.outcome == Prepared));
+    let mut independent = Qwen35SpecSemanticState::from_decode(&state);
+    for token in [A, B, C] {
+        assert_eq!(choose(&mut independent, &qwen, &state.params, token,
+            Some(&mut diagnostic)).token, token);
+    }
+    assert!(diagnostic.work().unwrap().attempts.iter().flatten()
+        .all(|attempt| attempt.outcome == PlanningConsumed));
+    assert!(state.prepare_dflash2_grammar(&qwen, &[A], false)
+        .unwrap().unwrap().work().is_none());
+    let empty = state.prepare_dflash2_grammar(&qwen, &[], true)
+        .unwrap().unwrap().work().unwrap();
+    assert_eq!(empty.actual_proposals, 0);
+    assert!(empty.attempts.iter().all(Option::is_none));
+}
+
+#[test]
+fn work_does_not_count_invalid_or_eos_tail_as_prepared_or_consumed() {
+    use DFlash2GrammarOutcome::{Invalid, PlanningConsumed};
+    let qwen = model();
+    let incomplete = state(&qwen, SEED, "root ::= \"abc\"\n");
+    let mut prepared = incomplete.prepare_dflash2_grammar(&qwen, &[A, X, C], true)
+        .unwrap().unwrap();
+    let mut semantic = Qwen35SpecSemanticState::from_decode(&incomplete);
+    for token in [A, B] {
+        assert_eq!(choose(&mut semantic, &qwen, &incomplete.params, token,
+            Some(&mut prepared)).token, token);
+    }
+    let work = prepared.work().unwrap();
+    assert_eq!(work.actual_proposals, 3);
+    assert_eq!(work.attempts[0].unwrap().outcome, PlanningConsumed);
+    assert_eq!(work.attempts[1].unwrap().outcome, Invalid);
+    assert!(work.attempts[2..].iter().all(Option::is_none));
+
+    let complete = state(&qwen, SEED, "root ::= \"a\"\n");
+    let mut prepared = complete.prepare_dflash2_grammar(&qwen, &[A, EOS, X], true)
+        .unwrap().unwrap();
+    let mut semantic = Qwen35SpecSemanticState::from_decode(&complete);
+    for token in [A, EOS] {
+        assert_eq!(choose(&mut semantic, &qwen, &complete.params, token,
+            Some(&mut prepared)).token, token);
+    }
+    let work = prepared.work().unwrap();
+    assert_eq!(work.actual_proposals, 3);
+    assert!(work.attempts[1].unwrap().eos);
+    assert_eq!(work.attempts[1].unwrap().outcome, PlanningConsumed);
+    assert!(work.attempts[2..].iter().all(Option::is_none));
+}
+
+#[test]
+fn work_separates_lazy_tracking_from_active_consumed_transitions() {
+    use DFlash2GrammarOutcome::PlanningConsumed;
+    let qwen = model();
+    let mut state = state(&qwen, SEED, "root ::= \"ab\"\n");
+    state.grammar_runtime.as_mut().unwrap().set_lazy_trigger(b"<tool_call>");
+    state.tool_splitter = ToolCallSplitter::from_registration(&QWEN35);
+    let mut prepared = state.prepare_dflash2_grammar(&qwen, &[MERGED, B, EOS], true)
+        .unwrap().unwrap();
+    let mut semantic = Qwen35SpecSemanticState::from_decode(&state);
+    for token in [MERGED, B, EOS] {
+        assert_eq!(choose(&mut semantic, &qwen, &state.params, token,
+            Some(&mut prepared)).token, token);
+    }
+    let work = prepared.work().unwrap();
+    assert!(work.awaiting_trigger_at_start);
+    assert_eq!(work.attempts.iter().flatten().map(|attempt| attempt.awaiting_trigger)
+        .collect::<Vec<_>>(), [true, false, false]);
+    assert!(work.attempts.iter().flatten()
+        .all(|attempt| attempt.outcome == PlanningConsumed));
 }

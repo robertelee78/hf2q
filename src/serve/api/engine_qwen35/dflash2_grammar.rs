@@ -10,6 +10,48 @@ use anyhow::{Context, Result};
 
 const MAX_PROPOSALS: usize = 7;
 
+/// Final disposition is recorded at the actual hypothetical-planning consumer,
+/// not inferred from callback invocation or the target's accepted-row count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DFlash2GrammarOutcome {
+    Invalid,
+    Prepared,
+    PlanningConsumed,
+    DivergenceDiscarded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub(super) struct DFlash2GrammarAttempt {
+    pub(super) awaiting_trigger: bool,
+    pub(super) eos: bool,
+    pub(super) outcome: DFlash2GrammarOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub(super) struct DFlash2GrammarWork {
+    pub(super) actual_proposals: usize,
+    pub(super) awaiting_trigger_at_start: bool,
+    pub(super) attempts: [Option<DFlash2GrammarAttempt>; MAX_PROPOSALS],
+}
+
+/// Close the exact attempted-proposal extent on invalid/EOS breaks and errors.
+/// Created only for an enabled timeline; no clock reads on the ordinary path.
+struct ProposalTiming;
+
+impl ProposalTiming {
+    fn begin() -> Self {
+        mlx_native::command_timeline::mark("grammar.proposal_begin");
+        Self
+    }
+}
+
+impl Drop for ProposalTiming {
+    fn drop(&mut self) {
+        mlx_native::command_timeline::mark("grammar.proposal_end");
+    }
+}
+
 #[derive(Clone)]
 struct PreparedTransition {
     token: u32,
@@ -23,9 +65,14 @@ pub(in crate::serve::api) struct PreparedDFlash2Grammar {
     transitions: [Option<PreparedTransition>; MAX_PROPOSALS],
     next: usize,
     generated_len: usize,
+    work: Option<DFlash2GrammarWork>,
 }
 
 impl PreparedDFlash2Grammar {
+    pub(super) fn work(&self) -> Option<DFlash2GrammarWork> {
+        self.work
+    }
+
     pub(super) fn take_transition(
         &mut self,
         token: u32,
@@ -36,11 +83,23 @@ impl PreparedDFlash2Grammar {
                 .is_some_and(|transition| transition.token == token);
         if !matches {
             // Never reuse a later coincidentally equal token after divergence.
+            if let Some(work) = self.work.as_mut() {
+                for attempt in work.attempts.iter_mut().flatten() {
+                    if attempt.outcome == DFlash2GrammarOutcome::Prepared {
+                        attempt.outcome = DFlash2GrammarOutcome::DivergenceDiscarded;
+                    }
+                }
+            }
             self.transitions.fill_with(|| None);
             self.next = MAX_PROPOSALS;
             return None;
         }
         let transition = self.transitions[self.next].take()?;
+        if let Some(attempt) = self.work.as_mut()
+            .and_then(|work| work.attempts[self.next].as_mut())
+        {
+            attempt.outcome = DFlash2GrammarOutcome::PlanningConsumed;
+        }
         self.next += 1;
         self.generated_len += 1;
         Some(transition.runtime)
@@ -55,6 +114,7 @@ impl Qwen35DecodeState {
         &self,
         qwen: &Qwen35LoadedModel,
         drafts: &[u32],
+        collect_work: bool,
     ) -> Result<Option<PreparedDFlash2Grammar>> {
         let Some(runtime) = self.grammar_runtime.as_ref() else {
             // In particular, do not clone decoder/router state on this path.
@@ -71,6 +131,11 @@ impl Qwen35DecodeState {
             transitions: std::array::from_fn(|_| None),
             next: 0,
             generated_len: self.generated_tokens.len(),
+            work: collect_work.then(|| DFlash2GrammarWork {
+                actual_proposals: drafts.len(),
+                awaiting_trigger_at_start: runtime.is_awaiting_trigger(),
+                attempts: [None; MAX_PROPOSALS],
+            }),
         };
         if drafts.is_empty() {
             return Ok(Some(prepared));
@@ -78,9 +143,17 @@ impl Qwen35DecodeState {
         let mut runtime = runtime.clone();
         let mut observer = None;
         for (index, &token) in drafts.iter().enumerate() {
+            let _timing = collect_work.then(ProposalTiming::begin);
             anyhow::ensure!((token as usize) < table.len(),
                 "DFlash2 grammar proposal {token} is outside the authoritative vocabulary");
             let eos = qwen.eos_token_ids.contains(&token);
+            if let Some(work) = prepared.work.as_mut() {
+                work.attempts[index] = Some(DFlash2GrammarAttempt {
+                    awaiting_trigger: runtime.is_awaiting_trigger(),
+                    eos,
+                    outcome: DFlash2GrammarOutcome::Invalid,
+                });
+            }
             let accepted = if eos {
                 runtime.accept_eog()
             } else {
@@ -92,6 +165,11 @@ impl Qwen35DecodeState {
                 // Grammar-invalid proposals are ordinary drafter misses. The
                 // valid prefix remains useful; no rejected state is published.
                 break;
+            }
+            if let Some(attempt) = prepared.work.as_mut()
+                .and_then(|work| work.attempts[index].as_mut())
+            {
+                attempt.outcome = DFlash2GrammarOutcome::Prepared;
             }
             if eos || index + 1 == drafts.len() {
                 prepared.transitions[index] = Some(PreparedTransition { token, runtime });

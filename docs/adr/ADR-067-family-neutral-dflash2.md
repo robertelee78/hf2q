@@ -2115,6 +2115,50 @@ The report, registration, source/image/descriptor bindings and original
 receipts are retained; they are not committed model artifacts. All earlier
 readiness failures and stopped comparison attempts remain failures/stopped.
 
+Subsequent independent offline audit passed all 28 actual unary/SSE exchanges,
+24 tool calls and four fixture fixes, with all six tool-result continuations per
+agent preserved. The unchanged raw auditor also passed its required client
+co-progress width of four; this is not physical same-forward membership.
+The engine-free exact N4 prefix oracle then passed all 28 archived wires using
+the actual Qwen3.8 GGUF serving-builder tokenizer, truncation disabled, and its
+embedded template, matching the original runtime fingerprints without repinning.
+Its `PassedExactAllArchivedWires` result SHA256 is
+`f0f8551027f0003b61d1b41ae6f7425a29505d7a86d670e21e31e1a1830fea10`
+in `d4-grammar-overlap-implementation-v1/t2-exact-prefix-post-oracle-v1`.
+Original summary/readiness/calibration bytes remain unchanged. This adds task
+protocol, fixture-correctness and exact prefix evidence, not a distinct-instance
+quality campaign, ordinary-path runtime parity or model/release qualification;
+no new model inference was performed for these offline checks.
+
+#### D4 per-proposal work-observation candidate (2026-11-22)
+
+The opt-in cycle timeline now records `hf2q.dflash2.grammar_work.v1`: actual
+proposal counts by physical slot, the request-local awaiting-trigger state, and
+each attempted proposal's invalid/prepared/planning-consumed/divergence-discarded
+disposition. Lane-contained native-clock proposal spans identify the operation
+being measured. Only an actual token-and-generated-length match in
+`take_transition` records consumption; RouteCheck exports its authoritative host
+plan, not the diagnostic candidate clone. These are hypothetical planning
+snapshots, not early mutation or replacement of live output observation.
+
+`scripts/four_agent/d4_grammar_overlap.py` requires the original capture SHA256
+and an explicit head or target-verifier-body scope. It intersects GPU interval
+unions with each active, actually consumed proposal's own preparation span:
+an overlapping lazy-tracking, invalid, unused or discarded span cannot qualify
+another transition. Clock spans do not prove uninterrupted CPU residency or GPU
+occupancy. The recorder perturbs diagnostics; it does not measure unprofiled
+speedup. Grammar-free preparation still returns before projection/state copying.
+
+Focused source-bound checks passed: 11 grammar semantics/work-disposition tests,
+8 existing scheduler-plan regressions, and 25 strict consumer tests. Both CLI
+scopes also accepted the unchanged 328-cycle T2 bytes as interval-only evidence
+with all useful-work metadata missing; neither supplied consumed-work evidence
+nor changed the rejected head verdict. Native test ownership/cleanup and source
+checks passed without retaining a lease. A fresh registered real capture,
+ordinary-path runtime semantic comparison and full-cycle overhead/quality gates
+remain required. No new model run or native dependency change is implied.
+
+
 
 
 #### D2-D4 implementation-candidate status
