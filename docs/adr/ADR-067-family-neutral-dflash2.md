@@ -4,7 +4,7 @@
 - **Status:** Accepted; implementation authorized for the v0.1.30 program
 - **Decider:** Robert E. Lee (product owner), 2026-11-10
 - **Scope:** every enabled hf2q text-generation architecture; Qwen3.8 is the first qualified checkpoint
-- **Updated:** 2026-11-22 — record the first source-bound full-profile D4 cohort and distinct registered-head/post-hoc verification-body interval results; D4 qualification and release remain open.
+- **Updated:** 2026-11-22 — record registered D4 active consumed verifier-body overlap, persistent same-row ordinary comparisons, exact task/prefix proof and independently audited unprofiled observations; numerical, family and release qualification remain open.
 
 ## Problem
 
@@ -2154,9 +2154,9 @@ Initial focused checks passed: 11 grammar semantics/work-disposition tests,
 scopes also accepted the unchanged 328-cycle T2 bytes as interval-only evidence
 with all useful-work metadata missing; neither supplied consumed-work evidence
 nor changed the rejected head verdict. Native test ownership/cleanup and source
-checks passed without retaining a lease. A fresh registered real capture,
-ordinary-path runtime semantic comparison and full-cycle overhead/quality gates
-remain required. No new model run or native dependency change is implied.
+checks passed without retaining a lease. At that checkpoint, a fresh registered
+real capture, ordinary-path runtime semantic comparison and full-cycle
+overhead/quality gates were still required; no native dependency changed.
 
 Independent source review then found two diagnostic contract defects: an
 all-anchor grammar cohort was gated out of zero-work observation, and the
@@ -2195,9 +2195,56 @@ These are CPU/synthetic proofs, not an exercised real-model comparison.
 This finite behavioral/window comparison is not structural grammar equivalence,
 probabilistic equality, natural reuse, unprofiled performance or release
 acceptance. The existing cohort-replay client's altered warm anchors cannot be
-called a natural continuation. A fresh source-bound registered capture and
-full-cycle overhead/quality gates remain required; no new model budget is
-implied by this implementation.
+called a natural continuation. The following actual capture exercises this
+diagnostic; full-cycle quality/performance qualification remains separate.
+
+#### D4 registered verifier-body observation (2026-11-22)
+
+The separately registered T3 run used source `8fd0f030a4fc53bd4912c645d9a83034142752bb`
+and the original full 262144-context, four-slot, 48 GiB KV configuration.
+Its 328 finished cycles contain 66 cycles with active, planning-consumed
+proposal preparation overlapping exact same-cycle verifier-body GPU unions:
+5.242624974926002 ms total. This excludes lazy tracking, unused preparation,
+invalid attempts and gaps between GPU commands. The same physical lane/cycle
+join contains 154 positive lane observations and 1,101 ordinary-checked rows;
+the complete capture records 6,337 successful persistent paired decisions.
+No missing counters, dropped commands/marks or forced-sync cycles were accepted.
+Output-head overlap remains zero; the rejected T2 head verdict is unchanged.
+
+Independent actual-data review binds the source, image, target/drafter payloads,
+full-profile readiness, normal pressure, zero swap and proven owned cleanup.
+The 28-request cohort passes the independent unary/SSE/tool/fixture audit and
+the exact all-archived-wire prefix oracle. These are finite observed behaviors,
+not structural grammar equivalence, future-state identity or a speedup.
+The [source-bound decision](https://github.com/robertelee78/hf2q/issues/866#issuecomment-7084955926)
+records the evidence and limits.
+
+A separate four-attempt unprofiled baseline/candidate/candidate/baseline screen
+passed independent actual task/work and operating/timing review. Each cohort
+has identical corresponding semantic/tool work and 46,981 prompt, 40,646 cached,
+6,337 completion and 3,234 reasoning tokens; all four exact-prefix proofs pass.
+
+| Arm | Path | Own-output four-task makespan, seconds |
+|---|---|---:|
+| A1 | Ordinary baseline | 30.003391 |
+| B1 | Grammar projection candidate | 29.462687 |
+| B2 | Grammar projection candidate | 29.811292 |
+| A2 | Ordinary baseline | 29.785206 |
+
+The descriptive adjacent candidate/baseline ratios are 0.9819785704 and
+1.0008758039, with geometric ratio 0.9913821619. All original full-profile,
+normal-pressure/zero-swap, profiling-omission, source, spacing, disk and owned
+cleanup checks pass. Per-turn semantic streamed TTFT and observed prefill/decode
+records are retained; absent metrics are not invented. Instrumented T3 is not
+a wall-time denominator. Two pairs establish no statistical win, confidence
+interval, speedup or family/release acceptance.
+
+The immutable compiled-source evidence accidentally retains its parent's
+`required_compiled_source_stamp` annotation. Actual build argv and adapter bind
+`8fd0f030`, and its compiler inputs/image match; the stale annotation is not
+runtime attestation and is preserved/disclosed, not silently rewritten.
+Whole D4, family quality/performance, D3/D5/D6 and release qualification remain
+open. All T/T2/T3 and four-arm budgets are closed; none transfers to another run.
 
 
 
