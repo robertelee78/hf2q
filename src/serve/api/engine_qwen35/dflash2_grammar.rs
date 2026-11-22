@@ -73,6 +73,14 @@ impl PreparedDFlash2Grammar {
         self.work
     }
 
+    pub(super) fn records_work(&self) -> bool {
+        self.work.is_some()
+    }
+
+    pub(super) fn omit_work_recording(&mut self) {
+        self.work = None;
+    }
+
     pub(super) fn take_transition(
         &mut self,
         token: u32,
@@ -195,6 +203,74 @@ impl Qwen35DecodeState {
             }
         }
         Ok(Some(prepared))
+    }
+}
+
+/// A persistent ordinary control for one deterministic diagnostic window.
+/// Its state is never refreshed from the projected path after the first row.
+pub(super) struct OrdinaryDFlash2Check {
+    semantic: super::Qwen35SpecSemanticState,
+    checked_rows: usize,
+}
+
+impl OrdinaryDFlash2Check {
+    pub(super) fn begin(
+        prepared: Option<&PreparedDFlash2Grammar>,
+        semantic: &super::Qwen35SpecSemanticState,
+        params: &super::SamplingParams,
+    ) -> Option<Self> {
+        if !prepared.is_some_and(PreparedDFlash2Grammar::records_work)
+            || !(f64::from(params.temperature) < crate::serve::sampler_pure::SAMPLING_EPS)
+        {
+            return None;
+        }
+        Some(Self {
+            semantic: semantic.clone(),
+            checked_rows: 0,
+        })
+    }
+
+    pub(super) fn rows(&self) -> usize {
+        self.checked_rows
+    }
+}
+
+impl super::Qwen35SpecSemanticState {
+    pub(super) fn select_and_observe_with_ordinary_check(
+        &mut self,
+        qwen: &Qwen35LoadedModel,
+        params: &super::SamplingParams,
+        source: super::Qwen35DecisionSource<'_>,
+        prepared: Option<&mut PreparedDFlash2Grammar>,
+        ordinary: Option<&mut OrdinaryDFlash2Check>,
+    ) -> Result<super::Qwen35CanonicalDecision> {
+        let Some(ordinary) = ordinary else {
+            return self.select_and_observe_from(qwen, params, source, prepared);
+        };
+        // Both samplers need the same pristine row. No copy on the disabled path.
+        let mut copied_logits;
+        let ordinary_source = match &source {
+            super::Qwen35DecisionSource::Argmax(token) =>
+                super::Qwen35DecisionSource::Argmax(*token),
+            super::Qwen35DecisionSource::Logits(logits) => {
+                copied_logits = logits.to_vec();
+                super::Qwen35DecisionSource::Logits(&mut copied_logits)
+            }
+        };
+        let generated_len = self.generated_tokens.len();
+        let projected = self.select_and_observe_from(qwen, params, source, prepared)?;
+        let expected = ordinary.semantic.select_and_observe_from(
+            qwen, params, ordinary_source, None,
+        )?;
+        anyhow::ensure!(
+            projected == expected
+                && self.generated_tokens == ordinary.semantic.generated_tokens
+                && self.sampling_history == ordinary.semantic.sampling_history,
+            "DFlash2 prepared grammar diverged from ordinary planning at {generated_len}: \
+             projected {projected:?}, ordinary {expected:?}"
+        );
+        ordinary.checked_rows += 1;
+        Ok(projected)
     }
 }
 

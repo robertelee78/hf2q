@@ -310,6 +310,29 @@ def _work(record, marks, clock, gpu):
             "active_consumed_overlap_observed": not reasons and consumed["gpu_overlap_seconds"] > 0}
 
 
+def _ordinary_checks(record, work):
+    key = "grammar_ordinary_checked_rows"
+    if key not in record:
+        return {"counter_status": "missing", "comparison_recorded": False,
+                "checked_rows": 0, "checked_lanes": 0, "rows_by_slot": None}
+    counts = record[key]
+    require(type(counts) is list and len(counts) == 4, "four ordinary-check physical slots")
+    lanes = {lane["slot"]: lane for lane in work.get("lanes", [])}
+    checked_rows = checked_lanes = 0
+    for slot, count in enumerate(counts):
+        if count is None:
+            continue
+        require(integer(count, 8) and count > 0, "exact positive ordinary checked-row count")
+        require(slot in lanes, "ordinary check requires an observed grammar work lane")
+        require(count <= lanes[slot]["actual_proposals"] + 1,
+                "ordinary check exceeds proposal-plus-anchor rows")
+        checked_rows += count
+        checked_lanes += 1
+    return {"counter_status": "observed", "comparison_recorded": checked_rows > 0,
+            "checked_rows": checked_rows, "checked_lanes": checked_lanes,
+            "rows_by_slot": counts}
+
+
 def _cycle(record, scope, previous):
     require(type(record) is dict and record.get("finished") is True, "finished cycle object required")
     require(integer(record.get("active_lanes"), 4) and record["active_lanes"] > 0
@@ -323,6 +346,7 @@ def _cycle(record, scope, previous):
     marks, clock = _marks(record)
     require(clock["begin"] >= previous[3], "cycle clock ordering across capture")
     gpu, counters = _commands(record, clock, scope, previous[:3])
+    work = _work(record, marks, clock, gpu)
     result = {
         "interval_capture_valid": True, "synchronous_head_profile": clock["sync"],
         "selected_gpu_commands": len(gpu), "excluded_commands": len(record["commands"]) - len(gpu),
@@ -330,7 +354,8 @@ def _cycle(record, scope, previous):
         "grammar_callback_seconds": duration(clock["grammar"]),
         "grammar_callback_overlap_seconds": intersection_seconds(clock["grammar"], gpu),
         "host_callback_overlap_seconds": intersection_seconds(clock["host"], gpu),
-        "grammar_work": _work(record, marks, clock, gpu),
+        "grammar_work": work,
+        "grammar_ordinary_check": _ordinary_checks(record, work),
     }
     return result, (*counters, clock["end"])
 
@@ -383,7 +408,11 @@ def analyze(path, *, expected_sha256, scope):
                     "legacy_missing_metadata_cycles": sum(row["grammar_work"]["metadata_status"] == "missing" for row in rows),
                     "synchronous_head_profile_cycles": sum(row["synchronous_head_profile"] for row in rows),
                     "grammar_callback_overlap_seconds": sum(row["grammar_callback_overlap_seconds"] for row in rows),
-                    "active_consumed_overlap_seconds": sum(row["grammar_work"].get("active_consumed_overlap_seconds", 0) for row in rows)},
+                    "active_consumed_overlap_seconds": sum(row["grammar_work"].get("active_consumed_overlap_seconds", 0) for row in rows),
+                    "ordinary_planning_checked_rows": sum(row["grammar_ordinary_check"]["checked_rows"] for row in rows),
+                    "ordinary_planning_checked_lanes": sum(row["grammar_ordinary_check"]["checked_lanes"] for row in rows),
+                    "ordinary_planning_recorded_cycles": sum(row["grammar_ordinary_check"]["comparison_recorded"] for row in rows),
+                    "ordinary_planning_missing_counter_cycles": sum(row["grammar_ordinary_check"]["counter_status"] == "missing" for row in rows)},
         "claims": {"input_authenticity_proven": False, "binary_model_config_source_binding_proven": False,
                    "registration_proven": False, "ordinary_path_runtime_semantic_parity_proven": False,
                    "release_family_runtime_quality_performance_qualification": False,

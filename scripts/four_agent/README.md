@@ -914,6 +914,15 @@ Malformed or incomplete captures fail closed. Source/binary/model bindings,
 registration, ordinary-path runtime parity and unprofiled quality/performance
 remain separate requirements; the instrumented recorder is not zero-overhead.
 
+With deterministic sampling, timeline collection also compares each projected
+canonical decision against a persistent ordinary semantic state on the same
+pristine verifier row. A mismatch fails before window commit. The separate
+`grammar_ordinary_checked_rows` array counts successful comparisons by physical
+slot; null or missing counters are unclaimed. The analyzer validates matching
+work lanes and proposal-plus-anchor bounds, but recorded counts alone do not
+authenticate runtime parity. This comparison adds CPU planning work and must
+not be used as an unprofiled performance control.
+
 ## Three-arm speed campaign (ADR-063 Q3)
 
 `q3_campaign.py` runs the per-family Q3 comparison: stock hf2q (`--stock-bin`, the released binary), experiment hf2q (`--experiment-bin`) and the peer's best valid configuration (`q5_cases/peer-<family>.json`); for Qwen3.8 and Qwen3.6 also Splash's best valid configuration (`--splash-case`, default `q5_cases/splash-<family>.json`; see "Splash peer of record"). A labeled matched-settings peer diagnostic (`--peer-matched-case`) is optional. Every run is one `q5_calibration.py` runtime, run one at a time. The design, estimator, verdict rules and root commands are in [docs/research/adr063-q3-campaign.md](../../docs/research/adr063-q3-campaign.md).

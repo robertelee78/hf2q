@@ -2169,6 +2169,36 @@ unused mutable fixture binding failed compilation; its receipt is preserved,
 the binding was corrected without suppressing warnings, and no test/model pass
 was inferred from that failure. These source repairs authorize no model trial.
 
+#### D4 same-row ordinary-planning diagnostic (2026-11-22)
+
+The timeline-only deterministic diagnostic retains one independent ordinary
+semantic state from the start of each window. Every canonical row compares
+projected observation with the unchanged `prepared=None` path on the same
+actual logits/argmax, preserving the ordinary state across rows. Recloning it
+from projected state at each row would mask late snapshot-state divergence.
+A mismatch fails the window before commit; it never selects a fallback.
+
+Pristine logit copies occur only on this diagnostic path. No target verifier
+graph, native API or default sampler changes. The authoritative host plan
+counts successful paired rows in `grammar_ordinary_checked_rows`, a separate
+four-physical-slot array. The RouteCheck candidate cannot supply these counts.
+Missing/noneligible counters remain unproved. Counts require observed work
+lanes and fit proposal-plus-anchor bounds, independently of consumed proposals.
+
+Focused checks passed 13 grammar tests, including late poisoned-snapshot
+detection and mismatch/lazy-trigger/forced-budget/EOS sequences; 10 scheduler
+tests, including deterministic/recording eligibility; and 35 strict consumer
+tests. A synthetic CLI capture reported paired rows without claiming runtime
+parity. Native ownership/source/cleanup checks passed without retaining a lease.
+These are CPU/synthetic proofs, not an exercised real-model comparison.
+
+This finite behavioral/window comparison is not structural grammar equivalence,
+probabilistic equality, natural reuse, unprofiled performance or release
+acceptance. The existing cohort-replay client's altered warm anchors cannot be
+called a natural continuation. A fresh source-bound registered capture and
+full-cycle overhead/quality gates remain required; no new model budget is
+implied by this implementation.
+
 
 
 

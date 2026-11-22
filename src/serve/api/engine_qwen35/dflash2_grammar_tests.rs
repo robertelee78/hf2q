@@ -352,3 +352,91 @@ fn work_separates_lazy_tracking_from_active_consumed_transitions() {
     assert!(work.attempts.iter().flatten()
         .all(|attempt| attempt.outcome == PlanningConsumed));
 }
+
+fn checked_sequence(
+    qwen: &Qwen35LoadedModel,
+    state: &Qwen35DecodeState,
+    drafts: &[u32],
+    decisions: &[(u32, u32)],
+) {
+    let mut projected = Qwen35SpecSemanticState::from_decode(state);
+    let mut prepared = state.prepare_dflash2_grammar(qwen, drafts, true)
+        .unwrap().unwrap();
+    let mut ordinary = OrdinaryDFlash2Check::begin(
+        Some(&prepared), &projected, &state.params,
+    ).unwrap();
+    for &(preferred, expected) in decisions {
+        let mut logits = vec![-100.0; qwen.vocab_size];
+        logits[preferred as usize] = 20.0;
+        let decision = projected.select_and_observe_with_ordinary_check(
+            qwen, &state.params, Qwen35DecisionSource::Logits(&mut logits),
+            Some(&mut prepared), Some(&mut ordinary),
+        ).unwrap();
+        assert_eq!(decision.token, expected);
+        assert_eq!(decision.terminal, expected == EOS);
+    }
+    assert_eq!(ordinary.rows(), decisions.len());
+    assert_eq!(projected.generated_tokens, ordinary.semantic.generated_tokens);
+    assert_eq!(projected.sampling_history, ordinary.semantic.sampling_history);
+}
+
+#[test]
+fn persistent_ordinary_check_covers_mismatch_lazy_forced_and_terminal_rows() {
+    let qwen = model();
+    let mut mismatch = state(&qwen, SEED, "root ::= \"abc\" | \"acb\"\n");
+    mismatch.params.temperature = 0.0;
+    checked_sequence(&qwen, &mismatch, &[A, B, C],
+        &[(A, A), (C, C), (B, B), (EOS, EOS)]);
+
+    let mut lazy = state(&qwen, SEED, "root ::= \"ab\"\n");
+    lazy.params.temperature = 0.0;
+    lazy.grammar_runtime.as_mut().unwrap().set_lazy_trigger(b"<tool_call>");
+    lazy.tool_splitter = ToolCallSplitter::from_registration(&QWEN35);
+    checked_sequence(&qwen, &lazy, &[MERGED, B, EOS],
+        &[(MERGED, MERGED), (B, B), (EOS, EOS)]);
+
+    let mut forced = state(&qwen, SEED, "root ::= \"acx\" | \"bca\"\n");
+    forced.params.temperature = 0.0;
+    forced.params.reasoning_forced_open = true;
+    forced.params.thinking_token_budget = Some(1);
+    forced.params.reasoning_end_tokens = Some(Arc::new(vec![B]));
+    forced.params.reasoning_close_tokens = Some(Arc::new(vec![B]));
+    forced.thinking_budget = Qwen35ThinkingBudgetState::from_params(&forced.params);
+    forced.thinking_budget.as_mut().unwrap()
+        .observe_generated(&forced.generated_tokens, false);
+    checked_sequence(&qwen, &forced, &[A, C, X],
+        &[(A, B), (C, C), (A, A), (EOS, EOS)]);
+}
+
+#[test]
+fn persistent_ordinary_check_detects_a_later_poisoned_snapshot_decision() {
+    let qwen = model();
+    let mut original = state(&qwen, SEED, "root ::= \"abc\"\n");
+    original.params.temperature = 0.0;
+    let wrong = state(&qwen, SEED, "root ::= \"acb\"\n");
+    let mut prepared = original.prepare_dflash2_grammar(&qwen, &[A, B, C], true)
+        .unwrap().unwrap();
+    let mut poison = wrong.prepare_dflash2_grammar(&qwen, &[A, C, B], false)
+        .unwrap().unwrap();
+    prepared.transitions[0] = poison.transitions[0].take();
+    let mut projected = Qwen35SpecSemanticState::from_decode(&original);
+    let mut ordinary = OrdinaryDFlash2Check::begin(
+        Some(&prepared), &projected, &original.params,
+    ).unwrap();
+    for (index, token) in [A, B].into_iter().enumerate() {
+        let mut logits = vec![-100.0; qwen.vocab_size];
+        logits[token as usize] = 20.0;
+        let result = projected.select_and_observe_with_ordinary_check(
+            &qwen, &original.params, Qwen35DecisionSource::Logits(&mut logits),
+            Some(&mut prepared), Some(&mut ordinary),
+        );
+        if index == 0 {
+            assert_eq!(result.unwrap().token, A);
+        } else {
+            assert!(result.is_err());
+        }
+    }
+    assert_eq!(ordinary.rows(), 1);
+    assert_eq!(projected.generated_tokens, [SEED, A, C]);
+    assert_eq!(ordinary.semantic.generated_tokens, [SEED, A, B]);
+}
