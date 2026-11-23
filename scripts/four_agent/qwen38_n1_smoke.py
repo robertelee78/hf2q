@@ -51,14 +51,16 @@ def approval(args):
     n4 = args.diagnostic_slots == 4
     workload = variant = None
     if n4:
-        from qwen_n4_live_smoke import preflight, task_instance, validate_agent_binding, workload_variant
+        from qwen_n4_live_smoke import (
+            preflight, task_instance, validate_agent_binding, workload_variant, agent_cache_control)
         validate_agent_binding(packet, args.agent_id, args.run_id, args.server_pid,
                                args.barrier_dir, args.barrier_token, args.output, args.family, args.engine_kind,
                                args.instance)
         workload = task_instance(packet, args.instance)
         variant = workload_variant(packet, args.workload)
-        require(variant is None or (workload is None and getattr(args, "benchmark_profile", None) is None),
-                "a workload variant runs the canonical task, without a benchmark profile or task instance")
+        require(variant is None or (getattr(args, "benchmark_profile", None) is None and
+                (workload is None or variant.composes_with_instance)),
+                "this workload variant does not compose with a task instance or benchmark profile")
     else:
         require(args.instance is None, "task instances are four-agent only")
         require(args.workload is None, "workload variants are four-agent only")
@@ -126,6 +128,11 @@ def approval(args):
         source_paths += [Path(__file__).with_name(n) for n in variant.modules]
     require(packet.get("sources") == {p.name: child.digest(p) for p in source_paths}, "client source drift")
     require(packet.get("approved") is True, "explicit internal operating approval absent")
+    if n4:
+        agent_cache_control(packet, variant, args.family, args.engine_kind, args.run_id, args.server_pid)
+    else:
+        require(packet.get("c2_cache_control") is None and packet.get("c2_observation_sources") is None,
+                "C2 cold control is four-agent only")
     proof = child.validate_proof(args.sandbox_proof, args.sandbox_proof_sha256)
     require(proof.get("cargo_sha256") == packet["cargo_sha256"] and
             proof.get("sandbox_exec_sha256") == packet["sandbox_exec_sha256"],
@@ -181,7 +188,7 @@ def build_request(model, messages, schemas, turn, family="qwen", engine_kind="hf
 
 
 def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q", family="qwen", on_first_token=None,
-             setup=None, assistant_policy=None):
+             setup=None, assistant_policy=None, *, cache_miss_allowed=False):
     """`on_first_token(monotonic_ns)` runs once, at the first streamed reasoning or semantic token.
     `assistant_policy` replaces the canonical per-turn protocol (a repair-turn `Workflow.policy`)."""
     if engine_kind != "hf2q":
@@ -240,9 +247,11 @@ def exchange(base, request, output, turn, seen, deadline=900, engine_kind="hf2q"
                     require(total <= RAW_LIMIT, "response wire32MiB envelope")
                     chunks.append(block)
                 message, call, stats = unary(b"".join(chunks), request["model"], turn, seen, engine_kind,
-                                             assistant_policy=assistant_policy)
+                                             assistant_policy=assistant_policy,
+                                             cache_miss_allowed=cache_miss_allowed)
             else:
-                parser = SSE(request["model"], turn, seen, engine_kind, assistant_policy=assistant_policy)
+                parser = SSE(request["model"], turn, seen, engine_kind, assistant_policy=assistant_policy,
+                             cache_miss_allowed=cache_miss_allowed)
                 frame, pending = [], bytearray()
                 while True:
                     require(time.monotonic() - started <= deadline and not INTERRUPTED, "request deadline")
@@ -362,6 +371,10 @@ def main():
     tools = None
     try:
         packet, workload, variant = approval(args)
+        cache_control = packet.get("c2_cache_control")
+        if cache_control is not None:
+            from qwen_n4_live_smoke import edit_cache_miss_allowed
+            summary["c2_cache_control"] = cache_control
         if workload is not None:
             summary["instance"] = workload.record()
         if variant is not None:
@@ -427,6 +440,7 @@ def main():
         for turn in range(max_tools(args.repair_turns) + 1):
             require(not INTERRUPTED and time.monotonic() - started < 7200, "whole client deadline")
             os.kill(args.server_pid, 0)
+            edit = None
             if variant is not None:
                 edit = variant.before_request(messages, turn)
                 if edit is not None:
@@ -441,7 +455,9 @@ def main():
             message, call, receipt = exchange(args.base_url, request, turn_output, turn, seen,
                                                deadline=min(900, 7200 - (time.monotonic() - started)), engine_kind=args.engine_kind, family=args.family,
                                                setup=args.request_setup,
-                                               assistant_policy=None if protocol is None else protocol.policy)
+                                               assistant_policy=None if protocol is None else protocol.policy,
+                                               cache_miss_allowed=(cache_control is not None and
+                                                   edit_cache_miss_allowed(cache_control, variant, turn, edit)))
             summary["turns"].append(receipt)
             messages.append(message)
             if call is not None:

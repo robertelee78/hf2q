@@ -15,6 +15,13 @@ completion shows that the cancelled slot was released. It also compares the
 survivors' outputs with the cancel pass (exact equality is expected on bitwise
 routes; reported, not gated).
 
+
+Qwen3.6 replay requires completed source receipts bound to repair_turns=1.
+`--c2-anchor-depth 1|4` first completes a recorded predecessor cohort, then
+requires one actual acknowledged cancellation recovery event, checks idle
+pending ownership, and retries only the cancelled request. Recovery disposition
+and logical depth/rank come from that event, never global restore-counter deltas;
+retry TTFT starts at POST submission and stops at the first semantic SSE delta.
 `widths` histograms the per-turn joint decode/MTP debug lines of any server
 log (S-C2). The server must run with the debug target enabled, e.g. launcher
 LOG_FILTER (see README "S3 cancel smoke").
@@ -35,18 +42,19 @@ import threading
 import time
 import urllib.request
 from urllib.parse import urlsplit
-
-SCHEMA = 'hf2q.s3.cancel-smoke.v1'
+SCHEMA = 'hf2q.s3.cancel-smoke.v2'
 WIDTHS_SCHEMA = 'hf2q.s3.joint-widths.v1'
 PASS, FAIL, INVALID = 'CancelSmokePass', 'CancelSmokeFail', 'CancelSmokeInvalid'
-FAMILIES = {'deepseek4': 'DeepSeek-V4', 'qwen38': 'Qwen'}
+FAMILIES = {'deepseek4': 'DeepSeek-V4', 'qwen38': 'Qwen', 'qwen36': 'Qwen'}
 FINISHES = ('stop', 'tool_calls', 'length')
 RAW_LIMIT = 32 * 1024 * 1024
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 JOINT = re.compile(r'\b(?P<engine>DeepSeek-V4|Qwen) joint (?P<kind>decode|MTP) turn(?P<fields>(?:\s+[a-z_]+=\S+)*)')
 DFLASH = re.compile(r'\bQwen DFlash2 stage timing(?P<fields>(?:\s+[a-z_]+=\S+)*)')
+DFLASH_TURN = re.compile(r'\bQwen DFlash2 decode turn(?P<fields>(?:\s+[a-z_]+=\S+)*)')
 FIELD = re.compile(r'([a-z_]+)=(\S+)')
 ERROR_LINE = re.compile(r'^\s*ERROR\s')
+RECOVERY = re.compile(r'\bQwen anchor cancellation recovery(?P<fields>(?:\s+[a-z_]+=\S+)*)')
 # A poison event, not a `cache_poisoned=false` field on an INFO progress line.
 POISON = re.compile(r'poison(?!(?:ed)?=false\b)', re.IGNORECASE)
 CANCELLATIONS = re.compile(r'^hf2q_sse_cancellations\s+(\d+)\s*$', re.MULTILINE)
@@ -107,9 +115,36 @@ def load_requests(directory, turn, agents, model):
         path = Path(directory) / f'agent-{agent}' / f'turn-{turn}' / 'request.json'
         raw = path.read_bytes()
         body = replay_request(raw, model)
-        rows.append({'agent': agent, 'path': str(path), 'recorded_sha256': sha256_bytes(raw),
+        rows.append({'agent': agent, 'turn': turn, 'path': str(path), 'recorded_sha256': sha256_bytes(raw),
                      'replayed_sha256': sha256_bytes(body), 'body': body})
     return rows
+
+
+def repair_workload_sources(directory, agents, selected_requests):
+    sources = {}
+    for agent in agents:
+        path = Path(directory) / f'agent-{agent}' / 'summary.json'
+        raw = path.read_bytes()
+        summary = loads(raw)
+        require(isinstance(summary, dict) and type(summary.get('repair_turns')) is int
+                and summary['repair_turns'] == 1
+                and summary.get('status') == 'ProtocolCompleteAwaitingIndependentPatchReview',
+                f'Qwen3.6 source {path} is not a completed declared repair-turn workload')
+        turns = summary.get('turns')
+        require(isinstance(turns, list), f'Qwen3.6 source {path} lacks retained request receipts')
+        selected = {}
+        for request in selected_requests:
+            if request['agent'] != agent:
+                continue
+            matches = [row for row in turns if isinstance(row, dict) and type(row.get('turn')) is int
+                       and row['turn'] == request['turn']]
+            require(len(matches) == 1 and matches[0].get('request_sha256') == request['recorded_sha256'],
+                    f'Qwen3.6 source {path} does not bind replayed turn {request["turn"]}')
+            selected[str(request['turn'])] = request['recorded_sha256']
+        require(selected, f'Qwen3.6 source {path} has no selected requests')
+        sources[f'agent-{agent}'] = {'path': str(path), 'sha256': sha256_bytes(raw), 'repair_turns': 1,
+                                    'selected_request_sha256': selected}
+    return sources
 
 
 # ----------------------------------------------------------------------------- SSE
@@ -231,6 +266,27 @@ def cancellations(base_url):
     return int(match.group(1))
 
 
+def anchor_idle_state(base_url):
+    with LOOPBACK.open(root_url(base_url) + '/metrics', timeout=5) as response:
+        text = response.read().decode('utf8', 'strict')
+    committed = {}
+    pending = {}
+    for slot, count in re.findall(r'^hf2q_qwen_anchor_committed\{slot="(\d+)"\} (\d+)$', text, re.MULTILINE):
+        require(slot not in committed, 'duplicate anchor committed gauge')
+        committed[slot] = int(count)
+    for slot, kind, count in re.findall(
+            r'^hf2q_qwen_anchor_owned_bytes\{slot="(\d+)",class="([^"]+)",state="pending"\} (\d+)$',
+            text, re.MULTILINE):
+        key = (slot, kind)
+        require(key not in pending, 'duplicate anchor pending gauge')
+        pending[key] = int(count)
+    classes = {'payload_image', 'logits', 'hidden', 'tokens', 'metadata'}
+    require(len(committed) == 4 and set(pending) == {(slot, kind) for slot in committed for kind in classes},
+            'C2 requires complete four-slot anchor idle gauges')
+    require(not any(pending.values()), 'pending anchor ownership remains after requests settled')
+    return {'committed_by_slot': committed, 'pending_owned_bytes': sum(pending.values())}
+
+
 def ready(base_url):
     try:
         with LOOPBACK.open(root_url(base_url) + '/readyz', timeout=5) as response:
@@ -259,23 +315,32 @@ def log_lines(path, start, end):
 def joint_turns(lines, family):
     engine = FAMILIES[family]
     turns = []
+    has_dflash_turns = any(DFLASH_TURN.search(line) for _, line in lines)
     for end, line in lines:
-        dflash = DFLASH.search(line) if family == 'qwen38' else None
+        dflash_turn = DFLASH_TURN.search(line) if family.startswith('qwen') else None
+        if dflash_turn is not None:
+            fields = parse_integer_fields(
+                ' '.join(f'{key}={value}' for key, value in FIELD.findall(dflash_turn.group('fields'))
+                         if key != 'path'), 'DFlash2 decode turn')
+            require({'lanes', 'serial', 'turn_lanes'} <= fields.keys(), 'DFlash2 turn lacks scope')
+            turns.append({'end_offset': end, 'kind': 'DFlash2', 'width': fields['lanes'], **fields})
+            continue
+        dflash = DFLASH.search(line) if family.startswith('qwen') and not has_dflash_turns else None
         if dflash is not None:
             fields = parse_integer_fields(dflash.group('fields'), 'DFlash2 stage')
             require('active_lanes' in fields, f'DFlash2 stage line lacks active_lanes: {line}')
-            turns.append({
-                'end_offset': end,
-                'kind': 'DFlash2',
-                'width': fields['active_lanes'],
-                'serial': 0,
-                **fields,
-            })
+            turns.append({'end_offset': end, 'kind': 'DFlash2',
+                          'width': fields['active_lanes'], 'serial': 0, **fields})
             continue
         match = JOINT.search(line)
         if match is None or match.group('engine') != engine:
             continue
-        fields = parse_integer_fields(match.group('fields'), 'joint turn')
+        # Closed-refusal lines describe no forward and therefore have no width.
+        if 'reason=' in match.group('fields'):
+            continue
+        fields = parse_integer_fields(
+            ' '.join(f'{key}={value}' for key, value in FIELD.findall(match.group('fields'))
+                     if key != 'path'), 'joint turn')
         if family == 'deepseek4' or match.group('kind') == 'MTP':
             width_key = 'lanes'
         else:
@@ -321,6 +386,37 @@ def problem_lines(lines):
     return [line for _, line in lines if ERROR_LINE.match(line) or POISON.search(line)]
 
 
+def cancellation_recovery(lines, close_offset):
+    """One acknowledged recovery in the owned cancellation interval, never counter inference."""
+    events = []
+    for end, line in lines:
+        match = RECOVERY.search(line)
+        if match is None or end <= close_offset:
+            continue
+        fields = dict(FIELD.findall(match.group('fields')))
+        required = {'request_id', 'slot', 'disposition', 'recovered_tokens',
+                    'restored_rank', 'performed_restore_count'}
+        require(required <= fields.keys(), f'incomplete cancellation recovery event: {line}')
+        disposition = fields['disposition'].strip('"')
+        require(disposition in ('preserved', 'restored', 'reset'), 'unknown cancellation disposition')
+        numeric = {}
+        for key in required - {'disposition'}:
+            require(re.fullmatch(r'-?\d+', fields[key]) is not None, f'invalid recovery {key}')
+            numeric[key] = int(fields[key])
+        depth, rank, count = (numeric[k] for k in ('recovered_tokens', 'restored_rank', 'performed_restore_count'))
+        require(numeric['request_id'] >= 0 and numeric['slot'] >= 0 and depth >= 0, 'negative recovery identity/depth')
+        require((disposition == 'restored' and depth > 0 and 0 <= rank < 8 and count == 1)
+                or (disposition == 'preserved' and depth > 0 and rank == -1 and count == 0)
+                or (disposition == 'reset' and depth == 0 and rank == -1 and count == 0),
+                'inconsistent recovery disposition/rank/depth/count')
+        events.append({'end_offset': end, 'disposition': disposition, **numeric,
+                       'preserved_live_prefix': disposition == 'preserved',
+                       'restored_tokens': depth if disposition == 'restored' else 0,
+                       'preserved_tokens': depth if disposition == 'preserved' else 0})
+    require(len(events) == 1, f'expected one owned cancellation recovery, observed {len(events)}')
+    return events[0]
+
+
 # ----------------------------------------------------------------------------- streams
 
 class Stream(threading.Thread):
@@ -337,9 +433,10 @@ class Stream(threading.Thread):
         self.directory.mkdir(parents=True)
         (self.directory / 'request.json').write_bytes(self.row['body'])
         connection = http.client.HTTPConnection(c.host, c.port, timeout=c.timeout)
-        started = time.monotonic()
+        started = None
         try:
             c.start.wait()
+            started = time.monotonic()
             connection.request('POST', '/v1/chat/completions', self.row['body'],
                                {'Content-Type': 'application/json', 'Connection': 'close'})
             sock = connection.sock
@@ -357,7 +454,7 @@ class Stream(threading.Thread):
             result['error'] = f'{type(error).__name__}: {error}'
         finally:
             connection.close()
-            result['elapsed_seconds'] = time.monotonic() - started
+            result['elapsed_seconds'] = time.monotonic() - started if started is not None else None
             acc = self.accumulator
             result.update(frames=acc.frames, semantic_events=acc.events, finish_reason=acc.finish,
                           usage=acc.usage, done=acc.done, output=acc.output())
@@ -393,8 +490,8 @@ class Stream(threading.Thread):
                     require(len(frame) == 1, 'multi-line SSE data')
                     semantic = acc.feed(frame[0].decode('utf8', 'strict'))
                     frame = []
-                    if semantic and 'first_event_seconds' not in result:
-                        result['first_event_seconds'] = time.monotonic() - started
+                    if semantic and 'first_semantic_token_seconds' not in result:
+                        result['first_semantic_token_seconds'] = time.monotonic() - started
                     with c.lock:
                         if self is c.victim and c.should_cancel():
                             c.cancel(sock, response)
@@ -454,10 +551,25 @@ def run_pass(args, rows, directory, victim_agent):
     while victim_agent is not None and coordinator.close is not None and after == before and time.monotonic() < deadline:
         time.sleep(0.25)
         after = cancellations(args.base_url)
-    end = log_size(args.server_log)
-    return {'agents': {f'agent-{a}': r for a, r in agents.items()}, 'close': coordinator.close,
-            'cancel_counter': {'before': before, 'after': after, 'delta': after - before},
-            'log_offsets': {'start': start, 'end': end}}
+    result = {'agents': {f'agent-{a}': r for a, r in agents.items()}, 'close': coordinator.close,
+              'cancel_counter': {'before': before, 'after': after, 'delta': after - before},
+              'log_offsets': {'start': start, 'end': log_size(args.server_log)}}
+    if args.c2_anchor_depth is not None and coordinator.close is not None:
+        try:
+            while True:
+                require(cancellations(args.base_url) == before + 1, 'C2 cancellation interval is not unique')
+                end = log_size(args.server_log)
+                lines = log_lines(args.server_log, coordinator.close['log_offset'], end)
+                if any(RECOVERY.search(line) for _, line in lines):
+                    result['recovery'] = cancellation_recovery(lines, coordinator.close['log_offset'])
+                    result['log_offsets']['end'] = end
+                    break
+                require(time.monotonic() < deadline, 'expected one owned cancellation recovery, observed 0 before deadline')
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+        except Invalid as error:
+            result['recovery_error'] = str(error)
+            result['log_offsets']['end'] = log_size(args.server_log)
+    return result
 
 
 # ----------------------------------------------------------------------------- verdict
@@ -521,6 +633,18 @@ def judge(receipt):
                 reasons.append(f"control pass {name} invalid: {result.get('error')}")
         if control['cancel_counter']['delta'] != 0:
             reasons.append('control pass changed hf2q_sse_cancellations')
+    if receipt.get('c2_anchor_depth') is not None and close is not None:
+        if 'recovery' not in cancel_pass:
+            reasons.append('missing unique acknowledged cancellation recovery')
+        retry = receipt['passes'].get('retry')
+        if retry is None:
+            reasons.append('missing owned cancellation retry')
+        else:
+            victim = retry['agents'][f"agent-{receipt['cancel']['agent']}"]
+            if not victim.get('valid') or victim.get('first_semantic_token_seconds') is None:
+                reasons.append('retry lacks valid semantic SSE token time')
+            if retry['cancel_counter']['delta'] != 0:
+                reasons.append('retry changed hf2q_sse_cancellations')
     receipt['reasons'] = reasons + invalid
     receipt['status'] = FAIL if reasons else INVALID if invalid else PASS
 
@@ -532,38 +656,75 @@ def run(args):
     require(len(args.agents) == 4 and len(set(args.agents)) == 4, 'four distinct agents')
     require(args.cancel_after_events >= 1, '--cancel-after-events must be positive')
     endpoint(args.base_url)
+    if args.c2_anchor_depth is not None:
+        require(args.family in ('qwen38', 'qwen36'), 'C2 recovery evidence requires Qwen')
     rows = load_requests(args.requests, args.turn, args.agents, args.model)
     require(ready(args.base_url), 'server not ready')
+    warmup_rows = (load_requests(args.requests, args.warmup_turn, args.agents, args.model)
+                   if args.c2_anchor_depth is not None else None)
+    selected_requests = rows + (warmup_rows or [])
+    repair_sources = (repair_workload_sources(args.requests, args.agents, selected_requests)
+                      if args.family == 'qwen36' else None)
     out.mkdir(parents=True)
     receipt = {'schema': SCHEMA, 'status': None, 'family': args.family, 'base_url': args.base_url,
                'model': args.model, 'server_pid': args.server_pid, 'server_log': str(args.server_log),
+               'c2_recovery_schema': 'hf2q.c2.cancel-recovery.v1' if args.c2_anchor_depth is not None else None,
                'source_sha256': sha256_bytes(Path(__file__).read_bytes()),
+               'c2_anchor_depth': args.c2_anchor_depth,
+               'source_repair_workload': repair_sources,
                'requests': {'directory': str(args.requests), 'turn': args.turn,
                             'agents': {f"agent-{r['agent']}": {k: r[k] for k in ('path', 'recorded_sha256', 'replayed_sha256')}
                                        for r in rows}},
                'cancel': {'agent': args.cancel_agent, 'after_semantic_events': args.cancel_after_events},
                'passes': {}, 'independent_review_required': True}
     try:
+        if warmup_rows is not None:
+            configured = [line for _, line in log_lines(args.server_log, 0, log_size(args.server_log))
+                          if 'Qwen35 multi-depth anchor store configured' in line]
+            require(len(configured) == 1, 'C2 needs exactly one resolved worker anchor configuration')
+            fields = dict(FIELD.findall(configured[0]))
+            require(fields.get('anchor_depth') == str(args.c2_anchor_depth),
+                    'declared C2 depth differs from actual resolved worker configuration')
+            warmup = run_pass(args, warmup_rows, out / 'warmup', None)
+            receipt['passes']['warmup'] = warmup
+            receipt['warmup_turn'] = args.warmup_turn
+            require(warmup['cancel_counter']['delta'] == 0
+                    and all(row.get('valid') for row in warmup['agents'].values()),
+                    'C2 committed-prefix warmup did not complete cleanly')
+            warmup['anchor_state_after'] = anchor_idle_state(args.base_url)
+            require(all(count > 0 for count in warmup['anchor_state_after']['committed_by_slot'].values()),
+                    'warmup did not publish a committed anchor in every slot')
         receipt['passes']['cancel'] = run_pass(args, rows, out / 'cancel', args.cancel_agent)
+        cancel_pass = receipt['passes']['cancel']
+        if args.c2_anchor_depth is not None and cancel_pass['close'] is not None:
+            require(cancel_pass['cancel_counter']['delta'] == 1, 'C2 cancellation interval is not unique')
+            require('recovery' in cancel_pass, cancel_pass.get('recovery_error', 'missing recovery completion'))
+            cancel_pass['anchor_state_after'] = anchor_idle_state(args.base_url)
+            victim_rows = [row for row in rows if row['agent'] == args.cancel_agent]
+            receipt['passes']['retry'] = run_pass(args, victim_rows, out / 'retry', None)
+            receipt['passes']['retry']['anchor_state_after'] = anchor_idle_state(args.base_url)
         if args.control:
             receipt['passes']['control'] = run_pass(args, rows, out / 'control', None)
         receipt['server_ready_after'] = ready(args.base_url)
         cancel_pass = receipt['passes']['cancel']
-        start = cancel_pass['log_offsets']['start']
-        end = receipt['passes'].get('control', cancel_pass)['log_offsets']['end']
+        start = min(p['log_offsets']['start'] for p in receipt['passes'].values())
+        end = max(p['log_offsets']['end'] for p in receipt['passes'].values())
         lines = log_lines(args.server_log, start, end)
         turns = joint_turns(lines, args.family)
         close = cancel_pass['close']
         cancel_end = cancel_pass['log_offsets']['end']
-        before = [t for t in turns if close is not None and t['end_offset'] <= close['log_offset']]
+        before = [t for t in turns if close is not None
+                  and cancel_pass['log_offsets']['start'] < t['end_offset'] <= close['log_offset']]
         after = [t for t in turns if close is not None and close['log_offset'] < t['end_offset'] <= cancel_end]
         receipt['joint_before_close'] = before[-1] if before else None
         receipt['joint_after_close_first'] = after[0] if after else None
         receipt['widths'] = {'whole_run': histogram(turns, args.family),
-                             'cancel_pass': histogram([t for t in turns if t['end_offset'] <= cancel_end], args.family),
+                             'cancel_pass': histogram([t for t in turns if cancel_pass['log_offsets']['start'] < t['end_offset'] <= cancel_end], args.family),
                              'cancel_pass_after_close': histogram(after, args.family)}
         if 'control' in receipt['passes']:
-            receipt['widths']['control_pass'] = histogram([t for t in turns if t['end_offset'] > cancel_end], args.family)
+            control = receipt['passes']['control']['log_offsets']
+            receipt['widths']['control_pass'] = histogram(
+                [t for t in turns if control['start'] < t['end_offset'] <= control['end']], args.family)
             receipt['control_comparison'] = compare(cancel_pass, receipt['passes']['control'], args.cancel_agent)
         if args.family == 'deepseek4':
             receipt['deepseek_cancelled_log_lines'] = sum(
@@ -611,6 +772,10 @@ def parse_args(argv):
     smoke.add_argument('--no-control', dest='control', action='store_false', help='skip the no-cancel control pass')
     smoke.add_argument('--request-timeout', type=float, default=900)
     smoke.add_argument('--counter-wait-seconds', type=float, default=30)
+    smoke.add_argument('--c2-anchor-depth', type=int, choices=(1, 4),
+                       help='require actual owned recovery and victim-only retry semantic TTFT for this declared C2 arm')
+    smoke.add_argument('--warmup-turn', type=int, default=1,
+                       help='C2 only: recorded predecessor turn completed before opening the cancellation interval')
     smoke.add_argument('--output', required=True, type=Path, help='new receipt directory')
     trace = sub.add_parser('widths', help='joint decode row-width histogram of a server log')
     trace.add_argument('--family', required=True, choices=sorted(FAMILIES))

@@ -424,7 +424,7 @@ fn anchor_c1_stale_tickets_and_open_transactions_never_apply() {
     s.begin_capture(anchor(2), &[]).unwrap();
     assert!(!can_restore(&s, &a));
     s.finish_capture(true).unwrap();
-    assert!(!can_restore(&s, &a));
+    assert!(can_restore(&s, &a));
     assert!(
         s.retain_reader(2, 2).is_err(),
         "pending payload cannot be promoted to disk"

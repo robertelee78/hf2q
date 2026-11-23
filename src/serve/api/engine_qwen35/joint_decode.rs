@@ -59,6 +59,8 @@ pub(in crate::serve::api) enum Qwen35LaneRefusal {
     SpeculationRoute,
     ClientClosed,
     HandleMismatch,
+    AnchorCapture,
+    AnchorRestore,
 }
 
 impl Qwen35LaneRefusal {
@@ -72,6 +74,8 @@ impl Qwen35LaneRefusal {
             Self::SpeculationRoute => "speculation_route",
             Self::ClientClosed => "client_closed",
             Self::HandleMismatch => "handle_mismatch",
+            Self::AnchorCapture => "anchor_capture",
+            Self::AnchorRestore => "anchor_restore",
         }
     }
 }
@@ -91,7 +95,9 @@ impl Qwen35DecodeState {
         if self.generated_tokens.is_empty() {
             return Err(Qwen35LaneRefusal::NoSeed);
         }
-        let fed = self.prompt_tokens.len() + self.generated_tokens.len() - 1;
+        let graft = kv_cache.graft_region_for_slot(self.slot_id)
+            .map_err(|_| Qwen35LaneRefusal::TargetCursor)? as usize;
+        let fed = graft + self.prompt_tokens.len() + self.generated_tokens.len() - 1;
         let cursor = kv_cache
             .sequence_len_for_slot(self.slot_id)
             .map_err(|_| Qwen35LaneRefusal::TargetCursor)?;
@@ -220,7 +226,13 @@ impl Qwen35DecodeState {
                 started,
             } => {
                 let token = match (output.greedy_token, output.logits) {
-                    (Some(predicted), _) => forced_token.map_or(predicted, |(token, _)| token),
+                    (Some(predicted), _) => {
+                        let selected = forced_token.map_or(predicted, |(token, _)| token);
+                        #[cfg(test)]
+                        let selected = super::anchor_exactness_tests::trace::decision_for(
+                            self.slot_id, self.params.c2_ticket.as_deref(), self.generated_tokens.len(), selected)?;
+                        selected
+                    }
                     (None, Some(logits)) => {
                         self.select_ordinary_logits_token(qwen, logits, forced_token)?
                     }

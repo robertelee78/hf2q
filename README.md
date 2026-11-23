@@ -802,6 +802,16 @@ remain explicit.
 The script is reference evidence only; it never participates in production
 serving and cannot replace hf2q's exact packed-artifact cache gate.
 
+C2 Qwen multi-depth qualification separates fixed historical HTTP inputs from
+fresh, unforced native-token observations and independently registered numerical
+replays. Ignored test-executable diagnostics bind request tickets, slot generations,
+raw bodies, model-file descriptors and complete decision/prefix extents. They
+require independently reviewed, calibrated live supervision; enabling anchor depth
+or passing component tests is not qualification. Historical native token IDs are
+not reconstructed from HTTP text. Real-client tool correctness, own-output
+continuation, natural prefix reuse and performance remain separate required gates.
+See the [C2 contract](docs/adr/ADR-063-apple-silicon-four-agent-speed-coherence.md).
+
 The Qwen watchdog acceptance scripts are reproducible operator gates, not
 startup defaults. Existing receipts are causal local dependency-spike evidence;
 they are not final hf2q distribution authority. Changes to those model or

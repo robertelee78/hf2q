@@ -66,6 +66,8 @@ fn loaded(device: &MlxDevice) -> Box<Qwen35LoadedModel> {
         model.cfg.vocab_size as usize,
     );
     let qwen = Box::new(Qwen35LoadedModel {
+        #[cfg(test)]
+        c2_model_witness: std::sync::Arc::new(()),
         model,
         tokenizer: tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default()),
         chat_template: "{{ messages }}".to_string(),

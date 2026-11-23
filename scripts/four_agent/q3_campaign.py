@@ -392,7 +392,7 @@ class Halt(Exception):
 
 class Driver:
     """Q3 campaign driver. ADR-065 campaigns (adr065_campaign.py) subclass it: `schema`, `launch_problems`,
-    `finished` and `step` are the hooks they override."""
+    `finished`, `_attempt_argv` and `step` are the hooks they override."""
     schema = SCHEMA
 
     def __init__(self, plan, cases, out, environ, runner, thermal, identify):
@@ -554,6 +554,9 @@ class Driver:
             if not (entry["outcome"] is None and record.get("disposition") == "rerun"):
                 return proceed
 
+    def _attempt_argv(self, stage, entry, case_path, output):
+        return qc.q5_argv(case_path, output, self.plan["negative_control_receipt"]["path"])
+
     def attempt(self, stage, entry):
         """Launch and settle one attempt of an entry; its record."""
         drift = q3_identity.diff(self.frozen, self.identify())
@@ -564,7 +567,7 @@ class Driver:
         name = f"{entry['name']}-a{len(entry['attempts'])}"
         output = self.out / "runs" / name
         record = {"name": name, "output": str(output), "case": str(case_path), "case_sha256": sha256(case_path),
-                  "argv": qc.q5_argv(case_path, output, self.plan["negative_control_receipt"]["path"]),
+                  "argv": self._attempt_argv(stage, entry, case_path, output),
                   "outcome": "Launched", "started_utc": now()}
         entry["attempts"].append(record)
         self.save()

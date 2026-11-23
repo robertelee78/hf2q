@@ -75,7 +75,7 @@ const QWEN_JOINT_SOLO_ENV: &str = "HF2Q_QWEN_JOINT_SOLO";
 
 /// Joint decode configuration resolved once at worker start.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Qwen35JointDecodeConfig {
+pub(in crate::serve::api) struct Qwen35JointDecodeConfig {
     pub max_rows: usize,
     pub mode: JointRouteMode,
     /// Dense FFN gate/up route; `HF2Q_QWEN_JOINT_FFN_SHARED=0` keeps the
@@ -206,7 +206,7 @@ fn select_qwen_joint_decode(
 
 /// Resolve joint decode once when the Qwen worker starts and log the
 /// decision, including why an artifact or configuration keeps serial decode.
-pub(super) fn qwen35_joint_decode_config(
+pub(in crate::serve::api) fn qwen35_joint_decode_config(
     model: &Qwen35Model,
     n_slots: usize,
 ) -> Option<Qwen35JointDecodeConfig> {
@@ -328,7 +328,7 @@ pub(super) fn qwen35_joint_decode_config(
 /// switches (`HF2Q_LEGACY_PER_LAYER_CB`, `MLX_UNRETAINED_REFS`) can revoke
 /// it: such a turn runs serially (logged once), and a later turn that
 /// satisfies them again runs jointly.
-pub(super) fn qwen35_joint_decode_turn_config(
+pub(in crate::serve::api) fn qwen35_joint_decode_turn_config(
     worker: Option<Qwen35JointDecodeConfig>,
 ) -> Option<Qwen35JointDecodeConfig> {
     let config = worker?;
@@ -446,6 +446,12 @@ pub(in crate::serve::api) struct Qwen35JointTelemetry {
     pub duplicate_slots: AtomicU64,
     pub max_rows: AtomicU64,
     pub too_few_ready: AtomicU64,
+    pub anchor_capture: AtomicU64,
+    pub anchor_restore: AtomicU64,
+    pub lane_anchor_capture: AtomicU64,
+    pub lane_anchor_restore: AtomicU64,
+    pub c2_joint_lane_steps: AtomicU64,
+    pub c2_serial_lane_steps: AtomicU64,
     pub lane_step_bound: AtomicU64,
     pub lane_pending_speculation_output: AtomicU64,
     pub lane_no_seed: AtomicU64,
@@ -461,6 +467,12 @@ pub(in crate::serve::api) static JOINT_TELEMETRY: Qwen35JointTelemetry = Qwen35J
     duplicate_slots: AtomicU64::new(0),
     max_rows: AtomicU64::new(0),
     too_few_ready: AtomicU64::new(0),
+    anchor_capture: AtomicU64::new(0),
+    anchor_restore: AtomicU64::new(0),
+    lane_anchor_capture: AtomicU64::new(0),
+    lane_anchor_restore: AtomicU64::new(0),
+    c2_joint_lane_steps: AtomicU64::new(0),
+    c2_serial_lane_steps: AtomicU64::new(0),
     lane_step_bound: AtomicU64::new(0),
     lane_pending_speculation_output: AtomicU64::new(0),
     lane_no_seed: AtomicU64::new(0),
@@ -476,6 +488,15 @@ pub(in crate::serve::api) fn record_joint_ineligible(reason: &Qwen35JointIneligi
         Qwen35JointIneligible::CaptureActive => &JOINT_TELEMETRY.capture_active,
         Qwen35JointIneligible::DuplicateSlots => &JOINT_TELEMETRY.duplicate_slots,
         Qwen35JointIneligible::MaxRowsBelowTwo => &JOINT_TELEMETRY.max_rows,
+        Qwen35JointIneligible::AnchorTransaction { kind, lanes } => {
+            use crate::serve::api::engine_qwen35::anchor_store::AnchorTransaction;
+            let (turn, lane) = match kind {
+                AnchorTransaction::Capture => (&JOINT_TELEMETRY.anchor_capture, &JOINT_TELEMETRY.lane_anchor_capture),
+                AnchorTransaction::Restore => (&JOINT_TELEMETRY.anchor_restore, &JOINT_TELEMETRY.lane_anchor_restore),
+            };
+            lane.fetch_add(*lanes as u64, Ordering::Relaxed);
+            turn
+        }
         Qwen35JointIneligible::TooFewReady { refusals, .. } => {
             for refusal in refusals {
                 let lane = match refusal {
@@ -489,13 +510,43 @@ pub(in crate::serve::api) fn record_joint_ineligible(reason: &Qwen35JointIneligi
                     Qwen35LaneRefusal::SpeculationRoute => &JOINT_TELEMETRY.lane_speculation_route,
                     Qwen35LaneRefusal::ClientClosed => &JOINT_TELEMETRY.lane_client_closed,
                     Qwen35LaneRefusal::HandleMismatch => &JOINT_TELEMETRY.lane_handle_mismatch,
+                    Qwen35LaneRefusal::AnchorCapture => &JOINT_TELEMETRY.lane_anchor_capture,
+                    Qwen35LaneRefusal::AnchorRestore => &JOINT_TELEMETRY.lane_anchor_restore,
                 };
                 lane.fetch_add(1, Ordering::Relaxed);
             }
-            &JOINT_TELEMETRY.too_few_ready
+            if refusals.contains(&Qwen35LaneRefusal::AnchorCapture) {
+                &JOINT_TELEMETRY.anchor_capture
+            } else if refusals.contains(&Qwen35LaneRefusal::AnchorRestore) {
+                &JOINT_TELEMETRY.anchor_restore
+            } else {
+                &JOINT_TELEMETRY.too_few_ready
+            }
         }
     };
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A lane-step is successful native dispatch participation, not an accepted
+/// speculative token, a CPU drain or a sampled group width.
+pub(in crate::serve::api) fn record_c2_decode_lane_steps(
+    decode_ready_lanes: usize, joint_lane_steps: usize, serial_lane_steps: usize,
+    route: &'static str, path: &'static str,
+) {
+    if decode_ready_lanes < 2 || joint_lane_steps + serial_lane_steps == 0 {
+        return;
+    }
+    if joint_lane_steps != 0 {
+        JOINT_TELEMETRY.c2_joint_lane_steps.fetch_add(joint_lane_steps as u64, Ordering::Relaxed);
+    }
+    if serial_lane_steps != 0 {
+        JOINT_TELEMETRY.c2_serial_lane_steps.fetch_add(serial_lane_steps as u64, Ordering::Relaxed);
+    }
+    tracing::debug!(
+        target: "hf2q::serve::api::engine_qwen35::progress",
+        decode_ready_lanes, joint_lane_steps, serial_lane_steps, route, path,
+        "Qwen C2 decode lane steps"
+    );
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -503,6 +554,10 @@ pub(in crate::serve::api) enum Qwen35JointIneligible {
     CaptureActive,
     DuplicateSlots,
     MaxRowsBelowTwo,
+    AnchorTransaction {
+        kind: crate::serve::api::engine_qwen35::anchor_store::AnchorTransaction,
+        lanes: usize,
+    },
     TooFewReady {
         ready: usize,
         refusals: Vec<Qwen35LaneRefusal>,
@@ -510,12 +565,24 @@ pub(in crate::serve::api) enum Qwen35JointIneligible {
 }
 
 impl Qwen35JointIneligible {
-    pub const fn label(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             Self::CaptureActive => "capture_active",
             Self::DuplicateSlots => "duplicate_slots",
             Self::MaxRowsBelowTwo => "max_rows",
-            Self::TooFewReady { .. } => "too_few_ready",
+            Self::AnchorTransaction { kind, .. } => match kind {
+                crate::serve::api::engine_qwen35::anchor_store::AnchorTransaction::Capture => "anchor_capture",
+                crate::serve::api::engine_qwen35::anchor_store::AnchorTransaction::Restore => "anchor_restore",
+            },
+            Self::TooFewReady { refusals, .. } => {
+                if refusals.contains(&Qwen35LaneRefusal::AnchorCapture) {
+                    "anchor_capture"
+                } else if refusals.contains(&Qwen35LaneRefusal::AnchorRestore) {
+                    "anchor_restore"
+                } else {
+                    "too_few_ready"
+                }
+            }
         }
     }
 }
@@ -545,6 +612,18 @@ fn reinstall_lanes(slots: &mut [Option<Qwen35Slot>], lanes: impl IntoIterator<It
     }
 }
 
+
+/// The real admission guard: pending publication is deliberately not examined.
+pub(in crate::serve::api) fn joint_anchor_admission(
+    handles: &[SlotHandle],
+    stores: &[Qwen35AnchorStore],
+) -> Option<Qwen35JointIneligible> {
+    let kind = handles.iter().find_map(|handle|
+        stores.get(handle.slot_id.0 as usize).and_then(Qwen35AnchorStore::open_transaction))?;
+    let lanes = handles.iter().filter(|handle|
+        stores.get(handle.slot_id.0 as usize).and_then(Qwen35AnchorStore::open_transaction) == Some(kind)).count();
+    Some(Qwen35JointIneligible::AnchorTransaction { kind, lanes })
+}
 /// Run the turn's joint groups one after another, then hand the serial
 /// leftovers back to the caller. Each group is one joint step whose lanes
 /// settle with the serial path's slot semantics.
@@ -558,10 +637,14 @@ pub(super) fn run_qwen35_joint_decode(
     prompt_anchors: &mut [Qwen35AnchorStore],
     registration: Option<&ModelRegistration>,
     handles: &[SlotHandle],
+    decode_ready_lanes: usize,
     kv_bytes_per_token: u64,
     config: Qwen35JointDecodeConfig,
     supervisor: &EngineSupervisor,
 ) -> Qwen35JointRun {
+    if let Some(reason) = joint_anchor_admission(handles, prompt_anchors) {
+        return Qwen35JointRun::NotEligible(reason);
+    }
     if guard
         .kv
         .as_ref()
@@ -670,6 +753,7 @@ pub(super) fn run_qwen35_joint_decode(
             group,
             serial.len(),
             handles.len(),
+            decode_ready_lanes,
             kv_bytes_per_token,
             config,
             supervisor,
@@ -727,6 +811,7 @@ fn run_qwen35_joint_group(
     group: Vec<SlotHandle>,
     serial_lanes: usize,
     turn_lanes: usize,
+    decode_ready_lanes: usize,
     kv_bytes_per_token: u64,
     config: Qwen35JointDecodeConfig,
     supervisor: &EngineSupervisor,
@@ -806,6 +891,8 @@ fn run_qwen35_joint_group(
         lanes = lanes.len(),
         rows = prepared.len(),
         serial = serial_lanes,
+        path = "joint",
+        turn_lanes,
         "Qwen joint decode turn"
     );
 
@@ -832,6 +919,7 @@ fn run_qwen35_joint_group(
         );
         match forward {
             Ok(outputs) => {
+                record_c2_decode_lane_steps(decode_ready_lanes, prepared.len(), 0, "ordinary", "joint");
                 for ((index, joint_lane), output) in prepared.into_iter().zip(outputs) {
                     let lane = &mut lanes[index];
                     lane.tick = Some(lane.state.finish_joint_tick(

@@ -1119,6 +1119,16 @@ impl Qwen35Model {
         } else {
             None
         };
+        #[cfg(test)]
+        let c2_selector = if output_tail.is_some()
+            && crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::enabled()
+        {
+            let (indices, _, _) = argmax.as_ref().context("C2 GPU selector requires actual argmax")?;
+            let coordinates = rows.iter().map(|row|
+                Ok((row.slot_id, usize::try_from(row.position)?))).collect::<Result<Vec<_>>>()?;
+            crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::gpu_selector(
+                &mut enc, registry, device, indices, &coordinates)?
+        } else { None };
         if let Some(tail) = output_tail.as_mut() {
             ensure!(
                 rows.iter().all(|row| row.output.wants_argmax()),
@@ -1126,6 +1136,8 @@ impl Qwen35Model {
             );
             let (indices, _values, _params) =
                 argmax.as_ref().context("Qwen joint output-head argmax")?;
+            #[cfg(test)]
+            let indices = c2_selector.as_ref().map_or(indices, |owners| &owners.selected);
             enc.memory_barrier();
             tail(&mut enc, registry, device, indices).context("Qwen joint output-head tail")?;
         }
@@ -1167,6 +1179,33 @@ impl Qwen35Model {
                     }
                     None => None,
                 };
+                #[cfg(test)]
+                if crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::enabled() {
+                    let window = packing.windows.iter().find(|window| row >= window.start && row < window.start + window.rows)
+                        .context("C2 row has no complete verifier-window provenance")?;
+                    let actual_tokens = gpu_token_ids.map(|tokens| tokens.as_logical_slice::<u32>()).transpose()?;
+                    let consumed = (window.start..=row).map(|index|
+                        actual_tokens.map_or(rows[index].token, |tokens| tokens[index])).collect::<Vec<_>>();
+                    if let Some(indices) = argmax_indices.filter(|_| input.output.wants_argmax()) {
+                        // Keep the actual GPU result distinct from both the raw
+                        // target row and the frozen selector's acceptance input.
+                        crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::gpu_argmax(
+                            input.slot_id, usize::try_from(input.position)?, indices[row]);
+                    }
+                    let projected = &all_logits[row * vocab..(row + 1) * vocab];
+                    let restored = decision.as_ref().map(|decision| {
+                        let mut raw = projected.to_vec();
+                        decision.restore(&mut raw);
+                        raw
+                    });
+                    // Restore only this diagnostic copy. Production logits remain
+                    // the decision kernel's masked scratch until their usual readback.
+                    crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::forward(
+                        input.slot_id, usize::try_from(rows[window.start].position)?, &consumed,
+                        "joint-existing-output-head", restored.as_deref().unwrap_or(projected), vocab,
+                        Some(&normed.as_logical_slice::<f32>()?[row * h..(row + 1) * h]), h,
+                    )?;
+                }
                 let logits = input.output.wants_logits().then(|| {
                     let mut logits = all_logits[row * vocab..(row + 1) * vocab].to_vec();
                     if let Some(decision) = decision.as_ref() {

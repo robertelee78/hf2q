@@ -249,6 +249,7 @@ pub fn is_qwen3_vl_moe_arch(arch: &str) -> bool {
 
 /// Dense vs MoE flavor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub enum Qwen35Variant {
     Dense,
     Moe,
@@ -279,6 +280,7 @@ impl Qwen35Variant {
 /// semantic axis). Per `project_model_class_split.md` and ADR-013
 /// Decision 2, Qwen3.5 owns its own enum in its own module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub enum Qwen35LayerKind {
     /// Gated DeltaNet linear-attention block.
     LinearAttention,
@@ -288,6 +290,7 @@ pub enum Qwen35LayerKind {
 
 /// MoE-only config fields. `None` on the dense variant.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct Qwen35MoeConfig {
     /// Per-expert FFN hidden size (512 for Qwen3.5-MoE).
     pub moe_intermediate_size: u32,
@@ -306,6 +309,7 @@ pub struct Qwen35MoeConfig {
 /// the exact key-to-field mapping — grounded in the apex GGUF dump on
 /// 2026-04-23.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct Qwen35Config {
     pub variant: Qwen35Variant,
 
