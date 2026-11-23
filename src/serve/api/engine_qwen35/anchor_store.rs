@@ -551,6 +551,11 @@ impl Qwen35AnchorStore {
         ANCHOR_TELEMETRY
             .captures_staged
             .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        super::anchor_exactness_tests::fresh_http::anchor_staged(
+            self.metric_slot, self.origin, self.epoch, id, request,
+            self.pending.as_ref().expect("staged anchor exists").prompt_tokens.len(),
+        );
         Ok(id)
     }
 
@@ -791,7 +796,12 @@ pub(in crate::serve::api) fn restore_committed_anchor(
         // Do not mask the typed GPU failure with a watchdog completion error.
         applied.context("apply Qwen anchor restore")?;
         completed?;
-        store.finish_restore(ticket, true)
+        let rank = store.finish_restore(ticket, true)?;
+        #[cfg(test)]
+        super::anchor_exactness_tests::fresh_http::anchor_restore_ticket(
+            slot, ticket.origin, ticket.epoch, ticket.anchor_id, ticket.operation,
+        );
+        Ok(rank)
     })();
     record_anchor_restore(started.elapsed());
     if result.is_err() {

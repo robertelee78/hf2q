@@ -20208,6 +20208,11 @@ fn admit_qwen35_slot(
             }
             let anchor = prompt_anchors[slot_idx].anchor(anchor_id)
                 .expect("successful restore retains selected Qwen anchor");
+            #[cfg(test)]
+            super::engine_qwen35::anchor_exactness_tests::fresh_http::anchor_restored(
+                guard.kv.as_ref().expect("kv Some after checked anchor restoration"),
+                handle.slot_id, anchor, &params,
+            );
             tracing::info!(
                 slot = handle.slot_id.0,
                 prompt_tokens = prompt_tokens.len(),
@@ -20925,6 +20930,11 @@ fn settle_qwen35_prefill_advance(
                 rate,
             );
             if let Some(checkpoint) = checkpoint {
+                #[cfg(test)]
+                super::engine_qwen35::anchor_exactness_tests::fresh_http::anchor_created(
+                    guard.kv.as_ref().expect("kv Some after checked prefill"),
+                    handle.slot_id, &checkpoint.kv, &checkpoint.prompt_tokens,
+                );
                 install_qwen35_stable_prompt_checkpoint(handle, prompt_anchors, checkpoint);
             }
             if reply.client_closed() {
@@ -20971,6 +20981,11 @@ fn settle_qwen35_prefill_advance(
                 rate,
             );
             if let Some(checkpoint) = checkpoint {
+                #[cfg(test)]
+                super::engine_qwen35::anchor_exactness_tests::fresh_http::anchor_created(
+                    guard.kv.as_ref().expect("kv Some after checked prefill"),
+                    handle.slot_id, &checkpoint.kv, &checkpoint.prompt_tokens,
+                );
                 install_qwen35_stable_prompt_checkpoint(handle, prompt_anchors, checkpoint);
             }
             if reply.client_closed() {
