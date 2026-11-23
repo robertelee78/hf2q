@@ -516,6 +516,36 @@ packets, acquisition review and diagnostic calibration/replay keys must still
 be bound independently. Existing production calibrations remain evidence for
 their original production executable, not the new test image.
 
+### 8.9 Separate C23 localization, not another qualification attempt
+
+The original C23 four-load budget is permanently closed. Its full-row K4-versus-K1
+comparison failed the unchanged decision envelope: maximum error
+`0.31496429443359375 nat > 0.25 nat`. Saved same-K calibration and matched records
+are byte-identical; they do not identify the first physical divergence.
+
+The operator separately authorized at most four instrumented diagnostic loads:
+an own calibration and independently acquired matched run for each of K4 and K1,
+with no retries, warmups, borrowed caps, or reopening of the original budget.
+Existing ownership, memory, storage, complete-trajectory and release gates remain
+mandatory. These diagnostics cannot themselves declare C2 or release acceptance.
+
+The test-only fresh packet's optional `localization` binding records the actual
+folded anchor image at lane 2 / turn 1, actual K4 restoration and admission lineage
+at turn 3, and all common logical rows `[914, 1923)`. K1 must report no restoration.
+Header-only export independently derives raw anchor extents from the allocator
+plan; it loads no weights or Metal device. Folded image words are not live
+creation state, so creation parity must remain unclaimed.
+
+Layer capture uses one packed bank: embedding output and two actual block
+boundaries per physical decoder layer, 129 F32 records of shape `[1009, 5120]`.
+The second block boundary is the fused FFN/residual sum, not a nonexistent
+standalone FFN output. Metadata retains physical rows, complete cohorts, slot
+generations, tickets and source views; an unobserved native kernel route remains
+unknown. Blits add no checked wait but can split compute encoders. Therefore
+physical interpretation requires exact equality of every selected same-K logit,
+hidden row and token ID against both original acquisitions. Any mismatch is
+instrumentation/graph perturbation, not proof of the original C23 cause.
+
 ## 9. Risks and non-goals
 
 | ID | Risk | Mitigation |
