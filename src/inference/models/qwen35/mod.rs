@@ -1165,3 +1165,6 @@ pub(crate) mod tensor_admission;
 
 #[cfg(test)]
 pub(crate) mod q1_target_layer_capture;
+
+#[cfg(test)]
+pub(crate) mod c23_layer_capture;

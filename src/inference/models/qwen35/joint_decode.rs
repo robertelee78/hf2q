@@ -586,6 +586,28 @@ impl Qwen35Model {
                 positions[axis * width + index] = packed(index).position;
             }
         }
+        #[cfg(test)]
+        let c23_layers = if super::super::c23_layer_capture::selected() {
+            let cohort = rows.iter().map(|row| (row.slot_id,row.position,row.token)).collect::<Vec<_>>();
+            let scope = super::super::c23_layer_capture::begin(device, cfg, &cohort,
+                &positions, width, || serde_json::json!({
+                    "route":"joint-existing-output-head","packed_width":width,
+                    "windows":packing.windows.iter().map(|window| serde_json::json!({
+                        "slot":window.slot.0,"start":window.start,"rows":window.rows})).collect::<Vec<_>>(),
+                    "attention_tile":packing.attention_tile,"mixer_fused":packing.mixer_fused,
+                    "dflash2_verify":packing.dflash2_verify,"dense_ffn":format!("{:?}",dense_ffn),
+                    "projection":format!("{:?}",options.projection),
+                    "pooled_outputs":options.pooled_outputs}))?;
+            if scope.is_some() {
+                ensure!(gpu_token_ids.is_none() && replay.is_none() && capture.is_none()
+                    && !packing.dflash2_verify && self.token_embd_native.is_some()
+                    && layer_weights.iter().all(|layer| matches!(layer,
+                        LayerWeightsGpu::FullAttn {ffn:FfnWeightsGpu::DenseQ(_),..}
+                        | LayerWeightsGpu::LinearAttn {ffn:FfnWeightsGpu::DenseQ(_),..})),
+                    "unsupported selected localization joint graph; never fallback");
+            }
+            scope
+        } else { None };
         let positions = host_buffer(device, DType::I32, positions.as_slice(), "positions")?;
         // The decode forward's actual input manifest (trace on only): one
         // row per packed slot in matrix order, padding rows owner-less. Its
@@ -682,6 +704,11 @@ impl Qwen35Model {
                 );
             }
             let enc = chain.as_mut().expect("joint layer encoder opened above");
+            #[cfg(test)]
+            let c23_before = if c23_layers.is_some() {
+                Some(rows.iter().map(|row| super::q1_layer_metadata::state(kv_cache,layer_idx,row.slot_id))
+                    .collect::<Result<Vec<_>>>()?)
+            } else { None };
             let (attention, post_norm, ffn) = match (weights, routes) {
                 (LayerWeightsGpu::FullAttn { attn, ffn }, LayerRoutes::Full(routes)) => (
                     encode_joint_full_attn_layer(
@@ -742,6 +769,18 @@ impl Qwen35Model {
                 eps,
             )
             .with_context(|| format!("Qwen joint fused residual norm layer {layer_idx}"))?;
+            #[cfg(test)]
+            if let Some(before) = c23_before.as_ref() {
+                let loaded = super::q1_layer_metadata::layer(weights,kv_cache,layer_idx,rows[0].slot_id,
+                    width_u32,cfg,&self.ggml_routing_policy,registry.ggml_routing_policy(),&before[0])?;
+                super::super::c23_layer_capture::snapshot(enc, &ffn_residual, layer_idx,
+                    crate::adr063_invariance::receipt::Stage::Residual,
+                    || serde_json::json!({"boundary":"actual joint fused attention residual sum",
+                        "loaded_projections_and_host_state":loaded,"all_real_rows_before":before,
+                        "actual_width":width,"mixer_fused":packing.mixer_fused,
+                        "attention_tile":packing.attention_tile,
+                        "projection":format!("{:?}",options.projection)}))?;
+            }
             enc.memory_barrier();
             let output = match ffn {
                 FfnWeightsGpu::DenseQ(weights) => build_dense_ffn_layer_gpu_q_into_with_gate_up(
@@ -867,6 +906,16 @@ impl Qwen35Model {
                     bail!("Qwen joint layer {layer_idx} has no admitted FFN arm")
                 }
             };
+            #[cfg(test)]
+            super::super::c23_layer_capture::snapshot(enc, &output, layer_idx,
+                crate::adr063_invariance::receipt::Stage::LayerOutput,
+                || serde_json::json!({"boundary":"actual joint FFN projection fused residual sum",
+                    "standalone_ffn_output":"nonexistent on selected fused path",
+                    "dense_ffn":format!("{:?}",dense_ffn),"actual_width":width,
+                    "chain_n":chain_n,"closes_chain":closes_chain(layer_idx,chain_n,n_layers),
+                    "head_route":format!("{:?}",plan.head),
+                    "projection":format!("{:?}",options.projection),
+                    "weights":match ffn {FfnWeightsGpu::DenseQ(w)=>super::q1_layer_metadata::ffn(w),_=>serde_json::Value::Null}}))?;
             if let Some(capture) = capture {
                 if let Some(capture_index) = capture
                     .layer_ids
@@ -1149,6 +1198,10 @@ impl Qwen35Model {
         enc.commit_and_wait_labeled(head_label)
             .map_err(|e| anyhow!("Qwen joint decode command buffer: {e}"))?;
         mlx_native::command_timeline::mark("joint.head_completed");
+        #[cfg(test)]
+        if let Some(snapshots) = c23_layers {
+            snapshots.finish_after_checked_output_head()?;
+        }
         match held_outputs {
             // The caller releases them when its commit settles.
             Some(held) => held.append(&mut retained),

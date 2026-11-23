@@ -1383,6 +1383,11 @@ pub(super) fn embed_tokens_gpu_into(
                     "codec":format!("{:?}",native.info.ggml_dtype),"native_rows":native.info.rows,
                     "native_columns":native.info.cols,"actual_token_rows":tokens.len()}))?;
         }
+        #[cfg(test)]
+        super::c23_layer_capture::snapshot(&mut enc, output, 0,
+            crate::adr063_invariance::receipt::Stage::Input,
+            || serde_json::json!({"boundary":"actual native embedding gather",
+                "codec":format!("{:?}",native.info.ggml_dtype)}))?;
         // The consuming Qwen/MTP forward is submitted to the same Metal
         // command queue, so normal retained-reference command buffers need
         // no host wait here: queue order is the dependency boundary and the
@@ -5212,6 +5217,29 @@ impl Qwen35Model {
                     LayerWeightsGpu::FullAttn{ffn:FfnWeightsGpu::DenseQ(_),..} |
                     LayerWeightsGpu::LinearAttn{ffn:FfnWeightsGpu::DenseQ(_),..})))?
         }else{None};
+        #[cfg(test)]
+        let c23_layers = if super::c23_layer_capture::selected() {
+            let cohort = tokens.iter().enumerate().map(|(row, &token)|
+                (slot_id, positions_flat[row], token)).collect::<Vec<_>>();
+            let scope = super::c23_layer_capture::begin(device, cfg, &cohort,
+                positions_flat, tokens.len(), || serde_json::json!({
+                    "route":"serial-Last","physical_slot":slot_id.0,
+                    "output_mode":format!("{:?}",output_head_mode),
+                    "n_seqs":kv_cache.n_seqs}))?;
+            if scope.is_some() {
+                ensure!(matches!(output_head_mode, OutputHeadMode::Last)
+                    && joint.is_none() && capture.is_none() && hidden_out.is_none()
+                    && residual_capture.is_none() && soft_tokens.is_empty()
+                    && deepstack.is_none() && self.glp.is_none()
+                    && self.token_embd_native.is_some()
+                    && !super::execution_dispatch::dense_q_split_profile_enabled()
+                    && layer_weights_gpu.iter().all(|layer| matches!(layer,
+                        LayerWeightsGpu::FullAttn {ffn:FfnWeightsGpu::DenseQ(_),..}
+                        | LayerWeightsGpu::LinearAttn {ffn:FfnWeightsGpu::DenseQ(_),..})),
+                    "unsupported selected localization graph; never fallback");
+            }
+            scope
+        } else { None };
 
         // ---- Step 1: embedding lookup → hidden ----
         //
@@ -6168,7 +6196,7 @@ impl Qwen35Model {
             }
             let layer_scratch_before = super::decode_pool::issued_total();
             #[cfg(test)]
-            let q1_layer_before = if q1_target_layers.is_some() {
+            let q1_layer_before = if q1_target_layers.is_some() || c23_layers.is_some() {
                 Some(q1_layer_metadata::state(kv_cache,layer_idx,slot_id)?)
             } else {None};
             // The residual entering this layer, kept for the activation
@@ -6838,6 +6866,17 @@ impl Qwen35Model {
                             &self.ggml_routing_policy,registry.ggml_routing_policy(),
                             q1_layer_before.as_ref().context("missing layer state")?)?)?;
                 }
+                #[cfg(test)]
+                if c23_layers.is_some() {
+                    let loaded = q1_layer_metadata::layer(layer_gpu,kv_cache,layer_idx,slot_id,seq_len,cfg,
+                        &self.ggml_routing_policy,registry.ggml_routing_policy(),
+                        q1_layer_before.as_ref().context("missing localization layer state")?)?;
+                    super::c23_layer_capture::snapshot(enc.encoder(), &ffn_residual_buf, layer_idx,
+                        crate::adr063_invariance::receipt::Stage::Residual,
+                        || serde_json::json!({"boundary":"actual fused attention residual sum",
+                            "loaded_projections_and_host_state":loaded,
+                            "actual_m":seq_len,"physical_slot":slot_id.0}))?;
+                }
                 if any_fused_eligible {
                     // Keep the encoder open; the DenseQ / MoeQ branch below
                     // will dispatch the FFN body into the same command buffer
@@ -7042,6 +7081,18 @@ impl Qwen35Model {
                                     "actual_m":seq_len,"weights":q1_layer_metadata::ffn(w),
                                     "after_state":q1_layer_metadata::state(kv_cache,layer_idx,slot_id)?}))?;
                         }
+                        #[cfg(test)]
+                        super::c23_layer_capture::snapshot(enc.encoder(), &out, layer_idx,
+                            crate::adr063_invariance::receipt::Stage::LayerOutput,
+                            || serde_json::json!({"boundary":"actual FFN projection fused residual sum",
+                                "standalone_ffn_output":"nonexistent on selected fused path",
+                                "hf_ffn_branch":if seq_len>1 {"DenseQ into arena/ring"}else{"DenseQ into pooled"},
+                                "ffn_terminal_k_batch":ffn_terminal_k_batch,
+                                "encode_time_k_boundary":is_k_boundary,
+                                "pipelined_layers":pipelined_layers,
+                                "phase1_head_fusion_eligible":phase1_fusion_env_eligible,
+                                "residual_folded":fold_residual.is_some(),
+                                "actual_m":seq_len,"weights":q1_layer_metadata::ffn(w)}))?;
                         if seq_len == 1 {
                             // Decode path (DROP_SITE per spec §1.1).
                             // commit_unlabeled preserves pre-iter90 enc.commit()
@@ -8114,6 +8165,10 @@ impl Qwen35Model {
         }
         #[cfg(test)]
         if let Some(snapshots)=q1_target_layers.take() {
+            snapshots.finish_after_checked_output_head()?;
+        }
+        #[cfg(test)]
+        if let Some(snapshots) = c23_layers {
             snapshots.finish_after_checked_output_head()?;
         }
         // ADR-019 Phase 2 iter92 — final drain of attn_out hold-vec.
