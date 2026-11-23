@@ -556,6 +556,11 @@ admission, runtime sampling and final publication, with the same roots checked
 during receipt replay. A later stage MUST charge the completed roots normally.
 This corrects an accounting omission; it grants no new exclusion or larger quota.
 
+Production-predecessor validation MUST reconstruct its launch using the original
+SHA-bound outer manifest's recorded repository directory, not the instrumented
+diagnostic checkout. The exact recorded argv and environment checks remain
+mandatory; moving the observer does not rewrite historical execution provenance.
+
 ## 9. Risks and non-goals
 
 | ID | Risk | Mitigation |
