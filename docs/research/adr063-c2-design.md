@@ -529,6 +529,15 @@ with no retries, warmups, borrowed caps, or reopening of the original budget.
 Existing ownership, memory, storage, complete-trajectory and release gates remain
 mandatory. These diagnostics cannot themselves declare C2 or release acceptance.
 
+The first diagnostic calibration stopped at the unchanged zero-compressor-growth
+guard and remains a consumed load without a usable calibration cap. After
+background-memory cleanup, the operator authorized exactly one replacement K4
+calibration: five diagnostic loads total, including that failure and the three
+originally unspent roles. The successor supervisor, native packet consumer and
+offline consumer require this separately bound replacement authority. The failed
+attempt and original C23 budget remain unchanged; no further retry or gate
+relaxation is authorized.
+
 The test-only fresh packet's optional `localization` binding records the actual
 folded anchor image at lane 2 / turn 1, actual K4 restoration and admission lineage
 at turn 3, and all common logical rows `[914, 1923)`. K1 must report no restoration.

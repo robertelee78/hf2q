@@ -22,6 +22,27 @@ fn planned_bytes(expected:&[ExpectedTensor])->Result<usize> {
     expected.iter().try_fold(0usize,|n,e|e.shape.iter().try_fold(e.scalar.bytes(),|n,d|n.checked_mul(*d))
         .and_then(|bytes|n.checked_add(bytes)).context("localization extent overflow"))
 }
+fn replacement_authorization_checked(auth: &Value) -> Result<()> {
+    ensure!(auth["schema"] == "hf2q.private.c23-replacement-calibration-authorization.v1"
+        && auth["authority"] == "Actual operator answer through ask tool"
+        && auth["answer"]["replacement_calibration"] == "authorize_one_after_memory_cleanup"
+        && auth["maximum_total_model_loads"] == 5
+        && auth["maximum_additional_model_loads"] == 4
+        && auth["model_loads_used"] == 1 && auth["model_loads_used_at_authorization"] == 1
+        && auth["maximum_replacement_calibration_loads"] == 1
+        && auth["retries"] == 0 && auth["warmups"] == 0
+        && auth["original_C23_model_budget"] == "PERMANENTLY_CLOSED4/4"
+        && auth["original_failure_preserved"] == true && auth["failed_attempt_preserved"] == true
+        && auth["background_memory_cleanup_required_before_replacement"] == true
+        && auth["unused_original_roles_superseded_by_fixed_successor_roles"] == true
+        && auth["requires_own_calibrations"] == true
+        && auth["requires_route_preservation_proof_before_execution"] == true
+        && auth["all_safety_guards_and_release_gates_unchanged"] == true && auth["frozen_D_limit"] == 0.25
+        && auth["full_frozen_trajectory_and_all_60_decision_rows_required"] == true
+        && auth["budget_reset_authorized"] == false && auth["relabel_original_failure_authorized"] == false
+        && auth["release_qualified"] == false, "bounded replacement authorization missing");
+    Ok(())
+}
 impl Session {
     pub(super) fn prepare(binding:&acquisition::FileBinding, outer:&super::Packet)->Result<Self> {
         let packet:Packet=serde_json::from_slice(&acquisition::checked_file(binding,1024*1024)?)?;
@@ -33,16 +54,7 @@ impl Session {
         ensure!(packet.payload_limit>0&&packet.payload_limit<=outer.payload_limit,"localization grant must fit unchanged fresh diagnostic disk grant");
         ensure!(packet.operator_authorization.sha256!=outer.owner_decision.sha256,"old fresh authority does not authorize localization");
         let auth:Value=serde_json::from_slice(&acquisition::checked_file(&packet.operator_authorization,1024*1024)?)?;
-        ensure!(auth["schema"]=="hf2q.private.c23-separate-localization-authorization.v1"
-            &&auth["answer"]["localization_authority"]=="authorize_separate_max4"
-            &&auth["maximum_additional_model_loads"]==4&&auth["retries"]==0&&auth["warmups"]==0
-            &&auth["original_C23_model_budget"]=="PERMANENTLY_CLOSED4/4"
-            &&auth["original_failure_preserved"]==true&&auth["requires_own_calibrations"]==true
-            &&auth["requires_route_preservation_proof_before_execution"]==true
-            &&auth["all_safety_guards_and_release_gates_unchanged"]==true&&auth["frozen_D_limit"]==0.25
-            &&auth["full_frozen_trajectory_and_all_60_decision_rows_required"]==true
-            &&auth["budget_reset_authorized"]==false&&auth["relabel_original_failure_authorized"]==false
-            &&auth["release_qualified"]==false,"separate four-load authorization missing");
+        replacement_authorization_checked(&auth)?;
         for name in ["HF2Q_DUMP_LAYER","HF2Q_DUMP_BISECT"] {ensure!(std::env::var_os(name).is_none(),"localization cannot use route-changing dump controls");}
         let expected:Vec<ExpectedTensor>=serde_json::from_slice(&acquisition::checked_file(&packet.anchor_expected,4*1024*1024)?)?;
         let layer_expected:Vec<ExpectedTensor>=serde_json::from_slice(&acquisition::checked_file(&packet.layer_expected,4*1024*1024)?)?;
@@ -298,4 +310,43 @@ fn c23_localization_conv_mapping_keeps_every_raw_word() {
 fn c23_localization_extent_fails_on_overflow() {
     let e=spec(0,0,Scalar::U32,usize::MAX);assert!(planned_bytes(&[e]).is_err());
     assert_ne!(at(0,2),at(1,2));assert_ne!(at(0,u32::MAX-1),at(0,u32::MAX));
+}
+
+#[test]
+fn c23_localization_replacement_authority_preserves_spent_load_and_safety() {
+    let auth = serde_json::json!({
+        "schema": "hf2q.private.c23-replacement-calibration-authorization.v1",
+        "authority": "Actual operator answer through ask tool",
+        "answer": {"replacement_calibration": "authorize_one_after_memory_cleanup"},
+        "maximum_total_model_loads": 5, "maximum_additional_model_loads": 4,
+        "model_loads_used": 1, "model_loads_used_at_authorization": 1,
+        "maximum_replacement_calibration_loads": 1, "retries": 0, "warmups": 0,
+        "original_C23_model_budget": "PERMANENTLY_CLOSED4/4",
+        "original_failure_preserved": true, "failed_attempt_preserved": true,
+        "background_memory_cleanup_required_before_replacement": true,
+        "unused_original_roles_superseded_by_fixed_successor_roles": true,
+        "requires_own_calibrations": true, "requires_route_preservation_proof_before_execution": true,
+        "all_safety_guards_and_release_gates_unchanged": true, "frozen_D_limit": 0.25,
+        "full_frozen_trajectory_and_all_60_decision_rows_required": true,
+        "budget_reset_authorized": false, "relabel_original_failure_authorized": false,
+        "release_qualified": false
+    });
+    replacement_authorization_checked(&auth).unwrap();
+    let mut original = auth.clone();
+    original["schema"] = serde_json::json!("hf2q.private.c23-separate-localization-authorization.v1");
+    original["answer"] = serde_json::json!({"localization_authority": "authorize_separate_max4"});
+    assert!(replacement_authorization_checked(&original).is_err());
+    for (field, value) in [
+        ("maximum_total_model_loads", serde_json::json!(6)),
+        ("maximum_replacement_calibration_loads", serde_json::json!(2)),
+        ("model_loads_used", serde_json::json!(0)),
+        ("model_loads_used", serde_json::json!(true)),
+        ("background_memory_cleanup_required_before_replacement", serde_json::json!(false)),
+        ("frozen_D_limit", serde_json::json!(0.26)),
+        ("original_failure_preserved", serde_json::json!(false)),
+    ] {
+        let mut invalid = auth.clone();
+        invalid[field] = value;
+        assert!(replacement_authorization_checked(&invalid).is_err(), "{field}");
+    }
 }
