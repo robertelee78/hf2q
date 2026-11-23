@@ -546,6 +546,16 @@ physical interpretation requires exact equality of every selected same-K logit,
 hidden row and token ID against both original acquisitions. Any mismatch is
 instrumentation/graph perturbation, not proof of the original C23 cause.
 
+Current generated control metadata MUST share the existing diagnostic output
+grant with the entire model-name parent, not only its `attempt` directory.
+This includes `prepared.json`, ledger-dependent configuration and operating
+review files, and the detached companions of both live directory roots.
+Those roots MUST be canonical and disjoint from each other and from immutable
+retained evidence. Their actual combined bytes MUST be deducted at preparation,
+admission, runtime sampling and final publication, with the same roots checked
+during receipt replay. A later stage MUST charge the completed roots normally.
+This corrects an accounting omission; it grants no new exclusion or larger quota.
+
 ## 9. Risks and non-goals
 
 | ID | Risk | Mitigation |
