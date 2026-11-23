@@ -120,9 +120,9 @@ bytes, and publishes only that verified candidate through a complete draft
 release. Model/cache/performance qualification is separate and remains owned by
 the relevant model and serving decisions. v0.1.7 passed the credentialed Apple
 candidate, exact public binary, stable-record, clean install, setup, update
-already-current, and data-preserving uninstall gates; the branded installer is
-live at `https://hf2q.us/install.sh` as a no-cache temporary redirect to the
-exact immutable versioned GitHub release asset.
+already-current, and data-preserving uninstall gates. The branded installer at
+`https://hf2q.us/install.sh` is a static bootstrap that reads the stable release
+record and runs the exact immutable versioned GitHub release installer.
 `hf2q update` follows the installation owner: standalone installations use
 the signed release channel, Cargo installations delegate to Cargo, and source
 checkouts receive exact update instructions without automatic repository
