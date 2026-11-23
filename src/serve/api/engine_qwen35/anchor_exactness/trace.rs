@@ -23,13 +23,22 @@ fn elements(buffer: &MlxBuffer, range: Range<usize>) -> Result<Vec<u8>> {
         _ => anyhow::bail!("C2 cache observation requires explicit U8/F32 representation"),
     }
 }
-fn slot_region(buffer: &MlxBuffer, slot: SlotId) -> Result<Vec<u8>> {
-    let shape = buffer.shape();
-    ensure!(!shape.is_empty() && (slot.0 as usize) < shape[0], "slot axis mismatch");
-    let width: usize = shape[1..].iter().product();
-    elements(buffer, slot.0 as usize * width..(slot.0 as usize + 1) * width)
+// Shape descriptors place n_seqs last, but the owning snapshot/restore
+// operations address contiguous per-slot spans (la_restore.rs:370-424,
+// 563-585). Follow those physical semantics, not an inferred shape stride.
+fn linear_slot_bytes(values: &[f32], slots: usize, slot: SlotId) -> Result<Vec<u8>> {
+    ensure!(slots > 0 && (slot.0 as usize) < slots && values.len() % slots == 0,
+        "linear slot extent mismatch");
+    let width = values.len() / slots;
+    let start = slot.0 as usize * width;
+    Ok(values[start..start + width].iter().flat_map(|v| v.to_bits().to_le_bytes()).collect())
 }
-fn rows(buffer: &MlxBuffer, slot: SlotId, valid: u32) -> Result<Vec<u8>> {
+fn slot_region(buffer: &MlxBuffer, slot: SlotId, slots: usize) -> Result<Vec<u8>> {
+    ensure!(buffer.dtype() == DType::F32 && buffer.shape().last() == Some(&slots),
+        "linear observation requires allocator slot descriptor");
+    linear_slot_bytes(buffer.as_logical_slice::<f32>()?, slots, slot)
+}
+pub(super) fn rows(buffer: &MlxBuffer, slot: SlotId, valid: u32) -> Result<Vec<u8>> {
     let shape = buffer.shape();
     ensure!(shape.len() == 4 && (slot.0 as usize) < shape[0] && valid as usize <= shape[2],
         "full-attention valid extent mismatch");
@@ -61,8 +70,8 @@ impl State {
         for layer in &kv.linear_attn {
             parity.push(layer.pp_flipped[slot.0 as usize]);
             // Scratch is not semantic state and is intentionally not restored.
-            regions.push(slot_region(layer.conv_bufs_for_slot(slot).0, slot)?);
-            regions.push(slot_region(layer.recurrent_bufs_for_slot(slot).0, slot)?);
+            regions.push(slot_region(layer.conv_bufs_for_slot(slot).0, slot, kv.n_seqs as usize)?);
+            regions.push(slot_region(layer.recurrent_bufs_for_slot(slot).0, slot, kv.n_seqs as usize)?);
         }
         Ok(Self { target, mtp, parity, regions })
     }
@@ -313,4 +322,20 @@ pub(crate) fn checkpoint_hidden(slot: SlotId, position: usize) -> Result<Vec<f32
         }
         anyhow::bail!("AcquisitionBlocked: actual normalized output-head checkpoint witness missing")
     })
+}
+
+#[test]
+fn c23_linear_observer_matches_actual_contiguous_slot_addressing() {
+    // Four slots, three channels and two taps; every raw word is distinct.
+    let values: Vec<f32> = (0..24).map(|n| f32::from_bits(0x3f000000 + n)).collect();
+    for slot in 0..4 {
+        let bytes = linear_slot_bytes(&values, 4, SlotId(slot)).unwrap();
+        let start = slot as usize * 6;
+        let expected: Vec<u8> = values[start..start + 6].iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        assert_eq!(bytes, expected);
+        assert_eq!(bytes.len(), 3 * 2 * 4);
+        if slot > 0 { assert_ne!(bytes, linear_slot_bytes(&values, 4, SlotId(slot - 1)).unwrap()); }
+    }
+    assert!(linear_slot_bytes(&values, 4, SlotId(4)).is_err());
+    assert!(linear_slot_bytes(&values[..23], 4, SlotId(0)).is_err());
 }

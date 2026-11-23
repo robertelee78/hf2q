@@ -5,6 +5,9 @@ use super::{fresh_reference as reference, frozen_script::{Prepared,Terminal,Forw
 use crate::serve::api::schema::{ChatCompletionRequest,Tool};
 use std::{collections::BTreeMap,sync::{Arc,Mutex,LazyLock,atomic::{AtomicBool,Ordering}},time::{Duration,Instant},io::Write};
 use serde_json::Value;
+#[path = "c23_localization.rs"]
+mod localization;
+pub(crate) use localization::{anchor_created, anchor_restored, anchor_staged, anchor_restore_ticket, localization_cohort};
 const HEADER:&str="x-hf2q-c2-ticket";
 #[derive(Clone,Copy,Deserialize,PartialEq,Eq)]
 #[serde(rename_all="snake_case")]
@@ -18,6 +21,7 @@ struct Packet {
     registration:Option<acquisition::FileBinding>,selected_cell:Option<[usize;2]>,
     arm:String,keep:usize,route:Route,expected:Option<acquisition::FileBinding>,
     payload_limit:u64,ready_timeout_seconds:u64,
+    localization:Option<acquisition::FileBinding>,
 }
 struct Row {logits:Vec<f32>,hidden:Vec<f32>,route:String}
 struct Request {
@@ -48,6 +52,7 @@ struct Run {
     packet:Packet,requests:Vec<Request>,owners:Owners,
     prefix:String,architecture:String,table:Option<TokenTable>,worker:Option<acquisition::c2::C2WorkerBinding>,
     writer:Option<Store>,error:Option<String>,
+    localization:Option<localization::Session>,
 }
 static RUN:LazyLock<Mutex<Option<Run>>>=LazyLock::new(||Mutex::new(None));
 fn lock()->std::sync::MutexGuard<'static,Option<Run>> {RUN.lock().unwrap_or_else(|e|e.into_inner())}
@@ -197,7 +202,9 @@ pub(crate) fn admitted(model:&Qwen35LoadedModel,cache:&HybridKvCache,slot:SlotId
     }
     let generation=run.owners.admit(slot.0,ticket)?;
     let r=&mut run.requests[index];r.generation=generation;r.slot=Some(slot.0);r.origin=prompt.len()-1;r.acquisition=Some(observed);
-    r.prepared.as_mut().unwrap().cached_tokens=Some(cached);Ok(())
+    r.prepared.as_mut().unwrap().cached_tokens=Some(cached);
+    localization::admitted(run,model,cache,slot,cached)?;
+    Ok(())
 }
 pub(crate) fn require_owner(slot:SlotId,ticket:Option<&str>)->Result<()> {
     let global=lock();let run=global.as_ref().context("fresh capture absent")?;
@@ -271,6 +278,7 @@ pub(crate) fn finished(state:&Qwen35DecodeState) {
         let index=owner(run,state.slot_id)?;ensure!(run.requests[index].ticket==ticket,"native terminal belongs to another slot generation");
         let r=&mut run.requests[index];if let Some(c)=&r.canonical {ensure!(terminal.decisions==c.decisions&&terminal.generated==c.generated&&terminal.finish_reason==c.finish_reason,"frozen numerical replay changed terminal tape");}
         let generation=r.generation;r.terminal=Some(terminal);
+        localization::finished(run,state.slot_id)?;
         run.owners.finish(state.slot_id.0,ticket,generation)?;Ok(())})();if let Err(e)=result{fail("native-terminal",e)}
 }
 pub(crate) fn argmax(slot:SlotId,position:usize,token:u32) {
@@ -341,6 +349,7 @@ fn driver(requests:Vec<Vec<Vec<u8>>>,reference:Option<reference::Validated>,stop
         }
     }
     {let mut global=lock();let run=global.as_mut().unwrap();if let Some(writer)=run.writer.take(){super::divergent::complete(writer)?;}else{ensure!(selected.is_none(),"selected replay store absent");}
+        localization::complete(run)?;
         let table=run.table.as_ref().map(|t|save(&output.join("token-table.json"),t.values.as_ref())).transpose()?;
         if run.packet.mode==Mode::Capture {let captured=reference::Capture{schema:reference::CAPTURE_SCHEMA.into(),inputs:run.packet.inputs.clone(),owner_decision:run.packet.owner_decision.clone(),identity:run.packet.identity.clone(),
             packet:acquisition::FileBinding{path:output.join("packet.json"),sha256:hash(&fs::read(output.join("packet.json"))?)},token_table:table,
@@ -362,6 +371,7 @@ pub(super) fn run(family:Family)->Result<()> {
     let _:Value=serde_json::from_slice(&acquisition::checked_file(&packet.owner_decision,4*1024*1024)?)?;
     ensure!(packet.identity.model_sha256==if family==Family::Qwen38{Q38}else{Q36},"wrong declared artifact");
     let input_raw=acquisition::checked_file(&packet.inputs,4*1024*1024)?;let inputs:reference::Inputs=serde_json::from_slice(&input_raw)?;let requests=inputs.validate(family)?;
+    let localization=packet.localization.as_ref().map(|binding|localization::Session::prepare(binding,&packet)).transpose()?;
     let (scope,reference)=match packet.mode {
         Mode::Capture=>{ensure!(packet.registration.is_none()&&packet.selected_cell.is_none()&&packet.expected.is_none()&&packet.arm=="canonical"&&packet.route==Route::Off&&packet.keep==4,"capture must be complete unforced OFF/K4 with no selector");
             (acquisition::Scope::begin_c2_fresh_capture(&packet.acquisition,&packet.identity,&packet.model,&packet.output,&raw,&input_raw)?,None)},
@@ -401,14 +411,22 @@ pub(super) fn run(family:Family)->Result<()> {
     let mut random=[0u8;32];fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
     let _gpu=crate::inference::hf2q_gpu_test_lock();scope.c2_hold()?;
     {let mut global=lock();ensure!(global.is_none()&&!super::fullw_http::historical_enabled(),"another HTTP acquisition active");*global=Some(Run{packet,requests:Vec::new(),owners:Owners::default(),
-        prefix:hex::encode(random),architecture:String::new(),table:None,worker:None,writer:None,error:None});}
+        prefix:hex::encode(random),architecture:String::new(),table:None,worker:None,writer:None,error:None,localization});}
     let stop=Arc::new(AtomicBool::new(false));let signal=stop.clone();drop(reservation);
     let worker=std::thread::spawn(move||{let result=driver(requests,reference,signal);if result.is_err(){unsafe{libc::raise(libc::SIGTERM);}}result});
     let served=crate::serve::cmd_serve(args,cli.log_format,None,None);stop.store(true,Ordering::Release);
     let captured=worker.join().map_err(|_|anyhow::anyhow!("fresh HTTP driver panicked")).and_then(|result|result);
     let release=acquisition::Scope::c2_release();
-    let error=lock().take().and_then(|run|run.error);
-    served?;captured?;ensure!(error.is_none(),"late native/HTTP acquisition error: {error:?}");release
+    let mut retained=lock().take();
+    let error=retained.as_ref().and_then(|run|run.error.clone());
+    let failed=served.is_err()||captured.is_err()||release.is_err()||error.is_some();
+    let diagnostic_retention=if failed {
+        let reason=format!("serve={:?}; capture={:?}; release={:?}; observation={error:?}",
+            served.as_ref().err(),captured.as_ref().err(),release.as_ref().err());
+        retained.as_mut().map(|run|localization::failed(run,&reason)).transpose()
+    }else{Ok(None)};
+    served?;captured?;ensure!(error.is_none(),"late native/HTTP acquisition error: {error:?}");
+    diagnostic_retention?;release
 }
 
 #[test]
