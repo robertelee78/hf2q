@@ -154,7 +154,7 @@ pub(crate) fn anchor_restore_ticket(slot:SlotId,origin:u64,epoch:u64,id:u64,oper
 }
 /// Restoration happens before ordinary admission binds the incoming generation.
 /// Retain its actual authenticated ticket now; admitted() completes the join.
-pub(crate) fn anchor_restored(cache:&HybridKvCache,slot:SlotId,anchor:&Qwen35Anchor,params:&SamplingParams) {
+pub(in crate::serve::api) fn anchor_restored(cache:&HybridKvCache,slot:SlotId,anchor:&Qwen35Anchor,params:&SamplingParams) {
     let result=(||->Result<()> {let mut global=lock();let Some(run)=global.as_mut() else{return Ok(())};if run.localization.is_none(){return Ok(())}
         let r=request(run,params.c2_ticket.as_deref().context("restore lost authenticated ticket")?)?;
         if [r.lane,r.turn]!=[2,3]{return Ok(())}let ticket=r.ticket.clone();

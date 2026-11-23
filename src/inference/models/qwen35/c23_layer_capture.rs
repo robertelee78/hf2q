@@ -142,9 +142,15 @@ pub(crate) fn begin(device: &MlxDevice, cfg: &Qwen35Config, cohort: &[(SlotId, i
             sink.width = width; sink.layers = layers;
         }
         ensure!(sink.width == width && sink.layers == layers, "stale model geometry");
-        let id = NEXT_FORWARD.fetch_update(std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| anyhow::anyhow!("forward id overflow"))?;
+        let mut id = NEXT_FORWARD.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next = id.checked_add(1).context("forward id overflow")?;
+            match NEXT_FORWARD.compare_exchange_weak(id, next,
+                std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => id = actual,
+            }
+        }
         let coordinates = cohort.iter().map(|&(slot, position, _)|
             Ok((slot, usize::try_from(position)?))).collect::<Result<Vec<_>>>()?;
         let cohort_owners = crate::serve::api::engine_qwen35::anchor_exactness_tests::fresh_http::localization_cohort(&coordinates)?;

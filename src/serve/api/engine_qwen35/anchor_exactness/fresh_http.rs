@@ -7,7 +7,8 @@ use std::{collections::BTreeMap,sync::{Arc,Mutex,LazyLock,atomic::{AtomicBool,Or
 use serde_json::Value;
 #[path = "c23_localization.rs"]
 mod localization;
-pub(crate) use localization::{anchor_created, anchor_restored, anchor_staged, anchor_restore_ticket, localization_cohort};
+pub(crate) use localization::{anchor_created, anchor_staged, anchor_restore_ticket, localization_cohort};
+pub(in crate::serve::api) use localization::anchor_restored;
 const HEADER:&str="x-hf2q-c2-ticket";
 #[derive(Clone,Copy,Deserialize,PartialEq,Eq)]
 #[serde(rename_all="snake_case")]
