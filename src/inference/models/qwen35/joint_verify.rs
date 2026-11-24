@@ -175,6 +175,7 @@ impl Qwen35Model {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -191,6 +192,11 @@ impl Qwen35Model {
     /// envelope and argmax equality are qualification gates, not
     /// assumptions, and a token verified here and the same token decoded
     /// serially or in a plain joint step need not agree in bits.
+    ///
+    /// `host_work` runs once after output-head submission and before the
+    /// checked wait, except native CB/dispatch profiling runs it after the
+    /// checked synchronous completion to preserve samples and errors. It must
+    /// not panic; retain any preparation error until this forward completes.
     #[allow(
         dead_code,
         reason = "DFlash2 scheduler wiring follows the target-capture gate"
@@ -203,6 +209,7 @@ impl Qwen35Model {
         dense_ffn: JointDenseFfnRoute,
         options: JointStepOptions,
         capture: Option<DFlash2TargetCapture<'_>>,
+        host_work: Option<&mut dyn FnMut()>,
     ) -> Result<Qwen35JointVerify> {
         self.forward_gpu_joint_verify_layout(
             lanes,
@@ -215,6 +222,7 @@ impl Qwen35Model {
             capture,
             None,
             None,
+            host_work,
         )
     }
 
@@ -232,6 +240,7 @@ impl Qwen35Model {
         options: JointStepOptions,
         capture: Option<DFlash2TargetCapture<'_>>,
         output_tail: Option<&mut JointOutputHeadTail<'_>>,
+        host_work: Option<&mut dyn FnMut()>,
     ) -> Result<Qwen35JointVerify> {
         self.forward_gpu_joint_verify_layout(
             lanes,
@@ -244,6 +253,7 @@ impl Qwen35Model {
             capture,
             output_tail,
             None,
+            host_work,
         )
     }
 
@@ -267,6 +277,7 @@ impl Qwen35Model {
         options: JointStepOptions,
         capture: Option<DFlash2TargetCapture<'_>>,
         decision_histories: &[Option<&[u32]>],
+        host_work: Option<&mut dyn FnMut()>,
     ) -> Result<Qwen35JointVerify> {
         self.forward_gpu_joint_verify_layout(
             lanes,
@@ -279,6 +290,7 @@ impl Qwen35Model {
             capture,
             None,
             Some(decision_histories),
+            host_work,
         )
     }
 
@@ -295,6 +307,7 @@ impl Qwen35Model {
         capture: Option<DFlash2TargetCapture<'_>>,
         output_tail: Option<&mut JointOutputHeadTail<'_>>,
         decision_histories: Option<&[Option<&[u32]>]>,
+        host_work: Option<&mut dyn FnMut()>,
     ) -> Result<Qwen35JointVerify> {
         if let Some(histories) = decision_histories {
             ensure!(
@@ -464,6 +477,7 @@ impl Qwen35Model {
                         .hold_layer_outputs
                         .then_some(&mut held_outputs),
                     decision_histories,
+                    host_work,
                 )?;
                 Ok((outputs, normed, replay))
             },

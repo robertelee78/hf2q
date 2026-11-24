@@ -1,6 +1,6 @@
 //! Verified checkpoint ownership and bounded DFlash2 cycle execution.
 
-use std::path::Path;
+use std::{path::Path, sync::Mutex};
 
 use sha2::{Digest, Sha256};
 
@@ -209,6 +209,9 @@ pub struct DFlash2Runtime {
     verify_budget: DFlash2VerifyBudget,
     gpu_target_tokens: bool,
     proposal_repetition_enabled: bool,
+    /// The current asynchronous draft producer, including an adopted prefetch.
+    /// CPU views check this exact command before reading its workspace outputs.
+    submitted_draft: Mutex<Option<CommandEncoder>>,
     /// The next step's draft, when the previous step committed it
     /// ([`Self::prefetch_draft`]). While it is `Some` the command may be
     /// executing: it reads the rings and writes the draft outputs of the
@@ -359,6 +362,7 @@ impl DFlash2Runtime {
             verify_budget: DFlash2VerifyBudget::default(),
             gpu_target_tokens,
             proposal_repetition_enabled,
+            submitted_draft: Mutex::new(None),
             prefetched: None,
             prefetch_counts: DraftPrefetchCounts::default(),
             budget_epoch: 0,
@@ -410,8 +414,8 @@ impl DFlash2Runtime {
 
     /// Submit the draft graph without a host wait. The graph also composes
     /// `workspace.target_tokens`; a same-queue target embedding may consume it
-    /// immediately, while host proposal access remains invalid until that
-    /// target command reaches its completion boundary.
+    /// immediately. CPU proposal access checks the retained producer's completion,
+    /// independently of the target command's eventual completion.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_draft_for_gpu_target<T: DFlash2TargetFamily>(
         &mut self,
@@ -481,6 +485,7 @@ impl DFlash2Runtime {
             "DFlash2 draft positions {logical_positions:?} do not match lane contexts {:?}",
             self.lane_lengths
         );
+        self.finish_submitted_draft()?;
         // A draft that does not involve a prefetch (the stock route, and a
         // step with nothing outstanding) allocates nothing here: the
         // outstanding snapshot is compared with the borrowed inputs, and a
@@ -509,6 +514,10 @@ impl DFlash2Runtime {
                         .encoder
                         .wait_until_completed()
                         .context("execute prefetched DFlash2 draft cycle")?;
+                } else {
+                    *self.submitted_draft.get_mut().map_err(|_| {
+                        anyhow::anyhow!("DFlash2 draft producer ownership mutex poisoned")
+                    })? = Some(prefetched.encoder);
                 }
                 return Ok(());
             }
@@ -603,6 +612,10 @@ impl DFlash2Runtime {
                 repetition: repetition.copied(),
             };
             self.prefetched = Some(PrefetchedDraft { inputs, encoder });
+        } else if !wait {
+            *self.submitted_draft.get_mut().map_err(|_| {
+                anyhow::anyhow!("DFlash2 draft producer ownership mutex poisoned")
+            })? = Some(encoder);
         }
         Ok(())
     }
@@ -662,10 +675,26 @@ impl DFlash2Runtime {
         )
     }
 
-    /// Wait for a prefetched draft command and drop it. Called before
-    /// anything writes the rings or encodes another command over this
-    /// workspace; a no-op when nothing is prefetched.
+    /// Check the actual producer before a host view or another workspace writer.
+    /// Keep a failed producer owned; a successful check releases it immediately.
+    fn finish_submitted_draft(&self) -> Result<()> {
+        let mut submitted = self.submitted_draft.lock().map_err(|_| {
+            anyhow::anyhow!("DFlash2 draft producer ownership mutex poisoned")
+        })?;
+        if let Some(encoder) = submitted.as_ref() {
+            encoder
+                .wait_until_completed()
+                .context("complete current DFlash2 draft producer")?;
+            *submitted = None;
+        }
+        Ok(())
+    }
+
+    /// Check the current producer, then wait for and drop any next-step prefetch.
+    /// Called before anything writes the rings or encodes another command over
+    /// this workspace; does no GPU work when neither submission is outstanding.
     pub(crate) fn settle_prefetch(&mut self) -> Result<()> {
+        self.finish_submitted_draft()?;
         match self.prefetched.take() {
             Some(prefetched) => self.discard_prefetched(prefetched),
             None => Ok(()),
@@ -690,8 +719,8 @@ impl DFlash2Runtime {
         self.prefetch_counts
     }
 
-    /// The current step's proposals. A prefetched draft overwrites them, so
-    /// they are unreadable from the prefetch until the next draft call.
+    /// The current step's proposals, after checked producer completion.
+    /// A prefetched next draft makes these unreadable until its adoption.
     pub fn proposals(&self) -> Result<&[u32]> {
         self.ensure_draft_outputs_current()?;
         Ok(self.workspace.proposed_tokens.as_slice::<u32>()?)
@@ -707,6 +736,7 @@ impl DFlash2Runtime {
             self.prefetched.is_none(),
             "DFlash2 draft outputs read after the next draft was prefetched"
         );
+        self.finish_submitted_draft()?;
         Ok(())
     }
 

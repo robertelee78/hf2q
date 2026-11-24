@@ -169,6 +169,7 @@ fn verify_with(
             options,
             Some(capture),
             None,
+            None,
         )
     } else {
         model.forward_gpu_dflash2_verify(
@@ -178,6 +179,7 @@ fn verify_with(
             JointDenseFfnRoute::SerialBuilder,
             options,
             Some(capture),
+            None,
         )
     }
     .unwrap_or_else(|error| panic!("DFlash2 verify of {cohort:?}: {error:#}"));

@@ -79,6 +79,7 @@ pub(super) fn runtime(device: &MlxDevice, staged: bool) -> DFlash2Runtime {
         verify_budget: DFlash2VerifyBudget::default(),
         gpu_target_tokens: false,
         proposal_repetition_enabled: false,
+        submitted_draft: std::sync::Mutex::new(None),
         prefetched: None,
         prefetch_counts: DraftPrefetchCounts::default(),
         budget_epoch: 0,
