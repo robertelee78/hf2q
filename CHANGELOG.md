@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Four-agent coordination preserves the client's primary startup error when final fixture observation also fails, recording secondary observation failures separately. Missing fixtures remain failed, and sandbox-proof binding validation is unchanged.
 - Keep repository-only grammar-probe tooling and development corpora out of the crate archive; shipped grammar, calibration data and registry-test inputs remain included.
 - C23 localization binds the separately authorized seven-total continuation: all five prior diagnostic loads remain spent, with only one replacement K1 calibration and its matched comparison permitted. Measured-RAM diagnostic admission must not charge filesystem lengths as resident RAM; disk accounting and genuine safety gates remain separate and mandatory. The original `CLOSED4/4` numerical failure remains preserved.
 - Upgrade the locked URL parser to 2.5.9 for the published security fix. Model-free adversarial HTTP controls record request receipt before sending a response, so an immediate SSE identity rejection cannot race the retained request evidence.

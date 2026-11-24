@@ -2,6 +2,8 @@
 import argparse
 import hashlib
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -172,6 +174,55 @@ class FourAgent(unittest.TestCase):
             data[AGENTS[2]][key] = data[AGENTS[2]][key][:-1]
             with self.subTest(key=key), self.assertRaises(Invalid):
                 aggregate(data, dict.fromkeys(AGENTS, 0), dict.fromkeys(AGENTS, True), PID, RUN)
+
+    def test_startup_proof_failure_survives_missing_fixture_observation(self):
+        """Real four-child approval rejection, without a server, model or sandbox execution."""
+        from qwen_n4_live_smoke import MODULES
+        from qwen38_n1_smoke import PREFLIGHT
+        module_dir = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            approval = root / "approval.json"
+            packet = {
+                "schema": "hf2q.qwen-n4-coordinator-approval.v1", "profile": PROFILE,
+                "approved": True, "family": "qwen", "engine_kind": "hf2q",
+                "server_pid": os.getpid(), "base_url": "http://127.0.0.1:18238/v1",
+                "model": "Qwen3.8 27B", "run_id": RUN, "barrier_token": TOKEN,
+                "python_sha256": child.digest(Path(sys.executable).resolve()),
+                "sources": {name: child.digest(module_dir / name) for name in MODULES},
+                "agent_template": {"preflight": dict.fromkeys(preflight(PREFLIGHT), True),
+                                   "sandbox_proof_sha256": "a" * 64},
+            }
+            approval.write_text(json.dumps(packet))
+            output = root / "client"
+            command = [sys.executable, "-E", "-s", "-B", str(module_dir / "qwen_n4_live_smoke.py")]
+            for key, value in {
+                "base-url": packet["base_url"], "model": packet["model"], "output": output,
+                "cargo": "/not-used/cargo", "toolchain": "stable",
+                "sandbox-exec": "/not-used/sandbox-exec", "sandbox-proof": root / "absent-proof.json",
+                "sandbox-proof-sha256": "b" * 64, "server-pid": os.getpid(),
+                "approval": approval, "approval-sha256": child.digest(approval),
+            }.items():
+                command += ["--" + key, str(value)]
+            completed = subprocess.run(command, capture_output=True, timeout=30)
+            self.assertEqual(completed.returncode, 1, completed.stderr.decode())
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(summary["status"], "Failed")
+            self.assertRegex(summary["error"],
+                             r"Invalid: agent-[0-3] exited before shared release: Invalid: sandbox proof binding")
+            self.assertTrue(summary["fixture_observation_errors"])
+            self.assertTrue(any(result.get("error") == "Invalid: sandbox proof binding"
+                                for result in summary["agents"].values()))
+            self.assertTrue(summary["cleanup"])
+            self.assertFalse(summary["runtime_qualified"])
+            self.assertFalse(summary["model_qualified"])
+            self.assertNotIn("barrier", summary)
+            for agent in AGENTS:
+                self.assertFalse((output / agent / "tools").exists())
+            for result in summary["agents"].values():
+                self.assertNotIn("observed_final_source_sha256", result)
+                self.assertEqual(result["turns"], [])
+                self.assertEqual(result["tools"], [])
 
 
 def client_args(phase_plan=None):
