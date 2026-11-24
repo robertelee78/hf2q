@@ -531,30 +531,41 @@ without usable calibration caps. The replacement had normal pressure, no swap,
 and about 34.5 GiB of Free plus cached memory available; compressor growth was
 not evidence of RAM exhaustion.
 
-The operator's separately bound capacity-diagnostics authority now permits
-exactly four remaining diagnostic loads: **two spent plus four new, six inclusive
-total**. It fixes a new successor namespace and exactly these roles, in order:
-K4 own footprint calibration `c23-localization-qwen38-k4-ac-v3`, K4 matched run
-`c23-localization-qwen38-k4-matched-v2`, K1 own footprint calibration
-`c23-localization-qwen38-k1-ac-v2`, and K1 matched run
-`c23-localization-qwen38-k1-matched-v2`. The successor supervisor, native packet
-consumer and offline consumer require this six-total authority; the native
-packet binds its actual SHA-256
-`7d124de0900db86b3daad0b8af5ddf80978daaf6d28362cacb90e3dc7eb47e14`
-and exact same-K successor output under the SHA-bound namespace. Native admission
-borrows that absolute, traversal-free namespace from the authorization; private
-producers verify the exact prior evidence paths and proofs, not machine-local
-path literals duplicated in Rust.
-Both failed grants, the original diagnostic authorities and the capacity-guard
-proof remain bound evidence, not authority to replay an old root or refund a
-load. No retries, warmups, reduced workload, borrowed caps, numerical-limit
-changes, reopening or relabelling of original C23 are authorized. Its original
-qualification budget remains `PERMANENTLY_CLOSED4/4` and its numerical result
-remains FAILED, `0.31496429443359375 nat > 0.25 nat`.
+The previous capacity-diagnostics authority permitted four fixed remaining
+loads after two spent failures: six inclusive total. Both K4 acquisitions
+completed, but K1 calibration then stopped before producing a usable cap.
+The guard incorrectly subtracted retained and live filesystem lengths from
+measured Free plus cached RAM. The saved observation had 39,012,106,240 bytes
+available and a measured reaction floor of 28,985,434,034 bytes; an additional
+11,247,782,542-byte disk-derived reserve caused the stop. Pressure remained
+normal, with no swap or compressor growth. This is not a completed calibration
+or proof that the remaining workload fits.
 
-Capacity-based protection uses available RAM, not compression alone. Admission
-requires the completed capacity-guard proof, fresh retained accounting, own
-calibrations and route-preservation proof. The diagnostic supervisor MUST record
+The separately bound measured-RAM authority now authorizes exactly one
+replacement K1 calibration and its own-cap matched comparison: **five spent
+plus two new, seven inclusive total**. Current native admission binds authority
+SHA-256 `4412ff8e577d895784b31a43f0a0bcf814a6c9294f9d127d05ae505b85497c5a`
+and only K1 roles `c23-localization-qwen38-k1-ac-v3` and
+`c23-localization-qwen38-k1-matched-v3` under its absolute, traversal-free
+successor namespace. All three failed grants and both successful K4 grants
+remain consumed and bound. Private producers verify exact prior evidence;
+machine-local paths are not duplicated in Rust.
+
+The completed K4 pair remains historical six-total evidence and is replayed
+under its original immutable producer, authority and memory semantics. It is
+not relabelled as measured-RAM successor evidence. No further retries, warmups,
+reduced workload, borrowed caps or numerical-limit changes are authorized.
+Original C23 remains `PERMANENTLY_CLOSED4/4` and FAILED:
+`0.31496429443359375 nat > 0.25 nat`.
+
+Capacity-based protection uses measured available RAM, not compression or
+filesystem lengths. Baseline, admission, live stops, terminal disposition and
+current receipt replay MUST use Free plus cached consistently, without
+deducting retained or live disk bytes. Complete retained/live disk accounting,
+full run grants, free-space floors and pending-publication reservations remain
+separate mandatory checks. Admission requires fresh complete measured-RAM
+guard proof, retained accounting, own calibration and route-preservation proof.
+The diagnostic supervisor MUST record
 compression and warning pressure as telemetry while retaining critical-pressure,
 swap, measured reaction headroom, own calibrated-cap, telemetry, ownership and
 cleanup stops. Any changed observer requires a fresh measured stop-latency

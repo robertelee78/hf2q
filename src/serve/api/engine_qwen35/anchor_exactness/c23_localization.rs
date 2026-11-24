@@ -25,14 +25,14 @@ fn planned_bytes(expected:&[ExpectedTensor])->Result<usize> {
 fn capacity_authorization_checked(auth: &Value) -> Result<&std::path::Path> {
     // Session::prepare pins the complete private authority by its actual SHA-256.
     // Keep native budget/guard semantics here; private paths and proofs stay private.
-    ensure!(auth["schema"] == "hf2q.private.c23-capacity-diagnostics-authorization.v1"
+    ensure!(auth["schema"] == "hf2q.private.c23-measured-ram-diagnostics-authorization.v1"
         && auth["authority"] == "Actual operator answer through ask tool"
         && auth["answer"].as_object().is_some_and(|fields| fields.len() == 1)
-        && auth["answer"]["diagnostic_loads"] == "authorize_four_remaining_six_total_no_retries"
-        && auth["maximum_total_model_loads"].as_u64() == Some(6)
-        && auth["maximum_additional_model_loads"].as_u64() == Some(4)
-        && auth["model_loads_used"].as_u64() == Some(2)
-        && auth["model_loads_used_at_authorization"].as_u64() == Some(2)
+        && auth["answer"]["k1_replacement"] == "authorize_one_replacement_seven_total"
+        && auth["maximum_total_model_loads"].as_u64() == Some(7)
+        && auth["maximum_additional_model_loads"].as_u64() == Some(2)
+        && auth["model_loads_used"].as_u64() == Some(5)
+        && auth["model_loads_used_at_authorization"].as_u64() == Some(5)
         && auth["retries"].as_u64() == Some(0) && auth["warmups"].as_u64() == Some(0)
         && auth["original_C23_model_budget"] == "PERMANENTLY_CLOSED4/4"
         && auth["original_failure_preserved"] == true && auth["failed_attempts_preserved"] == true
@@ -41,45 +41,61 @@ fn capacity_authorization_checked(auth: &Value) -> Result<&std::path::Path> {
         && auth["requires_own_calibrations"] == true
         && auth["requires_route_preservation_proof_before_execution"] == true
         && auth["requires_capacity_guard_proof_before_execution"] == true
+        && auth["requires_measured_ram_guard_proof_before_execution"] == true
         && auth["requires_fresh_retained_accounting"] == true
         && auth["all_safety_guards_and_release_gates_unchanged"] == true && auth["frozen_D_limit"] == 0.25
         && auth["full_frozen_trajectory_and_all_60_decision_rows_required"] == true
         && auth["budget_reset_authorized"] == false && auth["relabel_original_failure_authorized"] == false
-        && auth["release_qualified"] == false, "bounded six-total capacity authorization missing");
-    ensure!(auth["consumed_failed_roles"].as_array().is_some_and(|roles| roles.len() == 2),
-        "both failed diagnostic loads must remain consumed");
+        && auth["release_qualified"] == false, "bounded seven-total measured-RAM authorization missing");
+    for (field, hashes) in [
+        ("consumed_failed_roles", &[
+            "7d18cec53246024aac0e5359df8e3f7f126258bc729ed2d777626d23b1e19ad5",
+            "3b7f529272f02d52c04bc3fff02a4f22a02632859b004d86b15c5f76fd27b6d2",
+            "ab82cb239abac59115051a3e3e32e688c5e71f6c992874cdeacea99ff7377ffc",
+        ][..]),
+        ("consumed_successful_roles", &[
+            "92c5172e4b001541ed77fcc6e20357db0cb5863e9dcfe33e67fc9bdcca2e680a",
+            "4bead1377f982e2d3e2d426968ea85776a6f8938687f79c2a309b06b39eb3d05",
+        ][..]),
+    ] {
+        ensure!(auth[field].as_array().is_some_and(|roles| roles.len() == hashes.len()
+            && roles.iter().zip(hashes).all(|(binding, hash)| {
+                binding.as_object().is_some_and(|fields| fields.len() == 2)
+                    && binding["path"].as_str().is_some_and(|path| !path.is_empty())
+                    && binding["sha256"].as_str() == Some(*hash)
+            })), "all five immutable prior diagnostic spends must remain bound");
+    }
     let namespace = std::path::Path::new(auth["fixed_successor_namespace"].as_str()
-        .context("six-total successor namespace missing")?);
+        .context("seven-total successor namespace missing")?);
     ensure!(namespace.is_absolute()
+        && namespace.to_str().is_some_and(|path| !path.split('/').any(|part| matches!(part, "." | "..")))
         && !namespace.components().any(|part| matches!(part, std::path::Component::ParentDir)),
-        "six-total successor namespace must be absolute without parent traversal");
+        "seven-total successor namespace must be absolute without aliases");
     let roles = auth["fixed_roles"].as_array().context("fixed successor roles missing")?;
     let expected = [
-        (4, "footprint-calibration", "c23-localization-qwen38-k4-ac-v3"),
-        (4, "matched-cap", "c23-localization-qwen38-k4-matched-v2"),
-        (1, "footprint-calibration", "c23-localization-qwen38-k1-ac-v2"),
-        (1, "matched-cap", "c23-localization-qwen38-k1-matched-v2"),
+        (1, "footprint-calibration", "c23-localization-qwen38-k1-ac-v3"),
+        (1, "matched-cap", "c23-localization-qwen38-k1-matched-v3"),
     ];
     ensure!(roles.len() == expected.len()
         && roles.iter().zip(expected).all(|(role, (keep, mode, name))| {
             role.as_object().is_some_and(|fields| fields.len() == 3)
                 && role["keep"].as_u64() == Some(keep) && role["mode"] == mode && role["name"] == name
-        }), "six-total fixed successor roles changed");
+        }), "seven-total fixed successor roles changed");
     Ok(namespace)
 }
 fn capacity_output_checked(output: &std::path::Path, keep: usize, namespace: &std::path::Path) -> Result<()> {
     ensure!(output.is_absolute()
+        && output.to_str().is_some_and(|path| !path.split('/').any(|part| matches!(part, "." | "..")))
         && !output.components().any(|part| matches!(part, std::path::Component::ParentDir)),
-        "six-total output must be absolute without parent traversal");
-    ensure!(output.file_name() == Some(std::ffi::OsStr::new("output")), "six-total output suffix changed");
-    let attempt = output.parent().context("six-total attempt path missing")?;
-    ensure!(attempt.file_name() == Some(std::ffi::OsStr::new("attempt")), "six-total attempt suffix changed");
-    let role = attempt.parent().context("six-total role path missing")?;
+        "seven-total output must be absolute without aliases");
+    ensure!(output.file_name() == Some(std::ffi::OsStr::new("output")), "seven-total output suffix changed");
+    let attempt = output.parent().context("seven-total attempt path missing")?;
+    ensure!(attempt.file_name() == Some(std::ffi::OsStr::new("attempt")), "seven-total attempt suffix changed");
+    let role = attempt.parent().context("seven-total role path missing")?;
     ensure!(role.parent() == Some(namespace)
         && matches!((keep, role.file_name().and_then(|name| name.to_str())),
-            (4, Some("c23-localization-qwen38-k4-ac-v3" | "c23-localization-qwen38-k4-matched-v2"))
-            | (1, Some("c23-localization-qwen38-k1-ac-v2" | "c23-localization-qwen38-k1-matched-v2"))),
-        "localization requires the exact six-total successor namespace and same-K role");
+            (1, Some("c23-localization-qwen38-k1-ac-v3" | "c23-localization-qwen38-k1-matched-v3"))),
+        "localization requires the exact seven-total successor namespace and K1 role");
     Ok(())
 }
 impl Session {
@@ -92,8 +108,8 @@ impl Session {
             "localization logical extent changed");
         ensure!(packet.payload_limit>0&&packet.payload_limit<=outer.payload_limit,"localization grant must fit unchanged fresh diagnostic disk grant");
         ensure!(packet.operator_authorization.sha256!=outer.owner_decision.sha256,"old fresh authority does not authorize localization");
-        ensure!(packet.operator_authorization.sha256=="7d124de0900db86b3daad0b8af5ddf80978daaf6d28362cacb90e3dc7eb47e14",
-            "localization requires the actual six-total operator authority");
+        ensure!(packet.operator_authorization.sha256=="4412ff8e577d895784b31a43f0a0bcf814a6c9294f9d127d05ae505b85497c5a",
+            "localization requires the actual seven-total operator authority");
         let auth:Value=serde_json::from_slice(&acquisition::checked_file(&packet.operator_authorization,1024*1024)?)?;
         let namespace = capacity_authorization_checked(&auth)?;
         capacity_output_checked(&outer.output, outer.keep, namespace)?;
@@ -355,50 +371,56 @@ fn c23_localization_extent_fails_on_overflow() {
 }
 
 #[cfg(test)]
-fn six_total_authorization_fixture() -> Value {
+fn seven_total_authorization_fixture() -> Value {
     serde_json::json!({
-        "schema": "hf2q.private.c23-capacity-diagnostics-authorization.v1",
+        "schema": "hf2q.private.c23-measured-ram-diagnostics-authorization.v1",
         "authority": "Actual operator answer through ask tool",
-        "answer": {"diagnostic_loads": "authorize_four_remaining_six_total_no_retries"},
-        "maximum_additional_model_loads": 4, "maximum_total_model_loads": 6,
-        "model_loads_used": 2, "model_loads_used_at_authorization": 2, "retries": 0, "warmups": 0,
+        "answer": {"k1_replacement": "authorize_one_replacement_seven_total"},
+        "maximum_additional_model_loads": 2, "maximum_total_model_loads": 7,
+        "model_loads_used": 5, "model_loads_used_at_authorization": 5, "retries": 0, "warmups": 0,
         "original_C23_model_budget": "PERMANENTLY_CLOSED4/4",
         "original_failure_preserved": true, "failed_attempts_preserved": true, "spent_loads_nonrefundable": true,
         "unused_original_roles_superseded_by_fixed_successor_roles": true,
         "requires_own_calibrations": true, "requires_route_preservation_proof_before_execution": true,
         "requires_capacity_guard_proof_before_execution": true, "requires_fresh_retained_accounting": true,
+        "requires_measured_ram_guard_proof_before_execution": true,
         "all_safety_guards_and_release_gates_unchanged": true, "frozen_D_limit": 0.25,
         "full_frozen_trajectory_and_all_60_decision_rows_required": true,
         "budget_reset_authorized": false, "relabel_original_failure_authorized": false, "release_qualified": false,
         "consumed_failed_roles": [
-            {"path": "prior-first.json", "sha256": "1111111111111111111111111111111111111111111111111111111111111111"},
-            {"path": "prior-second.json", "sha256": "2222222222222222222222222222222222222222222222222222222222222222"}
+            {"path": "prior-first.json", "sha256": "7d18cec53246024aac0e5359df8e3f7f126258bc729ed2d777626d23b1e19ad5"},
+            {"path": "prior-second.json", "sha256": "3b7f529272f02d52c04bc3fff02a4f22a02632859b004d86b15c5f76fd27b6d2"},
+            {"path": "prior-third.json", "sha256": "ab82cb239abac59115051a3e3e32e688c5e71f6c992874cdeacea99ff7377ffc"}
         ],
-        "fixed_successor_namespace": "/diagnostics/six-total",
+        "consumed_successful_roles": [
+            {"path": "prior-fourth.json", "sha256": "92c5172e4b001541ed77fcc6e20357db0cb5863e9dcfe33e67fc9bdcca2e680a"},
+            {"path": "prior-fifth.json", "sha256": "4bead1377f982e2d3e2d426968ea85776a6f8938687f79c2a309b06b39eb3d05"}
+        ],
+        "fixed_successor_namespace": "/diagnostics/seven-total",
         "fixed_roles": [
-            {"keep": 4, "mode": "footprint-calibration", "name": "c23-localization-qwen38-k4-ac-v3"},
-            {"keep": 4, "mode": "matched-cap", "name": "c23-localization-qwen38-k4-matched-v2"},
-            {"keep": 1, "mode": "footprint-calibration", "name": "c23-localization-qwen38-k1-ac-v2"},
-            {"keep": 1, "mode": "matched-cap", "name": "c23-localization-qwen38-k1-matched-v2"}
+            {"keep": 1, "mode": "footprint-calibration", "name": "c23-localization-qwen38-k1-ac-v3"},
+            {"keep": 1, "mode": "matched-cap", "name": "c23-localization-qwen38-k1-matched-v3"}
         ]
     })
 }
 #[test]
-fn c23_localization_six_total_authority_accepts_actual_scope() {
-    capacity_authorization_checked(&six_total_authorization_fixture()).unwrap();
+fn c23_localization_seven_total_authority_accepts_actual_scope() {
+    capacity_authorization_checked(&seven_total_authorization_fixture()).unwrap();
 }
 #[test]
-fn c23_localization_six_total_authority_rejects_stale_authorities() {
+fn c23_localization_seven_total_authority_rejects_stale_authorities() {
     for (schema, answer, total, used) in [
         ("hf2q.private.c23-separate-localization-authorization.v1",
             serde_json::json!({"localization_authority": "authorize_separate_max4"}), 4, 0),
         ("hf2q.private.c23-replacement-calibration-authorization.v1",
             serde_json::json!({"replacement_calibration": "authorize_one_after_memory_cleanup"}), 5, 1),
+        ("hf2q.private.c23-capacity-diagnostics-authorization.v1",
+            serde_json::json!({"diagnostic_loads": "authorize_four_remaining_six_total_no_retries"}), 6, 2),
     ] {
-        let mut invalid = six_total_authorization_fixture();
+        let mut invalid = seven_total_authorization_fixture();
         invalid["schema"] = serde_json::json!(schema);
         assert!(capacity_authorization_checked(&invalid).is_err(), "stale schema {schema}");
-        let mut invalid = six_total_authorization_fixture(); invalid["answer"] = answer;
+        let mut invalid = seven_total_authorization_fixture(); invalid["answer"] = answer;
         assert!(capacity_authorization_checked(&invalid).is_err(), "stale answer {schema}");
         invalid["schema"] = serde_json::json!(schema);
         invalid["maximum_total_model_loads"] = serde_json::json!(total);
@@ -408,8 +430,8 @@ fn c23_localization_six_total_authority_rejects_stale_authorities() {
     }
 }
 #[test]
-fn c23_localization_six_total_authority_rejects_refunds_seventh_load_and_retries() {
-    let auth = six_total_authorization_fixture();
+fn c23_localization_seven_total_authority_rejects_refunds_eighth_load_and_retries() {
+    let auth = seven_total_authorization_fixture();
     for field in ["maximum_additional_model_loads", "maximum_total_model_loads",
         "model_loads_used", "model_loads_used_at_authorization", "retries", "warmups"] {
         for value in [serde_json::json!(true), serde_json::json!(false), serde_json::json!(-1),
@@ -418,16 +440,16 @@ fn c23_localization_six_total_authority_rejects_refunds_seventh_load_and_retries
             assert!(capacity_authorization_checked(&invalid).is_err(), "{field}");
         }
     }
-    for (field, value) in [("maximum_total_model_loads", 7), ("maximum_additional_model_loads", 5),
-        ("model_loads_used", 0), ("model_loads_used", 1), ("model_loads_used_at_authorization", 1),
+    for (field, value) in [("maximum_total_model_loads", 8), ("maximum_additional_model_loads", 3),
+        ("model_loads_used", 0), ("model_loads_used", 4), ("model_loads_used_at_authorization", 4),
         ("retries", 1), ("warmups", 1)] {
         let mut invalid = auth.clone(); invalid[field] = serde_json::json!(value);
         assert!(capacity_authorization_checked(&invalid).is_err(), "{field}={value}");
     }
 }
 #[test]
-fn c23_localization_six_total_authority_preserves_failure_and_all_guards() {
-    let auth = six_total_authorization_fixture();
+fn c23_localization_seven_total_authority_preserves_failure_and_all_guards() {
+    let auth = seven_total_authorization_fixture();
     for (field, value) in auth.as_object().unwrap() {
         let mut invalid = auth.clone(); invalid.as_object_mut().unwrap().remove(field);
         assert!(capacity_authorization_checked(&invalid).is_err(), "missing {field}");
@@ -441,64 +463,72 @@ fn c23_localization_six_total_authority_preserves_failure_and_all_guards() {
         ("frozen_D_limit", serde_json::json!(0.31496429443359375)),
         ("original_C23_model_budget", serde_json::json!("OPEN0/4")),
         ("authority", serde_json::json!("synthetic approval")),
-        ("answer", serde_json::json!({"diagnostic_loads": "authorize_four_remaining_six_total_no_retries", "retry": true})),
+        ("answer", serde_json::json!({"k1_replacement": "authorize_one_replacement_seven_total", "retry": true})),
     ] {
         let mut invalid = auth.clone(); invalid[field] = value;
         assert!(capacity_authorization_checked(&invalid).is_err(), "{field}");
     }
 }
 #[test]
-fn c23_localization_six_total_authority_rejects_changed_evidence_and_extra_roles() {
-    let auth = six_total_authorization_fixture();
-    for index in 0..4 {
-        for (field, value) in [("keep", serde_json::json!(true)), ("keep", serde_json::json!(2)),
+fn c23_localization_seven_total_authority_rejects_changed_evidence_and_extra_roles() {
+    let auth = seven_total_authorization_fixture();
+    for index in 0..2 {
+        for (field, value) in [("keep", serde_json::json!(true)), ("keep", serde_json::json!(4)),
             ("mode", serde_json::json!("retry")), ("name", serde_json::json!("old-role")),
             ("extra", serde_json::json!(true))] {
             let mut invalid = auth.clone(); invalid["fixed_roles"][index][field] = value;
             assert!(capacity_authorization_checked(&invalid).is_err(), "role {index}/{field}");
         }
     }
-    for field in ["fixed_roles", "consumed_failed_roles"] {
+    for field in ["fixed_roles", "consumed_failed_roles", "consumed_successful_roles"] {
         let mut invalid = auth.clone();
         let array = invalid[field].as_array_mut().unwrap(); array.push(array[0].clone());
         assert!(capacity_authorization_checked(&invalid).is_err(), "extra {field}");
         let mut invalid = auth.clone(); invalid[field].as_array_mut().unwrap().pop();
         assert!(capacity_authorization_checked(&invalid).is_err(), "missing {field}");
-        if field == "fixed_roles" {
-            let mut invalid = auth.clone(); invalid[field].as_array_mut().unwrap().swap(0, 1);
-            assert!(capacity_authorization_checked(&invalid).is_err(), "reordered {field}");
+        let mut invalid = auth.clone(); invalid[field].as_array_mut().unwrap().swap(0, 1);
+        assert!(capacity_authorization_checked(&invalid).is_err(), "reordered {field}");
+        if field != "fixed_roles" {
+            for index in 0..auth[field].as_array().unwrap().len() {
+                for (key, value) in [("path", ""), ("sha256", "changed")] {
+                    let mut invalid = auth.clone(); invalid[field][index][key] = serde_json::json!(value);
+                    assert!(capacity_authorization_checked(&invalid).is_err(), "{field}/{index}/{key}");
+                }
+            }
         }
     }
-    for namespace in ["relative-root", "/diagnostics/../old-root"] {
+    for namespace in ["relative-root", "/diagnostics/../old-root", "/diagnostics/./seven-total"] {
         let mut invalid = auth.clone(); invalid["fixed_successor_namespace"] = serde_json::json!(namespace);
         assert!(capacity_authorization_checked(&invalid).is_err(), "{namespace}");
     }
 }
 #[test]
-fn c23_localization_six_total_output_rejects_old_roots_and_wrong_roles() {
-    let auth = six_total_authorization_fixture();
+fn c23_localization_seven_total_output_rejects_old_roots_and_wrong_roles() {
+    let auth = seven_total_authorization_fixture();
     let namespace = auth["fixed_successor_namespace"].as_str().unwrap();
     let namespace_path = std::path::Path::new(namespace);
     for role in auth["fixed_roles"].as_array().unwrap() {
-        let keep = role["keep"].as_u64().unwrap() as usize;
         let name = role["name"].as_str().unwrap();
         let output = std::path::PathBuf::from(format!("{namespace}/{name}/attempt/output"));
-        capacity_output_checked(&output, keep, namespace_path).unwrap();
-        assert!(capacity_output_checked(&output, if keep == 4 { 1 } else { 4 }, namespace_path).is_err());
+        capacity_output_checked(&output, 1, namespace_path).unwrap();
+        assert!(capacity_output_checked(&output, 4, namespace_path).is_err());
         for invalid in [
             format!("{namespace}/{name}/attempt"),
             format!("{namespace}/{name}/attempt/output/nested"),
             format!("{namespace}/{name}/other/output"),
             format!("{namespace}-old/{name}/attempt/output"),
             format!("{namespace}/../old-root/{name}/attempt/output"),
+            format!("{namespace}/./{name}/attempt/output"),
             format!("relative-root/{name}/attempt/output"),
         ] {
-            assert!(capacity_output_checked(std::path::Path::new(&invalid), keep, namespace_path).is_err(), "{invalid}");
+            assert!(capacity_output_checked(std::path::Path::new(&invalid), 1, namespace_path).is_err(), "{invalid}");
         }
     }
     for name in ["c23-localization-qwen38-k4-ac-v1", "c23-localization-qwen38-k4-ac-v2",
-        "c23-localization-qwen38-k4-ac-v4", "seventh-load"] {
+        "c23-localization-qwen38-k4-ac-v3", "c23-localization-qwen38-k4-matched-v2",
+        "c23-localization-qwen38-k1-ac-v2", "c23-localization-qwen38-k1-matched-v2",
+        "c23-localization-qwen38-k1-ac-v4", "eighth-load"] {
         let output = format!("{namespace}/{name}/attempt/output");
-        assert!(capacity_output_checked(std::path::Path::new(&output), 4, namespace_path).is_err(), "{name}");
+        assert!(capacity_output_checked(std::path::Path::new(&output), 1, namespace_path).is_err(), "{name}");
     }
 }
