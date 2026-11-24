@@ -81,9 +81,9 @@ pub struct FaPrefillArena {
 
     /// Route (c) scratch for `HF2Q_QWEN_RESUME_ATTN_FAST`: the TQ-dequant
     /// K/V temps, their BF16 casts and the F32 output, sized for the
-    /// prefill's `(seq_len, kv_seq_len)`. Allocated by the first resumed FA
+    /// prefill's `(seq_len, kv_seq_len)`. Allocated by the first TQ FA
     /// layer and shared by the rest, so it lives through the forward's
-    /// terminal wait like the buffers above. `None` otherwise.
+    /// terminal wait like the buffers above. Cold history reuses arena K/V.
     pub(crate) resume_tq: Option<super::resume_attn_fast::ResumeTqScratch>,
     /// Joint segments share these roots, never their immutable shapes.
     pub(crate) shared_resume: Option<super::resume_attn_fast::ResumeTqWorkspace>,

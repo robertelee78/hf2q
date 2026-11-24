@@ -399,6 +399,39 @@ The comparison uses Q1 stores (`hf2q.adr063.invariance`) and `scripts/four_agent
 
 No graft/speculation axis is skipped: graft+auto must assert the explicit runtime-unavailable boundary and same-route ordinary parity, not relabel ordinary decode as K3 or add graft-aware MTP. The current default DFlash2 route is a separate capability/route observation; an unset flag alone is not proof that it ran.
 
+### 7.2.1 C23 persisted-KV representation repair candidate (2026-11-24)
+
+The saved K1 attention inputs independently reproduce both the captured raw
+attention and the captured packed K/V plus F32 norms. On the actual 1859-row
+forward, raw BF16 attention reproduces all 11,421,696 output values bitwise.
+Using the persisted TQ representation instead, full attention and the
+offset-914, 945-row suffix agree on all 5,806,080 suffix values bitwise. The
+TQ suffix differs from the captured raw suffix at 3,903,805 values (maximum
+absolute attention difference 0.03125). This isolates a representation fork
+on saved K1 projections; K4 Q/K/V were not captured, so it is not complete
+logit-causation or model-qualification evidence.
+
+The repair candidate makes cold and resumed TQ-only prefills consume the
+persisted cache, including the fused projection/cache/attention encoder.
+F32-cache controls retain raw K/V. Existing small-query direct attention and
+the fast/bridge kill switch remain explicit. Cold BF16 history borrows the
+arena's existing K/V storage; joint history sizing includes cold segments.
+No raw historical KV shadow or full-prefix recomputation is introduced.
+
+This deliberately changes the old cold arithmetic (Class B), not the
+same-route twin definition above or the D1 decision envelope. The numerical,
+independent real-task quality, cancellation/isolation, fresh Q5, fairness and
+performance gates remain required on the repaired source. Unit/kernel output
+parity cannot substitute for them or promote anchor depth four.
+
+Evidence: [C2 source-bound offline replay record](https://github.com/robertelee78/hf2q/issues/360#issuecomment-7144174929);
+result SHA256 `a096658c3630a75df3bea5c6ad1c76581f2521b9f12d69619410d747646f890e`.
+The original C23 numerical failure remains `FAILED CLOSED4/4`; all seven
+diagnostic loads remain spent. The final physical capture failed its
+terminal strict-Nominal thermal observation. Its saved data is forensic
+input only, not an accepted acquisition, calibration, C2 or release result.
+
+
 ### 7.3 O1 success-path twin (C1 carry-over)
 
 1. Slot 0 serves request A to success, so anchor A@d is committed.

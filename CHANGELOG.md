@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Qwen TQ-only cold and resumed prompt prefill consume the same persisted KV representation, including the fused encoder path; F32-cache controls remain raw. Cold BF16 history reuses arena storage instead of allocating duplicate K/V roots. This changes old cold arithmetic and does not promote multi-anchor defaults or replace numerical, real-task, memory, fairness, performance or release qualification.
 - Four-agent coordination preserves the client's primary startup error when final fixture observation also fails, recording secondary observation failures separately. Missing fixtures remain failed, and sandbox-proof binding validation is unchanged.
 - Keep repository-only grammar-probe tooling and development corpora out of the crate archive; shipped grammar, calibration data and registry-test inputs remain included.
 - C23 localization binds the separately authorized seven-total continuation: all five prior diagnostic loads remain spent, with only one replacement K1 calibration and its matched comparison permitted. Measured-RAM diagnostic admission must not charge filesystem lengths as resident RAM; disk accounting and genuine safety gates remain separate and mandatory. The original `CLOSED4/4` numerical failure remains preserved.

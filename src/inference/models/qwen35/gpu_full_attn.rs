@@ -6031,64 +6031,12 @@ pub fn apply_sdpa_with_kv_cache(
             }
         }
 
-        // ── Production path: flash_attn_prefill_bf16_d256 ──
-        //
-        // The legacy `sdpa` 3-pass tiled kernel (no online softmax, no
-        // simdgroup_matrix MMA) was 76.5 % of per-FA-layer cost at PP4096
-        // (W-5b.9 audit). It has been replaced by the same-purpose
-        // `flash_attn_prefill_bf16_d256` kernel that Gemma 4 has used in
-        // production since ADR-011 Phase 2 Wave 4 (commit `953dc1b`).
-        //
-        // Wave 5b.10 (commits a0cab10 + 43090a8 + 9ccaabb + c4a3e02) wired
-        // the new path with a forensic A/B env gate `HF2Q_QWEN35_FA_LEGACY=1`.
-        // Wave 5b.12 sunset audit (5 cold model loads × 3 cold prefills × 2
-        // paths = 30 runs, all token id 11) confirmed parity holds, so the
-        // env gate has been removed; the new path is now the unconditional
-        // production codepath for the prefill-from-zero regime.
-        //
-        // Eligibility for the new path:
-        //   - head_dim == 256 (Qwen3.5/3.6 production value)
-        //   - cur_len == 0   (full prefill from offset 0; the kernel
-        //     processes the chunk Q/K/V directly, not the full slot
-        //     buffer — kv_seq_len equals seq_len in this regime)
-        //
-        // Cases that fall through to the legacy path:
-        //   - head_dim != 256 (no D=256 dispatcher coverage; D=64 / D=512
-        //     would need separate wire-up — Qwen3.5/3.6 does not need them)
-        //   - cur_len > 0 (incremental prefill on top of an existing KV
-        //     cache; the new kernel reads chunk Q against chunk K/V only.
-        //     This case is not exercised by the production prefill path
-        //     at this iter — full-prefill-from-zero is the live regime —
-        //     but the legacy path is preserved as a correct fallback for
-        //     non-prefill-from-zero correctness)
-        // ITER-20 (refined): gate the FA-prefill path on `seq_len >= 16`
-        // (= BK for the d=256 dispatcher).  Originally gated on >=32 in
-        // iter-17 to avoid the dim=10 NaN observed at qL<32 (single
-        // partial Q tile + single partial K tile).  Bisection across
-        // the FRESH+OLD GGUF matrix revealed:
-        //
-        // * The dim=10 NaN bug specifically requires `kL_rem != 0` AND
-        //   `qL_rem != 0` AND single K-tile — i.e. qL < 16.  At qL >= 16,
-        //   K is BK-aligned (kL_rem=0) and the partial-K-tile mask path
-        //   is NOT exercised; FA produces coherent output for both
-        //   GGUFs at qL ∈ [16, ∞).
-        // * The legacy 3-pass `sdpa` kernel ALSO has its own short-qL
-        //   bug at qL <= 15 on Qwen3.6 (head_dim=256, kv_h=2):
-        //   produces all-NaN logits on BOTH OLD and FRESH dwq48 GGUFs.
-        //   Bisection: qL=15 NaN, qL=17 coherent.  HF2Q_DUMP_LAYER=ALL
-        //   masks via dense flush_gpu sync points (see ADR-005 iter-19).
-        //
-        // So qL ∈ [1, 15] has no known-good path on this kernel set:
-        //   * FA: dim=10 NaN at qL < 16
-        //   * Legacy SDPA: all-NaN at qL <= 15
-        //   * decode (flash_attn_vec): only fires at qL == 1
-        //
-        // The qL=16-31 range becomes coherent under the new >= 16 gate
-        // (was previously routed to broken legacy SDPA when gate was
-        // >= 32).  Long-prefill perf preserved (FA always fires).
-        // qL ∈ [2, 15] remains broken — workaround is the user
-        // padding their prompt up to qL >= 16.
-        let new_path_eligible = head_dim == 256 && cur_len == 0 && seq_len >= 16;
+        // F32-cache cold prefill reads the projected chunk directly. TQ
+        // slots must instead read their persisted representation, just as
+        // resumed prefill does. Otherwise a cold twin attends BF16(raw KV)
+        // while its resumed twin attends BF16(TQ-roundtripped KV).
+        let new_path_eligible =
+            head_dim == 256 && cur_len == 0 && seq_len >= 16 && slot.tq.is_none();
         // ADR-028 iter-177: trace branch eligibility for K=1 batched-verify
         // bug bisect. HF2Q_FA_TRACE=1 prints all booleans + actual branch.
         let fa_trace = std::env::var("HF2Q_FA_TRACE").as_deref() == Ok("1");
@@ -6298,8 +6246,8 @@ pub fn apply_sdpa_with_kv_cache(
             return Ok(out_buf);
         }
 
-        // ── ADR-017 Phase E.a B.2-fix + B.5: FA RESUME path
-        //    (head_dim=256, cur_len > 0, kv_seq_len >= 16) ──
+        // Dense BF16 attention over the persisted cache. TQ cold prefills
+        // use this path too, so a chunk boundary cannot change KV precision.
         //
         // Slot K/V have already been populated with the new tokens at
         // `[cur_len..cur_len + seq_len]` by the
@@ -6333,7 +6281,8 @@ pub fn apply_sdpa_with_kv_cache(
         // B.5 v1 gate: `kv_seq_len >= 16` (multi-K-tile) replaces
         // `seq_len >= 16`.  Closes the 23% danger-zone coverage gap and
         // allows chunked + LCP-resume to engage on ALL prompt lengths.
-        let resume_path_eligible = head_dim == 256 && cur_len > 0 && kv_seq_len >= 16;
+        let resume_path_eligible =
+            head_dim == 256 && kv_seq_len >= 16 && (cur_len > 0 || slot.tq.is_some());
         if fa_trace {
             eprintln!(
                 "[FA_TRACE] resume_eligible={} (will engage if true; else fallback)",
@@ -6752,10 +6701,13 @@ pub fn build_gated_attn_layer(
                 // assertion as `cur_len_for_arena` above (slot_idx <
                 // s.current_len.len()) — see comment block above.
                 let cur = s.current_len[slot_idx];
-                // cur_len==0: existing fresh-prefill path.
-                // cur_len>0 + seq_len<16 + head_dim==256 + slot.k/v F32:
-                //   new vec-small path inside fused encoder.
-                cur == 0
+                // TQ matrix prefills consume the encoded cache in this
+                // encoder. Small TQ chunks and the bridge kill switch use
+                // the ordinary TQ dispatcher instead of raw chunk K/V.
+                (cur == 0
+                    && (s.tq.is_none()
+                        || (seq_len > QWEN35_TQ_DIRECT_PREFILL_MAX_QUERIES
+                            && super::resume_attn_fast::resume_attn_fast_enabled())))
                     || (allow_vec_small_in_fused
                         && cur > 0
                         && seq_len < 16
@@ -7131,40 +7083,39 @@ pub fn build_gated_attn_layer(
                 // correctness and profiling attribution.
                 enc.encoder().memory_barrier();
 
-                // Joint segments reuse one forward-owned result after its
-                // consumer. Other callers retain the pool's drain lifetime.
+                // TQ results are forward-arena owned; joint segments share
+                // their result after its consumer. F32 controls use the pool.
                 let seq = seq_len as usize;
                 let nh = n_heads as usize;
                 let d = head_dim as usize;
-                let out_elems = seq * nh * d;
-                let out_seq = match fa_pre.shared_output.as_ref() {
-                    Some(output) => output.clone(),
-                    None => super::decode_pool::pooled_alloc_buffer(
-                        device,
-                        out_elems * 4,
-                        DType::F32,
-                        vec![seq, nh, d],
-                    ).map_err(|e| anyhow!("alloc out_seq (fused stage_ab): {e}"))?,
+                let out_seq = if slot.tq.is_some() {
+                    let _kernel = super::wave5b8_profile::Section::start(
+                        super::wave5b8_profile::SectionKind::FaSdpaKernel,
+                    );
+                    super::resume_attn_fast::encode_resume_via_tq_cache_fast(
+                        enc.encoder(), device, registry, slot, &arena.q_rope_buf,
+                        seq_len, cur_len_u32, kv_seq_len, max_seq_len,
+                        n_heads, n_kv_heads, head_dim, slot_id, fa_pre,
+                    )?
+                } else {
+                    match fa_pre.shared_output.as_ref() {
+                        Some(output) => output.clone(),
+                        None => super::decode_pool::pooled_alloc_buffer(
+                            device,
+                            seq * nh * d * 4,
+                            DType::F32,
+                            vec![seq, nh, d],
+                        ).map_err(|e| anyhow!("alloc out_seq (fused stage_ab): {e}"))?,
+                    }
                 };
                 // ADR-019 Phase 2 iter92 — push Arc-clone into K-batch hold-vec.
                 if let Some(hold) = out_seq_hold.as_deref_mut() {
                     hold.push(out_seq.clone());
                 }
 
-                // Encode the FA bridge body into the SAME `enc`.
-                //
-                // ADR-034 task #89 Step 3b (2026-05-21) — dispatch branch:
-                // - cur_len == 0: existing fresh-prefill BF16 kernel (8
-                //   dispatches + 5 intra-encoder barriers via the _into
-                //   wrapper). Byte-identical to pre-task-#89.
-                // - cur_len > 0 (only fires when predicate above allowed,
-                //   i.e. seq_len < 16 + head_dim == 256 + slot.k/v F32):
-                //   flash_attn_vec with q_seq_len = seq_len. Reads slot.k/v
-                //   F32 head-major directly (no BF16 cast of the full
-                //   capacity). Saves the prefill kernel's BF16 setup +
-                //   eliminates the launch overhead that motivated this
-                //   step (4.298 ms fa.ops1_4 at seq_len=2 cur_len>0 vs
-                //   0.422 ms at seq_len=20 cur_len=0).
+                // F32 cold and vec-small branches retain their existing
+                // kernels. The TQ bridge above already encoded its body
+                // against the just-written persisted cache in this encoder.
                 //
                 // Buffer-lifetime contract (codex /cfa 2026-05-21): the
                 // fused encoder is deferred (moved into fused_stage_a_enc
@@ -7174,7 +7125,7 @@ pub fn build_gated_attn_layer(
                 // alive until `reset_decode_pool` is called (top of next
                 // forward) — same lifetime contract as the existing arena
                 // scratches at forward_gpu_impl level.
-                {
+                if slot.tq.is_none() {
                     let _w5b10_kernel = super::wave5b8_profile::Section::start(
                         super::wave5b8_profile::SectionKind::FaSdpaKernel,
                     );
@@ -8616,6 +8567,8 @@ pub fn apply_gated_attn_layer_decode_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod tq_prefill;
 
     #[test]
     fn native_f32_projection_qwen_m4_is_deterministic() {
