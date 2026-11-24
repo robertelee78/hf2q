@@ -271,6 +271,81 @@ class SettledAuditControls(unittest.TestCase):
             self.assertIsNone(report)
             self.assertIn("stale lineage", failure)
 
+    def test_admitted_cohort_rejects_failed_q5_or_unproven_cleanup(self):
+        import q5_admission
+        import q5_calibration
+        import q5_case
+        import q5_policy
+
+        # Actual loopback/client evidence; Q5 identities and memory below are synthetic.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.run_fixture(root)
+            case = coding_long_context.derive_case(
+                json.loads((fake.HERE / "q5_cases/qwen38.json").read_bytes()), VARIANT)
+            for name, value in case["variables"].items():
+                if value is None:
+                    case["variables"][name] = "/synthetic/" + name
+            case_path = root / "case.json"
+            case_path.write_text(json.dumps(case))
+            bound = lambda path: {"path": str(path), "sha256": observation.sha(path)}
+            repo = str(fake.HERE.parent.parent)
+            builtins = q5_calibration.builtins(root)
+            builtins["REPO"] = repo
+            plan = q5_case.build_plan(case, builtins, {})
+            self.assertTrue(plan["complete"])
+            gib = 1 << 30
+            host = {"physical_bytes": 128 * gib, "fixture_scope": "SyntheticNotHostObservation"}
+            artifact = {"sha256": "a" * 64}
+            identity = {"artifact": artifact, "binary": {"sha256": "b" * 64}, "inputs": {}}
+            prior = {
+                "schema": q5_admission.RECEIPT_SCHEMA, "mode": "calibration", "run_kind": "calibration",
+                "verdict": {"verdict": "CalibrationPass"}, "family": case["family"],
+                "host": host, "workload": case["workload"], "binary": identity["binary"],
+                "artifact": artifact, "baseline": {"free_plus_cached_bytes": 96 * gib},
+                "samples": {"min_free_plus_cached_bytes": 64 * gib, "peak_footprint_bytes": 20 * gib},
+                "fixture_scope": "SyntheticNotModelCalibration",
+            }
+            prior_path = root / "calibration.json"
+            prior_path.write_text(json.dumps(prior))
+            admission_reference = bound(prior_path)
+            admission = q5_admission.admission_from(prior, {
+                "family": case["family"], "workload": case["workload"],
+                "binary_sha256": identity["binary"]["sha256"], "artifact": artifact,
+                "physical_bytes": host["physical_bytes"]})
+            floor_inputs = {"seed_rate_bytes_per_s": admission["seed_rate_bytes_per_s"], "latency_ns": 146000000}
+            initial = q5_policy.effective_floor(plan["policy"]["free_cached_floor_bytes"],
+                admission["seed_rate_bytes_per_s"], plan["policy"]["interval_seconds"], floor_inputs["latency_ns"])
+            receipt = {
+                "artifact": artifact, "binary": identity["binary"], "host": host, "workload": case["workload"],
+                "case": bound(case_path), "inputs": identity["inputs"],
+                "supervisor_sources": {name: observation.sha(fake.HERE / name) for name in q5_calibration.SOURCES},
+                "serve_argv": plan["serve"]["argv"], "serve_env": plan["serve"]["env"],
+                "run_kind": "admitted", "verdict": {"verdict": "AdmittedRunPass"},
+                "cleanup_proven": True, "cleanup": {"proven": True}, "stop": None,
+                "floor_inputs": floor_inputs, "baseline": prior["baseline"],
+                "admission": {**admission, "receipt": admission_reference["path"],
+                    "receipt_sha256": admission_reference["sha256"],
+                    "decision": q5_admission.admit(admission, 96 * gib, initial)},
+                "growth_cap": q5_admission.growth_cap(admission, host["physical_bytes"],
+                    plan["policy"]["free_cached_floor_bytes"]),
+                "policy": q5_policy.effective_policy({**plan["policy"],
+                    "footprint_cap_bytes": admission["footprint_cap_bytes"]}),
+            }
+            c2_evidence.run_identity(root, receipt, case, identity, host, {}, repo, admission_reference)
+            for failure in ("verdict", "aggregate_cleanup", "owned_cleanup", "missing_cleanup"):
+                bad = copy.deepcopy(receipt)
+                if failure == "verdict":
+                    bad["verdict"] = {"verdict": "CalibrationFailed", "reason": "cleanup_unproven"}
+                elif failure == "aggregate_cleanup":
+                    bad["cleanup_proven"] = False
+                elif failure == "owned_cleanup":
+                    bad["cleanup"]["proven"] = False
+                else:
+                    del bad["cleanup"]
+                with self.subTest(failure=failure), self.assertRaises(ValueError):
+                    c2_evidence.run_identity(root, bad, case, identity, host, {}, repo, admission_reference)
+
 
 if __name__ == "__main__":
     unittest.main()

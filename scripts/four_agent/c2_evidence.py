@@ -73,6 +73,10 @@ def run_identity(run, receipt, case, identity, host, overrides, repo_root, admis
     if admission_reference is None:
         require(receipt.get("run_kind") == "calibration", "fresh C2 baseline must be a calibration run")
     else:
+        require((receipt.get("verdict") or {}).get("verdict") == "AdmittedRunPass" and
+                receipt.get("cleanup_proven") is True and
+                (receipt.get("cleanup") or {}).get("proven") is True,
+                "C2 measured cohort requires a successful Q5 verdict and proven cleanup")
         prior = bound_json(admission_reference)
         admission = q5_admission.admission_from(prior, {
             "family": case["family"], "workload": case["workload"],
