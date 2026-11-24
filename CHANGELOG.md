@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- C23 localization accepts only the bound six-total capacity-diagnostics authority: two failed loads stay spent and four fixed successor loads remain, with no retries or gate relaxation; the original `CLOSED4/4` budget and numerical failure are preserved.
 - Upgrade the locked URL parser to 2.5.9 for the published security fix. Model-free adversarial HTTP controls record request receipt before sending a response, so an immediate SSE identity rejection cannot race the retained request evidence.
 - C2 measured cohorts require their final `AdmittedRunPass` and proven cleanup, not merely an admitted calibration and a completed client. A failed Q5 cleanup cannot become statistical acceptance or authorize another cohort.
 
