@@ -606,6 +606,43 @@ SHA-bound outer manifest's recorded repository directory, not the instrumented
 diagnostic checkout. The exact recorded argv and environment checks remain
 mandatory; moving the observer does not rewrite historical execution provenance.
 
+### 8.10 Saved-state localization and synthetic attention discrimination
+
+The replacement K1 native test completed, but its terminal thermal state was 1,
+violating the strict-nominal guard. It has no passing calibration receipt or
+usable cap; six diagnostic loads remain consumed. Saved-byte analysis does not
+waive that failure or authorize the remaining matched K1 role.
+
+All six same-K comparisons against the original acquisitions match all 180
+decision records byte-for-byte. The first captured cross-K difference is the
+zero-based physical layer 3 full-attention residual, before its FFN, starting at
+logical row 914 / hidden column 0. Input and the first three layers' two
+boundaries are identical over all 1009 common rows. All 162 saved anchor regions
+also match across creation and restoration, including the first full-attention
+cache prefix. Creation-live parity remains unobserved.
+
+Source tracing establishes a representation asymmetry: fresh prefill writes TQ
+cache but attends directly over original K/V cast to BF16; resumed prefill
+attends over the entire TQ-reconstructed history, including its new suffix,
+cast to BF16. Both use scale 1/16. This identifies a mechanism, not the actual
+cause: projected Q/K/V and pre-SDPA inputs were not captured.
+
+An isolated, ignored synthetic spike uses 24 query heads, 4 KV heads, dimension
+256, total length 1859, offset 914 and suffix length 945. With identical K/V
+representation, fresh and resumed outputs are bit-identical in both raw and
+TQ controls (5,806,080 suffix elements each). At fixed full geometry,
+raw-versus-TQ changes 9,428,453 of 11,421,696 elements, maximum absolute
+difference 0.015625, RMS 0.00044147319984391665. The locked release-profile
+test passed on published mlx-native 0.24.0 with synthetic tensors only.
+
+Reproduce on this experiment branch with
+`cargo test --release --locked --bin hf2q c23_synthetic_prefill_representation_discrimination -- --ignored --nocapture --test-threads=1`.
+No production route changed. These controls neither prove real-model
+attribution nor qualify C2, quality, performance, memory or the release.
+The original C23 numerical failure and all load-authority boundaries remain
+unchanged. A representation-consistent policy is not accepted without the
+unchanged real-artifact gates.
+
 ## 9. Risks and non-goals
 
 | ID | Risk | Mitigation |

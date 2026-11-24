@@ -607,6 +607,100 @@ mod tests {
         assert!(parse_resume_attn_fast(Some("fast")));
     }
 
+    /// Isolated synthetic discrimination, not a model-quality or C23 verdict.
+    #[test]
+    #[ignore = "C23 representation spike: synthetic tensors only"]
+    fn c23_synthetic_prefill_representation_discrimination() {
+        use crate::inference::models::qwen35::gpu_full_attn::{
+            apply_flash_attn_prefill_seq_major, apply_flash_attn_prefill_seq_major_resume,
+        };
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        const TOTAL: u32 = 1859;
+        const PREFIX: u32 = 914;
+        const SUFFIX: u32 = TOTAL - PREFIX;
+        const SEED: u64 = 0xc23;
+        let mut f = Fixture::new(TOTAL, TOTAL, 1, SEED).expect("Metal device required");
+        // Reconstruct precisely the fixture's first-layer pre-quantization K/V.
+        let mut rng = StdRng::seed_from_u64(SEED);
+        let kv_elems = TOTAL as usize * NKV as usize * D;
+        let k: Vec<f32> = (0..kv_elems).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let v: Vec<f32> = (0..kv_elems).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let shape = vec![TOTAL as usize, NKV as usize, D];
+        let k_gpu = upload(&f.device, &k, shape.clone());
+        let v_gpu = upload(&f.device, &v, shape);
+        let q_all = f.upload_q(0, TOTAL);
+        let row_elems = NH as usize * D;
+        let suffix_offset = PREFIX as usize * row_elems;
+        let q_suffix = q_all.slice_view(
+            (suffix_offset * 4) as u64, SUFFIX as usize * row_elems,
+        );
+        let mut raw_arena = f.arena(TOTAL);
+        let raw_full = apply_flash_attn_prefill_seq_major(
+            &f.device, &mut f.registry, &q_all, &k_gpu, &v_gpu,
+            TOTAL, NH, NKV, HEAD_DIM, Some(&mut raw_arena),
+        ).expect("fresh raw attention");
+        drain(&f.device);
+        let raw_full = read(&raw_full);
+        let k_hm = f.device.alloc_buffer(
+            kv_elems * 4, DType::F32, vec![NKV as usize, TOTAL as usize, D],
+        ).unwrap();
+        let v_hm = f.device.alloc_buffer(
+            kv_elems * 4, DType::F32, vec![NKV as usize, TOTAL as usize, D],
+        ).unwrap();
+        let mut enc = f.device.command_encoder().unwrap();
+        for (src, dst) in [(&k_gpu, &k_hm), (&v_gpu, &v_hm)] {
+            permute_021_f32(
+                &mut enc, &mut f.registry, f.device.metal_device(),
+                src, dst, TOTAL as usize, NKV as usize, D,
+            ).unwrap();
+        }
+        enc.commit_and_wait().unwrap();
+        let raw_resume = apply_flash_attn_prefill_seq_major_resume(
+            &f.device, &mut f.registry, &q_suffix, &k_hm, &v_hm,
+            SUFFIX, PREFIX, TOTAL, TOTAL, NH, NKV, HEAD_DIM,
+        ).expect("resumed raw attention");
+        let raw_resume = read(&raw_resume);
+        let mut tq_full_arena = f.arena(TOTAL);
+        let tq_full = f.fast(0, &q_all, 0, TOTAL, &mut tq_full_arena)
+            .expect("full TQ attention");
+        drain(&f.device);
+        let tq_full = read(&tq_full);
+        let mut tq_suffix_arena = f.arena(SUFFIX);
+        let tq_resume = f.fast(0, &q_suffix, PREFIX, SUFFIX, &mut tq_suffix_arena)
+            .expect("resumed TQ attention");
+        drain(&f.device);
+        let tq_resume = read(&tq_resume);
+        let stats = |a: &[f32], b: &[f32]| {
+            assert_eq!(a.len(), b.len());
+            assert!(a.iter().chain(b).all(|x| x.is_finite()));
+            let mut differing = 0usize;
+            let mut max_abs = 0.0f32;
+            let mut sum_squares = 0.0f64;
+            for (&x, &y) in a.iter().zip(b) {
+                differing += usize::from(x.to_bits() != y.to_bits());
+                let delta = (x - y).abs();
+                max_abs = max_abs.max(delta);
+                sum_squares += f64::from(delta).powi(2);
+            }
+            serde_json::json!({
+                "elements": a.len(), "differing": differing,
+                "max_abs": max_abs, "rms": (sum_squares / a.len() as f64).sqrt(),
+            })
+        };
+        let raw_offset = stats(&raw_full[suffix_offset..], &raw_resume);
+        let tq_offset = stats(&tq_full[suffix_offset..], &tq_resume);
+        let representation = stats(&raw_full, &tq_full);
+        eprintln!("C23_SYNTHETIC {}", serde_json::json!({
+            "total": TOTAL, "offset": PREFIX, "queries": SUFFIX,
+            "raw_offset": raw_offset, "tq_offset": tq_offset,
+            "raw_vs_tq_fixed_geometry": representation,
+            "model_weights_loaded": false, "C23_qualified": false,
+        }));
+        assert_bitwise("raw fresh/resumed suffix", &raw_full[suffix_offset..], &raw_resume);
+        assert_bitwise("TQ fresh/resumed suffix", &tq_full[suffix_offset..], &tq_resume);
+        assert_ne!(representation["differing"], 0, "fixture must discriminate representations");
+    }
+
     /// Bitwise against route (c) at Qwen3.8 shapes, including attended
     /// lengths that are not multiples of 64 (or of the kernel's 16-row K
     /// tile) and a query count that is not a multiple of 32. The second pass
