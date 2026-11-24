@@ -71,15 +71,10 @@ exclude = [
     # with 413 Payload Too Large). Keep the markdown; drop the binaries.
     "docs/*.pdf",
     "docs/figures/",
-    # Generated grammar-probe artifacts and campaign measurement evidence:
-    # reproducible from the committed generators (w5_gen.py, w6_gen.py,
-    # harvest_lexicon.py) and the judged corpora; the shipped default grammar
-    # lives in src/serve/api/grammar/gcd_w1.gbnf. The multi-MB generated
-    # .gbnf outputs, .gguf probes and .jsonl results are not consumer source.
-    "scripts/grammar_probe/**/*.gbnf",
-    "scripts/grammar_probe/**/*.gguf",
-    "scripts/grammar_probe/**/*.jsonl",
-    "scripts/grammar_probe/**/__pycache__/**",
+    # Grammar-probe generators, development corpora and run artifacts stay
+    # in the repository. Runtime grammar and calibration inputs are shipped
+    # separately under src/serve/api/grammar/ and src/calibrate/.
+    "scripts/grammar_probe/",
     # CI/CD workflow definitions are not consumer-facing source.
     ".github/",
     # macOS Finder metadata never belongs in a published tarball.
