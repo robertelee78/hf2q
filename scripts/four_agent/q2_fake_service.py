@@ -166,9 +166,11 @@ class FakeService:
     status lines in `self.log` (native_peer_splash_audit)."""
 
     def __init__(self, timing=None, faults=None, model=MODEL, slots=None, bursty=False, rendezvous=(),
-                 admit_together=None, repair=False, splash=False):
+                 admit_together=None, repair=False, splash=False, c2_depth=None):
         self.timing, self.model, self.bursty, self.repair = timing or Timing(), model, bursty, repair
         self.splash, self.prompts, self.log = splash, {}, []
+        assert c2_depth is None or (type(c2_depth) is int and c2_depth in (1, 4) and not splash)
+        self.c2_depth = c2_depth
         assert not (slots and rendezvous), "a slot-capped service cannot hold a rendezvous group open"
         self.slots = None if slots is None else threading.BoundedSemaphore(slots)
         self.acks = Path(tempfile.mkdtemp(prefix="q2-rendezvous-")) if rendezvous else None
@@ -260,6 +262,10 @@ class FakeService:
         turn = sum(1 for m in messages if m["role"] == "assistant")
         fault = self.fault(agent, turn)
         with self.state:
+            # Record receipt before writing: an identity rejection can close the stream immediately.
+            received = {"agent": agent, "turn": turn, "accepted_ns": accepted, "started_ns": started,
+                        "stream": bool(request.get("stream"))}
+            self.requests.append(received)
             self.counter += 1
             rid = f"chatcmpl-{uuid.uuid4().hex}"
             if fault == "reused_response_id":
@@ -273,6 +279,8 @@ class FakeService:
         prompt = max(256, len(body) // 4)
         usage = {"prompt_tokens": prompt, "completion_tokens": 40 + turn, "total_tokens": prompt + 40 + turn,
                  "prompt_tokens_details": {"cached_tokens": 0 if turn == 0 else prompt - 128}}
+        if self.c2_depth == 1 and turn in (3, 5):
+            usage["prompt_tokens_details"]["cached_tokens"] = 0
         if fault == "truncated_stop":
             usage.update(completion_tokens=8192, total_tokens=prompt + 8192)
         elif fault == "inflated_budget":
@@ -341,8 +349,7 @@ class FakeService:
             handler.wfile.write(payload)
         handler.close_connection = True
         with self.state:
-            self.requests.append({"agent": agent, "turn": turn, "accepted_ns": accepted, "started_ns": started,
-                                  "finished_ns": clock_ns(), "stream": bool(request.get("stream"))})
+            received["finished_ns"] = clock_ns()
 
     def splash_record(self, request, usage):
         """Splash's Started/Done lines and the turn's render key; returns the reply's created/metrics/timings."""
@@ -418,8 +425,7 @@ class StubTools:
         (self.fixture / "src").mkdir(parents=True)
         self.files = {"src/ports.rs": "pub fn parse_port(s: &str) -> u16 { s.parse().unwrap() }\n" if workload is None
                       else workload.initial,
-                      "tests/ports.rs": "#[test] fn ports() {}\n" if variant is None
-                      else variant.immutable["tests/ports.rs"]}
+                      "tests/ports.rs": getattr(variant, "immutable", {}).get("tests/ports.rs", "#[test] fn ports() {}\n")}
         self.receipts = []
         self.save()
 
@@ -451,7 +457,7 @@ class StubTools:
 
 def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", family="qwen", instance=None,
                 phase=None, release_ns=None, on_first_stream_ready=None, server_pid=SERVER_PID, acks=None, variant=None,
-                repair_turns=0):
+                repair_turns=0, cache_control=None):
     """The agent child's turn loop with stub tools; raises the actual client rejection on a bad response.
 
     `acks` (a rendezvous service's `acks` directory): acknowledge the first progress frame of every
@@ -482,6 +488,12 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
         summary["instance"] = workload.record()
     if selected is not None:
         summary["workload_variant"] = selected.record()
+    if cache_control is not None:
+        coordinator.agent_cache_control({
+            "c2_cache_control": cache_control,
+            "c2_observation_sources": {"c2_observation.py": child.digest(HERE / "c2_observation.py")}},
+            selected, family, engine_kind, run, server_pid)
+        summary["c2_cache_control"] = cache_control
     if phase is not None:
         summary["phase"] = phase
     if repair_turns:
@@ -489,6 +501,9 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
     tools, seen = StubTools(out, workload, selected, fail_first_test=bool(repair_turns)), set()
     protocol = Workflow(repair_turns) if repair_turns else None
     for turn in range(max_tools(repair_turns) + 1):
+        edit = None
+        if selected is not None:
+            edit = selected.before_request(messages, turn)
         request = build_request(model, messages, schemas, turn, family, engine_kind)
         turn_out = out / f"turn-{turn}"
         turn_out.mkdir()
@@ -499,7 +514,9 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
             callback = acknowledging(first_progress_ack(acks, agent, turn))
         message, call, receipt = exchange(base, request, turn_out, turn, seen, deadline=30, engine_kind=engine_kind,
                                           family=family, on_first_token=callback,
-                                          assistant_policy=None if protocol is None else protocol.policy)
+                                          assistant_policy=None if protocol is None else protocol.policy,
+                                          cache_miss_allowed=coordinator.edit_cache_miss_allowed(
+                                              cache_control, selected, turn, edit))
         summary["turns"].append(receipt)
         messages.append(message)
         if call is not None:
@@ -520,7 +537,8 @@ def drive_agent(base, out, agent, run=RUN, model=MODEL, engine_kind="hf2q", fami
 
 
 def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="hf2q", family="qwen", instance=None,
-             cleanup=None, run=RUN, server_pid=SERVER_PID, variant=None, repair_turns=0, stream_releases=None):
+             cleanup=None, run=RUN, server_pid=SERVER_PID, variant=None, repair_turns=0, stream_releases=None,
+             cache_control=None):
     """Coordinator summary over `results`; its status is the actual coordinator aggregate."""
     agents = coordinator.active_agents(phase_plan)
     cleanup = cleanup or {agent: copy.deepcopy(CLEAN) for agent in agents}
@@ -538,6 +556,8 @@ def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="h
         summary["instance"] = record
     if variant_record is not None:
         summary["workload_variant"] = variant_record
+    if cache_control is not None:
+        summary["c2_cache_control"] = cache_control
     if repair_turns:
         summary["repair_turns"] = repair_turns
     if phase_plan is not None:
@@ -572,7 +592,7 @@ def assemble(client_dir, results, releases, triggers, phase_plan, engine_kind="h
                             "releases": phase_releases}
     summary["status"] = coordinator.aggregate(results, exits, {a: cleanup[a]["verified"] for a in agents}, server_pid, run,
                                               engine_kind, family, record, phase_plan, variant_record,
-                                              repair_turns=repair_turns)
+                                              repair_turns=repair_turns, cache_control=cache_control)
     finished = max(results[a]["task_completed_monotonic_ns"] for a in agents)
     summary.update(makespan_finished_ns=finished, own_output_four_task_makespan_seconds=(finished - releases[0]) / 1e9,
                    agents=results, exits=exits, client_cleanup=cleanup, cleanup=True,
@@ -653,24 +673,31 @@ _SPLASH_EVIDENCE = {}   # template key -> (per-agent render proofs, Splash statu
 _TEMPLATE_ROOT = None
 
 
-def template(engine_kind="hf2q", phase_plan=None, instance=None, family="qwen", variant=None, repair_turns=0):
+def template(engine_kind="hf2q", phase_plan=None, instance=None, family="qwen", variant=None, repair_turns=0,
+             c2_depth=None):
     """Raw evidence of one honest run (cached per process): directory and per-agent results.
     `repair_turns=1`: every agent fails its first run_tests and repairs it (REPAIR_SCRIPT).
     `engine_kind="splash"`: the Splash wire with the pinned Qwen3.6 served id, and the closing render proofs."""
     global _TEMPLATE_ROOT
-    key = (engine_kind, phase_plan, instance, family, variant, repair_turns)
+    key = (engine_kind, phase_plan, instance, family, variant, repair_turns, c2_depth)
     if key not in _TEMPLATES:
         if _TEMPLATE_ROOT is None:
             _TEMPLATE_ROOT = tempfile.TemporaryDirectory(prefix="q2-fake-templates-")
             atexit.register(_TEMPLATE_ROOT.cleanup)
         root = Path(_TEMPLATE_ROOT.name) / f"t{len(_TEMPLATES)}"
+        control = None
+        if c2_depth is not None:
+            assert engine_kind == "hf2q" and family == "qwen" and phase_plan is None and variant == "divergent-edit-v1"
+            from q2_fake_c2 import context
+            root = root / "client"
+            control = context(root, c2_depth, RUN, SERVER_PID)
         results = {}
         splash = engine_kind == "splash"
-        with FakeService(repair=bool(repair_turns), splash=splash) as service:
+        with FakeService(repair=bool(repair_turns), splash=splash, c2_depth=c2_depth) as service:
             for agent in coordinator.active_agents(phase_plan):
                 results[agent] = drive_agent(service.url, root / agent, agent, engine_kind=engine_kind, family=family,
                                              instance=instance, phase=coordinator.agent_phase(phase_plan, agent),
-                                             variant=variant, repair_turns=repair_turns,
+                                             variant=variant, repair_turns=repair_turns, cache_control=control,
                                              **({"model": SPLASH_MODEL} if splash else {}))
             if splash:
                 from native_peer_splash_ready import render_proof
@@ -681,20 +708,29 @@ def template(engine_kind="hf2q", phase_plan=None, instance=None, family="qwen", 
 
 
 def honest_run(client_dir, makespan_s=100.0, engine_kind="hf2q", phase_plan=None, instance=None, slots=None,
-               family="qwen", variant=None, repair_turns=0):
+               family="qwen", variant=None, repair_turns=0, c2_depth=None):
     """Write a complete client directory (raw turns + coordinator summary) whose evidence re-derives its Pass."""
-    root, results = template(engine_kind, phase_plan, instance, family, variant, repair_turns)
+    root, results = template(engine_kind, phase_plan, instance, family, variant, repair_turns, c2_depth)
     client_dir = Path(client_dir)
     client_dir.mkdir(parents=True)
     for agent in results:
         shutil.copytree(root / agent, client_dir / agent)
     results = copy.deepcopy(results)
+    control = None
+    if c2_depth is not None:
+        from q2_fake_c2 import context
+        control = context(client_dir, c2_depth, RUN, SERVER_PID)
+        for result in results.values():
+            result["c2_cache_control"] = control
     releases, triggers = retime(results, phase_plan, makespan_s, slots)
     summary = assemble(client_dir, results, releases, triggers, phase_plan, engine_kind, family, instance,
-                       variant=variant, repair_turns=repair_turns)
+                       variant=variant, repair_turns=repair_turns, cache_control=control)
+    if control is not None:
+        from q2_fake_c2 import seal
+        seal(client_dir, summary, control)
     if engine_kind == "splash":  # the coordinator's readiness and closing records and the server's status log
         from native_peer_splash import SPLASH_COMMIT
-        render, log = _SPLASH_EVIDENCE[(engine_kind, phase_plan, instance, family, variant, repair_turns)]
+        render, log = _SPLASH_EVIDENCE[(engine_kind, phase_plan, instance, family, variant, repair_turns, c2_depth)]
         summary.update(native_readiness={"engine_kind": "splash", "source_revision": SPLASH_COMMIT,
                                          "q3_family": "qwen36"}, native_closing={"render": copy.deepcopy(render)})
         (client_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")

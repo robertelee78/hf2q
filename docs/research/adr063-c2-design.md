@@ -10,7 +10,7 @@ Story type: qualified implementation with hardware gates. It is built regardless
 
 Authored against `main` `d817dffa7371a2db85a43ed1d6502350906c33f5`. Source identities are listed at the end. Line numbers help reading only.
 
-This is a design. Nothing was built, run or measured for it. Byte figures are arithmetic from the artifacts' published geometry. Anything else that is not read from source is marked [INFERENCE].
+This is the design contract, not an acceptance record. The current C2 story carries implementation and validation evidence; passing individual components does not qualify C2. Byte figures below are arithmetic from the artifacts' published geometry. Anything else not read from source is marked [INFERENCE].
 
 ## 1. Acceptance map
 
@@ -23,7 +23,7 @@ This is a design. Nothing was built, run or measured for it. Byte figures are ar
 | Zero `NotEligible` caused by anchor capture or restore (reason-tagged counter); joint eligibility rate with anchors on within the Q3 CI of anchors off | §3.8, §8.5 (paired interval) |
 | Frozen limits: divergent-turn worst-slot semantic TTFT CI excludes 0 (improving); append-only makespan, worst-slot TTFT p95 and SSE-gap max ratios ≤ 1.025; footprint ≤ 1.25× a fresh Q5 calibration | §8.2–§8.4, decisions D2–D3 (§10) |
 | Fresh Q5 calibration for both Qwen artifacts with the declared anchors per slot precedes any C2 hardware run | §8.1 |
-| Qwen3.6 judged by bitwise exactness and `ExactTranscripts`; Qwen3.8 also passes the paired task-quality gate | §7.2, §7.5, §8.6, open decision D1 (§10) |
+| Both Qwen artifacts pass same-route bitwise exactness and append-only `ExactTranscripts`; divergent rows meet D1. Qwen3.8 and the now-declared Qwen3.6 repair-one workload also pass the paired task-quality gate | §7.2, §7.5, §8.6; governing ADR-063 §C2 |
 | Primary Qwen3.8 evidence on the vanilla official 27B; grafted variants are separate arms; Gemma and DeepSeek are successors | §8 (case files), §9 |
 
 ## 2. Current state (what C2 changes)
@@ -391,11 +391,13 @@ The comparison uses Q1 stores (`hf2q.adr063.invariance`) and `scripts/four_agent
 |---|---|
 | Artifact | Qwen3.8-27B vanilla (`HF2Q_QWEN38_GGUF`), Qwen3.6-35B-A3B vanilla (`HF2Q_QWEN36_GGUF`) |
 | Graft | absent; present (same graft for the twin); identity change between capture and restore. Expected: restore refused, cold path, output equal to the twin without the anchor |
-| Speculation | `HF2Q_QWEN_SPECULATION=off`; `auto` (anchors carry the spec boundary; K3 rounds after resume) |
+| Speculation | `HF2Q_QWEN_SPECULATION=off`; `auto`. Nongrafted eligible rows must execute actual K3 after resume. Grafted rows retain ADR-059's explicit MTP/spec-prefix suppression and compare the ordinary grafted route in both twins |
 | Restore depth | rank 0 (deepest) and rank 2 of K = 4, plus an equality hit |
 | Cancellation | cancel before capture, after capture before commit, and mid-decode after a resumed admission. Recovery state equals the never-cancelled twin at the recovered depth |
 | Failed restore | injected preflight refusal and injected encode-time failure; output equals the cold twin, and the store is poisoned in the second case |
 | Concurrency | four slots: slot 0 resumes while slots 1–3 decode (joint on, `HF2Q_QWEN_JOINT_DECODE` at its default). Slot 0 equals its single-slot twin by the existing per-slot joint parity (Q1 policy §2 row A, "Qwen four-slot per-slot parity"). Slots 1–3 state digests are unchanged across slot 0's restore (Class A: no peer mutation) |
+
+No graft/speculation axis is skipped: graft+auto must assert the explicit runtime-unavailable boundary and same-route ordinary parity, not relabel ordinary decode as K3 or add graft-aware MTP. The current default DFlash2 route is a separate capability/route observation; an unset flag alone is not proof that it ran.
 
 ### 7.3 O1 success-path twin (C1 carry-over)
 
@@ -407,7 +409,9 @@ The comparison uses Q1 stores (`hf2q.adr063.invariance`) and `scripts/four_agent
 
 Variant 3': B restores a shallower anchor A0@d0 < d and prefill writes `[d0, …)`. C must miss A (tombstoned) and may hit A0.
 
-Negative control (test-only fault injection disables `on_cursor_set`): C restores A, and the comparison against the twin reports `DivergedExactInvariant`. This shows the test can fail.
+The pruning-only negative control uses variant 3', where the slot generation is unchanged: test-only fault injection disables descendant pruning, C restores the overwritten A, and comparison against its twin must report `DivergedExactInvariant`.
+
+Keep the original full-cold-reset row as well. Cold reset advances the independent slot generation, so disabling pruning alone must still refuse A by generation. Do not rebind its generation or disable another validity guard to manufacture divergence.
 
 ### 7.4 Differential against the C1 oracle
 
@@ -441,6 +445,8 @@ The new `scripts/four_agent/coding_divergent_edit.py` follows the `coding_long_c
 
 At turns 3 and 5 of every agent, the client applies a deterministic context edit before sending. It truncates the tool-result message of turn `t−2` to its first 16 lines plus a fixed elision marker. That divergence point lies inside turn `t−1`'s prompt: below the latest anchor (turn `t−1`) and above the turn-`t−2` anchor. Under K = 4 the deepest valid anchor is turn `t−2`; under K = 1 the turn is cold.
 
+The live client and raw replay bind this distinction to the actual startup declaration and approved cohort, not the requested environment or a cache-skip flag. Only a real edit applied to the current request under observed K = 1 permits a cache miss; K = 4, ordinary follow-ups and repair tails retain positive-reuse checks. Raw replay independently reapplies the pinned transform and checks exact request lineage. A K1 cold response is not a K4 reuse, numerical, task-quality or performance pass.
+
 `estimate` reports per-turn wire bytes. The variant must compose with `--instance` so the paired quality gate can run on it (`quality_campaign.py` currently refuses variants, at line 126).
 
 ### 8.3 Divergent-turn worst-slot semantic TTFT (frozen limit 1)
@@ -460,12 +466,13 @@ At turns 3 and 5 of every agent, the client applies a deterministic context edit
 
 - Over all C2 runs (§8.3, §8.4 and §7.2 hardware runs), `hf2q_qwen_joint_not_eligible_turns_total{reason=~"anchor_.*"} == 0`, read from `/metrics` at run end and retained in the receipt.
 - Per-run eligibility rate `r` = joint lane-steps ÷ (joint + serial lane-steps among decode-ready lanes on turns with at least 2 decode lanes), from the tagged turn lines.
+  Retain the exact `Qwen C2 decode lane steps` progress events and the `hf2q_qwen_c2_joint_lane_steps_total` / `hf2q_qwen_c2_serial_lane_steps_total` metric deltas. Count actual dispatched lane steps using readiness before competing decode paths consume lanes; accepted-token counts, CPU token drains and configured slot width are not substitutes.
 - **Pass:** the paired ratio of `r` (K = 4 over K = 1) over the same Williams blocks (`q3_stats.paired_effect`, higher is better) has a 95% interval that contains 1, or lies entirely above 1, on each workload. Because `r` can be 0 in a run, a block with `r = 0` in either arm is recorded and makes the rule fail closed, pending owner review. `paired_effect` requires positive values.
 
 ### 8.6 Quality
 
 - **Qwen3.8:** the paired 24-instance task-quality gate (`scripts/four_agent/quality_campaign.py`) between K = 4 and K = 1, on the divergent-edit variant composed with instances.
-- **Qwen3.6:** bitwise exactness (§7.2) and `ExactTranscripts` against anchors off on the append-only workload (§7.5). On divergent turns, the D1 envelope applies on every row. No task pass rate (Q4-QWEN36).
+- **Qwen3.6:** bitwise exactness (§7.2), append-only `ExactTranscripts` (§7.5), and the D1 envelope on every divergent row. The declared repair-one workload also passes the paired task-quality gate, as required by ADR-063 §C2's 2026-11-05 amendment; the earlier no-task-pass-rate exemption no longer applies.
 - **Cancel smoke** (`scripts/four_agent/cancel_smoke.py`, `q5_cases/cancel-qwen38.json` and a Qwen3.6 derivative) with K = 4 and with K = 1. Its receipt adds, for every cancelled request whose client retries:
   - the retry's semantic TTFT;
   - the recovered depth (`restores_total{rank}` and the restored token count, or 0 for a reset);
@@ -476,6 +483,104 @@ At turns 3 and 5 of every agent, the client applies a deterministic context edit
 ### 8.7 Independent review
 
 A reviewer distinct from the implementer reproduces the §7.2 matrix verdicts and the §8.3 paired TTFT effect from the raw receipts with the checked-in commands.
+
+### 8.8 Fresh-reference configuration metadata (test executable only)
+
+The ignored entry
+`serve::api::engine_qwen35::anchor_exactness_tests::config_recipe_export::qwen_c2_native_config_recipe_export`
+reads `HF2Q_C2_CONFIG_RECIPE_PACKET`. Its closed packet binds the schema
+`hf2q.c2.native-config-recipe-packet.v1`, family, absolute model path, opened-file
+identity, full-content receipt, complete K4 case, expected exporter executable
+SHA-256 and new absolute output directory. Receipt and case bindings contain
+their paths and SHA-256 values; the output must be outside Git.
+
+`model-config.json` and `recipe.json` contain the native compact Serde bytes
+without appended newlines. The acquisition `config_sha256` is the SHA-256 of
+`recipe.json`; its model-config field hashes `model-config.json`. The exporter
+and loaded fresh-HTTP path share the same seven-field recipe factory. Neither
+a Debug-config hash nor a broader architecture/argv/environment document is
+this identity.
+
+This equivalence applies to the two pinned vanilla artifacts and fixed OFF/K4
+route: their intrinsic context is 262144 and tokenizer/output-head vocabulary
+sizes agree. Other artifacts require independent review of loaded versus header
+configuration, including serving-context and vocabulary reconciliation.
+
+The published native parser reads the retained FD without buffered payload
+read-ahead, with explicit 32 MiB read and 128 MiB declared-allocation budgets,
+catalog/string/array/depth limits and observed counters. Declared reservations
+are not a physical-memory bound. Export performs no model/device/context
+creation, inference or acquisition attestation and cannot qualify C2.
+The committed Rust/Cargo manifest, actual test-image build and digest, metadata
+packets, acquisition review and diagnostic calibration/replay keys must still
+be bound independently. Existing production calibrations remain evidence for
+their original production executable, not the new test image.
+
+### 8.9 Separate C23 localization, not another qualification attempt
+
+The original C23 four-load budget is permanently closed. Its full-row K4-versus-K1
+comparison failed the unchanged decision envelope: maximum error
+`0.31496429443359375 nat > 0.25 nat`. Saved same-K calibration and matched records
+are byte-identical; they do not identify the first physical divergence.
+
+The operator separately authorized at most four instrumented diagnostic loads:
+an own calibration and independently acquired matched run for each of K4 and K1,
+with no retries, warmups, borrowed caps, or reopening of the original budget.
+Existing ownership, memory, storage, complete-trajectory and release gates remain
+mandatory. These diagnostics cannot themselves declare C2 or release acceptance.
+
+The first diagnostic calibration stopped at the unchanged zero-compressor-growth
+guard and remains a consumed load without a usable calibration cap. After
+background-memory cleanup, the operator authorized exactly one replacement K4
+calibration: five diagnostic loads total, including that failure and the three
+originally unspent roles. The successor supervisor, native packet consumer and
+offline consumer require this separately bound replacement authority. The failed
+attempt and original C23 budget remain unchanged; no further retry or gate
+relaxation is authorized.
+
+The replacement also stopped on compressor growth, with normal pressure, no
+swap, and about 34.5 GiB of Free plus cached memory still available. It remains
+a consumed failed load, not a calibration receipt or evidence of RAM exhaustion.
+The operator subsequently directed capacity-based protection: use available
+RAM, rather than aborting on compression alone. The diagnostic supervisor MUST
+record compression while retaining critical-pressure, swap, measured reaction
+headroom, own calibrated-cap, telemetry, ownership and cleanup stops. Warning
+pressure is recorded, not a stop, matching ADR-063 Q5. Any changed observer
+requires a fresh measured stop-latency control before admission. This policy
+correction does not refund either load, authorize another replacement, relax the
+numerical envelope, or make a partial calibration usable.
+
+The test-only fresh packet's optional `localization` binding records the actual
+folded anchor image at lane 2 / turn 1, actual K4 restoration and admission lineage
+at turn 3, and all common logical rows `[914, 1923)`. K1 must report no restoration.
+Header-only export independently derives raw anchor extents from the allocator
+plan; it loads no weights or Metal device. Folded image words are not live
+creation state, so creation parity must remain unclaimed.
+
+Layer capture uses one packed bank: embedding output and two actual block
+boundaries per physical decoder layer, 129 F32 records of shape `[1009, 5120]`.
+The second block boundary is the fused FFN/residual sum, not a nonexistent
+standalone FFN output. Metadata retains physical rows, complete cohorts, slot
+generations, tickets and source views; an unobserved native kernel route remains
+unknown. Blits add no checked wait but can split compute encoders. Therefore
+physical interpretation requires exact equality of every selected same-K logit,
+hidden row and token ID against both original acquisitions. Any mismatch is
+instrumentation/graph perturbation, not proof of the original C23 cause.
+
+Current generated control metadata MUST share the existing diagnostic output
+grant with the entire model-name parent, not only its `attempt` directory.
+This includes `prepared.json`, ledger-dependent configuration and operating
+review files, and the detached companions of both live directory roots.
+Those roots MUST be canonical and disjoint from each other and from immutable
+retained evidence. Their actual combined bytes MUST be deducted at preparation,
+admission, runtime sampling and final publication, with the same roots checked
+during receipt replay. A later stage MUST charge the completed roots normally.
+This corrects an accounting omission; it grants no new exclusion or larger quota.
+
+Production-predecessor validation MUST reconstruct its launch using the original
+SHA-bound outer manifest's recorded repository directory, not the instrumented
+diagnostic checkout. The exact recorded argv and environment checks remain
+mandatory; moving the observer does not rewrite historical execution provenance.
 
 ## 9. Risks and non-goals
 
@@ -500,6 +605,8 @@ A reviewer distinct from the implementer reproduces the §7.2 matrix verdicts an
 - Grafted or abliterated artifacts as primary evidence (they are compatibility arms only).
 
 ## 10. Open decisions for root or owner (before implementation)
+
+ADR-063 §C2 records the owner resolutions of D1–D5. The original proposals below are retained as design history, not unresolved permission to weaken those requirements; its later Qwen3.6 repair-one task-gate amendment also governs §8.6.
 
 - **D1 (tightened per review).** Anchors-off cold-prefills the divergent turn from 0, while anchors-on resumes from a state built by a different transaction history (decode-route rows, other chunk boundaries). Under the ADR-063 Q1 numeric policy that is a Class B alternate route, so bitwise-equal transcripts cannot be guaranteed on divergent turns. Proposed rule:
   - bitwise exactness is proven by the same-route twin (§7.2) on both artifacts;

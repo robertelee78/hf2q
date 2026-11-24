@@ -61,6 +61,13 @@ policy fixture, not permission to allocate unbounded snapshots.
    lineage or graft generation. Graft/session/model replacement invalidates the
    incompatible store before new writes.
 
+Completed-capture pending publication is not an open construction transaction.
+It remains unselectable, while a committed anchor may preflight once construction
+has drained. C2 corrected the oracle's broader pending guard to implement this
+existing rule; this is an oracle bugfix, not a changed acceptance limit. C1's
+write-range invalidation remains precise; C2 additionally discards its pending
+publication at restore Phase B as specified by its serving contract.
+
 The normative oracle uses distinct payload bytes and immutable restore tickets
 to test this protocol. It does not perform GPU copies, establish command order,
 implement an affinity policy, or establish production restore atomicity.

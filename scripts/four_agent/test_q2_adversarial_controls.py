@@ -172,6 +172,21 @@ class AuditControls(unittest.TestCase):
         client, summary = self.run_dir(engine="peer")
         self.assertIsNone(audit.check_run(PASSING_RECEIPT, client, summary, None, "peer", True)[1])
 
+    def test_pinned_divergent_history_is_replayed_but_extra_edit_is_refused(self):
+        client = Path(self.tmp.name) / "divergent" / "client"
+        summary = fake.honest_run(client, variant="divergent-edit-v1")
+        report, reason = audit.check_run(PASSING_RECEIPT, client, summary, None, "hf2q", True)
+        self.assertIsNone(reason)
+        self.assertEqual(report["response_ids"], 28)
+        self.assertEqual(report["progress"]["width"], 4)
+
+        def extra_edit(request):
+            tools = [message for message in request["messages"] if message["role"] == "tool"]
+            tools[1]["content"] += "\nunbound edit"
+
+        rewrite(client, summary, "agent-0", 3, "request.json", request_edit(extra_edit))
+        self.assertRegex(self.reason(client, summary), "stale lineage: request history does not extend")
+
     def test_serialized_and_slot_capped_services_are_not_four_wide(self):
         for slots in (1, 2, 3):
             with self.subTest(slots=slots):

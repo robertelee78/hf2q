@@ -556,6 +556,16 @@ pub async fn chat_completions(
             return resp;
         }
     };
+    #[cfg(test)]
+    let prepared = {
+        let mut prepared = prepared;
+        let result = super::engine_qwen35::anchor_exactness_tests::fullw_http::prepared_http(
+            &headers, &req, &prepared.prompt_tokens, &mut prepared.params);
+        if let Err(error) = result {
+            return ApiError::generation_error(format!("C2 HTTP acquisition: {error:#}")).into_response();
+        }
+        prepared
+    };
     state
         .metrics
         .chat_completions_started
@@ -2449,6 +2459,8 @@ where
         stable_prompt_prefix_tokens,
         gemma_full_input_checkpoint,
         vision_fingerprint,
+        #[cfg(test)]
+        c2_ticket: None,
     };
     // Vision soft-token expansion (Phase 2c Task #17 / iter-99).  When
     // the multimodal preflight produced ViT embeddings, locate the
@@ -8926,6 +8938,7 @@ hf2q_qwen_anchor_restore_refused_total{{reason=\"validation\"}} {}\n\
 # HELP hf2q_qwen_anchor_tombstoned_total Anchors removed before a cursor rewind or divergent write.\n\
 # TYPE hf2q_qwen_anchor_tombstoned_total counter\n\
 hf2q_qwen_anchor_tombstoned_total{{cause=\"cursor\"}} {}\n\
+hf2q_qwen_anchor_tombstoned_total{{cause=\"cold_reset\"}} {}\n\
 # HELP hf2q_qwen_anchor_evicted_total Committed anchors evicted by the configured depth bound.\n\
 # TYPE hf2q_qwen_anchor_evicted_total counter\n\
 hf2q_qwen_anchor_evicted_total {}\n\
@@ -8946,8 +8959,9 @@ hf2q_qwen_anchor_restore_milliseconds_sum {:.6}\n\
 # TYPE hf2q_qwen_anchor_restore_milliseconds_count counter\n\
 hf2q_qwen_anchor_restore_milliseconds_count {}",
             telemetry.equality_hits.load(Ordering::Relaxed),
-            telemetry.restore_refused.load(Ordering::Relaxed),
+            telemetry.restore_refusals_by_reason[4].load(Ordering::Relaxed),
             telemetry.tombstoned_cursor.load(Ordering::Relaxed),
+            telemetry.tombstoned_cold_reset.load(Ordering::Relaxed),
             telemetry.evicted.load(Ordering::Relaxed),
             telemetry
                 .capture_skipped_oversized_owner
@@ -8959,6 +8973,11 @@ hf2q_qwen_anchor_restore_milliseconds_count {}",
             telemetry.restore_count.load(Ordering::Relaxed),
         )
         .expect("write Qwen anchor telemetry");
+        for (index, reason) in ["poisoned", "transaction", "unavailable", "stale"].iter().enumerate() {
+            writeln!(output, "hf2q_qwen_anchor_restore_refused_total{{reason=\"{reason}\"}} {}",
+                telemetry.restore_refusals_by_reason[index].load(Ordering::Relaxed))
+                .expect("write Qwen anchor refusal reason");
+        }
         writeln!(
             output,
             "# HELP hf2q_qwen_anchor_captures_staged_total Anchor snapshots staged as pending.\n\
@@ -8983,8 +9002,8 @@ hf2q_qwen_joint_not_eligible_turns_total{{reason=\"capture_active\"}} {}\n\
 hf2q_qwen_joint_not_eligible_turns_total{{reason=\"too_few_ready\"}} {}\n\
 hf2q_qwen_joint_not_eligible_turns_total{{reason=\"duplicate_slots\"}} {}\n\
 hf2q_qwen_joint_not_eligible_turns_total{{reason=\"max_rows\"}} {}\n\
-hf2q_qwen_joint_not_eligible_turns_total{{reason=\"anchor_capture\"}} 0\n\
-hf2q_qwen_joint_not_eligible_turns_total{{reason=\"anchor_restore\"}} 0\n\
+hf2q_qwen_joint_not_eligible_turns_total{{reason=\"anchor_capture\"}} {}\n\
+hf2q_qwen_joint_not_eligible_turns_total{{reason=\"anchor_restore\"}} {}\n\
 # HELP hf2q_qwen_joint_lane_refusals_total Qwen lane refusals by closed reason.\n\
 # TYPE hf2q_qwen_joint_lane_refusals_total counter\n\
 hf2q_qwen_joint_lane_refusals_total{{reason=\"step_bound\"}} {}\n\
@@ -8995,12 +9014,20 @@ hf2q_qwen_joint_lane_refusals_total{{reason=\"mtp_cursor\"}} {}\n\
 hf2q_qwen_joint_lane_refusals_total{{reason=\"speculation_route\"}} {}\n\
 hf2q_qwen_joint_lane_refusals_total{{reason=\"client_closed\"}} {}\n\
 hf2q_qwen_joint_lane_refusals_total{{reason=\"handle_mismatch\"}} {}\n\
-hf2q_qwen_joint_lane_refusals_total{{reason=\"anchor_capture\"}} 0\n\
-hf2q_qwen_joint_lane_refusals_total{{reason=\"anchor_restore\"}} 0\n",
+hf2q_qwen_joint_lane_refusals_total{{reason=\"anchor_capture\"}} {}\n\
+hf2q_qwen_joint_lane_refusals_total{{reason=\"anchor_restore\"}} {}\n\
+# HELP hf2q_qwen_c2_joint_lane_steps_total Successful joint native lane dispatches on turns with at least two originally decode-ready lanes.\n\
+# TYPE hf2q_qwen_c2_joint_lane_steps_total counter\n\
+hf2q_qwen_c2_joint_lane_steps_total {}\n\
+# HELP hf2q_qwen_c2_serial_lane_steps_total Successful serial native lane dispatches on turns with at least two originally decode-ready lanes.\n\
+# TYPE hf2q_qwen_c2_serial_lane_steps_total counter\n\
+hf2q_qwen_c2_serial_lane_steps_total {}\n",
             joint.capture_active.load(Ordering::Relaxed),
             joint.too_few_ready.load(Ordering::Relaxed),
             joint.duplicate_slots.load(Ordering::Relaxed),
             joint.max_rows.load(Ordering::Relaxed),
+            joint.anchor_capture.load(Ordering::Relaxed),
+            joint.anchor_restore.load(Ordering::Relaxed),
             joint.lane_step_bound.load(Ordering::Relaxed),
             joint
                 .lane_pending_speculation_output
@@ -9011,6 +9038,10 @@ hf2q_qwen_joint_lane_refusals_total{{reason=\"anchor_restore\"}} 0\n",
             joint.lane_speculation_route.load(Ordering::Relaxed),
             joint.lane_client_closed.load(Ordering::Relaxed),
             joint.lane_handle_mismatch.load(Ordering::Relaxed),
+            joint.lane_anchor_capture.load(Ordering::Relaxed),
+            joint.lane_anchor_restore.load(Ordering::Relaxed),
+            joint.c2_joint_lane_steps.load(Ordering::Relaxed),
+            joint.c2_serial_lane_steps.load(Ordering::Relaxed),
         )
     };
 

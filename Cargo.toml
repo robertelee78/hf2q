@@ -127,7 +127,7 @@ globset = "0.4"
 # ADR-045 canonical model-reference boundary. Keep these direct because the
 # parser consumes both APIs instead of relying on incidental transitive pins.
 percent-encoding = "=2.3.2"
-url = "=2.5.8"
+url = "=2.5.9"
 # Hugging Face non-LFS metadata carries the canonical Git blob SHA-1 in
 # its ETag. Verify that identity instead of accepting a same-size rewrite.
 sha1 = "=0.10.7"

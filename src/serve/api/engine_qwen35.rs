@@ -102,6 +102,8 @@ pub struct Qwen35LoadedModel {
     /// Loaded weights + per-layer config, ready for `forward_*` calls.
     /// Wedge-3 consumes this through the worker thread.
     pub model: Qwen35Model,
+    #[cfg(test)]
+    pub(crate) c2_model_witness: std::sync::Arc<()>,
     /// Tokenizer (truncation disabled, matching `cmd_generate_qwen35`).
     pub tokenizer: Tokenizer,
     /// GGUF-embedded chat template; empty string when absent.  Iter-215
@@ -700,6 +702,8 @@ impl Qwen35LoadedModel {
 
         let loaded = Self {
             model,
+            #[cfg(test)]
+            c2_model_witness: std::sync::Arc::new(()),
             tokenizer,
             chat_template,
             model_id,
@@ -822,6 +826,10 @@ impl Qwen35LoadedModel {
             );
         }
 
+        #[cfg(test)]
+        anchor_exactness_tests::fullw_http::model_loaded(&loaded,
+            gguf.metadata_string("general.architecture")
+                .ok_or_else(|| anyhow::anyhow!("C2 actual GGUF architecture missing"))?)?;
         Ok(loaded)
         })();
         if loaded.is_err() {
@@ -5949,6 +5957,9 @@ pub(in crate::serve::api) struct Qwen35CoherentTarget {
 
 #[path = "engine_qwen35/anchor_store.rs"]
 pub(in crate::serve::api) mod anchor_store;
+#[cfg(test)]
+#[path = "engine_qwen35/anchor_exactness_tests.rs"]
+pub(crate) mod anchor_exactness_tests;
 #[path = "engine_qwen35/critical_path.rs"]
 pub(in crate::serve::api) mod critical_path;
 #[path = "engine_qwen35/dflash2_scheduler.rs"]
@@ -6281,6 +6292,8 @@ enum Qwen35DecisionSource<'a> {
 
 #[derive(Clone)]
 struct Qwen35SpecSemanticState {
+    #[cfg(test)]
+    observer_slot: SlotId,
     generated_tokens: Vec<u32>,
     sampling_history: Vec<u32>,
     grammar_runtime: Option<super::grammar::GrammarRuntime>,
@@ -6292,6 +6305,8 @@ struct Qwen35SpecSemanticState {
 impl Qwen35SpecSemanticState {
     fn from_decode(state: &Qwen35DecodeState) -> Self {
         Self {
+            #[cfg(test)]
+            observer_slot: state.slot_id,
             generated_tokens: state.generated_tokens.clone(),
             sampling_history: state.sampling_history.clone(),
             grammar_runtime: state.grammar_runtime.clone(),
@@ -6339,6 +6354,9 @@ impl Qwen35SpecSemanticState {
                 .0
             }
         };
+        #[cfg(test)]
+        let token = anchor_exactness_tests::trace::decision_for(
+            self.observer_slot, params.c2_ticket.as_deref(), self.generated_tokens.len(), token)?;
         advance_qwen35_grammar(
             &mut self.grammar_runtime,
             params,
@@ -6348,6 +6366,9 @@ impl Qwen35SpecSemanticState {
         let terminal = qwen.eos_token_ids.contains(&token)
             || qwen35_grammar_terminal_token(self.grammar_runtime.as_ref(), params, token);
         if terminal {
+            #[cfg(test)]
+            anchor_exactness_tests::trace::stopping(self.observer_slot,params.c2_ticket.as_deref(),token,
+                if qwen.eos_token_ids.contains(&token) {"eos"} else {"grammar"})?;
             return Ok(Qwen35CanonicalDecision { token, terminal });
         }
 
@@ -6547,6 +6568,8 @@ impl Qwen35DecodeState {
             }
             token
         };
+        #[cfg(test)]
+        let next_token = anchor_exactness_tests::trace::decision_for(slot_id, params.c2_ticket.as_deref(), 0, next_token)?;
         advance_qwen35_grammar(
             &mut grammar_runtime,
             &params,
@@ -6576,6 +6599,9 @@ impl Qwen35DecodeState {
         if qwen.eos_token_ids.contains(&next_token)
             || qwen35_grammar_terminal_token(grammar_runtime.as_ref(), &params, next_token)
         {
+            #[cfg(test)]
+            anchor_exactness_tests::trace::stopping(slot_id,params.c2_ticket.as_deref(),next_token,
+                if qwen.eos_token_ids.contains(&next_token) {"eos"} else {"grammar"})?;
             generated_tokens.pop();
             decoded_text.clear();
             text_decoder.discard();
@@ -6665,6 +6691,10 @@ impl Qwen35DecodeState {
 
     /// Whether the slot already terminated during prefill-seed.
     pub(crate) fn finished_at_seed(&self) -> bool {
+        #[cfg(test)]
+        if self.finish_reason != "length" {
+            anchor_exactness_tests::fullw_http::finished(self);
+        }
         self.finish_reason != "length"
     }
 
@@ -6694,6 +6724,8 @@ impl Qwen35DecodeState {
             let tail = self.text_decoder.finish();
             self.decoded_text.push_str(&tail);
             tick.fragment.push_str(&tail);
+            #[cfg(test)]
+            anchor_exactness_tests::fullw_http::finished(self);
         }
         tick
     }
@@ -6708,6 +6740,11 @@ impl Qwen35DecodeState {
             .copied()
             .take(valid_tokens)
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn c2_generated_tokens(&self) -> &[u32] {
+        &self.generated_tokens
     }
 
     pub(crate) fn include_carry_owners(
@@ -6929,7 +6966,11 @@ impl Qwen35DecodeState {
                     self.step
                 )
             })?;
-            forced_token.map_or(predicted, |(token, _)| token)
+            let selected = forced_token.map_or(predicted, |(token, _)| token);
+            #[cfg(test)]
+            let selected = anchor_exactness_tests::trace::decision_for(
+                self.slot_id, self.params.c2_ticket.as_deref(), self.generated_tokens.len(), selected)?;
+            selected
         } else {
             let lease =
                 supervisor.arm("Qwen35 decode logits", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
@@ -7000,6 +7041,9 @@ impl Qwen35DecodeState {
                 self.want_logprobs,
             )?
         };
+        #[cfg(test)]
+        let token = anchor_exactness_tests::trace::decision_for(
+            self.slot_id, self.params.c2_ticket.as_deref(), self.generated_tokens.len(), token)?;
         if let (Some(values), Some(logprob)) = (self.logprobs_vec.as_mut(), logprob) {
             values.push(logprob);
         }
@@ -7027,6 +7071,8 @@ impl Qwen35DecodeState {
             tok,
         )?;
         if qwen.eos_token_ids.contains(&tok) {
+            #[cfg(test)]
+            anchor_exactness_tests::trace::stopping(self.slot_id,self.params.c2_ticket.as_deref(),tok,"eos")?;
             self.finish_reason = "stop";
             self.shadow_flush_censored();
             return Ok(Qwen35TickOutcome {
@@ -7036,6 +7082,8 @@ impl Qwen35DecodeState {
             });
         }
         if qwen35_grammar_terminal_token(self.grammar_runtime.as_ref(), &self.params, tok) {
+            #[cfg(test)]
+            anchor_exactness_tests::trace::stopping(self.slot_id,self.params.c2_ticket.as_deref(),tok,"grammar")?;
             self.finish_reason = "stop";
             self.shadow_flush_censored();
             return Ok(Qwen35TickOutcome {
@@ -7820,6 +7868,8 @@ impl Qwen35DecodeState {
         qwen: &Qwen35LoadedModel,
         registration: Option<&ModelRegistration>,
     ) -> Result<GenerationResult> {
+        #[cfg(test)]
+        anchor_exactness_tests::fullw_http::finished(&self);
         validate_grammar_terminal(
             self.grammar_runtime.as_ref(),
             self.params.grammar_kind,
@@ -7843,11 +7893,16 @@ impl Qwen35DecodeState {
             &self.generated_tokens,
         );
         let decode_duration = self.decode_start.elapsed();
+        let completion_tokens=self.generated_tokens.len();
+        #[cfg(test)]
+        if anchor_exactness_tests::fresh_http::enabled() {
+            anchor_exactness_tests::fresh_http::published(&self,completion_tokens)?;
+        }
         Ok(GenerationResult {
             text: content_text,
             reasoning_text,
             prompt_tokens: self.prompt_len,
-            completion_tokens: self.generated_tokens.len(),
+            completion_tokens,
             reasoning_tokens: if reasoning_token_count > 0 {
                 Some(reasoning_token_count)
             } else {
@@ -13272,6 +13327,7 @@ mod tests {
     ) -> Qwen35LoadedModel {
         Qwen35LoadedModel {
             model: super::Qwen35Model::empty_from_cfg(cfg),
+            c2_model_witness: std::sync::Arc::new(()),
             tokenizer: tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             chat_template: "{{ messages }}".to_string(),
             model_id: "iter-12-test".to_string(),

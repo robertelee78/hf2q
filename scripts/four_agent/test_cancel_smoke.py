@@ -21,14 +21,20 @@ QWEN_TURN = '\x1b[2m DEBUG\x1b[0m hf2q::serve::api::engine_qwen35::progress: Qwe
 class Fake(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, log, plans, *, count_cancels=True, joint_log=True, step=0.01):
+    def __init__(self, log, plans, *, count_cancels=True, joint_log=True, step=0.01, recovery=None,
+                 recovery_after_counter_read=False):
         super().__init__(('127.0.0.1', 0), Handler)
         self.log, self.plans, self.step = log, plans, step
         self.count_cancels, self.joint_log = count_cancels, joint_log
         self.lock = threading.Lock()
         self.active = 0
+        self.recovery = recovery
         self.cancellations = 0
         self.requests = []
+        self.recovery_after_counter_read = recovery_after_counter_read
+        self.counter_reads_after_close = 0
+        self.recovery_ready = threading.Event()
+        self.recovery_done = threading.Event()
 
     def joint_turn(self):
         with self.lock:
@@ -47,7 +53,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == '/readyz':
             body = b'{"ready":true}'
         elif self.path == '/metrics':
+            if self.server.cancellations:
+                with self.server.lock:
+                    self.server.counter_reads_after_close += 1
+                    if self.server.counter_reads_after_close >= 2:
+                        self.server.recovery_ready.set()
             body = f'# TYPE hf2q_sse_cancellations counter\nhf2q_sse_cancellations {self.server.cancellations}\n'.encode()
+            for slot in range(4):
+                body += f'hf2q_qwen_anchor_committed{{slot="{slot}"}} 1\n'.encode()
+                for kind in ('payload_image', 'logits', 'hidden', 'tokens', 'metadata'):
+                    body += (f'hf2q_qwen_anchor_owned_bytes{{slot="{slot}",class="{kind}",state="pending"}} 0\n').encode()
         else:
             self.send_error(404)
             return
@@ -101,6 +116,13 @@ class Handler(BaseHTTPRequestHandler):
             if server.count_cancels:
                 with server.lock:
                     server.cancellations += 1
+                if server.recovery is not None:
+                    if server.recovery_after_counter_read:
+                        server.recovery_ready.wait(timeout=5)
+                    with open(server.log, 'a') as handle:
+                        for event in server.recovery:
+                            handle.write(' INFO x: Qwen anchor cancellation recovery ' + event + '\n')
+                    server.recovery_done.set()
         finally:
             with server.lock:
                 server.active -= 1
@@ -108,7 +130,9 @@ class Handler(BaseHTTPRequestHandler):
 
 class Smoke(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.tmp = Path(temporary.name)
         self.log = self.tmp / 'server.stderr'
         self.log.write_text(' INFO hf2q::serve: listening\n')
         self.recorded = self.tmp / 'client'
@@ -165,6 +189,101 @@ class Smoke(unittest.TestCase):
                          [{'name': 'write_file', 'arguments': '{"path":"src/ports.rs"}'}])
         self.assertTrue(all(r['stream'] is True and r['stream_options'] == {'include_usage': True}
                             for r in fake.requests), 'recorded unary turns are replayed as streams')
+
+    def test_c2_owned_restore_and_semantic_retry_are_recorded(self):
+        self.log.write_text(self.log.read_text() +
+                            ' INFO x: Qwen35 multi-depth anchor store configured anchor_depth=4\n')
+        event = ('request_id=99 slot=0 disposition="restored" recovered_tokens=32 '
+                 'restored_rank=2 performed_restore_count=1')
+        code, summary = self.smoke(Fake(self.log, self.plans(), recovery=[event]),
+                                   '--c2-anchor-depth', '4', '--warmup-turn', '2')
+        self.assertEqual((code, summary['status']), (0, cs.PASS), summary['reasons'])
+        recovery = summary['passes']['cancel']['recovery']
+        self.assertEqual((recovery['disposition'], recovery['restored_rank'], recovery['restored_tokens']),
+                         ('restored', 2, 32))
+        self.assertFalse(recovery['preserved_live_prefix'])
+        retry = summary['passes']['retry']['agents']['agent-0']
+        self.assertTrue(retry['valid'])
+        self.assertGreater(retry['first_semantic_token_seconds'], 0)
+        self.assertEqual(set(summary['passes']['retry']['agents']), {'agent-0'})
+        self.assertEqual(summary['passes']['retry']['anchor_state_after']['pending_owned_bytes'], 0)
+
+    def test_c2_missing_recovery_is_not_inferred_from_counter_delta(self):
+        self.log.write_text(self.log.read_text() +
+                            ' INFO x: Qwen35 multi-depth anchor store configured anchor_depth=1\n')
+        code, summary = self.smoke(Fake(self.log, self.plans()), '--c2-anchor-depth', '1',
+                                   '--warmup-turn', '2')
+        self.assertEqual((code, summary['status']), (1, cs.FAIL))
+        self.assertTrue(any('observed 0' in reason for reason in summary['reasons']))
+        self.assertNotIn('retry', summary['passes'])
+
+    def test_qwen36_source_is_bound_to_completed_declared_repair_receipts(self):
+        selected = cs.load_requests(self.recorded, 2, range(4), MODEL)
+        for row in selected:
+            path = self.recorded / f'agent-{row["agent"]}' / 'summary.json'
+            path.write_text(json.dumps({'repair_turns': 1,
+                                       'status': 'ProtocolCompleteAwaitingIndependentPatchReview',
+                                       'turns': [{'turn': 2, 'request_sha256': row['recorded_sha256']}]}))
+        sources = cs.repair_workload_sources(self.recorded, range(4), selected)
+        self.assertEqual(sources['agent-0']['selected_request_sha256'], {'2': selected[0]['recorded_sha256']})
+        (self.recorded / 'agent-0' / 'summary.json').write_text(json.dumps(
+            {'repair_turns': 0, 'status': 'ProtocolCompleteAwaitingIndependentPatchReview'}))
+        with self.assertRaises(cs.Invalid):
+            cs.repair_workload_sources(self.recorded, range(4), selected)
+
+    def test_changed_cancel_or_warmup_request_cannot_borrow_a_repair_receipt(self):
+        for agent in range(4):
+            warmup = self.recorded / f'agent-{agent}' / 'turn-1'
+            warmup.mkdir()
+            (warmup / 'request.json').write_bytes(
+                (self.recorded / f'agent-{agent}' / 'turn-2/request.json').read_bytes())
+        selected = [row for turn in (1, 2) for row in cs.load_requests(self.recorded, turn, range(4), MODEL)]
+        for agent in range(4):
+            (self.recorded / f'agent-{agent}/summary.json').write_text(json.dumps({
+                'repair_turns': 1, 'status': 'ProtocolCompleteAwaitingIndependentPatchReview',
+                'turns': [{'turn': row['turn'], 'request_sha256': row['recorded_sha256']}
+                          for row in selected if row['agent'] == agent]}))
+        for turn in (1, 2):
+            path = self.recorded / f'agent-0/turn-{turn}/request.json'
+            original = path.read_bytes()
+            changed = json.loads(original)
+            changed['messages'][0]['content'] += '-changed'
+            path.write_text(json.dumps(changed))
+            current = [row for item in (1, 2) for row in cs.load_requests(self.recorded, item, range(4), MODEL)]
+            with self.subTest(turn=turn), self.assertRaises(cs.Invalid):
+                cs.repair_workload_sources(self.recorded, range(4), current)
+            path.write_bytes(original)
+
+    def test_joint_warmup_cannot_rescue_an_entirely_serial_cancellation_pass(self):
+        class WarmupJointOnly(Fake):
+            def joint_turn(self):
+                if len(self.requests) <= 4:
+                    super().joint_turn()
+
+        self.log.write_text(self.log.read_text() +
+                            ' INFO x: Qwen35 multi-depth anchor store configured anchor_depth=4\n')
+        recovery = 'request_id=99 slot=0 disposition=\"preserved\" recovered_tokens=32 restored_rank=-1 performed_restore_count=0'
+        code, summary = self.smoke(WarmupJointOnly(self.log, self.plans(), recovery=[recovery]),
+                                   '--c2-anchor-depth', '4', '--warmup-turn', '2', '--no-control')
+        self.assertEqual((code, summary['status']), (1, cs.FAIL))
+        self.assertIsNone(summary['joint_before_close'])
+        self.assertGreater(summary['widths']['whole_run']['turns'], 0)
+        self.assertEqual(summary['widths']['cancel_pass']['turns'], 0)
+
+    def test_recovery_after_counter_ack_is_awaited_before_interval_freezes(self):
+        self.log.write_text(self.log.read_text() +
+                            ' INFO x: Qwen35 multi-depth anchor store configured anchor_depth=4\n')
+        recovery = 'request_id=99 slot=0 disposition=\"restored\" recovered_tokens=32 restored_rank=2 performed_restore_count=1'
+        fake = Fake(self.log, self.plans(), recovery=[recovery], recovery_after_counter_read=True)
+        try:
+            code, summary = self.smoke(fake, '--c2-anchor-depth', '4', '--warmup-turn', '2', '--no-control')
+            self.assertEqual((code, summary['status']), (0, cs.PASS), summary['reasons'])
+            cancel = summary['passes']['cancel']
+            self.assertLessEqual(cancel['recovery']['end_offset'], cancel['log_offsets']['end'])
+            self.assertEqual(cancel['recovery']['restored_tokens'], 32)
+        finally:
+            fake.recovery_ready.set()
+            self.assertTrue(fake.recovery_done.wait(timeout=5), 'fixture recovery writer did not settle')
 
     def test_survivor_error_finish_fails(self):
         code, summary = self.smoke(Fake(self.log, self.plans(agent_2={'finish': 'error'})))
@@ -252,6 +371,7 @@ class Cases(unittest.TestCase):
             self.assertEqual(plan['client']['success_status'], cs.PASS)
             self.assertNotIn('approval', plan['client'])
 
+
     def test_launchers_replace_verbose_flag_only_when_log_filter_is_set(self):
         # hf2q ignores RUST_LOG under -v; the filter must replace -v, not sit beside it.
         for name, args in (('serve_deepseek4_opencode.sh', 'VERBOSITY'), ('serve_qwen36_opencode.sh', 'HF2Q_SERVE_ARGS')):
@@ -300,6 +420,28 @@ class Parsing(unittest.TestCase):
         self.assertEqual((turn['kind'], turn['width'], turn['serial']), ('DFlash2', 3, 0))
         self.assertEqual(turn['verify_rows'], 17)
 
+    def test_actual_dflash_turn_scope_supersedes_stage_width_sample(self):
+        turns = cs.joint_turns(self.lines(
+            ' DEBUG x: Qwen DFlash2 stage timing active_lanes=3 verify_rows=17\n'
+            ' DEBUG x: Qwen DFlash2 decode turn lanes=3 serial=1 turn_lanes=4 path="joint"\n'
+            ' DEBUG x: Qwen joint decode turn reason="too_few_ready"\n'), 'qwen38')
+        self.assertEqual(len(turns), 1)
+        self.assertEqual((turns[0]['width'], turns[0]['serial'], turns[0]['turn_lanes']), (3, 1, 4))
+
+    def test_recovery_preserve_restore_and_reset_are_distinct(self):
+        prefix = ' INFO x: Qwen anchor cancellation recovery request_id=1 slot=0 '
+        for disposition, tokens, rank, count in [('preserved', 17, -1, 0), ('restored', 19, 2, 1), ('reset', 0, -1, 0)]:
+            line = prefix + (f'disposition="{disposition}" recovered_tokens={tokens} '
+                             f'restored_rank={rank} performed_restore_count={count}')
+            event = cs.cancellation_recovery([(2, line)], 1)
+            self.assertEqual(event['disposition'], disposition)
+            self.assertEqual(event['preserved_tokens'], tokens if disposition == 'preserved' else 0)
+            self.assertEqual(event['restored_tokens'], tokens if disposition == 'restored' else 0)
+            with self.assertRaises(cs.Invalid):
+                cs.cancellation_recovery([(2, line), (3, line)], 1)
+        with self.assertRaises(cs.Invalid):
+            cs.cancellation_recovery([(2, prefix + 'disposition=reset')], 1)
+
     def test_log_lines_keep_only_complete_lines_in_range(self):
         with tempfile.NamedTemporaryFile('wb', delete=False) as handle:
             handle.write(b'a\nb\npartial')
@@ -318,6 +460,13 @@ class Parsing(unittest.TestCase):
 class Accumulating(unittest.TestCase):
     def frame(self, **choice):
         return json.dumps({'id': 'x', 'model': MODEL, 'choices': [{'index': 0, 'delta': {}, **choice}]})
+
+    def test_empty_role_does_not_count_as_semantic_token(self):
+        acc = cs.Accumulator(MODEL)
+        self.assertFalse(acc.feed(self.frame(delta={'role': 'assistant'})))
+        self.assertEqual(acc.events, 0)
+        self.assertTrue(acc.feed(self.frame(delta={'reasoning_content': 'thinking'})))
+        self.assertEqual(acc.events, 1)
 
     def test_usage_contradiction_and_data_after_done(self):
         acc = cs.Accumulator(MODEL)

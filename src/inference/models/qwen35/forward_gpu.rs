@@ -92,6 +92,10 @@ pub(crate) use joint_decode::{Qwen35JointOutput, Qwen35JointRow, Qwen35JointRowO
 mod joint_verify;
 pub(crate) use joint_verify::{Qwen35JointVerify, Qwen35JointVerifyLane, Qwen35JointVerifyPending};
 
+#[cfg(test)]
+#[path = "native_head_observer.rs"]
+mod native_head_observer;
+
 /// Segment views own the shared attention roots until the outer checked drain,
 /// including when the layer loop returns an error before its terminal wait.
 struct JointSegmentScratch {
@@ -1379,6 +1383,11 @@ pub(super) fn embed_tokens_gpu_into(
                     "codec":format!("{:?}",native.info.ggml_dtype),"native_rows":native.info.rows,
                     "native_columns":native.info.cols,"actual_token_rows":tokens.len()}))?;
         }
+        #[cfg(test)]
+        super::c23_layer_capture::snapshot(&mut enc, output, 0,
+            crate::adr063_invariance::receipt::Stage::Input,
+            || serde_json::json!({"boundary":"actual native embedding gather",
+                "codec":format!("{:?}",native.info.ggml_dtype)}))?;
         // The consuming Qwen/MTP forward is submitted to the same Metal
         // command queue, so normal retained-reference command buffers need
         // no host wait here: queue order is the dependency boundary and the
@@ -1900,6 +1909,8 @@ fn apply_output_head_gpu_into_buf_and_normed(
     };
     enc.commit_and_wait_labeled(label)
         .context("commit output_head fused norm+lm_head")?;
+    #[cfg(test)]
+    native_head_observer::completed(&normed)?;
 
     // Optional: dump output-norm stats to stderr.
     if dump_layer_n().is_some() {
@@ -2193,6 +2204,8 @@ fn apply_output_head_gpu_last_with_nextn_hidden(
     .context("lm_head projection from final nextn row")?;
     enc.commit_and_wait_labeled("output_head.nextn_norm_last_lm_head")
         .context("commit output_head nextn norm + last lm_head")?;
+    #[cfg(test)]
+    native_head_observer::completed(&last_normed)?;
 
     Ok((
         download_f32(&logits).context("download nextn final logits")?,
@@ -5204,6 +5217,29 @@ impl Qwen35Model {
                     LayerWeightsGpu::FullAttn{ffn:FfnWeightsGpu::DenseQ(_),..} |
                     LayerWeightsGpu::LinearAttn{ffn:FfnWeightsGpu::DenseQ(_),..})))?
         }else{None};
+        #[cfg(test)]
+        let c23_layers = if super::c23_layer_capture::selected() {
+            let cohort = tokens.iter().enumerate().map(|(row, &token)|
+                (slot_id, positions_flat[row], token)).collect::<Vec<_>>();
+            let scope = super::c23_layer_capture::begin(device, cfg, &cohort,
+                positions_flat, tokens.len(), || serde_json::json!({
+                    "route":"serial-Last","physical_slot":slot_id.0,
+                    "output_mode":format!("{:?}",output_head_mode),
+                    "n_seqs":kv_cache.n_seqs}))?;
+            if scope.is_some() {
+                ensure!(matches!(output_head_mode, OutputHeadMode::Last)
+                    && joint.is_none() && capture.is_none() && hidden_out.is_none()
+                    && residual_capture.is_none() && soft_tokens.is_empty()
+                    && deepstack.is_none() && self.glp.is_none()
+                    && self.token_embd_native.is_some()
+                    && !super::execution_dispatch::dense_q_split_profile_enabled()
+                    && layer_weights_gpu.iter().all(|layer| matches!(layer,
+                        LayerWeightsGpu::FullAttn {ffn:FfnWeightsGpu::DenseQ(_),..}
+                        | LayerWeightsGpu::LinearAttn {ffn:FfnWeightsGpu::DenseQ(_),..})),
+                    "unsupported selected localization graph; never fallback");
+            }
+            scope
+        } else { None };
 
         // ---- Step 1: embedding lookup → hidden ----
         //
@@ -6160,7 +6196,7 @@ impl Qwen35Model {
             }
             let layer_scratch_before = super::decode_pool::issued_total();
             #[cfg(test)]
-            let q1_layer_before = if q1_target_layers.is_some() {
+            let q1_layer_before = if q1_target_layers.is_some() || c23_layers.is_some() {
                 Some(q1_layer_metadata::state(kv_cache,layer_idx,slot_id)?)
             } else {None};
             // The residual entering this layer, kept for the activation
@@ -6830,6 +6866,17 @@ impl Qwen35Model {
                             &self.ggml_routing_policy,registry.ggml_routing_policy(),
                             q1_layer_before.as_ref().context("missing layer state")?)?)?;
                 }
+                #[cfg(test)]
+                if c23_layers.is_some() {
+                    let loaded = q1_layer_metadata::layer(layer_gpu,kv_cache,layer_idx,slot_id,seq_len,cfg,
+                        &self.ggml_routing_policy,registry.ggml_routing_policy(),
+                        q1_layer_before.as_ref().context("missing localization layer state")?)?;
+                    super::c23_layer_capture::snapshot(enc.encoder(), &ffn_residual_buf, layer_idx,
+                        crate::adr063_invariance::receipt::Stage::Residual,
+                        || serde_json::json!({"boundary":"actual fused attention residual sum",
+                            "loaded_projections_and_host_state":loaded,
+                            "actual_m":seq_len,"physical_slot":slot_id.0}))?;
+                }
                 if any_fused_eligible {
                     // Keep the encoder open; the DenseQ / MoeQ branch below
                     // will dispatch the FFN body into the same command buffer
@@ -7034,6 +7081,18 @@ impl Qwen35Model {
                                     "actual_m":seq_len,"weights":q1_layer_metadata::ffn(w),
                                     "after_state":q1_layer_metadata::state(kv_cache,layer_idx,slot_id)?}))?;
                         }
+                        #[cfg(test)]
+                        super::c23_layer_capture::snapshot(enc.encoder(), &out, layer_idx,
+                            crate::adr063_invariance::receipt::Stage::LayerOutput,
+                            || serde_json::json!({"boundary":"actual FFN projection fused residual sum",
+                                "standalone_ffn_output":"nonexistent on selected fused path",
+                                "hf_ffn_branch":if seq_len>1 {"DenseQ into arena/ring"}else{"DenseQ into pooled"},
+                                "ffn_terminal_k_batch":ffn_terminal_k_batch,
+                                "encode_time_k_boundary":is_k_boundary,
+                                "pipelined_layers":pipelined_layers,
+                                "phase1_head_fusion_eligible":phase1_fusion_env_eligible,
+                                "residual_folded":fold_residual.is_some(),
+                                "actual_m":seq_len,"weights":q1_layer_metadata::ffn(w)}))?;
                         if seq_len == 1 {
                             // Decode path (DROP_SITE per spec §1.1).
                             // commit_unlabeled preserves pre-iter90 enc.commit()
@@ -7890,6 +7949,12 @@ impl Qwen35Model {
                     .context("commit fallback for held last-layer encoder")?;
             }
         }
+        #[cfg(test)]
+        let c2_head = if matches!(output_head_mode, OutputHeadMode::All | OutputHeadMode::Last) {
+            native_head_observer::Scope::begin()?
+        } else {
+            None
+        };
         let logits = match output_head_mode {
             OutputHeadMode::All => {
                 if let Some(out) = nextn_hidden_out.as_mut() {
@@ -8016,6 +8081,25 @@ impl Qwen35Model {
                 Vec::new()
             }
         };
+        #[cfg(test)]
+        let c2_normed = c2_head.as_ref().map(|scope| scope.take()).transpose()?;
+        #[cfg(test)]
+        if let Some(normed) = c2_normed.as_ref().filter(|_| joint.is_none()) {
+            let values = match logits_buffer_out.as_ref().and_then(|out| out.as_ref()) {
+                Some(buffer) => buffer.as_logical_slice::<f32>()?,
+                None => logits.as_slice(),
+            };
+            ensure!(
+                values.len() % cfg.vocab_size as usize == 0
+                    && normed.len() == values.len() / cfg.vocab_size as usize * h as usize,
+                "native output-head logits and normalized hidden row extents differ"
+            );
+            crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::forward(
+                slot_id, usize::try_from(positions_flat[0])?, tokens,
+                if matches!(output_head_mode, OutputHeadMode::All) { "serial-All" } else { "serial-Last" },
+                values, cfg.vocab_size as usize, Some(normed), h as usize,
+            )?;
+        }
         if let Some(plan) = joint.as_ref() {
             // The other rows a lane's own forwards project: each earlier
             // lane's last row, and the last content row of a lane that folds
@@ -8040,6 +8124,14 @@ impl Qwen35Model {
                     .with_context(|| format!("joint prefill lane {index} logits of row {row}"))
                 };
                 let boundary = lane.boundary_row().map(&mut head).transpose()?;
+                #[cfg(test)]
+                if let (Some(scope), Some(boundary)) = (c2_head.as_ref(), boundary.as_ref()) {
+                    let normed = scope.take()?;
+                    let prefix = lane.boundary.as_ref().context("native prefill boundary")?.prefix_rows;
+                    native_head_observer::lane(lane, 0, prefix, tokens, positions_flat,
+                        "joint-prefill-boundary-Last", boundary, cfg.vocab_size as usize,
+                        &normed, h as usize)?;
+                }
                 let last = if index == last_lane {
                     ensure!(
                         lane.last_row() + 1 == seq_len,
@@ -8049,6 +8141,18 @@ impl Qwen35Model {
                 } else {
                     head(lane.last_row())?
                 };
+                #[cfg(test)]
+                if let Some(scope) = c2_head.as_ref() {
+                    let observed = (index != last_lane).then(|| scope.take()).transpose()?;
+                    let normed = observed.as_ref().or(c2_normed.as_ref())
+                        .context("native final prefill head rows")?;
+                    let values = if index == last_lane { &logits } else { &last };
+                    // The final row belongs to the complete lane transaction,
+                    // not merely its cue suffix when a boundary was folded.
+                    native_head_observer::lane(lane, 0, lane.rows, tokens,
+                        positions_flat, "joint-prefill-Last", values, cfg.vocab_size as usize,
+                        normed, h as usize)?;
+                }
                 lane_logits.push(super::prefill_joint::LaneLogits { last, boundary });
             }
             super::prefill_joint::publish_logits(lane_logits);
@@ -8061,6 +8165,10 @@ impl Qwen35Model {
         }
         #[cfg(test)]
         if let Some(snapshots)=q1_target_layers.take() {
+            snapshots.finish_after_checked_output_head()?;
+        }
+        #[cfg(test)]
+        if let Some(snapshots) = c23_layers {
             snapshots.finish_after_checked_output_head()?;
         }
         // ADR-019 Phase 2 iter92 — final drain of attn_out hold-vec.
@@ -9513,6 +9621,16 @@ impl Qwen35Model {
             )
             .context("apply_output_head_gpu_greedy")?
         };
+        #[cfg(test)]
+        if crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::enabled() {
+            crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::gpu_argmax(
+                slot_id, usize::try_from(positions_flat[0])?, token_id);
+            crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::forward(
+                slot_id, usize::try_from(positions_flat[0])?, tokens, "serial-GPU-greedy",
+                decode_bufs.logits_buf.as_logical_slice::<f32>()?, cfg.vocab_size as usize,
+                Some(decode_bufs.norm_out_buf.as_logical_slice::<f32>()?), h as usize,
+            )?;
+        }
         if let Some(t) = t_output_head {
             eprintln!(
                 "[GREEDY_PROFILE] output_head={:.1}ms",

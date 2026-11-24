@@ -586,6 +586,28 @@ impl Qwen35Model {
                 positions[axis * width + index] = packed(index).position;
             }
         }
+        #[cfg(test)]
+        let c23_layers = if super::super::c23_layer_capture::selected() {
+            let cohort = rows.iter().map(|row| (row.slot_id,row.position,row.token)).collect::<Vec<_>>();
+            let scope = super::super::c23_layer_capture::begin(device, cfg, &cohort,
+                &positions, width, || serde_json::json!({
+                    "route":"joint-existing-output-head","packed_width":width,
+                    "windows":packing.windows.iter().map(|window| serde_json::json!({
+                        "slot":window.slot.0,"start":window.start,"rows":window.rows})).collect::<Vec<_>>(),
+                    "attention_tile":packing.attention_tile,"mixer_fused":packing.mixer_fused,
+                    "dflash2_verify":packing.dflash2_verify,"dense_ffn":format!("{:?}",dense_ffn),
+                    "projection":format!("{:?}",options.projection),
+                    "pooled_outputs":options.pooled_outputs}))?;
+            if scope.is_some() {
+                ensure!(gpu_token_ids.is_none() && replay.is_none() && capture.is_none()
+                    && !packing.dflash2_verify && self.token_embd_native.is_some()
+                    && layer_weights.iter().all(|layer| matches!(layer,
+                        LayerWeightsGpu::FullAttn {ffn:FfnWeightsGpu::DenseQ(_),..}
+                        | LayerWeightsGpu::LinearAttn {ffn:FfnWeightsGpu::DenseQ(_),..})),
+                    "unsupported selected localization joint graph; never fallback");
+            }
+            scope
+        } else { None };
         let positions = host_buffer(device, DType::I32, positions.as_slice(), "positions")?;
         // The decode forward's actual input manifest (trace on only): one
         // row per packed slot in matrix order, padding rows owner-less. Its
@@ -682,6 +704,11 @@ impl Qwen35Model {
                 );
             }
             let enc = chain.as_mut().expect("joint layer encoder opened above");
+            #[cfg(test)]
+            let c23_before = if c23_layers.is_some() {
+                Some(rows.iter().map(|row| super::q1_layer_metadata::state(kv_cache,layer_idx,row.slot_id))
+                    .collect::<Result<Vec<_>>>()?)
+            } else { None };
             let (attention, post_norm, ffn) = match (weights, routes) {
                 (LayerWeightsGpu::FullAttn { attn, ffn }, LayerRoutes::Full(routes)) => (
                     encode_joint_full_attn_layer(
@@ -742,6 +769,18 @@ impl Qwen35Model {
                 eps,
             )
             .with_context(|| format!("Qwen joint fused residual norm layer {layer_idx}"))?;
+            #[cfg(test)]
+            if let Some(before) = c23_before.as_ref() {
+                let loaded = super::q1_layer_metadata::layer(weights,kv_cache,layer_idx,rows[0].slot_id,
+                    width_u32,cfg,&self.ggml_routing_policy,registry.ggml_routing_policy(),&before[0])?;
+                super::super::c23_layer_capture::snapshot(enc, &ffn_residual, layer_idx,
+                    crate::adr063_invariance::receipt::Stage::Residual,
+                    || serde_json::json!({"boundary":"actual joint fused attention residual sum",
+                        "loaded_projections_and_host_state":loaded,"all_real_rows_before":before,
+                        "actual_width":width,"mixer_fused":packing.mixer_fused,
+                        "attention_tile":packing.attention_tile,
+                        "projection":format!("{:?}",options.projection)}))?;
+            }
             enc.memory_barrier();
             let output = match ffn {
                 FfnWeightsGpu::DenseQ(weights) => build_dense_ffn_layer_gpu_q_into_with_gate_up(
@@ -867,6 +906,16 @@ impl Qwen35Model {
                     bail!("Qwen joint layer {layer_idx} has no admitted FFN arm")
                 }
             };
+            #[cfg(test)]
+            super::super::c23_layer_capture::snapshot(enc, &output, layer_idx,
+                crate::adr063_invariance::receipt::Stage::LayerOutput,
+                || serde_json::json!({"boundary":"actual joint FFN projection fused residual sum",
+                    "standalone_ffn_output":"nonexistent on selected fused path",
+                    "dense_ffn":format!("{:?}",dense_ffn),"actual_width":width,
+                    "chain_n":chain_n,"closes_chain":closes_chain(layer_idx,chain_n,n_layers),
+                    "head_route":format!("{:?}",plan.head),
+                    "projection":format!("{:?}",options.projection),
+                    "weights":match ffn {FfnWeightsGpu::DenseQ(w)=>super::q1_layer_metadata::ffn(w),_=>serde_json::Value::Null}}))?;
             if let Some(capture) = capture {
                 if let Some(capture_index) = capture
                     .layer_ids
@@ -1119,6 +1168,16 @@ impl Qwen35Model {
         } else {
             None
         };
+        #[cfg(test)]
+        let c2_selector = if output_tail.is_some()
+            && crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::enabled()
+        {
+            let (indices, _, _) = argmax.as_ref().context("C2 GPU selector requires actual argmax")?;
+            let coordinates = rows.iter().map(|row|
+                Ok((row.slot_id, usize::try_from(row.position)?))).collect::<Result<Vec<_>>>()?;
+            crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::gpu_selector(
+                &mut enc, registry, device, indices, &coordinates)?
+        } else { None };
         if let Some(tail) = output_tail.as_mut() {
             ensure!(
                 rows.iter().all(|row| row.output.wants_argmax()),
@@ -1126,6 +1185,8 @@ impl Qwen35Model {
             );
             let (indices, _values, _params) =
                 argmax.as_ref().context("Qwen joint output-head argmax")?;
+            #[cfg(test)]
+            let indices = c2_selector.as_ref().map_or(indices, |owners| &owners.selected);
             enc.memory_barrier();
             tail(&mut enc, registry, device, indices).context("Qwen joint output-head tail")?;
         }
@@ -1137,6 +1198,10 @@ impl Qwen35Model {
         enc.commit_and_wait_labeled(head_label)
             .map_err(|e| anyhow!("Qwen joint decode command buffer: {e}"))?;
         mlx_native::command_timeline::mark("joint.head_completed");
+        #[cfg(test)]
+        if let Some(snapshots) = c23_layers {
+            snapshots.finish_after_checked_output_head()?;
+        }
         match held_outputs {
             // The caller releases them when its commit settles.
             Some(held) => held.append(&mut retained),
@@ -1167,6 +1232,33 @@ impl Qwen35Model {
                     }
                     None => None,
                 };
+                #[cfg(test)]
+                if crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::enabled() {
+                    let window = packing.windows.iter().find(|window| row >= window.start && row < window.start + window.rows)
+                        .context("C2 row has no complete verifier-window provenance")?;
+                    let actual_tokens = gpu_token_ids.map(|tokens| tokens.as_logical_slice::<u32>()).transpose()?;
+                    let consumed = (window.start..=row).map(|index|
+                        actual_tokens.map_or(rows[index].token, |tokens| tokens[index])).collect::<Vec<_>>();
+                    if let Some(indices) = argmax_indices.filter(|_| input.output.wants_argmax()) {
+                        // Keep the actual GPU result distinct from both the raw
+                        // target row and the frozen selector's acceptance input.
+                        crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::gpu_argmax(
+                            input.slot_id, usize::try_from(input.position)?, indices[row]);
+                    }
+                    let projected = &all_logits[row * vocab..(row + 1) * vocab];
+                    let restored = decision.as_ref().map(|decision| {
+                        let mut raw = projected.to_vec();
+                        decision.restore(&mut raw);
+                        raw
+                    });
+                    // Restore only this diagnostic copy. Production logits remain
+                    // the decision kernel's masked scratch until their usual readback.
+                    crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::forward(
+                        input.slot_id, usize::try_from(rows[window.start].position)?, &consumed,
+                        "joint-existing-output-head", restored.as_deref().unwrap_or(projected), vocab,
+                        Some(&normed.as_logical_slice::<f32>()?[row * h..(row + 1) * h]), h,
+                    )?;
+                }
                 let logits = input.output.wants_logits().then(|| {
                     let mut logits = all_logits[row * vocab..(row + 1) * vocab].to_vec();
                     if let Some(decision) = decision.as_ref() {

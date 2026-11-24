@@ -1245,14 +1245,36 @@ pub struct HybridKvSlotAnchor {
     full_attn_current_len: Vec<u32>,
     mtp_current_len: Option<u32>,
     linear_image: Option<LaAnchorImage>,
+    #[cfg(test)]
+    test_payload_owner: Option<std::sync::Arc<[u8]>>,
 }
 
 impl HybridKvSlotAnchor {
     /// Physical bytes retained outside the live cache for this checkpoint.
     pub fn total_bytes(&self) -> usize {
+        #[cfg(test)]
+        if let Some(owner) = &self.test_payload_owner {
+            return owner.len();
+        }
         self.linear_image
             .as_ref()
             .map_or(0, LaAnchorImage::total_bytes)
+    }
+
+    /// Whether both checkpoints retain the same complete image owner.
+    /// Images are one right-sized allocation, never disjoint slice owners.
+    pub(crate) fn shares_payload_owner_with(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        if self.test_payload_owner.is_some() || other.test_payload_owner.is_some() {
+            return match (&self.test_payload_owner, &other.test_payload_owner) {
+                (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+                _ => false,
+            };
+        }
+        match (&self.linear_image, &other.linear_image) {
+            (Some(left), Some(right)) => left.shares_owner_with(right),
+            _ => false,
+        }
     }
 
     pub fn prompt_len(&self) -> usize {
@@ -1268,7 +1290,28 @@ impl HybridKvSlotAnchor {
             full_attn_current_len: Vec::new(),
             mtp_current_len: None,
             linear_image: None,
+            #[cfg(test)]
+            test_payload_owner: None,
         }
+    }
+
+    /// CPU payload owner for production-store/C1 ownership differentials.
+    /// Cloning an anchor aliases this allocation exactly like an image handle.
+    #[cfg(test)]
+    pub(crate) fn test_with_payload_owner(
+        prompt_len: usize, owner: std::sync::Arc<[u8]>,
+    ) -> Self {
+        Self { test_payload_owner: Some(owner), ..Self::test_stub(prompt_len) }
+    }
+
+
+    #[cfg(test)]
+    pub(crate) fn test_with_invalid_last_layer(&self) -> Result<Self> {
+        let mut invalid = self.clone();
+        invalid.linear_image = Some(self.linear_image.as_ref()
+            .context("anchor preflight test requires a real image")?
+            .test_with_invalid_last_layer()?);
+        Ok(invalid)
     }
 
     /// Everything the checkpoint holds, for bitwise comparison in tests.
@@ -1869,6 +1912,8 @@ impl HybridKvCache {
             full_attn_current_len,
             mtp_current_len,
             linear_image: Some(linear_image),
+            #[cfg(test)]
+            test_payload_owner: None,
         })
     }
 
@@ -1932,6 +1977,8 @@ impl HybridKvCache {
             full_attn_current_len: vec![boundary; self.full_attn.len()],
             mtp_current_len,
             linear_image: Some(image),
+            #[cfg(test)]
+            test_payload_owner: None,
         })
     }
 
