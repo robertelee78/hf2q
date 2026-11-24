@@ -561,7 +561,17 @@ def main():
         while len(records) != len(agents):
             require(not INTERRUPTED and time.monotonic() < until, "N4 barrier deadline/interruption")
             for agent, process in processes.items():
-                require(process.poll() is None, "agent exited before shared release")
+                if process.poll() is not None:
+                    result_path = output / agent / "summary.json"
+                    detail = ""
+                    if result_path.exists():
+                        try:
+                            result = loads(result_path.read_bytes())
+                            if result.get("error"):
+                                detail = f": {result['error']}"
+                        except (OSError, Invalid) as exc:
+                            detail = f": startup result unavailable ({type(exc).__name__}: {exc})"
+                    raise Invalid(f"{agent} exited before shared release{detail}")
                 ready = barrier / f"{agent}.ready.json"
                 if ready.exists():
                     records[agent], hashes[agent] = loads(ready.read_bytes()), child.digest(ready)
@@ -665,10 +675,20 @@ def main():
             if result_path.exists():
                 try:
                     results[agent] = loads(result_path.read_bytes())
+                except BaseException as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    summary.setdefault("result_observation_errors", {})[agent] = error
+                    summary.setdefault("error", error)
+                    summary["status"] = "Failed"
+                    continue
+                try:
                     source = output / agent / "tools" / "fixture" / "src" / "ports.rs"
                     results[agent]["observed_final_source_sha256"] = child.digest(source)
                 except BaseException as exc:
-                    summary["error"] = str(exc)
+                    error = f"{type(exc).__name__}: {exc}"
+                    summary.setdefault("fixture_observation_errors", {})[agent] = error
+                    summary.setdefault("error", error)
+                    summary["status"] = "Failed"
         for stream in streams:
             stream.close()
         if processes and native is not None and native.closing is not None:
