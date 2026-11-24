@@ -523,32 +523,45 @@ comparison failed the unchanged decision envelope: maximum error
 `0.31496429443359375 nat > 0.25 nat`. Saved same-K calibration and matched records
 are byte-identical; they do not identify the first physical divergence.
 
-The operator separately authorized at most four instrumented diagnostic loads:
-an own calibration and independently acquired matched run for each of K4 and K1,
-with no retries, warmups, borrowed caps, or reopening of the original budget.
-Existing ownership, memory, storage, complete-trajectory and release gates remain
-mandatory. These diagnostics cannot themselves declare C2 or release acceptance.
+The original separate diagnostic authority allowed four instrumented loads, and
+the replacement-only authority raised that to five inclusive loads. Neither is
+current replay authority. The first K4 calibration and its replacement both
+stopped on compressor growth and remain permanently consumed failed loads,
+without usable calibration caps. The replacement had normal pressure, no swap,
+and about 34.5 GiB of Free plus cached memory available; compressor growth was
+not evidence of RAM exhaustion.
 
-The first diagnostic calibration stopped at the unchanged zero-compressor-growth
-guard and remains a consumed load without a usable calibration cap. After
-background-memory cleanup, the operator authorized exactly one replacement K4
-calibration: five diagnostic loads total, including that failure and the three
-originally unspent roles. The successor supervisor, native packet consumer and
-offline consumer require this separately bound replacement authority. The failed
-attempt and original C23 budget remain unchanged; no further retry or gate
-relaxation is authorized.
+The operator's separately bound capacity-diagnostics authority now permits
+exactly four remaining diagnostic loads: **two spent plus four new, six inclusive
+total**. It fixes a new successor namespace and exactly these roles, in order:
+K4 own footprint calibration `c23-localization-qwen38-k4-ac-v3`, K4 matched run
+`c23-localization-qwen38-k4-matched-v2`, K1 own footprint calibration
+`c23-localization-qwen38-k1-ac-v2`, and K1 matched run
+`c23-localization-qwen38-k1-matched-v2`. The successor supervisor, native packet
+consumer and offline consumer require this six-total authority; the native
+packet binds its actual SHA-256
+`7d124de0900db86b3daad0b8af5ddf80978daaf6d28362cacb90e3dc7eb47e14`
+and exact same-K successor output under the SHA-bound namespace. Native admission
+borrows that absolute, traversal-free namespace from the authorization; private
+producers verify the exact prior evidence paths and proofs, not machine-local
+path literals duplicated in Rust.
+Both failed grants, the original diagnostic authorities and the capacity-guard
+proof remain bound evidence, not authority to replay an old root or refund a
+load. No retries, warmups, reduced workload, borrowed caps, numerical-limit
+changes, reopening or relabelling of original C23 are authorized. Its original
+qualification budget remains `PERMANENTLY_CLOSED4/4` and its numerical result
+remains FAILED, `0.31496429443359375 nat > 0.25 nat`.
 
-The replacement also stopped on compressor growth, with normal pressure, no
-swap, and about 34.5 GiB of Free plus cached memory still available. It remains
-a consumed failed load, not a calibration receipt or evidence of RAM exhaustion.
-The operator subsequently directed capacity-based protection: use available
-RAM, rather than aborting on compression alone. The diagnostic supervisor MUST
-record compression while retaining critical-pressure, swap, measured reaction
-headroom, own calibrated-cap, telemetry, ownership and cleanup stops. Warning
-pressure is recorded, not a stop, matching ADR-063 Q5. Any changed observer
-requires a fresh measured stop-latency control before admission. This policy
-correction does not refund either load, authorize another replacement, relax the
-numerical envelope, or make a partial calibration usable.
+Capacity-based protection uses available RAM, not compression alone. Admission
+requires the completed capacity-guard proof, fresh retained accounting, own
+calibrations and route-preservation proof. The diagnostic supervisor MUST record
+compression and warning pressure as telemetry while retaining critical-pressure,
+swap, measured reaction headroom, own calibrated-cap, telemetry, ownership and
+cleanup stops. Any changed observer requires a fresh measured stop-latency
+control before admission. Existing storage, full frozen trajectory, all 60
+decision rows, numerical, quality and release gates remain mandatory. Diagnostics
+cannot themselves declare C2 or release acceptance, and no partial calibration
+becomes usable.
 
 The test-only fresh packet's optional `localization` binding records the actual
 folded anchor image at lane 2 / turn 1, actual K4 restoration and admission lineage
