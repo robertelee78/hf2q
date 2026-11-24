@@ -1,6 +1,5 @@
-//! Class A fast path of route (c): resumed Qwen prefill attention on TQ-only
-//! full-attention slots, for chunks with a cached prefix (`cur_len > 0`) and
-//! more than 32 queries.
+//! Fast Qwen prefill attention on persisted TQ-only full-attention slots,
+//! for cold or resumed chunks with more than 32 queries.
 //!
 //! Route (c) ([`super::gpu_full_attn::apply_flash_attn_prefill_seq_major_resume_via_tq_cache_for_slot`])
 //! allocates eight fresh buffers per FA layer (the F32 K/V dequant temps,
@@ -125,8 +124,8 @@ pub(crate) fn fast_route_calls() -> u64 {
     FAST_ROUTE_CALLS.with(std::cell::Cell::get)
 }
 
-/// The arena's buffers for one resumed layer, allocating the
-/// [`ResumeTqScratch`] on the prefill's first resumed FA layer. Every FA
+/// The arena's buffers for one TQ layer, allocating the
+/// [`ResumeTqScratch`] on the prefill's first TQ FA layer. Every FA
 /// layer of one prefill attends the same `(seq_len, kv_seq_len)`; a
 /// different shape is a caller bug and errors.
 fn arena_buffers<'a>(
@@ -146,6 +145,10 @@ fn arena_buffers<'a>(
         }
         Some(_) => {}
         None => {
+            // Cold history fits the existing head-major K/V roots. Reuse
+            // them instead of allocating a second pair of BF16 buffers.
+            let history_buffers = (kv_seq_len <= arena.seq_capacity)
+                .then_some((&arena.k_bf16_hm, &arena.v_bf16_hm));
             arena.resume_tq = Some(ResumeTqScratch::new(
                 device,
                 seq_len,
@@ -154,6 +157,7 @@ fn arena_buffers<'a>(
                 arena.n_kv_heads,
                 arena.head_dim,
                 arena.shared_resume.as_ref(),
+                history_buffers,
             )?);
         }
     }
@@ -594,6 +598,70 @@ mod tests {
     }
 
     #[test]
+    fn tq_cold_and_resumed_prefill_share_the_same_kv_representation() {
+        use super::super::gpu_full_attn::apply_sdpa_with_kv_cache;
+
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping: no Metal device: {error}");
+                return;
+            }
+        };
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::flash_attn_prefill::register(&mut registry);
+        let mut rng = StdRng::seed_from_u64(0xc23);
+        for (total, prefix) in [(32u32, 16u32), (129, 64), (1859, 914)] {
+            let suffix = total - prefix;
+            let q_values: Vec<f32> = (0..total as usize * NH as usize * D)
+                .map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let k_values: Vec<f32> = (0..total as usize * NKV as usize * D)
+                .map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let v_values: Vec<f32> = (0..k_values.len())
+                .map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let q = upload(&device, &q_values, vec![total as usize, NH as usize, D]);
+            let k = upload(&device, &k_values, vec![total as usize, NKV as usize, D]);
+            let v = upload(&device, &v_values, vec![total as usize, NKV as usize, D]);
+            let q_offset = prefix as usize * NH as usize * D;
+            let kv_offset = prefix as usize * NKV as usize * D;
+            let q_suffix = q.slice_view((q_offset * 4) as u64, suffix as usize * NH as usize * D);
+            let k_suffix = k.slice_view((kv_offset * 4) as u64, suffix as usize * NKV as usize * D);
+            let v_suffix = v.slice_view((kv_offset * 4) as u64, suffix as usize * NKV as usize * D);
+            let mut full_arena = FaPrefillArena::new(&device, total, NH, NKV, HEAD_DIM).unwrap();
+            let mut suffix_arena = FaPrefillArena::new(&device, suffix, NH, NKV, HEAD_DIM).unwrap();
+            for fast in [false, true] {
+                let _route = ForceResumeAttnRoute::new(fast);
+                for tq in [false, true] {
+                    let capacity = total + CAPACITY_SLACK;
+                    let mut cache = HybridKvCache::new_with_options(
+                        &qwen38_attn_cfg(1), &device, capacity, 2, tq,
+                    ).unwrap();
+                    let slot = &mut cache.full_attn[0];
+                    let cold = apply_sdpa_with_kv_cache(
+                        &device, &mut registry, &q, &k, &v, slot, total,
+                        NH, NKV, HEAD_DIM, capacity, Some(&mut full_arena), SlotId(1),
+                    ).unwrap();
+                    drain(&device);
+                    slot.current_len[1] = prefix;
+                    let resumed = apply_sdpa_with_kv_cache(
+                        &device, &mut registry, &q_suffix, &k_suffix, &v_suffix, slot, suffix,
+                        NH, NKV, HEAD_DIM, capacity, Some(&mut suffix_arena), SlotId(1),
+                    ).unwrap();
+                    drain(&device);
+                    let expected = &cold.as_slice::<f32>().unwrap()[q_offset..];
+                    let actual = resumed.as_slice::<f32>().unwrap();
+                    assert_eq!(actual.len(), expected.len());
+                    let mismatch = actual.iter().zip(expected)
+                        .position(|(a, b)| a.to_bits() != b.to_bits());
+                    assert_eq!(mismatch, None,
+                        "cold/resumed attention differs: total={total} prefix={prefix} tq={tq} fast={fast}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn resume_attn_fast_switch_parses_and_defaults_on() {
         assert!(parse_resume_attn_fast(None));
         assert!(parse_resume_attn_fast(Some("  ")));
@@ -742,7 +810,9 @@ mod tests {
             ).expect("shared attention output"),
         );
         owner.shared_resume = Some(
-            ResumeTqWorkspace::new(&fx.device, 512, 2515, NH, NKV, HEAD_DIM, owner.shared_output.as_ref())
+            ResumeTqWorkspace::new(
+                &fx.device, 512, 2515, NH, NKV, HEAD_DIM, owner.shared_output.as_ref(), None,
+            )
                 .expect("shared resume workspace"),
         );
         let mut arenas: Vec<_> = cases

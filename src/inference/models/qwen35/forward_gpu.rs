@@ -5574,23 +5574,26 @@ impl Qwen35Model {
                                 .current_len
                                 .get(lane.slot.0 as usize)
                                 .context("joint prefill attention slot is missing")?;
-                            if cursor > 0 && slot.k.is_none() && slot.tq.is_some() {
+                            if slot.k.is_none() && slot.tq.is_some() {
                                 let attended = cursor
                                     .checked_add(content_rows)
-                                    .context("joint resume attention length overflow")?;
+                                    .context("joint TQ attention length overflow")?;
                                 ensure!(
                                     attended <= kv_cache.max_seq_len,
-                                    "joint resume attention exceeds cache capacity"
+                                    "joint TQ attention exceeds cache capacity"
                                 );
                                 history = history.max(attended);
                             }
                         }
                     }
                     if history > 0 {
+                        let history_buffers = (history <= rows)
+                            .then_some((&arena.k_bf16_hm, &arena.v_bf16_hm));
                         arena.shared_resume =
                             Some(super::resume_attn_fast::ResumeTqWorkspace::new(
                                 &device, rows, history, shape.n_head, shape.n_kv, shape.head_dim,
                                 arena.shared_output.as_ref(),
+                                history_buffers,
                             )?);
                     }
                 }

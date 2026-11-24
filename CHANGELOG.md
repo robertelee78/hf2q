@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Qwen TQ-only cold and resumed prompt prefill consume the same persisted KV representation, including the fused encoder path; F32-cache controls remain raw. Cold BF16 history reuses arena storage instead of allocating duplicate K/V roots. This changes old cold arithmetic and does not promote multi-anchor defaults or replace numerical, real-task, memory, fairness, performance or release qualification.
 - C23 localization binds the separately authorized seven-total continuation: all five prior diagnostic loads remain spent, with only one replacement K1 calibration and its matched comparison permitted. Measured-RAM diagnostic admission must not charge filesystem lengths as resident RAM; disk accounting and genuine safety gates remain separate and mandatory. The original `CLOSED4/4` numerical failure remains preserved.
 - Upgrade the locked URL parser to 2.5.9 for the published security fix. Model-free adversarial HTTP controls record request receipt before sending a response, so an immediate SSE identity rejection cannot race the retained request evidence.
 - C2 measured cohorts require their final `AdmittedRunPass` and proven cleanup, not merely an admitted calibration and a completed client. A failed Q5 cleanup cannot become statistical acceptance or authorize another cohort.
