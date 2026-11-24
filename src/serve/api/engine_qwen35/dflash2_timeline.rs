@@ -147,6 +147,8 @@ pub(super) struct CycleSummary {
     pub(super) selected_rows: usize,
     pub(super) accepted_rows: usize,
     pub(super) gpu_acceptance: bool,
+    pub(super) grammar_work: [Option<super::dflash2_grammar::DFlash2GrammarWork>; 4],
+    pub(super) grammar_ordinary_checked_rows: [Option<usize>; 4],
 }
 
 impl Cycle {
@@ -200,6 +202,10 @@ impl Drop for Cycle {
             "selected_rows": summary.map(|summary| summary.selected_rows),
             "accepted_rows": summary.map(|summary| summary.accepted_rows),
             "gpu_acceptance": summary.map(|summary| summary.gpu_acceptance),
+            "grammar_work_schema": "hf2q.dflash2.grammar_work.v1",
+            "grammar_work": summary.map(|summary| &summary.grammar_work),
+            "grammar_ordinary_checked_rows":
+                summary.map(|summary| &summary.grammar_ordinary_checked_rows),
             "dropped_commands": command_timeline::dropped(),
             "dropped_marks": command_timeline::dropped_marks(),
             "marks": marks,

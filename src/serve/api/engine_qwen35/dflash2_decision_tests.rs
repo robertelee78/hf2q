@@ -270,6 +270,7 @@ fn candidate_plans_are_the_host_samplers_plans() {
                 &drafts,
                 &mut outputs,
                 DecisionRoute::HostLogits,
+                None,
             )
             .expect("host plan");
         let candidate = state
@@ -279,6 +280,7 @@ fn candidate_plans_are_the_host_samplers_plans() {
                 &drafts,
                 &mut outputs,
                 DecisionRoute::Candidates,
+                None,
             )
             .expect("candidate plan");
         assert_eq!(
@@ -296,7 +298,7 @@ fn candidate_plans_are_the_host_samplers_plans() {
         // reports no mismatch.
         let before = DECISION_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed);
         let checked = state
-            .plan_selected_dflash2_window(&qwen, &window, &tokens, outputs)
+            .plan_selected_dflash2_window(&qwen, &window, &tokens, outputs, None)
             .expect("checked plan");
         assert_eq!(checked.plan, host.plan);
         assert_eq!(

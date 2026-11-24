@@ -6,6 +6,9 @@
 //! in-turn drain used by joint MTP. DFlash2 is optional and fail-closed: a lane
 //! joins only when its target cursor and persistent draft-ring cursor agree.
 
+#[path = "dflash2_grammar_overlap.rs"]
+mod grammar_overlap;
+
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -28,6 +31,7 @@ use crate::serve::api::engine_supervisor::EngineSupervisor;
 
 use super::{
     plan_qwen35_verified_block, Qwen35CanonicalDecision, Qwen35DecisionSource, Qwen35DecodeState,
+    PreparedDFlash2Grammar,
     Qwen35LoadedModel, Qwen35SpecSemanticState, Qwen35TickOutcome, Qwen35VerifiedBlockPlan,
     QWEN35_WORKER_TRANSACTION_TIMEOUT,
 };
@@ -196,6 +200,8 @@ struct Qwen35DFlash2Plan {
     /// but took the host sampler over their own logits.
     candidate_rows: usize,
     fallback_rows: usize,
+    grammar_work: Option<super::dflash2_grammar::DFlash2GrammarWork>,
+    grammar_ordinary_checked_rows: Option<usize>,
 }
 
 impl Qwen35DFlash2Plan {
@@ -268,8 +274,11 @@ impl Qwen35DecodeState {
         window: &Qwen35DFlash2Window,
         drafts: &[u32],
         mut rows: Vec<Qwen35JointRowOutput>,
+        mut prepared: Option<PreparedDFlash2Grammar>,
     ) -> Result<Qwen35DFlash2Plan> {
-        self.plan_dflash2_rows(qwen, window, drafts, &mut rows, window.decisions)
+        self.plan_dflash2_rows(
+            qwen, window, drafts, &mut rows, window.decisions, prepared.as_mut(),
+        )
     }
 
     /// [`Self::plan_dflash2_window`] over borrowed rows with an explicit
@@ -281,6 +290,7 @@ impl Qwen35DecodeState {
         drafts: &[u32],
         rows: &mut [Qwen35JointRowOutput],
         decisions: DecisionRoute,
+        mut prepared: Option<&mut PreparedDFlash2Grammar>,
     ) -> Result<Qwen35DFlash2Plan> {
         anyhow::ensure!(
             rows.len() == drafts.len() + 1,
@@ -289,6 +299,9 @@ impl Qwen35DecodeState {
             drafts.len()
         );
         let mut semantic = Qwen35SpecSemanticState::from_decode(self);
+        let mut ordinary = super::dflash2_grammar::OrdinaryDFlash2Check::begin(
+            prepared.as_deref(), &semantic, &self.params,
+        );
         let penalty = super::effective_repetition_penalty(&self.params);
         let vocab = qwen.vocab_size;
         let (mut candidate_rows, mut fallback_rows) = (0, 0);
@@ -298,10 +311,12 @@ impl Qwen35DecodeState {
                 let token = output
                     .greedy_token
                     .context("Qwen DFlash2 greedy row returned no argmax")?;
-                return semantic.select_and_observe_from(
+                return semantic.select_and_observe_with_ordinary_check(
                     qwen,
                     &self.params,
                     Qwen35DecisionSource::Argmax(token),
+                    prepared.as_deref_mut(),
+                    ordinary.as_mut(),
                 );
             }
             let candidates = match decisions {
@@ -328,20 +343,24 @@ impl Qwen35DecodeState {
                     .flatten();
                 if let Some(token) = token {
                     candidate_rows += 1;
-                    return semantic.select_and_observe_from(
+                    return semantic.select_and_observe_with_ordinary_check(
                         qwen,
                         &self.params,
                         Qwen35DecisionSource::Argmax(token),
+                        prepared.as_deref_mut(),
+                        ordinary.as_mut(),
                     );
                 }
                 fallback_rows += 1;
                 let mut logits = candidates
                     .logits()
                     .context("Qwen DFlash2 decision fallback logits")?;
-                return semantic.select_and_observe_from(
+                return semantic.select_and_observe_with_ordinary_check(
                     qwen,
                     &self.params,
                     Qwen35DecisionSource::Logits(&mut logits),
+                    prepared.as_deref_mut(),
+                    ordinary.as_mut(),
                 );
             }
             // The host sampler changes the logits it is given (penalty,
@@ -358,10 +377,12 @@ impl Qwen35DecodeState {
             } else {
                 logits
             };
-            semantic.select_and_observe_from(
+            semantic.select_and_observe_with_ordinary_check(
                 qwen,
                 &self.params,
                 Qwen35DecisionSource::Logits(logits),
+                prepared.as_deref_mut(),
+                ordinary.as_mut(),
             )
         };
         let plan = if drafts.is_empty() {
@@ -381,10 +402,13 @@ impl Qwen35DecodeState {
         } else {
             plan_qwen35_verified_block(drafts, &mut canonical_at)?
         };
+        drop(canonical_at);
         Ok(Qwen35DFlash2Plan {
             plan,
             candidate_rows,
             fallback_rows,
+            grammar_work: prepared.as_deref().and_then(PreparedDFlash2Grammar::work),
+            grammar_ordinary_checked_rows: ordinary.as_ref().map(|check| check.rows()),
         })
     }
 
@@ -394,22 +418,33 @@ impl Qwen35DecodeState {
         window: &Qwen35DFlash2Window,
         tokens: &[u32],
         mut rows: Vec<Qwen35JointRowOutput>,
+        mut prepared: Option<PreparedDFlash2Grammar>,
     ) -> Result<Qwen35DFlash2Plan> {
         anyhow::ensure!(!tokens.is_empty(), "Qwen DFlash2 selected no target rows");
         rows.truncate(tokens.len());
         if window.decisions != DecisionRoute::Check {
-            return self.plan_dflash2_window(qwen, window, &tokens[1..], rows);
+            return self.plan_dflash2_window(qwen, window, &tokens[1..], rows, prepared);
         }
         // Diagnostic: the candidates' plan beside the host sampler's over
         // the full logits. The host sampler's is the one used.
         let drafts = &tokens[1..];
+        let mut candidate_prepared = prepared.clone();
+        if let Some(candidate) = candidate_prepared.as_mut() {
+            // Only the authoritative host plan supplies ordinary-check evidence
+            // or errors; this diagnostic clone's failures are otherwise tolerated.
+            candidate.omit_work_recording();
+        }
         let candidate = {
             #[cfg(test)]
             let _comparison = super::anchor_exactness_tests::trace::Comparison::begin();
-            self.plan_dflash2_rows(qwen, window, drafts, &mut rows, DecisionRoute::Candidates)
+            self.plan_dflash2_rows(
+                qwen, window, drafts, &mut rows, DecisionRoute::Candidates,
+                candidate_prepared.as_mut(),
+            )
         };
-        let mut host =
-            self.plan_dflash2_rows(qwen, window, drafts, &mut rows, DecisionRoute::HostLogits)?;
+        let mut host = self.plan_dflash2_rows(
+            qwen, window, drafts, &mut rows, DecisionRoute::HostLogits, prepared.as_mut(),
+        )?;
         match candidate {
             Ok(candidate) if candidate.plan == host.plan => {
                 host.candidate_rows = candidate.candidate_rows;
@@ -729,6 +764,30 @@ impl Qwen35LoadedModel {
                     .then_some(states[index].sampling_history.as_slice())
             })
             .collect::<Vec<_>>();
+        let prepare_needed = grammar_overlap::needed(states, &verifying, &tokens, timeline_on);
+        let mut prepared_grammars: Option<grammar_overlap::PreparedBySlot> =
+            prepare_needed.then(|| std::array::from_fn(|_| Ok(None)));
+        let mut prepare_result = None;
+        let mut grammar_work = timeline_on.then(|| [None; 4]);
+        let mut grammar_ordinary_checked_rows = timeline_on.then(|| [None; 4]);
+        let mut prepare_grammar = || {
+            prepare_result = Some(grammar_overlap::prepare(
+                self,
+                runtime,
+                states,
+                &verifying,
+                &windows,
+                &tokens,
+                gpu_target_tokens,
+                prepared_grammars.as_mut().expect("enabled grammar preparation"),
+                timeline_on,
+            ));
+        };
+        let host_work = if prepare_needed {
+            Some(&mut prepare_grammar as &mut dyn FnMut())
+        } else {
+            None
+        };
         let verify = if decision_histories.iter().any(Option::is_some) {
             // Never together with GPU acceptance, which needs every lane
             // greedy; candidates are for lanes that are not.
@@ -741,6 +800,7 @@ impl Qwen35LoadedModel {
                 forward.options,
                 Some(capture),
                 &decision_histories,
+                host_work,
             )
         } else if gpu_target_tokens {
             let mut output_tail =
@@ -767,6 +827,7 @@ impl Qwen35LoadedModel {
                 forward.options,
                 Some(capture),
                 gpu_acceptance.then_some(&mut output_tail),
+                host_work,
             )
         } else {
             self.model.forward_gpu_dflash2_verify(
@@ -776,10 +837,27 @@ impl Qwen35LoadedModel {
                 forward.dense_ffn,
                 forward.options,
                 Some(capture),
+                host_work,
             )
         };
+        drop(prepare_grammar);
         drop(decision_histories);
         let verify = lease.finish().and(verify);
+        if let Some(result) = prepare_result {
+            if let Err(error) = result {
+                return Err(match verify {
+                    Ok(_) => error.context("prepare grammar alongside DFlash2 target"),
+                    Err(target) => error.context(format!(
+                        "prepare grammar alongside DFlash2 target; target completion also failed: {target:#}"
+                    )),
+                });
+            }
+        } else {
+            anyhow::ensure!(
+                !prepare_needed || verify.is_err(),
+                "DFlash2 target returned without requested grammar preparation"
+            );
+        }
         let verify_elapsed = verify_started.elapsed();
         let verify_micros = trace_timing.then(|| verify_elapsed.as_micros());
         timeline_mark("verify_end");
@@ -835,16 +913,32 @@ impl Qwen35LoadedModel {
                 .iter()
                 .map(|&index| tokens[index].take().expect("verified tokens")),
         ) {
-            let step = states[index]
-                .plan_selected_dflash2_window(
-                    self,
-                    windows[index].as_ref().expect("verified window"),
-                    &lane_tokens,
-                    rows,
-                )
-                .map(|plan| Verified::Window {
-                    plan,
-                    tokens: lane_tokens,
+            let slot = states[index].slot_id.0 as usize;
+            let preparation = match prepared_grammars.as_mut() {
+                Some(prepared) => std::mem::replace(&mut prepared[slot], Ok(None)),
+                None => Ok(None),
+            };
+            let step = preparation
+                .and_then(|prepared| {
+                    states[index].plan_selected_dflash2_window(
+                        self,
+                        windows[index].as_ref().expect("verified window"),
+                        &lane_tokens,
+                        rows,
+                        prepared,
+                    )
+                })
+                .map(|mut plan| {
+                    if let Some(work) = grammar_work.as_mut() {
+                        work[slot] = plan.grammar_work.take();
+                        grammar_ordinary_checked_rows.as_mut()
+                            .expect("enabled grammar timeline")[slot] =
+                            plan.grammar_ordinary_checked_rows;
+                    }
+                    Verified::Window {
+                        plan,
+                        tokens: lane_tokens,
+                    }
                 })
                 .unwrap_or_else(Verified::Failed);
             accepted.push(match &step {
@@ -1113,6 +1207,9 @@ impl Qwen35LoadedModel {
                 selected_rows: selected_rows.unwrap_or_default(),
                 accepted_rows: accepted.iter().sum::<usize>(),
                 gpu_acceptance,
+                grammar_work: grammar_work.expect("enabled grammar timeline"),
+                grammar_ordinary_checked_rows:
+                    grammar_ordinary_checked_rows.expect("enabled grammar timeline"),
             });
         }
 
@@ -1314,6 +1411,32 @@ mod tests {
         state
     }
 
+    #[test]
+    fn anchor_only_grammar_window_is_observed_without_enabling_ordinary_preparation() {
+        let qwen = loaded_model(QwenSpeculationPolicy::Off);
+        let mut state = decode_state(&qwen, 2);
+        let grammar = crate::serve::api::grammar::parse("root ::= \"a\"\n").unwrap();
+        let root = grammar.rule_id("root").unwrap();
+        state.grammar_runtime =
+            Some(crate::serve::api::grammar::GrammarRuntime::new(grammar, root).unwrap());
+        state.params.token_bytes = Some(std::sync::Arc::new(
+            crate::serve::api::token_text::token_bytes_table(&qwen.tokenizer, qwen.vocab_size),
+        ));
+        let states = [&mut state];
+        let anchor_only = [Some(vec![8])];
+        assert!(!grammar_overlap::needed(&states, &[0], &anchor_only, false));
+        assert!(grammar_overlap::needed(&states, &[0], &anchor_only, true));
+        let work = states[0].prepare_dflash2_grammar(&qwen, &[], true)
+            .unwrap().unwrap().work().unwrap();
+        assert_eq!(work.actual_proposals, 0);
+        assert!(work.attempts.iter().all(Option::is_none));
+        assert!(grammar_overlap::needed(&states, &[0], &[Some(vec![8, 9])], false));
+        states[0].grammar_runtime = None;
+        for collect_work in [false, true] {
+            assert!(!grammar_overlap::needed(&states, &[0], &anchor_only, collect_work));
+        }
+    }
+
     fn greedy(token: u32) -> Qwen35JointRowOutput {
         Qwen35JointRowOutput {
             greedy_token: Some(token),
@@ -1351,6 +1474,7 @@ mod tests {
                 &window,
                 &[9, 10, 55],
                 vec![greedy(9), greedy(10), greedy(11), greedy(12)],
+                None,
             )
             .expect("plan DFlash2 rejection");
         assert_eq!(
@@ -1379,6 +1503,7 @@ mod tests {
                 &window,
                 &[9, 10, 11],
                 vec![greedy(9), greedy(10), greedy(11), greedy(12)],
+                None,
             )
             .expect("plan DFlash2 full acceptance");
         assert_eq!(
@@ -1415,6 +1540,7 @@ mod tests {
                     greedy(99),
                     greedy(99),
                 ],
+                None,
             )
             .expect("plan selected GPU DFlash2 rows");
         assert_eq!(
@@ -1462,6 +1588,7 @@ mod tests {
                 &window,
                 &[9, 63, 11],
                 vec![greedy(9), greedy(63), greedy(11), greedy(12)],
+                None,
             )
             .expect("plan DFlash2 terminal draft");
         assert_eq!(plan.plan.output.into_iter().collect::<Vec<_>>(), [9]);
@@ -1494,6 +1621,7 @@ mod tests {
                     logits(11, qwen.vocab_size),
                     logits(12, qwen.vocab_size),
                 ],
+                None,
             )
             .expect("plan DFlash2 logprob rejection");
         assert_eq!(
@@ -1501,5 +1629,41 @@ mod tests {
             [9, 10, 11]
         );
         assert_eq!(plan.plan.valid_input_tokens, 3);
+    }
+
+    #[test]
+    fn ordinary_plan_check_requires_recording_and_deterministic_sampling() {
+        let qwen = loaded_model(QwenSpeculationPolicy::Off);
+        let eos = qwen.eos_token_ids[0];
+        for (record, temperature, expected_rows) in [
+            (true, 0.0, Some(1)), (false, 0.0, None), (true, 0.6, None),
+        ] {
+            let mut state = decode_state(&qwen, 2);
+            state.params.temperature = temperature;
+            let grammar = crate::serve::api::grammar::parse("root ::= \"a\"*\n").unwrap();
+            let root = grammar.rule_id("root").unwrap();
+            state.params.grammar = Some(grammar.clone());
+            state.grammar_runtime =
+                Some(crate::serve::api::grammar::GrammarRuntime::new(grammar, root).unwrap());
+            state.params.token_bytes = Some(std::sync::Arc::new(
+                crate::serve::api::token_text::token_bytes_table(&qwen.tokenizer, qwen.vocab_size),
+            ));
+            let prepared = state.prepare_dflash2_grammar(&qwen, &[], record)
+                .unwrap();
+            let window = Qwen35DFlash2Window {
+                pending_token: 8, position: 4, greedy: false,
+                maximum_rows: 1, decisions: DecisionRoute::HostLogits,
+            };
+            let mut values = vec![f32::NEG_INFINITY; qwen.vocab_size];
+            values[eos as usize] = 0.0;
+            let row = Qwen35JointRowOutput {
+                greedy_token: None, logits: Some(values), nextn_hidden: None, decision: None,
+            };
+            let plan = state.plan_selected_dflash2_window(
+                &qwen, &window, &[8], vec![row], prepared,
+            ).unwrap();
+            assert!(plan.plan.terminal_after_pending);
+            assert_eq!(plan.grammar_ordinary_checked_rows, expected_rows);
+        }
     }
 }

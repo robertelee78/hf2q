@@ -4,7 +4,7 @@
 - **Status:** Accepted; implementation authorized for the v0.1.30 program
 - **Decider:** Robert E. Lee (product owner), 2026-11-10
 - **Scope:** every enabled hf2q text-generation architecture; Qwen3.8 is the first qualified checkpoint
-- **Updated:** 2026-11-16 — separate BF16 checkpoint accuracy from complete native-AF4 conformance; retain task quality, transactional state, memory, stock/peer performance and RC requirements.
+- **Updated:** 2026-11-22 — record registered D4 active consumed verifier-body overlap, persistent same-row ordinary comparisons, exact task/prefix proof and independently audited unprofiled observations; numerical, family and release qualification remain open.
 
 ## Problem
 
@@ -2015,6 +2015,239 @@ Complete source/build/raw-stream/safety/comparison proof SHA256:
   than inferring it from command count.
 - Add decode-debt scheduling only as a separately attributed experiment after
   D1-D3 pass. It must not obscure drafter/verifier attribution.
+
+#### D4 grammar-projection candidate (2026-11-22)
+
+The Qwen DFlash2 scheduler now supplies useful grammar work to the target's
+output-head submission boundary. At most seven actual proposals per lane are
+simulated without sampling or mutating the live output ledger, repetition
+history, RNG or thinking budget. A matching canonical prefix moves its prepared
+post-accept, pre-tool-trigger grammar snapshots into the ordinary semantic path;
+a mismatch discards the remainder, and a grammar-invalid proposal truncates the
+projection. Real decoder, tool-trigger and budget observation retain their
+existing order. The canonical greedy ranked-validity and probabilistic full-mask
+samplers are unchanged.
+
+The asynchronous draft command, including an adopted prefetch, stays owned until
+its actual checked completion before CPU proposal access. Same-queue submission
+order alone does not authorize an early host read. The target invokes borrowed
+host work after submission and before checked completion/readback; preparation
+errors are retained until that boundary. Grammar-free steps allocate or copy no
+projection state and keep the existing target completion path. Both native
+command-buffer and dispatch profiling preserve the checked synchronous path and
+emit an explicit no-overlap marker instead of pretending to measure overlap.
+This uses published `mlx-native 0.24.0`, without a local patch.
+
+A source-bound dirty integration snapshot passed 20 focused checks:
+eight grammar/semantic edge cases, eight existing window/candidate plan cases,
+and four real synthetic-Metal producer/prefetch cases. The latter read through
+the checked producer API rather than an artificial later-command flush. The
+initial unused-mutable test-binding compilation failure is retained separately.
+The source review found no concrete defect in either the semantic or
+submission/ownership slice. Evidence namespace:
+`d4-grammar-overlap-implementation-v1/focused-tests-v2`.
+
+Reproduce these focused contracts with locked dependencies:
+
+```sh
+cargo test --release --locked --bin hf2q dflash2_grammar
+cargo test --release --locked --bin hf2q dflash2_scheduler
+cargo test --release --locked --bin hf2q draft_prefetch
+```
+
+These checks are not D4 acceptance. Actual useful CPU/GPU interval overlap,
+full-cycle overhead, realistic unary/SSE/tool-result continuation and
+cancellation/rollback on the exact candidate remain required. Callback invocation
+or command counts do not establish overlap. The current peer also synchronizes
+before grammar sampling; this candidate is not evidence that peer grammar
+overlap explains a measured speed gap. No D0-D6, C2, quality, fairness, memory,
+performance, default-promotion or release gate is waived.
+
+#### D4 first real cohort and measurement scopes (2026-11-22)
+
+The single corrected-eligibility diagnostic used production image
+`5c4c114bce45f242b28aea06d42571bc7ac4c65e` and harness
+`5b00230f9bbf8b48b63e0d4bc36ee0a8ec4dff28`, with published
+`mlx-native 0.24.0` on the 128 GiB M5 Max. The existing Qwen3.8 27B artifact
+SHA256 was `cf0eb0103c1ffe7b3702670aa794a669bafbe328b95e892268305dd87c2c30d7`;
+the pinned drafter was `qwen38-27b-dflash2-50307d4c`. The unchanged canonical
+cohort used four slots, context 262144 per slot, a 48 GiB shared KV budget,
+vision off, TQ defaults, auto/pinned-pair/full selection, output cap 8192,
+repetition penalty 1.05 as f32, and thinking/tool-thinking budgets 2048/512.
+The registered 28-request unary/SSE/tool cohort completed with
+`CalibrationPass`, strict/raw replay and native cleanup proven, normal pressure
+and zero swap growth. Client protocol completion still awaits independent task
+quality review; it is not model, D4 or release qualification.
+
+The registered consumer selected **only the output-head GPU interval**. All
+328 closed records were valid, but none overlapped the source-defined useful
+grammar span. In every cycle CPU grammar work ended before that head started.
+The registered head-window hypothesis is therefore not proved. Its result and
+the consumed one-attempt/no-retry budget remain unchanged.
+
+An explicitly **post-hoc** analysis of the same immutable bytes instead
+intersected the union of exact-labelled embedding/joint-layer/output-head GPU
+commands committed inside the verifier phase. It found intersections in
+327/328 cycles, totaling 16.185 ms against 16.217 ms of recorded grammar spans.
+This uses actual interval unions, never the envelope across GPU gaps, and never
+counts the separate native `kernel_start`/`kernel_end` fields as GPU execution.
+Source review confirms these layer command buffers belong to the target
+verifier, and submission does not mean immediate GPU execution. The request
+bytes and serving source establish installed request-local lazy tool grammars;
+server-default `grammar.active: false` does not describe their activation.
+However, these clocks do not count actual nonempty proposal preparation,
+active-versus-awaiting grammar work, successful transitions or matching-prefix
+consumption. Before claiming useful consumed grammar overlap, retain those
+per-lane/per-cycle counts at the preparation and `take_transition` consumer
+sites, distinguishing hypothetical planning from live output observation.
+Ordinary-path runtime semantic comparison remains independent evidence.
+This exploration cannot relabel the failed registered head test, establish a
+speedup, or waive any qualification gate. No extra model run or comparison arm
+was authorized by changing scope. No native API change is justified by these
+intervals alone.
+
+Retained evidence namespace: `d4-grammar-overlap-implementation-v1/runtime-t2-v1`.
+`head-window-result.json` SHA256:
+`e5f53a2e29c56ca0fb6dde6de8e8a62f9c983d70c4d304ab1c4ae2128bbec96c`.
+Original timeline SHA256:
+`591f8f0c742c53f0b05b095801ea9fe9ab3ade29e25b4eba3d4df48668e0e53a`.
+The report, registration, source/image/descriptor bindings and original
+receipts are retained; they are not committed model artifacts. All earlier
+readiness failures and stopped comparison attempts remain failures/stopped.
+
+Subsequent independent offline audit passed all 28 actual unary/SSE exchanges,
+24 tool calls and four fixture fixes, with all six tool-result continuations per
+agent preserved. The unchanged raw auditor also passed its required client
+co-progress width of four; this is not physical same-forward membership.
+The engine-free exact N4 prefix oracle then passed all 28 archived wires using
+the actual Qwen3.8 GGUF serving-builder tokenizer, truncation disabled, and its
+embedded template, matching the original runtime fingerprints without repinning.
+Its `PassedExactAllArchivedWires` result SHA256 is
+`f0f8551027f0003b61d1b41ae6f7425a29505d7a86d670e21e31e1a1830fea10`
+in `d4-grammar-overlap-implementation-v1/t2-exact-prefix-post-oracle-v1`.
+Original summary/readiness/calibration bytes remain unchanged. This adds task
+protocol, fixture-correctness and exact prefix evidence, not a distinct-instance
+quality campaign, ordinary-path runtime parity or model/release qualification;
+no new model inference was performed for these offline checks.
+
+#### D4 per-proposal work-observation candidate (2026-11-22)
+
+The opt-in cycle timeline now records `hf2q.dflash2.grammar_work.v1`: actual
+proposal counts by physical slot, the request-local awaiting-trigger state, and
+each attempted proposal's invalid/prepared/planning-consumed/divergence-discarded
+disposition. Lane-contained native-clock proposal spans identify the operation
+being measured. Only an actual token-and-generated-length match in
+`take_transition` records consumption; RouteCheck exports its authoritative host
+plan, not the diagnostic candidate clone. These are hypothetical planning
+snapshots, not early mutation or replacement of live output observation.
+
+`scripts/four_agent/d4_grammar_overlap.py` requires the original capture SHA256
+and an explicit head or target-verifier-body scope. It intersects GPU interval
+unions with each active, actually consumed proposal's own preparation span:
+an overlapping lazy-tracking, invalid, unused or discarded span cannot qualify
+another transition. Clock spans do not prove uninterrupted CPU residency or GPU
+occupancy. The recorder perturbs diagnostics; it does not measure unprofiled
+speedup. Grammar-free preparation still returns before projection/state copying.
+
+Initial focused checks passed: 11 grammar semantics/work-disposition tests,
+8 existing scheduler-plan regressions, and 25 strict consumer tests. Both CLI
+scopes also accepted the unchanged 328-cycle T2 bytes as interval-only evidence
+with all useful-work metadata missing; neither supplied consumed-work evidence
+nor changed the rejected head verdict. Native test ownership/cleanup and source
+checks passed without retaining a lease. At that checkpoint, a fresh registered
+real capture, ordinary-path runtime semantic comparison and full-cycle
+overhead/quality gates were still required; no native dependency changed.
+
+Independent source review then found two diagnostic contract defects: an
+all-anchor grammar cohort was gated out of zero-work observation, and the
+consumer accepted work totals contradicting active-lane/selected-row capacity.
+Both were repaired without changing disabled or grammar-free preparation.
+The focused scheduler suite passed 9 tests, including the anchor-only regression;
+the strict consumer passed 28 tests, including each contradictory-budget case.
+Both source findings were closed on review. The first repair test build's
+unused mutable fixture binding failed compilation; its receipt is preserved,
+the binding was corrected without suppressing warnings, and no test/model pass
+was inferred from that failure. These source repairs authorize no model trial.
+
+#### D4 same-row ordinary-planning diagnostic (2026-11-22)
+
+The timeline-only deterministic diagnostic retains one independent ordinary
+semantic state from the start of each window. Every canonical row compares
+projected observation with the unchanged `prepared=None` path on the same
+actual logits/argmax, preserving the ordinary state across rows. Recloning it
+from projected state at each row would mask late snapshot-state divergence.
+A mismatch fails the window before commit; it never selects a fallback.
+
+Pristine logit copies occur only on this diagnostic path. No target verifier
+graph, native API or default sampler changes. The authoritative host plan
+counts successful paired rows in `grammar_ordinary_checked_rows`, a separate
+four-physical-slot array. The RouteCheck candidate cannot supply these counts.
+Missing/noneligible counters remain unproved. Counts require observed work
+lanes and fit proposal-plus-anchor bounds, independently of consumed proposals.
+
+Focused checks passed 13 grammar tests, including late poisoned-snapshot
+detection and mismatch/lazy-trigger/forced-budget/EOS sequences; 10 scheduler
+tests, including deterministic/recording eligibility; and 35 strict consumer
+tests. A synthetic CLI capture reported paired rows without claiming runtime
+parity. Native ownership/source/cleanup checks passed without retaining a lease.
+These are CPU/synthetic proofs, not an exercised real-model comparison.
+
+This finite behavioral/window comparison is not structural grammar equivalence,
+probabilistic equality, natural reuse, unprofiled performance or release
+acceptance. The existing cohort-replay client's altered warm anchors cannot be
+called a natural continuation. The following actual capture exercises this
+diagnostic; full-cycle quality/performance qualification remains separate.
+
+#### D4 registered verifier-body observation (2026-11-22)
+
+The separately registered T3 run used source `8fd0f030a4fc53bd4912c645d9a83034142752bb`
+and the original full 262144-context, four-slot, 48 GiB KV configuration.
+Its 328 finished cycles contain 66 cycles with active, planning-consumed
+proposal preparation overlapping exact same-cycle verifier-body GPU unions:
+5.242624974926002 ms total. This excludes lazy tracking, unused preparation,
+invalid attempts and gaps between GPU commands. The same physical lane/cycle
+join contains 154 positive lane observations and 1,101 ordinary-checked rows;
+the complete capture records 6,337 successful persistent paired decisions.
+No missing counters, dropped commands/marks or forced-sync cycles were accepted.
+Output-head overlap remains zero; the rejected T2 head verdict is unchanged.
+
+Independent actual-data review binds the source, image, target/drafter payloads,
+full-profile readiness, normal pressure, zero swap and proven owned cleanup.
+The 28-request cohort passes the independent unary/SSE/tool/fixture audit and
+the exact all-archived-wire prefix oracle. These are finite observed behaviors,
+not structural grammar equivalence, future-state identity or a speedup.
+The [source-bound decision](https://github.com/robertelee78/hf2q/issues/866#issuecomment-7084955926)
+records the evidence and limits.
+
+A separate four-attempt unprofiled baseline/candidate/candidate/baseline screen
+passed independent actual task/work and operating/timing review. Each cohort
+has identical corresponding semantic/tool work and 46,981 prompt, 40,646 cached,
+6,337 completion and 3,234 reasoning tokens; all four exact-prefix proofs pass.
+
+| Arm | Path | Own-output four-task makespan, seconds |
+|---|---|---:|
+| A1 | Ordinary baseline | 30.003391 |
+| B1 | Grammar projection candidate | 29.462687 |
+| B2 | Grammar projection candidate | 29.811292 |
+| A2 | Ordinary baseline | 29.785206 |
+
+The descriptive adjacent candidate/baseline ratios are 0.9819785704 and
+1.0008758039, with geometric ratio 0.9913821619. All original full-profile,
+normal-pressure/zero-swap, profiling-omission, source, spacing, disk and owned
+cleanup checks pass. Per-turn semantic streamed TTFT and observed prefill/decode
+records are retained; absent metrics are not invented. Instrumented T3 is not
+a wall-time denominator. Two pairs establish no statistical win, confidence
+interval, speedup or family/release acceptance.
+
+The immutable compiled-source evidence accidentally retains its parent's
+`required_compiled_source_stamp` annotation. Actual build argv and adapter bind
+`8fd0f030`, and its compiler inputs/image match; the stale annotation is not
+runtime attestation and is preserved/disclosed, not silently rewritten.
+Whole D4, family quality/performance, D3/D5/D6 and release qualification remain
+open. All T/T2/T3 and four-arm budgets are closed; none transfers to another run.
+
+
+
 
 #### D2-D4 implementation-candidate status
 

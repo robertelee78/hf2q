@@ -5962,6 +5962,9 @@ pub(in crate::serve::api) mod anchor_store;
 pub(crate) mod anchor_exactness_tests;
 #[path = "engine_qwen35/critical_path.rs"]
 pub(in crate::serve::api) mod critical_path;
+#[path = "engine_qwen35/dflash2_grammar.rs"]
+mod dflash2_grammar;
+pub(in crate::serve::api) use dflash2_grammar::PreparedDFlash2Grammar;
 #[path = "engine_qwen35/dflash2_scheduler.rs"]
 mod dflash2_scheduler;
 pub(in crate::serve::api) use dflash2_scheduler::{
@@ -6322,7 +6325,7 @@ impl Qwen35SpecSemanticState {
         params: &SamplingParams,
         logits: &mut [f32],
     ) -> Result<Qwen35CanonicalDecision> {
-        self.select_and_observe_from(qwen, params, Qwen35DecisionSource::Logits(logits))
+        self.select_and_observe_from(qwen, params, Qwen35DecisionSource::Logits(logits), None)
     }
 
     /// The canonical decision from `source`, then its observation. A forced
@@ -6333,6 +6336,7 @@ impl Qwen35SpecSemanticState {
         qwen: &Qwen35LoadedModel,
         params: &SamplingParams,
         source: Qwen35DecisionSource<'_>,
+        prepared: Option<&mut PreparedDFlash2Grammar>,
     ) -> Result<Qwen35CanonicalDecision> {
         let forced = self
             .thinking_budget
@@ -6357,12 +6361,18 @@ impl Qwen35SpecSemanticState {
         #[cfg(test)]
         let token = anchor_exactness_tests::trace::decision_for(
             self.observer_slot, params.c2_ticket.as_deref(), self.generated_tokens.len(), token)?;
-        advance_qwen35_grammar(
-            &mut self.grammar_runtime,
-            params,
-            &qwen.eos_token_ids,
-            token,
-        )?;
+        if let Some(runtime) = prepared.and_then(|prepared| {
+            prepared.take_transition(token, self.generated_tokens.len())
+        }) {
+            self.grammar_runtime = Some(runtime);
+        } else {
+            advance_qwen35_grammar(
+                &mut self.grammar_runtime,
+                params,
+                &qwen.eos_token_ids,
+                token,
+            )?;
+        }
         let terminal = qwen.eos_token_ids.contains(&token)
             || qwen35_grammar_terminal_token(self.grammar_runtime.as_ref(), params, token);
         if terminal {

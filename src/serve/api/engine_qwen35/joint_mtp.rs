@@ -275,7 +275,7 @@ impl Qwen35DecodeState {
                         .context("Qwen joint MTP row returned no logits")?,
                 )
             };
-            semantic.select_and_observe_from(qwen, &self.params, source)
+            semantic.select_and_observe_from(qwen, &self.params, source, None)
         })
         .map(|plan| Qwen35JointMtpPlan { plan })
     }

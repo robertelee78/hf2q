@@ -164,22 +164,6 @@ fn draft(
                     draft.repetition.as_ref(),
                 )
                 .unwrap();
-            // A command that reads a draft output is ordered behind the
-            // draft, as the target's embedding command is in a served step.
-            let sink = device.alloc_buffer(4, DType::F32, vec![1]).unwrap();
-            let mut flush = device.command_encoder().unwrap();
-            mlx_native::ops::copy::dispatch_copy_f32(
-                &mut flush,
-                registry,
-                device.metal_device(),
-                &runtime.workspace.confidence,
-                &sink,
-                0,
-                0,
-                1,
-            )
-            .unwrap();
-            flush.commit_and_wait().unwrap();
         }
     }
     outputs(runtime)

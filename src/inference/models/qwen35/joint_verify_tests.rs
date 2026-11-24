@@ -973,6 +973,7 @@ fn dflash_verify_forward(
             arm.dense_ffn,
             arm.options,
             Some(capture),
+            None,
         )
         .unwrap_or_else(|error| panic!("{label}: DFlash2 verify: {error:#}"));
     let super::Qwen35JointVerify {

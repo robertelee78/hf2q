@@ -203,6 +203,12 @@ Placeholders are written `{NAME}` and are filled from three sources:
 - `env(1)` and shell `-c` strings are refused. A shell is accepted only when its first argument is an absolute script path; the family launchers are run as `/bin/bash <repo>/scripts/serve_<family>_opencode.sh`.
 - `client.approval.set` overwrites keys of the operator's approval template after launch. A value that is exactly one placeholder keeps its type, so `server_pid` stays an integer. `{"sha256_of": [paths]}` becomes a `{basename: sha256}` map.
 
+The supervisor receipt records `run_identity` (`run_id`, `nonce32`) even when
+readiness fails before client approval exists. Together with the pinned case,
+interpreter and environment, it permits exact `plan_sha256` replay without
+fabricating an approval packet. This identity is not proof of client execution
+or a passing run; stop, sampling and cleanup evidence still require validation.
+
 The example cases follow the existing runners:
 - They use the canonical launchers with explicit text-only, four-slot settings.
 - They use the checked-in four-agent client `qwen_n4_live_smoke.py`, with `--family qwen`, `gemma4` or `deepseek4`.
@@ -884,6 +890,38 @@ the actual directories, summary and raw receipts for each of the four agents. A
 `PassedExactAllArchivedWires` result proves exact prefix/usage acceptance, not
 patch quality, model performance or release qualification. The existing dense
 seven-turn N1 oracle remains separate and unchanged.
+
+### DFlash2 grammar overlap diagnostic
+
+`HF2Q_DFLASH2_CYCLE_TIMELINE` captures actual proposal work per physical slot
+(`hf2q.dflash2.grammar_work.v1`). Repeated lane-contained proposal spans join
+awaiting/active grammar state to final invalid, prepared, planning-consumed or
+divergence-discarded outcomes. Consumption means matching hypothetical planning,
+not advancement of the live output ledger.
+
+```bash
+python3 scripts/four_agent/d4_grammar_overlap.py "$TRACE" \
+  --expected-sha256 "$ORIGINAL_SHA256" --scope target-verifier-body
+```
+
+Use `--scope head` for the output head alone. Declare the scope before a new
+model experiment; choosing another scope afterward cannot rescue a failed
+registered head test. The analyzer uses actual GPU interval unions, not the
+envelope across gaps or CPU-driver `kernel_start/end` fields. Only each active,
+actually consumed transition's own preparation span supplies useful-work
+interval evidence. Old captures without work metadata stay interval-only.
+Malformed or incomplete captures fail closed. Source/binary/model bindings,
+registration, ordinary-path runtime parity and unprofiled quality/performance
+remain separate requirements; the instrumented recorder is not zero-overhead.
+
+With deterministic sampling, timeline collection also compares each projected
+canonical decision against a persistent ordinary semantic state on the same
+pristine verifier row. A mismatch fails before window commit. The separate
+`grammar_ordinary_checked_rows` array counts successful comparisons by physical
+slot; null or missing counters are unclaimed. The analyzer validates matching
+work lanes and proposal-plus-anchor bounds, but recorded counts alone do not
+authenticate runtime parity. This comparison adds CPU planning work and must
+not be used as an unprofiled performance control.
 
 ## Three-arm speed campaign (ADR-063 Q3)
 
