@@ -538,6 +538,18 @@ offline consumer require this separately bound replacement authority. The failed
 attempt and original C23 budget remain unchanged; no further retry or gate
 relaxation is authorized.
 
+The replacement also stopped on compressor growth, with normal pressure, no
+swap, and about 34.5 GiB of Free plus cached memory still available. It remains
+a consumed failed load, not a calibration receipt or evidence of RAM exhaustion.
+The operator subsequently directed capacity-based protection: use available
+RAM, rather than aborting on compression alone. The diagnostic supervisor MUST
+record compression while retaining critical-pressure, swap, measured reaction
+headroom, own calibrated-cap, telemetry, ownership and cleanup stops. Warning
+pressure is recorded, not a stop, matching ADR-063 Q5. Any changed observer
+requires a fresh measured stop-latency control before admission. This policy
+correction does not refund either load, authorize another replacement, relax the
+numerical envelope, or make a partial calibration usable.
+
 The test-only fresh packet's optional `localization` binding records the actual
 folded anchor image at lane 2 / turn 1, actual K4 restoration and admission lineage
 at turn 3, and all common logical rows `[914, 1923)`. K1 must report no restoration.

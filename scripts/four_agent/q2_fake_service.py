@@ -262,6 +262,10 @@ class FakeService:
         turn = sum(1 for m in messages if m["role"] == "assistant")
         fault = self.fault(agent, turn)
         with self.state:
+            # Record receipt before writing: an identity rejection can close the stream immediately.
+            received = {"agent": agent, "turn": turn, "accepted_ns": accepted, "started_ns": started,
+                        "stream": bool(request.get("stream"))}
+            self.requests.append(received)
             self.counter += 1
             rid = f"chatcmpl-{uuid.uuid4().hex}"
             if fault == "reused_response_id":
@@ -345,8 +349,7 @@ class FakeService:
             handler.wfile.write(payload)
         handler.close_connection = True
         with self.state:
-            self.requests.append({"agent": agent, "turn": turn, "accepted_ns": accepted, "started_ns": started,
-                                  "finished_ns": clock_ns(), "stream": bool(request.get("stream"))})
+            received["finished_ns"] = clock_ns()
 
     def splash_record(self, request, usage):
         """Splash's Started/Done lines and the turn's render key; returns the reply's created/metrics/timings."""

@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Upgrade the locked URL parser to 2.5.9 for the published security fix. Model-free adversarial HTTP controls record request receipt before sending a response, so an immediate SSE identity rejection cannot race the retained request evidence.
+
 - ADR-065 E1 analysis rejects native-profiled wall controls and requires source-proven omission for empty profiling settings. Historical profile/wall ratios do not qualify unprofiled observer distortion; raw diagnostics and exact-transcript evidence are retained.
 - C2 divergent-history clients now admit the designed K1 cold control only on a real, current-turn pinned history edit under an observed, source-bound K1 configuration. Unchanged follow-ups and K4 still require positive reuse; unary/SSE and independent raw replay share that rule. Startup, approval and lineage evidence remain mandatory, and no memory, numeric, quality or performance gate is relaxed.
 
