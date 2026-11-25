@@ -1,6 +1,9 @@
 //! Engine-free replay of every canonical N4 wire, including authorized repairs.
 use super::*;
 
+#[path = "handlers_prefix_post_oracle_c2_tests.rs"]
+mod c2;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct N4Config {
@@ -144,6 +147,10 @@ fn qwen_n4_exact_prefix_post_oracle() {
     let config_bytes =
         std::fs::read(std::env::var("HF2Q_N4_PREFIX_POST_ORACLE_CONFIG").unwrap()).unwrap();
     let config: N4Config = serde_json::from_slice(&config_bytes).unwrap();
+    run_n4(&config_bytes, config, None);
+}
+
+fn run_n4(config_bytes: &[u8], config: N4Config, context: Option<c2::C2Context>) {
     assert_eq!(config.template_source, "GgufEmbedded");
     assert_eq!(config.agents.len(), 4, "all four agents required");
 
@@ -262,6 +269,9 @@ fn qwen_n4_exact_prefix_post_oracle() {
             "recorded readiness document differs"
         );
     }
+    let c2_binding = context.as_ref().map(|context| {
+        c2::validate_context(context, &config, &case, &approval, &calibration, &runtime, &summary)
+    });
     let mut initial_histories = std::collections::HashSet::with_capacity(4);
     let mut agents = serde_json::Map::new();
     let mut wire_count = 0;
@@ -328,22 +338,26 @@ fn qwen_n4_exact_prefix_post_oracle() {
         );
         let summary_turns = actual["turns"].as_array().unwrap();
         assert_eq!(turns.len(), summary_turns.len(), "omitted actual wire");
+        if context.is_some() {
+            assert_eq!(agent_approval["c2_observation_sources"], approval["c2_observation_sources"]);
+        }
         validate_agent_archive(&archive.join(id), turns, repair_grant);
-        let observations = replay_qwen_prefix_turns(
-            &tokenizer,
-            template,
-            &snapshot["model_id"],
-            &registration,
-            turns,
-            Some(summary_turns),
-        );
+        let observations = if let Some(context) = &context {
+            c2::replay(context, &tokenizer, template, &snapshot["model_id"],
+                &registration, turns, summary_turns, actual, &agent_approval)
+        } else {
+            replay_qwen_prefix_turns(
+                &tokenizer, template, &snapshot["model_id"], &registration,
+                turns, Some(summary_turns),
+            )
+        };
         wire_count += observations.len();
         agents.insert(id.to_owned(), json!({"observations":observations}));
     }
     assert!(config.output.is_absolute());
     let parent = config.output.parent().unwrap().canonicalize().unwrap();
     assert!(parent.ancestors().all(|path| !path.join(".git").exists()));
-    let output = json!({
+    let mut output = json!({
         "schema":"hf2q.qwen-n4-prefix-post-oracle.v1",
         "full_prefix_reuse":"PassedExactAllArchivedWires",
         "model_inference_performed":false,
@@ -370,6 +384,13 @@ fn qwen_n4_exact_prefix_post_oracle() {
         "measurement_source_sha256":hash(include_bytes!("measurement.rs")),
         "agents":agents
     });
+    if let Some(binding) = c2_binding {
+        output["schema"] = json!("hf2q.qwen-n4-c2-prefix-post-oracle.v1");
+        output["full_prefix_reuse"] = json!("PassedExactAllArchivedC2Wires");
+        output["scope"] = json!("C2 archived rendered stable-prefix and observed cached-token bounds only; not cache/state bitwise, Class A, performance, task quality, or full C2 qualification");
+        output["c2"] = binding;
+        output["c2_oracle_source_sha256"] = json!(hash(include_bytes!("handlers_prefix_post_oracle_c2_tests.rs")));
+    }
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
