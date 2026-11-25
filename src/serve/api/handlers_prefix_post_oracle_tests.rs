@@ -211,6 +211,20 @@ fn replay_qwen_prefix_turns(
     turns: &[Turn],
     summary_turns: Option<&[Value]>,
 ) -> Vec<Value> {
+    replay_qwen_prefix_turns_with(tokenizer, template, model_id, registration, turns, summary_turns, None)
+}
+
+type PrefixObserver<'a> = dyn FnMut(usize, &Value, &[u32], &[u32], &Value) -> Value + 'a;
+
+fn replay_qwen_prefix_turns_with(
+    tokenizer: &tokenizers::Tokenizer,
+    template: &str,
+    model_id: &Value,
+    registration: &registry::ModelRegistration,
+    turns: &[Turn],
+    summary_turns: Option<&[Value]>,
+    mut observer: Option<&mut PrefixObserver<'_>>,
+) -> Vec<Value> {
     if let Some(summary) = summary_turns {
         assert_eq!(summary.len(), turns.len(), "every actual wire is required");
     }
@@ -313,14 +327,24 @@ fn replay_qwen_prefix_turns(
         let p_tokens = tokenize_http_prompt(tokenizer, &p).unwrap();
         let s_tokens = tokenize_http_prompt(tokenizer, &s).unwrap();
         assert!(p_tokens.len() <= 262144 - 8192, "no overflow rewrite admissible");
-        let cached = accept_prefix(
-            &p_tokens,
-            &s_tokens,
-            previous_stable.as_deref(),
-            &receipt["usage"],
-        )
-        .unwrap_or_else(|reason| panic!("turn {index}: {reason}"));
-        observations.push(json!({"turn":index,"request_sha256":hash(&wire),"receipt_sha256":hash(&receipt_bytes),"prompt_tokens":p_tokens.len(),"stable_tokens":s_tokens.len(),"excluded_generation_cue_tokens":p_tokens.len()-s_tokens.len(),"prior_stable_tokens":previous_stable.as_ref().map(Vec::len),"cached_tokens":cached,"prompt_token_ids_sha256":hash(&serde_json::to_vec(&p_tokens).unwrap()),"stable_token_ids_sha256":hash(&serde_json::to_vec(&s_tokens).unwrap()),"rendered_sha256":hash(p.as_bytes()),"enable_thinking":thinking,"resolved_kwargs":kwargs}));
+        if observer.is_some() {
+            assert!(p.starts_with(&s), "C2 stable rendering is not an exact byte prefix");
+        }
+        let detail = observer.as_mut().map(|observe| {
+            observe(index, &request_value, &p_tokens, &s_tokens, &receipt["usage"])
+        });
+        let cached = if let Some(detail) = &detail {
+            usize::try_from(detail["cached_tokens"].as_u64().unwrap()).unwrap()
+        } else {
+            accept_prefix(&p_tokens, &s_tokens, previous_stable.as_deref(), &receipt["usage"])
+                .unwrap_or_else(|reason| panic!("turn {index}: {reason}"))
+        };
+        let mut observation = json!({"turn":index,"request_sha256":hash(&wire),"receipt_sha256":hash(&receipt_bytes),"prompt_tokens":p_tokens.len(),"stable_tokens":s_tokens.len(),"excluded_generation_cue_tokens":p_tokens.len()-s_tokens.len(),"prior_stable_tokens":previous_stable.as_ref().map(Vec::len),"cached_tokens":cached,"prompt_token_ids_sha256":hash(&serde_json::to_vec(&p_tokens).unwrap()),"stable_token_ids_sha256":hash(&serde_json::to_vec(&s_tokens).unwrap()),"rendered_sha256":hash(p.as_bytes()),"enable_thinking":thinking,"resolved_kwargs":kwargs});
+        observation["stable_rendered_sha256"] = json!(hash(s.as_bytes()));
+        if let Some(detail) = detail {
+            observation["c2"] = detail;
+        }
+        observations.push(observation);
         previous_stable = Some(s_tokens);
     }
     observations

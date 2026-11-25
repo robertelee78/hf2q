@@ -639,6 +639,34 @@ SHA-bound outer manifest's recorded repository directory, not the instrumented
 diagnostic checkout. The exact recorded argv and environment checks remain
 mandatory; moving the observer does not rewrite historical execution provenance.
 
+### 8.10 Engine-free archived C2 prefix replay
+
+After server unload, run
+`serve::api::handlers::prefix_post_oracle_tests::n4::c2::qwen_n4_c2_exact_prefix_post_oracle`
+with `HF2Q_N4_C2_PREFIX_POST_ORACLE_CONFIG`. Its closed packet retains the N4
+tokenizer, template, readiness, calibration, summary and per-turn request/receipt
+bindings, plus the C2 case, approval, original server log, compiled-source and
+image-metadata bindings, expected subject commit, anchor depth and divergent-edit
+workload identifier.
+
+The expected commit, full source manifest and actual production-image build
+record must agree, including the reviewed published-native 0.24.0 pin and the
+calibration's exact executable path/digest. No release commit or image digest is
+hard-coded into acceptance. The separate test executor must match the subject's
+compiled production rendering/tokenizer/schema/Cargo source components; it is
+not identified as the production executable and performs no model inference.
+It reconstructs the real unary/SSE assistant messages, tool results and pinned
+turn-3/5 edits, then tracks bounded stable-prefix lineage and cursor pruning.
+Observed startup depth, not a requested environment flag, controls K1's edit-only
+cold allowance. Ordinary follow-ups and repair tails still require positive
+reuse. Every original wire is mandatory, including the declared ragged
+Qwen3.6 repair cohort. Existing append-only oracle acceptance is unchanged.
+
+The fresh external proof covers rendered stable-prefix and observed cached-token
+bounds only. It does not prove cache/hidden-state bitwise equality, Class A,
+task quality, timing or complete C2 acceptance, and cannot qualify another
+source/image by relabeling these archived results.
+
 ## 9. Risks and non-goals
 
 | ID | Risk | Mitigation |
