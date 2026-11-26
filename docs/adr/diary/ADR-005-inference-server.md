@@ -10536,3 +10536,36 @@ full_attn_bytes_breakdown_tq_on_drops_f32` invocation.
 (prefill 1.24×, decode 1.29× vs peer-FA) are operator-driven re-bench with
 no CI gate — re-verification on quiet hardware with documented commands is
 scheduled after the 0.1.7 release window as its own task.
+
+## 2026-11-26 — tool-result template inputs remain OpenAI-shaped
+
+The production Ara GGUF's embedded Gemma template (SHA256
+`2dfbfc7d538912f4ea11d29d85b4e25d7bc26386e53f57529f1d707c28b5828c`,
+also the checked-in `gemma4-apex-embedded-chat-template.jinja` fixture) renders
+both `tool_responses` and `content` when both are supplied. The API renderer
+injected the former while retaining the latter, duplicating every tool result.
+The frozen peer `2cbfc3cf34f94c8ada67eb8766efe7374a3d2db6` instead passes
+OpenAI-shaped messages through its Gemma direct-template path.
+
+A CPU-only reconstruction using the exact GGUF vocabulary/merges and retained
+production requests reproduced the observed prompt-token counts:
+
+| Turn | hf2q with synthetic envelope | Raw OpenAI / observed peer |
+| --- | ---: | ---: |
+| Initial | 465 | 465 |
+| After first file read | 550 | 516 |
+| After second file read | 910 | 703 |
+
+Remove the synthetic `tool_responses` field and its id-to-name map, superseding
+the response-envelope part of iter-133 and iter-229 decision 5. Preserve the
+actual `role`, `content`, `tool_call_id`, and optional `name`; the selected
+native template owns response framing and name resolution. Object-argument
+normalization, reasoning handling, and the dedicated DeepSeek encoder are
+unchanged. No compatibility envelope or opt-in switch replaces the removed
+field.
+
+Retire tests that only echo the removed field. Replace the Gemma golden that
+pinned duplicate payloads with assertions for one result payload and the proper
+native continuation boundary; retain official-Gemma direct-render parity and
+Qwen bare-tool-content coverage. The input-shape mechanism is proven; coding
+quality causality and release speed still require real runtime qualification.
