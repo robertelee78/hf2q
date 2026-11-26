@@ -1126,3 +1126,75 @@ Line numbers help reading only.
 | `P:ggml/src/ggml-metal/kernels/mul_mv_mma.metal` | `115e843e70a6b5f8b6d4dc691a14706fadf6e9929b7f661989b5d7ae3d7716f9` |
 | `P:ggml/src/ggml-metal/kernels/mul_mv.metal` | `3b6250aa1ec74091bbadedbae35355c2d6ea5d566c2033f91d9aecd896c69059` |
 | `P:src/models/gemma4.cpp` | `247d458f93ddace3091141d7d7e4da0c0b589bc843e5737d3b39f804eb889339` |
+
+## 15. Bounded F2 integration spike: parity passes, GPU-time bar missed
+
+This is a failed, isolated experiment, not a promotion or a completed story.
+The published Native M0 adopted **F2 only, R0 = 4**; E1 was dropped.
+Dropping E1 in #699 did not mean that F2 was rejected. The current hf2q
+batched body still needed an explicit F2 consumer.
+
+The trial used source `45bbe9d39a7ce7ca67ea917cdd06c3e29f32f925`, published
+`mlx-native = 0.24.0`, and the approved
+`bf65b7e163216885790442d0324839101ba4b5b49f7be4ec0cf3d7c5c538ef53`
+Gemma artifact on the M5 Max 128 GiB host. Compiler output confirmed the
+exact source stamp in both release images. The test image SHA-256 was
+`e42dbff7839f42a929ebddbac41d5eefcecb6dec8b2094f3937db89a0745063e`;
+the production image was
+`fc0827c864785befdfc15e1c4941abae456de0346bbf816ff64f15f59721b901`.
+
+Three distinct, no-retry scopes ran under Native-owned lifecycle control:
+
+1. **A1 passed.** 300 steps, active widths 1/2/3/4, 160 mixed-bucket and
+   40 same-bucket steps, ragged lanes and a mid-run slot replacement.
+   Logits, tokens, all written KV/norm bytes, and every-layer expert IDs
+   and weights matched bitwise. Receipt SHA-256:
+   `2e3e40c159c11ba2e3a200d65ae1797f55c56c74d12c2910d6f9316e0b483169`.
+2. **Separate-head disclosure completed.** One round, 512 measured steps
+   per arm/width, `HF2Q_FUSE_LMHEAD=0`. Candidate/stock GPU-step ratios:
+   width 4 `0.9968470212410594`, width 1 `1.0166058823044002`.
+   This extra round was disclosed, not re-gated.
+3. **The main bounded GPU probe missed both M1 numerical bars.** Three
+   measured rounds, 512 steps per arm/width, 32 warm-up steps discarded
+   per round, alternating first arm by round. Actual Native GPU-busy
+   intervals, not wall throughput; full-vocabulary logits matched on
+   every measured pair. Raw timings were saved before the failing assert.
+
+| Width | Samples per arm | Stock median GPU ns | Candidate median GPU ns | Ratio | Required maximum |
+|---|---:|---:|---:|---:|---:|
+| 4 | 1536 | 16557373.0 | 16482851.5 | 0.9954991954339617 | 0.90 |
+| 1 | 1536 | 8457726.0 | 8602144.5 | 1.0170753344338657 | 1.01 |
+
+The main test exited 101. Its raw report SHA-256 is
+`14cfc2ddfe7a58e7f8178d6d440da6a5b6d4d964dc1ee59269c236213d079e09`;
+the owned-attempt receipt is
+`e4ba5af11c2281942298696d82cc4df9bee051eeaea2edf83993e4e32bc732ee`.
+All three process trees were proved empty and reaped, with no refused
+PGIDs or cleanup errors. Every runtime pressure observation was normal;
+there was no positive swap or compressor growth. Power mode stayed
+`ac:2`, with Nominal before/after. Fair runtime/completion was permitted.
+
+This was a **2048-position-per-slot fixture**, not production Q5 or the
+complete formal M1 campaign: the exact warm-up procedure above is part
+of its evidence, not silently substituted for §8.2. A2–A4, M2,
+production-context Q5, combined quality and the release verdict remain
+unproved by it. No thresholds or old C2 model budgets were changed.
+
+Read-only GGUF-directory inspection, with no tensor payload read or
+model start, found 30 Q4_K expert gate/up tensors, top-8 routing and
+1408 output rows. These satisfy the storage/shape part of F2 admission;
+no per-kernel dispatch-hit trace was recorded. Source tracing resolves
+`provision(model, true)` to `Arm { fused, .. }`, and `decode_step` assigns
+`model.weights.decode_grouped_geglu = arm.fused` immediately before the
+real batched-body call. That body's admitted branch directly invokes
+Native F2. The stock arm uses the published Native expert-matvec route
+and the separate GELU epilogue. There is no observed dead-selector bug;
+the old model-free primitive ratio is not evidence of current in-situ
+speed. This trial rejects promotion of this integration, not the
+primitive's correctness or every possible future optimization.
+
+**Disposition:** keep the route off and this spike out of `main`; preserve
+the source and raw evidence. All three fixture starts are spent, with
+no retry permission. A different integration or a story re-budget needs
+an explicit decision; a failed probe is not a shipped optimization.
+
