@@ -2,6 +2,8 @@
 import hashlib
 import copy
 import json
+import struct
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -17,6 +19,15 @@ MODEL = {'deepseek4': 'DeepSeek V4 Flash 0731', 'gemma4': 'Gemma 4 26B A4B It'}
 TEMPLATE = {'deepseek4': (Path(__file__).resolve().parents[2] / 'src' / 'core' / 'chat_templates'
                           / 'deepseek-v4-flash-0731.jinja').read_bytes().decode('utf-8'),
             'gemma4': "{{ '<|tool_call>call:' }} gemma4 stand-in\n"}
+
+
+def write_gemma_model(path, template, architecture='gemma4'):
+    def string(text):
+        raw = text.encode()
+        return struct.pack('<Q', len(raw)) + raw
+    entries = [('general.architecture', architecture), ('tokenizer.chat_template', template)]
+    path.write_bytes(b'GGUF' + struct.pack('<IQQ', 3, 0, len(entries)) + b''.join(
+        string(key) + struct.pack('<I', 8) + string(value) for key, value in entries))
 
 
 def schemas():
@@ -150,20 +161,36 @@ class Refusal(unittest.TestCase):
 
 class Readiness(unittest.TestCase):
     def setUp(self):
-        # The Gemma 4 template ships only inside the GGUF; bind a stand-in for this test.
-        patcher = patch.dict(fp.TEMPLATE_SHA256, {'gemma4': hashlib.sha256(TEMPLATE['gemma4'].encode()).hexdigest()})
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        self.gemma = root / 'gemma.gguf'
+        write_gemma_model(self.gemma, TEMPLATE['gemma4'])
+        binary = root / 'peer'
+        binary.write_bytes(b'peer identity fixture')
+        binary_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+        receipt = root / 'identity.json'
+        receipt.write_text(json.dumps({'source_commit': fp.PEER_COMMIT, 'peer_build_info': 'b128-e86f5fd',
+            'binary': str(binary), 'binary_sha256': binary_sha,
+            'libraries_and_binary_sha256': {str(binary): binary_sha}}))
+        argv = [str(binary), '--model', str(self.gemma), '--spec-type', 'none']
+        self.reference = {'identity_receipt': str(receipt),
+            'identity_sha256': hashlib.sha256(receipt.read_bytes()).hexdigest(),
+            'source_commit': fp.PEER_COMMIT, 'build_info': 'b128-e86f5fd',
+            'serve_argv': argv, 'selected_speculation': 'none'}
+        self.supervised = {'serve_argv': argv, 'binary': str(binary), 'binary_sha256': binary_sha}
 
     def ok(self, family, **changes):
         health, props, slots = ready(family, **changes)
         if props['chat_template'] is None:
             props['chat_template'] = TEMPLATE[family]
-        return fp.validate_readiness(health, props, slots, MODEL[family], family)
+        return fp.validate_readiness(health, props, slots, MODEL[family], family,
+            self.reference if family == 'gemma4' else None,
+            self.supervised if family == 'gemma4' else None)
 
     def test_deepseek_pin_is_the_template_hf2q_renders(self):
         self.assertEqual(hashlib.sha256(TEMPLATE['deepseek4'].encode()).hexdigest(),
-                         fp.TEMPLATE_SHA256['deepseek4'])
+                         fp.DEEPSEEK_TEMPLATE_SHA256)
 
     def test_peer_lexer_source_without_trailing_newline_is_the_matched_template(self):
         # What the e86 peer's /props reported for the reviewed files in peer-arms-v1:
@@ -171,7 +198,23 @@ class Readiness(unittest.TestCase):
         for family in fp.FAMILIES:
             self.assertTrue(TEMPLATE[family].endswith('\n') and not TEMPLATE[family].endswith('\n\n'))
             result = self.ok(family, chat_template=TEMPLATE[family][:-1])
-            self.assertEqual(result['chat_template_sha256'], fp.TEMPLATE_SHA256[family])
+            self.assertEqual(result['chat_template_sha256'], hashlib.sha256(TEMPLATE[family].encode()).hexdigest())
+
+    def test_gemma_fine_tune_uses_its_bound_native_template_not_another_models_pin(self):
+        ara = TEMPLATE['gemma4'].replace('stand-in', 'Ara native encoding')
+        write_gemma_model(self.gemma, ara)
+        result = self.ok('gemma4', chat_template=ara.removesuffix('\n'))
+        self.assertEqual(result['chat_template_sha256'], hashlib.sha256(ara.encode()).hexdigest())
+        with self.assertRaisesRegex(Invalid, 'not the hf2q family template'):
+            self.ok('gemma4', chat_template=TEMPLATE['gemma4'])
+
+    def test_gemma_template_requires_actual_bound_gemma_metadata(self):
+        write_gemma_model(self.gemma, TEMPLATE['gemma4'], architecture='qwen3')
+        with self.assertRaisesRegex(Invalid, 'target is not Gemma 4'):
+            self.ok('gemma4')
+        health, props, slots = ready('gemma4', chat_template=TEMPLATE['gemma4'])
+        with self.assertRaisesRegex(Invalid, 'requires a bound target launch'):
+            fp.validate_readiness(health, props, slots, MODEL['gemma4'], 'gemma4')
 
     def test_any_other_template_text_refuses(self):
         for family in fp.FAMILIES:

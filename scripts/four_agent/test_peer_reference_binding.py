@@ -13,7 +13,7 @@ import family_peer as fp
 import q5_calibration
 from q5_case import CaseError
 from qwen38_n1_verdict import Invalid
-from test_family_peer import MODEL, TEMPLATE, ready
+from test_family_peer import MODEL, TEMPLATE, ready, write_gemma_model
 
 COMMIT = '5676dfbe01e7ebe0387913680eee0ed39bf4a363'
 BUILD = 'b12352-5676dfbe0'
@@ -36,6 +36,8 @@ class FrozenReference(unittest.TestCase):
         self.binary.write_bytes(b'model-free executable fixture')
         self.library = self.root / 'sibling.dylib'
         self.library.write_bytes(b'model-free sibling fixture')
+        self.model = self.root / 'gemma.gguf'
+        write_gemma_model(self.model, TEMPLATE['gemma4'])
         self.receipt = self.root / 'identity.json'
         identity = {'source_commit': COMMIT, 'peer_build_info': BUILD, 'binary': str(self.binary),
                     'binary_sha256': digest(self.binary.read_bytes()),
@@ -44,15 +46,13 @@ class FrozenReference(unittest.TestCase):
         self.receipt.write_text(json.dumps(identity))
         self.reference = {'identity_receipt': str(self.receipt), 'identity_sha256': digest(self.receipt.read_bytes()),
                           'source_commit': COMMIT, 'build_info': BUILD,
-                          'serve_argv': [str(self.binary), '--host', '127.0.0.1', '--port', '18245',
+                          'serve_argv': [str(self.binary), '--model', str(self.model),
+                                         '--host', '127.0.0.1', '--port', '18245',
                                          '--spec-type', 'draft-mtp', '--spec-draft-n-max', '3'],
                           'selected_speculation': 'draft-mtp'}
         self.issuances = 0
         self.packet = self.issue(self.reference)
         self.reference = self.packet['peer_reference']
-        patcher = patch.dict(fp.TEMPLATE_SHA256, {'gemma4': digest(TEMPLATE['gemma4'].encode())})
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def issue(self, reference, actual_argv=None, template_extra=None, set_extra=None):
         self.issuances += 1
@@ -216,12 +216,9 @@ class FrozenReference(unittest.TestCase):
             with self.assertRaises(Invalid):
                 self.consume(self.packet, 'b128-e86f5fd')
 
-    def test_legacy_no_binding_retains_historical_identity_and_no_proof_requirement(self):
-        result = self.consume(build='b128-e86f5fd')
-        self.assertEqual(result['source_revision'], fp.PEER_COMMIT)
-        self.assertIsNone(fp.validate_speculation_proof(self.root, {}))
-        with self.assertRaises(Invalid):
-            self.consume()
+    def test_unbound_legacy_gemma_launch_cannot_claim_native_template_parity(self):
+        with self.assertRaisesRegex(Invalid, 'requires a bound target launch'):
+            self.consume(build='b128-e86f5fd')
 
     def test_actual_unary_and_sse_counters_prove_trained_draft_exercise(self):
         for selected in TRAINED:

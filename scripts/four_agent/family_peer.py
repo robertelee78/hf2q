@@ -41,12 +41,9 @@ CANONICAL_KEYS = {'deepseek4': SHARED_KEYS | {'temperature', 'reasoning_effort'}
 # parallel_tool_calls default is false (serve/api/handlers.rs:1762-1764).
 NATIVE = {'deepseek4': {'chat_template_kwargs': {'enable_thinking': True}, 'parallel_tool_calls': False},
           'gemma4': {'chat_template_kwargs': {'enable_thinking': False}, 'parallel_tool_calls': False}}
-# Family-native templates hf2q renders: DeepSeek-V4 is
-# src/core/chat_templates/deepseek-v4-flash-0731.jinja (byte-identical to the
-# GGUF template); Gemma 4 is the GGUF-embedded template. The peer must serve
-# exactly these so DSML and Gemma tool-call encodings are the hf2q ones.
-TEMPLATE_SHA256 = {'deepseek4': 'aec3d906bce80d43a9e6e89922c04e8e752c05f71f10040ba3f61b746ebacd6d',
-                   'gemma4': 'ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4'}
+# DeepSeek renders the checked-in native encoding; Gemma renders the actual
+# target GGUF's embedded template, which differs between supported fine-tunes.
+DEEPSEEK_TEMPLATE_SHA256 = 'aec3d906bce80d43a9e6e89922c04e8e752c05f71f10040ba3f61b746ebacd6d'
 # Greedy sampling with the hf2q family repetition default; sampling fields are
 # server defaults because the canonical request omits them.
 SAMPLING = {'deepseek4': {'temperature': 0.0, 'top_k': 0, 'top_p': 1.0, 'min_p': 0.0,
@@ -159,19 +156,35 @@ def _close(value, expected):
         value, expected, rel_tol=0, abs_tol=1e-6)
 
 
-def served_template_matches(served, family):
-    """/props reports the peer lexer's source, not the file bytes (chat.cpp:1344).
-
-    The lexer turns CR/CRLF into LF and strips one trailing newline
-    (common/jinja/lexer.cpp:44-60 at e86f5fd1), as Jinja's default
-    keep_trailing_newline=false does when rendering. Both pinned templates are
-    CR-free and end in exactly one newline, so the served source must be the
-    pinned bytes or the pinned bytes minus that newline; nothing else matches.
-    """
+def served_template_matches(served, expected):
+    """/props contains the peer lexer's CR-normalized, trailing-newline source."""
     if not isinstance(served, str) or '\r' in served:
         return False
-    pin = TEMPLATE_SHA256[family]
-    return any(hashlib.sha256(text.encode()).hexdigest() == pin for text in (served, served + '\n'))
+    normalized = expected.replace('\r\n', '\n').replace('\r', '\n')
+    return served in (normalized, normalized.removesuffix('\n'))
+
+
+def expected_template(family, reference):
+    if family == 'deepseek4':
+        path = Path(__file__).resolve().parents[2] / 'src/core/chat_templates/deepseek-v4-flash-0731.jinja'
+        text = path.read_bytes().decode('utf-8')
+        require(hashlib.sha256(text.encode()).hexdigest() == DEEPSEEK_TEMPLATE_SHA256,
+                'DeepSeek native template changed')
+        return text
+    from ds4_file_digest import string_metadata
+    require(isinstance(reference, dict), 'Gemma native template requires a bound target launch')
+    argv = reference['serve_argv']
+    require(argv.count('--model') == 1 and argv.index('--model') + 1 < len(argv),
+            'Gemma reference requires one explicit target model')
+    path = Path(argv[argv.index('--model') + 1])
+    require(path.is_absolute(), 'Gemma target model path must be absolute')
+    try:
+        metadata = string_metadata(path, ('general.architecture', 'tokenizer.chat_template'))
+    except (OSError, ValueError) as error:
+        require(False, f'Gemma target template metadata unavailable: {error}')
+    require(metadata['general.architecture'] == 'gemma4', 'peer target is not Gemma 4')
+    require(bool(metadata['tokenizer.chat_template']), 'Gemma native template is empty')
+    return metadata['tokenizer.chat_template']
 
 
 # Frozen current peer common/speculative.cpp:72-85,3186-3323. These are
@@ -347,8 +360,9 @@ def validate_readiness(health, props, slots, model, family, reference=None, supe
         binding = {'source_revision': PEER_COMMIT, 'build_info': build}
     else:
         binding = _reference_identity(reference, build, supervised)
+    expected = expected_template(family, reference)
     template = props.get('chat_template')
-    require(served_template_matches(template, family), f'{family} peer template is not the hf2q family template')
+    require(served_template_matches(template, expected), f'{family} peer template is not the hf2q family template')
     modalities = props.get('modalities')
     require(isinstance(modalities, dict) and modalities.get('vision') is False,
             'peer must serve the text-only workload without a projector')
@@ -356,7 +370,7 @@ def validate_readiness(health, props, slots, model, family, reference=None, supe
     require(isinstance(params, dict) and all(_close(params.get(k), v) for k, v in SAMPLING[family].items())
             and params.get('speculative.types') == 'none', f'{family} peer sampling settings differ')
     return {'engine_kind': 'peer', 'family': family, **binding,
-            'chat_template_sha256': TEMPLATE_SHA256[family], 'logical_slots': SLOTS,
+            'chat_template_sha256': hashlib.sha256(expected.encode()).hexdigest(), 'logical_slots': SLOTS,
             'context_per_slot': CONTEXT_PER_SLOT, 'sampling': dict(SAMPLING[family]),
             'physical_cohort': 'Unavailable:not proved by readiness or HTTP overlap',
             'pool_profile': 'NotApplicable:HF-only', 'full_prefix_reuse': 'PendingPostOracle'}

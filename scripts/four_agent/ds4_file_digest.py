@@ -88,6 +88,28 @@ class Reader:
             raise DigestError(f"unknown GGUF metadata value type {kind}")
 
 
+def string_metadata(path, keys):
+    """Read selected GGUF strings; never inspect tensor descriptors or payload."""
+    wanted, result = set(keys), {}
+    with open(path, "rb") as stream:
+        r = Reader(stream)
+        require(r.take(4) == MAGIC, f"{path} is not a GGUF file")
+        version = r.unpack("<I")
+        require(version in (2, 3), f"unsupported GGUF version {version}")
+        r.unpack("<Q")  # Tensor count; the directory and tensor bytes stay unread.
+        count = r.unpack("<Q")
+        for _ in range(count):
+            key, kind = r.string(), r.unpack("<I")
+            if key in wanted:
+                require(key not in result, f"duplicate GGUF metadata key {key}")
+                require(kind == STRING, f"{key} must be a GGUF string")
+                result[key] = r.string()
+            else:
+                r.skip_value(kind)
+        require(wanted <= result.keys(), "required GGUF string metadata missing")
+    return result
+
+
 def tensor_nbytes(name, dims, ggml_type):
     require(ggml_type in GGML_TYPES, f"{name}: unknown GGML type id {ggml_type}")
     _, block, size = GGML_TYPES[ggml_type]

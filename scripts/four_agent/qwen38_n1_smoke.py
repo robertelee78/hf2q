@@ -102,6 +102,8 @@ def approval(args):
         "qwen38_n1_smoke.py", "qwen38_n1_tools.py", "qwen38_n1_process.py",
         "qwen38_n1_verdict.py", "test_qwen38_n1_verdict.py",
         "coding_family.py", "test_coding_family.py", "f2_semantic.py")]
+    if args.family == "gemma4" and args.engine_kind == "peer":
+        source_paths.append(Path(__file__).with_name("ds4_file_digest.py"))
     if n4:
         native = ()
         if args.engine_kind in family_contract.ADAPTER_KINDS:

@@ -452,6 +452,8 @@ def main():
                 and packet.get("model") == args.model, "single server binding")
         module_dir = Path(__file__).resolve().parent
         names = MODULES
+        if args.family == "gemma4" and args.engine_kind == "peer":
+            names += ("ds4_file_digest.py",)
         if args.benchmark_profile is not None:
             from gemma_matched_profile import EXTRA_MODULES, validate_activation
             validate_activation(args.benchmark_profile, packet, args.family, args.engine_kind, 4)
