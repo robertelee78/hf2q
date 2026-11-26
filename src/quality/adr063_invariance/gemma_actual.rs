@@ -23,6 +23,8 @@ pub(super) struct Packet {
     #[serde(default)] decode_dense_kernel:DecodeDenseKernel,
     /// Decode attention head split the loaded model must resolve (gap program); absent = Stock.
     #[serde(default)] decode_attn_ne:DecodeAttnNe,
+    /// Exact grouped expert gate/up GELU; absent = stock (kill switch).
+    #[serde(default)] decode_kernels:bool,
     /// Q5_0 tensor matmul the model's registries must have frozen; absent = false
     /// (the simdgroup route of every retained Gemma Q1 run, `HF2Q_Q5_0_TENSOR_MM=0`).
     #[serde(default)] q5_0_tensor_mm:bool,
@@ -288,6 +290,8 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
     let warm_live_kernel=require_warm_kernel(p.warm_live_kernel,model.weights.warm_live_kernel)?;
     let decode_dense_kernel=require_decode_dense_kernel(p.decode_dense_kernel,crate::inference::models::gemma4::decode_dense::resolve()?.value)?;
     let decode_attn_ne=require_decode_attn_ne(p.decode_attn_ne,model.weights.decode_attn_ne)?;
+    let decode_kernels=model.weights.decode_grouped_geglu;
+    ensure!(p.decode_kernels==decode_kernels,"resolved Gemma decode kernels {decode_kernels} differs from the packet's {} (absent = false, HF2Q_GEMMA_DECODE_KERNELS=0)",p.decode_kernels);
     let q5_0_tensor_mm=require_q5_0_tensor_mm(p.q5_0_tensor_mm,model.ctx.ggml_routing_policy().q5_0_tensor_mm)?;
     let observed=scope.observed(model.ctx.executor.device(),&model as *const _ as usize as u64,3)?;
     store.bind_acquisition(observed.clone()).map_err(anyhow::Error::msg)?;
@@ -395,7 +399,7 @@ fn run(separate:Option<Trajectory>,localizer:bool)->Result<()> {
             "actual packed prefill512 rows with four128-owner spans; actual decode input4rows; operator-specific source geometry, not whole-kernel/F2 membership"
         } else {"per-request ordinary; not T2"},
         "logit_rows_per_lane":144,"cache_boundaries":positions(p.trajectory),"capture_records":records,"warm_live_kernel":warm_live_kernel,
-        "decode_dense_kernel":decode_dense_kernel,"decode_attn_ne":decode_attn_ne,"q5_0_tensor_mm":q5_0_tensor_mm,
+        "decode_dense_kernel":decode_dense_kernel,"decode_attn_ne":decode_attn_ne,"decode_kernels":decode_kernels,"q5_0_tensor_mm":q5_0_tensor_mm,
         "planned_tensor_payload":bytes,"oracle_quality_qualified":false,"whole_q1_qualified":false,
         "float_policy":"Unspecified","diagnostic_head_scope":"same production scalar head applied to every actual prefill hidden row"});
     let mut stage_records=0;

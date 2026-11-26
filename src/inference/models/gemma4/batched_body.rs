@@ -123,6 +123,9 @@ pub struct BatchedDecodeBuffers {
     /// `[layers, N, top_k]` per-step copy of every layer's `moe_expert_ids`
     /// for the V2 diagnostic (`HF2Q_GEMMA_ROUTING_OVERLAP=1`); `None` when off.
     pub routing_overlap_ids: Option<MlxBuffer>,
+    /// A1-only routed IDs and weights; absent from production builds.
+    #[cfg(test)]
+    pub(crate) router_capture: Option<super::decode_router_capture::Buffers>,
 }
 
 /// Element count of an F32/U32 buffer (4 bytes/element).
@@ -181,6 +184,8 @@ impl BatchedDecodeBuffers {
             moe_accum: f32n(&acts.moe_accum, "moe_accum")?,
             sdpa_tmp: f32n(&acts.sdpa_tmp, "sdpa_tmp")?,
             routing_overlap_ids: None,
+            #[cfg(test)]
+            router_capture: None,
         })
     }
 
@@ -2080,6 +2085,15 @@ impl MlxModelWeights {
                 .blit_copy_bytes(&bufs.moe_expert_ids, 0, dst, layer_idx as u64 * bytes, bytes)
                 .map_err(|e| anyhow::anyhow!("routing overlap ids copy L{layer_idx}: {e}"))?;
         }
+        #[cfg(test)]
+        super::decode_router_capture::record(
+            session,
+            &bufs.router_capture,
+            &bufs.moe_expert_ids,
+            &bufs.moe_routing_weights_gpu,
+            layer_idx,
+            n * ids_stride,
+        )?;
         // catsplit: fused_gelu_mul (dense SwiGLU) + per-slot MoE routing/top-k.
         cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
         #[cfg(test)]
@@ -2137,10 +2151,6 @@ impl MlxModelWeights {
             .ok_or_else(|| {
                 anyhow::anyhow!("batched body requires fused _id MoE (stacked_down) L{layer_idx}")
             })?;
-        session.barrier_between(
-            &[&bufs.moe_norm_out, &bufs.moe_expert_ids, stacked_gate_up],
-            &[&bufs.moe_gate_up_id_out],
-        );
         let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
             n_tokens: nu,
             top_k: top_k as u32,
@@ -2150,43 +2160,57 @@ impl MlxModelWeights {
             expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
             ggml_type: self.layers[layer_idx].moe.gate_up_ggml_dtype,
         };
-        // ADR-040 Phase F `iter-F-moe-mvid`: force the per-token `mv_id` route
-        // (byte-identical to the serial slot-aware ref). At the batched decode
-        // width the down projection's `n_tokens = N*top_k` crosses the `mm_id`
-        // grouped-kernel threshold (>32, i.e. N≥5) whose reduction order is NOT
-        // bit-identical to serial — `slot_aware_n8_per_slot_parity_vs_serial`
-        // diverged on the routed entry point and is byte-identical on this one.
-        // `mm_id` is a prefill optimization + a measured regression at N≤8, so
-        // there is no decode-width cost. gate_up is mv at N≤4 anyway; pinning it
-        // keeps the whole MoE byte-identical for any future N.
-        crate::inference::expert_dispatch::dispatch_expert_matmul_id_mv(
-            session,
-            reg,
-            dev,
-            &bufs.moe_norm_out,
-            stacked_gate_up,
-            &bufs.moe_expert_ids,
-            &bufs.moe_gate_up_id_out,
-            &gu_params,
-        )
-        .map_err(|e| anyhow::anyhow!("batched gate_up _id L{layer_idx}: {e}"))?;
-        // catsplit: MoE gate_up `_id` (per-token mv_id) — the big expert read.
-        cat_boundary(session, exec, catsplit::Cat::MoeGateUp)?;
+        if self.decode_grouped_geglu && super::decode_kernels::admits(&gu_params) {
+            session.barrier_between(
+                &[&bufs.moe_norm_out, &bufs.moe_expert_ids, stacked_gate_up],
+                &[&bufs.moe_swiglu_id_out],
+            );
+            mlx_native::quantized_matmul_id_ggml_mv_grouped_geglu(
+                session.encoder_mut(),
+                reg,
+                dev,
+                &bufs.moe_norm_out,
+                stacked_gate_up,
+                &bufs.moe_expert_ids,
+                &bufs.moe_swiglu_id_out,
+                &gu_params,
+            )
+            .map_err(|e| anyhow::anyhow!("batched grouped gate_up GELU L{layer_idx}: {e}"))?;
+            cat_boundary(session, exec, catsplit::Cat::MoeGateUp)?;
+        } else {
+            session.barrier_between(
+                &[&bufs.moe_norm_out, &bufs.moe_expert_ids, stacked_gate_up],
+                &[&bufs.moe_gate_up_id_out],
+            );
+            // Keep per-token MV at wider decode widths too: the down call
+            // crosses mm_id's threshold at n5, whose reduction differs from
+            // serial (ADR-040 iter-F-moe-mvid). Never route it through mm_id.
+            crate::inference::expert_dispatch::dispatch_expert_matmul_id_mv(
+                session,
+                reg,
+                dev,
+                &bufs.moe_norm_out,
+                stacked_gate_up,
+                &bufs.moe_expert_ids,
+                &bufs.moe_gate_up_id_out,
+                &gu_params,
+            )
+            .map_err(|e| anyhow::anyhow!("batched gate_up _id L{layer_idx}: {e}"))?;
+            cat_boundary(session, exec, catsplit::Cat::MoeGateUp)?;
 
-        // -- swiglu (BATCHED over N*top_k expert rows) --
-        session.barrier_between(&[&bufs.moe_gate_up_id_out], &[&bufs.moe_swiglu_id_out]);
-        mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
-            session.encoder_mut(),
-            reg,
-            metal_dev,
-            &bufs.moe_gate_up_id_out,
-            &bufs.moe_swiglu_id_out,
-            moe_int,
-            top_k * n,
-        )
-        .map_err(|e| anyhow::anyhow!("batched swiglu L{layer_idx}: {e}"))?;
-        // catsplit: MoE expert SwiGLU activation.
-        cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
+            session.barrier_between(&[&bufs.moe_gate_up_id_out], &[&bufs.moe_swiglu_id_out]);
+            mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
+                session.encoder_mut(),
+                reg,
+                metal_dev,
+                &bufs.moe_gate_up_id_out,
+                &bufs.moe_swiglu_id_out,
+                moe_int,
+                top_k * n,
+            )
+            .map_err(|e| anyhow::anyhow!("batched swiglu L{layer_idx}: {e}"))?;
+            cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
+        }
 
         // -- down_id (BATCHED n_tokens=N*top_k) --
         session.barrier_between(
@@ -2500,6 +2524,15 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow::anyhow!("body_batched routing overlap alloc: {e}"))?,
             );
         }
+        #[cfg(test)]
+        {
+            bufs.router_capture = super::decode_router_capture::allocate(
+                dev,
+                self.layers.len(),
+                n,
+                elems(&bufs.moe_expert_ids) / n,
+            )?;
+        }
 
         // Positions buffer [N] u32 for per-slot RoPE.
         let mut positions_buf = dev
@@ -2690,6 +2723,10 @@ impl MlxModelWeights {
             }
             drop(committed);
             self.record_routing_overlap(&bufs, n, seq_positions, regime)?;
+            #[cfg(test)]
+            super::decode_router_capture::publish(
+                &bufs.router_capture, n, elems(&bufs.moe_expert_ids) / n,
+            )?;
 
             // §25 iter-L: fused head — read exact native-head logits after the
             // single wait. The normed GPU operand is retained through the wait
@@ -2771,6 +2808,10 @@ impl MlxModelWeights {
                 _hp.elapsed().as_nanos() as u64,
             );
             self.record_routing_overlap(&bufs, n, seq_positions, regime)?;
+            #[cfg(test)]
+            super::decode_router_capture::publish(
+                &bufs.router_capture, n, elems(&bufs.moe_expert_ids) / n,
+            )?;
         }
 
         // Final hidden rows [n, hidden] (pre-final-norm).

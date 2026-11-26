@@ -668,7 +668,11 @@ pub struct MlxModelWeights {
     /// `HF2Q_GEMMA_DECODE_ATTN_NE` (default NE 4; `0` is the kill switch).
     pub(crate) decode_attn_ne: crate::serve::gemma_decode_attention::GemmaDecodeAttnNe,
 
-    /// The four default-on routes as resolved at load, each with its source
+    /// Q4-GEMMA-DECODE F2, frozen at load; only qualified Q4_K n1..n4
+    /// batched expert gate/up calls use the fused exact GELU route.
+    pub(crate) decode_grouped_geglu: bool,
+
+    /// The model's routes as resolved at load, each with its source
     /// (load banner, audit line, `/hf2q/v1/runtime`). Empty for a weights
     /// struct a test builds by hand.
     pub(crate) route_audit: Vec<RouteAudit>,
@@ -930,7 +934,8 @@ impl MlxModelWeights {
             )?
         };
         let routing_policy = *gpu.ggml_routing_policy();
-        // The four release-gate routes (ADR-063 Q4-GEMMA-ATTN): each resolved
+        let decode_kernels = super::decode_kernels::resolve(&routing_policy)?;
+        // Existing release-gate routes plus the F2 qualification control: each
         // value and whether it is the family default, an operator setting or
         // a fallback. `q5_0_tensor_mm` is the value frozen into this model's
         // registries. One audit line, visible on a default `hf2q serve`.
@@ -944,6 +949,11 @@ impl MlxModelWeights {
                 "gemma_decode_dense_kernel",
                 decode_dense.value.wire_name(),
                 decode_dense.source.as_str(),
+            ),
+            RouteAudit::new(
+                "gemma_decode_kernels",
+                decode_kernels.value.to_string(),
+                decode_kernels.source.as_str(),
             ),
             RouteAudit::new(
                 "gemma_warm_attention_kernel",
@@ -1513,6 +1523,7 @@ impl MlxModelWeights {
             warm_live_kernel: warm_live_kernel.value,
             prefill_moe_down: crate::serve::gemma_prefill_moe::prefill_moe_down_from_env(),
             decode_attn_ne: decode_attn_ne.value,
+            decode_grouped_geglu: decode_kernels.value,
             route_audit,
         });
         crate::serve::gemma_prefill_moe::log_native_routing(&routing_policy);

@@ -21,6 +21,9 @@ pub(crate) mod admission;
 pub mod batched_body;
 pub mod batched_head;
 pub(crate) mod decode_dense;
+pub(crate) mod decode_kernels;
+#[cfg(test)]
+pub(crate) mod decode_router_capture;
 pub mod forward_gpu;
 pub mod gpu_ffn;
 pub mod gpu_full_attn;

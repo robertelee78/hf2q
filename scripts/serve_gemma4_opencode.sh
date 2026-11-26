@@ -134,6 +134,11 @@
 #                                    HF2Q_GEMMA_DECODE_DENSE; unset keeps the
 #                                    hf2q default (row_exact). stock is the
 #                                    kill switch.
+#     DECODE_KERNELS=0|1            (this script) forwards
+#                                    HF2Q_GEMMA_DECODE_KERNELS; 1 selects
+#                                    exact grouped Q4_K gate/up GELU at
+#                                    n1..n4. Off until qualification; 0 is
+#                                    the kill switch.
 #
 # NOT enabled (documented follow-ups, do NOT turn on blindly):
 #   * Disk persistence of the LCP registry for gemma (ADR-017 spiller
@@ -324,6 +329,15 @@ case "${DECODE_DENSE:-}" in
         exit 2
         ;;
 esac
+DECODE_KERNELS_ENV=""
+case "${DECODE_KERNELS:-}" in
+    "") ;;
+    0|1) DECODE_KERNELS_ENV="$DECODE_KERNELS" ;;
+    *)
+        echo "DECODE_KERNELS must be 0, 1 or unset" >&2
+        exit 2
+        ;;
+esac
 
 # Build argv through positional parameters. This is safe on macOS bash 3.2
 # when the optional projector or versioned LCP budget flag is absent.
@@ -357,5 +371,6 @@ exec env \
     ${ROUTING_OVERLAP_ENV:+HF2Q_GEMMA_ROUTING_OVERLAP="$ROUTING_OVERLAP_ENV"} \
     ${DECODE_ATTN_NE_ENV:+HF2Q_GEMMA_DECODE_ATTN_NE="$DECODE_ATTN_NE_ENV"} \
     ${DECODE_DENSE_ENV:+HF2Q_GEMMA_DECODE_DENSE="$DECODE_DENSE_ENV"} \
+    ${DECODE_KERNELS_ENV:+HF2Q_GEMMA_DECODE_KERNELS="$DECODE_KERNELS_ENV"} \
     ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
     "$HF2Q_BIN" -v serve "$@"

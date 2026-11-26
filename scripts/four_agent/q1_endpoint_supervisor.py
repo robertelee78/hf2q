@@ -79,6 +79,7 @@ ROUTE_SWITCHES = {
         'warm_live_kernel': ('HF2Q_GEMMA_WARM_TILED_ATTENTION', 'VecHybrid', {'VecHybrid': '0', 'TiledF16': '1', 'TensorF16': 'tensor'}),
         'decode_dense_kernel': ('HF2Q_GEMMA_DECODE_DENSE', 'Stock', {'Stock': 'stock', 'RowExact': 'row_exact', 'ColumnInvariantMma': 'mma'}),
         'decode_attn_ne': ('HF2Q_GEMMA_DECODE_ATTN_NE', 'Stock', {'Stock': '0', 'Ne2': '2', 'Ne4': '4'}),
+        'decode_kernels': ('HF2Q_GEMMA_DECODE_KERNELS', False, {False: '0', True: '1'}),
         'q5_0_tensor_mm': ('HF2Q_Q5_0_TENSOR_MM', False, {False: '0', True: '1'}),
     },
     'deepseek': {
