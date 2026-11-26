@@ -7,7 +7,7 @@
     "Unified f16 KV over a 1048576-token pool capped at 262144 per slot; the five full-attention layers hold about 20 GiB f16 at that pool size, the sliding-window layers under 1 GiB.",
     "Thinking off and preserve_thinking false, as hf2q renders Gemma 4 (no thinking channel, no template kwargs); the adapter also sends chat_template_kwargs.enable_thinking=false and parallel_tool_calls=false per request. Repetition penalty 1.05 matches the hf2q Gemma launcher default.",
     "Text-only: the peer loads a projector only with --mmproj, so the GGUF is served directly (no text_only_locator); readiness requires modalities.vision == false.",
-    "Template: the reviewed GGUF-embedded Gemma 4 template (sha256 ae53464b...); the client refuses any other /props chat_template.",
+    "Template: the exact native template embedded in the target GGUF, not a stock-model family hash. Release runs require peer_reference with the frozen peer identity; Q5 binds it to the supervised --model launch. Unbound legacy Gemma launches cannot claim template parity.",
     "Run as a calibration (no --admission-receipt): the peer binary differs from the hf2q calibration of record."
   ],
   "workload": {
@@ -213,6 +213,7 @@
             "{REPO}/scripts/four_agent/test_qwen_n4_peer.py",
             "{REPO}/scripts/four_agent/family_peer.py",
             "{REPO}/scripts/four_agent/test_family_peer.py",
+            "{REPO}/scripts/four_agent/ds4_file_digest.py",
             "{REPO}/scripts/four_agent/f2_semantic.py"
           ]
         }

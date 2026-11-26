@@ -235,6 +235,15 @@ The supervisor fills in `server_pid`, `base_url`, `model`, `run_id`, `barrier_to
 - The server argv is the Qwen3.6 peer run's argv (`peer-qwen36-e86-none-normal-n4-20261027T185853Z/server-launch-command.json`): 4 slots, 262144 tokens per slot, flash attention on, f16 K/V, no context shift, greedy sampling, no speculation, and the reviewed family template.
 - `PEER_BIN` defaults to the e86f5fd1 build. Readiness requires `/props` `build_info == PEER_BUILD_INFO`.
 - `family_peer.py` holds the DeepSeek-V4 and Gemma 4 adapters. It translates the canonical request into native peer fields and refuses every other field. It also checks `/props` template sha256, sampling and text-only settings. `test_q5_calibration.py` ties each case's flags to the adapter's `CONTROLS`.
+- Gemma peer readiness derives the expected template from the GGUF named by the
+  supervisor-bound `--model` launch. Fine-tunes such as the production Ara model
+  need not share the stock model's template hash. `/props` must still match that
+  exact model's native template after the peer lexer's newline normalization;
+  a different model's template, a missing bound target, or a non-Gemma GGUF is
+  refused. The readiness receipt records the actual embedded-template SHA-256.
+  Gemma requires the existing frozen `peer_reference` and Q5-issued
+  `peer_supervised_launch`; the unbound historical Gemma readiness path is no
+  longer sufficient to claim a matched template.
 - **DeepSeek-V4 omits `--kv-unified`.** The peer's DSV4 cache always keeps one stream per sequence. Unified mode would size each stream to the whole 1048576-token pool, about 4× the KV memory (see the case notes).
 - `CLIENT_APPROVAL_TEMPLATE` must carry `engine_kind: "peer"`. For DeepSeek-V4 and Gemma 4 it must also carry `family_controls` equal to `family_peer.CONTROLS[family]` and the peer preflight keys from `family_peer.preflight`.
 - Run each peer case as its own calibration (no `--admission-receipt`), because the binary differs from the hf2q calibration.

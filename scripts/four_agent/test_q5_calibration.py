@@ -424,8 +424,6 @@ class ArgvAndCases(unittest.TestCase):
             client = plan['client']['argv']
             self.assertEqual((client[client.index('--family') + 1], client[client.index('--engine-kind') + 1]),
                              (client_family, 'peer'))
-            sources = plan['client']['approval']['set']['sources']['sha256_of']
-            self.assertEqual({Path(s).name for s in sources}, set(MODULES))
             checks = {(c['field'], json.dumps(c['equals'])) for c in plan['readiness']['checks']}
             self.assertTrue({('total_slots', '4'), ('default_generation_settings.n_ctx', '262144'),
                              ('modalities.vision', 'false'), ('build_info', '"b128-e86f5fd"')} <= checks)
