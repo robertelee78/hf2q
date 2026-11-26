@@ -31985,11 +31985,9 @@ fn strip_trailing_stop(text: &mut String, stops: &[String]) {
 ///     `FALLBACK_GEMMA4_API_CHAT_TEMPLATE`, which prints `m.role` directly.
 ///     Every other template (including official Gemma 4 templates, which
 ///     rename internally) sees roles verbatim.
-///   - Per-message `tool_calls` (assistant-emitted) and synthetic
-///     `tool_responses` (synthesized from OpenAI `role: "tool"` history
-///     messages, see [`render_chat_prompt_with_tools`]) are exposed to the
-///     template as message fields so tool-aware templates (e.g. Gemma 4's
-///     `<|tool_call>` / `<|tool_response>` markers) render correctly.
+///   - Per-message OpenAI `tool_calls`, `tool_call_id`, and `name` are
+///     exposed to the template. Tool-result content is not duplicated into
+///     a synthetic response envelope; the native template owns its encoding.
 ///
 /// Use [`render_chat_prompt_with_tools`] to supply tool definitions; the
 /// thin entry-point `render_chat_prompt` is kept for legacy callers (one-shot
@@ -32032,14 +32030,9 @@ const RESERVED_TEMPLATE_KWARGS: &[&str] = &[
 ///      message in `messages` gets its `tool_calls` array exposed as a
 ///      Jinja-visible field. The template iterates and emits per-model markers
 ///      (e.g. Gemma 4's `<|tool_call>call:NAME{...}<tool_call|>`).
-///   3. Synthetic `tool_responses` (on `role: "tool"` messages): OpenAI
-///      represents tool results as `{role: "tool", tool_call_id, content}`
-///      sibling messages. Most chat templates (Gemma 4 included) instead
-///      expect a per-message `tool_responses: [{name, response}]` field.
-///      We synthesize that field on each `role: "tool"` message by looking up
-///      the function name from the prior assistant `tool_calls` keyed by
-///      `tool_call_id`. The role itself is left verbatim — the template
-///      decides whether to wrap with `<|turn>tool` or similar.
+///   3. OpenAI `role: "tool"` messages retain their `content`, `tool_call_id`,
+///      and optional `name`. Do not inject `tool_responses`: templates that
+///      consume both that non-OpenAI field and content emit the result twice.
 pub fn render_chat_prompt_with_tools(
     template_str: &str,
     messages: &[super::schema::ChatMessage],
@@ -32099,15 +32092,6 @@ pub(crate) fn render_chat_prompt_with_tools_generation_prompt(
     // template re-adds the `thought` label around echoed reasoning.
     let gemma_channel_template = template_str.contains("<|channel>");
 
-    // Lookup table tool_call_id → function-name for synthesizing
-    // `tool_responses` on role:"tool" messages. Populated INCREMENTALLY
-    // while walking messages (ADR-005 iter-229 Decision 5): a tool
-    // message only resolves ids defined by PRIOR assistant turns, and a
-    // duplicate id binds to the most recent prior definition. Forward
-    // references and unknown ids fall back to "unknown".
-    let mut id_to_name: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-
     let mut out_msgs: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
     for msg in messages {
         let mut role = msg.role.clone();
@@ -32162,12 +32146,6 @@ pub(crate) fn render_chat_prompt_with_tools_generation_prompt(
             let arr: Vec<serde_json::Value> = tcs
                 .iter()
                 .map(|tc| {
-                    // Only ASSISTANT turns define ids (OpenAI semantics);
-                    // tool_calls smuggled onto other roles must not poison
-                    // the resolution map (gate-3 #1).
-                    if msg.role == "assistant" {
-                        id_to_name.insert(tc.id.clone(), tc.function.name.clone());
-                    }
                     let arguments =
                         match serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
                             Ok(v @ serde_json::Value::Object(_)) => v,
@@ -32186,11 +32164,6 @@ pub(crate) fn render_chat_prompt_with_tools_generation_prompt(
             obj.insert("tool_calls".into(), serde_json::Value::Array(arr));
         }
 
-        // role:"tool" messages → synthesize `tool_responses` field. The
-        // OpenAI shape is `{tool_call_id, content}`; we look up the tool
-        // name from id_to_name and pass the content string verbatim.
-        // Templates (Gemma 4) accept either string or mapping for the
-        // `response` field; the string path is the safer default.
         if msg.role == "tool" {
             // OpenAI tool-result fields pass through verbatim: templates
             // that resolve the function name themselves (Gemma 4 official:
@@ -32203,24 +32176,6 @@ pub(crate) fn render_chat_prompt_with_tools_generation_prompt(
             }
             if let Some(name) = msg.name.as_ref() {
                 obj.insert("name".into(), serde_json::Value::String(name.clone()));
-            }
-            if let Some(tcid) = msg.tool_call_id.as_ref() {
-                let name = id_to_name
-                    .get(tcid)
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".into());
-                let response_str = msg
-                    .content
-                    .as_ref()
-                    .map(|c| match c {
-                        MessageContent::Text(s) => s.clone(),
-                        MessageContent::Parts(_) => c.text(),
-                    })
-                    .unwrap_or_default();
-                obj.insert(
-                    "tool_responses".into(),
-                    serde_json::json!([{"name": name, "response": response_str}]),
-                );
             }
         }
 
@@ -34717,75 +34672,6 @@ assistant:
     }
 
     #[test]
-    fn render_chat_prompt_with_tools_threads_per_message_tool_calls_and_responses() {
-        // Verify the per-message threading of `tool_calls` (assistant) and
-        // synthesized `tool_responses` (from role:"tool" messages, looked up
-        // by tool_call_id). A minimal template iterates messages and emits
-        // tool_calls + tool_responses verbatim.
-        let tmpl = "{%- for m in messages -%}\
-                    [{{ m.role }}]\
-                    {%- if m.tool_calls -%}\
-                    {%- for tc in m.tool_calls -%}TC:{{ tc.function.name }}({{ tc.function.arguments }});{%- endfor -%}\
-                    {%- endif -%}\
-                    {%- if m.tool_responses -%}\
-                    {%- for tr in m.tool_responses -%}TR:{{ tr.name }}={{ tr.response }};{%- endfor -%}\
-                    {%- endif -%}\
-                    {%- if m.content -%}{{ m.content }}{%- endif -%}\n\
-                    {%- endfor -%}";
-        let msgs = vec![
-            ChatMessage {
-                role: "user".into(),
-                content: Some(MessageContent::Text("Paris weather?".into())),
-                reasoning_content: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            },
-            ChatMessage {
-                role: "assistant".into(),
-                content: None,
-                reasoning_content: None,
-                tool_calls: Some(vec![super::super::schema::ToolCall {
-                    id: "call_abc".into(),
-                    call_type: "function".into(),
-                    function: super::super::schema::ToolCallFunction {
-                        name: "get_current_weather".into(),
-                        // Deliberately NOT valid JSON: iter-229 Decision 2
-                        // substitutes a mapping for valid object strings, so
-                        // this test keeps a malformed string to pin the
-                        // verbatim-threading path; shape coverage lives in
-                        // the iter-229 AC2 tests below.
-                        arguments: "location=Paris".into(),
-                    },
-                }]),
-                tool_call_id: None,
-                name: None,
-            },
-            ChatMessage {
-                role: "tool".into(),
-                content: Some(MessageContent::Text("{\"temperature\": 18}".into())),
-                reasoning_content: None,
-                tool_calls: None,
-                tool_call_id: Some("call_abc".into()),
-                name: None,
-            },
-        ];
-        let out = render_chat_prompt_with_tools(tmpl, &msgs, None, false, None).unwrap();
-        assert!(out.contains("[user]Paris weather?"), "out={out}");
-        // Assistant message: tool_calls visible verbatim (non-object
-        // arguments string is preserved raw per iter-229 Decision 2).
-        assert!(
-            out.contains("[assistant]TC:get_current_weather(location=Paris);"),
-            "out={out}"
-        );
-        // Tool message: tool_responses synthesized via id_to_name lookup.
-        assert!(
-            out.contains("[tool]TR:get_current_weather={\"temperature\": 18};"),
-            "out={out}"
-        );
-    }
-
-    #[test]
     fn render_chat_prompt_concatenates_multimodal_text_parts() {
         let tmpl = "{% for m in messages %}{{ m.content }}|{% endfor %}";
         let msgs = vec![ChatMessage {
@@ -34965,34 +34851,35 @@ assistant:
         include_str!("test_fixtures/gemma4-apex-embedded-chat-template.jinja");
 
     #[test]
-    fn iter229_ac2e_gemma_dual_shape_arguments_byte_pins() {
-        // Object-string arguments → mapping render (dictsort path).
-        let obj = render_chat_prompt_with_tools(
-            GEMMA4_EMBEDDED_TEMPLATE,
-            &i229_tail_transcript("{\"path\": \"foo.rs\"}"),
-            None,
-            false,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            obj,
-            "<bos><|turn>system\nYou are an agent.<turn|>\n<|turn>user\nFix the bug in foo.rs<turn|>\n<|turn>model\n<|tool_call>call:read_file{path:<|\"|>foo.rs<|\"|>}<tool_call|><turn|>\n<|turn>tool\n<|tool_response>response:read_file{value:<|\"|>fn main() { panic!() }<|\"|>}<tool_response|>fn main() { panic!() }<turn|>\n<|channel>thought\n<channel|>"
-        );
-        // Non-object arguments → raw string verbatim (template's own
-        // `is string` branch).
-        let raw = render_chat_prompt_with_tools(
-            GEMMA4_EMBEDDED_TEMPLATE,
-            &i229_tail_transcript("location=Paris"),
-            None,
-            false,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            raw,
-            "<bos><|turn>system\nYou are an agent.<turn|>\n<|turn>user\nFix the bug in foo.rs<turn|>\n<|turn>model\n<|tool_call>call:read_file{location=Paris}<tool_call|><turn|>\n<|turn>tool\n<|tool_response>response:read_file{value:<|\"|>fn main() { panic!() }<|\"|>}<tool_response|>fn main() { panic!() }<turn|>\n<|channel>thought\n<channel|>"
-        );
+    fn iter229_gemma_tool_history_uses_openai_messages_without_duplicate_results() {
+        for (arguments, expected_call) in [
+            (
+                "{\"path\": \"foo.rs\"}",
+                r#"<|tool_call>call:read_file{path:<|"|>foo.rs<|"|>}<tool_call|>"#,
+            ),
+            (
+                "location=Paris",
+                "<|tool_call>call:read_file{location=Paris}<tool_call|>",
+            ),
+        ] {
+            let out = render_chat_prompt_with_tools(
+                GEMMA4_EMBEDDED_TEMPLATE,
+                &i229_tail_transcript(arguments),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(out.contains(expected_call), "{out}");
+            assert_eq!(out.matches("fn main() { panic!() }").count(), 1, "{out}");
+            assert!(
+                out.ends_with(
+                    "<|turn>tool\nfn main() { panic!() }<turn|>\n\
+                     <|turn>model\n<|channel>thought\n<channel|>"
+                ),
+                "{out}"
+            );
+        }
     }
 
     #[test]
@@ -35183,22 +35070,6 @@ assistant:
             ),
             "{out}"
         );
-    }
-
-    #[test]
-    fn iter229_gate3_non_assistant_tool_calls_do_not_define_ids() {
-        // tool_calls smuggled onto a user message must not populate the
-        // id→name map (gate-3 #1): the later tool message stays "unknown".
-        let inspect = "{% for m in messages %}{% if m.tool_responses %}\
-                       {% for tr in m.tool_responses %}TR:{{ tr.name }};{% endfor %}\
-                       {% endif %}{% endfor %}";
-        let mut smuggler = i229_msg("user", "go");
-        smuggler.tool_calls = Some(vec![i229_tool_call("P", "poisoned_fn", "{}")]);
-        let mut t = i229_msg("tool", "r");
-        t.tool_call_id = Some("P".into());
-        let msgs = vec![smuggler, i229_msg("user", "really go"), t];
-        let out = render_chat_prompt_with_tools(inspect, &msgs, None, false, None).unwrap();
-        assert_eq!(out, "TR:unknown;");
     }
 
     #[test]
@@ -35410,47 +35281,9 @@ assistant:
     }
 
     #[test]
-    fn iter229_ac6_id_to_name_chronological_scoping() {
-        let inspect = "{% for m in messages %}{% if m.tool_responses %}\
-                       {% for tr in m.tool_responses %}TR:{{ tr.name }};{% endfor %}\
-                       {% endif %}{% endfor %}";
-        // (a) duplicate id: each tool message binds to the most recent
-        // PRIOR definition.
-        let mut a1 = i229_msg("assistant", "");
-        a1.tool_calls = Some(vec![i229_tool_call("X", "first_fn", "{}")]);
-        let mut t1 = i229_msg("tool", "r1");
-        t1.tool_call_id = Some("X".into());
-        let mut a2 = i229_msg("assistant", "");
-        a2.tool_calls = Some(vec![i229_tool_call("X", "second_fn", "{}")]);
-        let mut t2 = i229_msg("tool", "r2");
-        t2.tool_call_id = Some("X".into());
-        let msgs = vec![i229_msg("user", "go"), a1, t1, a2, t2];
-        let out = render_chat_prompt_with_tools(inspect, &msgs, None, false, None).unwrap();
-        assert_eq!(out, "TR:first_fn;TR:second_fn;");
-
-        // (b) forward reference: tool message BEFORE the defining
-        // assistant turn → "unknown".
-        let mut t0 = i229_msg("tool", "early");
-        t0.tool_call_id = Some("Y".into());
-        let mut a3 = i229_msg("assistant", "");
-        a3.tool_calls = Some(vec![i229_tool_call("Y", "late_fn", "{}")]);
-        let msgs = vec![i229_msg("user", "go"), t0, a3];
-        let out = render_chat_prompt_with_tools(inspect, &msgs, None, false, None).unwrap();
-        assert_eq!(out, "TR:unknown;");
-
-        // (c) unknown id → "unknown".
-        let mut tz = i229_msg("tool", "orphan");
-        tz.tool_call_id = Some("Z".into());
-        let msgs = vec![i229_msg("user", "go"), tz];
-        let out = render_chat_prompt_with_tools(inspect, &msgs, None, false, None).unwrap();
-        assert_eq!(out, "TR:unknown;");
-
-        // (d) tool message with NO tool_call_id: bare {role, content} —
-        // no tool_responses synthesized; qwen template consumes content.
+    fn qwen_tool_result_without_call_id_keeps_content() {
         let bare = i229_msg("tool", "bare result");
         let msgs = vec![i229_msg("user", "go"), bare];
-        let out = render_chat_prompt_with_tools(inspect, &msgs, None, false, None).unwrap();
-        assert_eq!(out, "", "no tool_responses must be synthesized");
         let out = render_chat_prompt_with_tools(
             crate::core::chat_templates::QWEN3_CHATML,
             &msgs,
