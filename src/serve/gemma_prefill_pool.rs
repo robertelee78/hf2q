@@ -51,6 +51,8 @@ pub(crate) enum Init {
 
 struct Arena {
     pool: MlxBufferPool,
+    /// Retains the queue identity and its residency owner across forwards.
+    device: Option<MlxDevice>,
     limit: usize,
     /// Free buckets by size, mirroring the pool's free list so a request
     /// knows whether it reuses a bucket or grows the arena.
@@ -68,6 +70,7 @@ impl Arena {
     fn new(limit: usize) -> Self {
         Self {
             pool: MlxBufferPool::new(),
+            device: None,
             limit,
             free: HashMap::new(),
             in_use: Vec::new(),
@@ -127,14 +130,39 @@ pub(crate) struct PrefillPoolCycle {
 }
 
 impl PrefillPoolCycle {
-    /// Open a cycle. `zero_all` turns every handout into [`Init::Zeroed`]
-    /// (diagnostics that CPU-read whole buffers). `drain` must wait for every
-    /// command buffer already committed to the queue; it runs only when the
-    /// previous cycle unwound with GPU work possibly in flight.
-    pub(crate) fn begin(zero_all: bool, drain: impl FnOnce() -> Result<()>) -> Result<Self> {
+    /// Open a cycle on `device`. A new queue retires the previous arena;
+    /// device clones share a queue and keep reusing their allocations.
+    /// `drain` waits for the current queue after an unwound cycle. When the
+    /// previous cycle belongs to another queue, that owner is drained instead.
+    pub(crate) fn begin(
+        device: &MlxDevice,
+        zero_all: bool,
+        drain: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
         let undrained = ARENA.with(|arena| {
-            let arena = arena.borrow();
+            let mut arena = arena.borrow_mut();
             anyhow::ensure!(!arena.active, "nested Gemma batched-prefill pool cycle");
+            let changed = arena.device.as_ref().is_some_and(|previous| {
+                !std::ptr::eq(&**previous.metal_queue(), &**device.metal_queue())
+            });
+            if changed {
+                if arena.undrained {
+                    let encoder = arena
+                        .device
+                        .as_ref()
+                        .expect("a changed queue has a previous owner")
+                        .command_encoder()
+                        .context("create previous Gemma prefill queue drain")?;
+                    crate::inference::native_observation::encoder(encoder)
+                        .commit_and_wait()
+                        .context("drain previous Gemma prefill queue before retiring its arena")?;
+                }
+                let limit = arena.limit;
+                *arena = Arena::new(limit);
+            }
+            if arena.device.is_none() {
+                arena.device = Some(device.clone());
+            }
             Ok(arena.undrained)
         })?;
         if undrained {
