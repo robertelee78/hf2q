@@ -981,7 +981,7 @@ Delivery boundary: P1 merged to main; and either the mlx-native release containi
 | Profile evidence | `$G/profile/l1/*/server.stderr`, `$G/profile/l3/*/server.stderr`, `$G/profile/l3/*.catsplit.json` |
 | Routing proxy | `$E/q1-gemma-routing1511-t0-on-actual-v1/output/routing-witness.jsonl` |
 
-## 14. Results (2026-11-04 to 2026-11-06)
+## 14. Results (2026-11-04 to 2026-11-27)
 
 Receipts are under `/Users/robert/.local/state/hf2q/v0130/q4-gemma-prefill-moe/`.
 
@@ -1081,3 +1081,87 @@ Both witness op files and all four selection shaders are byte-identical in
 the published 0.23.2 (`17781c1`) and 0.24.0 (`51e68cf`) sources. The witness
 pin is updated after that audit; the exact-pin and exact-budget guards stay
 intact. This is protocol continuity, not global numerical qualification.
+
+### 14.8 Current-pin closeout evidence (2026-11-27; incomplete)
+
+The November 6 not-run disposition in §14.3 is historical. The subsequently
+authorized closeout measured the missing speed gates and reran current-pin
+correctness. These are separate source-bound records, not one frozen combined
+release candidate.
+
+The speed campaign used `c7bdee2a`, production image `54d55a65…96c219`,
+the original `bf65b7e1…538ef53` Gemma artifact and unchanged four-slot production
+context. Ten A/B pairs completed; S2's preregistered modal cohort contains six
+pairs. All 80 coding patches were independently correct, with the same patch
+digest `eaa64e2e749330ae066b1d64296d72a4afee3f909f06c0d18bff3d8041053339`.
+Same-agent transcripts were exact apart from random call IDs.
+
+| Gate | Actual result | Scope |
+|---|---|---|
+| S2 | Median B−A −0.336600 s; 95% interval [−0.339300, −0.332950] s | Six modal pairs, `c7bdee2a` |
+| S4 | Median B−A −0.4596825 s; 95% interval [−0.498347, −0.4068895] s | All ten pairs, `c7bdee2a` |
+| Fairness | Worst TTFT-p95 B/A 0.89552889337; SSE-gap-p95 B/A 0.9780531345 | Both below 1.025, all ten pairs |
+| S3 | Median MoE A 0.859328910 s, B 0.506066775 s; reduction 0.353262135 s | Six catsplit captures, `93d7bf54`; exceeds §14.6's 0.124974125 s requirement |
+| S3 non-MoE buckets | Largest absolute relative change 0.005037806 | All three buckets below 0.03 |
+| S5 | Median n1 B−A −0.0651615 s | Original four ABBA captures, `93d7bf54`; disclosure, not a speed gate |
+
+Current-pin correctness uses `93d7bf54`, published Native 0.24.0 (`51e68cf`),
+production image `3e022134…18e1ee` and test image `f0c74169…56cb`.
+The corrected compiled-source receipt is `8f538da6…ee3cb3`, with 1,100 canonical
+absolute inputs; the earlier relative-path receipt is superseded.
+
+- **HF real artifact:** 44/44 exact selected tests passed across A/B and both
+  shader paths, including both original n8 hybrid/full-TQ regimes. No selected
+  test was skipped or filtered out.
+- **Q1 greedy144:** the frozen four-by-144 token input digest is
+  `84276820299d97a4848104df3be18f605caef60ba09988389d06ac8db01f5034`.
+  Actual full endpoint scoring returns `ExactEqual`: 5,616 common records,
+  zero differences or one-sided records. This is historical fixed input,
+  not newly claimed current-pin greedy lineage.
+- **HF model-free (§5.2):** 32 existing controls passed in six invocations,
+  covering both shader paths; no new assertions or test framework.
+- **Native N8:** the six original suites passed on both shader paths:
+  64 tests, with four instances of optional decode benchmarks ignored.
+- **Qwen (§5.4):** the original n8 slot-aware test passed all four A/B and
+  shader-path invocations, without assertion or context-capacity changes.
+  The canonical n8 test's split capacity is not a production-context fit claim.
+- **DeepSeek warm (§5.4):** the original test passed all three bitwise parity
+  shapes and its five alternating benchmark pairs. Its model is the protected
+  `936a97e6…c7ad0d` artifact, 107,431,343,168 bytes. This standalone test is not
+  a formal protected combined-release receipt or matched-peer speed claim.
+
+Completed model-owning processes were reaped and their leases released.
+Nominal starts and Fair runtime/completion are valid; compressor growth is
+recorded, not an invented veto.
+
+**Outstanding:** Native N3 under full shader validation and the DeepSeek B=4
+decode regression. The final authorized DeepSeek invocation completed its
+original parity, conditioning and 20-pair timing protocol, but the original
+test **failed**: process page-ins increased by one. Residency, topology and
+conditioned performance checks passed; the VM-environment check did not.
+All four authorized model starts are spent. No retry, qualified speedup or
+regression acceptance follows from the measured timing.
+
+N3 stops during pipeline construction, before the invalid metadata dispatch.
+Minimal documented tensor-API controls compile normally but fail full
+validation; the matching 27C frontend and a documented fixed launch bound also
+failed. No production shader patch, SIMD opt-out or checker waiver has been
+promoted. A tooling/runtime cause is an inference, not an established vendor
+diagnosis. Native's source-mode core continuation remains unstarted.
+
+The older Review697 transcript replacement remains bound to its own native
+change and build. It is not current-pin transcript evidence: §5.4/D6 must be
+reconciled explicitly before acceptance. #371 and #660 are closed, but #690
+remains open. Neither global Native Class A nor final release qualification
+is claimed.
+
+Public source-bound progress: [HF matrix][hf-current], [Q1 endpoints][q1-current],
+[Native N8][n8-current], [Qwen][qwen-current], [DeepSeek warm][ds-warm-current],
+and [failed decode / parked closeout][ds-decode-current].
+
+[hf-current]: https://github.com/robertelee78/hf2q/issues/690#issuecomment-7208832477
+[q1-current]: https://github.com/robertelee78/hf2q/issues/690#issuecomment-7209223552
+[n8-current]: https://github.com/robertelee78/hf2q/issues/690#issuecomment-7209490970
+[qwen-current]: https://github.com/robertelee78/hf2q/issues/690#issuecomment-7210154142
+[ds-warm-current]: https://github.com/robertelee78/hf2q/issues/690#issuecomment-7210442239
+[ds-decode-current]: https://github.com/robertelee78/hf2q/issues/690#issuecomment-7227779406
