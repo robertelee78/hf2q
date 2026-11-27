@@ -1029,3 +1029,27 @@ recorded before the run; a run perturbed by another agent's build was discarded 
   refused under graph capture. The production prefill gates pass under graph capture.
 - `qwen35::gpu_delta_net::tests::chunk_arena_byte_exact_parity_at_seq128` is intermittent (1/8 on main):
   a missing barrier in mlx-native `gated_delta_net_chunk`, present in 0.15.18 and 0.16.0.
+
+### 14.5 Current-pin arena residency-owner correction
+
+The Native 0.24.0 regate reached the existing n8 tiny-prefill discriminator and
+failed while constructing an independent N=1 boundary reference:
+`MlxBufferPool cannot mix residency-enabled devices`. The thread-local arena
+outlived its model context and retained the previous residency owner. Clearing
+free buckets alone does not reset that binding.
+
+`PrefillPoolCycle::begin` now binds the arena to the device's command queue.
+It retains a device clone so the queue identity cannot be reused while cached.
+A different queue retires the old arena; if its previous cycle unwound, the
+old owner's queue is drained first, not the incoming context's queue. Same-queue
+device clones still reuse allocations. The aggregate 2 GiB arena bound,
+initialization contracts and numerical kernels are unchanged.
+
+Focused proof on published Native 0.24.0: all six arena GPU contract tests
+passed, including same-queue clone reuse, bounds and unwind handling. The
+unchanged `gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant` also passed
+both canonical release-gate regimes, hybrid and full-TQ, with 64 cold rounds
+and 16 retained-suffix rounds each (`run_agentic_cache_release_gate.sh`).
+The artifact was the original `bf65b7e1…538ef53` Gemma Q4_K_M, not the Ara
+release artifact. This is a lifecycle correctness result, not completion of
+the current-pin matrix, S1/S3/S5 or final combined-release qualification.

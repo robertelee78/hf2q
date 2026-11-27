@@ -16,7 +16,7 @@ fn cycle_hands_out_distinct_buffers_and_reuses_them_across_forwards() {
     let device = ctx.device().clone();
 
     let (first_ptrs, first_lens) = {
-        let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
+        let cycle = PrefillPoolCycle::begin(&device, false, no_drain).unwrap();
         let a = cycle
             .alloc(&device, DType::F32, 257, Init::Overwritten, "a")
             .unwrap();
@@ -38,7 +38,8 @@ fn cycle_hands_out_distinct_buffers_and_reuses_them_across_forwards() {
         (ptrs, lens)
     };
 
-    let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
+    let cloned_device = device.clone();
+    let cycle = PrefillPoolCycle::begin(&cloned_device, false, no_drain).unwrap();
     let a = cycle
         .alloc(&device, DType::F32, 257, Init::Overwritten, "a")
         .unwrap();
@@ -69,7 +70,7 @@ fn zeroed_handouts_are_zero_and_overwritten_handouts_skip_the_fill() {
     let device = ctx.device().clone();
 
     let ptrs = {
-        let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
+        let cycle = PrefillPoolCycle::begin(&device, false, no_drain).unwrap();
         let mut zeroed = cycle
             .alloc(&device, DType::F32, 1000, Init::Zeroed, "z")
             .unwrap();
@@ -83,7 +84,7 @@ fn zeroed_handouts_are_zero_and_overwritten_handouts_skip_the_fill() {
         (zeroed.contents_ptr(), overwritten.contents_ptr())
     };
 
-    let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
+    let cycle = PrefillPoolCycle::begin(&device, false, no_drain).unwrap();
     let zeroed = cycle
         .alloc(&device, DType::F32, 1000, Init::Zeroed, "z")
         .unwrap();
@@ -113,14 +114,14 @@ fn zero_all_cycle_zeroes_overwritten_handouts() {
     let device = ctx.device().clone();
 
     {
-        let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
+        let cycle = PrefillPoolCycle::begin(&device, false, no_drain).unwrap();
         let mut buffer = cycle
             .alloc(&device, DType::U32, 96, Init::Overwritten, "o")
             .unwrap();
         fill(&mut buffer, 0xFF);
         cycle.gpu_quiescent();
     }
-    let cycle = PrefillPoolCycle::begin(true, no_drain).unwrap();
+    let cycle = PrefillPoolCycle::begin(&device, true, no_drain).unwrap();
     let buffer = cycle
         .alloc(&device, DType::U32, 96, Init::Overwritten, "o")
         .unwrap();
@@ -135,8 +136,8 @@ fn unwound_cycle_drains_before_recycling_and_nested_cycles_are_refused() {
     let device = ctx.device().clone();
 
     let first = {
-        let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
-        assert!(PrefillPoolCycle::begin(false, no_drain).is_err());
+        let cycle = PrefillPoolCycle::begin(&device, false, no_drain).unwrap();
+        assert!(PrefillPoolCycle::begin(&device, false, no_drain).is_err());
         let buffer = cycle
             .alloc(&device, DType::F32, 128, Init::Overwritten, "o")
             .unwrap();
@@ -146,7 +147,7 @@ fn unwound_cycle_drains_before_recycling_and_nested_cycles_are_refused() {
 
     let (executor, _registry) = ctx.split();
     let mut drained = false;
-    let cycle = PrefillPoolCycle::begin(false, || {
+    let cycle = PrefillPoolCycle::begin(&device, false, || {
         executor.begin().unwrap().finish().unwrap();
         drained = true;
         Ok(())
@@ -171,7 +172,7 @@ fn requests_past_the_limit_fall_back_to_zeroed_device_buffers() {
     set_limit_for_test(4096);
 
     let pooled_ptr = {
-        let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
+        let cycle = PrefillPoolCycle::begin(&device, false, no_drain).unwrap();
         let pooled = cycle
             .alloc(&device, DType::F32, 1024, Init::Overwritten, "p")
             .unwrap();
@@ -185,7 +186,7 @@ fn requests_past_the_limit_fall_back_to_zeroed_device_buffers() {
         pooled.contents_ptr()
     };
 
-    let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
+    let cycle = PrefillPoolCycle::begin(&device, false, no_drain).unwrap();
     let pooled = cycle
         .alloc(&device, DType::F32, 1024, Init::Overwritten, "p")
         .unwrap();
@@ -217,7 +218,7 @@ fn arena_holds_at_most_the_limit_during_a_forward() {
     };
 
     {
-        let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
+        let cycle = PrefillPoolCycle::begin(&device, false, no_drain).unwrap();
         let _a = cycle
             .alloc(&device, DType::F32, 1024, Init::Overwritten, "a")
             .unwrap();
@@ -234,7 +235,7 @@ fn arena_holds_at_most_the_limit_during_a_forward() {
     // earlier forward's free bucket instead of holding both (8 KiB).
     let shapes = [(256, "b"), (512, "c"), (256, "d")];
     let first: Vec<_> = {
-        let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
+        let cycle = PrefillPoolCycle::begin(&device, false, no_drain).unwrap();
         let mut ptrs = Vec::new();
         for (elements, label) in shapes {
             let buffer = cycle
@@ -258,7 +259,7 @@ fn arena_holds_at_most_the_limit_during_a_forward() {
     assert_bounded("between forwards");
 
     // The same shapes again reuse every bucket at the limit without evicting.
-    let cycle = PrefillPoolCycle::begin(false, no_drain).unwrap();
+    let cycle = PrefillPoolCycle::begin(&device, false, no_drain).unwrap();
     let mut second = Vec::new();
     for (elements, label) in shapes {
         let buffer = cycle

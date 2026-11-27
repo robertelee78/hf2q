@@ -1402,7 +1402,7 @@ impl MlxModelWeights {
             || crate::quantize::imatrix::is_active();
         // Declared before every activation so it drops after them.
         let prefill_pool =
-            gemma_prefill_pool::PrefillPoolCycle::begin(zero_all_activations, || {
+            gemma_prefill_pool::PrefillPoolCycle::begin(dev, zero_all_activations, || {
                 // An empty commit-and-wait drains the in-order queue.
                 exec.begin()
                     .map(crate::inference::native_observation::session)
