@@ -2243,11 +2243,63 @@ The immutable compiled-source evidence accidentally retains its parent's
 `required_compiled_source_stamp` annotation. Actual build argv and adapter bind
 `8fd0f030`, and its compiler inputs/image match; the stale annotation is not
 runtime attestation and is preserved/disclosed, not silently rewritten.
-Whole D4, family quality/performance, D3/D5/D6 and release qualification remain
-open. All T/T2/T3 and four-arm budgets are closed; none transfers to another run.
+At that measurement boundary, whole D4, family quality/performance, D3/D5/D6
+and release qualification remained open. All T/T2/T3 and four-arm budgets are
+closed; none transfers to another run.
 
+#### D4 merged-component qualification (2026-11-27)
 
+The merge-delivered component in [issue #866](https://github.com/robertelee78/hf2q/issues/866)
+is distinct from the complete D0–D6 family outcome. Its implementation landed
+through PR #872 as `6daf5c8cf55cf5dbfd03591118d43cb25276add5` (integrated source
+`5341efd999d6e9d72f07db5f094cf20ea724b883`). All six CI checks and the
+existing 136 focused checks passed: 13 grammar, ten scheduler, four actual
+Metal draft-prefetch and 109 strict Python diagnostic/Q5 checks. The two
+GPU scheduler differential cases retain the canonical host sampler; unsupported
+probabilistic, seeded, biased and diagnostic requests retain its full route.
+Named grammar consumers cover ranked-prefix acceptance, mismatch/invalid/EOS,
+lazy/same-token markers, partial UTF-8, forced tokens, persistent ordinary
+comparisons and independent lanes. Synthetic GPU tests are not substituted for
+real-model cancellation.
 
+The measured T3 source `8fd0f030a4fc53bd4912c645d9a83034142752bb`, integrated
+source, coherent candidate `95b3748b3f292b2412f70eaafe83c1034b31283a` and
+main at `eedee51047f2cd9f74ac539a3dd5757c01be2e7d` preserve identical D4
+runtime/caller source. The only differing Rust file, `joint_decode.rs`, adds
+solely `cfg(test)` C23 capture/finalization hooks; its production D4 path is
+unchanged. All four sources lock published mlx-native 0.24.0 with checksum
+`522f97e41655e16367e57116e7f18fa2132ab933d3c6db390bd8a34e8d7900a6`.
+This reconciles component evidence, not whole-binary or whole-release identity.
+The historical stale parent annotation remains disclosed above.
+
+The missing cancellation/rollback check now ran once, with zero retries, on
+the coherent candidate's production binary SHA-256
+`3a680954a3d50e9eb33a2978ca7fff48146bbce8d48e17bd1a40106d835bed4f`.
+It used the same full vanilla Qwen3.8-27B artifact, 262144-token context,
+four slots and 48 GiB KV, with DFlash2 auto/pinned_pair/full. The actual
+pre-close dispatch was width-four DFlash2, not capability metadata alone.
+One acknowledged cancellation restored rank zero / 915 tokens; pending-owned
+anchor bytes returned to zero. All three survivor outputs exactly equal the
+no-cancel control, and the cancelled partial output is its control prefix.
+The victim retry succeeds with 915 cached tokens; its client's
+`first_semantic_token_seconds` is 0.656031. Retry/control add no cancellations.
+The existing real-client smoke and physical Q5 both pass. All 75 samples were
+observed/normal, with no blind samples or swap growth; actual peak process
+footprint was 74,004,590,960 bytes and minimum free+cached 40,093,810,688 bytes.
+AC power was stable and the observed start/end thermal state was Nominal;
+this observation does not add a terminal-Nominal requirement. The complete
+owned cohort was emptied/reaped and its lease released.
+
+The registered T3/ABBA evidence above supplies actual useful body-overlap and
+full-cycle overhead observations; the new proof does not reopen those budgets
+or turn two ABBA pairs into a statistical speedup. Independent stateless
+reviewer `cmp-15df234d25ca9d89` accepts every component criterion with no blocking
+findings. The [candidate record](https://github.com/robertelee78/hf2q/issues/866#issuecomment-7230097570)
+binds the exact source and receipt hashes. The source mapping, named criterion
+map and immutable cancellation receipts are retained in
+`d4-component-closeout-v1` beside the original evidence on the mounted SSD.
+Full family D3/D5/D6, family quality/performance, C2 #360, whole Q4 and the
+exact combined-release qualification/publication remain open and unchanged.
 
 #### D2-D4 implementation-candidate status
 
