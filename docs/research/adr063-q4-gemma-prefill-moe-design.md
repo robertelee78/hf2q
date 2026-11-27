@@ -1053,3 +1053,31 @@ and 16 retained-suffix rounds each (`run_agentic_cache_release_gate.sh`).
 The artifact was the original `bf65b7e1…538ef53` Gemma Q4_K_M, not the Ara
 release artifact. This is a lifecycle correctness result, not completion of
 the current-pin matrix, S1/S3/S5 or final combined-release qualification.
+
+### 14.6 Current-pin primitive measurement
+
+The original six-layer M0c subset was remeasured on published Native 0.24.0
+(`51e68cf`), Apple M5 Max, with the served Gemma Q5 tensor policy enabled.
+The frozen `bf65b7e1…538ef53` bootstrap routing input has SHA-256
+`04430f8197f02cbc0d768c54f28eba9550be9f6eb36ea0aecd7d197213a477ef`;
+it is historical input data, not current-pin numerical evidence. The original
+rows (including the preregistered 1172 replacement for 1180), layers, 20 warmups
+and 200 measured samples were unchanged.
+
+The original scorer reports grid minus compact/no-skip 0.248655640 s plus
+measured compact schedule reuse 0.001292610 s: **S_meas 0.249948250 s/run**,
+with zero per-shape regressions beyond max(2%, 5 us). S1 passes. Half-tile
+skip remains a separate result, not substituted into that prediction.
+The continuous Native observer completed normally, reaped the benchmark and
+released the lease. Nominal start and Fair completion were accepted. No model
+was loaded. S3 therefore requires at least 0.124974125 s median MoE reduction;
+category attribution and the other outstanding gates are not inferred.
+
+### 14.7 Current-pin witness admission
+
+The existing host-only witness admission control exposed a stale 0.23.2
+protocol pin against the actual 0.24.0 build, before any model or GPU load.
+Both witness op files and all four selection shaders are byte-identical in
+the published 0.23.2 (`17781c1`) and 0.24.0 (`51e68cf`) sources. The witness
+pin is updated after that audit; the exact-pin and exact-budget guards stay
+intact. This is protocol continuity, not global numerical qualification.

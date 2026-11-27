@@ -120,7 +120,11 @@ pub const CPU_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 /// both witness ops and all four selection shaders are byte-identical. The
 /// additive ordinary DFlash2 RMS producer does not change this protocol;
 /// model, memory and serving qualification still require the exact new pin.
-pub const WITNESS_NATIVE_VERSION: &str = "0.23.2";
+/// Re-reviewed 0.23.2 -> 0.24.0 (registry sources `17781c1` -> `51e68cf`):
+/// both witness ops and all four selection shaders are byte-identical.
+/// The exact-pin admission remains enabled. This preserves this protocol only;
+/// model arithmetic, memory and serving require qualification at the new pin.
+pub const WITNESS_NATIVE_VERSION: &str = "0.24.0";
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
