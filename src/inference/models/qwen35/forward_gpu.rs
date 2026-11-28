@@ -4889,6 +4889,8 @@ impl Qwen35Model {
         slot_id: SlotId,
         residual_capture: Option<ResidualLayerCapture<'_>>,
     ) -> Result<Vec<f32>> {
+        #[cfg(test)]
+        let c2_native = crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::acquire::native_begin()?;
         // Every command buffer a multi-row forward commits without a wait
         // is kept from its first submission (the embedding) on, at every
         // wait cadence.
@@ -4939,6 +4941,8 @@ impl Qwen35Model {
         // apply through it and end there.
         super::decode_pool::release_overflow();
         super::decode_pool::end_caps_at_next_reset();
+        #[cfg(test)]
+        if result.is_ok() { c2_native.finish()?; }
         result
     }
 
@@ -5100,6 +5104,42 @@ impl Qwen35Model {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
+        #[cfg(test)]
+        {
+            use crate::serve::api::engine_qwen35::anchor_exactness_tests::{
+                trace::acquire, registration::NativeHead, native_inputs::InputBinding};
+            if acquire::enabled() {
+                ensure!(matches!(output_head_mode, OutputHeadMode::All | OutputHeadMode::Last),
+                    "required full-row acquisition does not support a partial output-head mode");
+                let mut heads = Vec::with_capacity(joint.as_ref().map_or(1, |plan| plan.lanes.len() * 2));
+                if let Some(plan) = joint.as_ref() {
+                    for lane in &plan.lanes {
+                        let first = if lane.shared_rows > 0 { 0 } else { lane.own_first as usize };
+                        let start = usize::try_from(*positions_flat.get(first).context("joint lane start position absent")?)?;
+                        let input = |rows: u32| InputBinding::host_rows(rows as usize, (0..rows).map(|row| {
+                            let physical = if row < lane.shared_rows { row }
+                                else { lane.own_first + row - lane.shared_rows };
+                            tokens[physical as usize]
+                        }));
+                        if let Some(boundary) = lane.boundary.as_ref() {
+                            heads.push(NativeHead { slot: lane.slot, start, input_rows: boundary.prefix_rows as usize,
+                                projected_rows: 1, vocab: cfg.vocab_size as usize, hidden_width: h as usize,
+                                gpu_argmax: false, input: input(boundary.prefix_rows)? });
+                        }
+                        heads.push(NativeHead { slot: lane.slot, start, input_rows: lane.rows as usize,
+                            projected_rows: 1, vocab: cfg.vocab_size as usize, hidden_width: h as usize,
+                            gpu_argmax: false, input: input(lane.rows)? });
+                    }
+                } else {
+                    heads.push(NativeHead { slot: slot_id, start: usize::try_from(positions_flat[0])?,
+                        input_rows: tokens.len(), projected_rows: if matches!(output_head_mode, OutputHeadMode::All) {
+                            tokens.len() } else { 1 },
+                        vocab: cfg.vocab_size as usize, hidden_width: h as usize, gpu_argmax: false,
+                        input: InputBinding::host(tokens)? });
+                }
+                acquire::native_contract(heads)?;
+            }
+        }
 
         // ---- Wedge-4c.5: validate DeepstackInjection up-front -------------
         //
@@ -7953,6 +7993,8 @@ impl Qwen35Model {
             }
         }
         #[cfg(test)]
+        crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::acquire::plan_native()?;
+        #[cfg(test)]
         let c2_head = if matches!(output_head_mode, OutputHeadMode::All | OutputHeadMode::Last) {
             native_head_observer::Scope::begin()?
         } else {
@@ -8275,6 +8317,19 @@ impl Qwen35Model {
             ));
         }
 
+        #[cfg(test)]
+        let c2_native = crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::acquire::native_begin()?;
+        #[cfg(test)]
+        if crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::acquire::enabled() {
+            crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::acquire::native_contract([
+                crate::serve::api::engine_qwen35::anchor_exactness_tests::registration::NativeHead {
+                    slot: slot_id, start: usize::try_from(positions_flat[0])?, input_rows: tokens.len(),
+                    projected_rows: 1, vocab: self.cfg.vocab_size as usize, hidden_width: self.cfg.hidden_size as usize,
+                    gpu_argmax: true,
+                    input: crate::serve::api::engine_qwen35::anchor_exactness_tests::native_inputs::InputBinding::host(tokens)?,
+                }
+            ])?;
+        }
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
@@ -9599,6 +9654,8 @@ impl Qwen35Model {
         } else {
             None
         };
+        #[cfg(test)]
+        crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::acquire::plan_native()?;
         let token_id = if legacy_per_layer_cb {
             apply_output_head_gpu_greedy_legacy(
                 &device,
@@ -9627,7 +9684,7 @@ impl Qwen35Model {
         #[cfg(test)]
         if crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::enabled() {
             crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::gpu_argmax(
-                slot_id, usize::try_from(positions_flat[0])?, token_id);
+                slot_id, usize::try_from(positions_flat[0])?, token_id)?;
             crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::forward(
                 slot_id, usize::try_from(positions_flat[0])?, tokens, "serial-GPU-greedy",
                 decode_bufs.logits_buf.as_logical_slice::<f32>()?, cfg.vocab_size as usize,
@@ -9646,6 +9703,8 @@ impl Qwen35Model {
         print_and_reset_cb_profile("forward_gpu_greedy");
 
         pool_operation.complete()?;
+        #[cfg(test)]
+        c2_native.finish()?;
         Ok(token_id)
     }
 

@@ -2,7 +2,7 @@
 //! its route, synchronization, or production decision. Frozen decisions are a
 //! separate, explicitly labelled diagnostic mode; lifecycle tests never use it.
 use super::*;
-use std::{cell::RefCell, collections::BTreeMap, ops::Range};
+use std::{cell::RefCell, collections::BTreeMap};
 use mlx_native::{DType, MlxBuffer};
 use crate::inference::models::qwen35::kv_cache::FullAttnKvSlot;
 
@@ -12,16 +12,6 @@ pub(super) struct State {
     pub mtp: Option<u32>,
     pub parity: Vec<bool>,
     pub regions: Vec<Vec<u8>>,
-}
-fn elements(buffer: &MlxBuffer, range: Range<usize>) -> Result<Vec<u8>> {
-    ensure!(range.end.checked_mul(buffer.dtype().size_of()).is_some_and(|n| n <= buffer.data_byte_len()),
-        "observable region exceeds logical extent");
-    match buffer.dtype() {
-        DType::U8 => Ok(buffer.as_logical_slice::<u8>()?[range].to_vec()),
-        DType::F32 => Ok(buffer.as_logical_slice::<f32>()?[range].iter()
-            .flat_map(|v| v.to_bits().to_le_bytes()).collect()),
-        _ => anyhow::bail!("C2 cache observation requires explicit U8/F32 representation"),
-    }
 }
 // Shape descriptors place n_seqs last, but the owning snapshot/restore
 // operations address contiguous per-slot spans (la_restore.rs:370-424,
@@ -42,10 +32,20 @@ pub(super) fn rows(buffer: &MlxBuffer, slot: SlotId, valid: u32) -> Result<Vec<u
     let shape = buffer.shape();
     ensure!(shape.len() == 4 && (slot.0 as usize) < shape[0] && valid as usize <= shape[2],
         "full-attention valid extent mismatch");
-    let mut bytes = Vec::new();
+    let length = shape[1].checked_mul(valid as usize).and_then(|n| n.checked_mul(shape[3]))
+        .and_then(|n| n.checked_mul(buffer.dtype().size_of())).context("cache row byte count overflow")?;
+    let mut bytes = Vec::with_capacity(length);
     for head in 0..shape[1] {
         let first = (slot.0 as usize * shape[1] + head) * shape[2] * shape[3];
-        bytes.extend(elements(buffer, first..first + valid as usize * shape[3])?);
+        let range = first..first + valid as usize * shape[3];
+        ensure!(range.end.checked_mul(buffer.dtype().size_of()).is_some_and(|n| n <= buffer.data_byte_len()),
+            "observable region exceeds logical extent");
+        match buffer.dtype() {
+            DType::U8 => bytes.extend_from_slice(&buffer.as_logical_slice::<u8>()?[range]),
+            DType::F32 => bytes.extend(buffer.as_logical_slice::<f32>()?[range].iter()
+                .flat_map(|value| value.to_bits().to_le_bytes())),
+            _ => anyhow::bail!("C2 cache observation requires explicit U8/F32 representation"),
+        }
     }
     Ok(bytes)
 }
@@ -63,10 +63,11 @@ fn full(layer: &FullAttnKvSlot, slot: SlotId, regions: &mut Vec<Vec<u8>>) -> Res
 }
 impl State {
     pub(super) fn read(kv: &HybridKvCache, slot: SlotId) -> Result<Self> {
-        let mut regions = Vec::new();
+        let mut regions = Vec::with_capacity(6 * (kv.full_attn.len() + usize::from(kv.mtp_slot.is_some()))
+            + 2 * kv.linear_attn.len());
         let target = kv.full_attn.iter().map(|l| full(l, slot, &mut regions)).collect::<Result<Vec<_>>>()?;
         let mtp = kv.mtp_slot.as_ref().map(|l| full(l, slot, &mut regions)).transpose()?;
-        let mut parity = Vec::new();
+        let mut parity = Vec::with_capacity(kv.linear_attn.len());
         for layer in &kv.linear_attn {
             parity.push(layer.pp_flipped[slot.0 as usize]);
             // Scratch is not semantic state and is intentionally not restored.
@@ -89,6 +90,8 @@ pub(super) struct Forward {
     pub hidden: Vec<u32>,
     pub vocab: usize,
     pub hidden_width: usize,
+    pub input_sha256: Option<String>,
+    pub planned_sequence: Option<u64>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Observations {
@@ -113,7 +116,11 @@ struct Active {
     prediction_origin: usize,
     transactions: Transactions,
     published_ledger: Vec<u32>,
+    session: Option<super::registration::Session>,
+    raw_ram: Option<super::live_ram::Reservation>,
 }
+#[path = "acquire.rs"]
+pub(crate) mod acquire;
 thread_local! { static ACTIVE: RefCell<Option<Active>> = const { RefCell::new(None) }; }
 pub(super) struct Scope;
 impl Scope {
@@ -123,7 +130,7 @@ impl Scope {
             ensure!(active.is_none(), "nested C2 acquisition");
             *active = Some(Active { observations: Observations::default(), frozen, decision_base,
                 target_slot: SLOT, prediction_origin: 0, transactions: Transactions::Disabled,
-                published_ledger: Vec::new() });
+                published_ledger: Vec::new(), session: None, raw_ram: None });
             Ok(Self)
         })
     }
@@ -132,12 +139,16 @@ impl Scope {
             if let Some(active) = cell.borrow_mut().as_mut() { active.target_slot = slot; }
         });
     }
-    pub(super) fn begin_transactions(writer: super::transaction_trace::Writer, ledger: &[u32]) -> Result<Self> {
+    pub(super) fn begin_transactions(writer: super::transaction_trace::Writer, ledger: &[u32],
+        prediction_origin: usize) -> Result<Self> {
         let scope = Self::begin(None, 0)?;
+        let session = super::registration::Session::new(writer.context(), prediction_origin)?;
         ACTIVE.with(|cell| {
             let mut active = cell.borrow_mut();
             let active = active.as_mut().context("C2 scope absent")?;
             active.transactions = Transactions::Recording(writer);
+            active.session = Some(session);
+            active.prediction_origin = prediction_origin;
             active.published_ledger = ledger.to_vec();
             Ok::<_, anyhow::Error>(())
         })?;
@@ -161,6 +172,7 @@ impl Scope {
                 Transactions::Failed => anyhow::bail!("Incomplete: transaction capture previously failed"),
             };
             writer.finish()?;
+            active.session.take().context("required acquisition session was not attached")?.finish()?;
             active.transactions = Transactions::Finished;
             Ok(())
         })
@@ -205,9 +217,21 @@ pub(crate) fn forward(
         let hidden = hidden.unwrap_or(&[]);
         ensure!(hidden.is_empty() || (hidden_width > 0 && hidden.len() % hidden_width == 0),
             "actual C2 hidden extent mismatch");
+        ensure!(route.len() <= 256, "raw route metadata exceeds its retained grant");
+        let (planned_sequence, input_sha256) = if let Some(session) = active.session.as_mut() {
+            let (sequence, digest) = session.forward(slot, start, input, vocab, hidden_width, logits.len(), hidden.len())?;
+            (Some(sequence), Some(digest))
+        } else { (None, None) };
+        if active.session.is_none() {
+            let bytes = logits.len().checked_add(hidden.len()).and_then(|n| n.checked_add(input.len()))
+                .and_then(|n| n.checked_mul(4)).and_then(|n| n.checked_add(route.len()))
+                .and_then(|n| n.checked_add(2 * std::mem::size_of::<Forward>()))
+                .context("prefix raw observation allocation overflow")?;
+            super::live_ram::observe_raw(&mut active.raw_ram, u64::try_from(bytes)?)?;
+        }
         active.observations.forwards.push(Forward { slot: slot.0, start, input: input.to_vec(),
             route: route.into(), logits: logits.iter().map(|v| v.to_bits()).collect(),
-            hidden: hidden.iter().map(|v| v.to_bits()).collect(), vocab, hidden_width });
+            hidden: hidden.iter().map(|v| v.to_bits()).collect(), vocab, hidden_width, planned_sequence, input_sha256 });
         Ok(())
     })
 }
@@ -226,6 +250,7 @@ pub(crate) fn decision_for(slot:SlotId,ticket:Option<&str>,index:usize,actual:u3
             *frozen.get(index.checked_sub(active.decision_base).context("decision before frozen start")?)
                 .context("actual decision exceeds independent frozen extent")?
         } else { actual };
+        if let Some(session) = active.session.as_mut() { session.decision(index)?; }
         active.observations.decisions.push((index, token));
         Ok(token)
     })
@@ -236,23 +261,27 @@ pub(crate) fn stopping(slot:SlotId,ticket:Option<&str>,token:u32,cause:&str)->Re
     }
     Ok(())
 }
-pub(crate) fn gpu_argmax(slot: SlotId, position: usize, token: u32) {
+pub(crate) fn gpu_argmax(slot: SlotId, position: usize, token: u32) -> Result<()> {
     super::fullw_http::argmax(slot, position, token);
     ACTIVE.with(|cell| {
-        if let Some(active) = cell.borrow_mut().as_mut() {
-            if slot != active.target_slot { return; }
+        let mut active = cell.borrow_mut();
+        if let Some(active) = active.as_mut() {
+            if slot != active.target_slot { return Ok(()); }
+            if let Some(session) = active.session.as_mut() { session.gpu_argmax(position)?; }
             active.observations.gpu_argmax.push((position, token));
         }
-    });
+        Ok(())
+    })
 }
 pub(super) fn transaction(cache: &HybridKvCache, slot: SlotId) -> Result<()> {
+    if acquire::enabled() { return acquire::capture_state(cache, slot); }
     ACTIVE.with(|cell| {
         let mut active = cell.borrow_mut();
         let Some(active) = active.as_mut() else { return Ok(()) };
         if slot == active.target_slot {
             let result = match &mut active.transactions {
                 Transactions::Disabled => Ok(()),
-                Transactions::Recording(writer) => writer.capture(cache, slot, &active.published_ledger),
+                Transactions::Recording(_) => Err(anyhow::anyhow!("required state stream lost its acquisition session")),
                 Transactions::Finished => Err(anyhow::anyhow!("Incomplete: transaction captured after finish")),
                 Transactions::Failed => Err(anyhow::anyhow!("Incomplete: transaction capture previously failed")),
             };
@@ -281,10 +310,19 @@ pub(super) fn coordinate(agent: &str, turn: usize, row: usize, stage: Stage) -> 
         agent: agent.into(), logical_row_start: row as u64, segment: 0 }
 }
 pub(super) fn capture_f32(store: &mut Store, at: Coordinate, values: &[f32], shape: Vec<usize>) -> Result<()> {
-    let bytes: Vec<_> = values.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-    store.capture(at, Scalar::F32, shape, values.as_ptr() as usize as u64,
-        bytes.len() as u64, 0, None, "production forward returned after its checked native drain", &bytes)
-        .map_err(anyhow::Error::msg)
+    capture_words(store, at, bytemuck::cast_slice(values), values.as_ptr() as usize as u64, shape)
+}
+pub(super) fn capture_bits(store: &mut Store, at: Coordinate, values: &[u32], shape: Vec<usize>) -> Result<()> {
+    capture_words(store, at, bytemuck::cast_slice(values), values.as_ptr() as usize as u64, shape)
+}
+fn capture_words(store: &mut Store, at: Coordinate, native: &[u8], parent: u64, shape: Vec<usize>) -> Result<()> {
+    let converted;
+    let bytes = if cfg!(target_endian = "little") { native } else {
+        converted = native.chunks_exact(4).flat_map(|word| word.iter().rev().copied()).collect::<Vec<_>>();
+        converted.as_slice()
+    };
+    store.capture(at, Scalar::F32, shape, parent, bytes.len() as u64, 0, None,
+        "production forward returned after its checked native drain", bytes).map_err(anyhow::Error::msg)
 }
 // Emit canonical decision rows, not a final-row proxy. Every planned row must
 // have a source forward. Different verifier chunking is allowed only Class B.

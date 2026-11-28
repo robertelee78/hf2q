@@ -227,6 +227,9 @@ impl Qwen35DecodeState {
             } => {
                 let token = match (output.greedy_token, output.logits) {
                     (Some(predicted), _) => {
+                        #[cfg(test)]
+                        super::anchor_exactness_tests::trace::acquire::require_decision(
+                            self.slot_id, self.generated_tokens.len(), qwen.vocab_size, qwen.hidden_size)?;
                         let selected = forced_token.map_or(predicted, |(token, _)| token);
                         #[cfg(test)]
                         let selected = super::anchor_exactness_tests::trace::decision_for(

@@ -32,6 +32,32 @@ mod post_commit;
 mod extent_export;
 #[path = "anchor_exactness/transaction_trace.rs"]
 mod transaction_trace;
+#[path = "anchor_exactness/obligations.rs"]
+mod obligations;
+#[path = "anchor_exactness/state_layout.rs"]
+mod state_layout;
+#[path = "anchor_exactness/forward_plan.rs"]
+mod forward_plan;
+#[path = "anchor_exactness/matrix_plan.rs"]
+mod matrix_plan;
+#[path = "anchor_exactness/metadata.rs"]
+mod metadata;
+#[path = "anchor_exactness/registration.rs"]
+pub(crate) mod registration;
+#[path = "anchor_exactness/checkpoint_witness.rs"]
+mod checkpoint_witness;
+#[path = "anchor_exactness/registered_plan.rs"]
+mod registered_plan;
+#[path = "anchor_exactness/case_evidence.rs"]
+mod case_evidence;
+#[path = "anchor_exactness/live_ram.rs"]
+mod live_ram;
+#[path = "anchor_exactness/request_kind.rs"]
+mod request_kind;
+#[path = "anchor_exactness/matrix_catalog_export.rs"]
+mod matrix_catalog_export;
+#[path = "anchor_exactness/native_inputs.rs"]
+pub(crate) mod native_inputs;
 #[path = "anchor_exactness/frozen_params.rs"]
 pub(crate) mod frozen_params;
 #[path = "anchor_exactness/frozen_script.rs"]
@@ -83,8 +109,7 @@ struct Packet {
     graft: Option<PathBuf>,
     changed_graft: Option<PathBuf>,
     capacity: u32,
-    // Independent extent registration is REQUIRED, not inferred from captured rows.
-    expected: std::collections::BTreeMap<String, acquisition::FileBinding>,
+    registration: Option<acquisition::FileBinding>,
     host_payload_limit: u64,
 }
 struct Fixture {
@@ -95,9 +120,12 @@ struct Fixture {
     restore_route: crate::inference::models::qwen35::kv_cache::LaRestoreRoute,
     _routes: crate::inference::spec_decode::dflash2::route_profile::Bound,
     joint: Option<crate::serve::api::engine::qwen35_joint_decode::Qwen35JointDecodeConfig>,
+    matrix: Option<std::rc::Rc<std::cell::RefCell<matrix_plan::Budget>>>,
+    _metadata_ram: Option<live_ram::Reservation>,
+    _ram_scope: Option<live_ram::Bound>,
 }
 impl Fixture {
-    fn load(family: Family) -> Result<Self> {
+    fn load(family: Family, mode: Option<matrix_plan::Mode>) -> Result<Self> {
         let path = PathBuf::from(std::env::var_os("HF2Q_C2_EXACTNESS_PACKET")
             .context("HF2Q_C2_EXACTNESS_PACKET must name the root-reviewed packet")?);
         let mut raw = Vec::new();
@@ -105,6 +133,17 @@ impl Fixture {
         ensure!(raw.len() <= 4 * 1024 * 1024, "C2 packet exceeds4MiB");
         let packet: Packet = serde_json::from_slice(&raw)?;
         ensure!(packet.execution_approved, "root execution approval missing");
+        let matrix = match (mode, packet.registration.as_ref()) {
+            (Some(mode), Some(binding)) => {
+                if mode == matrix_plan::Mode::Lifecycle && packet.graft.is_some() {
+                    ensure!(packet.changed_graft.is_some(), "grafted matrix requires its real changed-identity bank");
+                }
+                Some(std::rc::Rc::new(std::cell::RefCell::new(matrix_plan::Budget::new(
+                    matrix_plan::Manifest::load(binding, &packet.identity, mode, packet.graft.is_some())?))))
+            }
+            (None, None) => None,
+            _ => anyhow::bail!("selected matrix endpoint and pre-load registration manifest differ"),
+        };
         packet.workload.validate().map_err(anyhow::Error::msg)?;
         ensure!(packet.identity.family == family && packet.workload.family == family,
             "selected test and packet family differ");
@@ -191,8 +230,13 @@ impl Fixture {
             "anchor_restore":restore_route.label(),"source":"production resolve_for_load + provision_dflash2",
             "diagnostic_not_timing_proof":true
         }))?)?;
-        Ok(Self { loaded, packet, acquisition, supervisor: EngineSupervisor::new(),
-            restore_route, joint, _routes: routes })
+        let mut fixture = Self { loaded, packet, acquisition, supervisor: EngineSupervisor::new(),
+            restore_route, joint, _routes: routes, matrix, _metadata_ram: None, _ram_scope: None };
+        if let Some(budget) = &fixture.matrix {
+            fixture._metadata_ram = Some(live_ram::preflight(&fixture)?);
+            fixture._ram_scope = Some(live_ram::bind(budget)?);
+        }
+        Ok(fixture)
     }
     fn qwen(&mut self) -> &mut Qwen35LoadedModel {
         let LoadedModel::Qwen35(qwen) = self.loaded.as_mut() else { unreachable!() }; qwen
@@ -211,15 +255,40 @@ impl Fixture {
         qwen.model.with_gpu_cache_mut(|device, _| self.acquisition.observed(
             device, &qwen.model as *const _ as usize as u64, 1))?.for_store_root(root)
     }
-    fn expected(&self, name: &str) -> Result<Vec<ExpectedTensor>> {
-        let binding = self.packet.expected.get(name)
-            .with_context(|| format!("independent extent binding missing: {name}"))?;
-        let raw = acquisition::checked_file(binding, 128 * 1024 * 1024)?;
-        let expected: Vec<ExpectedTensor> = serde_json::from_slice(&raw)?;
-        ensure!(!expected.is_empty() && expected.len() <= 65536, "finite complete expected extent required");
-        Ok(expected)
+    fn matrix_budget(&self) -> Result<std::rc::Rc<std::cell::RefCell<matrix_plan::Budget>>> {
+        self.matrix.as_ref().cloned().context("required C2 matrix registration is absent")
     }
-    fn finish(&self) -> Result<()> { self.acquisition.check_unchanged() }
+    fn selected(&self, name: &str) -> Result<bool> {
+        Ok(self.matrix_budget()?.borrow().manifest.selected(name))
+    }
+    fn completed_case(&self, name: &str) -> Result<()> {
+        self.matrix_budget()?.borrow_mut().completed_case(name)
+    }
+    fn finish(&self) -> Result<()> {
+        self.acquisition.check_unchanged()?;
+        if let Some(matrix) = &self.matrix {
+            let mut budget = matrix.borrow_mut();
+            budget.finish()?;
+            let full = matrix_plan::catalog(budget.manifest.mode, self.packet.graft.is_some());
+            let result = serde_json::to_vec_pretty(&serde_json::json!({
+                "schema":"hf2q.c2.matrix-shard.v1","identity":self.packet.identity,
+                "acquisition":self.observed(&self.packet.output)?,"mode":budget.manifest.mode,
+                "full_case_catalog":full,"catalog_sha256":budget.manifest.catalog_sha256,
+                "selected_complete_cases":budget.manifest.cases,
+                "all_selected_cases_completed":true,
+                "whole_catalog_in_this_scope":budget.manifest.cases.len()==full.len(),
+                "route":self.packet.route,"grants":budget.manifest.grants,"spent_before_index":budget.spent,
+                "artifacts":budget.artifacts(),
+                "independent_full_matrix_qualified":false,"timing_quality_release_qualified":false,
+            }))?;
+            budget.reserve_metadata(u64::try_from(result.len())?)?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600)
+                .open(self.packet.output.join("matrix-shard.json"))?.write_all(&result)?;
+        }
+        Ok(())
+    }
 }
 fn load_options(model: &Path, graft: Option<PathBuf>) -> LoadOptions {
     LoadOptions { model_path: model.into(), tokenizer_path: None, config_path: None,

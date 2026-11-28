@@ -442,7 +442,7 @@ pub fn validate_pair_for(
     Ok(!synthetic)
 }
 #[cfg(test)]
-pub(super) fn synthetic(root: &Path, identity: &Identity) -> Acquisition {
+pub(crate) fn synthetic(root: &Path, identity: &Identity) -> Acquisition {
     Acquisition {
         packet_sha256: hash(b"synthetic-oracle-fixture"),
         nonce: hash(root.as_os_str().as_encoded_bytes()),
