@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """ADR-063 Q1 paired task-quality campaign over distinct four-agent coding instances.
 
-Runs instances 0..N-1 of the four-agent coding client (qwen_n4_live_smoke.py
---instance, rows of fixtures/coding-instances.json) on a subject arm (hf2q) and,
-unless floor-only, a reference arm (the peer, or stock hf2q when judging a
-candidate). Arm order alternates in ABBA blocks: even instances run the subject
-first, odd instances the reference first. Every run is one q5_calibration.py
-supervised runtime, started only after the previous one has exited.
+Runs instance labels 0..N-1 (default six) of the four-agent coding client
+(qwen_n4_live_smoke.py --instance) on a subject arm and, unless floor-only,
+a reference arm. Each label contributes four paired task instances, not one
+all-or-nothing cohort. Arm order alternates: subject first for even labels,
+reference first for odd labels. Every runtime exits before the next starts.
 
-An instance passes on an arm when the four-agent client reports
-FourAgentProtocolCompleteAwaitingIndependentReview. The manifest keeps every Q5
-receipt and client summary. When all runs have a task outcome, the paired
-outcomes go through the Q1 `paired` rule (hf2q.q1.numeric-policy.v1). Passing
-patches still need independent review. No run is repeated once the task
-started; a run that never reached the four-agent release can be resumed.
+Completed tasks are re-derived from their raw evidence. Successful patches
+must then receive independent Pass/Fail verdicts in the existing Q3 patch-review
+format (--patch-review). Until every successful source is reviewed, the
+campaign is AwaitingPatchReview and publishes no paired verdict. Review can
+be supplied with --resume without launching any settled task again.
+The Q1 paired policy and its thresholds are unchanged. No task is repeated
+after it started; a run that never reached the release may be resumed.
 See README "Quality campaign".
 """
 import argparse
@@ -31,10 +31,11 @@ import coding_instances
 import coding_long_context
 import native_peers
 import q2_run_audit
+import quality_outcomes
 import q5_case
 
 HERE = Path(__file__).resolve().parent
-SCHEMA = "hf2q.adr063.quality-campaign.v1"
+SCHEMA = "hf2q.adr063.quality-campaign.v2"
 OUTCOMES_SCHEMA = "hf2q.q1.paired-task-outcomes.v1"
 CLIENT = "{REPO}/scripts/four_agent/qwen_n4_live_smoke.py"
 TABLE = "{REPO}/scripts/four_agent/fixtures/coding-instances.json"
@@ -205,7 +206,8 @@ def build_plan(args, environ):
             "reference_kind": args.reference_kind if "reference" in arms else None,
             "instance_table": {"path": str(coding_instances.TABLE), "sha256": table_sha},
             "sources": {name: sha256(HERE / name) for name in
-                        ("quality_campaign.py", *coding_instances.MODULES, "qwen_n4_live_smoke.py")},
+                        ("quality_campaign.py", "quality_outcomes.py", "q2_run_audit.py",
+                         *coding_instances.MODULES, "qwen_n4_live_smoke.py")},
             "arms": arms, "schedule": schedule(args.instances, tuple(arms))}
     if args.negative_control_receipt is not None:
         receipt = Path(args.negative_control_receipt).resolve()
@@ -290,12 +292,12 @@ def settle(entry, record, case, plan, code):
         outcome, reason = classify(receipt, summary, entry["instance"], plan["instance_table"]["sha256"])
     else:
         outcome, reason = "NotStarted", "Q5 never created the run directory"
-    if outcome == "Pass":
-        # A claimed task success counts only after its raw client evidence re-derives it (ADR-063 Q2).
-        report, failure = q2_run_audit.check_run(receipt, summary_path.parent, summary, None,
-                                                 plan["arms"][entry["arm"]]["engine_kind"], require_width=False)
-        if failure is not None:
-            outcome, reason = "Invalid", failure
+    if outcome in ("Pass", "Fail"):
+        try:
+            report = q2_run_audit.audit_quality_agents(
+                receipt, summary_path.parent, summary, plan["arms"][entry["arm"]]["engine_kind"])
+        except (ValueError, KeyError, TypeError, IndexError, AttributeError, OSError) as error:
+            outcome, reason = "Invalid", f"quality run audit: {error}"
     record.update(q5_exit=code, outcome=outcome, reason=reason,
                   receipt_sha256=sha256(output / "receipt.json") if receipt is not None else None,
                   q5_verdict=None if receipt is None else receipt.get("verdict"),
@@ -303,8 +305,7 @@ def settle(entry, record, case, plan, code):
     if summary is not None:
         record.update(client_summary=str(summary_path), client_summary_sha256=sha256(summary_path),
                       client_status=summary.get("status"), client_error=summary.get("error"),
-                      agents={a: {"status": v.get("status"), "error": v.get("error")}
-                              for a, v in sorted(summary.get("agents", {}).items())})
+                      agents=None if report is None else report["agents"])
     if outcome in ("Pass", "Fail"):
         entry["outcome"] = outcome
 
@@ -313,22 +314,50 @@ def subprocess_runner(argv, env, stdout, stderr):
     return subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, cwd=HERE).returncode
 
 
-def outcomes(manifest):
-    runs = {(r["instance"], r["arm"]): r["outcome"] == "Pass" for r in manifest["runs"]}
-    floor_only = manifest["plan"]["reference_kind"] is None
-    return {"schema": OUTCOMES_SCHEMA, "reference_kind": manifest["plan"]["reference_kind"],
-            "instances": [{"id": f"i{i:02d}", "subject": runs[(i, "subject")],
-                           "reference": None if floor_only else runs[(i, "reference")]}
-                          for i in range(manifest["plan"]["instances"])]}
+def load_review(path):
+    if path is None:
+        return None, {"file": None, "sha256": None}
+    path = Path(path).resolve()
+    before = sha256(path)
+    document = load_json(path)
+    require(document is not None and sha256(path) == before, "patch review unreadable or changed")
+    return document, {"file": str(path), "sha256": before}
 
 
-def run(plan, cases, out, environ, runner=subprocess_runner, resume=False):
+def checked_verdict(manifest):
+    """Reproduce a settled per-agent quality verdict from its bound raw evidence."""
+    require(manifest.get("schema") == SCHEMA and manifest.get("status") == "Complete",
+            "quality campaign is not a complete per-agent campaign")
+    require(manifest.get("plan_sha256") == plan_sha256(manifest["plan"]), "quality plan changed")
+    for run in manifest["runs"]:
+        record = run["attempts"][-1]
+        receipt_path = Path(record["output"]) / "receipt.json"
+        summary_path = Path(record["client_summary"])
+        require(sha256(receipt_path) == record["receipt_sha256"] and
+                sha256(summary_path) == record["client_summary_sha256"], "quality input changed")
+        summary = load_json(summary_path)
+        actual = q2_run_audit.audit_quality_agents(
+            load_json(receipt_path), summary_path.parent, summary,
+            manifest["plan"]["arms"][run["arm"]]["engine_kind"])
+        require(actual["agents"] == record["agents"], "quality agent outcomes changed")
+    binding = manifest.get("patch_review") or {}
+    review, observed = load_review(binding.get("file"))
+    require(observed == {key: binding.get(key) for key in ("file", "sha256")}, "patch review changed")
+    document, pending = quality_outcomes.adjudicate(manifest, review)
+    require(not pending, "successful quality patches still await independent review")
+    actual = paired(document)
+    require(actual == manifest.get("verdict"), "claimed quality verdict differs from reviewed tasks")
+    return actual
+
+
+def run(plan, cases, out, environ, runner=subprocess_runner, resume=False, patch_review=None):
     path = out / "manifest.json"
     digest = plan_sha256(plan)
     if resume:
         manifest = load_json(path)
         require(manifest is not None and manifest.get("plan_sha256") == digest,
                 "resume needs the same cases, overrides, instance table, sources and negative control")
+        require(manifest.get("schema") == SCHEMA, "cannot resume an older cohort-scored campaign")
         require(manifest["status"] != "Complete", "campaign already complete")
     else:
         require(not out.exists(), "campaign output must be a new directory")
@@ -364,9 +393,14 @@ def run(plan, cases, out, environ, runner=subprocess_runner, resume=False):
             save(path, manifest)
             return manifest
         save(path, manifest)
-    document = outcomes(manifest)
-    save(out / "outcomes.json", document)
-    manifest.update(status="Complete", outcomes_sha256=sha256(out / "outcomes.json"), verdict=paired(document))
+    review, binding = load_review(patch_review)
+    document, pending = quality_outcomes.adjudicate(manifest, review)
+    manifest["patch_review"] = {**binding, "pending": pending}
+    if pending:
+        manifest.update(status="AwaitingPatchReview", verdict=None)
+    else:
+        save(out / "outcomes.json", document)
+        manifest.update(status="Complete", outcomes_sha256=sha256(out / "outcomes.json"), verdict=paired(document))
     manifest.pop("halted_at", None)
     save(path, manifest)
     return manifest
@@ -381,11 +415,12 @@ def parse_args(argv):
                         help="HF2Q_Q5_<NAME> override for the subject arm only (repeatable)")
     parser.add_argument("--reference-var", action="append", metavar="NAME=VALUE",
                         help="HF2Q_Q5_<NAME> override for the reference arm only (repeatable)")
-    parser.add_argument("--instances", type=int, default=POLICY["paired_min_instances"],
-                        help="run instances 0..N-1 (default 24, the policy minimum)")
+    parser.add_argument("--instances", type=int, default=POLICY["paired_min_instances"] // 4,
+                        help="run labels 0..N-1 (default six: 24 per-agent task instances)")
     parser.add_argument("--negative-control-receipt", help="accepted NegativeControlPass receipt, passed to every run")
     parser.add_argument("--output", type=Path, help="new campaign directory outside Git (existing with --resume)")
     parser.add_argument("--resume", action="store_true", help="continue a Halted campaign with an identical plan")
+    parser.add_argument("--patch-review", type=Path, help="independent Q3-format final-source Pass/Fail review")
     parser.add_argument("--dry-run", action="store_true", help="print the plan and schedule; launch nothing")
     args = parser.parse_args(argv)
     if (args.reference_case is None) != (args.reference_kind is None):
@@ -418,7 +453,8 @@ def main(argv=None):
                                                           plan.get("negative_control_receipt", {}).get("path", "<NC_RECEIPT>"))},
                              indent=2))
             return 0
-        manifest = run(plan, cases, args.output.absolute(), environ, resume=args.resume)
+        manifest = run(plan, cases, args.output.absolute(), environ, resume=args.resume,
+                       patch_review=args.patch_review)
     except (OSError, CampaignError, q5_case.CaseError, ValueError) as error:
         print(json.dumps({"valid": False, "error": f"{type(error).__name__}: {error}"}, indent=2))
         return 2

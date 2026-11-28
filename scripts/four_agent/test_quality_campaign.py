@@ -187,12 +187,29 @@ class FakeRuns:
         value = receipt(stop, exit_code=0 if kind == "pass" else 1)
         value.update(cleanup={"proven": True}, cleanup_proven=True)
         (output / "receipt.json").write_text(json.dumps(value))
-        if kind == "pass":
+        if kind in ("pass", "fail"):
             fake.honest_run(output / "client", instance=instance)
-            return 0
+            if kind == "fail":
+                path = output / "client" / "summary.json"
+                value = json.loads(path.read_text())
+                value["status"] = "Failed"
+                value["agents"]["agent-0"]["status"] = "Failed"
+                value["agents"]["agent-0"]["error"] = "task failed"
+                path.write_text(json.dumps(value))
+            return 0 if kind == "pass" else 1
         (output / "client").mkdir()
         (output / "client" / "summary.json").write_text(json.dumps(summary("Failed", instance=instance)))
         return 1
+
+
+def review_patches(out, manifest):
+    sources = {value["final_source_sha256"]
+               for run in manifest["runs"] for value in run["attempts"][-1]["agents"].values()
+               if value["outcome"] == "Pass"}
+    path = out / "patch-review.json"
+    path.write_text(json.dumps({"schema": "hf2q.adr063.q3-patch-review.v1",
+                               "verdicts": {sha: "Pass" for sha in sources}}))
+    return path
 
 
 class Campaign(unittest.TestCase):
@@ -203,22 +220,36 @@ class Campaign(unittest.TestCase):
         (root / "nc.json").write_text("{}")
         self.out = root / "campaign"
         self.args = qc.parse_args(["--subject-case", str(QWEN38), "--reference-case", str(QWEN38),
-                                   "--reference-kind", "stock-hf2q", "--instances", "24",
+                                   "--reference-kind", "stock-hf2q", "--instances", "6",
                                    "--negative-control-receipt", str(root / "nc.json"), "--output", str(self.out)])
 
     def test_complete_campaign_scores_paired_outcomes(self):
         plan, cases = qc.build_plan(self.args, {})
         runs = FakeRuns(lambda i, arm: "fail" if arm == "subject" and i < 5 else "pass")
         manifest = qc.run(plan, cases, self.out, {}, runs)
+        self.assertEqual(manifest["status"], "AwaitingPatchReview")
+        self.assertIsNone(manifest["verdict"])
+        calls = list(runs.calls)
+        manifest = qc.run(plan, cases, self.out, {}, runs, resume=True,
+                          patch_review=review_patches(self.out, manifest))
         self.assertEqual(manifest["status"], "Complete")
-        self.assertEqual(runs.calls, [(e["instance"], e["arm"]) for e in plan["schedule"]])
+        self.assertEqual(runs.calls, calls)
         self.assertEqual(manifest["verdict"]["verdict"], "Loss")
         self.assertEqual(manifest["verdict"]["subject_only_fail"], 5)
+        self.assertEqual(manifest["verdict"]["subject_pass"], 19)
+        self.assertEqual(qc.checked_verdict(manifest), manifest["verdict"])
         outcomes = json.loads((self.out / "outcomes.json").read_text())
         self.assertEqual(outcomes["reference_kind"], "stock-hf2q")
-        self.assertEqual([i["subject"] for i in outcomes["instances"][:6]], [False] * 5 + [True])
+        self.assertEqual([i["subject"] for i in outcomes["instances"][:6]],
+                         [False, True, True, True, False, True])
         first = manifest["runs"][0]["attempts"][0]
         self.assertEqual((first["outcome"], first["client_status"]), ("Fail", "Failed"))
+        review = self.out / "patch-review.json"
+        changed = json.loads(review.read_text())
+        changed["verdicts"] = {sha: "Fail" for sha in changed["verdicts"]}
+        review.write_text(json.dumps(changed))
+        with self.assertRaises(qc.CampaignError):
+            qc.checked_verdict(manifest)
 
     def test_refusal_halts_and_resumes_but_started_tasks_never_rerun(self):
         plan, cases = qc.build_plan(self.args, {})
@@ -228,9 +259,14 @@ class Campaign(unittest.TestCase):
         self.assertEqual((manifest["status"], manifest["halted_at"]), ("Halted", 3))
         refused.clear()
         manifest = qc.run(plan, cases, self.out, {}, runs, resume=True)
+        self.assertEqual(manifest["status"], "AwaitingPatchReview")
+        calls = list(runs.calls)
+        manifest = qc.run(plan, cases, self.out, {}, runs, resume=True,
+                          patch_review=review_patches(self.out, manifest))
         self.assertEqual((manifest["status"], manifest["verdict"]["verdict"]), ("Complete", "Pass"))
+        self.assertEqual(runs.calls, calls)
         self.assertEqual([a["outcome"] for a in manifest["runs"][3]["attempts"]], ["NotStarted", "Pass"])
-        self.assertEqual(len(runs.calls), 49)
+        self.assertEqual(len(runs.calls), 13)
         with self.assertRaises(qc.CampaignError):
             qc.run(plan, cases, self.out, {}, runs, resume=True)
 
@@ -266,7 +302,7 @@ class Campaign(unittest.TestCase):
     def args_list(self, out):
         root = Path(self.directory.name)
         return ["--subject-case", str(QWEN38), "--reference-case", str(QWEN38), "--reference-kind", "stock-hf2q",
-                "--instances", "24", "--negative-control-receipt", str(root / "nc.json"), "--output", str(out)]
+                "--instances", "6", "--negative-control-receipt", str(root / "nc.json"), "--output", str(out)]
 
 
 if __name__ == "__main__":

@@ -306,6 +306,44 @@ def wait_stream_release(directory, cohort, run, token, pid):
     return value
 
 
+def validate_agent_result(agent, result, exit_code, cleaned, pid, run, engine_kind="hf2q", family="qwen",
+                          instance_record=None, phase_plan=None, variant_record=None, request_setup=None,
+                          repair_turns=0, cache_control=None):
+    """Validate one completed task without requiring its peers to have succeeded."""
+    require(result.get("engine_kind", "hf2q") == engine_kind, "mixed engine result")
+    require(result.get("family", "qwen") == family, "mixed diagnostic family result")
+    require(exit_code == 0 and cleaned is True and result.get("cleanup") is True,
+            "client exit/cleanup unknown")
+    require(result.get("schema") == family_contract.schema(family, "agent-result", 4) and result.get("profile") == family_contract.profile(family, 4)
+            and result.get("agent_id") == agent and result.get("run_id") == run
+            and result.get("server_pid") == pid and result.get("diagnostic_slots") == 4,
+            "aggregate agent/server identity")
+    require(result.get("status") == "ProtocolCompleteAwaitingIndependentPatchReview", "agent incomplete")
+    require(result.get("barrier", {}).get("status") == "Released", "agent bypassed barrier")
+    require(result.get("full_prefix_reuse") == "PendingPostOracle" and
+            result.get("model_qualified") is False and result.get("runtime_qualified") is False,
+            "qualification/prefix verdict scope")
+    require(result.get("repair_turns") == (repair_turns or None), "aggregate repair turns")
+    require(len(result.get("tools", [])) <= max_tools(repair_turns) and
+            len(result.get("turns", [])) == len(result.get("tools", [])) + 1 and
+            (repair_turns or len(result.get("tools", [])) == 6), "not all28requests/24tools")
+    instance = None if instance_record is None else instance_record["id"]
+    require(result.get("initial_identity_sha256") == hashlib.sha256(identity(agent, run, instance).encode()).hexdigest(),
+            "aggregate prompt identity")
+    require(result.get("instance") == instance_record, "aggregate task instance")
+    require(result.get("workload_variant") == variant_record, "aggregate workload variant")
+    require(result.get("c2_cache_control") == cache_control, "aggregate observed C2 cache control")
+    require(result.get("request_setup") == request_setup, "aggregate request setup")
+    require(result.get("phase") == agent_phase(phase_plan, agent), "aggregate phase cohort")
+    require(result.get("final_source_sha256") == result.get("observed_final_source_sha256")
+            and isinstance(result.get("final_source_sha256"), str), "final fixture changed")
+    require(qualify(result["turns"], result["tools"], result["cleanup"],
+                    result["final_source_sha256"], result["observed_final_source_sha256"],
+                    repair_turns) == result["status"],
+            "child protocol receipt contradiction")
+    return result.get("initial_messages_sha256")
+
+
 def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwen", instance_record=None,
               phase_plan=None, variant_record=None, request_setup=None, repair_turns=0, cache_control=None):
     """`instance_record` is the coordinator's {"id", "table_sha256"}; None for the canonical task.
@@ -318,39 +356,9 @@ def aggregate(results, exits, cleanup, pid, run, engine_kind="hf2q", family="qwe
     require(set(results) == set(exits) == set(cleanup) == set(agents), "missing agent result")
     initial = set()
     for agent in agents:
-        result = results[agent]
-        require(result.get("engine_kind", "hf2q") == engine_kind, "mixed engine result")
-        require(result.get("family", "qwen") == family, "mixed diagnostic family result")
-        require(exits[agent] == 0 and cleanup[agent] is True and result.get("cleanup") is True,
-                "client exit/cleanup unknown")
-        require(result.get("schema") == family_contract.schema(family, "agent-result", 4) and result.get("profile") == family_contract.profile(family, 4)
-                and result.get("agent_id") == agent and result.get("run_id") == run
-                and result.get("server_pid") == pid and result.get("diagnostic_slots") == 4,
-                "aggregate agent/server identity")
-        require(result.get("status") == "ProtocolCompleteAwaitingIndependentPatchReview", "agent incomplete")
-        require(result.get("barrier", {}).get("status") == "Released", "agent bypassed barrier")
-        require(result.get("full_prefix_reuse") == "PendingPostOracle" and
-                result.get("model_qualified") is False and result.get("runtime_qualified") is False,
-                "qualification/prefix verdict scope")
-        require(result.get("repair_turns") == (repair_turns or None), "aggregate repair turns")
-        require(len(result.get("tools", [])) <= max_tools(repair_turns) and
-                len(result.get("turns", [])) == len(result.get("tools", [])) + 1 and
-                (repair_turns or len(result.get("tools", [])) == 6), "not all28requests/24tools")
-        instance = None if instance_record is None else instance_record["id"]
-        require(result.get("initial_identity_sha256") == hashlib.sha256(identity(agent, run, instance).encode()).hexdigest(),
-                "aggregate prompt identity")
-        require(result.get("instance") == instance_record, "aggregate task instance")
-        require(result.get("workload_variant") == variant_record, "aggregate workload variant")
-        require(result.get("c2_cache_control") == cache_control, "aggregate observed C2 cache control")
-        require(result.get("request_setup") == request_setup, "aggregate request setup")
-        require(result.get("phase") == agent_phase(phase_plan, agent), "aggregate phase cohort")
-        require(result.get("final_source_sha256") == result.get("observed_final_source_sha256")
-                and isinstance(result.get("final_source_sha256"), str), "final fixture changed")
-        require(qualify(result["turns"], result["tools"], result["cleanup"],
-                        result["final_source_sha256"], result["observed_final_source_sha256"],
-                        repair_turns) == result["status"],
-                "child protocol receipt contradiction")
-        initial.add(result.get("initial_messages_sha256"))
+        initial.add(validate_agent_result(
+            agent, results[agent], exits[agent], cleanup[agent], pid, run, engine_kind, family,
+            instance_record, phase_plan, variant_record, request_setup, repair_turns, cache_control))
     require(len(initial) == len(agents) and None not in initial, "agent prompts not independent")
     return "FourAgentProtocolCompleteAwaitingIndependentReview"
 

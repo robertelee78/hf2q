@@ -15,6 +15,7 @@ from pathlib import Path
 
 from f2_rows_extract import require
 import native_peers
+import quality_campaign
 from q3_metrics import has_oom_marker
 
 # q3_report rows of a native-comparison campaign carry this label; they are never a verdict of record.
@@ -156,9 +157,9 @@ def gate_status(document, reference, family, arms, stock_record=None):
             f"quality gate {reference}: manifest is not for family {family}")
     if document.get("status") == "Halted":
         return "Halted", None, None
-    q1 = (document.get("verdict") or {}).get("verdict")
-    if document.get("status") != "Complete" or q1 is None:
+    if document.get("status") != "Complete":
         return "Pending", None, None
+    q1 = quality_campaign.checked_verdict(document)["verdict"]
     require(binaries(document, "subject") == {arms["experiment"]["binary"]["sha256"]},
             f"quality gate {reference} was not run on the experiment binary")
     ran = binaries(document, "reference")

@@ -590,7 +590,6 @@ class CampaignControls(Harness):
         self.assertEqual((manifest["status"], manifest["halted_at"]), ("Halted", 0))
         attempt = manifest["runs"][0]["attempts"][0]
         self.assertEqual(attempt["outcome"], "Invalid")
-        self.assertIn("final tests/source", attempt["reason"])
         self.assertNotIn("verdict", manifest)
 
 

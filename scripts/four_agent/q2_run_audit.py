@@ -410,3 +410,57 @@ def check_run(receipt, client_dir, summary, phase_plan, engine_kind, require_wid
         return None, f"run audit: {error}"
     except (KeyError, TypeError, IndexError, AttributeError, OSError) as error:
         return None, f"run audit: malformed evidence ({type(error).__name__}: {error})"
+
+
+def audit_quality_agents(receipt, client_dir, summary, engine_kind):
+    """Replay each completed quality task; a failed peer is not four failed tasks."""
+    require(receipt.get("cleanup_proven") is True and (receipt.get("cleanup") or {}).get("proven") is True,
+            "quality run cleanup is unproven")
+    if summary.get("status") == SUCCESS:
+        report = audit_run(client_dir, summary, None, engine_kind, False, receipt=receipt)
+        report["agents"] = {
+            name: {"status": result["status"], "error": result.get("error"), "outcome": "Pass",
+                   "final_source_sha256": result["final_source_sha256"]}
+            for name, result in summary["agents"].items()}
+        return report
+    require_clock(summary)
+    require(summary.get("engine_kind") == engine_kind, "quality engine differs from its arm")
+    family = summary.get("family")
+    coordinator.family_contract.validate_selection(family, engine_kind, 4)
+    results = summary.get("agents")
+    require(isinstance(results, dict) and set(results) <= set(coordinator.AGENTS), "foreign quality agent")
+    barrier = summary.get("barrier") or {}
+    release = barrier.get("release_monotonic_ns")
+    require(barrier.get("status") == "Released" and type(release) is int, "quality cohort was not released")
+    control = authenticated_cache_control(receipt, client_dir, summary, None, engine_kind)
+    response_ids, turns, outcomes, initial = {}, {}, {}, set()
+    for name in coordinator.AGENTS:
+        result = results.get(name) or {}
+        outcome = {"status": result.get("status"), "error": result.get("error"), "outcome": "Fail"}
+        outcomes[name] = outcome
+        if result.get("status") != "ProtocolCompleteAwaitingIndependentPatchReview":
+            continue
+        cleanup = summary.get("client_cleanup", {}).get(name) or {}
+        checked_cleanup(cleanup)
+        identity = coordinator.validate_agent_result(
+            name, result, summary.get("exits", {}).get(name), cleanup.get("verified"),
+            summary.get("server_pid"), summary.get("run_id"), engine_kind, family,
+            summary.get("instance"), None, summary.get("workload_variant"),
+            summary.get("request_setup"), summary.get("repair_turns") or 0, control)
+        require(identity is not None and identity not in initial, "quality agent prompts not independent")
+        initial.add(identity)
+        require_clock(result["barrier"])
+        require(result["barrier"].get("release_monotonic_ns") == release,
+                "quality agent did not observe its cohort release")
+        turns[name] = audit_agent(Path(client_dir) / name, name, result, family, engine_kind,
+                                  response_ids, cache_control=control)
+        require(turns[name][0]["send_monotonic_ns"] >= release, "quality request before cohort release")
+        completed = result.get("task_completed_monotonic_ns")
+        require(type(completed) is int and completed >= turns[name][-1]["validated_terminal_monotonic_ns"],
+                "quality task completion before its terminal response")
+        outcome.update(outcome="Pass", final_source_sha256=result["final_source_sha256"])
+    report = {"agents": outcomes, "response_ids": len(response_ids)}
+    if turns and engine_kind not in ("hf2q", "peer"):
+        from native_peers import audit
+        report["native_trace"] = audit(engine_kind).audit_run(summary, client_dir, turns)
+    return report

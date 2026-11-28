@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import f2_q3_tier as tier
 import f2_scoreboard_render as render
@@ -12,6 +13,13 @@ from q3_fake_splash import mechanism_campaign, reviewed_template_fixture
 from test_f2_q3_record import quality_manifest, write_run
 from test_f2_q3_tier import BOTH, qwen38, tier_line
 from test_native_peer_splash import splash_manifest
+
+
+def setUpModule():
+    # Mechanism/report fixtures do not contain raw quality runs.
+    checker = mock.patch("quality_campaign.checked_verdict", side_effect=lambda document: document["verdict"])
+    checker.start()
+    unittest.addModuleCleanup(checker.stop)
 
 
 class MechanismScoreboard(unittest.TestCase):
