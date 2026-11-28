@@ -79,6 +79,16 @@ impl State {
     pub(super) fn same(&self, other: &Self, context: &str) -> Result<()> {
         ensure!(self == other, "DivergedExactInvariant: {context}"); Ok(())
     }
+    /// Anchor restore writes named buffers and resets parity (C2 design §3.3).
+    /// `regions` already contains the parity-current buffers, not scratch.
+    pub(super) fn semantic_eq(&self, other: &Self) -> bool {
+        self.target == other.target && self.mtp == other.mtp
+            && self.parity.len() == other.parity.len() && self.regions == other.regions
+    }
+    pub(super) fn same_semantic(&self, other: &Self, context: &str) -> Result<()> {
+        ensure!(self.semantic_eq(other), "DivergedExactInvariant: {context}");
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Forward {
@@ -417,4 +427,28 @@ fn c2_transaction_scope_rejects_missing_writer_and_keeps_failure_sticky() {
     assert!(scope.finish_transactions().is_err());
     assert!(scope.take().is_err(), "ignored close error must not publish observations");
     assert!(scope.finish_transactions().is_err());
+}
+
+#[test]
+fn c2_semantic_state_distinguishes_buffer_selection_from_live_bytes() {
+    let restored = State {
+        target: vec![381], mtp: Some(381), parity: vec![false, false],
+        regions: vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]],
+    };
+    let cold = State { parity: vec![true, true], ..restored.clone() };
+    assert!(restored.semantic_eq(&cold));
+    assert!(restored.same(&cold, "same-frame mutation must retain parity").is_err());
+    assert!(restored.same_semantic(&cold, "independent canonical frame").is_ok());
+    let mut changed = cold.clone();
+    changed.regions[0][0] ^= 1;
+    assert!(!restored.semantic_eq(&changed));
+    changed = cold.clone();
+    changed.target[0] += 1;
+    assert!(!restored.semantic_eq(&changed));
+    changed = cold.clone();
+    changed.mtp = None;
+    assert!(!restored.semantic_eq(&changed));
+    changed = cold;
+    changed.parity.pop();
+    assert!(!restored.semantic_eq(&changed));
 }

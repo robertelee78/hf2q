@@ -5,7 +5,7 @@ from pathlib import Path
 
 from c2_matrix_io import SCALARS, acquisition, bound, coordinate, integer, require, resolve
 from c2_matrix_plans import expected, native_inputs, state
-from q1_decision_policy import exact
+from q1_decision_policy import captured_records, exact, verified_payload
 
 
 def scoped(scope, reference):
@@ -27,6 +27,56 @@ def equal(left, right):
     verdict = exact(left, right)
     require(verdict["classification"] == "ExactEqual" and verdict["common_records"] > 0,
             "complete source-bound pair is not ExactEqual")
+    return verdict
+
+
+def semantic_state_pair(left_trace, right_trace):
+    """Compare complete active state, retaining physical-selector evidence.
+
+    Callers first authenticate each allocator-derived state plan/store. C2
+    NamedResetParity restores into named buffers; a cold twin may select the
+    other buffer. The recorded regions already use the parity-current views.
+    Intra-arm settlement and no-mutation checks still use literal `exact`.
+    """
+    left, right = captured_records(left_trace), captured_records(right_trace)
+    for records in (left, right):
+        require(all(key[0] == "CacheState" and key[2] == key[3] == key[5] == 0 for key in records),
+                "semantic state comparison requires a complete typed state store")
+    selectors = [[key for key in records if key[4] == 1] for records in (left, right)]
+    require(len(selectors[0]) == len(selectors[1]) == 1 and selectors[0] == selectors[1],
+            "both states require the same physical-selector extent")
+    selector = selectors[0][0]
+    cursor = (*selector[:4], 0, selector[5])
+    require(cursor in left and cursor in right, "semantic state omitted target/MTP cursors")
+    parity = []
+    for records in (left, right):
+        record = records[selector]
+        raw = verified_payload(record)
+        require(record["scalar"] == "U8" and len(record["shape"]) == 1
+                and integer(record["shape"][0], "physical parity count", 1) == len(raw)
+                and all(value in (0, 1) for value in raw), "invalid physical buffer-selector metadata")
+        parity.append(raw)
+    common = sorted(set(left) & set(right))
+    left_only, right_only = len(set(left) - set(right)), len(set(right) - set(left))
+    differing = []
+    for key in common:
+        l, r = left[key], right[key]
+        same_layout = (l["scalar"], l["shape"]) == (r["scalar"], r["shape"])
+        if not same_layout or (key != selector and verified_payload(l) != verified_payload(r)):
+            differing.append(key)
+    classification = ("DivergedExactInvariant" if differing else
+                      "ExactOnCommon" if left_only + right_only else "ExactEqual")
+    return {"schema": "hf2q.c2.semantic-state-comparison.v1", "classification": classification,
+            "common_records": len(common), "left_only": left_only, "right_only": right_only,
+            "differing_records": len(differing), "first_differing": list(differing[0]) if differing else None,
+            "semantic_records": len(common) - 1, "representation_records": 1,
+            "representation_parity_equal": parity[0] == parity[1]}
+
+
+def equal_semantic_state(left, right):
+    verdict = semantic_state_pair(left, right)
+    require(verdict["classification"] == "ExactEqual" and verdict["semantic_records"] > 0,
+            "complete active-state pair is not ExactEqual")
     return verdict
 
 

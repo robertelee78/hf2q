@@ -13,8 +13,8 @@ import sys
 
 from c2_matrix_io import Scope, bound, digest, integer, read_json, require, resolve
 from c2_matrix_plans import execution
-from c2_matrix_evidence import (canonical_arm, capability_markers, equal, final_state, logical_prompt,
-                                raw_arm, same_raw_twins, saved_witnesses, settlement_proof, transactions)
+from c2_matrix_evidence import (canonical_arm, capability_markers, equal_semantic_state, final_state, logical_prompt,
+                                raw_arm, same_raw_twins, saved_witnesses, semantic_state_pair, settlement_proof, transactions)
 from q1_decision_policy import exact
 from qwen38_n1_verdict import Invalid
 
@@ -199,11 +199,12 @@ def verify_case(scope, case, artifacts, required):
             semantic_tokens(scope, case, arms[arm], raw[arm])
             saved_witnesses(scope, case, arms[arm], raw[arm], authority)
     comparisons = [settlement_proof(states[arm], streams[arm], arms[arm]["outcome"]) for arm in arm_names]
-    comparisons.append(exact(states["actual"][0], states["twin"][0]))
+    state_comparison = exact if case == "cancel-fresh-reset" else semantic_state_pair
+    comparisons.append(state_comparison(states["actual"][0], states["twin"][0]))
     if "actual" in raw and "twin" in raw:
         comparisons.append(exact(raw["actual"]["path"], raw["twin"]["path"]))
     if "single" in arms:
-        comparisons.append(exact(states["actual"][0], states["single"][0]))
+        comparisons.append(semantic_state_pair(states["actual"][0], states["single"][0]))
         prompt = logical_prompt(scope, case, authority)
         require(value["checkpoint_depth"] == len(prompt) - (0 if value["equality"] else 16),
                 "canonical input authority changed the selected checkpoint depth")
@@ -220,7 +221,7 @@ def verify_case(scope, case, artifacts, required):
         same_raw_twins(raw["actual"], raw["twin"])
     if not case.startswith("cancel-") and not negative:
         require(len(streams["actual"]) == len(streams["twin"]), "positive state event streams omit a transaction")
-        comparisons.extend(equal(left[0], right[0]) for left, right in zip(streams["actual"][:-1], streams["twin"][:-1]))
+        comparisons.extend(equal_semantic_state(left[0], right[0]) for left, right in zip(streams["actual"][:-1], streams["twin"][:-1]))
     return {"case": case, "numeric_complete": True, "intentional_negative": negative,
             "comparisons": comparisons, "required_state_events": {arm: len(stream) for arm, stream in streams.items()}}
 

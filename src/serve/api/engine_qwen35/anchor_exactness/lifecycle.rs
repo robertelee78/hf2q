@@ -476,7 +476,7 @@ fn compare_case(fixture: &mut Fixture, rank: usize, equality: bool, peers: bool)
         &prompt, depth, peers, &name, "twin")?;
     super::trace_pair::write_pair(fixture, &name, &actual, &expected)?;
     ensure!(actual == expected, "DivergedExactInvariant: all actual logits/hidden/decision rows or routes");
-    actual_state.same(&expected_state, "resumed target/MTP/KV/TQ/DeltaNet/parity versus same-concurrency cold twin")?;
+    actual_state.same_semantic(&expected_state, "resumed target/MTP/KV/TQ/DeltaNet versus same-concurrency cold twin")?;
     ensure!(actual_tokens == expected_tokens && resumed.retained == cold.retained,
         "DivergedExactInvariant: tokens or retained ledger");
     // Second twin: independently replay a single active slot. Canonical
@@ -489,7 +489,7 @@ fn compare_case(fixture: &mut Fixture, rank: usize, equality: bool, peers: bool)
     let mut single_slot_parity_rows = None;
     if let (Some((observed, state, tokens)), Some(lane)) = (&single, &single_lane) {
         super::trace_pair::write_arm(fixture, &name, "single", observed)?;
-        actual_state.same(state, "concurrent target versus independent single-slot semantic cache")?;
+        actual_state.same_semantic(state, "concurrent target versus independent single-slot semantic cache")?;
         ensure!(resumed.retained == lane.retained, "DivergedExactInvariant: single-slot retained ledger");
         let graft = fixture.qwen().model.kv_graft.as_ref().map_or(0, |graft| graft.bank.n_slots as usize);
         single_slot_parity_rows = Some(canonical_pair::write_and_compare(fixture, &name, &prompt,
@@ -694,7 +694,8 @@ pub(super) fn o1(family: Family) -> Result<()> {
             let cached = if negative { a.len() } else { 0 };
             let actual = compare_final(&mut fixture, &mut lane, &c, cached, false, &name, "actual")?;
             let expected = compare_final(&mut fixture, &mut cold, &c, cached, false, &name, "twin")?;
-            let equal = actual == expected && lane.retained == cold.retained;
+            let equal = actual.0 == expected.0 && actual.1.semantic_eq(&expected.1)
+                && actual.2 == expected.2 && lane.retained == cold.retained;
             ensure!(equal != negative, "O1 sensitivity failed: expected {}", if negative {"DivergedExactInvariant"} else {"ExactEqual"});
             super::trace_pair::write_pair(&fixture, &name, &actual.0, &expected.0)?;
             super::case_evidence::classification(&fixture, &name, &serde_json::json!({

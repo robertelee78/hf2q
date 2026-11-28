@@ -10,7 +10,8 @@ import unittest
 from c2_matrix import classification
 from c2_matrix_io import Scope, acquisition, coordinate, input_digest
 from c2_matrix_plans import decision, expected, native_inputs, projection
-from c2_matrix_evidence import canonical_arm, capability_markers, same_raw_twins, settlement_proof
+from c2_matrix_evidence import (canonical_arm, capability_markers, equal_semantic_state,
+                                same_raw_twins, semantic_state_pair, settlement_proof)
 from q1_decision_policy import exact
 
 
@@ -54,6 +55,48 @@ class C2ReaderFixture(unittest.TestCase):
                      coverage=dict(expected=descriptors, captured=captured, errors=[], missing_native_capabilities=[]))
         path = root / "trace.json"
         return (path, trace), self.write(path, trace)
+
+
+class SemanticStateControls(C2ReaderFixture):
+    def state_store(self, name, parity, region=b"live", cursor=32, tokens=(7, 8)):
+        agent = "case/slot0"
+        descriptors = [expected("CacheState", agent, 0, 0, "U32", [1], 0),
+                       expected("CacheState", agent, 0, 0, "U8", [len(parity)], 1),
+                       expected("CacheState", agent, 0, 0, "U8", [len(region)], 2),
+                       expected("CacheState", agent, 0, 0, "U32", [len(tokens)], (1 << 32) - 1)]
+        payloads = [cursor.to_bytes(4, "little"), parity, region,
+                    b"".join(token.to_bytes(4, "little") for token in tokens)]
+        return self.trace_store(name, descriptors, payloads)[0][0]
+
+    def test_named_restore_and_cold_current_buffers_are_equal_without_rewriting_selectors(self):
+        restored = self.state_store("restored", b"\x00\x00")
+        cold = self.state_store("cold", b"\x01\x01")
+        verdict = equal_semantic_state(restored, cold)
+        self.assertEqual(verdict["classification"], "ExactEqual")
+        self.assertFalse(verdict["representation_parity_equal"])
+        self.assertEqual(exact(restored, cold)["classification"], "DivergedExactInvariant")
+        self.assertEqual((restored.parent / "row-1.bin").read_bytes(), b"\x00\x00")
+        self.assertEqual((cold.parent / "row-1.bin").read_bytes(), b"\x01\x01")
+
+    def test_selector_frame_equivalence_never_hides_semantic_cache_cursor_or_ledger_corruption(self):
+        restored = self.state_store("restored", b"\x00")
+        for name, changes in [("cache", {"region": b"lixe"}),
+                              ("cursor", {"cursor": 33}), ("ledger", {"tokens": (7, 9)})]:
+            with self.subTest(component=name):
+                changed = self.state_store(name, b"\x01", **changes)
+                self.assertEqual(semantic_state_pair(restored, changed)["classification"], "DivergedExactInvariant")
+                with self.assertRaises(ValueError):
+                    equal_semantic_state(restored, changed)
+
+    def test_physical_selector_values_and_layer_extent_remain_checked(self):
+        restored = self.state_store("restored", b"\x00")
+        malformed = self.state_store("invalid-selector", b"\x02")
+        with self.assertRaises(ValueError):
+            semantic_state_pair(restored, malformed)
+        wrong_layers = self.state_store("wrong-layer-count", b"\x01\x01")
+        self.assertEqual(semantic_state_pair(restored, wrong_layers)["classification"], "DivergedExactInvariant")
+        with self.assertRaises(ValueError):
+            equal_semantic_state(restored, wrong_layers)
 
 
 class CompleteShardControls(C2ReaderFixture):
