@@ -34,8 +34,16 @@ def validate(case, overrides, record, receipt, summary, summary_path):
     approval_raw = approval_path.read_bytes()
     approval_sha = hashlib.sha256(approval_raw).hexdigest()
     approval = json.loads(approval_raw)
-    builtins = q5_calibration.builtins(output)
-    builtins.update(RUN_ID=approval["run_id"], NONCE32=approval["barrier_token"])
+    argv = record["argv"]
+    driver = Path(argv[2]).resolve()
+    require(driver.name == "q5_calibration.py" and Path(argv[0]).is_absolute() and
+            Path(argv[3]).resolve() == case_path and
+            hashlib.sha256(driver.read_bytes()).hexdigest() == receipt["supervisor_sources"]["q5_calibration.py"],
+            "quality Q5 invocation/source differs")
+    # Replay capture identities, not the report consumer's checkout/interpreter.
+    builtins = {"REPO": str(driver.parents[2]), "OUT": str(output), "PYTHON": argv[0],
+                "PYTHON_SHA256": hashlib.sha256(Path(argv[0]).resolve().read_bytes()).hexdigest(),
+                "RUN_ID": approval["run_id"], "NONCE32": approval["barrier_token"]}
     environ = {q5_case.OVERRIDE_PREFIX + key: value for key, value in overrides.items()}
     plan = q5_case.build_plan(case, builtins, environ)
     require(plan["complete"] and hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()

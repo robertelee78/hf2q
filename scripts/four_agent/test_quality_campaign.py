@@ -3,6 +3,8 @@ import itertools
 import json
 import math
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -201,7 +203,7 @@ class FakeRuns:
                 value["agents"]["agent-0"]["status"] = "Failed"
                 value["agents"]["agent-0"]["error"] = "task failed"
                 path.write_text(json.dumps(value))
-            self.bind_launch(case, argv[3], output, env,
+            self.bind_launch(case, argv, output, env,
                              json.loads((output / "client/summary.json").read_bytes()))
             return 0 if kind == "pass" else 1
         (output / "client").mkdir()
@@ -209,7 +211,8 @@ class FakeRuns:
         return 1
 
     @staticmethod
-    def bind_launch(case, case_path, output, env, summary):
+    def bind_launch(case, argv, output, env, summary):
+        case_path = argv[3]
         q5 = qc.quality_launch.q5_calibration
         builtins = q5.builtins(output)
         builtins.update(RUN_ID=summary["run_id"], NONCE32="0" * 32)
@@ -231,6 +234,7 @@ class FakeRuns:
                        plan_sha256=qc.plan_sha256(plan), serve_argv=plan["serve"]["argv"],
                        serve_env=plan["serve"]["env"], server={"pid": summary["server_pid"]},
                        client_argv=qc.q5_case.expand(plan["client"]["argv"], values),
+                       supervisor_sources={"q5_calibration.py": qc.sha256(argv[2])},
                        inputs={spec["template"]: qc.sha256(spec["template"])})
         path.write_text(json.dumps(receipt))
 
@@ -273,6 +277,23 @@ class Campaign(unittest.TestCase):
         manifest = qc.run(plan, cases, self.out, {}, runs)
         return qc.run(plan, cases, self.out, {}, runs, resume=True,
                       patch_review=review_patches(self.out, manifest))
+
+    def test_capture_remains_admissible_from_another_checkout_and_interpreter_path(self):
+        import shutil
+        manifest = self.completed_capture()
+        consumer = self.out / "other-checkout/scripts/four_agent"
+        consumer.mkdir(parents=True)
+        for name in ("quality_campaign.py", "quality_launch.py", "q5_calibration.py"):
+            shutil.copyfile(HERE / name, consumer / name)
+        python = self.out / "other-python"
+        python.symlink_to(sys.executable)
+        script = (
+            f"import sys,json;sys.path[:0]=[{str(consumer)!r},{str(HERE)!r}];"
+            "import quality_campaign as qc;"
+            f"print(json.dumps(qc.checked_verdict(json.load(open({str(self.out / 'manifest.json')!r})))))")
+        result = subprocess.run([str(python), "-E", "-s", "-B", "-c", script],
+                                check=True, capture_output=True, text=True)
+        self.assertEqual(json.loads(result.stdout), manifest["verdict"])
 
     def assert_admission_rejects(self, manifest):
         import f2_q3_tier
