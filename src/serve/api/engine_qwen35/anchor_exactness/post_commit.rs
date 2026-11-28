@@ -3,7 +3,7 @@
 use super::*;
 pub(super) fn run(family: Family) -> Result<()> {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let mut fixture = Fixture::load(family)?;
+    let mut fixture = Fixture::load(family, None)?;
     let mut lane = super::lifecycle::Lane::new(&fixture)?;
     let ids = super::lifecycle::build(&mut fixture, &mut lane, 2)?;
     lane.store.restore_fault = Some(AnchorRestoreFault::PostCommit);

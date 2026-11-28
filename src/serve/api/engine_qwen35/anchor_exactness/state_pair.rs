@@ -1,41 +1,84 @@
-//! Full final semantic cache state, never a digest/final-logit proxy. Scratch
-//! and rows at/above the cursor are outside the restore contract and omitted.
+//! Final state is planned and its strict store is opened BEFORE tensor readback.
+//! Every arm owns its full state store; canonical single-lane parity reuses the
+//! actual/single state pair instead of duplicating the actual state's payload.
 use super::*;
-use super::trace::State;
-fn capture(store: &mut Store, agent: &str, segment: u32, scalar: Scalar, shape: Vec<usize>,
-    bytes: &[u8]) -> Result<()> {
-    store.capture(Coordinate { logical_step: 0, layer: 0, stage: Stage::CacheState,
-        agent: agent.into(), logical_row_start: 0, segment }, scalar, shape,
-        bytes.as_ptr() as usize as u64, bytes.len() as u64, 0, None,
-        "complete semantic slot state after production checked transaction", bytes).map_err(anyhow::Error::msg)
+use super::{state_layout::StateLayout, live_ram::OwnedState};
+
+#[derive(Serialize)]
+struct Plan<'a> {
+    schema: &'static str,
+    identity: &'a Identity,
+    scope_acquisition: &'a acquisition::Acquisition,
+    registration_sha256: &'a str,
+    case: &'a str,
+    arm: &'a str,
+    slot: u32,
+    store_root: &'a Path,
+    layout: &'a StateLayout,
+    expected: &'a [ExpectedTensor],
+    derived_before_state_read: bool,
 }
-pub(super) fn write(fixture: &Fixture, name: &str, actual: &State, twin: &State,
-    actual_ledger: &[u32], twin_ledger: &[u32]) -> Result<()> {
-    for (arm, state, ledger) in [("actual", actual, actual_ledger), ("twin", twin, twin_ledger)] {
-        let key = format!("{name}-{arm}-state");
-        let expected = fixture.expected(&key)?;
-        let records = expected.len();
-        let root = fixture.packet.output.join(&key);
-        let mut store = Store::new(&root, fixture.packet.identity.clone(),
-            format!("C2-ClassA-complete-semantic-state-{arm}"), expected,
-            fixture.packet.host_payload_limit, records).map_err(anyhow::Error::msg)?;
-        store.bind_acquisition(fixture.observed(&root)?).map_err(anyhow::Error::msg)?;
-        let agent = format!("{name}/slot0");
-        let cursors: Vec<_> = state.target.iter().copied().chain(state.mtp).collect();
-        let bytes: Vec<_> = cursors.iter().flat_map(|v| v.to_le_bytes()).collect();
-        capture(&mut store, &agent, 0, Scalar::U32, vec![cursors.len()], &bytes)?;
-        let parity: Vec<_> = state.parity.iter().map(|p| u8::from(*p)).collect();
-        capture(&mut store, &agent, 1, Scalar::U8, vec![parity.len()], &parity)?;
-        for (index, bytes) in state.regions.iter().enumerate() {
-            if bytes.is_empty() { continue; }
-            capture(&mut store, &agent, u32::try_from(index + 2)?, Scalar::U8, vec![bytes.len()], bytes)?;
-        }
-        if !ledger.is_empty() {
-            let tokens: Vec<_> = ledger.iter().flat_map(|v| v.to_le_bytes()).collect();
-            capture(&mut store, &agent, u32::MAX, Scalar::U32, vec![ledger.len()], &tokens)?;
-        }
-        let trace = store.finish().map_err(anyhow::Error::msg)?;
-        ensure!(trace.coverage.errors.is_empty(), "Incomplete semantic cache/ledger evidence");
+
+#[derive(Serialize)]
+struct Binding<'a> {
+    schema: &'static str,
+    identity: &'a Identity,
+    acquisition: &'a acquisition::Acquisition,
+    registration_sha256: &'a str,
+    case: &'a str,
+    arm: &'a str,
+    slot: u32,
+    plan: acquisition::FileBinding,
+    trace: acquisition::FileBinding,
+}
+
+pub(super) fn snapshot(fixture: &Fixture, name: &str, arm: &str,
+    cache: &HybridKvCache, ledger: &[u32]) -> Result<OwnedState> {
+    ensure!(fixture.selected(name)? && matches!(arm, "actual" | "twin" | "single"),
+        "final state case/arm was not independently registered");
+    let budget = fixture.matrix_budget()?;
+    let registration = fixture.packet.registration.as_ref().context("matrix registration missing")?;
+    let layout = StateLayout::from_cache(cache, SLOT, ledger.len())?;
+    let agent = format!("{name}/slot0");
+    let expected = layout.expected(&agent, 0)?;
+    let count = expected.len();
+    {
+        let mut budget = budget.borrow_mut();
+        budget.state_readback(layout.logical_bytes()?)?;
+        budget.reserve_store(count, layout.logical_bytes()?)?;
     }
-    Ok(())
+    let key = format!("{name}-{arm}-state");
+    let root = fixture.packet.output.join(&key);
+    let observed = fixture.observed(&fixture.packet.output)?;
+    let plan_path = fixture.packet.output.join(format!("{key}-plan.json"));
+    let plan_sha256 = super::metadata::write(&plan_path, budget.as_ref(), &Plan {
+        schema: "hf2q.c2.final-state-plan.v1", identity: &fixture.packet.identity,
+        scope_acquisition: &observed, registration_sha256: &registration.sha256, case: name, arm,
+        slot: 0, store_root: &root, layout: &layout, expected: &expected,
+        derived_before_state_read: true,
+    })?;
+    let mut store = Store::new(&root, fixture.packet.identity.clone(),
+        format!("C2-ClassA-complete-semantic-state-{arm}"), expected,
+        fixture.packet.host_payload_limit, count).map_err(anyhow::Error::msg)?;
+    store.bind_acquisition(observed.for_store_root(&root)?).map_err(anyhow::Error::msg)?;
+    let state = OwnedState::read(&budget, &layout, cache, SLOT)?;
+    super::state_layout::capture(&mut store, &layout, &state, ledger, &agent, 0)?;
+    let trace = store.finish().map_err(anyhow::Error::msg)?;
+    ensure!(trace.coverage.errors.is_empty() && trace.coverage.missing_native_capabilities.is_empty()
+        && trace.coverage.expected.len() == trace.coverage.captured.len(),
+        "Incomplete semantic cache/ledger evidence");
+    let trace_path = root.join("trace.json");
+    let trace_sha256 = super::metadata::hash_file(&trace_path, budget.as_ref())?;
+    let binding_path = root.join("binding.json");
+    let binding_sha256 = super::metadata::write(&binding_path, budget.as_ref(), &Binding {
+        schema: "hf2q.c2.final-state-binding.v1", identity: &trace.identity,
+        acquisition: trace.acquisition.as_ref().context("state store lost native acquisition binding")?,
+        registration_sha256: &registration.sha256, case: name, arm, slot: 0,
+        plan: acquisition::FileBinding { path: plan_path.strip_prefix(&fixture.packet.output)?.into(),
+            sha256: plan_sha256 },
+        trace: acquisition::FileBinding { path: trace_path.strip_prefix(&fixture.packet.output)?.into(),
+            sha256: trace_sha256 },
+    })?;
+    budget.borrow_mut().record_artifact(name, &key, &fixture.packet.output, &binding_path, binding_sha256)?;
+    Ok(state)
 }

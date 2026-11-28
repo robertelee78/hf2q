@@ -389,6 +389,65 @@ The comparison uses Q1 stores (`hf2q.adr063.invariance`) and `scripts/four_agent
 
 Transaction acquisition owns its writer from scope construction. Closing without a writer, publishing before closure, incomplete registered coverage, capture after closure, and repeated closure are errors; capture/closure failures remain sticky and prohibit publication. Returning completed raw observations transfers their buffers rather than cloning the retained tensor payload. Model-free controls exercise the real bounded store and these failure paths; they do not attest a model acquisition or complete the matrix. Independent request/call obligations and source-derived extent planning are still required to reject symmetric planner-plus-observer omissions.
 
+The test-only producer registers a separate request/step/native-call obligation
+tree before lower projection and observation hooks execute. Native input and
+selected output-head metadata determine the exact complete logit/normalized-hidden
+rows; semantic selection has its own pre-selection requirement. Missing both
+lower hooks in both arms cannot remove a required upper obligation. Saved-logit
+equality and final ledger settlement are distinct events, not invented forwards.
+Equality binds the original checkpoint's complete head rows, source/acquisition
+receipt and prepared hidden-consumption mode before advancing the request.
+
+`Packet.registration` binds a finite complete-case selection from the compiled
+lifecycle/O1 catalog and explicit record, child-store, payload, metadata, retained
+raw and state-readback grants. It replaces external packet-owned expected-row
+maps. Allocator geometry, cursors, parity and ledger length determine state
+extents before readback; every required state event streams into a separate,
+ordinary strict Q1 child store. Empty regions remain explicit metadata and never
+become fake zero-length tensors. Final four-slot and single-slot state stores are
+reused for canonical state parity rather than written again.
+
+Pre-call plans, required-parent receipts, completed execution and state-child
+indexes, raw/canonical bindings and complete-case shard indexes retain their
+source, acquisition nonce, case, arm and physical-slot custody. A completed
+execution alone cannot complete a case with an absent arm/store bundle. Shards
+must cover whole original cases and ultimately every original axis; O1's expected
+negative divergence/refusal must not be relabelled universal `ExactEqual`.
+Synthetic CPU controls are not model acquisition. Producer output explicitly
+does not claim independent whole-matrix, timing, quality or release qualification.
+
+Cancellation and recovered-depth reference arms carry their own typed request and
+terminal outcomes. A genuine no-advance arm owes state and settlement children,
+not fabricated target rows; advanced cancellation arms also owe all actual raw
+rows. Every case independently requires digest-bound classification and input
+authority, including failure, graft-identity and O1 negative-control receipts.
+
+Before case dispatch, a conservative combined live-allocation envelope covers
+overlapping lane caches and their K=4 committed/pending anchor owners, retained
+peer/final states, transient materialization, metadata and raw observations.
+Owner-lifetime reservations precede cache allocation and every state read and
+survive overlapping arms. Prefix-authority observations share the aggregate raw
+and live-RAM limits even outside a generation session. State readback appends
+directly to its preallocated output rather than allocating per-head copies.
+These ownership bounds are separate from disk bytes and from the externally
+admitted model/drafter working-set and owned-RSS guard; none proves a measured
+complete-case peak or admits another model start.
+
+Every required forward also retains its exact consumed token sequence in a
+digest-bound `native-inputs.json` artifact. Host tokens are hashed at the API
+boundary before native work; a same-length substitution fails the observation.
+GPU-resident inputs bind the actual buffer identity, token capacity and selected
+range before submission, then retain the existing checked-completion readback,
+never host placeholder values or an added synchronization. The consumer must
+join every input record to its required projection and pre-call plan. Missing,
+duplicated or post-observation-mutated inputs cannot complete a raw arm.
+
+The model-free ignored endpoint `matrix_catalog_export::qwen_c2_matrix_catalog_export`
+exports the compiled complete case and required-artifact catalogs for lifecycle
+and O1, bound to the actual exporter image digest. It opens no model/device and
+attests no acquisition. External registration must consume that catalog instead of
+duplicating route-dependent expected rows or maintaining a second case list.
+
 | Axis | Values |
 |---|---|
 | Artifact | Qwen3.8-27B vanilla (`HF2Q_QWEN38_GGUF`), Qwen3.6-35B-A3B vanilla (`HF2Q_QWEN36_GGUF`) |

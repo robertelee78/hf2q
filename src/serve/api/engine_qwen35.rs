@@ -6338,6 +6338,9 @@ impl Qwen35SpecSemanticState {
         source: Qwen35DecisionSource<'_>,
         prepared: Option<&mut PreparedDFlash2Grammar>,
     ) -> Result<Qwen35CanonicalDecision> {
+        #[cfg(test)]
+        anchor_exactness_tests::trace::acquire::require_decision(
+            self.observer_slot, self.generated_tokens.len(), qwen.vocab_size, qwen.hidden_size)?;
         let forced = self
             .thinking_budget
             .as_mut()
@@ -6561,6 +6564,9 @@ impl Qwen35DecodeState {
         let mut grammar_runtime = grammar_runtime_for_request(&params, registration)?;
         let mut tool_splitter = registration.and_then(ToolCallSplitter::from_registration);
         let mut sampling_history = qwen35_prompt_sampling_history(&prompt_tokens);
+        #[cfg(test)]
+        anchor_exactness_tests::trace::acquire::require_decision(
+            slot_id, 0, qwen.vocab_size, qwen.hidden_size)?;
         let next_token = if is_greedy && !want_logprobs {
             greedy_argmax_last_token(prefill_logits, qwen.vocab_size as u32)
         } else {
@@ -6963,6 +6969,9 @@ impl Qwen35DecodeState {
         let forced_token = self.next_ordinary_forced_token();
         let last_input = &self.generated_tokens[self.generated_tokens.len() - 1..];
         let tok = if self.is_greedy && !self.want_logprobs {
+            #[cfg(test)]
+            anchor_exactness_tests::trace::acquire::require_decision(
+                self.slot_id, self.generated_tokens.len(), qwen.vocab_size, qwen.hidden_size)?;
             let lease =
                 supervisor.arm("Qwen35 decode greedy", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
             let forward =
@@ -7031,6 +7040,9 @@ impl Qwen35DecodeState {
             logits.len(),
             qwen.vocab_size
         );
+        #[cfg(test)]
+        anchor_exactness_tests::trace::acquire::require_decision(
+            self.slot_id, self.generated_tokens.len(), qwen.vocab_size, qwen.hidden_size)?;
         let (token, logprob) = if let Some((token, _)) = forced_token {
             // Forced (thinking-budget) tokens are not sampled: report the
             // degenerate certain logprob with no alternatives.

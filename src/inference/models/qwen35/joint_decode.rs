@@ -525,6 +525,8 @@ impl Qwen35Model {
         decision_histories: Option<&[Option<&[u32]>]>,
         host_work: Option<&mut dyn FnMut()>,
     ) -> Result<(Vec<Qwen35JointRowOutput>, MlxBuffer)> {
+        #[cfg(test)]
+        let c2_native = crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::acquire::native_begin()?;
         let arena_setup = crate::inference::stage_profile::CpuSpan::begin("per_row_arena_setup");
         let cfg = &self.cfg;
         let hidden_size = cfg.hidden_size;
@@ -538,6 +540,29 @@ impl Qwen35Model {
             "Qwen joint forward packs {} rows at width {width}",
             rows.len()
         );
+        #[cfg(test)]
+        {
+            use crate::serve::api::engine_qwen35::anchor_exactness_tests::{
+                trace::acquire, registration::NativeHead, native_inputs::InputBinding};
+            if acquire::enabled() {
+                let heads = rows.iter().enumerate().map(|(row, input)| {
+                    let window = packing.windows.iter()
+                        .find(|window| row >= window.start && row < window.start + window.rows)
+                        .context("required native row has no immutable packing window")?;
+                    let start = usize::try_from(rows[window.start].position)?;
+                    ensure!(usize::try_from(input.position)? == start + row - window.start,
+                        "required native packing window has noncontiguous physical positions");
+                    let count = row - window.start + 1;
+                    let source = match gpu_token_ids {
+                        Some(buffer) => InputBinding::gpu(buffer, window.start, count)?,
+                        None => InputBinding::host_rows(count, rows[window.start..=row].iter().map(|input| input.token))?,
+                    };
+                    Ok(NativeHead { slot: input.slot_id, start, input_rows: row - window.start + 1,
+                        projected_rows: 1, vocab, hidden_width: h, gpu_argmax: input.output.wants_argmax(), input: source })
+                }).collect::<Result<Vec<_>>>()?;
+                acquire::native_contract(heads)?;
+            }
+        }
         if let Some(capture) = capture {
             ensure!(
                 capture.lane_indices.len() == packing.windows.len()
@@ -1008,6 +1033,8 @@ impl Qwen35Model {
         // Pooled: the head writes every row and every result leaves this
         // function as an owned copy before the next forward resets the pool,
         // so a step pays no fresh `[width, vocab]` allocation and CPU zeroing.
+        #[cfg(test)]
+        crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::acquire::plan_native()?;
         let logits = if prepared_head {
             let normed_bf16 = prepared_projection::bf16_input(
                 &mut enc,
@@ -1269,7 +1296,7 @@ impl Qwen35Model {
                         // Keep the actual GPU result distinct from both the raw
                         // target row and the frozen selector's acceptance input.
                         crate::serve::api::engine_qwen35::anchor_exactness_tests::trace::gpu_argmax(
-                            input.slot_id, usize::try_from(input.position)?, indices[row]);
+                            input.slot_id, usize::try_from(input.position)?, indices[row])?;
                     }
                     let projected = &all_logits[row * vocab..(row + 1) * vocab];
                     let restored = decision.as_ref().map(|decision| {
@@ -1307,7 +1334,10 @@ impl Qwen35Model {
             .collect::<Result<Vec<_>>>();
         drop(readback);
         mlx_native::command_timeline::mark("joint.readback_end");
-        outputs.map(|outputs| (outputs, normed))
+        let outputs = outputs?;
+        #[cfg(test)]
+        c2_native.finish()?;
+        Ok((outputs, normed))
     }
 }
 

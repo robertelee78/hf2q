@@ -1,7 +1,7 @@
 //! Same-route twins retain the actually executed prefix chunks and K3 steps,
 //! but never replay overwritten history or restore an image in the reference.
 use super::*;
-use super::trace::{Observations, State};
+use super::{trace::Observations, live_ram::OwnedState};
 use std::{collections::BTreeMap, sync::{Arc, atomic::Ordering}};
 #[path = "matrix_dispatch.rs"]
 mod matrix_dispatch;
@@ -16,6 +16,7 @@ struct Checkpoint {
     logits: Vec<f32>,
     // Diagnostic provenance only, never installed into model/cache state.
     hidden: Arc<Vec<f32>>,
+    witness: Option<super::checkpoint_witness::Reference>,
 }
 pub(super) struct Lane {
     pub(super) slot: SlotId,
@@ -27,15 +28,22 @@ pub(super) struct Lane {
     checkpoint: Option<Checkpoint>,
     hidden_witnesses: BTreeMap<u64, Arc<Vec<f32>>>,
     prefix_witnesses: BTreeMap<u64, prefix_script::Turn>,
+    checkpoint_witnesses: BTreeMap<u64, super::checkpoint_witness::Reference>,
     admission: Option<crate::serve::api::qwen35_speculation::QwenSpeculationDecision>,
+    _ram: Option<super::live_ram::Reservation>,
 }
 impl Lane {
-    pub(super) fn new(fixture: &Fixture) -> Result<Self> { Ok(Self {
+    pub(super) fn new(fixture: &Fixture) -> Result<Self> {
+        let ram = if let Some(budget) = &fixture.matrix {
+            Some(super::live_ram::reserve(budget, super::live_ram::lane_envelope(fixture)?)?)
+        } else { None };
+        Ok(Self {
         cache: matrix_dispatch::Cache::new(fixture.cache()?),
         store: Qwen35AnchorStore::new(4)?, retained: Vec::new(), spec: None,
         slot: SLOT, checkpoint: None, hidden_witnesses: BTreeMap::new(),
         prefix_witnesses: BTreeMap::new(),
-        driver: matrix_dispatch::Driver::new()?, admission: None }) }
+        checkpoint_witnesses: BTreeMap::new(),
+        driver: matrix_dispatch::Driver::new()?, admission: None, _ram: ram }) }
     pub(super) fn restore(&mut self, id: u64, supervisor: &EngineSupervisor) -> Result<()> {
         let anchor = self.store.anchor(id).cloned();
         let restored = restore_committed_anchor(&mut self.cache, self.slot, &mut self.store, id, supervisor);
@@ -44,7 +52,7 @@ impl Lane {
         let anchor = anchor.context("successful restore lost its committed anchor")?;
         let hidden = self.hidden_witnesses.get(&id).context("original checkpoint normalized-head witness missing")?.clone();
         self.checkpoint = Some(Checkpoint { tokens: anchor.prompt_tokens.clone(),
-            logits: anchor.prefill_logits, hidden });
+            logits: anchor.prefill_logits, hidden, witness: self.checkpoint_witnesses.get(&id).cloned() });
         self.retained = anchor.prompt_tokens;
         self.spec = anchor.spec;
         self.driver.set_prefix(self.slot, &self.retained, self.spec.as_ref());
@@ -63,7 +71,8 @@ impl Lane {
                 let hidden = self.hidden_witnesses.get(&anchor.id)
                     .context("recovered checkpoint lost its original normalized-head witness")?.clone();
                 Ok(Checkpoint { tokens: anchor.prompt_tokens.clone(),
-                    logits: anchor.prefill_logits.clone(), hidden })
+                    logits: anchor.prefill_logits.clone(), hidden,
+                    witness: self.checkpoint_witnesses.get(&anchor.id).cloned() })
             }).transpose()?;
         Ok(())
     }
@@ -73,13 +82,16 @@ impl Lane {
             || store.pending().is_some_and(|pending| pending.id == *id));
         self.prefix_witnesses.retain(|id, _| store.anchor(*id).is_some()
             || store.pending().is_some_and(|pending| pending.id == *id));
+        self.checkpoint_witnesses.retain(|id, _| store.anchor(*id).is_some()
+            || store.pending().is_some_and(|pending| pending.id == *id));
     }
     pub(super) fn cold(&mut self) -> Result<()> {
         self.store.reset();
         self.driver.set_prefix(self.slot, &[], None);
         self.cache.reset_for_slot(self.slot)?;
         self.retained.clear(); self.spec = None; self.checkpoint = None;
-        self.hidden_witnesses.clear(); self.prefix_witnesses.clear(); Ok(())
+        self.hidden_witnesses.clear(); self.prefix_witnesses.clear();
+        self.checkpoint_witnesses.clear(); Ok(())
     }
 }
 pub(super) struct Served {
@@ -99,13 +111,19 @@ pub(super) fn prefill_limit(fixture: &mut Fixture, lane: &mut Lane, prompt: &[u3
 }
 fn prefill_transaction(fixture: &mut Fixture, lane: &mut Lane, prompt: &[u32], cached: usize,
     publish: bool, limit: usize, request: Option<u64>) -> Result<Served> {
+    use super::{forward_plan::SavedHidden, registration::{NativeHead, StepWork}};
     let _observation_scope = if trace::enabled() { None } else { Some(trace::Scope::begin(None, 0)?) };
     let supervisor = fixture.supervisor.clone();
-    let qwen = fixture.qwen();
     let equality = if cached == prompt.len() {
         let checkpoint = lane.checkpoint.as_ref().context("equality checkpoint logits absent")?;
         ensure!(checkpoint.tokens == prompt, "equality seed belongs to a different logical prefix");
         Some(checkpoint.logits.clone())
+    } else { None };
+    let original = if fixture.matrix.is_some() && cached != prompt.len() {
+        Some(super::checkpoint_witness::Prepared::begin(fixture, prompt)?)
+    } else { None };
+    let saved = if cached == prompt.len() {
+        lane.checkpoint.as_ref().and_then(|checkpoint| checkpoint.witness.clone())
     } else { None };
     let params = SamplingParams { max_tokens: limit, ..SamplingParams::default() };
     let retained = crate::serve::api::engine::Qwen35RetainedPrefix {
@@ -114,32 +132,67 @@ fn prefill_transaction(fixture: &mut Fixture, lane: &mut Lane, prompt: &[u32], c
         cached_tokens: cached, anchor_id: None, restore_prompt_anchor: false,
         use_prefill_logits: cached == prompt.len() };
     let (decision, cached_spec) = crate::serve::api::engine::test_qwen35_admission_speculation(
-        qwen, &lane.cache, lane.slot, &preference, &lane.store, &retained, prompt.len(), &params, None)?;
+        fixture.qwen(), &lane.cache, lane.slot, &preference, &lane.store, &retained, prompt.len(), &params, None)?;
     lane.admission = Some(decision);
+    let saved_mode = if cached == prompt.len() && fixture.matrix.is_some() {
+        Some(saved.as_ref().context("equality lost its original source-bound checkpoint receipt")?
+            .planned_mode(fixture, prompt, cached_spec.is_some())?)
+    } else { None };
+    let qwen = fixture.qwen();
+    let vocab = qwen.vocab_size;
+    let hidden_width = qwen.hidden_size;
+    let physical_prediction = prompt.len().checked_add(qwen.model.kv_graft.as_ref()
+        .map_or(0, |graft| graft.bank.n_slots as usize)).and_then(|n| n.checked_sub(1))
+        .context("prefill request has no physical final row")?;
     let mut pending = Qwen35PrefillState::begin(prompt.to_vec(), params, None,
         &mut lane.cache, lane.slot, cached, equality, cached_spec, None,
-        qwen.hidden_size, qwen.model.kv_graft.as_ref())?;
-    let (state, logits) = loop {
+        hidden_width, qwen.model.kv_graft.as_ref())?;
+    let (state, logits, final_step) = loop {
+        let step = trace::acquire::begin_step(if cached == prompt.len() {
+            StepWork::SavedCheckpoint
+        } else { StepWork::Native })?;
+        if let Some(mode) = saved_mode {
+            let witness = saved.as_ref().context("required equality receipt absent")?;
+            trace::acquire::saved_checkpoint(NativeHead { slot: lane.slot, start: physical_prediction,
+                input_rows: 1, projected_rows: 1, vocab, hidden_width, gpu_argmax: false,
+                input: super::native_inputs::InputBinding::host(&prompt[prompt.len() - 1..])? },
+                witness.id, mode, &witness.receipt)?;
+        }
         let outcome = pending.advance(qwen, None, &mut lane.cache, CHUNK, &supervisor, None)?;
         trace::transaction(&lane.cache, lane.slot)?;
         match outcome {
-            Qwen35PrefillAdvance::Pending { state, .. } => pending = state,
-            Qwen35PrefillAdvance::Ready { state, prefill_logits, .. } => break (state, prefill_logits),
+            Qwen35PrefillAdvance::Pending { state, .. } => { step.finish()?; pending = state; }
+            Qwen35PrefillAdvance::Ready { state, prefill_logits, .. } => break (state, prefill_logits, step),
         }
     };
     let physical = lane.cache.sequence_len_for_slot(lane.slot)? as usize;
     let hidden = if cached == prompt.len() {
         let witness = lane.checkpoint.as_ref().context("equality hidden witness absent")?.hidden.clone();
         let consumed = state.mtp.as_ref().map(|mtp| mtp.verifier_hidden.as_logical_slice::<f32>()).transpose()?;
+        if let Some(mode) = saved_mode {
+            ensure!((mode == SavedHidden::ConsumedSpeculative) == consumed.is_some(),
+                "equality hidden-consumption mode changed after its pre-call declaration");
+        }
         let (source, actual_hidden) = match consumed {
             Some(hidden) => ("production-saved-logits-equality/consumed-spec-hidden", hidden),
             None => ("production-saved-logits-equality/original-checkpoint-normalized-head-witness", witness.as_slice()),
         };
+        if let Some(mode) = saved_mode {
+            saved.as_ref().context("equality receipt absent")?
+                .check_values(fixture, prompt, mode, &logits, actual_hidden)?;
+        }
         trace::forward(lane.slot, physical - 1, &prompt[prompt.len() - 1..],
-            source, &logits, qwen.vocab_size, Some(actual_hidden), qwen.hidden_size)?;
+            source, &logits, vocab, Some(actual_hidden), hidden_width)?;
         witness
     } else { Arc::new(trace::checkpoint_hidden(lane.slot, physical - 1)?) };
-    lane.checkpoint = Some(Checkpoint { tokens: prompt.to_vec(), logits: logits.clone(), hidden: hidden.clone() });
+    final_step.finish()?;
+    let witness = match original {
+        Some(original) => Some(original.finish(&logits, hidden.as_slice(),
+            state.mtp.as_ref().map(|mtp| &mtp.verifier_hidden))?),
+        None => saved,
+    };
+    lane.checkpoint = Some(Checkpoint { tokens: prompt.to_vec(), logits: logits.clone(),
+        hidden: hidden.clone(), witness: witness.clone() });
     let mut anchor = 0;
     if publish {
         let request = request.context("checkpoint capture requires an actual admitted request")?;
@@ -150,7 +203,7 @@ fn prefill_transaction(fixture: &mut Fixture, lane: &mut Lane, prompt: &[u32], c
             Err(error) => { lane.store.abort_transaction(ticket)?; return Err(error); }
         };
         let spec = state.spec_prefix_candidate(prompt.len()).map(|spec| {
-            qwen.model.with_gpu_cache_mut(|device, _| owned_spec_boundary(
+            fixture.qwen().model.with_gpu_cache_mut(|device, _| owned_spec_boundary(
                 device, spec.token_count, &spec.pending_target_hidden))
         }).transpose()?;
         lane.store.finish_capture(ticket)?;
@@ -158,6 +211,7 @@ fn prefill_transaction(fixture: &mut Fixture, lane: &mut Lane, prompt: &[u32], c
             prompt_tokens: prompt.to_vec(), kv: image, prefill_logits: logits,
             vision_fingerprint: None, spec })?;
         lane.hidden_witnesses.insert(anchor, hidden);
+        if let Some(witness) = witness { lane.checkpoint_witnesses.insert(anchor, witness); }
         lane.prune_witnesses();
     }
     Ok(Served { state, anchor, request })
@@ -331,21 +385,30 @@ fn prepare_peers(fixture: &mut Fixture, lane: &mut Lane) -> Result<()> {
         "concurrency fixture must retain all three actually decoding peers");
     Ok(())
 }
+pub(super) fn begin_acquisition(fixture: &Fixture, lane: &Lane, prompt: &[u32],
+    name: &str, arm: &str) -> Result<trace::Scope> {
+    let LoadedModel::Qwen35(qwen) = fixture.loaded.as_ref() else { unreachable!() };
+    let graft = qwen.model.kv_graft.as_ref().map_or(0, |graft| graft.bank.n_slots as usize);
+    let origin = prompt.len().checked_add(graft).and_then(|n| n.checked_sub(1))
+        .context("acquisition request has no physical prediction origin")?;
+    trace::Scope::begin_transactions(super::transaction_trace::Writer::new(fixture, name, arm)?,
+        &lane.retained, origin)
+}
+
 pub(super) fn compare_final(fixture: &mut Fixture, lane: &mut Lane, prompt: &[u32], cached: usize,
-    peers: bool, name: &str, arm: &str) -> Result<(Observations, State, Vec<u32>)> {
+    peers: bool, name: &str, arm: &str) -> Result<(Observations, OwnedState, Vec<u32>)> {
     lane.admit(prompt.len(), DECODE_LIMIT)?;
     if peers { prepare_peers(fixture, lane)?; }
     compare_final_prepared(fixture, lane, prompt, cached, name, arm)
 }
 fn compare_final_prepared(fixture: &mut Fixture, lane: &mut Lane, prompt: &[u32], cached: usize,
-    name: &str, arm: &str) -> Result<(Observations, State, Vec<u32>)> {
-    let scope = trace::Scope::begin_transactions(
-        super::transaction_trace::Writer::new(fixture, name, arm)?, &lane.retained)?;
+    name: &str, arm: &str) -> Result<(Observations, OwnedState, Vec<u32>)> {
+    let scope = begin_acquisition(fixture, lane, prompt, name, arm)?;
     let served = prefill(fixture, lane, prompt, cached, true)?;
     let readiness = served.state.joint_decode_readiness(&lane.cache).map_err(|reason| reason.label());
     let tokens = finish_success(fixture, lane, served)?;
     scope.publish(&lane.retained);
-    trace::transaction(&lane.cache, lane.slot)?;
+    trace::acquire::settle(&lane.cache, &lane.retained, &tokens)?;
     scope.finish_transactions()?;
     let mut observed = scope.take()?;
     observed.readiness = Some(readiness);
@@ -365,7 +428,8 @@ fn compare_final_prepared(fixture: &mut Fixture, lane: &mut Lane, prompt: &[u32]
             ensure!(k3 + joint_mtp == 0, "ineligible AUTO target {name}/{arm} completed MTP");
         }
     }
-    Ok((observed, State::read(&lane.cache, lane.slot)?, tokens))
+    let state = super::state_pair::snapshot(fixture, name, arm, &lane.cache, &lane.retained)?;
+    Ok((observed, state, tokens))
 }
 fn completed_routes(observed: &Observations) -> (u64, u64) {
     let count = |name| observed.route_events.iter().filter(|&&route| route == name).count() as u64;
@@ -379,9 +443,7 @@ fn compare_case(fixture: &mut Fixture, rank: usize, equality: bool, peers: bool)
     let mut authority = Lane::new(fixture)?;
     let authority_ids = build(fixture, &mut authority, 3)?;
     let script = script(&mut authority, &authority_ids)?;
-    let script_bytes = serde_json::to_vec_pretty(&script)?;
-    let prefix_script_sha256 = hash(&script_bytes);
-    fs::write(fixture.packet.output.join(format!("{name}-prefix-script.json")), script_bytes)?;
+    let prefix_script_sha256 = super::case_evidence::authority(fixture, &name, &script)?;
     drop(authority);
     let depth = script[selected].prompt.len();
     let prompt = divergent_prompt(&fixture.packet.workload.lanes[0], &script[selected].prompt, equality);
@@ -391,10 +453,12 @@ fn compare_case(fixture: &mut Fixture, rank: usize, equality: bool, peers: bool)
     // does. Their live requests/replies survive restore and all decode turns.
     resumed.admit(prompt.len(), DECODE_LIMIT)?;
     if peers { prepare_peers(fixture, &mut resumed)?; }
-    let before_peers = (1..4).map(|i| State::read(&resumed.cache, SlotId(i))).collect::<Result<Vec<_>>>()?;
+    let before_peers = (1..4).map(|i| super::live_ram::read(fixture, &resumed.cache, SlotId(i)))
+        .collect::<Result<Vec<_>>>()?;
     resumed.restore(ids[selected], &fixture.supervisor)?;
     for (index, before) in before_peers.iter().enumerate() {
-        before.same(&State::read(&resumed.cache, SlotId(index as u32 + 1))?, "peer changed across target restore")?;
+        before.same(&super::live_ram::read(fixture, &resumed.cache, SlotId(index as u32 + 1))?,
+            "peer changed across target restore")?;
     }
     let (actual, actual_state, actual_tokens) = compare_final_prepared(fixture, &mut resumed,
         &prompt, depth, &name, "actual")?;
@@ -404,8 +468,6 @@ fn compare_case(fixture: &mut Fixture, rank: usize, equality: bool, peers: bool)
     let (expected, expected_state, expected_tokens) = compare_final(fixture, &mut cold,
         &prompt, depth, peers, &name, "twin")?;
     super::trace_pair::write_pair(fixture, &name, &actual, &expected)?;
-    super::state_pair::write(fixture, &name, &actual_state, &expected_state,
-        &resumed.retained, &cold.retained)?;
     ensure!(actual == expected, "DivergedExactInvariant: all actual logits/hidden/decision rows or routes");
     actual_state.same(&expected_state, "resumed target/MTP/KV/TQ/DeltaNet/parity versus same-concurrency cold twin")?;
     ensure!(actual_tokens == expected_tokens && resumed.retained == cold.retained,
@@ -420,9 +482,6 @@ fn compare_case(fixture: &mut Fixture, rank: usize, equality: bool, peers: bool)
     let mut single_slot_parity_rows = None;
     if let (Some((observed, state, tokens)), Some(lane)) = (&single, &single_lane) {
         super::trace_pair::write_arm(fixture, &name, "single", observed)?;
-        let parity_case = format!("{name}-single-slot-parity");
-        super::state_pair::write(fixture, &parity_case, &actual_state, state,
-            &resumed.retained, &lane.retained)?;
         actual_state.same(state, "concurrent target versus independent single-slot semantic cache")?;
         ensure!(resumed.retained == lane.retained, "DivergedExactInvariant: single-slot retained ledger");
         let graft = fixture.qwen().model.kv_graft.as_ref().map_or(0, |graft| graft.bank.n_slots as usize);
@@ -494,64 +553,83 @@ fn compare_case(fixture: &mut Fixture, rank: usize, equality: bool, peers: bool)
         literal_k3_capability: if equality && graft_bound && fixture.packet.route == Route::MtpAuto { "PromptCacheHit" }
             else if graft_bound && fixture.packet.route == Route::MtpAuto { "ExpectedCapabilityNegativeControl-ADR059-no-grafted-MTP" }
             else if eligible_auto { "ObservedActualK3" } else { "NotDeclaredK3" } };
-    fs::write(fixture.packet.output.join(format!("{name}.json")), serde_json::to_vec_pretty(&evidence)?)?;
+    super::case_evidence::classification(fixture, &name, &evidence)?;
     Ok(())
 }
 fn failure_cases(fixture: &mut Fixture) -> Result<()> {
     for fault in [AnchorRestoreFault::Preflight, AnchorRestoreFault::Encode] {
+        let name = format!("failure-{fault:?}");
+        if !fixture.selected(&name)? { continue; }
         let mut lane = Lane::new(fixture)?;
         let ids = build(fixture, &mut lane, 3)?;
-        let before = State::read(&lane.cache, SLOT)?;
+        let authority = script(&mut lane, &ids)?;
+        let authority_sha256 = super::case_evidence::authority(fixture, &name, &authority)?;
+        let before = super::live_ram::read(fixture, &lane.cache, SLOT)?;
         let committed: Vec<_> = lane.store.committed().iter().map(|a| a.id).collect();
         lane.store.restore_fault = Some(fault);
         let refused = lane.restore(ids[1], &fixture.supervisor);
         ensure!(refused.is_err(), "injected restore failure did not execute");
         if matches!(fault, AnchorRestoreFault::Preflight) {
-            before.same(&State::read(&lane.cache, SLOT)?, "Phase A mutated cache")?;
+            before.same(&super::live_ram::read(fixture, &lane.cache, SLOT)?, "Phase A mutated cache")?;
             ensure!(committed == lane.store.committed().iter().map(|a| a.id).collect::<Vec<_>>()
                 && !lane.store.is_poisoned(), "Phase A mutated store");
         } else {
             ensure!(lane.store.is_poisoned() && lane.store.is_empty(), "encode failure must poison/clear without shallower fallback");
         }
+        let refusal = format!("{:#}", refused.err().expect("checked restore refusal"));
+        let poisoned = lane.store.is_poisoned();
         lane.cold()?;
         let mut cold = Lane::new(fixture)?;
         let prompt = fixture.packet.workload.lanes[0][..128].to_vec();
-        let name = format!("failure-{fault:?}");
         let actual = compare_final(fixture, &mut lane, &prompt, 0, false, &name, "actual")?;
         let expected = compare_final(fixture, &mut cold, &prompt, 0, false, &name, "twin")?;
         super::trace_pair::write_pair(fixture, &name, &actual.0, &expected.0)?;
-        super::state_pair::write(fixture, &name, &actual.1, &expected.1,
-            &lane.retained, &cold.retained)?;
         ensure!(actual == expected, "DivergedExactInvariant: failure recovery cold twin");
+        drop((actual, expected));
+        super::case_evidence::classification(fixture, &name, &serde_json::json!({
+            "schema":"hf2q.c2.failed-restore.v1","fault":format!("{fault:?}"),
+            "actual_refusal":refusal,"poisoned_after_fault":poisoned,
+            "cold_twin":"ExactEqual","prefix_script_sha256":authority_sha256,
+        }))?;
+        fixture.completed_case(&name)?;
     }
     Ok(())
 }
 pub(super) fn run(family: Family) -> Result<()> {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let mut fixture = Fixture::load(family)?;
+    let mut fixture = Fixture::load(family, Some(super::matrix_plan::Mode::Lifecycle))?;
     // Root runs absent and bound-same-graft packets separately, never two models.
     for rank in [0, 2] { for equality in [false, true] { for peers in [false, true] {
-        compare_case(&mut fixture, rank, equality, peers)?;
+        let name = format!("rank{rank}-eq{equality}-peers{peers}");
+        if fixture.selected(&name)? {
+            compare_case(&mut fixture, rank, equality, peers)?;
+            fixture.completed_case(&name)?;
+        }
     }}}
     super::cancellation::run(&mut fixture)?;
     failure_cases(&mut fixture)?;
-    super::graft::changed_identity(&mut fixture)?;
+    if fixture.packet.graft.is_some() && fixture.selected("graft-identity-change")? {
+        super::graft::changed_identity(&mut fixture)?;
+        fixture.completed_case("graft-identity-change")?;
+    }
     fixture.finish()
 }
 
 pub(super) fn o1(family: Family) -> Result<()> {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
-    let mut fixture = Fixture::load(family)?;
+    let mut fixture = Fixture::load(family, Some(super::matrix_plan::Mode::O1))?;
     let mut authority = Lane::new(&fixture)?;
     let authority_ids = build(&mut fixture, &mut authority, 2)?;
     let script = script(&mut authority, &authority_ids)?;
-    fs::write(fixture.packet.output.join("o1-prefix-script.json"), serde_json::to_vec_pretty(&script)?)?;
     drop(authority);
     let a = script[2].prompt.clone();
     let a0 = &script[0].prompt;
     let c = divergent_prompt(&fixture.packet.workload.lanes[0], &a, false);
     for shallower in [false, true] {
         for disabled_pruning in [false, true] {
+            let name = format!("o1-shallower{shallower}-pruningdisabled{disabled_pruning}");
+            if !fixture.selected(&name)? { continue; }
+            let authority_sha256 = super::case_evidence::authority(&fixture, &name, &script)?;
             let mut lane = Lane::new(&fixture)?;
             let ids = replay_script(&mut fixture, &mut lane, &script, 2, false)?;
             let a_id = ids[2];
@@ -605,16 +683,13 @@ pub(super) fn o1(family: Family) -> Result<()> {
             let mut cold = if negative {
                 independent_checkpoint(&mut fixture, &script, 2)?
             } else { Lane::new(&fixture)? };
-            let name = format!("o1-shallower{shallower}-pruningdisabled{disabled_pruning}");
             let cached = if negative { a.len() } else { 0 };
             let actual = compare_final(&mut fixture, &mut lane, &c, cached, false, &name, "actual")?;
             let expected = compare_final(&mut fixture, &mut cold, &c, cached, false, &name, "twin")?;
             let equal = actual == expected && lane.retained == cold.retained;
             ensure!(equal != negative, "O1 sensitivity failed: expected {}", if negative {"DivergedExactInvariant"} else {"ExactEqual"});
             super::trace_pair::write_pair(&fixture, &name, &actual.0, &expected.0)?;
-            super::state_pair::write(&fixture, &name, &actual.1, &expected.1,
-                &lane.retained, &cold.retained)?;
-            fs::write(fixture.packet.output.join(format!("{name}.json")), serde_json::to_vec_pretty(&serde_json::json!({
+            super::case_evidence::classification(&fixture, &name, &serde_json::json!({
                 "schema":"hf2q.c2.o1.v1", "shallower":shallower, "pruning_disabled":disabled_pruning,
                 "classification":if equal {"ExactEqual"} else {"DivergedExactInvariant"},
                 "cold_reset_negative_control":if !shallower && disabled_pruning {Some("RefusedByIndependentCacheGeneration")} else {None},
@@ -622,8 +697,11 @@ pub(super) fn o1(family: Family) -> Result<()> {
                 ,"checkpoint_depth":a.len(),"shallower_depth":a0.len(),"b_prompt_depth":b.len(),
                 "b_shared_prefix":shared,"twin_image_restores":0
                 ,"tombstoned":tombstone_after-tombstone_before,
-                "restore_refused":ANCHOR_TELEMETRY.restore_refused.load(Ordering::Relaxed)-refused_before
-            }))?)?;
+                "restore_refused":ANCHOR_TELEMETRY.restore_refused.load(Ordering::Relaxed)-refused_before,
+                "prefix_script_sha256":authority_sha256
+            }))?;
+            drop((actual, expected));
+            fixture.completed_case(&name)?;
         }
     }
     fixture.finish()

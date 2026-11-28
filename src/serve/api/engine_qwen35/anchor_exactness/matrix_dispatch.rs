@@ -130,6 +130,8 @@ impl Driver {
         let mut guard = Qwen35KvGuard { model: qwen, kv: cache.0.take() };
         let result = (|| -> Result<Outcome> {
             let seeded = !seeds.is_empty();
+            let seed_step = if seeded { Some(trace::acquire::begin_step(super::super::registration::StepWork::StateOnly)?) }
+                else { None };
             for (handle, state, logits, reply) in seeds {
                 if let Some(fatal) = engine::test_finish_qwen35_prefill(&mut guard, &mut self.scheduler,
                     &mut self.slots, &mut self.retained, &mut self.prompts, &mut self.anchors, None,
@@ -140,6 +142,7 @@ impl Driver {
                 trace::publish_ledger(SLOT, &self.retained[SLOT.0 as usize].tokens);
                 trace::transaction(guard.kv.as_ref().expect("live serving KV"), SLOT)?;
             }
+            if let Some(step) = seed_step { step.finish()?; }
             for _ in 0..turn_limit.unwrap_or(DECODE_LIMIT + 1) {
                 if target && self.slots[SLOT.0 as usize].is_none() { break; }
                 if self.slots.iter().all(Option::is_none) { break; }
@@ -149,6 +152,12 @@ impl Driver {
                     SchedulerStep::Mixed { decode_handles, .. } => decode_handles,
                     _ => anyhow::bail!("live matrix decoders were omitted from the scheduler turn"),
                 };
+                let native = self.slots[SLOT.0 as usize].as_ref().is_some_and(|(work, _, handle)| {
+                    handles.contains(handle) && matches!(work, Qwen35SlotWork::Decode(state)
+                        if state.step < state.max_tokens && state.pending_speculation_output.is_empty())
+                });
+                let step = trace::acquire::begin_step(if native { super::super::registration::StepWork::Native }
+                    else { super::super::registration::StepWork::StateOnly })?;
                 if let Some(fatal) = engine::decode_batch_qwen35(&mut guard, &mut self.scheduler,
                     &mut self.slots, &mut self.retained, &mut self.prompts, &mut self.anchors,
                     None, &handles, 0, joint, &supervisor) { return Err(fatal.error); }
@@ -156,6 +165,7 @@ impl Driver {
                 for slot in 0..SLOTS {
                     trace::transaction(guard.kv.as_ref().expect("live serving KV"), SlotId(slot))?;
                 }
+                step.finish()?;
                 self.collect_replies()?;
                 if target && self.slots[SLOT.0 as usize].is_none() { break; }
             }
