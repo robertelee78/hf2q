@@ -355,6 +355,7 @@ struct CaseEvidence {
     single_slot_twin: bool,
     state_exact: bool,
     peer_restore_unchanged: bool,
+    peer_restore_state_digests: Vec<super::case_evidence::PeerRestoreDigest>,
     resolved_speculation: &'static str,
     literal_k3_capability: &'static str,
 }
@@ -415,12 +416,12 @@ fn compare_final_prepared(fixture: &mut Fixture, lane: &mut Lane, prompt: &[u32]
     drop(scope);
     let decision = lane.admission.context("completed generation lost its production admission decision")?;
     let (k3, joint_mtp) = completed_routes(&observed);
-    fs::write(fixture.packet.output.join(format!("{name}-{arm}-participation.json")),
-        serde_json::to_vec_pretty(&serde_json::json!({
+    super::metadata::write(&fixture.packet.output.join(format!("{name}-{arm}-participation.json")),
+        fixture.matrix_budget()?.as_ref(), &serde_json::json!({
             "schema":"hf2q.c2.lane-participation.v1","case":name,"arm":arm,"slot":lane.slot.0,
             "route":fixture.packet.route,"admission_decision":decision.metric_reason(),
             "completed_k3":k3,"completed_joint_mtp":joint_mtp,"route_events":observed.route_events,
-        }))?)?;
+        }))?;
     if fixture.packet.route == Route::MtpAuto {
         if decision == crate::serve::api::qwen35_speculation::QwenSpeculationDecision::Eligible {
             ensure!(k3 + joint_mtp > 0, "eligible AUTO target {name}/{arm} never completed K3/joint-MTP");
@@ -456,10 +457,16 @@ fn compare_case(fixture: &mut Fixture, rank: usize, equality: bool, peers: bool)
     let before_peers = (1..4).map(|i| super::live_ram::read(fixture, &resumed.cache, SlotId(i)))
         .collect::<Result<Vec<_>>>()?;
     resumed.restore(ids[selected], &fixture.supervisor)?;
+    let mut peer_restore_state_digests = Vec::with_capacity(before_peers.len());
     for (index, before) in before_peers.iter().enumerate() {
-        before.same(&super::live_ram::read(fixture, &resumed.cache, SlotId(index as u32 + 1))?,
-            "peer changed across target restore")?;
+        let slot = SlotId(index as u32 + 1);
+        let after = super::live_ram::read(fixture, &resumed.cache, slot)?;
+        before.same(&after, "peer changed across target restore")?;
+        peer_restore_state_digests.push(super::case_evidence::PeerRestoreDigest { slot: slot.0,
+            before: super::case_evidence::peer_state_digest(slot, before),
+            after: super::case_evidence::peer_state_digest(slot, &after) });
     }
+    drop(before_peers);
     let (actual, actual_state, actual_tokens) = compare_final_prepared(fixture, &mut resumed,
         &prompt, depth, &name, "actual")?;
     let mut cold = independent_checkpoint(fixture, &script, selected)?;
@@ -545,6 +552,7 @@ fn compare_case(fixture: &mut Fixture, rank: usize, equality: bool, peers: bool)
         }.metric_reason(),
         checkpoint_depth: depth, prefix_script_sha256, single_slot_twin: true,
         state_exact: true, peer_restore_unchanged: true,
+        peer_restore_state_digests,
         resolved_speculation: if fixture.packet.route == Route::MtpAuto {
             if equality && graft_bound { "PromptCacheHit/ordinary-grafted" }
             else if graft_bound { "RuntimeUnavailable/ordinary-grafted" }

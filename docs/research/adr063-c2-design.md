@@ -448,6 +448,24 @@ and O1, bound to the actual exporter image digest. It opens no model/device and
 attests no acquisition. External registration must consume that catalog instead of
 duplicating route-dependent expected rows or maintaining a second case list.
 
+`scripts/four_agent/c2_matrix.py register` takes the compiled catalog binding,
+declared source identity, finite grants and selected complete case names and
+exclusively creates the registration manifest. `verify-shard` takes the bound
+packet, catalog and shard; it independently re-derives projection, selector and
+allocator state extents before requiring exact Q1 payload coverage. It joins
+actual input vectors, original saved-row witnesses, every required state event,
+same-concurrency raw twins and canonical single-slot twins. O1's pruning-only
+negative must remain genuinely divergent; equality on a common subset is not a
+positive case. All peer slots retain ordered before/after semantic state digests
+in the required classification artifact. Those digests bind physical slot,
+target/MTP cursor variants, parity, region boundaries and every payload byte.
+The pre-existing bytewise peer comparison remains required.
+
+These commands never open models or grant acquisition. A numeric shard review
+does not attest its native root, original-matrix axis coverage, actual resource
+peak, quality, timing or release. The independently reviewed native owner and
+finite resource/start plan remain separate mandatory prerequisites.
+
 | Axis | Values |
 |---|---|
 | Artifact | Qwen3.8-27B vanilla (`HF2Q_QWEN38_GGUF`), Qwen3.6-35B-A3B vanilla (`HF2Q_QWEN36_GGUF`) |
