@@ -90,7 +90,7 @@ pub(super) fn run(fixture: &mut Fixture) -> Result<()> {
         recovering.finish()?;
         close_actual(fixture, &lane, scope, &name, window, request, &recovery)?;
         let actual = super::state_pair::snapshot(fixture, &name, "actual", &lane.cache, &lane.retained)?;
-        expected.same(&actual, "cancel recovery versus never-cancelled recovered-depth twin")?;
+        expected.same_semantic(&actual, "cancel recovery versus never-cancelled recovered-depth twin")?;
         ensure!(lane.retained == saved_tokens && lane.store.pending().is_none(), "cancel published uncommitted state");
         let expected_disposition = if window == Window::BeforeCapture {
             AnchorRecovery::Preserved { tokens: saved_tokens.len() }

@@ -121,6 +121,20 @@ This answers the C2 HLD/LLD acceptance item.
 
 Restoring slot `s` from an anchor is therefore the P4a operation `DeltaNetCaptureRestore` with `rec_cap`/`conv_cap` = the image's layer views, `(s_j, t_j) = (0, 0)`, and destinations = slot `s`'s regions of the **named** `recurrent`/`conv_state` buffers. P4a §2.1 explicitly admits this geometry, and T-P4a-4 tests it. After completion, `pp_flipped[s] := false`, exactly as `restore_slot_anchor` does today (`kv_cache.rs:1715`). The restored bytes and parity therefore equal today's host restore.
 
+**Semantic state versus storage selectors.** An independently replayed cold twin
+need not have the same `pp_flipped` bits: anchor restore deliberately changes the
+physical ping-pong frame. Compare every target/MTP cursor, parity-current conv
+and recurrent buffer, active KV/TQ byte, and retained token exactly. The current
+buffer accessors select those semantic bytes before readback. Retain the actual
+selector bytes and their layer extent in the raw evidence; validate that each
+selector is Boolean, and report a representation difference separately from a
+semantic mismatch. Never replace captured selectors with synthetic zeroes.
+Peer/no-mutation checks, each arm's own final-state/Settlement equality, and the
+fresh-reset parity contract remain literal comparisons including selectors.
+An O1 sensitivity negative needs a real semantic/output difference, not merely
+a different ping-pong frame. This clarifies the existing named-reset restore
+contract; numerical tolerances and owner acceptance gates do not change.
+
 P4b's hf2q interface (P4 design §3.1) is used, not duplicated. Its plan item carries a source and a destination policy:
 
 ```rust

@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Keep repository-only four-agent Python regression modules out of the crate archive. Runtime/operator helpers and Rust unit-test fixtures remain included; registry source builds retain upload-size headroom as C2 tooling grows.
+- C2 cold-twin checks compare complete active cache state rather than physical ping-pong selectors deliberately reset by anchor restore. Raw selectors remain captured and validated; peer/no-mutation, own-Settlement and fresh-reset checks stay literal. No numerical tolerance or release gate changes.
 
 - C2 transaction acquisition constructs its writer with the scope and rejects missing, unfinished, incomplete or repeated completion. Capture/close errors remain fatal even if a caller ignores them; completed raw observations move to their consumer without a duplicate payload allocation. This test-only repair does not qualify the lifecycle matrix or release.
 - Paired task-quality campaigns count the frozen six labels × four agents, not 24 all-or-nothing cohorts. Successful peers survive a failed agent's task; unreviewed patches publish no quality verdict. Existing-format independent patch review can settle captures without rerunning them, and Q3/F2 admission re-derives the per-agent evidence and verdict. Statistical thresholds and release gates are unchanged.
