@@ -22,7 +22,7 @@ import quality_campaign as qc
 from qwen38_n1_smoke import build_request, exchange
 from qwen38_n1_verdict import Invalid
 from test_q3_campaign import Harness
-from test_quality_campaign import QWEN38, FakeRuns
+from test_quality_campaign import QWEN38, FakeRuns, launch_variables
 
 PASSING_RECEIPT = {"verdict": {"verdict": "CalibrationPass"}, "cleanup": {"proven": True}, "cleanup_proven": True}
 FOREIGN = " Independent coding agent agent-1, workload adr063-qwen-n4-parse-port-v1."
@@ -576,6 +576,7 @@ class CampaignControls(Harness):
         args = qc.parse_args(["--subject-case", str(QWEN38), "--reference-case", str(QWEN38), "--reference-kind",
                               "stock-hf2q", "--instances", "24", "--negative-control-receipt", str(self.nc),
                               "--output", str(root / "quality")])
+        args.subject_var = args.reference_var = launch_variables(root)
         plan, cases = qc.build_plan(args, {})
 
         class Forged(FakeRuns):

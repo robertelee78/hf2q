@@ -32,6 +32,7 @@ import coding_long_context
 import native_peers
 import q2_run_audit
 import quality_outcomes
+import quality_launch
 import q5_case
 
 HERE = Path(__file__).resolve().parent
@@ -206,7 +207,7 @@ def build_plan(args, environ):
             "reference_kind": args.reference_kind if "reference" in arms else None,
             "instance_table": {"path": str(coding_instances.TABLE), "sha256": table_sha},
             "sources": {name: sha256(HERE / name) for name in
-                        ("quality_campaign.py", "quality_outcomes.py", "q2_run_audit.py",
+                        ("quality_campaign.py", "quality_outcomes.py", "quality_launch.py", "q2_run_audit.py",
                          *coding_instances.MODULES, "qwen_n4_live_smoke.py")},
             "arms": arms, "schedule": schedule(args.instances, tuple(arms))}
     if args.negative_control_receipt is not None:
@@ -233,11 +234,19 @@ def classify(receipt, summary, instance, table_sha256):
     if receipt is None:
         return "Invalid", "Q5 receipt missing"
     verdict = receipt.get("verdict", {})
+    started = summary is not None and (
+        summary.get("barrier", {}).get("status") == "Released" or
+        summary.get("barrier", {}).get("release_monotonic_ns") is not None or
+        any(agent.get("turns") for agent in summary.get("agents", {}).values()))
     if receipt.get("client") is None:
+        if started:
+            return "Invalid", "receipt claims no client but task-start evidence exists"
         return "NotStarted", f"no client launched: {verdict.get('verdict')}: {verdict.get('reason')}"
     if summary is None:
         return "Invalid", "client launched but wrote no summary"
     if summary.get("barrier", {}).get("status") != "Released":
+        if started:
+            return "Invalid", "pending barrier contradicts task-start evidence"
         return "NotStarted", "client ended before the four-agent release: " + str(summary.get("error"))
     if summary.get("instance") != {"id": instance, "table_sha256": table_sha256}:
         return "Invalid", "client summary task instance differs from the campaign's"
@@ -294,6 +303,8 @@ def settle(entry, record, case, plan, code):
         outcome, reason = "NotStarted", "Q5 never created the run directory"
     if outcome in ("Pass", "Fail"):
         try:
+            quality_launch.validate(derive_case(case, entry["instance"]), plan["arms"][entry["arm"]]["overrides"],
+                                    record, receipt, summary, summary_path)
             report = q2_run_audit.audit_quality_agents(
                 receipt, summary_path.parent, summary, plan["arms"][entry["arm"]]["engine_kind"])
         except (ValueError, KeyError, TypeError, IndexError, AttributeError, OSError) as error:
@@ -335,6 +346,8 @@ def checked_verdict(manifest):
     require(set(plan["arms"]) == set(arms) and plan["schedule"] == expected,
             "quality arm schedule differs from its frozen plan")
     require(len(manifest["runs"]) == len(expected), "quality run set differs from its schedule")
+    cases = {arm: quality_launch.bound_json(spec["case"], spec["case_sha256"])
+             for arm, spec in plan["arms"].items()}
     consumed = set()
     for run, slot in zip(manifest["runs"], expected):
         require(all(run.get(key) == value for key, value in slot.items()), "quality task slot changed")
@@ -351,6 +364,8 @@ def checked_verdict(manifest):
                 continue
             require(outcome in ("Pass", "Fail") and outcome == record.get("outcome") == run["outcome"],
                     "quality attempt is not eligible settled task evidence")
+            quality_launch.validate(derive_case(cases[slot["arm"]], slot["instance"]),
+                                    plan["arms"][slot["arm"]]["overrides"], record, receipt, summary, summary_path)
             actual = q2_run_audit.audit_quality_agents(
                 receipt, summary_path.parent, summary, plan["arms"][slot["arm"]]["engine_kind"])
             require(actual["agents"] == record["agents"], "quality agent outcomes changed")

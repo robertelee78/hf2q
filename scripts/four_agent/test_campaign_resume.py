@@ -14,7 +14,7 @@ import q3_campaign as q3
 import q3_report
 import quality_campaign as qc
 from test_q3_campaign import Harness, noisy
-from test_quality_campaign import QWEN38, FakeRuns, review_patches
+from test_quality_campaign import QWEN38, FakeRuns, review_patches, launch_variables
 
 
 class Crash(Exception):
@@ -139,6 +139,7 @@ class QualityLaunchedResume(unittest.TestCase):
         args = qc.parse_args(["--subject-case", str(QWEN38), "--reference-case", str(QWEN38), "--reference-kind",
                               "stock-hf2q", "--instances", "1", "--negative-control-receipt", str(root / "nc.json"),
                               "--output", str(self.out)])
+        args.subject_var = args.reference_var = launch_variables(root)
         self.plan, self.cases = qc.build_plan(args, {})
 
     def crash_first_run(self, forge=None):
