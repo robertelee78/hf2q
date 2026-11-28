@@ -339,8 +339,8 @@ pub(super) fn compare_final(fixture: &mut Fixture, lane: &mut Lane, prompt: &[u3
 }
 fn compare_final_prepared(fixture: &mut Fixture, lane: &mut Lane, prompt: &[u32], cached: usize,
     name: &str, arm: &str) -> Result<(Observations, State, Vec<u32>)> {
-    let scope = trace::Scope::begin(None, 0)?;
-    scope.attach(super::transaction_trace::Writer::new(fixture, name, arm)?, &lane.retained)?;
+    let scope = trace::Scope::begin_transactions(
+        super::transaction_trace::Writer::new(fixture, name, arm)?, &lane.retained)?;
     let served = prefill(fixture, lane, prompt, cached, true)?;
     let readiness = served.state.joint_decode_readiness(&lane.cache).map_err(|reason| reason.label());
     let tokens = finish_success(fixture, lane, served)?;

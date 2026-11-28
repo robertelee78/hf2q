@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- C2 transaction acquisition constructs its writer with the scope and rejects missing, unfinished, incomplete or repeated completion. Capture/close errors remain fatal even if a caller ignores them; completed raw observations move to their consumer without a duplicate payload allocation. This test-only repair does not qualify the lifecycle matrix or release.
 - Paired task-quality campaigns count the frozen six labels × four agents, not 24 all-or-nothing cohorts. Successful peers survive a failed agent's task; unreviewed patches publish no quality verdict. Existing-format independent patch review can settle captures without rerunning them, and Q3/F2 admission re-derives the per-agent evidence and verdict. Statistical thresholds and release gates are unchanged.
   Admission binds raw output to the actual scheduled Q5 launch and rejects contradictory no-client retry history.
 - Qwen TQ-only cold and resumed prompt prefill consume the same persisted KV representation, including the fused encoder path; F32-cache controls remain raw. Cold BF16 history reuses arena storage instead of allocating duplicate K/V roots. This changes old cold arithmetic and does not promote multi-anchor defaults or replace numerical, real-task, memory, fairness, performance or release qualification.

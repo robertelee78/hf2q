@@ -387,6 +387,8 @@ The comparison uses Q1 stores (`hf2q.adr063.invariance`) and `scripts/four_agent
 
 **Harness.** An ignored real-artifact test module, `src/serve/api/engine_qwen35/anchor_exactness_tests.rs`, scripts token-level turns through the slot-aware engine functions (pattern: `speculation_real_artifact_tests.rs`). It records Q1 stores at each transaction.
 
+Transaction acquisition owns its writer from scope construction. Closing without a writer, publishing before closure, incomplete registered coverage, capture after closure, and repeated closure are errors; capture/closure failures remain sticky and prohibit publication. Returning completed raw observations transfers their buffers rather than cloning the retained tensor payload. Model-free controls exercise the real bounded store and these failure paths; they do not attest a model acquisition or complete the matrix. Independent request/call obligations and source-derived extent planning are still required to reject symmetric planner-plus-observer omissions.
+
 | Axis | Values |
 |---|---|
 | Artifact | Qwen3.8-27B vanilla (`HF2Q_QWEN38_GGUF`), Qwen3.6-35B-A3B vanilla (`HF2Q_QWEN36_GGUF`) |

@@ -99,13 +99,19 @@ pub(super) struct Observations {
     pub route_events: Vec<&'static str>,
     pub frozen_gpu_selector_used: bool,
 }
+enum Transactions {
+    Disabled,
+    Recording(super::transaction_trace::Writer),
+    Finished,
+    Failed,
+}
 struct Active {
     observations: Observations,
     frozen: Option<Vec<u32>>,
     decision_base: usize,
     target_slot: SlotId,
     prediction_origin: usize,
-    writer: Option<super::transaction_trace::Writer>,
+    transactions: Transactions,
     published_ledger: Vec<u32>,
 }
 thread_local! { static ACTIVE: RefCell<Option<Active>> = const { RefCell::new(None) }; }
@@ -116,7 +122,8 @@ impl Scope {
             let mut active = cell.borrow_mut();
             ensure!(active.is_none(), "nested C2 acquisition");
             *active = Some(Active { observations: Observations::default(), frozen, decision_base,
-                target_slot: SLOT, prediction_origin: 0, writer: None, published_ledger: Vec::new() });
+                target_slot: SLOT, prediction_origin: 0, transactions: Transactions::Disabled,
+                published_ledger: Vec::new() });
             Ok(Self)
         })
     }
@@ -125,15 +132,16 @@ impl Scope {
             if let Some(active) = cell.borrow_mut().as_mut() { active.target_slot = slot; }
         });
     }
-    pub(super) fn attach(&self, writer: super::transaction_trace::Writer, ledger: &[u32]) -> Result<()> {
+    pub(super) fn begin_transactions(writer: super::transaction_trace::Writer, ledger: &[u32]) -> Result<Self> {
+        let scope = Self::begin(None, 0)?;
         ACTIVE.with(|cell| {
             let mut active = cell.borrow_mut();
             let active = active.as_mut().context("C2 scope absent")?;
-            ensure!(active.writer.is_none(), "duplicate transaction writer");
-            active.writer = Some(writer);
+            active.transactions = Transactions::Recording(writer);
             active.published_ledger = ledger.to_vec();
-            Ok(())
-        })
+            Ok::<_, anyhow::Error>(())
+        })?;
+        Ok(scope)
     }
     pub(super) fn publish(&self, ledger: &[u32]) {
         ACTIVE.with(|cell| {
@@ -141,9 +149,21 @@ impl Scope {
         });
     }
     pub(super) fn finish_transactions(&self) -> Result<()> {
-        let writer = ACTIVE.with(|cell| cell.borrow_mut().as_mut().and_then(|a| a.writer.take()));
-        if let Some(writer) = writer { writer.finish()?; }
-        Ok(())
+        ACTIVE.with(|cell| {
+            let mut active = cell.borrow_mut();
+            let active = active.as_mut().context("C2 scope absent")?;
+            // Failure is sticky, including a failed or repeated close. An
+            // ignored error must never leave observations publishable.
+            let writer = match std::mem::replace(&mut active.transactions, Transactions::Failed) {
+                Transactions::Recording(writer) => writer,
+                Transactions::Disabled => anyhow::bail!("Incomplete: transaction writer was not attached"),
+                Transactions::Finished => anyhow::bail!("Incomplete: transaction capture already finished"),
+                Transactions::Failed => anyhow::bail!("Incomplete: transaction capture previously failed"),
+            };
+            writer.finish()?;
+            active.transactions = Transactions::Finished;
+            Ok(())
+        })
     }
     pub(super) fn inspect<T>(&self, f:impl FnOnce(&Observations)->T) -> Result<T> {
         ACTIVE.with(|cell| {
@@ -152,8 +172,13 @@ impl Scope {
         })
     }
     pub(super) fn take(&self) -> Result<Observations> {
-        ACTIVE.with(|cell| Ok(cell.borrow_mut().as_mut().context("C2 scope absent")?
-            .observations.clone()))
+        ACTIVE.with(|cell| {
+            let mut active = cell.borrow_mut();
+            let active = active.as_mut().context("C2 scope absent")?;
+            ensure!(matches!(active.transactions, Transactions::Finished),
+                "Incomplete: transaction capture is unfinished or failed");
+            Ok(std::mem::take(&mut active.observations))
+        })
     }
 }
 impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|cell| { cell.borrow_mut().take(); }); } }
@@ -225,9 +250,16 @@ pub(super) fn transaction(cache: &HybridKvCache, slot: SlotId) -> Result<()> {
         let mut active = cell.borrow_mut();
         let Some(active) = active.as_mut() else { return Ok(()) };
         if slot == active.target_slot {
-            if let Some(writer) = active.writer.as_mut() {
-                writer.capture(cache, slot, &active.published_ledger)?;
+            let result = match &mut active.transactions {
+                Transactions::Disabled => Ok(()),
+                Transactions::Recording(writer) => writer.capture(cache, slot, &active.published_ledger),
+                Transactions::Finished => Err(anyhow::anyhow!("Incomplete: transaction captured after finish")),
+                Transactions::Failed => Err(anyhow::anyhow!("Incomplete: transaction capture previously failed")),
+            };
+            if result.is_err() {
+                active.transactions = Transactions::Failed;
             }
+            result?;
         }
         Ok(())
     })
@@ -338,4 +370,13 @@ fn c23_linear_observer_matches_actual_contiguous_slot_addressing() {
     }
     assert!(linear_slot_bytes(&values, 4, SlotId(4)).is_err());
     assert!(linear_slot_bytes(&values[..23], 4, SlotId(0)).is_err());
+}
+
+#[test]
+fn c2_transaction_scope_rejects_missing_writer_and_keeps_failure_sticky() {
+    let scope = Scope::begin(None, 0).unwrap();
+    assert!(scope.take().is_err(), "a missing writer must not publish observations");
+    assert!(scope.finish_transactions().is_err());
+    assert!(scope.take().is_err(), "ignored close error must not publish observations");
+    assert!(scope.finish_transactions().is_err());
 }
