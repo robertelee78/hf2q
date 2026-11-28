@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import f2_q3_tier as tier
 import f2_scoreboard_render as r
@@ -16,6 +17,13 @@ from test_f2_q3_tier import EXP, board, tier_line
 
 STOCK, PEER, NATIVE = "5" * 64, "9" * 64, "4" * 64
 ARMS = {"stock": {"binary": {"sha256": STOCK}}, "experiment": {"binary": {"sha256": EXP}}, "peer": {"binary": {"sha256": PEER}}}
+
+
+def setUpModule():
+    # These fixtures isolate arm/binary binding; raw task adjudication is covered by test_quality_campaign.
+    checker = mock.patch("quality_campaign.checked_verdict", side_effect=lambda document: document["verdict"])
+    checker.start()
+    unittest.addModuleCleanup(checker.stop)
 
 
 def write_run(run, binary, readiness=None):

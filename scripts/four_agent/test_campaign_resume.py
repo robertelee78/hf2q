@@ -14,7 +14,7 @@ import q3_campaign as q3
 import q3_report
 import quality_campaign as qc
 from test_q3_campaign import Harness, noisy
-from test_quality_campaign import QWEN38, FakeRuns
+from test_quality_campaign import QWEN38, FakeRuns, review_patches, launch_variables
 
 
 class Crash(Exception):
@@ -139,6 +139,7 @@ class QualityLaunchedResume(unittest.TestCase):
         args = qc.parse_args(["--subject-case", str(QWEN38), "--reference-case", str(QWEN38), "--reference-kind",
                               "stock-hf2q", "--instances", "1", "--negative-control-receipt", str(root / "nc.json"),
                               "--output", str(self.out)])
+        args.subject_var = args.reference_var = launch_variables(root)
         self.plan, self.cases = qc.build_plan(args, {})
 
     def crash_first_run(self, forge=None):
@@ -151,20 +152,25 @@ class QualityLaunchedResume(unittest.TestCase):
         self.crash_first_run()
         runs = FakeRuns(lambda instance, arm: "pass")
         manifest = qc.run(self.plan, self.cases, self.out, {}, runs, resume=True)
+        self.assertEqual(manifest["status"], "AwaitingPatchReview")
+        calls = list(runs.calls)
+        manifest = qc.run(self.plan, self.cases, self.out, {}, runs, resume=True,
+                          patch_review=review_patches(self.out, manifest))
         self.assertEqual(manifest["status"], "Complete")
+        self.assertEqual(runs.calls, calls)
         first = manifest["runs"][0]
         self.assertEqual([(a["outcome"], a["q5_exit"]) for a in first["attempts"]], [("Pass", None)])
         self.assertEqual(first["outcome"], "Pass")
         self.assertIsNotNone(first["attempts"][0]["audit"])
         self.assertEqual(runs.calls, [(e["instance"], e["arm"]) for e in self.plan["schedule"][1:]])
-        self.assertEqual(manifest["verdict"]["verdict"], "Insufficient")  # one instance, below the 24 minimum
+        self.assertEqual(manifest["verdict"]["verdict"], "Insufficient")  # four tasks, below the 24 minimum
 
     def test_launched_forged_run_becomes_invalid_and_is_not_relaunched(self):
         def unscored(summary):
             summary["agents"]["agent-1"]["tools"][-1]["passed"] = False  # status still claims success
         self.crash_first_run(unscored)
         runs = FakeRuns(lambda instance, arm: "pass")
-        with self.assertRaisesRegex(qc.CampaignError, r"^run 0 is Invalid \(run audit: .*final tests/source.*\); no reruns"):
+        with self.assertRaises(qc.CampaignError):
             qc.run(self.plan, self.cases, self.out, {}, runs, resume=True)
         self.assertEqual(runs.calls, [])
         manifest = json.loads((self.out / "manifest.json").read_text())

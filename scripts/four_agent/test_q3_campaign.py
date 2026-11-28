@@ -35,6 +35,13 @@ EXP_SHA, STOCK_SHA, PEER_SHA, MODEL_SHA = "e" * 64, "5" * 64, "9" * 64, "a" * 64
 SHAS = {"stock": STOCK_SHA, "experiment": EXP_SHA, "peer": PEER_SHA, "peer_matched": "8" * 64}
 
 
+def setUpModule():
+    # Report/identity tests use receipt-shaped inputs, not the raw quality-adjudication integration fixture.
+    checker = mock.patch("quality_campaign.checked_verdict", side_effect=lambda document: document["verdict"])
+    checker.start()
+    unittest.addModuleCleanup(checker.stop)
+
+
 def effect_of(ratios):
     return q3_stats.paired_effect([(r * 100, 100) for r in ratios])
 
@@ -504,7 +511,8 @@ class Driver(Harness):
         run.mkdir()
         (run / "receipt.json").write_text(json.dumps({"binary": {"sha256": EXP_SHA}}))
         quality = self.root / "quality.json"
-        document = {"plan": {"arms": {"subject": {"family": "qwen38"}}, "reference_kind": "peer"},
+        document = {"status": "Complete",
+                    "plan": {"arms": {"subject": {"family": "qwen38"}}, "reference_kind": "peer"},
                     "runs": [{"arm": "subject", "attempts": [{"output": str(run)}]}], "verdict": {"verdict": "Pass"}}
         quality.write_text(json.dumps(document))
         self.assertEqual(self.verdict(manifest, quality_paths=[quality])["verdict"], "Win")

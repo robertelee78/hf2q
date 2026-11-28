@@ -10,6 +10,7 @@ import native_peers
 import q3_metrics
 import q3_stats
 import q3_mechanism
+import quality_campaign
 
 VERDICT_SCHEMA = "hf2q.adr063.q3-verdict.v1"
 PATCH_REVIEW_SCHEMA = "hf2q.adr063.q3-patch-review.v1"
@@ -233,7 +234,8 @@ def quality_state(manifest, quality_paths, review_path):
         subject = {(q3_metrics.load_json(Path(a["output"]) / "receipt.json") or {}).get("binary", {}).get("sha256")
                    for run in document.get("runs", []) if run.get("arm") == "subject" for a in run.get("attempts", [])}
         family = document.get("plan", {}).get("arms", {}).get("subject", {}).get("family")
-        verdict = (document.get("verdict") or {}).get("verdict")
+        verdict = (quality_campaign.checked_verdict(document)["verdict"]
+                   if document.get("status") == "Complete" else None)
         record = {"path": str(path), "sha256": sha256(path), "family": family, "verdict": verdict,
                   "reference_kind": document.get("plan", {}).get("reference_kind"),
                   "binds_experiment_binary": subject == {experiment_sha}}

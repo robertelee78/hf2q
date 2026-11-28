@@ -506,6 +506,15 @@ The live client and raw replay bind this distinction to the actual startup decla
 
 - **Qwen3.8:** the paired 24-instance task-quality gate (`scripts/four_agent/quality_campaign.py`) between K = 4 and K = 1, on the divergent-edit variant composed with instances.
 - **Qwen3.6:** bitwise exactness (§7.2), append-only `ExactTranscripts` (§7.5), and the D1 envelope on every divergent row. The declared repair-one workload also passes the paired task-quality gate, as required by ADR-063 §C2's 2026-11-05 amendment; the earlier no-task-pass-rate exemption no longer applies.
+
+The 24 task instances are Q1 §3.5's six frozen labels × four agents, not
+24 four-agent cohorts. The v2 quality driver retains per-agent raw-audited
+outcomes even when a peer task fails. Successful sources on both arms must
+receive the existing Q3-format independent patch review before a paired verdict
+is published; review-only resume never reruns a settled task. Q3/F2 admission
+reproduces the bound raw outcomes and review verdict. This repairs the
+consumer's unit of observation, not the policy, sampling or thresholds.
+
 - **Cancel smoke** (`scripts/four_agent/cancel_smoke.py`, `q5_cases/cancel-qwen38.json` and a Qwen3.6 derivative) with K = 4 and with K = 1. Its receipt adds, for every cancelled request whose client retries:
   - the retry's semantic TTFT;
   - the recovered depth (`restores_total{rank}` and the restored token count, or 0 for a reset);

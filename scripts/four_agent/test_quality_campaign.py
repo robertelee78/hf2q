@@ -3,6 +3,8 @@ import itertools
 import json
 import math
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -160,6 +162,11 @@ class Classify(unittest.TestCase):
         self.assertEqual(self.outcome(receipt(), summary(table="0" * 64)), "Invalid")
         self.assertEqual(self.outcome(None, None), "Invalid")
         self.assertEqual(self.outcome(receipt(), None), "Invalid")
+        self.assertEqual(self.outcome(receipt(client=False), summary()), "Invalid")
+        started = summary(released=False)
+        started["agents"]["agent-0"]["turns"] = [{"request": "already sent"}]
+        self.assertEqual(self.outcome(receipt(client=False), started), "Invalid")
+        self.assertEqual(self.outcome(receipt(), started), "Invalid")
 
 
 class FakeRuns:
@@ -173,7 +180,7 @@ class FakeRuns:
 
     def __call__(self, argv, env, stdout, stderr):
         case = json.loads(Path(argv[3]).read_text())
-        output = Path(argv[argv.index("--output") + 1])
+        output = Path(argv[argv.index("--output") + 1]).resolve()
         instance = int(case["client"]["argv"][-1])
         arm = "reference" if "-reference.json" in argv[3] else "subject"
         self.calls.append((instance, arm))
@@ -187,12 +194,67 @@ class FakeRuns:
         value = receipt(stop, exit_code=0 if kind == "pass" else 1)
         value.update(cleanup={"proven": True}, cleanup_proven=True)
         (output / "receipt.json").write_text(json.dumps(value))
-        if kind == "pass":
+        if kind in ("pass", "fail"):
             fake.honest_run(output / "client", instance=instance)
-            return 0
+            if kind == "fail":
+                path = output / "client" / "summary.json"
+                value = json.loads(path.read_text())
+                value["status"] = "Failed"
+                value["agents"]["agent-0"]["status"] = "Failed"
+                value["agents"]["agent-0"]["error"] = "task failed"
+                path.write_text(json.dumps(value))
+            self.bind_launch(case, argv, output, env,
+                             json.loads((output / "client/summary.json").read_bytes()))
+            return 0 if kind == "pass" else 1
         (output / "client").mkdir()
         (output / "client" / "summary.json").write_text(json.dumps(summary("Failed", instance=instance)))
         return 1
+
+    @staticmethod
+    def bind_launch(case, argv, output, env, summary):
+        case_path = argv[3]
+        q5 = qc.quality_launch.q5_calibration
+        builtins = q5.builtins(output)
+        builtins.update(RUN_ID=summary["run_id"], NONCE32="0" * 32)
+        plan = qc.q5_case.build_plan(case, builtins, env)
+        values, missing = qc.q5_case.resolve_variables(case, builtins, env)
+        if missing:
+            raise ValueError("model-free launch fixture needs complete case variables")
+        values.update(SERVED_MODEL=plan["served_model"], SERVER_PID=summary["server_pid"])
+        spec = plan["client"]["approval"]
+        approval = json.loads(Path(spec["template"]).read_bytes())
+        approval.update({key: q5.resolve_set(value, values) for key, value in spec["set"].items()})
+        path = output / "client-approval.json"
+        path.write_text(json.dumps(approval))
+        values.update(CLIENT_APPROVAL=str(path), CLIENT_APPROVAL_SHA256=qc.sha256(path))
+        path = output / "receipt.json"
+        receipt = json.loads(path.read_bytes())
+        receipt["client"]["summary_path"] = str(output / "client/summary.json")
+        receipt.update(case={"path": case_path, "sha256": qc.sha256(case_path)},
+                       plan_sha256=qc.plan_sha256(plan), serve_argv=plan["serve"]["argv"],
+                       serve_env=plan["serve"]["env"], server={"pid": summary["server_pid"]},
+                       client_argv=qc.q5_case.expand(plan["client"]["argv"], values),
+                       supervisor_sources={"q5_calibration.py": qc.sha256(argv[2])},
+                       inputs={spec["template"]: qc.sha256(spec["template"])})
+        path.write_text(json.dumps(receipt))
+
+
+def launch_variables(root):
+    template = root / "approval-template.json"
+    template.write_text("{}")
+    variables = {"CARGO": "/fake/cargo", "TOOLCHAIN": "stable", "SANDBOX_PROOF": "/fake/proof",
+                 "SANDBOX_PROOF_SHA256": "0" * 64, "CLIENT_APPROVAL_TEMPLATE": str(template)}
+    return [f"{key}={value}" for key, value in variables.items()]
+
+
+def review_patches(out, manifest):
+    sources = {value["final_source_sha256"]
+               for run in manifest["runs"] for value in run["attempts"][-1]["agents"].values()
+               if value["outcome"] == "Pass"}
+    path = out / "patch-review.json"
+    path.write_text(json.dumps({"schema": "hf2q.adr063.q3-patch-review.v1",
+                               "verdicts": {sha: "Pass" for sha in sources}}))
+    return path
 
 
 class Campaign(unittest.TestCase):
@@ -203,22 +265,153 @@ class Campaign(unittest.TestCase):
         (root / "nc.json").write_text("{}")
         self.out = root / "campaign"
         self.args = qc.parse_args(["--subject-case", str(QWEN38), "--reference-case", str(QWEN38),
-                                   "--reference-kind", "stock-hf2q", "--instances", "24",
+                                   "--reference-kind", "stock-hf2q", "--instances", "6",
                                    "--negative-control-receipt", str(root / "nc.json"), "--output", str(self.out)])
+        variables = launch_variables(root)
+        self.args.subject_var = variables + ["DFLASH2=0"]
+        self.args.reference_var = variables + ["DFLASH2=1"]
+
+    def completed_capture(self):
+        plan, cases = qc.build_plan(self.args, {})
+        runs = FakeRuns(lambda i, arm: "pass")
+        manifest = qc.run(plan, cases, self.out, {}, runs)
+        return qc.run(plan, cases, self.out, {}, runs, resume=True,
+                      patch_review=review_patches(self.out, manifest))
+
+    def test_capture_remains_admissible_from_another_checkout_and_interpreter_path(self):
+        import shutil
+        manifest = self.completed_capture()
+        consumer = self.out / "other-checkout/scripts/four_agent"
+        consumer.mkdir(parents=True)
+        for name in ("quality_campaign.py", "quality_launch.py", "q5_calibration.py"):
+            shutil.copyfile(HERE / name, consumer / name)
+        python = self.out / "other-python"
+        python.symlink_to(sys.executable)
+        script = (
+            f"import sys,json;sys.path[:0]=[{str(consumer)!r},{str(HERE)!r}];"
+            "import quality_campaign as qc;"
+            f"print(json.dumps(qc.checked_verdict(json.load(open({str(self.out / 'manifest.json')!r})))))")
+        result = subprocess.run([str(python), "-E", "-s", "-B", "-c", script],
+                                check=True, capture_output=True, text=True)
+        self.assertEqual(json.loads(result.stdout), manifest["verdict"])
+
+    def assert_admission_rejects(self, manifest):
+        import f2_q3_tier
+        with self.assertRaises(ValueError):
+            qc.checked_verdict(manifest)
+        with self.assertRaises(ValueError):
+            f2_q3_tier.gate_status(manifest, "stock-hf2q", "qwen38", {})
+
+    def test_one_label_cannot_be_copied_into_six_task_slots(self):
+        import shutil
+        manifest = self.completed_capture()
+        donors = {run["arm"]: run for run in manifest["runs"] if run["instance"] == 0}
+        for run in manifest["runs"]:
+            if run["instance"] == 0:
+                continue
+            record = json.loads(json.dumps(donors[run["arm"]]["attempts"][-1]))
+            copied = self.out / f"copied-{run['index']}"
+            shutil.copytree(record["output"], copied)
+            record.update(output=str(copied), client_summary=str(copied / "client/summary.json"))
+            run["attempts"] = [record]
+        self.assert_admission_rejects(manifest)
+
+    def test_bound_receipt_does_not_make_invalid_stops_eligible(self):
+        manifest = self.completed_capture()
+        path = Path(manifest["runs"][0]["attempts"][-1]["output"]) / "receipt.json"
+        original = path.read_bytes()
+        for failure in ("footprint_cap", "interrupted", "supervisor_error"):
+            with self.subTest(failure=failure):
+                changed = json.loads(json.dumps(manifest))
+                receipt = json.loads(original)
+                if failure == "supervisor_error":
+                    receipt["supervisor_error"] = "observer failed"
+                else:
+                    receipt["stop"] = {"reason": failure}
+                path.write_text(json.dumps(receipt))
+                changed["runs"][0]["attempts"][-1]["receipt_sha256"] = qc.sha256(path)
+                self.assert_admission_rejects(changed)
+        path.write_bytes(original)
+
+    def test_started_attempt_cannot_be_hidden_before_a_successful_retry(self):
+        import shutil
+        manifest = self.completed_capture()
+        record = json.loads(json.dumps(manifest["runs"][0]["attempts"][-1]))
+        earlier = self.out / "earlier-started-attempt"
+        shutil.copytree(record["output"], earlier)
+        record.update(output=str(earlier), client_summary=str(earlier / "client/summary.json"))
+        manifest["runs"][0]["attempts"].insert(0, record)
+        self.assert_admission_rejects(manifest)
+
+    def test_reference_raw_tree_cannot_replace_subject_evidence(self):
+        import shutil
+        manifest = self.completed_capture()
+        subject, reference = manifest["runs"][:2]
+        donor = reference["attempts"][-1]
+        copied = self.out / "copied-reference-client"
+        shutil.copytree(Path(donor["client_summary"]).parent, copied)
+        record = subject["attempts"][-1]
+        record.update(client_summary=str(copied / "summary.json"),
+                      client_summary_sha256=qc.sha256(copied / "summary.json"), agents=donor["agents"])
+        self.assert_admission_rejects(manifest)
+
+    def test_subject_receipt_must_match_its_frozen_arm_configuration(self):
+        manifest = self.completed_capture()
+        subject, reference = manifest["runs"][:2]
+        path = Path(subject["attempts"][-1]["output"]) / "receipt.json"
+        original = json.loads(path.read_bytes())
+        donor = json.loads((Path(reference["attempts"][-1]["output"]) / "receipt.json").read_bytes())
+        for key in ("plan_sha256", "serve_env"):
+            with self.subTest(key=key):
+                changed = json.loads(json.dumps(manifest))
+                receipt = {**original, key: donor[key]}
+                path.write_text(json.dumps(receipt))
+                changed["runs"][0]["attempts"][-1]["receipt_sha256"] = qc.sha256(path)
+                self.assert_admission_rejects(changed)
+        path.write_text(json.dumps(original))
+
+    def test_no_client_receipt_cannot_hide_a_released_attempt_before_retry(self):
+        import shutil
+        manifest = self.completed_capture()
+        record = json.loads(json.dumps(manifest["runs"][0]["attempts"][-1]))
+        earlier = self.out / "earlier-contradictory-attempt"
+        shutil.copytree(record["output"], earlier)
+        path = earlier / "receipt.json"
+        receipt = json.loads(path.read_bytes())
+        receipt.pop("client")
+        path.write_text(json.dumps(receipt))
+        record.update(output=str(earlier), client_summary=str(earlier / "client/summary.json"),
+                      receipt_sha256=qc.sha256(path), outcome="NotStarted")
+        manifest["runs"][0]["attempts"].insert(0, record)
+        self.assert_admission_rejects(manifest)
 
     def test_complete_campaign_scores_paired_outcomes(self):
         plan, cases = qc.build_plan(self.args, {})
         runs = FakeRuns(lambda i, arm: "fail" if arm == "subject" and i < 5 else "pass")
         manifest = qc.run(plan, cases, self.out, {}, runs)
+        self.assertEqual(manifest["status"], "AwaitingPatchReview")
+        self.assertIsNone(manifest["verdict"])
+        calls = list(runs.calls)
+        manifest = qc.run(plan, cases, self.out, {}, runs, resume=True,
+                          patch_review=review_patches(self.out, manifest))
         self.assertEqual(manifest["status"], "Complete")
-        self.assertEqual(runs.calls, [(e["instance"], e["arm"]) for e in plan["schedule"]])
+        self.assertEqual(runs.calls, calls)
         self.assertEqual(manifest["verdict"]["verdict"], "Loss")
         self.assertEqual(manifest["verdict"]["subject_only_fail"], 5)
+        self.assertEqual(manifest["verdict"]["subject_pass"], 19)
+        self.assertEqual(qc.checked_verdict(manifest), manifest["verdict"])
         outcomes = json.loads((self.out / "outcomes.json").read_text())
         self.assertEqual(outcomes["reference_kind"], "stock-hf2q")
-        self.assertEqual([i["subject"] for i in outcomes["instances"][:6]], [False] * 5 + [True])
+        self.assertEqual([i["subject"] for i in outcomes["instances"][:6]],
+                         [False, True, True, True, False, True])
         first = manifest["runs"][0]["attempts"][0]
         self.assertEqual((first["outcome"], first["client_status"]), ("Fail", "Failed"))
+        review = self.out / "patch-review.json"
+        changed = json.loads(review.read_text())
+        changed["verdicts"] = {sha: "Fail" for sha in changed["verdicts"]}
+        review.write_text(json.dumps(changed))
+        with self.assertRaises(qc.CampaignError):
+            qc.checked_verdict(manifest)
 
     def test_refusal_halts_and_resumes_but_started_tasks_never_rerun(self):
         plan, cases = qc.build_plan(self.args, {})
@@ -228,9 +421,15 @@ class Campaign(unittest.TestCase):
         self.assertEqual((manifest["status"], manifest["halted_at"]), ("Halted", 3))
         refused.clear()
         manifest = qc.run(plan, cases, self.out, {}, runs, resume=True)
+        self.assertEqual(manifest["status"], "AwaitingPatchReview")
+        calls = list(runs.calls)
+        manifest = qc.run(plan, cases, self.out, {}, runs, resume=True,
+                          patch_review=review_patches(self.out, manifest))
         self.assertEqual((manifest["status"], manifest["verdict"]["verdict"]), ("Complete", "Pass"))
+        self.assertEqual(runs.calls, calls)
+        self.assertEqual(qc.checked_verdict(manifest), manifest["verdict"])
         self.assertEqual([a["outcome"] for a in manifest["runs"][3]["attempts"]], ["NotStarted", "Pass"])
-        self.assertEqual(len(runs.calls), 49)
+        self.assertEqual(len(runs.calls), 13)
         with self.assertRaises(qc.CampaignError):
             qc.run(plan, cases, self.out, {}, runs, resume=True)
 
@@ -259,14 +458,14 @@ class Campaign(unittest.TestCase):
         with self.assertRaises(qc.CampaignError):  # an hf2q case cannot be the peer arm
             qc.build_plan(peer, {})
         plan, _ = qc.build_plan(self.args, {"HF2Q_Q5_MODEL": "/abs/model.gguf"})
-        self.assertEqual(plan["arms"]["reference"]["overrides"], {"MODEL": "/abs/model.gguf"})
+        self.assertEqual(plan["arms"]["reference"]["overrides"]["MODEL"], "/abs/model.gguf")
         env = qc.arm_environ({"HF2Q_Q5_MODEL": "/x", "PATH": "/bin"}, {"PORT": "1"})
         self.assertEqual(env, {"PATH": "/bin", "HF2Q_Q5_PORT": "1"})
 
     def args_list(self, out):
         root = Path(self.directory.name)
         return ["--subject-case", str(QWEN38), "--reference-case", str(QWEN38), "--reference-kind", "stock-hf2q",
-                "--instances", "24", "--negative-control-receipt", str(root / "nc.json"), "--output", str(out)]
+                "--instances", "6", "--negative-control-receipt", str(root / "nc.json"), "--output", str(out)]
 
 
 if __name__ == "__main__":
