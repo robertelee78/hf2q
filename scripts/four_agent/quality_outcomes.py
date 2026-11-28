@@ -1,4 +1,7 @@
 """Q1 task instances are label × agent, adjudicated with the existing patch-review format."""
+import hashlib
+import json
+from pathlib import Path
 import re
 
 from qwen_n4_live_smoke import AGENTS
@@ -62,3 +65,26 @@ def adjudicate(manifest, review):
         return None, sorted(pending)
     return {"schema": OUTCOMES_SCHEMA, "reference_kind": plan["reference_kind"],
             "instances": instances}, []
+
+
+def read_attempt(record):
+    """Parse the same held metadata bytes whose recorded digests were verified."""
+    output = Path(record["output"])
+    receipt_path = output / "receipt.json"
+    references = [str(receipt_path.resolve())]
+    if not output.exists():
+        require(record.get("receipt_sha256") is None and record.get("client_summary") is None and
+                record.get("client_summary_sha256") is None, "missing previously recorded quality input")
+        return None, None, None, references
+    raw = receipt_path.read_bytes()
+    require(hashlib.sha256(raw).hexdigest() == record.get("receipt_sha256"), "quality receipt changed")
+    receipt = json.loads(raw)
+    summary_path = record.get("client_summary")
+    if summary_path is None:
+        require(record.get("client_summary_sha256") is None, "quality summary binding missing")
+        return receipt, None, None, references
+    summary_path = Path(summary_path)
+    references.append(str(summary_path.resolve()))
+    raw = summary_path.read_bytes()
+    require(hashlib.sha256(raw).hexdigest() == record.get("client_summary_sha256"), "quality summary changed")
+    return receipt, json.loads(raw), summary_path, references

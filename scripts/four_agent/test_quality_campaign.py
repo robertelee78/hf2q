@@ -223,6 +223,61 @@ class Campaign(unittest.TestCase):
                                    "--reference-kind", "stock-hf2q", "--instances", "6",
                                    "--negative-control-receipt", str(root / "nc.json"), "--output", str(self.out)])
 
+    def completed_capture(self):
+        plan, cases = qc.build_plan(self.args, {})
+        runs = FakeRuns(lambda i, arm: "pass")
+        manifest = qc.run(plan, cases, self.out, {}, runs)
+        return qc.run(plan, cases, self.out, {}, runs, resume=True,
+                      patch_review=review_patches(self.out, manifest))
+
+    def assert_admission_rejects(self, manifest):
+        import f2_q3_tier
+        with self.assertRaises(ValueError):
+            qc.checked_verdict(manifest)
+        with self.assertRaises(ValueError):
+            f2_q3_tier.gate_status(manifest, "stock-hf2q", "qwen38", {})
+
+    def test_one_label_cannot_be_copied_into_six_task_slots(self):
+        import shutil
+        manifest = self.completed_capture()
+        donors = {run["arm"]: run for run in manifest["runs"] if run["instance"] == 0}
+        for run in manifest["runs"]:
+            if run["instance"] == 0:
+                continue
+            record = json.loads(json.dumps(donors[run["arm"]]["attempts"][-1]))
+            copied = self.out / f"copied-{run['index']}"
+            shutil.copytree(record["output"], copied)
+            record.update(output=str(copied), client_summary=str(copied / "client/summary.json"))
+            run["attempts"] = [record]
+        self.assert_admission_rejects(manifest)
+
+    def test_bound_receipt_does_not_make_invalid_stops_eligible(self):
+        manifest = self.completed_capture()
+        path = Path(manifest["runs"][0]["attempts"][-1]["output"]) / "receipt.json"
+        original = path.read_bytes()
+        for failure in ("footprint_cap", "interrupted", "supervisor_error"):
+            with self.subTest(failure=failure):
+                changed = json.loads(json.dumps(manifest))
+                receipt = json.loads(original)
+                if failure == "supervisor_error":
+                    receipt["supervisor_error"] = "observer failed"
+                else:
+                    receipt["stop"] = {"reason": failure}
+                path.write_text(json.dumps(receipt))
+                changed["runs"][0]["attempts"][-1]["receipt_sha256"] = qc.sha256(path)
+                self.assert_admission_rejects(changed)
+        path.write_bytes(original)
+
+    def test_started_attempt_cannot_be_hidden_before_a_successful_retry(self):
+        import shutil
+        manifest = self.completed_capture()
+        record = json.loads(json.dumps(manifest["runs"][0]["attempts"][-1]))
+        earlier = self.out / "earlier-started-attempt"
+        shutil.copytree(record["output"], earlier)
+        record.update(output=str(earlier), client_summary=str(earlier / "client/summary.json"))
+        manifest["runs"][0]["attempts"].insert(0, record)
+        self.assert_admission_rejects(manifest)
+
     def test_complete_campaign_scores_paired_outcomes(self):
         plan, cases = qc.build_plan(self.args, {})
         runs = FakeRuns(lambda i, arm: "fail" if arm == "subject" and i < 5 else "pass")
@@ -265,6 +320,7 @@ class Campaign(unittest.TestCase):
                           patch_review=review_patches(self.out, manifest))
         self.assertEqual((manifest["status"], manifest["verdict"]["verdict"]), ("Complete", "Pass"))
         self.assertEqual(runs.calls, calls)
+        self.assertEqual(qc.checked_verdict(manifest), manifest["verdict"])
         self.assertEqual([a["outcome"] for a in manifest["runs"][3]["attempts"]], ["NotStarted", "Pass"])
         self.assertEqual(len(runs.calls), 13)
         with self.assertRaises(qc.CampaignError):

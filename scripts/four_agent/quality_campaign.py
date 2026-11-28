@@ -329,17 +329,31 @@ def checked_verdict(manifest):
     require(manifest.get("schema") == SCHEMA and manifest.get("status") == "Complete",
             "quality campaign is not a complete per-agent campaign")
     require(manifest.get("plan_sha256") == plan_sha256(manifest["plan"]), "quality plan changed")
-    for run in manifest["runs"]:
-        record = run["attempts"][-1]
-        receipt_path = Path(record["output"]) / "receipt.json"
-        summary_path = Path(record["client_summary"])
-        require(sha256(receipt_path) == record["receipt_sha256"] and
-                sha256(summary_path) == record["client_summary_sha256"], "quality input changed")
-        summary = load_json(summary_path)
-        actual = q2_run_audit.audit_quality_agents(
-            load_json(receipt_path), summary_path.parent, summary,
-            manifest["plan"]["arms"][run["arm"]]["engine_kind"])
-        require(actual["agents"] == record["agents"], "quality agent outcomes changed")
+    plan = manifest["plan"]
+    arms = ("subject",) if plan["reference_kind"] is None else ("subject", "reference")
+    expected = schedule(plan["instances"], arms)
+    require(set(plan["arms"]) == set(arms) and plan["schedule"] == expected,
+            "quality arm schedule differs from its frozen plan")
+    require(len(manifest["runs"]) == len(expected), "quality run set differs from its schedule")
+    consumed = set()
+    for run, slot in zip(manifest["runs"], expected):
+        require(all(run.get(key) == value for key, value in slot.items()), "quality task slot changed")
+        require(bool(run["attempts"]), "quality task has no attempt")
+        for index, record in enumerate(run["attempts"]):
+            receipt, summary, summary_path, references = quality_outcomes.read_attempt(record)
+            require(not consumed.intersection(references), "quality evidence reused across attempts or tasks")
+            consumed.update(references)
+            outcome = ("NotStarted" if receipt is None else
+                       classify(receipt, summary, slot["instance"], plan["instance_table"]["sha256"])[0])
+            if index < len(run["attempts"]) - 1:
+                require(outcome == record.get("outcome") == "NotStarted",
+                        "quality task was retried after it started or became invalid")
+                continue
+            require(outcome in ("Pass", "Fail") and outcome == record.get("outcome") == run["outcome"],
+                    "quality attempt is not eligible settled task evidence")
+            actual = q2_run_audit.audit_quality_agents(
+                receipt, summary_path.parent, summary, plan["arms"][slot["arm"]]["engine_kind"])
+            require(actual["agents"] == record["agents"], "quality agent outcomes changed")
     binding = manifest.get("patch_review") or {}
     review, observed = load_review(binding.get("file"))
     require(observed == {key: binding.get(key) for key in ("file", "sha256")}, "patch review changed")
