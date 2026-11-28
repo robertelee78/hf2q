@@ -75,6 +75,9 @@ exclude = [
     # in the repository. Runtime grammar and calibration inputs are shipped
     # separately under src/serve/api/grammar/ and src/calibrate/.
     "scripts/grammar_probe/",
+    # Python regression modules remain repository CI inputs, not Rust CLI
+    # runtime assets. Exclude them to retain registry upload-size headroom.
+    "scripts/four_agent/test_*.py",
     # CI/CD workflow definitions are not consumer-facing source.
     ".github/",
     # macOS Finder metadata never belongs in a published tarball.
